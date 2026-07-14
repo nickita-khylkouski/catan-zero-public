@@ -51,6 +51,7 @@ from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa
 from tools import a1_ddp_epoch_canary as ddp_canary  # noqa: E402
 from tools import a1_aux_pair_coordinator as aux_coordinator  # noqa: E402
 from tools import a1_scientific_evidence as scientific_evidence  # noqa: E402
+from tools import audit_entity_graph_information_surface as information_surface  # noqa: E402
 
 
 RECEIPT_SCHEMA = "a1-one-dose-training-receipt-v3"
@@ -64,6 +65,25 @@ REPORT_INPUT_BINDING_SCHEMA = "a1-one-dose-input-binding-v1"
 REPORT_INPUT_BINDING_FIELD = "a1_one_dose_input_binding"
 TRAINING_TRANSACTION_SCHEMA = "a1-one-dose-training-transaction-v1"
 PRODUCTION_TRAINER_AUTHORITY_SCHEMA = "a1-production-trainer-authority-v1"
+PRODUCTION_TRAINER_CODE_SURFACE = tuple(
+    sorted(
+        train_bc.A1_REQUIRED_LEARNER_CODE_SUFFIXES
+        | {
+            "tools/a1_one_dose_train.py",
+            "tools/a1_build_post_wave_composite.py",
+            "tools/audit_entity_graph_information_surface.py",
+            "tools/mixed_memmap_corpus.py",
+            "tools/policy_target_reanalysis_contract.py",
+        }
+        # The child records every imported catan_zero module.  Bind the full
+        # package before taking the durable dose claim so lazy imports cannot
+        # slip different neural/loss bytes into the run after planning.
+        | {
+            path.relative_to(_REPO_ROOT).as_posix()
+            for path in (_REPO_ROOT / "src" / "catan_zero").rglob("*.py")
+        }
+    )
+)
 RETRY_CONTRACT_SCHEMA = "a1-one-dose-learner-retry-contract-v1"
 RETRY_IDENTITY_SCHEMA = "a1-one-dose-learner-retry-identity-v1"
 RETRY_REPAIR_KIND = "entity_graph_graph_layers_default_4_to_checkpoint_6"
@@ -288,7 +308,7 @@ def _stable_canonical_regular_file(
     return resolved, digest
 
 
-def _current_production_trainer_authority() -> dict[str, str]:
+def _current_production_trainer_authority() -> dict[str, Any]:
     """Authenticate the reviewed trainer in this executor's checkout.
 
     A frozen repository supplied on the CLI is authority only for replaying the
@@ -306,12 +326,27 @@ def _current_production_trainer_authority() -> dict[str, str]:
     trainer, trainer_sha256 = _stable_canonical_regular_file(
         expected, where="current production trainer"
     )
-    authority = {
+    code_surface = []
+    for relative_path in PRODUCTION_TRAINER_CODE_SURFACE:
+        code_file, code_sha256 = _stable_canonical_regular_file(
+            _REPO_ROOT / relative_path,
+            where=f"production trainer dependency {relative_path}",
+        )
+        code_surface.append(
+            {
+                "relative_path": relative_path,
+                "path": str(code_file),
+                "sha256": code_sha256,
+            }
+        )
+    authority: dict[str, Any] = {
         "schema_version": PRODUCTION_TRAINER_AUTHORITY_SCHEMA,
         "repository_root": str(_REPO_ROOT.resolve(strict=True)),
         "relative_path": "tools/train_bc.py",
         "path": str(trainer),
         "sha256": trainer_sha256,
+        "code_surface": code_surface,
+        "code_surface_sha256": _value_sha256(code_surface),
     }
     authority["authority_sha256"] = _value_sha256(authority)
     return authority
@@ -319,7 +354,7 @@ def _current_production_trainer_authority() -> dict[str, str]:
 
 def _require_current_production_trainer_authority(
     verified: Mapping[str, Any], *, command: Sequence[str] | None = None
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Reject production trainer path/byte drift before a dose is claimed."""
 
     if verified.get("data_kind") != "production_composite_v2":
@@ -732,6 +767,12 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
         payload.update(
             {
                 "trainer_authority": trainer_authority,
+                "event_history_training_contract": copy.deepcopy(
+                    verified["event_history_training_contract"]
+                ),
+                "event_history_component_authority": copy.deepcopy(
+                    verified["event_history_component_authority"]
+                ),
                 "production_mix_contract_sha256": _value_sha256(
                     verified["production_mix_contract"]
                 ),
@@ -1312,6 +1353,74 @@ def _verify_production_composite_inputs(
         "hard_negative": 0.04,
         "historical_replay": 0.20,
     }
+    raw_components = meta.get("components")
+    if not isinstance(raw_components, list) or len(raw_components) != len(
+        expected_ids
+    ):
+        raise ExecutorError(
+            "production composite lacks authenticated component metadata for "
+            "event-history admission"
+        )
+    component_metadata: dict[str, dict[str, Any]] = {}
+    event_history_component_authority: list[dict[str, str]] = []
+    for expected_id, component in zip(expected_ids, raw_components, strict=True):
+        nested = component.get("corpus_meta") if isinstance(component, dict) else None
+        inventory_sha256 = (
+            component.get("payload_inventory_sha256")
+            if isinstance(component, dict)
+            else None
+        )
+        if (
+            not isinstance(component, dict)
+            or component.get("component_id") != expected_id
+            or not isinstance(nested, dict)
+            or not isinstance(inventory_sha256, str)
+            or nested.get("payload_inventory_sha256") != inventory_sha256
+        ):
+            raise ExecutorError(
+                "production component event-history authority/order drifted: "
+                f"expected={expected_id!r}"
+            )
+        component_metadata[expected_id] = nested
+        event_history_component_authority.append(
+            {
+                "component_id": expected_id,
+                "payload_inventory_sha256": inventory_sha256,
+            }
+        )
+    event_history_acknowledgements = sorted(
+        {
+            str(component["payload_inventory_sha256"])
+            for component in component_metadata.values()
+        }
+    )
+    try:
+        event_history_training_contract = (
+            information_surface.build_a1_training_event_history_contract(
+                component_metadata,
+                graph_history_features=True,
+                event_history_consumer_enabled=True,
+                empty_payload_inventory_acknowledgements=(
+                    event_history_acknowledgements
+                ),
+            )
+        )
+    except (KeyError, information_surface.InformationSurfaceError) as error:
+        raise ExecutorError(
+            f"production composite event-history admission refused: {error}"
+        ) from error
+    if (
+        event_history_training_contract.get("training_event_history_trainable")
+        is not False
+        or event_history_training_contract.get("event_history_end_to_end_usable")
+        is not False
+        or event_history_training_contract.get("status")
+        != "empty_payloads_acknowledged"
+    ):
+        raise ExecutorError(
+            "production composite event history is no longer uniformly empty; "
+            "the frozen event-encoder crop is not authorized"
+        )
     contract = meta.get("production_mix_contract")
     learner_overrides = meta.get("learner_recipe_overrides")
     if (
@@ -1498,6 +1607,8 @@ def _verify_production_composite_inputs(
         "data_path": data_path,
         "data_kind": "production_composite_v2",
         "trainer_authority": _current_production_trainer_authority(),
+        "event_history_training_contract": event_history_training_contract,
+        "event_history_component_authority": event_history_component_authority,
         "corpus_meta_file_sha256": descriptor_sha,
         "descriptor_fingerprint": meta["descriptor_fingerprint"],
         "learner_recipe_overrides": meta["learner_recipe_overrides"],
@@ -3661,6 +3772,27 @@ def _build_direct_train_command(
                 "--allow-mixed-public-award-feature-contracts",
             ]
         )
+        event_history_contract = verified.get("event_history_training_contract")
+        acknowledgements = (
+            event_history_contract.get("empty_payload_inventory_acknowledgements")
+            if isinstance(event_history_contract, dict)
+            else None
+        )
+        if (
+            not isinstance(acknowledgements, list)
+            or not acknowledgements
+            or any(not isinstance(value, str) for value in acknowledgements)
+            or event_history_contract.get("training_event_history_trainable")
+            is not False
+            or event_history_contract.get("event_history_end_to_end_usable")
+            is not False
+        ):
+            raise ExecutorError(
+                "production composite lacks its authenticated empty event-history contract"
+            )
+        for acknowledgement in acknowledgements:
+            command.extend([EVENT_HISTORY_ACK_FLAG, acknowledgement])
+        command.append(EVENT_HISTORY_CROP_FLAG)
     if verified.get("data_kind") != "production_composite_v2":
         command.extend(
             [
@@ -3707,12 +3839,17 @@ def _build_direct_train_command(
     central_binding = verified.get("central_learner_binding")
     learner_ablation = verified.get("learner_ablation")
     if isinstance(central_binding, dict):
+        command.append("--allow-concurrent-bc")
+        if verified.get("data_kind") != "production_composite_v2":
+            command.extend(
+                [
+                    EVENT_HISTORY_ACK_FLAG,
+                    str(verified["payload_inventory_sha256"]),
+                    EVENT_HISTORY_CROP_FLAG,
+                ]
+            )
         command.extend(
             [
-                "--allow-concurrent-bc",
-                EVENT_HISTORY_ACK_FLAG,
-                str(verified["payload_inventory_sha256"]),
-                EVENT_HISTORY_CROP_FLAG,
                 "--a1-central-learner-binding-json",
                 _canonical_bytes(central_binding).decode("ascii"),
                 "--a1-central-executor-authority",
@@ -3730,6 +3867,15 @@ def _build_direct_train_command(
                 ]
             )
     elif learner_ablation is not None:
+        command.append("--allow-concurrent-bc")
+        if verified.get("data_kind") != "production_composite_v2":
+            command.extend(
+                [
+                    EVENT_HISTORY_ACK_FLAG,
+                    str(verified["payload_inventory_sha256"]),
+                    EVENT_HISTORY_CROP_FLAG,
+                ]
+            )
         command.extend(
             [
                 # Each executor child sees exactly one physical GPU through
@@ -3737,10 +3883,6 @@ def _build_direct_train_command(
                 # claim/output set.  The generic host-wide BC lock would
                 # otherwise serialize or reject independent diagnostic arms.
                 # Never add this to the historical/default one-dose command.
-                "--allow-concurrent-bc",
-                    EVENT_HISTORY_ACK_FLAG,
-                    str(verified["payload_inventory_sha256"]),
-                    EVENT_HISTORY_CROP_FLAG,
                     "--per-game-value-weight-mode",
                     str(recipe.get("per_game_value_weight_mode", "equal")),
                 "--a1-learner-ablation-id",
@@ -5368,6 +5510,316 @@ def _verify_matched_aux_torch_artifacts(
         ) from error
 
 
+def _require_production_event_history_surface(
+    surface: Any,
+    *,
+    expected_contract: Mapping[str, Any],
+    row_count: int,
+    where: str,
+) -> None:
+    """Require the authenticated empty-history crop in a report/checkpoint."""
+
+    if not isinstance(surface, dict) or any(
+        surface.get(key) != value for key, value in expected_contract.items()
+    ):
+        raise ExecutorError(f"{where} event-history contract drifted")
+    scan = surface.get("empty_event_mask_scan")
+    freeze = surface.get("event_encoder_freeze")
+    if (
+        surface.get("training_event_tensor_width") != 0
+        or not isinstance(scan, dict)
+        or scan.get("schema") != "training-empty-event-mask-scan-v1"
+        or scan.get("row_count") != row_count
+        or scan.get("nonzero_event_mask_count") != 0
+        or not isinstance(scan.get("scan_sha256"), str)
+        or not isinstance(freeze, dict)
+        or freeze.get("reason")
+        != "authenticated empty event axis is cropped to width zero"
+        or not isinstance(freeze.get("frozen_parameter_names"), list)
+        or not freeze["frozen_parameter_names"]
+        or freeze.get("frozen_parameter_tensors")
+        != len(freeze["frozen_parameter_names"])
+        or freeze.get("unexpected_frozen_parameter_tensors") != 0
+        or freeze.get("optimizer_excluded_parameter_tensors")
+        != freeze.get("frozen_parameter_tensors")
+        or freeze.get("optimizer_excluded_parameters")
+        != freeze.get("frozen_parameters")
+    ):
+        raise ExecutorError(
+            f"{where} did not prove the empty event axis was scanned, cropped, "
+            "and excluded from Adam"
+        )
+
+
+def _verify_production_validation_seed_manifest(
+    path: Path,
+    *,
+    report_payload: Mapping[str, Any],
+    verified: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind the emitted calibration cohort to the authenticated train split."""
+
+    manifest_path, file_sha256 = _stable_canonical_regular_file(
+        path, where="production validation-seed manifest"
+    )
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(
+            f"cannot parse production validation-seed manifest: {error}"
+        ) from error
+    expected_keys = {
+        "schema_version",
+        "data",
+        "data_fingerprint",
+        "validation_fraction",
+        "validation_seed",
+        "validation_max_samples",
+        "validation_game_seed_ranges",
+        "validation_game_seed_count",
+        "validation_game_seed_set_sha256",
+        "training_excluded_game_seed_count",
+        "training_excluded_game_seed_set_sha256",
+        "game_seeds",
+    }
+    seeds = payload.get("game_seeds") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected_keys
+        or payload.get("schema_version") != "train-validation-game-seeds-v1"
+        or payload.get("data") != str(verified["data_path"])
+        or payload.get("data_fingerprint") != verified["data_fingerprint"]
+        or payload.get("validation_fraction") != 0.05
+        or payload.get("validation_seed") != 17
+        or payload.get("validation_max_samples") != 0
+        or payload.get("validation_game_seed_ranges") != []
+        or not isinstance(seeds, list)
+        or not seeds
+        or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seeds)
+    ):
+        raise ExecutorError("production validation-seed manifest schema drifted")
+    try:
+        seed_array = np.asarray(seeds, dtype=np.int64)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ExecutorError(
+            "production validation-seed manifest contains a non-int64 seed"
+        ) from error
+    expected_count = int(
+        verified["validation_split_receipt"]["aggregate"][
+            "validation_game_count"
+        ]
+    )
+    expected_digest = str(verified["trainer_validation_game_seed_set_sha256"])
+    actual_digest = train_bc._game_seed_set_sha256(seed_array)  # noqa: SLF001
+    if (
+        not np.all(seed_array[1:] > seed_array[:-1])
+        or len(seed_array) != expected_count
+        or payload.get("validation_game_seed_count") != expected_count
+        or payload.get("training_excluded_game_seed_count") != expected_count
+        or actual_digest != expected_digest
+        or payload.get("validation_game_seed_set_sha256") != expected_digest
+        or payload.get("training_excluded_game_seed_set_sha256")
+        != expected_digest
+        or report_payload.get("validation_game_seed_manifest")
+        != str(manifest_path)
+        or report_payload.get("validation_game_seed_count") != expected_count
+        or report_payload.get("validation_game_seed_set_sha256")
+        != expected_digest
+    ):
+        raise ExecutorError(
+            "production validation-seed manifest differs from the authenticated split"
+        )
+    return {
+        "path": str(manifest_path),
+        "file_sha256": file_sha256,
+        "game_seed_count": expected_count,
+        "game_seed_set_sha256": expected_digest,
+    }
+
+
+def _require_production_public_award_transition(
+    award_training: Any,
+    *,
+    verified: Mapping[str, Any],
+    where: str,
+) -> None:
+    """Replay the exact 64/12/4/20 legacy-to-authoritative transition."""
+
+    transition = (
+        award_training.get("mixed_authoritative_transition")
+        if isinstance(award_training, dict)
+        else None
+    )
+    if not isinstance(transition, dict):
+        raise ExecutorError(f"{where} lacks a mixed public-award transition")
+    unhashed = dict(transition)
+    stated = unhashed.pop("transition_sha256", None)
+    expected_ids = [
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+        "historical_replay",
+    ]
+    expected_ratios = [0.64, 0.12, 0.04, 0.20]
+    expected_contracts = [
+        "authoritative_v1",
+        "authoritative_v1",
+        "authoritative_v1",
+        "legacy_zero_v0",
+    ]
+    split_components = verified["validation_split_receipt"]["components"]
+    expected_rows = [int(record["row_count"]) for record in split_components]
+    audits = transition.get("component_audits")
+    if (
+        stated != _value_sha256(unhashed)
+        or transition.get("schema_version") != "mixed-authoritative-transition-v1"
+        or transition.get("routing_authority")
+        != "authenticated_component_identity_not_feature_values"
+        or transition.get("component_ids") != expected_ids
+        or transition.get("component_sampling_ratios") != expected_ratios
+        or transition.get("component_contracts") != expected_contracts
+        or transition.get("corrected_corpus_rows") != sum(expected_rows[:3])
+        or transition.get("legacy_corpus_rows") != expected_rows[3]
+        or transition.get("corrected_sampler_mass") != 0.8
+        or transition.get("legacy_sampler_mass") != 0.2
+        or transition.get("legacy_rows_zero_slot12") is not True
+        or transition.get("corrected_rows_pass_slot12") is not True
+        or transition.get("checkpoint_contract") != "authoritative_v1"
+        or not isinstance(audits, list)
+        or len(audits) != 4
+    ):
+        raise ExecutorError(f"{where} public-award transition contract drifted")
+    for index, (audit, component_id, contract, row_count) in enumerate(
+        zip(audits, expected_ids, expected_contracts, expected_rows, strict=True)
+    ):
+        if not isinstance(audit, dict):
+            raise ExecutorError(f"{where} public-award audit {index} is malformed")
+        audit_unhashed = dict(audit)
+        audit_digest = audit_unhashed.pop("audit_sha256", None)
+        if (
+            audit_digest != _value_sha256(audit_unhashed)
+            or audit.get("component_id") != component_id
+            or audit.get("contract") != contract
+            or audit.get("rows") != row_count
+            or (
+                contract == "legacy_zero_v0"
+                and (
+                    audit.get("legacy_slot12_all_zero") is not True
+                    or audit.get("nonzero_award_values") != 0
+                )
+            )
+            or (
+                contract == "authoritative_v1"
+                and (
+                    audit.get("corrected_positive_support") is not True
+                    or not isinstance(audit.get("rows_with_award"), int)
+                    or int(audit["rows_with_award"]) <= 0
+                )
+            )
+        ):
+            raise ExecutorError(
+                f"{where} public-award component audit {component_id} drifted"
+            )
+    if (
+        not isinstance(award_training, dict)
+        or award_training.get("requested_contract") != "authoritative_v1"
+        or award_training.get("initializer_contract") != "legacy_zero_v0"
+        or award_training.get("effective_contract") != "authoritative_v1"
+        or award_training.get("mixed_corpus_acknowledged") is not True
+        or award_training.get("legacy_column_zero_initialized") is not True
+        or award_training.get("diagnostic_only") is not False
+        or award_training.get("promotion_eligible") is not True
+    ):
+        raise ExecutorError(f"{where} public-award training state drifted")
+
+
+def _verify_production_checkout_runtime_binding(
+    binding: Any, *, trainer_authority: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Replay every imported learner module recorded by the child trainer."""
+
+    expected_keys = {
+        "schema_version",
+        "repo_root",
+        "source_root",
+        "trainer",
+        "trainer_sha256",
+        "modules",
+        "binding_sha256",
+    }
+    if not isinstance(binding, dict) or set(binding) != expected_keys:
+        raise ExecutorError("production checkout runtime binding schema drifted")
+    unhashed = dict(binding)
+    stated = unhashed.pop("binding_sha256")
+    repo_root = Path(str(binding["repo_root"]))
+    source_root = Path(str(binding["source_root"]))
+    trainer = Path(str(binding["trainer"]))
+    if (
+        binding.get("schema_version") != train_bc.CHECKOUT_RUNTIME_BINDING_SCHEMA
+        or stated != _value_sha256(unhashed)
+        or repo_root != Path(str(trainer_authority["repository_root"]))
+        or source_root != repo_root / "src"
+        or trainer != Path(str(trainer_authority["path"]))
+        or binding.get("trainer_sha256") != trainer_authority.get("sha256")
+    ):
+        raise ExecutorError("production checkout runtime root/trainer drifted")
+    modules = binding.get("modules")
+    authority_surface = trainer_authority.get("code_surface")
+    if not isinstance(authority_surface, list):
+        raise ExecutorError("production trainer authority lacks its code surface")
+    authority_by_relative_path: dict[str, str] = {}
+    for record in authority_surface:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"relative_path", "path", "sha256"}
+            or not isinstance(record.get("relative_path"), str)
+            or not isinstance(record.get("sha256"), str)
+        ):
+            raise ExecutorError("production trainer authority code-surface drifted")
+        authority_by_relative_path[str(record["relative_path"])] = str(
+            record["sha256"]
+        )
+    required = {
+        "catan_zero",
+        "catan_zero.rl.optim_state",
+        "catan_zero.rl.entity_token_policy",
+    }
+    if not isinstance(modules, dict) or not required.issubset(modules):
+        raise ExecutorError("production checkout runtime lacks required learner modules")
+    for module_name, record in modules.items():
+        if (
+            not isinstance(module_name, str)
+            or not isinstance(record, dict)
+            or set(record) != {"path", "sha256"}
+        ):
+            raise ExecutorError("production checkout runtime module schema drifted")
+        try:
+            module_path = Path(str(record["path"])).resolve(strict=True)
+            module_path.relative_to(source_root.resolve(strict=True))
+        except (OSError, ValueError) as error:
+            raise ExecutorError(
+                f"production runtime module escaped current source root: {module_name}"
+            ) from error
+        try:
+            relative_path = module_path.relative_to(repo_root.resolve(strict=True))
+        except ValueError as error:
+            raise ExecutorError(
+                f"production runtime module escaped trainer repository: {module_name}"
+            ) from error
+        expected_sha256 = authority_by_relative_path.get(relative_path.as_posix())
+        if (
+            expected_sha256 is None
+            or str(module_path) != record["path"]
+            or _file_sha256(module_path) != record["sha256"]
+            or record["sha256"] != expected_sha256
+        ):
+            raise ExecutorError(
+                f"production runtime module was not pre-bound or its bytes drifted: "
+                f"{module_name}"
+            )
+    return copy.deepcopy(binding)
+
+
 def _verify_training_outputs(
     *,
     checkpoint: Path,
@@ -5397,6 +5849,23 @@ def _verify_training_outputs(
     )
     is_production_composite = (
         verified.get("data_kind") == "production_composite_v2"
+    )
+    checkout_runtime_binding = (
+        _verify_production_checkout_runtime_binding(
+            report_payload.get("checkout_runtime_binding"),
+            trainer_authority=verified["trainer_authority"],
+        )
+        if is_production_composite
+        else None
+    )
+    validation_seed_manifest = (
+        _verify_production_validation_seed_manifest(
+            report.with_suffix(".validation_seeds.json"),
+            report_payload=report_payload,
+            verified=verified,
+        )
+        if is_production_composite
+        else None
     )
     expected_steps = _expected_optimizer_steps(verified, recipe=recipe)
     effective_global_batch_size = _effective_global_batch_size(recipe)
@@ -5666,6 +6135,23 @@ def _verify_training_outputs(
             raise ExecutorError(
                 f"A1 intermediate checkpoint step {step} lost training provenance"
             )
+        if is_production_composite:
+            _require_production_event_history_surface(
+                snapshot.get("training_information_surface"),
+                expected_contract=verified["event_history_training_contract"],
+                row_count=int(verified["corpus_row_count"]),
+                where=f"production intermediate checkpoint step {step}",
+            )
+            if (
+                snapshot.get("public_award_feature_contract")
+                != "authoritative_v1"
+                or snapshot_value.get("checkout_runtime_binding")
+                != checkout_runtime_binding
+            ):
+                raise ExecutorError(
+                    f"production intermediate checkpoint step {step} lost "
+                    "award/runtime authority"
+                )
         _fsync_file(expected_path)
         verified_intermediate.append(expected_record)
     if "policy_aux_active_batch_size" in recipe:
@@ -5804,6 +6290,62 @@ def _verify_training_outputs(
         raise ExecutorError(
             "A1 training report does not bind the authenticated input/split/topology"
         )
+    production_information_surface = report_payload.get(
+        "training_information_surface"
+    )
+    if is_production_composite:
+        award_training = report_payload.get("public_award_feature_training")
+        if report_payload.get("public_award_feature_contract") != "authoritative_v1":
+            raise ExecutorError(
+                "production report did not prove the legacy-to-authoritative "
+                "public-award transition"
+            )
+        _require_production_public_award_transition(
+            award_training,
+            verified=verified,
+            where="production training report",
+        )
+        _require_production_event_history_surface(
+            production_information_surface,
+            expected_contract=verified["event_history_training_contract"],
+            row_count=int(verified["corpus_row_count"]),
+            where="production training report",
+        )
+        try:
+            import torch
+
+            terminal_checkpoint = torch.load(
+                checkpoint, map_location="cpu", weights_only=False
+            )
+        except Exception as error:
+            raise ExecutorError(
+                f"cannot load production terminal checkpoint: {error}"
+            ) from error
+        _require_production_event_history_surface(
+            (
+                terminal_checkpoint.get("training_information_surface")
+                if isinstance(terminal_checkpoint, dict)
+                else None
+            ),
+            expected_contract=verified["event_history_training_contract"],
+            row_count=int(verified["corpus_row_count"]),
+            where="production terminal checkpoint",
+        )
+        terminal_value_training = (
+            terminal_checkpoint.get("value_training")
+            if isinstance(terminal_checkpoint, dict)
+            else None
+        )
+        if (
+            terminal_checkpoint.get("public_award_feature_contract")
+            != "authoritative_v1"
+            or not isinstance(terminal_value_training, dict)
+            or terminal_value_training.get("checkout_runtime_binding")
+            != checkout_runtime_binding
+        ):
+            raise ExecutorError(
+                "production terminal checkpoint lost award/runtime authority"
+            )
     metrics = report_payload.get("metrics")
     if (
         not isinstance(metrics, list)
@@ -6011,14 +6553,12 @@ def _verify_training_outputs(
             expected_steps=expected_steps,
             recipe=recipe,
         )
-    for path in (checkpoint, optimizer, progress, report):
+    durable_outputs = [checkpoint, optimizer, progress, report]
+    if validation_seed_manifest is not None:
+        durable_outputs.append(Path(str(validation_seed_manifest["path"])))
+    for path in durable_outputs:
         _fsync_file(path)
-    for parent in {
-        checkpoint.parent,
-        optimizer.parent,
-        progress.parent,
-        report.parent,
-    }:
+    for parent in {path.parent for path in durable_outputs}:
         _fsync_directory(parent)
     return {
         "checkpoint": str(checkpoint),
@@ -6076,6 +6616,22 @@ def _verify_training_outputs(
         ),
         "validation_split_receipt_sha256": verified.get(
             "validation_split_receipt_sha256"
+        ),
+        **(
+            {
+                "validation_seed_manifest": validation_seed_manifest["path"],
+                "validation_seed_manifest_sha256": validation_seed_manifest[
+                    "file_sha256"
+                ],
+                "validation_game_seed_count": validation_seed_manifest[
+                    "game_seed_count"
+                ],
+                "validation_game_seed_set_sha256": validation_seed_manifest[
+                    "game_seed_set_sha256"
+                ],
+            }
+            if validation_seed_manifest is not None
+            else {}
         ),
     }
 
@@ -6885,6 +7441,10 @@ def _execute_locked(
             Path(str(record["checkpoint"]))
             for record in output_artifacts.get("intermediate_checkpoints", [])
         )
+        if "validation_seed_manifest" in output_artifacts:
+            immutable_outputs.append(
+                Path(str(output_artifacts["validation_seed_manifest"]))
+            )
         for output_path in immutable_outputs:
             os.chmod(output_path, 0o444)
         for parent in {checkpoint.parent, report.parent}:
@@ -7543,6 +8103,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "composite_build_receipt": verified.get("composite_build_receipt"),
             "source_authority": verified.get("source_authority_ref"),
+            "event_history_training_contract": verified.get(
+                "event_history_training_contract"
+            ),
             "command": command,
             "command_sha256": _value_sha256(command),
             "input_binding": input_binding,
@@ -7563,18 +8126,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan.update(
                 {
                     "learner_ablation": verified["learner_ablation"],
-                    "event_history_training_contract": {
-                        "schema": "a1-event-history-command-contract-v1",
-                        "empty_payload_inventory_acknowledgements": [
-                            {
-                                "component_id": "a1",
-                                "payload_inventory_sha256": verified[
-                                    "payload_inventory_sha256"
-                                ],
-                            }
-                        ],
-                        "crop_authenticated_empty_event_history": True,
-                    },
                     "diagnostic_only": True,
                     "promotion_eligible": False,
                 }

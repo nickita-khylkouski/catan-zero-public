@@ -48,7 +48,7 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, Sequence, TypedDict, cast
 
 import numpy as np
 
@@ -155,7 +155,9 @@ class RowSelectionProvenance(TypedDict):
     seed_manifest_path: str | None
     seed_manifest_sha256: str | None
     configured_game_seed_count: int | None
+    configured_game_seed_set_sha256: str | None
     observed_game_seed_count: int
+    observed_game_seed_set_sha256: str
     observed_row_count: int
 
 
@@ -224,11 +226,27 @@ def _legal_bucket(count: int) -> str:
     return "41+"
 
 
-def _iter_shards(shard_dir: str) -> list[str]:
-    root = Path(shard_dir)
-    shards = sorted(str(p) for p in root.rglob("*.npz"))
+def _normalized_shard_dirs(shard_dirs: str | Sequence[str]) -> list[str]:
+    raw = [shard_dirs] if isinstance(shard_dirs, str) else list(shard_dirs)
+    if not raw:
+        raise SystemExit("at least one --shard-dir is required")
+    resolved = [str(Path(value).expanduser().resolve(strict=True)) for value in raw]
+    if len(set(resolved)) != len(resolved):
+        raise SystemExit("--shard-dir roots must be unique")
+    return resolved
+
+
+def _iter_shards(shard_dirs: str | Sequence[str]) -> list[str]:
+    roots = _normalized_shard_dirs(shard_dirs)
+    shards = sorted(
+        str(path.resolve(strict=True))
+        for root in roots
+        for path in Path(root).rglob("*.npz")
+    )
+    if len(set(shards)) != len(shards):
+        raise SystemExit("--shard-dir roots overlap on the same .npz payload")
     if not shards:
-        raise SystemExit(f"no .npz shards found under {shard_dir}")
+        raise SystemExit(f"no .npz shards found under {roots}")
     return shards
 
 
@@ -255,7 +273,7 @@ def parse_validation_game_seed_ranges(raw: str) -> tuple[tuple[int, int], ...]:
 
 
 def derive_validation_game_seeds(
-    shard_dir: str, *, validation_fraction: float, validation_seed: int
+    shard_dir: str | Sequence[str], *, validation_fraction: float, validation_seed: int
 ) -> ValidationSeedSelection:
     """Reproduce ``train_bc.split_train_validation_indices`` at game level.
 
@@ -379,7 +397,7 @@ def write_validation_seed_manifest(
 
 
 def collect_rows(
-    shard_dir: str,
+    shard_dir: str | Sequence[str],
     *,
     max_rows: int | None = None,
     max_rows_per_shard: int | None = None,
@@ -1136,6 +1154,7 @@ def build_row_selection_provenance(
     seed_manifest_path: str | None = None,
     seed_manifest_sha256: str | None = None,
     configured_game_seed_count: int | None = None,
+    configured_game_seeds: np.ndarray | None = None,
 ) -> RowSelectionProvenance:
     observed_rows = sum(len(group["z"]) for group in groups)
     observed_seed_arrays = [
@@ -1143,10 +1162,21 @@ def build_row_selection_provenance(
         for group in groups
         if "game_seed" in group
     ]
-    observed_seed_count = (
-        int(len(np.unique(np.concatenate(observed_seed_arrays))))
+    observed_seeds = (
+        np.unique(np.concatenate(observed_seed_arrays))
         if observed_seed_arrays
-        else 0
+        else np.asarray([], dtype=np.int64)
+    )
+    configured_seeds = (
+        None
+        if configured_game_seeds is None
+        else np.unique(np.asarray(configured_game_seeds, dtype=np.int64))
+    )
+    seed_set_sha256 = lambda values: (  # noqa: E731
+        "sha256:"
+        + hashlib.sha256(
+            np.sort(values).astype("<i8", copy=False).tobytes()
+        ).hexdigest()
     )
     return RowSelectionProvenance(
         mode=mode,
@@ -1159,7 +1189,11 @@ def build_row_selection_provenance(
         seed_manifest_path=seed_manifest_path,
         seed_manifest_sha256=seed_manifest_sha256,
         configured_game_seed_count=configured_game_seed_count,
-        observed_game_seed_count=observed_seed_count,
+        configured_game_seed_set_sha256=(
+            None if configured_seeds is None else seed_set_sha256(configured_seeds)
+        ),
+        observed_game_seed_count=int(len(observed_seeds)),
+        observed_game_seed_set_sha256=seed_set_sha256(observed_seeds),
         observed_row_count=int(observed_rows),
     )
 
@@ -1169,7 +1203,10 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--shard-dir", required=True, help="dir searched recursively for *.npz"
+        "--shard-dir",
+        action="append",
+        required=True,
+        help="repeatable directory searched recursively for *.npz",
     )
     parser.add_argument(
         "--deployed-value-scale",
@@ -1358,7 +1395,9 @@ def main() -> None:
             reliability_bin_count=args.reliability_bins,
         )
     summary["checkpoint"] = args.checkpoint
-    summary["shard_dir"] = args.shard_dir
+    resolved_shard_dirs = _normalized_shard_dirs(args.shard_dir)
+    summary["shard_dir"] = resolved_shard_dirs[0]
+    summary["shard_dirs"] = resolved_shard_dirs
     summary["row_selection"] = build_row_selection_provenance(
         groups,
         mode=selection_mode,
@@ -1370,6 +1409,7 @@ def main() -> None:
         ),
         seed_manifest_sha256=seed_manifest_sha256,
         configured_game_seed_count=configured_seed_count,
+        configured_game_seeds=selected_seeds,
     )
     write_json(args.out, summary)
     print(json.dumps(summary, indent=2, sort_keys=True))

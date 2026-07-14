@@ -50,9 +50,16 @@ export PRIOR_AUDIT=$PRIOR_RUN/a1_post_wave.audit.json
 export PRIOR_CORPUS=/home/ubuntu/catan-zero/runs/memmap_a1_fresh_mixed_12000games
 export HISTORICAL_ROOT=$PROD/private/historical-replay-v3-for-v5
 export HISTORICAL_REF=$HISTORICAL_ROOT/historical_replay.component.json
+export OLD_INTERPOLATE=$PROD/private/a1-v5-surviving-evidence-20260714/interpolate_checkpoints.v2.py
+test "$(sha256sum "$OLD_INTERPOLATE" | cut -d' ' -f1)" = \
+  8a8441aff43052e71e1d18799f6c039977ad1b96582d02a45b6b4e11d6da9e78
 
 export LEARNER=$PROD/runs/learner/$WAVE_ID-one-dose-r1
-export CANARY=$LEARNER/ddp-canary.json
+# Training hashes live bytes while evaluation stages a clean Git commit.  Keep
+# those identities identical: the learner checkout must be detached and clean.
+test -z "$(git -C "$LEARNER_CODE_ROOT" symbolic-ref -q --short HEAD || true)"
+test -z "$(git -C "$LEARNER_CODE_ROOT" status --porcelain --untracked-files=all)"
+export LEARNER_COMMIT=$(git -C "$LEARNER_CODE_ROOT" rev-parse HEAD)
 export CANDIDATE=$LEARNER/candidate.pt
 export TRAIN_REPORT=$LEARNER/train.report.json
 export TRAIN_RECEIPT=$LEARNER/training.receipt.json
@@ -132,12 +139,9 @@ live deployment seen by generation/evaluation jobs.
 
 ```bash
 export PREP=$LEARNER_CODE_ROOT
-export OLD_INTERPOLATE=$PROD/private/a1-v5-surviving-evidence-20260714/interpolate_checkpoints.v2.py
-test "$(sha256sum "$OLD_INTERPOLATE" | cut -d' ' -f1)" = \
-  8a8441aff43052e71e1d18799f6c039977ad1b96582d02a45b6b4e11d6da9e78
-
-mkdir -p "$HISTORICAL_ROOT"
-sudo unshare -m /bin/bash -s <<EOF
+if [ ! -f "$HISTORICAL_REF" ]; then
+  mkdir -p "$HISTORICAL_ROOT"
+  sudo unshare -m /bin/bash -s <<EOF
 set -euo pipefail
 mount --make-rprivate /
 mount --bind "$OLD_INTERPOLATE" "$REPO/tools/interpolate_checkpoints.py"
@@ -152,6 +156,8 @@ sudo -u ubuntu env PYTHONPATH="$PREP" "$PY" \
   --current-version 5 \
   --out "$HISTORICAL_REF"
 EOF
+fi
+test -s "$HISTORICAL_REF"
 ```
 
 If `$HISTORICAL_REF` already exists, do not delete it. Replay its hashes through
@@ -169,6 +175,10 @@ wave authority. Run it in the same private namespace so the old code-tree
 fingerprint remains replayable without changing the live checkout:
 
 ```bash
+if [ -d "$COMPOSITE" ] && [ ! -f "$COMPOSITE/build_receipt.json" ]; then
+  mv "$COMPOSITE" "$COMPOSITE.failed-$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+if [ ! -f "$COMPOSITE/build_receipt.json" ]; then
 sudo unshare -m /bin/bash -s <<EOF
 set -euo pipefail
 mount --make-rprivate /
@@ -187,6 +197,8 @@ sudo -u ubuntu env \
   --historical-frozen-verifier-sha256 "$HISTORICAL_FROZEN_VERIFIER_SHA256" \
   --out "$COMPOSITE"
 EOF
+fi
+test -s "$COMPOSITE/build_receipt.json"
 ```
 
 The learner input is `$COMPOSITE/memmap_composite.json`; the required build
@@ -220,6 +232,9 @@ is the actual 128-step run.
 cd "$LEARNER_CODE_ROOT"
 export PYTHONPATH="$LEARNER_CODE_ROOT/src:$LEARNER_CODE_ROOT"
 mkdir -p "$LEARNER"
+# Canary receipts expire after one hour. Mint one unique receipt immediately
+# before the dry-run/GO pair; never reuse a commit-stable stale receipt.
+export CANARY=$LEARNER/ddp-canary-${LEARNER_COMMIT:0:12}-$(date +%s%N).json
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   "$PY" -m torch.distributed.run --standalone --nproc_per_node=8 \
   tools/a1_ddp_epoch_canary.py --out "$CANARY"
@@ -294,7 +309,7 @@ export SCREEN128_PLAN=$GATE/quick-step128.plan.json
 export EVAL_CTL=$LEARNER_CODE_ROOT/tools/fleet/a1_h100_eval_fleet.py
 mkdir -p "$GATE"
 export BASE_EVAL_MANIFEST=$LEARNER_CODE_ROOT/configs/operations/a1-r3-gather-aux64-reproduction-eval600-20260712-r1/fleet64.manifest.json
-export EVAL_COMMIT=$(git -C "$LEARNER_CODE_ROOT" rev-parse HEAD)
+export EVAL_COMMIT=$LEARNER_COMMIT
 export EVAL_REMOTE_REPO=/home/ubuntu/catan-zero-eval-${EVAL_COMMIT:0:12}
 export EVAL_MANIFEST=$GATE/fleet64.eval-source-${EVAL_COMMIT:0:12}.json
 
@@ -350,7 +365,8 @@ plan_and_run_screen() {
   local checkpoint="$2"
   local plan="$3"
   local collected="$4"
-  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" plan \
+  if [ ! -f "$plan" ]; then
+    "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" plan \
     --candidate "$checkpoint" \
     --champion "$V5" \
     --candidate-parent "$V5" \
@@ -364,10 +380,11 @@ plan_and_run_screen() {
     --scope full \
     --candidate-c-scale 0.10 --champion-c-scale 0.10 \
     --candidate-value-squash tanh --champion-value-squash tanh \
-    --out "$plan"
-  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
+      --out "$plan"
+  fi
+  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" resume \
     --plan "$plan" --phase internal --dry-run
-  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
+  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" resume \
     --plan "$plan" --phase internal --go
   wait_eval_phase "$plan" internal
   "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" collect \
@@ -434,14 +451,48 @@ this handoff was sealed.
 ```bash
 cd "$LEARNER_CODE_ROOT"
 export PYTHONPATH="$LEARNER_CODE_ROOT/src:$LEARNER_CODE_ROOT"
+export LEARNER_COMMIT=$(git -C "$LEARNER_CODE_ROOT" rev-parse HEAD)
 export EVAL_CTL=$LEARNER_CODE_ROOT/tools/fleet/a1_h100_eval_fleet.py
-# Reuse the derived, commit-bound manifest staged before the matched screen.
-test -f "$EVAL_MANIFEST"
 export GATE=$PROD/runs/eval/$WAVE_ID-one-dose-r1
+export CHECKPOINT_SELECTION=$GATE/checkpoint-selection.json
+test -s "$CHECKPOINT_SELECTION"
+export CANDIDATE=$("$PY" -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["selected_checkpoint"]["path"])' \
+  "$CHECKPOINT_SELECTION")
+export EVAL_COMMIT=$LEARNER_COMMIT
+export EVAL_MANIFEST=$GATE/fleet64.eval-source-${EVAL_COMMIT:0:12}.json
+# Reuse the exact commit-bound manifest staged before the matched screen.
+test -s "$EVAL_MANIFEST"
 export PARENT_PLAN=$GATE/exact-v5-parent.plan.json
 export F7_PLAN=$GATE/fixed-f7-veto.plan.json
 mkdir -p "$GATE"
 
+wait_eval_phase() {
+  local plan="$1" phase="$2" status state
+  while true; do
+    status=$("$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" status \
+      --plan "$plan" --phase "$phase")
+    echo "$status"
+    state=$("$PY" -c '
+import json, sys
+x = json.load(sys.stdin); c = x["counts"]
+if any(c[name] for name in ("failed", "stale", "missing", "unsafe")):
+    print("failed")
+elif c["done"] == len(x["jobs"]):
+    print("done")
+else:
+    print("active")
+' <<<"$status")
+    case "$state" in
+      done) return 0 ;;
+      failed) echo "evaluation phase $phase failed" >&2; return 1 ;;
+      active) sleep 10 ;;
+      *) echo "unknown evaluation state: $state" >&2; return 1 ;;
+    esac
+  done
+}
+
+if [ ! -f "$PARENT_PLAN" ]; then
 "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" plan \
   --candidate "$CANDIDATE" \
   --champion "$V5" \
@@ -457,11 +508,12 @@ mkdir -p "$GATE"
   --candidate-c-scale 0.10 --champion-c-scale 0.10 \
   --candidate-value-squash tanh --champion-value-squash tanh \
   --out "$PARENT_PLAN"
+fi
 
 for phase in internal external; do
-  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
+  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" resume \
     --plan "$PARENT_PLAN" --phase "$phase" --dry-run
-  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
+  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" resume \
     --plan "$PARENT_PLAN" --phase "$phase" --go
   wait_eval_phase "$PARENT_PLAN" "$phase"
   "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" collect \
@@ -469,6 +521,7 @@ for phase in internal external; do
     --output-dir "$GATE/exact-v5-collected"
 done
 
+if [ ! -f "$F7_PLAN" ]; then
 "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" plan \
   --candidate "$CANDIDATE" \
   --champion "$F7" \
@@ -485,10 +538,11 @@ done
   --candidate-c-scale 0.10 --champion-c-scale 0.10 \
   --candidate-value-squash tanh --champion-value-squash tanh \
   --out "$F7_PLAN"
+fi
 
-"$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
+"$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" resume \
   --plan "$F7_PLAN" --phase internal --dry-run
-"$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
+"$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" resume \
   --plan "$F7_PLAN" --phase internal --go
 wait_eval_phase "$F7_PLAN" internal
 "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" collect \
@@ -520,6 +574,7 @@ export PARENT_EXTERNAL_CHAMPION=$GATE/exact-v5-collected/$PARENT_RUN_ID/pooled/e
 
 "$PY" tools/phase_sliced_value_calibration.py \
   --shard-dir "$COMPOSITE/filtered_sources" \
+  --shard-dir "$PRIOR_RUN" \
   --checkpoint "$CANDIDATE" --device cuda:0 \
   --value-readout scalar --deployed-value-scale 1 \
   --deployed-value-squash tanh \
@@ -529,17 +584,23 @@ CAL_CAND_PID=$!
 
 "$PY" tools/phase_sliced_value_calibration.py \
   --shard-dir "$COMPOSITE/filtered_sources" \
+  --shard-dir "$PRIOR_RUN" \
   --checkpoint "$V5" --device cuda:1 \
   --value-readout scalar --deployed-value-scale 1 \
   --deployed-value-squash tanh \
   --validation-seed-manifest "$VAL_SEEDS" --require-held-out \
   --out "$V5_CAL" &
 CAL_V5_PID=$!
-wait "$CAL_CAND_PID"
-wait "$CAL_V5_PID"
+set +e
+wait "$CAL_CAND_PID"; CAL_CAND_RC=$?
+wait "$CAL_V5_PID"; CAL_V5_RC=$?
+set -e
+test "$CAL_CAND_RC" -eq 0
+test "$CAL_V5_RC" -eq 0
 
 "$PY" tools/extract_regret_states.py \
   --shard-root "$COMPOSITE/filtered_sources" \
+  --shard-root "$PRIOR_RUN" \
   --validation-seed-manifest "$VAL_SEEDS" \
   --top-k 200000 --out "$REGRET"
 

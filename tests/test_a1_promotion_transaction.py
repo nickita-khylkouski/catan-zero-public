@@ -572,6 +572,11 @@ def _modernize_one_dose_receipt(
             "command_sha256": promotion._digest_value(command),
             "execution_binding": execution_binding,
             "input_binding": input_binding,
+            "training_transaction_sha256": one_dose._training_transaction_sha256(
+                command=command, input_binding=input_binding
+            ),
+            "trainer_authority": None,
+            "lock_verifier_authority": None,
             "world_size": world_size,
             "gpu": 0,
             "gpus": gpus,
@@ -804,7 +809,9 @@ def _fixture(
                     "validation_game_seed_ranges": [],
                     "seed_manifest_sha256": "sha256:" + "9" * 64,
                     "configured_game_seed_count": 256,
+                    "configured_game_seed_set_sha256": "sha256:" + "a" * 64,
                     "observed_game_seed_count": 256,
+                    "observed_game_seed_set_sha256": "sha256:" + "a" * 64,
                     "observed_row_count": 4096,
                 },
                 "deployed_readout_diagnostics": {
@@ -1756,6 +1763,52 @@ def test_post_wave_composite_report_uses_authenticated_outer_ddp_receipt(
     )
     sampling_sha = "sha256:" + "8" * 64
     split_sha = "sha256:" + "9" * 64
+    trainer_authority = one_dose._current_production_trainer_authority()
+    event_history_acknowledgements = [
+        "sha256:" + f"{index:x}" * 64 for index in range(6, 10)
+    ]
+    event_history_training_contract = {
+        "schema": "a1-training-event-history-contract-v1",
+        "training_event_history_trainable": False,
+        "event_history_end_to_end_usable": False,
+        "status": "empty_payloads_acknowledged",
+        "empty_payload_inventory_acknowledgements": (
+            event_history_acknowledgements
+        ),
+    }
+    event_history_component_authority = [
+        {
+            "component_id": component_id,
+            "payload_inventory_sha256": inventory_sha256,
+        }
+        for component_id, inventory_sha256 in zip(
+            (
+                "current_producer",
+                "recent_history",
+                "hard_negative",
+                "historical_replay",
+            ),
+            event_history_acknowledgements,
+            strict=True,
+        )
+    ]
+    lock_authority = {
+        "schema_version": "a1-frozen-lock-verifier-authority-v1",
+        "lock": str(fixture["contract_path"]),
+        "lock_file_sha256": promotion._sha256(fixture["contract_path"]),
+        "contract_sha256": fixture["contract"]["contract_sha256"],
+        "frozen_repo": str(tmp_path / "frozen-repo"),
+        "verifier": str(tmp_path / "frozen-repo/tools/a1_pre_wave_contract.py"),
+        "verifier_sha256": "sha256:" + "c" * 64,
+        "require_all_job_claims": True,
+        "verified_lock_sha256": promotion._digest_value(fixture["contract"]),
+        "authority_sha256": "sha256:" + "d" * 64,
+    }
+    monkeypatch.setattr(
+        one_dose.frozen_lock_verifier,
+        "verify_frozen_lock",
+        lambda *_args, **_kwargs: (fixture["contract"], lock_authority),
+    )
     input_binding = receipt["input_binding"]
     for key in (
         "validation_manifest",
@@ -1769,6 +1822,12 @@ def test_post_wave_composite_report_uses_authenticated_outer_ddp_receipt(
     input_binding.update(
         {
             "data_kind": "production_composite_v2",
+            "trainer_authority": trainer_authority,
+            "lock_verifier_authority": lock_authority,
+            "event_history_training_contract": event_history_training_contract,
+            "event_history_component_authority": (
+                event_history_component_authority
+            ),
             "production_mix_contract_sha256": "sha256:" + "a" * 64,
             "production_sampling_receipt_sha256": sampling_sha,
             "validation_split_receipt": {"schema_version": "test-split-v1"},
@@ -1780,11 +1839,42 @@ def test_post_wave_composite_report_uses_authenticated_outer_ddp_receipt(
         }
     )
     input_binding["binding_sha256"] = promotion._digest_value(input_binding)
+    receipt["trainer_authority"] = trainer_authority
+    receipt["lock_verifier_authority"] = lock_authority
+    receipt["training_transaction_sha256"] = (
+        one_dose._training_transaction_sha256(
+            command=receipt["command"], input_binding=input_binding
+        )
+    )
     receipt["production_sampling_receipt_sha256"] = sampling_sha
     receipt["validation_split_receipt_sha256"] = split_sha
     receipt["outputs"]["production_sampling_receipt_sha256"] = sampling_sha
     receipt["outputs"]["validation_split_receipt_sha256"] = split_sha
     receipt["outputs"]["input_binding_sha256"] = input_binding["binding_sha256"]
+    validation_seeds = [880_001, 880_002]
+    validation_seed_digest = one_dose.train_bc._game_seed_set_sha256(  # noqa: SLF001
+        np.asarray(validation_seeds, dtype=np.int64)
+    )
+    validation_seed_manifest = tmp_path / "train.validation_seeds.json"
+    _write_json(
+        validation_seed_manifest,
+        {
+            "schema_version": "train-validation-game-seeds-v1",
+            "validation_game_seed_count": len(validation_seeds),
+            "validation_game_seed_set_sha256": validation_seed_digest,
+            "game_seeds": validation_seeds,
+        },
+    )
+    receipt["outputs"].update(
+        {
+            "validation_seed_manifest": str(validation_seed_manifest.resolve()),
+            "validation_seed_manifest_sha256": promotion._sha256(
+                validation_seed_manifest
+            ),
+            "validation_game_seed_count": len(validation_seeds),
+            "validation_game_seed_set_sha256": validation_seed_digest,
+        }
+    )
     report = json.loads(fixture["report"].read_text(encoding="utf-8"))
     report.update(
         {
@@ -1792,6 +1882,15 @@ def test_post_wave_composite_report_uses_authenticated_outer_ddp_receipt(
             "a1_learner_training_recipe_sha256": None,
             "a1_bound_learner_training_recipe": None,
             one_dose.REPORT_INPUT_BINDING_FIELD: input_binding,
+            "validation_game_seed_manifest": str(
+                validation_seed_manifest.resolve()
+            ),
+            "validation_game_seed_count": len(validation_seeds),
+            "validation_game_seed_set_sha256": validation_seed_digest,
+            "checkout_runtime_binding": {},
+            "training_information_surface": {},
+            "public_award_feature_contract": "authoritative_v1",
+            "public_award_feature_training": {},
         }
     )
     _write_json(fixture["report"], report)
@@ -1804,6 +1903,39 @@ def test_post_wave_composite_report_uses_authenticated_outer_ddp_receipt(
     adjudication.pop("adjudication_sha256")
     adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
     _write_json(fixture["adjudication"], adjudication)
+
+    runtime_binding = {"test": "runtime"}
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_production_checkout_runtime_binding",
+        lambda *_args, **_kwargs: runtime_binding,
+    )
+    monkeypatch.setattr(
+        one_dose,
+        "_require_production_event_history_surface",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        one_dose,
+        "_require_production_public_award_transition",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        promotion,
+        "_require_calibration_matches_training_validation_manifest",
+        lambda *_args, **_kwargs: None,
+    )
+    import torch
+
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda *_args, **_kwargs: {
+            "public_award_feature_contract": "authoritative_v1",
+            "training_information_surface": {},
+            "value_training": {"checkout_runtime_binding": runtime_binding},
+        },
+    )
 
     plan = _execute(fixture, go=False)
 
@@ -5540,6 +5672,7 @@ def _central_final_receipt_fixture(
         "file_sha256": promotion._sha256(published_path),
         "authority": {"schema_version": "a1-final-replication-executor-authority-v1"},
     }
+    central_input_binding = {"data_kind": "production_composite_v2"}
     value = {
         "schema_version": one_dose.CENTRAL_RECEIPT_SCHEMA,
         "status": "complete",
@@ -5558,7 +5691,12 @@ def _central_final_receipt_fixture(
         "command": command,
         "command_sha256": promotion._digest_value(command),
         "execution_binding": execution_binding,
-        "input_binding": {"data_kind": "production_composite_v2"},
+        "input_binding": central_input_binding,
+        "training_transaction_sha256": one_dose._training_transaction_sha256(
+            command=command, input_binding=central_input_binding
+        ),
+        "trainer_authority": None,
+        "lock_verifier_authority": None,
         "world_size": 8,
         "gpu": 0,
         "gpus": list(range(8)),

@@ -200,13 +200,22 @@ def authenticate_completed_receipt(
     execution_binding = one_dose._execution_binding(  # noqa: SLF001
         command=canonical_command, environment=environment
     )
+    input_binding = one_dose._input_binding(verified)  # noqa: SLF001
+    training_transaction_sha256 = one_dose._training_transaction_sha256(  # noqa: SLF001
+        command=canonical_command, input_binding=input_binding
+    )
     if (
         command != canonical_command
         or payload.get("command_sha256")
         != one_dose._value_sha256(canonical_command)  # noqa: SLF001
         or payload.get("execution_binding") != execution_binding
-        or payload.get("input_binding")
-        != one_dose._input_binding(verified)  # noqa: SLF001
+        or payload.get("input_binding") != input_binding
+        or payload.get("training_transaction_sha256")
+        != training_transaction_sha256
+        or payload.get("trainer_authority")
+        != verified.get("trainer_authority")
+        or payload.get("lock_verifier_authority")
+        != verified.get("lock_verifier_authority")
     ):
         raise CompletionError("one-dose command/environment/input replay drift")
     try:

@@ -31,6 +31,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+import numpy as np
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -1400,6 +1402,9 @@ def _verify_central_final_training_receipt(
         "command_sha256",
         "execution_binding",
         "input_binding",
+        "training_transaction_sha256",
+        "trainer_authority",
+        "lock_verifier_authority",
         "world_size",
         "gpu",
         "gpus",
@@ -2441,6 +2446,9 @@ def _verify_one_dose_training_receipt(
     if modern_receipt:
         expected_keys |= {
             "input_binding",
+            "training_transaction_sha256",
+            "trainer_authority",
+            "lock_verifier_authority",
             "gpus",
             "gpu_names",
             "training_topology",
@@ -2719,6 +2727,17 @@ def _verify_one_dose_training_receipt(
             and "intermediate_checkpoints" in value["outputs"]
         ):
             output_keys.add("intermediate_checkpoints")
+        if (
+            isinstance(value.get("input_binding"), dict)
+            and value["input_binding"].get("data_kind")
+            == "production_composite_v2"
+        ):
+            output_keys |= {
+                "validation_seed_manifest",
+                "validation_seed_manifest_sha256",
+                "validation_game_seed_count",
+                "validation_game_seed_set_sha256",
+            }
     elif isinstance(value.get("outputs"), dict) and "lineage_dose" in value["outputs"]:
         output_keys |= {"lineage_dose", "sampled_rows"}
     outputs = _require_exact_keys(
@@ -2823,6 +2842,10 @@ def _verify_one_dose_training_receipt(
         }
         if input_binding.get("data_kind") == "production_composite_v2":
             input_keys |= {
+                "trainer_authority",
+                "lock_verifier_authority",
+                "event_history_training_contract",
+                "event_history_component_authority",
                 "production_mix_contract_sha256",
                 "production_sampling_receipt_sha256",
                 "validation_split_receipt",
@@ -2876,6 +2899,170 @@ def _verify_one_dose_training_receipt(
             != _digest_value(effective_recipe)
         ):
             raise PromotionError("modern one-dose input/report/topology binding drifted")
+        expected_transaction = one_dose._training_transaction_sha256(  # noqa: SLF001
+            command=command, input_binding=input_binding
+        )
+        if (
+            value.get("training_transaction_sha256") != expected_transaction
+            or value.get("trainer_authority")
+            != input_binding.get("trainer_authority")
+            or value.get("lock_verifier_authority")
+            != input_binding.get("lock_verifier_authority")
+        ):
+            raise PromotionError(
+                "modern one-dose trainer/lock/transaction authority drifted"
+            )
+        if input_binding.get("data_kind") == "production_composite_v2":
+            try:
+                expected_trainer = one_dose._current_production_trainer_authority()  # noqa: SLF001
+                lock_authority = value["lock_verifier_authority"]
+                if not isinstance(lock_authority, dict):
+                    raise PromotionError(
+                        "production one-dose receipt lacks frozen lock authority"
+                    )
+                replayed_lock, replayed_authority = (
+                    one_dose.frozen_lock_verifier.verify_frozen_lock(
+                        contract_lock,
+                        frozen_repo=Path(str(lock_authority["frozen_repo"])),
+                        expected_verifier_sha256=str(
+                            lock_authority["verifier_sha256"]
+                        ),
+                        require_all_job_claims=bool(
+                            lock_authority["require_all_job_claims"]
+                        ),
+                    )
+                )
+                checkout_runtime_binding = (
+                    one_dose._verify_production_checkout_runtime_binding(  # noqa: SLF001
+                        report.get("checkout_runtime_binding"),
+                        trainer_authority=expected_trainer,
+                    )
+                )
+                validation_seed_manifest = _canonical_existing_file(
+                    _absolute(
+                        outputs["validation_seed_manifest"], base=path.parent
+                    ),
+                    where="production validation-seed manifest",
+                )
+                validation_seed_payload = _load_json(validation_seed_manifest)
+                validation_seeds = validation_seed_payload.get("game_seeds")
+                if (
+                    _sha256(validation_seed_manifest)
+                    != outputs["validation_seed_manifest_sha256"]
+                    or report.get("validation_game_seed_manifest")
+                    != str(validation_seed_manifest)
+                    or not isinstance(validation_seeds, list)
+                    or not validation_seeds
+                    or any(
+                        isinstance(seed, bool) or not isinstance(seed, int)
+                        for seed in validation_seeds
+                    )
+                ):
+                    raise PromotionError(
+                        "production validation-seed artifact provenance drifted"
+                    )
+                validation_seed_array = np.asarray(
+                    validation_seeds, dtype=np.int64
+                )
+                validation_seed_digest = (  # noqa: SLF001
+                    one_dose.train_bc._game_seed_set_sha256(
+                        validation_seed_array
+                    )
+                )
+                if (
+                    not np.all(
+                        validation_seed_array[1:] > validation_seed_array[:-1]
+                    )
+                    or len(validation_seed_array)
+                    != outputs["validation_game_seed_count"]
+                    or validation_seed_payload.get("validation_game_seed_count")
+                    != outputs["validation_game_seed_count"]
+                    or validation_seed_payload.get(
+                        "validation_game_seed_set_sha256"
+                    )
+                    != outputs["validation_game_seed_set_sha256"]
+                    or validation_seed_digest
+                    != outputs["validation_game_seed_set_sha256"]
+                    or report.get("validation_game_seed_count")
+                    != outputs["validation_game_seed_count"]
+                    or report.get("validation_game_seed_set_sha256")
+                    != outputs["validation_game_seed_set_sha256"]
+                ):
+                    raise PromotionError(
+                        "production validation-seed artifact content drifted"
+                    )
+                event_contract = input_binding["event_history_training_contract"]
+                one_dose._require_production_event_history_surface(  # noqa: SLF001
+                    report.get("training_information_surface"),
+                    expected_contract=event_contract,
+                    row_count=int(outputs["corpus_row_count"]),
+                    where="promotion training report",
+                )
+                award_training = report.get("public_award_feature_training")
+                if report.get("public_award_feature_contract") != "authoritative_v1":
+                    raise PromotionError(
+                        "production report did not prove the public-award transition"
+                    )
+                one_dose._require_production_public_award_transition(  # noqa: SLF001
+                    award_training,
+                    verified={
+                        "validation_split_receipt": input_binding[
+                            "validation_split_receipt"
+                        ],
+                    },
+                    where="promotion training report",
+                )
+                import torch
+
+                terminal_checkpoint = torch.load(
+                    output_checkpoint, map_location="cpu", weights_only=False
+                )
+                terminal_value_training = (
+                    terminal_checkpoint.get("value_training")
+                    if isinstance(terminal_checkpoint, dict)
+                    else None
+                )
+                one_dose._require_production_event_history_surface(  # noqa: SLF001
+                    (
+                        terminal_checkpoint.get("training_information_surface")
+                        if isinstance(terminal_checkpoint, dict)
+                        else None
+                    ),
+                    expected_contract=event_contract,
+                    row_count=int(outputs["corpus_row_count"]),
+                    where="promotion terminal checkpoint",
+                )
+                if (
+                    not isinstance(terminal_checkpoint, dict)
+                    or terminal_checkpoint.get("public_award_feature_contract")
+                    != "authoritative_v1"
+                    or not isinstance(terminal_value_training, dict)
+                    or terminal_value_training.get("checkout_runtime_binding")
+                    != checkout_runtime_binding
+                ):
+                    raise PromotionError(
+                        "production terminal checkpoint lost award/runtime authority"
+                    )
+            except PromotionError:
+                raise
+            except (
+                KeyError,
+                OSError,
+                RuntimeError,
+                one_dose.ExecutorError,
+                one_dose.frozen_lock_verifier.FrozenVerifierError,
+            ) as error:
+                raise PromotionError(
+                    f"production one-dose authority replay refused: {error}"
+                ) from error
+            if (
+                value["trainer_authority"] != expected_trainer
+                or replayed_lock != contract
+                or replayed_authority != lock_authority
+            ):
+                raise PromotionError(
+                    "production one-dose trainer or frozen-lock authority drifted"
+                )
         expected_report_topology = {
             "world_size": world_size,
             "batch_size": value["training_topology"]["local_batch_size"],
@@ -3002,6 +3189,25 @@ def _verify_one_dose_training_receipt(
         or claim.get("state_sha256") != value["claim_state_sha256"]
         or claim.get("command_sha256") != value["command_sha256"]
         or claim.get("execution_binding") != execution_binding
+        or (
+            modern_receipt
+            and claim.get("input_binding") != value.get("input_binding")
+        )
+        or (
+            modern_receipt
+            and claim.get("training_transaction_sha256")
+            != value.get("training_transaction_sha256")
+        )
+        or (
+            modern_receipt
+            and claim.get("trainer_authority")
+            != value.get("trainer_authority")
+        )
+        or (
+            modern_receipt
+            and claim.get("lock_verifier_authority")
+            != value.get("lock_verifier_authority")
+        )
         or claim.get("outputs") != outputs
         or (is_retry and claim.get("retry_contract") != retry_reference)
         or (
@@ -4299,13 +4505,28 @@ def _verify_calibration_source(
         "validation_game_seed_ranges",
         "seed_manifest_sha256",
         "configured_game_seed_count",
+        "configured_game_seed_set_sha256",
         "observed_game_seed_count",
+        "observed_game_seed_set_sha256",
         "observed_row_count",
     }
     if not cohort_keys.issubset(selection):
         raise PromotionError(f"{where}.row_selection lacks immutable cohort fields")
     if selection.get("mode") != "validation_seed_manifest":
         raise PromotionError(f"{where} must use a validation-seed manifest")
+    configured_count = selection.get("configured_game_seed_count")
+    observed_count = selection.get("observed_game_seed_count")
+    if (
+        isinstance(configured_count, bool)
+        or not isinstance(configured_count, int)
+        or configured_count <= 0
+        or observed_count != configured_count
+        or selection.get("observed_game_seed_set_sha256")
+        != selection.get("configured_game_seed_set_sha256")
+    ):
+        raise PromotionError(
+            f"{where} did not observe the complete configured validation-game cohort"
+        )
     seed_manifest_sha = selection.get("seed_manifest_sha256")
     seed_digest = (
         seed_manifest_sha.removeprefix("sha256:")
@@ -4358,15 +4579,85 @@ def _verify_calibration_source(
         where=f"{where}.deployed_readout_diagnostics.views.{expected_transform}.global.value_rmse",
         minimum=0.0,
     )
-    shard_dir = payload.get("shard_dir")
-    if not isinstance(shard_dir, str) or not shard_dir:
-        raise PromotionError(f"{where} has no source shard_dir")
+    raw_shard_dirs = payload.get("shard_dirs")
+    if raw_shard_dirs is None:
+        raw_shard_dirs = [payload.get("shard_dir")]
+    if (
+        not isinstance(raw_shard_dirs, list)
+        or not raw_shard_dirs
+        or any(not isinstance(value, str) or not value for value in raw_shard_dirs)
+    ):
+        raise PromotionError(f"{where} has no source shard_dirs")
+    shard_dirs = [
+        str(_absolute(value, base=checkpoint.parent)) for value in raw_shard_dirs
+    ]
+    if len(set(shard_dirs)) != len(shard_dirs):
+        raise PromotionError(f"{where} has duplicate source shard_dirs")
     cohort = {
-        "shard_dir": str(_absolute(shard_dir, base=checkpoint.parent)),
+        "shard_dirs": shard_dirs,
         "row_selection": {key: selection[key] for key in sorted(cohort_keys)},
         "global_n": global_metrics["n"],
     }
     return rmse, cohort
+
+
+def _require_calibration_matches_training_validation_manifest(
+    evidence_path: Path,
+    evidence: Mapping[str, Any],
+    *,
+    training_outputs: Mapping[str, Any],
+) -> None:
+    """Require both calibration roles to reuse the trainer's exact holdout."""
+
+    expected_path = _canonical_existing_file(
+        _absolute(
+            training_outputs.get("validation_seed_manifest"),
+            base=evidence_path.parent,
+        ),
+        where="training validation-seed manifest",
+    )
+    expected_file_sha = str(
+        training_outputs.get("validation_seed_manifest_sha256", "")
+    ).removeprefix("sha256:")
+    expected_count = training_outputs.get("validation_game_seed_count")
+    expected_seed_sha = training_outputs.get("validation_game_seed_set_sha256")
+    sources = evidence.get("sources")
+    if not isinstance(sources, list):
+        raise PromotionError("mechanism calibration evidence has no sources")
+    calibrated_roles: set[str] = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        role = source.get("role")
+        if role not in {"candidate_calibration", "champion_calibration"}:
+            continue
+        source_path = _absolute(source.get("path"), base=evidence_path.parent)
+        payload = _load_json(source_path)
+        selection = payload.get("row_selection")
+        if not isinstance(selection, dict):
+            raise PromotionError(f"{role} lacks row-selection provenance")
+        manifest_path = _canonical_existing_file(
+            _absolute(
+                selection.get("seed_manifest_path"), base=source_path.parent
+            ),
+            where=f"{role} validation-seed manifest",
+        )
+        if (
+            manifest_path != expected_path
+            or selection.get("seed_manifest_sha256") != expected_file_sha
+            or selection.get("configured_game_seed_count") != expected_count
+            or selection.get("configured_game_seed_set_sha256")
+            != expected_seed_sha
+            or selection.get("observed_game_seed_count") != expected_count
+            or selection.get("observed_game_seed_set_sha256")
+            != expected_seed_sha
+        ):
+            raise PromotionError(
+                f"{role} cohort differs from the authenticated training holdout"
+            )
+        calibrated_roles.add(str(role))
+    if calibrated_roles != {"candidate_calibration", "champion_calibration"}:
+        raise PromotionError("mechanism calibration is missing a required role")
 
 
 def _require_sealed_semantics(
@@ -7656,6 +7947,17 @@ def _verify_adjudication(
                 None if branch_lineage is None else branch_lineage["initializer"]
             ),
         )
+        if production_composite and kind == "mechanism_calibration":
+            training_outputs = training_receipt_preview.get("outputs")
+            if not isinstance(training_outputs, dict):
+                raise PromotionError(
+                    "production training receipt lacks output authority"
+                )
+            _require_calibration_matches_training_validation_manifest(
+                evidence_path,
+                evidence_value,
+                training_outputs=training_outputs,
+            )
         final_cohort_intervals.extend(
             _promotion_cohort_intervals(
                 evidence_path, evidence_value, kind=kind

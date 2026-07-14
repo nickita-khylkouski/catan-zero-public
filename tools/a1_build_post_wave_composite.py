@@ -372,7 +372,25 @@ def _validated_wave_inputs(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     try:
         lock = verify_lock_fn(lock_path, require_all_job_claims=True)
-        selected = memmap_builder._load_a1_selected_game_manifest(selected_path)  # noqa: SLF001
+        locked_counts = lock.get("game_contract", {}).get("category_games")
+        if (
+            not isinstance(locked_counts, dict)
+            or set(locked_counts) != set(FRESH_SOURCE_GAME_RATIOS)
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in locked_counts.values()
+            )
+        ):
+            raise contract.ContractError(
+                "sealed wave lock lacks valid category-game quota authority"
+            )
+        selected = memmap_builder._load_a1_selected_game_manifest(  # noqa: SLF001
+            selected_path,
+            expected_selected_game_count=sum(locked_counts.values()),
+            expected_category_game_counts=locked_counts,
+        )
         audit = memmap_builder._load_a1_post_wave_audit(  # noqa: SLF001
             audit_path, selected
         )

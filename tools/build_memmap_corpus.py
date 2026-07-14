@@ -39,7 +39,7 @@ import time
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -351,7 +351,12 @@ def _game_seed_set_sha256(seeds: Sequence[int]) -> str:
     return "sha256:" + hashlib.sha256(canonical.tobytes()).hexdigest()
 
 
-def _load_a1_selected_game_manifest(path: Path) -> dict[str, Any]:
+def _load_a1_selected_game_manifest(
+    path: Path,
+    *,
+    expected_selected_game_count: int = A1_SELECTED_GAME_COUNT,
+    expected_category_game_counts: Mapping[str, int] = A1_CATEGORY_GAME_COUNTS,
+) -> dict[str, Any]:
     """Load and fail-closed validate the immutable A1 game-level selection.
 
     The post-wave audit selects complete games *before* row expansion.  This
@@ -403,18 +408,32 @@ def _load_a1_selected_game_manifest(path: Path) -> dict[str, Any]:
     contract_sha = payload["a1_contract_sha256"]
     if not isinstance(contract_sha, str) or not _SHA256_RE.fullmatch(contract_sha):
         raise SystemExit("selected-game seed manifest has invalid a1_contract_sha256")
+    expected_counts = dict(expected_category_game_counts)
+    if (
+        isinstance(expected_selected_game_count, bool)
+        or not isinstance(expected_selected_game_count, int)
+        or expected_selected_game_count <= 0
+        or set(expected_counts) != set(A1_CATEGORY_GAME_COUNTS)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in expected_counts.values()
+        )
+        or sum(expected_counts.values()) != expected_selected_game_count
+    ):
+        raise SystemExit("selected-game expected quota authority is invalid")
     if (
         isinstance(payload["selected_game_count"], bool)
         or not isinstance(payload["selected_game_count"], int)
-        or payload["selected_game_count"] != A1_SELECTED_GAME_COUNT
+        or payload["selected_game_count"] != expected_selected_game_count
     ):
         raise SystemExit(
-            f"selected-game seed manifest must declare exactly {A1_SELECTED_GAME_COUNT} games"
+            "selected-game seed manifest must declare exactly "
+            f"{expected_selected_game_count} games"
         )
     declared_category_counts = payload["category_game_counts"]
     if (
         not isinstance(declared_category_counts, dict)
-        or declared_category_counts != A1_CATEGORY_GAME_COUNTS
+        or declared_category_counts != expected_counts
         or any(
             isinstance(value, bool) or not isinstance(value, int)
             for value in declared_category_counts.values()
@@ -422,20 +441,32 @@ def _load_a1_selected_game_manifest(path: Path) -> dict[str, Any]:
     ):
         raise SystemExit(
             "selected-game seed manifest category_game_counts must be exactly "
-            f"{A1_CATEGORY_GAME_COUNTS}"
+            f"{expected_counts}"
         )
 
     records = payload["records"]
-    if not isinstance(records, list) or len(records) != A1_SELECTED_GAME_COUNT:
+    if not isinstance(records, list) or len(records) != expected_selected_game_count:
         raise SystemExit(
             f"selected-game seed manifest records must contain exactly "
-            f"{A1_SELECTED_GAME_COUNT} entries"
+            f"{expected_selected_game_count} entries"
         )
     normalized_records: list[dict[str, Any]] = []
     prior_key: tuple[int, str] | None = None
     seen_seeds: set[int] = set()
     for index, record in enumerate(records):
-        if not isinstance(record, dict) or set(record) != _A1_SELECTED_RECORD_FIELDS:
+        record_fields = set(record) if isinstance(record, dict) else set()
+        if (
+            not isinstance(record, dict)
+            or frozenset(record_fields)
+            not in {
+                frozenset(_A1_SELECTED_RECORD_FIELDS),
+                frozenset(_A1_SELECTED_RECORD_FIELDS | {"category_semantic"}),
+            }
+            or (
+                "category_semantic" in record
+                and not isinstance(record["category_semantic"], dict)
+            )
+        ):
             raise SystemExit(
                 f"selected-game record {index} fields differ from the exact schema"
             )
@@ -459,7 +490,7 @@ def _load_a1_selected_game_manifest(path: Path) -> dict[str, Any]:
         seen_seeds.add(seed)
         if not isinstance(record["worker_id"], str) or not record["worker_id"]:
             raise SystemExit(f"selected-game record {index} has invalid worker_id")
-        if record["category"] not in A1_CATEGORY_GAME_COUNTS:
+        if record["category"] not in expected_counts:
             raise SystemExit(f"selected-game record {index} has invalid category")
         producer_sha = record["producer_checkpoint_sha256"]
         if not isinstance(producer_sha, str) or not _SHA256_RE.fullmatch(producer_sha):
@@ -484,7 +515,7 @@ def _load_a1_selected_game_manifest(path: Path) -> dict[str, Any]:
         normalized_records.append(dict(record))
 
     actual_counts = dict(Counter(record["category"] for record in normalized_records))
-    if actual_counts != A1_CATEGORY_GAME_COUNTS:
+    if actual_counts != expected_counts:
         raise SystemExit(
             "selected-game record category counts do not match the declared A1 quotas: "
             f"{actual_counts}"
@@ -511,7 +542,8 @@ def _load_a1_selected_game_manifest(path: Path) -> dict[str, Any]:
         or isinstance(payload["validation_game_count"], bool)
         or not isinstance(payload["validation_game_count"], int)
         or payload["validation_game_count"] != len(validation_seeds)
-        or len(training_seeds) + len(validation_seeds) != A1_SELECTED_GAME_COUNT
+        or len(training_seeds) + len(validation_seeds)
+        != expected_selected_game_count
     ):
         raise SystemExit("selected-game seed manifest split counts mismatch")
 
@@ -547,7 +579,7 @@ def _load_a1_selected_game_manifest(path: Path) -> dict[str, Any]:
         "file_sha256": _file_sha256(manifest_path),
         "manifest_sha256": _value_sha256(payload),
         "a1_contract_sha256": contract_sha,
-        "selected_game_count": A1_SELECTED_GAME_COUNT,
+        "selected_game_count": expected_selected_game_count,
         "selected_game_seed_set_sha256": actual_selected_seed_sha,
         "training_game_count": len(training_seeds),
         "training_game_seed_set_sha256": actual_training_seed_sha,

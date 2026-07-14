@@ -90,6 +90,9 @@ def _verified(tmp_path: Path) -> dict:
 
 def _production_trainer_verified(tmp_path: Path) -> dict:
     verified = _verified(tmp_path)
+    event_history_acknowledgements = [
+        "sha256:" + f"{index:x}" * 64 for index in range(6, 10)
+    ]
     verified.update(
         {
             "data_kind": "production_composite_v2",
@@ -102,6 +105,31 @@ def _production_trainer_verified(tmp_path: Path) -> dict:
             "source_authority_ref": {},
             "category_semantics": {},
             "category_semantics_sha256": "sha256:" + "8" * 64,
+            "event_history_training_contract": {
+                "schema": "a1-training-event-history-contract-v1",
+                "training_event_history_trainable": False,
+                "event_history_end_to_end_usable": False,
+                "status": "empty_payloads_acknowledged",
+                "empty_payload_inventory_acknowledgements": (
+                    event_history_acknowledgements
+                ),
+            },
+            "event_history_component_authority": [
+                {
+                    "component_id": component_id,
+                    "payload_inventory_sha256": inventory_sha256,
+                }
+                for component_id, inventory_sha256 in zip(
+                    (
+                        "current_producer",
+                        "recent_history",
+                        "hard_negative",
+                        "historical_replay",
+                    ),
+                    event_history_acknowledgements,
+                    strict=True,
+                )
+            ],
         }
     )
     return verified
@@ -437,10 +465,20 @@ def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
         "production_mix_contract": contract_payload,
         "components": [
             {
+                "component_id": component_id,
                 "source_category": component_id,
                 "corpus_dir": str(tmp_path / component_id),
+                "payload_inventory_sha256": (
+                    "sha256:" + f"{index + 6:x}" * 64
+                ),
+                "corpus_meta": {
+                    "payload_inventory_sha256": (
+                        "sha256:" + f"{index + 6:x}" * 64
+                    ),
+                    "implicit_zero_columns": ["event_tokens", "event_mask"],
+                },
             }
-            for component_id in component_ids
+            for index, component_id in enumerate(component_ids)
         ],
         "descriptor_file_sha256": "sha256:" + "2" * 64,
         "descriptor_fingerprint": "sha256:" + "3" * 64,
@@ -675,7 +713,7 @@ def test_b200_8gpu_topology_preserves_global_batch_and_renders_torchrun(
 def test_production_one_dose_emits_same_trajectory_dose_snapshots(
     tmp_path: Path,
 ) -> None:
-    verified = _verified(tmp_path)
+    verified = _production_trainer_verified(tmp_path)
     verified["recipe"] = {
         **verified["recipe"],
         "max_steps": 128,
@@ -686,9 +724,6 @@ def test_production_one_dose_emits_same_trajectory_dose_snapshots(
         "per_game_policy_weight": True,
         "per_game_policy_weight_mode": "equal",
     }
-    verified["data_kind"] = "production_composite_v2"
-    verified["trainer_authority"] = executor._current_production_trainer_authority()
-
     command = executor._build_direct_train_command(
         verified,
         python=Path(sys.executable),
@@ -984,6 +1019,15 @@ def test_production_composite_uses_current_trainer_not_frozen_lock_provenance(
     assert command[1] == authority["path"]
     assert str(frozen_trainer) not in command
     assert authority["sha256"] == executor._file_sha256(Path(command[1]))
+    assert command.count(executor.EVENT_HISTORY_ACK_FLAG) == 4
+    assert command.count(executor.EVENT_HISTORY_CROP_FLAG) == 1
+    assert [
+        command[index + 1]
+        for index, token in enumerate(command)
+        if token == executor.EVENT_HISTORY_ACK_FLAG
+    ] == verified["event_history_training_contract"][
+        "empty_payload_inventory_acknowledgements"
+    ]
 
     input_binding = executor._input_binding(verified)
     transaction = executor._training_transaction_sha256(

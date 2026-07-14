@@ -123,6 +123,73 @@ def _selection(lock: dict) -> dict:
     }
 
 
+def test_selected_manifest_accepts_lock_bound_scale_quota_and_semantics(
+    tmp_path: Path,
+) -> None:
+    lock = _lock(tmp_path)
+    producer = contract._producer(lock)  # noqa: SLF001
+    records = []
+    for job in lock["fleet"]["jobs"]:
+        opponent = contract._category_opponent_sha256(  # noqa: SLF001
+            lock, job["category"]
+        )
+        for offset, split in ((0, "train"), (1, "validation")):
+            records.append(
+                {
+                    "game_seed": int(job["base_seed"]) + offset,
+                    "job_id": job["job_id"],
+                    "worker_id": job["worker_id"],
+                    "category": job["category"],
+                    "category_semantic": {"semantic": job["category"]},
+                    "producer_checkpoint_sha256": producer["sha256"],
+                    "opponent_checkpoint_sha256": opponent,
+                    "split": split,
+                }
+            )
+    records.sort(key=lambda record: (record["game_seed"], record["job_id"]))
+    training = [record["game_seed"] for record in records if record["split"] == "train"]
+    validation = [
+        record["game_seed"] for record in records if record["split"] == "validation"
+    ]
+    all_seeds = [record["game_seed"] for record in records]
+    counts = {
+        "current_producer": 2,
+        "recent_history": 2,
+        "hard_negative": 2,
+    }
+    payload = {
+        "schema_version": builder.memmap_builder.A1_SELECTED_GAMES_SCHEMA,
+        "a1_contract_sha256": lock["contract_sha256"],
+        "selection_rule": builder.memmap_builder.A1_SELECTION_RULE,
+        "selected_game_count": 6,
+        "selected_game_seed_set_sha256": (
+            builder.memmap_builder._game_seed_set_sha256(all_seeds)  # noqa: SLF001
+        ),
+        "category_game_counts": counts,
+        "training_game_count": len(training),
+        "training_game_seed_set_sha256": (
+            builder.memmap_builder._game_seed_set_sha256(training)  # noqa: SLF001
+        ),
+        "validation_game_count": len(validation),
+        "validation_game_seed_set_sha256": (
+            builder.memmap_builder._game_seed_set_sha256(validation)  # noqa: SLF001
+        ),
+        "records_sha256": builder.memmap_builder._value_sha256(records),  # noqa: SLF001
+        "records": records,
+    }
+    path = tmp_path / "scale-selected.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = builder.memmap_builder._load_a1_selected_game_manifest(  # noqa: SLF001
+        path,
+        expected_selected_game_count=6,
+        expected_category_game_counts=counts,
+    )
+
+    assert loaded["selected_game_count"] == 6
+    assert loaded["records_sha256"] == payload["records_sha256"]
+
+
 def _write_source(path: Path, *, base_seed: int, version: int | None) -> None:
     seeds = np.asarray([base_seed, base_seed + 1], dtype=np.int64)
     arrays: dict[str, np.ndarray] = {

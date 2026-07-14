@@ -1423,11 +1423,30 @@ def write_new_readonly(path: Path, value: dict[str, Any]) -> None:
 
 
 def write_new_readonly_or_identical(path: Path, value: dict[str, Any]) -> None:
-    if path.exists():
-        if _canonical(_read_json(path)) != _canonical(value):
-            raise FleetError(f"existing collected artifact differs: {path}")
+    path = path.expanduser()
+    try:
+        write_new_readonly(path, value)
         return
-    write_new_readonly(path, value)
+    except FileExistsError:
+        pass
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or stat.S_IMODE(opened.st_mode) != 0o444:
+                raise FleetError(
+                    f"existing collected artifact is not a readonly regular file: {path}"
+                )
+            existing = json.load(handle)
+    except FleetError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise FleetError(
+            f"cannot safely adopt existing collected artifact {path}: {error}"
+        ) from error
+    if _canonical(existing) != _canonical(value):
+        raise FleetError(f"existing collected artifact differs: {path}")
 
 
 def _verify_plan_evaluation_binding(plan: dict[str, Any]) -> None:

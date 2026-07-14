@@ -94,7 +94,9 @@ def _path_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _assert_checkout_runtime_binding() -> dict[str, object]:
+def _assert_checkout_runtime_binding(
+    baseline: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Refuse a trainer whose script and imported package come from different trees."""
 
     if _checkout_optim_state is not sys.modules.get("catan_zero.rl.optim_state"):
@@ -140,6 +142,22 @@ def _assert_checkout_runtime_binding() -> dict[str, object]:
     binding["binding_sha256"] = "sha256:" + hashlib.sha256(
         json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    if baseline is not None:
+        baseline_modules = baseline.get("modules")
+        if (
+            baseline.get("repo_root") != binding["repo_root"]
+            or baseline.get("source_root") != binding["source_root"]
+            or baseline.get("trainer") != binding["trainer"]
+            or baseline.get("trainer_sha256") != binding["trainer_sha256"]
+            or not isinstance(baseline_modules, dict)
+            or any(
+                modules.get(module_name) != record
+                for module_name, record in baseline_modules.items()
+            )
+        ):
+            raise RuntimeError(
+                "checkout/runtime files changed after the trainer imported them"
+            )
     return binding
 
 # Make the sibling ``tools/`` modules importable (factory_common) whether this module is run
@@ -7983,6 +8001,7 @@ def _bind_composite_validation_provenance(
 def main(argv: Sequence[str] | None = None) -> None:
     global _PUBLIC_AWARD_FEATURE_CONTRACT
     checkout_runtime_binding = _assert_checkout_runtime_binding()
+    initial_checkout_runtime_binding = checkout_runtime_binding
     parser = build_parser()
     args = parser.parse_args(argv)
     args.checkout_runtime_binding = checkout_runtime_binding
@@ -10433,7 +10452,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
                 )
                 checkpoint_model = getattr(policy.model, "module", policy.model)
-                checkout_runtime_binding = _assert_checkout_runtime_binding()
+                checkout_runtime_binding = _assert_checkout_runtime_binding(
+                    initial_checkout_runtime_binding
+                )
                 args.checkout_runtime_binding = checkout_runtime_binding
                 snapshot_value_training = _value_training_metadata(
                     args,
@@ -10842,7 +10863,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             epoch_path = _epoch_checkpoint_path(args.checkpoint, epoch + 1)
             checkpoint_model = getattr(policy.model, "module", policy.model)
             # Re-audit after training so lazily imported modules are covered too.
-            checkout_runtime_binding = _assert_checkout_runtime_binding()
+            checkout_runtime_binding = _assert_checkout_runtime_binding(
+                initial_checkout_runtime_binding
+            )
             args.checkout_runtime_binding = checkout_runtime_binding
             value_training = _value_training_metadata(
                 args,
@@ -10900,7 +10923,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     checkpoint_model = getattr(policy.model, "module", policy.model)
     # The durable identity is the complete runtime actually loaded by the end of
     # training, not merely the smaller module set present during argument parsing.
-    checkout_runtime_binding = _assert_checkout_runtime_binding()
+    checkout_runtime_binding = _assert_checkout_runtime_binding(
+        initial_checkout_runtime_binding
+    )
     args.checkout_runtime_binding = checkout_runtime_binding
     value_training = _value_training_metadata(
         args,
