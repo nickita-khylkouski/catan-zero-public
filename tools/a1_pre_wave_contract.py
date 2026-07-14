@@ -2172,6 +2172,59 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
         }
 
     if current_c_scale == selected_c_scale:
+        expected_s1_reference = {
+            "path": str(s1_path.resolve(strict=True)),
+            "sha256": s1_record["sha256"],
+        }
+        existing_receipt = guard_payload.get(GUARD_SYNC_KEY)
+        # Disaster recovery replaces the lost post-promotion authority with a
+        # new, replayable S1 binding while deliberately retaining the deployed
+        # c_scale=.10 operator.  The old synchronizer treated that legitimate
+        # authority change as manual drift and made recovery impossible.  Only
+        # this typed recovery mode may rebind provenance in place; the complete
+        # guard recipe is validated below before the atomic replacement.
+        if (
+            allow_recovery_s1
+            and isinstance(existing_receipt, dict)
+            and existing_receipt.get("source_s1_evidence")
+            != expected_s1_reference
+        ):
+            rebound_payload = json.loads(json.dumps(guard_payload))
+            rebound_payload[GUARD_SYNC_KEY] = {
+                "schema_version": GUARD_SYNC_SCHEMA,
+                "selected_c_scale": selected_c_scale,
+                "source_s1_evidence": expected_s1_reference,
+                "previous_guard_sha256": before_sha256,
+                "synchronizer": {
+                    "path": GUARD_SYNC_TOOL,
+                    "sha256": _sha256(
+                        (REPO_ROOT / GUARD_SYNC_TOOL).resolve(strict=True)
+                    ),
+                },
+            }
+            _validate_guard_payload(
+                rebound_payload,
+                path=guard_path,
+                search=guard_search,
+                evaluator=guard_evaluator,
+                generation=guard_generation,
+                s1_evidence=s1_record,
+            )
+            if _sha256(guard_path) != before_sha256:
+                raise ContractError(
+                    f"guard {guard_path} changed concurrently during recovery rebind"
+                )
+            _atomic_replace_json(guard_path, rebound_payload)
+            after_sha256 = _sha256(guard_path)
+            return {
+                "status": "recovery_provenance_rebound",
+                "changed": True,
+                "selected_c_scale": selected_c_scale,
+                "guard": str(guard_path),
+                "before_sha256": before_sha256,
+                "after_sha256": after_sha256,
+                "s1_evidence": expected_s1_reference,
+            }
         synchronizer_stale = _validate_guard_sync_provenance(
             guard_payload,
             path=guard_path,
