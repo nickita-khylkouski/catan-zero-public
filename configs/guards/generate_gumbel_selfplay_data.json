@@ -9,7 +9,7 @@
     },
     "synchronizer": {
       "path": "tools/a1_pre_wave_contract.py",
-      "sha256": "sha256:8829f8dd217572b67b1d50d14967702e406bdfcddeeea5642b08527bf451a7b3"
+      "sha256": "sha256:ab5d4ef8d4a3f82ecacb6c94ff613e24041ec9d1d4e2722ae6c65a19220f101c"
     }
   },
   "guards": [
@@ -45,9 +45,9 @@
           "--n-fast": 16,
           "--n-full": 128,
           "--native-mcts-hot-loop": true,
-          "--rust-featurize": true,
           "--p-full": 0.25,
           "--public-observation": true,
+          "--rust-featurize": true,
           "--symmetry-averaged-eval": true,
           "--symmetry-averaged-eval-threshold": 20,
           "--temperature-decisions": 90
