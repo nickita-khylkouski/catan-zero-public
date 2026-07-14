@@ -357,6 +357,63 @@ def _tool_identity() -> dict[str, Any]:
     return {"git_commit": commit, "files": files, "files_sha256": _digest(files)}
 
 
+def _verify_recorded_tool_identity(recorded: Any) -> None:
+    """Replay the exact recovery sources from their recorded ancestor commit.
+
+    A committed recovery receipt must remain consumable after ordinary
+    fail-closed hardening.  Requiring the *current* HEAD string forever made a
+    one-shot receipt unusable after any descendant commit, even when every
+    recorded source blob remained available.  This verifier accepts no source
+    substitution: the recorded commit must be an ancestor of HEAD and every
+    recorded blob must still hash exactly to the receipt's identity.
+    """
+
+    if not isinstance(recorded, dict) or set(recorded) != {
+        "git_commit",
+        "files",
+        "files_sha256",
+    }:
+        raise RecoveryError("recorded recovery source identity is malformed")
+    commit = recorded["git_commit"]
+    files = recorded["files"]
+    if (
+        not isinstance(commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+        or not isinstance(files, dict)
+        or not files
+        or recorded["files_sha256"] != _digest(files)
+    ):
+        raise RecoveryError("recorded recovery source identity digest is malformed")
+    try:
+        subprocess.run(
+            ("git", "merge-base", "--is-ancestor", commit, "HEAD"),
+            cwd=REPO_ROOT,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for relative, expected in files.items():
+            if (
+                not isinstance(relative, str)
+                or relative.startswith("/")
+                or ".." in Path(relative).parts
+                or not isinstance(expected, str)
+                or _SHA_RE.fullmatch(expected) is None
+            ):
+                raise RecoveryError("recorded recovery source entry is malformed")
+            blob = subprocess.check_output(
+                ("git", "show", f"{commit}:{relative}"), cwd=REPO_ROOT
+            )
+            if _sha256_bytes(blob) != expected:
+                raise RecoveryError(
+                    f"recorded recovery source blob drift at {commit}:{relative}"
+                )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RecoveryError(
+            "recorded recovery source commit is unavailable or not an ancestor"
+        ) from error
+
+
 def _fresh_namespace(namespace: Path) -> tuple[Path, dict[str, str]]:
     lexical = Path(os.path.abspath(os.fspath(namespace.expanduser())))
     if lexical.name != RECOVERY_NAMESPACE_BASENAME:
@@ -1026,6 +1083,11 @@ def verify_committed_receipt(
     evidence, snapshot, _ = _handoff_evidence(Path(plan["surviving_handoff"]["path"]))
     safety, safety_bytes = _safety_reference(Path(plan["safety_reference"]["path"]))
     snapshot[Path(safety["path"])] = safety_bytes
+    current_source_identity = tool_identity_fn()
+    source_identity_replayed = current_source_identity == plan["source_identity"]
+    if not source_identity_replayed and tool_identity_fn is _tool_identity:
+        _verify_recorded_tool_identity(plan["source_identity"])
+        source_identity_replayed = True
     if (
         evidence["surviving_handoff"] != plan["surviving_handoff"]
         or evidence["producer_identity"] != plan["producer_identity"]
@@ -1035,7 +1097,7 @@ def verify_committed_receipt(
         or safety != plan["safety_reference"]
         or runtime_smoke_fn(Path(plan["recovered_checkpoint"]["path"]))
         != plan["runtime_smoke"]
-        or tool_identity_fn() != plan["source_identity"]
+        or not source_identity_replayed
     ):
         raise RecoveryError("recovery receipt no longer replays exact source/runtime identity")
     _revalidate_snapshot(snapshot)
