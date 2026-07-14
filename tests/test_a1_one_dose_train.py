@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import subprocess
@@ -604,6 +605,83 @@ def _failed_architecture_attempt(tmp_path: Path) -> tuple[dict, Path, list[str]]
             ),
             probe=lambda _gpu: "NVIDIA B200",
         )
+    return verified, executor._claim_path(verified), parent_command
+
+
+def _failed_production_preflight_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[dict, Path, list[str]]:
+    verified = executor.bind_training_topology(
+        _production_trainer_verified(tmp_path),
+        topology=executor.B200_8GPU_DDP_TOPOLOGY,
+        gpu=0,
+    )
+    fixed_authority = executor._current_production_trainer_authority()
+    buggy_authority = copy.deepcopy(fixed_authority)
+    buggy_authority["sha256"] = (
+        executor.BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256
+    )
+    for record in buggy_authority["code_surface"]:
+        if record["relative_path"] == "tools/train_bc.py":
+            record["sha256"] = (
+                executor.BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256
+            )
+    buggy_authority["code_surface_sha256"] = executor._value_sha256(
+        buggy_authority["code_surface"]
+    )
+    buggy_authority.pop("authority_sha256")
+    buggy_authority["authority_sha256"] = executor._value_sha256(buggy_authority)
+    verified["trainer_authority"] = buggy_authority
+    canary_semantics = {
+        "schema_version": "a1-ddp-canary-semantic-identity-v1",
+        "world_size": 8,
+        "local_batch_size": 512,
+        "global_batch_size": 4096,
+        "train_bc_sha256": executor.BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256,
+    }
+    verified["ddp_canary"] = {
+        "semantic_identity": canary_semantics,
+        "semantic_identity_sha256": executor._value_sha256(canary_semantics),
+    }
+    parent_checkpoint = tmp_path / "production-r1" / "candidate.pt"
+    parent_report = tmp_path / "production-r1" / "training.report.json"
+    parent_receipt = tmp_path / "production-r1" / "training.receipt.json"
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            executor,
+            "_current_production_trainer_authority",
+            lambda: copy.deepcopy(buggy_authority),
+        )
+        parent_command = executor.build_train_command(
+            verified,
+            python=Path(sys.executable),
+            checkpoint=parent_checkpoint,
+            report=parent_report,
+        )
+        with pytest.raises(executor.ExecutorError, match="exited nonzero"):
+            executor.execute(
+                verified=verified,
+                command=parent_command,
+                checkpoint=parent_checkpoint,
+                report=parent_report,
+                receipt=parent_receipt,
+                gpu=0,
+                runner=lambda *args, **kwargs: subprocess.CompletedProcess(
+                    parent_command, 1
+                ),
+                probe=lambda _gpu: "NVIDIA B200",
+            )
+    verified["trainer_authority"] = fixed_authority
+    fixed_canary_semantics = {
+        **canary_semantics,
+        "train_bc_sha256": executor.FIXED_PRODUCTION_PREFLIGHT_TRAINER_SHA256,
+    }
+    verified["ddp_canary"] = {
+        "semantic_identity": fixed_canary_semantics,
+        "semantic_identity_sha256": executor._value_sha256(
+            fixed_canary_semantics
+        ),
+    }
     return verified, executor._claim_path(verified), parent_command
 
 
@@ -2456,6 +2534,145 @@ def test_failed_before_optimizer_derives_new_immutable_retry_claim(
     )
     assert retry_state["status"] == "claimed"
     assert retry_claim != parent_claim
+
+
+def test_production_preflight_serialization_failure_derives_typed_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, parent_claim, _ = _failed_production_preflight_attempt(
+        tmp_path, monkeypatch
+    )
+    parent_claim_before = parent_claim.read_bytes()
+    parent = executor._load_claim_state(
+        parent_claim, contract_sha256=verified["contract_sha256"]
+    )
+    parent_receipt = Path(parent["receipt_target"])
+    parent_receipt_before = parent_receipt.read_bytes()
+    checkpoint = tmp_path / "production-r2" / "candidate.pt"
+    report = tmp_path / "production-r2" / "training.report.json"
+    receipt = tmp_path / "production-r2" / "training.receipt.json"
+    retry_contract = tmp_path / "production-r2" / "retry.contract.json"
+    retry_command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+
+    derived = executor.authorize_failed_before_optimizer_retry(
+        verified=verified,
+        parent_claim=parent_claim,
+        retry_command=retry_command,
+        checkpoint=checkpoint,
+        report=report,
+        receipt=receipt,
+        retry_contract_path=retry_contract,
+        publish=True,
+    )
+
+    contract_payload = derived["retry_contract"]
+    assert contract_payload["retry_identity"]["repair_kind"] == (
+        executor.PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND
+    )
+    assert contract_payload["parent"]["pre_optimizer_proof"][
+        "buggy_train_bc_sha256"
+    ] == executor.BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256
+    assert contract_payload["retry"]["fixed_train_bc_sha256"] == (
+        executor.FIXED_PRODUCTION_PREFLIGHT_TRAINER_SHA256
+    )
+    assert contract_payload["preserved_bindings"]["parent_ddp_canary"] != (
+        contract_payload["retry"]["ddp_canary"]
+    )
+    assert contract_payload["retry"]["allowed_argv_drift"] == [
+        "checkpoint",
+        "report",
+    ]
+    assert executor._claim_path(derived) != parent_claim
+    assert not executor._claim_path(derived).exists()
+    assert json.loads(retry_contract.read_text()) == contract_payload
+    assert parent_claim.read_bytes() == parent_claim_before
+    assert parent_receipt.read_bytes() == parent_receipt_before
+
+    retry_claim = executor._claim_attempt(
+        derived,
+        {
+            "schema_version": executor.RETRY_CLAIM_SCHEMA,
+            "status": "claimed",
+            "contract_sha256": verified["contract_sha256"],
+            "claim_identity_sha256": derived["claim_identity_sha256"],
+        },
+    )
+    assert retry_claim != parent_claim
+    with pytest.raises(executor.ExecutorError, match="already exists"):
+        executor._claim_attempt(
+            derived,
+            {
+                "schema_version": executor.RETRY_CLAIM_SCHEMA,
+                "status": "claimed",
+                "contract_sha256": verified["contract_sha256"],
+                "claim_identity_sha256": derived["claim_identity_sha256"],
+            },
+        )
+
+
+def test_production_preflight_retry_refuses_learner_semantic_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, parent_claim, _ = _failed_production_preflight_attempt(
+        tmp_path, monkeypatch
+    )
+    checkpoint = tmp_path / "production-r2" / "candidate.pt"
+    report = tmp_path / "production-r2" / "training.report.json"
+    retry_command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+    retry_command = _replace_option(retry_command, "--lr", "0.00012")
+
+    with pytest.raises(executor.ExecutorError, match="learner semantics"):
+        executor.authorize_failed_before_optimizer_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=retry_command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=tmp_path / "production-r2" / "receipt.json",
+            retry_contract_path=tmp_path / "production-r2" / "retry.json",
+            publish=False,
+        )
+
+
+def test_production_preflight_retry_refuses_any_parent_training_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, parent_claim, parent_command = _failed_production_preflight_attempt(
+        tmp_path, monkeypatch
+    )
+    parent_args = executor._train_command_namespace(parent_command)
+    parent_progress = Path(str(parent_args.checkpoint) + ".training-progress.json")
+    parent_progress.write_text("partial", encoding="utf-8")
+    checkpoint = tmp_path / "production-r2" / "candidate.pt"
+    report = tmp_path / "production-r2" / "training.report.json"
+    retry_command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+
+    with pytest.raises(executor.ExecutorError, match="zero-output/zero-step"):
+        executor.authorize_failed_before_optimizer_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=retry_command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=tmp_path / "production-r2" / "receipt.json",
+            retry_contract_path=tmp_path / "production-r2" / "retry.json",
+            publish=False,
+        )
 
 
 def test_retry_identity_is_stable_across_output_path_changes(tmp_path: Path) -> None:

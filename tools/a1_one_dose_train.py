@@ -87,6 +87,20 @@ PRODUCTION_TRAINER_CODE_SURFACE = tuple(
 RETRY_CONTRACT_SCHEMA = "a1-one-dose-learner-retry-contract-v1"
 RETRY_IDENTITY_SCHEMA = "a1-one-dose-learner-retry-identity-v1"
 RETRY_REPAIR_KIND = "entity_graph_graph_layers_default_4_to_checkpoint_6"
+PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND = (
+    "production_ddp_preflight_metadata_set_json_serialization"
+)
+# This pair is intentionally byte-specific.  The first trainer consumed the
+# original claim after rank 0 returned Python ``set`` objects in production
+# source-authority metadata and then failed while publishing the JSON DDP
+# preflight.  The second trainer converts those two values to sorted lists.
+# A future train_bc edit cannot silently reuse this one-off repair authority.
+BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256 = (
+    "sha256:ad22fe0a7ea6cf05816d600e96360d501d6aca7ca52d77ed62dfc4cf43f25386"
+)
+FIXED_PRODUCTION_PREFLIGHT_TRAINER_SHA256 = (
+    "sha256:6fa6bc031aba2f8949d36d0865ea4497450ae760a5cdf227840a9d922a1a2ec9"
+)
 ABLATION_RECEIPT_SCHEMA = "a1-learner-ablation-training-receipt-v1"
 ABLATION_CLAIM_SCHEMA = "a1-learner-ablation-training-claim-v1"
 UPGRADE_RECEIPT_SCHEMA = "a1-architecture-upgrade-training-receipt-v1"
@@ -4641,6 +4655,443 @@ def _write_retry_contract_no_clobber(path: Path, payload: dict[str, Any]) -> Non
         tmp.unlink(missing_ok=True)
 
 
+def _validated_recorded_production_trainer_authority(
+    authority: Any, *, expected_trainer_sha256: str, where: str
+) -> dict[str, Any]:
+    """Replay a receipt-bound trainer authority without trusting its labels."""
+
+    expected_keys = {
+        "schema_version",
+        "repository_root",
+        "relative_path",
+        "path",
+        "sha256",
+        "code_surface",
+        "code_surface_sha256",
+        "authority_sha256",
+    }
+    if not isinstance(authority, dict) or set(authority) != expected_keys:
+        raise ExecutorError(f"{where} trainer authority fields drift")
+    unhashed = dict(authority)
+    stated_authority_sha256 = unhashed.pop("authority_sha256", None)
+    code_surface = authority.get("code_surface")
+    if (
+        authority.get("schema_version") != PRODUCTION_TRAINER_AUTHORITY_SCHEMA
+        or authority.get("relative_path") != "tools/train_bc.py"
+        or authority.get("sha256") != expected_trainer_sha256
+        or stated_authority_sha256 != _value_sha256(unhashed)
+        or not isinstance(code_surface, list)
+        or authority.get("code_surface_sha256") != _value_sha256(code_surface)
+    ):
+        raise ExecutorError(f"{where} trainer authority digest/identity drift")
+    records: dict[str, str] = {}
+    for record in code_surface:
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"relative_path", "path", "sha256"}
+            or not isinstance(record.get("relative_path"), str)
+            or not isinstance(record.get("path"), str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", str(record.get("sha256")))
+            is None
+            or record["relative_path"] in records
+        ):
+            raise ExecutorError(f"{where} trainer code-surface record drift")
+        records[record["relative_path"]] = record["sha256"]
+    if records.get("tools/train_bc.py") != expected_trainer_sha256:
+        raise ExecutorError(f"{where} train_bc code-surface identity drift")
+    return copy.deepcopy(authority)
+
+
+def _production_retry_output_paths(args: argparse.Namespace) -> tuple[Path, ...]:
+    """Enumerate every learner artifact the failed command could have emitted."""
+
+    checkpoint = Path(args.checkpoint).expanduser().resolve(strict=False)
+    report = Path(args.report).expanduser().resolve(strict=False)
+    try:
+        checkpoint_steps = train_bc._parse_checkpoint_steps(  # noqa: SLF001
+            str(args.checkpoint_steps), max_steps=int(args.max_steps)
+        )
+    except SystemExit as error:
+        raise ExecutorError("parent retry checkpoint-step contract is invalid") from error
+    paths = [
+        checkpoint,
+        Path(str(checkpoint) + ".optimizer.pt"),
+        Path(str(checkpoint) + ".training-progress.json"),
+        report,
+    ]
+    paths.extend(
+        train_bc._step_checkpoint_path(checkpoint, step).resolve(strict=False)  # noqa: SLF001
+        for step in checkpoint_steps
+    )
+    return tuple(paths)
+
+
+def _production_retry_ddp_canary_semantics(
+    canary: Any, *, expected_trainer_sha256: str, where: str
+) -> dict[str, Any]:
+    """Project a fresh canary across the one intended train_bc byte repair."""
+
+    if not isinstance(canary, dict):
+        raise ExecutorError(f"{where} DDP canary is missing")
+    semantic_identity = canary.get("semantic_identity")
+    if (
+        not isinstance(semantic_identity, dict)
+        or canary.get("semantic_identity_sha256")
+        != _value_sha256(semantic_identity)
+        or semantic_identity.get("train_bc_sha256")
+        != expected_trainer_sha256
+    ):
+        raise ExecutorError(f"{where} DDP canary authority drift")
+    portable = copy.deepcopy(semantic_identity)
+    portable.pop("train_bc_sha256")
+    return portable
+
+
+def _authorize_production_preflight_serialization_retry(
+    *,
+    verified: dict[str, Any],
+    parent_claim: Path,
+    retry_command: list[str],
+    checkpoint: Path,
+    report: Path,
+    receipt: Path,
+    retry_contract_path: Path,
+    publish: bool,
+) -> dict[str, Any]:
+    """Authorize the one byte-typed production DDP preflight repair.
+
+    The consumed parent used one exact buggy ``train_bc`` and produced no
+    learner artifacts.  Its command, input authority, environment, terminal
+    claim, and failed receipt are replayed here.  Only the repaired trainer
+    bytes and fresh output namespace may differ.
+    """
+
+    current_authority = _require_current_production_trainer_authority(verified)
+    assert current_authority is not None
+    current_authority = _validated_recorded_production_trainer_authority(
+        current_authority,
+        expected_trainer_sha256=FIXED_PRODUCTION_PREFLIGHT_TRAINER_SHA256,
+        where="fixed production preflight",
+    )
+
+    expected_parent_claim = _claim_path(verified).resolve(strict=False)
+    parent_claim = parent_claim.expanduser()
+    if parent_claim.is_symlink():
+        raise ExecutorError("retry parent claim must not be a symlink")
+    try:
+        parent_claim = parent_claim.resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(f"cannot resolve parent failed claim: {error}") from error
+    if parent_claim != expected_parent_claim:
+        raise ExecutorError(
+            "retry parent claim is not the canonical sealed-contract claim"
+        )
+    parent = _load_claim_state(
+        parent_claim, contract_sha256=str(verified["contract_sha256"])
+    )
+    if (
+        parent.get("status") != "failed"
+        or parent.get("outputs") is not None
+        or parent.get("lineage_dose") is not None
+        or parent.get("returncode") != 1
+        or parent.get("failure") != "ExecutorError: train_bc exited nonzero: 1"
+    ):
+        raise ExecutorError(
+            "production preflight retry requires the exact terminal zero-output "
+            "nonzero parent"
+        )
+    parent_command = parent.get("command")
+    if not isinstance(parent_command, list) or not all(
+        isinstance(item, str) for item in parent_command
+    ):
+        raise ExecutorError("retry parent claim has no canonical command")
+    if parent.get("command_sha256") != _value_sha256(parent_command):
+        raise ExecutorError("retry parent command digest does not replay")
+    parent_binding = parent.get("execution_binding")
+    if not isinstance(parent_binding, dict):
+        raise ExecutorError("retry parent claim has no execution binding")
+    _validate_execution_binding(parent_binding)
+    if parent_binding["command_sha256"] != parent["command_sha256"]:
+        raise ExecutorError("retry parent execution binding disagrees with its command")
+    parent_input_binding = parent.get("input_binding")
+    if (
+        not isinstance(parent_input_binding, dict)
+        or parent_input_binding.get("binding_sha256")
+        != _value_sha256(
+            {
+                key: value
+                for key, value in parent_input_binding.items()
+                if key != "binding_sha256"
+            }
+        )
+    ):
+        raise ExecutorError("retry parent input binding is invalid")
+
+    receipt_target = Path(str(parent.get("receipt_target", ""))).expanduser()
+    if receipt_target.is_symlink():
+        raise ExecutorError("parent failure receipt must not be a symlink")
+    try:
+        receipt_target = receipt_target.resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(
+            f"cannot resolve parent failure receipt: {error}"
+        ) from error
+    parent_receipt = _load_failed_receipt(receipt_target)
+    agreement_fields = (
+        "contract_sha256",
+        "command",
+        "command_sha256",
+        "execution_binding",
+        "input_binding",
+        "training_transaction_sha256",
+        "trainer_authority",
+        "returncode",
+        "outputs",
+        "lineage_dose",
+        "failure",
+    )
+    if (
+        parent_receipt.get("status") != "failed"
+        or parent_receipt.get("claim") != str(parent_claim)
+        or parent_receipt.get("claim_state_sha256") != parent.get("state_sha256")
+        or any(parent_receipt.get(key) != parent.get(key) for key in agreement_fields)
+    ):
+        raise ExecutorError("parent failed claim and receipt do not agree")
+    parent_authority = _validated_recorded_production_trainer_authority(
+        parent_receipt.get("trainer_authority"),
+        expected_trainer_sha256=BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256,
+        where="buggy production preflight parent",
+    )
+    if parent_input_binding.get("trainer_authority") != parent_authority:
+        raise ExecutorError("parent input binding disagrees with buggy trainer authority")
+
+    parent_records = {
+        record["relative_path"]: record["sha256"]
+        for record in parent_authority["code_surface"]
+    }
+    current_records = {
+        record["relative_path"]: record["sha256"]
+        for record in current_authority["code_surface"]
+    }
+    allowed_code_repairs = {
+        "tools/train_bc.py",
+        "tools/a1_one_dose_train.py",
+    }
+    if set(parent_records) != set(current_records) or any(
+        parent_records[path] != current_records[path]
+        for path in parent_records
+        if path not in allowed_code_repairs
+    ):
+        raise ExecutorError(
+            "production retry changes code outside the typed preflight repair surface"
+        )
+
+    parent_args = _train_command_namespace(parent_command)
+    if (
+        parent_command.count("torch.distributed.run") != 1
+        or parent_command.count("--nproc_per_node=8") != 1
+        or int(verified["recipe"]["world_size"]) != 8
+    ):
+        raise ExecutorError("production preflight retry parent is not exact 8-rank DDP")
+    parent_output_paths = _production_retry_output_paths(parent_args)
+    for path in parent_output_paths:
+        if path.exists() or path.is_symlink():
+            raise ExecutorError(
+                "cannot prove zero-output/zero-step production preflight failure; "
+                f"artifact exists: {path}"
+            )
+
+    retry_args = _train_command_namespace(retry_command)
+    allowed_argv_drift = {"checkpoint", "report"}
+    parent_values = vars(parent_args)
+    retry_values = vars(retry_args)
+    semantic_drift = sorted(
+        key
+        for key in set(parent_values) | set(retry_values)
+        if key not in allowed_argv_drift
+        and parent_values.get(key) != retry_values.get(key)
+    )
+    if semantic_drift:
+        raise ExecutorError(
+            f"production preflight retry changes learner semantics: {semantic_drift}"
+        )
+    selected_gpus = _selected_gpus(verified, fallback_gpu=0)
+    if parent_binding["environment"] != _child_environment(selected_gpus):
+        raise ExecutorError("production preflight retry changes learner environment")
+    current_input_binding = _input_binding(verified)
+    ignored_input_fields = {
+        "binding_sha256",
+        "ddp_canary",
+        "trainer_authority",
+    }
+    parent_semantics = {
+        key: value
+        for key, value in parent_input_binding.items()
+        if key not in ignored_input_fields
+    }
+    current_semantics = {
+        key: value
+        for key, value in current_input_binding.items()
+        if key not in ignored_input_fields
+    }
+    if parent_semantics != current_semantics:
+        raise ExecutorError("production preflight retry changes authenticated inputs")
+    parent_canary_semantics = _production_retry_ddp_canary_semantics(
+        parent_input_binding.get("ddp_canary"),
+        expected_trainer_sha256=BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256,
+        where="buggy production preflight parent",
+    )
+    current_canary_semantics = _production_retry_ddp_canary_semantics(
+        current_input_binding.get("ddp_canary"),
+        expected_trainer_sha256=FIXED_PRODUCTION_PREFLIGHT_TRAINER_SHA256,
+        where="fixed production preflight retry",
+    )
+    if parent_canary_semantics != current_canary_semantics:
+        raise ExecutorError("production preflight retry changes DDP canary semantics")
+
+    checkpoint = checkpoint.expanduser().resolve(strict=False)
+    report = report.expanduser().resolve(strict=False)
+    receipt = receipt.expanduser().resolve(strict=False)
+    retry_contract_path = retry_contract_path.expanduser()
+    if retry_contract_path.is_symlink():
+        raise ExecutorError("retry contract path must not be a symlink")
+    retry_contract_path = retry_contract_path.resolve(strict=False)
+    if (
+        Path(retry_args.checkpoint).expanduser().resolve(strict=False) != checkpoint
+        or Path(retry_args.report).expanduser().resolve(strict=False) != report
+    ):
+        raise ExecutorError("retry command does not bind the requested fresh outputs")
+    _require_fresh_outputs(checkpoint, report, receipt)
+    if retry_contract_path in {
+        checkpoint,
+        Path(str(checkpoint) + ".optimizer.pt"),
+        Path(str(checkpoint) + ".training-progress.json"),
+        report,
+        receipt,
+        parent_claim,
+        receipt_target,
+    }:
+        raise ExecutorError("retry contract path aliases a claim, receipt, or output")
+    if set(_production_retry_output_paths(retry_args)) & set(parent_output_paths):
+        raise ExecutorError("retry must use a completely fresh output set")
+
+    parent_evidence = {
+        "claim": str(parent_claim),
+        "claim_file_sha256": _file_sha256(parent_claim),
+        "claim_state_sha256": parent["state_sha256"],
+        "receipt": str(receipt_target),
+        "receipt_file_sha256": _file_sha256(receipt_target),
+        "receipt_sha256": parent_receipt["receipt_sha256"],
+        "command_sha256": parent["command_sha256"],
+        "input_binding_sha256": parent_input_binding["binding_sha256"],
+        "training_transaction_sha256": parent["training_transaction_sha256"],
+        "returncode": parent["returncode"],
+        "failure": parent["failure"],
+    }
+    retry_identity_evidence = {
+        "schema_version": RETRY_IDENTITY_SCHEMA,
+        "repair_kind": PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND,
+        "parent_contract_sha256": verified["contract_sha256"],
+        "parent": parent_evidence,
+    }
+    # The claim identity excludes output paths and the repaired checkout.  This
+    # exact consumed parent can therefore mint only one O_EXCL retry claim.
+    retry_identity = _value_sha256(retry_identity_evidence)
+    preserved = {
+        "parent_contract_sha256": verified["contract_sha256"],
+        "lock_file_sha256": verified["lock_file_sha256"],
+        "corpus_meta_file_sha256": verified["corpus_meta_file_sha256"],
+        "payload_inventory_sha256": verified["payload_inventory_sha256"],
+        "data_fingerprint": verified["data_fingerprint"],
+        "producer_checkpoint_sha256": verified["producer"]["sha256"],
+        "effective_learner_recipe_sha256": _value_sha256(verified["recipe"]),
+        "learner_value_objective_sha256": _value_sha256(verified["objective"]),
+        "selected_game_seed_set_sha256": verified[
+            "selected_game_seed_set_sha256"
+        ],
+        "training_game_seed_set_sha256": verified[
+            "training_game_seed_set_sha256"
+        ],
+        "validation_game_seed_set_sha256": verified[
+            "validation_game_seed_set_sha256"
+        ],
+        "parent_input_semantics_sha256": _value_sha256(parent_semantics),
+        "retry_input_semantics_sha256": _value_sha256(current_semantics),
+        "parent_ddp_canary": copy.deepcopy(
+            parent_input_binding["ddp_canary"]
+        ),
+        "ddp_canary_semantics_without_trainer_sha256": _value_sha256(
+            current_canary_semantics
+        ),
+    }
+    retry_contract = {
+        "schema_version": RETRY_CONTRACT_SCHEMA,
+        "retry_identity": retry_identity_evidence,
+        "retry_identity_sha256": retry_identity,
+        "parent": {
+            **parent_evidence,
+            "trainer_authority": parent_authority,
+            "pre_optimizer_proof": {
+                "kind": PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND,
+                "buggy_train_bc_sha256": (
+                    BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256
+                ),
+                "failure_phase": "ddp_preflight_json_publish_before_model_optimizer",
+                "optimizer_steps": 0,
+                "outputs": None,
+                "absent_output_paths": [str(path) for path in parent_output_paths],
+            },
+        },
+        "preserved_bindings": preserved,
+        "retry": {
+            "command_sha256": _value_sha256(retry_command),
+            "trainer_authority": current_authority,
+            "fixed_train_bc_sha256": FIXED_PRODUCTION_PREFLIGHT_TRAINER_SHA256,
+            "ddp_canary": copy.deepcopy(current_input_binding["ddp_canary"]),
+            "allowed_argv_drift": sorted(allowed_argv_drift),
+            "checkpoint": str(checkpoint),
+            "optimizer_sidecar": str(Path(str(checkpoint) + ".optimizer.pt")),
+            "progress_sidecar": str(
+                Path(str(checkpoint) + ".training-progress.json")
+            ),
+            "report": str(report),
+            "receipt": str(receipt),
+        },
+    }
+    retry_contract["retry_contract_sha256"] = _value_sha256(retry_contract)
+    derived_claim_path = _claim_path(
+        {**verified, "claim_identity_sha256": retry_identity}
+    ).resolve(strict=False)
+    if retry_contract_path == derived_claim_path:
+        raise ExecutorError("retry contract path aliases its derived durable claim")
+    if publish:
+        if retry_contract_path.exists():
+            try:
+                existing = json.loads(
+                    retry_contract_path.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ExecutorError("existing retry contract is unreadable") from error
+            if existing != retry_contract:
+                raise ExecutorError(
+                    "existing retry contract differs; refusing overwrite/edit"
+                )
+        else:
+            _write_retry_contract_no_clobber(retry_contract_path, retry_contract)
+    derived = dict(verified)
+    derived.update(
+        {
+            "claim_identity_sha256": retry_identity,
+            "retry_contract": retry_contract,
+            "retry_contract_path": retry_contract_path,
+            "retry_contract_file_sha256": (
+                _file_sha256(retry_contract_path) if publish else None
+            ),
+        }
+    )
+    return derived
+
+
 def authorize_failed_before_optimizer_retry(
     *,
     verified: dict[str, Any],
@@ -4661,9 +5112,15 @@ def authorize_failed_before_optimizer_retry(
     """
 
     if verified.get("data_kind") == "production_composite_v2":
-        raise ExecutorError(
-            "historical graph-layer retry authority does not apply to a flywheel "
-            "production composite"
+        return _authorize_production_preflight_serialization_retry(
+            verified=verified,
+            parent_claim=parent_claim,
+            retry_command=retry_command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=receipt,
+            retry_contract_path=retry_contract_path,
+            publish=publish,
         )
 
     live_bindings = {
