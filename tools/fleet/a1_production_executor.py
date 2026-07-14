@@ -152,6 +152,314 @@ if sha256(destination) != expected:
     raise SystemExit("installed destination hash mismatch")
 """
 
+_REMOTE_BULK_PRECHECK_SCRIPT = r"""
+import hashlib
+import json
+import pathlib
+import stat
+import sys
+
+receipt_path = pathlib.Path(sys.argv[1])
+expected_manifest = sys.argv[2]
+expected_bundle = sys.argv[3]
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+if not receipt_path.is_absolute() or receipt_path.resolve(strict=False) != receipt_path:
+    raise SystemExit("bulk receipt path is not canonical")
+try:
+    metadata = receipt_path.lstat()
+except FileNotFoundError:
+    raise SystemExit(3)
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("bulk receipt is not a regular non-symlink file")
+try:
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit("bulk receipt is unreadable: " + repr(error))
+if (
+    receipt.get("schema_version") != "a1-production-bulk-install-v1"
+    or receipt.get("manifest_sha256") != expected_manifest
+    or receipt.get("bundle_sha256") != expected_bundle
+):
+    raise SystemExit("bulk receipt binds different bytes")
+if receipt.get("status") != "complete":
+    raise SystemExit(3)
+artifacts = receipt.get("artifacts")
+if not isinstance(artifacts, list) or not artifacts:
+    raise SystemExit("bulk receipt has no artifact inventory")
+destinations = set()
+for record in artifacts:
+    if not isinstance(record, dict) or set(record) != {"destination", "sha256", "mode"}:
+        raise SystemExit("bulk receipt artifact schema drift")
+    destination = pathlib.Path(record["destination"])
+    if (
+        str(destination) in destinations
+        or not destination.is_absolute()
+        or destination.resolve(strict=False) != destination
+    ):
+        raise SystemExit("bulk receipt destination is unsafe or duplicated")
+    destinations.add(str(destination))
+    try:
+        metadata = destination.lstat()
+    except FileNotFoundError:
+        raise SystemExit("completed bulk destination is missing")
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or sha256(destination) != record["sha256"]
+        or stat.S_IMODE(metadata.st_mode) != int(record["mode"])
+    ):
+        raise SystemExit("completed bulk destination drift")
+"""
+
+_REMOTE_BULK_INSTALL_SCRIPT = r"""
+import hashlib
+import json
+import os
+import pathlib
+import stat
+import sys
+import tarfile
+import time
+import uuid
+
+bundle = pathlib.Path(sys.argv[1])
+expected_bundle = sys.argv[2]
+receipt_path = pathlib.Path(sys.argv[3])
+
+def sha256_path(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+def sha256_handle(handle):
+    digest = hashlib.sha256()
+    for block in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+def canonical_digest(value):
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+def validate_destination(destination, expected, mode):
+    if not destination.is_absolute() or destination.resolve(strict=False) != destination:
+        raise SystemExit("bulk destination is not canonical: " + str(destination))
+    try:
+        metadata = destination.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("bulk destination is not a regular non-symlink file: " + str(destination))
+    if sha256_path(destination) != expected:
+        raise SystemExit("bulk destination exists with different bytes: " + str(destination))
+    if stat.S_IMODE(metadata.st_mode) != mode:
+        raise SystemExit("bulk destination mode drift: " + str(destination))
+    return True
+
+def load_receipt():
+    if not receipt_path.is_absolute() or receipt_path.resolve(strict=False) != receipt_path:
+        raise SystemExit("bulk receipt path is not canonical")
+    try:
+        metadata = receipt_path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise SystemExit("bulk receipt is not a regular non-symlink file")
+    try:
+        return json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit("bulk receipt is unreadable: " + repr(error))
+
+try:
+    bundle_metadata = bundle.lstat()
+    if stat.S_ISLNK(bundle_metadata.st_mode) or not stat.S_ISREG(bundle_metadata.st_mode):
+        raise SystemExit("incoming bulk bundle is not a regular non-symlink file")
+    if sha256_path(bundle) != expected_bundle:
+        raise SystemExit("incoming bulk bundle hash mismatch")
+    with tarfile.open(bundle, "r:") as archive:
+        members = archive.getmembers()
+        by_name = {member.name: member for member in members}
+        if len(by_name) != len(members) or "manifest.json" not in by_name:
+            raise SystemExit("bulk bundle member inventory drift")
+        manifest_member = by_name["manifest.json"]
+        if not manifest_member.isfile() or manifest_member.size > (16 << 20):
+            raise SystemExit("bulk manifest member is unsafe")
+        manifest_handle = archive.extractfile(manifest_member)
+        if manifest_handle is None:
+            raise SystemExit("bulk manifest is unreadable")
+        try:
+            manifest = json.load(manifest_handle)
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit("bulk manifest is invalid: " + repr(error))
+        if not isinstance(manifest, dict) or set(manifest) != {
+            "schema_version", "artifacts", "manifest_sha256"
+        }:
+            raise SystemExit("bulk manifest schema drift")
+        unhashed = dict(manifest)
+        declared_manifest = unhashed.pop("manifest_sha256")
+        if (
+            manifest["schema_version"] != "a1-production-bulk-install-v1"
+            or declared_manifest != canonical_digest(unhashed)
+        ):
+            raise SystemExit("bulk manifest semantic digest mismatch")
+        artifacts = manifest["artifacts"]
+        if not isinstance(artifacts, list) or not artifacts:
+            raise SystemExit("bulk manifest has no artifacts")
+        expected_members = {"manifest.json"}
+        destinations = set()
+        normalized = []
+        for record in artifacts:
+            if not isinstance(record, dict) or set(record) != {
+                "member", "destination", "sha256", "mode"
+            }:
+                raise SystemExit("bulk artifact schema drift")
+            member_name = record["member"]
+            destination_text = record["destination"]
+            expected = record["sha256"]
+            mode = record["mode"]
+            if (
+                not isinstance(member_name, str)
+                or not member_name.startswith("payload/")
+                or pathlib.PurePosixPath(member_name).is_absolute()
+                or ".." in pathlib.PurePosixPath(member_name).parts
+                or member_name in expected_members
+                or not isinstance(destination_text, str)
+                or destination_text in destinations
+                or not isinstance(expected, str)
+                or len(expected) != 71
+                or not expected.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in expected[7:])
+                or mode != 0o444
+            ):
+                raise SystemExit("unsafe or duplicate bulk artifact")
+            expected_members.add(member_name)
+            destinations.add(destination_text)
+            member = by_name.get(member_name)
+            if member is None or not member.isfile():
+                raise SystemExit("bulk artifact member is missing or non-regular")
+            source = archive.extractfile(member)
+            if source is None or sha256_handle(source) != expected:
+                raise SystemExit("bulk artifact member hash mismatch")
+            destination = pathlib.Path(destination_text)
+            normalized.append((member, destination, expected, mode))
+        if set(by_name) != expected_members:
+            raise SystemExit("bulk bundle has unmanifested members")
+
+        # Validate every destination before creating any file. A failed bundle
+        # therefore never installs a partially authenticated artifact set.
+        existing = {
+            str(destination): validate_destination(destination, expected, mode)
+            for _member, destination, expected, mode in normalized
+        }
+        receipt_artifacts = [
+            {"destination": str(destination), "sha256": expected, "mode": mode}
+            for _member, destination, expected, mode in normalized
+        ]
+        receipt = load_receipt()
+        if receipt is not None:
+            if (
+                receipt.get("schema_version") != "a1-production-bulk-install-v1"
+                or receipt.get("manifest_sha256") != declared_manifest
+                or receipt.get("bundle_sha256") != expected_bundle
+                or receipt.get("artifacts") != receipt_artifacts
+                or receipt.get("status") not in ("prepared", "complete")
+            ):
+                raise SystemExit("bulk receipt binds different bytes")
+            if receipt["status"] == "complete":
+                if not all(existing.values()):
+                    raise SystemExit("completed bulk receipt has missing destinations")
+                raise SystemExit(0)
+        else:
+            receipt = {
+                "schema_version": "a1-production-bulk-install-v1",
+                "status": "prepared",
+                "manifest_sha256": declared_manifest,
+                "bundle_sha256": expected_bundle,
+                "artifacts": receipt_artifacts,
+                "created_at": time.time(),
+            }
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            if receipt_path.resolve(strict=False) != receipt_path:
+                raise SystemExit("bulk receipt parent is not canonical")
+            descriptor = os.open(
+                receipt_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                json.dump(receipt, output, sort_keys=True)
+                output.flush()
+                os.fsync(output.fileno())
+
+        for member, destination, expected, mode in normalized:
+            if existing[str(destination)]:
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.resolve(strict=False) != destination:
+                raise SystemExit("bulk destination parent became non-canonical")
+            temporary = destination.parent / (
+                "." + destination.name + ".bulk-" + uuid.uuid4().hex + ".tmp"
+            )
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                source = archive.extractfile(member)
+                if source is None:
+                    raise SystemExit("bulk artifact vanished during install")
+                with os.fdopen(descriptor, "wb") as output:
+                    for block in iter(lambda: source.read(1 << 20), b""):
+                        output.write(block)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    os.fchmod(output.fileno(), mode)
+                if sha256_path(temporary) != expected:
+                    raise SystemExit("bulk temporary artifact hash mismatch")
+                try:
+                    os.link(temporary, destination, follow_symlinks=False)
+                except FileExistsError:
+                    if not validate_destination(destination, expected, mode):
+                        raise SystemExit("bulk destination race")
+            finally:
+                temporary.unlink(missing_ok=True)
+            if not validate_destination(destination, expected, mode):
+                raise SystemExit("installed bulk destination is missing")
+
+        receipt["status"] = "complete"
+        receipt["completed_at"] = time.time()
+        temporary_receipt = receipt_path.parent / (
+            "." + receipt_path.name + "." + uuid.uuid4().hex + ".tmp"
+        )
+        descriptor = os.open(
+            temporary_receipt,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(receipt, output, sort_keys=True)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary_receipt, receipt_path)
+        if not all(
+            validate_destination(destination, expected, mode)
+            for _member, destination, expected, mode in normalized
+        ):
+            raise SystemExit("completed bulk install verification failed")
+finally:
+    bundle.unlink(missing_ok=True)
+"""
+
 
 class ExecutorError(RuntimeError):
     pass
@@ -779,6 +1087,148 @@ def _scp(hosts: dict[str, Any], alias: str, source: Path, destination: str) -> N
         raise ExecutorError(f"scp to {alias} failed: {result.stderr.strip()}")
 
 
+def _build_bulk_install_bundle(
+    files: Sequence[tuple[Path, str, str]], destination: Path
+) -> tuple[dict[str, Any], str]:
+    """Build one deterministic, hash-bound immutable install bundle."""
+
+    unique: dict[str, tuple[Path, str]] = {}
+    for source, remote_destination, expected in files:
+        remote_path = PurePosixPath(remote_destination)
+        if (
+            not remote_path.is_absolute()
+            or str(remote_path) != remote_destination
+            or ".." in remote_path.parts
+        ):
+            raise ExecutorError(
+                f"bulk install destination is not canonical: {remote_destination}"
+            )
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected):
+            raise ExecutorError(
+                f"bulk install digest is invalid for {remote_destination}"
+            )
+        try:
+            metadata = source.lstat()
+        except OSError as error:
+            raise ExecutorError(f"cannot stat bulk install source {source}: {error}") from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ExecutorError(
+                f"bulk install source is not a regular non-symlink file: {source}"
+            )
+        if _sha256(source) != expected:
+            raise ExecutorError(f"bulk install source hash drift: {source}")
+        previous = unique.get(remote_destination)
+        candidate = (source, expected)
+        if previous is not None and previous != candidate:
+            if previous[1] != expected:
+                raise ExecutorError(
+                    f"conflicting bulk install destination: {remote_destination}"
+                )
+            # Identical bytes from two local names are one remote artifact.
+            continue
+        unique[remote_destination] = candidate
+    if not unique:
+        raise ExecutorError("bulk install bundle cannot be empty")
+
+    artifacts = []
+    ordered: list[tuple[str, Path]] = []
+    for index, remote_destination in enumerate(sorted(unique)):
+        source, expected = unique[remote_destination]
+        member = f"payload/{index:08d}"
+        artifacts.append(
+            {
+                "member": member,
+                "destination": remote_destination,
+                "sha256": expected,
+                "mode": 0o444,
+            }
+        )
+        ordered.append((member, source))
+    manifest: dict[str, Any] = {
+        "schema_version": "a1-production-bulk-install-v1",
+        "artifacts": artifacts,
+    }
+    manifest["manifest_sha256"] = _digest(manifest)
+    manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+
+    with tarfile.open(destination, "w", format=tarfile.USTAR_FORMAT) as archive:
+        manifest_info = tarfile.TarInfo("manifest.json")
+        manifest_info.size = len(manifest_bytes)
+        manifest_info.mode = 0o444
+        manifest_info.mtime = 0
+        manifest_info.uid = manifest_info.gid = 0
+        manifest_info.uname = manifest_info.gname = ""
+        archive.addfile(manifest_info, io.BytesIO(manifest_bytes))
+        for (member, source), record in zip(ordered, artifacts, strict=True):
+            metadata = source.stat()
+            info = tarfile.TarInfo(member)
+            info.size = metadata.st_size
+            info.mode = 0o444
+            info.mtime = 0
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            with source.open("rb") as handle:
+                archive.addfile(info, handle)
+            if _sha256(source) != record["sha256"]:
+                raise ExecutorError(f"bulk install source changed while archiving: {source}")
+    return manifest, _sha256(destination)
+
+
+def _remote_bulk_install(
+    hosts: dict[str, Any],
+    alias: str,
+    files: Sequence[tuple[Path, str, str]],
+    temporary_path: Path,
+) -> None:
+    """Install a host's immutable inputs with one authenticated transaction."""
+
+    bundle = temporary_path / f"bulk-install-{alias}.tar"
+    manifest, bundle_sha256 = _build_bulk_install_bundle(files, bundle)
+    manifest_sha256 = str(manifest["manifest_sha256"])
+    token = manifest_sha256.removeprefix("sha256:")
+    receipt_path = f"{hosts['remote_root']}/receipts/bulk-install-{token}.json"
+    precheck_command = " ".join(
+        shlex.quote(value)
+        for value in (
+            hosts["python"],
+            "-c",
+            _REMOTE_BULK_PRECHECK_SCRIPT,
+            receipt_path,
+            manifest_sha256,
+            bundle_sha256,
+        )
+    )
+    precheck = _ssh(hosts, alias, precheck_command)
+    if precheck.returncode == 0:
+        return
+    if precheck.returncode != 3:
+        detail = precheck.stderr.strip() or f"exit {precheck.returncode}"
+        raise ExecutorError(f"bulk install precheck failed on {alias}: {detail}")
+
+    incoming_dir = f"{hosts['remote_root']}/incoming"
+    incoming = f"{incoming_dir}/bulk-{uuid.uuid4().hex}.tar"
+    mkdir = _ssh(hosts, alias, f"mkdir -p {shlex.quote(incoming_dir)}")
+    if mkdir.returncode != 0:
+        raise ExecutorError(f"remote bulk mkdir failed on {alias}: {mkdir.stderr.strip()}")
+    _scp(hosts, alias, bundle, incoming)
+    command = " ".join(
+        shlex.quote(value)
+        for value in (
+            hosts["python"],
+            "-c",
+            _REMOTE_BULK_INSTALL_SCRIPT,
+            incoming,
+            bundle_sha256,
+            receipt_path,
+        )
+    )
+    result = _ssh(hosts, alias, command)
+    if result.returncode != 0:
+        # The remote script unlinks the incoming bundle in a finally block.
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise ExecutorError(f"bulk immutable install failed on {alias}: {detail}")
+
+
 def _remote_install(
     hosts: dict[str, Any], alias: str, source: Path, destination: str, expected: str
 ) -> None:
@@ -1255,16 +1705,15 @@ def _staged_catanatron_origin_command(*, python: str, repo_dir: str) -> str:
     return " ".join(shlex.quote(value) for value in invocation)
 
 
-def _stage_repo(
-    hosts: dict[str, Any],
-    alias: str,
+def _repo_stage_inputs(
+    hosts: Mapping[str, Any],
     repo_tar: Path,
     repo_sha: str,
     artifacts: Sequence[Mapping[str, Any]],
     temporary_path: Path,
-    repo_dir: str,
-) -> None:
-    """Atomically install the exact repo tree and bind it with an O_EXCL receipt."""
+) -> tuple[list[tuple[Path, str, str]], str, str, str]:
+    """Materialize the two immutable inputs consumed by the repo stage."""
+
     manifest = {
         "schema_version": "a1-production-repo-v1",
         "repo_tar_sha256": repo_sha,
@@ -1274,14 +1723,35 @@ def _stage_repo(
         ],
     }
     manifest["manifest_sha256"] = _digest(manifest)
-    local_manifest = temporary_path / f"repo-manifest-{alias}.json"
+    local_manifest = temporary_path / "repo-manifest.json"
     local_manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     token = repo_sha.removeprefix("sha256:")
     remote_tar = f"{hosts['remote_root']}/operator/repo-{token}.tar"
     remote_manifest = f"{hosts['remote_root']}/operator/repo-{token}.json"
     receipt_path = f"{hosts['remote_root']}/receipts/repo-stage-{token}.json"
-    _remote_install(hosts, alias, repo_tar, remote_tar, repo_sha)
-    _remote_install(hosts, alias, local_manifest, remote_manifest, _sha256(local_manifest))
+    return (
+        [
+            (repo_tar, remote_tar, repo_sha),
+            (local_manifest, remote_manifest, _sha256(local_manifest)),
+        ],
+        remote_tar,
+        remote_manifest,
+        receipt_path,
+    )
+
+
+def _stage_repo(
+    hosts: dict[str, Any],
+    alias: str,
+    artifacts: Sequence[Mapping[str, Any]],
+    repo_dir: str,
+    *,
+    remote_tar: str,
+    remote_manifest: str,
+    receipt_path: str,
+) -> None:
+    """Activate already-installed repo inputs and bind the exact repo tree."""
+
     script = _STAGE_REPO_SCRIPT
     result = _ssh(
         hosts,
@@ -1437,31 +1907,20 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
             "lock": Path(public["lock"]),
             "render": Path(public["render"]),
         }
-        for alias in aliases:
-            _stage_repo(
-                hosts, alias, repo_tar, repo_sha, artifacts, temporary_path, repo_dir
-            )
-            for name, source in operator_sources.items():
-                _remote_install(
-                    hosts,
-                    alias,
-                    source,
-                    operator_manifests[name]["path"],
-                    operator_manifests[name]["sha256"],
-                )
-            _remote_sync_append_only_ledger(
+        repo_inputs, remote_repo_tar, remote_repo_manifest, repo_receipt_path = (
+            _repo_stage_inputs(
                 hosts,
-                alias,
-                Path(required["seed_ledger"]["path"]),
-                required["seed_ledger"]["path"],
-                public["live_seed_ledger_sha256"],
+                repo_tar,
+                repo_sha,
+                artifacts,
+                temporary_path,
             )
-            for source, destination, digest in stage_files_by_alias[alias]:
-                _remote_install(hosts, alias, source, destination, digest)
-
-        lane_pids: dict[str, int] = dict(receipt.get("lane_pids", {}))
+        )
+        lane_remote_paths: dict[str, str] = {}
+        lane_inputs_by_alias: dict[str, list[tuple[Path, str, str]]] = {
+            alias: [] for alias in aliases
+        }
         for worker_id, lane in sorted(lanes.items()):
-            alias = lane[0]["host_alias"]
             payload = _lane_payload(
                 worker_id,
                 lane,
@@ -1471,9 +1930,57 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
                 category_order=tuple(public["category_order"]),
             )
             local_lane = temporary_path / f"{worker_id}.json"
-            local_lane.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            local_lane.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
             remote_lane = f"{hosts['remote_root']}/lanes/{worker_id}.json"
-            _remote_install(hosts, alias, local_lane, remote_lane, _sha256(local_lane))
+            lane_remote_paths[worker_id] = remote_lane
+            lane_inputs_by_alias[str(lane[0]["host_alias"])].append(
+                (local_lane, remote_lane, _sha256(local_lane))
+            )
+
+        for alias in aliases:
+            immutable_inputs = [
+                *repo_inputs,
+                *[
+                    (
+                        source,
+                        operator_manifests[name]["path"],
+                        operator_manifests[name]["sha256"],
+                    )
+                    for name, source in sorted(operator_sources.items())
+                ],
+                *stage_files_by_alias[alias],
+                *lane_inputs_by_alias[alias],
+            ]
+            _remote_bulk_install(
+                hosts,
+                alias,
+                immutable_inputs,
+                temporary_path,
+            )
+            _stage_repo(
+                hosts,
+                alias,
+                artifacts,
+                repo_dir,
+                remote_tar=remote_repo_tar,
+                remote_manifest=remote_repo_manifest,
+                receipt_path=repo_receipt_path,
+            )
+            _remote_sync_append_only_ledger(
+                hosts,
+                alias,
+                Path(required["seed_ledger"]["path"]),
+                required["seed_ledger"]["path"],
+                public["live_seed_ledger_sha256"],
+            )
+
+        lane_pids: dict[str, int] = dict(receipt.get("lane_pids", {}))
+        for worker_id, lane in sorted(lanes.items()):
+            alias = lane[0]["host_alias"]
+            remote_lane = lane_remote_paths[worker_id]
             supervisor = f"{repo_dir}/tools/fleet/a1_lane_supervisor.py"
             log = f"{hosts['remote_root']}/logs/{worker_id}.supervisor.log"
             launch = _supervisor_launch_command(

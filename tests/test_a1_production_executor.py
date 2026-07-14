@@ -332,6 +332,106 @@ def test_remote_install_precheck_refuses_mismatch_and_symlink(
     assert message in result.stderr
 
 
+def test_bulk_install_is_deterministic_atomic_and_resumable(tmp_path: Path) -> None:
+    first = tmp_path / "sources" / "first"
+    second = tmp_path / "sources" / "second"
+    first.parent.mkdir()
+    first.write_bytes(b"first")
+    second.write_bytes(b"second" * 1024)
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    files = [
+        (first, str(remote / "a" / "first"), _sha(first)),
+        (second, str(remote / "b" / "second"), _sha(second)),
+    ]
+    bundle = tmp_path / "bundle.tar"
+    manifest, bundle_sha256 = executor._build_bulk_install_bundle(files, bundle)
+    receipt = remote / "receipts" / "bulk.json"
+
+    installed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            executor._REMOTE_BULK_INSTALL_SCRIPT,
+            str(bundle),
+            bundle_sha256,
+            str(receipt),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert installed.returncode == 0, installed.stderr
+    assert (remote / "a" / "first").read_bytes() == first.read_bytes()
+    assert (remote / "b" / "second").read_bytes() == second.read_bytes()
+    assert stat.S_IMODE((remote / "a" / "first").stat().st_mode) == 0o444
+    assert not bundle.exists()
+
+    precheck = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            executor._REMOTE_BULK_PRECHECK_SCRIPT,
+            str(receipt),
+            manifest["manifest_sha256"],
+            bundle_sha256,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert precheck.returncode == 0, precheck.stderr
+
+    replay_bundle = tmp_path / "replay.tar"
+    replay_manifest, replay_sha256 = executor._build_bulk_install_bundle(
+        list(reversed(files)), replay_bundle
+    )
+    assert replay_manifest == manifest
+    assert replay_sha256 == bundle_sha256
+
+
+def test_bulk_install_validates_every_member_before_installing(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"authenticated")
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    bundle = tmp_path / "bundle.tar"
+    _manifest, _bundle_sha256 = executor._build_bulk_install_bundle(
+        [(source, str(remote / "artifact"), _sha(source))], bundle
+    )
+    rebuilt = tmp_path / "tampered.tar"
+    with tarfile.open(bundle) as original, tarfile.open(
+        rebuilt, "w", format=tarfile.USTAR_FORMAT
+    ) as tampered:
+        for member in original.getmembers():
+            data = original.extractfile(member).read()
+            if member.name.startswith("payload/"):
+                data = b"tampered"
+                member.size = len(data)
+            tampered.addfile(member, io.BytesIO(data))
+    bundle.unlink()
+    receipt = remote / "receipts" / "bulk.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            executor._REMOTE_BULK_INSTALL_SCRIPT,
+            str(rebuilt),
+            _sha(rebuilt),
+            str(receipt),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "member hash mismatch" in result.stderr
+    assert not (remote / "artifact").exists()
+    assert not receipt.exists()
+
+
 def test_stage_files_are_alias_scoped_except_global_artifacts(tmp_path: Path) -> None:
     _lock_path, _render_path, lock, rendered = _fixture(tmp_path)
     required = rendered["required_artifacts"] | {
@@ -1148,6 +1248,63 @@ def test_resume_refuses_unresolved_pending_supervisor_launch(tmp_path: Path) -> 
     )
     with pytest.raises(executor.ExecutorError, match="unresolved pending"):
         executor._resume_receipt(receipt, public, resume=True)
+
+
+def test_prepared_bridged_plan_resumes_through_one_bulk_stage_per_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path, render_path, lock, rendered = _fixture(tmp_path)
+    hosts_path = _hosts(tmp_path, rendered)
+    monkeypatch.setattr(executor, "_repo_artifacts", lambda _rendered, **_kwargs: [])
+    receipt_path = tmp_path / "executor.receipt.json"
+    plan = executor.build_plan(
+        lock_path=lock_path,
+        render_path=render_path,
+        hosts_path=hosts_path,
+        receipt_path=receipt_path,
+        verify_lock_fn=_verifier(lock),
+    )
+    public_before = executor._public(plan)
+    plan["_private"]["executor_bridge"] = {"bound": "privately"}
+    receipt_path.write_text(
+        json.dumps({**public_before, "status": "prepared", "lane_pids": {}}),
+        encoding="utf-8",
+    )
+    bulk_calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(executor, "_execution_repo_root", lambda _plan: tmp_path)
+    monkeypatch.setattr(executor, "_preflight_host", lambda *_args: {"ok": True})
+    monkeypatch.setattr(
+        executor,
+        "_remote_bulk_install",
+        lambda _hosts, alias, files, _temporary: bulk_calls.append(
+            (alias, len(files))
+        ),
+    )
+    monkeypatch.setattr(executor, "_stage_repo", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        executor, "_remote_sync_append_only_ledger", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        executor,
+        "_remote_install",
+        lambda *_args: pytest.fail("resumed execute used per-file staging"),
+    )
+
+    def fake_ssh(_hosts: dict, _alias: str, command: str, **_kwargs):
+        if " status " in command:
+            return subprocess.CompletedProcess([], 0, json.dumps({"jobs": []}), "")
+        return subprocess.CompletedProcess([], 0, "12345\n", "")
+
+    monkeypatch.setattr(executor, "_ssh", fake_ssh)
+
+    result = executor.execute(plan, receipt_path=receipt_path, resume=True)
+
+    assert result["status"] == "launched"
+    assert executor._public(plan) == public_before
+    assert [alias for alias, _count in bulk_calls] == [
+        f"h{index:02d}" for index in range(10)
+    ]
+    assert all(count > 4 for _alias, count in bulk_calls)
 
 
 def test_exact_stop_ssh_is_hard_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
