@@ -131,6 +131,7 @@ def _plan(
         tool_hashes={
             "tools/gumbel_search_cross_net_h2h.py": "sha256:" + "1" * 64,
             "tools/catanatron_neutral_harness_match.py": "sha256:" + "2" * 64,
+            "tools/a1_evaluation_pool.py": "sha256:" + "4" * 64,
             "tools/fleet/launch_detached.sh": "sha256:" + "3" * 64,
         },
     )
@@ -146,6 +147,42 @@ def test_remote_preflight_refuses_untracked_runtime_code(tmp_path: Path) -> None
     assert 'test -z "$(git status --porcelain=v1 --untracked-files=all)"' in command
     assert "_assert_installed_native_wheel_sha256" in command
     assert plan["engine_identity"]["native_wheel_sha256"] in command
+    assert plan["internal_engine_identity"]["native_runtime_sha256"] in command
+
+
+def test_local_plan_source_requires_clean_head_and_exact_pooler_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hashes = fleet._tool_hashes(fleet._REPO_ROOT)  # noqa: SLF001
+    plan = {"repo_commit": "a" * 40, "tool_hashes": hashes}
+    monkeypatch.setattr(fleet, "_git_commit", lambda _root: "a" * 40)
+    monkeypatch.setattr(fleet, "_tool_hashes", lambda _root: dict(hashes))
+    monkeypatch.setattr(
+        fleet.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    fleet._verify_local_plan_source(plan)  # noqa: SLF001
+
+    monkeypatch.setattr(
+        fleet.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, "?? tools/untracked.py\n", ""
+        ),
+    )
+    with pytest.raises(fleet.FleetError, match="checkout is not clean"):
+        fleet._verify_local_plan_source(plan)  # noqa: SLF001
+
+    monkeypatch.setattr(
+        fleet.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    drifted = {**hashes, "tools/a1_evaluation_pool.py": "sha256:" + "0" * 64}
+    monkeypatch.setattr(fleet, "_tool_hashes", lambda _root: drifted)
+    with pytest.raises(fleet.FleetError, match="tool hashes drifted"):
+        fleet._verify_local_plan_source(plan)  # noqa: SLF001
 
 
 def test_installed_native_wheel_digest_mismatch_is_refused(monkeypatch) -> None:
@@ -750,7 +787,9 @@ def test_role_specific_value_squash_is_sealed_into_plan_and_internal_jobs(
         assert job["command_hash"] == fleet._digest(argv)  # noqa: SLF001
 
 
-def test_corrected_belief_gameplay_operator_is_sealed_per_role(tmp_path: Path) -> None:
+def test_corrected_belief_gameplay_operator_is_sealed_per_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     manifest, default = _plan(tmp_path)
     diagnostic = fleet.build_plan(
         manifest,
@@ -817,6 +856,7 @@ def test_corrected_belief_gameplay_operator_is_sealed_per_role(tmp_path: Path) -
     assert "--sigma-reference-visits" not in champion_argv
     plan_path = tmp_path / "corrected-plan.json"
     fleet.write_new_readonly(plan_path, diagnostic)
+    monkeypatch.setattr(fleet, "_verify_local_plan_source", lambda _plan: None)
     assert fleet.load_plan(plan_path, manifest)["plan_hash"] == diagnostic["plan_hash"]
 
 
@@ -855,7 +895,7 @@ def test_same_checkpoint_clip_vs_tanh_plan_is_diagnostic_and_executable(
 
 
 def test_same_checkpoint_adaptive_n256_s3_plan_is_exact_and_fail_closed(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifest, default = _plan(tmp_path)
     checkpoint = Path(default["champion"]["source"])
@@ -907,6 +947,7 @@ def test_same_checkpoint_adaptive_n256_s3_plan_is_exact_and_fail_closed(
 
     plan_path = tmp_path / "s3-plan.json"
     fleet.write_new_readonly(plan_path, diagnostic)
+    monkeypatch.setattr(fleet, "_verify_local_plan_source", lambda _plan: None)
     assert fleet.load_plan(plan_path, manifest)["plan_hash"] == diagnostic["plan_hash"]
 
 
@@ -1241,10 +1282,13 @@ def test_checkpoint_staging_creates_both_distinct_remote_parent_dirs(
     assert "mkdir -p /srv/a1/candidates /srv/a1/champions" in commands[0][-1]
 
 
-def test_plan_hash_and_checkpoint_bytes_are_replayed_on_load(tmp_path: Path) -> None:
+def test_plan_hash_and_checkpoint_bytes_are_replayed_on_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     manifest, plan = _plan(tmp_path)
     path = tmp_path / "plan.json"
     fleet.write_new_readonly(path, plan)
+    monkeypatch.setattr(fleet, "_verify_local_plan_source", lambda _plan: None)
     assert fleet.load_plan(path, manifest)["plan_hash"] == plan["plan_hash"]
     assert plan["candidate"]["remote"] == plan["candidate"]["source"]
     assert plan["champion"]["remote"] == plan["champion"]["source"]

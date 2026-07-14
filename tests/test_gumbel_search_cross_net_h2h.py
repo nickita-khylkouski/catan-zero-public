@@ -73,6 +73,44 @@ def test_archived_state_reconstruction_binding_is_explicit_base_replay() -> None
     }
 
 
+def test_ordinary_engine_identity_binds_exact_compiled_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "catanatron_rs.so"
+    runtime.write_bytes(b"compiled native runtime")
+    commit = "a" * 40
+    evaluator_sha256 = h2h._checkpoint_sha256(Path(h2h.__file__).resolve())
+    runtime_sha256 = h2h._checkpoint_sha256(runtime)
+
+    def check_output(command, **_kwargs):
+        return commit if command[1] == "rev-parse" else ""
+
+    monkeypatch.setattr(h2h.subprocess, "check_output", check_output)
+    monkeypatch.setattr(h2h, "_native_runtime_extension_path", lambda: runtime)
+    planned, observed = h2h._ordinary_engine_identity(
+        SimpleNamespace(
+            engine_repo_commit=commit,
+            native_wheel_sha256="sha256:" + "b" * 64,
+            internal_evaluator_sha256=evaluator_sha256,
+            expected_native_runtime_sha256=runtime_sha256,
+        )
+    )
+
+    assert planned == observed
+    assert planned["native_runtime_sha256"] == runtime_sha256
+
+
+def test_ordinary_engine_identity_refuses_dirty_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def check_output(command, **_kwargs):
+        return "a" * 40 if command[1] == "rev-parse" else " M src/dirty.py\n"
+
+    monkeypatch.setattr(h2h.subprocess, "check_output", check_output)
+    with pytest.raises(ValueError, match="clean Git checkout"):
+        h2h._ordinary_engine_identity(SimpleNamespace())
+
+
 def test_eval_config_hash_seals_native_hot_loop_choice() -> None:
     reference = EvalConfig(mode="cross_net", candidate="a.pt", baseline="b.pt")
     native = EvalConfig(

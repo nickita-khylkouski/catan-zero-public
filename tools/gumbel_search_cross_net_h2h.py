@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.machinery
 import json
 import multiprocessing
 import re
@@ -85,8 +87,92 @@ from tools.high_regret_suite_contract import (  # noqa: E402
 
 
 HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
+INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA = "a1-internal-h2h-engine-identity-v1"
 ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
 H2H_SEARCH_RNG_DERIVATION = "sha256(game_seed,seat_color)-u64-v1"
+
+
+def _native_runtime_extension_path() -> Path:
+    native = importlib.import_module("catanatron_rs.catanatron_rs")
+    raw_path = getattr(native, "__file__", None)
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("catanatron_rs native extension has no __file__")
+    path = Path(raw_path).resolve(strict=True)
+    if not any(
+        str(path).endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ):
+        raise ValueError("catanatron_rs runtime is not a compiled extension")
+    return path
+
+
+def _ordinary_engine_identity(args: Any) -> tuple[dict[str, str], dict[str, str]]:
+    """Fingerprint the ordinary H2H evaluator and the loaded native runtime.
+
+    Promotion-grade fleet runs supply the plan's commit, wheel, and evaluator
+    digests.  Standalone diagnostic runs derive the same fields locally so every
+    ordinary report has one schema; the fleet controller remains responsible
+    for proving its remote checkout is clean and matches the sealed plan.
+    """
+
+    try:
+        actual_commit = subprocess.check_output(
+            ("git", "rev-parse", "HEAD"), cwd=_REPO_ROOT, text=True
+        ).strip()
+        status = subprocess.check_output(
+            ("git", "status", "--porcelain=v1", "--untracked-files=all"),
+            cwd=_REPO_ROOT,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError("cannot fingerprint ordinary H2H Git checkout") from error
+    if status.strip():
+        raise ValueError("ordinary H2H requires a clean Git checkout")
+    expected_commit = str(getattr(args, "engine_repo_commit", "") or actual_commit)
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        raise ValueError("ordinary H2H requires a full engine repo commit")
+    if actual_commit != expected_commit:
+        raise ValueError("ordinary H2H repo commit differs from checked-out HEAD")
+
+    evaluator_sha = _checkpoint_sha256(Path(__file__).resolve())
+    expected_evaluator_sha = str(
+        getattr(args, "internal_evaluator_sha256", "") or evaluator_sha
+    )
+    if expected_evaluator_sha != evaluator_sha:
+        raise ValueError("ordinary H2H evaluator bytes differ from the sealed plan")
+
+    wheel_sha = str(getattr(args, "native_wheel_sha256", "") or "")
+    if not wheel_sha:
+        inventory = _REPO_ROOT / "native/catanatron-rs/WHEEL_SHA256SUMS"
+        rows = [
+            line.split()
+            for line in inventory.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if len(rows) != 1 or len(rows[0]) != 2:
+            raise ValueError("ordinary H2H native wheel inventory is not sealed")
+        wheel_sha = "sha256:" + rows[0][0]
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", wheel_sha):
+        raise ValueError("ordinary H2H native wheel digest is invalid")
+    try:
+        runtime = _native_runtime_extension_path()
+    except (ImportError, OSError, TypeError, ValueError) as error:
+        raise ValueError("cannot fingerprint ordinary H2H native runtime") from error
+    runtime_sha256 = _checkpoint_sha256(runtime)
+    expected_runtime_sha256 = str(
+        getattr(args, "expected_native_runtime_sha256", "") or runtime_sha256
+    )
+    if expected_runtime_sha256 != runtime_sha256:
+        raise ValueError(
+            "ordinary H2H native runtime bytes differ from the sealed plan"
+        )
+    planned = {
+        "schema_version": INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA,
+        "repo_commit": expected_commit,
+        "native_wheel_sha256": wheel_sha,
+        "evaluator_sha256": evaluator_sha,
+        "native_runtime_sha256": expected_runtime_sha256,
+    }
+    return planned, dict(planned)
 
 
 def _held_out_engine_identity(args: Any) -> tuple[dict[str, str], dict[str, str]]:
@@ -110,22 +196,22 @@ def _held_out_engine_identity(args: Any) -> tuple[dict[str, str], dict[str, str]
         actual_commit = subprocess.check_output(
             ("git", "rev-parse", "HEAD"), cwd=_REPO_ROOT, text=True
         ).strip()
-        subprocess.run(
-            ("git", "diff", "--quiet", "HEAD"), cwd=_REPO_ROOT, check=True
-        )
+        subprocess.run(("git", "diff", "--quiet", "HEAD"), cwd=_REPO_ROOT, check=True)
         subprocess.run(
             ("git", "diff", "--cached", "--quiet", "HEAD"),
             cwd=_REPO_ROOT,
             check=True,
         )
     except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError("held-out high-regret checkout is not clean Git bytes") from error
+        raise ValueError(
+            "held-out high-regret checkout is not clean Git bytes"
+        ) from error
     if actual_commit != commit:
-        raise ValueError("held-out high-regret repo commit differs from checked-out HEAD")
+        raise ValueError(
+            "held-out high-regret repo commit differs from checked-out HEAD"
+        )
     try:
-        import catanatron_rs
-
-        runtime = Path(catanatron_rs.__file__).resolve(strict=True)
+        runtime = _native_runtime_extension_path()
     except (ImportError, OSError, TypeError, ValueError) as error:
         raise ValueError("cannot fingerprint held-out native runtime") from error
     planned = {
@@ -1683,6 +1769,8 @@ def main() -> None:
     parser.add_argument("--engine-repo-commit", default=None)
     parser.add_argument("--native-wheel-path", default=None)
     parser.add_argument("--native-wheel-sha256", default=None)
+    parser.add_argument("--internal-evaluator-sha256", default=None)
+    parser.add_argument("--expected-native-runtime-sha256", default=None)
     parser.add_argument(
         "--gate-config",
         choices=sorted(GATE_CONFIGS),
@@ -1806,6 +1894,8 @@ def main() -> None:
     high_regret_suite_path: Path | None = None
     high_regret_planned_engine: dict[str, str] | None = None
     high_regret_engine: dict[str, str] | None = None
+    ordinary_planned_engine: dict[str, str] | None = None
+    ordinary_engine: dict[str, str] | None = None
     if args.held_out_high_regret_suite:
         try:
             high_regret_suite_path, _high_regret_suite, pairs = (
@@ -1817,6 +1907,10 @@ def main() -> None:
         except ValueError as error:
             parser.error(str(error))
     else:
+        try:
+            ordinary_planned_engine, ordinary_engine = _ordinary_engine_identity(args)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
         pairs = [
             {"pair_id": i, "game_seed": int(args.base_seed) + i}
             for i in range(max(1, int(args.pairs)))
@@ -2046,6 +2140,11 @@ def main() -> None:
     summary["config_hash"] = eval_config_hash
     summary["full_config_hash"] = eval_full_config_hash
     summary["typed_config"] = eval_config.canonical_payload()
+    if high_regret_suite_path is None:
+        assert ordinary_planned_engine is not None
+        assert ordinary_engine is not None
+        summary["planned_engine_identity"] = ordinary_planned_engine
+        summary["engine_identity"] = ordinary_engine
     if high_regret_suite_path is not None:
         summary = {
             "schema_version": "a1-held-out-high-regret-report-v1",

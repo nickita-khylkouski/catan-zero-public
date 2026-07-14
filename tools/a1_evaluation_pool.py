@@ -27,6 +27,7 @@ if str(_REPO_ROOT) not in sys.path:
 from tools import a1_promotion_artifacts as artifacts  # noqa: E402
 from tools import a1_promotion_transaction as promotion  # noqa: E402
 from tools.gumbel_search_cross_net_h2h import (  # noqa: E402
+    INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA,
     _add_search_telemetry,
     _finalize_search_telemetry,
     _new_search_telemetry,
@@ -96,6 +97,50 @@ def _internal_effective_search_config(
     for name in ("candidate", "baseline", "base_seed", "pairs"):
         fields.pop(name, None)
     return fields
+
+
+def _internal_engine_identity(
+    report: dict[str, Any], *, where: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    planned = report.get("planned_engine_identity")
+    runtime = report.get("engine_identity")
+    planned_keys = {
+        "schema_version",
+        "repo_commit",
+        "native_wheel_sha256",
+        "evaluator_sha256",
+        "native_runtime_sha256",
+    }
+    runtime_keys = set(planned_keys)
+    if not isinstance(planned, dict) or set(planned) != planned_keys:
+        raise PoolError(f"{where} has no canonical planned internal engine identity")
+    if not isinstance(runtime, dict) or set(runtime) != runtime_keys:
+        raise PoolError(f"{where} has no canonical runtime internal engine identity")
+    if (
+        planned.get("schema_version") != INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA
+        or not isinstance(planned.get("repo_commit"), str)
+        or len(planned["repo_commit"]) != 40
+        or any(
+            character not in "0123456789abcdef" for character in planned["repo_commit"]
+        )
+    ):
+        raise PoolError(f"{where} internal engine commit identity is invalid")
+    for name in (
+        "native_wheel_sha256",
+        "evaluator_sha256",
+        "native_runtime_sha256",
+    ):
+        value = planned.get(name)
+        if (
+            not isinstance(value, str)
+            or not value.startswith("sha256:")
+            or len(value) != 71
+            or any(character not in "0123456789abcdef" for character in value[7:])
+        ):
+            raise PoolError(f"{where} internal engine {name} is invalid")
+    if any(runtime.get(name) != value for name, value in planned.items()):
+        raise PoolError(f"{where} runtime internal engine differs from its plan")
+    return copy.deepcopy(planned), copy.deepcopy(runtime)
 
 
 def _neutral_effective_search_config(
@@ -463,6 +508,8 @@ def pool_internal(
     candidate_sha256 = promotion._sha256(candidate)  # noqa: SLF001
     champion_sha256 = promotion._sha256(champion)  # noqa: SLF001
     effective_config: dict[str, Any] | None = None
+    planned_engine_identity: dict[str, str] | None = None
+    runtime_engine_identity: dict[str, str] | None = None
     for path, report in loaded:
         validate_complete_report(report, kind="internal", where=str(path))
         _validate_checkpoint_sha256(
@@ -482,6 +529,17 @@ def pool_internal(
             effective_config = shard_effective
         elif _canonical(shard_effective) != _canonical(effective_config):
             raise PoolError(f"fleet report effective science/config drift in {path}")
+        shard_planned_engine, shard_runtime_engine = _internal_engine_identity(
+            report, where=str(path)
+        )
+        if planned_engine_identity is None:
+            planned_engine_identity = shard_planned_engine
+            runtime_engine_identity = shard_runtime_engine
+        elif (
+            shard_planned_engine != planned_engine_identity
+            or shard_runtime_engine != runtime_engine_identity
+        ):
+            raise PoolError(f"fleet report internal engine identity drift in {path}")
         if report.get("gate_config") != "flywheel":
             raise PoolError(f"{path} is not a flywheel gate report")
         if report.get("errors") != [] or int(report.get("games_truncated", -1)) != 0:
@@ -530,6 +588,8 @@ def pool_internal(
             "baseline_checkpoint_sha256": champion_sha256,
             "base_seed": intervals[0]["base_seed"],
             "effective_search_config": effective_config,
+            "planned_engine_identity": planned_engine_identity,
+            "engine_identity": runtime_engine_identity,
             "pairs_requested": complete_pairs,
             "games_played": len(games),
             "games_with_winner": len(games),

@@ -22,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import dataclasses
 import fcntl
 import hashlib
+import importlib
+import importlib.machinery
 import json
 import math
 import os
@@ -46,7 +48,7 @@ from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE  # noqa: E402
 
 
 MANIFEST_SCHEMA = "a1-h100-eval-fleet-manifest-v1"
-PLAN_SCHEMA = "a1-h100-eval-fleet-plan-v1"
+PLAN_SCHEMA = "a1-h100-eval-fleet-plan-v2"
 RAY_SCHEMA = "a1-h100-eval-ray-cluster-v1"
 EXPECTED_HOSTS = {
     "c1": ("192.222.54.251", 4),
@@ -196,6 +198,7 @@ def _run_id_from_plan_fields(plan: dict[str, Any]) -> str:
         "champion_sha256": plan["champion"]["sha256"],
         "evaluation_binding": plan["evaluation_binding"],
         "engine_identity": plan["engine_identity"],
+        "internal_engine_identity": plan["internal_engine_identity"],
         "science_hash": plan["science_config_hash"],
         "internal_pairs": plan["pair_claims"]["internal"]["pairs"],
         "external_pairs": plan["pair_claims"]["external_matched"]["pairs"],
@@ -824,6 +827,8 @@ def _internal_argv(
     champion_n_full_wide_threshold: int | None = None,
     candidate_wide_roots_always_full: bool = False,
     champion_wide_roots_always_full: bool = False,
+    engine_identity: dict[str, str] | None = None,
+    evaluator_sha256: str | None = None,
 ) -> list[str]:
     argv = [
         python,
@@ -936,6 +941,27 @@ def _internal_argv(
     if wide_args:
         out_index = argv.index("--out")
         argv[out_index:out_index] = wide_args
+    if engine_identity is not None or evaluator_sha256 is not None:
+        if engine_identity is None or evaluator_sha256 is None:
+            raise FleetError("internal engine identity must be supplied atomically")
+        if engine_identity.get("evaluator_sha256") != evaluator_sha256:
+            raise FleetError("internal evaluator digest differs from engine identity")
+        if not re.fullmatch(
+            r"sha256:[0-9a-f]{64}",
+            str(engine_identity.get("native_runtime_sha256", "")),
+        ):
+            raise FleetError("internal engine identity has no native runtime digest")
+        out_index = argv.index("--out")
+        argv[out_index:out_index] = [
+            "--engine-repo-commit",
+            engine_identity["repo_commit"],
+            "--native-wheel-sha256",
+            engine_identity["native_wheel_sha256"],
+            "--internal-evaluator-sha256",
+            evaluator_sha256,
+            "--expected-native-runtime-sha256",
+            engine_identity["native_runtime_sha256"],
+        ]
     return argv
 
 
@@ -1021,9 +1047,29 @@ def _tool_hashes(repo_root: Path) -> dict[str, str]:
     names = (
         "tools/gumbel_search_cross_net_h2h.py",
         "tools/catanatron_neutral_harness_match.py",
+        "tools/a1_evaluation_pool.py",
         "tools/fleet/launch_detached.sh",
     )
     return {name: _sha256(repo_root / name) for name in names}
+
+
+def _verify_local_plan_source(plan: dict[str, Any]) -> None:
+    """Prove the controller/pooler bytes are the clean checkout that made a plan."""
+
+    if _git_commit(_REPO_ROOT) != plan.get("repo_commit"):
+        raise FleetError("local controller HEAD differs from evaluation plan commit")
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=_REPO_ROOT,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout
+    if status.strip():
+        raise FleetError("local controller checkout is not clean")
+    if plan.get("tool_hashes") != _tool_hashes(_REPO_ROOT):
+        raise FleetError("local controller/evaluator/pooler tool hashes drifted")
 
 
 def _engine_identity(repo_root: Path, repo_commit: str) -> dict[str, str]:
@@ -1053,6 +1099,36 @@ def _engine_identity(repo_root: Path, repo_commit: str) -> dict[str, str]:
         "repo_commit": repo_commit,
         "native_wheel_sha256": "sha256:" + rows[0][0],
         "python_referee_sha256": "sha256:" + referee_hasher.hexdigest(),
+    }
+
+
+def _native_runtime_sha256() -> str:
+    """Hash the compiled extension loaded by the planning controller."""
+
+    try:
+        native = importlib.import_module("catanatron_rs.catanatron_rs")
+        raw_path = getattr(native, "__file__", None)
+        if not isinstance(raw_path, str) or not raw_path:
+            raise FleetError("catanatron_rs native extension has no __file__")
+        path = Path(raw_path).resolve(strict=True)
+    except (ImportError, OSError, TypeError, ValueError) as error:
+        raise FleetError("cannot fingerprint installed native extension") from error
+    if not any(
+        str(path).endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ):
+        raise FleetError("catanatron_rs runtime is not a compiled extension")
+    return _sha256(path)
+
+
+def _internal_engine_identity(
+    *, repo_commit: str, wheel_sha256: str, evaluator_sha256: str
+) -> dict[str, str]:
+    return {
+        "schema_version": "a1-internal-h2h-engine-identity-v1",
+        "repo_commit": repo_commit,
+        "native_wheel_sha256": wheel_sha256,
+        "evaluator_sha256": evaluator_sha256,
+        "native_runtime_sha256": _native_runtime_sha256(),
     }
 
 
@@ -1204,6 +1280,11 @@ def build_plan(
     resolved_repo_commit = repo_commit or _git_commit(repo_root)
     resolved_tool_hashes = tool_hashes or _tool_hashes(repo_root)
     engine_identity = _engine_identity(repo_root, resolved_repo_commit)
+    internal_engine_identity = _internal_engine_identity(
+        repo_commit=resolved_repo_commit,
+        wheel_sha256=engine_identity["native_wheel_sha256"],
+        evaluator_sha256=resolved_tool_hashes["tools/gumbel_search_cross_net_h2h.py"],
+    )
     run_identity = {
         "manifest_hash": manifest["manifest_hash"],
         "repo_commit": resolved_repo_commit,
@@ -1212,6 +1293,7 @@ def build_plan(
         "champion": {"sha256": champion_sha},
         "evaluation_binding": evaluation_binding,
         "engine_identity": engine_identity,
+        "internal_engine_identity": internal_engine_identity,
         "science_config_hash": science_hash,
         "role_search_config": role_search_config,
         "pair_claims": {
@@ -1291,6 +1373,10 @@ def build_plan(
             champion_wide_roots_always_full=bool(
                 role_search_config["champion"].get("wide_roots_always_full", False)
             ),
+            engine_identity=internal_engine_identity,
+            evaluator_sha256=resolved_tool_hashes[
+                "tools/gumbel_search_cross_net_h2h.py"
+            ],
         )
         jobs.append(
             {
@@ -1380,6 +1466,7 @@ def build_plan(
         "role_search_config": role_search_config,
         "evaluation_binding": evaluation_binding,
         "engine_identity": engine_identity,
+        "internal_engine_identity": internal_engine_identity,
         "workers_per_gpu": workers_per_gpu,
         "candidate": {
             "source": str(candidate),
@@ -1504,6 +1591,7 @@ def load_plan(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     expected_tools = {
         "tools/gumbel_search_cross_net_h2h.py",
         "tools/catanatron_neutral_harness_match.py",
+        "tools/a1_evaluation_pool.py",
         "tools/fleet/launch_detached.sh",
     }
     if set(plan.get("tool_hashes", {})) != expected_tools or any(
@@ -1511,6 +1599,13 @@ def load_plan(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         for value in plan.get("tool_hashes", {}).values()
     ):
         raise FleetError("evaluation plan tool hashes are incomplete or malformed")
+    expected_internal_engine = _internal_engine_identity(
+        repo_commit=str(plan.get("repo_commit")),
+        wheel_sha256=plan["engine_identity"]["native_wheel_sha256"],
+        evaluator_sha256=plan["tool_hashes"]["tools/gumbel_search_cross_net_h2h.py"],
+    )
+    if plan.get("internal_engine_identity") != expected_internal_engine:
+        raise FleetError("evaluation plan internal engine identity does not replay")
     for role in ("candidate", "champion"):
         source = Path(str(plan[role]["source"])).expanduser().resolve(strict=True)
         if _sha256(source) != plan[role]["sha256"]:
@@ -1520,6 +1615,7 @@ def load_plan(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 f"{role} remote path must equal the immutable B200 source path"
             )
     _validate_planned_jobs(plan, manifest)
+    _verify_local_plan_source(plan)
     return plan
 
 
@@ -1699,6 +1795,10 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
             champion_wide_roots_always_full=bool(
                 role_search_config["champion"].get("wide_roots_always_full", False)
             ),
+            engine_identity=plan["internal_engine_identity"],
+            evaluator_sha256=plan["tool_hashes"][
+                "tools/gumbel_search_cross_net_h2h.py"
+            ],
         )
         if job["pairs"] != pairs or job["base_seed"] != seed or job["argv"] != expected:
             raise FleetError(f"internal shard contract drift: {job['job_id']}")
@@ -1990,11 +2090,13 @@ def _preflight_command(
     import_probe = (
         "from importlib.metadata import version; from pathlib import Path; "
         "from tools.fleet.a1_h100_eval_fleet import "
-        "_assert_installed_native_wheel_sha256; "
+        "_assert_installed_native_wheel_sha256,_native_runtime_sha256; "
         "import catan_zero, catanatron_rs; "
         "assert Path(catan_zero.__file__).resolve().is_relative_to("
         f"Path({manifest['remote_repo']!r}) / 'src'); "
         f"_assert_installed_native_wheel_sha256({expected_wheel_sha256!r}); "
+        "assert _native_runtime_sha256() == "
+        f"{plan['internal_engine_identity']['native_runtime_sha256']!r}; "
         f"assert version('catanatron-rs') == {NATIVE_WHEEL_VERSION!r}; "
         "capability_fn=getattr(catanatron_rs,'gumbel_search_capabilities',None); "
         "assert callable(capability_fn); "
@@ -2521,8 +2623,14 @@ def collect_phase(
             candidate=Path(plan["candidate"]["remote"]),
             champion=Path(plan["champion"]["remote"]),
         )
+        expected_internal_engine = plan["internal_engine_identity"]
+        runtime_engine = result.get("engine_identity")
+        if (
+            result.get("planned_engine_identity") != expected_internal_engine
+            or runtime_engine != expected_internal_engine
+        ):
+            raise FleetError("pooled internal engine identity differs from sealed plan")
         result["evaluation_binding"] = plan["evaluation_binding"]
-        result["planned_engine_identity"] = plan["engine_identity"]
         destination = pooled_dir / "internal.json"
         write_new_readonly_or_identical(destination, result)
         outputs = {"internal": str(destination)}
@@ -2885,32 +2993,67 @@ def _verify_fixed_panel_evaluation_binding(
 def _verify_fixed_panel_engine_identity(
     value: Any, *, observed_runtime: Any, panel_kind: str
 ) -> str:
-    expected_keys = {
-        "schema_version",
-        "repo_commit",
-        "native_wheel_sha256",
-        "python_referee_sha256",
-    }
+    expected_keys = (
+        {
+            "schema_version",
+            "repo_commit",
+            "native_wheel_sha256",
+            "evaluator_sha256",
+            "native_runtime_sha256",
+        }
+        if panel_kind == "internal"
+        else {
+            "schema_version",
+            "repo_commit",
+            "native_wheel_sha256",
+            "python_referee_sha256",
+        }
+    )
     if not isinstance(value, dict) or set(value) != expected_keys:
         raise FleetError("fixed-panel planned engine identity is malformed")
     if (
-        value.get("schema_version") != "a1-neutral-engine-identity-v1"
+        value.get("schema_version")
+        != (
+            "a1-internal-h2h-engine-identity-v1"
+            if panel_kind == "internal"
+            else "a1-neutral-engine-identity-v1"
+        )
         or not re.fullmatch(r"[0-9a-f]{40}", str(value.get("repo_commit", "")))
         or not re.fullmatch(
             r"sha256:[0-9a-f]{64}", str(value.get("native_wheel_sha256", ""))
         )
         or not re.fullmatch(
-            r"sha256:[0-9a-f]{64}", str(value.get("python_referee_sha256", ""))
+            r"sha256:[0-9a-f]{64}",
+            str(
+                value.get(
+                    "evaluator_sha256"
+                    if panel_kind == "internal"
+                    else "python_referee_sha256",
+                    "",
+                )
+            ),
         )
     ):
         raise FleetError("fixed-panel planned engine identity is invalid")
     expected = _engine_identity(_REPO_ROOT, _git_commit(_REPO_ROOT))
+    if panel_kind == "internal":
+        expected = {
+            "schema_version": "a1-internal-h2h-engine-identity-v1",
+            "repo_commit": expected["repo_commit"],
+            "native_wheel_sha256": expected["native_wheel_sha256"],
+            "evaluator_sha256": _tool_hashes(_REPO_ROOT)[
+                "tools/gumbel_search_cross_net_h2h.py"
+            ],
+            "native_runtime_sha256": _native_runtime_sha256(),
+        }
     if value != expected:
         raise FleetError("fixed-panel planned engine differs from canonical source")
     runtime_sha256: str | None = None
-    if panel_kind == "external":
+    if panel_kind in {"internal", "external"}:
         if not isinstance(observed_runtime, dict):
-            raise FleetError("fixed-panel external report has no runtime engine identity")
+            raise FleetError(
+                f"fixed-panel {panel_kind} report has no runtime engine identity"
+            )
         for field in expected_keys:
             if observed_runtime.get(field) != value[field]:
                 raise FleetError(
@@ -3034,7 +3177,6 @@ def build_fixed_panel_receipt(
             raise FleetError(f"fixed-panel shard pooling refused: {error}") from error
         observed_replay = copy.deepcopy(report)
         observed_replay.pop("evaluation_binding", None)
-        observed_replay.pop("planned_engine_identity", None)
         if _canonical(observed_replay) != _canonical(replayed_report):
             raise FleetError("fixed-panel pooled report does not replay from shards")
         expected_map_kind = "BASE" if panel_kind == "internal" else "TOURNAMENT"

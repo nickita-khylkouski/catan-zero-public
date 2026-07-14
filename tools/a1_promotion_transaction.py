@@ -19,6 +19,8 @@ import argparse
 import dataclasses
 import fcntl
 import hashlib
+import importlib
+import importlib.machinery
 import json
 import os
 import re
@@ -61,8 +63,8 @@ from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_game
 ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v2"
 PREVIOUS_ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
 BRANCH_CHALLENGE_ADJUDICATION_SCHEMA = "a1-branch-challenge-adjudication-v1"
-CHECKPOINT_SELECTION_SCHEMA = "a1-same-trajectory-checkpoint-selection-v2"
-MATCHED_QUICK_SCREEN_SCHEMA = "a1-matched-quick-screen-v1"
+CHECKPOINT_SELECTION_SCHEMA = "a1-same-trajectory-checkpoint-selection-v3"
+MATCHED_QUICK_SCREEN_SCHEMA = "a1-matched-quick-screen-v2"
 MATCHED_QUICK_SCREEN_SELECTION_RULE = {
     "name": "earliest-within-absolute-win-rate-of-best-v1",
     "max_absolute_win_rate_gap_basis_points": 200,
@@ -86,6 +88,7 @@ HIGH_REGRET_SCHEMA = "a1-high-regret-comparison-v1"
 BUCKET_VETO_SCHEMA = "a1-bucket-veto-v1"
 HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
 HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
+INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA = "a1-internal-h2h-engine-identity-v1"
 ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
 HIGH_REGRET_SUITE_SCHEMA = SUITE_SCHEMA
 BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
@@ -1701,6 +1704,46 @@ def _verify_matched_quick_screen_report(
     }:
         raise PromotionError(f"{where} pooled baseline binding drifted")
 
+    raw_binding = payload.get("evaluation_binding")
+    if not isinstance(raw_binding, dict):
+        raise PromotionError(f"{where} has no evaluation baseline binding")
+    registry_path, _registry_ref = _validate_file_ref(
+        raw_binding.get("registry"),
+        base=path.parent,
+        where=f"{where}.evaluation_binding.registry",
+    )
+    registry = ChampionRegistry.load(registry_path)
+    pointer = registry.get_role("generator_champion")
+    if pointer is None:
+        raise PromotionError(f"{where} registry has no generator_champion")
+    pointer_path = _canonical_existing_file(
+        Path(pointer.checkpoint_path), where=f"{where} registry generator_champion"
+    )
+    incumbent_search = pointer.provenance.get("a1_candidate_search_config")
+    incumbent_identity = pointer.provenance.get("a1_candidate_agent_identity_sha256")
+    pointer_ref = {"path": str(pointer_path), "sha256": _sha256(pointer_path)}
+    if (
+        pointer_path != baseline_path
+        or pointer_ref["sha256"] != baseline_sha256
+        or pointer.md5 != _md5(pointer_path)
+        or not isinstance(incumbent_search, dict)
+        or not incumbent_search
+        or incumbent_identity
+        != _agent_identity(pointer_ref, incumbent_search)["agent_identity_sha256"]
+    ):
+        raise PromotionError(
+            f"{where} registry does not authenticate the baseline search identity"
+        )
+    evaluation_binding = _verify_evaluation_baseline_binding(
+        raw_binding,
+        champion_path=baseline_path,
+        champion_sha256=baseline_sha256,
+        champion_search_config=incumbent_search,
+        base=path.parent,
+        where=f"{where}.evaluation_binding",
+    )
+    _verify_internal_h2h_engine_identity(payload, where=where)
+
     effective_search_config = payload.get("effective_search_config")
     if not isinstance(effective_search_config, dict) or not effective_search_config:
         raise PromotionError(f"{where} has no effective search configuration")
@@ -1713,13 +1756,20 @@ def _verify_matched_quick_screen_report(
     if payload.get("search_rng_contract") != INTERNAL_H2H_SEARCH_RNG_CONTRACT:
         raise PromotionError(f"{where} internal search RNG contract drifted")
     search_configuration = {
-        "schema_version": "a1-matched-quick-screen-search-v1",
+        "schema_version": "a1-matched-quick-screen-search-v2",
+        "training_parent": {
+            "path": str(baseline_path),
+            "sha256": baseline_sha256,
+        },
         "baseline_checkpoint": {
             "path": str(baseline_path),
             "sha256": baseline_sha256,
         },
         "effective_search_config": effective_search_config,
         "search_rng_contract": INTERNAL_H2H_SEARCH_RNG_CONTRACT,
+        "evaluation_binding": evaluation_binding,
+        "planned_engine_identity": payload["planned_engine_identity"],
+        "engine_identity": payload["engine_identity"],
     }
 
     games = payload.get("games")
@@ -1811,6 +1861,7 @@ def _verify_matched_quick_screen(
     path: Path,
     *,
     checkpoint_refs: Mapping[int, Mapping[str, Any]],
+    expected_training_parent_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Replay the typed common-random-number dose screen and select its dose.
 
@@ -1893,7 +1944,29 @@ def _verify_matched_quick_screen(
         where="matched quick-screen.search_configuration_sha256",
     )
     if search_sha256 != _digest_value(search_configuration):
-        raise PromotionError("matched quick-screen search configuration digest mismatch")
+        raise PromotionError(
+            "matched quick-screen search configuration digest mismatch"
+        )
+    training_parent = search_configuration.get("training_parent")
+    if not isinstance(training_parent, dict):
+        raise PromotionError(
+            "matched quick-screen has no authenticated training parent"
+        )
+    parent_path, parent_ref = _validate_file_ref(
+        training_parent,
+        base=path.parent,
+        where="matched quick-screen training parent",
+    )
+    normalized_parent = {"path": str(parent_path), "sha256": parent_ref["sha256"]}
+    if expected_training_parent_sha256 is not None:
+        expected_training_parent_sha256 = _validate_sha256(
+            expected_training_parent_sha256,
+            where="expected matched quick-screen training parent sha256",
+        )
+        if normalized_parent["sha256"] != expected_training_parent_sha256:
+            raise PromotionError(
+                "matched quick-screen baseline differs from authenticated training parent"
+            )
 
     raw_checkpoints = value["checkpoints"]
     if not isinstance(raw_checkpoints, list) or len(raw_checkpoints) != 3:
@@ -2022,7 +2095,23 @@ def _verify_matched_quick_screen(
         "checkpoints": verified_checkpoints,
         "results": verified_results,
         "selected_optimizer_step": selected_step,
+        "training_parent": normalized_parent,
     }
+
+
+def _same_trajectory_training_parent_sha256(
+    *, training_receipt: Mapping[str, Any], training_report_path: Path
+) -> str:
+    report = _load_json(training_report_path)
+    parent_sha256 = _training_evaluation_parent_sha256(report, training_receipt)
+    if parent_sha256 is None:
+        raise PromotionError(
+            "same-trajectory training has no authenticated causal parent"
+        )
+    parent_sha256 = _validate_sha256(
+        parent_sha256, where="same-trajectory training parent sha256"
+    )
+    return parent_sha256
 
 
 def _verify_same_trajectory_checkpoint_selection(
@@ -2053,6 +2142,7 @@ def _verify_same_trajectory_checkpoint_selection(
             "schema_version",
             "training_receipt",
             "training_report",
+            "training_parent",
             "terminal_checkpoint",
             "eligible_optimizer_steps",
             "selected_optimizer_step",
@@ -2139,6 +2229,17 @@ def _verify_same_trajectory_checkpoint_selection(
         or report.get("intermediate_checkpoints") != raw_intermediate
     ):
         raise PromotionError("training report and receipt disagree on dose snapshots")
+    training_parent_sha256 = _same_trajectory_training_parent_sha256(
+        training_receipt=training_receipt,
+        training_report_path=training_report_path,
+    )
+    raw_training_parent = _require_exact_keys(
+        value["training_parent"],
+        {"path", "sha256"},
+        where="checkpoint selection receipt.training_parent",
+    )
+    if raw_training_parent.get("sha256") != training_parent_sha256:
+        raise PromotionError("checkpoint selection binds the wrong training parent")
 
     checkpoint_refs = {
         CHECKPOINT_SELECTION_STEPS[0]: {
@@ -2159,7 +2260,10 @@ def _verify_same_trajectory_checkpoint_selection(
     screen = _verify_matched_quick_screen(
         screen_path,
         checkpoint_refs=checkpoint_refs,
+        expected_training_parent_sha256=training_parent_sha256,
     )
+    if raw_training_parent != screen["training_parent"]:
+        raise PromotionError("checkpoint selection and screen bind different parents")
     selected_step = screen["selected_optimizer_step"]
     if value["selected_optimizer_step"] != selected_step:
         raise PromotionError(
@@ -2194,6 +2298,7 @@ def _verify_same_trajectory_checkpoint_selection(
         "sha256": expected_file_sha256,
         "selection_sha256": declared,
         "selected_optimizer_step": selected_step,
+        "training_parent": screen["training_parent"],
         "selected_checkpoint": selected_ref,
         "terminal_checkpoint": expected_terminal_ref,
         "screen_evidence": {
@@ -2499,6 +2604,10 @@ def _verify_one_dose_training_receipt(
         raise PromotionError("one-dose training receipt contract-lock bytes drifted")
     retry_reference: dict[str, Any] | None = None
     if is_retry:
+        allowed_retry_repair_kinds = {
+            one_dose.RETRY_REPAIR_KIND,
+            one_dose.PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND,
+        }
         retry_reference = _require_exact_keys(
             value["retry_contract"],
             {"path", "file_sha256", "retry_contract_sha256"},
@@ -2524,7 +2633,7 @@ def _verify_one_dose_training_receipt(
         if (
             not isinstance(retry_identity, dict)
             or retry_identity.get("schema_version") != one_dose.RETRY_IDENTITY_SCHEMA
-            or retry_identity.get("repair_kind") != one_dose.RETRY_REPAIR_KIND
+            or retry_identity.get("repair_kind") not in allowed_retry_repair_kinds
             or retry_identity.get("parent_contract_sha256")
             != contract["contract_sha256"]
             or retry_contract.get("retry_identity_sha256")
@@ -4389,6 +4498,94 @@ def _verify_fleet_pool_provenance(
         raise PromotionError(f"{where} pooled games do not replay from fleet sources")
 
 
+def _canonical_internal_h2h_engine_identity() -> dict[str, str]:
+    """Return the evaluator identity promotion trusts in this checkout."""
+
+    try:
+        import subprocess
+
+        commit = subprocess.check_output(
+            ("git", "rev-parse", "HEAD"), cwd=_REPO_ROOT, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise PromotionError(
+            "cannot fingerprint canonical internal evaluator"
+        ) from error
+    inventory = _REPO_ROOT / "native/catanatron-rs/WHEEL_SHA256SUMS"
+    try:
+        rows = [
+            line.split()
+            for line in inventory.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, UnicodeError) as error:
+        raise PromotionError("cannot read canonical native wheel identity") from error
+    if (
+        len(rows) != 1
+        or len(rows[0]) != 2
+        or not re.fullmatch(r"[0-9a-f]{64}", rows[0][0])
+    ):
+        raise PromotionError("canonical native wheel identity is malformed")
+    try:
+        native = importlib.import_module("catanatron_rs.catanatron_rs")
+        raw_path = getattr(native, "__file__", None)
+        if not isinstance(raw_path, str) or not raw_path:
+            raise PromotionError("canonical native extension has no __file__")
+        runtime_path = Path(raw_path).resolve(strict=True)
+    except (ImportError, OSError, TypeError, ValueError) as error:
+        raise PromotionError("cannot fingerprint canonical native runtime") from error
+    if not any(
+        str(runtime_path).endswith(suffix)
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ):
+        raise PromotionError("canonical native runtime is not a compiled extension")
+    return {
+        "schema_version": INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA,
+        "repo_commit": commit,
+        "native_wheel_sha256": "sha256:" + rows[0][0],
+        "evaluator_sha256": _sha256(
+            _REPO_ROOT / "tools/gumbel_search_cross_net_h2h.py"
+        ),
+        "native_runtime_sha256": _sha256(runtime_path),
+    }
+
+
+def _verify_internal_h2h_engine_identity(
+    payload: Mapping[str, Any], *, where: str
+) -> None:
+    planned = _require_exact_keys(
+        payload.get("planned_engine_identity"),
+        {
+            "schema_version",
+            "repo_commit",
+            "native_wheel_sha256",
+            "evaluator_sha256",
+            "native_runtime_sha256",
+        },
+        where=f"{where}.planned_engine_identity",
+    )
+    runtime = _require_exact_keys(
+        payload.get("engine_identity"),
+        {
+            "schema_version",
+            "repo_commit",
+            "native_wheel_sha256",
+            "evaluator_sha256",
+            "native_runtime_sha256",
+        },
+        where=f"{where}.engine_identity",
+    )
+    expected = _canonical_internal_h2h_engine_identity()
+    if planned != expected:
+        raise PromotionError(f"{where} planned internal evaluator is not canonical")
+    if runtime != planned:
+        raise PromotionError(
+            f"{where} runtime internal evaluator differs from its plan"
+        )
+    for key in ("native_wheel_sha256", "evaluator_sha256", "native_runtime_sha256"):
+        _validate_sha256(runtime[key], where=f"{where}.engine_identity.{key}")
+
+
 def _verify_calibration_source(
     payload: dict[str, Any],
     *,
@@ -5379,6 +5576,7 @@ def _verify_internal_h2h_source(
         raise PromotionError(
             f"{where} strict superiority cannot be combined with a non-regression veto"
         )
+    _verify_internal_h2h_engine_identity(payload, where=where)
     _verify_internal_h2h_rng_contract(payload, where=where)
     _verify_evaluation_baseline_binding(
         payload.get("evaluation_binding"),
@@ -5450,7 +5648,9 @@ def _verify_internal_h2h_source(
             "candidate_n_full_wide_threshold": sealed_semantics[
                 "n_full_wide_threshold"
             ],
-            "baseline_n_full_wide_threshold": sealed_semantics["n_full_wide_threshold"],
+            "baseline_n_full_wide_threshold": sealed_semantics[
+                "n_full_wide_threshold"
+            ],
             "candidate_wide_roots_always_full": sealed_semantics[
                 "wide_roots_always_full"
             ],
@@ -6191,9 +6391,7 @@ def _verify_high_regret_source(
             "candidate_n_full_wide_threshold": sealed_semantics[
                 "n_full_wide_threshold"
             ],
-            "baseline_n_full_wide_threshold": sealed_semantics[
-                "n_full_wide_threshold"
-            ],
+            "baseline_n_full_wide_threshold": sealed_semantics["n_full_wide_threshold"],
             "candidate_wide_roots_always_full": sealed_semantics[
                 "wide_roots_always_full"
             ],
@@ -8918,6 +9116,10 @@ def create_same_trajectory_checkpoint_selection(
         or report.get("intermediate_checkpoints") != raw_intermediate
     ):
         raise PromotionError("selection report lost its same-trajectory snapshots")
+    training_parent_sha256 = _same_trajectory_training_parent_sha256(
+        training_receipt=receipt,
+        training_report_path=training_report_path,
+    )
     checkpoint_refs = {
         CHECKPOINT_SELECTION_STEPS[0]: {
             "path": intermediates[0]["checkpoint"],
@@ -8932,6 +9134,7 @@ def create_same_trajectory_checkpoint_selection(
     screen = _verify_matched_quick_screen(
         screen_evidence_path,
         checkpoint_refs=checkpoint_refs,
+        expected_training_parent_sha256=training_parent_sha256,
     )
     derived_step = screen["selected_optimizer_step"]
     if selected_optimizer_step is not None and selected_optimizer_step != derived_step:
@@ -8960,6 +9163,7 @@ def create_same_trajectory_checkpoint_selection(
             "path": str(training_report_path),
             "sha256": _sha256(training_report_path),
         },
+        "training_parent": screen["training_parent"],
         "terminal_checkpoint": terminal_ref,
         "eligible_optimizer_steps": list(CHECKPOINT_SELECTION_STEPS),
         "selected_optimizer_step": selected_optimizer_step,

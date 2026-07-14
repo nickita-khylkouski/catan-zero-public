@@ -128,6 +128,8 @@ def _write_matched_quick_screen(
     *,
     intermediate: list[dict],
     terminal: Path,
+    baseline: Path,
+    evaluation_binding: dict,
     points_by_step: dict[int, float],
 ) -> dict:
     checkpoints = {
@@ -141,9 +143,6 @@ def _write_matched_quick_screen(
         },
         128: _checkpoint_ref(terminal),
     }
-    baseline = path.parent / "screen-baseline.pt"
-    if not baseline.exists():
-        baseline.write_bytes(b"screen baseline")
     ordered_game_keys = [
         {"game_seed": 9_000_000 + pair, "orientation": orientation}
         for pair in range(100)
@@ -158,16 +157,20 @@ def _write_matched_quick_screen(
         "determinization_particles": 4,
         "symmetry_averaged_eval": True,
     }
+    planned_engine_identity = promotion._canonical_internal_h2h_engine_identity()  # noqa: SLF001
+    runtime_engine_identity = dict(planned_engine_identity)
     search_configuration = {
-        "schema_version": "a1-matched-quick-screen-search-v1",
+        "schema_version": "a1-matched-quick-screen-search-v2",
+        "training_parent": _checkpoint_ref(baseline),
         "baseline_checkpoint": _checkpoint_ref(baseline),
         "effective_search_config": effective_search_config,
         "search_rng_contract": promotion.INTERNAL_H2H_SEARCH_RNG_CONTRACT,
+        "evaluation_binding": evaluation_binding,
+        "planned_engine_identity": planned_engine_identity,
+        "engine_identity": runtime_engine_identity,
     }
     search_sha256 = promotion._digest_value(search_configuration)
-    half_points = {
-        step: int(round(points_by_step[step] * 2)) for step in (64, 96, 128)
-    }
+    half_points = {step: int(round(points_by_step[step] * 2)) for step in (64, 96, 128)}
     best_half_points = max(half_points.values())
     selected_step = min(
         step
@@ -199,6 +202,9 @@ def _write_matched_quick_screen(
             )
         _scores, diagnostics = promotion.pair_scores_from_h2h_games(games)
         report = {
+            "evaluation_binding": evaluation_binding,
+            "planned_engine_identity": planned_engine_identity,
+            "engine_identity": runtime_engine_identity,
             "candidate_checkpoint": checkpoints[step]["path"],
             "candidate_checkpoint_sha256": checkpoints[step]["sha256"],
             "baseline_checkpoint": str(baseline),
@@ -900,6 +906,8 @@ def _fixture(
         internal_source,
         {
             "evaluation_binding": evaluation_binding,
+            "planned_engine_identity": promotion._canonical_internal_h2h_engine_identity(),  # noqa: SLF001
+            "engine_identity": promotion._canonical_internal_h2h_engine_identity(),  # noqa: SLF001
             "candidate_checkpoint": str(candidate),
             "baseline_checkpoint": str(champion),
             "typed_config": typed_config,
@@ -1485,6 +1493,7 @@ def _fixture(
         "pointer": pointer,
         "contract_path": contract_path,
         "contract": contract,
+        "evaluation_binding": evaluation_binding,
         "adjudication": adjudication_path,
         "report": report_path,
         "training_receipt": training_receipt,
@@ -1623,14 +1632,16 @@ def _mutate_training_receipt(fixture: dict, mutate) -> dict:
     return payload
 
 
-def _convert_training_receipt_to_sealed_retry(fixture: dict) -> None:
+def _convert_training_receipt_to_sealed_retry(
+    fixture: dict, *, repair_kind: str = one_dose.RETRY_REPAIR_KIND
+) -> None:
     receipt_path = fixture["training_receipt"]
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     claim_path = Path(receipt["claim"])
     claim = json.loads(claim_path.read_text(encoding="utf-8"))
     identity_evidence = {
         "schema_version": one_dose.RETRY_IDENTITY_SCHEMA,
-        "repair_kind": one_dose.RETRY_REPAIR_KIND,
+        "repair_kind": repair_kind,
         "parent_contract_sha256": fixture["contract"]["contract_sha256"],
         "parent": {
             "claim": "/sealed/failed-r1.claim.json",
@@ -1964,6 +1975,8 @@ def test_explicit_same_trajectory_checkpoint_selection_replays_64_96_128(
         screen,
         intermediate=modern["intermediate"],
         terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
         points_by_step={64: 100.0, 96: 130.0, 128: 110.0},
     )
     selected = modern["intermediate"][1]
@@ -1978,6 +1991,7 @@ def test_explicit_same_trajectory_checkpoint_selection_replays_64_96_128(
             "path": str(fixture["report"]),
             "sha256": promotion._sha256(fixture["report"]),
         },
+        "training_parent": _checkpoint_ref(fixture["champion"]),
         "terminal_checkpoint": _checkpoint_ref(fixture["candidate"]),
         "eligible_optimizer_steps": [64, 96, 128],
         "selected_optimizer_step": 96,
@@ -2029,6 +2043,8 @@ def test_checkpoint_selection_rejects_candidate_chaining_marker(
         screen,
         intermediate=modern["intermediate"],
         terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
         points_by_step={64: 120.0, 96: 120.0, 128: 120.0},
     )
     selected = modern["intermediate"][0]
@@ -2040,6 +2056,7 @@ def test_checkpoint_selection_rejects_candidate_chaining_marker(
             "receipt_sha256": receipt["receipt_sha256"],
         },
         "training_report": _checkpoint_ref(fixture["report"]),
+        "training_parent": _checkpoint_ref(fixture["champion"]),
         "terminal_checkpoint": _checkpoint_ref(fixture["candidate"]),
         "eligible_optimizer_steps": [64, 96, 128],
         "selected_optimizer_step": 64,
@@ -2082,6 +2099,8 @@ def test_select_dose_builder_seals_same_trajectory_choice(tmp_path: Path) -> Non
         screen,
         intermediate=modern["intermediate"],
         terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
         points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
     )
     output = tmp_path / "checkpoint-selection.json"
@@ -2111,6 +2130,8 @@ def test_select_dose_derives_step_and_rejects_caller_override(tmp_path: Path) ->
         screen,
         intermediate=modern["intermediate"],
         terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
         points_by_step={64: 100.0, 96: 130.0, 128: 110.0},
     )
 
@@ -2134,6 +2155,8 @@ def test_select_dose_rejects_result_not_bound_to_common_games(tmp_path: Path) ->
         screen,
         intermediate=modern["intermediate"],
         terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
         points_by_step={64: 120.0, 96: 120.0, 128: 120.0},
     )
     payload["results"][1]["ordered_game_keys_sha256"] = "sha256:" + "d" * 64
@@ -2160,6 +2183,8 @@ def test_build_dose_screen_from_three_pooled_reports(tmp_path: Path) -> None:
         fixture_screen,
         intermediate=modern["intermediate"],
         terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
         points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
     )
     reports = {
@@ -2193,6 +2218,8 @@ def test_build_dose_screen_rejects_cross_report_search_drift(tmp_path: Path) -> 
         fixture_screen,
         intermediate=modern["intermediate"],
         terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
         points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
     )
     reports = {
@@ -2215,6 +2242,84 @@ def test_build_dose_screen_rejects_cross_report_search_drift(tmp_path: Path) -> 
         )
 
 
+def test_internal_screen_rejects_forged_runtime_and_registry_search_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    fixture_payload = _write_matched_quick_screen(
+        tmp_path / "fixture-screen.json",
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
+        points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
+    )
+    reports = {
+        result["optimizer_step"]: Path(result["evaluation_report"]["path"])
+        for result in fixture_payload["results"]
+    }
+
+    runtime_drift = json.loads(reports[64].read_text(encoding="utf-8"))
+    runtime_drift["engine_identity"]["native_runtime_sha256"] = "sha256:" + "0" * 64
+    _write_json(reports[64], runtime_drift)
+    with pytest.raises(promotion.PromotionError, match="runtime internal evaluator"):
+        promotion.create_matched_quick_screen(
+            step64_report_path=reports[64],
+            step96_report_path=reports[96],
+            step128_report_path=reports[128],
+            output_path=tmp_path / "runtime-drift-screen.json",
+        )
+
+    _write_matched_quick_screen(
+        tmp_path / "fixture-screen.json",
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
+        points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
+    )
+    forged = json.loads(reports[64].read_text(encoding="utf-8"))
+    incumbent = forged["evaluation_binding"]["authoritative_incumbent"]
+    incumbent["search_config"]["c_scale"] = 0.3
+    incumbent["agent_identity_sha256"] = promotion._agent_identity(  # noqa: SLF001
+        {"path": incumbent["path"], "sha256": incumbent["sha256"]},
+        incumbent["search_config"],
+    )["agent_identity_sha256"]
+    _write_json(reports[64], forged)
+    with pytest.raises(promotion.PromotionError, match="sealed A1 semantic drift"):
+        promotion.create_matched_quick_screen(
+            step64_report_path=reports[64],
+            step96_report_path=reports[96],
+            step128_report_path=reports[128],
+            output_path=tmp_path / "search-drift-screen.json",
+        )
+
+
+def test_same_trajectory_parent_uses_causal_sha_not_transformed_initializer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transformed = tmp_path / "transformed-init.pt"
+    transformed.write_bytes(b"function-preserving transformed bytes")
+    report = tmp_path / "typed-training-report.json"
+    _write_json(report, {"init_checkpoint": str(transformed)})
+    causal_sha256 = "sha256:" + "a" * 64
+    monkeypatch.setattr(
+        promotion,
+        "_training_evaluation_parent_sha256",
+        lambda _report, _receipt: causal_sha256,
+    )
+
+    assert (
+        promotion._same_trajectory_training_parent_sha256(  # noqa: SLF001
+            training_receipt={}, training_report_path=report
+        )
+        == causal_sha256
+    )
+
+
 def test_build_dose_screen_rejects_candidate_checkpoint_hash_drift(
     tmp_path: Path,
 ) -> None:
@@ -2227,6 +2332,8 @@ def test_build_dose_screen_rejects_candidate_checkpoint_hash_drift(
         fixture_screen,
         intermediate=modern["intermediate"],
         terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
         points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
     )
     reports = {
@@ -2438,16 +2545,33 @@ def test_adjudication_cannot_rebind_candidate_to_champion_search(
         _execute(fixture, go=False)
 
 
+@pytest.mark.parametrize(
+    "repair_kind",
+    [
+        one_dose.RETRY_REPAIR_KIND,
+        one_dose.PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND,
+    ],
+)
 def test_dry_run_accepts_schema_separated_sealed_retry_receipt(
-    tmp_path: Path,
+    tmp_path: Path, repair_kind: str
 ) -> None:
     fixture = _fixture(tmp_path)
-    _convert_training_receipt_to_sealed_retry(fixture)
+    _convert_training_receipt_to_sealed_retry(fixture, repair_kind=repair_kind)
 
     plan = _execute(fixture, go=False)
 
     assert plan["status"] == "dry_run"
     assert plan["training_receipt"]["path"] == str(fixture["training_receipt"])
+
+
+def test_dry_run_rejects_unknown_sealed_retry_repair_kind(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _convert_training_receipt_to_sealed_retry(
+        fixture, repair_kind="untyped_retry_escape_hatch"
+    )
+
+    with pytest.raises(promotion.PromotionError, match="retry identity is invalid"):
+        _execute(fixture, go=False)
 
 
 def test_direct_promotion_rejects_legacy_one_dose_receipt(tmp_path: Path) -> None:

@@ -79,7 +79,10 @@ def _internal_report(candidate: Path, champion: Path, seed: int) -> dict:
     digest = hashlib.sha256(
         json.dumps(typed, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    planned_engine_identity = promotion._canonical_internal_h2h_engine_identity()  # noqa: SLF001
     return {
+        "planned_engine_identity": planned_engine_identity,
+        "engine_identity": dict(planned_engine_identity),
         "candidate_checkpoint": str(candidate.resolve()),
         "candidate_checkpoint_sha256": promotion._sha256(candidate),
         "baseline_checkpoint": str(champion.resolve()),
@@ -430,6 +433,21 @@ def test_internal_pool_refuses_config_drift(tmp_path: Path) -> None:
     drifted["full_config_hash"] = "sha256:" + digest
     _write(second, drifted)
     with pytest.raises(pool.PoolError, match="science/config drift"):
+        pool.pool_internal([first, second], candidate=candidate, champion=champion)
+
+
+def test_internal_pool_refuses_native_runtime_identity_drift(tmp_path: Path) -> None:
+    candidate = _checkpoint(tmp_path, "candidate.pt")
+    champion = _checkpoint(tmp_path, "champion.pt")
+    first = tmp_path / "first-runtime.json"
+    second = tmp_path / "second-runtime.json"
+    _write(first, _internal_report(candidate, champion, 9001))
+    drifted = _internal_report(candidate, champion, 9002)
+    drifted["planned_engine_identity"]["native_runtime_sha256"] = "sha256:" + "0" * 64
+    drifted["engine_identity"] = dict(drifted["planned_engine_identity"])
+    _write(second, drifted)
+
+    with pytest.raises(pool.PoolError, match="internal engine identity drift"):
         pool.pool_internal([first, second], candidate=candidate, champion=champion)
 
 
