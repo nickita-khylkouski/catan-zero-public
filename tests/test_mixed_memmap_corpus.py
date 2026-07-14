@@ -137,7 +137,7 @@ def test_schema_mismatch_fails_closed():
 
 def test_known_optional_columns_are_synthesized_with_safe_semantics():
     module = _module()
-    current = _Corpus(0, 2)
+    current = _Corpus(0, 2, legal_width=2)
     current._eager.update(
         {
             "legal_action_ids": np.asarray([[1, -1], [1, 2]], dtype=np.int16),
@@ -146,6 +146,13 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
             "used_full_search": np.asarray([False, True]),
             "root_value": np.asarray([0.2, 0.4], dtype=np.float32),
             "root_value_mask": np.asarray([True, True]),
+            "afterstate_target": np.asarray(
+                [[0.1, np.nan], [0.2, 0.3]], dtype=np.float32
+            ),
+            "afterstate_target_mask": np.asarray(
+                [[True, False], [True, True]], dtype=np.bool_
+            ),
+            "simulations_used": np.asarray([128, 128], dtype=np.int32),
             "aux_subgoal_target_version": np.asarray([1, 1], dtype=np.uint8),
             "aux_vp_in_n": np.asarray([0.5, 1.5], dtype=np.float32),
         }
@@ -158,6 +165,21 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
             "used_full_search": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
             "root_value": {"kind": "fixed", "dtype": "float32", "inner_shape": []},
             "root_value_mask": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
+            "afterstate_target": {
+                "kind": "ragged2d",
+                "dtype": "float32",
+                "fill": float("nan"),
+            },
+            "afterstate_target_mask": {
+                "kind": "ragged2d",
+                "dtype": "bool",
+                "fill": False,
+            },
+            "simulations_used": {
+                "kind": "fixed",
+                "dtype": "int32",
+                "inner_shape": [],
+            },
             "aux_subgoal_target_version": {
                 "kind": "fixed",
                 "dtype": "uint8",
@@ -170,7 +192,7 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
             },
         }
     )
-    old = _Corpus(2, 2)
+    old = _Corpus(2, 2, legal_width=2)
     old._eager.update(
         {
             "legal_action_ids": np.asarray([[3, -1], [3, 4]], dtype=np.int16),
@@ -190,20 +212,71 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
     assert np.array_equal(mixed["used_full_search"][:], [False, True, False, True])
     assert np.allclose(mixed["root_value"][:], [0.2, 0.4, 0.0, 0.0])
     assert np.array_equal(mixed["root_value_mask"][:], [True, True, False, False])
+    assert np.allclose(
+        mixed["afterstate_target"][:],
+        [[0.1, np.nan], [0.2, 0.3], [np.nan, np.nan], [np.nan, np.nan]],
+        equal_nan=True,
+    )
+    assert np.array_equal(
+        mixed["afterstate_target_mask"][:],
+        [[True, False], [True, True], [False, False], [False, False]],
+    )
+    assert np.array_equal(mixed["simulations_used"][:], [128, 128, 0, 0])
+    assert mixed["afterstate_target"][3].shape == (2,)
+    assert mixed["afterstate_target"][[3, 0]].shape == (2, 2)
+    assert mixed["afterstate_target"].dtype == np.dtype(np.float32)
+    assert mixed["afterstate_target_mask"].dtype == np.dtype(np.bool_)
+    assert mixed["simulations_used"].dtype == np.dtype(np.int32)
     assert np.array_equal(mixed["aux_subgoal_target_version"][:], [1, 1, 0, 0])
     assert np.array_equal(
         mixed["aux_vp_in_n"][:], [0.5, 1.5, np.nan, np.nan], equal_nan=True
     )
     assert mixed.synthesized_columns_by_component == {
         1: (
+            "afterstate_target",
+            "afterstate_target_mask",
             "aux_subgoal_target_version",
             "aux_vp_in_n",
             "is_forced",
             "root_value",
             "root_value_mask",
+            "simulations_used",
             "used_full_search",
         )
     }
+
+
+@pytest.mark.parametrize("missing", ["afterstate_target", "afterstate_target_mask"])
+def test_afterstate_target_and_mask_must_be_an_atomic_pair(missing: str) -> None:
+    module = _module()
+    complete = _Corpus(0, 2)
+    complete._eager.update(
+        {
+            "afterstate_target": np.zeros((2, 3), dtype=np.float32),
+            "afterstate_target_mask": np.ones((2, 3), dtype=np.bool_),
+        }
+    )
+    complete._columns.update(
+        {
+            "afterstate_target": {
+                "kind": "ragged2d",
+                "dtype": "float32",
+                "fill": float("nan"),
+            },
+            "afterstate_target_mask": {
+                "kind": "ragged2d",
+                "dtype": "bool",
+                "fill": False,
+            },
+        }
+    )
+    broken = _Corpus(2, 2)
+    present = "afterstate_target_mask" if missing == "afterstate_target" else "afterstate_target"
+    broken._eager[present] = complete._eager[present].copy()
+    broken._columns[present] = dict(complete._columns[present])
+
+    with pytest.raises(SystemExit, match="incomplete afterstate target/mask pair"):
+        module.ConcatMemmapCorpus([complete, broken])
 
 
 def test_unknown_missing_column_still_fails_closed():

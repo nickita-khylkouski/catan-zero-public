@@ -30,6 +30,15 @@ SYNTHESIZABLE_COLUMNS = frozenset(
         "used_full_search",
         "root_value",
         "root_value_mask",
+        # The sealed gen3 replay corpus predates preserved search-accounting
+        # and one-ply afterstate columns.  Their absence has an exact neutral
+        # meaning: no authenticated afterstate target and no recorded search
+        # simulations.  `used_full_search` remains derived independently from
+        # the historical policy-weight column, so this does not disable its
+        # stored policy targets.
+        "afterstate_target",
+        "afterstate_target_mask",
+        "simulations_used",
         *AUX_TARGET_KEYS,
         # Historical replay predates the strict-future auxiliary-target
         # contract.  Version 0 means unversioned/ineligible and is synthesized
@@ -237,13 +246,21 @@ class _ConcatColumn:
 
 
 class _ConstantColumn:
-    """Lazy scalar column used for semantically absent optional targets."""
+    """Lazy fixed-shape column used for semantically absent optional targets."""
 
-    def __init__(self, row_count: int, value: Any, dtype: Any):
+    def __init__(
+        self,
+        row_count: int,
+        value: Any,
+        dtype: Any,
+        *,
+        inner_shape: Sequence[int] = (),
+    ):
         self._n = int(row_count)
         self._value = value
-        self.shape = (self._n,)
-        self.ndim = 1
+        self._inner_shape = tuple(int(size) for size in inner_shape)
+        self.shape = (self._n, *self._inner_shape)
+        self.ndim = len(self.shape)
         self.dtype = np.dtype(dtype)
 
     def __len__(self) -> int:
@@ -252,8 +269,10 @@ class _ConstantColumn:
     def __getitem__(self, index: Any):
         indices, scalar = _normalize_global_index(index, self._n)
         if scalar:
-            return np.asarray(self._value, dtype=self.dtype)
-        return np.full(indices.shape, self._value, dtype=self.dtype)
+            return np.full(self._inner_shape, self._value, dtype=self.dtype)
+        return np.full(
+            (*indices.shape, *self._inner_shape), self._value, dtype=self.dtype
+        )
 
     def present_values(self) -> set[str]:
         return {str(self._value)} if self._n else set()
@@ -298,6 +317,22 @@ def _synthesized_column(corpus: Any, key: str):
         return _ConstantColumn(corpus.row_count, 0.0, np.float32)
     if key == "root_value_mask":
         return _ConstantColumn(corpus.row_count, False, np.bool_)
+    if key == "afterstate_target":
+        return _ConstantColumn(
+            corpus.row_count,
+            np.nan,
+            np.float32,
+            inner_shape=(int(corpus.legal_width),),
+        )
+    if key == "afterstate_target_mask":
+        return _ConstantColumn(
+            corpus.row_count,
+            False,
+            np.bool_,
+            inner_shape=(int(corpus.legal_width),),
+        )
+    if key == "simulations_used":
+        return _ConstantColumn(corpus.row_count, 0, np.int32)
     if key == AUX_SUBGOAL_TARGET_VERSION_KEY:
         return _ConstantColumn(corpus.row_count, 0, np.uint8)
     if key in {"aux_next_settlement", "aux_robber_target"}:
@@ -346,6 +381,14 @@ class ConcatMemmapCorpus:
 
         first = self.corpora[0]
         component_key_sets = [set(corpus.keys()) for corpus in self.corpora]
+        afterstate_pair = {"afterstate_target", "afterstate_target_mask"}
+        for index, keys in enumerate(component_key_sets):
+            present_afterstate = keys & afterstate_pair
+            if present_afterstate and present_afterstate != afterstate_pair:
+                raise SystemExit(
+                    "memmap component has an incomplete afterstate target/mask pair: "
+                    f"component={index} present={sorted(present_afterstate)}"
+                )
         union_keys = set.union(*component_key_sets)
         if adapter_versions is not None:
             union_keys.add("adapter_version")
