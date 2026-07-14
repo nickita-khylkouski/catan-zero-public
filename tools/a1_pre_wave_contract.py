@@ -4598,6 +4598,8 @@ def _validate_operator_binding_evidence(
     final_evaluator: dict[str, Any],
     post_promotion_handoff_path: Path | None = None,
     allow_post_promotion_s1: bool = False,
+    recovery_receipt_path: Path | None = None,
+    allow_recovery_s1: bool = False,
 ) -> dict[str, Any]:
     """Validate the narrow no-S2/no-S3 operator-choice bridge.
 
@@ -4739,6 +4741,8 @@ def _validate_operator_binding_evidence(
         final_evaluator=final_evaluator,
         post_promotion_handoff_path=post_promotion_handoff_path,
         allow_post_promotion_s1=allow_post_promotion_s1,
+        recovery_receipt_path=recovery_receipt_path,
+        allow_recovery_s1=allow_recovery_s1,
     )
     if (
         payload["source_s1_selected_fields_sha256"]
@@ -4787,6 +4791,8 @@ def _validate_operator_binding_evidence(
             final_evaluator=final_evaluator,
             post_promotion_handoff_path=post_promotion_handoff_path,
             allow_post_promotion_s1=allow_post_promotion_s1,
+            recovery_receipt_path=recovery_receipt_path,
+            allow_recovery_s1=allow_recovery_s1,
         )
         if s2_payload["source_s1"] != payload["source_s1"]:
             raise ContractError("S3 and S2 operator bindings do not share exact S1 lineage")
@@ -5153,6 +5159,8 @@ def _validate_search_stage_evidence(
             final_evaluator=final_evaluator,
             post_promotion_handoff_path=post_promotion_handoff_path,
             allow_post_promotion_s1=allow_post_promotion_s1,
+            recovery_receipt_path=recovery_receipt_path,
+            allow_recovery_s1=allow_recovery_s1,
         )
     if payload.get("schema_version") != SEARCH_STAGE_EVIDENCE_SCHEMA:
         raise ContractError(
