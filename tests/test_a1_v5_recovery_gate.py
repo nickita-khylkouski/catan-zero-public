@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from tools import a1_promotion_transaction as promotion
+from tools import a1_frozen_lock_verifier as frozen_lock_verifier
 from tools import a1_v5_disaster_recovery as recovery
 from tools import a1_v5_recovery_gate as gate
 from tools.champion_registry import ChampionRegistry, RolePointer
@@ -226,6 +227,59 @@ def test_dual_gate_reuses_full_adjudication_and_fixed_f7_veto(
         recovery_verifier_fn=lambda _path: gate_inputs["replay"],
     )
     assert replayed == written == authority
+
+
+def test_gate_and_published_authority_bind_frozen_lock_verifier(
+    gate_inputs: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen_repo = tmp_path / "frozen"
+    verifier = _write(
+        frozen_repo / "tools" / "a1_pre_wave_contract.py",
+        b"# exact frozen verifier\n",
+    )
+    verifier_authority = {
+        "schema_version": frozen_lock_verifier.AUTHORITY_SCHEMA,
+        "lock": str(gate_inputs["paths"]["contract_lock_path"]),
+        "lock_file_sha256": _sha(gate_inputs["paths"]["contract_lock_path"]),
+        "contract_sha256": "sha256:" + "a" * 64,
+        "frozen_repo": str(frozen_repo.resolve()),
+        "verifier": str(verifier),
+        "verifier_sha256": _sha(verifier),
+        "require_all_job_claims": True,
+        "verified_lock_sha256": "sha256:" + "b" * 64,
+        "authority_sha256": "sha256:" + "c" * 64,
+    }
+
+    def fake_builder(**kwargs: Any):
+        assert kwargs["frozen_repo"] == frozen_repo
+        assert kwargs["expected_verifier_sha256"] == _sha(verifier)
+        return (lambda *_a, **_k: {}), verifier_authority
+
+    monkeypatch.setattr(
+        frozen_lock_verifier,
+        "build_frozen_lock_verifier",
+        fake_builder,
+    )
+    output = tmp_path / "frozen-authority.json"
+    written = gate.write_recovery_gate_authority(
+        output,
+        **gate_inputs["paths"],
+        frozen_repo_path=frozen_repo,
+        frozen_verifier_sha256=_sha(verifier),
+        recovery_verifier_fn=lambda _path: gate_inputs["replay"],
+    )
+
+    assert written["contract_verifier"] == verifier_authority
+    assert written["inputs"]["frozen_lock_verifier"] == {
+        "path": str(verifier),
+        "sha256": _sha(verifier),
+    }
+    assert gate.verify_recovery_gate_authority(
+        output,
+        recovery_verifier_fn=lambda _path: gate_inputs["replay"],
+    ) == written
 
 
 def test_f7_h0_is_a_conjunctive_veto(gate_inputs: dict[str, Any]) -> None:

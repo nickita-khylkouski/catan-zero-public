@@ -2967,6 +2967,74 @@ def test_post_wave_audit_fails_closed_when_manifests_are_missing(
     assert any("missing manifest" in error for error in payload["errors"])
 
 
+@pytest.mark.parametrize(
+    ("frozen_repo", "frozen_verifier_sha256"),
+    [
+        (Path("/frozen/repo"), None),
+        (None, "sha256:" + "a" * 64),
+    ],
+)
+def test_post_wave_audit_requires_complete_frozen_verifier_pair(
+    tmp_path: Path,
+    frozen_repo: Path | None,
+    frozen_verifier_sha256: str | None,
+) -> None:
+    lock_path, lock = _lock(tmp_path)
+    _append_job_claims(lock)
+
+    with pytest.raises(contract.ContractError, match="requires --frozen-repo"):
+        contract.audit_outputs(
+            lock_path,
+            tmp_path / "audit.json",
+            frozen_repo=frozen_repo,
+            frozen_verifier_sha256=frozen_verifier_sha256,
+        )
+
+
+def test_post_wave_audit_cli_forwards_frozen_verifier_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    lock_path = tmp_path / "lock.json"
+    out_path = tmp_path / "audit.json"
+    frozen_repo = tmp_path / "frozen"
+    verifier_sha256 = "sha256:" + "b" * 64
+
+    def fake_audit(
+        lock: Path,
+        out: Path,
+        **kwargs: object,
+    ) -> dict[str, str]:
+        observed.update({"lock": lock, "out": out, **kwargs})
+        return {"audit_sha256": "sha256:" + "c" * 64}
+
+    monkeypatch.setattr(contract, "audit_outputs", fake_audit)
+    assert (
+        contract.main(
+            [
+                "audit",
+                "--lock",
+                str(lock_path),
+                "--out",
+                str(out_path),
+                "--frozen-repo",
+                str(frozen_repo),
+                "--frozen-verifier-sha256",
+                verifier_sha256,
+            ]
+        )
+        == 0
+    )
+    assert observed == {
+        "lock": lock_path.absolute(),
+        "out": out_path.absolute(),
+        "harvest_relocation": None,
+        "frozen_repo": frozen_repo.absolute(),
+        "frozen_verifier_sha256": verifier_sha256,
+    }
+
+
 def test_selected_opponent_rows_require_only_deterministic_producer_seat(
     tmp_path: Path,
 ) -> None:
@@ -3051,6 +3119,83 @@ def test_post_wave_audit_canonicalizes_symlinked_contract_path(
     assert payload["contract_path"] == str(lock_path.resolve(strict=True))
 
 
+def test_post_wave_feature_semantics_require_exact_existing_contracts(
+    tmp_path: Path,
+) -> None:
+    shard = tmp_path / "semantic.npz"
+    rows = 2
+    arrays = {
+        "adapter_version": np.full(
+            rows, contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
+        ),
+        "event_tokens": np.zeros((rows, 2, 1), dtype=np.float16),
+        "event_mask": np.zeros((rows, 2), dtype=bool),
+        "event_target_ids": np.full((rows, 2, 4), -1, dtype=np.int16),
+    }
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        report = contract._require_shard_feature_semantics(  # noqa: SLF001
+            payload, rows=rows, where="fixture"
+        )
+    assert report["entity_feature_adapter_version"] == (
+        contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    assert report["event_history"]["authenticated_empty"] is True
+    empty_scan = report["event_history"]["empty_event_mask_scan"]
+    assert empty_scan["schema"] == "training-empty-event-mask-scan-v1"
+    assert empty_scan["row_count"] == 2
+    assert empty_scan["padded_event_width"] == 2
+    assert empty_scan["nonzero_event_mask_count"] == 0
+
+    expected_award = contract._expected_public_award_feature_provenance(  # noqa: SLF001
+        rust_featurize=True
+    )
+    assert contract._require_public_award_feature_provenance(  # noqa: SLF001
+        expected_award, rust_featurize=True, where="fixture"
+    ) == expected_award
+    drifted_award = dict(expected_award)
+    drifted_award["native_capability"] = None
+    with pytest.raises(contract.ContractError, match="provenance drift"):
+        contract._require_public_award_feature_provenance(  # noqa: SLF001
+            drifted_award, rust_featurize=True, where="fixture"
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "replacement", "error"),
+    [
+        (
+            "adapter_version",
+            np.full(2, "unknown-adapter", dtype="U64"),
+            "adapter_version drift",
+        ),
+        ("event_mask", np.ones((2, 2), dtype=bool), "event_mask has live entries"),
+    ],
+)
+def test_post_wave_feature_semantics_reject_drift(
+    tmp_path: Path,
+    column: str,
+    replacement: np.ndarray,
+    error: str,
+) -> None:
+    arrays = {
+        "adapter_version": np.full(
+            2, contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
+        ),
+        "event_tokens": np.zeros((2, 2, 1), dtype=np.float16),
+        "event_mask": np.zeros((2, 2), dtype=bool),
+        "event_target_ids": np.full((2, 2, 4), -1, dtype=np.int16),
+    }
+    arrays[column] = replacement
+    shard = tmp_path / "semantic-drift.npz"
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match=error):
+            contract._require_shard_feature_semantics(  # noqa: SLF001
+                payload, rows=2, where="fixture"
+            )
+
+
 def test_single_read_registry_evidence_rejects_in_place_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3105,6 +3250,12 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
             "target_information_regime": np.full(
                 n, "public_conservation_pimc_v1", dtype="U32"
             ),
+            "adapter_version": np.full(
+                n, contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
+            ),
+            "event_tokens": np.zeros((n, 2, 1), dtype=np.float16),
+            "event_mask": np.zeros((n, 2), dtype=bool),
+            "event_target_ids": np.full((n, 2, 4), -1, dtype=np.int16),
         }
         # The bounded reserve is real: the highest-seed attempt truncates and
         # must be excluded before selected metrics/holdout construction.
@@ -3166,6 +3317,14 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
                     },
                     "selfplay_config": contract._expected_selfplay_config(lock),
                     "target_information_regime": "public_conservation_pimc_v1",
+                    "adapter_version": contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+                    "public_award_feature_provenance": (
+                        contract._expected_public_award_feature_provenance(  # noqa: SLF001
+                            rust_featurize=bool(
+                                lock["science"]["evaluator"]["rust_featurize"]
+                            )
+                        )
+                    ),
                 }
             ),
             encoding="utf-8",
@@ -3201,6 +3360,13 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
                     "cli_args": cli,
                     "config_hash": config_hash,
                     "target_information_regime": "public_conservation_pimc_v1",
+                    "public_award_feature_provenance": (
+                        contract._expected_public_award_feature_provenance(  # noqa: SLF001
+                            rust_featurize=bool(
+                                lock["science"]["evaluator"]["rust_featurize"]
+                            )
+                        )
+                    ),
                     "worker_summaries": [str(worker)],
                     "shards": [str(shard)],
                 }
@@ -3208,15 +3374,86 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
             encoding="utf-8",
         )
 
+    frozen_repo = tmp_path / "frozen-r2"
+    verifier_sha256 = "sha256:" + "d" * 64
+    verifier_authority = {
+        "schema_version": contract.frozen_lock_verifier.AUTHORITY_SCHEMA,
+        "lock": str(lock_path.resolve(strict=True)),
+        "lock_file_sha256": contract._sha256(lock_path),  # noqa: SLF001
+        "contract_sha256": lock["contract_sha256"],
+        "frozen_repo": str(frozen_repo),
+        "verifier": str(frozen_repo / "tools/a1_pre_wave_contract.py"),
+        "verifier_sha256": verifier_sha256,
+        "require_all_job_claims": True,
+        "verified_lock_sha256": contract._digest_value(lock),  # noqa: SLF001
+    }
+    verifier_authority["authority_sha256"] = contract._digest_value(  # noqa: SLF001
+        verifier_authority
+    )
+    verifier_calls: list[dict[str, object]] = []
+
+    def fake_frozen_verify(
+        path: Path,
+        *,
+        frozen_repo: Path,
+        expected_verifier_sha256: str,
+        require_all_job_claims: bool,
+    ) -> tuple[dict, dict]:
+        verifier_calls.append(
+            {
+                "path": path,
+                "frozen_repo": frozen_repo,
+                "expected_verifier_sha256": expected_verifier_sha256,
+                "require_all_job_claims": require_all_job_claims,
+            }
+        )
+        return json.loads(json.dumps(lock)), json.loads(json.dumps(verifier_authority))
+
+    monkeypatch.setattr(
+        contract.frozen_lock_verifier, "verify_frozen_lock", fake_frozen_verify
+    )
     report_path = tmp_path / "audit.pass.json"
-    report = contract.audit_outputs(lock_path, report_path)
+    report = contract.audit_outputs(
+        lock_path,
+        report_path,
+        frozen_repo=frozen_repo,
+        frozen_verifier_sha256=verifier_sha256,
+    )
     assert report["passed"] is True
+    assert report["lock_verifier_authority"] == verifier_authority
+    assert verifier_calls == [
+        {
+            "path": lock_path.resolve(strict=True),
+            "frozen_repo": frozen_repo,
+            "expected_verifier_sha256": verifier_sha256,
+            "require_all_job_claims": True,
+        }
+    ]
+    assert lock["generation"]["native_mcts_hot_loop"] is True
     assert report["games"] == contract.EXPECTED_GAMES
     assert report["target_information_regime"] == {
         "required": "public_conservation_pimc_v1",
         "counts": {
             "public_conservation_pimc_v1": sum(contract.EXPECTED_ATTEMPTS.values())
         },
+    }
+    feature_semantics = report["feature_semantics"]
+    assert feature_semantics["public_award_feature_provenance"]["expected"] == (
+        contract._expected_public_award_feature_provenance(  # noqa: SLF001
+            rust_featurize=bool(lock["science"]["evaluator"]["rust_featurize"])
+        )
+    )
+    assert feature_semantics["entity_feature_adapter"]["row_counts"] == {
+        contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION: sum(
+            contract.EXPECTED_ATTEMPTS.values()
+        )
+    }
+    assert feature_semantics["event_history"]["authenticated_empty"] is True
+    assert feature_semantics["event_history"]["row_count"] == sum(
+        contract.EXPECTED_ATTEMPTS.values()
+    )
+    assert feature_semantics["event_history"]["history_width_row_counts"] == {
+        "2": sum(contract.EXPECTED_ATTEMPTS.values())
     }
 
     original_create = contract._create_or_verify_readonly

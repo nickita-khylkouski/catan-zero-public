@@ -92,6 +92,7 @@ DEVELOPMENT_CARDS: tuple[str, ...] = (
 
 _BATCH_API_AVAILABLE: bool | None = None
 _UNATTESTED_ROOT_PHASE = object()
+_UNSET_ROOT_EVALUATION = object()
 
 
 def batch_api_available() -> bool:
@@ -1144,6 +1145,10 @@ class GumbelChanceMCTS:
         # sampled tree consumes.
         particle_seeds = [self.rng.getrandbits(64) for _ in range(particle_count)]
         results: list[SearchResult] = []
+        shared_root_evaluation: Any = _UNSET_ROOT_EVALUATION
+        share_root_evaluation = self._can_share_information_set_root_evaluation(
+            len(authoritative_legal)
+        )
         for particle_index, particle_seed in enumerate(particle_seeds):
             sampled = game.determinize_for_player(root_color, int(particle_seed))
             sampled_legal, _sampled_actions, _sampled_spectra = self._fetch_legal_actions(
@@ -1155,19 +1160,65 @@ class GumbelChanceMCTS:
                     f"authoritative={tuple(authoritative_legal)} sampled={tuple(sampled_legal)}"
                 )
             self._information_set_root_turn = int(sampled.num_turns())
-            results.append(
-                self._search_single_world(
-                    sampled,
-                    force_full=use_full,
-                    n_simulations_override=budgets[particle_index],
-                    attested_root_phase=root_phase,
+            if share_root_evaluation:
+                if shared_root_evaluation is _UNSET_ROOT_EVALUATION:
+                    # Public-observation featurization and root legal actions are
+                    # identical across conservation-PIMC worlds.  D6 therefore
+                    # denoises the same public root twelve times per particle.
+                    # Evaluate the first validated sampled world once (never the
+                    # hidden-truth authoritative game) and reuse only that root
+                    # result; every interior leaf remains particle-specific.
+                    shared_root_evaluation = (
+                        self.evaluator.evaluate_symmetry_averaged(
+                            sampled,
+                            tuple(sampled_legal),
+                            root_color=root_color,
+                            colors=self.config.colors,
+                        )
+                    )
+                results.append(
+                    self._search_single_world(
+                        sampled,
+                        force_full=use_full,
+                        n_simulations_override=budgets[particle_index],
+                        attested_root_phase=root_phase,
+                        precomputed_root_evaluation=shared_root_evaluation,
+                    )
                 )
-            )
+            else:
+                results.append(
+                    self._search_single_world(
+                        sampled,
+                        force_full=use_full,
+                        n_simulations_override=budgets[particle_index],
+                        attested_root_phase=root_phase,
+                    )
+                )
         return self._aggregate_information_set_results(
             results,
             legal_actions=tuple(authoritative_legal),
             used_full_search=use_full,
             root_phase=root_phase,
+        )
+
+    def _can_share_information_set_root_evaluation(self, legal_width: int) -> bool:
+        """Whether PIMC particles share one public D6 root evaluation.
+
+        This is intentionally narrower than generic evaluator caching: only the
+        symmetry-averaged *root* is shared, only under public information-set
+        search, and only when the same width gate that selects D6 is active.
+        """
+        return (
+            bool(self.config.information_set_search)
+            and bool(self.config.symmetry_averaged_eval)
+            and _matches_explicit_or_legacy_width_gate(
+                int(legal_width),
+                min_legal_actions=self.config.symmetry_averaged_eval_threshold,
+                legacy_exclusive_threshold=self.config.wide_candidates_threshold,
+            )
+            and callable(
+                getattr(self.evaluator, "evaluate_symmetry_averaged", None)
+            )
         )
 
     def _aggregate_information_set_results(
@@ -1406,6 +1457,7 @@ class GumbelChanceMCTS:
         force_full: bool | None = None,
         n_simulations_override: int | None = None,
         attested_root_phase: str | None | object = _UNATTESTED_ROOT_PHASE,
+        precomputed_root_evaluation: Any = _UNSET_ROOT_EVALUATION,
     ) -> SearchResult:
         root_color = str(game.current_color())
         legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(game)
@@ -1451,7 +1503,14 @@ class GumbelChanceMCTS:
             root_color=root_color,
             root_phase=self._resolve_d1_root_phase(game, attested_root_phase),
         )
-        self._expand(root, at_root=True)
+        if precomputed_root_evaluation is _UNSET_ROOT_EVALUATION:
+            self._expand(root, at_root=True)
+        else:
+            self._expand(
+                root,
+                at_root=True,
+                precomputed_evaluation=precomputed_root_evaluation,
+            )
         priors = {action_id: stats.prior for action_id, stats in root.actions.items()}
 
         sh_winner_action, used = self._run_root_search(
@@ -2721,9 +2780,25 @@ class GumbelChanceMCTS:
         node.expanded = True
         return True
 
-    def _expand(self, node: _GNode, *, at_root: bool = False) -> float:
+    def _expand(
+        self,
+        node: _GNode,
+        *,
+        at_root: bool = False,
+        precomputed_evaluation: Any = _UNSET_ROOT_EVALUATION,
+    ) -> float:
         legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(node.game)
-        if (
+        if precomputed_evaluation is not _UNSET_ROOT_EVALUATION:
+            if not at_root:
+                raise RuntimeError("precomputed evaluation is valid only at the root")
+            priors, value, uncertainty = _split_evaluation(
+                precomputed_evaluation
+            )
+            # `_finish_expand` may add a missing-action floor before
+            # normalization.  Keep the shared evaluator result immutable across
+            # particles even for a partial/custom evaluator.
+            priors = dict(priors)
+        elif (
             at_root
             and bool(self.config.symmetry_averaged_eval)
             and _matches_explicit_or_legacy_width_gate(

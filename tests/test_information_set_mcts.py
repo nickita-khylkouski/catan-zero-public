@@ -172,6 +172,93 @@ def test_information_set_particles_share_one_exact_total_budget() -> None:
     assert sum(result.visit_counts.values()) == 128
 
 
+def test_information_set_d6_reuses_one_public_root_without_operator_drift() -> None:
+    class _CountingD6Evaluator:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(public_observation=True)
+            self.calls = 0
+
+        def evaluate_symmetry_averaged(
+            self, game, legal_actions, *, root_color, colors
+        ):
+            assert isinstance(game, _SampledGame)
+            assert tuple(legal_actions) == (11, 12)
+            assert root_color == "RED"
+            assert tuple(colors) == ("RED", "BLUE")
+            self.calls += 1
+            return {11: 0.4, 12: 0.6}, 0.2
+
+    missing = object()
+
+    def build(*, share: bool):
+        mcts = _mcts()
+        mcts.config = replace(
+            mcts.config,
+            symmetry_averaged_eval=True,
+            symmetry_averaged_eval_threshold=2,
+        )
+        evaluator = _CountingD6Evaluator()
+        mcts.evaluator = evaluator
+        seen_evaluations: list[object] = []
+
+        def search_one(
+            _self,
+            game,
+            *,
+            force_full=None,
+            n_simulations_override=None,
+            attested_root_phase=None,
+            precomputed_root_evaluation=missing,
+        ):
+            del attested_root_phase
+            if precomputed_root_evaluation is missing:
+                root_evaluation = evaluator.evaluate_symmetry_averaged(
+                    game,
+                    (11, 12),
+                    root_color="RED",
+                    colors=("RED", "BLUE"),
+                )
+            else:
+                root_evaluation = precomputed_root_evaluation
+            seen_evaluations.append(root_evaluation)
+            priors, root_value = root_evaluation
+            budget = int(n_simulations_override)
+            p11 = 0.25 + (game.seed % 100) / 1000.0
+            return SearchResult(
+                selected_action=11,
+                improved_policy={11: p11, 12: 1.0 - p11},
+                visit_counts={11: budget // 2, 12: budget - budget // 2},
+                q_values={11: 0.1, 12: -0.1},
+                priors=dict(priors),
+                root_value=float(root_value),
+                used_full_search=bool(force_full),
+                simulations_used=budget,
+            )
+
+        mcts._search_single_world = MethodType(search_one, mcts)
+        if not share:
+
+            def never_share(_self, _legal_width):
+                return False
+
+            mcts._can_share_information_set_root_evaluation = MethodType(
+                never_share, mcts
+            )
+        return mcts, evaluator, seen_evaluations
+
+    shared, shared_evaluator, shared_objects = build(share=True)
+    repeated, repeated_evaluator, _repeated_objects = build(share=False)
+    shared_result = shared.search(_AuthoritativeGame("truth A"), force_full=True)
+    repeated_result = repeated.search(
+        _AuthoritativeGame("truth B"), force_full=True
+    )
+
+    assert shared_evaluator.calls == 1
+    assert repeated_evaluator.calls == 4
+    assert len({id(result) for result in shared_objects}) == 1
+    assert shared_result == repeated_result
+
+
 def test_per_particle_override_enforces_exact_total_budget() -> None:
     """Particle sub-budgets cannot inherit legacy SH rounding overruns."""
 

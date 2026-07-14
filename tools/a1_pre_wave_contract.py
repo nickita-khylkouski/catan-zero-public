@@ -51,13 +51,24 @@ if str(TOOLS) not in sys.path:
 
 from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig  # noqa: E402
 from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluatorConfig  # noqa: E402
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    ENTITY_FEATURE_ADAPTER_SPECS,
+    require_known_entity_feature_adapter,
+)
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
     GumbelSelfPlayConfig,
     PLAYER_NAMES,
     TARGET_INFORMATION_REGIME_PUBLIC,
     _pool_champion_plays_first_seat,
 )
+from catan_zero.rl.entity_token_policy import (  # noqa: E402
+    PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+)
 from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
+from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
+from tools import audit_entity_graph_information_surface as information_surface  # noqa: E402
+from tools import generate_gumbel_selfplay_data as generation_cli  # noqa: E402
 from tools import legacy_scalar_readout_attestation as legacy_scalar  # noqa: E402
 from tools import a0_binding_verdict as a0_binding  # noqa: E402
 from tools import search_teacher_adjudicator as search_adjudicator  # noqa: E402
@@ -8923,18 +8934,177 @@ def _validate_selected_opponent_rows(
         raise ContractError("selected opponent player/seat provenance disagrees")
 
 
+def _expected_public_award_feature_provenance(
+    *, rust_featurize: bool
+) -> dict[str, Any]:
+    """Return the one producer record authorized by the sealed feature path.
+
+    The generator owns the provenance schema/contract constants.  The model
+    owns the checkpoint-side contract constant.  Requiring those two existing
+    authorities to agree prevents this audit from silently inventing a third
+    interpretation of player-token slot 12.
+    """
+
+    if (
+        generation_cli.PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+        != PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+    ):
+        raise ContractError(
+            "generator/model public-award authoritative contracts disagree"
+        )
+    return {
+        "schema_version": generation_cli.PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA,
+        "contract": PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
+        "feature_producer": (
+            "catanatron_rs_public_award_v1"
+            if rust_featurize
+            else "python_snapshot_public_award_v1"
+        ),
+        "native_capability": (
+            "public_award_feature_parity" if rust_featurize else None
+        ),
+    }
+
+
+def _require_public_award_feature_provenance(
+    raw: object,
+    *,
+    rust_featurize: bool,
+    where: str,
+) -> dict[str, Any]:
+    expected = _expected_public_award_feature_provenance(
+        rust_featurize=rust_featurize
+    )
+    if not isinstance(raw, Mapping) or dict(raw) != expected:
+        raise ContractError(
+            f"{where}: public_award_feature_provenance drift; "
+            f"observed={raw!r} expected={expected!r}"
+        )
+    return expected
+
+
+def _authenticated_empty_event_authority() -> dict[str, Any]:
+    """Resolve the checked-in adapter/native empty-history authorities.
+
+    This intentionally fails when either existing registry advances to a
+    public-event implementation.  Such a rollout must issue a new generation
+    contract instead of letting the old post-wave acceptance path reinterpret
+    new event tensors as the authenticated-empty corpus it was written for.
+    """
+
+    adapter_version = require_known_entity_feature_adapter(
+        CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    adapter_spec = ENTITY_FEATURE_ADAPTER_SPECS[adapter_version]
+    native = information_surface.native_inference_event_history_capability()
+    if adapter_spec.event_history != "empty" or native.get("available") is not False:
+        raise ContractError(
+            "post-wave authenticated-empty event audit is incompatible with the "
+            "current adapter/native event-history authority"
+        )
+    return {
+        "entity_feature_adapter_version": adapter_version,
+        "adapter_event_history_semantic": adapter_spec.event_history,
+        "native_inference": native,
+    }
+
+
+def _require_shard_feature_semantics(
+    payload: Any,
+    *,
+    rows: int,
+    where: str,
+) -> dict[str, Any]:
+    """Authenticate adapter identity and the current constant-empty events.
+
+    All attempts are checked, including reserve/truncated games.  That matters
+    because the audit publishes every shard as accepted source material even
+    though only a deterministic game subset is selected for this learner.
+    """
+
+    authority = _authenticated_empty_event_authority()
+    required = {"adapter_version", "event_tokens", "event_mask", "event_target_ids"}
+    missing = sorted(required.difference(payload.files))
+    if missing:
+        raise ContractError(
+            f"{where}: missing feature-semantic columns {missing}"
+        )
+
+    adapters = np.asarray(payload["adapter_version"])
+    if adapters.shape != (rows,):
+        raise ContractError(f"{where}: adapter_version is not row-aligned")
+    observed_adapters = set(adapters.astype(str).tolist())
+    expected_adapter = str(authority["entity_feature_adapter_version"])
+    if observed_adapters != {expected_adapter}:
+        raise ContractError(
+            f"{where}: adapter_version drift; observed={sorted(observed_adapters)} "
+            f"expected={[expected_adapter]}"
+        )
+
+    event_mask = np.asarray(payload["event_mask"])
+    if (
+        event_mask.ndim != 2
+        or event_mask.shape[0] != rows
+        or event_mask.shape[1] <= 0
+    ):
+        raise ContractError(
+            f"{where}: event_mask violates the entity schema: {event_mask.shape}"
+        )
+    if event_mask.dtype.kind != "b":
+        raise ContractError(f"{where}: event_mask is not boolean")
+    if np.any(event_mask):
+        raise ContractError(f"{where}: authenticated-empty event_mask has live entries")
+    empty_scan = {
+        "schema": "training-empty-event-mask-scan-v1",
+        "row_count": rows,
+        "padded_event_width": int(event_mask.shape[1]),
+        "nonzero_event_mask_count": 0,
+    }
+    empty_scan["scan_sha256"] = _digest_value(empty_scan)
+    return {
+        "row_count": rows,
+        "entity_feature_adapter_version": expected_adapter,
+        "event_history": {
+            "authenticated_empty": True,
+            "empty_event_mask_scan": empty_scan,
+        },
+    }
+
+
 def audit_outputs(
     lock_path: Path,
     out_path: Path,
     *,
     harvest_relocation: Path | None = None,
+    frozen_repo: Path | None = None,
+    frozen_verifier_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Deep post-wave audit.  This is callable only after generation; it never launches it."""
+    if (frozen_repo is None) != (frozen_verifier_sha256 is None):
+        raise ContractError(
+            "post-wave audit requires --frozen-repo and "
+            "--frozen-verifier-sha256 together"
+        )
     try:
         lock_path = lock_path.expanduser().resolve(strict=True)
     except OSError as error:
         raise ContractError(f"cannot resolve contract lock {lock_path}: {error}") from error
-    lock = verify_lock(lock_path, require_all_job_claims=True)
+    lock_verifier_authority: dict[str, Any] | None = None
+    if frozen_repo is None:
+        lock = verify_lock(lock_path, require_all_job_claims=True)
+    else:
+        assert frozen_verifier_sha256 is not None
+        try:
+            lock, lock_verifier_authority = frozen_lock_verifier.verify_frozen_lock(
+                lock_path,
+                frozen_repo=frozen_repo,
+                expected_verifier_sha256=frozen_verifier_sha256,
+                require_all_job_claims=True,
+            )
+        except frozen_lock_verifier.FrozenVerifierError as error:
+            raise ContractError(
+                f"frozen post-wave lock verification failed: {error}"
+            ) from error
     game_contract = dict(lock["game_contract"])
     expected_games = {
         str(key): int(value) for key, value in game_contract["category_games"].items()
@@ -8969,6 +9139,11 @@ def audit_outputs(
     job_selections: list[dict[str, Any]] = []
     selected_game_records: list[dict[str, Any]] = []
     target_information_regimes: Counter[str] = Counter()
+    feature_semantic_rows = 0
+    adapter_version_counts: Counter[str] = Counter()
+    event_history_width_counts: Counter[int] = Counter()
+    public_award_generation_manifests = 0
+    public_award_worker_manifests = 0
     required_target_information_regime = str(
         lock["post_wave_acceptance"]["require_target_information_regime"]
     )
@@ -8976,6 +9151,11 @@ def audit_outputs(
     checkpoint_by_id = {record["id"]: record for record in lock["checkpoints"]}
     category_specs = {item["name"]: item for item in lock["source_categories"]}
     selfplay_colors = tuple(_expected_selfplay_config(lock)["colors"])
+    rust_featurize = bool(lock["science"]["evaluator"]["rust_featurize"])
+    expected_public_award_provenance = _expected_public_award_feature_provenance(
+        rust_featurize=rust_featurize
+    )
+    empty_event_authority = _authenticated_empty_event_authority()
     for job in lock["fleet"]["jobs"]:
         attestation_source = Path(job["output_dir"]) / "a1_contract.json"
         attestation_path = (
@@ -9013,6 +9193,16 @@ def audit_outputs(
             errors.append(f"missing manifest: {manifest_path}")
             continue
         manifest = _load_json(manifest_path)
+        try:
+            _require_public_award_feature_provenance(
+                manifest.get("public_award_feature_provenance"),
+                rust_featurize=rust_featurize,
+                where=str(job["job_id"]),
+            )
+        except ContractError as error:
+            errors.append(str(error))
+        else:
+            public_award_generation_manifests += 1
         shard_records.append(
             {
                 "kind": "generation_manifest",
@@ -9024,6 +9214,9 @@ def audit_outputs(
                 "producer_checkpoint_sha256": producer["sha256"],
                 "opponent_checkpoint_sha256": _category_opponent_sha256(
                     lock, job["category"]
+                ),
+                "public_award_feature_provenance": manifest.get(
+                    "public_award_feature_provenance"
                 ),
             }
         )
@@ -9136,6 +9329,40 @@ def audit_outputs(
                 )
                 continue
             worker_manifest = _load_json(worker_manifest_path)
+            try:
+                _require_public_award_feature_provenance(
+                    worker_manifest.get("public_award_feature_provenance"),
+                    rust_featurize=rust_featurize,
+                    where=str(worker_manifest_path),
+                )
+            except ContractError as error:
+                errors.append(f"{job['job_id']}: {error}")
+            else:
+                public_award_worker_manifests += 1
+            expected_adapter_version = empty_event_authority[
+                "entity_feature_adapter_version"
+            ]
+            if worker_manifest.get("adapter_version") != expected_adapter_version:
+                errors.append(
+                    f"{job['job_id']}: worker adapter_version="
+                    f"{worker_manifest.get('adapter_version')!r}, expected "
+                    f"{expected_adapter_version!r}"
+                )
+            shard_records.append(
+                {
+                    "kind": "worker_generation_manifest",
+                    "path": str(worker_manifest_path),
+                    "sha256": _sha256(worker_manifest_path),
+                    "job_id": job["job_id"],
+                    "category": job["category"],
+                    "entity_feature_adapter_version": worker_manifest.get(
+                        "adapter_version"
+                    ),
+                    "public_award_feature_provenance": worker_manifest.get(
+                        "public_award_feature_provenance"
+                    ),
+                }
+            )
             if (
                 worker_manifest.get("target_information_regime")
                 != required_target_information_regime
@@ -9218,8 +9445,7 @@ def audit_outputs(
                     raise ContractError(f"duplicate shard reference {canonical_shard}")
                 seen_shards.add(canonical_shard)
                 job_shards.append(canonical_shard)
-                shard_records.append(
-                    {
+                data_shard_record = {
                         "kind": "data_shard",
                         "path": str(canonical_shard),
                         "sha256": _sha256(canonical_shard),
@@ -9236,8 +9462,17 @@ def audit_outputs(
                             lock, job
                         )["effective_search_config_sha256"],
                         "evaluator_sha256": lock["science"]["evaluator_sha256"],
+                        "entity_feature_adapter_version": empty_event_authority[
+                            "entity_feature_adapter_version"
+                        ],
+                        "public_award_feature_contract": (
+                            PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+                        ),
+                        "event_history_semantic": empty_event_authority[
+                            "adapter_event_history_semantic"
+                        ],
                     }
-                )
+                shard_records.append(data_shard_record)
                 with np.load(canonical_shard, allow_pickle=False) as payload:
                     game_seeds = np.asarray(payload["game_seed"], dtype=np.int64)
                     decision_indices = np.asarray(
@@ -9257,6 +9492,26 @@ def audit_outputs(
                             "game status/target-information/decision arrays are not "
                             "row-aligned"
                         )
+                    feature_semantics = _require_shard_feature_semantics(
+                        payload,
+                        rows=int(game_seeds.size),
+                        where=f"{job['job_id']}:{canonical_shard.name}",
+                    )
+                    feature_semantic_rows += int(feature_semantics["row_count"])
+                    adapter_version_counts.update(
+                        [str(feature_semantics["entity_feature_adapter_version"])]
+                        * int(feature_semantics["row_count"])
+                    )
+                    event_history_width_counts[
+                        int(
+                            feature_semantics["event_history"][
+                                "empty_event_mask_scan"
+                            ]["padded_event_width"]
+                        )
+                    ] += int(feature_semantics["row_count"])
+                    data_shard_record["feature_semantics_sha256"] = _digest_value(
+                        feature_semantics
+                    )
                     target_information_regimes.update(regimes.tolist())
                     if np.any(regimes != required_target_information_regime):
                         actual = sorted(set(regimes.tolist()))
@@ -9504,6 +9759,23 @@ def audit_outputs(
     record_seeds = [int(record["game_seed"]) for record in selected_game_records]
     if len(record_seeds) != len(all_seeds) or set(record_seeds) != all_seeds:
         errors.append("selected game/source records do not bijectively cover selected seeds")
+    expected_worker_manifest_count = sum(
+        min(int(lock["generation"]["workers_per_gpu"]), int(job["attempts"]))
+        for job in lock["fleet"]["jobs"]
+    )
+    if public_award_generation_manifests != len(lock["fleet"]["jobs"]):
+        errors.append(
+            "public-award provenance did not authenticate every generation manifest"
+        )
+    if public_award_worker_manifests != expected_worker_manifest_count:
+        errors.append(
+            "public-award provenance did not authenticate every worker manifest"
+        )
+    if len(event_history_width_counts) > 1:
+        errors.append(
+            "authenticated-empty event history uses mixed padded widths: "
+            f"{dict(event_history_width_counts)}"
+        )
     validation_contract = lock["post_wave_acceptance"]["validation_holdout"]
     validation_seed_manifest_path = out_path.with_suffix(".validation_seeds.json")
     selected_game_manifest_path = out_path.with_suffix(".selected_games.json")
@@ -9602,6 +9874,50 @@ def audit_outputs(
                 else [{**record, "arm_id": arm_id} for record in selected_records]
             ),
         }
+    adapter_version = str(empty_event_authority["entity_feature_adapter_version"])
+    padded_event_width = (
+        next(iter(event_history_width_counts))
+        if len(event_history_width_counts) == 1
+        else None
+    )
+    aggregate_empty_event_scan: dict[str, Any] = {
+        "schema": "training-empty-event-mask-scan-v1",
+        "row_count": feature_semantic_rows,
+        "padded_event_width": padded_event_width,
+        "nonzero_event_mask_count": 0,
+    }
+    aggregate_empty_event_scan["scan_sha256"] = _digest_value(
+        aggregate_empty_event_scan
+    )
+    feature_semantics_report: dict[str, Any] = {
+        "public_award_feature_provenance": {
+            "expected": expected_public_award_provenance,
+            "generation_manifests_authenticated": (
+                public_award_generation_manifests
+            ),
+            "worker_manifests_authenticated": public_award_worker_manifests,
+        },
+        "entity_feature_adapter": {
+            "version": adapter_version,
+            "base_adapter_spec": dataclasses.asdict(
+                ENTITY_FEATURE_ADAPTER_SPECS[adapter_version]
+            ),
+            "row_counts": dict(adapter_version_counts),
+        },
+        "event_history": {
+            **empty_event_authority,
+            "authenticated_empty": True,
+            "row_count": feature_semantic_rows,
+            "history_width_row_counts": {
+                str(width): count
+                for width, count in sorted(event_history_width_counts.items())
+            },
+            "empty_event_mask_scan": aggregate_empty_event_scan,
+        },
+    }
+    feature_semantics_report["feature_semantics_sha256"] = _digest_value(
+        feature_semantics_report
+    )
     report: dict[str, Any] = {
         "schema_version": (
             DUAL_ARM_AUDIT_SCHEMA
@@ -9618,6 +9934,11 @@ def audit_outputs(
         ),
         "contract_path": str(lock_path.absolute()),
         "contract_sha256": lock["contract_sha256"],
+        **(
+            {}
+            if lock_verifier_authority is None
+            else {"lock_verifier_authority": lock_verifier_authority}
+        ),
         "passed": not errors,
         "errors": errors,
         "games": {category: len(seeds) for category, seeds in category_seeds.items()},
@@ -9633,6 +9954,7 @@ def audit_outputs(
             "required": required_target_information_regime,
             "counts": dict(target_information_regimes),
         },
+        "feature_semantics": feature_semantics_report,
         "reports": {
             "truncation": {
                 "selected_truncated_games": 0,
@@ -9673,6 +9995,13 @@ def audit_outputs(
                     lock["science"]["search_operator"], lock["fleet"]["jobs"]
                 )[category]["effective_search_config_sha256"],
                 "evaluator_sha256": lock["science"]["evaluator_sha256"],
+                "public_award_feature_provenance": (
+                    expected_public_award_provenance
+                ),
+                "entity_feature_adapter_version": adapter_version,
+                "event_history_semantic": empty_event_authority[
+                    "adapter_event_history_semantic"
+                ],
             }
             for category in expected_games
         },
@@ -9840,6 +10169,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     audit_parser.add_argument("--lock", required=True)
     audit_parser.add_argument("--out", required=True)
     audit_parser.add_argument(
+        "--frozen-repo",
+        help=(
+            "exact historical checkout whose path-bound verifier authenticates "
+            "the sealed lock"
+        ),
+    )
+    audit_parser.add_argument(
+        "--frozen-verifier-sha256",
+        help="explicit SHA-256 of the frozen checkout's lock verifier",
+    )
+    audit_parser.add_argument(
         "--harvest-relocation",
         help=(
             "typed a1-fleet-harvest-relocation-v1 map for atomically "
@@ -9996,6 +10336,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.harvest_relocation is None
                 else Path(args.harvest_relocation).absolute()
             ),
+            frozen_repo=(
+                None if args.frozen_repo is None else Path(args.frozen_repo).absolute()
+            ),
+            frozen_verifier_sha256=args.frozen_verifier_sha256,
         )
         print(json.dumps({"status": "PASS", "audit_sha256": payload["audit_sha256"]}))
         return 0

@@ -416,6 +416,33 @@ def _audit_fixture(tmp_path: Path, lock: dict, data_shards: list[dict]) -> dict:
     }
 
 
+def _lock_verifier_authority(
+    tmp_path: Path,
+    *,
+    name: str,
+    lock_path: Path,
+    lock: dict,
+    require_all_job_claims: bool,
+) -> dict:
+    frozen = tmp_path / name
+    verifier = frozen / "tools" / "a1_pre_wave_contract.py"
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text("# exact frozen verifier fixture\n", encoding="utf-8")
+    authority = {
+        "schema_version": builder.frozen_lock_verifier.AUTHORITY_SCHEMA,
+        "lock": str(lock_path.resolve()),
+        "lock_file_sha256": builder._file_sha256(lock_path),  # noqa: SLF001
+        "contract_sha256": lock["contract_sha256"],
+        "frozen_repo": str(frozen.resolve()),
+        "verifier": str(verifier.resolve()),
+        "verifier_sha256": builder._file_sha256(verifier),  # noqa: SLF001
+        "require_all_job_claims": require_all_job_claims,
+        "verified_lock_sha256": builder._digest(lock),  # noqa: SLF001
+    }
+    authority["authority_sha256"] = builder._digest(authority)  # noqa: SLF001
+    return authority
+
+
 def test_filter_wave_shards_binds_job_category_seed_before_expansion(
     tmp_path: Path,
 ) -> None:
@@ -633,18 +660,18 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
         "hard_negative": 1.0,
         "historical_replay": 0.52,
     }
-    assert descriptor["policy_kl_anchor_component_ids"] == [
-        "historical_replay"
-    ]
+    assert descriptor["policy_kl_anchor_component_ids"] == []
     assert descriptor["policy_distillation_component_ids"] == [
         "current_producer",
         "recent_history",
         "hard_negative",
+        "historical_replay",
     ]
     assert descriptor["value_training_component_ids"] == [
         "current_producer",
         "recent_history",
         "hard_negative",
+        "historical_replay",
     ]
     assert descriptor["learner_recipe_overrides"][
         "policy_kl_anchor_weight"
@@ -700,8 +727,6 @@ def test_frozen_runtime_verifier_replays_exact_path_bound_lock(
         """from __future__ import annotations
 import json
 def verify_lock(path, *, require_all_job_claims=False):
-    if require_all_job_claims is not True:
-        raise RuntimeError('all claims required')
     with open(path, encoding='utf-8') as handle:
         return json.load(handle)
 """,
@@ -723,18 +748,42 @@ def verify_lock(path, *, require_all_job_claims=False):
     }
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
 
-    verify = builder._frozen_runtime_lock_verifier(  # noqa: SLF001
+    verify, authority = builder.frozen_lock_verifier.build_frozen_lock_verifier(
         frozen_repo=frozen,
         expected_verifier_sha256=verifier_sha,
         lock_path=lock_path,
     )
     assert verify(lock_path, require_all_job_claims=True) == lock
+    assert authority["schema_version"] == "a1-frozen-lock-verifier-authority-v1"
+    assert authority["verifier_sha256"] == verifier_sha
+    assert authority["require_all_job_claims"] is True
     with pytest.raises(
-        builder.CompositeBuildError, match="exact path and all job claims"
+        builder.frozen_lock_verifier.FrozenVerifierError,
+        match="exact path and sealed job-claim mode",
     ):
         verify(lock_path, require_all_job_claims=False)
-    with pytest.raises(builder.CompositeBuildError, match="explicit SHA-256"):
-        builder._frozen_runtime_lock_verifier(  # noqa: SLF001
+
+    historical_verify, historical_authority = (
+        builder.frozen_lock_verifier.build_frozen_lock_verifier(
+            frozen_repo=frozen,
+            expected_verifier_sha256=verifier_sha,
+            lock_path=lock_path,
+            require_all_job_claims=False,
+        )
+    )
+    assert historical_verify(lock_path, require_all_job_claims=False) == lock
+    assert historical_authority["require_all_job_claims"] is False
+    assert historical_authority["authority_sha256"] != authority["authority_sha256"]
+    with pytest.raises(
+        builder.frozen_lock_verifier.FrozenVerifierError,
+        match="exact path and sealed job-claim mode",
+    ):
+        historical_verify(lock_path, require_all_job_claims=True)
+    with pytest.raises(
+        builder.frozen_lock_verifier.FrozenVerifierError,
+        match="explicit SHA-256",
+    ):
+        builder.frozen_lock_verifier.build_frozen_lock_verifier(
             frozen_repo=frozen,
             expected_verifier_sha256="sha256:" + "0" * 64,
             lock_path=lock_path,
@@ -825,6 +874,35 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     )
     lock_path = tmp_path / "contract.lock.json"
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    historical_wrapper = json.loads(historical_ref.read_text(encoding="utf-8"))
+    prior_lock_path = Path(
+        historical_wrapper["authority"]["source_contract"]["path"]
+    )
+    prior_lock = json.loads(prior_lock_path.read_text(encoding="utf-8"))
+    historical_verify_calls: list[tuple[Path, bool]] = []
+
+    def historical_verify_lock(
+        path: Path, *, require_all_job_claims: bool = True
+    ) -> dict:
+        historical_verify_calls.append((path.resolve(), require_all_job_claims))
+        assert path.resolve() == prior_lock_path.resolve()
+        assert require_all_job_claims is False
+        return prior_lock
+
+    current_verifier_authority = _lock_verifier_authority(
+        tmp_path,
+        name="current-frozen",
+        lock_path=lock_path,
+        lock=lock,
+        require_all_job_claims=True,
+    )
+    historical_verifier_authority = _lock_verifier_authority(
+        tmp_path,
+        name="historical-frozen",
+        lock_path=prior_lock_path,
+        lock=prior_lock,
+        require_all_job_claims=False,
+    )
     monkeypatch.setattr(
         builder,
         "_validated_wave_inputs",
@@ -837,7 +915,12 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         audit_path=Path(str(audit["path"])),
         historical_component_path=historical_ref,
         output_root=output,
+        verify_lock_fn=lambda *_args, **_kwargs: lock,
+        historical_verify_lock_fn=historical_verify_lock,
+        current_lock_verifier_authority=current_verifier_authority,
+        historical_lock_verifier_authority=historical_verifier_authority,
     )
+    assert historical_verify_calls == [(prior_lock_path.resolve(), False)]
     descriptor_path = Path(str(receipt["descriptor"]["path"]))
     # A learner B200 receives the filtered composite and authority bundle, not
     # the multi-gigabyte raw generation tree.  Removing every original data
@@ -867,9 +950,7 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
 
     assert verified["data_kind"] == "production_composite_v2"
     assert verified["bound_recipe"]["policy_kl_anchor_weight"] == 0.0
-    assert verified["recipe"]["policy_kl_anchor_weight"] == (
-        builder.HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT
-    )
+    assert verified["recipe"]["policy_kl_anchor_weight"] == 0.0
     assert (
         verified["production_mix_contract"]["effective_component_sampling_ratios"]
         == builder.EFFECTIVE_COMPONENT_RATIOS
@@ -879,6 +960,38 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     assert verified["validation_split_receipt"]["aggregate"]["selected_game_count"] == 8
 
     authority_path = Path(receipt["source_authority"]["path"])
+    source_authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    assert source_authority["schema_version"] == (
+        "a1-post-wave-composite-source-authority-v2"
+    )
+    assert source_authority["lock_verifier_authorities"] == {
+        "current_wave": current_verifier_authority,
+        "historical_replay": historical_verifier_authority,
+    }
+    assert source_authority["lock_verifier_authorities"]["current_wave"][
+        "require_all_job_claims"
+    ] is True
+    assert source_authority["lock_verifier_authorities"]["historical_replay"][
+        "require_all_job_claims"
+    ] is False
+    drifted_verifier = json.loads(authority_path.read_text(encoding="utf-8"))
+    drifted_current = drifted_verifier["lock_verifier_authorities"]["current_wave"]
+    drifted_current["require_all_job_claims"] = False
+    drifted_current.pop("authority_sha256")
+    drifted_current["authority_sha256"] = builder._digest(  # noqa: SLF001
+        drifted_current
+    )
+    drifted_verifier.pop("authority_sha256")
+    drifted_verifier["authority_sha256"] = builder._digest(  # noqa: SLF001
+        drifted_verifier
+    )
+    drifted_verifier_path = output / "drifted-verifier-authority.json"
+    drifted_verifier_path.write_text(json.dumps(drifted_verifier), encoding="utf-8")
+    with pytest.raises(SystemExit, match="lock-verifier authority binding drift"):
+        builder.train_bc._validate_flywheel_source_authority(  # noqa: SLF001
+            drifted_verifier_path
+        )
+
     tampered = json.loads(authority_path.read_text(encoding="utf-8"))
     tampered["canonical_composite_root"] = str(tmp_path.resolve())
     binding = tampered["fresh_source_bindings"][0]

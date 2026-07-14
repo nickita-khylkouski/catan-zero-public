@@ -44,6 +44,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import a1_build_post_wave_composite as composite_builder  # noqa: E402
+from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
 from tools import train_bc  # noqa: E402
 from tools import a1_lineage_dose as lineage  # noqa: E402
 from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
@@ -61,6 +62,7 @@ REPORT_EXECUTION_BINDING_SCHEMA = "a1-one-dose-execution-binding-v1"
 REPORT_EXECUTION_BINDING_FIELD = "a1_one_dose_execution_binding"
 REPORT_INPUT_BINDING_SCHEMA = "a1-one-dose-input-binding-v1"
 REPORT_INPUT_BINDING_FIELD = "a1_one_dose_input_binding"
+TRAINING_TRANSACTION_SCHEMA = "a1-one-dose-training-transaction-v1"
 RETRY_CONTRACT_SCHEMA = "a1-one-dose-learner-retry-contract-v1"
 RETRY_IDENTITY_SCHEMA = "a1-one-dose-learner-retry-identity-v1"
 RETRY_REPAIR_KIND = "entity_graph_graph_layers_default_4_to_checkpoint_6"
@@ -708,8 +710,27 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
                 ],
             }
         )
+    lock_verifier_authority = verified.get("lock_verifier_authority")
+    if lock_verifier_authority is not None:
+        payload["lock_verifier_authority"] = copy.deepcopy(
+            lock_verifier_authority
+        )
     payload["binding_sha256"] = _value_sha256(payload)
     return payload
+
+
+def _training_transaction_sha256(
+    *, command: Sequence[str], input_binding: Mapping[str, Any]
+) -> str:
+    """Bind child argv and frozen-input authority into one launch identity."""
+
+    return _value_sha256(
+        {
+            "schema_version": TRAINING_TRANSACTION_SCHEMA,
+            "command_sha256": _value_sha256(list(command)),
+            "input_binding_sha256": input_binding.get("binding_sha256"),
+        }
+    )
 
 
 def _validate_execution_binding(binding: dict[str, Any]) -> None:
@@ -860,6 +881,42 @@ def _verify_lock_with_sealed_runtime(
     return verified
 
 
+def _verify_training_lock(
+    lock_path: Path,
+    *,
+    reviewed_lock_file_sha256: str | None = None,
+    frozen_repo: Path | None = None,
+    frozen_verifier_sha256: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Select exactly one authenticated lock-verification authority."""
+
+    if bool(frozen_repo) != bool(frozen_verifier_sha256):
+        raise ExecutorError(
+            "--frozen-repo and --frozen-verifier-sha256 are required together"
+        )
+    if frozen_repo is not None and reviewed_lock_file_sha256 is not None:
+        raise ExecutorError(
+            "frozen lock authority and reviewed-ablation lock authority are mutually exclusive"
+        )
+    if frozen_repo is None:
+        return (
+            _verify_lock_with_sealed_runtime(
+                lock_path,
+                reviewed_lock_file_sha256=reviewed_lock_file_sha256,
+            ),
+            None,
+        )
+    assert frozen_verifier_sha256 is not None
+    try:
+        return frozen_lock_verifier.verify_frozen_lock(
+            lock_path,
+            frozen_repo=frozen_repo,
+            expected_verifier_sha256=frozen_verifier_sha256,
+        )
+    except frozen_lock_verifier.FrozenVerifierError as error:
+        raise ExecutorError(f"frozen A1 lock verifier refused: {error}") from error
+
+
 def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     science = lock.get("science")
     if not isinstance(science, dict):
@@ -907,6 +964,8 @@ def verify_training_inputs(
     validation_path: Path | None,
     composite_build_receipt: Path | None = None,
     reviewed_lock_file_sha256: str | None = None,
+    frozen_repo: Path | None = None,
+    frozen_verifier_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Replay the sealed lock and complete audit→memmap→holdout chain."""
 
@@ -929,8 +988,11 @@ def verify_training_inputs(
         raise ExecutorError(f"A1 data path is not a corpus directory/descriptor: {data_path}")
 
     try:
-        lock = _verify_lock_with_sealed_runtime(
-            lock_path, reviewed_lock_file_sha256=reviewed_lock_file_sha256
+        lock, lock_verifier_authority = _verify_training_lock(
+            lock_path,
+            reviewed_lock_file_sha256=reviewed_lock_file_sha256,
+            frozen_repo=frozen_repo,
+            frozen_verifier_sha256=frozen_verifier_sha256,
         )
         recipe, objective = _require_a1_science(lock)
         meta = train_bc._preflight_a1_memmap_metadata(  # noqa: SLF001
@@ -950,6 +1012,7 @@ def verify_training_inputs(
                 meta=meta,
                 validation_path=validation_path,
                 build_receipt_path=composite_build_receipt,
+                lock_verifier_authority=lock_verifier_authority,
             )
         if composite_build_receipt is not None:
             raise ExecutorError(
@@ -1000,6 +1063,7 @@ def verify_training_inputs(
         "lock_path": lock_path,
         "lock_file_sha256": _file_sha256(lock_path),
         "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
+        "lock_verifier_authority": lock_verifier_authority,
         "contract_sha256": contract_sha,
         "recipe": recipe,
         "objective": objective,
@@ -1135,6 +1199,7 @@ def _verify_production_composite_inputs(
     meta: dict[str, Any],
     validation_path: Path | None,
     build_receipt_path: Path | None,
+    lock_verifier_authority: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Authenticate the promotion-eligible 64/12/4/20 replay descriptor.
 
@@ -1184,9 +1249,9 @@ def _verify_production_composite_inputs(
         or meta.get("stored_policy_component_temperatures")
         != composite_builder.STORED_POLICY_COMPONENT_TEMPERATURES
         or learner_overrides != composite_builder.LEARNER_RECIPE_OVERRIDES
-        or meta.get("policy_kl_anchor_component_ids") != expected_ids[3:]
-        or meta.get("policy_distillation_component_ids") != expected_ids[:3]
-        or meta.get("value_training_component_ids") != expected_ids[:3]
+        or meta.get("policy_kl_anchor_component_ids") != []
+        or meta.get("policy_distillation_component_ids") != expected_ids
+        or meta.get("value_training_component_ids") != expected_ids
         or not isinstance(
             meta.get("entity_feature_adapter_component_versions"), dict
         )
@@ -1207,11 +1272,10 @@ def _verify_production_composite_inputs(
     if contract.get("initializer_checkpoint_sha256") != producer.get("sha256"):
         raise ExecutorError("production composite initializer differs from sealed producer")
     # The generation lock predates the post-wave composite, so it binds the
-    # base learner recipe with K=0.  The byte-authenticated descriptor is the
-    # later authority for the exact post-wave objective overlay, including the
-    # light forward-KL-only historical behavior anchor. Preserve the sealed
-    # recipe separately while rendering every authenticated override; no
-    # caller-provided delta is admitted here.
+    # base learner recipe with K=0.  The byte-authenticated descriptor preserves
+    # that known TEMP control while binding the exact component scopes. Preserve
+    # the sealed recipe separately while rendering every authenticated override;
+    # no caller-provided delta is admitted here.
     bound_recipe = dict(recipe)
     recipe = dict(recipe)
     recipe.update(learner_overrides)
@@ -1343,6 +1407,7 @@ def _verify_production_composite_inputs(
         "lock_path": lock_path,
         "lock_file_sha256": _file_sha256(lock_path),
         "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
+        "lock_verifier_authority": copy.deepcopy(lock_verifier_authority),
         "contract_sha256": str(lock["contract_sha256"]),
         "bound_recipe": bound_recipe,
         "recipe": recipe,
@@ -6606,6 +6671,9 @@ def _execute_locked(
         command=command, environment=child_environment
     )
     input_binding = _input_binding(verified)
+    training_transaction_sha256 = _training_transaction_sha256(
+        command=command, input_binding=input_binding
+    )
     started_ns = time.time_ns()
     claim_identity = str(
         verified.get("claim_identity_sha256", verified["contract_sha256"])
@@ -6669,6 +6737,7 @@ def _execute_locked(
         "command_sha256": _value_sha256(command),
         "execution_binding": execution_binding,
         "input_binding": input_binding,
+        "training_transaction_sha256": training_transaction_sha256,
         "started_unix_ns": started_ns,
     }
     if is_retry or is_central or is_ablation or is_upgrade:
@@ -6762,6 +6831,8 @@ def _execute_locked(
         "command_sha256": _value_sha256(command),
         "execution_binding": execution_binding,
         "input_binding": input_binding,
+        "training_transaction_sha256": training_transaction_sha256,
+        "lock_verifier_authority": verified.get("lock_verifier_authority"),
         "world_size": int(verified["recipe"]["world_size"]),
         "gpu": gpu,
         "gpus": list(selected_gpus),
@@ -6953,6 +7024,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly reviewed sha256 of the raw immutable lock bytes",
     )
     parser.add_argument(
+        "--frozen-repo",
+        type=Path,
+        default=None,
+        help=(
+            "exact historical checkout that sealed a path-bound lock; requires "
+            "--frozen-verifier-sha256"
+        ),
+    )
+    parser.add_argument(
+        "--frozen-verifier-sha256",
+        default="",
+        help=(
+            "explicit SHA-256 of <frozen-repo>/tools/a1_pre_wave_contract.py"
+        ),
+    )
+    parser.add_argument(
         "--aux-coordinator-root",
         type=Path,
         default=None,
@@ -7125,6 +7212,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--ablation-code-tree-sha256, and --reviewed-lock-file-sha256 "
                 "must be supplied together"
             )
+        frozen_requested = bool(args.frozen_repo or args.frozen_verifier_sha256)
+        if frozen_requested and not (
+            args.frozen_repo is not None and args.frozen_verifier_sha256
+        ):
+            raise ExecutorError(
+                "--frozen-repo and --frozen-verifier-sha256 are required together"
+            )
+        if frozen_requested and (
+            generic_ablation_requested
+            or aux_requested
+            or p1_requested
+            or final_requested
+        ):
+            raise ExecutorError(
+                "frozen production-lock authority cannot be combined with a reviewed ablation authority"
+            )
         verified = verify_training_inputs(
             lock_path=args.lock,
             data_path=args.data,
@@ -7137,6 +7240,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or p1_requested
                 or final_requested
                 else None
+            ),
+            frozen_repo=args.frozen_repo,
+            frozen_verifier_sha256=(
+                args.frozen_verifier_sha256 if frozen_requested else None
             ),
         )
         if args.architecture_upgrade_receipt is not None:
@@ -7315,6 +7422,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         execution_binding = _execution_binding(
             command=command, environment=child_environment
         )
+        input_binding = _input_binding(verified)
+        transaction_sha256 = _training_transaction_sha256(
+            command=command, input_binding=input_binding
+        )
         plan = {
             "schema_version": PLAN_SCHEMA,
             "mode": "go" if args.go else "dry-run",
@@ -7342,6 +7453,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "source_authority": verified.get("source_authority_ref"),
             "command": command,
             "command_sha256": _value_sha256(command),
+            "input_binding": input_binding,
+            "training_transaction_sha256": transaction_sha256,
+            "lock_verifier_authority": verified.get(
+                "lock_verifier_authority"
+            ),
             "execution_binding": execution_binding,
             "checkpoint": str(checkpoint),
             "report": str(report),

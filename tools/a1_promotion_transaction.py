@@ -36,6 +36,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
+from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
 from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import _a1_promotion_lock_state as promotion_lock_state  # noqa: E402
 from tools.a1_external_panel_compare import (  # noqa: E402
@@ -7774,6 +7775,61 @@ def _backup_paths(receipt_path: Path) -> tuple[Path, Path]:
     )
 
 
+def _verify_recovery_gate_for_promotion(
+    authority: Mapping[str, Any],
+    *,
+    authority_ref: Mapping[str, str],
+    verifier_authority: Mapping[str, Any] | None,
+    contract_lock: Path,
+    adjudication_path: Path,
+    training_receipt: Path,
+    cohort_exclusions: Path,
+    registry_path: Path,
+    current_pointer: Path,
+    verified: Mapping[str, Any],
+) -> dict[str, str]:
+    """Bind the replayed conjunctive recovery gate to this exact transaction."""
+
+    if authority.get("contract_verifier") != verifier_authority:
+        raise PromotionError(
+            "recovery gate and promotion use different contract verifier authority"
+        )
+    inputs = authority.get("inputs")
+    if not isinstance(inputs, dict):
+        raise PromotionError("recovery gate authority has no exact input references")
+    expected_paths = {
+        "contract_lock": contract_lock,
+        "standard_adjudication": adjudication_path,
+        "training_receipt": training_receipt,
+        "cohort_exclusions": cohort_exclusions,
+        "registry": registry_path,
+        "current_pointer": current_pointer,
+    }
+    for name, expected_path in expected_paths.items():
+        ref = inputs.get(name)
+        expected_ref = {
+            "path": str(expected_path),
+            "sha256": _sha256(expected_path),
+        }
+        if ref != expected_ref:
+            raise PromotionError(
+                f"recovery gate authority binds a different promotion input: {name}"
+            )
+    if authority.get("candidate") != verified.get("candidate"):
+        raise PromotionError("recovery gate authority binds a different candidate")
+    policy = authority.get("policy")
+    if not isinstance(policy, dict) or policy.get("promotion_eligible") is not True:
+        raise PromotionError("recovery gate authority is not promotion eligible")
+    return {
+        "path": str(authority_ref["path"]),
+        "sha256": str(authority_ref["sha256"]),
+        "authority_sha256": _validate_sha256(
+            authority.get("authority_sha256"),
+            where="recovery gate authority.authority_sha256",
+        ),
+    }
+
+
 def prepare_promotion(
     *,
     registry_path: Path,
@@ -7785,6 +7841,9 @@ def prepare_promotion(
     receipt_path: Path,
     reason: str,
     legacy_contract_attestation: Path | None = None,
+    recovery_gate_authority: Mapping[str, Any] | None = None,
+    recovery_gate_authority_ref: Mapping[str, str] | None = None,
+    verifier_authority: Mapping[str, Any] | None = None,
     verify_lock_fn: Callable[..., dict[str, Any]] = a1_contract.verify_lock,
 ) -> dict[str, Any]:
     registry_path = _canonical_existing_file(
@@ -7823,7 +7882,28 @@ def prepare_promotion(
         registry=registry,
         current_pointer=current_pointer,
         legacy_snapshot=legacy_snapshot,
+        recovery_authority=(
+            None
+            if recovery_gate_authority is None
+            else recovery_gate_authority.get("recovery_authority")
+        ),
     )
+    recovery_gate_ref: dict[str, str] | None = None
+    if recovery_gate_authority is not None:
+        if recovery_gate_authority_ref is None:
+            raise PromotionError("recovery gate authority has no immutable file reference")
+        recovery_gate_ref = _verify_recovery_gate_for_promotion(
+            recovery_gate_authority,
+            authority_ref=recovery_gate_authority_ref,
+            verifier_authority=verifier_authority,
+            contract_lock=contract_lock,
+            adjudication_path=adjudication_path,
+            training_receipt=training_receipt,
+            cohort_exclusions=cohort_exclusions,
+            registry_path=registry_path,
+            current_pointer=current_pointer,
+            verified=verified,
+        )
     cohort_disjointness = _verify_cohort_exclusions(
         cohort_exclusions,
         contract_sha256=contract["contract_sha256"],
@@ -7883,6 +7963,8 @@ def prepare_promotion(
             "n_full": 128,
             "n_full_wide": None,
             "legacy_contract_attestation": legacy_attestation_ref,
+            "verifier_authority": verifier_authority,
+            "recovery_gate_authority": recovery_gate_ref,
         },
         "adjudication": {
             "path": str(adjudication_path.resolve()),
@@ -7927,9 +8009,12 @@ def execute_promotion(
     receipt_path: Path,
     reason: str,
     legacy_contract_attestation: Path | None = None,
+    recovery_gate_authority: Path | None = None,
+    frozen_repo: Path | None = None,
+    frozen_verifier_sha256: str | None = None,
     lock_path: Path | None = None,
     go: bool = False,
-    verify_lock_fn: Callable[..., dict[str, Any]] = a1_contract.verify_lock,
+    verify_lock_fn: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     registry_path = _canonical_existing_file(
         registry_path, where="authoritative registry"
@@ -7938,6 +8023,28 @@ def execute_promotion(
         current_pointer, where="CURRENT_CHAMPION pointer"
     )
     contract_lock = _canonical_existing_file(contract_lock, where="A1 contract lock")
+    if (frozen_repo is None) != (frozen_verifier_sha256 is None):
+        raise PromotionError(
+            "frozen repo and frozen verifier SHA-256 must be supplied together"
+        )
+    verifier_authority: dict[str, Any] | None = None
+    if frozen_repo is not None:
+        if verify_lock_fn is not None:
+            raise PromotionError(
+                "cannot combine a frozen verifier identity with an injected verifier"
+            )
+        try:
+            verify_lock_fn, verifier_authority = (
+                frozen_lock_verifier.build_frozen_lock_verifier(
+                    frozen_repo=frozen_repo,
+                    expected_verifier_sha256=str(frozen_verifier_sha256),
+                    lock_path=contract_lock,
+                )
+            )
+        except frozen_lock_verifier.FrozenVerifierError as error:
+            raise PromotionError(f"frozen lock verifier refused: {error}") from error
+    elif verify_lock_fn is None:
+        verify_lock_fn = a1_contract.verify_lock
     adjudication_path = _canonical_existing_file(
         adjudication_path, where="promotion adjudication"
     )
@@ -7951,6 +8058,27 @@ def execute_promotion(
         legacy_contract_attestation = _canonical_existing_file(
             legacy_contract_attestation, where="legacy contract attestation"
         )
+    recovery_gate_value: Mapping[str, Any] | None = None
+    recovery_gate_ref: dict[str, str] | None = None
+    if recovery_gate_authority is not None:
+        recovery_gate_path = _canonical_existing_file(
+            recovery_gate_authority,
+            where="recovery full-gate authority",
+        )
+        # Lazy import avoids the intentional module dependency in the opposite
+        # direction: the recovery gate reuses this promotion verifier.
+        from tools import a1_v5_recovery_gate as recovery_gate  # noqa: PLC0415
+
+        try:
+            recovery_gate_value = recovery_gate.verify_recovery_gate_authority(
+                recovery_gate_path
+            )
+        except recovery_gate.RecoveryGateError as error:
+            raise PromotionError(f"recovery full-gate authority refused: {error}") from error
+        recovery_gate_ref = {
+            "path": str(recovery_gate_path),
+            "sha256": _sha256(recovery_gate_path),
+        }
     receipt_path = _canonical_new_file(receipt_path, where="promotion receipt")
     lock_path = _enforce_canonical_lock(registry_path, lock_path)
     with _exclusive_lock(lock_path):
@@ -7964,6 +8092,9 @@ def execute_promotion(
             receipt_path=receipt_path,
             reason=reason,
             legacy_contract_attestation=legacy_contract_attestation,
+            recovery_gate_authority=recovery_gate_value,
+            recovery_gate_authority_ref=recovery_gate_ref,
+            verifier_authority=verifier_authority,
             verify_lock_fn=verify_lock_fn,
         )
         if not go:
@@ -8486,6 +8617,9 @@ def build_parser() -> argparse.ArgumentParser:
     promote.add_argument("--training-receipt", required=True, type=Path)
     promote.add_argument("--cohort-exclusions", required=True, type=Path)
     promote.add_argument("--legacy-contract-attestation", type=Path, default=None)
+    promote.add_argument("--recovery-gate-authority", type=Path, default=None)
+    promote.add_argument("--frozen-repo", type=Path)
+    promote.add_argument("--frozen-verifier-sha256")
     promote.add_argument("--receipt", required=True, type=Path)
     promote.add_argument("--reason", required=True)
     promote.add_argument("--lock-file", type=Path, default=None)
@@ -8535,6 +8669,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 training_receipt=args.training_receipt,
                 cohort_exclusions=args.cohort_exclusions,
                 legacy_contract_attestation=args.legacy_contract_attestation,
+                recovery_gate_authority=args.recovery_gate_authority,
+                frozen_repo=args.frozen_repo,
+                frozen_verifier_sha256=args.frozen_verifier_sha256,
                 receipt_path=args.receipt,
                 reason=args.reason,
                 lock_path=args.lock_file,

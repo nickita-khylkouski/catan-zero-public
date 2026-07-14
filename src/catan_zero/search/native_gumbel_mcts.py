@@ -15,6 +15,7 @@ from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTSConfig,
     SearchResult,
     _UNATTESTED_ROOT_PHASE,
+    _UNSET_ROOT_EVALUATION,
     _matches_explicit_or_legacy_width_gate,
 )
 
@@ -212,6 +213,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         force_full: bool | None = None,
         n_simulations_override: int | None = None,
         attested_root_phase: str | None | object = _UNATTESTED_ROOT_PHASE,
+        precomputed_root_evaluation: Any = _UNSET_ROOT_EVALUATION,
     ) -> SearchResult:
         if not self.using_native_hot_loop:
             return super()._search_single_world(
@@ -219,6 +221,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 force_full=force_full,
                 n_simulations_override=n_simulations_override,
                 attested_root_phase=attested_root_phase,
+                precomputed_root_evaluation=precomputed_root_evaluation,
             )
 
         import catanatron_rs  # type: ignore
@@ -251,7 +254,16 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         legal_width = len(
             game.playable_action_indices(list(colors), self.config.map_kind)
         )
-        if (
+        if precomputed_root_evaluation is not _UNSET_ROOT_EVALUATION:
+
+            def root_evaluator(_native_game: Any, _legal: list[int], _root_color: str):
+                result = precomputed_root_evaluation
+                # Match the reference expansion boundary: each particle gets
+                # its own mutable prior mapping while values/uncertainty retain
+                # their exact evaluator representation.
+                return (dict(result[0]), *result[1:])
+
+        elif (
             bool(self.config.symmetry_averaged_eval)
             and _matches_explicit_or_legacy_width_gate(
                 legal_width,

@@ -429,9 +429,9 @@ def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
             executor.composite_builder.LEARNER_RECIPE_OVERRIDES
         ),
         "learner_recipe_overrides_sha256": "sha256:" + "4" * 64,
-        "policy_kl_anchor_component_ids": component_ids[3:],
-        "policy_distillation_component_ids": component_ids[:3],
-        "value_training_component_ids": component_ids[:3],
+        "policy_kl_anchor_component_ids": [],
+        "policy_distillation_component_ids": component_ids,
+        "value_training_component_ids": component_ids,
         "aux_subgoal_target_contract_sha256": "sha256:" + "a" * 64,
         "public_award_feature_transition_contract_sha256": "sha256:" + "b" * 64,
         "source_authority_semantic_sha256": "sha256:" + "c" * 64,
@@ -888,6 +888,10 @@ def test_production_composite_receipts_component_whole_game_split(
     build_receipt = _production_composite_build_receipt(
         tmp_path, verified=verified, descriptor=descriptor, meta=meta
     )
+    frozen_authority = {
+        "schema_version": "a1-frozen-lock-verifier-authority-v1",
+        "authority_sha256": "sha256:" + "7" * 64,
+    }
 
     result = executor._verify_production_composite_inputs(
         lock=verified["lock"],
@@ -900,6 +904,7 @@ def test_production_composite_receipts_component_whole_game_split(
         meta=meta,
         validation_path=None,
         build_receipt_path=build_receipt,
+        lock_verifier_authority=frozen_authority,
     )
 
     split = result["validation_split_receipt"]
@@ -919,13 +924,17 @@ def test_production_composite_receipts_component_whole_game_split(
     ]
     assert result["training_row_count"] == 8
     assert result["validation_row_count"] == 8
+    assert result["lock_verifier_authority"] == frozen_authority
+    assert executor._input_binding(result)["lock_verifier_authority"] == (
+        frozen_authority
+    )
     command = executor._build_direct_train_command(
         result,
         python=Path(sys.executable),
         checkpoint=tmp_path / "candidate.pt",
         report=tmp_path / "report.json",
     )
-    assert _option(command, "--policy-kl-anchor-weight") == "0.006"
+    assert _option(command, "--policy-kl-anchor-weight") == "0.0"
     assert _option(command, "--policy-kl-anchor-direction") == "forward"
     args = executor.train_bc.build_parser().parse_args(command[2:])
     executor.train_bc._validate_composite_learner_recipe_authorization(  # noqa: SLF001
@@ -2003,6 +2012,93 @@ def test_verification_replays_lock_payload_and_validation_chain(
     assert calls == {"require_all_job_claims": True, "binding_checked": True}
     assert verified["contract_sha256"] == _SHA
     assert verified["recipe"]["value_lr_mult"] == 0.3
+
+
+def test_frozen_training_lock_authority_bypasses_ambient_verifier_and_binds_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text("{}", encoding="utf-8")
+    frozen_repo = tmp_path / "frozen"
+    frozen_repo.mkdir()
+    lock = _lock()
+    authority = {
+        "schema_version": "a1-frozen-lock-verifier-authority-v1",
+        "lock": str(lock_path.resolve()),
+        "lock_file_sha256": executor._file_sha256(lock_path),
+        "contract_sha256": lock["contract_sha256"],
+        "frozen_repo": str(frozen_repo.resolve()),
+        "verifier": str((frozen_repo / "tools/a1_pre_wave_contract.py").resolve()),
+        "verifier_sha256": "sha256:" + "8" * 64,
+        "require_all_job_claims": True,
+        "verified_lock_sha256": "sha256:" + "9" * 64,
+        "authority_sha256": "sha256:" + "1" * 64,
+    }
+    calls: dict[str, object] = {}
+
+    def fake_frozen_verify(path: Path, **kwargs: object):
+        calls["path"] = path
+        calls.update(kwargs)
+        return lock, authority
+
+    monkeypatch.setattr(
+        executor.frozen_lock_verifier, "verify_frozen_lock", fake_frozen_verify
+    )
+    monkeypatch.setattr(
+        executor.a1_contract,
+        "verify_lock",
+        lambda *_args, **_kwargs: pytest.fail("ambient verifier was called"),
+    )
+
+    verified_lock, observed = executor._verify_training_lock(
+        lock_path,
+        frozen_repo=frozen_repo,
+        frozen_verifier_sha256=authority["verifier_sha256"],
+    )
+    assert verified_lock == lock
+    assert observed == authority
+    assert calls == {
+        "path": lock_path,
+        "frozen_repo": frozen_repo,
+        "expected_verifier_sha256": authority["verifier_sha256"],
+    }
+
+    verified = _verified(tmp_path)
+    verified["lock_verifier_authority"] = authority
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    binding = executor._input_binding(verified)
+    identity = executor._training_transaction_sha256(
+        command=command, input_binding=binding
+    )
+    assert binding["lock_verifier_authority"] == authority
+    assert identity.startswith("sha256:")
+    drifted = dict(binding)
+    drifted["lock_verifier_authority"] = {
+        **authority,
+        "verifier_sha256": "sha256:" + "0" * 64,
+    }
+    drifted["binding_sha256"] = executor._value_sha256(
+        {key: value for key, value in drifted.items() if key != "binding_sha256"}
+    )
+    assert executor._training_transaction_sha256(
+        command=command, input_binding=drifted
+    ) != identity
+
+
+def test_frozen_training_lock_flags_are_atomic(tmp_path: Path) -> None:
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(executor.ExecutorError, match="required together"):
+        executor._verify_training_lock(
+            lock_path,
+            frozen_repo=tmp_path,
+            frozen_verifier_sha256=None,
+        )
 
 
 def test_execute_writes_atomic_success_receipt_and_never_resumes(

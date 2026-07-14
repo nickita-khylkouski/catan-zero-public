@@ -16,6 +16,9 @@ set -euo pipefail
 
 export REPO=/home/ubuntu/catan-zero-v1
 export PY=$REPO/.venv/bin/python
+# Immutable staging checkout containing the builder/trainer code from this
+# runbook revision. Do not reuse the stale 20260714 prep tree.
+export LEARNER_CODE_ROOT=/home/ubuntu/catan-zero-learner-post-wave-r2
 export PROD=/home/ubuntu/catan-zero-production
 export WAVE_ID=a1-v5-recovery-n128-p4-64000games-64gpu-20260714-r2
 export WAVE=$PROD/private/$WAVE_ID
@@ -23,6 +26,10 @@ export LOCK=$WAVE/lock.json
 export RENDER=$WAVE/rendered/commands.json
 export FROZEN_REPO=/home/ubuntu/catan-zero-wave-5ba993a
 export FROZEN_VERIFIER_SHA256=sha256:ab5d4ef8d4a3f82ecacb6c94ff613e24041ec9d1d4e2722ae6c65a19220f101c
+export FLEET_MANIFEST=$FROZEN_REPO/configs/gpu_fleet_64.json
+export HARVEST_SSH_TRANSPORT=$LEARNER_CODE_ROOT/tools/fleet/a1_harvest_ssh_transport.py
+export HISTORICAL_FROZEN_REPO=/home/ubuntu/catan-zero-v1
+export HISTORICAL_FROZEN_VERIFIER_SHA256=sha256:45594de3835242904a7c3257c5ff644531c4a3c70a447880b20b3b1a23d8c9cc
 
 export HARVEST=$PROD/runs/harvest/$WAVE_ID
 export AUDIT=$WAVE/post-wave-audit.json
@@ -76,17 +83,29 @@ after the production executor reports all 192 jobs terminal-successful.
 
 ```bash
 cd "$REPO"
-"$PY" tools/fleet/a1_harvest_transaction.py \
+mkdir -p "$(dirname "$HARVEST")"
+A1_SSH_FLEET_MANIFEST="$FLEET_MANIFEST" \
+"$PY" "$FROZEN_REPO/tools/fleet/a1_harvest_transaction.py" \
   --lock "$LOCK" \
   --render "$RENDER" \
   --destination "$HARVEST" \
+  --ssh-command "$HARVEST_SSH_TRANSPORT" \
   --fetch-workers 12
 
-"$PY" tools/a1_pre_wave_contract.py audit \
+"$PY" "$LEARNER_CODE_ROOT/tools/a1_pre_wave_contract.py" audit \
   --lock "$LOCK" \
   --harvest-relocation "$HARVEST/relocation_map.json" \
+  --frozen-repo "$FROZEN_REPO" \
+  --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \
   --out "$AUDIT"
 ```
+
+Harvest deliberately executes from `$FROZEN_REPO`. The post-wave audit executes
+from `$LEARNER_CODE_ROOT` so it understands the truthful
+`native_mcts_hot_loop=true` runtime provenance, while the paired frozen flags
+authenticate the unchanged r2 lock with the exact path-bound verifier that
+sealed it. The emitted audit binds that frozen-verifier authority before any
+corpus ingest.
 
 The audit deterministically emits `$WAVE/post-wave-audit.selected_games.json`.
 That selection contains exactly 64,000 complete games: 51,200 current-producer,
@@ -106,7 +125,7 @@ private mount namespace. This neither rewrites nor temporarily replaces the
 live deployment seen by generation/evaluation jobs.
 
 ```bash
-export PREP=/home/ubuntu/a1-learner-prep-20260714
+export PREP=$LEARNER_CODE_ROOT
 export OLD_INTERPOLATE=$PROD/private/a1-v5-surviving-evidence-20260714/interpolate_checkpoints.v2.py
 test "$(sha256sum "$OLD_INTERPOLATE" | cut -d' ' -f1)" = \
   8a8441aff43052e71e1d18799f6c039977ad1b96582d02a45b6b4e11d6da9e78
@@ -148,15 +167,18 @@ sudo unshare -m /bin/bash -s <<EOF
 set -euo pipefail
 mount --make-rprivate /
 mount --bind "$OLD_INTERPOLATE" "$REPO/tools/interpolate_checkpoints.py"
-cd "$PREP"
-sudo -u ubuntu env PYTHONPATH="$PREP" "$PY" \
-  tools/a1_build_post_wave_composite.py \
+cd "$LEARNER_CODE_ROOT"
+sudo -u ubuntu env \
+  PYTHONPATH="$LEARNER_CODE_ROOT/src:$LEARNER_CODE_ROOT" "$PY" \
+  "$LEARNER_CODE_ROOT/tools/a1_build_post_wave_composite.py" \
   --lock "$LOCK" \
   --selected-game-manifest "$WAVE/post-wave-audit.selected_games.json" \
   --post-wave-audit "$AUDIT" \
   --historical-replay-component "$HISTORICAL_REF" \
   --frozen-repo "$FROZEN_REPO" \
   --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \
+  --historical-frozen-repo "$HISTORICAL_FROZEN_REPO" \
+  --historical-frozen-verifier-sha256 "$HISTORICAL_FROZEN_VERIFIER_SHA256" \
   --out "$COMPOSITE"
 EOF
 ```
@@ -164,16 +186,23 @@ EOF
 The learner input is `$COMPOSITE/memmap_composite.json`; the required build
 authority is `$COMPOSITE/build_receipt.json`. The descriptor samples games at
 64% current, 12% recovery-reference, 4% hard-negative, and 20% historical
-replay. Only the three fresh n128 components supply policy, value, and eligible
-auxiliary targets. Historical replay is an authenticated behavior anchor only:
-it contributes forward `KL(prior || candidate)` at conditional weight `0.006`,
-not stale policy cross-entropy or old-policy return/value labels. Forced fresh
-rows carry zero policy weight and full value weight. The
+replay. The first production candidate preserves the known-winning TEMP
+control: all four authenticated components supply policy and value targets and
+the KL anchor is zero. Fresh-only policy scope, fresh-only value scope, and a
+nonzero replay KL anchor are separate treatments and are not bundled into this
+baseline. Only the three fresh n128 components supply eligible auxiliary
+targets. Forced fresh rows carry zero policy weight and full value weight. The
 legacy replay memmap predates preservation of `adapter_version`; the builder
 recovers that identity from the original hash-bound raw NPZs, binds the version
 for every component in the descriptor, and the loader lazily restores only the
 missing legacy column. Mixed, missing, unknown, or checkpoint-incompatible
 adapter semantics still fail closed.
+
+`source_authority.json` binds two distinct frozen verifier authorities. The
+current r2 lock is replayed with `require_all_job_claims=true`; the already
+sealed historical v2 lock is replayed by its exact old verifier with
+`require_all_job_claims=false`. Neither verifier is allowed to stand in for the
+other, and both authority records are covered by the source-authority digest.
 
 ## 4. Execute one independent 8-B200 dose
 
@@ -182,6 +211,8 @@ prints the exact command without touching optimizer state. The second command
 is the actual 128-step run.
 
 ```bash
+cd "$LEARNER_CODE_ROOT"
+export PYTHONPATH="$LEARNER_CODE_ROOT/src:$LEARNER_CODE_ROOT"
 mkdir -p "$LEARNER"
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   "$PY" -m torch.distributed.run --standalone --nproc_per_node=8 \
@@ -198,6 +229,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   --python "$PY" \
   --topology b200-8gpu-ddp \
   --ddp-canary-receipt "$CANARY" \
+  --frozen-repo "$FROZEN_REPO" \
+  --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \
   --gpu 0
 
 # Execute the byte-identical transaction.
@@ -211,6 +244,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   --python "$PY" \
   --topology b200-8gpu-ddp \
   --ddp-canary-receipt "$CANARY" \
+  --frozen-repo "$FROZEN_REPO" \
+  --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \
   --gpu 0 \
   --go
 ```
@@ -222,7 +257,7 @@ The effective production dose is fixed by the lock and topology binder:
 - 128 optimizer steps = 524,288 sampled rows;
 - LR `3e-5`, 100-step warmup, flat schedule;
 - policy/soft-target/value weights `1.0/0.9/0.25`;
-- replay-only forward-KL behavior anchor `0.006`;
+- no replay KL anchor (`0.0`), preserving the selected TEMP control;
 - value-head LR multiplier `0.3`;
 - no train-time D6 augmentation;
 - public-information masking and whole-game component-balanced validation.
@@ -250,6 +285,67 @@ export GATE=$PROD/runs/eval/$WAVE_ID-one-dose-r1
 export SCREEN64_PLAN=$GATE/quick-step64.plan.json
 export SCREEN96_PLAN=$GATE/quick-step96.plan.json
 export SCREEN128_PLAN=$GATE/quick-step128.plan.json
+export EVAL_CTL=$LEARNER_CODE_ROOT/tools/fleet/a1_h100_eval_fleet.py
+mkdir -p "$GATE"
+export BASE_EVAL_MANIFEST=$LEARNER_CODE_ROOT/configs/operations/a1-r3-gather-aux64-reproduction-eval600-20260712-r1/fleet64.manifest.json
+export EVAL_COMMIT=$(git -C "$LEARNER_CODE_ROOT" rev-parse HEAD)
+export EVAL_REMOTE_REPO=/home/ubuntu/catan-zero-eval-${EVAL_COMMIT:0:12}
+export EVAL_MANIFEST=$GATE/fleet64.eval-source.json
+
+# The evaluator proves remote_repo HEAD exactly; it does not mutate or update
+# source on its own. Stage a separate detached, read-only checkout on all 12
+# H100 hosts, preserving the sealed deployment and its Python environment.
+"$PY" "$LEARNER_CODE_ROOT/tools/fleet/a1_stage_h100_eval_source.py" \
+  --manifest "$BASE_EVAL_MANIFEST" \
+  --git-url https://github.com/nickita-khylkouski/catan-zero-public.git \
+  --commit "$EVAL_COMMIT" \
+  --destination "$EVAL_REMOTE_REPO" \
+  --out "$EVAL_MANIFEST"
+"$PY" "$LEARNER_CODE_ROOT/tools/fleet/a1_stage_h100_eval_source.py" \
+  --manifest "$BASE_EVAL_MANIFEST" \
+  --git-url https://github.com/nickita-khylkouski/catan-zero-public.git \
+  --commit "$EVAL_COMMIT" \
+  --destination "$EVAL_REMOTE_REPO" \
+  --out "$EVAL_MANIFEST" \
+  --go
+
+# All three plans intentionally share the exact same common-random-number
+# cohort. Only the candidate checkpoint and run identity differ.
+plan_and_run_screen() {
+  local step="$1"
+  local checkpoint="$2"
+  local plan="$3"
+  local collected="$4"
+  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" plan \
+    --candidate "$checkpoint" \
+    --champion "$V5" \
+    --candidate-parent "$V5" \
+    --registry "$RECOVERY_REGISTRY" \
+    --comparison-mode promotion_parent \
+    --internal-pairs 128 --internal-base-seed 6198800000 \
+    --external-pairs 64 --external-base-seed 6198801000 \
+    --workers-per-gpu 16 \
+    --iteration-id "$WAVE_ID-dose-screen-step$step" \
+    --seed-cohort-id "$WAVE_ID-dose-screen" \
+    --scope full \
+    --candidate-c-scale 0.10 --champion-c-scale 0.10 \
+    --candidate-value-squash tanh --champion-value-squash tanh \
+    --out "$plan"
+  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
+    --plan "$plan" --phase internal --dry-run
+  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" launch \
+    --plan "$plan" --phase internal --go
+  "$PY" "$EVAL_CTL" --manifest "$EVAL_MANIFEST" collect \
+    --plan "$plan" --phase internal --output-dir "$collected"
+}
+
+plan_and_run_screen 64 "$LEARNER/candidate_step0064.pt" \
+  "$SCREEN64_PLAN" "$GATE/quick-step64-collected"
+plan_and_run_screen 96 "$LEARNER/candidate_step0096.pt" \
+  "$SCREEN96_PLAN" "$GATE/quick-step96-collected"
+plan_and_run_screen 128 "$LEARNER/candidate.pt" \
+  "$SCREEN128_PLAN" "$GATE/quick-step128-collected"
+
 SCREEN64_RUN_ID=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$SCREEN64_PLAN")
 SCREEN96_RUN_ID=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$SCREEN96_PLAN")
 SCREEN128_RUN_ID=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$SCREEN128_PLAN")
@@ -301,8 +397,11 @@ pairwise disjoint and were unused in the authoritative VAL-only ledger when
 this handoff was sealed.
 
 ```bash
-export EVAL_CTL=$REPO/tools/fleet/a1_h100_eval_fleet.py
-export EVAL_MANIFEST=$REPO/configs/operations/a1-r3-gather-aux64-reproduction-eval600-20260712-r1/fleet64.manifest.json
+cd "$LEARNER_CODE_ROOT"
+export PYTHONPATH="$LEARNER_CODE_ROOT/src:$LEARNER_CODE_ROOT"
+export EVAL_CTL=$LEARNER_CODE_ROOT/tools/fleet/a1_h100_eval_fleet.py
+# Reuse the derived, commit-bound manifest staged before the matched screen.
+test -f "$EVAL_MANIFEST"
 export GATE=$PROD/runs/eval/$WAVE_ID-one-dose-r1
 export PARENT_PLAN=$GATE/exact-v5-parent.plan.json
 export F7_PLAN=$GATE/fixed-f7-veto.plan.json
@@ -385,10 +484,50 @@ conjunctive recovery authority with the independently collected `$F7_REPORT`:
   --registry "$RECOVERY_REGISTRY" \
   --current-pointer "$RECOVERY_POINTER" \
   --f7-nonregression-report "$F7_REPORT" \
+  --frozen-repo "$FROZEN_REPO" \
+  --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \
   --out "$GATE/recovery-full-gate.authority.json"
 ```
 
 This authority never auto-promotes. A candidate advances only if the standard
 gate proves strict H1 over v5 and the independent f7 cohort does not reach H0.
 If it fails, retain v5 and diagnose from the completed fixed cohorts; do not
-continue training the failed candidate.
+continue training the failed candidate. If it passes, replay the exact authority
+through the ordinary recoverable promotion transaction. Dry-run first; `--go`
+is the sole mutation boundary:
+
+```bash
+export FULL_GATE=$GATE/recovery-full-gate.authority.json
+export PROMOTION_RECEIPT=$GATE/recovery-promotion.receipt.json
+
+"$PY" tools/a1_promotion_transaction.py promote \
+  --registry "$RECOVERY_REGISTRY" \
+  --current-pointer "$RECOVERY_POINTER" \
+  --contract-lock "$LOCK" \
+  --adjudication "$GATE/standard-promotion-adjudication.json" \
+  --training-receipt "$TRAIN_RECEIPT" \
+  --cohort-exclusions "$GATE/cohort-exclusions.json" \
+  --recovery-gate-authority "$FULL_GATE" \
+  --frozen-repo "$FROZEN_REPO" \
+  --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \
+  --receipt "$PROMOTION_RECEIPT" \
+  --reason "r2 64K n128 recovery child passed exact v5 H1 plus f7 veto"
+
+"$PY" tools/a1_promotion_transaction.py promote \
+  --registry "$RECOVERY_REGISTRY" \
+  --current-pointer "$RECOVERY_POINTER" \
+  --contract-lock "$LOCK" \
+  --adjudication "$GATE/standard-promotion-adjudication.json" \
+  --training-receipt "$TRAIN_RECEIPT" \
+  --cohort-exclusions "$GATE/cohort-exclusions.json" \
+  --recovery-gate-authority "$FULL_GATE" \
+  --frozen-repo "$FROZEN_REPO" \
+  --frozen-verifier-sha256 "$FROZEN_VERIFIER_SHA256" \
+  --receipt "$PROMOTION_RECEIPT" \
+  --reason "r2 64K n128 recovery child passed exact v5 H1 plus f7 veto" \
+  --go
+```
+
+The gate authority, promotion dry-run, prepared receipt, and committed receipt
+all bind the exact frozen verifier path and SHA-256. Replaying either stage from
+the ambient current checkout is forbidden.

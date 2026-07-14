@@ -2697,13 +2697,21 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         "historical_replay",
         "authority_sha256",
     }
+    source_authority_schema = (
+        payload.get("schema_version") if isinstance(payload, dict) else None
+    )
+    if source_authority_schema == "a1-post-wave-composite-source-authority-v2":
+        expected.add("lock_verifier_authorities")
     if isinstance(payload, dict) and "category_semantics" in payload:
         expected.add("category_semantics")
     if (
         not isinstance(payload, dict)
         or set(payload) != expected
-        or payload.get("schema_version")
-        != "a1-post-wave-composite-source-authority-v1"
+        or source_authority_schema
+        not in {
+            "a1-post-wave-composite-source-authority-v1",
+            "a1-post-wave-composite-source-authority-v2",
+        }
     ):
         raise SystemExit("flywheel source authority fields/schema drift")
     try:
@@ -3075,6 +3083,70 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         manifests=historical_manifests,
         category_semantics=prior_category_semantics,
     )
+    if source_authority_schema == "a1-post-wave-composite-source-authority-v2":
+        verifier_authorities = payload.get("lock_verifier_authorities")
+        if not isinstance(verifier_authorities, dict) or set(
+            verifier_authorities
+        ) != {"current_wave", "historical_replay"}:
+            raise SystemExit("flywheel lock-verifier authority roles drift")
+
+        verifier_fields = {
+            "schema_version",
+            "lock",
+            "lock_file_sha256",
+            "contract_sha256",
+            "frozen_repo",
+            "verifier",
+            "verifier_sha256",
+            "require_all_job_claims",
+            "verified_lock_sha256",
+            "authority_sha256",
+        }
+
+        def verified_verifier_authority(
+            raw: object,
+            *,
+            contract_ref: dict[str, object],
+            contract_payload: dict[str, object],
+            require_all_job_claims: bool,
+        ) -> None:
+            if (
+                not isinstance(raw, dict)
+                or set(raw) != verifier_fields
+                or raw.get("schema_version")
+                != "a1-frozen-lock-verifier-authority-v1"
+            ):
+                raise SystemExit("flywheel lock-verifier authority fields drift")
+            unhashed = dict(raw)
+            declared = unhashed.pop("authority_sha256", None)
+            if declared != _canonical_json_sha256(unhashed):
+                raise SystemExit("flywheel lock-verifier authority digest drift")
+            if (
+                raw.get("require_all_job_claims") is not require_all_job_claims
+                or raw.get("lock_file_sha256") != contract_ref.get("file_sha256")
+                or raw.get("contract_sha256")
+                != contract_ref.get("contract_sha256")
+                or raw.get("verified_lock_sha256")
+                != _canonical_json_sha256(contract_payload)
+                or not Path(str(raw.get("lock", ""))).is_absolute()
+                or not Path(str(raw.get("frozen_repo", ""))).is_absolute()
+                or not Path(str(raw.get("verifier", ""))).is_absolute()
+                or not _is_sha256(raw.get("verifier_sha256"))
+            ):
+                raise SystemExit("flywheel lock-verifier authority binding drift")
+
+        verified_verifier_authority(
+            verifier_authorities["current_wave"],
+            contract_ref=payload["current_contract"],
+            contract_payload=current_contract,
+            require_all_job_claims=True,
+        )
+        verified_verifier_authority(
+            verifier_authorities["historical_replay"],
+            contract_ref=historical_authority["source_contract"],
+            contract_payload=prior_contract,
+            require_all_job_claims=False,
+        )
     return {
         **payload,
         "fresh_source_bindings": fresh_bindings,
@@ -4255,6 +4327,11 @@ def _portable_composite_semantic_digests(
                 source_authority.get("category_semantics")
             ),
         }
+        verifier_authorities = source_authority.get("lock_verifier_authorities")
+        if verifier_authorities is not None:
+            source_projection["lock_verifier_authorities_sha256"] = (
+                _canonical_json_sha256(verifier_authorities)
+            )
         if any(
             not _is_sha256(value)
             for key, value in source_projection.items()

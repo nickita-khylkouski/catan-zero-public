@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 import numpy as np
@@ -5628,3 +5629,138 @@ def test_central_final_receipt_refuses_nonfinal_or_single_gpu_drift(
             training_report_path=fixture["report"],
             training_report_sha256=promotion._sha256(fixture["report"]),
         )
+
+
+def test_recovery_gate_authority_binds_every_final_promotion_input(
+    tmp_path: Path,
+) -> None:
+    paths = {
+        name: tmp_path / f"{name}.json"
+        for name in (
+            "contract_lock",
+            "standard_adjudication",
+            "training_receipt",
+            "cohort_exclusions",
+            "registry",
+            "current_pointer",
+        )
+    }
+    for name, path in paths.items():
+        path.write_text(name + "\n", encoding="utf-8")
+    candidate = {"path": str(tmp_path / "candidate.pt"), "sha256": "sha256:" + "a" * 64}
+    verifier_authority = {
+        "schema_version": promotion.frozen_lock_verifier.AUTHORITY_SCHEMA,
+        "authority_sha256": "sha256:" + "b" * 64,
+    }
+    gate_authority = {
+        "inputs": {
+            name: {"path": str(path), "sha256": promotion._sha256(path)}
+            for name, path in paths.items()
+        },
+        "candidate": candidate,
+        "contract_verifier": verifier_authority,
+        "policy": {"promotion_eligible": True},
+        "authority_sha256": "sha256:" + "c" * 64,
+    }
+    authority_path = tmp_path / "full-gate.json"
+    authority_path.write_text("authority\n", encoding="utf-8")
+
+    bound = promotion._verify_recovery_gate_for_promotion(
+        gate_authority,
+        authority_ref={
+            "path": str(authority_path),
+            "sha256": promotion._sha256(authority_path),
+        },
+        verifier_authority=verifier_authority,
+        contract_lock=paths["contract_lock"],
+        adjudication_path=paths["standard_adjudication"],
+        training_receipt=paths["training_receipt"],
+        cohort_exclusions=paths["cohort_exclusions"],
+        registry_path=paths["registry"],
+        current_pointer=paths["current_pointer"],
+        verified={"candidate": candidate},
+    )
+    assert bound["authority_sha256"] == "sha256:" + "c" * 64
+
+    gate_authority["inputs"]["training_receipt"]["sha256"] = "sha256:" + "d" * 64
+    with pytest.raises(promotion.PromotionError, match="training_receipt"):
+        promotion._verify_recovery_gate_for_promotion(
+            gate_authority,
+            authority_ref={
+                "path": str(authority_path),
+                "sha256": promotion._sha256(authority_path),
+            },
+            verifier_authority=verifier_authority,
+            contract_lock=paths["contract_lock"],
+            adjudication_path=paths["standard_adjudication"],
+            training_receipt=paths["training_receipt"],
+            cohort_exclusions=paths["cohort_exclusions"],
+            registry_path=paths["registry"],
+            current_pointer=paths["current_pointer"],
+            verified={"candidate": candidate},
+        )
+
+
+def test_execute_promotion_propagates_frozen_and_recovery_gate_authorities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path)
+    frozen_repo = tmp_path / "frozen"
+    verifier = frozen_repo / "tools" / "a1_pre_wave_contract.py"
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text("# frozen\n", encoding="utf-8")
+    verifier_authority = {
+        "schema_version": promotion.frozen_lock_verifier.AUTHORITY_SCHEMA,
+        "frozen_repo": str(frozen_repo),
+        "verifier": str(verifier),
+        "verifier_sha256": promotion._sha256(verifier),
+        "authority_sha256": "sha256:" + "e" * 64,
+    }
+    full_gate_path = tmp_path / "full-gate.json"
+    _write_json(full_gate_path, {"authority": "fixture"})
+    full_gate = {
+        "recovery_authority": {"schema_version": "fixture"},
+        "contract_verifier": verifier_authority,
+    }
+    observed: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        promotion.frozen_lock_verifier,
+        "build_frozen_lock_verifier",
+        lambda **_kwargs: (_verify(fixture), verifier_authority),
+    )
+    from tools import a1_v5_recovery_gate as recovery_gate
+
+    monkeypatch.setattr(
+        recovery_gate,
+        "verify_recovery_gate_authority",
+        lambda path: full_gate if path == full_gate_path.resolve() else None,
+    )
+
+    def fake_prepare(**kwargs: Any) -> dict[str, Any]:
+        observed.update(kwargs)
+        return {"status": "dry_run"}
+
+    monkeypatch.setattr(promotion, "prepare_promotion", fake_prepare)
+    result = promotion.execute_promotion(
+        registry_path=fixture["registry"],
+        current_pointer=fixture["pointer"],
+        contract_lock=fixture["contract_path"],
+        adjudication_path=fixture["adjudication"],
+        training_receipt=fixture["training_receipt"],
+        cohort_exclusions=fixture["cohort_exclusions"],
+        receipt_path=fixture["receipt"],
+        reason="recovery promotion",
+        recovery_gate_authority=full_gate_path,
+        frozen_repo=frozen_repo,
+        frozen_verifier_sha256=promotion._sha256(verifier),
+    )
+
+    assert result == {"status": "dry_run"}
+    assert observed["recovery_gate_authority"] is full_gate
+    assert observed["recovery_gate_authority_ref"] == {
+        "path": str(full_gate_path.resolve()),
+        "sha256": promotion._sha256(full_gate_path),
+    }
+    assert observed["verifier_authority"] == verifier_authority

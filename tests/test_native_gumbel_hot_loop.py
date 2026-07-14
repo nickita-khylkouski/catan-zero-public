@@ -62,6 +62,14 @@ class _WrongBatchPublicEvaluator(_ScalarOnlyPublicEvaluator):
         return expected + [({}, 0.0)] * self.delta
 
 
+class _LegacyRepeatedRootD6(NativeGumbelChanceMCTS):
+    """Test oracle for the pre-hoist PIMC evaluator schedule."""
+
+    def _can_share_information_set_root_evaluation(self, legal_width: int) -> bool:
+        del legal_width
+        return False
+
+
 def test_native_hot_loop_is_explicit_and_fallback_preserves_reference() -> None:
     pytest.importorskip("catanatron_rs")
     try:
@@ -104,8 +112,17 @@ def test_native_information_set_p4_exact_budget_d6_and_global_ids() -> None:
     legal = set(game.playable_action_indices(["RED", "BLUE"], None))
     result = NativeGumbelChanceMCTS(config, evaluator).search(game, force_full=True)
 
+    repeated_evaluator = _PublicCountingEvaluator()
+    repeated = _LegacyRepeatedRootD6(config, repeated_evaluator).search(
+        rust.Game.simple(["RED", "BLUE"], seed=31), force_full=True
+    )
+
     assert result.simulations_used == 128
-    assert evaluator.root_symmetry_calls == 4
+    # The four PIMC particles expose the same public root.  D6 is evaluated
+    # once (12 orientation forwards), not once per hidden-world particle (48).
+    assert evaluator.root_symmetry_calls == 1
+    assert repeated_evaluator.root_symmetry_calls == 4
+    assert result == repeated
     assert result.selected_action in legal
     assert set(result.improved_policy) == legal
     assert set(result.visit_counts) == legal
@@ -190,6 +207,72 @@ def test_native_particle_override_preserves_exact_per_particle_dose() -> None:
     assert native["exact_budget_sh"] is True
     assert native["exact_budget_sh_min_n"] == 0
     assert "n_full_wide" not in native
+
+
+def test_native_particle_root_callback_replays_immutable_precomputed_d6(
+    monkeypatch,
+) -> None:
+    cached = ({3: 0.25, 7: 0.75}, 0.4)
+    callback_results = []
+
+    class _Game:
+        def current_color(self):
+            return "RED"
+
+        def playable_action_indices(self, colors, map_kind):
+            assert tuple(colors) == ("RED", "BLUE")
+            assert map_kind is None
+            return [3, 7]
+
+    def fake_search(
+        game,
+        evaluator,
+        config,
+        *,
+        evaluator_many,
+        root_evaluator,
+        force_full,
+    ):
+        del evaluator, config, evaluator_many, force_full
+        assert root_evaluator is not None
+        first = root_evaluator(game, [3, 7], "RED")
+        first[0][3] = 999.0
+        second = root_evaluator(game, [3, 7], "RED")
+        callback_results.append(second)
+        return {
+            "selected_action": 7,
+            "improved_policy": {3: 0.25, 7: 0.75},
+            "visit_counts": {3: 8, 7: 24},
+            "q_values": {3: -0.1, 7: 0.2},
+            "priors": {3: 0.25, 7: 0.75},
+            "root_value": 0.4,
+            "used_full_search": True,
+            "simulations_used": 32,
+            "afterstate_values": {},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(gumbel_search=fake_search),
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(seed=41)
+    search.evaluator = _PublicCountingEvaluator()
+    search.rng = random.Random(41)
+    search.using_native_hot_loop = True
+
+    result = search._search_single_world(
+        _Game(),
+        force_full=True,
+        n_simulations_override=32,
+        precomputed_root_evaluation=cached,
+    )
+
+    assert callback_results == [cached]
+    assert cached == ({3: 0.25, 7: 0.75}, 0.4)
+    assert search.evaluator.root_symmetry_calls == 0
+    assert result.simulations_used == 32
 
 
 def test_native_config_maps_sigma_reference_visits() -> None:

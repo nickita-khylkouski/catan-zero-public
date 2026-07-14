@@ -33,12 +33,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools import a1_pre_wave_contract as pre_wave  # noqa: E402
+from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
 from tools import a1_promotion_transaction as promotion  # noqa: E402
 from tools import a1_v5_disaster_recovery as recovery  # noqa: E402
 from tools.champion_registry import ChampionRegistry  # noqa: E402
 
 
-AUTHORITY_SCHEMA = "a1-v5-recovery-full-gate-authority-v1"
+AUTHORITY_SCHEMA = "a1-v5-recovery-full-gate-authority-v2"
 # This cohort must remain disjoint from every prior VAL-only claim.  The former
 # 6_199_700_000 base was already partially occupied by a sealed 192-pair panel,
 # which made the required 300-pair recovery veto impossible to claim.
@@ -210,12 +211,37 @@ def verify_recovery_gate(
     current_pointer_path: Path,
     f7_nonregression_report_path: Path,
     legacy_contract_attestation_path: Path | None = None,
-    verify_lock_fn: Callable[..., dict[str, Any]] = pre_wave.verify_lock,
+    frozen_repo_path: Path | None = None,
+    frozen_verifier_sha256: str | None = None,
+    verify_lock_fn: Callable[..., dict[str, Any]] | None = None,
     recovery_verifier_fn: Callable[[Path], Mapping[str, Any]] = (
         recovery.verify_committed_receipt
     ),
 ) -> dict[str, Any]:
     """Replay all ordinary evidence plus the independent f7 veto."""
+
+    if (frozen_repo_path is None) != (frozen_verifier_sha256 is None):
+        raise RecoveryGateError(
+            "frozen repo and frozen verifier SHA-256 must be supplied together"
+        )
+    verifier_authority: dict[str, Any] | None = None
+    if frozen_repo_path is not None:
+        if verify_lock_fn is not None:
+            raise RecoveryGateError(
+                "cannot combine a frozen verifier identity with an injected verifier"
+            )
+        try:
+            verify_lock_fn, verifier_authority = (
+                frozen_lock_verifier.build_frozen_lock_verifier(
+                    frozen_repo=frozen_repo_path,
+                    expected_verifier_sha256=str(frozen_verifier_sha256),
+                    lock_path=contract_lock_path,
+                )
+            )
+        except frozen_lock_verifier.FrozenVerifierError as error:
+            raise RecoveryGateError(f"frozen lock verifier refused: {error}") from error
+    elif verify_lock_fn is None:
+        verify_lock_fn = pre_wave.verify_lock
 
     paths = {
         "recovery_receipt": _existing(
@@ -243,6 +269,11 @@ def verify_recovery_gate(
         paths["legacy_contract_attestation"] = _existing(
             legacy_contract_attestation_path,
             where="legacy contract attestation",
+        )
+    if verifier_authority is not None:
+        paths["frozen_lock_verifier"] = _existing(
+            Path(str(verifier_authority["verifier"])),
+            where="frozen A1 lock verifier",
         )
     snapshot = {
         path: _stable_read(path, where=f"recovery gate input {name}")
@@ -358,6 +389,7 @@ def verify_recovery_gate(
                 **input_refs["contract_lock"],
                 "contract_sha256": contract["contract_sha256"],
             },
+            "contract_verifier": verifier_authority,
             "candidate": candidate,
             "strict_h1_parent_gate": {
                 "passed": True,
@@ -399,7 +431,7 @@ def verify_recovery_gate(
 def verify_recovery_gate_authority(
     authority_path: Path,
     *,
-    verify_lock_fn: Callable[..., dict[str, Any]] = pre_wave.verify_lock,
+    verify_lock_fn: Callable[..., dict[str, Any]] | None = None,
     recovery_verifier_fn: Callable[[Path], Mapping[str, Any]] = (
         recovery.verify_committed_receipt
     ),
@@ -425,6 +457,24 @@ def verify_recovery_gate_authority(
         "current_pointer",
         "f7_report",
     }
+    verifier_authority = value.get("contract_verifier")
+    frozen_repo_path: Path | None = None
+    frozen_verifier_sha256: str | None = None
+    if verifier_authority is not None:
+        if not isinstance(verifier_authority, dict):
+            raise RecoveryGateError("recovery gate contract verifier is malformed")
+        if (
+            verifier_authority.get("schema_version")
+            != frozen_lock_verifier.AUTHORITY_SCHEMA
+        ):
+            raise RecoveryGateError("recovery gate contract verifier schema drift")
+        frozen_repo_path = Path(str(verifier_authority.get("frozen_repo")))
+        frozen_verifier_sha256 = str(verifier_authority.get("verifier_sha256"))
+        required.add("frozen_lock_verifier")
+        if verify_lock_fn is not None:
+            raise RecoveryGateError(
+                "published frozen authority cannot replay with an injected verifier"
+            )
     if set(inputs) != required and set(inputs) != required | {
         "legacy_contract_attestation"
     }:
@@ -449,6 +499,8 @@ def verify_recovery_gate_authority(
             if "legacy_contract_attestation" not in inputs
             else Path(inputs["legacy_contract_attestation"]["path"])
         ),
+        frozen_repo_path=frozen_repo_path,
+        frozen_verifier_sha256=frozen_verifier_sha256,
         verify_lock_fn=verify_lock_fn,
         recovery_verifier_fn=recovery_verifier_fn,
     )
@@ -501,6 +553,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--current-pointer", type=Path, required=True)
     parser.add_argument("--f7-nonregression-report", type=Path, required=True)
     parser.add_argument("--legacy-contract-attestation", type=Path)
+    parser.add_argument("--frozen-repo", type=Path, required=True)
+    parser.add_argument("--frozen-verifier-sha256", required=True)
     parser.add_argument("--out", type=Path, required=True)
     return parser
 
@@ -519,6 +573,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             current_pointer_path=args.current_pointer,
             f7_nonregression_report_path=args.f7_nonregression_report,
             legacy_contract_attestation_path=args.legacy_contract_attestation,
+            frozen_repo_path=args.frozen_repo,
+            frozen_verifier_sha256=args.frozen_verifier_sha256,
         )
     except RecoveryGateError as error:
         raise SystemExit(f"REFUSED: {error}") from error
