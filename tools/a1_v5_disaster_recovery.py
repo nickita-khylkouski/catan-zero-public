@@ -414,6 +414,47 @@ def _verify_recorded_tool_identity(recorded: Any) -> None:
         ) from error
 
 
+def _runtime_smoke_replays(
+    current: Mapping[str, Any], recorded: Mapping[str, Any]
+) -> bool:
+    """Accept relocation only for the same hashed runtime source files."""
+
+    if dict(current) == dict(recorded):
+        return True
+    try:
+        current_value = json.loads(json.dumps(current))
+        recorded_value = json.loads(json.dumps(recorded))
+        for section, relative in (
+            ("runtime_contract", "configs/runtime/a1_production_runtime.json"),
+            ("loader", "src/catan_zero/rl/entity_token_policy.py"),
+        ):
+            current_record = current_value[section]
+            recorded_record = recorded_value[section]
+            if not isinstance(current_record, dict) or not isinstance(
+                recorded_record, dict
+            ):
+                return False
+            current_path = Path(str(current_record.get("path", ""))).resolve(
+                strict=True
+            )
+            expected_current = (REPO_ROOT / relative).resolve(strict=True)
+            recorded_path = Path(str(recorded_record.get("path", "")))
+            if (
+                current_path != expected_current
+                or tuple(recorded_path.parts[-len(Path(relative).parts) :])
+                != Path(relative).parts
+                or current_record.get("sha256") != recorded_record.get("sha256")
+            ):
+                return False
+            # Absolute deployment roots are operational, not semantic.  All
+            # other fields—including the file digest and runtime versions—must
+            # still compare exactly.
+            current_record["path"] = recorded_record["path"]
+        return current_value == recorded_value
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
 def _fresh_namespace(namespace: Path) -> tuple[Path, dict[str, str]]:
     lexical = Path(os.path.abspath(os.fspath(namespace.expanduser())))
     if lexical.name != RECOVERY_NAMESPACE_BASENAME:
@@ -1095,8 +1136,10 @@ def verify_committed_receipt(
         != plan["lost_claims_from_surviving_handoff"]
         or evidence["recovered_checkpoint"] != plan["recovered_checkpoint"]
         or safety != plan["safety_reference"]
-        or runtime_smoke_fn(Path(plan["recovered_checkpoint"]["path"]))
-        != plan["runtime_smoke"]
+        or not _runtime_smoke_replays(
+            runtime_smoke_fn(Path(plan["recovered_checkpoint"]["path"])),
+            plan["runtime_smoke"],
+        )
         or not source_identity_replayed
     ):
         raise RecoveryError("recovery receipt no longer replays exact source/runtime identity")
