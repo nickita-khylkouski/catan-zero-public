@@ -1925,6 +1925,11 @@ def test_post_wave_composite_report_uses_authenticated_outer_ddp_receipt(
         "_require_calibration_matches_training_validation_manifest",
         lambda *_args, **_kwargs: None,
     )
+    monkeypatch.setattr(
+        promotion,
+        "_require_high_regret_matches_training_validation_manifest",
+        lambda *_args, **_kwargs: None,
+    )
     import torch
 
     monkeypatch.setattr(

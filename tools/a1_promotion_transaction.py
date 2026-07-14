@@ -4660,6 +4660,62 @@ def _require_calibration_matches_training_validation_manifest(
         raise PromotionError("mechanism calibration is missing a required role")
 
 
+def _require_high_regret_matches_training_validation_manifest(
+    evidence_path: Path,
+    evidence: Mapping[str, Any],
+    *,
+    training_outputs: Mapping[str, Any],
+) -> None:
+    """Bind regret extraction/suite selection to the same training holdout."""
+
+    sources = evidence.get("sources")
+    if not isinstance(sources, list):
+        raise PromotionError("high-regret evidence has no sources")
+    matching = [
+        source
+        for source in sources
+        if isinstance(source, dict) and source.get("role") == "high_regret"
+    ]
+    if len(matching) != 1:
+        raise PromotionError("high-regret evidence lacks one typed source")
+    high_source_path = _absolute(
+        matching[0].get("path"), base=evidence_path.parent
+    )
+    high_source = _load_json(high_source_path)
+    suite_path, _suite_ref = _validate_file_ref(
+        high_source.get("suite_manifest"),
+        base=high_source_path.parent,
+        where="high-regret suite manifest",
+    )
+    suite = _load_json(suite_path)
+    binding = suite.get("validation_seed_manifest")
+    if not isinstance(binding, dict):
+        raise PromotionError("high-regret suite lacks validation authority")
+    expected_path = _canonical_existing_file(
+        _absolute(
+            training_outputs.get("validation_seed_manifest"),
+            base=evidence_path.parent,
+        ),
+        where="training validation-seed manifest",
+    )
+    bound_path = _canonical_existing_file(
+        _absolute(binding.get("path"), base=suite_path.parent),
+        where="high-regret validation-seed manifest",
+    )
+    if (
+        bound_path != expected_path
+        or binding.get("sha256")
+        != training_outputs.get("validation_seed_manifest_sha256")
+        or binding.get("game_seed_count")
+        != training_outputs.get("validation_game_seed_count")
+        or binding.get("game_seed_set_sha256")
+        != training_outputs.get("validation_game_seed_set_sha256")
+    ):
+        raise PromotionError(
+            "high-regret suite differs from the authenticated training holdout"
+        )
+
+
 def _require_sealed_semantics(
     actual: dict[str, Any], expected: dict[str, Any], *, where: str
 ) -> None:
@@ -7954,6 +8010,17 @@ def _verify_adjudication(
                     "production training receipt lacks output authority"
                 )
             _require_calibration_matches_training_validation_manifest(
+                evidence_path,
+                evidence_value,
+                training_outputs=training_outputs,
+            )
+        if production_composite and kind == "high_regret":
+            training_outputs = training_receipt_preview.get("outputs")
+            if not isinstance(training_outputs, dict):
+                raise PromotionError(
+                    "production training receipt lacks output authority"
+                )
+            _require_high_regret_matches_training_validation_manifest(
                 evidence_path,
                 evidence_value,
                 training_outputs=training_outputs,
