@@ -1,11 +1,11 @@
 {
   "a1_pre_wave_guard_sync": {
-    "previous_guard_sha256": "sha256:60fba508e928468cebf6a6d79e8436410bfe97e21e9bf4e9cbb67362cd062d9e",
+    "previous_guard_sha256": "sha256:9a904db230aa34a86f2644b0b6a42be794ff111a9d86aa0a3ba2114e9fd477b8",
     "schema_version": "a1-pre-wave-generation-guard-sync-v1",
     "selected_c_scale": 0.1,
     "source_s1_evidence": {
-      "path": "/home/ubuntu/catan-zero-production/private/operator_bindings/a1-v5-post-promotion-s1-r1/s1.post-promotion.binding.json",
-      "sha256": "sha256:e8772c575e308bab55e421f7596a4ba056433479dbbd4a58c07e0f76925c6b82"
+      "path": "/home/ubuntu/catan-zero-production/private/a1-v5-disaster-recovery/private/operator_bindings-v2/s1.recovery.binding.json",
+      "sha256": "sha256:7405c980e2d7826408cf376864a553ed5cf0dfa56b01ac98bab27ae5ef7d43db"
     },
     "synchronizer": {
       "path": "tools/a1_pre_wave_contract.py",
