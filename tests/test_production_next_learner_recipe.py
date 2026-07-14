@@ -114,6 +114,29 @@ def test_production_composite_uses_replay_contract_without_a1_sentinel() -> None
     assert args.a1_contract_sha256 == ""
 
 
+def test_authenticated_diagnostic_derivative_inherits_production_split() -> None:
+    args = SimpleNamespace(a1_contract_sha256="")
+    train_bc._bind_composite_validation_provenance(  # noqa: SLF001
+        args,
+        object(),
+        validation_seed_contract=None,
+        composite_meta={
+            "schema_version": "memmap_composite_v2",
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+            "flywheel_diagnostic_derivative": True,
+            "diagnostic_derivation_authority": {
+                "schema_version": "flywheel-diagnostic-descriptor-derivation-v1"
+            },
+            "flywheel_replay_contract": {
+                "schema_version": "flywheel-replay-composite-v2"
+            },
+        },
+        ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+    )
+    assert args.a1_contract_sha256 == ""
+
+
 def test_composite_without_any_validation_authority_fails_closed() -> None:
     with pytest.raises(SystemExit, match="must carry the exact"):
         train_bc._bind_composite_validation_provenance(  # noqa: SLF001

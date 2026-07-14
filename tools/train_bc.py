@@ -3525,6 +3525,185 @@ def _validate_flywheel_component_provenance(
     return payload
 
 
+FLYWHEEL_DIAGNOSTIC_DERIVATION_SCHEMA = (
+    "flywheel-diagnostic-descriptor-derivation-v1"
+)
+
+
+def _preflight_flywheel_diagnostic_derivative(
+    descriptor_path: Path,
+    descriptor: dict[str, object],
+) -> dict[str, object] | None:
+    """Authenticate one narrow diagnostic projection of a production composite.
+
+    The production descriptor remains immutable and retains its strict recipe.
+    A diagnostic learner may change only the proven one-axis policy-game
+    weighting treatment and/or remove historical replay from policy CE. Value
+    training, components, sampling, source authority, and every other byte are
+    inherited unchanged from the fully replayed production descriptor.
+    """
+
+    authority = descriptor.get("diagnostic_derivation_authority")
+    if authority is None:
+        return None
+    expected_authority_keys = {
+        "schema_version",
+        "base_descriptor",
+        "semantic_delta",
+        "semantic_delta_sha256",
+        "diagnostic_only",
+        "promotion_eligible",
+    }
+    base_ref = authority.get("base_descriptor") if isinstance(authority, dict) else None
+    semantic_delta = authority.get("semantic_delta") if isinstance(authority, dict) else None
+    if (
+        not isinstance(authority, dict)
+        or set(authority) != expected_authority_keys
+        or authority.get("schema_version")
+        != FLYWHEEL_DIAGNOSTIC_DERIVATION_SCHEMA
+        or authority.get("diagnostic_only") is not True
+        or authority.get("promotion_eligible") is not False
+        or not isinstance(base_ref, dict)
+        or set(base_ref) != {"path", "file_sha256", "fingerprint"}
+        or not isinstance(semantic_delta, dict)
+        or not semantic_delta
+        or set(semantic_delta)
+        - {
+            "learner_recipe_overrides",
+            "policy_distillation_component_ids",
+            "value_training_component_ids",
+        }
+        or authority.get("semantic_delta_sha256")
+        != _canonical_json_sha256(semantic_delta)
+    ):
+        raise SystemExit("flywheel diagnostic derivation authority is malformed")
+    try:
+        base_path = Path(str(base_ref["path"])).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(
+            f"cannot resolve flywheel diagnostic base descriptor: {error}"
+        ) from error
+    if (
+        str(base_path) != base_ref["path"]
+        or base_path == descriptor_path
+        or _sha256_existing_file(base_path) != base_ref["file_sha256"]
+    ):
+        raise SystemExit("flywheel diagnostic base descriptor byte binding drift")
+    try:
+        base_descriptor = json.loads(base_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"cannot read flywheel diagnostic base descriptor: {error}"
+        ) from error
+    if (
+        not isinstance(base_descriptor, dict)
+        or _canonical_json_sha256(base_descriptor) != base_ref["fingerprint"]
+        or base_descriptor.get("diagnostic_derivation_authority") is not None
+    ):
+        raise SystemExit("flywheel diagnostic base descriptor semantic binding drift")
+    # Recursively replay the ordinary production contract. The absence of a
+    # derivation authority on the base makes this recursion one level deep.
+    base_meta = _preflight_memmap_composite_descriptor(base_path)
+    if (
+        base_meta.get("diagnostic_only") is not False
+        or base_meta.get("promotion_eligible") is not True
+        or base_meta.get("descriptor_file_sha256") != base_ref["file_sha256"]
+        or base_meta.get("descriptor_fingerprint") != base_ref["fingerprint"]
+    ):
+        raise SystemExit("flywheel diagnostic base is not production eligible")
+
+    expected = copy.deepcopy(base_descriptor)
+    expected["diagnostic_only"] = True
+    expected["promotion_eligible"] = False
+    if "learner_recipe_overrides" in semantic_delta:
+        delta = semantic_delta["learner_recipe_overrides"]
+        if (
+            not isinstance(delta, dict)
+            or set(delta) != {"base", "effective"}
+            or delta.get("base") != base_descriptor.get("learner_recipe_overrides")
+            or not isinstance(delta.get("effective"), dict)
+        ):
+            raise SystemExit("flywheel diagnostic learner-override delta is malformed")
+        base_overrides = delta["base"]
+        effective_overrides = delta["effective"]
+        changed = {
+            key
+            for key in set(base_overrides) | set(effective_overrides)
+            if base_overrides.get(key) != effective_overrides.get(key)
+        }
+        if (
+            set(base_overrides) != set(effective_overrides)
+            or changed != {"per_game_policy_weight"}
+            or base_overrides.get("per_game_policy_weight") is not True
+            or effective_overrides.get("per_game_policy_weight") is not False
+        ):
+            raise SystemExit(
+                "flywheel diagnostic recipe may only disable per-game policy weighting"
+            )
+        expected["learner_recipe_overrides"] = copy.deepcopy(effective_overrides)
+        expected["learner_recipe_overrides_sha256"] = _canonical_json_sha256(
+            effective_overrides
+        )
+    expected_base_component_ids = [
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+        "historical_replay",
+    ]
+    expected_fresh_component_ids = expected_base_component_ids[:3]
+    if "policy_distillation_component_ids" in semantic_delta:
+        delta = semantic_delta["policy_distillation_component_ids"]
+        if delta != {
+            "base": expected_base_component_ids,
+            "effective": expected_fresh_component_ids,
+        }:
+            raise SystemExit("flywheel diagnostic policy scope delta is unsupported")
+        expected["policy_distillation_component_ids"] = (
+            expected_fresh_component_ids
+        )
+    if "value_training_component_ids" in semantic_delta:
+        delta = semantic_delta["value_training_component_ids"]
+        if delta != {
+            "base": expected_base_component_ids,
+            "effective": expected_fresh_component_ids,
+        }:
+            raise SystemExit("flywheel diagnostic value scope delta is unsupported")
+        expected["value_training_component_ids"] = expected_fresh_component_ids
+    expected["diagnostic_derivation_authority"] = copy.deepcopy(authority)
+    if descriptor != expected:
+        raise SystemExit(
+            "flywheel diagnostic descriptor differs beyond its authenticated delta"
+        )
+
+    result = copy.deepcopy(base_meta)
+    result.update(
+        {
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+            "descriptor_path": str(descriptor_path),
+            "descriptor_file_sha256": _sha256_existing_file(descriptor_path),
+            "descriptor_fingerprint": _canonical_json_sha256(descriptor),
+            "learner_recipe_overrides": copy.deepcopy(
+                expected["learner_recipe_overrides"]
+            ),
+            "learner_recipe_overrides_sha256": expected[
+                "learner_recipe_overrides_sha256"
+            ],
+            "policy_distillation_component_ids": copy.deepcopy(
+                expected["policy_distillation_component_ids"]
+            ),
+            "policy_distillation_scope_explicit": True,
+            "value_training_component_ids": copy.deepcopy(
+                expected["value_training_component_ids"]
+            ),
+            "value_training_scope_explicit": True,
+            "diagnostic_derivation_authority": copy.deepcopy(authority),
+            "flywheel_diagnostic_derivative": True,
+        }
+    )
+    return result
+
+
 def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object]:
     """Authenticate an ordered diagnostic-only no-copy descriptor.
 
@@ -3541,6 +3720,11 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         raise SystemExit(f"cannot load memmap composite descriptor {path}: {error}") from error
     if not isinstance(descriptor, dict):
         raise SystemExit("memmap composite descriptor is not an object")
+    diagnostic_derivative = _preflight_flywheel_diagnostic_derivative(
+        descriptor_path, descriptor
+    )
+    if diagnostic_derivative is not None:
+        return diagnostic_derivative
     schema_version = descriptor.get("schema_version")
     common_fields = {
         "schema_version", "diagnostic_only", "promotion_eligible", "components",
@@ -8079,30 +8263,45 @@ def _bind_composite_validation_provenance(
 
     Historical diagnostic composites carry the sealed A1 component holdout
     manifests returned by ``_load_composite_validation_contract``.  A
-    promotion-eligible flywheel composite deliberately has no A1 sentinel: its
+    production flywheel composite deliberately has no A1 sentinel: its
     whole-game split is derived component-by-component by
     :func:`split_train_validation_indices` and its authority is the replay
-    contract authenticated during descriptor preflight.  Keeping these two
-    paths explicit prevents the production path from dereferencing the absent
-    diagnostic contract before the first optimizer step.
+    contract authenticated during descriptor preflight. A diagnostic
+    derivative of that exact production descriptor inherits the same split;
+    its authenticated marker permits the split without making the derivative
+    promotion eligible. Keeping these paths explicit prevents either path from
+    dereferencing the absent diagnostic contract before the first optimizer
+    step.
     """
 
     if validation_seed_contract is None:
-        if not (
+        ordinary_production = (
             composite_meta.get("schema_version") == "memmap_composite_v2"
             and composite_meta.get("diagnostic_only") is False
             and composite_meta.get("promotion_eligible") is True
+        )
+        authenticated_diagnostic_derivative = (
+            composite_meta.get("schema_version") == "memmap_composite_v2"
+            and composite_meta.get("diagnostic_only") is True
+            and composite_meta.get("promotion_eligible") is False
+            and composite_meta.get("flywheel_diagnostic_derivative") is True
+            and isinstance(
+                composite_meta.get("diagnostic_derivation_authority"), dict
+            )
+        )
+        if not (
+            (ordinary_production or authenticated_diagnostic_derivative)
             and isinstance(composite_meta.get("flywheel_replay_contract"), dict)
         ):
             raise SystemExit(
                 "composite without an A1 validation contract must carry the exact "
-                "promotion-eligible flywheel replay contract"
+                "authenticated flywheel replay contract"
             )
         # This is not an A1 one-dose corpus, so it must not mint an A1 contract
         # identity.  The report separately binds ``flywheel_replay_contract``.
         if getattr(args, "a1_contract_sha256", "") not in {"", None}:
             raise SystemExit(
-                "promotion-eligible flywheel composite may not inherit an A1 "
+                "production-split flywheel composite may not inherit an A1 "
                 "validation contract identity"
             )
         return
@@ -8262,7 +8461,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "production uses a complete component-aware game split; diagnostic "
                 "runs may use a whole-game --validation-game-sentinel-manifest"
             )
-        if a1_preflight_meta.get("diagnostic_only") is True:
+        flywheel_diagnostic_derivative = bool(
+            a1_preflight_meta.get("flywheel_diagnostic_derivative") is True
+        )
+        if (
+            a1_preflight_meta.get("diagnostic_only") is True
+            and not flywheel_diagnostic_derivative
+        ):
             validation_seed_contract = _load_composite_validation_contract(
                 a1_preflight_meta,
                 validation_fraction=float(args.validation_fraction),
@@ -8278,7 +8483,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
         elif args.validation_game_sentinel_manifest:
             raise SystemExit(
-                "promotion-eligible flywheel composites use their component-aware "
+                "production-derived flywheel composites use their component-aware "
                 "whole-game validation split and may not import an A1 sentinel"
             )
     elif args.validation_game_seed_manifest:
@@ -10182,6 +10387,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         epoch_policy_component_dose: dict[str, float] = {}
         epoch_policy_component_phase_dose: dict[str, float] = {}
+        epoch_value_component_dose: dict[str, float] = {}
         if bool(getattr(data, "policy_distillation_scope_authenticated", False)):
             component_ids = tuple(data.component_ids)
             base_rows = train_indices[np.asarray(order, dtype=np.int64)]
@@ -10222,6 +10428,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                         suffix="aux",
                     )
                 )
+        if bool(getattr(data, "value_training_scope_authenticated", False)):
+            epoch_value_component_dose = {
+                str(component_id): 0.0
+                for component_id in getattr(data, "component_ids", tuple())
+            }
         epoch_losses = []
         epoch_extra_sums: dict[str, float] = {
             "policy_loss": 0.0,
@@ -10444,6 +10655,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             loss = float(batch_metrics["loss"])
             accuracy = float(batch_metrics["accuracy"])
+            value_active_row_mask = batch_metrics.pop(
+                "_value_active_row_mask", None
+            )
+            batch_value_component_dose = (
+                _value_component_active_dose_for_batch(
+                    data, batch, value_active_row_mask
+                )
+            )
+            if batch_value_component_dose is not None:
+                for component_id, active_rows in batch_value_component_dose.items():
+                    epoch_value_component_dose[component_id] += active_rows
             optimizer_observability = batch_metrics.get("optimizer_observability")
             optimizer_step_applied = bool(
                 batch_metrics.get("optimizer_step_applied", accum_do_step)
@@ -10708,6 +10930,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_policy_component_phase_dose = _reduce_named_sums(
             epoch_policy_component_phase_dose, ddp
         )
+        epoch_value_component_dose = _reduce_named_sums(
+            epoch_value_component_dose, ddp
+        )
         policy_component_active_dose = {
             component_id: {
                 "base_active_rows": int(
@@ -10755,6 +10980,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                         phase_dose["base_active_rows"]
                         + phase_dose["aux_active_rows"]
                     )
+        value_component_active_dose = None
+        if bool(getattr(data, "value_training_scope_authenticated", False)):
+            value_component_active_dose = {
+                component_id: {
+                    "active_rows": int(
+                        round(epoch_value_component_dose[component_id])
+                    )
+                }
+                for component_id in getattr(data, "component_ids", tuple())
+            }
         policy_loss_epoch = _metric_from_sum_denominator(
             epoch_extra_sums["policy_loss"], epoch_extra_denominators["policy_loss"]
         )
@@ -10840,6 +11075,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_component_phase_active_dose": (
                     policy_component_phase_active_dose
                 ),
+                "value_component_active_dose": value_component_active_dose,
                 "value_loss": value_loss_epoch,
                 "scalar_value_mse_diagnostic": value_loss_epoch,
                 "final_vp_loss": final_vp_loss_epoch,
@@ -11144,6 +11380,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         }
         for component_id in getattr(data, "component_ids", tuple())
     }
+    value_component_active_dose = None
+    if bool(getattr(data, "value_training_scope_authenticated", False)):
+        value_component_active_dose = {
+            component_id: {
+                "active_rows": int(
+                    sum(
+                        int(
+                            (metric.get("value_component_active_dose") or {})
+                            .get(component_id, {})
+                            .get("active_rows", 0)
+                        )
+                        for metric in metrics
+                    )
+                )
+            }
+            for component_id in getattr(data, "component_ids", tuple())
+        }
     policy_component_phase_active_dose = None
     if policy_aux_phase_sampling_weights is not None:
         policy_component_phase_active_dose = {
@@ -11392,6 +11645,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_training_scope": value_training_scope_report,
         "aux_subgoal_training_contract": aux_subgoal_training_contract,
         "policy_component_active_dose": policy_component_active_dose,
+        "value_component_active_dose": value_component_active_dose,
         "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
         "policy_component_phase_active_dose": policy_component_phase_active_dose,
         "sample_weight_quality": policy_sample_weight_report,
@@ -11598,6 +11852,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "value_training_scope_explicit": bool(
                     a1_preflight_meta.get("value_training_scope_explicit", False)
                 ),
+                "diagnostic_derivation_authority": a1_preflight_meta.get(
+                    "diagnostic_derivation_authority"
+                ),
                 "component_contract_sha256s": (
                     [
                         contract["a1_contract_sha256"]
@@ -11768,6 +12025,9 @@ def _train_candidate_batch(
         truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
     )
     value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+    value_active_mask = torch.zeros(
+        len(batch), dtype=torch.bool, device=policy.device
+    )
     if outcome_targets is not None:
         value_error = nn.functional.mse_loss(values, outcome_targets, reduction="none")
         value_loss = _weighted_mean_loss(
@@ -11780,11 +12040,10 @@ def _train_candidate_batch(
             value_weights * outcome_confidence,
             mask=has_outcome,
         )
-        value_active_count = int(
-            (has_outcome & ((value_weights * outcome_confidence) > 0.0))
-            .sum()
-            .item()
+        value_active_mask = has_outcome & (
+            (value_weights * outcome_confidence) > 0.0
         )
+        value_active_count = int(value_active_mask.sum().item())
     else:
         value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
         value_active_count = 0
@@ -11870,6 +12129,9 @@ def _train_candidate_batch(
         ),
         "active_count": active_count,
         "value_active_count": int(value_active_count),
+        "_value_active_row_mask": (
+            value_active_mask.detach().cpu().numpy().astype(np.bool_, copy=False)
+        ),
         "accuracy": float(accuracy.item()),
         "top3_accuracy": float(top3_accuracy.item()),
         "phase_stats": phase_stats,
@@ -12644,6 +12906,9 @@ def _train_xdim_batch(
         value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        value_active_mask = torch.zeros(
+            len(batch), dtype=torch.bool, device=policy.device
+        )
         if value_outcome_targets is not None and "value" in outputs:
             value_error = nn.functional.mse_loss(
                 outputs["value"], value_outcome_targets, reduction="none"
@@ -12658,12 +12923,10 @@ def _train_xdim_batch(
                 value_weights * outcome_confidence,
                 mask=value_has_outcome,
             )
-            value_active_count = int(
-                (
-                    value_has_outcome
-                    & ((value_weights * outcome_confidence) > 0.0)
-                ).sum().item()
+            value_active_mask = value_has_outcome & (
+                (value_weights * outcome_confidence) > 0.0
             )
+            value_active_count = int(value_active_mask.sum().item())
         else:
             value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
             value_active_count = 0
@@ -13177,6 +13440,9 @@ def _train_xdim_batch(
         "active_count": active_count,
         "policy_aux_active_count": int(policy_aux_active_count),
         "value_active_count": int(value_active_count),
+        "_value_active_row_mask": (
+            value_active_mask.detach().cpu().numpy().astype(np.bool_, copy=False)
+        ),
         "accuracy": float(accuracy.item()),
         "top3_accuracy": float(top3_accuracy.item()),
         "phase_stats": phase_stats,
@@ -20246,6 +20512,43 @@ def _value_training_scope_report(
         "schema_version": "component-value-training-scope-v1",
         "component_ids": [component_ids[index] for index in sorted(eligible)],
         "components": components,
+    }
+
+
+def _value_component_active_dose_for_batch(
+    data, batch: np.ndarray, active_mask: np.ndarray | None
+) -> dict[str, float] | None:
+    """Measure rows that actually entered the value loss by component."""
+
+    if not bool(getattr(data, "value_training_scope_authenticated", False)):
+        return None
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    eligible = set(
+        int(value)
+        for value in getattr(data, "value_training_component_indices", tuple())
+    )
+    mask = np.asarray(active_mask)
+    if (
+        not component_ids
+        or not eligible
+        or any(value < 0 or value >= len(component_ids) for value in eligible)
+        or mask.dtype != np.bool_
+        or mask.shape != (len(batch),)
+    ):
+        raise RuntimeError(
+            "authenticated value scope lost its realized row exposure"
+        )
+    components = np.asarray(
+        data.component_indices_for_rows(np.asarray(batch, dtype=np.int64)),
+        dtype=np.int64,
+    )
+    if components.shape != mask.shape:
+        raise RuntimeError("authenticated value component mapping shape drift")
+    if np.any(mask & ~np.isin(components, np.asarray(sorted(eligible)))):
+        raise RuntimeError("excluded value component received positive exposure")
+    return {
+        str(component_id): float(np.count_nonzero(mask & (components == index)))
+        for index, component_id in enumerate(component_ids)
     }
 
 

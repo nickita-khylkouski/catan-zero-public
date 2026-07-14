@@ -1494,6 +1494,275 @@ def test_policy_game_weight_can_be_isolated_as_a_generic_ablation(
     assert "--per-game-policy-weight-mode" not in command
 
 
+def _descriptor_bound_production_verified(tmp_path: Path) -> tuple[dict, Path, dict]:
+    verified = _production_trainer_verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    base = {
+        "schema_version": "memmap_composite_v2",
+        "diagnostic_only": False,
+        "promotion_eligible": True,
+        "components": [],
+        "learner_recipe_overrides": dict(
+            executor.composite_builder.LEARNER_RECIPE_OVERRIDES
+        ),
+        "learner_recipe_overrides_sha256": executor._value_sha256(
+            executor.composite_builder.LEARNER_RECIPE_OVERRIDES
+        ),
+        "policy_kl_anchor_component_ids": [],
+        "policy_distillation_component_ids": list(
+            executor.ALL_POST_WAVE_COMPONENT_IDS
+        ),
+        "value_training_component_ids": list(
+            executor.ALL_POST_WAVE_COMPONENT_IDS
+        ),
+    }
+    descriptor = tmp_path / "production-composite.json"
+    descriptor.write_text(json.dumps(base, indent=2, sort_keys=True) + "\n")
+    verified.update(
+        {
+            "data_path": descriptor.resolve(),
+            "validation_path": descriptor.resolve(),
+            "corpus_meta_file_sha256": executor._file_sha256(descriptor),
+            "validation_file_sha256": executor._file_sha256(descriptor),
+            "descriptor_fingerprint": executor._value_sha256(base),
+            "data_fingerprint": executor._value_sha256(base),
+            "learner_recipe_overrides": dict(
+                executor.composite_builder.LEARNER_RECIPE_OVERRIDES
+            ),
+            "learner_recipe_overrides_sha256": executor._value_sha256(
+                executor.composite_builder.LEARNER_RECIPE_OVERRIDES
+            ),
+        }
+    )
+    verified["bound_recipe"] = dict(verified["recipe"])
+    verified["recipe"].update(
+        executor.composite_builder.LEARNER_RECIPE_OVERRIDES
+    )
+    return verified, descriptor, base
+
+
+def test_policy_game_weight_ablation_derives_authenticated_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, base_path, base = _descriptor_bound_production_verified(tmp_path)
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    arm = executor.bind_learner_ablation(
+        verified,
+        ablation_id="policy-game-weight-off-dose-1024",
+        overrides_json=(
+            '{"max_steps":1024,"per_game_policy_weight":false,'
+            '"per_game_policy_weight_mode":"equal"}'
+        ),
+        reviewed_code_tree_sha256=code_sha,
+    )
+    derived_path = tmp_path / "run" / "candidate.pt.training-descriptor.json"
+    arm = executor.bind_diagnostic_training_descriptor(
+        arm, descriptor_path=derived_path
+    )
+
+    authority = arm["diagnostic_training_descriptor_authority"]
+    assert set(authority["semantic_delta"]) == {"learner_recipe_overrides"}
+    assert authority["learner_recipe_overrides"]["per_game_policy_weight"] is False
+    assert arm["data_path"] == derived_path
+    assert not derived_path.exists()
+    executor._materialize_diagnostic_training_descriptor(arm)
+    derived = json.loads(derived_path.read_text())
+    assert derived["learner_recipe_overrides"]["per_game_policy_weight"] is False
+    assert derived["learner_recipe_overrides_sha256"] == executor._value_sha256(
+        derived["learner_recipe_overrides"]
+    )
+    assert derived["policy_distillation_component_ids"] == list(
+        executor.ALL_POST_WAVE_COMPONENT_IDS
+    )
+    assert base_path.read_text() == json.dumps(base, indent=2, sort_keys=True) + "\n"
+    assert derived_path.stat().st_mode & 0o777 == 0o444
+
+
+def test_fresh_policy_scope_retains_selected_policy_weight_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, _base_path, _base = _descriptor_bound_production_verified(tmp_path)
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    arm = executor.bind_learner_ablation(
+        verified,
+        ablation_id="fresh-policy-only",
+        overrides_json=(
+            '{"max_steps":1024,"per_game_policy_weight":false,'
+            '"per_game_policy_weight_mode":"equal"}'
+        ),
+        reviewed_code_tree_sha256=code_sha,
+    )
+    arm = executor.bind_diagnostic_training_descriptor(
+        arm,
+        descriptor_path=tmp_path / "fresh-policy.training-descriptor.json",
+        fresh_policy_distillation_only=True,
+    )
+
+    authority = arm["diagnostic_training_descriptor_authority"]
+    assert set(authority["semantic_delta"]) == {
+        "learner_recipe_overrides",
+        "policy_distillation_component_ids",
+    }
+    assert authority["learner_recipe_overrides"]["per_game_policy_weight"] is False
+    assert authority["policy_distillation_component_ids"] == list(
+        executor.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
+    )
+    assert authority["value_training_component_ids"] == list(
+        executor.ALL_POST_WAVE_COMPONENT_IDS
+    )
+    assert arm["learner_ablation"]["training_descriptor_authority"] == authority
+
+
+def test_fresh_value_scope_is_independent_from_policy_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, base_path, _base = _descriptor_bound_production_verified(tmp_path)
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    arm = executor.bind_learner_ablation(
+        verified,
+        ablation_id="fresh-value-only",
+        overrides_json=(
+            '{"max_steps":1024,"per_game_policy_weight":false,'
+            '"per_game_policy_weight_mode":"equal"}'
+        ),
+        reviewed_code_tree_sha256=code_sha,
+    )
+    derived_path = tmp_path / "fresh-value.training-descriptor.json"
+    arm = executor.bind_diagnostic_training_descriptor(
+        arm,
+        descriptor_path=derived_path,
+        fresh_value_training_only=True,
+    )
+
+    authority = arm["diagnostic_training_descriptor_authority"]
+    assert set(authority["semantic_delta"]) == {
+        "learner_recipe_overrides",
+        "value_training_component_ids",
+    }
+    assert authority["learner_recipe_overrides"]["per_game_policy_weight"] is False
+    assert authority["policy_distillation_component_ids"] == list(
+        executor.ALL_POST_WAVE_COMPONENT_IDS
+    )
+    assert authority["value_training_component_ids"] == list(
+        executor.FRESH_VALUE_TRAINING_COMPONENT_IDS
+    )
+
+    executor._materialize_diagnostic_training_descriptor(arm)
+    derived = json.loads(derived_path.read_text())
+    monkeypatch.setattr(
+        executor.train_bc,
+        "_preflight_memmap_composite_descriptor",
+        lambda path: {
+            "diagnostic_only": False,
+            "promotion_eligible": True,
+            "descriptor_file_sha256": executor._file_sha256(base_path),
+            "descriptor_fingerprint": executor._value_sha256(
+                json.loads(base_path.read_text())
+            ),
+            "policy_distillation_component_ids": list(
+                executor.ALL_POST_WAVE_COMPONENT_IDS
+            ),
+            "value_training_component_ids": list(
+                executor.ALL_POST_WAVE_COMPONENT_IDS
+            ),
+        },
+    )
+    replayed = executor.train_bc._preflight_flywheel_diagnostic_derivative(
+        derived_path.resolve(), derived
+    )
+    assert replayed is not None
+    assert replayed["policy_distillation_component_ids"] == list(
+        executor.ALL_POST_WAVE_COMPONENT_IDS
+    )
+    assert replayed["value_training_component_ids"] == list(
+        executor.FRESH_VALUE_TRAINING_COMPONENT_IDS
+    )
+
+
+def test_fresh_value_scope_requires_policy_game_weight_off_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, _base_path, _base = _descriptor_bound_production_verified(tmp_path)
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    arm = executor.bind_learner_ablation(
+        verified,
+        ablation_id="fresh-value-with-wrong-baseline",
+        overrides_json='{"max_steps":1024}',
+        reviewed_code_tree_sha256=code_sha,
+    )
+    with pytest.raises(executor.ExecutorError, match="policy-weight-off"):
+        executor.bind_diagnostic_training_descriptor(
+            arm,
+            descriptor_path=tmp_path / "wrong.training-descriptor.json",
+            fresh_value_training_only=True,
+        )
+
+
+def test_generic_production_ablation_report_binding_does_not_require_aux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, _base_path, _base = _descriptor_bound_production_verified(tmp_path)
+    verified["learner_ablation"] = {
+        "schema_version": "a1-learner-ablation-v1",
+        "ablation_id": "plain-recipe-arm",
+    }
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "value_training": {},
+                "a1_aux_regularization_binding": None,
+                "a1_learner_ablation": None,
+                "a1_effective_learner_training_recipe": None,
+            }
+        )
+    )
+    execution = {
+        "schema_version": executor.REPORT_EXECUTION_BINDING_SCHEMA,
+        "command_sha256": "sha256:" + "1" * 64,
+        "environment": {
+            key: "test" for key in executor.CHILD_ENVIRONMENT_KEYS
+        },
+    }
+    execution["environment_sha256"] = executor._value_sha256(
+        execution["environment"]
+    )
+    monkeypatch.setattr(executor, "_input_binding", lambda _verified: {})
+    monkeypatch.setattr(
+        executor,
+        "_direct_lineage_dose",
+        lambda _verified, report_payload=None: {"dose": "test"},
+    )
+
+    executor._bind_training_report(
+        report, verified=verified, execution_binding=execution
+    )
+    payload = json.loads(report.read_text())
+    assert payload["a1_learner_ablation"] == verified["learner_ablation"]
+    assert payload["diagnostic_only"] is True
+    assert payload["promotion_eligible"] is False
+
+
 def test_long_policy_weight_ablation_retains_dose_frontier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

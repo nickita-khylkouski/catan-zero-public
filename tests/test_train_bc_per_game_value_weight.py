@@ -5,6 +5,7 @@ import pytest
 
 from tools.train_bc import (
     _apply_authenticated_value_training_scope,
+    _value_component_active_dose_for_batch,
     _value_training_scope_report,
     build_value_sample_weights,
     per_game_weight_quality,
@@ -112,6 +113,19 @@ def test_authenticated_value_scope_can_make_replay_anchor_only() -> None:
     report = _value_training_scope_report(_Composite(), scoped)
     assert report["component_ids"] == ["n128", "n256"]
     assert report["components"]["gen3_replay"]["positive_value_rows"] == 0
+
+    dose = _value_component_active_dose_for_batch(
+        _Composite(),
+        np.arange(6, dtype=np.int64),
+        np.asarray([True, True, True, False, False, False]),
+    )
+    assert dose == {"n128": 2.0, "n256": 1.0, "gen3_replay": 0.0}
+    with pytest.raises(RuntimeError, match="excluded value component"):
+        _value_component_active_dose_for_batch(
+            _Composite(),
+            np.arange(6, dtype=np.int64),
+            np.asarray([True, True, True, False, False, True]),
+        )
 
 
 def test_per_game_value_weight_composes_with_forced_row_and_multiplier() -> None:

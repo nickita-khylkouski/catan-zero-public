@@ -825,6 +825,10 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
             payload["p1_training_descriptor_authority"] = copy.deepcopy(
                 verified["p1_training_descriptor_authority"]
             )
+        if "diagnostic_training_descriptor_authority" in verified:
+            payload["diagnostic_training_descriptor_authority"] = copy.deepcopy(
+                verified["diagnostic_training_descriptor_authority"]
+            )
     else:
         payload.update(
             {
@@ -2585,6 +2589,274 @@ def bind_learner_ablation(
         }
     )
     return result
+
+
+FRESH_POLICY_DISTILLATION_COMPONENT_IDS = (
+    "current_producer",
+    "recent_history",
+    "hard_negative",
+)
+FRESH_VALUE_TRAINING_COMPONENT_IDS = FRESH_POLICY_DISTILLATION_COMPONENT_IDS
+ALL_POST_WAVE_COMPONENT_IDS = (
+    *FRESH_POLICY_DISTILLATION_COMPONENT_IDS,
+    "historical_replay",
+)
+DIAGNOSTIC_TRAINING_DESCRIPTOR_SCHEMA = (
+    "a1-diagnostic-training-descriptor-authority-v1"
+)
+
+
+def bind_diagnostic_training_descriptor(
+    verified: dict[str, Any],
+    *,
+    descriptor_path: Path,
+    fresh_policy_distillation_only: bool = False,
+    fresh_value_training_only: bool = False,
+) -> dict[str, Any]:
+    """Derive one byte-bound diagnostic descriptor from the production input.
+
+    ``train_bc`` authenticates several argv values through the composite
+    descriptor. A recipe ablation therefore cannot merely change argv: the
+    descriptor must carry the same reviewed delta. This helper derives that
+    input without mutating the published production descriptor. It also owns
+    the fresh-policy-only treatment, whose value scope deliberately remains
+    all-component.
+    """
+
+    if verified.get("data_kind") != "production_composite_v2":
+        if fresh_policy_distillation_only or fresh_value_training_only:
+            raise ExecutorError(
+                "fresh policy/value scope requires a post-wave composite"
+            )
+        return verified
+    learner_ablation = verified.get("learner_ablation")
+    if not isinstance(learner_ablation, dict) or isinstance(
+        verified.get("central_learner_binding"), dict
+    ):
+        if fresh_policy_distillation_only or fresh_value_training_only:
+            raise ExecutorError(
+                "fresh policy/value scope requires a generic diagnostic ablation"
+            )
+        return verified
+
+    base_path, base_file_sha256 = _stable_canonical_regular_file(
+        verified["data_path"], where="base production training descriptor"
+    )
+    try:
+        base = json.loads(base_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(f"cannot read base production descriptor: {error}") from error
+    if (
+        not isinstance(base, dict)
+        or base_file_sha256 != verified["corpus_meta_file_sha256"]
+        or _value_sha256(base) != verified["descriptor_fingerprint"]
+        or tuple(base.get("policy_distillation_component_ids", ()))
+        != ALL_POST_WAVE_COMPONENT_IDS
+        or tuple(base.get("value_training_component_ids", ()))
+        != ALL_POST_WAVE_COMPONENT_IDS
+    ):
+        raise ExecutorError("base production descriptor identity/scope drifted")
+
+    base_overrides = base.get("learner_recipe_overrides")
+    if not isinstance(base_overrides, dict) or not base_overrides:
+        raise ExecutorError("base production descriptor has no learner override authority")
+    effective_recipe = verified["recipe"]
+    derived_overrides: dict[str, Any] = {}
+    for key in base_overrides:
+        if key not in effective_recipe:
+            raise ExecutorError(
+                f"effective learner recipe lost descriptor-authorized field {key!r}"
+            )
+        derived_overrides[key] = effective_recipe[key]
+
+    derived = copy.deepcopy(base)
+    derived["learner_recipe_overrides"] = derived_overrides
+    derived["learner_recipe_overrides_sha256"] = _value_sha256(derived_overrides)
+    if fresh_policy_distillation_only or fresh_value_training_only:
+        if (
+            derived_overrides.get("per_game_policy_weight") is not False
+            or derived_overrides.get("per_game_policy_weight_mode") != "equal"
+        ):
+            raise ExecutorError(
+                "fresh policy/value scopes require the selected per-game-policy-"
+                "weight-off/equal diagnostic baseline"
+            )
+    if fresh_policy_distillation_only:
+        derived["policy_distillation_component_ids"] = list(
+            FRESH_POLICY_DISTILLATION_COMPONENT_IDS
+        )
+    if fresh_value_training_only:
+        derived["value_training_component_ids"] = list(
+            FRESH_VALUE_TRAINING_COMPONENT_IDS
+        )
+
+    semantic_delta: dict[str, Any] = {}
+    if derived_overrides != base_overrides:
+        semantic_delta["learner_recipe_overrides"] = {
+            "base": copy.deepcopy(base_overrides),
+            "effective": copy.deepcopy(derived_overrides),
+        }
+    if (
+        derived["policy_distillation_component_ids"]
+        != base["policy_distillation_component_ids"]
+    ):
+        semantic_delta["policy_distillation_component_ids"] = {
+            "base": copy.deepcopy(base["policy_distillation_component_ids"]),
+            "effective": copy.deepcopy(
+                derived["policy_distillation_component_ids"]
+            ),
+        }
+    if (
+        derived["value_training_component_ids"]
+        != base["value_training_component_ids"]
+    ):
+        semantic_delta["value_training_component_ids"] = {
+            "base": copy.deepcopy(base["value_training_component_ids"]),
+            "effective": copy.deepcopy(derived["value_training_component_ids"]),
+        }
+    if not semantic_delta:
+        return verified
+
+    # The trainer independently replays the unchanged production descriptor
+    # and accepts only these two reviewed diagnostic deltas. Marking the
+    # derived bytes diagnostic prevents an optimization treatment from
+    # masquerading as the promotion-eligible production recipe.
+    derived["diagnostic_only"] = True
+    derived["promotion_eligible"] = False
+    diagnostic_derivation_authority = {
+        "schema_version": train_bc.FLYWHEEL_DIAGNOSTIC_DERIVATION_SCHEMA,
+        "base_descriptor": {
+            "path": str(base_path),
+            "file_sha256": base_file_sha256,
+            "fingerprint": verified["descriptor_fingerprint"],
+        },
+        "semantic_delta": copy.deepcopy(semantic_delta),
+        "semantic_delta_sha256": _value_sha256(semantic_delta),
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+    derived["diagnostic_derivation_authority"] = (
+        diagnostic_derivation_authority
+    )
+
+    lexical = descriptor_path.expanduser().absolute()
+    if (
+        lexical == base_path
+        or lexical.parent != lexical.parent.resolve(strict=False)
+        or lexical.is_symlink()
+    ):
+        raise ExecutorError(
+            "diagnostic training descriptor path must be distinct, lexical, "
+            "absolute, and non-symlink"
+        )
+    derived_bytes = json.dumps(derived, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    derived_file_sha256 = "sha256:" + hashlib.sha256(derived_bytes).hexdigest()
+    derived_fingerprint = _value_sha256(derived)
+    authority = {
+        "schema_version": DIAGNOSTIC_TRAINING_DESCRIPTOR_SCHEMA,
+        "base_descriptor": {
+            "path": str(base_path),
+            "file_sha256": base_file_sha256,
+            "fingerprint": verified["descriptor_fingerprint"],
+        },
+        "derived_descriptor": {
+            "path": str(lexical),
+            "file_sha256": derived_file_sha256,
+            "fingerprint": derived_fingerprint,
+        },
+        "semantic_delta": semantic_delta,
+        "semantic_delta_sha256": _value_sha256(semantic_delta),
+        "diagnostic_derivation_authority": diagnostic_derivation_authority,
+        "learner_recipe_overrides": copy.deepcopy(derived_overrides),
+        "learner_recipe_overrides_sha256": _value_sha256(derived_overrides),
+        "policy_distillation_component_ids": copy.deepcopy(
+            derived["policy_distillation_component_ids"]
+        ),
+        "value_training_component_ids": copy.deepcopy(
+            derived["value_training_component_ids"]
+        ),
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+    authority["authority_sha256"] = _value_sha256(authority)
+
+    result = dict(verified)
+    result.update(
+        {
+            "data_path": lexical,
+            "corpus_meta_file_sha256": derived_file_sha256,
+            "descriptor_fingerprint": derived_fingerprint,
+            "data_fingerprint": derived_fingerprint,
+            "validation_path": lexical,
+            "validation_file_sha256": derived_file_sha256,
+            "learner_recipe_overrides": copy.deepcopy(derived_overrides),
+            "learner_recipe_overrides_sha256": _value_sha256(
+                derived_overrides
+            ),
+            "diagnostic_training_descriptor_authority": authority,
+            "_diagnostic_training_descriptor_bytes": derived_bytes,
+        }
+    )
+    bound_ablation = copy.deepcopy(learner_ablation)
+    bound_ablation["training_descriptor_authority"] = authority
+    result["learner_ablation"] = bound_ablation
+    result["claim_identity_sha256"] = _value_sha256(
+        {
+            "schema_version": "a1-learner-ablation-claim-identity-v3",
+            "contract_sha256": verified["contract_sha256"],
+            "function_preserving_upgrade": verified.get(
+                "function_preserving_upgrade"
+            ),
+            "ablation": bound_ablation,
+        }
+    )
+    return result
+
+
+def _materialize_diagnostic_training_descriptor(verified: Mapping[str, Any]) -> None:
+    """Publish the planned derived descriptor once, without overwrite."""
+
+    authority = verified.get("diagnostic_training_descriptor_authority")
+    raw_bytes = verified.get("_diagnostic_training_descriptor_bytes")
+    if authority is None and raw_bytes is None:
+        return
+    if not isinstance(authority, dict) or not isinstance(raw_bytes, bytes):
+        raise ExecutorError("diagnostic training descriptor materialization is incomplete")
+    target = Path(authority["derived_descriptor"]["path"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if (
+            target.is_symlink()
+            or not target.is_file()
+            or _file_sha256(target)
+            != authority["derived_descriptor"]["file_sha256"]
+            or stat.S_IMODE(target.stat().st_mode) != 0o444
+        ):
+            raise ExecutorError("existing diagnostic training descriptor differs")
+        return
+    temporary = target.with_name(f".{target.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(raw_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o444)
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            if (
+                target.is_symlink()
+                or not target.is_file()
+                or _file_sha256(target)
+                != authority["derived_descriptor"]["file_sha256"]
+            ):
+                raise ExecutorError("raced diagnostic training descriptor differs")
+        _fsync_directory(target.parent)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _central_learner_binding(
@@ -6382,8 +6654,14 @@ def _bind_training_report(
         # the matched aux receipt/initializer authority it did validate.
         matched_aux = learner_ablation.get("matched_aux_regularization")
         if (
-            matched_aux is None
-            or payload.get("a1_aux_regularization_binding") != matched_aux
+            (
+                matched_aux is not None
+                and payload.get("a1_aux_regularization_binding") != matched_aux
+            )
+            or (
+                matched_aux is None
+                and payload.get("a1_aux_regularization_binding") is not None
+            )
             or payload.get("a1_learner_ablation") is not None
             or payload.get("a1_effective_learner_training_recipe") is not None
             or not isinstance(payload.get("value_training"), dict)
@@ -6398,6 +6676,16 @@ def _bind_training_report(
         )
         payload["a1_learner_ablation"] = learner_ablation
         payload["value_training"]["learner_ablation"] = learner_ablation
+        descriptor_authority = verified.get(
+            "diagnostic_training_descriptor_authority"
+        )
+        if descriptor_authority is not None:
+            payload["a1_diagnostic_training_descriptor_authority"] = (
+                descriptor_authority
+            )
+            payload["value_training"][
+                "diagnostic_training_descriptor_authority"
+            ] = descriptor_authority
         payload["diagnostic_only"] = True
         payload["promotion_eligible"] = False
     tmp = report.with_name(f".{report.name}.tmp.{os.getpid()}.{time.time_ns()}")
@@ -7384,6 +7672,25 @@ def _verify_training_outputs(
                 "historical_replay",
             ],
             "component_game_sampling_ratios": [0.64, 0.12, 0.04, 0.20],
+            "policy_distillation_component_ids": (
+                verified.get("diagnostic_training_descriptor_authority", {}).get(
+                    "policy_distillation_component_ids",
+                    list(ALL_POST_WAVE_COMPONENT_IDS),
+                )
+            ),
+            "policy_distillation_scope_explicit": True,
+            "value_training_component_ids": (
+                verified.get("diagnostic_training_descriptor_authority", {}).get(
+                    "value_training_component_ids",
+                    list(ALL_POST_WAVE_COMPONENT_IDS),
+                )
+            ),
+            "value_training_scope_explicit": True,
+            "diagnostic_derivation_authority": (
+                verified.get("diagnostic_training_descriptor_authority", {}).get(
+                    "diagnostic_derivation_authority"
+                )
+            ),
             "stored_policy_component_temperatures": (
                 composite_builder.STORED_POLICY_COMPONENT_TEMPERATURES
             ),
@@ -7425,6 +7732,144 @@ def _verify_training_outputs(
             raise ExecutorError(
                 "training report does not bind the exact promotion replay composite"
             )
+        descriptor_authority = verified.get(
+            "diagnostic_training_descriptor_authority"
+        )
+        if descriptor_authority is not None:
+            expected_policy_components = set(
+                descriptor_authority["policy_distillation_component_ids"]
+            )
+            expected_value_components = set(
+                descriptor_authority["value_training_component_ids"]
+            )
+            policy_scope = report_payload.get("policy_distillation_scope")
+            policy_components = (
+                policy_scope.get("components")
+                if isinstance(policy_scope, dict)
+                else None
+            )
+            component_dose = report_payload.get("policy_component_active_dose")
+            value_scope = report_payload.get("value_training_scope")
+            value_components = (
+                value_scope.get("components")
+                if isinstance(value_scope, dict)
+                else None
+            )
+            value_component_dose = report_payload.get(
+                "value_component_active_dose"
+            )
+            if (
+                report_payload.get(
+                    "a1_diagnostic_training_descriptor_authority"
+                )
+                != descriptor_authority
+                or report_payload.get("value_training", {}).get(
+                    "diagnostic_training_descriptor_authority"
+                )
+                != descriptor_authority
+                or not isinstance(policy_scope, dict)
+                or policy_scope.get("schema_version")
+                != "component-policy-distillation-scope-v1"
+                or policy_scope.get("component_ids")
+                != descriptor_authority["policy_distillation_component_ids"]
+                or not isinstance(policy_components, dict)
+                or set(policy_components) != set(ALL_POST_WAVE_COMPONENT_IDS)
+                or not isinstance(component_dose, dict)
+                or set(component_dose) != set(ALL_POST_WAVE_COMPONENT_IDS)
+                or not isinstance(value_scope, dict)
+                or value_scope.get("schema_version")
+                != "component-value-training-scope-v1"
+                or value_scope.get("component_ids")
+                != descriptor_authority["value_training_component_ids"]
+                or not isinstance(value_components, dict)
+                or set(value_components) != set(ALL_POST_WAVE_COMPONENT_IDS)
+                or not isinstance(value_component_dose, dict)
+                or set(value_component_dose) != set(ALL_POST_WAVE_COMPONENT_IDS)
+            ):
+                raise ExecutorError(
+                    "diagnostic descriptor scope/provenance differs from issued authority"
+                )
+            for component_id in ALL_POST_WAVE_COMPONENT_IDS:
+                policy_enabled = component_id in expected_policy_components
+                value_enabled = component_id in expected_value_components
+                policy_record = policy_components[component_id]
+                dose_record = component_dose[component_id]
+                value_record = value_components[component_id]
+                value_dose_record = value_component_dose[component_id]
+                if (
+                    not isinstance(policy_record, dict)
+                    or policy_record.get("policy_distillation_enabled")
+                    is not policy_enabled
+                    or not isinstance(dose_record, dict)
+                    or not isinstance(value_record, dict)
+                    or value_record.get("value_training_enabled") is not value_enabled
+                    or not isinstance(value_dose_record, dict)
+                ):
+                    raise ExecutorError(
+                        f"diagnostic objective scope drifted for {component_id}"
+                    )
+                positive_rows = policy_record.get("positive_policy_rows")
+                weight_sum = policy_record.get("policy_weight_sum")
+                active_rows = dose_record.get("total_active_rows")
+                if (
+                    isinstance(positive_rows, bool)
+                    or not isinstance(positive_rows, int)
+                    or isinstance(weight_sum, bool)
+                    or not isinstance(weight_sum, (int, float))
+                    or not math.isfinite(float(weight_sum))
+                    or isinstance(active_rows, bool)
+                    or not isinstance(active_rows, int)
+                    or (
+                        policy_enabled
+                        and not (
+                            positive_rows > 0
+                            and float(weight_sum) > 0.0
+                            and active_rows > 0
+                        )
+                    )
+                    or (
+                        not policy_enabled
+                        and not (
+                            positive_rows == 0
+                            and float(weight_sum) == 0.0
+                            and active_rows == 0
+                        )
+                    )
+                ):
+                    raise ExecutorError(
+                        f"diagnostic policy exposure drifted for {component_id}"
+                    )
+                positive_value_rows = value_record.get("positive_value_rows")
+                value_weight_sum = value_record.get("value_weight_sum")
+                value_active_rows = value_dose_record.get("active_rows")
+                if (
+                    isinstance(positive_value_rows, bool)
+                    or not isinstance(positive_value_rows, int)
+                    or isinstance(value_weight_sum, bool)
+                    or not isinstance(value_weight_sum, (int, float))
+                    or not math.isfinite(float(value_weight_sum))
+                    or isinstance(value_active_rows, bool)
+                    or not isinstance(value_active_rows, int)
+                    or (
+                        value_enabled
+                        and not (
+                            positive_value_rows > 0
+                            and float(value_weight_sum) > 0.0
+                            and value_active_rows > 0
+                        )
+                    )
+                    or (
+                        not value_enabled
+                        and not (
+                            positive_value_rows == 0
+                            and float(value_weight_sum) == 0.0
+                            and value_active_rows == 0
+                        )
+                    )
+                ):
+                    raise ExecutorError(
+                        f"diagnostic value exposure drifted for {component_id}"
+                    )
         if isinstance(central_binding, dict):
             realized = report_payload.get("a1_realized_central_sample_order")
             if (
@@ -8643,6 +9088,10 @@ def _execute_locked(
     claim = _claim_path(verified)
     for parent in {checkpoint.parent, report.parent, receipt.parent, claim.parent}:
         _mkdir_durable(parent)
+    # Descriptor-authorized ablations are immutable inputs, not mutable corpus
+    # edits. Publish the exact planned bytes before hardware acquisition and
+    # before the irreversible one-dose claim.
+    _materialize_diagnostic_training_descriptor(verified)
     output_namespace = _canonical_one_dose_output_namespace(
         checkpoint=checkpoint,
         report=report,
@@ -9039,6 +9488,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="explicitly reviewed sha256 of the raw immutable lock bytes",
     )
     parser.add_argument(
+        "--fresh-policy-distillation-only",
+        action="store_true",
+        help=(
+            "diagnostic post-wave arm: distill policy only on current/recent/hard "
+            "components while retaining all components for value training"
+        ),
+    )
+    parser.add_argument(
+        "--fresh-value-training-only",
+        action="store_true",
+        help=(
+            "diagnostic post-wave arm: train value only on current/recent/hard "
+            "components while leaving policy distillation scope unchanged"
+        ),
+    )
+    parser.add_argument(
         "--frozen-repo",
         type=Path,
         default=None,
@@ -9221,6 +9686,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         generic_ablation_requested = bool(
             args.ablation_id or args.recipe_overrides_json
         )
+        if args.fresh_policy_distillation_only and not generic_ablation_requested:
+            raise ExecutorError(
+                "--fresh-policy-distillation-only requires a generic diagnostic ablation"
+            )
+        if args.fresh_value_training_only and not generic_ablation_requested:
+            raise ExecutorError(
+                "--fresh-value-training-only requires a generic diagnostic ablation"
+            )
         if generic_ablation_requested and not all(ablation_values):
             raise ExecutorError(
                 "--ablation-id, --recipe-overrides-json, "
@@ -9266,6 +9739,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ablation_id=args.ablation_id,
                 overrides_json=args.recipe_overrides_json,
                 reviewed_code_tree_sha256=args.ablation_code_tree_sha256,
+            )
+            checkpoint_for_descriptor = Path(
+                os.path.abspath(os.fspath(args.checkpoint.expanduser()))
+            )
+            verified = bind_diagnostic_training_descriptor(
+                verified,
+                descriptor_path=checkpoint_for_descriptor.with_name(
+                    f"{checkpoint_for_descriptor.name}.training-descriptor.json"
+                ),
+                fresh_policy_distillation_only=(
+                    args.fresh_policy_distillation_only
+                ),
+                fresh_value_training_only=args.fresh_value_training_only,
             )
         if p1_requested:
             assert args.p1_coordinator_root is not None

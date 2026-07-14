@@ -204,12 +204,18 @@ test -s "$COMPOSITE/build_receipt.json"
 The learner input is `$COMPOSITE/memmap_composite.json`; the required build
 authority is `$COMPOSITE/build_receipt.json`. The descriptor samples games at
 64% current, 12% recovery-reference, 4% hard-negative, and 20% historical
-replay. The first production candidate preserves the known-winning TEMP
-control: all four authenticated components supply policy and value targets and
-the KL anchor is zero. Fresh-only policy scope, fresh-only value scope, and a
-nonzero replay KL anchor are separate treatments and are not bundled into this
-baseline. Only the three fresh n128 components supply eligible auxiliary
-targets. Forced fresh rows carry zero policy weight and full value weight. The
+replay. This is a **TEMP-derived V5 objective**, not an exact replication of
+the historical TEMP winner: V5 changes the teacher/component composition and
+the production descriptor enables per-game policy weighting, while historical
+TEMP used n128+n256+replay and kept both per-game weighting flags off. The
+closest historical-objective diagnostic therefore uses this same V5 corpus
+with only `per_game_policy_weight=false`; per-game weighting ON remains a
+separate treatment. All four authenticated components supply policy and value
+targets and the KL anchor is zero. Fresh-only policy scope, fresh-only value
+scope, and a nonzero replay KL anchor are separate treatments and must not be
+bundled into that baseline. Only the three fresh n128 components supply
+eligible auxiliary targets. Forced fresh rows carry zero policy weight and
+full value weight. The
 legacy replay memmap predates preservation of `adapter_version`; the builder
 recovers that identity from the original hash-bound raw NPZs, binds the version
 for every component in the descriptor, and the loader lazily restores only the
