@@ -2607,6 +2607,7 @@ def _verify_one_dose_training_receipt(
         allowed_retry_repair_kinds = {
             one_dose.RETRY_REPAIR_KIND,
             one_dose.PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND,
+            one_dose.PRODUCTION_PREFLIGHT_TRANSPORT_RETRY_REPAIR_KIND,
         }
         retry_reference = _require_exact_keys(
             value["retry_contract"],

@@ -2550,6 +2550,7 @@ def test_adjudication_cannot_rebind_candidate_to_champion_search(
     [
         one_dose.RETRY_REPAIR_KIND,
         one_dose.PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND,
+        one_dose.PRODUCTION_PREFLIGHT_TRANSPORT_RETRY_REPAIR_KIND,
     ],
 )
 def test_dry_run_accepts_schema_separated_sealed_retry_receipt(
