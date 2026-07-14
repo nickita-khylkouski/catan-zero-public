@@ -2652,28 +2652,38 @@ def _require_exact_flywheel_category_semantics(
     if selected_semantics is None and isinstance(selected_records, list):
         # The sealed post-wave selector binds the semantic object on every game
         # record instead of duplicating it at the top level.  Reconstruct the
-        # redundant surface only when every record supplies one unambiguous
-        # value; the record digest authenticates these bytes.
-        derived: dict[str, object] = {}
-        for index, record in enumerate(selected_records):
-            category = record.get("category") if isinstance(record, dict) else None
-            semantic = (
-                record.get("category_semantic")
-                if isinstance(record, dict)
-                else None
-            )
-            if category not in _FLYWHEEL_FRESH_CATEGORY_IDS or not isinstance(
-                semantic, dict
+        # redundant surface only when the record schema actually carries it.
+        # Older sealed manifests carry no category-semantic field at all and
+        # must preserve that historical absence.  A partial population is
+        # ambiguous and remains fail-closed.
+        record_semantics = [
+            record.get("category_semantic") if isinstance(record, dict) else None
+            for record in selected_records
+        ]
+        if any(value is not None for value in record_semantics):
+            if any(value is None for value in record_semantics):
+                raise SystemExit(
+                    "selected-game category semantics are only partially populated"
+                )
+            derived: dict[str, object] = {}
+            for index, (record, semantic) in enumerate(
+                zip(selected_records, record_semantics, strict=True)
             ):
-                raise SystemExit(
-                    f"selected-game record {index} category semantic was stripped or swapped"
+                category = (
+                    record.get("category") if isinstance(record, dict) else None
                 )
-            previous = derived.setdefault(str(category), semantic)
-            if previous != semantic:
-                raise SystemExit(
-                    f"selected-game record {index} category semantic was stripped or swapped"
-                )
-        selected_semantics = derived
+                if category not in _FLYWHEEL_FRESH_CATEGORY_IDS or not isinstance(
+                    semantic, dict
+                ):
+                    raise SystemExit(
+                        f"selected-game record {index} category semantic was stripped or swapped"
+                    )
+                previous = derived.setdefault(str(category), semantic)
+                if previous != semantic:
+                    raise SystemExit(
+                        f"selected-game record {index} category semantic was stripped or swapped"
+                    )
+            selected_semantics = derived
 
     surfaces = {
         "source authority": authority.get("category_semantics"),
@@ -3306,9 +3316,14 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
     return {
         **payload,
         "fresh_source_bindings": fresh_bindings,
-        "fresh_source_ids": fresh_ids,
+        # This enriched authority crosses the single-node DDP rendezvous as
+        # JSON.  Keep the deterministic source-id collections JSON-native;
+        # returning the verifier's working sets here made rank 0 finish the
+        # expensive payload authentication and then fail before the first
+        # optimizer step with ``Object of type set is not JSON serializable``.
+        "fresh_source_ids": sorted(fresh_ids),
         "historical_source_bindings": historical_bindings,
-        "historical_source_ids": historical_ids,
+        "historical_source_ids": sorted(historical_ids),
         "category_semantics": category_semantics,
     }
 

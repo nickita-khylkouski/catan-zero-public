@@ -974,13 +974,13 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         "selected_game_seed_set_sha256": "sha256:" + "9" * 64,
         "records": [
             {
-                "game_seed": int(job["base_seed"]) + offset,
-                "job_id": job["job_id"],
-                "worker_id": job["worker_id"],
-                "category": job["category"],
-                "producer_checkpoint_sha256": producer["sha256"],
-                "opponent_checkpoint_sha256": opponent[job["category"]],
-                "split": "train" if offset == 0 else "validation",
+                    "game_seed": int(job["base_seed"]) + offset,
+                    "job_id": job["job_id"],
+                    "worker_id": job["worker_id"],
+                    "category": job["category"],
+                    "producer_checkpoint_sha256": producer["sha256"],
+                    "opponent_checkpoint_sha256": opponent[job["category"]],
+                    "split": "train" if offset == 0 else "validation",
             }
             for job in lock["fleet"]["jobs"]
             for offset in (0, 1)
@@ -1117,6 +1117,14 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     assert verified["validation_split_receipt"]["aggregate"]["selected_game_count"] == 8
 
     authority_path = Path(receipt["source_authority"]["path"])
+    enriched_authority = builder.train_bc._validate_flywheel_source_authority(  # noqa: SLF001
+        authority_path
+    )
+    assert isinstance(enriched_authority["fresh_source_ids"], list)
+    assert isinstance(enriched_authority["historical_source_ids"], list)
+    # The enriched authority is sent from rank 0 to the other DDP ranks.
+    # Exercise the real serialization boundary, not only semantic validation.
+    json.dumps(enriched_authority, sort_keys=True)
     source_authority = json.loads(authority_path.read_text(encoding="utf-8"))
     assert source_authority["schema_version"] == (
         "a1-post-wave-composite-source-authority-v3"
