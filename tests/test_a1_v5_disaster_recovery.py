@@ -42,6 +42,19 @@ def _fixed_tool() -> dict[str, object]:
     }
 
 
+def test_runtime_config_scalar_is_normalized_to_canonical_json() -> None:
+    class NumPyLikeInt:
+        def item(self) -> int:
+            return 567
+
+    normalized = recovery._json_runtime_value(  # noqa: SLF001
+        {"action_size": NumPyLikeInt(), "shape": (4, 8)},
+        where="policy config",
+    )
+    assert normalized == {"action_size": 567, "shape": [4, 8]}
+    assert json.loads(json.dumps(normalized)) == normalized
+
+
 @pytest.fixture()
 def exact_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
     producer = _write(tmp_path / "producer-v5.pt", b"exact-v5-checkpoint")

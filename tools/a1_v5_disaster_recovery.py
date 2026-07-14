@@ -90,6 +90,42 @@ def _md5_bytes(value: bytes) -> str:
     return hashlib.md5(value).hexdigest()  # noqa: S324
 
 
+def _json_runtime_value(value: Any, *, where: str) -> Any:
+    """Normalize runtime/config scalars without weakening canonical JSON.
+
+    Historical checkpoints may carry NumPy scalar dimensions (notably
+    ``np.int64(action_size)``).  They are semantically ordinary JSON numbers,
+    but the stdlib encoder does not recognize them.  Convert only scalar
+    ``item()`` values and recursively reject everything else; tensors, arrays,
+    and arbitrary objects must never leak into the recovery receipt.
+    """
+
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_runtime_value(child, where=f"{where}.{key}")
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _json_runtime_value(child, where=f"{where}[{index}]")
+            for index, child in enumerate(value)
+        ]
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            scalar = item()
+        except (TypeError, ValueError) as error:
+            raise RecoveryError(f"{where} is not a scalar runtime value") from error
+        if scalar is value:
+            raise RecoveryError(f"{where} scalar conversion did not make progress")
+        return _json_runtime_value(scalar, where=where)
+    raise RecoveryError(
+        f"{where} has unsupported runtime value type {type(value).__name__}"
+    )
+
+
 def _require_sha(value: Any, where: str) -> str:
     if not isinstance(value, str) or _SHA_RE.fullmatch(value) is None:
         raise RecoveryError(f"{where} must be a canonical sha256 digest")
@@ -245,10 +281,16 @@ def _runtime_smoke(checkpoint: Path) -> dict[str, Any]:
     except Exception as error:  # noqa: BLE001 - loadability is the smoke invariant.
         raise RecoveryError(f"current policy runtime cannot load recovered checkpoint: {error}") from error
     config = policy.config
-    config_value = (
-        {field.name: getattr(config, field.name) for field in dataclasses.fields(config)}
-        if dataclasses.is_dataclass(config)
-        else repr(config)
+    config_value = _json_runtime_value(
+        (
+            {
+                field.name: getattr(config, field.name)
+                for field in dataclasses.fields(config)
+            }
+            if dataclasses.is_dataclass(config)
+            else repr(config)
+        ),
+        where="policy config",
     )
     parameter_signature = [
         {"name": name, "shape": list(tensor.shape), "dtype": str(tensor.dtype)}
