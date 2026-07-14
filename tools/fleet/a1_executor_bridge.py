@@ -9,6 +9,7 @@ metadata, so the sealed ``plan_sha256`` and receipt identity do not change.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import subprocess
@@ -188,11 +189,36 @@ def build_bridged_plan(
         hosts_path=hosts_path,
         receipt_path=receipt_path,
     )
+    # The frozen verifier has just authenticated the exact lock path and all
+    # of its claims.  Reuse those bytes for the hardened executor's portable
+    # structural replay: calling the hardened contract verifier directly
+    # would incorrectly require path equality with the hardened checkout's
+    # fleet manifest, even though the sealed plan deliberately points at the
+    # frozen checkout.  Bind the bytes to the frozen plan before returning a
+    # defensive copy to each verifier call, closing both relocation and TOCTOU
+    # ambiguity without weakening any lock semantics.
+    try:
+        frozen_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BridgeError(f"cannot replay frozen lock bytes: {error}") from error
+    lock_manifest = plan.get("operator_manifests", {}).get("lock")
+    if (
+        not isinstance(frozen_lock, dict)
+        or frozen_lock.get("contract_sha256") != plan.get("contract_sha256")
+        or not isinstance(lock_manifest, dict)
+        or lock_manifest.get("sha256") != hardened._sha256(lock_path)  # noqa: SLF001
+    ):
+        raise BridgeError("frozen plan and lock bytes disagree during portable replay")
+
+    def verified_frozen_lock(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return copy.deepcopy(frozen_lock)
+
     portable_plan = hardened.build_plan(
         lock_path=lock_path,
         render_path=render_path,
         hosts_path=hosts_path,
         receipt_path=receipt_path,
+        verify_lock_fn=verified_frozen_lock,
         repo_root=frozen_repo,
     )
     if portable_plan != plan:
