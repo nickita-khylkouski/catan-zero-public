@@ -17,6 +17,7 @@ import tarfile
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
@@ -40,6 +41,7 @@ CLIENT_ENVIRONMENT = {
 SUPERVISOR_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
 REQUIRED_NOFILE_SOFT = 65_536
 STOP_SSH_TIMEOUT_SECONDS = 45.0
+MAX_PARALLEL_STAGE_HOSTS = 12
 MPS_UNIT_PATH = _REPO_ROOT / "tools/fleet/systemd/nvidia-mps.service"
 PRODUCTION_RUNTIME = runtime_contract.load_runtime_contract()
 PRODUCTION_RUNTIME_CONTRACT_PATH = runtime_contract.DEFAULT_CONTRACT
@@ -1940,7 +1942,9 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
                 (local_lane, remote_lane, _sha256(local_lane))
             )
 
-        for alias in aliases:
+        def stage_alias(alias: str) -> None:
+            """Install one host independently; no mutable state is shared."""
+
             immutable_inputs = [
                 *repo_inputs,
                 *[
@@ -1976,6 +1980,17 @@ def execute(plan: dict[str, Any], *, receipt_path: Path, resume: bool) -> dict[s
                 required["seed_ledger"]["path"],
                 public["live_seed_ledger_sha256"],
             )
+
+        # Every destination and receipt is host-local and every local bundle
+        # name contains the alias.  Serial staging made a 12-host launch wait
+        # for twelve identical checkpoint transfers in sequence, so stage the
+        # independent hosts concurrently and retain deterministic alias-order
+        # error propagation through ``map``.
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_PARALLEL_STAGE_HOSTS, len(aliases)),
+            thread_name_prefix="a1-stage",
+        ) as pool:
+            list(pool.map(stage_alias, aliases))
 
         lane_pids: dict[str, int] = dict(receipt.get("lane_pids", {}))
         for worker_id, lane in sorted(lanes.items()):
