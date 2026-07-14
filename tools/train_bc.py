@@ -10658,9 +10658,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             value_active_row_mask = batch_metrics.pop(
                 "_value_active_row_mask", None
             )
+            source_global_rows = batch
+            if bool(
+                getattr(data, "value_training_scope_authenticated", False)
+            ):
+                source_global_rows = _source_global_rows_for_training_batch(
+                    batch_data, batch
+                )
             batch_value_component_dose = (
                 _value_component_active_dose_for_batch(
-                    data, batch, value_active_row_mask
+                    data, source_global_rows, value_active_row_mask
                 )
             )
             if batch_value_component_dose is not None:
@@ -13633,6 +13640,39 @@ def _objective_measure_validation_aggregate(
             "weighted_numerator_per_sample": numerator_density,
             "weight_per_sample": denominator_density,
         }
+    # Policy accuracy is conditional on policy-active rows, just like policy
+    # cross-entropy.  In a scoped learner an excluded replay component reports
+    # zero active rows and therefore zero accuracy.  Weighting that placeholder
+    # zero by the component's sampling mass diluted fresh-policy accuracy (for
+    # the production .80/.20 split, .613 became .4904) even though replay never
+    # entered the policy objective.  Reconstruct both accuracy means from their
+    # explicit active-row denominator under the same component/game measure.
+    for key in ("accuracy", "top3_accuracy"):
+        if not all(
+            key in report
+            and "accuracy_active_count" in report
+            and int(report.get("samples", 0)) > 0
+            for report in reports
+        ):
+            continue
+        numerator_density = 0.0
+        denominator_density = 0.0
+        for probability, report in zip(normalized, reports, strict=True):
+            samples = float(report["samples"])
+            denominator = float(report["accuracy_active_count"])
+            numerator_density += (
+                float(probability) * float(report[key]) * denominator / samples
+            )
+            denominator_density += float(probability) * denominator / samples
+        metrics[key] = (
+            numerator_density / denominator_density
+            if denominator_density > 0.0
+            else 0.0
+        )
+        sufficient[key] = {
+            "weighted_numerator_per_sample": numerator_density,
+            "weight_per_sample": denominator_density,
+        }
     # CAT-100 is a sum of separately normalized masked-head objectives.  A
     # synthetic row denominator for their already-summed batch mean is not a
     # sufficient statistic: label density differs by head and by game.  Carry
@@ -15799,6 +15839,13 @@ def _iterate_training_batches(
 
     def _materialize(batch: np.ndarray):
         materialized = {key: data[key][batch] for key in keys}
+        # train_fn indexes a materialized batch with local ``0..N-1`` rows.
+        # Preserve the immutable global source rows separately so post-loss
+        # provenance (notably component dose) cannot reinterpret those local
+        # positions as rows from component zero of the full composite.
+        materialized["_source_global_row_indices"] = np.asarray(
+            batch, dtype=np.int64
+        ).copy()
         stored_policy_temperatures = _stored_policy_temperatures_for_batch(
             data, batch
         )
@@ -20515,10 +20562,26 @@ def _value_training_scope_report(
     }
 
 
+def _source_global_rows_for_training_batch(
+    batch_data: object, batch: np.ndarray
+) -> np.ndarray:
+    """Resolve full-corpus rows after optional threaded materialization."""
+
+    rows = np.asarray(batch, dtype=np.int64)
+    if isinstance(batch_data, dict) and "_source_global_row_indices" in batch_data:
+        source = np.asarray(batch_data["_source_global_row_indices"], dtype=np.int64)
+        if source.ndim != 1 or np.any(rows < 0) or np.any(rows >= len(source)):
+            raise RuntimeError("materialized source-global row mapping is invalid")
+        rows = source[rows]
+    if rows.ndim != 1 or np.any(rows < 0):
+        raise RuntimeError("training batch has invalid source-global rows")
+    return rows
+
+
 def _value_component_active_dose_for_batch(
     data, batch: np.ndarray, active_mask: np.ndarray | None
 ) -> dict[str, float] | None:
-    """Measure rows that actually entered the value loss by component."""
+    """Measure source rows that actually entered the value loss by component."""
 
     if not bool(getattr(data, "value_training_scope_authenticated", False)):
         return None

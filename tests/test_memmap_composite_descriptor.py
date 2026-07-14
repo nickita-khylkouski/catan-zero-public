@@ -767,6 +767,41 @@ def test_prefetch_preserves_source_bound_stored_policy_temperatures():
     ]
 
 
+def test_prefetch_value_dose_uses_noncontiguous_global_component_rows():
+    data = train_bc.ConcatMemmapCorpus(
+        [_TinyCorpus([0, 1]), _TinyCorpus([10, 11]), _TinyCorpus([20, 21])]
+    )
+    data.component_ids = ("current", "recent", "replay")
+    data.value_training_component_indices = (0, 1)
+    data.value_training_scope_authenticated = True
+    # Deliberately noncontiguous and component-interleaved. The prefetch path
+    # exposes local [0,1,2,3] to train_fn but provenance must retain these rows.
+    source_rows = np.asarray([5, 0, 2, 1], dtype=np.int64)
+    materialized, local, _policy_weights, _value_weights = next(
+        iter(
+            train_bc._iterate_training_batches(
+                data,
+                np.arange(4, dtype=np.int64),
+                source_rows,
+                4,
+                np.ones(6, dtype=np.float32),
+                np.ones(6, dtype=np.float32),
+                num_workers=1,
+                prefetch=1,
+            )
+        )
+    )
+
+    resolved = train_bc._source_global_rows_for_training_batch(materialized, local)
+    np.testing.assert_array_equal(resolved, source_rows)
+    dose = train_bc._value_component_active_dose_for_batch(
+        data,
+        resolved,
+        np.asarray([False, True, True, True]),
+    )
+    assert dose == {"current": 2.0, "recent": 1.0, "replay": 0.0}
+
+
 def test_prefetch_preserves_authenticated_policy_kl_anchor_scope():
     data = train_bc.ConcatMemmapCorpus(
         [_TinyCorpus([0, 1]), _TinyCorpus([10, 11])]

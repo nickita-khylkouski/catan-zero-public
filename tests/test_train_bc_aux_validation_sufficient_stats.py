@@ -119,6 +119,34 @@ def test_composite_validation_reconstructs_nonzero_uncertainty_objective() -> No
     }
 
 
+def test_scoped_policy_accuracy_excludes_zero_denominator_replay() -> None:
+    reports = [
+        {
+            "samples": 100,
+            "accuracy_active_count": 50,
+            "accuracy": 0.613,
+            "top3_accuracy": 0.91,
+        },
+        {
+            "samples": 100,
+            "accuracy_active_count": 0,
+            "accuracy": 0.0,
+            "top3_accuracy": 0.0,
+        },
+    ]
+
+    metrics, sufficient = train_bc._objective_measure_validation_aggregate(
+        reports, np.asarray([0.8, 0.2])
+    )
+
+    # Replay has 20% sampler mass but no rows in the scoped policy objective;
+    # it must not turn .613 into the old diluted .4904.
+    assert metrics["accuracy"] == pytest.approx(0.613)
+    assert metrics["top3_accuracy"] == pytest.approx(0.91)
+    assert sufficient is not None
+    assert sufficient["accuracy"]["weight_per_sample"] == pytest.approx(0.4)
+
+
 def test_nonzero_objective_term_without_exact_statistics_fails_closed() -> None:
     reports = [
         {
