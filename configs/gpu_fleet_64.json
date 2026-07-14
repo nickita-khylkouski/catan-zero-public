@@ -7,17 +7,17 @@
   "remote_repo": "/home/ubuntu/catan-zero-v1",
   "remote_root": "/home/ubuntu/catan-fleet-jobs",
   "hosts": [
-    {"alias": "c1", "address": "192.222.54.251", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "c2", "address": "68.209.75.117", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "c3", "address": "192.222.53.18", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "c4", "address": "68.209.73.252", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "c5", "address": "68.209.74.145", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "c6", "address": "68.209.74.2", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "c7", "address": "68.209.74.24", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "c8", "address": "68.209.72.159", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "h100-8a", "address": "192.222.53.119", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "h100-8b", "address": "192.222.55.216", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "h100-8c", "address": "192.222.54.141", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"},
-    {"alias": "h100-8d", "address": "209.20.158.82", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "3c84b8be7052cf052648d95c4b581c7123ef60d3"}
+    {"alias": "c1", "address": "192.222.54.251", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "c2", "address": "68.209.75.117", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "c3", "address": "192.222.53.18", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "c4", "address": "68.209.73.252", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "c5", "address": "68.209.74.145", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "c6", "address": "68.209.74.2", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "c7", "address": "68.209.74.24", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "c8", "address": "68.209.72.159", "gpu_count": 4, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "h100-8a", "address": "192.222.53.119", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "h100-8b", "address": "192.222.55.216", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "h100-8c", "address": "192.222.54.141", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"},
+    {"alias": "h100-8d", "address": "209.20.158.82", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3", "repo_commit": "4e95bc0cc81cf3d121410aeb0093f3975c492af6"}
   ]
 }
