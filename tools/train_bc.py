@@ -5028,6 +5028,114 @@ def _a1_preflight_store(
     return dist.PrefixStore(prefix, store)
 
 
+A1_PREFLIGHT_STORE_CHUNK_BYTES = 4 * 1024 * 1024
+A1_PREFLIGHT_STORE_MAX_PACKET_BYTES = 256 * 1024 * 1024
+A1_PREFLIGHT_STORE_MAX_CHUNKS = (
+    A1_PREFLIGHT_STORE_MAX_PACKET_BYTES // A1_PREFLIGHT_STORE_CHUNK_BYTES
+)
+A1_PREFLIGHT_STORE_PACKET_SCHEMA = "train-bc-a1-preflight-store-packet-v1"
+
+
+def _publish_a1_preflight_packet(
+    store: Any, result_key: str, packet: dict[str, object]
+) -> None:
+    """Publish one authenticated packet without exceeding TCPStore's 8 MiB cap.
+
+    Chunks are written before the manifest.  Peers block on the manifest key,
+    so they cannot mistake a partially published packet for a complete result.
+    JSON's default ``ensure_ascii=True`` keeps every byte boundary safe to pass
+    through the Store string API.
+    """
+
+    encoded = json.dumps(packet, sort_keys=True, separators=(",", ":")).encode("ascii")
+    if len(encoded) > A1_PREFLIGHT_STORE_MAX_PACKET_BYTES:
+        raise ValueError("A1 preflight packet exceeds the bounded Store transport size")
+    chunks = [
+        encoded[offset : offset + A1_PREFLIGHT_STORE_CHUNK_BYTES]
+        for offset in range(0, len(encoded), A1_PREFLIGHT_STORE_CHUNK_BYTES)
+    ]
+    if not chunks:
+        chunks = [b""]
+    for index, chunk in enumerate(chunks):
+        store.set(f"{result_key}/chunk/{index:08d}", chunk.decode("ascii"))
+    manifest = {
+        "schema_version": A1_PREFLIGHT_STORE_PACKET_SCHEMA,
+        "chunk_bytes": A1_PREFLIGHT_STORE_CHUNK_BYTES,
+        "chunk_count": len(chunks),
+        "payload_size_bytes": len(encoded),
+        "payload_sha256": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
+    }
+    store.set(
+        f"{result_key}/manifest",
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+    )
+
+
+def _receive_a1_preflight_packet(
+    store: Any, result_key: str
+) -> dict[str, object]:
+    """Receive, bound, and decode a chunked rank-0 preflight packet."""
+
+    raw_manifest = store.get(f"{result_key}/manifest")
+    if isinstance(raw_manifest, bytes):
+        raw_manifest = raw_manifest.decode("utf-8")
+    manifest = json.loads(raw_manifest)
+    expected_fields = {
+        "schema_version",
+        "chunk_bytes",
+        "chunk_count",
+        "payload_size_bytes",
+        "payload_sha256",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_fields:
+        raise ValueError("A1 preflight packet manifest fields drifted")
+    chunk_count = manifest.get("chunk_count")
+    payload_size = manifest.get("payload_size_bytes")
+    if (
+        manifest.get("schema_version") != A1_PREFLIGHT_STORE_PACKET_SCHEMA
+        or manifest.get("chunk_bytes") != A1_PREFLIGHT_STORE_CHUNK_BYTES
+        or isinstance(chunk_count, bool)
+        or not isinstance(chunk_count, int)
+        or chunk_count < 1
+        or chunk_count > A1_PREFLIGHT_STORE_MAX_CHUNKS
+        or isinstance(payload_size, bool)
+        or not isinstance(payload_size, int)
+        or payload_size < 1
+        or payload_size > A1_PREFLIGHT_STORE_MAX_PACKET_BYTES
+        or chunk_count
+        != (payload_size + A1_PREFLIGHT_STORE_CHUNK_BYTES - 1)
+        // A1_PREFLIGHT_STORE_CHUNK_BYTES
+        or not _is_sha256(manifest.get("payload_sha256"))
+    ):
+        raise ValueError("A1 preflight packet manifest is malformed")
+
+    chunks: list[bytes] = []
+    for index in range(chunk_count):
+        raw_chunk = store.get(f"{result_key}/chunk/{index:08d}")
+        if isinstance(raw_chunk, str):
+            raw_chunk = raw_chunk.encode("utf-8")
+        if not isinstance(raw_chunk, bytes):
+            raise ValueError("A1 preflight packet chunk is not bytes")
+        expected_size = (
+            A1_PREFLIGHT_STORE_CHUNK_BYTES
+            if index + 1 < chunk_count
+            else payload_size - A1_PREFLIGHT_STORE_CHUNK_BYTES * (chunk_count - 1)
+        )
+        if len(raw_chunk) != expected_size:
+            raise ValueError("A1 preflight packet chunk length drifted")
+        chunks.append(raw_chunk)
+    encoded = b"".join(chunks)
+    if len(encoded) != payload_size:
+        raise ValueError("A1 preflight packet total length drifted")
+    actual_sha256 = f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+    if actual_sha256 != manifest["payload_sha256"]:
+        raise ValueError("A1 preflight packet digest drifted")
+    packet = json.loads(encoded.decode("utf-8"))
+    if not isinstance(packet, dict):
+        raise ValueError("A1 preflight packet is not an object")
+    return packet
+
+
 def _coordinated_a1_memmap_preflight(
     data_path: str | Path,
     *,
@@ -5072,7 +5180,7 @@ def _coordinated_a1_memmap_preflight(
                 "error": str(error),
             }
             try:
-                store.set(result_key, json.dumps(packet, sort_keys=True))
+                _publish_a1_preflight_packet(store, result_key, packet)
             except Exception as publish_error:
                 raise SystemExit(
                     "rank 0 A1 preflight failed and its failure could not be "
@@ -5080,7 +5188,7 @@ def _coordinated_a1_memmap_preflight(
                 ) from error
             raise
         try:
-            store.set(result_key, json.dumps(packet, sort_keys=True))
+            _publish_a1_preflight_packet(store, result_key, packet)
         except Exception as error:
             raise SystemExit(
                 f"rank 0 could not publish successful A1 preflight: {error}"
@@ -5088,10 +5196,7 @@ def _coordinated_a1_memmap_preflight(
         return metadata
 
     try:
-        raw = store.get(result_key)
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        packet = json.loads(raw)
+        packet = _receive_a1_preflight_packet(store, result_key)
     except Exception as error:
         raise SystemExit(
             f"rank {ddp.get('rank')} could not receive rank-0 A1 preflight: {error}"

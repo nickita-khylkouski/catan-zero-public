@@ -15,11 +15,15 @@ import train_bc  # type: ignore  # noqa: E402
 
 
 class _Store:
-    def __init__(self) -> None:
+    def __init__(self, *, max_value_bytes: int | None = None) -> None:
         self.values: dict[str, bytes] = {}
+        self.max_value_bytes = max_value_bytes
 
-    def set(self, key: str, value: str) -> None:
-        self.values[key] = value.encode("utf-8")
+    def set(self, key: str, value: str | bytes) -> None:
+        encoded = value.encode("utf-8") if isinstance(value, str) else value
+        if self.max_value_bytes is not None and len(encoded) > self.max_value_bytes:
+            raise ValueError("store value exceeds transport limit")
+        self.values[key] = encoded
 
     def get(self, key: str) -> bytes:
         return self.values[key]
@@ -140,14 +144,126 @@ def test_peer_rejects_malformed_success_metadata(
 ) -> None:
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
     store = _Store()
-    store.set(
+    train_bc._publish_a1_preflight_packet(
+        store,
         "result",
-        json.dumps({"schema_version": 1, "ok": True, "metadata": "not-an-object"}),
+        {"schema_version": 1, "ok": True, "metadata": "not-an-object"},
     )
     with pytest.raises(SystemExit, match="malformed metadata"):
         train_bc._coordinated_a1_memmap_preflight(
             "/corpus",
             validation_manifest_path="/validation.json",
             ddp=_ddp(1),
+            _store=store,
+        )
+
+
+def test_large_success_metadata_is_chunked_below_tcpstore_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    metadata = {
+        "payload_inventory_sha256": "sha256:" + "a" * 64,
+        "large_authenticated_metadata": "x" * (9 * 1024 * 1024),
+    }
+    monkeypatch.setattr(
+        train_bc,
+        "_preflight_a1_memmap_metadata",
+        lambda *args, **kwargs: metadata,
+    )
+    store = _Store(max_value_bytes=8 * 1024 * 1024)
+
+    rank0 = train_bc._coordinated_a1_memmap_preflight(
+        "/corpus",
+        validation_manifest_path="/validation.json",
+        ddp=_ddp(0),
+        _store=store,
+    )
+    peer = train_bc._coordinated_a1_memmap_preflight(
+        "/corpus",
+        validation_manifest_path="/validation.json",
+        ddp=_ddp(4),
+        _store=store,
+    )
+
+    assert rank0 == metadata
+    assert peer == metadata
+    chunk_values = [value for key, value in store.values.items() if "/chunk/" in key]
+    assert len(chunk_values) >= 3
+    assert max(map(len, chunk_values)) <= 4 * 1024 * 1024
+
+
+def test_peer_rejects_corrupt_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    store = _Store()
+    train_bc._publish_a1_preflight_packet(
+        store,
+        "result",
+        {"schema_version": 1, "ok": True, "metadata": {"bound": True}},
+    )
+    chunk_key = "result/chunk/00000000"
+    store.values[chunk_key] = b"!" + store.values[chunk_key][1:]
+
+    with pytest.raises(SystemExit, match="packet digest drifted"):
+        train_bc._coordinated_a1_memmap_preflight(
+            "/corpus",
+            validation_manifest_path="/validation.json",
+            ddp=_ddp(2),
+            _store=store,
+        )
+
+
+def test_peer_rejects_malformed_packet_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    store = _Store()
+    store.set(
+        "result/manifest",
+        json.dumps(
+            {
+                "schema_version": train_bc.A1_PREFLIGHT_STORE_PACKET_SCHEMA,
+                "chunk_bytes": train_bc.A1_PREFLIGHT_STORE_CHUNK_BYTES,
+                "chunk_count": 0,
+                "payload_size_bytes": 1,
+                "payload_sha256": "sha256:" + "0" * 64,
+            }
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="packet manifest is malformed"):
+        train_bc._coordinated_a1_memmap_preflight(
+            "/corpus",
+            validation_manifest_path="/validation.json",
+            ddp=_ddp(6),
+            _store=store,
+        )
+
+
+def test_peer_rejects_oversized_packet_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    store = _Store()
+    store.set(
+        "result/manifest",
+        json.dumps(
+            {
+                "schema_version": train_bc.A1_PREFLIGHT_STORE_PACKET_SCHEMA,
+                "chunk_bytes": train_bc.A1_PREFLIGHT_STORE_CHUNK_BYTES,
+                "chunk_count": train_bc.A1_PREFLIGHT_STORE_MAX_CHUNKS + 1,
+                "payload_size_bytes": (
+                    train_bc.A1_PREFLIGHT_STORE_MAX_PACKET_BYTES + 1
+                ),
+                "payload_sha256": "sha256:" + "0" * 64,
+            }
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="packet manifest is malformed"):
+        train_bc._coordinated_a1_memmap_preflight(
+            "/corpus",
+            validation_manifest_path="/validation.json",
+            ddp=_ddp(5),
             _store=store,
         )
