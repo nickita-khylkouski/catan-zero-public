@@ -19,10 +19,12 @@ learner and it refuses an existing/non-empty output root.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import uuid
 from collections import Counter, defaultdict
@@ -73,15 +75,25 @@ EFFECTIVE_COMPONENT_RATIOS = {
 # target at T=1.0.  ``soft_target_temperature=0.7`` is deliberately inert for
 # stored-policy targets, so bind the source temperatures in the descriptor
 # instead of relying on that easy-to-misread global score-target flag.
-# Historical replay is value-only in this descriptor, but bind its calibrated
-# temperature too so the descriptor remains unambiguous if inspected or
-# replayed by tooling that materializes all component metadata.
+# Historical replay is behavior-anchor-only in this descriptor.  Its stored
+# search-policy temperature is therefore objective-inert, but remains bound so
+# the component's authenticated source semantics are not erased.
 STORED_POLICY_COMPONENT_TEMPERATURES = {
     "current_producer": 1.0,
     "recent_history": 1.0,
     "hard_negative": 1.0,
     HISTORICAL_REPLAY_CATEGORY: 0.52,
 }
+
+# The replay anchor is normalized conditionally over authenticated historical
+# rows that both carry a prior and have more than one legal action.  The A1
+# recovery program's light anchor was specified as 0.03 at all-corpus mass; a
+# fixed 20% replay component therefore uses 0.20 * 0.03 = 0.006 here.  This is
+# deliberately the smallest registered anchor, not the 0.020 strong arm: the
+# short learner dose already limits forgetting, while a light forward-KL
+# constraint preserves incumbent behavior without allowing obsolete search or
+# return labels to supervise the new student.
+HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT = 0.006
 
 
 def _single_adapter_version(values: Sequence[object], *, source: str) -> str:
@@ -161,6 +173,8 @@ def _historical_raw_adapter_version(
     return _single_adapter_version(
         sorted(observed), source="historical raw replay authority"
     )
+
+
 LEARNER_RECIPE_OVERRIDES: dict[str, object] = {
     "forced_action_weight": 0.0,
     "forced_row_value_weight": 1.0,
@@ -170,7 +184,7 @@ LEARNER_RECIPE_OVERRIDES: dict[str, object] = {
     "per_game_value_weight": False,
     "per_game_value_weight_mode": "equal",
     "policy_kl_anchor_direction": "forward",
-    "policy_kl_anchor_weight": 0.0,
+    "policy_kl_anchor_weight": HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT,
     "policy_loss_weight": 1.0,
     "q_loss_weight": 0.0,
     "soft_target_source": "policy",
@@ -201,6 +215,115 @@ def _file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return f"sha256:{digest.hexdigest()}"
+
+
+def _frozen_runtime_lock_verifier(
+    *,
+    frozen_repo: Path,
+    expected_verifier_sha256: str,
+    lock_path: Path,
+) -> Callable[..., dict[str, Any]]:
+    """Authenticate a path-bound v3 lock in its exact frozen code runtime.
+
+    A v3 lock deliberately requires its fleet manifest to live inside the
+    checkout that sealed it. Running today's verifier from a newer checkout
+    therefore rejects a valid historical lock before the post-wave builder can
+    apply newer learner semantics. This bridge executes only an explicitly
+    hash-bound verifier that the raw lock itself also names in
+    ``provenance.runtime_code_tree``. The verified lock bytes are then replayed
+    defensively inside this process; the lock is not rewritten or resealed.
+    """
+
+    try:
+        root = frozen_repo.expanduser().resolve(strict=True)
+        requested_lock = lock_path.expanduser().resolve(strict=True)
+        verifier_path = (root / "tools/a1_pre_wave_contract.py").resolve(
+            strict=True
+        )
+        raw_lock = _load_json(requested_lock)
+    except (OSError, ValueError) as error:
+        raise CompositeBuildError(
+            f"cannot resolve frozen lock-verifier inputs: {error}"
+        ) from error
+    actual_verifier_sha256 = _file_sha256(verifier_path)
+    if actual_verifier_sha256 != expected_verifier_sha256:
+        raise CompositeBuildError(
+            "frozen lock verifier differs from its explicit SHA-256 binding"
+        )
+    provenance = raw_lock.get("provenance")
+    if not isinstance(provenance, dict):
+        raise CompositeBuildError("frozen lock has no runtime-code provenance")
+    runtime_records = provenance.get("runtime_code_tree")
+    matches = [
+        record
+        for record in runtime_records or []
+        if isinstance(record, dict)
+        and record.get("path") == str(verifier_path)
+        and record.get("sha256") == actual_verifier_sha256
+    ]
+    if len(matches) != 1:
+        raise CompositeBuildError(
+            "frozen lock does not bind the explicitly selected verifier bytes"
+        )
+    script = r'''import json,pathlib,sys
+root=pathlib.Path(sys.argv[1]).resolve(strict=True)
+expected=(root/'tools/a1_pre_wave_contract.py').resolve(strict=True)
+from tools import a1_pre_wave_contract as module
+if pathlib.Path(module.__file__).resolve(strict=True)!=expected: raise SystemExit(f'frozen verifier import leaked to {module.__file__}')
+lock=module.verify_lock(pathlib.Path(sys.argv[2]),require_all_job_claims=True)
+print(json.dumps(lock,sort_keys=True,separators=(',',':')))'''
+    environment = os.environ.copy()
+    for name in (
+        "PYTHONHOME",
+        "PYTHONSAFEPATH",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+    ):
+        environment.pop(name, None)
+    environment.update(
+        {
+            "PYTHONPATH": f"{root / 'src'}:{root}",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(root), str(requested_lock)],
+        cwd=root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise CompositeBuildError(f"frozen lock verifier refused: {detail}")
+    try:
+        verified_lock = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise CompositeBuildError(
+            "frozen lock verifier returned invalid JSON"
+        ) from error
+    if verified_lock != raw_lock:
+        raise CompositeBuildError(
+            "frozen verifier result differs from the requested lock bytes"
+        )
+
+    def replay_verified_lock(
+        candidate: Path, *, require_all_job_claims: bool = False
+    ) -> dict[str, Any]:
+        try:
+            resolved = candidate.expanduser().resolve(strict=True)
+        except OSError as error:
+            raise CompositeBuildError(
+                f"cannot replay frozen lock path: {error}"
+            ) from error
+        if resolved != requested_lock or require_all_job_claims is not True:
+            raise CompositeBuildError(
+                "frozen lock replay requires the exact path and all job claims"
+            )
+        return copy.deepcopy(verified_lock)
+
+    return replay_verified_lock
 
 
 def _artifact_ref(path: Path) -> dict[str, str]:
@@ -1220,11 +1343,11 @@ def _build_descriptor(
     aux_subgoal_component_ids: list[str] = []
     for component in components:
         component_id = str(component["component_id"])
-        # Historical replay remains valid outcome/value supervision but its
-        # policy was produced by an older, weaker search teacher.  Fresh
-        # components enter the authenticated aux scope only when their
-        # byte-bound memmap metadata proves every row carries the strict-future
-        # version.
+        # Historical replay is behavior-anchor-only: neither its old search
+        # policy nor its policy-conditional terminal return is a current-teacher
+        # target. Fresh components enter the authenticated aux scope only when
+        # their byte-bound memmap metadata proves every row carries the
+        # strict-future version.
         if component_id not in FRESH_SOURCE_GAME_RATIOS:
             continue
         corpus_dir = component.get("corpus_dir")
@@ -1301,7 +1424,7 @@ def _build_descriptor(
             STORED_POLICY_COMPONENT_TEMPERATURES
         ),
         "entity_feature_adapter_component_versions": adapter_versions,
-        "value_training_component_ids": component_ids,
+        "value_training_component_ids": fresh_component_ids,
         "aux_subgoal_component_ids": aux_subgoal_component_ids,
         "flywheel_replay_contract": replay_contract,
         "source_authority_manifest": source_authority["path"],
@@ -1485,15 +1608,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--selected-game-manifest", type=Path, required=True)
     parser.add_argument("--post-wave-audit", type=Path, required=True)
     parser.add_argument("--historical-replay-component", type=Path, required=True)
+    parser.add_argument("--frozen-repo", type=Path)
+    parser.add_argument("--frozen-verifier-sha256")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
+        if bool(args.frozen_repo) != bool(args.frozen_verifier_sha256):
+            raise CompositeBuildError(
+                "--frozen-repo and --frozen-verifier-sha256 are required together"
+            )
+        verify_lock_fn = contract.verify_lock
+        if args.frozen_repo is not None:
+            verify_lock_fn = _frozen_runtime_lock_verifier(
+                frozen_repo=args.frozen_repo,
+                expected_verifier_sha256=args.frozen_verifier_sha256,
+                lock_path=args.lock,
+            )
         receipt = build_post_wave_composite(
             lock_path=args.lock,
             selected_path=args.selected_game_manifest,
             audit_path=args.post_wave_audit,
             historical_component_path=args.historical_replay_component,
             output_root=args.out,
+            verify_lock_fn=verify_lock_fn,
         )
     except CompositeBuildError as error:
         parser.error(str(error))

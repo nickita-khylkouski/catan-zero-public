@@ -92,6 +92,10 @@ rank-offset PyTorch RNG. The exact production replay mix is 64% current, 12%
 recent history, 4% hard negative, and 20% historical replay. Validation is a
 deterministic 5% whole-game split within every component and acceptance uses
 the matching component-weighted objective, not a raw concatenated-row mean.
+Only the three fresh n128 components supply policy/value/auxiliary targets.
+Historical replay is behavior-anchor-only: forward `KL(prior || candidate)` at
+conditional coefficient `0.006`, with stale replay policy CE and
+policy-conditional return/value supervision disabled.
 
 `tools/a1_one_dose_train.py` retains the historical one-GPU B200 path and also
 supports one eight-GPU B200 host at local batch 512 per rank. Both realize the

@@ -1166,6 +1166,7 @@ def _verify_production_composite_inputs(
         "historical_replay": 0.20,
     }
     contract = meta.get("production_mix_contract")
+    learner_overrides = meta.get("learner_recipe_overrides")
     if (
         meta.get("schema_version") != "memmap_composite_v2"
         or meta.get("diagnostic_only") is not False
@@ -1182,6 +1183,10 @@ def _verify_production_composite_inputs(
         != [expected_ratios[value] for value in expected_ids]
         or meta.get("stored_policy_component_temperatures")
         != composite_builder.STORED_POLICY_COMPONENT_TEMPERATURES
+        or learner_overrides != composite_builder.LEARNER_RECIPE_OVERRIDES
+        or meta.get("policy_kl_anchor_component_ids") != expected_ids[3:]
+        or meta.get("policy_distillation_component_ids") != expected_ids[:3]
+        or meta.get("value_training_component_ids") != expected_ids[:3]
         or not isinstance(
             meta.get("entity_feature_adapter_component_versions"), dict
         )
@@ -1201,6 +1206,15 @@ def _verify_production_composite_inputs(
         raise ExecutorError("production composite is not exact 64/12/4/20 replay")
     if contract.get("initializer_checkpoint_sha256") != producer.get("sha256"):
         raise ExecutorError("production composite initializer differs from sealed producer")
+    # The generation lock predates the post-wave composite, so it binds the
+    # base learner recipe with K=0.  The byte-authenticated descriptor is the
+    # later authority for the exact post-wave objective overlay, including the
+    # light forward-KL-only historical behavior anchor. Preserve the sealed
+    # recipe separately while rendering every authenticated override; no
+    # caller-provided delta is admitted here.
+    bound_recipe = dict(recipe)
+    recipe = dict(recipe)
+    recipe.update(learner_overrides)
     build_receipt = _validate_production_composite_build_receipt(
         path=build_receipt_path,
         lock=lock,
@@ -1330,6 +1344,7 @@ def _verify_production_composite_inputs(
         "lock_file_sha256": _file_sha256(lock_path),
         "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
         "contract_sha256": str(lock["contract_sha256"]),
+        "bound_recipe": bound_recipe,
         "recipe": recipe,
         "objective": objective,
         "producer": producer,
@@ -3418,6 +3433,8 @@ def _build_direct_train_command(
             str(recipe["q_loss_weight"]),
             "--policy-kl-anchor-weight",
             str(recipe["policy_kl_anchor_weight"]),
+            "--policy-kl-anchor-direction",
+            str(recipe.get("policy_kl_anchor_direction", "forward")),
             "--value-uncertainty-loss-weight",
             str(recipe["value_uncertainty_loss_weight"]),
             "--aux-subgoal-loss-weight",

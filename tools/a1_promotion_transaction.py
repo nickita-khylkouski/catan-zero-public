@@ -58,7 +58,13 @@ from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_game
 ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v2"
 PREVIOUS_ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
 BRANCH_CHALLENGE_ADJUDICATION_SCHEMA = "a1-branch-challenge-adjudication-v1"
-CHECKPOINT_SELECTION_SCHEMA = "a1-same-trajectory-checkpoint-selection-v1"
+CHECKPOINT_SELECTION_SCHEMA = "a1-same-trajectory-checkpoint-selection-v2"
+MATCHED_QUICK_SCREEN_SCHEMA = "a1-matched-quick-screen-v1"
+MATCHED_QUICK_SCREEN_SELECTION_RULE = {
+    "name": "earliest-within-absolute-win-rate-of-best-v1",
+    "max_absolute_win_rate_gap_basis_points": 200,
+    "tie_break": "lowest_optimizer_step",
+}
 INTERMEDIATE_CHECKPOINT_SCHEMA = "train-bc-intermediate-checkpoint-v1"
 CHECKPOINT_SELECTION_STEPS = (64, 96, 128)
 BRANCH_CHALLENGE_LINEAGE_SCHEMA = "a1-branch-challenge-lineage-v1"
@@ -1630,6 +1636,389 @@ def _verify_intermediate_checkpoint_record(
     return {**record, "checkpoint": str(checkpoint)}
 
 
+def _verify_matched_quick_screen_report(
+    path: Path,
+    *,
+    where: str,
+) -> dict[str, Any]:
+    """Replay one canonical pooled internal-H2H report used for dose selection."""
+
+    path = _canonical_existing_file(path, where=where)
+    payload = _load_json(path)
+    fleet_merge = payload.get("fleet_merge")
+    if (
+        not isinstance(fleet_merge, dict)
+        or fleet_merge.get("schema_version") != "a1-fleet-evaluation-pool-v1"
+        or fleet_merge.get("kind") != "internal_h2h"
+    ):
+        raise PromotionError(f"{where} is not a canonical pooled internal-H2H report")
+
+    candidate_path = _canonical_existing_file(
+        _absolute(payload.get("candidate_checkpoint"), base=path.parent),
+        where=f"{where}.candidate_checkpoint",
+    )
+    candidate_sha256 = _validate_sha256(
+        payload.get("candidate_checkpoint_sha256"),
+        where=f"{where}.candidate_checkpoint_sha256",
+    )
+    if _sha256(candidate_path) != candidate_sha256:
+        raise PromotionError(f"{where} candidate checkpoint bytes drifted")
+    _fleet_candidate_path, fleet_candidate = _validate_file_ref(
+        fleet_merge.get("candidate"),
+        base=path.parent,
+        where=f"{where}.fleet_merge.candidate",
+    )
+    if fleet_candidate != {
+        "path": str(candidate_path),
+        "sha256": candidate_sha256,
+    }:
+        raise PromotionError(f"{where} pooled candidate binding drifted")
+
+    baseline_path = _canonical_existing_file(
+        _absolute(payload.get("baseline_checkpoint"), base=path.parent),
+        where=f"{where}.baseline_checkpoint",
+    )
+    baseline_sha256 = _validate_sha256(
+        payload.get("baseline_checkpoint_sha256"),
+        where=f"{where}.baseline_checkpoint_sha256",
+    )
+    if _sha256(baseline_path) != baseline_sha256:
+        raise PromotionError(f"{where} baseline checkpoint bytes drifted")
+    _fleet_baseline_path, fleet_baseline = _validate_file_ref(
+        fleet_merge.get("champion"),
+        base=path.parent,
+        where=f"{where}.fleet_merge.champion",
+    )
+    if fleet_baseline != {
+        "path": str(baseline_path),
+        "sha256": baseline_sha256,
+    }:
+        raise PromotionError(f"{where} pooled baseline binding drifted")
+
+    effective_search_config = payload.get("effective_search_config")
+    if not isinstance(effective_search_config, dict) or not effective_search_config:
+        raise PromotionError(f"{where} has no effective search configuration")
+    effective_search_sha256 = _validate_sha256(
+        fleet_merge.get("effective_search_config_sha256"),
+        where=f"{where}.fleet_merge.effective_search_config_sha256",
+    )
+    if effective_search_sha256 != _digest_value(effective_search_config):
+        raise PromotionError(f"{where} effective search configuration digest drifted")
+    if payload.get("search_rng_contract") != INTERNAL_H2H_SEARCH_RNG_CONTRACT:
+        raise PromotionError(f"{where} internal search RNG contract drifted")
+    search_configuration = {
+        "schema_version": "a1-matched-quick-screen-search-v1",
+        "baseline_checkpoint": {
+            "path": str(baseline_path),
+            "sha256": baseline_sha256,
+        },
+        "effective_search_config": effective_search_config,
+        "search_rng_contract": INTERNAL_H2H_SEARCH_RNG_CONTRACT,
+    }
+
+    games = payload.get("games")
+    if not isinstance(games, list) or not games or len(games) % 2:
+        raise PromotionError(f"{where} has no complete retained game pairs")
+    if (
+        payload.get("games_played") != len(games)
+        or payload.get("games_with_winner") != len(games)
+        or payload.get("complete_pairs") != len(games) // 2
+        or payload.get("games_truncated") != 0
+        or payload.get("errors") != []
+    ):
+        raise PromotionError(f"{where} headline game counts do not replay")
+    ordered_game_keys: list[dict[str, Any]] = []
+    normalized_games: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    orientations_by_seed: dict[int, set[str]] = {}
+    candidate_wins = 0
+    for index, raw in enumerate(games):
+        if not isinstance(raw, dict):
+            raise PromotionError(f"{where}.games[{index}] is not an object")
+        seed = raw.get("game_seed")
+        orientation = raw.get("orientation")
+        if (
+            isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or seed < 0
+            or orientation not in {"candidate_red", "candidate_blue"}
+        ):
+            raise PromotionError(f"{where}.games[{index}] has invalid pair identity")
+        identity = (seed, str(orientation))
+        if identity in seen:
+            raise PromotionError(f"{where} contains duplicate game identity {identity}")
+        seen.add(identity)
+        orientations_by_seed.setdefault(seed, set()).add(str(orientation))
+        if (
+            type(raw.get("candidate_won")) is not bool  # noqa: E721
+            or type(raw.get("search_won")) is not bool  # noqa: E721
+            or raw["candidate_won"] != raw["search_won"]
+            or raw.get("terminated") is not True
+            or raw.get("truncated") is not False
+            or raw.get("error") not in {None, ""}
+            or bool(raw.get("engine_divergence", False))
+        ):
+            raise PromotionError(f"{where}.games[{index}] is not a clean terminal game")
+        candidate_wins += int(raw["candidate_won"])
+        ordered_game_keys.append(
+            {"game_seed": seed, "orientation": str(orientation)}
+        )
+        normalized_games.append(dict(raw))
+    expected_order = sorted(
+        ordered_game_keys,
+        key=lambda item: (item["game_seed"], item["orientation"]),
+    )
+    if ordered_game_keys != expected_order:
+        raise PromotionError(f"{where} pooled games are not in canonical order")
+    if any(
+        orientations != {"candidate_red", "candidate_blue"}
+        for orientations in orientations_by_seed.values()
+    ):
+        raise PromotionError(f"{where} does not retain both orientations per seed")
+    if (
+        payload.get("candidate_wins") != candidate_wins
+        or payload.get("baseline_wins") != len(games) - candidate_wins
+    ):
+        raise PromotionError(f"{where} candidate/baseline win counts do not replay")
+    _pair_scores, diagnostics = pair_scores_from_h2h_games(normalized_games)
+    if diagnostics != payload.get("pair_diagnostics"):
+        raise PromotionError(f"{where} pair diagnostics do not replay")
+
+    return {
+        "path": str(path),
+        "sha256": _sha256(path),
+        "candidate_checkpoint": {
+            "path": str(candidate_path),
+            "sha256": candidate_sha256,
+        },
+        "baseline_checkpoint": {
+            "path": str(baseline_path),
+            "sha256": baseline_sha256,
+        },
+        "ordered_game_keys": ordered_game_keys,
+        "search_configuration": search_configuration,
+        "candidate_half_points": 2 * candidate_wins,
+    }
+
+
+def _verify_matched_quick_screen(
+    path: Path,
+    *,
+    checkpoint_refs: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Replay the typed common-random-number dose screen and select its dose.
+
+    Selection is derived here from the authenticated screen.  A caller cannot
+    nominate a favorite step after seeing the results.  Every eligible
+    checkpoint must be present, and every result binds the same ordered games
+    and exact search configuration.
+    """
+
+    path = _canonical_existing_file(path, where="matched quick-screen evidence")
+    value = _require_exact_keys(
+        _load_json(path),
+        {
+            "schema_version",
+            "eligible_optimizer_steps",
+            "checkpoints",
+            "ordered_game_keys",
+            "ordered_game_keys_sha256",
+            "search_configuration",
+            "search_configuration_sha256",
+            "results",
+            "selection_rule",
+            "candidate_checkpoint_sha256",
+            "screen_sha256",
+        },
+        where="matched quick-screen evidence",
+    )
+    unhashed = dict(value)
+    declared = _validate_sha256(
+        unhashed.pop("screen_sha256"),
+        where="matched quick-screen evidence.screen_sha256",
+    )
+    if declared != _digest_value(unhashed):
+        raise PromotionError("matched quick-screen semantic digest mismatch")
+    if (
+        value["schema_version"] != MATCHED_QUICK_SCREEN_SCHEMA
+        or value["eligible_optimizer_steps"] != list(CHECKPOINT_SELECTION_STEPS)
+        or value["selection_rule"] != MATCHED_QUICK_SCREEN_SELECTION_RULE
+    ):
+        raise PromotionError("matched quick-screen policy drifted")
+
+    raw_keys = value["ordered_game_keys"]
+    if not isinstance(raw_keys, list) or not raw_keys:
+        raise PromotionError("matched quick-screen has no ordered game keys")
+    ordered_keys: list[dict[str, Any]] = []
+    seen_keys: set[tuple[int, str]] = set()
+    for index, raw in enumerate(raw_keys):
+        key = _require_exact_keys(
+            raw,
+            {"game_seed", "orientation"},
+            where=f"matched quick-screen.ordered_game_keys[{index}]",
+        )
+        seed = key["game_seed"]
+        orientation = key["orientation"]
+        if (
+            isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or seed < 0
+            or not isinstance(orientation, str)
+            or not orientation.strip()
+        ):
+            raise PromotionError("matched quick-screen contains an invalid game key")
+        identity = (seed, orientation)
+        if identity in seen_keys:
+            raise PromotionError("matched quick-screen contains duplicate game keys")
+        seen_keys.add(identity)
+        ordered_keys.append({"game_seed": seed, "orientation": orientation})
+    game_keys_sha256 = _validate_sha256(
+        value["ordered_game_keys_sha256"],
+        where="matched quick-screen.ordered_game_keys_sha256",
+    )
+    if game_keys_sha256 != _digest_value(ordered_keys):
+        raise PromotionError("matched quick-screen ordered game-key digest mismatch")
+
+    search_configuration = value["search_configuration"]
+    if not isinstance(search_configuration, dict) or not search_configuration:
+        raise PromotionError("matched quick-screen search configuration is empty")
+    search_sha256 = _validate_sha256(
+        value["search_configuration_sha256"],
+        where="matched quick-screen.search_configuration_sha256",
+    )
+    if search_sha256 != _digest_value(search_configuration):
+        raise PromotionError("matched quick-screen search configuration digest mismatch")
+
+    raw_checkpoints = value["checkpoints"]
+    if not isinstance(raw_checkpoints, list) or len(raw_checkpoints) != 3:
+        raise PromotionError("matched quick-screen must bind all three checkpoints")
+    verified_checkpoints: dict[int, dict[str, str]] = {}
+    for index, raw in enumerate(raw_checkpoints):
+        record = _require_exact_keys(
+            raw,
+            {"optimizer_step", "checkpoint"},
+            where=f"matched quick-screen.checkpoints[{index}]",
+        )
+        step = record["optimizer_step"]
+        if step != CHECKPOINT_SELECTION_STEPS[index]:
+            raise PromotionError("matched quick-screen checkpoint order drifted")
+        checkpoint_path, checkpoint_ref = _validate_file_ref(
+            record["checkpoint"],
+            base=path.parent,
+            where=f"matched quick-screen checkpoint step {step}",
+        )
+        expected = checkpoint_refs.get(step)
+        if expected is None or checkpoint_ref != {
+            "path": str(Path(str(expected["path"])).resolve()),
+            "sha256": expected["sha256"],
+        }:
+            raise PromotionError(
+                f"matched quick-screen binds the wrong step-{step} checkpoint"
+            )
+        verified_checkpoints[step] = {
+            "path": str(checkpoint_path),
+            "sha256": checkpoint_ref["sha256"],
+        }
+
+    results = value["results"]
+    if not isinstance(results, list) or len(results) != 3:
+        raise PromotionError("matched quick-screen must contain three checkpoint results")
+    half_points_by_step: dict[int, int] = {}
+    verified_results: list[dict[str, Any]] = []
+    for index, raw in enumerate(results):
+        result = _require_exact_keys(
+            raw,
+            {
+                "optimizer_step",
+                "checkpoint_sha256",
+                "evaluation_report",
+                "candidate_half_points",
+                "games_played",
+                "ordered_game_keys_sha256",
+                "search_configuration_sha256",
+            },
+            where=f"matched quick-screen.results[{index}]",
+        )
+        step = result["optimizer_step"]
+        if step != CHECKPOINT_SELECTION_STEPS[index]:
+            raise PromotionError("matched quick-screen result order drifted")
+        games_played = result["games_played"]
+        if (
+            isinstance(games_played, bool)
+            or not isinstance(games_played, int)
+            or games_played != len(ordered_keys)
+        ):
+            raise PromotionError("matched quick-screen result game count drifted")
+        half_points = result["candidate_half_points"]
+        if (
+            isinstance(half_points, bool)
+            or not isinstance(half_points, int)
+            or half_points < 0
+            or half_points > 2 * games_played
+        ):
+            raise PromotionError(
+                "matched quick-screen candidate half-points are invalid"
+            )
+        report_path, report_ref = _validate_file_ref(
+            result["evaluation_report"],
+            base=path.parent,
+            where=f"matched quick-screen step {step} evaluation report",
+        )
+        report = _verify_matched_quick_screen_report(
+            report_path,
+            where=f"matched quick-screen step {step} evaluation report",
+        )
+        if (
+            result["checkpoint_sha256"] != verified_checkpoints[step]["sha256"]
+            or result["ordered_game_keys_sha256"] != game_keys_sha256
+            or result["search_configuration_sha256"] != search_sha256
+            or report["candidate_checkpoint"] != verified_checkpoints[step]
+            or report["ordered_game_keys"] != ordered_keys
+            or report["search_configuration"] != search_configuration
+            or report["candidate_half_points"] != half_points
+        ):
+            raise PromotionError(
+                "matched quick-screen result/report does not bind the common "
+                "checkpoint/games/search/outcomes"
+            )
+        half_points_by_step[step] = half_points
+        verified_results.append(
+            {**result, "evaluation_report": {**report_ref, "path": str(report_path)}}
+        )
+
+    best_half_points = max(half_points_by_step.values())
+    max_gap_basis_points = MATCHED_QUICK_SCREEN_SELECTION_RULE[
+        "max_absolute_win_rate_gap_basis_points"
+    ]
+    game_count = len(ordered_keys)
+    selected_step = min(
+        step
+        for step in CHECKPOINT_SELECTION_STEPS
+        if (best_half_points - half_points_by_step[step]) * 10_000
+        <= max_gap_basis_points * 2 * game_count
+    )
+    selected_sha256 = _validate_sha256(
+        value["candidate_checkpoint_sha256"],
+        where="matched quick-screen.candidate_checkpoint_sha256",
+    )
+    if selected_sha256 != verified_checkpoints[selected_step]["sha256"]:
+        raise PromotionError(
+            "matched quick-screen candidate hash differs from deterministic selection"
+        )
+    return {
+        "path": str(path),
+        "sha256": _sha256(path),
+        "screen_sha256": declared,
+        "ordered_game_keys": ordered_keys,
+        "ordered_game_keys_sha256": game_keys_sha256,
+        "search_configuration": search_configuration,
+        "search_configuration_sha256": search_sha256,
+        "checkpoints": verified_checkpoints,
+        "results": verified_results,
+        "selected_optimizer_step": selected_step,
+    }
+
+
 def _verify_same_trajectory_checkpoint_selection(
     path: Path,
     *,
@@ -1745,9 +2134,31 @@ def _verify_same_trajectory_checkpoint_selection(
     ):
         raise PromotionError("training report and receipt disagree on dose snapshots")
 
-    selected_step = value["selected_optimizer_step"]
-    if selected_step not in CHECKPOINT_SELECTION_STEPS:
-        raise PromotionError("selected optimizer step is not one of 64/96/128")
+    checkpoint_refs = {
+        CHECKPOINT_SELECTION_STEPS[0]: {
+            "path": intermediates[0]["checkpoint"],
+            "sha256": intermediates[0]["checkpoint_sha256"],
+        },
+        CHECKPOINT_SELECTION_STEPS[1]: {
+            "path": intermediates[1]["checkpoint"],
+            "sha256": intermediates[1]["checkpoint_sha256"],
+        },
+        CHECKPOINT_SELECTION_STEPS[2]: expected_terminal_ref,
+    }
+    screen_path, screen_ref = _validate_file_ref(
+        value["screen_evidence"],
+        base=path.parent,
+        where="checkpoint selection receipt.screen_evidence",
+    )
+    screen = _verify_matched_quick_screen(
+        screen_path,
+        checkpoint_refs=checkpoint_refs,
+    )
+    selected_step = screen["selected_optimizer_step"]
+    if value["selected_optimizer_step"] != selected_step:
+        raise PromotionError(
+            "checkpoint selection step differs from the deterministic screen result"
+        )
     selected_ref = _require_exact_keys(
         value["selected_checkpoint"], {"path", "sha256"},
         where="checkpoint selection receipt.selected_checkpoint",
@@ -1772,11 +2183,6 @@ def _verify_same_trajectory_checkpoint_selection(
     ):
         raise PromotionError("adjudicated candidate differs from checkpoint selection")
 
-    screen_path, screen_ref = _validate_file_ref(
-        value["screen_evidence"],
-        base=path.parent,
-        where="checkpoint selection receipt.screen_evidence",
-    )
     return {
         "path": str(path),
         "sha256": expected_file_sha256,
@@ -1784,7 +2190,13 @@ def _verify_same_trajectory_checkpoint_selection(
         "selected_optimizer_step": selected_step,
         "selected_checkpoint": selected_ref,
         "terminal_checkpoint": expected_terminal_ref,
-        "screen_evidence": {**screen_ref, "path": str(screen_path)},
+        "screen_evidence": {
+            **screen_ref,
+            "path": str(screen_path),
+            "screen_sha256": screen["screen_sha256"],
+            "ordered_game_keys_sha256": screen["ordered_game_keys_sha256"],
+            "search_configuration_sha256": screen["search_configuration_sha256"],
+        },
     }
 
 
@@ -6375,7 +6787,11 @@ def _contiguous_seed_intervals(
 
 
 def _explicit_game_seeds(payload: dict[str, Any], *, where: str) -> set[int]:
-    games = payload.get("games")
+    games = (
+        payload.get("ordered_game_keys")
+        if payload.get("schema_version") == MATCHED_QUICK_SCREEN_SCHEMA
+        else payload.get("games")
+    )
     if not isinstance(games, list) or not games:
         raise PromotionError(f"{where} has no retained games for cohort isolation")
     seeds: set[int] = set()
@@ -6466,6 +6882,92 @@ def _seed_interval(
     return result
 
 
+def _verify_prior_cohort_source(
+    source_path: Path,
+    *,
+    expected_candidate_sha256: str,
+    kind: str,
+    where: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Recompute a prior cohort from its authenticated candidate-bound report."""
+
+    payload = _load_json(source_path)
+    if payload.get("schema_version") == MATCHED_QUICK_SCREEN_SCHEMA:
+        raw_checkpoints = payload.get("checkpoints")
+        if not isinstance(raw_checkpoints, list):
+            raise PromotionError(f"{where} has no typed screen checkpoints")
+        checkpoint_refs: dict[int, dict[str, str]] = {}
+        for index, raw in enumerate(raw_checkpoints):
+            record = _require_exact_keys(
+                raw,
+                {"optimizer_step", "checkpoint"},
+                where=f"{where}.checkpoints[{index}]",
+            )
+            step = record["optimizer_step"]
+            checkpoint_path, checkpoint_ref = _validate_file_ref(
+                record["checkpoint"],
+                base=source_path.parent,
+                where=f"{where}.checkpoints[{index}].checkpoint",
+            )
+            checkpoint_refs[step] = {
+                "path": str(checkpoint_path),
+                "sha256": checkpoint_ref["sha256"],
+            }
+        screen = _verify_matched_quick_screen(
+            source_path,
+            checkpoint_refs=checkpoint_refs,
+        )
+        selected_sha256 = screen["checkpoints"][screen["selected_optimizer_step"]][
+            "sha256"
+        ]
+        if selected_sha256 != expected_candidate_sha256:
+            raise PromotionError(
+                f"{where} selected checkpoint binds a different candidate"
+            )
+        seeds = {key["game_seed"] for key in screen["ordered_game_keys"]}
+        intervals = _contiguous_seed_intervals(seeds, kind=kind, where=where)
+        return intervals, sorted(
+            checkpoint["sha256"] for checkpoint in screen["checkpoints"].values()
+        )
+
+    candidate_hashes: set[str] = set()
+    checkpoint_path_raw = payload.get("candidate_checkpoint")
+    checkpoint_sha_raw = payload.get("candidate_checkpoint_sha256")
+    if checkpoint_path_raw is not None or checkpoint_sha_raw is not None:
+        if not isinstance(checkpoint_path_raw, str) or not checkpoint_path_raw:
+            raise PromotionError(f"{where} candidate checkpoint path is missing")
+        checkpoint_sha = _validate_sha256(
+            checkpoint_sha_raw,
+            where=f"{where}.candidate_checkpoint_sha256",
+        )
+        checkpoint_path = _canonical_existing_file(
+            _absolute(checkpoint_path_raw, base=source_path.parent),
+            where=f"{where}.candidate_checkpoint",
+        )
+        if _sha256(checkpoint_path) != checkpoint_sha:
+            raise PromotionError(f"{where} candidate checkpoint hash drifted")
+        candidate_hashes.add(checkpoint_sha)
+
+    candidate_raw = payload.get("candidate")
+    if candidate_raw is not None:
+        _candidate_path, candidate_ref = _validate_file_ref(
+            candidate_raw,
+            base=source_path.parent,
+            where=f"{where}.candidate",
+        )
+        candidate_hashes.add(candidate_ref["sha256"])
+    if not candidate_hashes:
+        raise PromotionError(f"{where} has no verifiable candidate checkpoint binding")
+    if len(candidate_hashes) != 1:
+        raise PromotionError(f"{where} has conflicting candidate checkpoint hashes")
+
+    seeds = _explicit_game_seeds(payload, where=where)
+    return (
+        _contiguous_seed_intervals(seeds, kind=kind, where=where),
+        sorted(candidate_hashes),
+    )
+
+
 def _verify_cohort_exclusions(
     path: Path,
     *,
@@ -6507,7 +7009,7 @@ def _verify_cohort_exclusions(
         )
     excluded: list[dict[str, Any]] = []
     labels: set[str] = set()
-    bound_sources: list[dict[str, str]] = []
+    bound_sources: list[dict[str, Any]] = []
     for index, raw in enumerate(cohorts):
         cohort = _require_exact_keys(
             raw,
@@ -6525,31 +7027,47 @@ def _verify_cohort_exclusions(
         ):
             raise PromotionError("cohort exclusion label/kind is invalid or duplicated")
         labels.add(label)
-        _source_path, source_ref = _validate_file_ref(
+        source_path, source_ref = _validate_file_ref(
             cohort["source"],
             base=path.parent,
             where=f"cohort exclusions.cohorts[{index}].source",
         )
-        bound_sources.append({"label": label, **source_ref})
         intervals = cohort["seed_intervals"]
         if not isinstance(intervals, list) or not intervals:
             raise PromotionError(
                 f"cohort exclusions.cohorts[{index}].seed_intervals must be non-empty"
             )
-        for interval_index, interval in enumerate(intervals):
-            excluded.append(
-                {
-                    "label": label,
-                    **_seed_interval(
-                        interval,
-                        where=(
-                            f"cohort exclusions.cohorts[{index}]."
-                            f"seed_intervals[{interval_index}]"
-                        ),
-                        kind=kind,
-                    ),
-                }
+        declared_intervals = [
+            _seed_interval(
+                interval,
+                where=(
+                    f"cohort exclusions.cohorts[{index}]."
+                    f"seed_intervals[{interval_index}]"
+                ),
             )
+            for interval_index, interval in enumerate(intervals)
+        ]
+        derived_with_kind, candidate_hashes = _verify_prior_cohort_source(
+            source_path,
+            expected_candidate_sha256=candidate_sha256,
+            kind=kind,
+            where=f"cohort exclusions source {label!r}",
+        )
+        derived_intervals = [
+            {"base_seed": item["base_seed"], "end_seed": item["end_seed"]}
+            for item in derived_with_kind
+        ]
+        if declared_intervals != derived_intervals:
+            raise PromotionError(
+                f"cohort exclusion {label!r} seed intervals do not exactly match "
+                "the bound report's explicit games"
+            )
+        bound_sources.append(
+            {"label": label, **source_ref, "candidate_sha256s": candidate_hashes}
+        )
+        excluded.extend(
+            {"label": label, **interval} for interval in derived_with_kind
+        )
     overlaps: list[dict[str, Any]] = []
     for final in final_intervals:
         for prior in excluded:
@@ -7702,15 +8220,136 @@ def recover_transaction(
         return result
 
 
+def create_matched_quick_screen(
+    *,
+    step64_report_path: Path,
+    step96_report_path: Path,
+    step128_report_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Seal the three canonical pooled reports into one typed matched screen."""
+
+    output_path = _canonical_new_file(output_path, where="matched quick-screen output")
+    report_paths = {
+        64: step64_report_path,
+        96: step96_report_path,
+        128: step128_report_path,
+    }
+    reports = {
+        step: _verify_matched_quick_screen_report(
+            path,
+            where=f"step-{step} matched quick-screen report",
+        )
+        for step, path in report_paths.items()
+    }
+    first = reports[64]
+    for step in (96, 128):
+        report = reports[step]
+        if report["baseline_checkpoint"] != first["baseline_checkpoint"]:
+            raise PromotionError(
+                "matched quick-screen reports use different baseline checkpoints"
+            )
+        if report["ordered_game_keys"] != first["ordered_game_keys"]:
+            raise PromotionError(
+                "matched quick-screen reports do not use identical ordered game keys"
+            )
+        if report["search_configuration"] != first["search_configuration"]:
+            raise PromotionError(
+                "matched quick-screen reports do not use identical search configuration"
+            )
+    checkpoint_hashes = {
+        report["candidate_checkpoint"]["sha256"] for report in reports.values()
+    }
+    if len(checkpoint_hashes) != len(CHECKPOINT_SELECTION_STEPS):
+        raise PromotionError("matched quick-screen reports do not bind three checkpoints")
+
+    ordered_game_keys = first["ordered_game_keys"]
+    game_keys_sha256 = _digest_value(ordered_game_keys)
+    search_configuration = first["search_configuration"]
+    search_sha256 = _digest_value(search_configuration)
+    half_points = {
+        step: report["candidate_half_points"] for step, report in reports.items()
+    }
+    best_half_points = max(half_points.values())
+    max_gap_basis_points = MATCHED_QUICK_SCREEN_SELECTION_RULE[
+        "max_absolute_win_rate_gap_basis_points"
+    ]
+    game_count = len(ordered_game_keys)
+    selected_step = min(
+        step
+        for step in CHECKPOINT_SELECTION_STEPS
+        if (best_half_points - half_points[step]) * 10_000
+        <= max_gap_basis_points * 2 * game_count
+    )
+    payload = {
+        "schema_version": MATCHED_QUICK_SCREEN_SCHEMA,
+        "eligible_optimizer_steps": list(CHECKPOINT_SELECTION_STEPS),
+        "checkpoints": [
+            {
+                "optimizer_step": step,
+                "checkpoint": reports[step]["candidate_checkpoint"],
+            }
+            for step in CHECKPOINT_SELECTION_STEPS
+        ],
+        "ordered_game_keys": ordered_game_keys,
+        "ordered_game_keys_sha256": game_keys_sha256,
+        "search_configuration": search_configuration,
+        "search_configuration_sha256": search_sha256,
+        "results": [
+            {
+                "optimizer_step": step,
+                "checkpoint_sha256": reports[step]["candidate_checkpoint"][
+                    "sha256"
+                ],
+                "evaluation_report": {
+                    "path": reports[step]["path"],
+                    "sha256": reports[step]["sha256"],
+                },
+                "candidate_half_points": half_points[step],
+                "games_played": game_count,
+                "ordered_game_keys_sha256": game_keys_sha256,
+                "search_configuration_sha256": search_sha256,
+            }
+            for step in CHECKPOINT_SELECTION_STEPS
+        ],
+        "selection_rule": MATCHED_QUICK_SCREEN_SELECTION_RULE,
+        "candidate_checkpoint_sha256": reports[selected_step][
+            "candidate_checkpoint"
+        ]["sha256"],
+    }
+    payload["screen_sha256"] = _digest_value(payload)
+    _write_new_bytes(output_path, _canonical_bytes(payload) + b"\n")
+    # Replay the just-sealed bytes through the independent consumer before
+    # returning an operator-visible success result.
+    verified = _verify_matched_quick_screen(
+        output_path,
+        checkpoint_refs={
+            step: reports[step]["candidate_checkpoint"]
+            for step in CHECKPOINT_SELECTION_STEPS
+        },
+    )
+    return {
+        **payload,
+        "path": str(output_path),
+        "file_sha256": _sha256(output_path),
+        "selected_optimizer_step": verified["selected_optimizer_step"],
+    }
+
+
 def create_same_trajectory_checkpoint_selection(
     *,
     training_receipt_path: Path,
     training_report_path: Path,
     screen_evidence_path: Path,
-    selected_optimizer_step: int,
+    selected_optimizer_step: int | None = None,
     output_path: Path,
 ) -> dict[str, Any]:
-    """Create, but do not authorize, one immutable dose-selection receipt."""
+    """Create one immutable dose-selection receipt from a typed matched screen.
+
+    ``selected_optimizer_step`` is retained only as a compatibility assertion:
+    when supplied, it must equal the step derived from the screen's sealed
+    selection rule.  It can never override that rule.
+    """
 
     training_receipt_path = _canonical_existing_file(
         training_receipt_path, where="selection training receipt"
@@ -7722,7 +8361,10 @@ def create_same_trajectory_checkpoint_selection(
         screen_evidence_path, where="selection screen evidence"
     )
     output_path = _canonical_new_file(output_path, where="checkpoint selection receipt")
-    if selected_optimizer_step not in CHECKPOINT_SELECTION_STEPS:
+    if (
+        selected_optimizer_step is not None
+        and selected_optimizer_step not in CHECKPOINT_SELECTION_STEPS
+    ):
         raise PromotionError("selected optimizer step must be exactly 64, 96, or 128")
     receipt = _verify_receipt_digest(_load_json(training_receipt_path))
     if receipt.get("schema_version") != one_dose.RECEIPT_SCHEMA:
@@ -7766,6 +8408,27 @@ def create_same_trajectory_checkpoint_selection(
         or report.get("intermediate_checkpoints") != raw_intermediate
     ):
         raise PromotionError("selection report lost its same-trajectory snapshots")
+    checkpoint_refs = {
+        CHECKPOINT_SELECTION_STEPS[0]: {
+            "path": intermediates[0]["checkpoint"],
+            "sha256": intermediates[0]["checkpoint_sha256"],
+        },
+        CHECKPOINT_SELECTION_STEPS[1]: {
+            "path": intermediates[1]["checkpoint"],
+            "sha256": intermediates[1]["checkpoint_sha256"],
+        },
+        CHECKPOINT_SELECTION_STEPS[2]: terminal_ref,
+    }
+    screen = _verify_matched_quick_screen(
+        screen_evidence_path,
+        checkpoint_refs=checkpoint_refs,
+    )
+    derived_step = screen["selected_optimizer_step"]
+    if selected_optimizer_step is not None and selected_optimizer_step != derived_step:
+        raise PromotionError(
+            "caller-selected optimizer step differs from deterministic screen result"
+        )
+    selected_optimizer_step = derived_step
     if selected_optimizer_step == 128:
         selected_ref = terminal_ref
     else:
@@ -7836,14 +8499,25 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument(
         "--go", action="store_true", help="restore; default is dry-run"
     )
+    screen = subparsers.add_parser(
+        "build-dose-screen",
+        help="seal matched step-64/96/128 pooled evaluation reports",
+    )
+    screen.add_argument("--step64-report", required=True, type=Path)
+    screen.add_argument("--step96-report", required=True, type=Path)
+    screen.add_argument("--step128-report", required=True, type=Path)
+    screen.add_argument("--output", required=True, type=Path)
     select = subparsers.add_parser(
-        "select-dose", help="seal an explicit same-trajectory 64/96/128 choice"
+        "select-dose", help="seal the screen-derived same-trajectory 64/96/128 choice"
     )
     select.add_argument("--training-receipt", required=True, type=Path)
     select.add_argument("--training-report", required=True, type=Path)
     select.add_argument("--screen-evidence", required=True, type=Path)
     select.add_argument(
-        "--selected-optimizer-step", required=True, type=int, choices=(64, 96, 128)
+        "--selected-optimizer-step",
+        type=int,
+        choices=(64, 96, 128),
+        help="optional assertion; selection is derived from the typed screen",
     )
     select.add_argument("--output", required=True, type=Path)
     return parser
@@ -7871,6 +8545,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 receipt_path=args.receipt,
                 lock_path=args.lock_file,
                 go=bool(args.go),
+            )
+        elif args.command == "build-dose-screen":
+            result = create_matched_quick_screen(
+                step64_report_path=args.step64_report,
+                step96_report_path=args.step96_report,
+                step128_report_path=args.step128_report,
+                output_path=args.output,
             )
         else:
             result = create_same_trajectory_checkpoint_selection(

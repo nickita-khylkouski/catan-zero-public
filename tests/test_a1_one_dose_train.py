@@ -425,11 +425,13 @@ def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
         ],
         "descriptor_file_sha256": "sha256:" + "2" * 64,
         "descriptor_fingerprint": "sha256:" + "3" * 64,
-        "learner_recipe_overrides": {
-            "per_game_policy_weight": True,
-            "per_game_policy_weight_mode": "equal",
-        },
+        "learner_recipe_overrides": dict(
+            executor.composite_builder.LEARNER_RECIPE_OVERRIDES
+        ),
         "learner_recipe_overrides_sha256": "sha256:" + "4" * 64,
+        "policy_kl_anchor_component_ids": component_ids[3:],
+        "policy_distillation_component_ids": component_ids[:3],
+        "value_training_component_ids": component_ids[:3],
         "aux_subgoal_target_contract_sha256": "sha256:" + "a" * 64,
         "public_award_feature_transition_contract_sha256": "sha256:" + "b" * 64,
         "source_authority_semantic_sha256": "sha256:" + "c" * 64,
@@ -917,6 +919,18 @@ def test_production_composite_receipts_component_whole_game_split(
     ]
     assert result["training_row_count"] == 8
     assert result["validation_row_count"] == 8
+    command = executor._build_direct_train_command(
+        result,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert _option(command, "--policy-kl-anchor-weight") == "0.006"
+    assert _option(command, "--policy-kl-anchor-direction") == "forward"
+    args = executor.train_bc.build_parser().parse_args(command[2:])
+    executor.train_bc._validate_composite_learner_recipe_authorization(  # noqa: SLF001
+        args, meta
+    )
 
 
 def test_production_composite_requires_atomic_build_receipt(tmp_path: Path) -> None:

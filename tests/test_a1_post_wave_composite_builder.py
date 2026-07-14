@@ -633,6 +633,25 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
         "hard_negative": 1.0,
         "historical_replay": 0.52,
     }
+    assert descriptor["policy_kl_anchor_component_ids"] == [
+        "historical_replay"
+    ]
+    assert descriptor["policy_distillation_component_ids"] == [
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+    ]
+    assert descriptor["value_training_component_ids"] == [
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+    ]
+    assert descriptor["learner_recipe_overrides"][
+        "policy_kl_anchor_weight"
+    ] == builder.HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT
+    assert descriptor["learner_recipe_overrides"]["policy_kl_anchor_direction"] == (
+        "forward"
+    )
     assert descriptor["entity_feature_adapter_component_versions"] == {
         component_id: CURRENT_RUST_ENTITY_ADAPTER_VERSION
         for component_id in (
@@ -666,6 +685,59 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
                 "file_sha256": builder._file_sha256(authority),  # noqa: SLF001
                 "authority_sha256": builder._digest({}),  # noqa: SLF001
             },
+        )
+
+
+def test_frozen_runtime_verifier_replays_exact_path_bound_lock(
+    tmp_path: Path,
+) -> None:
+    frozen = tmp_path / "frozen"
+    tools = frozen / "tools"
+    tools.mkdir(parents=True)
+    (tools / "__init__.py").write_text("", encoding="utf-8")
+    verifier = tools / "a1_pre_wave_contract.py"
+    verifier.write_text(
+        """from __future__ import annotations
+import json
+def verify_lock(path, *, require_all_job_claims=False):
+    if require_all_job_claims is not True:
+        raise RuntimeError('all claims required')
+    with open(path, encoding='utf-8') as handle:
+        return json.load(handle)
+""",
+        encoding="utf-8",
+    )
+    verifier_sha = builder._file_sha256(verifier)  # noqa: SLF001
+    lock_path = tmp_path / "lock.json"
+    lock = {
+        "contract_sha256": "sha256:" + "a" * 64,
+        "provenance": {
+            "runtime_code_tree": [
+                {
+                    "kind": "runtime_code",
+                    "path": str(verifier.resolve()),
+                    "sha256": verifier_sha,
+                }
+            ]
+        },
+    }
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    verify = builder._frozen_runtime_lock_verifier(  # noqa: SLF001
+        frozen_repo=frozen,
+        expected_verifier_sha256=verifier_sha,
+        lock_path=lock_path,
+    )
+    assert verify(lock_path, require_all_job_claims=True) == lock
+    with pytest.raises(
+        builder.CompositeBuildError, match="exact path and all job claims"
+    ):
+        verify(lock_path, require_all_job_claims=False)
+    with pytest.raises(builder.CompositeBuildError, match="explicit SHA-256"):
+        builder._frozen_runtime_lock_verifier(  # noqa: SLF001
+            frozen_repo=frozen,
+            expected_verifier_sha256="sha256:" + "0" * 64,
+            lock_path=lock_path,
         )
 
 
@@ -794,6 +866,10 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     )
 
     assert verified["data_kind"] == "production_composite_v2"
+    assert verified["bound_recipe"]["policy_kl_anchor_weight"] == 0.0
+    assert verified["recipe"]["policy_kl_anchor_weight"] == (
+        builder.HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT
+    )
     assert (
         verified["production_mix_contract"]["effective_component_sampling_ratios"]
         == builder.EFFECTIVE_COMPONENT_RATIOS

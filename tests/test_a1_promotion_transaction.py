@@ -122,6 +122,141 @@ def _checkpoint_ref(path: Path) -> dict[str, str]:
     return {"path": str(path), "sha256": promotion._sha256(path)}
 
 
+def _write_matched_quick_screen(
+    path: Path,
+    *,
+    intermediate: list[dict],
+    terminal: Path,
+    points_by_step: dict[int, float],
+) -> dict:
+    checkpoints = {
+        64: {
+            "path": intermediate[0]["checkpoint"],
+            "sha256": intermediate[0]["checkpoint_sha256"],
+        },
+        96: {
+            "path": intermediate[1]["checkpoint"],
+            "sha256": intermediate[1]["checkpoint_sha256"],
+        },
+        128: _checkpoint_ref(terminal),
+    }
+    baseline = path.parent / "screen-baseline.pt"
+    if not baseline.exists():
+        baseline.write_bytes(b"screen baseline")
+    ordered_game_keys = [
+        {"game_seed": 9_000_000 + pair, "orientation": orientation}
+        for pair in range(100)
+        for orientation in ("candidate_blue", "candidate_red")
+    ]
+    game_keys_sha256 = promotion._digest_value(ordered_game_keys)
+    effective_search_config = {
+        "mode": "cross_net",
+        "n_full": 128,
+        "public_observation": True,
+        "information_set_search": True,
+        "determinization_particles": 4,
+        "symmetry_averaged_eval": True,
+    }
+    search_configuration = {
+        "schema_version": "a1-matched-quick-screen-search-v1",
+        "baseline_checkpoint": _checkpoint_ref(baseline),
+        "effective_search_config": effective_search_config,
+        "search_rng_contract": promotion.INTERNAL_H2H_SEARCH_RNG_CONTRACT,
+    }
+    search_sha256 = promotion._digest_value(search_configuration)
+    half_points = {
+        step: int(round(points_by_step[step] * 2)) for step in (64, 96, 128)
+    }
+    best_half_points = max(half_points.values())
+    selected_step = min(
+        step
+        for step in (64, 96, 128)
+        if (best_half_points - half_points[step]) * 10_000
+        <= promotion.MATCHED_QUICK_SCREEN_SELECTION_RULE[
+            "max_absolute_win_rate_gap_basis_points"
+        ]
+        * 2
+        * len(ordered_game_keys)
+    )
+    reports: dict[int, Path] = {}
+    for step in (64, 96, 128):
+        wins = int(points_by_step[step])
+        games = []
+        for index, key in enumerate(ordered_game_keys):
+            candidate_won = index < wins
+            games.append(
+                {
+                    "pair_id": index // 2,
+                    **key,
+                    "candidate_won": candidate_won,
+                    "search_won": candidate_won,
+                    "terminated": True,
+                    "truncated": False,
+                    "error": None,
+                    "engine_divergence": False,
+                }
+            )
+        _scores, diagnostics = promotion.pair_scores_from_h2h_games(games)
+        report = {
+            "candidate_checkpoint": checkpoints[step]["path"],
+            "candidate_checkpoint_sha256": checkpoints[step]["sha256"],
+            "baseline_checkpoint": str(baseline),
+            "baseline_checkpoint_sha256": promotion._sha256(baseline),
+            "effective_search_config": effective_search_config,
+            "search_rng_contract": promotion.INTERNAL_H2H_SEARCH_RNG_CONTRACT,
+            "games_played": len(games),
+            "games_with_winner": len(games),
+            "complete_pairs": len(games) // 2,
+            "games_truncated": 0,
+            "errors": [],
+            "candidate_wins": wins,
+            "baseline_wins": len(games) - wins,
+            "pair_diagnostics": diagnostics,
+            "games": games,
+            "fleet_merge": {
+                "schema_version": "a1-fleet-evaluation-pool-v1",
+                "kind": "internal_h2h",
+                "candidate": checkpoints[step],
+                "champion": _checkpoint_ref(baseline),
+                "effective_search_config_sha256": promotion._digest_value(
+                    effective_search_config
+                ),
+            },
+        }
+        report_path = path.with_name(f"{path.stem}.step{step}.report.json")
+        _write_json(report_path, report)
+        reports[step] = report_path
+    payload = {
+        "schema_version": promotion.MATCHED_QUICK_SCREEN_SCHEMA,
+        "eligible_optimizer_steps": [64, 96, 128],
+        "checkpoints": [
+            {"optimizer_step": step, "checkpoint": checkpoints[step]}
+            for step in (64, 96, 128)
+        ],
+        "ordered_game_keys": ordered_game_keys,
+        "ordered_game_keys_sha256": game_keys_sha256,
+        "search_configuration": search_configuration,
+        "search_configuration_sha256": search_sha256,
+        "results": [
+            {
+                "optimizer_step": step,
+                "checkpoint_sha256": checkpoints[step]["sha256"],
+                "evaluation_report": _checkpoint_ref(reports[step]),
+                "candidate_half_points": half_points[step],
+                "games_played": len(ordered_game_keys),
+                "ordered_game_keys_sha256": game_keys_sha256,
+                "search_configuration_sha256": search_sha256,
+            }
+            for step in (64, 96, 128)
+        ],
+        "selection_rule": promotion.MATCHED_QUICK_SCREEN_SELECTION_RULE,
+        "candidate_checkpoint_sha256": checkpoints[selected_step]["sha256"],
+    }
+    payload["screen_sha256"] = promotion._digest_value(payload)
+    _write_json(path, payload)
+    return payload
+
+
 def _make_internal_pool_shard_complete(
     source: dict, *, candidate: Path, champion: Path
 ) -> None:
@@ -1306,7 +1441,14 @@ def _fixture(
     diagnostic_source = tmp_path / "prior-diagnostic-cohort.json"
     _write_json(
         diagnostic_source,
-        {"kind": "arm_selection", "seed_intervals": [[9_000_000, 9_000_200]]},
+        {
+            "kind": "arm_selection",
+            "candidate_checkpoint": str(candidate),
+            "candidate_checkpoint_sha256": promotion._sha256(candidate),
+            "games": [
+                {"game_seed": seed} for seed in range(9_000_000, 9_000_200)
+            ],
+        },
     )
     cohort_exclusions = {
         "schema_version": promotion.COHORT_EXCLUSIONS_SCHEMA,
@@ -1680,7 +1822,12 @@ def test_explicit_same_trajectory_checkpoint_selection_replays_64_96_128(
         lambda _path, *, reference_time_ns: modern["canary"],
     )
     screen = tmp_path / "matched-quick-screen.json"
-    _write_json(screen, {"screen": "same common-random-number cohort"})
+    _write_matched_quick_screen(
+        screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        points_by_step={64: 100.0, 96: 130.0, 128: 110.0},
+    )
     selected = modern["intermediate"][1]
     selection = {
         "schema_version": promotion.CHECKPOINT_SELECTION_SCHEMA,
@@ -1740,7 +1887,12 @@ def test_checkpoint_selection_rejects_candidate_chaining_marker(
         lambda _path, *, reference_time_ns: modern["canary"],
     )
     screen = tmp_path / "matched-quick-screen.json"
-    _write_json(screen, {"screen": "same common-random-number cohort"})
+    _write_matched_quick_screen(
+        screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        points_by_step={64: 120.0, 96: 120.0, 128: 120.0},
+    )
     selected = modern["intermediate"][0]
     selection = {
         "schema_version": promotion.CHECKPOINT_SELECTION_SCHEMA,
@@ -1784,9 +1936,16 @@ def test_checkpoint_selection_rejects_candidate_chaining_marker(
 
 def test_select_dose_builder_seals_same_trajectory_choice(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
-    _modernize_one_dose_receipt(fixture, world_size=8, with_intermediate=True)
+    _receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
     screen = tmp_path / "matched-quick-screen.json"
-    _write_json(screen, {"screen": "same common-random-number cohort"})
+    _write_matched_quick_screen(
+        screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
+    )
     output = tmp_path / "checkpoint-selection.json"
 
     selection = promotion.create_same_trajectory_checkpoint_selection(
@@ -1804,6 +1963,151 @@ def test_select_dose_builder_seals_same_trajectory_choice(tmp_path: Path) -> Non
     assert selection["file_sha256"] == promotion._sha256(output)
 
 
+def test_select_dose_derives_step_and_rejects_caller_override(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    screen = tmp_path / "matched-quick-screen.json"
+    _write_matched_quick_screen(
+        screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        points_by_step={64: 100.0, 96: 130.0, 128: 110.0},
+    )
+
+    with pytest.raises(promotion.PromotionError, match="caller-selected.*differs"):
+        promotion.create_same_trajectory_checkpoint_selection(
+            training_receipt_path=fixture["training_receipt"],
+            training_report_path=fixture["report"],
+            screen_evidence_path=screen,
+            selected_optimizer_step=64,
+            output_path=tmp_path / "checkpoint-selection.json",
+        )
+
+
+def test_select_dose_rejects_result_not_bound_to_common_games(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    screen = tmp_path / "matched-quick-screen.json"
+    payload = _write_matched_quick_screen(
+        screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        points_by_step={64: 120.0, 96: 120.0, 128: 120.0},
+    )
+    payload["results"][1]["ordered_game_keys_sha256"] = "sha256:" + "d" * 64
+    payload.pop("screen_sha256")
+    payload["screen_sha256"] = promotion._digest_value(payload)
+    _write_json(screen, payload)
+
+    with pytest.raises(promotion.PromotionError, match="common checkpoint/games/search"):
+        promotion.create_same_trajectory_checkpoint_selection(
+            training_receipt_path=fixture["training_receipt"],
+            training_report_path=fixture["report"],
+            screen_evidence_path=screen,
+            output_path=tmp_path / "checkpoint-selection.json",
+        )
+
+
+def test_build_dose_screen_from_three_pooled_reports(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    fixture_screen = tmp_path / "fixture-screen.json"
+    fixture_payload = _write_matched_quick_screen(
+        fixture_screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
+    )
+    reports = {
+        result["optimizer_step"]: Path(result["evaluation_report"]["path"])
+        for result in fixture_payload["results"]
+    }
+
+    screen = promotion.create_matched_quick_screen(
+        step64_report_path=reports[64],
+        step96_report_path=reports[96],
+        step128_report_path=reports[128],
+        output_path=tmp_path / "operator-screen.json",
+    )
+
+    assert screen["selected_optimizer_step"] == 64
+    assert screen["candidate_checkpoint_sha256"] == modern["intermediate"][0][
+        "checkpoint_sha256"
+    ]
+    assert screen["file_sha256"] == promotion._sha256(
+        tmp_path / "operator-screen.json"
+    )
+
+
+def test_build_dose_screen_rejects_cross_report_search_drift(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    fixture_screen = tmp_path / "fixture-screen.json"
+    fixture_payload = _write_matched_quick_screen(
+        fixture_screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
+    )
+    reports = {
+        result["optimizer_step"]: Path(result["evaluation_report"]["path"])
+        for result in fixture_payload["results"]
+    }
+    changed = json.loads(reports[96].read_text(encoding="utf-8"))
+    changed["effective_search_config"]["n_full"] = 256
+    changed["fleet_merge"]["effective_search_config_sha256"] = (
+        promotion._digest_value(changed["effective_search_config"])
+    )
+    _write_json(reports[96], changed)
+
+    with pytest.raises(promotion.PromotionError, match="identical search configuration"):
+        promotion.create_matched_quick_screen(
+            step64_report_path=reports[64],
+            step96_report_path=reports[96],
+            step128_report_path=reports[128],
+            output_path=tmp_path / "operator-screen.json",
+        )
+
+
+def test_build_dose_screen_rejects_candidate_checkpoint_hash_drift(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    fixture_screen = tmp_path / "fixture-screen.json"
+    fixture_payload = _write_matched_quick_screen(
+        fixture_screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
+    )
+    reports = {
+        result["optimizer_step"]: Path(result["evaluation_report"]["path"])
+        for result in fixture_payload["results"]
+    }
+    changed = json.loads(reports[64].read_text(encoding="utf-8"))
+    changed["candidate_checkpoint_sha256"] = "sha256:" + "e" * 64
+    _write_json(reports[64], changed)
+
+    with pytest.raises(promotion.PromotionError, match="checkpoint bytes drifted"):
+        promotion.create_matched_quick_screen(
+            step64_report_path=reports[64],
+            step96_report_path=reports[96],
+            step128_report_path=reports[128],
+            output_path=tmp_path / "operator-screen.json",
+        )
+
+
 def _mutate_cohort_exclusions(fixture: dict, mutate) -> dict:
     path = fixture["cohort_exclusions"]
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1815,14 +2119,14 @@ def _mutate_cohort_exclusions(fixture: dict, mutate) -> dict:
 
 
 @pytest.mark.parametrize(
-    ("base_seed", "end_seed", "expected_kind"),
+    ("base_seed", "end_seed"),
     [
-        (7_000_050, 7_000_060, "internal_h2h"),
-        (8_100_050, 8_100_060, "external_panel"),
+        (7_000_050, 7_000_060),
+        (8_100_050, 8_100_060),
     ],
 )
-def test_promotion_refuses_reused_diagnostic_cohort(
-    tmp_path: Path, base_seed: int, end_seed: int, expected_kind: str
+def test_promotion_refuses_declared_ranges_not_derived_from_diagnostic_report(
+    tmp_path: Path, base_seed: int, end_seed: int
 ) -> None:
     fixture = _fixture(tmp_path)
 
@@ -1834,7 +2138,7 @@ def test_promotion_refuses_reused_diagnostic_cohort(
     _mutate_cohort_exclusions(fixture, overlap)
     with pytest.raises(
         promotion.PromotionError,
-        match=rf"overlaps.*{expected_kind}",
+        match="do not exactly match",
     ):
         _execute(fixture, go=False)
 
@@ -1846,6 +2150,24 @@ def test_promotion_refuses_mutated_bound_diagnostic_source(tmp_path: Path) -> No
     source.write_text("mutated\n", encoding="utf-8")
 
     with pytest.raises(promotion.PromotionError, match="artifact drift"):
+        _execute(fixture, go=False)
+
+
+def test_promotion_recomputes_candidate_hash_from_bound_diagnostic_report(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    exclusions = json.loads(fixture["cohort_exclusions"].read_text(encoding="utf-8"))
+    source = Path(exclusions["cohorts"][0]["source"]["path"])
+    report = json.loads(source.read_text(encoding="utf-8"))
+    report["candidate_checkpoint_sha256"] = "sha256:" + "e" * 64
+    _write_json(source, report)
+    exclusions["cohorts"][0]["source"]["sha256"] = promotion._sha256(source)
+    exclusions.pop("manifest_sha256")
+    exclusions["manifest_sha256"] = promotion._digest_value(exclusions)
+    _write_json(fixture["cohort_exclusions"], exclusions)
+
+    with pytest.raises(promotion.PromotionError, match="candidate checkpoint hash drifted"):
         _execute(fixture, go=False)
 
 
