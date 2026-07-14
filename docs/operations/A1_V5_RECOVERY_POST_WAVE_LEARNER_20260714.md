@@ -18,7 +18,7 @@ export REPO=/home/ubuntu/catan-zero-v1
 export PY=$REPO/.venv/bin/python
 # Immutable staging checkout containing the builder/trainer code from this
 # runbook revision. Do not reuse the stale 20260714 prep tree.
-export LEARNER_CODE_ROOT=/home/ubuntu/catan-zero-learner-post-wave-r2
+export LEARNER_CODE_ROOT=/home/ubuntu/catan-zero-learner-post-wave-final
 export PROD=/home/ubuntu/catan-zero-production
 export WAVE_ID=a1-v5-recovery-n128-p4-64000games-64gpu-20260714-r2
 export WAVE=$PROD/private/$WAVE_ID
@@ -26,7 +26,7 @@ export LOCK=$WAVE/lock.json
 export RENDER=$WAVE/rendered/commands.json
 export FROZEN_REPO=/home/ubuntu/catan-zero-wave-5ba993a
 export FROZEN_VERIFIER_SHA256=sha256:ab5d4ef8d4a3f82ecacb6c94ff613e24041ec9d1d4e2722ae6c65a19220f101c
-export FLEET_MANIFEST=$PROD/private/gather-vs-recovered-v5-20260714-r1/fleet64.manifest.json
+export FLEET_MANIFEST=$FROZEN_REPO/configs/gpu_fleet_64.json
 export HARVEST_SSH_TRANSPORT=$LEARNER_CODE_ROOT/tools/fleet/a1_harvest_ssh_transport.py
 export HISTORICAL_FROZEN_REPO=/home/ubuntu/catan-zero-v1
 export HISTORICAL_FROZEN_VERIFIER_SHA256=sha256:45594de3835242904a7c3257c5ff644531c4a3c70a447880b20b3b1a23d8c9cc
@@ -296,7 +296,7 @@ mkdir -p "$GATE"
 export BASE_EVAL_MANIFEST=$LEARNER_CODE_ROOT/configs/operations/a1-r3-gather-aux64-reproduction-eval600-20260712-r1/fleet64.manifest.json
 export EVAL_COMMIT=$(git -C "$LEARNER_CODE_ROOT" rev-parse HEAD)
 export EVAL_REMOTE_REPO=/home/ubuntu/catan-zero-eval-${EVAL_COMMIT:0:12}
-export EVAL_MANIFEST=$GATE/fleet64.eval-source.json
+export EVAL_MANIFEST=$GATE/fleet64.eval-source-${EVAL_COMMIT:0:12}.json
 
 # The evaluator proves remote_repo HEAD exactly; it does not mutate or update
 # source on its own. Stage a separate detached, read-only checkout on all 12
