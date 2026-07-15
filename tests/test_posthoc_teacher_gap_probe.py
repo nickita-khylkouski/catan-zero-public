@@ -76,6 +76,8 @@ def _report() -> dict:
 class _FakeTrainBC:
     def __init__(self):
         self.calls = {}
+        self.corpus_loads = 0
+        self.evaluate_calls = []
         self._MASK_HIDDEN_INFO_PLAYER_TOKENS = False
 
     def _training_data_fingerprint(self, path, data_format):
@@ -92,6 +94,7 @@ class _FakeTrainBC:
         }
 
     def load_teacher_data_memmap(self, path):
+        self.corpus_loads += 1
         self.calls["corpus"] = path
         return {"action_taken": np.arange(5), "game_seed": np.arange(5)}
 
@@ -109,16 +112,32 @@ class _FakeTrainBC:
 
     def evaluate_bc_batches(self, *args, **kwargs):
         self.calls["evaluate"] = (args, kwargs)
+        self.evaluate_calls.append((args, kwargs))
+        dose = 0.05 if getattr(args[0], "name", "") == "step128" else 0.0
         return {
             "samples": 2,
             "active_policy_teacher_gap_rows": 2,
             "active_policy_kl_target_model_mean": 0.2,
             "active_policy_kl_target_prior_mean": 0.5,
-            "active_policy_teacher_gap_closure": 0.6,
+            "active_policy_teacher_gap_closure": 0.6 + dose,
             "prior_kl_rows": 4,
             "prior_kl_model_prior_mean": 0.3,
+            "prior_kl_prior_model_mean": 0.35,
             "prior_kl_target_prior_mean": 0.4,
             "prior_kl_ratio": 0.75,
+            "loss_denominators": {"policy_kl_anchor_loss": 3.0},
+            "policy_kl_anchor_loss": 0.25 - dose,
+            "accuracy_active_count": 2,
+            "accuracy": 0.4 + dose,
+            "top3_accuracy": 0.8 + dose,
+            "active_policy_model_entropy_rows": 2,
+            "active_policy_model_entropy_mean": 0.9 - dose,
+            "primary_value_loss_kind": "scalar_mse",
+            "primary_value_loss": 0.3 - dose,
+            "scalar_value_mse_diagnostic": 0.3 - dose,
+            "value_categorical_loss": 0.0,
+            "final_vp_loss": 0.1,
+            "value_uncertainty_loss": 0.0,
         }
 
 
@@ -192,6 +211,55 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert result["legacy_prior_kl"]["prior_kl_ratio"] == 0.75
     assert result["inputs"]["checkpoint"]["sha256"].startswith("sha256:")
     assert result["inputs"]["training_report"]["sha256"].startswith("sha256:")
+    assert result["checkpoint_fingerprint"]["policy_entropy"]["mean_nats"] == 0.9
+
+
+def test_batch_probe_loads_shared_corpus_once_and_compares_step_doses(
+    tmp_path, monkeypatch
+):
+    module = _module()
+    report_path, _checkpoint, data, manifest = _paths(tmp_path, _report())
+    step64 = tmp_path / "step64.pt"
+    step128 = tmp_path / "step128.pt"
+    step64.write_bytes(b"step64")
+    step128.write_bytes(b"step128")
+    fake = _FakeTrainBC()
+    loaded = []
+
+    def load_policy(_arch, path, _device):
+        loaded.append(path.name)
+        return SimpleNamespace(name=path.stem)
+
+    monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
+    monkeypatch.setattr(module, "_load_policy", load_policy)
+    result = module.run_batch_probe(
+        report_path=report_path,
+        checkpoints=[("step64", step64), ("step128", step128)],
+        data_path=data,
+        validation_manifest_path=manifest,
+        device="cpu",
+        batch_size=64,
+    )
+
+    assert fake.corpus_loads == 1
+    assert len(fake.evaluate_calls) == 2
+    assert loaded == ["step64.pt", "step128.pt"]
+    assert result["checkpoint_order"] == ["step64", "step128"]
+    assert result["shared_holdout"]["validation_rows"] == 2
+    assert result["shared_holdout"]["identity_sha256"].startswith("sha256:")
+    assert set(result["checkpoints"]) == {"step64", "step128"}
+    assert (
+        result["checkpoints"]["step128"]["fingerprint"]["policy_top1"]
+        ["action_accuracy"]
+        == pytest.approx(0.45)
+    )
+    comparison = result["dose_comparison"]["metrics"]
+    assert comparison["policy_top1_accuracy"]["step128_minus_step64"] == pytest.approx(
+        0.05
+    )
+    assert comparison["scalar_value_mse"]["step128_minus_step64"] == pytest.approx(
+        -0.05
+    )
 
 
 def test_refuses_wrong_memmap_fingerprint(tmp_path, monkeypatch):

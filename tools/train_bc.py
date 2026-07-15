@@ -15152,6 +15152,8 @@ def evaluate_bc_batches(
             "active_policy_teacher_gap_rows": 0.0,
             "active_policy_kl_target_model_sum": 0.0,
             "active_policy_kl_target_prior_sum": 0.0,
+            "active_policy_model_entropy_sum": 0.0,
+            "active_policy_model_entropy_rows": 0.0,
         }
         extra_denominators: dict[str, float] = {
             "policy_loss": 0.0,
@@ -15318,6 +15320,12 @@ def evaluate_bc_batches(
             extra_sums["active_policy_kl_target_prior_sum"] += float(
                 batch_metrics.get("active_policy_kl_target_prior_sum", 0.0)
             )
+            extra_sums["active_policy_model_entropy_sum"] += float(
+                batch_metrics.get("active_policy_model_entropy_sum", 0.0)
+            )
+            extra_sums["active_policy_model_entropy_rows"] += float(
+                batch_metrics.get("active_policy_model_entropy_rows", 0.0)
+            )
             batch_active_count = float(batch_metrics.get("active_count", len(batch)))
             acc_sum += float(batch_metrics["accuracy"]) * batch_active_count
             top3_sum += float(batch_metrics["top3_accuracy"]) * batch_active_count
@@ -15473,6 +15481,13 @@ def evaluate_bc_batches(
             "accuracy_active_count": int(round(active_count_total)),
             "accuracy": acc_sum / max(active_count_total, 1.0),
             "top3_accuracy": top3_sum / max(active_count_total, 1.0),
+            "active_policy_model_entropy_rows": int(
+                round(extra_sums["active_policy_model_entropy_rows"])
+            ),
+            "active_policy_model_entropy_mean": (
+                extra_sums["active_policy_model_entropy_sum"]
+                / max(extra_sums["active_policy_model_entropy_rows"], 1.0)
+            ),
             "phase_accuracy": _finalize_phase_stats(phase_stats),
             "phase_accuracy_excluding_forced": _finalize_phase_stats(phase_stats_unforced),
             "teacher_accuracy": _finalize_phase_stats(teacher_stats),
@@ -16147,6 +16162,26 @@ def _eval_xdim_batch(
         active_count = int(active.sum().item())
         accuracy = _masked_metric_mean((predictions == target).float(), active)
         top3_accuracy = _topk_legal_accuracy(outputs["logits"], target, k=3, mask=active)
+        entropy_legal_mask = torch.as_tensor(
+            np.asarray(data["legal_action_ids"][batch]) >= 0,
+            dtype=torch.bool,
+            device=policy.device,
+        )
+        entropy_logits = outputs["logits"].float().masked_fill(
+            ~entropy_legal_mask, float("-inf")
+        )
+        model_log_probs = torch.nn.functional.log_softmax(
+            entropy_logits, dim=-1
+        )
+        model_probs = model_log_probs.exp()
+        model_entropy = -torch.where(
+            torch.isfinite(model_log_probs),
+            model_probs * model_log_probs,
+            torch.zeros_like(model_log_probs),
+        ).sum(dim=-1)
+        active_policy_model_entropy_sum = float(
+            model_entropy[active].sum().item()
+        )
         predictions_np = predictions.detach().cpu().numpy()
         targets_np = target.detach().cpu().numpy()
         logits_np = outputs["logits"].float().detach().cpu().numpy()
@@ -16284,6 +16319,10 @@ def _eval_xdim_batch(
             "active_count": active_count,
             "accuracy": float(accuracy.item()),
             "top3_accuracy": float(top3_accuracy.item()),
+            "active_policy_model_entropy_sum": (
+                active_policy_model_entropy_sum
+            ),
+            "active_policy_model_entropy_rows": active_count,
             "phase_stats": _field_stats(
                 data,
                 batch[active_np],

@@ -403,6 +403,8 @@ def test_xdim_validation_default_mse_objective_and_telemetry() -> None:
     )
     assert metrics["loss"] == pytest.approx(0.25)
     assert metrics["component_reconstructed_loss"] == pytest.approx(metrics["loss"])
+    assert metrics["active_policy_model_entropy_rows"] == 4
+    assert metrics["active_policy_model_entropy_mean"] == pytest.approx(np.log(2.0))
     assert policy.model.training is True  # validation restores the caller's mode
 
 
