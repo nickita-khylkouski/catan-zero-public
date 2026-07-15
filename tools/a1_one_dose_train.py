@@ -29,6 +29,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import socket
 from typing import Any, Callable, Mapping, Sequence
@@ -308,6 +309,9 @@ AUX_SUBGOAL_TARGET_FIELDS = frozenset(
 )
 P1_CENTRAL_ARMS = frozenset({"K0", "K3", "K10"})
 CENTRAL_LEARNER_BINDING_SCHEMA = "a1-central-learner-binding-v3"
+LOCK_VERIFICATION_CACHE_SCHEMA = "a1-lock-verification-cache-v1"
+LOCK_VERIFICATION_CACHE_VALIDATOR_VERSION = 1
+LOCK_VERIFICATION_CACHE_ENV = "A1_ONE_DOSE_LOCK_VERIFICATION_CACHE_DIR"
 
 
 class ExecutorError(RuntimeError):
@@ -982,6 +986,300 @@ def _producer(lock: dict[str, Any]) -> dict[str, Any]:
     return matches[0]
 
 
+def _lock_verification_cache_root() -> Path:
+    override = os.environ.get(LOCK_VERIFICATION_CACHE_ENV)
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".cache"
+    return base / "catan-zero" / "a1-lock-verification"
+
+
+def _verification_path_identity(path: Path) -> tuple[dict[str, Any], bool]:
+    """Describe one verification input without trusting pathname metadata alone."""
+
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        info = lexical.lstat()
+    except FileNotFoundError:
+        return ({"path": str(lexical), "kind": "missing"}, True)
+    except OSError as error:
+        raise ExecutorError(
+            f"cannot inspect lock-verification input {lexical}: {error}"
+        ) from error
+    common = {
+        "path": str(lexical),
+        "device": int(info.st_dev),
+        "inode": int(info.st_ino),
+        "size_bytes": int(info.st_size),
+        "mtime_ns": int(info.st_mtime_ns),
+        "ctime_ns": int(info.st_ctime_ns),
+        "mode": int(stat.S_IMODE(info.st_mode)),
+        "uid": int(info.st_uid),
+    }
+    if stat.S_ISREG(info.st_mode):
+        return ({**common, "kind": "regular_file"}, True)
+    if stat.S_ISDIR(info.st_mode):
+        return ({**common, "kind": "directory"}, True)
+    # The historical verifier may accept a symlink in an archival path, but a
+    # reusable receipt must never turn that mutable indirection into authority.
+    kind = "symlink" if stat.S_ISLNK(info.st_mode) else "special"
+    return ({**common, "kind": kind}, False)
+
+
+def _referenced_verification_paths(
+    lock_path: Path,
+    raw_lock: Mapping[str, Any],
+    *,
+    verifier_path: Path,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Snapshot the lock's direct and JSON-linked verification inputs.
+
+    The sealed lock is already authenticated before this traversal.  We follow
+    only explicit ``path``/``*_path`` fields and only parse small JSON files;
+    checkpoint and corpus payloads are statted, never reread by the cache.
+    """
+
+    pending_values: list[tuple[Any, Path]] = [(raw_lock, lock_path.parent)]
+    paths: dict[str, Path] = {}
+    explicit = (lock_path, verifier_path, Path(__file__).resolve(strict=True))
+    for path in explicit:
+        lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+        paths[str(lexical)] = lexical
+    parsed_json: set[str] = set()
+    while pending_values:
+        value, relative_to = pending_values.pop()
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                if isinstance(child, str) and (key == "path" or key.endswith("_path")):
+                    candidate = Path(child).expanduser()
+                    if not candidate.is_absolute():
+                        candidate = relative_to / candidate
+                    candidate = Path(os.path.abspath(os.fspath(candidate)))
+                    paths[str(candidate)] = candidate
+                else:
+                    pending_values.append((child, relative_to))
+        elif isinstance(value, (list, tuple)):
+            pending_values.extend((child, relative_to) for child in value)
+
+        if len(paths) > 16_384:
+            raise ExecutorError("reviewed lock references too many verification paths")
+
+        # Discover indirection in authenticated receipts and manifests.  The
+        # identity is captured before and after the read so a changing linked
+        # document can never seed a reusable receipt.
+        for path_key, path in list(paths.items()):
+            if path_key in parsed_json or path.suffix.lower() != ".json":
+                continue
+            parsed_json.add(path_key)
+            try:
+                before = path.lstat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as error:
+                raise ExecutorError(
+                    f"cannot inspect linked lock-verification JSON {path}: {error}"
+                ) from error
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or stat.S_ISLNK(before.st_mode)
+                or before.st_size > 16 * 1024 * 1024
+            ):
+                continue
+            try:
+                linked = json.loads(path.read_text(encoding="utf-8"))
+                after = path.lstat()
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                # The full verifier owns the semantic error.  It is enough for
+                # the cache to retain the file identity and decline recursion.
+                continue
+            before_id = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            after_id = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if before_id != after_id:
+                raise ExecutorError(
+                    f"linked lock-verification JSON changed while read: {path}"
+                )
+            pending_values.append((linked, path.parent))
+
+    identities: list[dict[str, Any]] = []
+    cache_eligible = True
+    for path in sorted(paths.values(), key=lambda item: str(item)):
+        identity, eligible = _verification_path_identity(path)
+        identities.append(identity)
+        cache_eligible = cache_eligible and eligible
+    return identities, cache_eligible
+
+
+def _sealed_verifier_code_binding(
+    raw_lock: Mapping[str, Any], *, authority: Mapping[str, Any]
+) -> dict[str, Any]:
+    provenance = raw_lock.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise ExecutorError("reviewed A1 lock has no code provenance")
+    sections: dict[str, Any] = {}
+    for section in ("generator_code", "learner_code", "runtime_code_tree"):
+        records = provenance.get(section)
+        if section == "generator_code" and records is None:
+            continue
+        if not isinstance(records, list) or not records:
+            raise ExecutorError(f"reviewed A1 lock has no {section} records")
+        records_sha256 = _value_sha256(records)
+        declared = provenance.get(f"{section}_sha256")
+        if declared is not None and declared != records_sha256:
+            raise ExecutorError(f"reviewed A1 {section} declared digest drift")
+        sections[section] = {
+            "records_sha256": records_sha256,
+            "declared_sha256": declared,
+        }
+    binding: dict[str, Any] = {
+        "verifier_path": str(Path(authority["verifier_path"])),
+        "verifier_sha256": str(authority["verifier_sha256"]),
+        "sections": sections,
+    }
+    binding["code_tree_binding_sha256"] = _value_sha256(binding)
+    return binding
+
+
+def _lock_verification_cache_binding(
+    *,
+    lock_path: Path,
+    lock_file_sha256: str,
+    semantic_lock_sha256: str,
+    reviewed_lock_file_sha256: str,
+    authority: Mapping[str, Any],
+    code_binding: Mapping[str, Any],
+    filesystem_identities: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    portable_authority = {
+        str(key): str(value) if isinstance(value, Path) else value
+        for key, value in authority.items()
+    }
+    binding: dict[str, Any] = {
+        "schema_version": LOCK_VERIFICATION_CACHE_SCHEMA,
+        "validator_version": LOCK_VERIFICATION_CACHE_VALIDATOR_VERSION,
+        "require_all_job_claims": True,
+        "lock_path": str(lock_path),
+        "lock_file_sha256": lock_file_sha256,
+        "semantic_lock_sha256": semantic_lock_sha256,
+        "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
+        "trust_anchor_sha256": _value_sha256(portable_authority),
+        "sealed_verifier_code_binding": dict(code_binding),
+        "verification_implementation_sha256": _file_sha256(Path(__file__)),
+        "filesystem_identities": [dict(row) for row in filesystem_identities],
+        "filesystem_identities_sha256": _value_sha256(
+            [dict(row) for row in filesystem_identities]
+        ),
+    }
+    binding["binding_sha256"] = _value_sha256(binding)
+    return binding
+
+
+def _lock_verification_cache_path(binding: Mapping[str, Any]) -> Path:
+    digest = str(binding["binding_sha256"]).split(":", 1)[1]
+    return _lock_verification_cache_root() / f"{digest}.json"
+
+
+def _load_lock_verification_cache(
+    binding: Mapping[str, Any], *, cache_eligible: bool
+) -> dict[str, Any] | None:
+    if not cache_eligible:
+        return None
+    path = _lock_verification_cache_path(binding)
+    try:
+        directory_info = path.parent.lstat()
+        cache_info = path.lstat()
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_info.st_mode) & 0o077
+            or not stat.S_ISREG(cache_info.st_mode)
+            or stat.S_ISLNK(cache_info.st_mode)
+            or cache_info.st_uid != os.geteuid()
+            or stat.S_IMODE(cache_info.st_mode) & 0o077
+        ):
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "binding",
+        "verified_lock",
+        "verified_lock_sha256",
+        "receipt_sha256",
+    }:
+        return None
+    unsigned = dict(payload)
+    receipt_sha256 = unsigned.pop("receipt_sha256", None)
+    verified = payload.get("verified_lock")
+    if (
+        payload.get("schema_version") != LOCK_VERIFICATION_CACHE_SCHEMA
+        or payload.get("binding") != binding
+        or not isinstance(verified, dict)
+        or payload.get("verified_lock_sha256") != _value_sha256(verified)
+        or receipt_sha256 != _value_sha256(unsigned)
+        or verified.get("contract_sha256") != binding.get("semantic_lock_sha256")
+    ):
+        return None
+    return copy.deepcopy(verified)
+
+
+def _publish_lock_verification_cache(
+    binding: Mapping[str, Any], verified: Mapping[str, Any], *, cache_eligible: bool
+) -> None:
+    """Best-effort atomic publication; cache failure never weakens verification."""
+
+    if not cache_eligible:
+        return
+    path = _lock_verification_cache_path(binding)
+    temporary: str | None = None
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory_info = path.parent.lstat()
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or directory_info.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_info.st_mode) & 0o077
+        ):
+            return
+        unsigned: dict[str, Any] = {
+            "schema_version": LOCK_VERIFICATION_CACHE_SCHEMA,
+            "binding": dict(binding),
+            "verified_lock": copy.deepcopy(dict(verified)),
+            "verified_lock_sha256": _value_sha256(dict(verified)),
+        }
+        payload = {**unsigned, "receipt_sha256": _value_sha256(unsigned)}
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        _fsync_directory(path.parent)
+    except (OSError, TypeError, ValueError):
+        return
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
 def _verify_lock_with_sealed_runtime(
     lock_path: Path, *, reviewed_lock_file_sha256: str | None = None
 ) -> dict[str, Any]:
@@ -1023,6 +1321,13 @@ def _verify_lock_with_sealed_runtime(
     provenance = raw.get("provenance")
     if not isinstance(provenance, dict):
         raise ExecutorError("reviewed A1 lock has no code provenance")
+    semantic_lock_sha256 = raw.get("contract_sha256")
+    unhashed_lock = dict(raw)
+    unhashed_lock.pop("contract_sha256", None)
+    semantic_lock_valid = bool(
+        isinstance(semantic_lock_sha256, str)
+        and semantic_lock_sha256 == _value_sha256(unhashed_lock)
+    )
     expected_contract_id = authority.get("contract_id")
     expected_contract_sha = authority.get("contract_sha256")
     expected_producer_sha = authority.get("producer_sha256")
@@ -1038,6 +1343,60 @@ def _verify_lock_with_sealed_runtime(
         raise ExecutorError(
             "reviewed production lock differs from its sealed handoff/contract identity"
         )
+    runtime = provenance.get("runtime_code_tree")
+    matches = [
+        record
+        for record in runtime or []
+        if isinstance(record, dict)
+        and str(record.get("path", "")) == str(authority["verifier_path"])
+    ]
+    if len(matches) != 1 or matches[0].get("sha256") != authority["verifier_sha256"]:
+        raise ExecutorError("reviewed A1 lock does not bind its sealed verifier")
+    verifier = Path(authority["verifier_path"]).expanduser().resolve(strict=True)
+    canonical_lock_path = lock_path.resolve(strict=True)
+    identities_before: list[dict[str, Any]] = []
+    cache_eligible = False
+    cache_binding: dict[str, Any] | None = None
+    if semantic_lock_valid:
+        code_binding = _sealed_verifier_code_binding(raw, authority=authority)
+        identities_before, cache_eligible = _referenced_verification_paths(
+            canonical_lock_path,
+            raw,
+            verifier_path=verifier,
+        )
+        assert isinstance(semantic_lock_sha256, str)
+        cache_binding = _lock_verification_cache_binding(
+            lock_path=canonical_lock_path,
+            lock_file_sha256=actual_lock_sha,
+            semantic_lock_sha256=semantic_lock_sha256,
+            reviewed_lock_file_sha256=reviewed_lock_file_sha256,
+            authority=authority,
+            code_binding=code_binding,
+            filesystem_identities=identities_before,
+        )
+        cached = _load_lock_verification_cache(
+            cache_binding, cache_eligible=cache_eligible
+        )
+        if cached is not None:
+            identities_after, still_eligible = _referenced_verification_paths(
+                canonical_lock_path,
+                raw,
+                verifier_path=verifier,
+            )
+            if still_eligible and identities_after == identities_before:
+                print(
+                    json.dumps(
+                        {
+                            "progress": "a1_lock_verification_cache",
+                            "status": "hit",
+                            "binding_sha256": cache_binding["binding_sha256"],
+                            "filesystem_identity_count": len(identities_before),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                return cached
     # Authenticate every dependency the sealed verifier may import before
     # starting its interpreter. The raw lock is already pinned/authenticated,
     # so these paths/digests are trusted declarations rather than attacker
@@ -1061,25 +1420,14 @@ def _verify_lock_with_sealed_runtime(
                     f"{dependency} expected={record['sha256']} "
                     f"actual={actual_dependency_sha}"
                 )
-    runtime = (raw.get("provenance") or {}).get("runtime_code_tree")
-    matches = [
-        record
-        for record in runtime or []
-        if isinstance(record, dict)
-        and str(record.get("path", "")) == str(authority["verifier_path"])
-    ]
-    if (
-        len(matches) != 1
-        or matches[0].get("sha256") != authority["verifier_sha256"]
-    ):
-        raise ExecutorError("reviewed A1 lock does not bind its sealed verifier")
-    verifier = Path(authority["verifier_path"]).expanduser().resolve(strict=True)
     actual_verifier_sha = _file_sha256(verifier)
     if actual_verifier_sha != authority["verifier_sha256"]:
         raise ExecutorError(
             "pinned sealed verifier digest mismatch: "
             f"expected={authority['verifier_sha256']} actual={actual_verifier_sha}"
         )
+    if not semantic_lock_valid:
+        raise ExecutorError("reviewed A1 lock semantic digest drift")
     sealed_root = verifier.parents[1]
     script = (
         "import json,sys; from pathlib import Path; "
@@ -1110,6 +1458,34 @@ def _verify_lock_with_sealed_runtime(
         "contract_sha256"
     ):
         raise ExecutorError("sealed A1 verifier returned a different lock identity")
+    assert cache_binding is not None
+    identities_after, still_eligible = _referenced_verification_paths(
+        canonical_lock_path,
+        raw,
+        verifier_path=verifier,
+    )
+    if identities_after != identities_before:
+        raise ExecutorError(
+            "lock-verification filesystem inputs changed during full verification"
+        )
+    _publish_lock_verification_cache(
+        cache_binding,
+        verified,
+        cache_eligible=cache_eligible and still_eligible,
+    )
+    print(
+        json.dumps(
+            {
+                "progress": "a1_lock_verification_cache",
+                "status": "miss",
+                "binding_sha256": cache_binding["binding_sha256"],
+                "filesystem_identity_count": len(identities_before),
+                "cache_eligible": cache_eligible and still_eligible,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     return verified
 
 
