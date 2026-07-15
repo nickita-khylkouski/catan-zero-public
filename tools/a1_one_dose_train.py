@@ -1042,36 +1042,48 @@ def _referenced_verification_paths(
 
     pending_values: list[tuple[Any, Path]] = [(raw_lock, lock_path.parent)]
     paths: dict[str, Path] = {}
-    explicit = (lock_path, verifier_path, Path(__file__).resolve(strict=True))
-    for path in explicit:
-        lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
-        paths[str(lexical)] = lexical
-    parsed_json: set[str] = set()
-    while pending_values:
-        value, relative_to = pending_values.pop()
-        if isinstance(value, Mapping):
-            for key, child in value.items():
-                if isinstance(child, str) and (key == "path" or key.endswith("_path")):
-                    candidate = Path(child).expanduser()
-                    if not candidate.is_absolute():
-                        candidate = relative_to / candidate
-                    candidate = Path(os.path.abspath(os.fspath(candidate)))
-                    paths[str(candidate)] = candidate
-                else:
-                    pending_values.append((child, relative_to))
-        elif isinstance(value, (list, tuple)):
-            pending_values.extend((child, relative_to) for child in value)
+    json_frontier: list[Path] = []
+    json_frontier_index = 0
 
+    def discover_path(path: Path) -> None:
+        """Record and enqueue one lexical path exactly once."""
+
+        lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+        path_key = str(lexical)
+        if path_key in paths:
+            return
+        paths[path_key] = lexical
         if len(paths) > 16_384:
             raise ExecutorError("reviewed lock references too many verification paths")
+        if lexical.suffix.lower() == ".json":
+            json_frontier.append(lexical)
 
-        # Discover indirection in authenticated receipts and manifests.  The
-        # identity is captured before and after the read so a changing linked
-        # document can never seed a reusable receipt.
-        for path_key, path in list(paths.items()):
-            if path_key in parsed_json or path.suffix.lower() != ".json":
-                continue
-            parsed_json.add(path_key)
+    explicit = (lock_path, verifier_path, Path(__file__).resolve(strict=True))
+    for path in explicit:
+        discover_path(path)
+    while pending_values or json_frontier_index < len(json_frontier):
+        if pending_values:
+            value, relative_to = pending_values.pop()
+            if isinstance(value, Mapping):
+                for key, child in value.items():
+                    if isinstance(child, str) and (
+                        key == "path" or key.endswith("_path")
+                    ):
+                        candidate = Path(child).expanduser()
+                        if not candidate.is_absolute():
+                            candidate = relative_to / candidate
+                        discover_path(candidate)
+                    else:
+                        pending_values.append((child, relative_to))
+            elif isinstance(value, (list, tuple)):
+                pending_values.extend((child, relative_to) for child in value)
+
+        # Drain only the newly discovered JSON frontier. Each linked document
+        # is inspected and parsed at most once; nested values can enqueue more
+        # paths on the next value-walk iteration without rescanning old paths.
+        while json_frontier_index < len(json_frontier):
+            path = json_frontier[json_frontier_index]
+            json_frontier_index += 1
             try:
                 before = path.lstat()
             except (FileNotFoundError, NotADirectoryError):

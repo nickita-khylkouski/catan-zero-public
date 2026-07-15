@@ -1,14 +1,86 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import stat
 import subprocess
 
 import pytest
 
 from tools import a1_one_dose_train as executor
+
+
+def test_nested_json_frontier_reads_and_inspects_each_path_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verifier = tmp_path / "verifier.py"
+    verifier.write_text("# verifier\n", encoding="utf-8")
+    artifacts = []
+    for index in range(48):
+        artifact = tmp_path / f"artifact-{index:03d}.bin"
+        artifact.write_bytes(bytes([index]))
+        artifacts.append(artifact)
+
+    linked_json = [tmp_path / f"linked-{index:02d}.json" for index in range(8)]
+    noise = [
+        {"scalar": index, "nested": [index, {"again": index}]}
+        for index in range(128)
+    ]
+    for index in reversed(range(len(linked_json))):
+        payload: dict[str, object] = {
+            "duplicate_artifact_path": artifacts[index % len(artifacts)].name,
+            "noise": noise,
+        }
+        if index + 1 < len(linked_json):
+            payload["next_path"] = linked_json[index + 1].name
+        linked_json[index].write_text(json.dumps(payload), encoding="utf-8")
+
+    raw_lock: dict[str, object] = {
+        "entry_path": linked_json[0].name,
+        "artifacts": [{"path": path.name} for path in artifacts],
+        "noise": noise,
+    }
+    lock = tmp_path / "contract.lock.json"
+    lock.write_text(json.dumps(raw_lock), encoding="utf-8")
+    expected_json = {str(lock), *(str(path) for path in linked_json)}
+    read_counts: Counter[str] = Counter()
+    suffix_counts: Counter[str] = Counter()
+    original_read_text = Path.read_text
+    original_suffix = PurePath.suffix
+
+    def counted_read_text(self: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        key = str(self)
+        if key in expected_json:
+            read_counts[key] += 1
+        return original_read_text(self, *args, **kwargs)
+
+    def counted_suffix(self: PurePath) -> str:
+        suffix_counts[str(self)] += 1
+        return original_suffix.__get__(self, type(self))
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+    monkeypatch.setattr(PurePath, "suffix", property(counted_suffix))
+
+    identities, eligible = executor._referenced_verification_paths(
+        lock,
+        raw_lock,
+        verifier_path=verifier,
+    )
+
+    assert eligible is True
+    assert read_counts == Counter({path: 1 for path in expected_json})
+    assert suffix_counts and max(suffix_counts.values()) == 1
+    identity_paths = [str(row["path"]) for row in identities]
+    assert identity_paths == sorted(identity_paths)
+    assert set(identity_paths) == {
+        str(lock),
+        str(verifier),
+        str(Path(executor.__file__).resolve(strict=True)),
+        *(str(path) for path in artifacts),
+        *(str(path) for path in linked_json),
+    }
 
 
 def _reviewed_lock(
