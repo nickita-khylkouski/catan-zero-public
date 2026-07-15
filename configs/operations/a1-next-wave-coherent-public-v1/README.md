@@ -11,7 +11,7 @@ that every real lane must pass explicitly.
 The teacher uses one sanitized two-player public-belief tree. It does not split
 the budget across PIMC particles and it never clone-searches authoritative
 hidden truth. Normal roots use n128/n16 playout-cap randomization; roots with at
-least 40 legal actions always receive n256. D6 averaging begins at width 20.
+least 20 legal actions always receive n256. D6 averaging begins at width 20.
 Mandatory one-action prompts are recorded for trajectory and terminal-value
 learning but skip neural MCTS target work. The exploration clock advances only
 on non-forced choices: temperature 1.0 for the first 40 choices, 0.1 through
@@ -41,7 +41,7 @@ ulimit -n 65536
   --ledger-claim-label "$CLAIM_ID" --device cuda \
   --track 2p_no_trade --vps-to-win 10 --format npz --score-actions \
   --n-full 128 --n-fast 16 --p-full 0.25 \
-  --n-full-wide 256 --n-full-wide-threshold 40 --wide-roots-always-full \
+  --n-full-wide 256 --n-full-wide-threshold 20 --wide-roots-always-full \
   --c-visit 50.0 --c-scale 0.1 --max-decisions 600 --max-depth 80 \
   --temperature-clock nonforced_choice --temperature-decisions 40 \
   --temperature-high 1.0 --temperature-low 0.0 \
@@ -152,7 +152,7 @@ DEVICES=cuda:0,cuda:1,cuda:2,cuda:3
   --candidate "$CANDIDATE" --baseline "$INCUMBENT" --out "$EVAL_OUT" \
   --pairs 200 --workers 32 --devices "$DEVICES" --base-seed __EVAL_SEED__ \
   --max-decisions 600 --max-depth 80 \
-  --n-full 128 --n-full-wide 256 --n-full-wide-threshold 40 \
+  --n-full 128 --n-full-wide 256 --n-full-wide-threshold 20 \
   --wide-roots-always-full \
   --c-visit 50.0 --c-scale 0.1 --correct-rust-chance-spectra \
   --lazy-interior-chance --map-kind BASE \

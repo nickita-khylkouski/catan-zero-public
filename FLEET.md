@@ -48,14 +48,10 @@ table is not a teacher/volume role split.
 
 ## 3. Canonical code + environment (CAT-117)
 - Repo: **`github.com/nickita-khylkouski/catan-zero-public`** (**PUBLIC**, no
-  auth required). `v1.5-native-semantics` is the last sealed `catanatron_rs
-  0.1.8` release. The next native-MCTS release is `catanatron_rs 0.1.9` with
-  `gumbel-mcts 0.2.3`; it receives an immutable tag only after checksum commit
-  B of the two-commit transaction below. Source commit A is deliberately not
-  deployable as a new runtime: the 0.1.9 wheel digest does not exist yet.
-- Env target after checksum commit B: **Python 3.11.15**, **torch cu128** (all
-  H100 + B200), **catanatron_rs 0.1.9 cp311**. Until B, the tracked checksum
-  inventory and runtime digest remain the sealed 0.1.8 artifact.
+  auth required). `v1.5-coherent-public` seals `catanatron_rs 0.1.9` with
+  `gumbel-mcts 0.2.3` and the coherent public-belief search operator.
+- Env target: **Python 3.11.15**, **torch cu128** (all H100 + B200),
+  **catanatron_rs 0.1.9 cp311**.
 - Verification snapshot (2026-07-09): local full suite **1,737 passed / 200
   skipped**; H100 full suite **1,913 passed / 24 skipped**; native
   feature/context/symmetry acceptance **19/19 passed**. The final handoff delta
@@ -135,14 +131,14 @@ future native source change must repeat the transaction above; do not publish
 an old wheel under a new tag, move an existing tag, or edit the inventory
 before two clean builds agree.
 
-The 0.1.9 source transaction is currently at commit-A preparation. Its source
-manifests, locks, builder identity, semantic tests, and capability smoke target
-0.1.9/0.2.3. `native/catanatron-rs/WHEEL_SHA256SUMS` and the production runtime
-wheel digest intentionally remain 0.1.8 until two clean Linux builds produce
-the same 0.1.9 bytes. Updating either digest before that evidence is forbidden.
+The 0.1.9 transaction is complete. Source commit `29aa126` produced byte-identical
+Linux wheels on two independent B200 hosts; checksum-only commit `739cbc7`
+seals `catanatron_rs-0.1.9-cp311-cp311-manylinux_2_34_x86_64.whl` at SHA-256
+`c25b3bc2532ea2914666952c19aed05e971a071b6210dd3e8de6232e8fc4ba74`.
+The production runtime contract names the same version, filename, and digest.
 
 ## 4. Rust engine (CAT-133)
-- `native/catanatron-rs` v0.1.9 is the next canonical wheel source and builds `catanatron_rs-0.1.9-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` v0.2.3 is its linked native-search dependency. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. After checksum commit B, fleet deployment must be uniform 0.1.9 with `sigma_reference_visits`, `belief_target_evidence`, `initial_road_d1_scope`, `public_award_feature_parity`, `policy_temperature_semantics`, `coherent_public_belief_search`, and `forced_root_trajectory_only`. Until B, the old inventory remains untouched and admission of the new operator fails closed.
+- `native/catanatron-rs` v0.1.9 is the canonical wheel source and builds `catanatron_rs-0.1.9-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` v0.2.3 is its linked native-search dependency. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. Fleet deployment must be uniform 0.1.9 with `sigma_reference_visits`, `belief_target_evidence`, `initial_road_d1_scope`, `public_award_feature_parity`, `policy_temperature_semantics`, `coherent_public_belief_search`, and `forced_root_trajectory_only`.
 - **Licensing posture: pending user decision — see CAT-138.**
 
 ## 5. Seed ledger (CAT-125)

@@ -46,7 +46,7 @@ def test_next_wave_typed_generation_config_is_exact_schema_13_recipe() -> None:
     assert cfg.native_mcts_hot_loop is True
     assert cfg.forced_root_target_mode == "trajectory_only"
     assert (cfg.n_full, cfg.n_fast, cfg.p_full) == (128, 16, 0.25)
-    assert (cfg.n_full_wide, cfg.n_full_wide_threshold) == (256, 40)
+    assert (cfg.n_full_wide, cfg.n_full_wide_threshold) == (256, 20)
     assert cfg.wide_roots_always_full is True
     assert cfg.symmetry_averaged_eval_threshold == 20
     assert cfg.eval_cache_size == 0

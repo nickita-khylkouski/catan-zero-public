@@ -50,7 +50,7 @@
           "--n-fast": 16,
           "--p-full": 0.25,
           "--n-full-wide": 256,
-          "--n-full-wide-threshold": 40,
+          "--n-full-wide-threshold": 20,
           "--wide-roots-always-full": true,
           "--max-decisions": 600,
           "--max-depth": 80,
