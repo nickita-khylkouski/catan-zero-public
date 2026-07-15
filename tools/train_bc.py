@@ -999,6 +999,37 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--policy-kl-target",
+        type=float,
+        default=None,
+        help=(
+            "Opt in to a projected-dual parent-policy trust region by setting "
+            "the desired DDP-global mean KL(prior_policy || trained_policy) over "
+            "the existing authenticated, multi-action anchor rows. The current "
+            "--policy-kl-anchor-weight is the initial dual coefficient; omitted "
+            "(default) leaves the fixed-weight anchor path unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--policy-kl-dual-lr",
+        type=float,
+        default=0.01,
+        help=(
+            "Projected-dual step size for --policy-kl-target: lambda <- "
+            "clip(lambda + dual_lr * (global_KL - target), 0, max_weight). "
+            "Ignored when --policy-kl-target is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--policy-kl-max-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Upper bound for the adaptive policy-KL dual coefficient. Ignored "
+            "when --policy-kl-target is omitted."
+        ),
+    )
+    parser.add_argument(
         "--value-uncertainty-loss-weight",
         type=float,
         default=0.0,
@@ -4112,6 +4143,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "lr", "per_game_value_weight", "per_game_value_weight_mode",
         "policy_loss_weight",
         "policy_kl_anchor_direction", "policy_kl_anchor_weight",
+        "policy_kl_target", "policy_kl_dual_lr", "policy_kl_max_weight",
         "q_loss_weight", "soft_target_source", "soft_target_temperature",
         "soft_target_weight", "truncated_vp_margin_value_weight",
         "value_target_lambda",
@@ -5013,6 +5045,9 @@ def _validate_composite_learner_recipe_authorization(
         "public_card_lr_mult": float,
         "policy_kl_anchor_direction": str,
         "policy_kl_anchor_weight": float,
+        "policy_kl_target": float,
+        "policy_kl_dual_lr": float,
+        "policy_kl_max_weight": float,
         "q_loss_weight": float,
         "soft_target_source": str,
         "soft_target_min_legal_coverage": float,
@@ -7021,6 +7056,16 @@ def _effective_a1_learner_training_recipe(
         effective["public_card_lr_mult"] = public_card_lr_mult
     if bool(getattr(args, "per_game_policy_surprise_weighting", False)):
         effective["per_game_policy_surprise_weighting"] = True
+    if getattr(args, "policy_kl_target", None) is not None:
+        # The fixed anchor's historical recipe shape remains untouched.  An
+        # adaptive trust region is trajectory-changing and must be explicitly
+        # present in any sealed learner authority.
+        effective["policy_kl_target"] = float(args.policy_kl_target)
+        effective["policy_kl_dual_lr"] = float(args.policy_kl_dual_lr)
+        effective["policy_kl_max_weight"] = float(args.policy_kl_max_weight)
+        effective["policy_kl_anchor_direction"] = str(
+            args.policy_kl_anchor_direction
+        )
     world_size = int(ddp["world_size"])
     effective["world_size"] = world_size
     effective["global_batch_size"] = (
@@ -8781,6 +8826,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         0.0 <= float(args.target_reliability_confidence_floor) <= 1.0
     ):
         raise SystemExit("--target-reliability-confidence-floor must be in [0, 1]")
+    _validate_adaptive_policy_kl_args(args)
     args.max_grad_norm = _validate_max_grad_norm(args.max_grad_norm)
     if float(args.belief_resource_loss_weight) < 0.0:
         raise SystemExit("--belief-resource-loss-weight must be >= 0")
@@ -9190,6 +9236,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             q_loss_weight=float(args.q_loss_weight),
             value_target_lambda=float(args.value_target_lambda),
             policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
+            policy_kl_target=args.policy_kl_target,
             policy_surprise_weight=float(args.policy_surprise_weight),
             per_game_policy_surprise_weighting=bool(
                 args.per_game_policy_surprise_weighting
@@ -10822,6 +10869,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         symmetry_rng=symmetry_rng,
         ddp=ddp,
     )
+    policy_kl_controller = _adaptive_policy_kl_controller(
+        args, resume_progress=resume_progress
+    )
+    if policy_kl_controller is not None:
+        if optimizer is None:
+            raise SystemExit(
+                "adaptive policy-KL controller requires a live optimizer"
+            )
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "adaptive_parent_policy_kl",
+                    "resumed": resume_progress is not None,
+                    **policy_kl_controller.state_dict(),
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
     optimizer_observed_steps = 0
     optimizer_clipped_steps = 0
     optimizer_zero_objective_steps = 0
@@ -11159,6 +11225,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_aux_active_count = 0.0
         epoch_value_active_count = 0.0
         epoch_anchor_eligible_count = 0.0
+        epoch_policy_kl_weighted_objective_sum = 0.0
+        epoch_policy_kl_coefficient_row_sum = 0.0
+        policy_kl_group_sum = 0.0
+        policy_kl_group_rows = 0.0
+        policy_kl_controller_epoch_start = (
+            None
+            if policy_kl_controller is None
+            else policy_kl_controller.state_dict()
+        )
         phase_stats = _empty_phase_stats()
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
@@ -11189,8 +11264,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         train_fn_extra_kwargs: dict[str, object] = {}
         if train_fn is _train_xdim_batch:
             train_fn_extra_kwargs = {
-                "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight),
+                "policy_kl_anchor_weight": (
+                    float(args.policy_kl_anchor_weight)
+                    if policy_kl_controller is None
+                    else float(policy_kl_controller.coefficient)
+                ),
                 "policy_kl_anchor_direction": str(args.policy_kl_anchor_direction),
+                "policy_kl_anchor_measure": policy_kl_controller is not None,
                 "value_uncertainty_loss_weight": float(args.value_uncertainty_loss_weight),
                 "aux_subgoal_loss_weight": float(args.aux_subgoal_loss_weight),
                 "belief_resource_loss_weight": float(
@@ -11287,6 +11367,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 total_steps=total_training_steps,
                 schedule=str(args.lr_schedule),
             )
+            batch_policy_kl_coefficient = (
+                float(args.policy_kl_anchor_weight)
+                if policy_kl_controller is None
+                else float(policy_kl_controller.coefficient)
+            )
+            if train_fn is _train_xdim_batch:
+                train_fn_extra_kwargs["policy_kl_anchor_weight"] = (
+                    batch_policy_kl_coefficient
+                )
             # DDP documents that no_sync() must wrap the forward pass as well as
             # backward().  Applying it only inside _train_xdim_batch after the
             # forward leaves reducer hooks armed and silently synchronizes every
@@ -11502,6 +11591,54 @@ def main(argv: Sequence[str] | None = None) -> None:
             epoch_anchor_eligible_count += float(
                 batch_metrics.get("policy_kl_anchor_eligible_rows", 0)
             )
+            batch_kl_sum = float(
+                batch_metrics.get("policy_kl_anchor_loss_weighted_sum", 0.0)
+            )
+            batch_kl_rows = float(
+                batch_metrics.get("policy_kl_anchor_loss_weight_sum", 0.0)
+            )
+            epoch_policy_kl_weighted_objective_sum += (
+                batch_policy_kl_coefficient * batch_kl_sum
+            )
+            epoch_policy_kl_coefficient_row_sum += (
+                batch_policy_kl_coefficient * batch_kl_rows
+            )
+            if policy_kl_controller is not None:
+                policy_kl_group_sum += batch_kl_sum
+                policy_kl_group_rows += batch_kl_rows
+                if accum_do_step:
+                    global_kl_sum, global_kl_rows = (
+                        _global_policy_kl_controller_parts(
+                            policy_kl_group_sum,
+                            policy_kl_group_rows,
+                            ddp,
+                        )
+                    )
+                    controller_update = policy_kl_controller.update(
+                        global_kl_sum=global_kl_sum,
+                        global_eligible_rows=global_kl_rows,
+                    )
+                    policy_kl_group_sum = 0.0
+                    policy_kl_group_rows = 0.0
+                    if (
+                        args.progress_every_batches
+                        and batch_number % int(args.progress_every_batches) == 0
+                    ):
+                        _rank0_print(
+                            json.dumps(
+                                {
+                                    "progress": "adaptive_parent_policy_kl_step",
+                                    "epoch": epoch + 1,
+                                    "batch": batch_number,
+                                    "optimizer_step": global_step + int(
+                                        optimizer_step_applied
+                                    ),
+                                    **controller_update,
+                                },
+                                sort_keys=True,
+                            ),
+                            ddp,
+                        )
             for key in (
                 "policy_loss",
                 "value_loss",
@@ -11615,7 +11752,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     mask_hidden_info=bool(args.mask_hidden_info),
                     soft_target_source=args.soft_target_source,
                     value_training=snapshot_value_training,
-                    training_information_surface=training_information_surface,
+                    training_information_surface=_policy_kl_controller_surface(
+                        training_information_surface, policy_kl_controller
+                    ),
                 )
                 if bool(ddp["enabled"]):
                     import torch.distributed as dist
@@ -11654,6 +11793,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             if args.max_steps > 0 and global_step >= args.max_steps:
                 break
+        if policy_kl_controller is not None and (
+            policy_kl_group_sum != 0.0 or policy_kl_group_rows != 0.0
+        ):
+            raise RuntimeError(
+                "adaptive policy-KL accumulation group was not closed at epoch end"
+            )
         phase_stats = _reduce_nested_count_stats(phase_stats, ddp)
         phase_stats_unforced = _reduce_nested_count_stats(phase_stats_unforced, ddp)
         teacher_stats = _reduce_nested_count_stats(teacher_stats, ddp)
@@ -11662,6 +11807,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         top3_sum = float(np.sum(epoch_top3)) if epoch_top3 else 0.0
         epoch_extra_sums = _reduce_named_sums(epoch_extra_sums, ddp)
         epoch_extra_denominators = _reduce_named_sums(epoch_extra_denominators, ddp)
+        policy_kl_dynamic_epoch_parts = _reduce_named_sums(
+            {
+                "weighted_objective_sum": epoch_policy_kl_weighted_objective_sum,
+                "coefficient_row_sum": epoch_policy_kl_coefficient_row_sum,
+            },
+            ddp,
+        )
         epoch_aux_subgoal_sums = _reduce_named_sums(
             epoch_aux_subgoal_sums, ddp
         )
@@ -11825,6 +11977,58 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "value_categorical_truncated_loss",
             )
         }
+        anchor_epoch_denominator = float(
+            epoch_extra_denominators["policy_kl_anchor_loss"]
+        )
+        policy_kl_weighted_objective_epoch = (
+            float(policy_kl_dynamic_epoch_parts["weighted_objective_sum"])
+            / anchor_epoch_denominator
+            if anchor_epoch_denominator > 0.0
+            else 0.0
+        )
+        policy_kl_effective_weight_epoch = (
+            float(policy_kl_dynamic_epoch_parts["coefficient_row_sum"])
+            / anchor_epoch_denominator
+            if anchor_epoch_denominator > 0.0
+            else (
+                float(args.policy_kl_anchor_weight)
+                if policy_kl_controller is None
+                else float(policy_kl_controller.coefficient)
+            )
+        )
+        policy_kl_controller_epoch = None
+        if policy_kl_controller is not None:
+            controller_end = policy_kl_controller.state_dict()
+            assert policy_kl_controller_epoch_start is not None
+            epoch_controller_rows = int(controller_end["eligible_rows"]) - int(
+                policy_kl_controller_epoch_start["eligible_rows"]
+            )
+            epoch_controller_kl_sum = float(
+                controller_end["observed_kl_sum"]
+            ) - float(policy_kl_controller_epoch_start["observed_kl_sum"])
+            policy_kl_controller_epoch = {
+                "schema_version": POLICY_KL_CONTROLLER_SCHEMA,
+                "coefficient_start": float(
+                    policy_kl_controller_epoch_start["coefficient"]
+                ),
+                "coefficient_end": float(controller_end["coefficient"]),
+                "updates": int(controller_end["updates"])
+                - int(policy_kl_controller_epoch_start["updates"]),
+                "skipped_empty_updates": int(
+                    controller_end["skipped_empty_updates"]
+                )
+                - int(
+                    policy_kl_controller_epoch_start["skipped_empty_updates"]
+                ),
+                "eligible_rows": epoch_controller_rows,
+                "observed_kl_mean": (
+                    epoch_controller_kl_sum / epoch_controller_rows
+                    if epoch_controller_rows > 0
+                    else None
+                ),
+                "target_kl": float(policy_kl_controller.target_kl),
+                "effective_coefficient_mean": policy_kl_effective_weight_epoch,
+            }
         # This is the objective that actually went through backward(), including
         # optional categorical/auxiliary terms and non-unit policy weights.  The
         # old component reconstruction omitted all of those terms and therefore
@@ -11835,8 +12039,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             + resolved_scalar_value_weight * value_loss_epoch
             + float(args.final_vp_loss_weight) * final_vp_loss_epoch
             + float(args.q_loss_weight) * q_loss_epoch
-            + float(args.policy_kl_anchor_weight)
-            * auxiliary_loss_epochs["policy_kl_anchor_loss"]
+            + policy_kl_weighted_objective_epoch
             + float(args.value_uncertainty_loss_weight)
             * auxiliary_loss_epochs["value_uncertainty_loss"]
             + float(args.aux_subgoal_loss_weight)
@@ -11865,6 +12068,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_kl_anchor_eligible_rows": int(
                     anchor_eligible_count_total
                 ),
+                "policy_kl_anchor_effective_weight": (
+                    policy_kl_effective_weight_epoch
+                ),
+                "policy_kl_anchor_weighted_objective": (
+                    policy_kl_weighted_objective_epoch
+                ),
+                "adaptive_policy_kl_controller": policy_kl_controller_epoch,
                 "policy_component_active_dose": policy_component_active_dose,
                 "policy_component_phase_active_dose": (
                     policy_component_phase_active_dose
@@ -11984,7 +12194,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.amp,
                 data_sharded=bool(args.ddp_shard_data),
                 truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
-                policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
+                policy_kl_anchor_weight=(
+                    float(args.policy_kl_anchor_weight)
+                    if policy_kl_controller is None
+                    else float(policy_kl_controller.coefficient)
+                ),
                 policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
                 value_uncertainty_loss_weight=float(args.value_uncertainty_loss_weight),
                 aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
@@ -12067,7 +12281,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 mask_hidden_info=bool(args.mask_hidden_info),
                 soft_target_source=args.soft_target_source,
                 value_training=value_training,
-                training_information_surface=training_information_surface,
+                training_information_surface=_policy_kl_controller_surface(
+                    training_information_surface, policy_kl_controller
+                ),
             )
             # CAT-128 patch #8: persist optimizer (Adam) state as <ckpt>.optimizer.pt.
             # Called on ALL ranks (the FSDP gather is a collective); rank-0 writes.
@@ -12085,6 +12301,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 scalar_training_weight_sum=cumulative_scalar_training_weight,
                 categorical_training_weight_sum=(
                     cumulative_categorical_training_weight
+                ),
+                policy_kl_controller_state=(
+                    None
+                    if policy_kl_controller is None
+                    else policy_kl_controller.state_dict()
                 ),
                 ddp=ddp,
             )
@@ -12142,7 +12363,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         mask_hidden_info=bool(args.mask_hidden_info),
         soft_target_source=args.soft_target_source,
         value_training=value_training,
-        training_information_surface=training_information_surface,
+        training_information_surface=_policy_kl_controller_surface(
+            training_information_surface, policy_kl_controller
+        ),
     )
     # CAT-128 patch #8: persist final optimizer (Adam) state alongside the checkpoint.
     optimizer_saved = _save_optimizer_sidecar(
@@ -12158,6 +12381,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         symmetry_rng=symmetry_rng,
         scalar_training_weight_sum=cumulative_scalar_training_weight,
         categorical_training_weight_sum=cumulative_categorical_training_weight,
+        policy_kl_controller_state=(
+            None
+            if policy_kl_controller is None
+            else policy_kl_controller.state_dict()
+        ),
         ddp=ddp,
     )
     policy_component_active_dose = {
@@ -12479,7 +12707,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "graph_history_features": bool(
             getattr(env_config, "use_graph_history_features", False)
         ),
-        "training_information_surface": training_information_surface,
+        "training_information_surface": _policy_kl_controller_surface(
+            training_information_surface, policy_kl_controller
+        ),
         "checkpoint": args.checkpoint,
         "checkpoint_steps_requested": list(checkpoint_steps),
         "intermediate_checkpoints": intermediate_checkpoints,
@@ -12612,7 +12842,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         "final_vp_loss_weight": args.final_vp_loss_weight,
         "q_loss_weight": args.q_loss_weight,
         "policy_kl_anchor_weight": args.policy_kl_anchor_weight,
+        "policy_kl_anchor_initial_weight": args.policy_kl_anchor_weight,
+        "policy_kl_anchor_final_weight": (
+            float(args.policy_kl_anchor_weight)
+            if policy_kl_controller is None
+            else float(policy_kl_controller.coefficient)
+        ),
         "policy_kl_anchor_direction": args.policy_kl_anchor_direction,
+        "policy_kl_target": args.policy_kl_target,
+        "policy_kl_dual_lr": args.policy_kl_dual_lr,
+        "policy_kl_max_weight": args.policy_kl_max_weight,
+        "adaptive_policy_kl_controller": (
+            None
+            if policy_kl_controller is None
+            else policy_kl_controller.state_dict()
+        ),
         "policy_kl_anchor_normalization": (
             "conditional_authenticated_multi_action_prior_rows"
         ),
@@ -13592,6 +13836,7 @@ def _train_xdim_batch(
     truncated_vp_margin_value_weight: float = 0.0,
     policy_kl_anchor_weight: float = 0.0,
     policy_kl_anchor_direction: str = "forward",
+    policy_kl_anchor_measure: bool = False,
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
     belief_resource_loss_weight: float = 0.0,
@@ -13860,7 +14105,9 @@ def _train_xdim_batch(
         # so a 0-weight run is bit-identical to pre-anchor behavior.
         kl_anchor_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         kl_anchor_loss_sum, kl_anchor_loss_denominator = _zero_loss_parts(policy.device)
-        if float(policy_kl_anchor_weight) != 0.0:
+        if float(policy_kl_anchor_weight) != 0.0 or bool(
+            policy_kl_anchor_measure
+        ):
             _anchor = _policy_kl_anchor_loss_parts(
                 data,
                 batch,
@@ -17039,6 +17286,7 @@ def _validate_target_information_admission(
     value_target_lambda: float,
     policy_kl_anchor_weight: float,
     policy_surprise_weight: float,
+    policy_kl_target: float | None = None,
     per_game_policy_surprise_weighting: bool = False,
 ) -> dict[str, object]:
     """Fail closed before public-information training consumes search targets.
@@ -17096,7 +17344,9 @@ def _validate_target_information_admission(
         objectives.append("q_target")
     if float(value_target_lambda) != 1.0 and "root_value" in data:
         objectives.append("root_value")
-    if float(policy_kl_anchor_weight) > 0.0 and "prior_policy" in data:
+    if (
+        float(policy_kl_anchor_weight) > 0.0 or policy_kl_target is not None
+    ) and "prior_policy" in data:
         objectives.append("policy_kl_anchor")
     if float(policy_surprise_weight) > 0.0 and (
         "target_policy" in data or "prior_policy" in data
@@ -25260,6 +25510,280 @@ def _reduce_scalar_sum(value: float, ddp: dict[str, int | bool]) -> float:
     return float(values[0].item())
 
 
+POLICY_KL_CONTROLLER_SCHEMA = "adaptive-parent-policy-kl-controller-v1"
+
+
+class AdaptivePolicyKLController:
+    """Projected-dual controller for the authenticated parent-policy anchor.
+
+    The observed constraint is the exact eligible-row mean used by the
+    existing forward-KL loss.  Callers reduce numerator and denominator over
+    every DDP rank and every microbatch in one optimizer-step group before
+    invoking :meth:`update`, so every rank advances an identical coefficient.
+    """
+
+    def __init__(
+        self,
+        *,
+        target_kl: float,
+        dual_lr: float,
+        max_weight: float,
+        coefficient: float,
+    ) -> None:
+        self.target_kl = float(target_kl)
+        self.dual_lr = float(dual_lr)
+        self.max_weight = float(max_weight)
+        self.coefficient = float(coefficient)
+        self.updates = 0
+        self.skipped_empty_updates = 0
+        self.eligible_rows = 0
+        self.observed_kl_sum = 0.0
+        self.last_observed_kl: float | None = None
+        self.min_coefficient = float(coefficient)
+        self.max_coefficient_observed = float(coefficient)
+        scalars = {
+            "target_kl": self.target_kl,
+            "dual_lr": self.dual_lr,
+            "max_weight": self.max_weight,
+            "coefficient": self.coefficient,
+        }
+        if any(not math.isfinite(float(value)) for value in scalars.values()):
+            raise ValueError(f"policy-KL controller values must be finite: {scalars}")
+        if self.target_kl < 0.0:
+            raise ValueError("policy-KL target must be >= 0")
+        if self.dual_lr <= 0.0:
+            raise ValueError("policy-KL dual LR must be > 0")
+        if self.max_weight <= 0.0:
+            raise ValueError("policy-KL max weight must be > 0")
+        if not 0.0 <= self.coefficient <= self.max_weight:
+            raise ValueError(
+                "initial policy-KL anchor weight must be in [0, max_weight]"
+            )
+
+    def update(self, *, global_kl_sum: float, global_eligible_rows: float) -> dict:
+        numerator = float(global_kl_sum)
+        denominator = float(global_eligible_rows)
+        if not math.isfinite(numerator) or not math.isfinite(denominator):
+            raise RuntimeError("policy-KL controller received non-finite global parts")
+        if numerator < -1.0e-8 or denominator < 0.0:
+            raise RuntimeError("policy-KL controller received negative global parts")
+        before = float(self.coefficient)
+        if denominator <= 0.0:
+            self.skipped_empty_updates += 1
+            return {
+                "updated": False,
+                "global_eligible_rows": 0,
+                "observed_kl": None,
+                "coefficient_before": before,
+                "coefficient_after": before,
+            }
+        observed = max(0.0, numerator) / denominator
+        after = min(
+            float(self.max_weight),
+            max(0.0, before + float(self.dual_lr) * (observed - self.target_kl)),
+        )
+        self.coefficient = after
+        self.updates += 1
+        rows = int(round(denominator))
+        self.eligible_rows += rows
+        self.observed_kl_sum += max(0.0, numerator)
+        self.last_observed_kl = observed
+        self.min_coefficient = min(float(self.min_coefficient), after)
+        self.max_coefficient_observed = max(
+            float(self.max_coefficient_observed), after
+        )
+        return {
+            "updated": True,
+            "global_eligible_rows": rows,
+            "observed_kl": observed,
+            "target_kl": float(self.target_kl),
+            "coefficient_before": before,
+            "coefficient_after": after,
+        }
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": POLICY_KL_CONTROLLER_SCHEMA,
+            "direction": "forward",
+            "update_rule": (
+                "clip(lambda+dual_lr*(global_eligible_mean_kl-target_kl),"
+                "0,max_weight)"
+            ),
+            "metric_scope": "ddp_global_authenticated_multi_action_prior_rows",
+            "target_kl": float(self.target_kl),
+            "dual_lr": float(self.dual_lr),
+            "max_weight": float(self.max_weight),
+            "coefficient": float(self.coefficient),
+            "updates": int(self.updates),
+            "skipped_empty_updates": int(self.skipped_empty_updates),
+            "eligible_rows": int(self.eligible_rows),
+            "observed_kl_sum": float(self.observed_kl_sum),
+            "observed_kl_mean": (
+                float(self.observed_kl_sum) / int(self.eligible_rows)
+                if self.eligible_rows > 0
+                else None
+            ),
+            "last_observed_kl": self.last_observed_kl,
+            "min_coefficient": float(self.min_coefficient),
+            "max_coefficient_observed": float(self.max_coefficient_observed),
+        }
+
+    def restore(self, raw: object) -> None:
+        if not isinstance(raw, dict):
+            raise SystemExit(
+                "adaptive policy-KL optimizer resume lacks controller state"
+            )
+        immutable = {
+            "schema_version": POLICY_KL_CONTROLLER_SCHEMA,
+            "direction": "forward",
+            "update_rule": (
+                "clip(lambda+dual_lr*(global_eligible_mean_kl-target_kl),"
+                "0,max_weight)"
+            ),
+            "metric_scope": "ddp_global_authenticated_multi_action_prior_rows",
+            "target_kl": float(self.target_kl),
+            "dual_lr": float(self.dual_lr),
+            "max_weight": float(self.max_weight),
+        }
+        if any(raw.get(key) != value for key, value in immutable.items()):
+            raise SystemExit(
+                "resumed adaptive policy-KL controller config differs from command"
+            )
+        try:
+            integer_fields = {
+                name: raw[name]
+                for name in (
+                    "updates",
+                    "skipped_empty_updates",
+                    "eligible_rows",
+                )
+            }
+            if any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in integer_fields.values()
+            ):
+                raise TypeError("controller counters must be exact integers")
+            coefficient = float(raw["coefficient"])
+            updates = int(integer_fields["updates"])
+            skipped = int(integer_fields["skipped_empty_updates"])
+            eligible_rows = int(integer_fields["eligible_rows"])
+            observed_sum = float(raw["observed_kl_sum"])
+            last = raw.get("last_observed_kl")
+            last_observed = None if last is None else float(last)
+            minimum = float(raw["min_coefficient"])
+            maximum = float(raw["max_coefficient_observed"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise SystemExit(
+                "resumed adaptive policy-KL controller state is malformed"
+            ) from error
+        numeric = (coefficient, observed_sum, minimum, maximum)
+        if last_observed is not None:
+            numeric = (*numeric, last_observed)
+        if (
+            any(not math.isfinite(value) for value in numeric)
+            or not 0.0 <= coefficient <= self.max_weight
+            or updates < 0
+            or skipped < 0
+            or eligible_rows < 0
+            or observed_sum < 0.0
+            or not 0.0 <= minimum <= maximum <= self.max_weight
+            or not minimum <= coefficient <= maximum
+            or (last_observed is not None and last_observed < 0.0)
+            or (updates == 0 and eligible_rows != 0)
+            or (updates == 0 and observed_sum != 0.0)
+            or (updates == 0 and last_observed is not None)
+            or (updates > 0 and eligible_rows < updates)
+            or (updates > 0 and last_observed is None)
+        ):
+            raise SystemExit(
+                "resumed adaptive policy-KL controller state is out of bounds"
+            )
+        self.coefficient = coefficient
+        self.updates = updates
+        self.skipped_empty_updates = skipped
+        self.eligible_rows = eligible_rows
+        self.observed_kl_sum = observed_sum
+        self.last_observed_kl = last_observed
+        self.min_coefficient = minimum
+        self.max_coefficient_observed = maximum
+
+
+def _adaptive_policy_kl_controller(
+    args: argparse.Namespace,
+    *,
+    resume_progress: dict[str, object] | None,
+) -> AdaptivePolicyKLController | None:
+    target = getattr(args, "policy_kl_target", None)
+    if target is None:
+        if resume_progress is not None and resume_progress.get(
+            "policy_kl_controller_state"
+        ) is not None:
+            raise SystemExit(
+                "resumed checkpoint carries adaptive policy-KL state but the "
+                "current command omits --policy-kl-target"
+            )
+        return None
+    controller = AdaptivePolicyKLController(
+        target_kl=float(target),
+        dual_lr=float(args.policy_kl_dual_lr),
+        max_weight=float(args.policy_kl_max_weight),
+        coefficient=float(args.policy_kl_anchor_weight),
+    )
+    if resume_progress is not None:
+        controller.restore(resume_progress.get("policy_kl_controller_state"))
+    return controller
+
+
+def _validate_adaptive_policy_kl_args(args: argparse.Namespace) -> None:
+    target = getattr(args, "policy_kl_target", None)
+    if target is None:
+        return
+    if str(args.policy_kl_anchor_direction) != "forward":
+        raise SystemExit(
+            "--policy-kl-target requires --policy-kl-anchor-direction forward"
+        )
+    if str(args.arch) not in {"entity_graph", "xdim_graph"}:
+        raise SystemExit(
+            "--policy-kl-target requires --arch entity_graph/xdim_graph"
+        )
+    try:
+        AdaptivePolicyKLController(
+            target_kl=float(target),
+            dual_lr=float(args.policy_kl_dual_lr),
+            max_weight=float(args.policy_kl_max_weight),
+            coefficient=float(args.policy_kl_anchor_weight),
+        )
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"invalid adaptive policy-KL controller: {error}") from error
+
+
+def _global_policy_kl_controller_parts(
+    local_sum: float,
+    local_eligible_rows: float,
+    ddp: dict[str, int | bool],
+) -> tuple[float, float]:
+    reduced = _reduce_named_sums(
+        {
+            "kl_sum": float(local_sum),
+            "eligible_rows": float(local_eligible_rows),
+        },
+        ddp,
+    )
+    return float(reduced["kl_sum"]), float(reduced["eligible_rows"])
+
+
+def _policy_kl_controller_surface(
+    surface: dict[str, object] | None,
+    controller: AdaptivePolicyKLController | None,
+) -> dict[str, object] | None:
+    if controller is None:
+        return surface
+    return {
+        **(surface or {}),
+        "adaptive_parent_policy_kl": controller.state_dict(),
+    }
+
+
 def _distributed_scalar_max(value: float, ddp: dict[str, int | bool]) -> float:
     if not ddp["enabled"]:
         return float(value)
@@ -25432,6 +25956,7 @@ def _save_training_progress_sidecar(
     symmetry_rng,
     scalar_training_weight_sum: float,
     categorical_training_weight_sum: float,
+    policy_kl_controller_state: dict[str, object] | None = None,
     ddp: dict,
 ) -> None:
     """Write the checkpoint-set commit marker on rank 0 after optimizer save."""
@@ -25495,6 +26020,7 @@ def _save_training_progress_sidecar(
             categorical_training_weight_sum=float(
                 categorical_training_weight_sum
             ),
+            policy_kl_controller_state=policy_kl_controller_state,
             ddp=ddp,
         )
     except TrainingProgressError as error:
