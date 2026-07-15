@@ -116,6 +116,7 @@ def guard_cli_flag_lint(
     *,
     parser: argparse.ArgumentParser | None = None,
     expected_values: Mapping[str, Any] | None = None,
+    forbidden_flags: Sequence[str] = (),
 ) -> GuardResult:
     """FAIL if any `critical_flags` entry is absent from `argv` (as a bare
     token `--flag` or `--flag=value`), meaning the launch would silently
@@ -128,6 +129,12 @@ def guard_cli_flag_lint(
     caught as a FAIL even though the token itself is present. This closes
     the "token-only" gap where unsafe values could masquerade as explicit
     flags (CAT-69 follow-up / CAT-88 silent-default class).
+
+    `forbidden_flags` closes the inverse gap for nullable/optional modes.  A
+    typed config can deliberately leave (for example) an opponent manifest or
+    an adaptive search budget unset, but argparse has no ``--no-...`` spelling
+    for a nullable value.  Listing the positive flag here proves that a caller
+    did not override the sealed ``None`` with a command-line value.
 
     `critical_flags` is normally a hand-maintained list, which can itself
     drift out of sync with the target script (a flag gets renamed or
@@ -148,7 +155,11 @@ def guard_cli_flag_lint(
 
     if parser is not None:
         real_flags = set(discover_configurable_flags(parser))
-        stale = [flag for flag in all_critical if flag not in real_flags]
+        stale = [
+            flag
+            for flag in [*all_critical, *forbidden_flags]
+            if flag not in real_flags
+        ]
         if stale:
             return _fail(
                 "cli_flag_lint",
@@ -177,6 +188,15 @@ def guard_cli_flag_lint(
 
     argv_tokens = list(argv)
     argv_set = set(argv_tokens)
+    forbidden_present = [flag for flag in forbidden_flags if _is_present(flag)]
+    if forbidden_present:
+        return _fail(
+            "cli_flag_lint",
+            "launch supplies forbidden override(s) for sealed nullable/optional "
+            f"fields: {forbidden_present}. Remove these flags; this recipe requires "
+            "the typed-config null/off value.",
+            forbidden_flags=forbidden_present,
+        )
     missing = [flag for flag in all_critical if not _is_present(flag)]
     if missing:
         return _fail(
