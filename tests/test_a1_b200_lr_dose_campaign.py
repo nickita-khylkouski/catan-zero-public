@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from tools import a1_b200_lr_dose_campaign as campaign
 from tools import a1_build_post_wave_composite as composite_builder
@@ -130,6 +131,14 @@ def test_normalization_preserves_decision_class_and_labels_legacy(tmp_path: Path
 def test_completed_campaign_report_requires_real_policy_and_module_dose(
     tmp_path: Path,
 ) -> None:
+    expected_parent = "sha256:" + "7" * 64
+    learner_parent = {
+        "schema_version": "a1-learner-lineage-parent-v1",
+        "role": "diagnostic_recent_history",
+        "checkpoint": {"path": "/parent/f7.pt", "sha256": expected_parent},
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
     dimensions = {
         name: {
             "all": {
@@ -156,6 +165,13 @@ def test_completed_campaign_report_requires_real_policy_and_module_dose(
             {
                 "steps_completed": 128,
                 "optimizer_restored": False,
+                "a1_learner_lineage_parent": learner_parent,
+                "a1_lineage_dose": {
+                    "declared_producer_sha256": expected_parent,
+                },
+                "a1_one_dose_input_binding": {
+                    "learner_lineage_parent": learner_parent,
+                },
                 "policy_aux_active_rows": 0,
                 "policy_total_active_rows": 50_875,
                 "training_strata_dose": {
@@ -171,12 +187,33 @@ def test_completed_campaign_report_requires_real_policy_and_module_dose(
                     "observed_steps": 8,
                     "modules": {"blocks": {"mean_pre_clip_grad_norm": 1.0}},
                 },
+                "per_game_policy_surprise_weighting": True,
+                "public_card_lr_mult": 4.0,
+                "forced_row_value_action_type_weights": {
+                    "END_TURN": 0.1,
+                    "ROLL": 0.25,
+                },
+                "policy_aux_sampling": {
+                    "schema_version": "train-policy-aux-sampling-v1",
+                    "enabled": True,
+                    "base_measure": (
+                        "authenticated_component_x_exact_per_game_policy_surprise"
+                    ),
+                    "exact_per_game_policy_surprise_weighting": True,
+                    "preconditioning_weights": {
+                        "content_sha256": "sha256:" + "1" * 64,
+                    },
+                    "final_sampling_weights": {
+                        "content_sha256": "sha256:" + "2" * 64,
+                    },
+                },
             }
         ),
         encoding="utf-8",
     )
     sealed = {
         "reporting_contract": {"required_dimensions": list(dimensions)},
+        "lineage_contract": {"expected_parent_sha256": expected_parent},
     }
     summary = campaign._verify_training_report(
         sealed,
@@ -296,3 +333,17 @@ def test_diagnostic_parent_may_be_exact_sealed_recent_history(
     )
     assert bound["diagnostic_comparison_source"]["source"] == f7
     assert bound["diagnostic_comparison_source"]["promotion_eligible"] is False
+    learner_parent = bound["learner_lineage_parent"]
+    assert learner_parent["checkpoint"] == f7
+    assert learner_parent["corpus_producer"] == verified["producer"]
+    assert learner_parent["diagnostic_only"] is True
+    assert learner_parent["promotion_eligible"] is False
+    assert one_dose._learner_lineage_parent_sha256(bound) == f7["sha256"]
+
+    missing_parent = dict(bound)
+    del missing_parent["learner_lineage_parent"]
+    with pytest.raises(
+        one_dose.ExecutorError,
+        match="explicit learner lineage parent",
+    ):
+        one_dose._learner_lineage_parent_sha256(missing_parent)

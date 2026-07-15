@@ -43,11 +43,17 @@
       {
         "phase": "play_turn",
         "min_legal_width": 20,
-        "max_legal_width": 39,
+        "max_legal_width": 31,
         "count": 16
       },
       {
         "phase": "play_turn",
+        "min_legal_width": 32,
+        "max_legal_width": 39,
+        "count": 8
+      },
+      {
+        "phase": "opening_placement",
         "min_legal_width": 40,
         "max_legal_width": null,
         "count": 8

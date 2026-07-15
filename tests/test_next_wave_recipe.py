@@ -70,8 +70,8 @@ def test_next_wave_typed_generation_config_is_exact_schema_13_recipe() -> None:
     assert cfg.native_mcts_hot_loop is True
     assert cfg.forced_root_target_mode == "trajectory_only"
     assert (cfg.n_full, cfg.n_fast, cfg.p_full) == (128, 16, 0.25)
-    assert (cfg.n_full_wide, cfg.n_full_wide_threshold) == (256, 20)
-    assert cfg.wide_roots_always_full is True
+    assert (cfg.n_full_wide, cfg.n_full_wide_threshold) == (None, None)
+    assert cfg.wide_roots_always_full is False
     assert cfg.symmetry_averaged_eval_threshold == 20
     assert cfg.eval_cache_size == 0
     assert cfg.shard_size == 512
@@ -109,8 +109,6 @@ def test_next_wave_guard_pins_the_same_science_values() -> None:
         "--max-depth": "max_depth",
         "--n-fast": "n_fast",
         "--n-full": "n_full",
-        "--n-full-wide": "n_full_wide",
-        "--n-full-wide-threshold": "n_full_wide_threshold",
         "--native-mcts-hot-loop": "native_mcts_hot_loop",
         "--p-full": "p_full",
         "--public-observation": "public_observation",
@@ -130,6 +128,11 @@ def test_next_wave_guard_pins_the_same_science_values() -> None:
     }
     for flag, field in mapping.items():
         assert expected[flag] == config[field]
+
+    assert config["n_full_wide"] is None
+    assert config["n_full_wide_threshold"] is None
+    assert "--n-full-wide" not in expected
+    assert "--n-full-wide-threshold" not in expected
 
     critical = set(lint["critical_flags"])
     assert {"--base-seed", "--games"} <= critical

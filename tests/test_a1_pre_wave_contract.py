@@ -909,9 +909,9 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert recipe["training_rng_rank_offset"] is True
     assert recipe["per_game_value_weight"] is False
     assert "$.promotion_handoff.path" in unresolved
-    assert payload["science"]["search"]["n_full_wide"] == 256
-    assert payload["science"]["search"]["n_full_wide_threshold"] == 20
-    assert payload["science"]["search"]["wide_roots_always_full"] is True
+    assert payload["science"]["search"]["n_full_wide"] is None
+    assert payload["science"]["search"]["n_full_wide_threshold"] is None
+    assert payload["science"]["search"]["wide_roots_always_full"] is False
     assert payload["generation"]["meaningful_public_history"] is True
     assert payload["generation"]["record_automatic_transitions"] is False
     assert payload["fleet"]["output_root"] == "__UNRESOLVED__"

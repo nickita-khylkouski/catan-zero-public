@@ -64,6 +64,8 @@ REPORT_EXECUTION_BINDING_SCHEMA = "a1-one-dose-execution-binding-v1"
 REPORT_EXECUTION_BINDING_FIELD = "a1_one_dose_execution_binding"
 REPORT_INPUT_BINDING_SCHEMA = "a1-one-dose-input-binding-v1"
 REPORT_INPUT_BINDING_FIELD = "a1_one_dose_input_binding"
+REPORT_LEARNER_LINEAGE_PARENT_FIELD = "a1_learner_lineage_parent"
+LEARNER_LINEAGE_PARENT_SCHEMA = "a1-learner-lineage-parent-v1"
 TRAINING_TRANSACTION_SCHEMA = "a1-one-dose-training-transaction-v1"
 PRODUCTION_TRAINER_AUTHORITY_SCHEMA = "a1-production-trainer-authority-v1"
 PRODUCTION_TRAINER_CODE_SURFACE = tuple(
@@ -849,6 +851,11 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
         "diagnostic_comparison_source": (
             copy.deepcopy(verified["diagnostic_comparison_source"])
             if isinstance(verified.get("diagnostic_comparison_source"), dict)
+            else None
+        ),
+        "learner_lineage_parent": (
+            copy.deepcopy(verified["learner_lineage_parent"])
+            if isinstance(verified.get("learner_lineage_parent"), dict)
             else None
         ),
     }
@@ -2797,6 +2804,7 @@ def bind_learner_ablation(
             "diagnostic_comparison_source": result.get(
                 "diagnostic_comparison_source"
             ),
+            "learner_lineage_parent": result.get("learner_lineage_parent"),
             "ablation": result["learner_ablation"],
         }
     )
@@ -2886,6 +2894,14 @@ def bind_diagnostic_training_descriptor(
         # immutable production descriptor. Its canonical value is carried by
         # the derived descriptor and replayed by train_bc before optimizer use.
         derived_overrides[typed_forced_key] = effective_recipe[typed_forced_key]
+    for key, disabled_value in (
+        ("public_card_lr_mult", 1.0),
+        ("per_game_policy_surprise_weighting", False),
+    ):
+        if effective_recipe.get(key, disabled_value) != disabled_value:
+            # These are coupled to the receipt-backed public-card initializer
+            # and exact per-game sampler by the generic ablation authority.
+            derived_overrides[key] = effective_recipe[key]
     reporting_contract = learner_ablation.get("reporting_contract")
     lr_dose_campaign = bool(
         isinstance(reporting_contract, dict)
@@ -4865,6 +4881,23 @@ def bind_function_preserving_upgrade(
         )
     if diagnostic_comparison_source is not None:
         result["diagnostic_comparison_source"] = diagnostic_comparison_source
+        # A production composite's data producer and the checkpoint used as an
+        # independent diagnostic learner parent are different identities.  Do
+        # not overload ``producer``: bind the permitted recent-history parent
+        # explicitly so dose accounting can authenticate f7 while corpus
+        # provenance continues to name the v5 producer.
+        result["learner_lineage_parent"] = {
+            "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
+            "role": "diagnostic_recent_history",
+            "checkpoint": copy.deepcopy(upgrade["source"]),
+            "corpus_producer": copy.deepcopy(verified["producer"]),
+            "category_semantics_sha256": verified.get(
+                "category_semantics_sha256"
+            ),
+            "function_preserving_upgrade_receipt_sha256": receipt["sha256"],
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+        }
     result["claim_identity_sha256"] = _value_sha256(
         {
             "schema_version": "a1-architecture-upgrade-training-identity-v1",
@@ -6792,6 +6825,60 @@ def _expected_optimizer_steps(
     return int(steps)
 
 
+def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
+    """Return the authenticated learner parent without changing corpus identity.
+
+    Ordinary one-dose training starts from the sealed corpus producer.  The
+    diagnostic recent-history exception is narrower: it is accepted only when
+    the explicit parent record, comparison-source authority, and typed
+    function-preserving upgrade all name the same checkpoint.
+    """
+
+    producer = verified.get("producer")
+    if not isinstance(producer, Mapping):
+        raise ExecutorError("one-dose learner has no sealed corpus producer")
+    parent = verified.get("learner_lineage_parent")
+    diagnostic = verified.get("diagnostic_comparison_source")
+    if parent is None:
+        if diagnostic is not None:
+            raise ExecutorError(
+                "diagnostic comparison source lacks an explicit learner lineage parent"
+            )
+        return str(producer["sha256"])
+    upgrade = verified.get("function_preserving_upgrade_lineage")
+    checkpoint = parent.get("checkpoint") if isinstance(parent, Mapping) else None
+    expected = {
+        "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
+        "role": "diagnostic_recent_history",
+        "checkpoint": copy.deepcopy(
+            diagnostic.get("source") if isinstance(diagnostic, Mapping) else None
+        ),
+        "corpus_producer": copy.deepcopy(dict(producer)),
+        "category_semantics_sha256": verified.get("category_semantics_sha256"),
+        "function_preserving_upgrade_receipt_sha256": (
+            upgrade.get("receipt_sha256") if isinstance(upgrade, Mapping) else None
+        ),
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
+    if (
+        verified.get("data_kind") != "production_composite_v2"
+        or not isinstance(diagnostic, Mapping)
+        or diagnostic.get("role") != "recent_history"
+        or diagnostic.get("diagnostic_only") is not True
+        or diagnostic.get("promotion_eligible") is not False
+        or not isinstance(upgrade, Mapping)
+        or not isinstance(checkpoint, Mapping)
+        or dict(parent) != expected
+        or checkpoint.get("sha256")
+        != upgrade.get("source_checkpoint_sha256")
+    ):
+        raise ExecutorError(
+            "diagnostic learner lineage parent lost exact recent-history authority"
+        )
+    return str(checkpoint["sha256"])
+
+
 def _direct_lineage_dose(
     verified: dict[str, Any],
     *,
@@ -6867,7 +6954,7 @@ def _direct_lineage_dose(
             sampled_rows = reported_draws
     try:
         return lineage.direct_lineage_dose(
-            declared_producer_sha256=verified["producer"]["sha256"],
+            declared_producer_sha256=_learner_lineage_parent_sha256(verified),
             init_checkpoint_sha256=verified.get(
                 "architecture_initializer", verified["producer"]
             )["sha256"],
@@ -6913,6 +7000,7 @@ def _bind_training_report(
         REPORT_EXECUTION_BINDING_FIELD in payload
         or REPORT_INPUT_BINDING_FIELD in payload
         or "a1_lineage_dose" in payload
+        or REPORT_LEARNER_LINEAGE_PARENT_FIELD in payload
     ):
         raise ExecutorError(
             "A1 training child pre-populated executor-owned provenance"
@@ -6920,6 +7008,9 @@ def _bind_training_report(
     _validate_execution_binding(execution_binding)
     payload[REPORT_EXECUTION_BINDING_FIELD] = execution_binding
     payload[REPORT_INPUT_BINDING_FIELD] = _input_binding(verified)
+    payload[REPORT_LEARNER_LINEAGE_PARENT_FIELD] = copy.deepcopy(
+        verified.get("learner_lineage_parent")
+    )
     payload["a1_lineage_dose"] = _direct_lineage_dose(
         verified, report_payload=payload
     )
@@ -7798,6 +7889,9 @@ def _verify_training_outputs(
         "init_checkpoint_sha256": verified.get(
             "architecture_initializer", verified["producer"]
         )["sha256"],
+        REPORT_LEARNER_LINEAGE_PARENT_FIELD: copy.deepcopy(
+            verified.get("learner_lineage_parent")
+        ),
         "a1_lineage_dose": lineage_dose,
         "forced_action_weight": float(recipe["forced_action_weight"]),
         "forced_row_value_weight": float(recipe["forced_row_value_weight"]),
@@ -9328,6 +9422,9 @@ def _recover_terminal_complete_receipt(
         "validation_manifest": str(verified["validation_path"]),
         "validation_manifest_file_sha256": verified["validation_file_sha256"],
         "producer_checkpoint_sha256": verified["producer"]["sha256"],
+        "learner_lineage_parent": copy.deepcopy(
+            verified.get("learner_lineage_parent")
+        ),
         "learner_training_recipe_sha256": _value_sha256(
             verified.get("bound_recipe", verified["recipe"])
         ),
@@ -9650,6 +9747,9 @@ def _execute_locked(
         "validation_manifest": str(verified["validation_path"]),
         "validation_manifest_file_sha256": verified["validation_file_sha256"],
         "producer_checkpoint_sha256": verified["producer"]["sha256"],
+        "learner_lineage_parent": copy.deepcopy(
+            verified.get("learner_lineage_parent")
+        ),
         "learner_training_recipe_sha256": _value_sha256(
             verified.get("bound_recipe", verified["recipe"])
         ),
@@ -10374,6 +10474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "diagnostic_comparison_source": verified.get(
                 "diagnostic_comparison_source"
             ),
+            "learner_lineage_parent": verified.get("learner_lineage_parent"),
         }
         if verified.get("learner_ablation") is not None:
             plan.update(
