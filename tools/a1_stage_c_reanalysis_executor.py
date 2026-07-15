@@ -19,6 +19,7 @@ evaluator, which sanitizes the root before any neural evaluation or expansion.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import importlib.metadata
 import json
@@ -39,10 +40,30 @@ for root in (REPO_ROOT, REPO_ROOT / "tools"):
 from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 from tools import reconstruct_state  # noqa: E402
 from tools import train_bc  # noqa: E402
+from catan_zero.rl.target_reliability import (  # noqa: E402
+    TARGET_RELIABILITY_COLUMNS,
+    TARGET_RELIABILITY_SCHEMA,
+    unaudited_target_reliability_fields,
+)
+from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
+    GumbelChanceMCTSConfig,
+)
+from catan_zero.search.native_gumbel_mcts import (  # noqa: E402
+    create_gumbel_search,
+)
+from catan_zero.search.neural_rust_mcts import (  # noqa: E402
+    EntityGraphRustEvaluator,
+    EntityGraphRustEvaluatorConfig,
+    rust_policy_action_ids,
+)
 
 
 RECEIPT_SCHEMA = "a1-stage-c-sparse-reconstruction-receipt-v1"
 READY_SUBSET_SCHEMA = "a1-stage-c-reconstructable-subset-v1"
+EXECUTION_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-chunk-receipt-v1"
+PATCH_SCHEMA = "a1-stage-c-coherent-reanalysis-target-patch-v1"
+MERGE_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-merge-receipt-v1"
+ROW_SEED_SCHEMA = "a1-stage-c-coherent-reanalysis-root-seed-v1"
 STATUS = {
     "unclassified": 0,
     "reconstructable_public_roundtrip": 1,
@@ -58,6 +79,36 @@ REQUIRED_COHERENT_CAPABILITIES = frozenset(
         "coherent_public_belief_search",
         "forced_root_trajectory_only",
     }
+)
+PATCH_ROW_COLUMNS = (
+    "ready_ordinal",
+    "selected_ordinal",
+    "row_index",
+    "game_seed",
+    "decision_index",
+    "chunk_index",
+    "identity_sha256",
+    "search_seed",
+    "selected_action_policy_id",
+    "root_value",
+    "root_value_mask",
+    "simulations_used",
+    "used_full_search",
+    "q_values_root_perspective",
+    "target_policy_target_identity_sha256",
+    "target_reanalyzer_checkpoint_sha256",
+    "target_operator_contract_file_sha256",
+    *TARGET_RELIABILITY_COLUMNS,
+)
+PATCH_RAGGED_COLUMNS = (
+    "legal_action_ids_flat",
+    "target_policy_flat",
+    "target_policy_mask_flat",
+    "target_scores_flat",
+    "target_scores_mask_flat",
+    "completed_q_values_flat",
+    "completed_q_mask_flat",
+    "prior_policy_flat",
 )
 
 
@@ -81,7 +132,9 @@ def _runtime_attestation() -> dict[str, Any]:
             text=True,
         ).stdout.strip()
     except (ImportError, OSError, subprocess.CalledProcessError) as error:
-        raise ExecutorError(f"cannot attest sparse reconstruction runtime: {error}") from error
+        raise ExecutorError(
+            f"cannot attest sparse reconstruction runtime: {error}"
+        ) from error
     native_module = getattr(catanatron_rs, "catanatron_rs", catanatron_rs)
     extension = Path(native_module.__file__).resolve(strict=True)
     capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
@@ -102,8 +155,10 @@ def _runtime_attestation() -> dict[str, Any]:
         REPO_ROOT / "tools/reconstruct_state.py",
         REPO_ROOT / "tools/a1_stage_c_teacher_alignment.py",
         REPO_ROOT / "src/catan_zero/rl/gumbel_self_play.py",
+        REPO_ROOT / "src/catan_zero/rl/target_reliability.py",
         REPO_ROOT / "src/catan_zero/search/gumbel_chance_mcts.py",
         REPO_ROOT / "src/catan_zero/search/native_gumbel_mcts.py",
+        REPO_ROOT / "src/catan_zero/search/neural_rust_mcts.py",
     ):
         sources.append(
             {
@@ -145,10 +200,7 @@ def _sequence_rows(
             raise ExecutorError(f"selected game_seed={game_seed} is absent from corpus")
         row_indices = np.arange(start, stop, dtype=np.int64)
         game_decisions = decisions[row_indices]
-        if (
-            game_decisions[0] != 0
-            or np.any(game_decisions[1:] <= game_decisions[:-1])
-        ):
+        if game_decisions[0] != 0 or np.any(game_decisions[1:] <= game_decisions[:-1]):
             raise ExecutorError(
                 f"game_seed={game_seed} has malformed recorded decision indices"
             )
@@ -164,7 +216,9 @@ def _sequence_rows(
     return result
 
 
-def _stored_roundtrip_features(data: Mapping[str, Any], row: int) -> dict[str, np.ndarray]:
+def _stored_roundtrip_features(
+    data: Mapping[str, Any], row: int
+) -> dict[str, np.ndarray]:
     names = (
         *reconstruct_state._ROUNDTRIP_ENTITY_KEYS,  # noqa: SLF001
         *reconstruct_state._ROUNDTRIP_ACTION_KEYS,  # noqa: SLF001
@@ -233,9 +287,12 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
         overlay_path, where="Stage-C eligibility overlay"
     )
     corpus_root = Path(str(overlay["corpus"]["path"])).resolve(strict=True)
-    if alignment._file_sha256(corpus_root / "corpus_meta.json") != overlay[  # noqa: SLF001
-        "corpus"
-    ]["corpus_meta_file_sha256"]:
+    if (
+        alignment._file_sha256(corpus_root / "corpus_meta.json")
+        != overlay[  # noqa: SLF001
+            "corpus"
+        ]["corpus_meta_file_sha256"]
+    ):
         raise ExecutorError("Stage-C corpus metadata drifted")
     data = train_bc.MemmapCorpus(corpus_root)
     with np.load(subset_path, allow_pickle=False) as subset_file:
@@ -257,9 +314,7 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
     action_size = _checkpoint_action_size(source_checkpoint)
     history = plan["target_policy_target_identity"]["target_semantics"]
     correct_chance = bool(
-        plan["target_policy_target_identity"]["chance"][
-            "correct_rust_chance_spectra"
-        ]
+        plan["target_policy_target_identity"]["chance"]["correct_rust_chance_spectra"]
     )
     ordinals_by_game: dict[int, list[int]] = {}
     for ordinal, game_seed in enumerate(subset["game_seed"].astype(np.int64)):
@@ -379,16 +434,17 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
     alignment._write_array_immutable(other_ui_path, omitted_other_ui)  # noqa: SLF001
     ready = status == STATUS["reconstructable_public_roundtrip"]
     ready_arrays = {name: values[ready] for name, values in subset.items()}
+    ready_arrays["ready_ordinal"] = np.arange(
+        int(np.count_nonzero(ready)), dtype=np.int64
+    )
+    ready_arrays["selected_ordinal"] = np.flatnonzero(ready).astype(np.int64)
     ready_arrays["omitted_automatic_transitions_before_root"] = omitted[ready]
     ready_arrays["omitted_roll_transitions_before_root"] = omitted_roll[ready]
-    ready_arrays["omitted_end_turn_transitions_before_root"] = omitted_end_turn[
-        ready
-    ]
-    ready_arrays["omitted_other_ui_transitions_before_root"] = omitted_other_ui[
-        ready
-    ]
+    ready_arrays["omitted_end_turn_transitions_before_root"] = omitted_end_turn[ready]
+    ready_arrays["omitted_other_ui_transitions_before_root"] = omitted_other_ui[ready]
     alignment._write_immutable(  # noqa: SLF001
-        ready_path, alignment._npz_bytes(ready_arrays)  # noqa: SLF001
+        ready_path,
+        alignment._npz_bytes(ready_arrays),  # noqa: SLF001
     )
     counts = {
         name: int(np.count_nonzero(status == code)) for name, code in STATUS.items()
@@ -403,9 +459,9 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
             "plan_sha256": plan["plan_sha256"],
         },
         "source_subset": plan["subset"]["artifact"],
-        "target_policy_target_identity_sha256": plan[
-            "target_policy_target_identity"
-        ]["identity_sha256"],
+        "target_policy_target_identity_sha256": plan["target_policy_target_identity"][
+            "identity_sha256"
+        ],
         "runtime": _runtime_attestation(),
         "source_checkpoint_action_size": action_size,
         "status_codes": STATUS,
@@ -492,17 +548,14 @@ def _verify_receipt(path: Path) -> dict[str, Any]:
     for artifact in receipt["artifacts"].values():
         artifact_path = Path(str(artifact["path"])).resolve(strict=True)
         if (
-            artifact.get("file_sha256")
-            != alignment._file_sha256(artifact_path)  # noqa: SLF001
+            artifact.get("file_sha256") != alignment._file_sha256(artifact_path)  # noqa: SLF001
             or artifact.get("size_bytes") != artifact_path.stat().st_size
         ):
             raise ExecutorError("Stage-C reconstruction artifact bytes drifted")
     return {"path": str(receipt_path), **receipt}
 
 
-def assert_information_set_safe_search(
-    plan: Mapping[str, Any], search: Any
-) -> None:
+def assert_information_set_safe_search(plan: Mapping[str, Any], search: Any) -> None:
     """Gate the only supported consumer of reconstructed authoritative roots."""
 
     config = getattr(search, "config", None)
@@ -541,6 +594,774 @@ def run_information_set_safe_search(
     return search.search(reconstructed_game, force_full=True)
 
 
+def _load_ready_subset(receipt: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    artifact = receipt["artifacts"]["reconstructable_subset"]
+    path = Path(str(artifact["path"])).resolve(strict=True)
+    with np.load(path, allow_pickle=False) as source:
+        arrays = {name: np.asarray(source[name]) for name in source.files}
+    if not arrays or "identity_sha256" not in arrays:
+        raise ExecutorError("reconstructable subset has no row identities")
+    count = len(arrays["identity_sha256"])
+    if any(len(value) != count for value in arrays.values()):
+        raise ExecutorError("reconstructable subset columns are not row-aligned")
+    if np.unique(arrays["identity_sha256"]).size != count:
+        raise ExecutorError("reconstructable subset row identities are not unique")
+    # v1 qualification receipts written before the execute path did not carry
+    # explicit ordinals.  Their immutable row order is nevertheless sealed by
+    # the subset file hash, so deriving these columns is unambiguous.
+    arrays.setdefault("ready_ordinal", np.arange(count, dtype=np.int64))
+    arrays.setdefault("selected_ordinal", np.arange(count, dtype=np.int64))
+    return arrays
+
+
+def _sealed_typed_fields(plan: Mapping[str, Any]) -> dict[str, Any]:
+    target = plan["target_policy_target_identity"]
+    typed = target["authority"]["typed_generation_config"]
+    path, payload = alignment._load_json(  # noqa: SLF001
+        Path(str(typed["path"])), where="Stage-C typed target config"
+    )
+    if typed.get("file_sha256") != alignment._file_sha256(path):  # noqa: SLF001
+        raise ExecutorError("Stage-C typed target config bytes drifted")
+    fields = payload.get("fields")
+    if payload.get("schema_version") != target["target_semantics"][
+        "typed_generation_config_schema"
+    ] or not isinstance(fields, Mapping):
+        raise ExecutorError("Stage-C typed target config is malformed")
+    return dict(fields)
+
+
+def _target_checkpoint(plan: Mapping[str, Any]) -> Path:
+    checkpoint = plan["target_policy_target_identity"]["producer_checkpoint"]
+    path = Path(str(checkpoint["path"])).resolve(strict=True)
+    if checkpoint.get("sha256") != alignment._file_sha256(path):  # noqa: SLF001
+        raise ExecutorError("Stage-C target checkpoint bytes drifted")
+    return path
+
+
+def _effective_search_config(
+    plan: Mapping[str, Any], *, row_seed: int
+) -> GumbelChanceMCTSConfig:
+    target = plan["target_policy_target_identity"]
+    fields = _sealed_typed_fields(plan)
+    allowed = {field.name for field in dataclasses.fields(GumbelChanceMCTSConfig)}
+    kwargs = {name: value for name, value in fields.items() if name in allowed}
+    kwargs["seed"] = int(row_seed)
+    if "colors" in kwargs:
+        kwargs["colors"] = tuple(str(value) for value in kwargs["colors"])
+    config = GumbelChanceMCTSConfig(**kwargs)
+    if (
+        int(config.n_full) != 128
+        or not bool(config.coherent_public_belief_search)
+        or bool(config.information_set_search)
+        or bool(config.belief_chance_spectra)
+        or target.get("target_information_regime") != alignment.COHERENT_REGIME
+    ):
+        raise ExecutorError(
+            "Stage-C execute requires exact coherent-public n128, never PIMC"
+        )
+    operator = target.get("operator_contract_semantics", {})
+    if (
+        operator.get("native_mcts_hot_loop") is not True
+        or operator.get("coherent_public_belief_search") is not True
+        or operator.get("information_set_search") is not False
+    ):
+        raise ExecutorError(
+            "sealed target operator does not require native coherent search"
+        )
+    return config
+
+
+def _evaluator_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
+    fields = _sealed_typed_fields(plan)
+    if fields.get("public_observation") is not True:
+        raise ExecutorError("sealed target evaluator is not public-observation safe")
+    if fields.get("rust_featurize") is not True:
+        raise ExecutorError("sealed target evaluator did not bind native featurization")
+    return EntityGraphRustEvaluator.from_checkpoint(
+        str(_target_checkpoint(plan)),
+        device=str(device),
+        config=EntityGraphRustEvaluatorConfig(
+            value_scale=float(fields.get("value_scale", 1.0)),
+            prior_temperature=float(fields.get("prior_temperature", 1.0)),
+            cache_size=int(fields.get("eval_cache_size", 0)),
+            value_readout=str(fields.get("value_readout", "scalar")),
+            public_observation=True,
+            rust_featurize=True,
+        ),
+    )
+
+
+def _row_seed(identity_sha256: str) -> int:
+    identity = str(identity_sha256)
+    if not identity.startswith("sha256:") or len(identity) != 71:
+        raise ExecutorError("malformed Stage-C row identity digest")
+    return int.from_bytes(
+        hashlib.sha256(
+            ROW_SEED_SCHEMA.encode("ascii") + b"\0" + identity.encode("ascii")
+        ).digest()[:8],
+        "big",
+    )
+
+
+def _search_patch(
+    *,
+    plan: Mapping[str, Any],
+    evaluator: Any,
+    reconstructed_game: Any,
+    row_seed: int,
+    expected_legal_policy_ids: np.ndarray,
+) -> dict[str, Any]:
+    config = _effective_search_config(plan, row_seed=row_seed)
+    search = create_gumbel_search(
+        config,
+        evaluator,
+        native_hot_loop=True,
+        allow_python_fallback=False,
+    )
+    result = run_information_set_safe_search(plan, search, reconstructed_game)
+    legal_rust = tuple(
+        int(action)
+        for action in reconstructed_game.playable_action_indices(
+            list(config.colors), config.map_kind
+        )
+    )
+    action_size = _checkpoint_action_size(_target_checkpoint(plan))
+    legal_policy_ids = np.asarray(
+        rust_policy_action_ids(
+            reconstructed_game,
+            legal_rust,
+            colors=tuple(config.colors),
+            action_size=action_size,
+        ),
+        dtype=np.int32,
+    )
+    stored = np.asarray(expected_legal_policy_ids, dtype=np.int64).reshape(-1)
+    stored = stored[stored >= 0]
+    if not np.array_equal(legal_policy_ids.astype(np.int64), stored):
+        raise ExecutorError(
+            "legal action order changed between qualification and search"
+        )
+    support = set(legal_rust)
+    if (
+        set(map(int, result.improved_policy)) != support
+        or set(map(int, result.priors)) != support
+    ):
+        raise ExecutorError("coherent search did not cover the exact legal root")
+    target = np.asarray(
+        [float(result.improved_policy[action]) for action in legal_rust],
+        dtype=np.float32,
+    )
+    priors = np.asarray(
+        [float(result.priors[action]) for action in legal_rust], dtype=np.float32
+    )
+    raw_q = np.asarray(
+        [float(result.q_values.get(action, np.nan)) for action in legal_rust],
+        dtype=np.float32,
+    )
+    completed = np.asarray(
+        [float(result.completed_q_values.get(action, np.nan)) for action in legal_rust],
+        dtype=np.float32,
+    )
+    if (
+        not bool(result.used_full_search)
+        or int(result.simulations_used) <= 0
+        or not math.isfinite(float(result.root_value))
+        or not bool(result.q_values_root_perspective)
+        or not np.all(np.isfinite(completed))
+        or not np.isclose(float(target.sum()), 1.0, atol=1.0e-5)
+        or not np.isclose(float(priors.sum()), 1.0, atol=1.0e-5)
+    ):
+        raise ExecutorError(
+            "coherent n128 search returned incomplete or ambiguous target evidence"
+        )
+    try:
+        selected_position = legal_rust.index(int(result.selected_action))
+    except ValueError as error:
+        raise ExecutorError("coherent search selected a non-legal action") from error
+    return {
+        "legal_action_ids": legal_policy_ids,
+        "target_policy": target,
+        "target_policy_mask": target > 0.0,
+        "target_scores": raw_q,
+        "target_scores_mask": np.isfinite(raw_q),
+        "completed_q_values": completed,
+        "completed_q_mask": np.ones(completed.shape, dtype=np.bool_),
+        "prior_policy": priors,
+        "selected_action_policy_id": int(legal_policy_ids[selected_position]),
+        "root_value": float(result.root_value),
+        "root_value_mask": True,
+        "simulations_used": int(result.simulations_used),
+        "used_full_search": True,
+        "q_values_root_perspective": True,
+    }
+
+
+def _partition_positions(
+    subset: Mapping[str, np.ndarray], *, partition_index: int, partitions: int
+) -> np.ndarray:
+    if partitions < 1 or not 0 <= partition_index < partitions:
+        raise ExecutorError("partition_index must be in [0, partitions)")
+    chunks = np.asarray(subset["chunk_index"], dtype=np.int64)
+    return np.flatnonzero((chunks % int(partitions)) == int(partition_index))
+
+
+def _patch_arrays(records: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray]:
+    offsets = [0]
+    for record in records:
+        offsets.append(offsets[-1] + len(record["legal_action_ids"]))
+    count = len(records)
+    arrays: dict[str, np.ndarray] = {
+        "ready_ordinal": np.asarray(
+            [record["ready_ordinal"] for record in records], dtype=np.int64
+        ),
+        "selected_ordinal": np.asarray(
+            [record["selected_ordinal"] for record in records], dtype=np.int64
+        ),
+        "row_index": np.asarray(
+            [record["row_index"] for record in records], dtype=np.int64
+        ),
+        "game_seed": np.asarray(
+            [record["game_seed"] for record in records], dtype=np.int64
+        ),
+        "decision_index": np.asarray(
+            [record["decision_index"] for record in records], dtype=np.int64
+        ),
+        "chunk_index": np.asarray(
+            [record["chunk_index"] for record in records], dtype=np.int32
+        ),
+        "identity_sha256": np.asarray(
+            [record["identity_sha256"] for record in records], dtype="<U71"
+        ),
+        "search_seed": np.asarray(
+            [record["search_seed"] for record in records], dtype=np.uint64
+        ),
+        "selected_action_policy_id": np.asarray(
+            [record["selected_action_policy_id"] for record in records],
+            dtype=np.int32,
+        ),
+        "root_value": np.asarray(
+            [record["root_value"] for record in records], dtype=np.float32
+        ),
+        "root_value_mask": np.ones(count, dtype=np.bool_),
+        "simulations_used": np.asarray(
+            [record["simulations_used"] for record in records], dtype=np.int32
+        ),
+        "used_full_search": np.ones(count, dtype=np.bool_),
+        "q_values_root_perspective": np.ones(count, dtype=np.bool_),
+        "legal_action_offsets": np.asarray(offsets, dtype=np.int64),
+    }
+    string_fields = (
+        "target_policy_target_identity_sha256",
+        "target_reanalyzer_checkpoint_sha256",
+        "target_operator_contract_file_sha256",
+    )
+    for name in string_fields:
+        arrays[name] = np.asarray([record[name] for record in records], dtype="<U71")
+    ragged = {
+        "legal_action_ids_flat": ("legal_action_ids", np.int32),
+        "target_policy_flat": ("target_policy", np.float32),
+        "target_policy_mask_flat": ("target_policy_mask", np.bool_),
+        "target_scores_flat": ("target_scores", np.float32),
+        "target_scores_mask_flat": ("target_scores_mask", np.bool_),
+        "completed_q_values_flat": ("completed_q_values", np.float32),
+        "completed_q_mask_flat": ("completed_q_mask", np.bool_),
+        "prior_policy_flat": ("prior_policy", np.float32),
+    }
+    for output_name, (record_name, dtype) in ragged.items():
+        values = [np.asarray(record[record_name], dtype=dtype) for record in records]
+        arrays[output_name] = (
+            np.concatenate(values) if values else np.asarray([], dtype=dtype)
+        )
+    neutral = unaudited_target_reliability_fields()
+    for name in TARGET_RELIABILITY_COLUMNS:
+        scalar = np.asarray(neutral[name])
+        arrays[name] = np.full(count, scalar.item(), dtype=scalar.dtype)
+    return arrays
+
+
+def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
+    qualification = _verify_receipt(args.receipt)
+    plan = alignment._verify_plan(  # noqa: SLF001
+        Path(str(qualification["stage_c_plan"]["path"]))
+    )
+    subset = _load_ready_subset(qualification)
+    positions = _partition_positions(
+        subset,
+        partition_index=int(args.partition_index),
+        partitions=int(args.partitions),
+    )
+    if positions.size == 0:
+        raise ExecutorError("requested Stage-C execution partition is empty")
+    overlay_path = Path(str(plan["eligibility_overlay"]["path"]))
+    _overlay_path, overlay = alignment._load_json(  # noqa: SLF001
+        overlay_path, where="Stage-C eligibility overlay"
+    )
+    corpus_root = Path(str(overlay["corpus"]["path"])).resolve(strict=True)
+    if (
+        alignment._file_sha256(corpus_root / "corpus_meta.json")
+        != overlay[  # noqa: SLF001
+            "corpus"
+        ]["corpus_meta_file_sha256"]
+    ):
+        raise ExecutorError("Stage-C corpus metadata drifted before execution")
+    data = train_bc.MemmapCorpus(corpus_root)
+    selected_seeds = np.asarray(subset["game_seed"][positions], dtype=np.int64)
+    sequences = _sequence_rows(data, selected_seeds)
+    action_size = _checkpoint_action_size(_target_checkpoint(plan))
+    correct_chance = bool(
+        plan["target_policy_target_identity"]["chance"]["correct_rust_chance_spectra"]
+    )
+    history = plan["target_policy_target_identity"]["target_semantics"]
+    evaluator = _evaluator_from_plan(plan, device=str(args.device))
+    ordinals_by_game: dict[int, list[int]] = {}
+    for position in positions.tolist():
+        ordinals_by_game.setdefault(int(subset["game_seed"][position]), []).append(
+            int(position)
+        )
+    target = plan["target_policy_target_identity"]
+    checkpoint_sha = str(target["producer_checkpoint"]["sha256"])
+    operator_contract_sha = str(target["authority"]["contract"]["file_sha256"])
+    records: list[dict[str, Any]] = []
+    for game_seed, game_positions in sorted(ordinals_by_game.items()):
+        sequence, game_rows = sequences[game_seed]
+        decisions = [
+            int(subset["decision_index"][position]) for position in game_positions
+        ]
+        reconstructed = reconstruct_state.reconstruct_states_from_sequence(
+            sequence,
+            decisions,
+            correct_rust_chance_spectra=correct_chance,
+            action_size=action_size,
+        )
+        for position in sorted(
+            game_positions,
+            key=lambda value: int(subset["decision_index"][value]),
+        ):
+            row = int(subset["row_index"][position])
+            decision = int(subset["decision_index"][position])
+            game = reconstructed.states.get(decision)
+            if game is None:
+                detail = reconstructed.failure or "unclassified sparse replay failure"
+                raise ExecutorError(
+                    f"qualified root became unreconstructable row={row}: {detail}"
+                )
+            roundtrip = reconstruct_state.round_trip_row(
+                sequence,
+                decision,
+                _stored_roundtrip_features(data, row),
+                _one_row(data["legal_action_ids"], row),
+                correct_rust_chance_spectra=correct_chance,
+                action_size=action_size,
+                meaningful_public_history=bool(history["meaningful_public_history"]),
+                history_limit=int(history["event_history_limit"]),
+                reconstructed_game=game,
+            )
+            if not roundtrip.ok:
+                raise ExecutorError(
+                    "qualified root public surface drifted before search: "
+                    f"row={row} detail={roundtrip.detail}"
+                )
+            identity = str(subset["identity_sha256"][position])
+            seed = _row_seed(identity)
+            patch = _search_patch(
+                plan=plan,
+                evaluator=evaluator,
+                reconstructed_game=game,
+                row_seed=seed,
+                expected_legal_policy_ids=_one_row(data["legal_action_ids"], row),
+            )
+            records.append(
+                {
+                    "ready_ordinal": int(subset["ready_ordinal"][position]),
+                    "selected_ordinal": int(subset["selected_ordinal"][position]),
+                    "row_index": row,
+                    "game_seed": game_seed,
+                    "decision_index": decision,
+                    "chunk_index": int(subset["chunk_index"][position]),
+                    "identity_sha256": identity,
+                    "search_seed": seed,
+                    "target_policy_target_identity_sha256": target["identity_sha256"],
+                    "target_reanalyzer_checkpoint_sha256": checkpoint_sha,
+                    "target_operator_contract_file_sha256": operator_contract_sha,
+                    **patch,
+                }
+            )
+    records.sort(key=lambda value: int(value["ready_ordinal"]))
+    arrays = _patch_arrays(records)
+    patch_path = args.patch.expanduser().resolve(strict=False)
+    alignment._write_immutable(  # noqa: SLF001
+        patch_path,
+        alignment._npz_bytes(arrays),  # noqa: SLF001
+    )
+    qualification_path = Path(str(qualification["path"]))
+    effective = dataclasses.asdict(_effective_search_config(plan, row_seed=0))
+    effective.pop("seed", None)
+    receipt: dict[str, Any] = {
+        "schema_version": EXECUTION_RECEIPT_SCHEMA,
+        "patch_schema_version": PATCH_SCHEMA,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "stage_c_plan": qualification["stage_c_plan"],
+        "qualification_receipt": {
+            "path": str(qualification_path),
+            "file_sha256": alignment._file_sha256(qualification_path),  # noqa: SLF001
+            "receipt_sha256": qualification["receipt_sha256"],
+        },
+        "target_policy_target_identity_sha256": target["identity_sha256"],
+        "target_reanalyzer_checkpoint": target["producer_checkpoint"],
+        "target_operator_contract": target["authority"]["contract"],
+        "search": {
+            "required_operator": "coherent_public_belief_search",
+            "legacy_pimc_allowed": False,
+            "authoritative_hidden_state_search_allowed": False,
+            "native_hot_loop_required": True,
+            "force_full": True,
+            "nominal_n_full": 128,
+            "row_seed_schema": ROW_SEED_SCHEMA,
+            "effective_config_without_row_seed": effective,
+            "effective_config_sha256": _value_sha256(effective),
+        },
+        "evaluator": {
+            "type": "EntityGraphRustEvaluator",
+            "public_observation": True,
+            "rust_featurize": True,
+        },
+        "runtime": _runtime_attestation(),
+        "partition": {
+            "partition_index": int(args.partition_index),
+            "partitions": int(args.partitions),
+            "assignment": "sealed_chunk_index_mod_partitions",
+            "chunk_indices": sorted(
+                set(int(value) for value in arrays["chunk_index"].tolist())
+            ),
+        },
+        "counts": {
+            "rows": len(records),
+            "legal_actions": int(arrays["legal_action_offsets"][-1]),
+        },
+        "reliability": {
+            "schema_version": TARGET_RELIABILITY_SCHEMA,
+            "mode": "primary_search_only_unaudited_v1",
+            "typed_neutral_sentinel": True,
+        },
+        "patch_columns": sorted(arrays),
+        "artifact": alignment._artifact_ref(patch_path),  # noqa: SLF001
+    }
+    receipt["receipt_sha256"] = _value_sha256(receipt)
+    return receipt
+
+
+def _verify_patch_arrays(
+    arrays: Mapping[str, np.ndarray], *, receipt: Mapping[str, Any]
+) -> None:
+    expected = {
+        *PATCH_ROW_COLUMNS,
+        *PATCH_RAGGED_COLUMNS,
+        "legal_action_offsets",
+    }
+    if set(arrays) != expected or sorted(arrays) != receipt.get("patch_columns"):
+        raise ExecutorError("Stage-C patch column contract drifted")
+    count = int(receipt["counts"]["rows"])
+    for name in PATCH_ROW_COLUMNS:
+        if np.asarray(arrays[name]).shape != (count,):
+            raise ExecutorError(f"Stage-C patch row column {name} is misaligned")
+    offsets = np.asarray(arrays["legal_action_offsets"], dtype=np.int64)
+    if (
+        offsets.shape != (count + 1,)
+        or offsets[0] != 0
+        or np.any(offsets[1:] <= offsets[:-1])
+    ):
+        raise ExecutorError("Stage-C patch legal offsets are malformed")
+    flat_count = int(offsets[-1])
+    if flat_count != int(receipt["counts"]["legal_actions"]):
+        raise ExecutorError("Stage-C patch legal-action count drifted")
+    for name in PATCH_RAGGED_COLUMNS:
+        if np.asarray(arrays[name]).shape != (flat_count,):
+            raise ExecutorError(f"Stage-C patch ragged column {name} is misaligned")
+    if (
+        np.unique(arrays["ready_ordinal"]).size != count
+        or np.unique(arrays["identity_sha256"]).size != count
+    ):
+        raise ExecutorError("Stage-C patch contains duplicate rows")
+    target_identity = str(receipt["target_policy_target_identity_sha256"])
+    checkpoint_sha = str(receipt["target_reanalyzer_checkpoint"]["sha256"])
+    operator_sha = str(receipt["target_operator_contract"]["file_sha256"])
+    for name, expected_value in (
+        ("target_policy_target_identity_sha256", target_identity),
+        ("target_reanalyzer_checkpoint_sha256", checkpoint_sha),
+        ("target_operator_contract_file_sha256", operator_sha),
+    ):
+        if not np.all(np.asarray(arrays[name]).astype(str) == expected_value):
+            raise ExecutorError(f"Stage-C patch {name} provenance drifted")
+    neutral = unaudited_target_reliability_fields()
+    for name in TARGET_RELIABILITY_COLUMNS:
+        values = np.asarray(arrays[name])
+        expected_value = np.asarray(neutral[name]).item()
+        if isinstance(expected_value, float) and math.isnan(expected_value):
+            valid = np.all(np.isnan(values))
+        else:
+            valid = np.all(values == expected_value)
+        if not valid:
+            raise ExecutorError("Stage-C patch reliability sentinel drifted")
+    for row in range(count):
+        start, stop = int(offsets[row]), int(offsets[row + 1])
+        legal = np.asarray(arrays["legal_action_ids_flat"])[start:stop]
+        target = np.asarray(arrays["target_policy_flat"])[start:stop]
+        prior = np.asarray(arrays["prior_policy_flat"])[start:stop]
+        scores = np.asarray(arrays["target_scores_flat"])[start:stop]
+        score_mask = np.asarray(arrays["target_scores_mask_flat"])[start:stop]
+        completed = np.asarray(arrays["completed_q_values_flat"])[start:stop]
+        if (
+            np.any(legal < 0)
+            or np.unique(legal).size != legal.size
+            or int(arrays["selected_action_policy_id"][row]) not in set(legal.tolist())
+            or not np.all(np.isfinite(target))
+            or np.any(target < 0.0)
+            or not np.array_equal(
+                np.asarray(arrays["target_policy_mask_flat"])[start:stop],
+                target > 0.0,
+            )
+            or not np.array_equal(score_mask, np.isfinite(scores))
+            or not np.all(np.asarray(arrays["completed_q_mask_flat"])[start:stop])
+            or not np.isclose(float(target.sum()), 1.0, atol=1.0e-5)
+            or not np.isclose(float(prior.sum()), 1.0, atol=1.0e-5)
+            or not np.all(np.isfinite(completed))
+            or int(arrays["search_seed"][row])
+            != _row_seed(str(arrays["identity_sha256"][row]))
+            or not bool(arrays["root_value_mask"][row])
+            or not bool(arrays["used_full_search"][row])
+            or not bool(arrays["q_values_root_perspective"][row])
+            or int(arrays["simulations_used"][row]) <= 0
+        ):
+            raise ExecutorError("Stage-C patch contains invalid search evidence")
+
+
+def _verify_execution_receipt(path: Path) -> dict[str, Any]:
+    receipt_path, receipt = alignment._load_json(  # noqa: SLF001
+        path, where="Stage-C execution receipt"
+    )
+    unsigned = dict(receipt)
+    stated = unsigned.pop("receipt_sha256", None)
+    if (
+        receipt.get("schema_version") != EXECUTION_RECEIPT_SCHEMA
+        or receipt.get("patch_schema_version") != PATCH_SCHEMA
+        or stated != _value_sha256(unsigned)
+    ):
+        raise ExecutorError("Stage-C execution receipt digest drifted")
+    qualification_ref = receipt["qualification_receipt"]
+    qualification_path = Path(str(qualification_ref["path"]))
+    qualification = _verify_receipt(qualification_path)
+    if (
+        qualification_ref.get("file_sha256")
+        != alignment._file_sha256(qualification_path)  # noqa: SLF001
+        or qualification_ref.get("receipt_sha256") != qualification["receipt_sha256"]
+    ):
+        raise ExecutorError("Stage-C qualification binding drifted")
+    plan = alignment._verify_plan(  # noqa: SLF001
+        Path(str(receipt["stage_c_plan"]["path"]))
+    )
+    target = plan["target_policy_target_identity"]
+    if (
+        receipt.get("target_policy_target_identity_sha256") != target["identity_sha256"]
+        or receipt.get("target_reanalyzer_checkpoint") != target["producer_checkpoint"]
+        or receipt.get("target_operator_contract") != target["authority"]["contract"]
+    ):
+        raise ExecutorError("Stage-C execution target identity drifted")
+    if (
+        alignment._file_sha256(_target_checkpoint(plan))
+        != target[  # noqa: SLF001
+            "producer_checkpoint"
+        ]["sha256"]
+    ):
+        raise ExecutorError("Stage-C target checkpoint drifted")
+    runtime = receipt.get("runtime")
+    if not isinstance(runtime, Mapping) or runtime != _runtime_attestation():
+        raise ExecutorError("Stage-C execution runtime drifted")
+    artifact = receipt["artifact"]
+    patch_path = Path(str(artifact["path"])).resolve(strict=True)
+    if (
+        artifact.get("file_sha256") != alignment._file_sha256(patch_path)  # noqa: SLF001
+        or artifact.get("size_bytes") != patch_path.stat().st_size
+    ):
+        raise ExecutorError("Stage-C execution patch bytes drifted")
+    with np.load(patch_path, allow_pickle=False) as source:
+        arrays = {name: np.asarray(source[name]) for name in source.files}
+    _verify_patch_arrays(arrays, receipt=receipt)
+    return {
+        "path": str(receipt_path),
+        "file_sha256": alignment._file_sha256(receipt_path),  # noqa: SLF001
+        "qualification": qualification,
+        "plan": plan,
+        "arrays": arrays,
+        **receipt,
+    }
+
+
+def _record_from_patch(arrays: Mapping[str, np.ndarray], row: int) -> dict[str, Any]:
+    offsets = np.asarray(arrays["legal_action_offsets"], dtype=np.int64)
+    start, stop = int(offsets[row]), int(offsets[row + 1])
+    record = {name: np.asarray(arrays[name])[row].item() for name in PATCH_ROW_COLUMNS}
+    for output_name, record_name in (
+        ("legal_action_ids_flat", "legal_action_ids"),
+        ("target_policy_flat", "target_policy"),
+        ("target_policy_mask_flat", "target_policy_mask"),
+        ("target_scores_flat", "target_scores"),
+        ("target_scores_mask_flat", "target_scores_mask"),
+        ("completed_q_values_flat", "completed_q_values"),
+        ("completed_q_mask_flat", "completed_q_mask"),
+        ("prior_policy_flat", "prior_policy"),
+    ):
+        record[record_name] = np.asarray(arrays[output_name])[start:stop]
+    return record
+
+
+def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
+    executions = [_verify_execution_receipt(path) for path in args.receipt]
+    if not executions:
+        raise ExecutorError("Stage-C merge requires execution receipts")
+    first = executions[0]
+    plan_sha = first["stage_c_plan"]["plan_sha256"]
+    qualification_sha = first["qualification_receipt"]["receipt_sha256"]
+    target_sha = first["target_policy_target_identity_sha256"]
+    if any(
+        execution["stage_c_plan"]["plan_sha256"] != plan_sha
+        or execution["qualification_receipt"]["receipt_sha256"] != qualification_sha
+        or execution["target_policy_target_identity_sha256"] != target_sha
+        for execution in executions[1:]
+    ):
+        raise ExecutorError("Stage-C merge received foreign execution receipts")
+    partition_counts = {int(item["partition"]["partitions"]) for item in executions}
+    if len(partition_counts) != 1:
+        raise ExecutorError("Stage-C execution receipts disagree on partition count")
+    partitions = partition_counts.pop()
+    partition_indices = [
+        int(item["partition"]["partition_index"]) for item in executions
+    ]
+    if sorted(partition_indices) != list(range(partitions)):
+        raise ExecutorError(
+            "Stage-C merge requires exactly one receipt for every partition"
+        )
+    ready_subset = _load_ready_subset(first["qualification"])
+    expected_count = len(ready_subset["identity_sha256"])
+    records_by_ordinal: dict[int, dict[str, Any]] = {}
+    for execution in executions:
+        arrays = execution["arrays"]
+        for row in range(int(execution["counts"]["rows"])):
+            record = _record_from_patch(arrays, row)
+            ordinal = int(record["ready_ordinal"])
+            if ordinal in records_by_ordinal:
+                raise ExecutorError(f"duplicate Stage-C row claim ordinal={ordinal}")
+            if not 0 <= ordinal < expected_count:
+                raise ExecutorError("Stage-C row claim has foreign ready ordinal")
+            if (
+                str(record["identity_sha256"])
+                != str(ready_subset["identity_sha256"][ordinal])
+                or int(record["row_index"]) != int(ready_subset["row_index"][ordinal])
+                or int(record["game_seed"]) != int(ready_subset["game_seed"][ordinal])
+                or int(record["decision_index"])
+                != int(ready_subset["decision_index"][ordinal])
+                or int(record["chunk_index"])
+                != int(ready_subset["chunk_index"][ordinal])
+            ):
+                raise ExecutorError("Stage-C row claim identity drifted")
+            records_by_ordinal[ordinal] = record
+    if set(records_by_ordinal) != set(range(expected_count)):
+        raise ExecutorError(
+            "Stage-C merge has incomplete reconstructable-root coverage: "
+            f"got={len(records_by_ordinal)} expected={expected_count}"
+        )
+    merged_arrays = _patch_arrays(
+        [records_by_ordinal[index] for index in range(expected_count)]
+    )
+    output_path = args.output.expanduser().resolve(strict=False)
+    alignment._write_immutable(  # noqa: SLF001
+        output_path,
+        alignment._npz_bytes(merged_arrays),  # noqa: SLF001
+    )
+    receipt_refs = [
+        {
+            "path": execution["path"],
+            "file_sha256": execution["file_sha256"],
+            "receipt_sha256": execution["receipt_sha256"],
+            "partition_index": execution["partition"]["partition_index"],
+        }
+        for execution in sorted(
+            executions, key=lambda item: int(item["partition"]["partition_index"])
+        )
+    ]
+    receipt: dict[str, Any] = {
+        "schema_version": MERGE_RECEIPT_SCHEMA,
+        "patch_schema_version": PATCH_SCHEMA,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "stage_c_plan": first["stage_c_plan"],
+        "qualification_receipt": first["qualification_receipt"],
+        "target_policy_target_identity_sha256": target_sha,
+        "target_reanalyzer_checkpoint": first["target_reanalyzer_checkpoint"],
+        "target_operator_contract": first["target_operator_contract"],
+        "search": first["search"],
+        "evaluator": first["evaluator"],
+        "runtime": first["runtime"],
+        "execution_receipts": receipt_refs,
+        "counts": {
+            "partitions": partitions,
+            "rows": expected_count,
+            "legal_actions": int(merged_arrays["legal_action_offsets"][-1]),
+        },
+        "coverage": {
+            "scope": "all_qualified_reconstructable_roots",
+            "missing_rows": 0,
+            "duplicate_rows": 0,
+            "ordered_by": "qualification_ready_ordinal",
+        },
+        "non_target_source_columns_mutated": False,
+        "source_corpus_rewritten": False,
+        "patch_columns": sorted(merged_arrays),
+        "artifact": alignment._artifact_ref(output_path),  # noqa: SLF001
+    }
+    receipt["receipt_sha256"] = _value_sha256(receipt)
+    return receipt
+
+
+def _verify_merge_receipt(path: Path) -> dict[str, Any]:
+    receipt_path, receipt = alignment._load_json(  # noqa: SLF001
+        path, where="Stage-C merge receipt"
+    )
+    unsigned = dict(receipt)
+    stated = unsigned.pop("receipt_sha256", None)
+    if (
+        receipt.get("schema_version") != MERGE_RECEIPT_SCHEMA
+        or receipt.get("patch_schema_version") != PATCH_SCHEMA
+        or stated != _value_sha256(unsigned)
+    ):
+        raise ExecutorError("Stage-C merge receipt digest drifted")
+    executions = [
+        _verify_execution_receipt(Path(str(reference["path"])))
+        for reference in receipt["execution_receipts"]
+    ]
+    for reference, execution in zip(
+        receipt["execution_receipts"], executions, strict=True
+    ):
+        if (
+            reference.get("file_sha256") != execution["file_sha256"]
+            or reference.get("receipt_sha256") != execution["receipt_sha256"]
+        ):
+            raise ExecutorError("Stage-C merge execution receipt binding drifted")
+    artifact = receipt["artifact"]
+    output = Path(str(artifact["path"])).resolve(strict=True)
+    if (
+        artifact.get("file_sha256") != alignment._file_sha256(output)  # noqa: SLF001
+        or artifact.get("size_bytes") != output.stat().st_size
+    ):
+        raise ExecutorError("Stage-C merged patch bytes drifted")
+    with np.load(output, allow_pickle=False) as source:
+        arrays = {name: np.asarray(source[name]) for name in source.files}
+    _verify_patch_arrays(arrays, receipt=receipt)
+    if int(receipt["counts"]["rows"]) != len(arrays["row_index"]):
+        raise ExecutorError("Stage-C merged row count drifted")
+    return {"path": str(receipt_path), **receipt}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -550,6 +1371,25 @@ def build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("--write", required=True, type=Path)
     verify = commands.add_parser("verify")
     verify.add_argument("--receipt", required=True, type=Path)
+    execute = commands.add_parser(
+        "execute", help="run one deterministic GPU partition of coherent n128 roots"
+    )
+    execute.add_argument("--receipt", required=True, type=Path)
+    execute.add_argument("--partition-index", required=True, type=int)
+    execute.add_argument("--partitions", required=True, type=int)
+    execute.add_argument("--device", default="cuda")
+    execute.add_argument("--patch", required=True, type=Path)
+    execute.add_argument("--write", required=True, type=Path)
+    verify_execute = commands.add_parser("verify-execution")
+    verify_execute.add_argument("--receipt", required=True, type=Path)
+    merge = commands.add_parser(
+        "merge", help="merge complete coherent n128 execution partitions"
+    )
+    merge.add_argument("--receipt", action="append", required=True, type=Path)
+    merge.add_argument("--output", required=True, type=Path)
+    merge.add_argument("--write", required=True, type=Path)
+    verify_merge = commands.add_parser("verify-merge")
+    verify_merge.add_argument("--receipt", required=True, type=Path)
     return parser
 
 
@@ -559,8 +1399,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "qualify":
             result = _qualify(args)
             alignment._write_json_immutable(args.write, result)  # noqa: SLF001
-        else:
+        elif args.command == "verify":
             result = _verify_receipt(args.receipt)
+        elif args.command == "execute":
+            result = _execute_partition(args)
+            alignment._write_json_immutable(args.write, result)  # noqa: SLF001
+        elif args.command == "verify-execution":
+            result = _verify_execution_receipt(args.receipt)
+            result = {
+                key: value
+                for key, value in result.items()
+                if key not in {"arrays", "qualification", "plan"}
+            }
+        elif args.command == "merge":
+            result = _merge_executions(args)
+            alignment._write_json_immutable(args.write, result)  # noqa: SLF001
+        else:
+            result = _verify_merge_receipt(args.receipt)
     except (
         ExecutorError,
         alignment.AlignmentError,

@@ -66,22 +66,19 @@ def test_search_hook_requires_coherent_public_sanitization() -> None:
             information_set_search=False,
             lazy_interior_chance=True,
         ),
-        evaluator=SimpleNamespace(
-            config=SimpleNamespace(public_observation=True)
-        ),
+        evaluator=SimpleNamespace(config=SimpleNamespace(public_observation=True)),
         search=lambda game, *, force_full: calls.append((game, force_full)) or "result",
     )
     executor.assert_information_set_safe_search(_target_plan(), safe)
-    assert executor.run_information_set_safe_search(
-        _target_plan(), safe, "reconstructed"
-    ) == "result"
+    assert (
+        executor.run_information_set_safe_search(_target_plan(), safe, "reconstructed")
+        == "result"
+    )
     assert calls == [("reconstructed", True)]
 
     hidden = SimpleNamespace(
         config=safe.config,
-        evaluator=SimpleNamespace(
-            config=SimpleNamespace(public_observation=False)
-        ),
+        evaluator=SimpleNamespace(config=SimpleNamespace(public_observation=False)),
     )
     with pytest.raises(executor.ExecutorError, match="public-observation"):
         executor.assert_information_set_safe_search(_target_plan(), hidden)
@@ -135,3 +132,112 @@ def test_checkpoint_action_size_uses_model_contract_not_catalog_size(
     )
 
     assert executor._checkpoint_action_size(checkpoint) == 567
+
+
+def test_effective_search_config_replays_sealed_coherent_native_fields(
+    tmp_path,
+) -> None:
+    typed = tmp_path / "typed.json"
+    typed.write_text(
+        __import__("json").dumps(
+            {
+                "schema_version": 13,
+                "fields": {
+                    "n_full": 128,
+                    "n_fast": 16,
+                    "p_full": 0.25,
+                    "c_visit": 50.0,
+                    "c_scale": 0.1,
+                    "coherent_public_belief_search": True,
+                    "information_set_search": False,
+                    "belief_chance_spectra": False,
+                    "lazy_interior_chance": True,
+                    "symmetry_averaged_eval": True,
+                    "symmetry_averaged_eval_threshold": 20,
+                    "forced_root_target_mode": "trajectory_only",
+                    "native_mcts_hot_loop": True,
+                    "public_observation": True,
+                    "rust_featurize": True,
+                },
+            }
+        )
+    )
+    plan = {
+        "target_policy_target_identity": {
+            "target_information_regime": "public_belief_single_tree_v1",
+            "operator_contract_semantics": {
+                "native_mcts_hot_loop": True,
+                "coherent_public_belief_search": True,
+                "information_set_search": False,
+            },
+            "target_semantics": {"typed_generation_config_schema": 13},
+            "authority": {
+                "typed_generation_config": {
+                    "path": str(typed),
+                    "file_sha256": executor.alignment._file_sha256(typed),
+                }
+            },
+        }
+    }
+
+    config = executor._effective_search_config(plan, row_seed=73)
+
+    assert config.seed == 73
+    assert config.n_full == 128
+    assert config.coherent_public_belief_search is True
+    assert config.information_set_search is False
+    assert config.lazy_interior_chance is True
+    assert config.symmetry_averaged_eval_threshold == 20
+
+
+def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
+    identity = "sha256:" + "a" * 64
+    provenance = {
+        "target_policy_target_identity_sha256": "sha256:" + "b" * 64,
+        "target_reanalyzer_checkpoint_sha256": "sha256:" + "c" * 64,
+        "target_operator_contract_file_sha256": "sha256:" + "d" * 64,
+    }
+    record = {
+        "ready_ordinal": 0,
+        "selected_ordinal": 3,
+        "row_index": 17,
+        "game_seed": 19,
+        "decision_index": 23,
+        "chunk_index": 1,
+        "identity_sha256": identity,
+        "search_seed": executor._row_seed(identity),
+        "selected_action_policy_id": 11,
+        "root_value": 0.2,
+        "root_value_mask": True,
+        "simulations_used": 128,
+        "used_full_search": True,
+        "q_values_root_perspective": True,
+        **provenance,
+        "legal_action_ids": np.asarray([11, 13], dtype=np.int32),
+        "target_policy": np.asarray([0.7, 0.3], dtype=np.float32),
+        "target_policy_mask": np.asarray([True, True]),
+        "target_scores": np.asarray([0.4, np.nan], dtype=np.float32),
+        "target_scores_mask": np.asarray([True, False]),
+        "completed_q_values": np.asarray([0.4, 0.1], dtype=np.float32),
+        "completed_q_mask": np.asarray([True, True]),
+        "prior_policy": np.asarray([0.6, 0.4], dtype=np.float32),
+    }
+    arrays = executor._patch_arrays([record])
+    receipt = {
+        "patch_columns": sorted(arrays),
+        "counts": {"rows": 1, "legal_actions": 2},
+        "target_policy_target_identity_sha256": provenance[
+            "target_policy_target_identity_sha256"
+        ],
+        "target_reanalyzer_checkpoint": {
+            "sha256": provenance["target_reanalyzer_checkpoint_sha256"]
+        },
+        "target_operator_contract": {
+            "file_sha256": provenance["target_operator_contract_file_sha256"]
+        },
+    }
+
+    executor._verify_patch_arrays(arrays, receipt=receipt)
+    assert arrays["legal_action_offsets"].tolist() == [0, 2]
+    assert arrays["target_reliability_audited"].tolist() == [False]
+    assert arrays["target_reliability_confidence"].tolist() == [1.0]
