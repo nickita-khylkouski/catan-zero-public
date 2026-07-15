@@ -79,6 +79,11 @@ from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
+from catan_zero.rl.target_reliability import (
+    TARGET_RELIABILITY_COLUMNS,
+    TARGET_RELIABILITY_VERSION,
+    target_reliability_confidence,
+)
 from catan_zero.rl import optim_state as _checkout_optim_state
 from catan_zero.rl.flywheel.composite_contract import (
     FRESH_SOURCE_GAME_RATIOS,
@@ -1362,6 +1367,28 @@ def build_parser() -> argparse.ArgumentParser:
             "proportional to sqrt(the game's original positive policy mass). "
             "For composite-v2, mass is measured under its authenticated "
             "component->game->row sampler rather than uniform-row counting."
+        ),
+    )
+    parser.add_argument(
+        "--target-reliability-confidence-weighting",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Explicitly opt policy loss into the versioned duplicate-search "
+            "confidence column. Audited rows are multiplied by their stored "
+            "confidence (floored by --target-reliability-confidence-floor); "
+            "unaudited/version-0 rows remain neutral. The trainer refuses this "
+            "flag unless coherent-search version-1 evidence is present and "
+            "internally consistent. Default off is an exact objective no-op."
+        ),
+    )
+    parser.add_argument(
+        "--target-reliability-confidence-floor",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum policy-loss multiplier for audited rows when reliability "
+            "weighting is enabled. Ignored while weighting is off."
         ),
     )
     parser.add_argument(
@@ -8750,6 +8777,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--per-game-policy-surprise-weighting and the legacy "
             "--policy-surprise-weight sampler are mutually exclusive"
         )
+    if not math.isfinite(float(args.target_reliability_confidence_floor)) or not (
+        0.0 <= float(args.target_reliability_confidence_floor) <= 1.0
+    ):
+        raise SystemExit("--target-reliability-confidence-floor must be in [0, 1]")
     args.max_grad_norm = _validate_max_grad_norm(args.max_grad_norm)
     if float(args.belief_resource_loss_weight) < 0.0:
         raise SystemExit("--belief-resource-loss-weight must be >= 0")
@@ -10045,6 +10076,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             vps_to_win=args.vps_to_win,
             per_game_policy_weight=bool(args.per_game_policy_weight),
             per_game_policy_weight_mode=str(args.per_game_policy_weight_mode),
+            target_reliability_confidence_weighting=bool(
+                args.target_reliability_confidence_weighting
+            ),
+            target_reliability_confidence_floor=float(
+                args.target_reliability_confidence_floor
+            ),
         )
         policy_weights = _apply_authenticated_policy_distillation_scope(
             data, policy_weights
@@ -10171,6 +10208,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "vps_to_win": int(args.vps_to_win),
             "per_game_policy_weight": bool(args.per_game_policy_weight),
             "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
+            "target_reliability_confidence_weighting": bool(
+                args.target_reliability_confidence_weighting
+            ),
+            "target_reliability_confidence_floor": float(
+                args.target_reliability_confidence_floor
+            ),
             "forced_row_value_weight": float(args.forced_row_value_weight),
             "per_game_value_weight": bool(args.per_game_value_weight),
             "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
@@ -12479,6 +12522,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "forced_action_weight": args.forced_action_weight,
         "per_game_policy_weight": bool(args.per_game_policy_weight),
         "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
+        "target_reliability_confidence_weighting": bool(
+            args.target_reliability_confidence_weighting
+        ),
+        "target_reliability_confidence_floor": float(
+            args.target_reliability_confidence_floor
+        ),
         "forced_row_value_weight": args.forced_row_value_weight,
         "per_game_value_weight": bool(args.per_game_value_weight),
         "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
@@ -16772,6 +16821,7 @@ def load_teacher_data(
         "target_scores_mask",
         "target_score_source",
         "target_information_regime",
+        *TARGET_RELIABILITY_COLUMNS,
         "root_value",
         "root_value_mask",
         "afterstate_target",
@@ -17452,6 +17502,62 @@ def _normalize_teacher_shard(
         "value_weight_multiplier": _field_or_default(
             shard,
             "value_weight_multiplier",
+            np.ones(n, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+        "target_reliability_version": _field_or_default(
+            shard,
+            "target_reliability_version",
+            np.zeros(n, dtype=np.uint8),
+            path,
+            leading=n,
+        ).astype(np.uint8, copy=False),
+        "target_reliability_audited": _field_or_default(
+            shard,
+            "target_reliability_audited",
+            np.zeros(n, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "target_reliability_js_divergence": _field_or_default(
+            shard,
+            "target_reliability_js_divergence",
+            np.full(n, np.nan, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+        "target_reliability_policy_top1_agreement": _field_or_default(
+            shard,
+            "target_reliability_policy_top1_agreement",
+            np.zeros(n, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "target_reliability_q_top1_agreement": _field_or_default(
+            shard,
+            "target_reliability_q_top1_agreement",
+            np.zeros(n, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "target_reliability_q_margin_primary": _field_or_default(
+            shard,
+            "target_reliability_q_margin_primary",
+            np.full(n, np.nan, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+        "target_reliability_q_margin_duplicate": _field_or_default(
+            shard,
+            "target_reliability_q_margin_duplicate",
+            np.full(n, np.nan, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+        "target_reliability_confidence": _field_or_default(
+            shard,
+            "target_reliability_confidence",
             np.ones(n, dtype=np.float32),
             path,
             leading=n,
@@ -21315,6 +21421,127 @@ def _torch_ppo_masked_logits(logits, valid_actions, action_size):
     return _masked_logits(logits, valid_actions, action_size)
 
 
+def target_reliability_policy_factors(
+    data,
+    *,
+    enabled: bool,
+    confidence_floor: float,
+) -> np.ndarray:
+    """Return neutral or explicitly contracted per-row policy multipliers."""
+
+    n = int(len(data["action_taken"]))
+    factors = np.ones(n, dtype=np.float32)
+    if not bool(enabled):
+        return factors
+    floor = float(confidence_floor)
+    if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
+        raise SystemExit("--target-reliability-confidence-floor must be in [0, 1]")
+    missing = [name for name in TARGET_RELIABILITY_COLUMNS if name not in data]
+    if missing:
+        raise SystemExit(
+            "--target-reliability-confidence-weighting requires the complete "
+            f"typed reliability row contract; missing={missing}"
+        )
+
+    version = np.asarray(data["target_reliability_version"], dtype=np.uint8)
+    audited = np.asarray(data["target_reliability_audited"], dtype=np.bool_)
+    js = np.asarray(data["target_reliability_js_divergence"], dtype=np.float32)
+    policy_agreement = np.asarray(
+        data["target_reliability_policy_top1_agreement"], dtype=np.bool_
+    )
+    q_agreement = np.asarray(
+        data["target_reliability_q_top1_agreement"], dtype=np.bool_
+    )
+    primary_margin = np.asarray(
+        data["target_reliability_q_margin_primary"], dtype=np.float32
+    )
+    duplicate_margin = np.asarray(
+        data["target_reliability_q_margin_duplicate"], dtype=np.float32
+    )
+    confidence = np.asarray(
+        data["target_reliability_confidence"], dtype=np.float32
+    )
+    columns = {
+        "version": version,
+        "audited": audited,
+        "js": js,
+        "policy_agreement": policy_agreement,
+        "q_agreement": q_agreement,
+        "primary_margin": primary_margin,
+        "duplicate_margin": duplicate_margin,
+        "confidence": confidence,
+    }
+    malformed_shapes = {
+        name: value.shape for name, value in columns.items() if value.shape != (n,)
+    }
+    if malformed_shapes:
+        raise SystemExit(
+            "target reliability columns must be one-dimensional and row-aligned: "
+            f"{malformed_shapes}"
+        )
+    unsupported = set(map(int, np.unique(version))) - {
+        0,
+        TARGET_RELIABILITY_VERSION,
+    }
+    if unsupported:
+        raise SystemExit(
+            f"unsupported target reliability versions: {sorted(unsupported)}"
+        )
+    contracted = version == TARGET_RELIABILITY_VERSION
+    if not bool(np.any(contracted)):
+        raise SystemExit(
+            "--target-reliability-confidence-weighting found no version-1 rows"
+        )
+    if bool(np.any(audited & ~contracted)):
+        raise SystemExit("audited reliability rows must carry version 1")
+    if "target_information_regime" not in data:
+        raise SystemExit(
+            "target reliability weighting requires target_information_regime"
+        )
+    regimes = np.asarray(data["target_information_regime"]).astype(str)
+    if regimes.shape != (n,) or bool(
+        np.any(contracted & (regimes != TARGET_INFORMATION_REGIME_PUBLIC_COHERENT))
+    ):
+        raise SystemExit(
+            "version-1 target reliability rows require coherent public-belief targets"
+        )
+
+    observed = contracted & audited
+    if not bool(np.any(observed)):
+        raise SystemExit(
+            "--target-reliability-confidence-weighting found no audited version-1 rows"
+        )
+    if (
+        bool(np.any(~np.isfinite(js[observed])))
+        or bool(np.any((js[observed] < 0.0) | (js[observed] > math.log(2.0) + 1e-6)))
+        or bool(np.any(~np.isfinite(primary_margin[observed])))
+        or bool(np.any(~np.isfinite(duplicate_margin[observed])))
+        or bool(np.any(primary_margin[observed] < 0.0))
+        or bool(np.any(duplicate_margin[observed] < 0.0))
+        or bool(np.any(~np.isfinite(confidence[observed])))
+        or bool(np.any((confidence[observed] < 0.0) | (confidence[observed] > 1.0)))
+    ):
+        raise SystemExit("audited target reliability evidence is malformed")
+
+    expected = np.asarray(
+        [
+            target_reliability_confidence(
+                float(divergence), policy_top1_agreement=bool(agreement)
+            )
+            for divergence, agreement in zip(
+                js[observed], policy_agreement[observed], strict=True
+            )
+        ],
+        dtype=np.float32,
+    )
+    if not bool(np.allclose(confidence[observed], expected, rtol=0.0, atol=2e-6)):
+        raise SystemExit(
+            "stored target reliability confidence differs from its version-1 formula"
+        )
+    factors[observed] = np.maximum(floor, confidence[observed])
+    return factors
+
+
 def build_sample_weights(
     data: dict,
     *,
@@ -21327,6 +21554,8 @@ def build_sample_weights(
     vps_to_win: int,
     per_game_policy_weight: bool = False,
     per_game_policy_weight_mode: str = "equal",
+    target_reliability_confidence_weighting: bool = False,
+    target_reliability_confidence_floor: float = 0.25,
 ) -> np.ndarray:
     n = len(data["action_taken"])
     weights = np.ones(n, dtype=np.float32)
@@ -21395,6 +21624,13 @@ def build_sample_weights(
     mean = float(np.mean(weights)) if len(weights) else 1.0
     if "policy_weight_multiplier" in data:
         weights *= np.asarray(data["policy_weight_multiplier"], dtype=np.float32)
+        mean = float(np.mean(weights)) if len(weights) else 1.0
+    if bool(target_reliability_confidence_weighting):
+        weights *= target_reliability_policy_factors(
+            data,
+            enabled=True,
+            confidence_floor=float(target_reliability_confidence_floor),
+        )
         mean = float(np.mean(weights)) if len(weights) else 1.0
     if per_game_policy_weight and len(weights):
         # Only rows that already carry policy loss are redistributed. In

@@ -64,6 +64,8 @@
     "opponent_mix_manifest": null,
     "opponent_pool_manifest": null,
     "p_full": 0.25,
+    "target_reliability_audit_fraction": 0.0,
+    "target_reliability_audit_seed": 0,
     "prior_temperature": 1.0,
     "producer_checkpoint_sha256": "",
     "public_card_count_feature_schema": "public_card_state_v2",

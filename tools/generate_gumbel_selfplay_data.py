@@ -60,6 +60,7 @@ from catan_zero.rl.gumbel_self_play import (
     read_opponent_pool_manifest,
     run_worker_games,
 )
+from catan_zero.rl.target_reliability import target_reliability_contract
 from catan_zero.rl.flywheel.opponent_mix import (
     EXTERNAL_ENGINE_FRACTION_CAP,
     OpponentMixConfig,
@@ -290,9 +291,14 @@ def _validate_science_args(
         "late_temperature",
         "prior_temperature",
         "value_scale",
+        "target_reliability_audit_fraction",
     )
     for name in finite_names:
-        value = float(getattr(args, name))
+        value = float(
+            getattr(args, name, 0.0)
+            if name == "target_reliability_audit_fraction"
+            else getattr(args, name)
+        )
         if not math.isfinite(value):
             parser.error(f"--{name.replace('_', '-')} must be finite (got {value!r})")
     if not 0.0 <= float(args.p_full) <= 1.0:
@@ -329,6 +335,26 @@ def _validate_science_args(
         parser.error(
             "public-state search cannot be combined with --belief-chance-spectra"
         )
+    reliability_fraction = float(
+        getattr(args, "target_reliability_audit_fraction", 0.0)
+    )
+    if not 0.0 <= reliability_fraction <= 1.0:
+        parser.error("--target-reliability-audit-fraction must be in [0, 1]")
+    if reliability_fraction > 0.0:
+        if not coherent:
+            parser.error(
+                "--target-reliability-audit-fraction requires "
+                "--coherent-public-belief-search"
+            )
+        if int(args.n_full) != 128:
+            parser.error(
+                "--target-reliability-audit-fraction is contracted for --n-full 128"
+            )
+        if not bool(args.exact_budget_sh) or int(args.exact_budget_sh_min_n) > 128:
+            parser.error(
+                "--target-reliability-audit-fraction requires exact-budget n128 "
+                "(--exact-budget-sh with --exact-budget-sh-min-n <= 128)"
+            )
     n_full_wide = getattr(args, "n_full_wide", None)
     if information_set and n_full_wide is not None:
         base_budgets = information_set_particle_budgets(
@@ -946,6 +972,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--target-reliability-audit-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Deterministic fraction of recorded policy-active exact-n128 roots "
+            "that receive a second coherent search with independently separated "
+            "Gumbel/chance/belief RNG streams. The duplicate only writes typed "
+            "reliability evidence and never drives the live move. 0 disables all "
+            "extra search work and preserves the historical shard schema."
+        ),
+    )
+    parser.add_argument(
+        "--target-reliability-audit-seed",
+        type=int,
+        default=0,
+        help=(
+            "Domain seed for deterministic audit-root selection and duplicate "
+            "search streams; only used when the audit fraction is nonzero."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1404,6 +1451,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "shard_size": int(args.shard_size),
                 "format": args.format,
                 "preserve_search_evidence": bool(args.preserve_search_evidence),
+                "target_reliability_audit_fraction": float(
+                    args.target_reliability_audit_fraction
+                ),
+                "target_reliability_audit_seed": int(
+                    args.target_reliability_audit_seed
+                ),
                 "score_actions": bool(args.score_actions),
                 "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
                 "lazy_interior_chance": bool(args.lazy_interior_chance),
@@ -1980,6 +2033,12 @@ def _run_worker(
         record_automatic_transitions=bool(
             worker_args.get("record_automatic_transitions", True)
         ),
+        target_reliability_audit_fraction=float(
+            worker_args.get("target_reliability_audit_fraction", 0.0)
+        ),
+        target_reliability_audit_seed=int(
+            worker_args.get("target_reliability_audit_seed", 0)
+        ),
     )
     search_config = GumbelChanceMCTSConfig(
         colors=colors,
@@ -2239,6 +2298,12 @@ def _merge_worker_summaries(
         "forced_decisions_total": int(forced_decisions_total),
         "simulations_used_total": int(simulations_used_total),
         "target_information_regime": target_information_regime,
+        "target_reliability_contract": target_reliability_contract(
+            audit_fraction=float(
+                getattr(args, "target_reliability_audit_fraction", 0.0)
+            ),
+            audit_seed=int(getattr(args, "target_reliability_audit_seed", 0)),
+        ),
         AUX_SUBGOAL_TARGET_VERSION_KEY: AUX_SUBGOAL_TARGET_VERSION,
         "aux_subgoal_target_semantic": AUX_SUBGOAL_TARGET_SEMANTIC,
         "search_evidence_schema": (

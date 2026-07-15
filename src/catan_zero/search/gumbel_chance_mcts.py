@@ -55,6 +55,7 @@ from catan_zero.search.rust_mcts import (
     _terminal_or_zero,
 )
 from catan_zero.search.public_belief import PublicBelief
+from catan_zero.search.rng_streams import domain_separated_search_seed
 
 __all__ = [
     "GumbelChanceMCTSConfig",
@@ -768,6 +769,13 @@ class GumbelChanceMCTSConfig:
     # ``belief_chance_spectra`` flags so existing recipes remain unchanged.
     coherent_public_belief_search: bool = False
 
+    # Reliability probes can separate the three stochastic mechanisms that
+    # otherwise share ``self.rng``: root Gumbel/control draws, in-tree chance
+    # outcomes, and public-belief determinization/materialization.  Default
+    # False preserves the historical draw order exactly.  Production self-play
+    # remains on that path; independently replicated audit searches opt in.
+    rng_stream_separation: bool = False
+
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
@@ -1024,7 +1032,46 @@ class GumbelChanceMCTS:
             )
         self.evaluator = evaluator or HeuristicRustEvaluator()
         self.rng = random.Random(self.config.seed)
+        self._gumbel_rng = self.rng
+        self._chance_rng = self.rng
+        self._belief_rng = self.rng
+        self._belief_materialization_seed = int(self.config.seed)
+        self.seed_search_rngs(int(self.config.seed))
         _require_rust_module()
+
+    def seed_search_rngs(self, seed: int) -> None:
+        """Reset search RNG state under the configured stream contract.
+
+        The legacy path aliases every role to ``self.rng`` and therefore keeps
+        the historical sequence byte-for-byte.  The opt-in reliability path
+        creates three independent streams from a single root seed.
+        """
+
+        base_seed = int(seed)
+        self.rng.seed(base_seed)
+        if not bool(self.config.rng_stream_separation):
+            self._gumbel_rng = self.rng
+            self._chance_rng = self.rng
+            self._belief_rng = self.rng
+            # Historical public-belief materialization was keyed by the
+            # config seed, not the per-game reset applied to ``self.rng``.
+            # Keep that exact producer behavior on the default path; only the
+            # opt-in reliability replica binds materialization to its
+            # independently derived root seed.
+            self._belief_materialization_seed = int(self.config.seed)
+            return
+        self._gumbel_rng = random.Random(
+            domain_separated_search_seed(base_seed, "gumbel")
+        )
+        self._chance_rng = random.Random(
+            domain_separated_search_seed(base_seed, "chance")
+        )
+        self._belief_rng = random.Random(
+            domain_separated_search_seed(base_seed, "belief")
+        )
+        self._belief_materialization_seed = domain_separated_search_seed(
+            base_seed, "belief"
+        )
 
     def new_game(self, *, seed: int | None = None) -> Any:
         catanatron_rs = _require_rust_module()
@@ -1149,7 +1196,9 @@ class GumbelChanceMCTS:
         # root legal actions did not drift; all Python expansion starts only on
         # the sanitized result. Pre-draw before traversal so that result is a
         # pure function of public state + MCTS seed, never traversal call order.
-        sampled = game.determinize_for_player(root_color, self.rng.getrandbits(64))
+        sampled = game.determinize_for_player(
+            root_color, self._belief_rng.getrandbits(64)
+        )
         sampled_legal, _sampled_actions, _sampled_spectra = self._fetch_legal_actions(
             sampled
         )
@@ -1224,7 +1273,7 @@ class GumbelChanceMCTS:
                 self.config,
                 force_full=force_full,
                 wide_budget_root=wide_budget_root,
-                random_draw=self.rng.random,
+                random_draw=self._gumbel_rng.random,
             )
             n_full_effective = int(self.config.n_full)
             if wide_budget_root:
@@ -1253,7 +1302,9 @@ class GumbelChanceMCTS:
         # Pre-draw every determinization seed before any particle search.  This
         # makes the particle set independent of how many RNG draws a particular
         # sampled tree consumes.
-        particle_seeds = [self.rng.getrandbits(64) for _ in range(particle_count)]
+        particle_seeds = [
+            self._belief_rng.getrandbits(64) for _ in range(particle_count)
+        ]
         results: list[SearchResult] = []
         shared_root_evaluation: Any = _UNSET_ROOT_EVALUATION
         share_root_evaluation = self._can_share_information_set_root_evaluation(
@@ -1583,7 +1634,7 @@ class GumbelChanceMCTS:
             self.config,
             force_full=force_full,
             wide_budget_root=wide_budget_root,
-            random_draw=self.rng.random,
+            random_draw=self._gumbel_rng.random,
         )
         # ARM (placement budget asymmetry): a full search at a wide root spends
         # n_full_wide sims instead of n_full. Disabled (None) => n_full everywhere.
@@ -1852,7 +1903,7 @@ class GumbelChanceMCTS:
             # scheduling interleaves candidates instead of exhausting one
             # candidate before starting the next.
             candidate_rngs = {
-                action_id: random.Random(self.rng.getrandbits(64))
+                action_id: random.Random(self._chance_rng.getrandbits(64))
                 for action_id in top_k
             }
 
@@ -1937,17 +1988,17 @@ class GumbelChanceMCTS:
         candidate completes synchronously while other ready leaves still batch.
         """
         pending: list[_PendingSimulation] = []
-        outer_rng = self.rng
+        outer_rng = self._chance_rng
         try:
             for action_id in action_ids:
-                self.rng = candidate_rngs[action_id]
+                self._chance_rng = candidate_rngs[action_id]
                 selected = self._prepare_simulation(
                     root, depth=0, forced_action=action_id
                 )
                 if isinstance(selected, _PendingSimulation):
                     pending.append(selected)
         finally:
-            self.rng = outer_rng
+            self._chance_rng = outer_rng
 
         if pending:
             requests = [(item.node.game, item.legal_actions) for item in pending]
@@ -1973,7 +2024,7 @@ class GumbelChanceMCTS:
         return len(action_ids)
 
     def _sample_gumbel(self) -> float:
-        uniform = min(max(self.rng.random(), 1.0e-12), 1.0 - 1.0e-12)
+        uniform = min(max(self._gumbel_rng.random(), 1.0e-12), 1.0 - 1.0e-12)
         return -math.log(-math.log(uniform))
 
     # ------------------------------------------------------------------
@@ -2807,7 +2858,7 @@ class GumbelChanceMCTS:
                         action_json,
                         cached_spectrum=cached_spectrum,
                         perspective=node.root_color,
-                        materialization_seed=int(self.config.seed),
+                        materialization_seed=int(self._belief_materialization_seed),
                     )
             elif self.config.correct_rust_chance_spectra:
                 if is_move_robber_with_victim(action_json):
@@ -2945,7 +2996,7 @@ class GumbelChanceMCTS:
     def _sample_outcome(self, outcomes: tuple[tuple[int, float], ...]) -> int:
         if len(outcomes) == 1:
             return outcomes[0][0]
-        draw = self.rng.random()
+        draw = self._chance_rng.random()
         cumulative = 0.0
         for outcome_index, probability in outcomes:
             cumulative += probability
@@ -2956,7 +3007,7 @@ class GumbelChanceMCTS:
     def _sample_categorical(self, policy: dict[int, float]) -> int:
         if not policy:
             raise RuntimeError("cannot sample from an empty policy")
-        draw = self.rng.random()
+        draw = self._gumbel_rng.random()
         cumulative = 0.0
         items = list(policy.items())
         for action_id, probability in items:

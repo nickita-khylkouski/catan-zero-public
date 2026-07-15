@@ -350,6 +350,10 @@ class TrainConfig(PipelineConfig):
     forced_action_weight: float = 0.1
     per_game_policy_weight: bool = False
     per_game_policy_weight_mode: str = "equal"
+    # Explicit, versioned policy-target reliability objective.  The learner
+    # validates coherent v1 row evidence before this can affect a weight.
+    target_reliability_confidence_weighting: bool = False
+    target_reliability_confidence_floor: float = 0.25
     forced_row_value_weight: float = 1.0
     # Optional canonical ACTION_TYPE=multiplier map applied only to forced
     # rows, after ``forced_row_value_weight``.  The empty string preserves the
@@ -437,6 +441,10 @@ class GenerateConfig(PipelineConfig):
     n_full: int = 64
     n_fast: int = 16
     p_full: float = 0.25
+    # Diagnostic duplicate-search dose. Zero is a strict producer no-op; when
+    # enabled the generator admits only coherent exact-n128 roots.
+    target_reliability_audit_fraction: float = 0.0
+    target_reliability_audit_seed: int = 0
     n_full_wide: int | None = None
     n_full_wide_threshold: int | None = None
     wide_roots_always_full: bool = False
