@@ -419,6 +419,27 @@ def _row_seed_inventory(paths: Sequence[Path]) -> tuple[set[int], dict[int, int]
     return seeds, rows
 
 
+def _terminal_status_inventory(paths: Sequence[Path]) -> dict[int, tuple[bool, bool]]:
+    statuses: dict[int, tuple[bool, bool]] = {}
+    for path in paths:
+        with np.load(path, allow_pickle=False) as shard:
+            seeds = np.asarray(shard["game_seed"], dtype=np.int64).reshape(-1)
+            terminated = np.asarray(shard["terminated"], dtype=np.bool_).reshape(-1)
+            truncated = np.asarray(shard["truncated"], dtype=np.bool_).reshape(-1)
+        if not (seeds.shape == terminated.shape == truncated.shape):
+            raise RepairError(f"unaligned terminal status arrays in {path}")
+        for seed in np.unique(seeds):
+            mask = seeds == seed
+            realized = set(zip(terminated[mask].tolist(), truncated[mask].tolist()))
+            if len(realized) != 1:
+                raise RepairError(f"terminal status changes within seed {int(seed)}")
+            value = next(iter(realized))
+            prior = statuses.setdefault(int(seed), value)
+            if prior != value:
+                raise RepairError(f"terminal status changes across shards for {int(seed)}")
+    return statuses
+
+
 def _rewrite_without_seeds(source: Path, destination: Path, excluded: set[int]) -> int:
     """Rewrite one shard while preserving row-aligned and ragged search evidence."""
 
@@ -534,6 +555,8 @@ def finalize_repair(plan_path: Path) -> dict[str, Any]:
 
     original_seeds, original_rows = _row_seed_inventory(original_paths)
     replacement_seeds, replacement_rows = _row_seed_inventory(replacement_paths)
+    original_status = _terminal_status_inventory(original_paths)
+    replacement_status = _terminal_status_inventory(replacement_paths)
     expected_original = set(
         range(
             int(contract["execution"]["seed_start"]),
@@ -546,10 +569,16 @@ def finalize_repair(plan_path: Path) -> dict[str, Any]:
         raise RepairError("original physical shards do not cover the sealed seed interval")
     if replacement_seeds != replacements or any(replacement_rows.get(seed, 0) <= 0 for seed in replacements):
         raise RepairError("replacement physical shards do not cover exactly the planned seeds")
-    for path in replacement_paths:
-        with np.load(path, allow_pickle=False) as shard:
-            if bool(np.any(np.asarray(shard["truncated"], dtype=np.bool_))):
-                raise RepairError(f"replacement game truncated: {path}")
+    dirty_original = {seed for seed, value in original_status.items() if value != (True, False)}
+    if dirty_original != excluded or any(
+        original_status.get(seed) != (False, True) for seed in excluded
+    ):
+        raise RepairError(
+            "repair plan must name exactly all original truncated games; "
+            f"actual={sorted(dirty_original)} planned={sorted(excluded)}"
+        )
+    if any(replacement_status.get(seed) != (True, False) for seed in replacements):
+        raise RepairError("every replacement must be a clean terminal game")
 
     selected_seeds = sorted((expected_original - excluded) | replacements)
     if len(selected_seeds) != int(contract["execution"]["total_games"]):
@@ -621,6 +650,37 @@ def finalize_repair(plan_path: Path) -> dict[str, Any]:
     )
     if curated_seeds != set(selected_seeds):
         raise RepairError("curated repaired view seed set drift")
+    if any(
+        value != (True, False)
+        for value in _terminal_status_inventory(
+            [Path(str(item["path"])) for item in final_inventory]
+        ).values()
+    ):
+        raise RepairError("curated repaired view retains a non-complete game")
+    selected_manifest: dict[str, Any] = {
+        "schema_version": SELECTED_SCHEMA,
+        "classification": CLASSIFICATION,
+        "production_eligible": False,
+        "contract_sha256": contract["contract_sha256"],
+        "selection_rule": plan["selection_rule"],
+        "excluded_truncated_seeds": sorted(excluded),
+        "replacement_seeds": sorted(replacements),
+        "selected_game_count": len(selected_seeds),
+        "selected_game_seed_set_sha256": _seed_set_sha256(selected_seeds),
+        "game_seeds": selected_seeds,
+    }
+    selected_manifest_path = repair_root / "selected_games.json"
+    _write_signed(
+        selected_manifest_path, selected_manifest, field="manifest_sha256"
+    )
+    source_shard_inventory = [
+        {
+            "path": item["path"],
+            "size_bytes": item["size_bytes"],
+            "sha256": item["sha256"],
+        }
+        for item in final_inventory
+    ]
     payload: dict[str, Any] = {
         "schema_version": RECEIPT_SCHEMA,
         "classification": CLASSIFICATION,
@@ -649,12 +709,27 @@ def finalize_repair(plan_path: Path) -> dict[str, Any]:
         "replacement_seeds": sorted(replacements),
         "selected_game_count": len(selected_seeds),
         "selected_game_seed_set_sha256": _seed_set_sha256(selected_seeds),
+        "selected_game_manifest": {
+            "path": str(selected_manifest_path),
+            "file_sha256": _file_sha256(selected_manifest_path),
+            "manifest_sha256": _load(selected_manifest_path)["manifest_sha256"],
+        },
         "removed_truncated_rows": removed_rows,
         "selected_row_count": int(sum(curated_rows.values())),
         "repaired_shards_root": str(final_root),
         "selected_shards": final_inventory,
+        "source_shard_inventory": source_shard_inventory,
+        "source_shard_inventory_sha256": _digest(source_shard_inventory),
         "npz_inventory_sha256": _digest(final_inventory),
         "payload_inventory_sha256": _digest(final_inventory),
+        "totals": {
+            "games_completed": len(selected_seeds),
+            "games_failed": 0,
+            "games_truncated": 0,
+            "complete_trace_games": len(selected_seeds),
+            "incomplete_trace_games": 0,
+            "rows": int(sum(curated_rows.values())),
+        },
     }
     receipt = repair_root / "repair.receipt.json"
     _write_signed(receipt, payload, field="receipt_sha256")
@@ -683,6 +758,26 @@ def verify_repair_receipt(path: Path, *, contract_path: Path) -> dict[str, Any]:
         != contract["target_information_regime"]
     ):
         raise RepairError("repair receipt contract/plan/semantic binding drift")
+    selected_manifest_path = Path(
+        str(receipt.get("selected_game_manifest", {}).get("path", ""))
+    ).resolve(strict=True)
+    selected_manifest = _load_signed(
+        selected_manifest_path, schema=SELECTED_SCHEMA, field="manifest_sha256"
+    )
+    selected_seeds = list(map(int, selected_manifest.get("game_seeds", ())))
+    if (
+        _file_sha256(selected_manifest_path)
+        != receipt.get("selected_game_manifest", {}).get("file_sha256")
+        or selected_manifest.get("manifest_sha256")
+        != receipt.get("selected_game_manifest", {}).get("manifest_sha256")
+        or selected_manifest.get("contract_sha256") != contract["contract_sha256"]
+        or selected_manifest.get("selected_game_count") != 8192
+        or len(selected_seeds) != 8192
+        or len(set(selected_seeds)) != 8192
+        or _seed_set_sha256(selected_seeds)
+        != receipt.get("selected_game_seed_set_sha256")
+    ):
+        raise RepairError("repair selected-game manifest binding drift")
     inventory = receipt.get("selected_shards")
     if not isinstance(inventory, list) or not inventory:
         raise RepairError("repair receipt has no selected shard inventory")
@@ -709,6 +804,7 @@ def verify_repair_receipt(path: Path, *, contract_path: Path) -> dict[str, Any]:
         or _seed_set_sha256(sorted(seeds))
         != receipt.get("selected_game_seed_set_sha256")
         or int(sum(rows.values())) != receipt.get("selected_row_count")
+        or seeds != set(selected_seeds)
     ):
         raise RepairError("repair selected seed/row inventory drift")
     return receipt
