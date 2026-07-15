@@ -2886,6 +2886,14 @@ def bind_diagnostic_training_descriptor(
         # immutable production descriptor. Its canonical value is carried by
         # the derived descriptor and replayed by train_bc before optimizer use.
         derived_overrides[typed_forced_key] = effective_recipe[typed_forced_key]
+    for key, disabled_value in (
+        ("public_card_lr_mult", 1.0),
+        ("per_game_policy_surprise_weighting", False),
+    ):
+        if effective_recipe.get(key, disabled_value) != disabled_value:
+            # These are coupled to the receipt-backed public-card initializer
+            # and exact per-game sampler by the generic ablation authority.
+            derived_overrides[key] = effective_recipe[key]
     reporting_contract = learner_ablation.get("reporting_contract")
     lr_dose_campaign = bool(
         isinstance(reporting_contract, dict)

@@ -41,11 +41,13 @@ adaptive threshold (400 games total). The final artifact is
 `$OUT/teacher-operator-report.json`.
 
 The panel is not the first 64 eligible states. It deterministically walks real
-Rust-engine games and reserves at least 24 `play_turn` roots at legal width
-2-19, 16 at width 20-39, and 8 at width 40+. Only the remaining 16 roots are
-unconstrained. This prevents opening placements from masquerading as evidence
-about the adaptive high-choice operator. Collection is bounded at 512 real
-game trajectories and fails rather than relaxing a quota.
+Rust-engine games and reserves 24 `play_turn` roots at legal width 2-19, 16 at
+width 20-31, 8 at width 32-39, and 8 width-40+ opening placements. The final 8
+roots are unconstrained. A live census of thousands of real champion states
+found a maximum `play_turn` width of 39, so claiming a `play_turn` width-40
+quota would be impossible. Width-40 activation is therefore explicitly sealed
+and reported as opening-only for this distribution. Collection is bounded at
+512 real game trajectories and fails rather than relaxing a quota.
 
 ## Parallel fleet execution
 

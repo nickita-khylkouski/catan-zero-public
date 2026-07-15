@@ -39,6 +39,7 @@ from fixed_root_search_stability import (  # noqa: E402
     enforce_root_stratum_quotas,
     load_evaluator_spec,
     load_search_spec,
+    root_phase_width_summary,
     validate_search_comparison,
 )
 from factory_common import write_json  # noqa: E402
@@ -134,13 +135,15 @@ def load_campaign(path: str | Path) -> dict[str, Any]:
         quota_contract[key] = count
     required_quota_contract = {
         ("play_turn", 2, 19): 24,
-        ("play_turn", 20, 39): 16,
-        ("play_turn", 40, None): 8,
+        ("play_turn", 20, 31): 16,
+        ("play_turn", 32, 39): 8,
+        ("opening_placement", 40, None): 8,
     }
     if quota_contract != required_quota_contract:
         raise CampaignError(
             "fixed-root campaign must reserve 24 play-turn roots at width 2-19, "
-            "16 at width 20-39, and 8 at width 40+"
+            "16 at width 20-31, 8 at width 32-39, and 8 opening-placement "
+            "roots at width 40+"
         )
     if int(fixed_protocol.get("n_roots", -1)) != 64:
         raise CampaignError("stratified fixed-root campaign must use 64 roots")
@@ -498,9 +501,18 @@ def build_stage_commands(
 def _validate_h2h(
     report: dict[str, Any], *, threshold: int, pairs: int, checkpoint_sha: str
 ) -> None:
+    expected_checkpoint_sha = _normalize_sha256(checkpoint_sha)
+    for field in ("candidate_checkpoint_sha256", "baseline_checkpoint_sha256"):
+        try:
+            actual_checkpoint_sha = _normalize_sha256(str(report.get(field)))
+        except CampaignError as error:
+            raise CampaignError(f"paired-game report has invalid {field}") from error
+        if actual_checkpoint_sha != expected_checkpoint_sha:
+            raise CampaignError(
+                f"paired-game report {field} drift: "
+                f"{actual_checkpoint_sha} != {expected_checkpoint_sha}"
+            )
     exact = {
-        "candidate_checkpoint_sha256": checkpoint_sha.removeprefix("sha256:"),
-        "baseline_checkpoint_sha256": checkpoint_sha.removeprefix("sha256:"),
         "candidate_n_full": 128,
         "baseline_n_full": 128,
         "candidate_n_full_wide": 256,
@@ -616,6 +628,7 @@ def aggregate_campaign(loaded: dict[str, Any], *, out_dir: Path) -> dict[str, An
     checkpoint_sha: str | None = None
     root_panel_sha: str | None = None
     base_semantic_sha: str | None = None
+    root_distribution: dict[str, Any] | None = None
     results: dict[str, Any] = {}
 
     for arm_id, arm in loaded["arms"].items():
@@ -662,6 +675,28 @@ def aggregate_campaign(loaded: dict[str, Any], *, out_dir: Path) -> dict[str, An
             ) from error
         if root_panel.get("root_stratum_counts") != actual_stratum_counts:
             raise CampaignError(f"{fixed_path} root stratum counts are inconsistent")
+        observed_phase_widths = root_phase_width_summary(fixed.get("per_root", []))
+        if root_panel.get("root_phase_width_summary") != observed_phase_widths:
+            raise CampaignError(f"{fixed_path} phase/width summary is inconsistent")
+        width_40_phases = sorted(
+            {
+                str(root["phase"])
+                for root in fixed.get("per_root", [])
+                if int(root["legal_width"]) >= 40
+            }
+        )
+        this_root_distribution = {
+            "phase_width_summary": observed_phase_widths,
+            "width_40_activation_phases": width_40_phases,
+            "width_40_classification": (
+                "opening_only"
+                if width_40_phases == ["opening_placement"]
+                else "mixed_or_nonopening"
+            ),
+        }
+        root_distribution = root_distribution or this_root_distribution
+        if this_root_distribution != root_distribution:
+            raise CampaignError("fixed reports disagree on root phase/width support")
         this_checkpoint_sha = str(fixed.get("checkpoint", {}).get("sha256"))
         this_root_panel_sha = str(fixed.get("root_panel", {}).get("content_sha256"))
         checkpoint_sha = checkpoint_sha or this_checkpoint_sha
@@ -832,6 +867,7 @@ def aggregate_campaign(loaded: dict[str, Any], *, out_dir: Path) -> dict[str, An
             ],
         },
         "root_panel_content_sha256": root_panel_sha,
+        "root_distribution": root_distribution,
         "causal_contract": {
             "same_checkpoint_both_roles": True,
             "base_budget": 128,

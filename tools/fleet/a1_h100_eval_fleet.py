@@ -157,6 +157,14 @@ def _science_config_for_operator(operator_mode: str) -> dict[str, Any]:
     if operator_mode == LEGACY_PIMC_OPERATOR:
         return LEGACY_PIMC_SCIENCE_CONFIG
     if operator_mode == COHERENT_PUBLIC_OPERATOR:
+        if (
+            current_science.operator_selection_status()
+            != "adopted_teacher_campaign"
+        ):
+            raise FleetError(
+                "coherent-public evaluation is blocked until the causal teacher "
+                "campaign adopts one operator into the current science contract"
+            )
         return COHERENT_PUBLIC_SCIENCE_CONFIG
     raise FleetError(f"unknown evaluation operator mode {operator_mode!r}")
 
@@ -612,12 +620,29 @@ def _science_args(
             "--coherent-public-belief-search",
             "--forced-root-target-mode",
             str(science["forced_root_target_mode"]),
-            "--n-full-wide",
-            str(science["n_full_wide"]),
-            "--n-full-wide-threshold",
-            str(science["n_full_wide_threshold"]),
-            "--wide-roots-always-full",
         ]
+        shared_wide = science.get("n_full_wide")
+        shared_threshold = science.get("n_full_wide_threshold")
+        shared_always_full = bool(science.get("wide_roots_always_full", False))
+        if (shared_wide is None) != (shared_threshold is None):
+            raise FleetError(
+                "current coherent-public operator has an incomplete adaptive "
+                "search budget"
+            )
+        if shared_wide is None:
+            if shared_always_full:
+                raise FleetError(
+                    "current coherent-public base operator cannot force wide roots full"
+                )
+        else:
+            args += [
+                "--n-full-wide",
+                str(int(shared_wide)),
+                "--n-full-wide-threshold",
+                str(int(shared_threshold)),
+            ]
+            if shared_always_full:
+                args += ["--wide-roots-always-full"]
     else:
         args += ["--information-set-search"]
     if c_scale is not None:
@@ -1289,8 +1314,8 @@ def build_plan(
             for role in ("candidate", "champion")
         ):
             raise FleetError(
-                "coherent-public evaluation owns one shared exact adaptive-n256 "
-                "width-20 recipe; role-specific wide overrides are forbidden"
+                "coherent-public evaluation owns the current adopted shared "
+                "teacher operator; role-specific wide overrides are forbidden"
             )
     if candidate_sha == champion_sha:
         if role_search_config["candidate"] == role_search_config["champion"]:

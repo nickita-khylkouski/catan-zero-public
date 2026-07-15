@@ -166,12 +166,32 @@ def test_completed_campaign_report_requires_real_policy_and_module_dose(
                     "policy_active_fraction": 50_875 / 524_288,
                     "dimensions": dimensions,
                 },
-                "module_optimizer_observability": {
+                    "module_optimizer_observability": {
                     "schema_version": "module-optimizer-observability-v1",
                     "observed_steps": 8,
-                    "modules": {"blocks": {"mean_pre_clip_grad_norm": 1.0}},
-                },
-            }
+                        "modules": {"blocks": {"mean_pre_clip_grad_norm": 1.0}},
+                    },
+                    "per_game_policy_surprise_weighting": True,
+                    "public_card_lr_mult": 4.0,
+                    "forced_row_value_action_type_weights": {
+                        "END_TURN": 0.1,
+                        "ROLL": 0.25,
+                    },
+                    "policy_aux_sampling": {
+                        "schema_version": "train-policy-aux-sampling-v1",
+                        "enabled": True,
+                        "base_measure": (
+                            "authenticated_component_x_exact_per_game_policy_surprise"
+                        ),
+                        "exact_per_game_policy_surprise_weighting": True,
+                        "preconditioning_weights": {
+                            "content_sha256": "sha256:" + "1" * 64,
+                        },
+                        "final_sampling_weights": {
+                            "content_sha256": "sha256:" + "2" * 64,
+                        },
+                    },
+                }
         ),
         encoding="utf-8",
     )

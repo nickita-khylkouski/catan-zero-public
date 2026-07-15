@@ -3759,6 +3759,8 @@ def _preflight_flywheel_diagnostic_derivative(
             if base_overrides.get(key) != effective_overrides.get(key)
         }
         typed_key = "forced_row_value_action_type_weights"
+        public_card_key = "public_card_lr_mult"
+        surprise_key = "per_game_policy_surprise_weighting"
         lr_dose_keys = {
             "epochs",
             "max_steps",
@@ -3767,7 +3769,26 @@ def _preflight_flywheel_diagnostic_derivative(
             "lr_schedule",
         }
         optional_lr_dose_keys = {"policy_aux_active_batch_size"}
-        allowed_additions = {typed_key, *lr_dose_keys, *optional_lr_dose_keys}
+        science_profile_keys = {public_card_key, surprise_key}
+        allowed_additions = {
+            typed_key,
+            *science_profile_keys,
+            *lr_dose_keys,
+            *optional_lr_dose_keys,
+        }
+        science_profile_present = bool(changed & science_profile_keys)
+        science_profile_valid = True
+        if science_profile_present:
+            # Existing authenticated corpora may use the canonical card-only
+            # learner treatment, but not the meaningful-history architecture
+            # whose event payloads are absent from these shards.  Bind the
+            # three coupled learner semantics as one exact profile.
+            science_profile_valid = (
+                effective_overrides.get(public_card_key) == 4.0
+                and effective_overrides.get(surprise_key) is True
+                and effective_overrides.get(typed_key)
+                == "END_TURN=0.1,ROLL=0.25"
+            )
         lr_dose_present = bool(changed & (lr_dose_keys | optional_lr_dose_keys))
         lr_dose_valid = True
         if lr_dose_present:
@@ -3809,6 +3830,7 @@ def _preflight_flywheel_diagnostic_derivative(
             - {
                 "per_game_policy_weight",
                 typed_key,
+                *science_profile_keys,
                 *lr_dose_keys,
                 *optional_lr_dose_keys,
             }
@@ -3835,11 +3857,13 @@ def _preflight_flywheel_diagnostic_derivative(
                     )
                 )
             )
+            or not science_profile_valid
             or not lr_dose_valid
         ):
             raise SystemExit(
                 "flywheel diagnostic recipe may only disable per-game policy "
                 "weighting, add a canonical forced-action-type value map, "
+                "use the exact existing-corpus card/surprise learner profile, "
                 "and/or use the exact authenticated A/B/C/D LR-dose profile"
             )
         expected["learner_recipe_overrides"] = copy.deepcopy(effective_overrides)
@@ -4938,21 +4962,33 @@ def _validate_composite_learner_recipe_authorization(
     if not isinstance(expected, dict):
         raise SystemExit("memmap composite has no authenticated learner recipe override")
     converters = {
+        "advantage_policy_weighting": str,
+        "aux_subgoal_loss_weight": float,
+        "epochs": int,
+        "final_vp_loss_weight": float,
         "forced_action_weight": float,
         "forced_row_value_weight": float,
         "forced_row_value_action_type_weights": str,
         "hlgauss_scalar_aux_loss_weight": float,
         "loser_sample_weight": float,
         "lr": float,
+        "lr_schedule": str,
+        "lr_warmup_steps": int,
+        "max_steps": int,
+        "per_game_policy_surprise_weighting": bool,
         "per_game_policy_weight": bool,
         "per_game_policy_weight_mode": str,
         "per_game_value_weight": bool,
         "per_game_value_weight_mode": str,
+        "policy_aux_active_batch_size": int,
         "policy_loss_weight": float,
+        "policy_surprise_weight": float,
+        "public_card_lr_mult": float,
         "policy_kl_anchor_direction": str,
         "policy_kl_anchor_weight": float,
         "q_loss_weight": float,
         "soft_target_source": str,
+        "soft_target_min_legal_coverage": float,
         "soft_target_temperature": float,
         "soft_target_weight": float,
         "truncated_vp_margin_value_weight": float,
@@ -4962,7 +4998,17 @@ def _validate_composite_learner_recipe_authorization(
         "value_head_type": str,
         "value_hlgauss_sigma_ratio": float,
         "value_loss_weight": float,
+        "value_lr_mult": float,
+        "value_trunk_grad_scale": float,
+        "vp_margin_weight": float,
+        "winner_sample_weight": float,
     }
+    missing_converters = sorted(set(expected) - set(converters))
+    if missing_converters:
+        raise SystemExit(
+            "memmap composite authenticated learner recipe contains fields "
+            "without command converters: " + ", ".join(missing_converters)
+        )
     actual = {
         key: converters[key](getattr(args, key))
         for key in expected
@@ -10397,6 +10443,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         else:
             epoch_sample_weights = component_game_sampling
     policy_aux_sampling_weights = None
+    policy_aux_preconditioning_weights = None
+    policy_aux_base_measure = "off"
     policy_aux_phase_sampling_weights = getattr(
         data, "policy_aux_phase_sampling_weights", None
     )
@@ -10413,8 +10461,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(
                 "policy auxiliary sampling requires authenticated composite base weights"
             )
+        policy_aux_preconditioning_weights = (
+            epoch_sample_weights
+            if exact_per_game_surprise
+            else component_game_sampling
+        )
+        if policy_aux_preconditioning_weights is None:
+            raise SystemExit("policy auxiliary sampler lost its base measure")
+        policy_aux_base_measure = (
+            "authenticated_component_x_exact_per_game_policy_surprise"
+            if exact_per_game_surprise
+            else "authenticated_component"
+        )
         policy_aux_sampling_weights = _conditioned_policy_aux_sampling_weights(
-            component_game_sampling,
+            policy_aux_preconditioning_weights,
             np.asarray(policy_sample_weights)[train_indices],
         )
         if bool(getattr(data, "policy_aux_phase_scope_authenticated", False)):
@@ -10460,6 +10520,40 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "mode": "off",
                 "enabled": False,
             }
+        if policy_aux_sampling_weights is None:
+            policy_aux_sampling_report = {
+                "schema_version": "train-policy-aux-sampling-v1",
+                "enabled": False,
+                "base_measure": "off",
+            }
+        else:
+            assert policy_aux_preconditioning_weights is not None
+            policy_aux_sampling_report = {
+                "schema_version": "train-policy-aux-sampling-v1",
+                "enabled": True,
+                "base_measure": policy_aux_base_measure,
+                "exact_per_game_policy_surprise_weighting": (
+                    exact_per_game_surprise
+                ),
+                "conditioned_on_positive_policy_loss_weight": True,
+                "authenticated_phase_allocation_applied": bool(
+                    getattr(data, "policy_aux_phase_scope_authenticated", False)
+                ),
+                "preconditioning_weights": {
+                    "shape": list(policy_aux_preconditioning_weights.shape),
+                    "dtype": str(policy_aux_preconditioning_weights.dtype),
+                    "content_sha256": _array_content_sha256(
+                        policy_aux_preconditioning_weights
+                    ),
+                },
+                "final_sampling_weights": {
+                    "shape": list(policy_aux_sampling_weights.shape),
+                    "dtype": str(policy_aux_sampling_weights.dtype),
+                    "content_sha256": _array_content_sha256(
+                        policy_aux_sampling_weights
+                    ),
+                },
+            }
         value_sample_weight_report["by_game"] = per_game_weight_quality(
             data, value_sample_weights
         )
@@ -10479,6 +10573,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         value_sample_weight_report = {}
         policy_surprise_weight_report = {}
         policy_surprise_sampling_report = {}
+        policy_aux_sampling_report = {}
     _rank0_print(
         json.dumps(
             {
@@ -10495,6 +10590,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_surprise_cap": float(args.policy_surprise_cap),
                 "policy_surprise_weight_quality": policy_surprise_weight_report,
                 "policy_surprise_sampling": policy_surprise_sampling_report,
+                "policy_aux_sampling": policy_aux_sampling_report,
             },
             sort_keys=True,
         ),
@@ -12360,6 +12456,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "policy_surprise_weight_quality": policy_surprise_weight_report,
         "policy_surprise_sampling": policy_surprise_sampling_report,
+        "policy_aux_sampling": policy_aux_sampling_report,
         "first_batch_profile": first_batch_profile,
         # Backward-compatible headline: ``parameter_count`` remains the TOTAL
         # serialized/checkpoint-compatible architecture size. Never interpret

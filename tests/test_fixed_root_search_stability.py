@@ -30,6 +30,7 @@ from fixed_root_search_stability import (  # type: ignore  # noqa: E402
     build_seed_manifests,
     content_sha256,
     jensen_shannon_divergence,
+    json_artifact_content_sha256,
     load_evaluator_spec,
     load_search_spec,
     seal_root_panel,
@@ -404,6 +405,13 @@ def test_locked_input_rehash_detects_mid_run_drift(tmp_path):
     path.write_text("after", encoding="utf-8")
     with pytest.raises(RuntimeError, match="changed during run"):
         verify_locked_files(locked)
+
+
+def test_json_artifact_digest_survives_integer_action_key_round_trip():
+    value = {"policy": {2: 0.25, 10: 0.75}}
+    loaded = json.loads(json.dumps(value))
+    assert content_sha256(value) != content_sha256(loaded)
+    assert json_artifact_content_sha256(value) == content_sha256(loaded)
 
 
 def test_panel_hash_checkpoint_and_evaluator_provenance_fail_closed():

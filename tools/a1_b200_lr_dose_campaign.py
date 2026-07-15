@@ -32,6 +32,14 @@ WORLD_SIZE = 8
 GLOBAL_BATCH_SIZE = 4096
 SHORT_STEPS = 128
 LONG_STEPS = 256
+SCIENCE_CONTRACT_RELATIVE = Path(
+    "configs/operations/a1-next-wave-coherent-public-v1/science.contract.json"
+)
+EXISTING_CORPUS_SCIENCE_FIELDS = {
+    "forced_row_value_action_type_weights": "END_TURN=0.1,ROLL=0.25",
+    "per_game_policy_surprise_weighting": True,
+    "public_card_lr_mult": 4.0,
+}
 ARMS: dict[str, dict[str, int | float]] = {
     "A": {"lr": 3e-5, "lr_warmup_steps": 100},
     "B": {"lr": 3e-5, "lr_warmup_steps": 16},
@@ -124,10 +132,15 @@ def _arm_overrides(
     *,
     max_steps: int,
     policy_aux_active_batch_size: int,
+    science_recipe: Mapping[str, Any],
 ) -> dict[str, object]:
     if arm not in ARMS:
         raise CampaignError(f"unknown campaign arm {arm!r}")
     recipe: dict[str, object] = {
+        **{
+            key: science_recipe[key]
+            for key in EXISTING_CORPUS_SCIENCE_FIELDS
+        },
         "epochs": 1,
         "max_steps": int(max_steps),
         "lr": float(ARMS[arm]["lr"]),
@@ -156,6 +169,9 @@ def _one_dose_invocation(
         policy_aux_active_batch_size=int(
             campaign["policy_active_dose"]["policy_aux_active_batch_size"]
         ),
+        science_recipe=campaign["canonical_learner_projection"][
+            "training_recipe"
+        ],
     )
     ablation_id = f"lr-dose-{arm.lower()}-steps{max_steps}"
     return [
@@ -210,6 +226,27 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         args.architecture_upgrade_receipt, where="architecture upgrade receipt"
     )
     canary = _regular_file(args.ddp_canary_receipt, where="8xB200 DDP canary")
+    science_contract = _regular_file(
+        repo / SCIENCE_CONTRACT_RELATIVE, where="canonical science contract"
+    )
+    try:
+        science_payload = json.loads(science_contract.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CampaignError(f"cannot load canonical science contract: {error}") from error
+    learner = science_payload.get("learner") if isinstance(science_payload, dict) else None
+    science_recipe = learner.get("training_recipe") if isinstance(learner, dict) else None
+    if not isinstance(science_recipe, dict):
+        raise CampaignError("canonical science contract has no learner training recipe")
+    science_drift = {
+        key: {"expected": expected, "actual": science_recipe.get(key)}
+        for key, expected in EXISTING_CORPUS_SCIENCE_FIELDS.items()
+        if science_recipe.get(key) != expected
+    }
+    if science_drift:
+        raise CampaignError(
+            "canonical existing-corpus learner semantics drifted: "
+            + json.dumps(science_drift, sort_keys=True)
+        )
     expected_parent = _normalize_sha256(
         args.expected_parent_sha256, where="expected diagnostic parent"
     )
@@ -295,6 +332,15 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "estimated_total_policy_active_rows": estimated_total_active,
             "selection_uses_realized_report_not_estimate": True,
         },
+        "canonical_learner_projection": {
+            "science_contract": str(science_contract),
+            "science_contract_file_sha256": _file_sha256(science_contract),
+            "contract_id": science_payload.get("contract_id"),
+            "training_recipe": dict(science_recipe),
+            "training_recipe_sha256": _value_sha256(science_recipe),
+            "existing_corpus_architecture_scope": "authenticated_card_only_v1",
+            "meaningful_history_v2_enabled": False,
+        },
         "arms": {
             arm: {
                 **values,
@@ -303,6 +349,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
                     arm,
                     max_steps=SHORT_STEPS,
                     policy_aux_active_batch_size=aux_local,
+                    science_recipe=science_recipe,
                 ),
                 "output_subdir": f"arms/{arm}",
             }
@@ -341,6 +388,8 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "architecture_upgrade_receipt_sha256": _file_sha256(upgrade),
             "ddp_canary_receipt": str(canary),
             "ddp_canary_receipt_sha256": _file_sha256(canary),
+            "science_contract": str(science_contract),
+            "science_contract_file_sha256": _file_sha256(science_contract),
             "reviewed_code_tree_sha256": reviewed_code,
             "reviewed_lock_file_sha256": lock_sha,
         },
@@ -363,6 +412,7 @@ def _verify_input_bytes(campaign: Mapping[str, Any]) -> None:
         ("composite_build_receipt", "composite_build_receipt_sha256"),
         ("architecture_upgrade_receipt", "architecture_upgrade_receipt_sha256"),
         ("ddp_canary_receipt", "ddp_canary_receipt_sha256"),
+        ("science_contract", "science_contract_file_sha256"),
     ):
         actual = _file_sha256(_regular_file(Path(inputs[path_key]), where=path_key))
         if actual != inputs[digest_key]:
@@ -469,6 +519,41 @@ def _verify_rendered_arm(
         raise CampaignError("rendered within-trajectory checkpoint curve drift")
     if _option(command, "--train-diagnostics-every-batches") != "16":
         raise CampaignError("rendered module-attribution cadence drift")
+    learner_ablation = plan.get("learner_ablation")
+    actual_recipe = (
+        learner_ablation.get("effective_recipe")
+        if isinstance(learner_ablation, dict)
+        else None
+    )
+    canonical = campaign["canonical_learner_projection"]["training_recipe"]
+    if not isinstance(actual_recipe, dict) or not isinstance(canonical, dict):
+        raise CampaignError("one-dose plan lost its effective canonical recipe")
+    expected_recipe = dict(canonical)
+    expected_recipe.update(
+        {
+            "batch_size": GLOBAL_BATCH_SIZE // WORLD_SIZE,
+            "world_size": WORLD_SIZE,
+            "global_batch_size": GLOBAL_BATCH_SIZE,
+            "epochs": 1,
+            "max_steps": int(max_steps),
+            "lr": float(ARMS[arm]["lr"]),
+            "lr_warmup_steps": int(ARMS[arm]["lr_warmup_steps"]),
+        }
+    )
+    recipe_drift = {
+        key: {"expected": expected, "actual": actual_recipe.get(key)}
+        for key, expected in expected_recipe.items()
+        if actual_recipe.get(key) != expected
+    }
+    if recipe_drift:
+        raise CampaignError(
+            "rendered learner differs from the canonical science projection: "
+            + json.dumps(recipe_drift, sort_keys=True)
+        )
+    if int(actual_recipe.get("policy_aux_active_batch_size", -1)) != int(
+        campaign["policy_active_dose"]["policy_aux_active_batch_size"]
+    ):
+        raise CampaignError("rendered learner lost matched policy-active dose")
 
 
 def _verify_training_report(
@@ -521,6 +606,28 @@ def _verify_training_report(
         or not module_report["modules"]
     ):
         raise CampaignError("training report lost module gradient/update attribution")
+    aux_sampler = report.get("policy_aux_sampling")
+    if (
+        not isinstance(aux_sampler, dict)
+        or aux_sampler.get("schema_version") != "train-policy-aux-sampling-v1"
+        or aux_sampler.get("enabled") is not True
+        or aux_sampler.get("base_measure")
+        != "authenticated_component_x_exact_per_game_policy_surprise"
+        or aux_sampler.get("exact_per_game_policy_surprise_weighting") is not True
+        or report.get("per_game_policy_surprise_weighting") is not True
+        or float(report.get("public_card_lr_mult", -1.0)) != 4.0
+        or report.get("forced_row_value_action_type_weights")
+        != {"END_TURN": 0.1, "ROLL": 0.25}
+    ):
+        raise CampaignError("training report lost canonical learner/sampler semantics")
+    for field in ("preconditioning_weights", "final_sampling_weights"):
+        record = aux_sampler.get(field)
+        if not isinstance(record, dict):
+            raise CampaignError(f"policy auxiliary sampler lost {field} attribution")
+        _normalize_sha256(
+            str(record.get("content_sha256")),
+            where=f"policy auxiliary {field} content digest",
+        )
     return {
         "arm": arm,
         "max_steps": max_steps,
@@ -531,6 +638,58 @@ def _verify_training_report(
         "policy_active_fraction": float(strata["policy_active_fraction"]),
         "policy_aux_row_draws": int(strata["policy_aux_row_draws"]),
         "module_observed_steps": expected_observations,
+    }
+
+
+def _verify_completed_arm_receipt(
+    campaign: Mapping[str, Any], *, arm: str
+) -> dict[str, Any]:
+    """Require terminal success and authenticate the artifacts before advancing."""
+
+    arm_root = Path(campaign["output_root"]) / "arms" / arm
+    receipt_path = _regular_file(
+        arm_root / "one-dose.receipt.json", where=f"completed arm {arm} receipt"
+    )
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CampaignError(f"cannot read completed arm {arm} receipt: {error}") from error
+    outputs = payload.get("outputs") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("status") != "complete"
+        or payload.get("returncode") != 0
+        or not isinstance(outputs, dict)
+    ):
+        raise CampaignError(f"arm {arm} has no terminal successful receipt")
+    artifacts: dict[str, dict[str, str]] = {}
+    for name, expected_path in (
+        ("checkpoint", arm_root / "candidate.pt"),
+        ("report", arm_root / "train.report.json"),
+    ):
+        path_value = outputs.get(name)
+        digest_value = outputs.get(f"{name}_sha256")
+        if str(path_value) != str(expected_path):
+            raise CampaignError(f"arm {arm} {name} escaped its planned namespace")
+        artifact = _regular_file(expected_path, where=f"completed arm {arm} {name}")
+        expected_digest = _normalize_sha256(
+            str(digest_value), where=f"arm {arm} {name} receipt digest"
+        )
+        actual_digest = _file_sha256(artifact)
+        if actual_digest != expected_digest:
+            raise CampaignError(
+                f"arm {arm} {name} bytes differ from its terminal receipt"
+            )
+        artifacts[name] = {
+            "path": str(artifact),
+            "sha256": actual_digest,
+        }
+    return {
+        "receipt": str(receipt_path),
+        "receipt_file_sha256": _file_sha256(receipt_path),
+        "status": "complete",
+        "returncode": 0,
+        "artifacts": artifacts,
     }
 
 
@@ -550,13 +709,19 @@ def _execute_invocation(
     result = subprocess.run([*invocation, "--go"], check=False)
     if result.returncode != 0:
         raise CampaignError(f"one-dose arm {arm} exited {result.returncode}")
+    receipt_summary = _verify_completed_arm_receipt(campaign, arm=arm)
     report_summary = _verify_training_report(
         campaign,
         arm=arm,
         max_steps=max_steps,
         one_dose_plan=plan,
     )
-    return {"mode": "go", "returncode": 0, **report_summary}
+    return {
+        "mode": "go",
+        "returncode": 0,
+        "receipt": receipt_summary,
+        **report_summary,
+    }
 
 
 def _parse_bindings(values: Sequence[str], *, label: str) -> dict[str, Path]:
@@ -580,18 +745,14 @@ def _select(args: argparse.Namespace) -> dict[str, Any]:
     evaluations = _parse_bindings(args.evaluation, label="evaluation")
     receipt_records: dict[str, Any] = {}
     for arm, path in receipts.items():
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict) or payload.get("returncode") != 0:
-            raise CampaignError(f"arm {arm} has no successful one-dose receipt")
         expected = str(Path(campaign["output_root"]) / "arms" / arm / "one-dose.receipt.json")
         if str(path) != expected:
             raise CampaignError(f"arm {arm} receipt is outside its planned namespace")
+        completed = _verify_completed_arm_receipt(campaign, arm=arm)
         receipt_records[arm] = {
             "path": str(path),
-            "file_sha256": _file_sha256(path),
-            "checkpoint_sha256": (payload.get("outputs") or {}).get(
-                "checkpoint_sha256"
-            ),
+            "file_sha256": completed["receipt_file_sha256"],
+            "checkpoint_sha256": completed["artifacts"]["checkpoint"]["sha256"],
         }
     selection: dict[str, Any] = {
         "schema_version": SELECTION_SCHEMA,
@@ -606,6 +767,9 @@ def _select(args: argparse.Namespace) -> dict[str, Any]:
             policy_aux_active_batch_size=int(
                 campaign["policy_active_dose"]["policy_aux_active_batch_size"]
             ),
+            science_recipe=campaign["canonical_learner_projection"][
+                "training_recipe"
+            ],
         ),
         "winner_replays_from_original_parent": True,
         "candidate_chaining": False,
@@ -644,6 +808,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--campaign", required=True, type=Path)
     run.add_argument("--arm", required=True, choices=tuple(ARMS))
     run.add_argument("--go", action="store_true")
+
+    sequence = sub.add_parser(
+        "run-sequence",
+        help="run independent arms serially, advancing only after authenticated success",
+    )
+    sequence.add_argument("--campaign", required=True, type=Path)
+    sequence.add_argument(
+        "--arms",
+        default="C,D,A,B",
+        help="unique comma-separated arm order (default: C,D,A,B)",
+    )
+    sequence.add_argument("--go", action="store_true")
 
     select = sub.add_parser("select", help="bind evaluated winner after all arms")
     select.add_argument("--campaign", required=True, type=Path)
@@ -685,6 +861,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 go=bool(args.go),
             )
             print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        if args.command == "run-sequence":
+            campaign = _load_bound_json(args.campaign, schema=SCHEMA)
+            arms = [value.strip() for value in args.arms.split(",") if value.strip()]
+            if (
+                not arms
+                or any(arm not in ARMS for arm in arms)
+                or len(set(arms)) != len(arms)
+            ):
+                raise CampaignError("--arms must contain unique A, B, C, and/or D values")
+            results: list[dict[str, Any]] = []
+            for arm in arms:
+                invocation = _one_dose_invocation(
+                    campaign,
+                    arm=arm,
+                    max_steps=SHORT_STEPS,
+                    suffix=f"arms/{arm}",
+                )
+                result = _execute_invocation(
+                    campaign,
+                    arm=arm,
+                    max_steps=SHORT_STEPS,
+                    invocation=invocation,
+                    go=bool(args.go),
+                )
+                results.append(result)
+            print(
+                json.dumps(
+                    {"mode": "go" if args.go else "dry-run", "arms": arms, "results": results},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
         if args.command == "select":
             selection = _select(args)
