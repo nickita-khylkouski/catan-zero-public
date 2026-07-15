@@ -3451,23 +3451,67 @@ def belief_buy_development_card_outcomes(
         ]
         if not card_names:
             return []
-        child_games = list(
-            public_materializer(
-                raw_json,
-                str(perspective) if perspective is not None else actor_color,
-                card_names,
-                int(materialization_seed),
+        observer = str(perspective) if perspective is not None else actor_color
+        try:
+            child_games = list(
+                public_materializer(
+                    raw_json,
+                    observer,
+                    card_names,
+                    int(materialization_seed),
+                )
             )
-        )
+        except RuntimeError as error:
+            # Late-game public conservation can assign positive naive deck mass
+            # to a card that has no non-terminal hidden allocation: reserving it
+            # for the deck would force an opponent over the victory threshold.
+            # The native batch API correctly fails closed in that case. Probe
+            # each public-supported card with the same domain-separated seed,
+            # discard only that impossible support, and condition the remaining
+            # probabilities instead of aborting the entire paired evaluation.
+            if "no non-terminal hidden allocation can condition on requested dev draw" not in str(
+                error
+            ):
+                raise
+            supported_names: list[str] = []
+            child_games = []
+            for card in card_names:
+                try:
+                    children = list(
+                        public_materializer(
+                            raw_json,
+                            observer,
+                            [card],
+                            int(materialization_seed),
+                        )
+                    )
+                except RuntimeError as card_error:
+                    if (
+                        "no non-terminal hidden allocation can condition on requested dev draw"
+                        in str(card_error)
+                    ):
+                        continue
+                    raise
+                if len(children) != 1:
+                    raise RuntimeError(
+                        "public-belief dev materializer returned "
+                        f"{len(children)} children for one card"
+                    )
+                supported_names.append(card)
+                child_games.append(children[0])
+            card_names = supported_names
         if len(child_games) != len(card_names):
             raise RuntimeError(
                 "public-belief dev materializer returned "
                 f"{len(child_games)} children for {len(card_names)} cards"
             )
+        supported_mass = sum(float(public_probabilities[card]) for card in card_names)
+        if supported_mass <= 0.0:
+            return []
         return [
             (
                 DEVELOPMENT_CARDS.index(card),
-                float(public_probabilities[card]),
+                float(public_probabilities[card]) / supported_mass,
                 child_game,
             )
             for card, child_game in zip(card_names, child_games)

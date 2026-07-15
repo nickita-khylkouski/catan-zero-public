@@ -185,6 +185,38 @@ def test_dev_draw_materializes_every_public_supported_card_without_native_deck()
     ]
 
 
+def test_dev_draw_conditions_away_public_card_with_no_nonterminal_allocation() -> None:
+    class ConstrainedMaterializer(_PublicDevMaterializerGame):
+        def apply_public_belief_development_draws(
+            self,
+            action_json: str,
+            observer: str,
+            card_names: list[str],
+            seed: int,
+        ) -> list[tuple[str, str]]:
+            self.calls.append((action_json, observer, tuple(card_names), seed))
+            if "VICTORY_POINT" in card_names:
+                raise RuntimeError(
+                    "no non-terminal hidden allocation can condition on requested dev draw"
+                )
+            return [("public-child", card) for card in card_names]
+
+    game = ConstrainedMaterializer(_snapshot())
+    action = ["BLUE", "BUY_DEVELOPMENT_CARD", None]
+    outcomes = belief_buy_development_card_outcomes(
+        game,
+        action,
+        perspective="BLUE",
+        materialization_seed=73,
+    )
+
+    assert [DEVELOPMENT_CARDS[index] for index, _weight, _child in outcomes] == [
+        card for card in DEVELOPMENT_CARDS if card != "VICTORY_POINT"
+    ]
+    assert math.isclose(sum(weight for _index, weight, _child in outcomes), 1.0)
+    assert all(child[1] != "VICTORY_POINT" for _index, _weight, child in outcomes)
+
+
 def test_keyed_sampling_is_reproducible_order_independent_and_truth_invariant() -> None:
     first = PublicBelief.from_snapshot(_snapshot(), perspective="BLUE")
     second = PublicBelief.from_snapshot(_permuted_opponent_truth(), perspective="BLUE")
@@ -259,6 +291,10 @@ class _ParticleSearch(GumbelChanceMCTS):
         import random
 
         self.rng = random.Random(config.seed)
+        self._gumbel_rng = self.rng
+        self._chance_rng = self.rng
+        self._belief_rng = self.rng
+        self._belief_materialization_seed = int(config.seed)
 
     def _fetch_legal_actions(self, game):
         return (1, 2), {}, {}
