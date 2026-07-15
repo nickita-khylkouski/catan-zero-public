@@ -27,8 +27,9 @@ from typing import Any, Mapping, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+for import_root in (REPO_ROOT / "tools", REPO_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from tools import a1_target_eligibility_inventory as identity  # noqa: E402
 from tools.prelaunch_guard import parse_seed_ledger  # noqa: E402
