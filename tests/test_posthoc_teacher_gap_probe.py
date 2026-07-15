@@ -45,6 +45,8 @@ def _report() -> dict:
         "vp_margin_weight": 0.4,
         "vps_to_win": 10,
         "mask_hidden_info": True,
+        "public_award_feature_contract": "authoritative_v1",
+        "public_card_count_features": False,
         "batch_size": 512,
         "soft_target_temperature": 0.7,
         "soft_target_weight": 0.9,
@@ -76,6 +78,8 @@ def _report() -> dict:
 class _FakeTrainBC:
     def __init__(self):
         self.calls = {}
+        self.corpus_loads = 0
+        self.evaluate_calls = []
         self._MASK_HIDDEN_INFO_PLAYER_TOKENS = False
 
     def _training_data_fingerprint(self, path, data_format):
@@ -92,6 +96,7 @@ class _FakeTrainBC:
         }
 
     def load_teacher_data_memmap(self, path):
+        self.corpus_loads += 1
         self.calls["corpus"] = path
         return {"action_taken": np.arange(5), "game_seed": np.arange(5)}
 
@@ -109,6 +114,7 @@ class _FakeTrainBC:
 
     def evaluate_bc_batches(self, *args, **kwargs):
         self.calls["evaluate"] = (args, kwargs)
+        self.evaluate_calls.append((args, kwargs))
         return {
             "samples": 2,
             "active_policy_teacher_gap_rows": 2,
@@ -192,6 +198,211 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert result["legacy_prior_kl"]["prior_kl_ratio"] == 0.75
     assert result["inputs"]["checkpoint"]["sha256"].startswith("sha256:")
     assert result["inputs"]["training_report"]["sha256"].startswith("sha256:")
+
+
+def test_functional_drift_uses_only_active_multi_action_rows():
+    torch = pytest.importorskip("torch")
+    module = _module()
+    parent_logits = torch.tensor(
+        [[2.0, 0.0, 1_000.0], [1.0, 1_000.0, 1_000.0], [0.0, 1.0, 2.0]]
+    )
+    candidate_logits = torch.tensor(
+        [[0.0, 2.0, -1_000.0], [2.0, -1_000.0, -1_000.0], [2.0, 1.0, 0.0]]
+    )
+    parts = module._functional_drift_batch(  # noqa: SLF001
+        parent_logits,
+        candidate_logits,
+        torch.tensor([0.1, 9.0, 9.0]),
+        torch.tensor([0.4, -9.0, -9.0]),
+        legal_mask=torch.tensor(
+            [[True, True, False], [True, False, False], [True, True, True]]
+        ),
+        eligible=torch.tensor([True, True, False]),
+    )
+
+    assert parts["rows"] == 1.0
+    assert parts["top1_flip_sum"] == 1.0
+    assert parts["value_abs_delta_sum"] == pytest.approx(0.3)
+    assert parts["value_squared_delta_sum"] == pytest.approx(0.09)
+    assert np.isfinite(parts["parent_candidate_kl_sum"])
+    assert np.isfinite(parts["candidate_parent_kl_sum"])
+
+
+def test_single_checkpoint_parent_mode_keeps_v1_payload_compatibility(
+    tmp_path, monkeypatch
+):
+    module = _module()
+    report_path, candidate, data, manifest = _paths(tmp_path, _report())
+    parent = tmp_path / "legacy-parent.pt"
+    parent.write_bytes(b"parent")
+    fake = _FakeTrainBC()
+    monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
+    monkeypatch.setattr(
+        module,
+        "_load_policy",
+        lambda *_: SimpleNamespace(
+            config=SimpleNamespace(public_card_count_features=False),
+            public_award_feature_contract="authoritative_v1",
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_functional_drift",
+        lambda **_: {"schema_version": "checkpoint-functional-dose-fingerprint-v1"},
+    )
+
+    result = module.run_probe(
+        report_path=report_path,
+        checkpoint_path=candidate,
+        parent_checkpoint_path=parent,
+        data_path=data,
+        validation_manifest_path=manifest,
+        device="cpu",
+    )
+
+    assert result["schema_version"] == "posthoc-checkpoint-teacher-gap/v1"
+    assert set(result["inputs"]["parent_checkpoint"]) == {"path", "sha256"}
+    assert result["functional_dose_fingerprint"]["schema_version"] == (
+        "checkpoint-functional-dose-fingerprint-v1"
+    )
+
+
+def test_batch_loads_corpus_and_parent_once_and_compares_all_candidates(
+    tmp_path, monkeypatch
+):
+    module = _module()
+    report = _report()
+    report_path, _checkpoint, data, manifest = _paths(tmp_path, report)
+    parent = tmp_path / "parent.pt"
+    step64 = tmp_path / "step64.pt"
+    step128 = tmp_path / "step128.pt"
+    parent.write_bytes(b"parent")
+    step64.write_bytes(b"step64")
+    step128.write_bytes(b"step128")
+    report["init_checkpoint_sha256"] = module._sha256(parent)  # noqa: SLF001
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    fake = _FakeTrainBC()
+    loaded = []
+
+    def load_policy(_arch, path, _device):
+        loaded.append(path.name)
+        return SimpleNamespace(
+            name=path.stem,
+            config=SimpleNamespace(public_card_count_features=False),
+            public_award_feature_contract="authoritative_v1",
+        )
+
+    def functional_drift(**kwargs):
+        dose = 0.128 if kwargs["candidate_policy"].name == "step128" else 0.064
+        return {
+            "schema_version": "checkpoint-functional-dose-fingerprint-v1",
+            "eligible_rows": 2,
+            "surface": "validation_policy_active_multi_action_rows",
+            "kl_parent_candidate_mean": dose,
+            "kl_candidate_parent_mean": dose + 0.01,
+            "top1_flip_rate": dose + 0.02,
+            "parent_policy_entropy_mean": 1.0,
+            "candidate_policy_entropy_mean": 1.0 - dose,
+            "policy_entropy_delta": -dose,
+            "value_mean_absolute_delta": dose + 0.03,
+            "value_root_mean_square_delta": dose + 0.04,
+        }
+
+    monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
+    monkeypatch.setattr(module, "_load_policy", load_policy)
+    monkeypatch.setattr(module, "_functional_drift", functional_drift)
+    result = module.run_batch_probe(
+        report_path=report_path,
+        checkpoints=[("step64", step64), ("step128", step128)],
+        parent_checkpoint_path=parent,
+        data_path=data,
+        validation_manifest_path=manifest,
+        device="cpu",
+        batch_size=64,
+    )
+
+    assert fake.corpus_loads == 1
+    assert len(fake.evaluate_calls) == 2
+    assert loaded == ["parent.pt", "step64.pt", "step128.pt"]
+    assert result["checkpoint_order"] == ["step64", "step128"]
+    assert (
+        result["shared_holdout"]["parent_checkpoint"]["sha256"]
+        == report["init_checkpoint_sha256"]
+    )
+    assert result["shared_holdout"]["input_surface"] == {
+        "public_award_feature_contract": "authoritative_v1",
+        "public_card_count_features": False,
+        "mask_hidden_info": True,
+    }
+    assert result["shared_holdout"]["comparison_identity_sha256"].startswith("sha256:")
+    assert set(result["checkpoints"]) == {"step64", "step128"}
+    assert (
+        result["checkpoints"]["step64"]["parent_checkpoint_sha256"]
+        == report["init_checkpoint_sha256"]
+    )
+    delta = result["dose_comparison"]["metrics"]["kl_parent_candidate_mean"]
+    assert delta["step128_minus_step64"] == pytest.approx(0.064)
+
+
+def test_batch_refuses_parent_not_bound_by_training_report(tmp_path, monkeypatch):
+    module = _module()
+    report_path, _checkpoint, data, manifest = _paths(tmp_path, _report())
+    parent = tmp_path / "parent.pt"
+    candidate = tmp_path / "candidate2.pt"
+    parent.write_bytes(b"parent")
+    candidate.write_bytes(b"candidate")
+    monkeypatch.setattr(module, "_load_train_bc", lambda: _FakeTrainBC())
+
+    with pytest.raises(SystemExit, match="report-authenticated learner parent"):
+        module.run_batch_probe(
+            report_path=report_path,
+            checkpoints=[("candidate", candidate)],
+            parent_checkpoint_path=parent,
+            data_path=data,
+            validation_manifest_path=manifest,
+            device="cpu",
+        )
+
+
+def test_batch_refuses_parent_candidate_public_card_schema_mismatch(
+    tmp_path, monkeypatch
+):
+    module = _module()
+    report = _report()
+    # Older authenticated reports may not have recorded this field.  Even for
+    # them, a functional-dose comparison must never cross input schemas.
+    report.pop("public_card_count_features")
+    report_path, _checkpoint, data, manifest = _paths(tmp_path, report)
+    parent = tmp_path / "parent.pt"
+    candidate = tmp_path / "candidate2.pt"
+    parent.write_bytes(b"parent")
+    candidate.write_bytes(b"candidate")
+    report["init_checkpoint_sha256"] = module._sha256(parent)  # noqa: SLF001
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    fake = _FakeTrainBC()
+
+    def load_policy(_arch, path, _device):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                public_card_count_features=path.name == "candidate2.pt"
+            ),
+            public_award_feature_contract="authoritative_v1",
+        )
+
+    monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
+    monkeypatch.setattr(module, "_load_policy", load_policy)
+
+    with pytest.raises(SystemExit, match="different public input schemas"):
+        module.run_batch_probe(
+            report_path=report_path,
+            checkpoints=[("candidate", candidate)],
+            parent_checkpoint_path=parent,
+            data_path=data,
+            validation_manifest_path=manifest,
+            device="cpu",
+        )
 
 
 def test_refuses_wrong_memmap_fingerprint(tmp_path, monkeypatch):
