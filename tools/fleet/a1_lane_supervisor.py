@@ -46,6 +46,11 @@ FORBIDDEN_ADAPTIVE_ARGV = (
     "--raw-policy-above-width",
 )
 ARM_N_FULL = {"n128": 128, "n256": 256}
+COHERENT_ROW_SURFACE_FIELDS = (
+    "meaningful_public_history",
+    "event_history_limit",
+    "record_automatic_transitions",
+)
 
 
 class SupervisorError(RuntimeError):
@@ -587,6 +592,73 @@ def _validate_completed(command: dict[str, Any]) -> dict[str, Any]:
         != int(argv[argv.index("--base-seed") + 1])
     ):
         raise SupervisorError(f"completed job {command['job_id']} manifest is not exact/clean")
+    config_fields = (
+        command.get("config_provenance", {}).get("config", {}).get("fields", {})
+    )
+    if not isinstance(config_fields, dict) or any(
+        field not in config_fields for field in COHERENT_ROW_SURFACE_FIELDS
+    ):
+        raise SupervisorError(
+            f"completed job {command['job_id']} lacks sealed coherent row-surface fields"
+        )
+    try:
+        requested_workers = int(argv[argv.index("--workers") + 1])
+    except (ValueError, IndexError) as error:
+        raise SupervisorError(
+            f"completed job {command['job_id']} has invalid worker topology"
+        ) from error
+    worker_summaries = manifest.get("worker_summaries")
+    expected_workers = min(requested_workers, attempts)
+    if (
+        not isinstance(worker_summaries, list)
+        or len(worker_summaries) != expected_workers
+    ):
+        raise SupervisorError(
+            f"completed job {command['job_id']} worker manifest count drifted"
+        )
+    output_root = out_dir.resolve(strict=True)
+    seen_worker_manifests: set[Path] = set()
+    expected_row_surface = {
+        field: config_fields[field] for field in COHERENT_ROW_SURFACE_FIELDS
+    }
+    for raw_worker_manifest in worker_summaries:
+        if not isinstance(raw_worker_manifest, str) or not raw_worker_manifest:
+            raise SupervisorError(
+                f"completed job {command['job_id']} has malformed worker manifest reference"
+            )
+        candidate = Path(raw_worker_manifest)
+        if not candidate.is_absolute():
+            candidate = out_dir / candidate
+        try:
+            worker_manifest_path = candidate.resolve(strict=True)
+        except OSError as error:
+            raise SupervisorError(
+                f"completed job {command['job_id']} cannot resolve worker manifest "
+                f"{raw_worker_manifest!r}"
+            ) from error
+        if (
+            not worker_manifest_path.is_relative_to(output_root)
+            or not worker_manifest_path.is_file()
+            or worker_manifest_path in seen_worker_manifests
+        ):
+            raise SupervisorError(
+                f"completed job {command['job_id']} has unsafe/duplicate worker manifest "
+                f"{raw_worker_manifest!r}"
+            )
+        seen_worker_manifests.add(worker_manifest_path)
+        worker_manifest = _load(worker_manifest_path)
+        selfplay_config = worker_manifest.get("selfplay_config")
+        if not isinstance(selfplay_config, dict):
+            raise SupervisorError(
+                f"completed job {command['job_id']} worker manifest lacks selfplay_config"
+            )
+        for field, expected in expected_row_surface.items():
+            actual = selfplay_config.get(field)
+            if type(actual) is not type(expected) or actual != expected:
+                raise SupervisorError(
+                    f"completed job {command['job_id']} worker selfplay_config.{field}="
+                    f"{actual!r}, expected {expected!r}"
+                )
     registry_path = Path(
         command["environment"][CONFIG_REGISTRY_ENVIRONMENT_VARIABLE]
     )

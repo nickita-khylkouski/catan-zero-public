@@ -1016,8 +1016,31 @@ def _complete_output(command: dict) -> None:
     attempts = int(argv[argv.index("--games") + 1])
     base_seed = int(argv[argv.index("--base-seed") + 1])
     provenance = command["config_provenance"]
+    worker_count = min(int(argv[argv.index("--workers") + 1]), attempts)
+    row_surface = {
+        field: provenance["config"]["fields"][field]
+        for field in supervisor.COHERENT_ROW_SURFACE_FIELDS
+    }
+    worker_summaries = []
+    for worker_index in range(worker_count):
+        worker_manifest = out / f"worker_{worker_index:03d}" / "manifest.json"
+        worker_manifest.parent.mkdir(parents=True, exist_ok=True)
+        worker_manifest.write_text(
+            json.dumps({"selfplay_config": row_surface}), encoding="utf-8"
+        )
+        worker_summaries.append(str(worker_manifest))
     (out / "manifest.json").write_text(
-        json.dumps({"games_requested": attempts, "games_completed": attempts, "games_failed": 0, "errors": [], "base_seed": base_seed, "config_hash": provenance["config_hash"]}),
+        json.dumps(
+            {
+                "games_requested": attempts,
+                "games_completed": attempts,
+                "games_failed": 0,
+                "errors": [],
+                "base_seed": base_seed,
+                "config_hash": provenance["config_hash"],
+                "worker_summaries": worker_summaries,
+            }
+        ),
         encoding="utf-8",
     )
     registry = Path(command["environment"]["CATAN_ZERO_CONFIG_REGISTRY"])
@@ -1064,6 +1087,54 @@ def test_completed_receipts_are_validated_and_never_rerun(
         Path(lane["receipt_dir"], f"{command['job_id']}.json").write_text(json.dumps(receipt), encoding="utf-8")
     monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_a, **_k: pytest.fail("completed job reran"))
     assert supervisor.run_lane(lane_path)["status"] == "complete"
+
+
+def test_completed_job_rejects_pre_fix_worker_row_surface_defaults(
+    tmp_path: Path,
+) -> None:
+    _lock_path, _render_path, _lock, rendered = _fixture(tmp_path)
+    command = rendered["commands"][0]
+    fields = command["config_provenance"]["config"]["fields"]
+    fields.update(
+        {
+            "meaningful_public_history": True,
+            "event_history_limit": 32,
+            "record_automatic_transitions": False,
+        }
+    )
+    full_hash = supervisor._digest(command["config_provenance"]["config"])
+    command["config_provenance"]["full_config_hash"] = full_hash
+    command["config_provenance"]["config_hash"] = (
+        "sha256:" + full_hash.removeprefix("sha256:")[:16]
+    )
+    unhashed = {
+        key: value
+        for key, value in command["config_provenance"].items()
+        if key != "provenance_sha256"
+    }
+    command["config_provenance"]["provenance_sha256"] = supervisor._digest(unhashed)
+    _complete_output(command)
+    manifest = json.loads(
+        Path(
+            command["argv"][command["argv"].index("--out-dir") + 1], "manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    first_worker = Path(manifest["worker_summaries"][0])
+    worker = json.loads(first_worker.read_text(encoding="utf-8"))
+    worker["selfplay_config"].update(
+        {
+            "meaningful_public_history": False,
+            "event_history_limit": 64,
+            "record_automatic_transitions": True,
+        }
+    )
+    first_worker.write_text(json.dumps(worker), encoding="utf-8")
+
+    with pytest.raises(
+        supervisor.SupervisorError,
+        match="worker selfplay_config.meaningful_public_history=False, expected True",
+    ):
+        supervisor._validate_completed(command)
 
 
 @pytest.mark.parametrize("wait_for_lane_lock", [False, True])
