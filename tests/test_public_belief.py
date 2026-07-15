@@ -196,7 +196,10 @@ def test_dev_draw_conditions_away_public_card_with_no_nonterminal_allocation() -
         ) -> list[tuple[str, str]]:
             self.calls.append((action_json, observer, tuple(card_names), seed))
             if "VICTORY_POINT" in card_names:
-                raise RuntimeError(
+                # The PyO3 binding maps native engine errors through ``py_err``
+                # to ValueError.  Exercise the real extension boundary here;
+                # pure-Python test doubles may still raise RuntimeError.
+                raise ValueError(
                     "no non-terminal hidden allocation can condition on requested dev draw"
                 )
             return [("public-child", card) for card in card_names]

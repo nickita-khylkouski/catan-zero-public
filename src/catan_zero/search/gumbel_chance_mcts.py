@@ -3461,7 +3461,7 @@ def belief_buy_development_card_outcomes(
                     int(materialization_seed),
                 )
             )
-        except RuntimeError as error:
+        except (RuntimeError, ValueError) as error:
             # Late-game public conservation can assign positive naive deck mass
             # to a card that has no non-terminal hidden allocation: reserving it
             # for the deck would force an opponent over the victory threshold.
@@ -3485,7 +3485,7 @@ def belief_buy_development_card_outcomes(
                             int(materialization_seed),
                         )
                     )
-                except RuntimeError as card_error:
+                except (RuntimeError, ValueError) as card_error:
                     if (
                         "no non-terminal hidden allocation can condition on requested dev draw"
                         in str(card_error)
