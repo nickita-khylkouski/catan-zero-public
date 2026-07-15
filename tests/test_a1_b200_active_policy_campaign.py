@@ -18,6 +18,13 @@ def _write_signed(path: Path, value: dict, field: str) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def _checkpoint_dose_stub(step: int) -> dict:
+    return {
+        "schema_version": train_bc.CHECKPOINT_DOSE_TELEMETRY_SCHEMA,
+        "optimizer_step": step,
+    }
+
+
 def test_completion_fallback_replays_native_runtime_from_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -258,11 +265,15 @@ def test_selection_maximizes_teacher_gap_inside_explicit_drift_budgets(
                     "layer_drift": {
                         "trunk_relative_l2": min(kls[arm], 0.029) * step / 128,
                     },
+                    "dose_telemetry": _checkpoint_dose_stub(step),
                 }
             )
         dose_telemetry = {
-            "schema_version": "a1-active-policy-dose-telemetry-v1",
+            "schema_version": campaign.DOSE_TELEMETRY_SCHEMA,
             "active_rows": {"policy_aux": 1},
+            "checkpoint_trajectory": [
+                row["dose_telemetry"] for row in rows
+            ],
         }
         dose_telemetry["dose_telemetry_sha256"] = campaign._value_sha256(
             dose_telemetry
@@ -348,11 +359,15 @@ def test_selection_can_choose_an_earlier_checkpoint_over_overdosed_terminals(
                         "teacher_gap_closure": peak,
                     },
                     "layer_drift": {"trunk_relative_l2": drift},
+                    "dose_telemetry": _checkpoint_dose_stub(step),
                 }
             )
         dose_telemetry = {
-            "schema_version": "a1-active-policy-dose-telemetry-v1",
+            "schema_version": campaign.DOSE_TELEMETRY_SCHEMA,
             "active_rows": {"policy_aux": 1},
+            "checkpoint_trajectory": [
+                row["dose_telemetry"] for row in rows
+            ],
         }
         dose_telemetry["dose_telemetry_sha256"] = campaign._value_sha256(
             dose_telemetry
@@ -454,6 +469,7 @@ def test_arm_dose_telemetry_seals_exposure_grad_clip_and_update_rms() -> None:
         "policy_aux_effective_weight_sum": 30_000.0,
         "policy_total_effective_weight_sum": 50_000.0,
         "value_active_rows": 500_000,
+        "policy_kl_anchor_eligible_rows": 0,
         "metrics": [
             {
                 "loss_denominators": {
@@ -491,6 +507,7 @@ def test_arm_dose_telemetry_seals_exposure_grad_clip_and_update_rms() -> None:
             "observations": [
                 {
                     "available": True,
+                    "optimizer_step": 64,
                     "scope": "rank_local_microbatch",
                     "policy_trunk_grad_norm": 0.7,
                     "policy_base_trunk_grad_norm": 0.5,
@@ -499,9 +516,16 @@ def test_arm_dose_telemetry_seals_exposure_grad_clip_and_update_rms() -> None:
                     "policy_aux_to_base_grad_norm_ratio": 0.4,
                     "trunk_gradient_cosine": -0.1,
                     "policy_base_aux_gradient_cosine": 0.2,
+                    "objective_trunk_grad_l2": {
+                        "policy": 0.7,
+                        "policy_base": 0.5,
+                        "active_policy": 0.2,
+                        "value": 0.3,
+                    },
                 },
                 {
                     "available": True,
+                    "optimizer_step": 128,
                     "scope": "rank_local_microbatch",
                     "policy_trunk_grad_norm": 0.8,
                     "policy_base_trunk_grad_norm": 0.5,
@@ -510,9 +534,68 @@ def test_arm_dose_telemetry_seals_exposure_grad_clip_and_update_rms() -> None:
                     "policy_aux_to_base_grad_norm_ratio": 0.6,
                     "trunk_gradient_cosine": -0.2,
                     "policy_base_aux_gradient_cosine": 0.1,
+                    "objective_trunk_grad_l2": {
+                        "policy": 0.8,
+                        "policy_base": 0.5,
+                        "active_policy": 0.3,
+                        "value": 0.25,
+                    },
                 },
             ],
         },
+    }
+    gradient_rows = report["objective_gradient_interference"]["observations"]
+    checkpoint_doses = []
+    for step in campaign.CHECKPOINT_STEPS:
+        fraction = step / campaign.MAX_STEPS
+        base_rows = int(10_000 * fraction)
+        aux_rows = int(expected_aux * fraction)
+        clipped = step // 32
+        checkpoint_doses.append(
+            {
+                "schema_version": train_bc.CHECKPOINT_DOSE_TELEMETRY_SCHEMA,
+                "optimizer_step": step,
+                "training_row_draws": {},
+                "active_rows": {
+                    "policy_base": base_rows,
+                    "policy_aux": aux_rows,
+                    "policy_total": base_rows + aux_rows,
+                    "value": int(500_000 * fraction),
+                    "policy_kl_anchor": 0,
+                },
+                "policy_effective_weight_sums": {
+                    "base": 20_000.0 * fraction,
+                    "aux": 30_000.0 * fraction,
+                    "total": 50_000.0 * fraction,
+                },
+                "objective_effective_weight_sums": {
+                    "policy_loss": 50_000.0 * fraction,
+                    "policy_base_loss": 20_000.0 * fraction,
+                    "active_policy_loss": 30_000.0 * fraction,
+                    "value_loss": 400_000.0 * fraction,
+                    "final_vp_loss": 0.0,
+                },
+                "optimizer": {
+                    "observed_steps": step,
+                    "clipped_steps": clipped,
+                    "clipped_fraction": clipped / step,
+                },
+                "shared_trunk_objective_gradients": {
+                    "observations": [
+                        row for row in gradient_rows if row["optimizer_step"] <= step
+                    ]
+                },
+                "module_optimizer_observability": None,
+                "feature_path_gradients": {
+                    "public_card": {"status": "observed"},
+                    "meaningful_history": {"status": "observed"},
+                },
+            }
+        )
+    report["checkpoint_dose_trajectory"] = {
+        "schema_version": train_bc.CHECKPOINT_DOSE_TRAJECTORY_SCHEMA,
+        "checkpoint_steps": list(campaign.CHECKPOINT_STEPS),
+        "checkpoints": checkpoint_doses,
     }
 
     telemetry = campaign._arm_dose_telemetry(  # noqa: SLF001
