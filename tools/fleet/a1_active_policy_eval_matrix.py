@@ -3,7 +3,7 @@
 
 The coherent-n128 learner campaign names P10/P25/P50/P100 rather than the
 historical A/B/C/D LR arms.  This controller authenticates the campaign's
-in-budget arms, maps every eligible terminal checkpoint against both exact f7
+in-budget arms, maps each arm's selected in-budget dose checkpoint against exact f7
 and the registry v5 incumbent, and partitions the full 64-H100 fleet across
 those matchups.  Every matchup reuses one common paired-seed cohort and swaps
 colors inside each pair.
@@ -38,7 +38,7 @@ from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.fleet import a1_h100_eval_fleet as fleet  # noqa: E402
 
 
-SCHEMA = "a1-active-policy-eval-matrix-v1"
+SCHEMA = "a1-active-policy-eval-matrix-v2"
 OPERATION_SCHEMA = "a1-active-policy-eval-matrix-operation-v1"
 COMPLETION_SCHEMA = "a1-active-policy-eval-matrix-completion-v1"
 BASELINES = ("f7", "v5")
@@ -97,6 +97,9 @@ def _load_selection(
         raise MatrixError(str(error)) from error
     campaign_ref = selection.get("campaign")
     eligible = selection.get("eligible_arms")
+    rows = selection.get("arm_fingerprints")
+    winner = selection.get("winner")
+    winner_candidate = selection.get("winner_candidate")
     if (
         not isinstance(campaign_ref, dict)
         or Path(str(campaign_ref.get("path", ""))).resolve(strict=True)
@@ -109,7 +112,23 @@ def _load_selection(
         or any(arm not in active_campaign.ARMS for arm in eligible)
         or selection.get("candidate_chaining") is not False
         or selection.get("playing_strength_evaluation_still_required") is not True
-        or selection.get("winner") not in eligible
+        or winner not in eligible
+        or not isinstance(rows, dict)
+        or set(rows) != set(active_campaign.ARMS)
+        or any(
+            not isinstance(rows.get(arm), dict)
+            or rows[arm].get("has_eligible_checkpoint") is not True
+            or not isinstance(rows[arm].get("selected_checkpoint"), dict)
+            for arm in eligible
+        )
+        or not isinstance(winner_candidate, dict)
+        or winner_candidate != rows[winner].get("selected_checkpoint")
+        or selection.get("winner_step") != winner_candidate.get("step")
+        or selection.get("winner_checkpoint")
+        != {
+            "path": winner_candidate.get("checkpoint"),
+            "sha256": winner_candidate.get("checkpoint_sha256"),
+        }
     ):
         raise MatrixError("active-policy selection lost campaign/eligibility semantics")
     canonical_order = [arm for arm in active_campaign.ARMS if arm in set(eligible)]
@@ -159,6 +178,7 @@ def _load_authority(
         raise MatrixError("registry generator_champion is not the authoritative v5")
 
     completed: dict[str, dict[str, Any]] = {}
+    candidates: dict[str, dict[str, Any]] = {}
     fingerprints: dict[str, dict[str, Any]] = {}
     selection_rows = selection.get("arm_fingerprints")
     if not isinstance(selection_rows, dict):
@@ -175,29 +195,68 @@ def _load_authority(
         except (active_campaign.CampaignError, KeyError) as error:
             raise MatrixError(f"eligible arm {arm} authority refused: {error}") from error
         checkpoints = fingerprint.get("checkpoints")
-        terminal = checkpoints[-1] if isinstance(checkpoints, list) and checkpoints else None
         selection_row = selection_rows[arm]
+        selected = selection_row.get("selected_checkpoint")
+        selected_fingerprint = None
+        if isinstance(checkpoints, list) and isinstance(selected, dict):
+            selected_fingerprint = next(
+                (
+                    checkpoint
+                    for checkpoint in checkpoints
+                    if checkpoint.get("step") == selected.get("step")
+                ),
+                None,
+            )
         if (
-            selection_row.get("within_drift_budgets") is not True
-            or selection_row.get("positive_terminal_teacher_gap_closure") is not True
+            selection_row.get("has_eligible_checkpoint") is not True
             or selection_row.get("file_sha256") != _file_sha256(fingerprint_path)
             or selection_row.get("fingerprint_sha256")
             != fingerprint.get("fingerprint_sha256")
             or fingerprint.get("arm") != arm
-            or not isinstance(terminal, dict)
-            or terminal.get("step") != active_campaign.MAX_STEPS
-            or Path(str(terminal.get("checkpoint", ""))).resolve(strict=True)
-            != Path(arm_completed["checkpoint"]).resolve(strict=True)
-            or terminal.get("checkpoint_sha256")
-            != arm_completed["checkpoint_sha256"]
+            or not isinstance(selected, dict)
+            or selected.get("eligible") is not True
+            or selected.get("within_drift_budgets") is not True
+            or selected.get("positive_teacher_gap_closure") is not True
+            or not isinstance(selected_fingerprint, dict)
+            or Path(str(selected.get("checkpoint", ""))).resolve(strict=True)
+            != Path(str(selected_fingerprint.get("checkpoint", ""))).resolve(
+                strict=True
+            )
+            or selected.get("checkpoint_sha256")
+            != selected_fingerprint.get("checkpoint_sha256")
+            or selected.get("checkpoint_sha256")
+            != _file_sha256(Path(str(selected["checkpoint"])).resolve(strict=True))
+            or float(selected.get("parent_kl", -1.0))
+            != float(selected_fingerprint.get("functional", {}).get("parent_kl", -2.0))
+            or float(selected.get("teacher_gap_closure", -1.0))
+            != float(
+                selected_fingerprint.get("functional", {}).get(
+                    "teacher_gap_closure", -2.0
+                )
+            )
+            or float(selected.get("trunk_relative_l2", -1.0))
+            != float(
+                selected_fingerprint.get("layer_drift", {}).get(
+                    "trunk_relative_l2", -2.0
+                )
+            )
         ):
-            raise MatrixError(f"eligible arm {arm} terminal checkpoint drifted")
+            raise MatrixError(f"eligible arm {arm} selected checkpoint drifted")
         completed[arm] = arm_completed
+        candidates[arm] = {
+            "arm": arm,
+            "step": int(selected["step"]),
+            "checkpoint": str(Path(str(selected["checkpoint"])).resolve(strict=True)),
+            "checkpoint_sha256": str(selected["checkpoint_sha256"]),
+            "parent_kl": float(selected["parent_kl"]),
+            "trunk_relative_l2": float(selected["trunk_relative_l2"]),
+            "teacher_gap_closure": float(selected["teacher_gap_closure"]),
+        }
         fingerprints[arm] = {
             "path": str(fingerprint_path),
             "file_sha256": _file_sha256(fingerprint_path),
             "fingerprint_sha256": fingerprint["fingerprint_sha256"],
-            "terminal_checkpoint": copy.deepcopy(terminal),
+            "selected_checkpoint": copy.deepcopy(selected_fingerprint),
         }
 
     return {
@@ -212,6 +271,7 @@ def _load_authority(
         "registry": registry,
         "v5": v5,
         "completed": completed,
+        "candidates": candidates,
         "fingerprints": fingerprints,
     }
 
@@ -315,8 +375,8 @@ def build_matrix(
     occupied: set[str] = set()
 
     for (arm, baseline_name), aliases in zip(matchups, groups, strict=True):
-        completed = authority["completed"][arm]
-        candidate = Path(completed["checkpoint"])
+        candidate_authority = authority["candidates"][arm]
+        candidate = Path(candidate_authority["checkpoint"])
         baseline = authority["f7"] if baseline_name == "f7" else authority["v5"]
         comparison_mode = (
             "historical_comparison" if baseline_name == "f7" else "branch_challenge"
@@ -371,8 +431,9 @@ def build_matrix(
                 "plan": str(plan_path),
                 "plan_hash": plan["plan_hash"],
                 "candidate": {
-                    "path": completed["checkpoint"],
-                    "sha256": completed["checkpoint_sha256"],
+                    "path": candidate_authority["checkpoint"],
+                    "sha256": candidate_authority["checkpoint_sha256"],
+                    "optimizer_step": candidate_authority["step"],
                 },
                 "baseline_checkpoint": {
                     "path": str(baseline),
@@ -412,6 +473,9 @@ def build_matrix(
             "selection_sha256": authority["selection"]["selection_sha256"],
             "eligible_arms": eligible,
             "winner": authority["selection"]["winner"],
+            "candidate_steps": {
+                arm: authority["candidates"][arm]["step"] for arm in eligible
+            },
         },
         "arm_fingerprints": authority["fingerprints"],
         "registry": str(authority["registry_path"]),
@@ -514,7 +578,7 @@ def load_matrix(
     for row in rows:
         plan = fleet.load_plan(Path(row["plan"]), manifest)
         arm = str(row["arm"])
-        completed = authority["completed"][arm]
+        candidate = authority["candidates"][arm]
         expected_baseline = authority["f7"] if row["baseline"] == "f7" else authority["v5"]
         slots = {
             str(job["slot_id"])
@@ -526,8 +590,9 @@ def load_matrix(
             or plan["operator_mode"] != fleet.COHERENT_PUBLIC_OPERATOR
             or plan["seed_cohort_id"] != matrix["seed_cohort_id"]
             or plan["pair_claims"]["internal"] != matrix["internal_claim"]
-            or plan["candidate"]["source"] != completed["checkpoint"]
-            or plan["candidate"]["sha256"] != completed["checkpoint_sha256"]
+            or plan["candidate"]["source"] != candidate["checkpoint"]
+            or plan["candidate"]["sha256"] != candidate["checkpoint_sha256"]
+            or row.get("candidate", {}).get("optimizer_step") != candidate["step"]
             or plan["champion"]["source"] != str(expected_baseline)
             or plan["champion"]["sha256"] != fleet._sha256(expected_baseline)  # noqa: SLF001
             or slots != set(row["gpu_slots"])

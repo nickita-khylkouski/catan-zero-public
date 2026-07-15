@@ -244,9 +244,13 @@ def test_selection_maximizes_teacher_gap_inside_explicit_drift_budgets(
         path = tmp_path / f"{arm}.json"
         rows = []
         for step in campaign.CHECKPOINT_STEPS:
+            checkpoint = tmp_path / f"{arm}-step{step}.pt"
+            checkpoint.write_bytes(f"{arm}:{step}".encode())
             rows.append(
                 {
                     "step": step,
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_sha256": campaign._file_sha256(checkpoint),
                     "functional": {
                         "parent_kl": kls[arm] * step / 128,
                         "teacher_gap_closure": closures[arm] * step / 128,
@@ -288,9 +292,102 @@ def test_selection_maximizes_teacher_gap_inside_explicit_drift_budgets(
 
     selected = campaign._select(campaign_path, campaign_payload, bindings)
     assert selected["winner"] == "P50"
-    assert selected["eligible_arms"] == ["P10", "P25", "P50"]
-    assert selected["arm_fingerprints"]["P100"]["within_drift_budgets"] is False
+    assert selected["winner_step"] == 128
+    assert selected["eligible_arms"] == ["P10", "P25", "P50", "P100"]
+    assert selected["arm_fingerprints"]["P100"][
+        "all_checkpoints_within_drift_budgets"
+    ] is False
+    assert selected["arm_fingerprints"]["P100"]["eligible_checkpoint_steps"] == [
+        8,
+        12,
+        16,
+        32,
+        64,
+    ]
+    assert selected["arm_fingerprints"]["P100"]["selected_checkpoint"][
+        "step"
+    ] == 64
     assert selected["winner_meets_reference_teacher_gap_closure"] is True
+
+
+def test_selection_can_choose_an_earlier_checkpoint_over_overdosed_terminals(
+    tmp_path: Path,
+) -> None:
+    campaign_path = tmp_path / "campaign.json"
+    campaign_payload = {
+        "schema_version": campaign.SCHEMA,
+        "selection_contract": {
+            "max_parent_kl": 0.03,
+            "max_trunk_relative_l2": 0.03,
+            "reference_update_frontier": dict(
+                campaign.R2_UPDATE_FRONTIER_REFERENCE
+            ),
+        },
+        "lineage_contract": {
+            "upgraded_initializer_sha256": "sha256:" + "6" * 64,
+        },
+        "arms": {arm: dict(values) for arm, values in campaign.ARMS.items()},
+    }
+    _write_signed(campaign_path, campaign_payload, "campaign_sha256")
+    bindings: dict[str, Path] = {}
+    for arm_index, arm in enumerate(campaign.ARMS):
+        path = tmp_path / f"{arm}.json"
+        rows = []
+        for step in campaign.CHECKPOINT_STEPS:
+            checkpoint = tmp_path / f"{arm}-step{step}.pt"
+            checkpoint.write_bytes(f"{arm}:{step}".encode())
+            peak = 0.20 if arm == "P100" and step == 32 else 0.01 + arm_index * 0.001
+            drift = 0.02 if step <= 32 else 0.04
+            rows.append(
+                {
+                    "step": step,
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_sha256": campaign._file_sha256(checkpoint),
+                    "functional": {
+                        "parent_kl": drift,
+                        "teacher_gap_closure": peak,
+                    },
+                    "layer_drift": {"trunk_relative_l2": drift},
+                }
+            )
+        dose_telemetry = {
+            "schema_version": "a1-active-policy-dose-telemetry-v1",
+            "active_rows": {"policy_aux": 1},
+        }
+        dose_telemetry["dose_telemetry_sha256"] = campaign._value_sha256(
+            dose_telemetry
+        )
+        payload = {
+            "schema_version": campaign.FINGERPRINT_SCHEMA,
+            "campaign": {
+                "path": str(campaign_path),
+                "file_sha256": campaign._file_sha256(campaign_path),
+                "campaign_sha256": campaign_payload["campaign_sha256"],
+            },
+            "arm": arm,
+            "active_policy_branch_multiplier": campaign.ARMS[arm][
+                "active_policy_branch_multiplier"
+            ],
+            "policy_aux_active_batch_size": campaign.ARMS[arm][
+                "policy_aux_active_batch_size"
+            ],
+            "parent_checkpoint_sha256": campaign_payload["lineage_contract"][
+                "upgraded_initializer_sha256"
+            ],
+            "dose_telemetry": dose_telemetry,
+            "checkpoints": rows,
+        }
+        _write_signed(path, payload, "fingerprint_sha256")
+        bindings[arm] = path
+
+    selected = campaign._select(campaign_path, campaign_payload, bindings)
+
+    assert selected["winner"] == "P100"
+    assert selected["winner_step"] == 32
+    assert selected["winner_checkpoint"]["path"].endswith("P100-step32.pt")
+    assert selected["arm_fingerprints"]["P100"]["selected_checkpoint"][
+        "step"
+    ] == 32
 
 
 def test_explicit_diagnostic_checkpoint_schedule_excludes_terminal(
