@@ -1208,6 +1208,150 @@ RAGGED_FILLS: dict[str, float] = {
     "legal_action_target_ids": -1.0,
 }
 
+# ``GumbelShardWriter`` intentionally stores root-search evidence compactly:
+# offsets index policy-active rows only, since inactive rows have no policy
+# target.  A memmap corpus is row-addressable, so conversion expands those
+# offsets to all rows (inactive rows receive an empty segment) and records the
+# source schema version/mask per row.  The visits and completed-Q arrays remain
+# byte-for-byte in legal-action order.
+SEARCH_EVIDENCE_SOURCE_COLUMNS = frozenset(
+    {
+        "search_evidence_version",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+    }
+)
+SEARCH_EVIDENCE_MEMMAP_COLUMNS = (
+    "search_evidence_version",
+    "search_evidence_mask",
+    "search_evidence_offsets",
+    "search_visit_counts_flat",
+    "search_completed_q_flat",
+)
+
+
+def _row_aligned_search_evidence(
+    shard: Mapping[str, Any], path: Path
+) -> dict[str, np.ndarray] | None:
+    """Validate compact NPZ evidence and expand its offsets to every row."""
+
+    present = SEARCH_EVIDENCE_SOURCE_COLUMNS & set(shard)
+    if not present:
+        return None
+    if present != SEARCH_EVIDENCE_SOURCE_COLUMNS:
+        raise SystemExit(
+            f"{path}: incomplete search-evidence payload; "
+            f"missing={sorted(SEARCH_EVIDENCE_SOURCE_COLUMNS - present)}"
+        )
+    if "action_taken" not in shard or "policy_weight_multiplier" not in shard:
+        raise SystemExit(
+            f"{path}: search evidence requires action_taken and "
+            "policy_weight_multiplier"
+        )
+    rows = int(np.asarray(shard["action_taken"]).reshape(-1).size)
+    weights = np.asarray(shard["policy_weight_multiplier"], dtype=np.float32).reshape(-1)
+    if weights.shape != (rows,) or bool(np.any(~np.isfinite(weights))) or bool(
+        np.any(weights < 0.0)
+    ):
+        raise SystemExit(f"{path}: invalid policy weights for search evidence")
+    active = weights > 0.0
+
+    version_raw = np.asarray(shard["search_evidence_version"])
+    if version_raw.shape != () or version_raw.dtype != np.dtype(np.uint8):
+        raise SystemExit(
+            f"{path}: search_evidence_version must be scalar uint8"
+        )
+    version = int(version_raw.item())
+    if version != 1:
+        raise SystemExit(f"{path}: unsupported search evidence version {version}")
+
+    compact_offsets = np.asarray(shard["search_evidence_offsets"])
+    visits = np.asarray(shard["search_visit_counts_flat"])
+    completed_q = np.asarray(shard["search_completed_q_flat"])
+    if compact_offsets.dtype.kind not in {"u", "i"}:
+        raise SystemExit(f"{path}: search_evidence_offsets must be integral")
+    compact_offsets = compact_offsets.astype(np.int64, copy=False)
+    if visits.dtype != np.dtype(np.uint16):
+        raise SystemExit(f"{path}: search_visit_counts_flat must be uint16")
+    if completed_q.dtype != np.dtype(np.float32):
+        raise SystemExit(f"{path}: search_completed_q_flat must be float32")
+    active_count = int(np.count_nonzero(active))
+    if (
+        compact_offsets.shape != (active_count + 1,)
+        or int(compact_offsets[0]) != 0
+        or bool(np.any(compact_offsets[1:] < compact_offsets[:-1]))
+        or visits.shape != completed_q.shape
+        or int(compact_offsets[-1]) != int(visits.size)
+        or bool(np.any(~np.isfinite(completed_q)))
+    ):
+        raise SystemExit(f"{path}: malformed compact search evidence")
+
+    if "legal_action_ids" not in shard:
+        raise SystemExit(f"{path}: search evidence requires legal_action_ids")
+    legal = np.asarray(shard["legal_action_ids"])
+    if legal.ndim != 2 or legal.shape[0] != rows:
+        raise SystemExit(f"{path}: legal_action_ids is not row-aligned")
+    legal_counts = np.count_nonzero(legal >= 0, axis=1).astype(np.int64)
+    compact_lengths = np.diff(compact_offsets)
+    if not np.array_equal(compact_lengths, legal_counts[active]):
+        raise SystemExit(
+            f"{path}: search evidence widths differ from active legal widths"
+        )
+    if "simulations_used" in shard:
+        simulations = np.asarray(shard["simulations_used"]).reshape(-1)
+        if simulations.shape != (rows,):
+            raise SystemExit(f"{path}: simulations_used is not row-aligned")
+        cumulative = np.empty(visits.size + 1, dtype=np.uint64)
+        cumulative[0] = 0
+        np.cumsum(visits, dtype=np.uint64, out=cumulative[1:])
+        evidence_sims = (
+            cumulative[compact_offsets[1:]] - cumulative[compact_offsets[:-1]]
+        )
+        if not np.array_equal(evidence_sims, simulations[active].astype(np.uint64)):
+            raise SystemExit(
+                f"{path}: search evidence visit sums differ from simulations_used"
+            )
+
+    lengths = np.zeros(rows, dtype=np.int64)
+    lengths[active] = compact_lengths
+    offsets = np.empty(rows + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+    return {
+        "search_evidence_version": np.where(active, version, 0).astype(np.uint8),
+        "search_evidence_mask": active.astype(np.bool_, copy=False),
+        "search_evidence_offsets": offsets,
+        "search_visit_counts_flat": visits,
+        "search_completed_q_flat": completed_q,
+    }
+
+
+def _filter_row_aligned_search_evidence(
+    evidence: dict[str, np.ndarray], keep: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Apply a row filter without changing any retained evidence values."""
+
+    keep = np.asarray(keep, dtype=np.bool_).reshape(-1)
+    offsets = evidence["search_evidence_offsets"]
+    if offsets.shape != (keep.size + 1,):
+        raise SystemExit("search evidence row filter is not aligned")
+    if bool(np.all(keep)):
+        return evidence
+    lengths = np.diff(offsets)
+    flat_keep = np.repeat(keep, lengths)
+    kept_lengths = lengths[keep]
+    new_offsets = np.empty(kept_lengths.size + 1, dtype=np.int64)
+    new_offsets[0] = 0
+    np.cumsum(kept_lengths, out=new_offsets[1:])
+    return {
+        "search_evidence_version": evidence["search_evidence_version"][keep],
+        "search_evidence_mask": evidence["search_evidence_mask"][keep],
+        "search_evidence_offsets": new_offsets,
+        "search_visit_counts_flat": evidence["search_visit_counts_flat"][flat_keep],
+        "search_completed_q_flat": evidence["search_completed_q_flat"][flat_keep],
+    }
+
 
 def _fill_matches(values: np.ndarray, fill: float) -> np.ndarray:
     """Elementwise "is this the pad fill" test, treating NaN fill specially."""
@@ -1601,8 +1745,10 @@ def build_memmap_corpus(
             close = getattr(raw, "close", None)
             if callable(close):
                 close()
+    first_raw = _load_npz(files[0])
+    first_search_evidence = _row_aligned_search_evidence(first_raw, files[0])
     first = _normalize_teacher_shard(
-        _load_npz(files[0]),
+        first_raw,
         files[0],
         include_aux_defaults=include_aux_targets,
     )
@@ -1618,9 +1764,44 @@ def build_memmap_corpus(
         first = {
             name: np.asarray(value)[first_keep] for name, value in first.items()
         }
+        if first_search_evidence is not None:
+            first_search_evidence = _filter_row_aligned_search_evidence(
+                first_search_evidence, first_keep
+            )
     first = _normalize_event_storage_width(first)
     columns = [key for key in LOADER_KEYS if key in first]
     schemas = {name: _classify(name, first[name]) for name in columns}
+    if first_search_evidence is not None:
+        schemas.update(
+            {
+                "search_evidence_version": {
+                    "kind": "fixed",
+                    "dtype": np.dtype(np.uint8).str,
+                    "inner_shape": [],
+                },
+                "search_evidence_mask": {
+                    "kind": "fixed",
+                    "dtype": np.dtype(np.bool_).str,
+                    "inner_shape": [],
+                },
+                "search_evidence_offsets": {
+                    "kind": "row_offsets",
+                    "dtype": np.dtype(np.int64).str,
+                },
+                "search_visit_counts_flat": {
+                    "kind": "independent_ragged1d",
+                    "dtype": np.dtype(np.uint16).str,
+                    "fill": 0,
+                    "offsets": "search_evidence_offsets",
+                },
+                "search_completed_q_flat": {
+                    "kind": "independent_ragged1d",
+                    "dtype": np.dtype(np.float32).str,
+                    "fill": float("nan"),
+                    "offsets": "search_evidence_offsets",
+                },
+            }
+        )
     implicit_zero_columns: list[str] = []
     if omit_zero_events:
         missing_event_columns = IMPLICIT_ZERO_EVENT_COLUMNS - set(columns)
@@ -1646,11 +1827,25 @@ def build_memmap_corpus(
         if schemas[name]["kind"] not in {"string", "implicit_constant"}
     }
     code_handles = {name: open(out_dir / f"{name}.codes.dat", "wb") for name in columns if schemas[name]["kind"] == "string"}
+    search_evidence_handles = (
+        {
+            name: open(out_dir / f"{name}.dat", "wb")
+            for name in (
+                "search_evidence_version",
+                "search_evidence_mask",
+                "search_visit_counts_flat",
+                "search_completed_q_flat",
+            )
+        }
+        if first_search_evidence is not None
+        else {}
+    )
     # Global string factorisation: category -> code, stable in first-seen order.
     categories: dict[str, dict[str, int]] = {name: {} for name in code_handles}
     category_lists: dict[str, list[str]] = {name: [] for name in code_handles}
 
     row_lengths: list[np.ndarray] = []
+    search_evidence_row_lengths: list[np.ndarray] = []
     row_count = 0
     flat_count = 0
     legal_width = 0
@@ -1678,6 +1873,11 @@ def build_memmap_corpus(
                 selected_source_tracker.start_source()
         prior_source_index = source_index
         raw = _load_npz(file)
+        search_evidence = _row_aligned_search_evidence(raw, file)
+        if (search_evidence is None) != (first_search_evidence is None):
+            raise SystemExit(
+                f"{file}: search-evidence presence differs from first shard"
+            )
         norm = _normalize_teacher_shard(
             raw,
             file,
@@ -1715,6 +1915,10 @@ def build_memmap_corpus(
                 name: np.asarray(value)[selected_row_mask]
                 for name, value in norm.items()
             }
+            if search_evidence is not None:
+                search_evidence = _filter_row_aligned_search_evidence(
+                    search_evidence, selected_row_mask
+                )
             for status_name, expected in (("terminated", True), ("truncated", False)):
                 if status_name not in norm:
                     raise SystemExit(
@@ -1759,6 +1963,10 @@ def build_memmap_corpus(
             dropped_fast_rows += int((~keep).sum())
             if not keep.all():
                 norm = {name: np.asarray(value)[keep] for name, value in norm.items()}
+                if search_evidence is not None:
+                    search_evidence = _filter_row_aligned_search_evidence(
+                        search_evidence, keep
+                    )
         norm = _normalize_event_storage_width(norm)
         present = {key for key in LOADER_KEYS if key in norm}
         if present != column_set:
@@ -1803,6 +2011,17 @@ def build_memmap_corpus(
         counts = np.sum(legal_ids >= 0, axis=1).astype(np.int64)
         n = int(legal_ids.shape[0])
         prefix_mask = np.arange(width)[None, :] < counts[:, None]
+        if search_evidence is not None:
+            evidence_lengths = np.diff(search_evidence["search_evidence_offsets"])
+            evidence_mask = search_evidence["search_evidence_mask"]
+            if (
+                evidence_mask.shape != (n,)
+                or evidence_lengths.shape != (n,)
+                or not np.array_equal(evidence_mask, norm["policy_weight_multiplier"] > 0.0)
+                or not np.array_equal(evidence_lengths[evidence_mask], counts[evidence_mask])
+                or bool(np.any(evidence_lengths[~evidence_mask] != 0))
+            ):
+                raise SystemExit(f"{file}: row-aligned search evidence drift")
 
         # Trimming is lossless only if the valid legal entries are a contiguous
         # prefix (guaranteed by legal_action_mask == legal_action_ids>=0) and
@@ -1900,6 +2119,20 @@ def build_memmap_corpus(
                 flat = array[prefix_mask]  # row-major prefix concat -> (sum counts, [feat])
                 np.ascontiguousarray(flat).tofile(handles[name])
 
+        if search_evidence is not None:
+            for name in (
+                "search_evidence_version",
+                "search_evidence_mask",
+                "search_visit_counts_flat",
+                "search_completed_q_flat",
+            ):
+                np.ascontiguousarray(search_evidence[name]).tofile(
+                    search_evidence_handles[name]
+                )
+            search_evidence_row_lengths.append(
+                np.diff(search_evidence["search_evidence_offsets"])
+            )
+
         row_lengths.append(counts)
         row_count += n
         flat_count += int(counts.sum())
@@ -1923,6 +2156,8 @@ def build_memmap_corpus(
     for handle in handles.values():
         handle.close()
     for handle in code_handles.values():
+        handle.close()
+    for handle in search_evidence_handles.values():
         handle.close()
 
     for record in source_attestations:
@@ -1996,6 +2231,18 @@ def build_memmap_corpus(
         np.cumsum(lengths, out=offsets[1:])
     offsets.tofile(out_dir / "row_offsets.dat")
 
+    if first_search_evidence is not None:
+        evidence_lengths = (
+            np.concatenate(search_evidence_row_lengths)
+            if search_evidence_row_lengths
+            else np.zeros(0, dtype=np.int64)
+        )
+        evidence_offsets = np.empty(row_count + 1, dtype=np.int64)
+        evidence_offsets[0] = 0
+        if evidence_lengths.size:
+            np.cumsum(evidence_lengths, out=evidence_offsets[1:])
+        evidence_offsets.tofile(out_dir / "search_evidence_offsets.dat")
+
     for name in code_handles:
         schemas[name] = {"kind": "string", "categories": category_lists[name]}
 
@@ -2038,6 +2285,23 @@ def build_memmap_corpus(
             source_shard_inventory
         ),
         "columns": schemas,
+        "search_evidence": (
+            None
+            if first_search_evidence is None
+            else {
+                "schema": "gumbel_root_search_evidence_v1",
+                "row_addressing": "all_rows_empty_inactive_v1",
+                "active_row_count": int(
+                    sum(
+                        np.count_nonzero(lengths)
+                        for lengths in search_evidence_row_lengths
+                    )
+                ),
+                "flat_entry_count": int(
+                    sum(int(np.sum(lengths)) for lengths in search_evidence_row_lengths)
+                ),
+            }
+        ),
         "game_seed_present": "game_seed" in column_set,
         # --full-rows-only provenance: whether fast rows were physically dropped,
         # and how many. False + 0 for a normal (pooled) build.

@@ -5104,6 +5104,8 @@ def _expected_memmap_payload_filenames(
             "fixed",
             "ragged2d",
             "ragged3d",
+            "row_offsets",
+            "independent_ragged1d",
             "string",
             "implicit_constant",
         }:
@@ -16804,6 +16806,11 @@ MEMMAP_LAZY_COLUMNS = frozenset(
         # every DDP rank even when the active objective never reads them.
         "afterstate_target",
         "afterstate_target_mask",
+        "search_evidence_version",
+        "search_evidence_mask",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
     }
 )
 
@@ -17073,6 +17080,35 @@ class _MemmapRaggedColumn:
         return arr.astype(dtype) if dtype is not None else arr
 
 
+class _MemmapRowOffsetsColumn:
+    """Row-addressable view of an independent ragged column's offsets.
+
+    The on-disk ABI remains the conventional ``N+1`` prefix array.  Indexing
+    exposes the corresponding ``[start, stop)`` pair for each requested row,
+    avoiding any ambiguity for inactive rows whose segment is empty.
+    """
+
+    def __init__(self, offsets: np.ndarray):
+        self._offsets = offsets
+        self._n = int(offsets.shape[0] - 1)
+        self.shape = (self._n, 2)
+        self.ndim = 2
+        self.dtype = offsets.dtype
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx):
+        indices = _normalize_index(idx, self._n)
+        return np.stack(
+            (self._offsets[indices], self._offsets[indices + 1]), axis=-1
+        )
+
+    def __array__(self, dtype=None):
+        array = np.stack((self._offsets[:-1], self._offsets[1:]), axis=-1)
+        return array.astype(dtype) if dtype is not None else array
+
+
 class MemmapCorpus:
     """Dict-of-arrays view over a corpus built by tools/build_memmap_corpus.py.
 
@@ -17149,8 +17185,27 @@ class MemmapCorpus:
             )
         self._eager: dict[str, np.ndarray] = {}
         self._lazy: dict[str, object] = {}
+        independent_offsets: dict[str, np.memmap] = {}
+        for name, schema in self._columns.items():
+            if schema["kind"] != "row_offsets":
+                continue
+            offsets = np.memmap(
+                corpus_dir / f"{name}.dat",
+                dtype=np.dtype(schema["dtype"]),
+                mode="r",
+                shape=(self.row_count + 1,),
+            )
+            if (
+                int(offsets[0]) != 0
+                or bool(np.any(offsets[1:] < offsets[:-1]))
+            ):
+                raise SystemExit(f"{meta_path}: invalid row offsets in {name!r}")
+            independent_offsets[name] = offsets
+            self._lazy[name] = _MemmapRowOffsetsColumn(offsets)
         for name, schema in self._columns.items():
             kind = schema["kind"]
+            if kind == "row_offsets":
+                continue
             if kind == "string":
                 codes = np.memmap(
                     corpus_dir / f"{name}.codes.dat",
@@ -17185,6 +17240,34 @@ class MemmapCorpus:
                 inner = tuple(int(d) for d in schema["inner_shape"])
                 self._lazy[name] = _ImplicitConstantColumn(
                     self.row_count, inner, schema["dtype"], schema["fill"]
+                )
+                continue
+            if kind == "independent_ragged1d":
+                offsets_name = schema.get("offsets")
+                offsets = independent_offsets.get(offsets_name)
+                if offsets is None:
+                    raise SystemExit(
+                        f"{meta_path}: independent ragged column {name!r} has "
+                        f"unknown offsets {offsets_name!r}"
+                    )
+                flat_count = int(offsets[-1])
+                flat = (
+                    np.memmap(
+                        corpus_dir / f"{name}.dat",
+                        dtype=np.dtype(schema["dtype"]),
+                        mode="r",
+                        shape=(flat_count,),
+                    )
+                    if flat_count
+                    else np.empty(0, dtype=np.dtype(schema["dtype"]))
+                )
+                self._lazy[name] = _MemmapRaggedColumn(
+                    flat,
+                    offsets,
+                    self.legal_width,
+                    schema["fill"],
+                    schema["dtype"],
+                    None,
                 )
                 continue
             if kind not in {"ragged2d", "ragged3d"}:

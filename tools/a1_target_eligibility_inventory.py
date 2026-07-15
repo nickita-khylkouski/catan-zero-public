@@ -71,6 +71,15 @@ SERIALIZED_STATE_COLUMNS = frozenset(
 POLICY_COLUMNS = frozenset(
     {"policy_weight_multiplier", "target_information_regime"}
 )
+SEARCH_EVIDENCE_COLUMNS = frozenset(
+    {
+        "search_evidence_version",
+        "search_evidence_mask",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+    }
+)
 OPERATOR_FIELDS = (
     "target_information_regime",
     "information_set_search",
@@ -201,6 +210,119 @@ def _regime_counts(
     )
 
 
+def _search_evidence_inventory(
+    root: Path, meta: Mapping[str, Any], policy: np.ndarray
+) -> dict[str, Any]:
+    """Authenticate the row-addressable memmap form of compact root evidence."""
+
+    columns = meta.get("columns")
+    if not isinstance(columns, dict):
+        raise InventoryError(f"{root}: missing memmap columns")
+    present = SEARCH_EVIDENCE_COLUMNS & set(columns)
+    if not present:
+        return {
+            "present": False,
+            "schema": None,
+            "row_addressing": None,
+            "policy_active_alignment": None,
+            "active_rows": 0,
+            "flat_entries": 0,
+        }
+    if present != SEARCH_EVIDENCE_COLUMNS:
+        raise InventoryError(
+            f"{root}: incomplete row-addressable search evidence; "
+            f"missing={sorted(SEARCH_EVIDENCE_COLUMNS - present)}"
+        )
+    expected_schemas = {
+        "search_evidence_version": ("fixed", np.dtype(np.uint8), []),
+        "search_evidence_mask": ("fixed", np.dtype(np.bool_), []),
+        "search_evidence_offsets": ("row_offsets", np.dtype(np.int64), None),
+        "search_visit_counts_flat": (
+            "independent_ragged1d",
+            np.dtype(np.uint16),
+            None,
+        ),
+        "search_completed_q_flat": (
+            "independent_ragged1d",
+            np.dtype(np.float32),
+            None,
+        ),
+    }
+    for name, (kind, dtype, inner) in expected_schemas.items():
+        schema = columns[name]
+        if (
+            not isinstance(schema, dict)
+            or schema.get("kind") != kind
+            or np.dtype(schema.get("dtype")) != dtype
+            or (inner is not None and schema.get("inner_shape") != inner)
+        ):
+            raise InventoryError(f"{root}: malformed search evidence schema {name!r}")
+        if kind == "independent_ragged1d" and schema.get("offsets") != (
+            "search_evidence_offsets"
+        ):
+            raise InventoryError(f"{root}: {name!r} lost its evidence offsets binding")
+
+    rows = int(meta.get("row_count", -1))
+    offsets_path = root / "search_evidence_offsets.dat"
+    if offsets_path.stat().st_size != (rows + 1) * np.dtype(np.int64).itemsize:
+        raise InventoryError(f"{root}: search evidence offsets byte length drift")
+    offsets = np.memmap(
+        offsets_path, mode="r", dtype=np.int64, shape=(rows + 1,)
+    )
+    if int(offsets[0]) != 0 or bool(np.any(offsets[1:] < offsets[:-1])):
+        raise InventoryError(f"{root}: search evidence offsets are not monotone")
+    lengths = np.asarray(offsets[1:] - offsets[:-1])
+    mask = np.asarray(_column(root, meta, "search_evidence_mask").reshape(-1))
+    version = np.asarray(_column(root, meta, "search_evidence_version").reshape(-1))
+    expected_active = np.asarray(policy) > 0.0
+    if (
+        not np.array_equal(mask, expected_active)
+        or bool(np.any(lengths[~mask] != 0))
+        or bool(np.any(lengths[mask] <= 0))
+        or bool(np.any(version[mask] != 1))
+        or bool(np.any(version[~mask] != 0))
+    ):
+        raise InventoryError(f"{root}: search evidence is not policy-row aligned")
+
+    legal_offsets = np.fromfile(root / "row_offsets.dat", dtype=np.int64)
+    if legal_offsets.shape != (rows + 1,) or not np.array_equal(
+        lengths[mask], np.diff(legal_offsets)[mask]
+    ):
+        raise InventoryError(f"{root}: search evidence/legal widths differ")
+    flat_entries = int(offsets[-1])
+    expected_sizes = {
+        "search_visit_counts_flat.dat": flat_entries * np.dtype(np.uint16).itemsize,
+        "search_completed_q_flat.dat": flat_entries * np.dtype(np.float32).itemsize,
+    }
+    for filename, expected_size in expected_sizes.items():
+        if (root / filename).stat().st_size != expected_size:
+            raise InventoryError(f"{root}: {filename} byte length drift")
+    if flat_entries:
+        completed_q = np.memmap(
+            root / "search_completed_q_flat.dat",
+            mode="r",
+            dtype=np.float32,
+            shape=(flat_entries,),
+        )
+        if bool(np.any(~np.isfinite(completed_q))):
+            raise InventoryError(f"{root}: non-finite completed-Q evidence")
+    declared = meta.get("search_evidence")
+    if (
+        not isinstance(declared, dict)
+        or declared.get("schema") != "gumbel_root_search_evidence_v1"
+        or declared.get("row_addressing") != "all_rows_empty_inactive_v1"
+        or declared.get("active_row_count") != int(np.count_nonzero(mask))
+        or declared.get("flat_entry_count") != flat_entries
+    ):
+        raise InventoryError(f"{root}: search evidence metadata drift")
+    return {
+        "present": True,
+        "schema": declared["schema"],
+        "row_addressing": declared["row_addressing"],
+        "policy_active_alignment": True,
+        "active_rows": int(np.count_nonzero(mask)),
+        "flat_entries": flat_entries,
+    }
 def _trajectory_inventory(
     root: Path, meta: Mapping[str, Any], *, chunk_rows: int = 1_000_000
 ) -> dict[str, Any]:
@@ -379,6 +501,7 @@ def inspect_memmap(
         if regime != required_regime
     )
     replay = _trajectory_inventory(root, meta)
+    search_evidence = _search_evidence_inventory(root, meta, policy)
     return {
         "label": label,
         "corpus_dir": str(root),
@@ -411,6 +534,7 @@ def inspect_memmap(
             if name.startswith("search_")
             or name in {"root_completed_q", "root_visit_counts"}
         ),
+        "search_evidence": search_evidence,
         "exact_root_reanalysis": replay,
     }
 
