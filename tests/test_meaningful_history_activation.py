@@ -22,7 +22,7 @@ from catan_zero.rl.entity_token_policy import (  # noqa: E402
 )
 
 
-def _config(*, history: bool) -> EntityGraphConfig:
+def _config(*, history: bool, dropout: float = 0.0) -> EntityGraphConfig:
     base = EntityGraphConfig(
         action_size=32,
         static_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
@@ -31,7 +31,7 @@ def _config(*, history: bool) -> EntityGraphConfig:
         hidden_size=16,
         state_layers=1,
         attention_heads=2,
-        dropout=0.0,
+        dropout=dropout,
     )
     return replace(
         base,
@@ -40,7 +40,7 @@ def _config(*, history: bool) -> EntityGraphConfig:
     )
 
 
-def _batch(*, active_history: bool) -> dict:
+def _batch(*, active_history: bool, event_width: int = 32) -> dict:
     generator = torch.Generator().manual_seed(20260715)
     batch = {}
     for name, count, width in (
@@ -49,20 +49,25 @@ def _batch(*, active_history: bool) -> dict:
         ("edge", 72, EDGE_FEATURE_SIZE),
         ("player", 4, PLAYER_FEATURE_SIZE),
         ("global", 1, GLOBAL_FEATURE_SIZE),
-        ("event", 32, EVENT_FEATURE_SIZE),
     ):
         batch[f"{name}_tokens"] = torch.randn(2, count, width, generator=generator)
         if name != "global":
             batch[f"{name}_mask"] = torch.ones(2, count, dtype=torch.bool)
-    batch["event_mask"].fill_(False)
-    if active_history:
-        batch["event_mask"][:, -4:] = True
+    # Draw action features before the variable-width history tensor so the
+    # incumbent and upgraded batches differ only on the intended surface.
     batch["legal_action_tokens"] = torch.randn(
         2, 3, LEGAL_ACTION_FEATURE_SIZE, generator=generator
     )
     batch["legal_action_context"] = torch.randn(
         2, 3, CONTEXT_ACTION_FEATURE_SIZE, generator=generator
     )
+    batch["event_tokens"] = torch.randn(
+        2, event_width, EVENT_FEATURE_SIZE, generator=generator
+    )
+    batch["event_mask"] = torch.ones(2, event_width, dtype=torch.bool)
+    batch["event_mask"].fill_(False)
+    if active_history:
+        batch["event_mask"][:, -4:] = True
     return batch
 
 
@@ -76,8 +81,11 @@ def test_history_upgrade_is_exact_with_nonempty_events_at_zero_gate():
     assert missing == ["meaningful_history_residual_gate"]
     assert torch.count_nonzero(upgraded.meaningful_history_residual_gate).item() == 0
 
-    empty = _batch(active_history=False)
-    active = _batch(active_history=True)
+    # The incumbent consumes its historical 64-row event surface; the upgrade
+    # consumes the bounded 32-row meaningful-history surface.  Exact equality
+    # across these real serving shapes is the function-preserving contract.
+    empty = _batch(active_history=False, event_width=64)
+    active = _batch(active_history=True, event_width=32)
     with torch.no_grad():
         before = incumbent(empty)
         after = upgraded(active)
@@ -103,6 +111,36 @@ def test_zero_gate_learns_immediately_and_then_history_changes_outputs():
         gate.fill_(0.25)
         activated = model(batch)["logits"]
     assert not torch.equal(baseline, activated)
+
+
+def test_zero_gate_preserves_incumbent_dropout_rng_and_event_encoder_gradients():
+    torch.manual_seed(29)
+    incumbent = EntityGraphNet(_config(history=False, dropout=0.2)).train()
+    upgraded = EntityGraphNet(_config(history=True, dropout=0.2)).train()
+    missing, unexpected = upgraded.load_state_dict(incumbent.state_dict(), strict=False)
+    assert unexpected == []
+    assert missing == ["meaningful_history_residual_gate"]
+
+    empty = _batch(active_history=False, event_width=64)
+    active = _batch(active_history=True, event_width=32)
+    torch.manual_seed(31)
+    before = incumbent(empty)
+    torch.manual_seed(31)
+    after = upgraded(active)
+    for key in ("logits", "value", "final_vp"):
+        assert torch.equal(before[key], after[key]), key
+
+    loss = after["logits"].square().mean() + after["value"].square().mean()
+    loss.backward()
+    assert upgraded.meaningful_history_residual_gate.grad is not None
+    assert upgraded.meaningful_history_residual_gate.grad.abs().sum().item() > 0.0
+    event_grads = [
+        parameter.grad for parameter in upgraded.event_encoder.parameters()
+    ]
+    assert all(
+        gradient is None or torch.count_nonzero(gradient).item() == 0
+        for gradient in event_grads
+    )
 
 
 def test_history_upgrade_receipt_allowlist_accepts_only_the_zero_gate():

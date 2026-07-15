@@ -48,6 +48,14 @@ from catan_zero.rl.xdim_lite_policy import (
 
 ENTITY_POLICY_SCHEMA_VERSION = "entity_graph_policy_v1"
 
+# The f7 incumbent was trained and served with a 64-row event-token surface.
+# Those rows were masked from its mature state trunk, but their *presence* is
+# still part of the numerical graph: changing the attention sequence from 64
+# rows to the 32-row meaningful-history window changes floating-point reduction
+# order even when the new residual gate is exactly zero.  Meaningful history is
+# therefore a side input while the inherited trunk retains this legacy width.
+_LEGACY_EVENT_HISTORY_WIDTH = 64
+
 # Player-token slot 12 was accidentally constant zero in every historical
 # Python and native corpus through catanatron_rs 0.1.7.  Consequently the
 # corresponding input column in all legacy entity-graph checkpoints is still
@@ -1350,6 +1358,47 @@ class EntityGraphNet:
                 if event_token_limit is not None:
                     event_tokens = event_tokens[:, :event_token_limit]
                     event_mask = event_mask[:, :event_token_limit]
+                meaningful_event_width = int(event_tokens.shape[1])
+                if self.meaningful_public_history_enabled:
+                    if meaningful_event_width > _LEGACY_EVENT_HISTORY_WIDTH:
+                        raise ValueError(
+                            "meaningful public history exceeds the inherited "
+                            "event-token surface: "
+                            f"{meaningful_event_width} > "
+                            f"{_LEGACY_EVENT_HISTORY_WIDTH}"
+                        )
+                    # Keep the mature f7 trunk's exact 64-row attention shape.
+                    # The first `meaningful_event_width` rows carry the new
+                    # public history for the side residual; every event row is
+                    # still masked as a key/value in the inherited trunk.  The
+                    # padded suffix also keeps the event encoder's tensor shape
+                    # and dropout RNG consumption identical to f7 at gate=0.
+                    pad_width = _LEGACY_EVENT_HISTORY_WIDTH - meaningful_event_width
+                    if pad_width:
+                        event_tokens = torch.cat(
+                            (
+                                event_tokens,
+                                event_tokens.new_zeros(
+                                    event_tokens.shape[0],
+                                    pad_width,
+                                    event_tokens.shape[2],
+                                ),
+                            ),
+                            dim=1,
+                        )
+                        event_mask_for_trunk = torch.cat(
+                            (
+                                event_mask,
+                                event_mask.new_zeros(
+                                    event_mask.shape[0], pad_width
+                                ),
+                            ),
+                            dim=1,
+                        )
+                    else:
+                        event_mask_for_trunk = event_mask
+                else:
+                    event_mask_for_trunk = event_mask
                 # The event0 inference path has no event elements to encode.
                 # Calling the MLP on [B, 0, F] is mathematically empty but still
                 # launches its Linear/LayerNorm/GELU kernels.  Construct the
@@ -1367,6 +1416,11 @@ class EntityGraphNet:
                     event_piece = self.event_encoder(
                         event_tokens.float()
                     ) + self.type_embedding[6].view(1, 1, -1)
+                history_event_piece = (
+                    event_piece[:, :meaningful_event_width]
+                    if self.meaningful_public_history_enabled
+                    else event_piece
+                )
                 player_piece = self.player_encoder(batch["player_tokens"].float())
                 if self.public_card_count_features_enabled:
                     player_piece = player_piece + self.public_card_count_residual(
@@ -1394,9 +1448,9 @@ class EntityGraphNet:
                 # fan-outs / action counts); in eager mode this is an int anyway.
                 batch_size = tokens.shape[0]
                 event_padding_mask = (
-                    torch.ones_like(event_mask, dtype=torch.bool)
+                    torch.ones_like(event_mask_for_trunk, dtype=torch.bool)
                     if self.meaningful_public_history_enabled
-                    else ~event_mask.bool()
+                    else ~event_mask_for_trunk.bool()
                 )
                 masks = [
                     torch.zeros(
@@ -1411,7 +1465,12 @@ class EntityGraphNet:
                     ),
                     event_padding_mask,
                 ]
-                return tokens, torch.cat(masks, dim=1), event_piece, event_mask
+                return (
+                    tokens,
+                    torch.cat(masks, dim=1),
+                    history_event_piece,
+                    event_mask,
+                )
 
             def _gather_target_tokens(self, tokens, batch: dict[str, Any]):
                 """Pool post-trunk board tokens for each action's targets.
