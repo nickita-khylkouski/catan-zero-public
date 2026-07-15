@@ -45,7 +45,7 @@ from typing import Any
 import numpy as np
 
 from catan_zero.rl.action_mask import ActionCatalog
-from catan_zero.rl.gumbel_self_play import _apply_selected_action
+from catan_zero.rl.gumbel_self_play import _action_type_of, _apply_selected_action
 from catan_zero.search.neural_rust_mcts import (
     rust_action_context_batch,
     rust_game_to_entity_batch,
@@ -62,7 +62,11 @@ DEFAULT_COLORS = ("RED", "BLUE")
 class GameActionSequence:
     game_seed: int
     colors: tuple[str, ...]
-    # action_taken (policy-catalog ids) ordered by decision_index, contiguous.
+    # Recorded action_taken policy-catalog ids, ordered by decision_index.
+    # Modern corpora intentionally omit single-legal-action UI/chance plumbing;
+    # decision_indices may therefore be sparse.  Every omitted index is
+    # replayable only when the live engine proves that exactly one action was
+    # legal there.
     actions: list[int]
     decision_indices: list[int]
     phases: list[str]
@@ -72,12 +76,67 @@ class GameActionSequence:
         return len(self.actions)
 
 
-def action_size_for_colors(colors: tuple[str, ...]) -> int:
-    """Flat policy action-space size for a color set.
+class SparseReconstructionError(ValueError):
+    """A sparse trajectory cannot uniquely determine an archived root."""
 
-    Matches the neural policy's `action_size` (== env.action_space.n ==
-    ActionCatalog(colors).size); `rust_policy_action_ids` only uses it as a
-    range check, and the policy-id catalog itself is identical regardless.
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        game_seed: int,
+        decision_index: int,
+        legal_action_count: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = str(code)
+        self.game_seed = int(game_seed)
+        self.decision_index = int(decision_index)
+        self.legal_action_count = (
+            None if legal_action_count is None else int(legal_action_count)
+        )
+
+
+def _validated_sparse_actions(
+    *,
+    game_seed: int,
+    actions: list[int],
+    decision_indices: list[int] | None,
+) -> dict[int, int]:
+    indices = (
+        list(range(len(actions)))
+        if decision_indices is None
+        else [int(value) for value in decision_indices]
+    )
+    if len(indices) != len(actions):
+        raise SparseReconstructionError(
+            "malformed_sequence",
+            "actions and decision_indices have different lengths",
+            game_seed=game_seed,
+            decision_index=-1,
+        )
+    if any(value < 0 for value in indices) or indices != sorted(set(indices)):
+        raise SparseReconstructionError(
+            "malformed_sequence",
+            "decision_indices must be unique, non-negative, and increasing",
+            game_seed=game_seed,
+            decision_index=-1,
+        )
+    return {
+        int(decision): int(action)
+        for decision, action in zip(indices, actions, strict=True)
+    }
+
+
+def action_size_for_colors(colors: tuple[str, ...]) -> int:
+    """Return the catalog minimum when no checkpoint contract is available.
+
+    Production checkpoints may deliberately retain a larger inherited action
+    dimension (the current f7 checkpoint uses 567 while the two-player catalog
+    has 332 entries). Policy ids remain identical, but legal-action token
+    normalization depends on the checkpoint dimension. Exact corpus roundtrip
+    must therefore pass the authenticated checkpoint ``action_size``; this
+    helper is only a legacy/fallback minimum.
     """
     return int(ActionCatalog(colors).size)
 
@@ -87,6 +146,7 @@ def gather_game_action_sequence(
     game_seed: int,
     *,
     colors: tuple[str, ...] = DEFAULT_COLORS,
+    allow_omitted_automatic_transitions: bool = False,
 ) -> GameActionSequence:
     """Collect one game's full action sequence by streaming shards under `scope`.
 
@@ -95,7 +155,10 @@ def gather_game_action_sequence(
     rows are fully contained there and never collide with another worker's
     (game_seed = base_seed + globally-incremented game_index within a run).
     Rows are gathered across the worker's shard files and sorted by
-    decision_index; a gap raises (a game must have a contiguous 0..N-1 record).
+    decision_index.  Legacy callers remain fail-closed on gaps.  Modern
+    trajectory-only corpora may opt into sparse reconstruction: gaps are then
+    admitted here but still have to prove single-action uniqueness while the
+    engine replays them.
     """
     from regret_common import discover_shards, load_shard
 
@@ -118,8 +181,12 @@ def gather_game_action_sequence(
         raise ValueError(f"no rows found for game_seed={game_seed} under {scope}")
     rows.sort(key=lambda r: r[0])
     dec_indices = [r[0] for r in rows]
+    if len(dec_indices) != len(set(dec_indices)):
+        raise ValueError(
+            f"game_seed={game_seed} decision_index sequence has duplicates"
+        )
     expected = list(range(dec_indices[0], dec_indices[0] + len(dec_indices)))
-    if dec_indices != expected:
+    if not allow_omitted_automatic_transitions and dec_indices != expected:
         raise ValueError(
             f"game_seed={game_seed} decision_index sequence has gaps/dupes: "
             f"got {dec_indices[:8]}... expected contiguous from {dec_indices[0]}"
@@ -172,21 +239,104 @@ def _policy_id_to_rust_id(
     return int(matches[0])
 
 
+def _apply_sparse_replay_step(
+    game: Any,
+    *,
+    decision_index: int,
+    recorded: dict[int, int],
+    game_seed: int,
+    colors: tuple[str, ...],
+    action_size: int,
+    chance_rng: random.Random,
+    correct_rust_chance_spectra: bool,
+) -> tuple[Any, str | None]:
+    """Apply one recorded or provably unique omitted transition."""
+
+    d = int(decision_index)
+    if game.winning_color() is not None:
+        raise SparseReconstructionError(
+            "terminal_before_target",
+            f"game ended at decision {d} before requested target",
+            game_seed=game_seed,
+            decision_index=d,
+        )
+    legal_rust = tuple(
+        int(action) for action in game.playable_action_indices(list(colors), None)
+    )
+    omitted = d not in recorded
+    if not omitted:
+        try:
+            rust_id = _policy_id_to_rust_id(
+                game, recorded[d], colors=colors, action_size=action_size
+            )
+        except ValueError as error:
+            raise SparseReconstructionError(
+                "recorded_action_illegal",
+                str(error),
+                game_seed=game_seed,
+                decision_index=d,
+                legal_action_count=len(legal_rust),
+            ) from error
+    elif len(legal_rust) == 1:
+        rust_id = int(legal_rust[0])
+    else:
+        raise SparseReconstructionError(
+            "missing_nonautomatic_decision",
+            "an omitted decision has more than one legal action; the stored "
+            "bytes do not determine which branch was taken",
+            game_seed=game_seed,
+            decision_index=d,
+            legal_action_count=len(legal_rust),
+        )
+    action_json = None
+    omitted_action_type = None
+    if omitted:
+        action_ids = [
+            int(action)
+            for action in game.playable_action_indices(list(colors), None)
+        ]
+        raw_actions = json.loads(game.playable_actions_json())
+        action_json = dict(zip(action_ids, raw_actions)).get(rust_id)
+        if action_json is None:
+            raise SparseReconstructionError(
+                "runtime_error",
+                "unique omitted action is absent from playable_actions_json",
+                game_seed=game_seed,
+                decision_index=d,
+                legal_action_count=len(legal_rust),
+            )
+        omitted_action_type = _action_type_of(action_json) or "OTHER_UI"
+    return (
+        _apply_selected_action(
+            game,
+            rust_id,
+            colors=tuple(colors),
+            rng=chance_rng,
+            correct_rust_chance_spectra=correct_rust_chance_spectra,
+            action_json=action_json,
+        ),
+        omitted_action_type,
+    )
+
+
 def reconstruct_state(
     game_seed: int,
     actions: list[int],
     target_decision: int,
     *,
+    decision_indices: list[int] | None = None,
     colors: tuple[str, ...] = DEFAULT_COLORS,
     correct_rust_chance_spectra: bool = True,
     action_size: int | None = None,
     return_rng: bool = False,
 ) -> Any:
-    """Replay `actions[0:target_decision]` from `game_seed` and return the live game.
+    """Replay a dense or sparse action trace and return one archived root.
 
     The returned game is the state the actor faced AT decision index
-    `target_decision` (before applying `actions[target_decision]`). Setting
-    `target_decision == len(actions)` returns the terminal/truncated end state.
+    `target_decision` (before applying the action at that decision).  With a
+    sparse ``decision_indices`` trace, every absent prior decision is applied
+    only when the engine exposes exactly one legal action.  A missing
+    multi-action decision is mathematically ambiguous and fails closed.
 
     With `return_rng=True`, returns `(game, chance_rng)` where `chance_rng` is
     the game's chance stream positioned exactly where the archived trajectory
@@ -195,27 +345,28 @@ def reconstruct_state(
     """
     if action_size is None:
         action_size = action_size_for_colors(tuple(colors))
-    if not 0 <= target_decision <= len(actions):
+    recorded = _validated_sparse_actions(
+        game_seed=int(game_seed),
+        actions=actions,
+        decision_indices=decision_indices,
+    )
+    maximum = (max(recorded) + 1) if recorded else 0
+    if not 0 <= target_decision <= maximum:
         raise ValueError(
-            f"target_decision {target_decision} out of range [0, {len(actions)}]"
+            f"target_decision {target_decision} out of range [0, {maximum}]"
         )
     catanatron_rs = _require_rust_module()
     game = catanatron_rs.Game.simple(list(colors), seed=int(game_seed))
     chance_rng = random.Random(int(game_seed) ^ CHANCE_RNG_SALT)
     for d in range(int(target_decision)):
-        if game.winning_color() is not None:
-            raise ValueError(
-                f"game ended at decision {d} before reaching target "
-                f"{target_decision} (game_seed={game_seed}) -- replay diverged"
-            )
-        rust_id = _policy_id_to_rust_id(
-            game, int(actions[d]), colors=colors, action_size=action_size
-        )
-        game = _apply_selected_action(
+        game, _omitted_action_type = _apply_sparse_replay_step(
             game,
-            rust_id,
-            colors=tuple(colors),
-            rng=chance_rng,
+            decision_index=d,
+            recorded=recorded,
+            game_seed=game_seed,
+            colors=colors,
+            action_size=action_size,
+            chance_rng=chance_rng,
             correct_rust_chance_spectra=correct_rust_chance_spectra,
         )
     if return_rng:
@@ -223,11 +374,118 @@ def reconstruct_state(
     return game
 
 
+def reconstruct_state_from_sequence(
+    sequence: GameActionSequence,
+    target_decision: int,
+    *,
+    correct_rust_chance_spectra: bool = True,
+    action_size: int | None = None,
+    return_rng: bool = False,
+) -> Any:
+    """Typed sparse-sequence entry point used by Stage-C reanalysis."""
+
+    return reconstruct_state(
+        sequence.game_seed,
+        sequence.actions,
+        target_decision,
+        decision_indices=sequence.decision_indices,
+        colors=sequence.colors,
+        correct_rust_chance_spectra=correct_rust_chance_spectra,
+        action_size=action_size,
+        return_rng=return_rng,
+    )
+
+
+@dataclass(slots=True)
+class SparseReconstructionBatch:
+    states: dict[int, Any]
+    omitted_automatic_transitions: dict[int, int]
+    omitted_automatic_transition_types: dict[int, dict[str, int]]
+    failure: SparseReconstructionError | None
+
+
+def reconstruct_states_from_sequence(
+    sequence: GameActionSequence,
+    target_decisions: list[int] | tuple[int, ...] | np.ndarray,
+    *,
+    correct_rust_chance_spectra: bool = True,
+    action_size: int | None = None,
+) -> SparseReconstructionBatch:
+    """Replay one game once and capture several selected archived roots.
+
+    A failure after an earlier target does not invalidate the already captured
+    roots.  The caller can classify only targets after the first ambiguous or
+    divergent transition, rather than blocking the whole game/corpus.
+    """
+
+    targets = sorted(set(int(value) for value in np.asarray(target_decisions).tolist()))
+    if not targets or targets[0] < 0:
+        raise ValueError("target_decisions must contain non-negative decisions")
+    recorded = _validated_sparse_actions(
+        game_seed=sequence.game_seed,
+        actions=sequence.actions,
+        decision_indices=sequence.decision_indices,
+    )
+    maximum = (max(recorded) + 1) if recorded else 0
+    if targets[-1] > maximum:
+        raise ValueError(
+            f"target decision {targets[-1]} out of range [0, {maximum}]"
+        )
+    if action_size is None:
+        action_size = action_size_for_colors(sequence.colors)
+    catanatron_rs = _require_rust_module()
+    game = catanatron_rs.Game.simple(
+        list(sequence.colors), seed=int(sequence.game_seed)
+    )
+    chance_rng = random.Random(int(sequence.game_seed) ^ CHANCE_RNG_SALT)
+    states: dict[int, Any] = {}
+    omitted_by_target: dict[int, int] = {}
+    omitted_types_by_target: dict[int, dict[str, int]] = {}
+    target_set = set(targets)
+    omitted_count = 0
+    omitted_type_counts: dict[str, int] = {}
+    failure: SparseReconstructionError | None = None
+    for decision in range(targets[-1] + 1):
+        if decision in target_set:
+            states[decision] = game.copy()
+            omitted_by_target[decision] = omitted_count
+            omitted_types_by_target[decision] = dict(omitted_type_counts)
+        if decision == targets[-1]:
+            break
+        try:
+            game, omitted_action_type = _apply_sparse_replay_step(
+                game,
+                decision_index=decision,
+                recorded=recorded,
+                game_seed=sequence.game_seed,
+                colors=sequence.colors,
+                action_size=action_size,
+                chance_rng=chance_rng,
+                correct_rust_chance_spectra=correct_rust_chance_spectra,
+            )
+        except SparseReconstructionError as error:
+            failure = error
+            break
+        if omitted_action_type is not None:
+            omitted_count += 1
+            omitted_type_counts[omitted_action_type] = (
+                omitted_type_counts.get(omitted_action_type, 0) + 1
+            )
+    return SparseReconstructionBatch(
+        states=states,
+        omitted_automatic_transitions=omitted_by_target,
+        omitted_automatic_transition_types=omitted_types_by_target,
+        failure=failure,
+    )
+
+
 def featurize_state(
     game: Any,
     *,
     colors: tuple[str, ...] = DEFAULT_COLORS,
     action_size: int | None = None,
+    meaningful_public_history: bool = False,
+    history_limit: int = 64,
 ) -> dict[str, Any]:
     """Entity tokens + legal policy ids + context for the live game's current state.
 
@@ -258,6 +516,8 @@ def featurize_state(
         snapshot=snapshot,
         action_by_id=action_by_id,
         public_observation=True,
+        meaningful_public_history=meaningful_public_history,
+        history_limit=history_limit,
     )
     features = {key: value[0] for key, value in entity.items()}
     context = rust_action_context_batch(
@@ -289,6 +549,7 @@ _ROUNDTRIP_ENTITY_KEYS = (
     "player_tokens",
     "global_tokens",
     "event_tokens",
+    "event_target_ids",
     "hex_mask",
     "vertex_mask",
     "edge_mask",
@@ -316,6 +577,8 @@ class RoundTripResult:
     max_abs_diff: float
     worst_key: str
     detail: str = ""
+    phase_match: bool = True
+    player_match: bool = True
 
 
 def round_trip_row(
@@ -327,17 +590,59 @@ def round_trip_row(
     correct_rust_chance_spectra: bool = True,
     fp16_atol: float = 1e-2,
     action_size: int | None = None,
+    meaningful_public_history: bool = False,
+    history_limit: int = 64,
+    reconstructed_game: Any | None = None,
 ) -> RoundTripResult:
     """Reconstruct the state at `row_decision_index` and compare to stored data."""
-    game = reconstruct_state(
-        seq.game_seed,
-        seq.actions,
-        row_decision_index,
-        colors=seq.colors,
-        correct_rust_chance_spectra=correct_rust_chance_spectra,
-        action_size=action_size,
+    game = (
+        reconstructed_game
+        if reconstructed_game is not None
+        else reconstruct_state_from_sequence(
+            seq,
+            row_decision_index,
+            correct_rust_chance_spectra=correct_rust_chance_spectra,
+            action_size=action_size,
+        )
     )
-    feat = featurize_state(game, colors=seq.colors, action_size=action_size)
+    feat = featurize_state(
+        game,
+        colors=seq.colors,
+        action_size=action_size,
+        meaningful_public_history=meaningful_public_history,
+        history_limit=history_limit,
+    )
+
+    try:
+        sequence_position = seq.decision_indices.index(int(row_decision_index))
+    except ValueError:
+        sequence_position = -1
+    expected_phase = (
+        str(seq.phases[sequence_position])
+        if 0 <= sequence_position < len(seq.phases)
+        else ""
+    )
+    expected_player = (
+        str(seq.players[sequence_position])
+        if 0 <= sequence_position < len(seq.players)
+        else ""
+    )
+    reconstructed_phase = feat.get("phase")
+    reconstructed_player = feat.get("acting_color")
+    phase_match = (
+        not expected_phase
+        or (
+            reconstructed_phase is not None
+            and str(reconstructed_phase) == expected_phase
+        )
+    )
+    player_match = (
+        not expected_player
+        or (
+            reconstructed_player is not None
+            and str(reconstructed_player) == expected_player
+        )
+    )
 
     # Legal-action policy ids must match exactly (padding stripped).
     stored_ids = np.asarray(stored_legal_ids).reshape(-1)
@@ -357,6 +662,23 @@ def round_trip_row(
             continue
         a = np.asarray(stored_features[key], dtype=np.float32)
         b = np.asarray(feat["features"][key], dtype=np.float32)
+        if (
+            key in {"event_tokens", "event_target_ids", "event_mask"}
+            and a.ndim == b.ndim
+            and a.shape[1:] == b.shape[1:]
+            and a.shape[0] >= b.shape[0]
+        ):
+            # NPZ/memmap collation pads meaningful-history rows to the model's
+            # inherited width (64), while the producer intentionally emitted
+            # only event_history_limit rows (32). Authenticate the padding
+            # before trimming; otherwise a hidden extra event could disappear.
+            tail = a[b.shape[0] :]
+            expected_fill = -1.0 if key == "event_target_ids" else 0.0
+            if tail.size and not np.all(tail == expected_fill):
+                worst_key = key
+                max_abs_diff = float("inf")
+                break
+            a = a[: b.shape[0]]
         if a.shape != b.shape:
             worst_key = key
             max_abs_diff = float("inf")
@@ -396,7 +718,23 @@ def round_trip_row(
             if diff > max_abs_diff:
                 max_abs_diff = diff
                 worst_key = "legal_action_context"
-    ok = legal_ids_match and math_isfinite(max_abs_diff) and max_abs_diff <= fp16_atol
+    ok = (
+        legal_ids_match
+        and phase_match
+        and player_match
+        and math_isfinite(max_abs_diff)
+        and max_abs_diff <= fp16_atol
+    )
+    detail_parts = []
+    if not phase_match:
+        detail_parts.append(
+            f"phase reconstructed={reconstructed_phase!r} stored={expected_phase!r}"
+        )
+    if not player_match:
+        detail_parts.append(
+            "player reconstructed="
+            f"{reconstructed_player!r} stored={expected_player!r}"
+        )
     return RoundTripResult(
         game_seed=seq.game_seed,
         decision_index=int(row_decision_index),
@@ -404,6 +742,9 @@ def round_trip_row(
         legal_ids_match=legal_ids_match,
         max_abs_diff=max_abs_diff,
         worst_key=worst_key,
+        detail="; ".join(detail_parts),
+        phase_match=phase_match,
+        player_match=player_match,
     )
 
 
@@ -420,6 +761,7 @@ def round_trip_shard_rows(
     fp16_atol: float = 1e-2,
     seed: int = 0,
     row_indices: list[int] | tuple[int, ...] | np.ndarray | None = None,
+    allow_omitted_automatic_transitions: bool = False,
 ) -> dict[str, Any]:
     """Round-trip a sample of rows from one shard, self-locating each game's scope.
 
@@ -461,7 +803,12 @@ def round_trip_shard_rows(
             gseed = int(seeds[i])
             if gseed not in seq_cache:
                 seq_cache[gseed] = gather_game_action_sequence(
-                    scope, gseed, colors=colors
+                    scope,
+                    gseed,
+                    colors=colors,
+                    allow_omitted_automatic_transitions=(
+                        allow_omitted_automatic_transitions
+                    ),
                 )
             seq = seq_cache[gseed]
             stored_features = {
@@ -509,6 +856,8 @@ def round_trip_shard_rows(
                     "game_seed": r.game_seed,
                     "decision_index": r.decision_index,
                     "legal_ids_match": r.legal_ids_match,
+                    "phase_match": r.phase_match,
+                    "player_match": r.player_match,
                     "max_abs_diff": r.max_abs_diff,
                     "worst_key": r.worst_key,
                     "detail": r.detail,
@@ -577,15 +926,28 @@ def main() -> None:
         action="store_true",
         help="also gather the shard row at this decision and verify featurisation match",
     )
+    parser.add_argument(
+        "--allow-omitted-automatic-transitions",
+        action="store_true",
+        help=(
+            "admit sparse decision indices only when replay proves every gap "
+            "had exactly one legal action"
+        ),
+    )
     args = parser.parse_args()
 
     colors = tuple(c.strip() for c in args.colors.split(","))
-    seq = gather_game_action_sequence(Path(args.scope), args.game_seed, colors=colors)
-    game = reconstruct_state(
+    seq = gather_game_action_sequence(
+        Path(args.scope),
         args.game_seed,
-        seq.actions,
-        args.decision_index,
         colors=colors,
+        allow_omitted_automatic_transitions=(
+            args.allow_omitted_automatic_transitions
+        ),
+    )
+    game = reconstruct_state_from_sequence(
+        seq,
+        args.decision_index,
         correct_rust_chance_spectra=args.correct_rust_chance_spectra,
     )
     snapshot = json.loads(game.json_snapshot())
@@ -611,6 +973,9 @@ def main() -> None:
             colors=colors,
             fp16_atol=1e-2,
             row_indices=[row_index],
+            allow_omitted_automatic_transitions=(
+                args.allow_omitted_automatic_transitions
+            ),
         )
         output["round_trip"] = round_trip
         print(json.dumps(output, indent=2, sort_keys=True))
