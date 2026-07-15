@@ -11174,20 +11174,38 @@ def main(argv: Sequence[str] | None = None) -> None:
             value_sample_weights,
             num_workers=int(args.data_loader_workers),
             prefetch=int(args.data_loader_prefetch),
+            policy_aux_rows=(
+                None
+                if aux_order is None
+                else train_indices[np.asarray(aux_order, dtype=np.int64)]
+            ),
+            policy_aux_batch_size=int(args.policy_aux_active_batch_size),
         )
         for batch_number, (_batch_tuple, _is_last_batch) in enumerate(
             _iter_with_last(batch_iterator), start=1
         ):
-            batch_data, batch, batch_policy_weights, batch_value_weights = _batch_tuple
+            if aux_order is None:
+                (
+                    batch_data,
+                    batch,
+                    batch_policy_weights,
+                    batch_value_weights,
+                ) = _batch_tuple
+                policy_aux_data = None
+                policy_aux_batch = None
+                aux_source_rows = None
+            else:
+                (
+                    batch_data,
+                    batch,
+                    batch_policy_weights,
+                    batch_value_weights,
+                    policy_aux_data,
+                    policy_aux_batch,
+                    aux_source_rows,
+                ) = _batch_tuple
             if len(batch) == 0:
                 continue
-            aux_batch = None
-            if aux_order is not None:
-                aux_start = (batch_number - 1) * int(args.policy_aux_active_batch_size)
-                aux_stop = aux_start + int(args.policy_aux_active_batch_size)
-                aux_batch = train_indices[aux_order[aux_start:aux_stop]]
-                if len(aux_batch) != int(args.policy_aux_active_batch_size):
-                    raise RuntimeError("policy auxiliary draw dose drift")
             # C1 grad-accum bookkeeping. At accum==1 do_zero_grad and do_step are
             # both True every batch (identical to pre-C1). The LR schedule uses
             # global_step (optimizer steps), so within an accumulation group every
@@ -11280,11 +11298,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     **objective_interference_kwargs,
                     **(
                         {
-                            "policy_aux_data": data,
-                            "policy_aux_batch": aux_batch,
-                            "policy_aux_sample_weights": policy_sample_weights,
+                            "policy_aux_data": policy_aux_data,
+                            "policy_aux_batch": policy_aux_batch,
+                            "policy_aux_sample_weights": batch_policy_weights,
                         }
-                        if aux_batch is not None
+                        if policy_aux_batch is not None
                         else {}
                     ),
                 )
@@ -11325,14 +11343,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                     epoch_training_strata_dose[key] = (
                         epoch_training_strata_dose.get(key, 0.0) + float(value)
                     )
-                if aux_batch is not None:
+                if aux_source_rows is not None:
                     realized_aux_strata = _flatten_training_strata_dose(
                         _training_strata_dose_for_batch(
                             data,
-                            np.asarray(aux_batch, dtype=np.int64),
-                            policy_weights=np.asarray(policy_sample_weights)[aux_batch],
-                            value_weights=np.zeros(len(aux_batch), dtype=np.float32),
-                            value_active_mask=np.zeros(len(aux_batch), dtype=np.bool_),
+                            np.asarray(aux_source_rows, dtype=np.int64),
+                            policy_weights=np.asarray(policy_sample_weights)[
+                                aux_source_rows
+                            ],
+                            value_weights=np.zeros(
+                                len(aux_source_rows), dtype=np.float32
+                            ),
+                            value_active_mask=np.zeros(
+                                len(aux_source_rows), dtype=np.bool_
+                            ),
                             draw_stream="policy_aux",
                         )
                     )
@@ -16054,6 +16078,11 @@ MEMMAP_LAZY_COLUMNS = frozenset(
         "target_policy_mask",
         "target_scores",
         "target_scores_mask",
+        # These are ragged per-action columns. Leaving them out of this set
+        # made MemmapCorpus reconstruct the full legal-width-padded arrays in
+        # every DDP rank even when the active objective never reads them.
+        "afterstate_target",
+        "afterstate_target_mask",
     }
 )
 
@@ -16630,6 +16659,8 @@ def _iterate_training_batches(
     *,
     num_workers: int,
     prefetch: int,
+    policy_aux_rows: np.ndarray | None = None,
+    policy_aux_batch_size: int = 0,
 ):
     """Yield ``(data, batch, policy_weights, value_weights)`` tuples for one epoch.
 
@@ -16639,11 +16670,14 @@ def _iterate_training_batches(
 
     Prefetch path (MemmapCorpus + num_workers>0): background threads materialise
     each batch's columns into a plain dict while the GPU trains the previous
-    batch, overlapping the per-batch ragged reconstruction. train_fn then sees a
-    materialised dict indexed by a local ``arange``, which is element-for-element
-    identical to indexing the corpus with the global batch. Threads (not
-    processes) share the read-only memmaps safely and avoid the fork-duplication
-    pitfall of DataLoader workers.
+    batch, overlapping the per-batch ragged reconstruction. If policy-auxiliary
+    rows are supplied, their corresponding batch is gathered in the *same*
+    materialisation. This removes the old synchronous second memmap gather from
+    the rank main thread without changing either sampled row stream. train_fn
+    then sees a materialised dict indexed by local positions, which is
+    element-for-element identical to indexing the corpus with the global rows.
+    Threads (not processes) share the read-only memmaps safely and avoid the
+    fork-duplication pitfall of DataLoader workers.
     """
     batches = [
         train_indices[order[start : start + batch_size]]
@@ -16651,30 +16685,80 @@ def _iterate_training_batches(
     ]
     batches = [b for b in batches if len(b) > 0]
 
+    aux_batches: list[np.ndarray] | None = None
+    if policy_aux_rows is not None:
+        aux_rows = np.asarray(policy_aux_rows, dtype=np.int64)
+        aux_size = int(policy_aux_batch_size)
+        if aux_size <= 0 or aux_rows.ndim != 1:
+            raise RuntimeError("policy auxiliary prefetch shape is invalid")
+        expected = len(batches) * aux_size
+        if len(aux_rows) != expected:
+            raise RuntimeError(
+                "policy auxiliary draw dose drift: "
+                f"rows={len(aux_rows)} expected={expected}"
+            )
+        aux_batches = [
+            aux_rows[start : start + aux_size]
+            for start in range(0, len(aux_rows), aux_size)
+        ]
+
     if num_workers <= 0 or not isinstance(data, (MemmapCorpus, ConcatMemmapCorpus)):
-        for batch in batches:
-            yield data, batch, policy_sample_weights, value_sample_weights
+        for index, batch in enumerate(batches):
+            if aux_batches is None:
+                yield data, batch, policy_sample_weights, value_sample_weights
+            else:
+                aux_batch = aux_batches[index]
+                yield (
+                    data,
+                    batch,
+                    policy_sample_weights,
+                    value_sample_weights,
+                    data,
+                    aux_batch,
+                    aux_batch,
+                )
         return
 
     keys = list(data.keys())
 
-    def _materialize(batch: np.ndarray):
-        materialized = {key: data[key][batch] for key in keys}
+    def _materialize(batch: np.ndarray, aux_batch: np.ndarray | None):
+        rows = (
+            batch
+            if aux_batch is None
+            else np.concatenate((batch, aux_batch))
+        )
+        materialized = {}
+        for key in keys:
+            if _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY and key in {
+                "event_tokens",
+                "event_target_ids",
+                "event_mask",
+            }:
+                # The full-corpus mask was authenticated as empty before this
+                # optimization is enabled. Preserve the exact decoded tensor
+                # ABI while avoiding reads of the two largest all-zero payloads.
+                column = data[key]
+                materialized[key] = np.empty(
+                    (len(rows), 0, *tuple(column.shape[2:])),
+                    dtype=column.dtype,
+                )
+            else:
+                materialized[key] = data[key][rows]
         # train_fn indexes a materialized batch with local ``0..N-1`` rows.
         # Preserve the immutable global source rows separately so post-loss
         # provenance (notably component dose) cannot reinterpret those local
         # positions as rows from component zero of the full composite.
         materialized["_source_global_row_indices"] = np.asarray(
-            batch, dtype=np.int64
+            rows, dtype=np.int64
         ).copy()
         stored_policy_temperatures = _stored_policy_temperatures_for_batch(
-            data, batch
+            data, rows
         )
         if stored_policy_temperatures is not None:
             materialized["_stored_policy_temperature"] = (
                 stored_policy_temperatures
             )
-        policy_kl_anchor_eligible = _policy_kl_anchor_scope_mask(data, batch)
+        policy_kl_anchor_eligible = _policy_kl_anchor_scope_mask(data, rows)
         if policy_kl_anchor_eligible is not None:
             # A materialised batch is a plain dict, so authenticated composite
             # attributes (and component_indices_for_rows) no longer exist by
@@ -16685,13 +16769,13 @@ def _iterate_training_batches(
             materialized["_policy_kl_anchor_eligible"] = (
                 policy_kl_anchor_eligible
             )
-        aux_subgoal_eligible = _aux_subgoal_scope_mask(data, batch)
+        aux_subgoal_eligible = _aux_subgoal_scope_mask(data, rows)
         if aux_subgoal_eligible is not None:
             # Preserve the authenticated component scope after global memmap
             # rows are materialized into a local plain dict.
             materialized["_aux_subgoal_eligible"] = aux_subgoal_eligible
         public_award_authoritative = _public_award_authoritative_row_mask(
-            data, batch
+            data, rows
         )
         if public_award_authoritative is not None:
             # Threaded prefetch replaces the authenticated composite object with
@@ -16702,19 +16786,49 @@ def _iterate_training_batches(
                 public_award_authoritative
             )
         local = np.arange(len(batch), dtype=np.int64)
-        return materialized, local, policy_sample_weights[batch], value_sample_weights[batch]
+        local_policy_weights = policy_sample_weights[rows]
+        local_value_weights = value_sample_weights[rows]
+        if aux_batch is None:
+            return (
+                materialized,
+                local,
+                local_policy_weights,
+                local_value_weights,
+            )
+        aux_local = np.arange(len(batch), len(rows), dtype=np.int64)
+        return (
+            materialized,
+            local,
+            local_policy_weights,
+            local_value_weights,
+            materialized,
+            aux_local,
+            aux_batch,
+        )
 
     prefetch = max(1, int(prefetch))
     with ThreadPoolExecutor(max_workers=int(num_workers)) as executor:
         pending: deque = deque()
         next_index = 0
         while next_index < len(batches) and len(pending) < prefetch:
-            pending.append(executor.submit(_materialize, batches[next_index]))
+            pending.append(
+                executor.submit(
+                    _materialize,
+                    batches[next_index],
+                    None if aux_batches is None else aux_batches[next_index],
+                )
+            )
             next_index += 1
         while pending:
             future = pending.popleft()
             if next_index < len(batches):
-                pending.append(executor.submit(_materialize, batches[next_index]))
+                pending.append(
+                    executor.submit(
+                        _materialize,
+                        batches[next_index],
+                        None if aux_batches is None else aux_batches[next_index],
+                    )
+                )
                 next_index += 1
             yield future.result()
 
