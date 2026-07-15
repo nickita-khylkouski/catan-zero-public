@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::f64;
 
 use catanatron_rs::{
-    execute_spectrum, generate_playable_actions, Action, ActionSpace, ActionType, ActionValue,
-    Color, Game, MapKind,
+    execute_spectrum, generate_playable_actions, starting_devcard_bank, Action, ActionSpace,
+    ActionType, ActionValue, Color, DevCard, Game, MapKind,
 };
 
 pub type Evaluation = (HashMap<usize, f64>, f64, f64);
@@ -65,6 +65,12 @@ pub trait Evaluator {
 // Config
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForcedRootTargetMode {
+    Full,
+    TrajectoryOnly,
+}
+
 #[derive(Clone, Debug)]
 pub struct SearchConfig {
     pub colors: Vec<Color>,
@@ -87,6 +93,7 @@ pub struct SearchConfig {
     pub n_full: i32,
     pub n_fast: i32,
     pub p_full: f64,
+    pub forced_root_target_mode: ForcedRootTargetMode,
     pub n_full_wide: Option<i32>,
     pub n_full_wide_threshold: Option<usize>,
     pub wide_roots_always_full: bool,
@@ -113,6 +120,11 @@ pub struct SearchConfig {
     /// Stop a determinized tree as soon as play leaves the root actor's turn.
     /// This is the actor-turn PIMC horizon used by information-set search.
     pub stop_at_root_turn_boundary: bool,
+    /// One-tree, two-player public-belief chance semantics. The caller supplies
+    /// a sanitized root. Robber probabilities are then exact by 2p resource
+    /// conservation; development draws are materialized from the public
+    /// posterior independently of the concrete hidden deck.
+    pub coherent_public_belief_search: bool,
 }
 
 impl Default for SearchConfig {
@@ -136,6 +148,7 @@ impl Default for SearchConfig {
             n_full: 64,
             n_fast: 16,
             p_full: 0.25,
+            forced_root_target_mode: ForcedRootTargetMode::Full,
             n_full_wide: None,
             n_full_wide_threshold: None,
             wide_roots_always_full: false,
@@ -155,6 +168,7 @@ impl Default for SearchConfig {
             uncertainty_backup_exp: 1.0,
             uncertainty_backup_cap: 1.0,
             stop_at_root_turn_boundary: false,
+            coherent_public_belief_search: false,
         }
     }
 }
@@ -418,6 +432,12 @@ impl GumbelMctsEngine {
         evaluator: &mut E,
         force_full: Option<bool>,
     ) -> Result<SearchResult, String> {
+        if self.config.coherent_public_belief_search && game.state.colors.len() != 2 {
+            return Err(format!(
+                "coherent public-belief search requires exactly two players, got {}",
+                game.state.colors.len()
+            ));
+        }
         if self.config.rescale_noise_floor_initial_road_only
             && self
                 .config
@@ -835,7 +855,9 @@ impl GumbelMctsEngine {
 
     #[inline]
     fn is_root_turn_boundary(&self, arena: &Arena, node_idx: usize, depth: i32) -> bool {
-        if !self.config.stop_at_root_turn_boundary || depth <= 0 {
+        if !(self.config.stop_at_root_turn_boundary || self.config.coherent_public_belief_search)
+            || depth <= 0
+        {
             return false;
         }
         let node = arena.get(node_idx);
@@ -990,7 +1012,7 @@ impl GumbelMctsEngine {
         let root_color = arena.get(node_idx).root_color;
         let outcomes = {
             let node = arena.get(node_idx);
-            execute_spectrum(&node.game, &node.playable_actions[action_idx])
+            self.chance_outcomes(&node.game, &node.playable_actions[action_idx], root_color)?
         };
         let total_prob: f64 = outcomes.iter().map(|(_, p)| *p).sum();
         if total_prob <= 0.0 || outcomes.is_empty() {
@@ -1039,6 +1061,73 @@ impl GumbelMctsEngine {
             stats.children.insert(i, new_child_indices[i]);
         }
         Ok(())
+    }
+
+    fn chance_outcomes(
+        &self,
+        game: &Game,
+        action: &Action,
+        root_color: Color,
+    ) -> Result<Vec<(Game, f64)>, String> {
+        if !self.config.coherent_public_belief_search
+            || action.action_type != ActionType::BuyDevelopmentCard
+        {
+            // In coherent 2p search MOVE_ROBBER is already exact here: the
+            // Python orchestration supplied a public-conservation sanitized
+            // root, and two-player bank+own-hand conservation fixes the sole
+            // opponent's complete resource hand.
+            return Ok(execute_spectrum(game, action));
+        }
+        if game.state.development_listdeck.is_empty() {
+            return Err("coherent public-belief dev draw encountered an empty deck".into());
+        }
+
+        // Same public posterior as Python PublicBelief: base composition minus
+        // every publicly played card and the observer's own known unplayed
+        // cards. Opponent face-down cards remain exchangeable with the deck.
+        let mut public_unknown = [0_u8; 5];
+        for card in starting_devcard_bank() {
+            public_unknown[card.idx()] += 1;
+        }
+        for color in &game.state.colors {
+            let player = game.state.player_state(*color);
+            for index in 0..5 {
+                public_unknown[index] = public_unknown[index]
+                    .checked_sub(player.played_dev_cards[index])
+                    .ok_or("public played development cards exceed base deck")?;
+            }
+        }
+        let observer = game.state.player_state(root_color);
+        for index in 0..5 {
+            public_unknown[index] = public_unknown[index]
+                .checked_sub(observer.dev_cards[index])
+                .ok_or("observer development cards exceed public remaining deck")?;
+        }
+        let total = public_unknown
+            .iter()
+            .map(|count| usize::from(*count))
+            .sum::<usize>();
+        if total == 0 {
+            return Err("coherent public-belief dev posterior has no support".into());
+        }
+        let cards = DevCard::ALL
+            .into_iter()
+            .filter(|card| public_unknown[card.idx()] > 0)
+            .collect::<Vec<_>>();
+        let children =
+            game.public_belief_development_draws(root_color, action, &cards, self.config.seed)?;
+        if children.len() != cards.len() {
+            return Err(format!(
+                "public-belief dev materializer returned {} children for {} cards",
+                children.len(),
+                cards.len()
+            ));
+        }
+        Ok(cards
+            .into_iter()
+            .zip(children)
+            .map(|(card, child)| (child, f64::from(public_unknown[card.idx()]) / total as f64))
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -1380,6 +1469,20 @@ impl GumbelMctsEngine {
     ) -> Result<SearchResult, String> {
         let action = &legal[0];
         let action_id = self.action_ids(legal)?[0];
+        if self.config.forced_root_target_mode == ForcedRootTargetMode::TrajectoryOnly {
+            return Ok(SearchResult {
+                selected_action: action_id,
+                improved_policy: vec![(action_id, 1.0)],
+                visit_counts: vec![],
+                q_values: vec![],
+                priors: vec![(action_id, 1.0)],
+                root_value: f64::NAN,
+                completed_q_values: vec![],
+                used_full_search: false,
+                simulations_used: 0,
+                afterstate_values: vec![],
+            });
+        }
         if action.action_type != ActionType::Roll {
             let legal_ids = self.action_ids(legal)?;
             let (_, value, _) = evaluator.evaluate_root(game, &legal_ids, root_color)?;
@@ -1735,7 +1838,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("authoritative root-phase attestation"));
     }
-    use catanatron_rs::{Coordinate, Player};
+    use catanatron_rs::{ActionPrompt, Coordinate, Player, Resource};
 
     #[derive(Default)]
     struct CountingEvaluator {
@@ -1775,6 +1878,118 @@ mod tests {
             vec![Player::simple(Color::Red), Player::simple(Color::Blue)],
             Some(seed),
         )
+    }
+
+    #[test]
+    fn coherent_public_belief_dev_chance_ignores_concrete_hidden_support() {
+        let mut game = opening(79);
+        let observer = game.state.current_color();
+        let opponent = game
+            .state
+            .colors
+            .iter()
+            .copied()
+            .find(|color| *color != observer)
+            .unwrap();
+
+        game.state.is_initial_build_phase = false;
+        game.state.current_prompt = ActionPrompt::PlayTurn;
+        game.state.player_state_mut(observer).has_rolled = true;
+        let buy_resources = [0, 0, 1, 1, 1];
+        game.state.player_state_mut(observer).resources = buy_resources;
+        for (index, count) in buy_resources.into_iter().enumerate() {
+            game.state.resource_freqdeck[index] -= count;
+        }
+
+        let hidden_count = 2;
+        {
+            let hidden = game.state.player_state_mut(opponent);
+            hidden.dev_cards[DevCard::RoadBuilding.idx()] = hidden_count;
+            hidden.owned_at_start[DevCard::RoadBuilding.idx()] = true;
+        }
+        game.state.development_listdeck = starting_devcard_bank();
+        for _ in 0..hidden_count {
+            let position = game
+                .state
+                .development_listdeck
+                .iter()
+                .position(|card| *card == DevCard::RoadBuilding)
+                .unwrap();
+            game.state.development_listdeck.remove(position);
+        }
+        game.playable_actions = generate_playable_actions(&game.state);
+        let action = game
+            .playable_actions
+            .iter()
+            .find(|action| action.action_type == ActionType::BuyDevelopmentCard)
+            .cloned()
+            .expect("buy-development-card action must be legal");
+
+        let concrete = execute_spectrum(&game, &action);
+        assert_eq!(concrete.len(), 4);
+        assert!(concrete.iter().all(|(child, _)| {
+            child.state.player_state(observer).dev_cards[DevCard::RoadBuilding.idx()] == 0
+        }));
+
+        let engine = GumbelMctsEngine::new(SearchConfig {
+            coherent_public_belief_search: true,
+            ..Default::default()
+        });
+        let belief = engine.chance_outcomes(&game, &action, observer).unwrap();
+        assert_eq!(belief.len(), 5);
+        assert!(
+            (belief
+                .iter()
+                .map(|(_, probability)| probability)
+                .sum::<f64>()
+                - 1.0)
+                .abs()
+                < 1e-12
+        );
+        let road_probability = belief
+            .iter()
+            .find_map(|(child, probability)| {
+                (child.state.player_state(observer).dev_cards[DevCard::RoadBuilding.idx()] == 1)
+                    .then_some(*probability)
+            })
+            .expect("public-belief support must include ROAD_BUILDING");
+        assert!((road_probability - 2.0 / 25.0).abs() < 1e-12);
+        assert!(belief.iter().all(|(child, _)| {
+            child.state.player_state(observer).resources[Resource::Sheep.idx()] == 0
+                && child.state.player_state(observer).resources[Resource::Wheat.idx()] == 0
+                && child.state.player_state(observer).resources[Resource::Ore.idx()] == 0
+        }));
+    }
+
+    #[test]
+    fn forced_trajectory_only_selects_without_evaluator_or_fake_values() {
+        let game = opening(91);
+        let action = Action::new(Color::Red, ActionType::Roll, ActionValue::None);
+        let expected_action = ActionSpace::new(&[Color::Red, Color::Blue], MapKind::Base)
+            .index(&action)
+            .unwrap();
+        let mut evaluator = CountingEvaluator::default();
+        let mut engine = GumbelMctsEngine::new(SearchConfig {
+            forced_root_target_mode: ForcedRootTargetMode::TrajectoryOnly,
+            ..Default::default()
+        });
+
+        let result = engine
+            .forced_single_action(&game, &[action], Color::Red, &mut evaluator)
+            .unwrap();
+
+        assert_eq!(result.selected_action, expected_action);
+        assert_eq!(result.improved_policy, vec![(expected_action, 1.0)]);
+        assert_eq!(result.priors, vec![(expected_action, 1.0)]);
+        assert!(result.visit_counts.is_empty());
+        assert!(result.q_values.is_empty());
+        assert!(result.completed_q_values.is_empty());
+        assert!(result.afterstate_values.is_empty());
+        assert!(result.root_value.is_nan());
+        assert!(!result.used_full_search);
+        assert_eq!(result.simulations_used, 0);
+        assert_eq!(evaluator.root_calls, 0);
+        assert_eq!(evaluator.leaf_calls, 0);
     }
 
     #[test]

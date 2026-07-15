@@ -233,6 +233,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "truncated_vp_margin_value_weight",
         "forced_action_weight",
         "forced_row_value_weight",
+        "forced_row_value_action_type_weights",
         "winner_sample_weight",
         "loser_sample_weight",
     }
@@ -2337,12 +2338,18 @@ def bind_learner_ablation(
             "authority; generic ablation ids and caller-chosen coefficients are "
             "not admissible"
         )
-    if upgrade is not None and not (
-        aux_upgrade and set(overrides) == {"aux_subgoal_loss_weight"}
-    ):
+    target_gather_upgrade = bool(
+        isinstance(upgrade, dict)
+        and upgrade.get("module") == architecture_upgrade.MODULE_TARGET_GATHER
+    )
+    # Target gather is an exact zero-output initializer, and the generic
+    # ablation receipt already binds both its upgrade identity and the full
+    # effective loss recipe. Keep this combination diagnostic-only below; do
+    # not extend the exception to arbitrary architecture deltas.
+    if upgrade is not None and not target_gather_upgrade:
         raise ExecutorError(
-            "an architecture upgrade may be combined only with the reviewed "
-            "single-variable aux_subgoal_loss_weight experiment"
+            "a generic learner ablation may be combined only with the reviewed "
+            "function-preserving action-target-gather upgrade"
         )
     if "aux_subgoal_loss_weight" in overrides and not aux_upgrade:
         raise ExecutorError(
@@ -2359,6 +2366,28 @@ def bind_learner_ablation(
     if "value_trunk_grad_scale" in overrides:
         effective["value_trunk_grad_scale"] = 1.0
     for key, value in overrides.items():
+        if key == "forced_row_value_action_type_weights":
+            if type(value) is not str:
+                raise ExecutorError(
+                    "A1 learner ablation forced_row_value_action_type_weights "
+                    "must preserve JSON type str"
+                )
+            try:
+                parsed_type_weights = (
+                    train_bc._parse_forced_row_value_action_type_weights(value)
+                )
+            except SystemExit as error:
+                raise ExecutorError(str(error)) from error
+            if not parsed_type_weights:
+                raise ExecutorError(
+                    "A1 learner ablation forced action-type map must be nonempty"
+                )
+            effective[key] = (
+                train_bc._canonical_forced_row_value_action_type_weights(
+                    parsed_type_weights
+                )
+            )
+            continue
         if key == "per_game_value_weight_mode":
             if value not in {"equal", "sqrt"}:
                 raise ExecutorError(
@@ -2479,6 +2508,11 @@ def bind_learner_ablation(
         drift["value_trunk_grad_scale"] = {
             "contract": 1.0,
             "effective": effective["value_trunk_grad_scale"],
+        }
+    if effective.get("forced_row_value_action_type_weights", ""):
+        drift["forced_row_value_action_type_weights"] = {
+            "contract": "disabled (implicit historical default)",
+            "effective": effective["forced_row_value_action_type_weights"],
         }
     if not drift and aux_arm != "AUX0":
         raise ExecutorError("A1 learner ablation is a no-op")
@@ -2668,6 +2702,12 @@ def bind_diagnostic_training_descriptor(
                 f"effective learner recipe lost descriptor-authorized field {key!r}"
             )
         derived_overrides[key] = effective_recipe[key]
+    typed_forced_key = "forced_row_value_action_type_weights"
+    if effective_recipe.get(typed_forced_key):
+        # This additive diagnostic field intentionally does not exist in the
+        # immutable production descriptor. Its canonical value is carried by
+        # the derived descriptor and replayed by train_bc before optimizer use.
+        derived_overrides[typed_forced_key] = effective_recipe[typed_forced_key]
 
     derived = copy.deepcopy(base)
     derived["learner_recipe_overrides"] = derived_overrides
@@ -4162,6 +4202,13 @@ def _build_direct_train_command(
             "--trust-curated-data-quality",
         ]
     )
+    if recipe.get("forced_row_value_action_type_weights"):
+        command.extend(
+            [
+                "--forced-row-value-action-type-weights",
+                str(recipe["forced_row_value_action_type_weights"]),
+            ]
+        )
     if "sampler_seed" in recipe:
         command.extend(["--sampler-seed", str(recipe["sampler_seed"])])
     if (
@@ -7447,6 +7494,12 @@ def _verify_training_outputs(
         "steps_completed": expected_steps,
         "total_training_steps": expected_steps,
     }
+    if recipe.get("forced_row_value_action_type_weights"):
+        expected["forced_row_value_action_type_weights"] = (
+            train_bc._parse_forced_row_value_action_type_weights(
+                str(recipe["forced_row_value_action_type_weights"])
+            )
+        )
     if matched_aux is not None:
         expected.update(
             {

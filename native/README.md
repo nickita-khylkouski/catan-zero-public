@@ -50,3 +50,13 @@ is an exact no-op and `T=0` retains deterministic argmax selection. Callers
 requesting these semantics fail closed on older wheel digests that either
 silently emitted zero for the public award or treated every positive gameplay
 temperature as `T=1`.
+
+Version `0.1.9` links `gumbel-mcts` `0.2.3` and adds
+`coherent_public_belief_search` plus `forced_root_trajectory_only`. Coherent
+belief search spends one unsplit budget in a sanitized two-player tree, stops
+at the root actor's turn boundary, and materializes development-card draws
+from public posterior support instead of the arbitrary concrete hidden deck.
+Trajectory-only forced roots return the mathematically exact sole action with
+no neural evaluation or invented Q/root-value evidence. Both semantics are
+advertised through `gumbel_search_capabilities()` and production admission
+must reject older wheels when either mode is requested.

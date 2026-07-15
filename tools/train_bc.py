@@ -211,6 +211,13 @@ _MIXED_AWARD_COMPONENT_CONTRACTS = (
 _MIXED_AWARD_TRANSITION_SCHEMA = "mixed-authoritative-transition-v1"
 
 TARGET_INFORMATION_REGIME_PUBLIC = "public_conservation_pimc_v1"
+TARGET_INFORMATION_REGIME_PUBLIC_COHERENT = "public_belief_single_tree_v1"
+TARGET_INFORMATION_REGIMES_PUBLIC = frozenset(
+    {
+        TARGET_INFORMATION_REGIME_PUBLIC,
+        TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+    }
+)
 TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
 
 MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
@@ -1332,6 +1339,17 @@ def build_parser() -> argparse.ArgumentParser:
             "CAT-60: multiplier for VALUE-loss weight on rows with exactly one legal "
             "action. Default 1.0 is a no-op (byte-identical to pre-CAT-60 behavior). "
             "Distinct from --forced-action-weight, which only affects the POLICY loss."
+        ),
+    )
+    parser.add_argument(
+        "--forced-row-value-action-type-weights",
+        default="",
+        help=(
+            "Optional comma-separated ActionCatalog action-type multipliers for "
+            "VALUE loss on forced rows, e.g. ROLL=0.1,END_TURN=0.25. These "
+            "multiply --forced-row-value-weight; unlisted forced action types "
+            "retain multiplier 1.0. Empty by default, preserving the historical "
+            "objective exactly."
         ),
     )
     parser.add_argument(
@@ -3537,10 +3555,11 @@ def _preflight_flywheel_diagnostic_derivative(
     """Authenticate one narrow diagnostic projection of a production composite.
 
     The production descriptor remains immutable and retains its strict recipe.
-    A diagnostic learner may change only the proven one-axis policy-game
-    weighting treatment and/or remove historical replay from policy CE. Value
-    training, components, sampling, source authority, and every other byte are
-    inherited unchanged from the fully replayed production descriptor.
+    A diagnostic learner may change only the proven policy-game weighting
+    treatment, add the explicit forced-action-type value weighting treatment,
+    and/or remove historical replay from an objective. Components, sampling,
+    source authority, and every other byte are inherited unchanged from the
+    fully replayed production descriptor.
     """
 
     authority = descriptor.get("diagnostic_derivation_authority")
@@ -3631,14 +3650,39 @@ def _preflight_flywheel_diagnostic_derivative(
             for key in set(base_overrides) | set(effective_overrides)
             if base_overrides.get(key) != effective_overrides.get(key)
         }
+        typed_key = "forced_row_value_action_type_weights"
         if (
-            set(base_overrides) != set(effective_overrides)
-            or changed != {"per_game_policy_weight"}
-            or base_overrides.get("per_game_policy_weight") is not True
-            or effective_overrides.get("per_game_policy_weight") is not False
+            set(base_overrides) - set(effective_overrides)
+            or set(effective_overrides) - set(base_overrides) - {typed_key}
+            or not changed
+            or changed - {"per_game_policy_weight", typed_key}
+            or (
+                "per_game_policy_weight" in changed
+                and (
+                    base_overrides.get("per_game_policy_weight") is not True
+                    or effective_overrides.get("per_game_policy_weight") is not False
+                )
+            )
+            or (
+                typed_key in changed
+                and (
+                    typed_key in base_overrides
+                    or not isinstance(effective_overrides.get(typed_key), str)
+                    or not _parse_forced_row_value_action_type_weights(
+                        effective_overrides.get(typed_key, "")
+                    )
+                    or effective_overrides.get(typed_key)
+                    != _canonical_forced_row_value_action_type_weights(
+                        _parse_forced_row_value_action_type_weights(
+                            effective_overrides.get(typed_key, "")
+                        )
+                    )
+                )
+            )
         ):
             raise SystemExit(
-                "flywheel diagnostic recipe may only disable per-game policy weighting"
+                "flywheel diagnostic recipe may only disable per-game policy "
+                "weighting and/or add a canonical forced-action-type value map"
             )
         expected["learner_recipe_overrides"] = copy.deepcopy(effective_overrides)
         expected["learner_recipe_overrides_sha256"] = _canonical_json_sha256(
@@ -3854,6 +3898,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     allowed_override_fields = {
         *required_override_fields,
         "forced_action_weight", "forced_row_value_weight",
+        "forced_row_value_action_type_weights",
         "hlgauss_scalar_aux_loss_weight", "loser_sample_weight",
         "lr", "per_game_value_weight", "per_game_value_weight_mode",
         "policy_loss_weight",
@@ -3877,6 +3922,24 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "per_game_policy_weight_mode"
     ] not in {"equal", "sqrt"}:
         raise SystemExit("memmap composite per-game policy recipe override is invalid")
+    typed_forced_spec = overrides.get("forced_row_value_action_type_weights")
+    if typed_forced_spec is not None:
+        if not isinstance(typed_forced_spec, str):
+            raise SystemExit(
+                "memmap composite forced action-type value map must be a string"
+            )
+        parsed_typed_forced = _parse_forced_row_value_action_type_weights(
+            typed_forced_spec
+        )
+        if (
+            not parsed_typed_forced
+            or typed_forced_spec
+            != _canonical_forced_row_value_action_type_weights(parsed_typed_forced)
+        ):
+            raise SystemExit(
+                "memmap composite forced action-type value map must be nonempty "
+                "and canonical"
+            )
     if descriptor.get("learner_recipe_overrides_sha256") != _canonical_json_sha256(overrides):
         raise SystemExit("memmap composite learner recipe override digest mismatch")
     components: list[dict[str, object]] = []
@@ -4719,6 +4782,7 @@ def _validate_composite_learner_recipe_authorization(
     converters = {
         "forced_action_weight": float,
         "forced_row_value_weight": float,
+        "forced_row_value_action_type_weights": str,
         "hlgauss_scalar_aux_loss_weight": float,
         "loser_sample_weight": float,
         "lr": float,
@@ -6676,6 +6740,16 @@ def _effective_a1_learner_training_recipe(
         "ddp_shard_data",
     )
     effective = {field: getattr(args, field) for field in bound_fields}
+    forced_type_weights = _parse_forced_row_value_action_type_weights(
+        str(getattr(args, "forced_row_value_action_type_weights", "") or "")
+    )
+    if forced_type_weights:
+        # Additive opt-in objective. Historical recipes omit the field at the
+        # empty default, while an active type map is canonicalized and becomes
+        # part of the sealed effective recipe.
+        effective["forced_row_value_action_type_weights"] = (
+            _canonical_forced_row_value_action_type_weights(forced_type_weights)
+        )
     if getattr(args, "sampler_seed", None) is not None:
         # Historical A1 recipes keep their exact shape when this additive flag
         # is omitted. An explicit independent sampler stream changes the
@@ -7565,6 +7639,8 @@ def _validate_a1_learner_training_recipe(
         authorized_extra_fields.add("policy_aux_active_batch_size")
     if float(getattr(args, "value_trunk_grad_scale", 1.0)) != 1.0:
         authorized_extra_fields.add("value_trunk_grad_scale")
+    if effective.get("forced_row_value_action_type_weights"):
+        authorized_extra_fields.add("forced_row_value_action_type_weights")
     missing = set(expected) - set(effective)
     extra = set(effective) - (set(expected) | authorized_extra_fields)
     drift = {
@@ -7586,6 +7662,11 @@ def _validate_a1_learner_training_recipe(
         drift["value_trunk_grad_scale"] = {
             "contract": 1.0,
             "effective": float(effective["value_trunk_grad_scale"]),
+        }
+    if "forced_row_value_action_type_weights" in effective:
+        drift["forced_row_value_action_type_weights"] = {
+            "contract": "disabled (implicit historical default)",
+            "effective": effective["forced_row_value_action_type_weights"],
         }
     aux_regularization = _validate_a1_aux_regularization_binding(
         args, recipe_drift=drift
@@ -9545,6 +9626,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     policy_phase_weight_map = _parse_weight_map(args.phase_weights)
     value_phase_weights_raw = args.value_phase_weights or args.phase_weights
     value_phase_weight_map = _parse_weight_map(value_phase_weights_raw)
+    forced_row_value_action_type_weight_map = (
+        _parse_forced_row_value_action_type_weights(
+            args.forced_row_value_action_type_weights
+        )
+    )
+    forced_row_value_action_catalog = (
+        _action_catalog_for_env_config(env_config)
+        if forced_row_value_action_type_weight_map
+        else None
+    )
 
     def _build_derived_training_arrays() -> dict[str, np.ndarray]:
         """Build deterministic O(rows) learner arrays once per host."""
@@ -9568,6 +9659,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             data,
             phase_weights=value_phase_weight_map,
             forced_row_value_weight=args.forced_row_value_weight,
+            forced_row_value_action_type_weights=(
+                forced_row_value_action_type_weight_map
+            ),
+            action_catalog=forced_row_value_action_catalog,
             per_game_value_weight=args.per_game_value_weight,
             per_game_value_weight_mode=args.per_game_value_weight_mode,
         )
@@ -9703,6 +9798,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             ],
         }
+        if forced_row_value_action_type_weight_map:
+            # Preserve historical cache identities at the disabled default.
+            cache_payload["forced_row_value_action_type_weights"] = (
+                forced_row_value_action_type_weight_map
+            )
         _cache_key, cache_identity = _derived_array_cache_key(cache_payload)
         cache_root = Path(
             os.environ.get(
@@ -9947,6 +10047,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         value_sample_weight_report["by_game"] = per_game_weight_quality(
             data, value_sample_weights
         )
+        if forced_row_value_action_type_weight_map:
+            value_sample_weight_report["by_forced_action_type"] = (
+                forced_action_type_value_mass_quality(
+                    data,
+                    value_sample_weights,
+                    action_catalog=forced_row_value_action_catalog,
+                    configured_weights=forced_row_value_action_type_weight_map,
+                )
+            )
     else:
         # Reports are only printed/written by rank 0. Avoid repeating their
         # O(rows) grouping work and transient arrays on every local DDP rank.
@@ -11797,6 +11906,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "elapsed_sec": time.perf_counter() - start,
     }
+    if forced_row_value_action_type_weight_map:
+        report["forced_row_value_action_type_weights"] = (
+            forced_row_value_action_type_weight_map
+        )
     if is_memmap_composite:
         report.update({
             "memmap_composite": {
@@ -16061,9 +16174,9 @@ def _validate_target_information_admission(
     masked student may use realised outcomes and hard recorded actions from a
     legacy corpus only when every search-derived objective is disabled for the
     run.  The current trainer configures those objectives corpus-wide, so a
-    mixed corpus is admitted to them only when every row explicitly carries
-    the public-conservation PIMC regime. Missing provenance is ``unknown`` and
-    is intentionally unsafe.
+    mixed corpus is admitted to them only when every row explicitly carries a
+    recognized public-search regime. Missing provenance is ``unknown`` and is
+    intentionally unsafe.
     """
 
     n = int(len(data["action_taken"]))
@@ -16097,7 +16210,8 @@ def _validate_target_information_admission(
             "target_information_regime counts do not cover the corpus: "
             f"counts={sum(counts.values())} rows={n}"
         )
-    unsafe_count = n - int(counts.get(TARGET_INFORMATION_REGIME_PUBLIC, 0))
+    safe_count = sum(int(counts.get(regime, 0)) for regime in TARGET_INFORMATION_REGIMES_PUBLIC)
+    unsafe_count = n - safe_count
     objectives: list[str] = []
     if (
         float(policy_loss_weight) != 0.0
@@ -16126,10 +16240,10 @@ def _validate_target_information_admission(
         raise SystemExit(
             "public-observation training refused unsafe/unknown search targets: "
             f"objectives={objectives}, unsafe_or_unknown_rows={unsafe_count}/{n}, "
-            f"target_information_regimes={counts}. Only "
-            f"{TARGET_INFORMATION_REGIME_PUBLIC!r} may supply soft policy, Q, or "
+            f"target_information_regimes={counts}. Only one of "
+            f"{sorted(TARGET_INFORMATION_REGIMES_PUBLIC)!r} may supply soft policy, Q, or "
             "search-root value targets to --mask-hidden-info training. Re-generate "
-            "with public-conservation PIMC search, or disable every listed search-target "
+            "with an attested public-search operator, or disable every listed search-target "
             "objective and train only on hard actions/realised outcomes."
         )
     return report
@@ -17299,6 +17413,18 @@ def _expected_action_mask_version(env_config) -> str:
     try:
         _, info = env.reset(seed=0)
         return str(info.get("action_mask_version", ""))
+    finally:
+        env.close()
+
+
+def _action_catalog_for_env_config(env_config):
+    """Return the exact catalog used by the configured training environment."""
+
+    from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
+
+    env = ColonistMultiAgentEnv(env_config)
+    try:
+        return env.action_catalog
     finally:
         env.close()
 
@@ -20620,6 +20746,8 @@ def build_value_sample_weights(
     *,
     phase_weights: dict[str, float] | None = None,
     forced_row_value_weight: float = 1.0,
+    forced_row_value_action_type_weights: Mapping[str, float] | None = None,
+    action_catalog: object | None = None,
     per_game_value_weight: bool = False,
     per_game_value_weight_mode: str = "equal",
 ) -> np.ndarray:
@@ -20648,8 +20776,11 @@ def build_value_sample_weights(
       1. ``phase_weights`` multiplier (this function, existing).
       2. ``value_weight_multiplier`` (CAT-45's per-row sampling-weight field, already stored on
          the corpus -- existing).
-      3. ``forced_row_value_weight`` multiplier on rows with exactly one legal action (new).
-      4. ``per_game_value_weight`` normalization: divides by summed game weight
+      3. ``forced_row_value_weight`` multiplier on rows with exactly one legal action.
+      4. ``forced_row_value_action_type_weights`` multiplier selected from the
+         stored ``action_taken`` through the active ``ActionCatalog``. Unlisted
+         forced action types retain multiplier 1.0.
+      5. ``per_game_value_weight`` normalization: divides by summed game weight
          for uniform-row corpora or mean game weight for game-uniform v2
          composites. It does not undo forced-row downweighting within a game.
 
@@ -20665,20 +20796,184 @@ def build_value_sample_weights(
             weights[phases == phase] *= float(weight)
     if "value_weight_multiplier" in data:
         weights *= np.asarray(data["value_weight_multiplier"], dtype=np.float32)
-    if float(forced_row_value_weight) != 1.0 and "legal_action_ids" in data:
-        legal_column = data["legal_action_ids"]
-        legal_counts = (
-            legal_column.row_counts()
-            if isinstance(legal_column, _MemmapRaggedColumn)
-            else np.sum(np.asarray(legal_column) >= 0, axis=1)
-        )
+    type_weights = dict(forced_row_value_action_type_weights or {})
+    legal_counts = None
+    if (
+        float(forced_row_value_weight) != 1.0 or type_weights
+    ) and "legal_action_ids" in data:
+        legal_counts = _legal_action_counts(data["legal_action_ids"])
+    if float(forced_row_value_weight) != 1.0 and legal_counts is not None:
         weights[legal_counts == 1] *= float(forced_row_value_weight)
+    if type_weights:
+        if legal_counts is None:
+            raise SystemExit(
+                "--forced-row-value-action-type-weights requires legal_action_ids"
+            )
+        forced = legal_counts == 1
+        multipliers, _action_types = _action_catalog_type_projection(
+            action_catalog, type_weights
+        )
+        if np.any(forced):
+            forced_actions = _validated_forced_action_ids(
+                data, forced, action_catalog_size=len(multipliers)
+            )
+            weights[forced] *= multipliers[forced_actions]
     if per_game_value_weight and len(weights):
         weights = _normalize_weights_per_game(data, weights, mode=per_game_value_weight_mode)
     mean = float(np.mean(weights)) if len(weights) else 1.0
     if mean > 0.0:
         weights = weights / mean
     return weights.astype(np.float32, copy=False)
+
+
+def _legal_action_counts(legal_column: object) -> np.ndarray:
+    counts = (
+        legal_column.row_counts()
+        if isinstance(legal_column, _MemmapRaggedColumn)
+        else np.sum(np.asarray(legal_column) >= 0, axis=1)
+    )
+    return np.asarray(counts, dtype=np.int64)
+
+
+def _action_catalog_type_projection(
+    action_catalog: object | None,
+    configured_weights: Mapping[str, float],
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Build dense action-id multipliers from the authoritative catalog."""
+
+    if action_catalog is None:
+        raise SystemExit(
+            "--forced-row-value-action-type-weights requires an ActionCatalog"
+        )
+    size = int(getattr(action_catalog, "size", -1))
+    describe = getattr(action_catalog, "describe", None)
+    if size <= 0 or not callable(describe):
+        raise SystemExit("forced-row value weighting received an invalid ActionCatalog")
+    action_types = tuple(
+        str(describe(action_id)["action_type"]).upper()
+        for action_id in range(size)
+    )
+    malformed = {
+        str(name): value
+        for name, value in configured_weights.items()
+        if (
+            str(name) != str(name).upper()
+            or not _ACTION_TYPE_NAME_RE.fullmatch(str(name))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        )
+    }
+    if malformed:
+        raise SystemExit(
+            "forced-row value action-type weights are malformed: "
+            f"{malformed!r}"
+        )
+    known_types = set(action_types)
+    unknown = set(configured_weights) - known_types
+    if unknown:
+        raise SystemExit(
+            "--forced-row-value-action-type-weights names unknown ActionCatalog "
+            f"types {sorted(unknown)}; known={sorted(known_types)}"
+        )
+    multipliers = np.fromiter(
+        (float(configured_weights.get(name, 1.0)) for name in action_types),
+        dtype=np.float32,
+        count=size,
+    )
+    return multipliers, action_types
+
+
+def _validated_forced_action_ids(
+    data: dict,
+    forced_mask: np.ndarray,
+    *,
+    action_catalog_size: int,
+) -> np.ndarray:
+    actions = np.asarray(data["action_taken"])[forced_mask]
+    action_ids = np.asarray(actions, dtype=np.int64)
+    if (
+        action_ids.shape != actions.shape
+        or np.any(action_ids < 0)
+        or np.any(action_ids >= action_catalog_size)
+        or not np.array_equal(action_ids, actions)
+    ):
+        raise SystemExit(
+            "forced-row action_taken contains an id outside the active ActionCatalog"
+        )
+    return action_ids
+
+
+def forced_action_type_value_mass_quality(
+    data: dict,
+    weights: np.ndarray,
+    *,
+    action_catalog: object,
+    configured_weights: Mapping[str, float],
+) -> dict[str, object]:
+    """Report final effective value-loss mass for each forced action type."""
+
+    multipliers, action_types = _action_catalog_type_projection(
+        action_catalog, configured_weights
+    )
+    if "legal_action_ids" not in data:
+        raise SystemExit(
+            "forced action-type value mass reporting requires legal_action_ids"
+        )
+    final_weights = np.asarray(weights, dtype=np.float64)
+    forced = _legal_action_counts(data["legal_action_ids"]) == 1
+    action_ids = _validated_forced_action_ids(
+        data, forced, action_catalog_size=len(multipliers)
+    )
+    counts_by_id = np.bincount(action_ids, minlength=len(multipliers))
+    mass_by_id = np.bincount(
+        action_ids,
+        weights=final_weights[forced],
+        minlength=len(multipliers),
+    )
+    rows_by_type: dict[str, int] = {}
+    mass_by_type: dict[str, float] = {}
+    for action_id, action_type in enumerate(action_types):
+        rows_by_type[action_type] = rows_by_type.get(action_type, 0) + int(
+            counts_by_id[action_id]
+        )
+        mass_by_type[action_type] = mass_by_type.get(action_type, 0.0) + float(
+            mass_by_id[action_id]
+        )
+    forced_mass = float(np.sum(final_weights[forced]))
+    total_mass = float(np.sum(final_weights))
+    by_action_type = {
+        action_type: {
+            "rows": rows_by_type[action_type],
+            "configured_multiplier": float(
+                configured_weights.get(action_type, 1.0)
+            ),
+            "effective_value_mass": mass_by_type[action_type],
+            "fraction_of_forced_value_mass": (
+                mass_by_type[action_type] / forced_mass if forced_mass > 0.0 else 0.0
+            ),
+            "fraction_of_total_value_mass": (
+                mass_by_type[action_type] / total_mass if total_mass > 0.0 else 0.0
+            ),
+        }
+        for action_type in sorted(rows_by_type)
+        if rows_by_type[action_type] > 0
+    }
+    return {
+        "enabled": True,
+        "configured_weights": {
+            key: float(configured_weights[key]) for key in sorted(configured_weights)
+        },
+        "forced_rows": int(np.count_nonzero(forced)),
+        "forced_row_fraction": (
+            float(np.mean(forced)) if len(forced) else 0.0
+        ),
+        "effective_forced_value_mass": forced_mass,
+        "effective_total_value_mass": total_mass,
+        "effective_forced_value_mass_fraction": (
+            forced_mass / total_mass if total_mass > 0.0 else 0.0
+        ),
+        "by_action_type": by_action_type,
+    }
 
 
 def _validated_component_offsets(data: dict, n: int) -> np.ndarray | None:
@@ -21048,6 +21343,60 @@ def _parse_weight_map(raw: str) -> dict[str, float]:
         name, value = item.split("=", 1)
         weights[name.strip()] = float(value)
     return weights
+
+
+_ACTION_TYPE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
+
+
+def _parse_forced_row_value_action_type_weights(raw: str) -> dict[str, float]:
+    """Parse an opt-in ActionCatalog type -> forced-row value multiplier map."""
+
+    weights: dict[str, float] = {}
+    for part in str(raw or "").split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise SystemExit(
+                "invalid --forced-row-value-action-type-weights entry: "
+                f"{item!r}; expected ACTION_TYPE=WEIGHT"
+            )
+        raw_name, raw_value = item.split("=", 1)
+        name = raw_name.strip().upper()
+        if not _ACTION_TYPE_NAME_RE.fullmatch(name):
+            raise SystemExit(
+                "invalid --forced-row-value-action-type-weights action type: "
+                f"{raw_name.strip()!r}"
+            )
+        if name in weights:
+            raise SystemExit(
+                "duplicate --forced-row-value-action-type-weights action type: "
+                f"{name}"
+            )
+        try:
+            value = float(raw_value)
+        except ValueError as error:
+            raise SystemExit(
+                "invalid --forced-row-value-action-type-weights multiplier for "
+                f"{name}: {raw_value!r}"
+            ) from error
+        if not math.isfinite(value) or value < 0.0:
+            raise SystemExit(
+                "--forced-row-value-action-type-weights multipliers must be "
+                f"finite and >= 0: {name}={raw_value!r}"
+            )
+        weights[name] = value
+    return weights
+
+
+def _canonical_forced_row_value_action_type_weights(
+    weights: Mapping[str, float],
+) -> str:
+    """Return the stable recipe/receipt representation of a parsed type map."""
+
+    return ",".join(
+        f"{name}={float(weights[name])!r}" for name in sorted(weights)
+    )
 
 
 def _parse_prefixes(raw: str) -> tuple[str, ...]:

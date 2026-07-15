@@ -45,6 +45,7 @@ def _worker_args(**overrides) -> dict:
         "max_decisions": 600,
         "max_depth": 80,
         "temperature_move_fraction": 0.075,
+        "temperature_clock": "prompt",
         "temperature_high": 1.0,
         "temperature_low": 0.0,
         "late_temperature_move_fraction": None,
@@ -63,6 +64,9 @@ def _worker_args(**overrides) -> dict:
         "lazy_interior_chance": False,
         "public_observation": False,
         "belief_chance_spectra": False,
+        "information_set_search": False,
+        "coherent_public_belief_search": False,
+        "forced_root_target_mode": "full",
         "opponent_pool_manifest": None,
     }
     values.update(overrides)
@@ -77,9 +81,7 @@ def _capture_configs(monkeypatch):
     def _fake_run_worker_games(**kwargs):
         captured["config"] = kwargs["config"]
         captured["search_config"] = kwargs["search_config"]
-        captured["resume_semantics_sha256"] = kwargs.get(
-            "resume_semantics_sha256"
-        )
+        captured["resume_semantics_sha256"] = kwargs.get("resume_semantics_sha256")
         return {
             "games_completed": 0,
             "games_failed": 0,
@@ -124,7 +126,9 @@ def test_public_award_provenance_rejects_stale_native_wheel(
     monkeypatch.setitem(
         sys.modules,
         "catanatron_rs",
-        type("StaleWheel", (), {"gumbel_search_capabilities": staticmethod(lambda: [])}),
+        type(
+            "StaleWheel", (), {"gumbel_search_capabilities": staticmethod(lambda: [])}
+        ),
     )
     with pytest.raises(RuntimeError, match="public_award_feature_parity"):
         cli._public_award_feature_provenance(rust_featurize=True)
@@ -142,7 +146,9 @@ def test_rescale_noise_floor_c_default_is_the_dataclass_no_op(monkeypatch) -> No
     assert captured["search_config"].sigma_eval == 0.79
 
 
-def test_rescale_noise_floor_c_and_sigma_eval_thread_through_from_worker_args(monkeypatch) -> None:
+def test_rescale_noise_floor_c_and_sigma_eval_thread_through_from_worker_args(
+    monkeypatch,
+) -> None:
     captured = _capture_configs(monkeypatch)
     cli._run_worker(_worker_args(rescale_noise_floor_c=1.0, sigma_eval=0.5))
 
@@ -187,7 +193,9 @@ def test_belief_target_aggregation_threads_through_worker_args(monkeypatch) -> N
 # --------------------------------------------------------------------------- D6 root denoising wiring
 
 
-def test_symmetry_averaging_defaults_to_off_with_canonical_wide_threshold(monkeypatch) -> None:
+def test_symmetry_averaging_defaults_to_off_with_canonical_wide_threshold(
+    monkeypatch,
+) -> None:
     captured = _capture_configs(monkeypatch)
     cli._run_worker(_worker_args())
 
@@ -230,7 +238,9 @@ def test_symmetry_averaging_fails_closed_for_incapable_evaluator(monkeypatch) ->
         )
 
 
-def test_adaptive_wide_budget_threshold_and_always_full_thread_through(monkeypatch) -> None:
+def test_adaptive_wide_budget_threshold_and_always_full_thread_through(
+    monkeypatch,
+) -> None:
     captured = _capture_configs(monkeypatch)
     cli._run_worker(
         _worker_args(
@@ -252,14 +262,19 @@ def test_science_validation_accepts_adaptive_n256_by_expanding_particles() -> No
     parser = cli.build_parser()
     args = parser.parse_args(
         [
-            "--out-dir", "/tmp/adaptive-p8",
-            "--n-full", "128",
-            "--n-full-wide", "256",
+            "--out-dir",
+            "/tmp/adaptive-p8",
+            "--n-full",
+            "128",
+            "--n-full-wide",
+            "256",
             "--wide-roots-always-full",
             "--public-observation",
             "--information-set-search",
-            "--determinization-particles", "8",
-            "--determinization-min-simulations", "32",
+            "--determinization-particles",
+            "8",
+            "--determinization-min-simulations",
+            "32",
         ]
     )
     cli._validate_science_args(args, parser)
@@ -269,14 +284,19 @@ def test_science_validation_rejects_adaptive_n256_that_deepens_each_particle() -
     parser = cli.build_parser()
     args = parser.parse_args(
         [
-            "--out-dir", "/tmp/adaptive-p4",
-            "--n-full", "128",
-            "--n-full-wide", "256",
+            "--out-dir",
+            "/tmp/adaptive-p4",
+            "--n-full",
+            "128",
+            "--n-full-wide",
+            "256",
             "--wide-roots-always-full",
             "--public-observation",
             "--information-set-search",
-            "--determinization-particles", "4",
-            "--determinization-min-simulations", "32",
+            "--determinization-particles",
+            "4",
+            "--determinization-min-simulations",
+            "32",
         ]
     )
     with pytest.raises(SystemExit):
@@ -302,3 +322,38 @@ def test_late_temperature_threads_through_from_worker_args(monkeypatch) -> None:
 
     assert captured["config"].late_temperature_move_fraction == 0.25
     assert captured["config"].late_temperature == 0.3
+
+
+def test_strategic_clock_and_forced_trajectory_mode_thread_through(monkeypatch) -> None:
+    captured = _capture_configs(monkeypatch)
+    cli._run_worker(
+        _worker_args(
+            temperature_clock="nonforced_choice",
+            coherent_public_belief_search=True,
+            forced_root_target_mode="trajectory_only",
+        )
+    )
+
+    assert captured["config"].temperature_clock == "nonforced_choice"
+    assert captured["search_config"].coherent_public_belief_search is True
+    assert captured["search_config"].information_set_search is False
+    assert captured["search_config"].forced_root_target_mode == "trajectory_only"
+
+
+def test_coherent_public_belief_accepts_one_full_budget_tree() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "--out-dir",
+            "/tmp/coherent-n128-wide256",
+            "--n-full",
+            "128",
+            "--n-full-wide",
+            "256",
+            "--wide-roots-always-full",
+            "--public-observation",
+            "--coherent-public-belief-search",
+            "--no-information-set-search",
+        ]
+    )
+    cli._validate_science_args(args, parser)

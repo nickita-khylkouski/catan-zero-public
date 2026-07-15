@@ -6,11 +6,14 @@ import os
 from pathlib import Path
 import subprocess
 
+from tools import production_runtime_contract as runtime_contract
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "tools" / "install_v1_freeze.sh"
 MPS_UNIT = ROOT / "tools" / "fleet" / "systemd" / "nvidia-mps.service"
-WHEEL_NAME = "catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl"
+RUNTIME = runtime_contract.load_runtime_contract()
+WHEEL_NAME = RUNTIME["catanatron_rs_wheel_filename"]
 
 
 def _run(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -148,6 +151,8 @@ def test_installer_shell_syntax_and_preflight_order() -> None:
     assert "initial_road_d1_scope" in text
     assert "public_award_feature_parity" in text
     assert "policy_temperature_semantics" in text
+    assert "coherent_public_belief_search" in text
+    assert "forced_root_trajectory_only" in text
     assert 'uv python install "$RUNTIME_PYTHON_VERSION"' in text
     assert '--contract "$RUNTIME_CONTRACT_REL" --check-python "$PY"' in text
     assert 'if [ "$SYSTEM_PYTHON_EXACT" -eq 1 ]' in text
@@ -187,7 +192,8 @@ def test_additional_well_formed_inventory_record_fails_closed(tmp_path: Path) ->
     repo = _release_repo(
         tmp_path,
         f"{digest}  {WHEEL_NAME}\n"
-        f"{'1' * 64}  catanatron_rs-0.1.8-cp310-cp310-manylinux_2_34_x86_64.whl\n",
+        f"{'1' * 64}  catanatron_rs-{RUNTIME['catanatron_rs_version']}"
+        "-cp310-cp310-manylinux_2_34_x86_64.whl\n",
     )
     result, sudo_marker, _destination = _invoke(tmp_path, repo=repo, wheel=wheel)
     assert result.returncode == 3

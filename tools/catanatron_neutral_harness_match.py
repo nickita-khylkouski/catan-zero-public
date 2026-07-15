@@ -221,6 +221,12 @@ def _search_config(
             else None
         ),
         information_set_search=bool(search_kwargs.get("information_set_search", False)),
+        coherent_public_belief_search=bool(
+            search_kwargs.get("coherent_public_belief_search", False)
+        ),
+        forced_root_target_mode=str(
+            search_kwargs.get("forced_root_target_mode", "full")
+        ),
         determinization_particles=int(
             search_kwargs.get("determinization_particles", 1)
         ),
@@ -229,9 +235,7 @@ def _search_config(
         ),
         belief_chance_spectra=bool(search_kwargs.get("belief_chance_spectra", False)),
         gameplay_policy_aggregation=str(
-            search_kwargs.get(
-                "gameplay_policy_aggregation", "mean_improved_policy"
-            )
+            search_kwargs.get("gameplay_policy_aggregation", "mean_improved_policy")
         ),
         sigma_reference_visits=(
             int(search_kwargs["sigma_reference_visits"])
@@ -415,8 +419,7 @@ def _native_runtime_extension_path() -> Path:
         raise RuntimeError("catanatron_rs native extension has no __file__")
     path = Path(raw_path).resolve(strict=True)
     if not any(
-        str(path).endswith(suffix)
-        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+        str(path).endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES
     ):
         raise RuntimeError(
             "catanatron_rs native implementation did not resolve to a compiled "
@@ -470,6 +473,12 @@ def _search_recipe(args: Any) -> dict[str, Any]:
         "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
         "public_observation": bool(args.public_observation),
         "information_set_search": bool(args.information_set_search),
+        "coherent_public_belief_search": bool(
+            getattr(args, "coherent_public_belief_search", False)
+        ),
+        "forced_root_target_mode": str(
+            getattr(args, "forced_root_target_mode", "full")
+        ),
         "determinization_particles": int(args.determinization_particles),
         "determinization_min_simulations": int(args.determinization_min_simulations),
         "prior_temperature": float(args.prior_temperature),
@@ -901,6 +910,16 @@ def build_summary(
         "information_set_search": (
             bool(args.information_set_search) if args.mode == "search" else None
         ),
+        "coherent_public_belief_search": (
+            bool(getattr(args, "coherent_public_belief_search", False))
+            if args.mode == "search"
+            else None
+        ),
+        "forced_root_target_mode": (
+            str(getattr(args, "forced_root_target_mode", "full"))
+            if args.mode == "search"
+            else None
+        ),
         "determinization_particles": (
             int(args.determinization_particles) if args.mode == "search" else None
         ),
@@ -972,6 +991,31 @@ def build_summary(
         "errors": errors,
         "games": games,
     }
+
+
+def _validate_public_search_recipe(args: Any) -> None:
+    """Require exactly one public-information tree operator in search mode."""
+    public = bool(args.public_observation)
+    information_set = bool(args.information_set_search)
+    coherent = bool(getattr(args, "coherent_public_belief_search", False))
+    belief_spectra = bool(args.belief_chance_spectra)
+
+    if not public:
+        raise ValueError("search mode requires --public-observation")
+    if information_set == coherent:
+        raise ValueError(
+            "search mode requires exactly one of --information-set-search or "
+            "--coherent-public-belief-search"
+        )
+    if coherent and belief_spectra:
+        raise ValueError(
+            "--coherent-public-belief-search cannot be combined with "
+            "--belief-chance-spectra"
+        )
+    if information_set and belief_spectra:
+        raise ValueError(
+            "--information-set-search cannot be combined with --belief-chance-spectra"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1057,7 +1101,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "Search public-belief determinizations instead of cloning authoritative "
-            "hidden truth. Required for every public-observation search panel."
+            "hidden truth. Exactly one of this PIMC mode or "
+            "--coherent-public-belief-search is required for a search panel."
+        ),
+    )
+    parser.add_argument(
+        "--coherent-public-belief-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use one actor-turn tree rooted in a public-belief state, with hidden "
+            "chance materialized from public support. Requires --public-observation "
+            "and is mutually exclusive with PIMC --information-set-search and "
+            "--belief-chance-spectra."
+        ),
+    )
+    parser.add_argument(
+        "--forced-root-target-mode",
+        choices=("full", "trajectory_only"),
+        default="full",
+        help=(
+            "Use trajectory_only to skip neural/search work at single-action "
+            "prompts; the played action is mathematically unchanged."
         ),
     )
     parser.add_argument(
@@ -1187,9 +1252,7 @@ def main() -> None:
         if not re.fullmatch(r"[0-9a-f]{40}", str(engine_identity["repo_commit"])):
             parser.error("search mode requires --engine-repo-commit")
         for name in ("native_wheel_sha256", "python_referee_sha256"):
-            if not re.fullmatch(
-                r"sha256:[0-9a-f]{64}", str(engine_identity[name])
-            ):
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(engine_identity[name])):
                 parser.error(f"search mode requires --{name.replace('_', '-')}")
         try:
             native_runtime = _native_runtime_extension_path()
@@ -1221,23 +1284,18 @@ def main() -> None:
     ]:
         parser.error("--devices must contain at least one device")
     if args.mode == "search":
-        if bool(args.public_observation) != bool(args.information_set_search):
-            parser.error(
-                "search mode requires --public-observation and "
-                "--information-set-search together"
-            )
-        if not bool(args.information_set_search):
-            parser.error(
-                "search mode refuses authoritative hidden-state MCTS; enable "
-                "--information-set-search"
-            )
+        try:
+            _validate_public_search_recipe(args)
+        except ValueError as error:
+            parser.error(str(error))
         if int(args.determinization_particles) < 1:
             parser.error("--determinization-particles must be >= 1")
         if int(args.determinization_min_simulations) < 1:
             parser.error("--determinization-min-simulations must be >= 1")
-        if args.sigma_reference_visits is not None and int(
-            args.sigma_reference_visits
-        ) < 0:
+        if (
+            args.sigma_reference_visits is not None
+            and int(args.sigma_reference_visits) < 0
+        ):
             parser.error("--sigma-reference-visits must be non-negative")
         if (
             str(args.gameplay_policy_aggregation) == "aggregate_q_then_improve"

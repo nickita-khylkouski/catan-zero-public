@@ -18,7 +18,8 @@
 #                stale fallback: v1.0-deploy predates the H100 hardening.
 #   CATAN_DEST   fresh checkout dir (default ~/catan-zero-v1; an existing venv,
 #                dirty checkout, or non-empty non-git directory is refused)
-#   CATAN_RS_WHEEL  catanatron_rs 0.1.8 cp311 manylinux wheel (pip can't fetch it;
+#   CATAN_RS_WHEEL  exact cp311 manylinux wheel named by the runtime contract
+#                (pip can't fetch it;
 #                if unset/absent, auto-downloaded from the CATAN_REF release assets)
 #   TORCH_INDEX  torch wheel index (default cu128)
 #   PY           python interpreter (default python3.11; 3.11 REQUIRED). If
@@ -404,6 +405,8 @@ required_capabilities = {
     "initial_road_d1_scope",
     "public_award_feature_parity",
     "policy_temperature_semantics",
+    "coherent_public_belief_search",
+    "forced_root_trajectory_only",
 }
 assert required_capabilities <= capabilities, (
     f"wheel lacks required native Gumbel capabilities: "
@@ -434,7 +437,7 @@ print(f"env-doctor OK: py={platform.python_version()} torch={torch.__version__} 
       f"cuda={torch.cuda.is_available()} catanatron_rs={rs}")
 PY
 
-# 6. smoke — Rust featurizer, information-set, and native MCTS API (0.1.8); fast, CPU-only
+# 6. smoke — Rust featurizer, information-set, and native MCTS API; fast, CPU-only
 ulimit -n 65536 2>/dev/null || true
 PYTHONPATH="$CATAN_DEST/src" python -m pytest \
   tests/test_rust_featurize_parity.py \
@@ -635,6 +638,8 @@ required_capabilities = {
     "initial_road_d1_scope",
     "public_award_feature_parity",
     "policy_temperature_semantics",
+    "coherent_public_belief_search",
+    "forced_root_trajectory_only",
 }
 dependency_versions = {
     distribution: version(distribution)

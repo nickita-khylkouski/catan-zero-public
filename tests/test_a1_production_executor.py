@@ -112,8 +112,18 @@ def test_native_wheel_inventory_digest_is_owned_by_runtime_contract(
     )
     monkeypatch.setattr(executor, "NATIVE_WHEEL_INVENTORY", inventory)
 
-    with pytest.raises(executor.ExecutorError, match="one canonical 0.1.8 artifact"):
+    with pytest.raises(
+        executor.ExecutorError,
+        match=rf"one canonical {executor.NATIVE_WHEEL_VERSION} artifact",
+    ):
         executor._native_wheel_release_identity()  # noqa: SLF001
+
+
+def test_native_release_requires_coherent_belief_and_forced_root_capabilities() -> None:
+    assert {
+        "coherent_public_belief_search",
+        "forced_root_trajectory_only",
+    } <= executor.NATIVE_REQUIRED_CAPABILITIES
 
 
 def _fixture(

@@ -1830,7 +1830,7 @@ def verify_native_runtime_authority(
         or authority["capabilities"] != release["required_capabilities"]
         or authority["replay_verified"] is not True
     ):
-        raise CoordinatorError("native runtime is not canonical catanatron-rs 0.1.8")
+        raise CoordinatorError("native runtime is not the canonical catanatron-rs release")
     for field in (
         "artifact_inventory_sha256",
         "release_identity_sha256",

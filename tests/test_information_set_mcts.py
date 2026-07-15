@@ -35,8 +35,15 @@ class _AuthoritativeGame:
 
     def json_snapshot(self) -> str:
         return json.dumps(
-            {"current_prompt": self.prompt, "hidden_truth": self.hidden_truth}
+            {
+                "colors": ["RED", "BLUE"],
+                "current_prompt": self.prompt,
+                "hidden_truth": self.hidden_truth,
+            }
         )
+
+    def apply_public_belief_development_draws(self, *args, **kwargs):
+        raise AssertionError("root orchestration must not materialize chance directly")
 
 
 class _SampledGame:
@@ -82,7 +89,11 @@ def _mcts(*, particles: int = 4, n_full: int = 128) -> GumbelChanceMCTS:
         assert isinstance(game, _SampledGame)
         assert force_full in {True, False}
         mcts.attested_root_phases.append(attested_root_phase)
-        budget = int(n_simulations_override)
+        budget = (
+            int(n_simulations_override)
+            if n_simulations_override is not None
+            else int(_self.config.n_full if force_full else _self.config.n_fast)
+        )
         # Particle-dependent but authoritative-truth-independent evidence.
         p11 = 0.25 + (game.seed % 100) / 1000.0
         return SearchResult(
@@ -170,6 +181,31 @@ def test_information_set_particles_share_one_exact_total_budget() -> None:
     )
     assert result.simulations_used == 128
     assert sum(result.visit_counts.values()) == 128
+
+
+def test_coherent_public_belief_uses_one_sanitized_full_budget_tree() -> None:
+    first_game = _AuthoritativeGame("opponent has KNIGHT")
+    second_game = _AuthoritativeGame("opponent has VICTORY_POINT")
+    first_mcts = _mcts(particles=4, n_full=128)
+    first_mcts.config = replace(
+        first_mcts.config,
+        information_set_search=False,
+        coherent_public_belief_search=True,
+    )
+    second_mcts = _mcts(particles=4, n_full=128)
+    second_mcts.config = replace(
+        second_mcts.config,
+        information_set_search=False,
+        coherent_public_belief_search=True,
+    )
+
+    first = first_mcts.search(first_game, force_full=True)
+    second = second_mcts.search(second_game, force_full=True)
+
+    assert first == second
+    assert first.simulations_used == 128
+    assert len(first_game.seeds) == len(second_game.seeds) == 1
+    assert first_game.seeds == second_game.seeds
 
 
 def test_information_set_d6_reuses_one_public_root_without_operator_drift() -> None:
@@ -620,3 +656,11 @@ def test_actor_turn_boundary_stops_on_opponent_or_new_turn() -> None:
     assert mcts._is_information_set_turn_boundary(opponent, depth=1)
     assert mcts._is_information_set_turn_boundary(later, depth=1)
     assert not mcts._is_information_set_turn_boundary(opponent, depth=0)
+
+    mcts.config = replace(
+        mcts.config,
+        information_set_search=False,
+        coherent_public_belief_search=True,
+    )
+    assert mcts._is_information_set_turn_boundary(opponent, depth=1)
+    assert mcts._is_information_set_turn_boundary(later, depth=1)

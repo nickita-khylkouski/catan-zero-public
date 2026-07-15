@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "catanatron-rs"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "rand",
  "rayon",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "gumbel-mcts"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "catanatron-rs",
  "rand",

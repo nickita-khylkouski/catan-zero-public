@@ -233,6 +233,8 @@ def _archived_state_reconstruction_binding() -> dict[str, Any]:
         "chance_stream": "random.Random(game_seed ^ 0xA17E)",
         "replay_contract": REPLAY_CONTRACT,
     }
+
+
 from sprt_gate import (  # noqa: E402
     GATE_CONFIGS,
     evaluate_pentanomial_sprt,
@@ -876,9 +878,7 @@ def _resolve_value_squashes(args: Any) -> dict[str, str]:
     candidate = _get("candidate_value_squash")
     baseline = _get("baseline_value_squash")
     resolved = {
-        "candidate_value_squash": (
-            str(candidate) if candidate is not None else shared
-        ),
+        "candidate_value_squash": (str(candidate) if candidate is not None else shared),
         "baseline_value_squash": str(baseline) if baseline is not None else shared,
     }
     if any(value not in {"tanh", "clip"} for value in resolved.values()):
@@ -1033,6 +1033,10 @@ def _build_search_config(
         lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
         information_set_search=bool(worker_args.get("information_set_search", False)),
+        coherent_public_belief_search=bool(
+            worker_args.get("coherent_public_belief_search", False)
+        ),
+        forced_root_target_mode=str(worker_args.get("forced_root_target_mode", "full")),
         determinization_particles=int(worker_args.get("determinization_particles", 1)),
         determinization_min_simulations=int(
             worker_args.get("determinization_min_simulations", 32)
@@ -1066,9 +1070,7 @@ def _build_search_config(
             str(gameplay_policy_aggregation)
             if gameplay_policy_aggregation is not None
             else str(
-                worker_args.get(
-                    "gameplay_policy_aggregation", "mean_improved_policy"
-                )
+                worker_args.get("gameplay_policy_aggregation", "mean_improved_policy")
             )
         ),
         max_root_candidates=int(worker_args.get("max_root_candidates", 16)),
@@ -1138,9 +1140,7 @@ def _game_search_seed(*, game_seed: int, seat_color: str) -> int:
     color = str(seat_color).upper()
     if color not in COLORS:
         raise ValueError(f"unsupported H2H seat color: {seat_color!r}")
-    payload = f"gumbel-search-cross-net-h2h-v1:{int(game_seed)}:{color}".encode(
-        "ascii"
-    )
+    payload = f"gumbel-search-cross-net-h2h-v1:{int(game_seed)}:{color}".encode("ascii")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
 
@@ -1215,9 +1215,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full=candidate_n_full,
             n_full_wide=budgets["candidate_n_full_wide"],
             n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
-            wide_roots_always_full=budgets[
-                "candidate_wide_roots_always_full"
-            ],
+            wide_roots_always_full=budgets["candidate_wide_roots_always_full"],
             c_scale=c_scales["candidate_c_scale"],
             **role_search["candidate"],
         ),
@@ -1231,9 +1229,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full=baseline_n_full,
             n_full_wide=budgets["baseline_n_full_wide"],
             n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
-            wide_roots_always_full=budgets[
-                "baseline_wide_roots_always_full"
-            ],
+            wide_roots_always_full=budgets["baseline_wide_roots_always_full"],
             c_scale=c_scales["baseline_c_scale"],
             **role_search["baseline"],
         ),
@@ -1364,16 +1360,32 @@ def _validate_information_set_recipe(args: Any) -> None:
     """Reject masked search that can still expand authoritative hidden truth."""
     public = bool(args.public_observation)
     information_set = bool(args.information_set_search)
-    if public and not information_set:
+    coherent = bool(getattr(args, "coherent_public_belief_search", False))
+    if information_set and coherent:
         raise ValueError(
-            "--public-observation requires --information-set-search; masking NN "
-            "features alone does not make the MCTS tree public-information safe"
+            "--coherent-public-belief-search cannot be combined with "
+            "--information-set-search"
+        )
+    if public and not (information_set or coherent):
+        raise ValueError(
+            "--public-observation requires --information-set-search or "
+            "--coherent-public-belief-search; masking NN features alone does not "
+            "make the MCTS tree public-information safe"
         )
     if information_set and not public:
         raise ValueError("--information-set-search requires --public-observation")
+    if coherent and not public:
+        raise ValueError(
+            "--coherent-public-belief-search requires --public-observation"
+        )
     if information_set and bool(args.belief_chance_spectra):
         raise ValueError(
             "--information-set-search cannot be combined with --belief-chance-spectra"
+        )
+    if coherent and bool(args.belief_chance_spectra):
+        raise ValueError(
+            "--coherent-public-belief-search cannot be combined with "
+            "--belief-chance-spectra"
         )
     if int(args.determinization_particles) < 1:
         raise ValueError("--determinization-particles must be >= 1")
@@ -1381,9 +1393,10 @@ def _validate_information_set_recipe(args: Any) -> None:
         raise ValueError("--determinization-min-simulations must be >= 1")
     roles = _resolve_role_search_calibration(args)
     for role, resolved in roles.items():
-        if resolved["sigma_reference_visits"] is not None and int(
-            resolved["sigma_reference_visits"]
-        ) < 0:
+        if (
+            resolved["sigma_reference_visits"] is not None
+            and int(resolved["sigma_reference_visits"]) < 0
+        ):
             raise ValueError(f"--{role}-sigma-reference-visits must be non-negative")
         if resolved["gameplay_policy_aggregation"] == "aggregate_q_then_improve":
             if not information_set:
@@ -1612,9 +1625,31 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Actor-turn search over public-belief determinizations. REQUIRED with "
+            "Actor-turn PIMC search over public-belief determinizations. One of this "
+            "mode or --coherent-public-belief-search is required with "
             "--public-observation; masked NN inputs alone leave authoritative hidden "
             "truth available to tree expansion."
+        ),
+    )
+    parser.add_argument(
+        "--coherent-public-belief-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use one actor-turn tree rooted in a public-belief state, with hidden "
+            "chance materialized from public support. Requires --public-observation "
+            "and is mutually exclusive with PIMC --information-set-search and "
+            "--belief-chance-spectra."
+        ),
+    )
+    parser.add_argument(
+        "--forced-root-target-mode",
+        choices=("full", "trajectory_only"),
+        default="full",
+        help=(
+            "Use trajectory_only to skip all neural/search work when exactly one "
+            "action is legal. This cannot change a played move and substantially "
+            "reduces Catan evaluation cost."
         ),
     )
     parser.add_argument(
@@ -1848,9 +1883,7 @@ def main() -> None:
             candidate_wide_roots_always_full=budgets[
                 "candidate_wide_roots_always_full"
             ],
-            baseline_wide_roots_always_full=budgets[
-                "baseline_wide_roots_always_full"
-            ],
+            baseline_wide_roots_always_full=budgets["baseline_wide_roots_always_full"],
             candidate_c_scale=c_scales["candidate_c_scale"],
             baseline_c_scale=c_scales["baseline_c_scale"],
             candidate_value_squash=squashes["candidate_value_squash"],
@@ -1901,8 +1934,8 @@ def main() -> None:
             high_regret_suite_path, _high_regret_suite, pairs = (
                 _load_held_out_high_regret_suite(args.held_out_high_regret_suite)
             )
-            high_regret_planned_engine, high_regret_engine = (
-                _held_out_engine_identity(args)
+            high_regret_planned_engine, high_regret_engine = _held_out_engine_identity(
+                args
             )
         except ValueError as error:
             parser.error(str(error))
@@ -1970,6 +2003,8 @@ def main() -> None:
             "public_observation": bool(args.public_observation),
             "belief_chance_spectra": bool(args.belief_chance_spectra),
             "information_set_search": bool(args.information_set_search),
+            "coherent_public_belief_search": bool(args.coherent_public_belief_search),
+            "forced_root_target_mode": str(args.forced_root_target_mode),
             "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
             "evaluator_rust_featurize": bool(args.evaluator_rust_featurize),
             "determinization_particles": int(args.determinization_particles),
@@ -1977,9 +2012,7 @@ def main() -> None:
                 args.determinization_min_simulations
             ),
             "value_squash": str(args.value_squash),
-            "candidate_value_squash": value_squashes[
-                "candidate_value_squash"
-            ],
+            "candidate_value_squash": value_squashes["candidate_value_squash"],
             "baseline_value_squash": value_squashes["baseline_value_squash"],
             "c_scale": float(args.c_scale),
             "candidate_c_scale": c_scales["candidate_c_scale"],
@@ -2318,6 +2351,12 @@ def _build_summary(
         "public_observation": bool(args.public_observation),
         "belief_chance_spectra": bool(args.belief_chance_spectra),
         "information_set_search": bool(args.information_set_search),
+        "coherent_public_belief_search": bool(
+            getattr(args, "coherent_public_belief_search", False)
+        ),
+        "forced_root_target_mode": str(
+            getattr(args, "forced_root_target_mode", "full")
+        ),
         "native_mcts_hot_loop": bool(getattr(args, "native_mcts_hot_loop", False)),
         "mcts_implementation": (
             "rust_native_hot_loop_v1"
@@ -2338,31 +2377,21 @@ def _build_summary(
         "baseline_n_full_wide": budgets["baseline_n_full_wide"],
         "candidate_n_full_wide_threshold": budgets["candidate_n_full_wide_threshold"],
         "baseline_n_full_wide_threshold": budgets["baseline_n_full_wide_threshold"],
-        "wide_roots_always_full": bool(
-            getattr(args, "wide_roots_always_full", False)
-        ),
-        "candidate_wide_roots_always_full": budgets[
-            "candidate_wide_roots_always_full"
-        ],
-        "baseline_wide_roots_always_full": budgets[
-            "baseline_wide_roots_always_full"
-        ],
+        "wide_roots_always_full": bool(getattr(args, "wide_roots_always_full", False)),
+        "candidate_wide_roots_always_full": budgets["candidate_wide_roots_always_full"],
+        "baseline_wide_roots_always_full": budgets["baseline_wide_roots_always_full"],
         "search_budgets_by_role": {
             "candidate": {
                 "n_full": resolved_candidate_n_full,
                 "n_full_wide": budgets["candidate_n_full_wide"],
                 "n_full_wide_threshold": budgets["candidate_n_full_wide_threshold"],
-                "wide_roots_always_full": budgets[
-                    "candidate_wide_roots_always_full"
-                ],
+                "wide_roots_always_full": budgets["candidate_wide_roots_always_full"],
             },
             "baseline": {
                 "n_full": resolved_baseline_n_full,
                 "n_full_wide": budgets["baseline_n_full_wide"],
                 "n_full_wide_threshold": budgets["baseline_n_full_wide_threshold"],
-                "wide_roots_always_full": budgets[
-                    "baseline_wide_roots_always_full"
-                ],
+                "wide_roots_always_full": budgets["baseline_wide_roots_always_full"],
             },
         },
         "raw_policy_above_width": (

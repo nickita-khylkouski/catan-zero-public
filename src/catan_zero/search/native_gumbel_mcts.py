@@ -60,9 +60,8 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             unsupported.append("use_batch_api=False")
         if bool(self.config.uncertainty_backup_weighting):
             unsupported.append("uncertainty_backup_weighting=True")
-        if (
-            self.using_native_hot_loop
-            and bool(self.config.rescale_noise_floor_initial_road_only)
+        if self.using_native_hot_loop and bool(
+            self.config.rescale_noise_floor_initial_road_only
         ):
             import catanatron_rs  # type: ignore
 
@@ -73,7 +72,10 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                     "rescale_noise_floor_initial_road_only requires a native wheel "
                     "advertising initial_road_d1_scope"
                 )
-        if self.using_native_hot_loop and self.config.sigma_reference_visits is not None:
+        if (
+            self.using_native_hot_loop
+            and self.config.sigma_reference_visits is not None
+        ):
             import catanatron_rs  # type: ignore
 
             capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
@@ -97,14 +99,9 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                     "non-unit gameplay temperature requires a native wheel "
                     "advertising policy_temperature_semantics"
                 )
-        if (
-            self.using_native_hot_loop
-            and (
-                self.config.information_set_target_aggregation
-                == "aggregate_q_then_improve"
-                or self.config.gameplay_policy_aggregation
-                == "aggregate_q_then_improve"
-            )
+        if self.using_native_hot_loop and (
+            self.config.information_set_target_aggregation == "aggregate_q_then_improve"
+            or self.config.gameplay_policy_aggregation == "aggregate_q_then_improve"
         ):
             import catanatron_rs  # type: ignore
 
@@ -114,6 +111,31 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 unsupported.append(
                     "aggregate_q_then_improve belief aggregation requires a native wheel advertising "
                     "belief_target_evidence"
+                )
+        if self.using_native_hot_loop and bool(
+            self.config.coherent_public_belief_search
+        ):
+            import catanatron_rs  # type: ignore
+
+            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+            capabilities = set(capability_fn()) if callable(capability_fn) else set()
+            if "coherent_public_belief_search" not in capabilities:
+                unsupported.append(
+                    "coherent_public_belief_search requires a native wheel "
+                    "advertising coherent_public_belief_search"
+                )
+        if (
+            self.using_native_hot_loop
+            and self.config.forced_root_target_mode == "trajectory_only"
+        ):
+            import catanatron_rs  # type: ignore
+
+            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+            capabilities = set(capability_fn()) if callable(capability_fn) else set()
+            if "forced_root_trajectory_only" not in capabilities:
+                unsupported.append(
+                    "forced_root_target_mode=trajectory_only requires a native "
+                    "wheel advertising forced_root_trajectory_only"
                 )
         if unsupported:
             raise ValueError(
@@ -144,6 +166,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 "n_full",
                 "n_fast",
                 "p_full",
+                "forced_root_target_mode",
                 "lazy_interior_chance",
                 "max_root_candidates",
                 "max_root_candidates_wide",
@@ -166,7 +189,10 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         values.update(
             colors=list(config.colors),
             map_kind=config.map_kind or "BASE",
-            stop_at_root_turn_boundary=bool(config.information_set_search),
+            stop_at_root_turn_boundary=bool(
+                config.information_set_search or config.coherent_public_belief_search
+            ),
+            coherent_public_belief_search=bool(config.coherent_public_belief_search),
             # A binding call constructs a fresh Rust engine. Seed it from the
             # reference search object's ADVANCING RNG rather than resetting to
             # config.seed on every move/particle. This is deterministic across
@@ -251,9 +277,18 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 )
 
         root_evaluator = None
-        legal_width = len(
-            game.playable_action_indices(list(colors), self.config.map_kind)
+        native_legal = tuple(
+            int(action)
+            for action in game.playable_action_indices(
+                list(colors), self.config.map_kind
+            )
         )
+        if (
+            len(native_legal) == 1
+            and self.config.forced_root_target_mode == "trajectory_only"
+        ):
+            return self._forced_trajectory_only_result(native_legal[0])
+        legal_width = len(native_legal)
         if precomputed_root_evaluation is not _UNSET_ROOT_EVALUATION:
 
             def root_evaluator(_native_game: Any, _legal: list[int], _root_color: str):
@@ -311,9 +346,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 int(key): float(value)
                 for key, value in raw.get("completed_q_values", {}).items()
             },
-            q_values_root_perspective=bool(
-                raw.get("q_values_root_perspective", False)
-            ),
+            q_values_root_perspective=bool(raw.get("q_values_root_perspective", False)),
         )
 
 

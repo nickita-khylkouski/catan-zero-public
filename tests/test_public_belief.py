@@ -21,12 +21,24 @@ from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTSConfig,
     SearchResult,
 )
-from catan_zero.search.gumbel_chance_mcts import belief_move_robber_outcome_weights
+from catan_zero.search.gumbel_chance_mcts import (
+    belief_buy_development_card_outcomes,
+    belief_move_robber_outcome_weights,
+)
 
 
 def _snapshot() -> dict:
     return {
         "colors": ["BLUE", "RED"],
+        # Base-bank conservation with BLUE=[2,1,0,1,0] fixes the sole
+        # opponent's hand exactly at RED=[0,4,0,0,0].
+        "resource_bank": {
+            "WOOD": 17,
+            "BRICK": 14,
+            "SHEEP": 19,
+            "WHEAT": 18,
+            "ORE": 19,
+        },
         "development_deck_count": 19,
         "development_deck_order": ["KNIGHT", "VICTORY_POINT"],
         "player_state": [
@@ -97,15 +109,22 @@ def test_legacy_robber_search_weights_are_hidden_truth_invariant() -> None:
     )
     assert [(index, weight) for index, weight, _child in first] == [
         (index, weight) for index, weight, _child in second
-    ] == [(index, 0.2) for index in range(5)]
+    ] == [(1, 1.0)]
 
 
-def test_unknown_opponent_robber_distribution_is_uniform_over_resource_identity() -> None:
+def test_two_player_opponent_robber_distribution_is_exact_by_conservation() -> None:
     belief = PublicBelief.from_snapshot(_snapshot(), perspective="BLUE")
+    probabilities = belief.robber_steal_probabilities("RED")
+    assert probabilities == {"BRICK": 1.0}
+
+
+def test_legacy_snapshot_without_bank_keeps_uniform_fallback() -> None:
+    snapshot = _snapshot()
+    snapshot.pop("resource_bank")
+    belief = PublicBelief.from_snapshot(snapshot, perspective="BLUE")
     probabilities = belief.robber_steal_probabilities("RED")
     assert tuple(probabilities) == RESOURCES
     assert all(math.isclose(value, 0.2) for value in probabilities.values())
-    assert math.isclose(sum(probabilities.values()), 1.0)
 
 
 def test_known_own_hand_robber_distribution_is_count_weighted() -> None:
@@ -127,6 +146,43 @@ def test_dev_draw_uses_public_played_and_own_known_cards_only() -> None:
     assert tuple(probabilities) == DEVELOPMENT_CARDS
     for card in DEVELOPMENT_CARDS:
         assert math.isclose(probabilities[card], expected_counts[card] / denominator)
+
+
+class _PublicDevMaterializerGame:
+    def __init__(self, snapshot: dict) -> None:
+        self.snapshot = snapshot
+        self.calls: list[tuple[str, str, tuple[str, ...], int]] = []
+
+    def json_snapshot(self) -> str:
+        return json.dumps(self.snapshot)
+
+    def apply_public_belief_development_draws(
+        self,
+        action_json: str,
+        observer: str,
+        card_names: list[str],
+        seed: int,
+    ) -> list[tuple[str, str]]:
+        self.calls.append((action_json, observer, tuple(card_names), seed))
+        return [("public-child", card) for card in card_names]
+
+
+def test_dev_draw_materializes_every_public_supported_card_without_native_deck() -> None:
+    game = _PublicDevMaterializerGame(_snapshot())
+    action = ["BLUE", "BUY_DEVELOPMENT_CARD", None]
+    outcomes = belief_buy_development_card_outcomes(
+        game,
+        action,
+        perspective="BLUE",
+        materialization_seed=73,
+    )
+    assert [index for index, _weight, _child in outcomes] == list(range(5))
+    assert [child for _index, _weight, child in outcomes] == [
+        ("public-child", card) for card in DEVELOPMENT_CARDS
+    ]
+    assert game.calls == [
+        (json.dumps(action), "BLUE", DEVELOPMENT_CARDS, 73)
+    ]
 
 
 def test_keyed_sampling_is_reproducible_order_independent_and_truth_invariant() -> None:

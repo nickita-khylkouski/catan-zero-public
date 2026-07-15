@@ -6,11 +6,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 OUT_DIR="${OUT_DIR:-$SOURCE_ROOT/dist}"
 SEALED_CANONICAL_BUILD_ROOT="/tmp/catan-zero-catanatron-rs-wheel-src"
 CANONICAL_BUILD_ROOT="${CATAN_RS_CANONICAL_BUILD_ROOT:-$SEALED_CANONICAL_BUILD_ROOT}"
-WHEEL_NAME="catanatron_rs-0.1.8-cp311-cp311-manylinux_2_34_x86_64.whl"
-RECEIPT_NAME="catanatron_rs-0.1.8-build-receipt.json"
-SEALED_SOURCE_DATE_EPOCH="1784073600"
+WHEEL_NAME="catanatron_rs-0.1.9-cp311-cp311-manylinux_2_34_x86_64.whl"
+RECEIPT_NAME="catanatron_rs-0.1.9-build-receipt.json"
+SEALED_SOURCE_DATE_EPOCH="1784160000"
 SEALED_RUSTFLAGS="--remap-path-prefix=/tmp/catan-zero-catanatron-rs-wheel-src=/src/catan-zero-public -C link-arg=-Wl,--build-id=none"
-SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.8-public-award-temperature-wheel-v1"
+SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.9-coherent-belief-forced-root-wheel-v1"
 
 die() {
   echo "build_catanatron_rs_wheel: $*" >&2
@@ -157,7 +157,7 @@ echo "$PYTHON_VERSION"
 echo "$STRIP_VERSION"
 
 mkdir -p "$OUT_DIR"
-rm -f "$OUT_DIR"/catanatron_rs-0.1.8-*.whl
+rm -f "$OUT_DIR"/catanatron_rs-0.1.9-*.whl
 rm -f "$OUT_DIR/$RECEIPT_NAME"
 
 # PyO3's Python-enabled Rust tests link libpython, unlike the final extension
@@ -194,7 +194,7 @@ cargo test \
   public_belief_determinization_tests \
   --lib
 # Capability names are not evidence of semantics.  Run the exact source tests
-# for every corrected 0.1.8 behavior before compiling and hashing the wheel.
+# for every corrected 0.1.9 behavior before compiling and hashing the wheel.
 LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" \
 RUSTFLAGS="$RUSTFLAGS -L native=$PYTHON_TEST_LIBDIR" \
 cargo test \
@@ -207,6 +207,16 @@ cargo test \
   --locked \
   --manifest-path "$ROOT/native/gumbel_mcts_rs/Cargo.toml" \
   temperature \
+  --lib
+cargo test \
+  --locked \
+  --manifest-path "$ROOT/native/gumbel_mcts_rs/Cargo.toml" \
+  coherent_public_belief_dev_chance_ignores_concrete_hidden_support \
+  --lib
+cargo test \
+  --locked \
+  --manifest-path "$ROOT/native/gumbel_mcts_rs/Cargo.toml" \
+  forced_trajectory_only_selects_without_evaluator_or_fake_values \
   --lib
 maturin build \
   --locked \
@@ -299,7 +309,7 @@ from importlib.metadata import version
 
 import catanatron_rs
 
-assert version("catanatron-rs") == "0.1.8"
+assert version("catanatron-rs") == "0.1.9"
 capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
 assert callable(capability_fn), "wheel lacks gumbel_search_capabilities"
 capabilities = set(capability_fn())
@@ -309,6 +319,8 @@ required = {
     "initial_road_d1_scope",
     "public_award_feature_parity",
     "policy_temperature_semantics",
+    "coherent_public_belief_search",
+    "forced_root_trajectory_only",
 }
 assert required <= capabilities, (required, capabilities)
 PY

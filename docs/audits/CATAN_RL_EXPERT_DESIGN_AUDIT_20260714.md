@@ -6,6 +6,35 @@
 
 **Status:** Evidence-backed design audit. Measurements below come from the authenticated V5 composite and its fresh current-producer component. This document separates implemented safeguards from deliberate approximations and unresolved hypotheses.
 
+## Implementation update
+
+The audit now has a runnable, opt-in next-wave implementation. Historical A1
+corpora and issued contracts are unchanged.
+
+- `coherent_public_belief_search` spends the complete n128/adaptive-n256 budget
+  in one sanitized two-player tree. It stops when play leaves the root actor's
+  turn, uses exact two-player resource conservation for robber outcomes, and
+  materializes development-card draws from the public posterior rather than
+  authoritative hidden support.
+- `forced_root_target_mode=trajectory_only` records the mathematically exact
+  sole action without running a neural forward or fabricating root-Q/value
+  evidence. The row retains terminal-outcome value supervision.
+- `temperature_clock=nonforced_choice` advances exploration only at real
+  choices, so mandatory roll/end-turn prompt density no longer shortens the
+  exploration window.
+- The learner supports action-type-specific forced-row value weights. The
+  selected next-wave dose uses `END_TURN=0.1`, `ROLL=0.25`, retains full value
+  weight for unlisted forced types such as discard, and keeps forced policy
+  weight at zero.
+- The function-preserving action-target-gather initializer can be bound to the
+  same diagnostic one-dose transaction, and candidate evaluation can use the
+  identical coherent public operator.
+
+The versioned operator, guard, learner overrides, and exact commands live in
+`configs/operations/a1-next-wave-coherent-public-v1/README.md`. These changes
+make the next wave executable; they do not claim that history-conditioned
+belief or four-player negotiation is solved.
+
 ## Executive summary
 
 The commonly repeated statement that "50% of Catan moves are forced" is wrong as a description of the game. The measured statistic is:

@@ -814,7 +814,7 @@ def test_command_is_direct_one_b200_fresh_unfused_adam(tmp_path: Path) -> None:
 def test_b200_8gpu_topology_preserves_global_batch_and_renders_torchrun(
     tmp_path: Path,
 ) -> None:
-    verified = _verified(tmp_path)
+    verified = _production_trainer_verified(tmp_path)
     verified["recipe"].update(
         {
             "training_rng_rank_offset": True,
@@ -827,9 +827,6 @@ def test_b200_8gpu_topology_preserves_global_batch_and_renders_torchrun(
         topology=executor.B200_8GPU_DDP_TOPOLOGY,
         gpu=0,
     )
-    bound["data_kind"] = "production_composite_v2"
-    bound["trainer_authority"] = executor._current_production_trainer_authority()
-
     command = executor.build_train_command(
         bound,
         python=Path(sys.executable),
@@ -1581,6 +1578,136 @@ def test_policy_game_weight_ablation_derives_authenticated_descriptor(
     )
     assert base_path.read_text() == json.dumps(base, indent=2, sort_keys=True) + "\n"
     assert derived_path.stat().st_mode & 0o777 == 0o444
+
+
+def test_forced_action_type_value_map_derives_and_replays_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, base_path, _base = _descriptor_bound_production_verified(tmp_path)
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    arm = executor.bind_learner_ablation(
+        verified,
+        ablation_id="forced-type-value-dose",
+        overrides_json=(
+            '{"forced_row_value_action_type_weights":'
+            '"roll=0.2,END_TURN=0.5"}'
+        ),
+        reviewed_code_tree_sha256=code_sha,
+    )
+    derived_path = tmp_path / "forced-type.training-descriptor.json"
+    arm = executor.bind_diagnostic_training_descriptor(
+        arm, descriptor_path=derived_path
+    )
+    executor._materialize_diagnostic_training_descriptor(arm)
+    derived = json.loads(derived_path.read_text())
+    canonical = "END_TURN=0.5,ROLL=0.2"
+    assert derived["learner_recipe_overrides"][
+        "forced_row_value_action_type_weights"
+    ] == canonical
+
+    monkeypatch.setattr(
+        executor.train_bc,
+        "_preflight_memmap_composite_descriptor",
+        lambda path: {
+            "diagnostic_only": False,
+            "promotion_eligible": True,
+            "descriptor_file_sha256": executor._file_sha256(base_path),
+            "descriptor_fingerprint": executor._value_sha256(
+                json.loads(base_path.read_text())
+            ),
+            "learner_recipe_overrides": dict(
+                executor.composite_builder.LEARNER_RECIPE_OVERRIDES
+            ),
+        },
+    )
+    replayed = executor.train_bc._preflight_flywheel_diagnostic_derivative(
+        derived_path.resolve(), derived
+    )
+    assert replayed is not None
+    assert replayed["learner_recipe_overrides"][
+        "forced_row_value_action_type_weights"
+    ] == canonical
+
+
+def test_target_gather_upgrade_combines_with_typed_forced_value_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, _base_path, _base = _descriptor_bound_production_verified(tmp_path)
+    initializer = tmp_path / "target-gather-initializer.pt"
+    initializer.write_bytes(b"function-preserving target gather")
+    receipt = tmp_path / "target-gather.receipt.json"
+    receipt.write_text("{}")
+    upgrade = {
+        "module": executor.architecture_upgrade.MODULE_TARGET_GATHER,
+        "source": dict(verified["producer"]),
+        "upgraded_initializer": {
+            "path": str(initializer.resolve()),
+            "sha256": executor._file_sha256(initializer),
+        },
+        "receipt_sha256": "sha256:" + "4" * 64,
+        "receipt": {
+            "path": str(receipt.resolve()),
+            "sha256": executor._file_sha256(receipt),
+        },
+    }
+    monkeypatch.setattr(
+        executor.architecture_upgrade, "verify_receipt", lambda _path: upgrade
+    )
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+
+    upgraded = executor.bind_function_preserving_upgrade(verified, receipt)
+    derived = executor.bind_learner_ablation(
+        upgraded,
+        ablation_id="coherent-public-action-gather-v1",
+        overrides_json=json.dumps(
+            {
+                "forced_action_weight": 0.0,
+                "forced_row_value_action_type_weights": "ROLL=0.25,END_TURN=0.1",
+                "forced_row_value_weight": 1.0,
+                "value_loss_weight": 0.25,
+            }
+        ),
+        reviewed_code_tree_sha256=code_sha,
+    )
+
+    assert derived["architecture_initializer"] == upgrade["upgraded_initializer"]
+    assert derived["function_preserving_upgrade"]["module"] == (
+        executor.architecture_upgrade.MODULE_TARGET_GATHER
+    )
+    assert derived["recipe"]["forced_row_value_action_type_weights"] == (
+        "END_TURN=0.1,ROLL=0.25"
+    )
+    assert derived["recipe"]["value_loss_weight"] == 0.25
+    assert derived["recipe"]["resume_optimizer"] is False
+    assert derived["learner_ablation"]["diagnostic_only"] is True
+    assert derived["learner_ablation"]["promotion_eligible"] is False
+
+    derived = executor.bind_diagnostic_training_descriptor(
+        derived,
+        descriptor_path=tmp_path / "target-gather.training-descriptor.json",
+    )
+    derived["trainer_authority"] = executor._current_production_trainer_authority()
+    command = executor.build_train_command(
+        derived,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert _option(command, "--init-checkpoint") == str(initializer.resolve())
+    assert _option(command, "--forced-row-value-action-type-weights") == (
+        "END_TURN=0.1,ROLL=0.25"
+    )
+    assert "--no-resume-optimizer" in command
 
 
 def test_fresh_policy_scope_retains_selected_policy_weight_baseline(
@@ -2561,12 +2688,18 @@ def test_loader_prefetch_materializes_byte_identical_batches() -> None:
     synchronous = collect(0)
     prefetched = collect(2)
     assert len(synchronous) == len(prefetched) == 3
-    for (sync_data, sync_policy, sync_value), (
-        prefetch_data,
-        prefetch_policy,
-        prefetch_value,
-    ) in zip(synchronous, prefetched, strict=True):
-        assert set(sync_data) == set(prefetch_data)
+    for batch_index, (
+        (sync_data, sync_policy, sync_value),
+        (prefetch_data, prefetch_policy, prefetch_value),
+    ) in enumerate(zip(synchronous, prefetched, strict=True)):
+        internal_prefetch_keys = {
+            key for key in prefetch_data if key.startswith("_source_")
+        }
+        assert set(sync_data) == set(prefetch_data) - internal_prefetch_keys
+        assert np.array_equal(
+            prefetch_data["_source_global_row_indices"],
+            train_indices[order[batch_index * 2 : (batch_index + 1) * 2]],
+        )
         for key in sync_data:
             assert sync_data[key].dtype == prefetch_data[key].dtype
             assert sync_data[key].shape == prefetch_data[key].shape

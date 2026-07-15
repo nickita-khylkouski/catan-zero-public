@@ -60,6 +60,7 @@ from catan_zero.rl.gumbel_self_play import (  # noqa: E402
     GumbelSelfPlayConfig,
     PLAYER_NAMES,
     TARGET_INFORMATION_REGIME_PUBLIC,
+    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _pool_champion_plays_first_seat,
 )
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
@@ -546,6 +547,13 @@ _SEARCH_INPUT_KEYS = {
     "rescale_noise_floor_c",
     "sigma_eval",
 }
+# Additive science fields introduced after the issued PIMC contracts.  They
+# remain separate from ``_SEARCH_INPUT_KEYS`` so an old lock keeps its exact
+# explicit-operator bytes instead of being silently upgraded with new defaults.
+_OPTIONAL_SEARCH_INPUT_KEYS = {
+    "coherent_public_belief_search",
+    "forced_root_target_mode",
+}
 # Frozen explicit-operator shape in the sole issued markerless v2 lock. Keep
 # this independent of the expanding current dataclass/input schema.
 HISTORICAL_MARKERLESS_SEARCH_INPUT_KEYS = frozenset(
@@ -604,6 +612,10 @@ _GENERATION_KEYS = {
     "eval_server",
     "native_mcts_hot_loop",
 }
+# Same compatibility rule as the search operator: old locks omitted this field
+# and therefore retain the historical prompt clock, while a new lock that
+# carries it binds the selected clock into its digest and rendered argv.
+_OPTIONAL_GENERATION_KEYS = {"temperature_clock"}
 
 
 class ContractError(ValueError):
@@ -1692,11 +1704,24 @@ def _checkpoint_metadata(
 
 
 def _validate_search_operator_fields(
-    raw: dict[str, Any], *, expected_keys: set[str] | frozenset[str] = _SEARCH_INPUT_KEYS
+    raw: dict[str, Any],
+    *,
+    expected_keys: set[str] | frozenset[str] | None = None,
 ) -> None:
     """Validate explicit operator fields without expanding runtime defaults."""
 
-    _require_exact_keys(raw, set(expected_keys), where="science.search")
+    if expected_keys is not None:
+        # Frozen historical shapes use this path and must remain byte-exact.
+        _require_exact_keys(raw, set(expected_keys), where="science.search")
+    else:
+        actual = set(raw)
+        missing = _SEARCH_INPUT_KEYS - actual
+        extra = actual - (_SEARCH_INPUT_KEYS | _OPTIONAL_SEARCH_INPUT_KEYS)
+        if missing or extra:
+            raise ContractError(
+                "science.search fields mismatch; "
+                f"missing={sorted(missing)}, extra={sorted(extra)}"
+            )
     bool_keys = {
         "wide_roots_always_full",
         "symmetry_averaged_eval",
@@ -1706,6 +1731,8 @@ def _validate_search_operator_fields(
         "belief_chance_spectra",
         "information_set_search",
     }
+    if "coherent_public_belief_search" in raw:
+        bool_keys.add("coherent_public_belief_search")
     int_keys = {
         "max_depth",
         "n_full",
@@ -1741,6 +1768,54 @@ def _validate_search_operator_fields(
     for key in numeric_keys:
         if isinstance(raw[key], bool) or not isinstance(raw[key], (int, float)):
             raise ContractError(f"science.search.{key} must be numeric")
+    if "forced_root_target_mode" in raw:
+        mode = raw["forced_root_target_mode"]
+        if not isinstance(mode, str) or mode not in {"full", "trajectory_only"}:
+            raise ContractError(
+                "science.search.forced_root_target_mode must be 'full' or "
+                "'trajectory_only'"
+            )
+
+
+def _target_information_regime_for_search(search: Mapping[str, Any]) -> str:
+    """Validate and return the public-search target regime bound by a lock."""
+
+    information_set = search.get("information_set_search")
+    coherent = search.get("coherent_public_belief_search", False)
+    if type(information_set) is not bool or type(coherent) is not bool:
+        raise ContractError("public-search mode selectors must be JSON booleans")
+    if information_set == coherent:
+        raise ContractError(
+            "A1 public-observation targets require exactly one of "
+            "information_set_search or coherent_public_belief_search"
+        )
+    if bool(search.get("belief_chance_spectra", False)):
+        raise ContractError(
+            "public-search modes cannot be combined with belief_chance_spectra"
+        )
+    particles = search.get("determinization_particles")
+    minimum = search.get("determinization_min_simulations")
+    if type(particles) is not int or particles < 1:
+        raise ContractError("determinization_particles must be >= 1")
+    if type(minimum) is not int or minimum < 1:
+        raise ContractError("determinization_min_simulations must be >= 1")
+    if information_set:
+        if particles > int(search["n_fast"]):
+            raise ContractError(
+                "determinization_particles cannot exceed the n_fast total budget"
+            )
+        return TARGET_INFORMATION_REGIME_PUBLIC
+    if "forced_root_target_mode" not in search:
+        raise ContractError(
+            "coherent_public_belief_search requires an explicit "
+            "forced_root_target_mode provenance field"
+        )
+    if particles != 1:
+        raise ContractError(
+            "coherent_public_belief_search uses one tree and requires "
+            "determinization_particles=1"
+        )
+    return TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
 
 
 def _effective_search(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1748,6 +1823,11 @@ def _effective_search(raw: dict[str, Any]) -> dict[str, Any]:
     config = GumbelChanceMCTSConfig(colors=("RED", "BLUE"), seed=0, **raw)
     effective = dataclasses.asdict(config)
     effective.pop("seed")
+    # Dataclass defaults grow over time.  An issued operator that omitted these
+    # additive fields keeps the old effective-config shape; a new operator that
+    # explicitly carries them binds their effective values.
+    for key in _OPTIONAL_SEARCH_INPUT_KEYS - set(raw):
+        effective.pop(key, None)
     return effective
 
 
@@ -1808,7 +1888,7 @@ def _category_search_identities(
 def _search_operator(raw: dict[str, Any]) -> dict[str, Any]:
     """The explicit, adjudicated operator (separate from code-default fields)."""
     effective = _effective_search(raw)
-    return {key: effective[key] for key in sorted(_SEARCH_INPUT_KEYS)}
+    return {key: effective[key] for key in sorted(raw)}
 
 
 def _effective_evaluator(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1987,6 +2067,15 @@ def _validate_guard_payload(
             raise ContractError(
                 "guard advertises the Rust featurizer for a Python-feature contract"
             )
+    optional_contract_flags = {
+        "coherent_public_belief_search": "--coherent-public-belief-search",
+        "forced_root_target_mode": "--forced-root-target-mode",
+    }
+    for key, flag in optional_contract_flags.items():
+        if key in search:
+            required_critical.add(flag)
+    if "temperature_clock" in generation:
+        required_critical.add("--temperature-clock")
     if not required_critical.issubset(critical):
         raise ContractError(
             f"guard {path} is missing critical flags {sorted(required_critical - critical)}"
@@ -2012,6 +2101,11 @@ def _validate_guard_payload(
             "determinization_min_simulations"
         ],
     }
+    for key, flag in optional_contract_flags.items():
+        if key in search:
+            comparisons[flag] = search[key]
+    if "temperature_clock" in generation:
+        comparisons["--temperature-clock"] = generation["temperature_clock"]
     if not archived_markerless:
         comparisons[native_flag] = generation["native_mcts_hot_loop"]
         if evaluator["rust_featurize"] is True:
@@ -2372,7 +2466,14 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
 
 
 def _validate_generation(generation: dict[str, Any]) -> None:
-    _require_exact_keys(generation, _GENERATION_KEYS, where="generation")
+    actual = set(generation)
+    missing = _GENERATION_KEYS - actual
+    extra = actual - (_GENERATION_KEYS | _OPTIONAL_GENERATION_KEYS)
+    if missing or extra:
+        raise ContractError(
+            "generation fields mismatch; "
+            f"missing={sorted(missing)}, extra={sorted(extra)}"
+        )
     for key in ("eval_server", "native_mcts_hot_loop"):
         if type(generation[key]) is not bool:
             raise ContractError(f"generation.{key} must be a JSON boolean")
@@ -2428,6 +2529,16 @@ def _validate_generation(generation: dict[str, Any]) -> None:
         )
     if int(generation["workers_per_gpu"]) <= 0 or int(generation["shard_size"]) <= 0:
         raise ContractError("workers_per_gpu and shard_size must be positive")
+    if "temperature_clock" in generation:
+        clock = generation["temperature_clock"]
+        if not isinstance(clock, str) or clock not in {
+            "prompt",
+            "nonforced_choice",
+        }:
+            raise ContractError(
+                "generation.temperature_clock must be 'prompt' or "
+                "'nonforced_choice'"
+            )
 
 
 def _validate_current_runtime_execution(
@@ -2450,7 +2561,9 @@ def _validate_current_runtime_execution(
         )
 
 
-def _validate_post_wave(value: dict[str, Any]) -> None:
+def _validate_post_wave(
+    value: dict[str, Any], *, expected_target_information_regime: str | None = None
+) -> None:
     required = {
         "require_complete_games",
         "selected_truncations_max",
@@ -2479,10 +2592,24 @@ def _validate_post_wave(value: dict[str, Any]) -> None:
         )
     ):
         raise ContractError("all fail-closed A1 post-wave requirements must be true")
-    if value["require_target_information_regime"] != TARGET_INFORMATION_REGIME_PUBLIC:
+    target_regime = value["require_target_information_regime"]
+    supported_regimes = {
+        TARGET_INFORMATION_REGIME_PUBLIC,
+        TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+    }
+    if not isinstance(target_regime, str) or target_regime not in supported_regimes:
         raise ContractError(
-            "require_target_information_regime must be exactly "
-            f"{TARGET_INFORMATION_REGIME_PUBLIC!r}"
+            "require_target_information_regime must be one of "
+            f"{sorted(supported_regimes)!r}"
+        )
+    if (
+        expected_target_information_regime is not None
+        and target_regime != expected_target_information_regime
+    ):
+        raise ContractError(
+            "post-wave target-information regime does not match the sealed "
+            f"search operator: expected {expected_target_information_regime!r}, "
+            f"got {target_regime!r}"
         )
     if (
         int(value["selected_truncations_max"]) != 0
@@ -6620,22 +6747,7 @@ def build_lock(
     )
     if evaluator["public_observation"] is not True:
         raise ContractError("science.evaluator.public_observation must be true")
-    if search["information_set_search"] is not True:
-        raise ContractError(
-            "A1 public-observation policy targets require information_set_search=true"
-        )
-    if int(search["determinization_particles"]) < 1:
-        raise ContractError("determinization_particles must be >= 1")
-    if int(search["determinization_particles"]) > int(search["n_fast"]):
-        raise ContractError(
-            "determinization_particles cannot exceed the n_fast total budget"
-        )
-    if int(search["determinization_min_simulations"]) < 1:
-        raise ContractError("determinization_min_simulations must be >= 1")
-    if bool(search["belief_chance_spectra"]):
-        raise ContractError(
-            "belief_chance_spectra must be false under full-world determinization"
-        )
+    target_information_regime = _target_information_regime_for_search(search)
     if evaluator["value_readout"] not in {"scalar", "categorical"}:
         raise ContractError("value_readout must be scalar or categorical")
     if evaluator["value_squash"] != "tanh":
@@ -6975,7 +7087,10 @@ def build_lock(
             f"{sorted(missing_learner_code)}"
         )
     runtime_code_tree = _runtime_code_tree_records()
-    _validate_post_wave(dict(draft["post_wave_acceptance"]))
+    _validate_post_wave(
+        dict(draft["post_wave_acceptance"]),
+        expected_target_information_regime=target_information_regime,
+    )
 
     category_attempts = {
         category: sum(
@@ -7243,6 +7358,7 @@ def verify_lock(
             raise ContractError(
                 "effective search config does not reconstruct from selected operator"
             )
+    target_information_regime = _target_information_regime_for_search(search)
     if _digest_value(evaluator) != lock["science"]["evaluator_sha256"]:
         raise ContractError("evaluator digest mismatch")
     if evaluator["value_readout"] != lock["science"]["value_readout"]:
@@ -7377,7 +7493,10 @@ def verify_lock(
         ),
         archived_markerless=historical_markerless,
     )
-    _validate_post_wave(dict(lock["post_wave_acceptance"]))
+    _validate_post_wave(
+        dict(lock["post_wave_acceptance"]),
+        expected_target_information_regime=target_information_regime,
+    )
     if not historical_markerless:
         rebuilt = build_lock(
             Path(str(lock["source_draft"]["path"])),
@@ -7846,6 +7965,19 @@ def _generator_argv(
         "--seed-claim",
         "--resume",
     ]
+    if "coherent_public_belief_search" in search:
+        argv.append(
+            _bool_flag(
+                "--coherent-public-belief-search",
+                bool(search["coherent_public_belief_search"]),
+            )
+        )
+    if "forced_root_target_mode" in search:
+        argv.extend(
+            ("--forced-root-target-mode", str(search["forced_root_target_mode"]))
+        )
+    if "temperature_clock" in generation:
+        argv.extend(("--temperature-clock", str(generation["temperature_clock"])))
     if lock.get("schema_version") == GENERATION_ARM_LOCK_SCHEMA:
         argv.extend(
             (
@@ -8766,6 +8898,10 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "exact_budget_sh_min_n": search["exact_budget_sh_min_n"],
         "belief_chance_spectra": search["belief_chance_spectra"],
         "information_set_search": search["information_set_search"],
+        "coherent_public_belief_search": search.get(
+            "coherent_public_belief_search", False
+        ),
+        "forced_root_target_mode": search.get("forced_root_target_mode", "full"),
         "native_mcts_hot_loop": bool(
             generation.get("native_mcts_hot_loop", False)
         ),
@@ -8786,6 +8922,7 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "max_decisions": generation["max_decisions"],
         "temperature_decisions": generation["temperature_decisions"],
         "temperature_decisions_effective": generation["temperature_decisions"],
+        "temperature_clock": generation.get("temperature_clock", "prompt"),
         "temperature_move_fraction": float(generation["temperature_decisions"])
         / float(generation["max_decisions"]),
         "temperature_high": generation["temperature_high"],
@@ -8849,6 +8986,7 @@ def _expected_selfplay_config(lock: dict[str, Any]) -> dict[str, Any]:
             obs_width=int(generation["obs_width"]),
             max_decisions=int(generation["max_decisions"]),
             temperature_move_fraction=opening_fraction,
+            temperature_clock=str(generation.get("temperature_clock", "prompt")),
             temperature_high=float(generation["temperature_high"]),
             temperature_low=float(generation["temperature_low"]),
             late_temperature_move_fraction=late_fraction,

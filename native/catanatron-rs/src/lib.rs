@@ -5875,6 +5875,121 @@ impl Game {
         Ok(result)
     }
 
+    /// Materialize development-card draw successors from the observer's public
+    /// information set, rather than from the authoritative hidden deck.
+    ///
+    /// Each returned game is independently sanitized with
+    /// [`Game::determinize_for_player`] and then conditioned on drawing the
+    /// requested card.  A requested card may therefore be materialized even
+    /// when every authoritative copy is currently hidden in an opponent hand.
+    /// Card identities in opponent hands and deck order cannot affect the
+    /// result; only public played-card counts, public hand sizes, the observer's
+    /// own cards, and `seed` do.  The caller supplies belief probabilities and
+    /// receives children in exactly `cards` order.
+    pub fn public_belief_development_draws(
+        &self,
+        observer: Color,
+        action: &Action,
+        cards: &[DevCard],
+        seed: u64,
+    ) -> Result<Vec<Game>, String> {
+        if action.action_type != ActionType::BuyDevelopmentCard {
+            return Err("public-belief development draw requires BUY_DEVELOPMENT_CARD".into());
+        }
+        if action.color != observer {
+            return Err("public-belief development draw actor must be the observer".into());
+        }
+
+        // Public posterior support: base deck minus all publicly played cards
+        // and the observer's own known, unplayed cards. Opponent face-down
+        // cards remain exchangeable with the physical deck.
+        let observer_state = self.state.player_state(observer);
+        let mut public_unknown = [0_u8; 5];
+        for card in starting_devcard_bank() {
+            public_unknown[card.idx()] += 1;
+        }
+        for color in &self.state.colors {
+            let state = self.state.player_state(*color);
+            for index in 0..5 {
+                public_unknown[index] = public_unknown[index]
+                    .checked_sub(state.played_dev_cards[index])
+                    .ok_or("public played development cards exceed base deck")?;
+            }
+        }
+        for index in 0..5 {
+            public_unknown[index] = public_unknown[index]
+                .checked_sub(observer_state.dev_cards[index])
+                .ok_or("observer development cards exceed public remaining deck")?;
+        }
+
+        let mut results = Vec::with_capacity(cards.len());
+        for requested in cards {
+            if public_unknown[requested.idx()] == 0 {
+                return Err(format!(
+                    "requested public-belief development card has zero support: {:?}",
+                    requested
+                ));
+            }
+
+            // Card-specific mixing keeps sibling hidden allocations independent
+            // while remaining a pure function of public state and caller seed.
+            let card_seed = seed ^ (requested.idx() as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut sampled = self.determinize_for_player(observer, card_seed)?;
+
+            if !sampled.state.development_listdeck.contains(requested) {
+                // The requested public-supported card landed in an opponent's
+                // sampled hand. Exchange it with a deck card, preserving every
+                // public hand/deck size and repairing hidden VP/playability.
+                // Prefer a replacement that keeps the sampled world publicly
+                // non-terminal.
+                let donor = sampled
+                    .state
+                    .colors
+                    .iter()
+                    .copied()
+                    .find(|color| {
+                        *color != observer
+                            && sampled.state.player_state(*color).dev_cards[requested.idx()] > 0
+                    })
+                    .ok_or(
+                        "public-supported development card was neither in deck nor opponent hand",
+                    )?;
+                let replacement_position = sampled
+                    .state
+                    .development_listdeck
+                    .iter()
+                    .position(|replacement| {
+                        let donor_state = sampled.state.player_state(donor);
+                        let hidden_vps_after = donor_state.dev_cards[DevCard::VictoryPoint.idx()]
+                            - u8::from(*requested == DevCard::VictoryPoint)
+                            + u8::from(*replacement == DevCard::VictoryPoint);
+                        donor_state.victory_points + i16::from(hidden_vps_after)
+                            < sampled.vps_to_win
+                    })
+                    .ok_or(
+                        "no non-terminal hidden allocation can condition on requested dev draw",
+                    )?;
+                let replacement = sampled
+                    .state
+                    .development_listdeck
+                    .remove(replacement_position);
+                {
+                    let donor_state = sampled.state.player_state_mut(donor);
+                    donor_state.dev_cards[requested.idx()] -= 1;
+                    donor_state.dev_cards[replacement.idx()] += 1;
+                    donor_state.actual_victory_points = donor_state.victory_points
+                        + i16::from(donor_state.dev_cards[DevCard::VictoryPoint.idx()]);
+                    donor_state.owned_at_start = donor_state.dev_cards.map(|count| count > 0);
+                }
+                sampled.state.development_listdeck.push(*requested);
+            }
+
+            sampled.execute(action.clone(), true, Some(ActionValue::DevCard(*requested)))?;
+            results.push(sampled);
+        }
+        Ok(results)
+    }
+
     pub fn set_record_actions(&mut self, record_actions: bool) {
         self.record_actions = record_actions;
     }
@@ -7773,6 +7888,31 @@ pub mod python_bindings {
             self.game
                 .determinize_for_player(observer, seed)
                 .map(|game| PyGame { game })
+                .map_err(py_err)
+        }
+
+        /// Materialize public-belief BUY_DEVELOPMENT_CARD successors in one
+        /// round trip. ``card_names`` order is preserved. Unlike
+        /// ``apply_chance_outcomes_batch``, support and child states are
+        /// independent of the authoritative hidden deck/allocation.
+        fn apply_public_belief_development_draws(
+            &self,
+            action_json: &str,
+            observer_color: &str,
+            card_names: Vec<String>,
+            seed: u64,
+        ) -> PyResult<Vec<PyGame>> {
+            let value: Value = serde_json::from_str(action_json)
+                .map_err(|error| PyValueError::new_err(format!("invalid action JSON: {error}")))?;
+            let action = action_from_json_value(&value).map_err(py_err)?;
+            let observer = parse_color(observer_color).map_err(py_err)?;
+            let cards = card_names
+                .iter()
+                .map(|name| parse_dev_card(name).map_err(py_err))
+                .collect::<PyResult<Vec<_>>>()?;
+            self.game
+                .public_belief_development_draws(observer, &action, &cards, seed)
+                .map(|games| games.into_iter().map(|game| PyGame { game }).collect())
                 .map_err(py_err)
         }
     }
@@ -13838,6 +13978,121 @@ mod public_belief_determinization_tests {
             has_diverse_seed,
             "a non-degenerate hidden pool must produce particle diversity across seeds",
         );
+    }
+
+    fn two_player_buy_game(hidden_cards: [u8; 5]) -> (Game, Color, Action) {
+        let mut game = Game::new(
+            vec![Player::simple(Color::Red), Player::simple(Color::Blue)],
+            Some(79),
+        );
+        let observer = game.state.current_color();
+        let opponent = game
+            .state
+            .colors
+            .iter()
+            .copied()
+            .find(|color| *color != observer)
+            .unwrap();
+
+        game.state.is_initial_build_phase = false;
+        game.state.current_prompt = ActionPrompt::PlayTurn;
+        game.state.player_state_mut(observer).has_rolled = true;
+        let buy_resources = [0, 0, 1, 1, 1];
+        game.state.player_state_mut(observer).resources = buy_resources;
+        for index in 0..5 {
+            game.state.resource_freqdeck[index] -= buy_resources[index];
+        }
+
+        {
+            let opponent_state = game.state.player_state_mut(opponent);
+            opponent_state.dev_cards = hidden_cards;
+            opponent_state.owned_at_start = hidden_cards.map(|count| count > 0);
+            opponent_state.actual_victory_points = opponent_state.victory_points
+                + i16::from(hidden_cards[DevCard::VictoryPoint.idx()]);
+        }
+        let mut deck = starting_devcard_bank();
+        for card in DevCard::ALL {
+            for _ in 0..hidden_cards[card.idx()] {
+                let position = deck
+                    .iter()
+                    .position(|candidate| *candidate == card)
+                    .unwrap();
+                deck.remove(position);
+            }
+        }
+        game.state.development_listdeck = deck;
+        game.playable_actions = generate_playable_actions(&game.state);
+        let action = game
+            .playable_actions
+            .iter()
+            .find(|action| action.action_type == ActionType::BuyDevelopmentCard)
+            .cloned()
+            .expect("buy-development-card action must be legal in fixture");
+        (game, observer, action)
+    }
+
+    #[test]
+    fn public_belief_dev_draws_cover_support_and_ignore_authoritative_deck() {
+        // In `first`, every ROAD_BUILDING card is authoritatively hidden in the
+        // opponent hand. In `second`, every MONOPOLY is hidden instead. Public
+        // hand/deck sizes are identical, so all five conditioned successors
+        // must still exist and match exactly for the same seed.
+        let mut road_hidden = [0_u8; 5];
+        road_hidden[DevCard::RoadBuilding.idx()] = 2;
+        let mut monopoly_hidden = [0_u8; 5];
+        monopoly_hidden[DevCard::Monopoly.idx()] = 2;
+        let (first, observer, action) = two_player_buy_game(road_hidden);
+        let mut second = first.clone();
+        let opponent = second
+            .state
+            .colors
+            .iter()
+            .copied()
+            .find(|color| *color != observer)
+            .unwrap();
+        {
+            let opponent_state = second.state.player_state_mut(opponent);
+            opponent_state.dev_cards = monopoly_hidden;
+            opponent_state.owned_at_start = monopoly_hidden.map(|count| count > 0);
+            opponent_state.actual_victory_points = opponent_state.victory_points;
+        }
+        let mut second_deck = starting_devcard_bank();
+        for _ in 0..2 {
+            let position = second_deck
+                .iter()
+                .position(|candidate| *candidate == DevCard::Monopoly)
+                .unwrap();
+            second_deck.remove(position);
+        }
+        second.state.development_listdeck = second_deck;
+
+        let first_children = first
+            .public_belief_development_draws(observer, &action, &DevCard::ALL, 45_901)
+            .unwrap();
+        let second_children = second
+            .public_belief_development_draws(observer, &action, &DevCard::ALL, 45_901)
+            .unwrap();
+        assert_eq!(first_children.len(), DevCard::ALL.len());
+        assert_eq!(second_children.len(), DevCard::ALL.len());
+
+        for (card, (first_child, second_child)) in DevCard::ALL
+            .iter()
+            .zip(first_children.iter().zip(second_children.iter()))
+        {
+            let first_json = game_to_json_value(first_child);
+            let second_json = game_to_json_value(second_child);
+            assert_eq!(
+                first_json, second_json,
+                "conditioned {card:?} child leaked authoritative hidden allocation",
+            );
+            assert_eq!(
+                first_child.state.player_state(observer).dev_cards[card.idx()],
+                1,
+                "observer must receive the requested {card:?}",
+            );
+            assert_eq!(first_child.state.development_listdeck.len(), 22);
+            assert_public_conservation(first_child);
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ import pytest
 
 from tools.train_bc import (
     TARGET_INFORMATION_REGIME_PUBLIC,
+    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _validate_target_information_admission,
 )
 
@@ -50,6 +51,12 @@ def test_public_information_set_targets_are_admitted():
     assert report["search_target_objectives"] == ["soft_policy"]
 
 
+def test_coherent_public_belief_targets_are_admitted():
+    report = _admit(_data([TARGET_INFORMATION_REGIME_PUBLIC_COHERENT] * 3))
+    assert report["unsafe_or_unknown_rows"] == 0
+    assert report["search_target_objectives"] == ["soft_policy"]
+
+
 @pytest.mark.parametrize(
     "regime", ["authoritative_hidden_state_search_v1", "unknown", ""]
 )
@@ -90,9 +97,7 @@ def test_unsafe_corpus_can_only_use_hard_actions_and_realised_outcomes():
 def test_unsafe_corpus_cannot_bypass_admission_via_policy_auxiliary(
     overrides, objective: str
 ):
-    data = _data(
-        ["authoritative_hidden_state_search_v1"], prior_policy=True
-    )
+    data = _data(["authoritative_hidden_state_search_v1"], prior_policy=True)
     with pytest.raises(SystemExit, match=objective):
         _admit(
             data,

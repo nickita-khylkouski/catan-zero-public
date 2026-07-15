@@ -127,9 +127,7 @@ def test_h2h_search_seed_is_stable_per_game_and_distinct_by_seat() -> None:
     red = h2h._game_search_seed(game_seed=6199801000, seat_color="RED")
     blue = h2h._game_search_seed(game_seed=6199801000, seat_color="BLUE")
 
-    assert red == h2h._game_search_seed(
-        game_seed=6199801000, seat_color="red"
-    )
+    assert red == h2h._game_search_seed(game_seed=6199801000, seat_color="red")
     assert red != blue
     assert red != h2h._game_search_seed(game_seed=6199801001, seat_color="RED")
     with pytest.raises(ValueError, match="unsupported H2H seat color"):
@@ -274,9 +272,7 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
         "sha256": h2h._checkpoint_sha256(validation),
         "schema_version": validation_payload["schema_version"],
         "game_seed_count": len(validation_seeds),
-        "game_seed_set_sha256": validation_payload[
-            "validation_game_seed_set_sha256"
-        ],
+        "game_seed_set_sha256": validation_payload["validation_game_seed_set_sha256"],
     }
     np.savez(
         source,
@@ -584,6 +580,62 @@ def test_public_observation_requires_information_set_search() -> None:
     _validate_information_set_recipe(args)
 
 
+def test_coherent_public_belief_search_is_a_distinct_public_mode() -> None:
+    args = SimpleNamespace(
+        public_observation=True,
+        information_set_search=False,
+        coherent_public_belief_search=True,
+        belief_chance_spectra=False,
+        determinization_particles=4,
+        determinization_min_simulations=32,
+    )
+    _validate_information_set_recipe(args)
+
+    config = _build_search_config(
+        _base_worker_args(
+            coherent_public_belief_search=True,
+            forced_root_target_mode="trajectory_only",
+        ),
+        seed=1,
+    )
+    assert config.coherent_public_belief_search is True
+    assert config.information_set_search is False
+    assert config.forced_root_target_mode == "trajectory_only"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"information_set_search": True},
+            "cannot be combined with --information-set-search",
+        ),
+        (
+            {"belief_chance_spectra": True},
+            "cannot be combined with --belief-chance-spectra",
+        ),
+        (
+            {"public_observation": False},
+            "requires --public-observation",
+        ),
+    ],
+)
+def test_coherent_public_belief_search_rejects_mixed_or_unmasked_modes(
+    overrides: dict[str, bool], message: str
+) -> None:
+    values = {
+        "public_observation": True,
+        "information_set_search": False,
+        "coherent_public_belief_search": True,
+        "belief_chance_spectra": False,
+        "determinization_particles": 4,
+        "determinization_min_simulations": 32,
+    }
+    values.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _validate_information_set_recipe(SimpleNamespace(**values))
+
+
 def test_build_search_config_threads_information_set_recipe() -> None:
     config = _build_search_config(
         _base_worker_args(
@@ -873,7 +925,9 @@ def test_worker_constructs_corrected_candidate_and_legacy_baseline(monkeypatch):
         def __init__(self, config, evaluator):
             built_configs.append(config)
 
-    monkeypatch.setattr(h2h, "_build_evaluator", lambda *args, **kwargs: FakeEvaluator())
+    monkeypatch.setattr(
+        h2h, "_build_evaluator", lambda *args, **kwargs: FakeEvaluator()
+    )
     monkeypatch.setattr(h2h, "GumbelChanceMCTS", FakeMCTS)
     result = h2h._run_worker(
         {

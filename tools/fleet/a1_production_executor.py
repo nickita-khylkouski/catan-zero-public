@@ -58,6 +58,8 @@ NATIVE_REQUIRED_CAPABILITIES = frozenset(
         "initial_road_d1_scope",
         "public_award_feature_parity",
         "policy_temperature_semantics",
+        "coherent_public_belief_search",
+        "forced_root_trajectory_only",
     }
 )
 HISTORICAL_DB1_REPO_ROOT = Path("/home/ubuntu/catan-db1c8b1-campaign")

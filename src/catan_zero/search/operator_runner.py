@@ -5,9 +5,9 @@ different result types and budget counters.  This module is the single mapping
 boundary.  It wraps the evaluator before constructing an operator, times each
 decision, and reports both algorithmic visits and actual neural work.
 
-No adapter silently claims public-information safety.  At present only Gumbel
-search with ``information_set_search=True`` has the engine-level
-determinization and actor-turn boundary required for that label.
+No adapter silently claims public-information safety. Gumbel search can earn
+that label through either the legacy conservation-PIMC adapter or the coherent
+single public-belief tree; the two remain distinct measured regimes.
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ __all__ = [
 InformationRegime = Literal[
     "authoritative_hidden_state",
     "public_conservation_pimc",
+    "public_belief_single_tree",
     "public_observation_policy",
 ]
 OperatorKind = Literal["gumbel", "puct", "regularized_mcts", "raw_policy"]
@@ -148,18 +149,16 @@ class MeasuredSearchOperator:
         evaluator: RustEvaluator,
         *,
         config: (
-            GumbelChanceMCTSConfig
-            | RustMCTSConfig
-            | RegularizedMCTSConfig
-            | None
+            GumbelChanceMCTSConfig | RustMCTSConfig | RegularizedMCTSConfig | None
         ) = None,
     ) -> None:
         self.kind = kind
         self.accounting_evaluator = SearchAccountingEvaluator(evaluator)
         evaluator_config = getattr(evaluator, "config", None)
-        if evaluator_config is not None and int(
-            getattr(evaluator_config, "cache_size", 0)
-        ) != 0:
+        if (
+            evaluator_config is not None
+            and int(getattr(evaluator_config, "cache_size", 0)) != 0
+        ):
             raise ValueError(
                 "measured search requires evaluator cache_size=0 so orientation_rows "
                 "equals actual model rows"
@@ -172,11 +171,12 @@ class MeasuredSearchOperator:
             if config is not None and not isinstance(config, GumbelChanceMCTSConfig):
                 raise TypeError("gumbel requires GumbelChanceMCTSConfig")
             self.search = GumbelChanceMCTS(config, self.accounting_evaluator)
-            self.information_regime: InformationRegime = (
-                "public_conservation_pimc"
-                if bool(self.search.config.information_set_search)
-                else "authoritative_hidden_state"
-            )
+            if bool(self.search.config.coherent_public_belief_search):
+                self.information_regime = "public_belief_single_tree"
+            elif bool(self.search.config.information_set_search):
+                self.information_regime = "public_conservation_pimc"
+            else:
+                self.information_regime = "authoritative_hidden_state"
         elif kind == "puct":
             if config is not None and not isinstance(config, RustMCTSConfig):
                 raise TypeError("puct requires RustMCTSConfig")
@@ -219,7 +219,7 @@ class MeasuredSearchOperator:
         ):
             raise RuntimeError(
                 f"{self.kind} has no complete public-information adapter; "
-                "use Gumbel information_set_search or run an explicitly "
+                "use Gumbel public-belief/information-set search or run an explicitly "
                 "authoritative-state diagnostic"
             )
         before = self.accounting_evaluator.snapshot()
@@ -263,7 +263,9 @@ class MeasuredSearchOperator:
         priors, value = self.accounting_evaluator.evaluate(
             game, legal, root_color=root_color, colors=colors
         )
-        action = max(legal, key=lambda candidate: (priors.get(candidate, 0.0), -candidate))
+        action = max(
+            legal, key=lambda candidate: (priors.get(candidate, 0.0), -candidate)
+        )
         return int(action), dict(priors), {}, float(value), 0, 0
 
     def _run_tree(

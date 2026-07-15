@@ -2,7 +2,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-use gumbel_mcts::{EvaluationRequest, Evaluator, GumbelMctsEngine, SearchConfig};
+use gumbel_mcts::{
+    EvaluationRequest, Evaluator, ForcedRootTargetMode, GumbelMctsEngine, SearchConfig,
+};
 
 // Use :: to disambiguate from the pymodule function name
 use ::catanatron_rs as ctrs;
@@ -234,6 +236,18 @@ fn gumbel_search(
     if let Some(v) = config_dict.get_item("p_full")? {
         config.p_full = v.extract()?;
     }
+    if let Some(v) = config_dict.get_item("forced_root_target_mode")? {
+        let mode: String = v.extract()?;
+        config.forced_root_target_mode = match mode.as_str() {
+            "full" => ForcedRootTargetMode::Full,
+            "trajectory_only" => ForcedRootTargetMode::TrajectoryOnly,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "forced_root_target_mode must be 'full' or 'trajectory_only'",
+                ));
+            }
+        };
+    }
     if let Some(v) = config_dict.get_item("n_full_wide")? {
         config.n_full_wide = Some(v.extract()?);
     }
@@ -287,9 +301,7 @@ fn gumbel_search(
             config.attested_root_phase = Some(phase);
         }
     }
-    if config.rescale_noise_floor_initial_road_only
-        && config.attested_root_phase.is_none()
-    {
+    if config.rescale_noise_floor_initial_road_only && config.attested_root_phase.is_none() {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "initial-road-only D1 requires attested_root_phase",
         ));
@@ -320,6 +332,9 @@ fn gumbel_search(
     }
     if let Some(v) = config_dict.get_item("stop_at_root_turn_boundary")? {
         config.stop_at_root_turn_boundary = v.extract()?;
+    }
+    if let Some(v) = config_dict.get_item("coherent_public_belief_search")? {
+        config.coherent_public_belief_search = v.extract()?;
     }
     if let Some(v) = config_dict.get_item("colors")? {
         let colors: Vec<String> = v.extract()?;
@@ -409,6 +424,8 @@ fn gumbel_search_capabilities() -> Vec<&'static str> {
         "initial_road_d1_scope",
         "public_award_feature_parity",
         "policy_temperature_semantics",
+        "coherent_public_belief_search",
+        "forced_root_trajectory_only",
     ]
 }
 

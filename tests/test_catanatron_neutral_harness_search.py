@@ -25,6 +25,7 @@ from catanatron_neutral_harness_match import (  # type: ignore  # noqa: E402
     _search_config,
     _search_recipe,
     _validate_checkpoint_value_readout,
+    _validate_public_search_recipe,
     _write_game_artifact,
     build_parser,
     build_summary,
@@ -314,6 +315,7 @@ def test_parser_preserves_raw_smoke_default_and_exposes_search_recipe() -> None:
     assert args.lazy_interior_chance is True
     assert args.public_observation is True
     assert args.information_set_search is True
+    assert args.coherent_public_belief_search is False
     assert args.determinization_particles == 4
     assert args.determinization_min_simulations == 32
     assert args.value_readout == "scalar"
@@ -397,6 +399,66 @@ def test_neutral_search_runtime_and_fingerprint_share_d6_adaptive_recipe() -> No
     assert _run_fingerprint(semantics) != _run_fingerprint(
         _game_semantics(default_args, "checkpoint-md5", "sha256:" + "1" * 64)
     )
+
+
+def test_neutral_search_threads_coherent_public_belief_mode() -> None:
+    args = build_parser().parse_args(
+        [
+            "--checkpoint",
+            "checkpoint.pt",
+            "--opponent",
+            "random",
+            "--mode",
+            "search",
+            "--out",
+            "out.json",
+            "--no-information-set-search",
+            "--coherent-public-belief-search",
+            "--forced-root-target-mode",
+            "trajectory_only",
+        ]
+    )
+    _validate_public_search_recipe(args)
+    recipe = _search_recipe(args)
+    config = _search_config(recipe, ("BLUE", "RED"), seed=7)
+
+    assert recipe["coherent_public_belief_search"] is True
+    assert recipe["information_set_search"] is False
+    assert config.coherent_public_belief_search is True
+    assert config.information_set_search is False
+    assert config.forced_root_target_mode == "trajectory_only"
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--coherent-public-belief-search"],
+        [
+            "--no-information-set-search",
+            "--coherent-public-belief-search",
+            "--belief-chance-spectra",
+        ],
+        ["--no-information-set-search", "--no-public-observation"],
+    ],
+)
+def test_neutral_search_rejects_ambiguous_or_unsafe_public_modes(
+    extra_args: list[str],
+) -> None:
+    args = build_parser().parse_args(
+        [
+            "--checkpoint",
+            "checkpoint.pt",
+            "--opponent",
+            "random",
+            "--mode",
+            "search",
+            "--out",
+            "out.json",
+            *extra_args,
+        ]
+    )
+    with pytest.raises(ValueError):
+        _validate_public_search_recipe(args)
 
 
 def test_neutral_search_seals_corrected_belief_gameplay_operator() -> None:

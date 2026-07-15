@@ -16,13 +16,18 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_VERSION_KEY,
     AUX_TARGET_KEYS,
 )
-from catan_zero.rl.flywheel.opponent_mix import MixCategory, MixCheckpointRef, OpponentMixConfig
+from catan_zero.rl.flywheel.opponent_mix import (
+    MixCategory,
+    MixCheckpointRef,
+    OpponentMixConfig,
+)
 from catan_zero.rl.gumbel_self_play import (
     COLORS,
     GumbelSelfPlayConfig,
     MixRuntime,
     TARGET_INFORMATION_REGIME_AUTHORITATIVE,
     TARGET_INFORMATION_REGIME_PUBLIC,
+    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _apply_selected_action,
     _search_execution_contract,
     _target_information_regime_for_search,
@@ -77,7 +82,14 @@ def _catanatron_rs_version() -> tuple[int, ...]:
 _A19_A20_FIXED_ON_WHEEL = _catanatron_rs_version() >= (0, 1, 1)
 
 
-def _fast_config(*, max_decisions: int, n_full: int = 4, n_fast: int = 2, p_full: float = 1.0, seed: int = 0):
+def _fast_config(
+    *,
+    max_decisions: int,
+    n_full: int = 4,
+    n_fast: int = 2,
+    p_full: float = 1.0,
+    seed: int = 0,
+):
     self_play_config = GumbelSelfPlayConfig(max_decisions=max_decisions)
     search_config = GumbelChanceMCTSConfig(
         seed=seed, n_full=n_full, n_fast=n_fast, p_full=p_full, max_depth=40
@@ -113,7 +125,9 @@ def test_game_outcome_fields_are_zero_sum_across_seats():
         if game.winning_color() is not None:
             break
         game.play_tick()
-    assert game.winning_color() is not None, "expected a natural game completion within budget"
+    assert game.winning_color() is not None, (
+        "expected a natural game completion within budget"
+    )
 
     outcome = _game_outcome_fields(game, terminal=True, colors=COLORS)
     assert outcome["winner"] in COLORS
@@ -166,9 +180,7 @@ def test_initial_settlement_and_road_change_perspective_only_after_road():
     settlement_snapshot = json.loads(after_settlement.json_snapshot())
     assert settlement_snapshot["current_prompt"] == "BUILD_INITIAL_ROAD"
     assert str(after_settlement.current_color()) == root_actor
-    assert (
-        1.0 if str(after_settlement.current_color()) == root_actor else -1.0
-    ) == 1.0
+    assert (1.0 if str(after_settlement.current_color()) == root_actor else -1.0) == 1.0
 
     after_road = apply_first_action_with_type(after_settlement, "BUILD_ROAD")
     road_snapshot = json.loads(after_road.json_snapshot())
@@ -387,9 +399,7 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
     # Current-row actions are excluded from the strict-future aux contract.
     assert red0["aux_next_settlement"] == np.int16(-1)
     assert red0["aux_robber_target"] == np.int16(11)
-    assert red0[AUX_SUBGOAL_TARGET_VERSION_KEY] == np.uint8(
-        AUX_SUBGOAL_TARGET_VERSION
-    )
+    assert red0[AUX_SUBGOAL_TARGET_VERSION_KEY] == np.uint8(AUX_SUBGOAL_TARGET_VERSION)
     blue = record.decisions[1].row
     assert blue["aux_largest_army"] == np.float32(1.0)
     assert blue["aux_next_settlement"] == np.int16(-1)
@@ -479,7 +489,9 @@ def test_forced_decisions_are_recorded_with_zero_policy_weight_and_real_value_we
     # decision (forced or not) gets exactly one row.
     assert len(record.decisions) == record.total_decisions
 
-    forced_rows = [decision.row for decision in record.decisions if decision.row["is_forced"]]
+    forced_rows = [
+        decision.row for decision in record.decisions if decision.row["is_forced"]
+    ]
     assert len(forced_rows) == record.forced_decisions
     for row in forced_rows:
         assert float(row["policy_weight_multiplier"]) == pytest.approx(0.0)
@@ -506,9 +518,12 @@ def test_forced_roll_rows_carry_real_afterstate_targets():
     roll_rows = [
         decision.row
         for decision in record.decisions
-        if decision.row["is_forced"] and bool(np.any(decision.row["afterstate_target_mask"]))
+        if decision.row["is_forced"]
+        and bool(np.any(decision.row["afterstate_target_mask"]))
     ]
-    assert roll_rows, "expected at least one forced ROLL row with a real afterstate target"
+    assert roll_rows, (
+        "expected at least one forced ROLL row with a real afterstate target"
+    )
     for row in roll_rows:
         assert row["used_full_search"] is True
         assert row["simulations_used"] == 0
@@ -524,7 +539,9 @@ def test_forced_roll_rows_carry_real_afterstate_targets():
 # ---------------------------------------------------------------------------
 
 
-def test_run_worker_games_writes_valid_shards_that_round_trip_through_train_bc(tmp_path):
+def test_run_worker_games_writes_valid_shards_that_round_trip_through_train_bc(
+    tmp_path,
+):
     _rust()
     self_play_config, search_config = _fast_config(max_decisions=6)
     evaluator = HeuristicRustEvaluator(score_actions=False)
@@ -564,7 +581,9 @@ def test_run_worker_games_writes_valid_shards_that_round_trip_through_train_bc(t
         # train_bc.py's soft-target coverage gate into a spurious one-hot
         # hard-CE fallback on a fully-covered soft target.
         assert normalized["target_policy"].dtype == np.float32
-        assert normalized["target_score_source"].tolist().count("gumbel_mcts_visit_q") <= n
+        assert (
+            normalized["target_score_source"].tolist().count("gumbel_mcts_visit_q") <= n
+        )
         # policy_weight_multiplier/value_weight_multiplier must survive the
         # round trip (they drive train_bc.py's loss weighting).
         assert "policy_weight_multiplier" in normalized
@@ -680,8 +699,7 @@ def test_run_worker_games_writes_a_real_manifest_json(tmp_path):
     assert manifest["rows"] == summary["rows"]
     assert manifest["shards"] == summary["shards"]
     assert (
-        manifest["target_information_regime"]
-        == TARGET_INFORMATION_REGIME_AUTHORITATIVE
+        manifest["target_information_regime"] == TARGET_INFORMATION_REGIME_AUTHORITATIVE
     )
     assert manifest[AUX_SUBGOAL_TARGET_VERSION_KEY] == AUX_SUBGOAL_TARGET_VERSION
     assert manifest["aux_subgoal_target_semantic"] == AUX_SUBGOAL_TARGET_SEMANTIC
@@ -700,9 +718,12 @@ def test_target_information_regime_requires_explicit_search_and_native_support()
         belief_chance_spectra=True,
         public_observation=True,
     )
-    assert _target_information_regime_for_search(
-        legacy, engine_supports_determinization=True
-    ) == TARGET_INFORMATION_REGIME_AUTHORITATIVE
+    assert (
+        _target_information_regime_for_search(
+            legacy, engine_supports_determinization=True
+        )
+        == TARGET_INFORMATION_REGIME_AUTHORITATIVE
+    )
 
     requested = SimpleNamespace(
         information_set_search=True,
@@ -712,9 +733,32 @@ def test_target_information_regime_requires_explicit_search_and_native_support()
         _target_information_regime_for_search(
             requested, engine_supports_determinization=False
         )
-    assert _target_information_regime_for_search(
-        requested, engine_supports_determinization=True
-    ) == TARGET_INFORMATION_REGIME_PUBLIC
+    assert (
+        _target_information_regime_for_search(
+            requested, engine_supports_determinization=True
+        )
+        == TARGET_INFORMATION_REGIME_PUBLIC
+    )
+
+    coherent = SimpleNamespace(
+        coherent_public_belief_search=True,
+        information_set_search=False,
+        belief_chance_spectra=False,
+    )
+    with pytest.raises(RuntimeError, match="apply_public_belief_development_draws"):
+        _target_information_regime_for_search(
+            coherent,
+            engine_supports_determinization=True,
+            engine_supports_public_belief_development_draws=False,
+        )
+    assert (
+        _target_information_regime_for_search(
+            coherent,
+            engine_supports_determinization=True,
+            engine_supports_public_belief_development_draws=True,
+        )
+        == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+    )
 
     with pytest.raises(ValueError, match="belief_chance_spectra"):
         _target_information_regime_for_search(
@@ -733,19 +777,31 @@ def test_search_execution_contract_attests_effective_particle_budget_semantics()
         "budget_scope": "total_before_determinization_division",
         "configured_exact_budget_sh": False,
         "information_set_particle_subbudgets_exact": True,
+        "forced_root_target_mode": "full",
         "native_mcts_hot_loop": True,
     }
 
-    single_world = SimpleNamespace(
-        information_set_search=False, exact_budget_sh=False
-    )
-    assert _search_execution_contract(
-        single_world, native_mcts_hot_loop=False
-    ) == {
-        "budget_scope": "single_world",
+    single_world = SimpleNamespace(information_set_search=False, exact_budget_sh=False)
+    assert _search_execution_contract(single_world, native_mcts_hot_loop=False) == {
+        "budget_scope": "single_authoritative_world",
         "configured_exact_budget_sh": False,
         "information_set_particle_subbudgets_exact": False,
+        "forced_root_target_mode": "full",
         "native_mcts_hot_loop": False,
+    }
+
+    coherent = SimpleNamespace(
+        information_set_search=False,
+        coherent_public_belief_search=True,
+        exact_budget_sh=False,
+        forced_root_target_mode="trajectory_only",
+    )
+    assert _search_execution_contract(coherent, native_mcts_hot_loop=True) == {
+        "budget_scope": "single_public_belief_tree",
+        "configured_exact_budget_sh": False,
+        "information_set_particle_subbudgets_exact": False,
+        "forced_root_target_mode": "trajectory_only",
+        "native_mcts_hot_loop": True,
     }
 
 
@@ -801,7 +857,11 @@ def _mix_runtime_two_categories() -> MixRuntime:
             name="hard_experimental",
             weight=1.0,
             source="checkpoint_list",
-            checkpoints=(MixCheckpointRef(path="fake-hard-negative.pt", version=7, md5="deadbeef"),),
+            checkpoints=(
+                MixCheckpointRef(
+                    path="fake-hard-negative.pt", version=7, md5="deadbeef"
+                ),
+            ),
         ),
     )
     return MixRuntime(
@@ -837,7 +897,10 @@ def test_opponent_mix_stamps_tag_and_md5_and_never_records_opponent_seat_rows(tm
     assert summary["opponent_mix_per_tag_stats"]
     # Both configured categories should show up over 12 games at a ~50/50
     # nominal split (small-N slack: just assert neither is entirely absent).
-    assert set(summary["opponent_mix_per_tag_stats"]) <= {"producer_self_play", "hard_experimental"}
+    assert set(summary["opponent_mix_per_tag_stats"]) <= {
+        "producer_self_play",
+        "hard_experimental",
+    }
 
     saw_pool_row = False
     saw_mirror_row = False
@@ -885,8 +948,12 @@ def test_opponent_mix_stamps_tag_and_md5_and_never_records_opponent_seat_rows(tm
                 "the opponent seat's own decisions must never be recorded"
             )
 
-    assert saw_pool_row, "expected at least one hard_experimental (pool) row across 12 games"
-    assert saw_mirror_row, "expected at least one producer_self_play (mirror) row across 12 games"
+    assert saw_pool_row, (
+        "expected at least one hard_experimental (pool) row across 12 games"
+    )
+    assert saw_mirror_row, (
+        "expected at least one producer_self_play (mirror) row across 12 games"
+    )
 
 
 def test_opponent_pool_and_opponent_mix_are_mutually_exclusive(tmp_path):
@@ -941,19 +1008,25 @@ def _find_move_robber_with_victim(catanatron_rs, *, seed: int, max_ticks: int = 
     for _ in range(max_ticks):
         playable = json.loads(game.playable_actions_json())
         candidates = [
-            action for action in playable if action[1] == "MOVE_ROBBER" and action[2][1] is not None
+            action
+            for action in playable
+            if action[1] == "MOVE_ROBBER" and action[2][1] is not None
         ]
         if candidates:
             ids = [int(a) for a in game.playable_action_indices(list(COLORS), None)]
             action_index = ids[playable.index(candidates[0])]
             return game, action_index, candidates[0]
         game.play_tick()
-    raise AssertionError("did not reach a MOVE_ROBBER-with-victim decision within budget")
+    raise AssertionError(
+        "did not reach a MOVE_ROBBER-with-victim decision within budget"
+    )
 
 
 def test_apply_selected_action_steals_only_resources_the_victim_actually_holds():
     catanatron_rs = _rust()
-    game, action_index, action_json = _find_move_robber_with_victim(catanatron_rs, seed=0)
+    game, action_index, action_json = _find_move_robber_with_victim(
+        catanatron_rs, seed=0
+    )
 
     victim_name = action_json[2][1]
     snapshot = json.loads(game.json_snapshot())
@@ -965,23 +1038,33 @@ def test_apply_selected_action_steals_only_resources_the_victim_actually_holds()
     rng = random.Random(123)
     for _ in range(50):
         result_game = _apply_selected_action(
-            game.copy(), action_index, colors=COLORS, rng=rng, correct_rust_chance_spectra=True
+            game.copy(),
+            action_index,
+            colors=COLORS,
+            rng=rng,
+            correct_rust_chance_spectra=True,
         )
         after = json.loads(result_game.json_snapshot())
         after_hand = after["player_state"][colors.index(victim_name)]["resources"]
         delta = {r: int(victim_hand[r]) - int(after_hand[r]) for r in RESOURCES}
         stolen = [r for r, d in delta.items() if d == 1]
-        assert len(stolen) == 1, f"expected exactly one resource stolen, got delta={delta}"
+        assert len(stolen) == 1, (
+            f"expected exactly one resource stolen, got delta={delta}"
+        )
         assert stolen[0] in held, f"stole {stolen[0]!r} which the victim did not hold"
 
 
-def _find_buy_development_card_with_phantom_outcome(catanatron_rs, *, seed: int, max_ticks: int = 4000):
+def _find_buy_development_card_with_phantom_outcome(
+    catanatron_rs, *, seed: int, max_ticks: int = 4000
+):
     game = catanatron_rs.Game.simple(list(COLORS), seed=seed)
     for _ in range(max_ticks):
         if game.winning_color() is not None:
             break
         playable = json.loads(game.playable_actions_json())
-        candidates = [action for action in playable if action[1] == "BUY_DEVELOPMENT_CARD"]
+        candidates = [
+            action for action in playable if action[1] == "BUY_DEVELOPMENT_CARD"
+        ]
         if candidates:
             action_json = candidates[0]
             ids = [int(a) for a in game.playable_action_indices(list(COLORS), None)]
@@ -994,13 +1077,19 @@ def _find_buy_development_card_with_phantom_outcome(catanatron_rs, *, seed: int,
             before_deck = int(snapshot["development_deck_count"])
             has_phantom = False
             for outcome_index, _entry in enumerate(spectrum):
-                candidate_game = game.apply_chance_outcome(json.dumps(action_json), outcome_index)
+                candidate_game = game.apply_chance_outcome(
+                    json.dumps(action_json), outcome_index
+                )
                 candidate_snapshot = json.loads(candidate_game.json_snapshot())
-                candidate_cards = candidate_snapshot["player_state"][actor_index]["dev_cards"]
+                candidate_cards = candidate_snapshot["player_state"][actor_index][
+                    "dev_cards"
+                ]
                 gained = [
                     card
                     for card in DEVELOPMENT_CARDS
-                    if int(candidate_cards.get(card, 0)) - int(before_cards.get(card, 0)) == 1
+                    if int(candidate_cards.get(card, 0))
+                    - int(before_cards.get(card, 0))
+                    == 1
                 ]
                 deck_decreased = (
                     int(candidate_snapshot["development_deck_count"]) == before_deck - 1
@@ -1031,7 +1120,9 @@ def test_apply_selected_action_dev_card_draw_always_gains_exactly_one_real_card(
             break
         game.play_tick()
     else:
-        raise AssertionError("did not reach a BUY_DEVELOPMENT_CARD decision within budget")
+        raise AssertionError(
+            "did not reach a BUY_DEVELOPMENT_CARD decision within budget"
+        )
 
     snapshot = json.loads(game.json_snapshot())
     colors = [str(color) for color in snapshot["colors"]]
@@ -1042,7 +1133,11 @@ def test_apply_selected_action_dev_card_draw_always_gains_exactly_one_real_card(
     rng = random.Random(7)
     for _ in range(50):
         result_game = _apply_selected_action(
-            game.copy(), action_index, colors=COLORS, rng=rng, correct_rust_chance_spectra=True
+            game.copy(),
+            action_index,
+            colors=COLORS,
+            rng=rng,
+            correct_rust_chance_spectra=True,
         )
         after = json.loads(result_game.json_snapshot())
         after_cards = after["player_state"][actor_index]["dev_cards"]
@@ -1051,7 +1146,9 @@ def test_apply_selected_action_dev_card_draw_always_gains_exactly_one_real_card(
             for card in DEVELOPMENT_CARDS
             if int(after_cards.get(card, 0)) - int(before_cards.get(card, 0)) == 1
         ]
-        assert len(gained) == 1, "every applied outcome must actually draw exactly one card"
+        assert len(gained) == 1, (
+            "every applied outcome must actually draw exactly one card"
+        )
         assert int(after["development_deck_count"]) == before_deck - 1
 
 
@@ -1062,8 +1159,8 @@ def test_apply_selected_action_dev_card_draw_always_gains_exactly_one_real_card(
 )
 def test_buy_development_card_phantom_bug_is_present_before_0_1_1():
     catanatron_rs = _rust()
-    _game, _action_index, _action_json = _find_buy_development_card_with_phantom_outcome(
-        catanatron_rs, seed=6
+    _game, _action_index, _action_json = (
+        _find_buy_development_card_with_phantom_outcome(catanatron_rs, seed=6)
     )
 
 

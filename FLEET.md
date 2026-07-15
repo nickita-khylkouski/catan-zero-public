@@ -48,11 +48,14 @@ table is not a teacher/volume role split.
 
 ## 3. Canonical code + environment (CAT-117)
 - Repo: **`github.com/nickita-khylkouski/catan-zero-public`** (**PUBLIC**, no
-  auth required). The canonical native-MCTS release is
-  **`v1.5-native-semantics`**, created only at checksum commit B of the two-commit
-  transaction below. All earlier tags predate the `catanatron_rs 0.1.8` native
-  search API and must not provision or resume native-MCTS lanes.
-- Env target: **Python 3.11.15**, **torch cu128** (all H100 + B200), **catanatron_rs 0.1.8 cp311**.
+  auth required). `v1.5-native-semantics` is the last sealed `catanatron_rs
+  0.1.8` release. The next native-MCTS release is `catanatron_rs 0.1.9` with
+  `gumbel-mcts 0.2.3`; it receives an immutable tag only after checksum commit
+  B of the two-commit transaction below. Source commit A is deliberately not
+  deployable as a new runtime: the 0.1.9 wheel digest does not exist yet.
+- Env target after checksum commit B: **Python 3.11.15**, **torch cu128** (all
+  H100 + B200), **catanatron_rs 0.1.9 cp311**. Until B, the tracked checksum
+  inventory and runtime digest remain the sealed 0.1.8 artifact.
 - Verification snapshot (2026-07-09): local full suite **1,737 passed / 200
   skipped**; H100 full suite **1,913 passed / 24 skipped**; native
   feature/context/symmetry acceptance **19/19 passed**. The final handoff delta
@@ -69,7 +72,7 @@ table is not a teacher/volume role split.
   curl -fsSL "https://raw.githubusercontent.com/nickita-khylkouski/catan-zero-public/${CATAN_REF}/tools/install_v1_freeze.sh" \
     | CATAN_REF="$CATAN_REF" bash
   ```
-  `tools/install_v1_freeze.sh` — clone+checkout tag → install and enable the canonical foreground `nvidia-mps.service` → py3.11 venv → torch cu128 → `pip install -e vendor/catanatron` → `pip install -e .[dev,rl]` → verify and install the sealed `catanatron_rs` 0.1.8 cp311 wheel → env-doctor → rust-featurize/information-set/native-MCTS parity smoke. A commit ref is supported only with an explicit staged `$CATAN_RS_WHEEL`; `CATAN_REPO` also accepts a local git-bundle path as an offline fallback.
+  `tools/install_v1_freeze.sh` — clone+checkout tag → install and enable the canonical foreground `nvidia-mps.service` → py3.11 venv → torch cu128 → `pip install -e vendor/catanatron` → `pip install -e .[dev,rl]` → verify and install the sealed `catanatron_rs` cp311 wheel named by the runtime contract → env-doctor → rust-featurize/information-set/native-MCTS parity smoke. A commit ref is supported only with an explicit staged `$CATAN_RS_WHEEL`; `CATAN_REPO` also accepts a local git-bundle path as an offline fallback.
 - Fleet acceptance (after install, after staging the private masked champion at
   `~/bundle/champion_v0.pt`, and before the box joins rotation):
   ```
@@ -98,7 +101,7 @@ the checksum update into the source commit.
    documentation change. Run `tools/build_catanatron_rs_wheel.sh` twice from
    independent clean build state. The builder stages commit A at its sealed
    canonical path and emits both the wheel and
-   `catanatron_rs-0.1.8-build-receipt.json`. Require byte-identical wheel
+   `catanatron_rs-0.1.9-build-receipt.json`. Require byte-identical wheel
    SHA-256 values and matching sealed toolchain/environment provenance. The
    receipt schema is `catanatron-rs-wheel-build-receipt-v2`; in addition to
    both catanatron lockfiles it must bind
@@ -132,8 +135,14 @@ future native source change must repeat the transaction above; do not publish
 an old wheel under a new tag, move an existing tag, or edit the inventory
 before two clean builds agree.
 
+The 0.1.9 source transaction is currently at commit-A preparation. Its source
+manifests, locks, builder identity, semantic tests, and capability smoke target
+0.1.9/0.2.3. `native/catanatron-rs/WHEEL_SHA256SUMS` and the production runtime
+wheel digest intentionally remain 0.1.8 until two clean Linux builds produce
+the same 0.1.9 bytes. Updating either digest before that evidence is forbidden.
+
 ## 4. Rust engine (CAT-133)
-- `native/catanatron-rs` v0.1.8 is now the canonical wheel source and builds `catanatron_rs-0.1.8-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` is its linked native-search dependency. `native/catanatron-rs/WHEEL_SHA256SUMS` seals the exact release asset and the installer rejects any byte mismatch. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. Fleet deployment must be uniform 0.1.8 with `sigma_reference_visits`, `belief_target_evidence`, `initial_road_d1_scope`, `public_award_feature_parity`, and `policy_temperature_semantics` capabilities before corrected belief-level native MCTS, opening-road-only D1, Rust entity featurization, or non-unit gameplay temperature.
+- `native/catanatron-rs` v0.1.9 is the next canonical wheel source and builds `catanatron_rs-0.1.9-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` v0.2.3 is its linked native-search dependency. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. After checksum commit B, fleet deployment must be uniform 0.1.9 with `sigma_reference_visits`, `belief_target_evidence`, `initial_road_d1_scope`, `public_award_feature_parity`, `policy_temperature_semantics`, `coherent_public_belief_search`, and `forced_root_trajectory_only`. Until B, the old inventory remains untouched and admission of the new operator fails closed.
 - **Licensing posture: pending user decision — see CAT-138.**
 
 ## 5. Seed ledger (CAT-125)

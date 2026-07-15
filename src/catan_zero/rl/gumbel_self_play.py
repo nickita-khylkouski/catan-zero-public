@@ -126,8 +126,13 @@ SEARCH_EVIDENCE_VERSION = 1
 # not prove that the planner's cloned world state was information-safe.
 TARGET_INFORMATION_REGIME_AUTHORITATIVE = "authoritative_hidden_state_search_v1"
 TARGET_INFORMATION_REGIME_PUBLIC = "public_conservation_pimc_v1"
+TARGET_INFORMATION_REGIME_PUBLIC_COHERENT = "public_belief_single_tree_v1"
 TARGET_INFORMATION_REGIMES = frozenset(
-    {TARGET_INFORMATION_REGIME_AUTHORITATIVE, TARGET_INFORMATION_REGIME_PUBLIC}
+    {
+        TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+        TARGET_INFORMATION_REGIME_PUBLIC,
+        TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+    }
 )
 
 # Kept in sync with `tools/convert_teacher_to_entity_tokens.py`'s BASE_KEYS /
@@ -249,10 +254,10 @@ class GumbelSelfPlayConfig:
     # --max-decisions must match it (enforced by tests/test_cli_config_drift.py).
     max_decisions: int = 600
     # Temperature schedule: T=temperature_high for the first
-    # round(max_decisions * temperature_move_fraction) decisions of each game,
-    # then T=temperature_low (argmax) for the remainder. Resolved against the
-    # configured cap (not the eventual/actual game length, which isn't known
-    # in advance) -- the standard AlphaZero/KataGo move-count-cutoff schedule.
+    # round(max_decisions * temperature_move_fraction) schedule steps, then
+    # T=temperature_low. ``temperature_clock`` defines whether a step is every
+    # engine prompt or only a non-forced choice. The absolute cutoff is resolved
+    # against the configured cap, matching the AlphaZero/KataGo move-count form.
     #
     # This fraction is COUPLED to max_decisions: it is a fraction OF THE CAP, so
     # the absolute count of temperature moves is round(cap * fraction). The
@@ -263,6 +268,11 @@ class GumbelSelfPlayConfig:
     temperature_move_fraction: float = 0.075
     temperature_high: float = 1.0
     temperature_low: float = 0.0
+    # Historical ``prompt`` counts every engine prompt, including sole ROLL
+    # and END_TURN plumbing. ``nonforced_choice`` counts only positions with
+    # more than one legal action, making the exploration window invariant to
+    # dice-seven/discard prompt density.
+    temperature_clock: str = "prompt"
     # CAT-12 (roadmap R8 diversity-strangulation / queue #16): optional THIRD stage
     # extending a small nonzero temperature past the opening cutoff instead of
     # dropping straight to `temperature_low` (argmax). When
@@ -467,14 +477,31 @@ def action_size_for_evaluator(evaluator: RustEvaluator, colors: tuple[str, ...])
 
 
 def _temperature_for_decision(
-    decision_index: int, *, config: GumbelSelfPlayConfig, eval_override: bool
+    decision_index: int,
+    *,
+    config: GumbelSelfPlayConfig,
+    eval_override: bool,
+    nonforced_choice_index: int | None = None,
 ) -> float:
     if eval_override:
         return float(config.temperature_low)
+    clock = str(config.temperature_clock)
+    if clock == "prompt":
+        schedule_index = int(decision_index)
+    elif clock == "nonforced_choice":
+        if nonforced_choice_index is None:
+            raise ValueError(
+                "temperature_clock='nonforced_choice' requires a choice index"
+            )
+        schedule_index = int(nonforced_choice_index)
+    else:
+        raise ValueError(
+            f"temperature_clock must be 'prompt' or 'nonforced_choice', got {clock!r}"
+        )
     cutoff = max(
         1, round(float(config.max_decisions) * float(config.temperature_move_fraction))
     )
-    if decision_index < cutoff:
+    if schedule_index < cutoff:
         return float(config.temperature_high)
     if config.late_temperature_move_fraction is not None:
         late_cutoff = max(
@@ -484,7 +511,7 @@ def _temperature_for_decision(
                 * float(config.late_temperature_move_fraction)
             ),
         )
-        if decision_index < late_cutoff:
+        if schedule_index < late_cutoff:
             return float(config.late_temperature)
     return float(config.temperature_low)
 
@@ -652,10 +679,10 @@ def _build_decision_row(
     # legal_rust is exactly the key set of any of these dicts by
     # SearchResult's contract (covers ALL legal root actions).
     legal_rust = tuple(sorted(result.improved_policy.keys()))
-    # Forced (single-legal-action) decisions always report
-    # used_full_search=True (gumbel_chance_mcts.py's fast path never runs a
-    # fast/full playout-cap draw), but they carry zero search signal -- they
-    # must get policy_weight_multiplier=0 regardless of used_full_search.
+    # Forced (single-legal-action) decisions carry no policy-improvement
+    # signal. Historical full mode may report used_full_search=True after
+    # evaluating a value; trajectory_only deliberately reports False and does
+    # no neural work. Both must receive zero policy weight.
     is_forced = len(legal_rust) <= 1
     acting_color = str(game.current_color())
     mapped = rust_policy_action_ids(
@@ -782,12 +809,8 @@ def _build_decision_row(
         "policy_weight_multiplier": np.float32(
             0.0 if is_forced else (1.0 if result.used_full_search else 0.0)
         ),
-        # Forced rows still carry a real value signal: forced ROLLs pay for a
-        # full 11-outcome enumeration (real root_value + afterstate_target),
-        # and forced non-ROLL rows (e.g. a forced discard) get a real
-        # evaluator root_value from the forced-single-action fast path --
-        # neither should be starved of value-head training coverage the way
-        # skipping them entirely would.
+        # Forced rows remain terminal-outcome value examples even when
+        # trajectory_only skips the discarded root-Q/afterstate computation.
         "value_weight_multiplier": np.float32(1.0),
         "used_full_search": bool(result.used_full_search),
         "is_forced": bool(is_forced),
@@ -859,19 +882,46 @@ def _build_decision_row(
 
 
 def _target_information_regime_for_search(
-    search_config: Any, *, engine_supports_determinization: bool
+    search_config: Any,
+    *,
+    engine_supports_determinization: bool,
+    engine_supports_public_belief_development_draws: bool = False,
 ) -> str:
     """Return the planner-state provenance explicitly asserted by search.
 
     Fail-safe default: all historical Gumbel search configurations use an
     authoritative game clone, even when evaluator inputs are masked or the
     partial belief chance-spectrum flag is enabled.  Public provenance requires
-    BOTH the explicit ``information_set_search`` config and the native
-    ``determinize_for_player`` capability; no collection of loosely related
-    booleans is accepted as equivalent proof.
+    BOTH an explicit public-search mode and its native engine capabilities; no
+    collection of loosely related booleans is accepted as equivalent proof.
     """
 
-    if bool(getattr(search_config, "information_set_search", False)):
+    information_set = bool(getattr(search_config, "information_set_search", False))
+    coherent = bool(getattr(search_config, "coherent_public_belief_search", False))
+    belief_chance = bool(getattr(search_config, "belief_chance_spectra", False))
+    if information_set and coherent:
+        raise ValueError(
+            "information_set_search and coherent_public_belief_search are "
+            "mutually exclusive"
+        )
+    if coherent:
+        if belief_chance:
+            raise ValueError(
+                "coherent_public_belief_search cannot be combined with "
+                "belief_chance_spectra"
+            )
+        if not engine_supports_determinization:
+            raise RuntimeError(
+                "coherent_public_belief_search=True requires a native game engine "
+                "exposing determinize_for_player"
+            )
+        if not engine_supports_public_belief_development_draws:
+            raise RuntimeError(
+                "coherent_public_belief_search=True requires a native game engine "
+                "exposing apply_public_belief_development_draws"
+            )
+        return TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+    if information_set:
         if not engine_supports_determinization:
             raise RuntimeError(
                 "information_set_search=True requires a native game engine exposing "
@@ -883,7 +933,7 @@ def _target_information_regime_for_search(
                 "information_set_search requires determinization_particles >= 1, "
                 f"got {particles}"
             )
-        if bool(getattr(search_config, "belief_chance_spectra", False)):
+        if belief_chance:
             raise ValueError(
                 "information_set_search cannot be combined with belief_chance_spectra; "
                 "sampled worlds already materialize hidden chance state"
@@ -909,16 +959,24 @@ def _search_execution_contract(
     """
 
     information_set = bool(getattr(search_config, "information_set_search", False))
+    coherent = bool(getattr(search_config, "coherent_public_belief_search", False))
     return {
         "budget_scope": (
             "total_before_determinization_division"
             if information_set
-            else "single_world"
+            else (
+                "single_public_belief_tree"
+                if coherent
+                else "single_authoritative_world"
+            )
         ),
         "configured_exact_budget_sh": bool(
             getattr(search_config, "exact_budget_sh", False)
         ),
         "information_set_particle_subbudgets_exact": information_set,
+        "forced_root_target_mode": str(
+            getattr(search_config, "forced_root_target_mode", "full")
+        ),
         "native_mcts_hot_loop": bool(native_mcts_hot_loop),
     }
 
@@ -935,6 +993,8 @@ def _search_evidence_recalibration_scope(search_config: Any) -> str:
     than writing evidence that merely looks sufficient.
     """
 
+    if bool(getattr(search_config, "coherent_public_belief_search", False)):
+        return "public_belief_single_tree_root_v1"
     if not bool(getattr(search_config, "information_set_search", False)):
         return "single_world_root_v1"
     aggregation = str(
@@ -980,15 +1040,12 @@ def play_one_game(
     behavior: both seats use `evaluator`, every decision is recorded, and
     `_build_decision_row` omits the two provenance columns entirely.
 
-    Forced (single-legal-action) decisions ARE recorded (not skipped): a
-    forced ROLL pays for a full 11-outcome chance enumeration in
-    `gumbel_chance_mcts.py`'s forced-single-action fast path specifically so
-    it produces a real root_value and afterstate_target, and a forced
-    non-ROLL decision (e.g. a forced discard) gets a real evaluator
-    root_value from that same fast path -- skipping either would silently
-    zero out self-play's value-head training coverage for those phases
-    (ROLL/discard). They carry `policy_weight_multiplier=0` (no search signal
-    to imitate) but `value_weight_multiplier=1` (still a real value target).
+    Forced (single-legal-action) decisions ARE recorded, with zero policy
+    weight and terminal-outcome value weight. In historical ``full`` mode the
+    search also computes root-Q/afterstate evidence. In ``trajectory_only``
+    mode it selects the sole action without evaluator/search work and omits
+    that unused evidence; the eventual game outcome still supplies the value
+    target, so phase coverage is retained.
 
     Both seats are driven by the same `mcts`. Its RNG advances naturally across
     decisions inside this game; `run_worker_games` assigns each absolute game a
@@ -1005,6 +1062,9 @@ def play_one_game(
     target_information_regime = _target_information_regime_for_search(
         mcts.config,
         engine_supports_determinization=hasattr(game, "determinize_for_player"),
+        engine_supports_public_belief_development_draws=hasattr(
+            game, "apply_public_belief_development_draws"
+        ),
     )
     chance_rng = random.Random(int(game_seed) ^ 0xA17E)
 
@@ -1015,6 +1075,7 @@ def play_one_game(
     recorded_aux_indices: list[int] = []
     aux_hex_ids: dict[tuple[int, int, int], int] | None = None
     decision_index = 0
+    nonforced_choice_index = 0
     forced_decisions = 0
     simulations_used_total = 0
     terminal = False
@@ -1048,7 +1109,10 @@ def play_one_game(
             aux_hex_ids = rust_hex_id_by_coordinate(snapshot)
 
         temperature = _temperature_for_decision(
-            decision_index, config=config, eval_override=eval_override
+            decision_index,
+            config=config,
+            eval_override=eval_override,
+            nonforced_choice_index=nonforced_choice_index,
         )
         mcts.config = dataclasses.replace(mcts.config, temperature=temperature)
 
@@ -1070,6 +1134,8 @@ def play_one_game(
             mcts.evaluator = evaluator
 
         result = mcts.search(game, force_full=True if eval_override else None)
+        if len(legal_rust) > 1:
+            nonforced_choice_index += 1
         simulations_used_total += int(result.simulations_used)
         selected_action = action_by_id.get(int(result.selected_action))
         if selected_action is None:
@@ -1759,8 +1825,7 @@ class WorkerProgress:
             keys=("games", "champion_wins"),
         )
         if any(
-            version != str(int(version)) or int(version) < 0
-            for version in pool_stats
+            version != str(int(version)) or int(version) < 0 for version in pool_stats
         ):
             raise ValueError(
                 "worker progress opponent-pool versions must be canonical non-negative integers"
@@ -2092,9 +2157,7 @@ def _generation_resume_semantics_sha256(
                 with checkpoint.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                         checkpoint_digest.update(chunk)
-                record["checkpoint_sha256"] = (
-                    "sha256:" + checkpoint_digest.hexdigest()
-                )
+                record["checkpoint_sha256"] = "sha256:" + checkpoint_digest.hexdigest()
                 record["checkpoint_size_bytes"] = checkpoint.stat().st_size
             archive_records.append(record)
         opponent_descriptor: dict[str, Any] = {
@@ -2238,14 +2301,23 @@ def run_worker_games(
     out_dir = Path(out_dir)
     action_size = action_size_for_evaluator(evaluator, config.colors)
     engine_supports_determinization = False
-    if bool(getattr(search_config, "information_set_search", False)):
+    engine_supports_public_belief_development_draws = False
+    if bool(getattr(search_config, "information_set_search", False)) or bool(
+        getattr(search_config, "coherent_public_belief_search", False)
+    ):
         catanatron_rs = _gumbel_chance_mcts._require_rust_module()
         engine_supports_determinization = hasattr(
             catanatron_rs.Game, "determinize_for_player"
         )
+        engine_supports_public_belief_development_draws = hasattr(
+            catanatron_rs.Game, "apply_public_belief_development_draws"
+        )
     target_information_regime = _target_information_regime_for_search(
         search_config,
         engine_supports_determinization=engine_supports_determinization,
+        engine_supports_public_belief_development_draws=(
+            engine_supports_public_belief_development_draws
+        ),
     )
     generation_semantics_sha256 = _generation_resume_semantics_sha256(
         caller_contract_sha256=resume_semantics_sha256,
@@ -2301,8 +2373,7 @@ def run_worker_games(
         progress_matches = bool(
             progress is not None
             and progress.run_id == run_id
-            and progress.generation_semantics_sha256
-            == generation_semantics_sha256
+            and progress.generation_semantics_sha256 == generation_semantics_sha256
             and progress.base_seed == int(base_seed)
             and progress.game_index_start == int(game_index_start)
             and progress.games_requested == int(games)

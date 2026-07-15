@@ -105,6 +105,46 @@ def test_value_trunk_gradient_ablation_is_typed_bound_and_rendered() -> None:
     assert bound["learner_ablation"]["recipe_drift"] == ablation["recipe_drift"]
 
 
+def test_forced_action_type_value_map_is_receipt_bound_and_rendered() -> None:
+    result = _bind(
+        forced_row_value_action_type_weights="roll=0.2,END_TURN=0.5"
+    )
+    canonical = "END_TURN=0.5,ROLL=0.2"
+    assert result["recipe"]["forced_row_value_action_type_weights"] == canonical
+    assert result["learner_ablation"]["recipe_drift"][
+        "forced_row_value_action_type_weights"
+    ] == {
+        "contract": "disabled (implicit historical default)",
+        "effective": canonical,
+    }
+
+    command = executor.build_train_command(
+        result,
+        python=Path(sys.executable),
+        checkpoint=Path("/tmp/typed-forced.pt"),
+        report=Path("/tmp/typed-forced.json"),
+    )
+    assert command[
+        command.index("--forced-row-value-action-type-weights") + 1
+    ] == canonical
+    args = train_bc.build_parser().parse_args(command[2:])
+    bound = {
+        "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "learner_training_recipe_sha256": executor._value_sha256(
+            contract.EXPECTED_LEARNER_TRAINING_RECIPE
+        ),
+    }
+    effective = train_bc._validate_a1_learner_training_recipe(
+        args,
+        {"world_size": 1, "rank": 0, "local_rank": 0, "enabled": False},
+        bound,
+    )
+    assert effective == result["recipe"]
+    assert bound["learner_ablation"]["effective_recipe"][
+        "forced_row_value_action_type_weights"
+    ] == canonical
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -116,6 +156,9 @@ def test_value_trunk_gradient_ablation_is_typed_bound_and_rendered() -> None:
         {"value_loss_weight": 0.25},  # explicit no-op
         {"soft_target_weight": 2.0},
         {"forced_row_value_weight": -1.0},
+        {"forced_row_value_action_type_weights": 0.1},
+        {"forced_row_value_action_type_weights": "ROLL=-0.1"},
+        {"forced_row_value_action_type_weights": ""},
         {"value_target_lambda": 1.1},
         {"lr_schedule": "banana"},
         {"per_game_value_weight_mode": "sqrt"},

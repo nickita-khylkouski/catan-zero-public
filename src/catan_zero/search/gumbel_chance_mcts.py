@@ -108,9 +108,9 @@ def batch_api_available() -> bool:
         try:
             import catanatron_rs  # type: ignore
 
-            _BATCH_API_AVAILABLE = hasattr(catanatron_rs.Game, "decision_context_json") and hasattr(
-                catanatron_rs.Game, "apply_chance_outcomes_batch"
-            )
+            _BATCH_API_AVAILABLE = hasattr(
+                catanatron_rs.Game, "decision_context_json"
+            ) and hasattr(catanatron_rs.Game, "apply_chance_outcomes_batch")
         except ImportError:
             _BATCH_API_AVAILABLE = False
     return _BATCH_API_AVAILABLE
@@ -138,7 +138,8 @@ def _decision_context(
         spectrum = entry.get("spectrum")
         if spectrum is not None:
             spectrum_by_id[action_id] = tuple(
-                (index, float(probability)) for index, probability in enumerate(spectrum)
+                (index, float(probability))
+                for index, probability in enumerate(spectrum)
             )
     return tuple(legal_actions), action_json_by_id, spectrum_by_id
 
@@ -322,7 +323,9 @@ def _prune_policy_target(
     if min_visits <= 0 or not policy:
         return policy
     kept_mass = sum(
-        prob for action_id, prob in policy.items() if visits.get(action_id, 0) >= min_visits
+        prob
+        for action_id, prob in policy.items()
+        if visits.get(action_id, 0) >= min_visits
     )
     if kept_mass <= 0.0:
         return policy
@@ -386,9 +389,7 @@ def _temperature_scale_policy(
         raise ValueError("policy sampling temperature normalization failed")
     return {
         int(action): (
-            weights.get(int(action), 0.0) / total
-            if float(probability) > 0.0
-            else 0.0
+            weights.get(int(action), 0.0) / total if float(probability) > 0.0 else 0.0
         )
         for action, probability in policy.items()
     }
@@ -461,6 +462,13 @@ class GumbelChanceMCTSConfig:
     n_full: int = 64
     n_fast: int = 16
     p_full: float = 0.25
+    # Forced roots have no policy decision to improve. ``full`` preserves the
+    # historical behavior: evaluate forced non-roll roots and enumerate every
+    # forced ROLL outcome for a root value. ``trajectory_only`` emits only the
+    # mathematically exact sole action and deliberately leaves Q/value evidence
+    # absent. Self-play already masks forced roots from policy/root-value
+    # supervision, so this mode removes expensive labels that are discarded.
+    forced_root_target_mode: str = "full"
     # ARM (placement budget asymmetry, default disabled): when set and a FULL
     # search hits a wide root, spend `n_full_wide` simulations there instead of
     # `n_full`. `n_full_wide_threshold` decouples this budget gate from the
@@ -566,17 +574,18 @@ class GumbelChanceMCTSConfig:
     # Hidden-information leak fix (f72), PLANNER-ONLY. When True, the search's
     # internal simulation resolves the two hidden-info chance nodes from a
     # public BELIEF instead of the true hidden state:
-    #   - MOVE_ROBBER steal: for an opponent victim, uniform over all five public
-    #     resource identities on the legacy fixed-five wheel (rather than the
-    #     victim's true held-type set/composition); for the perspective player's
+    #   - MOVE_ROBBER steal: in 2p, exact count weights derived from public bank
+    #     + perspective hand conservation; in multiplayer/legacy snapshots,
+    #     uniform maximum-entropy identity weights. For the perspective player's
     #     own hand, use the known count-weighted distribution. Residual on newer
-    #     hand-filtered wheels: the engine may expose only materializable types.
+    #     hand-filtered wheels exists only outside the coherent sanitized path.
     #   - BUY_DEVELOPMENT_CARD: reweight drawable outcomes by the perspective's
     #     posterior predictive deck (full 25-card composition minus their own
     #     cards minus ALL players' PLAYED cards -- i.e. opponents' face-down cards
-    #     are exchangeable with the deck). Residual: a card
-    #     type held 100% face-down by opponents has no drawable engine outcome to
-    #     materialize, so it cannot appear as a simulated draw.
+    #     are exchangeable with the deck). Wheels exposing
+    #     `apply_public_belief_development_draws` materialize every supported
+    #     type independently of the authoritative deck; older wheels retain the
+    #     historical materializable-support limitation.
     # This is a CHANCE-node correction, not full information-set search:
     # opponent legal actions still come from the authoritative hidden state.
     # It ONLY changes the planner's expectation backups; the live-game/env
@@ -749,6 +758,16 @@ class GumbelChanceMCTSConfig:
     # semantics, including its c==0 exact no-op default.
     rescale_noise_floor_initial_road_only: bool = False
 
+    # Two-player public-belief search, default OFF. This is the coherent
+    # successor to conservation-PIMC: sanitize the authoritative root exactly
+    # once, spend the whole n_full/n_fast budget in ONE tree, stop when the
+    # root actor's turn ends, resolve robber steals from exact 2p public
+    # conservation, and materialize every dev-draw successor from the public
+    # posterior rather than the sampled/authoritative hidden deck. It is
+    # deliberately separate from the legacy ``information_set_search`` and
+    # ``belief_chance_spectra`` flags so existing recipes remain unchanged.
+    coherent_public_belief_search: bool = False
+
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
@@ -842,7 +861,9 @@ class _GNode:
     # expansion time (batch-API path only) so ROLL traversal doesn't need a
     # second `spectrum_json` round-trip. Empty/missing when the legacy path
     # was used or an action has no chance component.
-    action_spectrum: dict[int, tuple[tuple[int, float], ...]] = field(default_factory=dict)
+    action_spectrum: dict[int, tuple[tuple[int, float], ...]] = field(
+        default_factory=dict
+    )
     expanded: bool = False
     # Populated only for decision roots when the phase-gated D1 experiment is
     # enabled.  Interior nodes deliberately leave this None, which keeps the
@@ -947,25 +968,21 @@ class GumbelChanceMCTS:
                 "'mean_improved_policy' or 'aggregate_q_then_improve'"
             )
         if (
-            self.config.information_set_target_aggregation
-            != "mean_improved_policy"
+            self.config.information_set_target_aggregation != "mean_improved_policy"
             and not bool(self.config.information_set_search)
         ):
             raise ValueError(
                 "aggregate_q_then_improve requires information_set_search=True"
             )
         if (
-            self.config.gameplay_policy_aggregation
-            != "mean_improved_policy"
+            self.config.gameplay_policy_aggregation != "mean_improved_policy"
             and not bool(self.config.information_set_search)
         ):
             raise ValueError(
-                "aggregate_q_then_improve gameplay requires "
-                "information_set_search=True"
+                "aggregate_q_then_improve gameplay requires information_set_search=True"
             )
         if (
-            self.config.information_set_target_aggregation
-            == "aggregate_q_then_improve"
+            self.config.information_set_target_aggregation == "aggregate_q_then_improve"
             and self.config.sigma_reference_visits is None
         ):
             raise ValueError(
@@ -973,8 +990,7 @@ class GumbelChanceMCTS:
                 "particle-count/budget changes cannot silently sharpen targets"
             )
         if (
-            self.config.gameplay_policy_aggregation
-            == "aggregate_q_then_improve"
+            self.config.gameplay_policy_aggregation == "aggregate_q_then_improve"
             and self.config.sigma_reference_visits is None
         ):
             raise ValueError(
@@ -982,11 +998,29 @@ class GumbelChanceMCTS:
                 "sigma_reference_visits so particle-count/budget changes cannot "
                 "silently sharpen action selection"
             )
+        if self.config.forced_root_target_mode not in {"full", "trajectory_only"}:
+            raise ValueError(
+                "forced_root_target_mode must be 'full' or 'trajectory_only'"
+            )
         if bool(self.config.information_set_search) and bool(
             self.config.belief_chance_spectra
         ):
             raise ValueError(
                 "information_set_search cannot be combined with belief_chance_spectra"
+            )
+        if bool(self.config.coherent_public_belief_search) and bool(
+            self.config.information_set_search
+        ):
+            raise ValueError(
+                "coherent_public_belief_search cannot be combined with "
+                "information_set_search"
+            )
+        if bool(self.config.coherent_public_belief_search) and bool(
+            self.config.belief_chance_spectra
+        ):
+            raise ValueError(
+                "coherent_public_belief_search already supplies public-belief "
+                "chance nodes; do not also enable belief_chance_spectra"
             )
         self.evaluator = evaluator or HeuristicRustEvaluator()
         self.rng = random.Random(self.config.seed)
@@ -1048,6 +1082,8 @@ class GumbelChanceMCTS:
     # Public search entry point.
     # ------------------------------------------------------------------
     def search(self, game: Any, *, force_full: bool | None = None) -> SearchResult:
+        if bool(getattr(self.config, "coherent_public_belief_search", False)):
+            return self._search_coherent_public_belief(game, force_full=force_full)
         if bool(getattr(self.config, "information_set_search", False)):
             return self._search_information_set(game, force_full=force_full)
         return self._search_authoritative(game, force_full=force_full)
@@ -1056,6 +1092,75 @@ class GumbelChanceMCTS:
         self, game: Any, *, force_full: bool | None = None
     ) -> SearchResult:
         return self._search_single_world(game, force_full=force_full)
+
+    def _search_coherent_public_belief(
+        self, game: Any, *, force_full: bool | None = None
+    ) -> SearchResult:
+        """Search one two-player public-belief tree with the full budget.
+
+        The root is sanitized once, rather than splitting n128 into four n32
+        PIMC trees. Traversal remains inside the root actor's turn. Robber
+        composition is exact by two-player resource conservation and dev-card
+        chance expansion uses the Rust public-belief materializer, so the
+        arbitrary hidden allocation in the sanitized root is never used as a
+        chance-support restriction.
+        """
+        required_methods = (
+            "determinize_for_player",
+            "apply_public_belief_development_draws",
+            "json_snapshot",
+        )
+        missing = [name for name in required_methods if not hasattr(game, name)]
+        if missing:
+            raise RuntimeError(
+                "coherent_public_belief_search requires a catanatron_rs wheel "
+                f"exposing {', '.join(missing)}"
+            )
+        evaluator_config = getattr(self.evaluator, "config", None)
+        if evaluator_config is None or not bool(
+            getattr(evaluator_config, "public_observation", False)
+        ):
+            raise RuntimeError(
+                "coherent_public_belief_search requires evaluator "
+                "public_observation=True"
+            )
+
+        snapshot = json.loads(game.json_snapshot())
+        colors = tuple(str(color) for color in snapshot.get("colors", ()))
+        if len(colors) != 2:
+            raise RuntimeError(
+                "coherent_public_belief_search is exact only for two-player "
+                f"Catan, got colors={colors!r}"
+            )
+        root_color = str(game.current_color())
+        root_phase = self._phase_gated_d1_root_phase(game)
+
+        if self.config.forced_root_target_mode == "trajectory_only":
+            authoritative_legal = _legal_action_indices(
+                game,
+                colors=self.config.colors,
+                map_kind=self.config.map_kind,
+            )
+            if len(authoritative_legal) == 1:
+                return self._forced_trajectory_only_result(authoritative_legal[0])
+
+        # Never ask the authoritative root for a chance spectrum. The native
+        # determinization boundary itself regenerates and verifies that public
+        # root legal actions did not drift; all Python expansion starts only on
+        # the sanitized result. Pre-draw before traversal so that result is a
+        # pure function of public state + MCTS seed, never traversal call order.
+        sampled = game.determinize_for_player(root_color, self.rng.getrandbits(64))
+        sampled_legal, _sampled_actions, _sampled_spectra = self._fetch_legal_actions(
+            sampled
+        )
+        if not sampled_legal:
+            raise RuntimeError("no legal actions at coherent public-belief MCTS root")
+        self._information_set_root_turn = int(sampled.num_turns())
+        return self._search_single_world(
+            sampled,
+            force_full=force_full,
+            attested_root_phase=root_phase,
+        )
 
     def _search_information_set(
         self, game: Any, *, force_full: bool | None = None
@@ -1095,6 +1200,11 @@ class GumbelChanceMCTS:
         authoritative_legal, _actions, _spectra = self._fetch_legal_actions(game)
         if not authoritative_legal:
             raise RuntimeError("no legal actions at information-set MCTS root")
+        if (
+            len(authoritative_legal) == 1
+            and self.config.forced_root_target_mode == "trajectory_only"
+        ):
+            return self._forced_trajectory_only_result(authoritative_legal[0])
 
         requested_particles = int(self.config.determinization_particles)
         if requested_particles < 1:
@@ -1151,8 +1261,8 @@ class GumbelChanceMCTS:
         )
         for particle_index, particle_seed in enumerate(particle_seeds):
             sampled = game.determinize_for_player(root_color, int(particle_seed))
-            sampled_legal, _sampled_actions, _sampled_spectra = self._fetch_legal_actions(
-                sampled
+            sampled_legal, _sampled_actions, _sampled_spectra = (
+                self._fetch_legal_actions(sampled)
             )
             if tuple(sampled_legal) != tuple(authoritative_legal):
                 raise RuntimeError(
@@ -1168,13 +1278,11 @@ class GumbelChanceMCTS:
                     # Evaluate the first validated sampled world once (never the
                     # hidden-truth authoritative game) and reuse only that root
                     # result; every interior leaf remains particle-specific.
-                    shared_root_evaluation = (
-                        self.evaluator.evaluate_symmetry_averaged(
-                            sampled,
-                            tuple(sampled_legal),
-                            root_color=root_color,
-                            colors=self.config.colors,
-                        )
+                    shared_root_evaluation = self.evaluator.evaluate_symmetry_averaged(
+                        sampled,
+                        tuple(sampled_legal),
+                        root_color=root_color,
+                        colors=self.config.colors,
                     )
                 results.append(
                     self._search_single_world(
@@ -1216,9 +1324,7 @@ class GumbelChanceMCTS:
                 min_legal_actions=self.config.symmetry_averaged_eval_threshold,
                 legacy_exclusive_threshold=self.config.wide_candidates_threshold,
             )
-            and callable(
-                getattr(self.evaluator, "evaluate_symmetry_averaged", None)
-            )
+            and callable(getattr(self.evaluator, "evaluate_symmetry_averaged", None))
         )
 
     def _aggregate_information_set_results(
@@ -1277,14 +1383,9 @@ class GumbelChanceMCTS:
         }
 
         belief_improved = improved
-        if (
-            len(legal_actions) > 1
-            and (
-                self.config.information_set_target_aggregation
-                == "aggregate_q_then_improve"
-                or self.config.gameplay_policy_aggregation
-                == "aggregate_q_then_improve"
-            )
+        if len(legal_actions) > 1 and (
+            self.config.information_set_target_aggregation == "aggregate_q_then_improve"
+            or self.config.gameplay_policy_aggregation == "aggregate_q_then_improve"
         ):
             belief_improved = self._belief_level_improved_policy(
                 results,
@@ -1294,8 +1395,7 @@ class GumbelChanceMCTS:
             )
         gameplay_policy = (
             belief_improved
-            if self.config.gameplay_policy_aggregation
-            == "aggregate_q_then_improve"
+            if self.config.gameplay_policy_aggregation == "aggregate_q_then_improve"
             else improved
         )
         if float(self.config.temperature) > 0.0:
@@ -1316,8 +1416,7 @@ class GumbelChanceMCTS:
             )
         target_policy = improved
         if (
-            self.config.information_set_target_aggregation
-            == "aggregate_q_then_improve"
+            self.config.information_set_target_aggregation == "aggregate_q_then_improve"
             and len(legal_actions) > 1
         ):
             target_policy = belief_improved
@@ -1338,8 +1437,7 @@ class GumbelChanceMCTS:
             afterstate_values=afterstate_values,
             completed_q_values={
                 action: sum(
-                    float(result.completed_q_values[action])
-                    for result in results
+                    float(result.completed_q_values[action]) for result in results
                 )
                 / count
                 for action in legal_actions
@@ -1409,9 +1507,7 @@ class GumbelChanceMCTS:
                     )
 
         completed_q = {
-            action: sum(
-                float(result.completed_q_values[action]) for result in results
-            )
+            action: sum(float(result.completed_q_values[action]) for result in results)
             / float(particle_count)
             for action in legal_actions
         }
@@ -1460,7 +1556,9 @@ class GumbelChanceMCTS:
         precomputed_root_evaluation: Any = _UNSET_ROOT_EVALUATION,
     ) -> SearchResult:
         root_color = str(game.current_color())
-        legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(game)
+        legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(
+            game
+        )
         if not legal_actions:
             raise RuntimeError("no legal actions at MCTS root")
         if len(legal_actions) == 1:
@@ -1527,9 +1625,13 @@ class GumbelChanceMCTS:
 
         completed_q = self._completed_q(root)
         improved_policy = self._improved_policy(root, completed_q)
-        visit_counts = {action_id: stats.visits for action_id, stats in root.actions.items()}
+        visit_counts = {
+            action_id: stats.visits for action_id, stats in root.actions.items()
+        }
         q_values = {
-            action_id: stats.q for action_id, stats in root.actions.items() if stats.visits > 0
+            action_id: stats.q
+            for action_id, stats in root.actions.items()
+            if stats.visits > 0
         }
         afterstate_values = {
             action_id: stats.afterstate_value
@@ -1569,7 +1671,9 @@ class GumbelChanceMCTS:
         # from the unpruned distribution, so this ticket's scope (policy-target
         # hygiene) cannot change which move gets played.
         training_policy = _prune_policy_target(
-            improved_policy, visit_counts, min_visits=int(self.config.policy_target_min_visits)
+            improved_policy,
+            visit_counts,
+            min_visits=int(self.config.policy_target_min_visits),
         )
 
         return SearchResult(
@@ -1614,9 +1718,7 @@ class GumbelChanceMCTS:
             root_value=root.value,
             used_full_search=False,
             simulations_used=0,
-            completed_q_values={
-                action: float(root.prior_value) for action in priors
-            },
+            completed_q_values={action: float(root.prior_value) for action in priors},
             q_values_root_perspective=True,
         )
 
@@ -1638,6 +1740,8 @@ class GumbelChanceMCTS:
         only one candidate) so downstream training signal stays real.
         """
         action = int(legal_actions[0])
+        if self.config.forced_root_target_mode == "trajectory_only":
+            return self._forced_trajectory_only_result(action)
         if action_json_by_id is None:
             action_json_by_id = _playable_action_json_by_index(
                 game, legal_actions, self.config.colors, self.config.map_kind
@@ -1651,7 +1755,10 @@ class GumbelChanceMCTS:
             # that broke the earlier plain-PUCT MCTS run).
             _priors, value, _uncertainty = _split_evaluation(
                 self.evaluator.evaluate(
-                    game, legal_actions, root_color=root_color, colors=self.config.colors
+                    game,
+                    legal_actions,
+                    root_color=root_color,
+                    colors=self.config.colors,
                 )
             )
             return SearchResult(
@@ -1663,9 +1770,7 @@ class GumbelChanceMCTS:
                 root_value=float(max(min(value, 1.0), -1.0)),
                 used_full_search=True,
                 simulations_used=0,
-                completed_q_values={
-                    action: float(max(min(value, 1.0), -1.0))
-                },
+                completed_q_values={action: float(max(min(value, 1.0), -1.0))},
                 q_values_root_perspective=True,
             )
 
@@ -1694,6 +1799,30 @@ class GumbelChanceMCTS:
             q_values_root_perspective=True,
         )
 
+    @staticmethod
+    def _forced_trajectory_only_result(action: int) -> SearchResult:
+        """Return the exact trajectory action with no invented supervision.
+
+        A sole legal action needs neither policy improvement nor a value
+        forward pass. NaN/empty evidence is intentional: consumers can advance
+        the environment identically while masks derived from these fields
+        cannot mistake an unevaluated root for a teacher target.
+        """
+        action = int(action)
+        return SearchResult(
+            selected_action=action,
+            improved_policy={action: 1.0},
+            visit_counts={},
+            q_values={},
+            priors={action: 1.0},
+            root_value=float("nan"),
+            used_full_search=False,
+            simulations_used=0,
+            afterstate_values={},
+            completed_q_values={},
+            q_values_root_perspective=True,
+        )
+
     # ------------------------------------------------------------------
     # Root: Gumbel-Top-k + Sequential Halving.
     # ------------------------------------------------------------------
@@ -1711,7 +1840,9 @@ class GumbelChanceMCTS:
         gumbel = {action_id: self._sample_gumbel() for action_id in legal}
         logits = root.action_logits
         top_k = sorted(
-            legal, key=lambda action_id: gumbel[action_id] + logits.get(action_id, 0.0), reverse=True
+            legal,
+            key=lambda action_id: gumbel[action_id] + logits.get(action_id, 0.0),
+            reverse=True,
         )[:m]
         remaining = list(top_k)
         candidate_rngs: dict[int, random.Random] | None = None
@@ -1721,7 +1852,8 @@ class GumbelChanceMCTS:
             # scheduling interleaves candidates instead of exhausting one
             # candidate before starting the next.
             candidate_rngs = {
-                action_id: random.Random(self.rng.getrandbits(64)) for action_id in top_k
+                action_id: random.Random(self.rng.getrandbits(64))
+                for action_id in top_k
             }
 
         if exact_budget_override or (
@@ -1850,8 +1982,12 @@ class GumbelChanceMCTS:
     def _sigma_scale(self, node: _GNode) -> float:
         max_visits = self.config.sigma_reference_visits
         if max_visits is None:
-            max_visits = max((stats.visits for stats in node.actions.values()), default=0)
-        return (float(self.config.c_visit) + float(max_visits)) * float(self.config.c_scale)
+            max_visits = max(
+                (stats.visits for stats in node.actions.values()), default=0
+            )
+        return (float(self.config.c_visit) + float(max_visits)) * float(
+            self.config.c_scale
+        )
 
     def _completed_q(self, node: _GNode) -> dict[int, float]:
         """Completed Q-values: visited actions keep their real Q; unvisited
@@ -1920,10 +2056,14 @@ class GumbelChanceMCTS:
             if stats.visits > 0:
                 visited_prior_sum += stats.prior
                 visited_q_sum += stats.prior * (sign * q_of(stats))
-        weighted_q = (visited_q_sum / visited_prior_sum) if visited_prior_sum > 0 else 0.0
+        weighted_q = (
+            (visited_q_sum / visited_prior_sum) if visited_prior_sum > 0 else 0.0
+        )
 
         node_value = sign * node.prior_value
-        v_mix = (node_value + total_child_visits * weighted_q) / (1.0 + total_child_visits)
+        v_mix = (node_value + total_child_visits * weighted_q) / (
+            1.0 + total_child_visits
+        )
 
         completed = {
             action_id: (sign * q_of(stats)) if stats.visits > 0 else v_mix
@@ -1971,7 +2111,9 @@ class GumbelChanceMCTS:
             completed[action_id] = v_mix + shrink * (completed[action_id] - v_mix)
 
     @staticmethod
-    def _rescale_completed_q(completed_q: dict[int, float], *, epsilon: float = 1.0e-8) -> dict[int, float]:
+    def _rescale_completed_q(
+        completed_q: dict[int, float], *, epsilon: float = 1.0e-8
+    ) -> dict[int, float]:
         """Min-max rescale completed Q to [0, 1] over the node's own action
         range (mctx's `_rescale_values`), BEFORE the sigma transform.
 
@@ -1989,7 +2131,10 @@ class GumbelChanceMCTS:
         min_q = min(values)
         max_q = max(values)
         denom = (max_q - min_q) + epsilon
-        return {action_id: (value - min_q) / denom for action_id, value in completed_q.items()}
+        return {
+            action_id: (value - min_q) / denom
+            for action_id, value in completed_q.items()
+        }
 
     def _rescaled_completed_q(
         self,
@@ -2062,7 +2207,10 @@ class GumbelChanceMCTS:
             alpha = 0.0
         else:
             alpha = raw_spread / denom
-        return {action_id: 0.5 + alpha * (value - 0.5) for action_id, value in rescaled.items()}
+        return {
+            action_id: 0.5 + alpha * (value - 0.5)
+            for action_id, value in rescaled.items()
+        }
 
     def _improved_policy(
         self,
@@ -2079,7 +2227,8 @@ class GumbelChanceMCTS:
         )
         logits = node.action_logits
         scores = {
-            action_id: logits.get(action_id, 0.0) + scale * rescaled_q.get(action_id, 0.0)
+            action_id: logits.get(action_id, 0.0)
+            + scale * rescaled_q.get(action_id, 0.0)
             for action_id in node.actions
         }
         return _softmax_from_scores(scores)
@@ -2214,9 +2363,10 @@ class GumbelChanceMCTS:
             bool(self.config.lazy_interior_chance) and depth > 0
         ):
             value = self._traverse_roll(node, action_id, stats, depth)
-        elif is_move_robber_with_victim(action_json) or _action_type(
-            action_json
-        ) == "BUY_DEVELOPMENT_CARD":
+        elif (
+            is_move_robber_with_victim(action_json)
+            or _action_type(action_json) == "BUY_DEVELOPMENT_CARD"
+        ):
             value = self._traverse_robber_or_dev(node, action_id, stats, depth)
         else:
             return self._prepare_single_sample(node, action_id, stats, depth)
@@ -2284,9 +2434,7 @@ class GumbelChanceMCTS:
             stats.value_sum += value
             stats.value_sq_sum += value * value
             if self.config.uncertainty_backup_weighting:
-                self._accumulate_backup_weight(
-                    stats, value, child.prior_uncertainty
-                )
+                self._accumulate_backup_weight(stats, value, child.prior_uncertainty)
             node.visits += 1
             node.value_sum += value
             return value
@@ -2301,7 +2449,9 @@ class GumbelChanceMCTS:
             return selected
         return backup(selected)
 
-    def _simulate(self, node: _GNode, *, depth: int, forced_action: int | None = None) -> float:
+    def _simulate(
+        self, node: _GNode, *, depth: int, forced_action: int | None = None
+    ) -> float:
         winner = node.game.winning_color()
         if winner is not None:
             return 1.0 if str(winner) == node.root_color else -1.0
@@ -2349,7 +2499,10 @@ class GumbelChanceMCTS:
             bool(self.config.lazy_interior_chance) and depth > 0
         ):
             value = self._traverse_roll(node, action_id, stats, depth)
-        elif is_move_robber_with_victim(action_json) or _action_type(action_json) == "BUY_DEVELOPMENT_CARD":
+        elif (
+            is_move_robber_with_victim(action_json)
+            or _action_type(action_json) == "BUY_DEVELOPMENT_CARD"
+        ):
             # F7: enumerate + expectation-backup like ROLL, instead of
             # single-sampling -- these outcome spaces are small (<=5) and
             # `move_robber_victim_outcome_weights`/`buy_development_card_real_outcomes`
@@ -2367,7 +2520,13 @@ class GumbelChanceMCTS:
         return value
 
     def _is_information_set_turn_boundary(self, node: _GNode, *, depth: int) -> bool:
-        if not bool(self.config.information_set_search) or depth <= 0:
+        if (
+            not (
+                bool(self.config.information_set_search)
+                or bool(self.config.coherent_public_belief_search)
+            )
+            or depth <= 0
+        ):
             return False
         if str(node.game.current_color()) != str(node.root_color):
             return True
@@ -2397,8 +2556,14 @@ class GumbelChanceMCTS:
         `cached_spectrum` avoids a second `spectrum_json` round-trip when the
         caller already has it from `decision_context_json` at expansion time.
         """
-        outcomes = cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
-        positive_outcomes = [(index, probability) for index, probability in outcomes if probability > 0.0]
+        outcomes = (
+            cached_spectrum
+            if cached_spectrum is not None
+            else _spectrum(game, action_json)
+        )
+        positive_outcomes = [
+            (index, probability) for index, probability in outcomes if probability > 0.0
+        ]
         if not positive_outcomes:
             return {}, {}, 0.0
 
@@ -2428,8 +2593,13 @@ class GumbelChanceMCTS:
 
         can_batch_evaluate = hasattr(self.evaluator, "evaluate_many")
         if can_batch_evaluate:
-            contexts = {index: self._fetch_legal_actions(child.game) for index, child in children.items()}
-            requests = [(child.game, contexts[index][0]) for index, child in children.items()]
+            contexts = {
+                index: self._fetch_legal_actions(child.game)
+                for index, child in children.items()
+            }
+            requests = [
+                (child.game, contexts[index][0]) for index, child in children.items()
+            ]
             batch_results = _evaluate_many_checked(
                 self.evaluator,
                 requests,
@@ -2440,7 +2610,13 @@ class GumbelChanceMCTS:
                 priors, value, uncertainty = _split_evaluation(result)
                 legal_actions, action_json_by_id, spectrum_by_id = contexts[index]
                 self._finish_expand(
-                    child, legal_actions, action_json_by_id, spectrum_by_id, priors, value, uncertainty
+                    child,
+                    legal_actions,
+                    action_json_by_id,
+                    spectrum_by_id,
+                    priors,
+                    value,
+                    uncertainty,
                 )
         else:
             for child in children.values():
@@ -2455,7 +2631,9 @@ class GumbelChanceMCTS:
         )
         return children, probabilities, afterstate_value
 
-    def _traverse_roll(self, node: _GNode, action_id: int, stats: _GAction, depth: int) -> float:
+    def _traverse_roll(
+        self, node: _GNode, action_id: int, stats: _GAction, depth: int
+    ) -> float:
         if not stats.children:
             stats.children, stats.probabilities, stats.afterstate_value = (
                 self._enumerate_roll_outcomes(
@@ -2483,7 +2661,8 @@ class GumbelChanceMCTS:
         self._simulate(stats.children[outcome_index], depth=depth + 1)
 
         value = sum(
-            stats.probabilities[index] * stats.children[index].value for index in stats.children
+            stats.probabilities[index] * stats.children[index].value
+            for index in stats.children
         )
         stats.visits += 1
         stats.value_sum += value
@@ -2506,7 +2685,9 @@ class GumbelChanceMCTS:
         if not stats.probabilities:
             cached_spectrum = node.action_spectrum.get(action_id)
             outcomes = (
-                cached_spectrum if cached_spectrum is not None else _spectrum(node.game, action_json)
+                cached_spectrum
+                if cached_spectrum is not None
+                else _spectrum(node.game, action_json)
             )
             node.action_spectrum.setdefault(action_id, outcomes)
             stats.probabilities = dict(outcomes)
@@ -2514,7 +2695,9 @@ class GumbelChanceMCTS:
         outcome_index = self._sample_outcome(tuple(stats.probabilities.items()))
         child = stats.children.get(outcome_index)
         if child is None:
-            child_game = node.game.apply_chance_outcome(json.dumps(action_json), outcome_index)
+            child_game = node.game.apply_chance_outcome(
+                json.dumps(action_json), outcome_index
+            )
             child = _GNode(game=child_game, root_color=node.root_color)
             stats.children[outcome_index] = child
 
@@ -2542,7 +2725,9 @@ class GumbelChanceMCTS:
         total_weight = sum(weight for _index, weight, _game in candidates)
         if not candidates or total_weight <= 0.0:
             return {}, {}, 0.0
-        probabilities = {index: weight / total_weight for index, weight, _game in candidates}
+        probabilities = {
+            index: weight / total_weight for index, weight, _game in candidates
+        }
         children: dict[int, _GNode] = {
             index: _GNode(game=child_game, root_color=root_color)
             for index, _weight, child_game in candidates
@@ -2550,8 +2735,13 @@ class GumbelChanceMCTS:
 
         can_batch_evaluate = hasattr(self.evaluator, "evaluate_many")
         if can_batch_evaluate:
-            contexts = {index: self._fetch_legal_actions(child.game) for index, child in children.items()}
-            requests = [(child.game, contexts[index][0]) for index, child in children.items()]
+            contexts = {
+                index: self._fetch_legal_actions(child.game)
+                for index, child in children.items()
+            }
+            requests = [
+                (child.game, contexts[index][0]) for index, child in children.items()
+            ]
             batch_results = _evaluate_many_checked(
                 self.evaluator,
                 requests,
@@ -2562,13 +2752,21 @@ class GumbelChanceMCTS:
                 priors, value, uncertainty = _split_evaluation(result)
                 legal_actions, action_json_by_id, spectrum_by_id = contexts[index]
                 self._finish_expand(
-                    child, legal_actions, action_json_by_id, spectrum_by_id, priors, value, uncertainty
+                    child,
+                    legal_actions,
+                    action_json_by_id,
+                    spectrum_by_id,
+                    priors,
+                    value,
+                    uncertainty,
                 )
         else:
             for child in children.values():
                 self._expand(child)
 
-        afterstate_value = sum(probabilities[index] * children[index].prior_value for index in children)
+        afterstate_value = sum(
+            probabilities[index] * children[index].prior_value for index in children
+        )
         return children, probabilities, afterstate_value
 
     def _traverse_robber_or_dev(
@@ -2587,7 +2785,10 @@ class GumbelChanceMCTS:
             action_json = node.action_json[action_id]
             cached_spectrum = node.action_spectrum.get(action_id)
             candidates: list[tuple[int, float, Any]] | None = None
-            if self.config.belief_chance_spectra:
+            if (
+                self.config.belief_chance_spectra
+                or self.config.coherent_public_belief_search
+            ):
                 # Planner-only public-belief de-leak (config docstring). Takes
                 # precedence over correct_rust_chance_spectra: belief IS a
                 # correction and never passes the native (true-state) spectrum
@@ -2606,6 +2807,7 @@ class GumbelChanceMCTS:
                         action_json,
                         cached_spectrum=cached_spectrum,
                         perspective=node.root_color,
+                        materialization_seed=int(self.config.seed),
                     )
             elif self.config.correct_rust_chance_spectra:
                 if is_move_robber_with_victim(action_json):
@@ -2619,12 +2821,17 @@ class GumbelChanceMCTS:
             if candidates is None:
                 stats.children, stats.probabilities, stats.afterstate_value = (
                     self._enumerate_roll_outcomes(
-                        node.game, action_json, root_color=node.root_color, cached_spectrum=cached_spectrum
+                        node.game,
+                        action_json,
+                        root_color=node.root_color,
+                        cached_spectrum=cached_spectrum,
                     )
                 )
             else:
                 stats.children, stats.probabilities, stats.afterstate_value = (
-                    self._enumerate_materialized_outcomes(candidates, root_color=node.root_color)
+                    self._enumerate_materialized_outcomes(
+                        candidates, root_color=node.root_color
+                    )
                 )
             if not stats.children:
                 # Defensive: no real outcome at all (should not happen) --
@@ -2644,7 +2851,8 @@ class GumbelChanceMCTS:
         self._simulate(stats.children[outcome_index], depth=depth + 1)
 
         value = sum(
-            stats.probabilities[index] * stats.children[index].value for index in stats.children
+            stats.probabilities[index] * stats.children[index].value
+            for index in stats.children
         )
         stats.visits += 1
         stats.value_sum += value
@@ -2655,7 +2863,9 @@ class GumbelChanceMCTS:
             )
         return value
 
-    def _corrected_move_robber_outcome(self, game: Any, action_json: Any) -> tuple[int, Any]:
+    def _corrected_move_robber_outcome(
+        self, game: Any, action_json: Any
+    ) -> tuple[int, Any]:
         """Sample a stolen resource weighted by the victim's REAL hand.
 
         Single-shot, non-cached convenience wrapper (kept for direct
@@ -2671,17 +2881,23 @@ class GumbelChanceMCTS:
             # hand-weighted -- pass through natively, zero extra work.
             outcomes = _spectrum(game, action_json)
             outcome_index = self._sample_outcome(outcomes)
-            return outcome_index, game.apply_chance_outcome(json.dumps(action_json), outcome_index)
+            return outcome_index, game.apply_chance_outcome(
+                json.dumps(action_json), outcome_index
+            )
         if not candidates:
             # Defensive: no real single-resource-steal outcome at all (should
             # not happen for a victim with >=1 card) -- fall back to the raw
             # highest-probability outcome rather than crashing the search.
             outcomes = _spectrum(game, action_json)
             outcome_index, _probability = max(outcomes, key=lambda item: item[1])
-            return outcome_index, game.apply_chance_outcome(json.dumps(action_json), outcome_index)
+            return outcome_index, game.apply_chance_outcome(
+                json.dumps(action_json), outcome_index
+            )
 
         total = sum(weight for _index, weight, _game in candidates)
-        normalized = tuple((index, weight / total) for index, weight, _game in candidates)
+        normalized = tuple(
+            (index, weight / total) for index, weight, _game in candidates
+        )
         chosen_index = self._sample_outcome(normalized)
         chosen_game = next(
             candidate_game
@@ -2690,7 +2906,9 @@ class GumbelChanceMCTS:
         )
         return chosen_index, chosen_game
 
-    def _corrected_buy_dev_card_outcome(self, game: Any, action_json: Any) -> tuple[int, Any]:
+    def _corrected_buy_dev_card_outcome(
+        self, game: Any, action_json: Any
+    ) -> tuple[int, Any]:
         """Sample among only the REAL (card-drawing) BUY_DEVELOPMENT_CARD outcomes.
 
         Single-shot, non-cached convenience wrapper (kept for direct
@@ -2707,11 +2925,14 @@ class GumbelChanceMCTS:
             # highest-probability outcome rather than crashing the search.
             outcomes = _spectrum(game, action_json)
             outcome_index, _probability = max(outcomes, key=lambda item: item[1])
-            return outcome_index, game.apply_chance_outcome(json.dumps(action_json), outcome_index)
+            return outcome_index, game.apply_chance_outcome(
+                json.dumps(action_json), outcome_index
+            )
 
         total = sum(probability for _index, probability, _game in real_candidates)
         normalized = tuple(
-            (index, probability / total) for index, probability, _game in real_candidates
+            (index, probability / total)
+            for index, probability, _game in real_candidates
         )
         chosen_index = self._sample_outcome(normalized)
         chosen_game = next(
@@ -2746,7 +2967,9 @@ class GumbelChanceMCTS:
 
     def _fetch_legal_actions(
         self, game: Any
-    ) -> tuple[tuple[int, ...], dict[int, Any], dict[int, tuple[tuple[int, float], ...]]]:
+    ) -> tuple[
+        tuple[int, ...], dict[int, Any], dict[int, tuple[tuple[int, float], ...]]
+    ]:
         """Legal actions + action JSON (+ cached chance spectra), batch-API-aware.
 
         Uses `Game.decision_context_json` (one round trip) when
@@ -2756,19 +2979,25 @@ class GumbelChanceMCTS:
         wheels (e.g. wheel 0.1.0 on the local dev mirror).
         """
         if self.config.use_batch_api and batch_api_available():
-            return _decision_context(game, colors=self.config.colors, map_kind=self.config.map_kind)
+            return _decision_context(
+                game, colors=self.config.colors, map_kind=self.config.map_kind
+            )
         legal_actions = _legal_action_indices(
             game, colors=self.config.colors, map_kind=self.config.map_kind
         )
         action_json_by_id = (
-            _playable_action_json_by_index(game, legal_actions, self.config.colors, self.config.map_kind)
+            _playable_action_json_by_index(
+                game, legal_actions, self.config.colors, self.config.map_kind
+            )
             if legal_actions
             else {}
         )
         return legal_actions, action_json_by_id, {}
 
     def _expand_forced(self, node: _GNode) -> bool:
-        legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(node.game)
+        legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(
+            node.game
+        )
         if len(legal_actions) != 1:
             return False
         action_id = int(legal_actions[0])
@@ -2787,13 +3016,13 @@ class GumbelChanceMCTS:
         at_root: bool = False,
         precomputed_evaluation: Any = _UNSET_ROOT_EVALUATION,
     ) -> float:
-        legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(node.game)
+        legal_actions, action_json_by_id, spectrum_by_id = self._fetch_legal_actions(
+            node.game
+        )
         if precomputed_evaluation is not _UNSET_ROOT_EVALUATION:
             if not at_root:
                 raise RuntimeError("precomputed evaluation is valid only at the root")
-            priors, value, uncertainty = _split_evaluation(
-                precomputed_evaluation
-            )
+            priors, value, uncertainty = _split_evaluation(precomputed_evaluation)
             # `_finish_expand` may add a missing-action floor before
             # normalization.  Keep the shared evaluator result immutable across
             # particles even for a partial/custom evaluator.
@@ -2823,11 +3052,20 @@ class GumbelChanceMCTS:
         else:
             priors, value, uncertainty = _split_evaluation(
                 self.evaluator.evaluate(
-                    node.game, legal_actions, root_color=node.root_color, colors=self.config.colors
+                    node.game,
+                    legal_actions,
+                    root_color=node.root_color,
+                    colors=self.config.colors,
                 )
             )
         return self._finish_expand(
-            node, legal_actions, action_json_by_id, spectrum_by_id, priors, value, uncertainty
+            node,
+            legal_actions,
+            action_json_by_id,
+            spectrum_by_id,
+            priors,
+            value,
+            uncertainty,
         )
 
     def _finish_expand(
@@ -2853,16 +3091,21 @@ class GumbelChanceMCTS:
                 for action in missing:
                     priors[int(action)] = floor * 0.01
             priors = _normalize_policy(
-                {int(action): float(priors.get(int(action), 0.0)) for action in legal_actions}
+                {
+                    int(action): float(priors.get(int(action), 0.0))
+                    for action in legal_actions
+                }
             )
             node.action_json = action_json_by_id
             node.action_spectrum = spectrum_by_id
             node.actions = {
-                int(action): _GAction(prior=float(priors[int(action)])) for action in legal_actions
+                int(action): _GAction(prior=float(priors[int(action)]))
+                for action in legal_actions
             }
             prior_temperature = max(float(self.config.prior_temperature), 1.0e-6)
             node.action_logits = {
-                int(action): math.log(max(float(priors[int(action)]), 1.0e-8)) / prior_temperature
+                int(action): math.log(max(float(priors[int(action)]), 1.0e-8))
+                / prior_temperature
                 for action in legal_actions
             }
         node.prior_value = float(max(min(value, 1.0), -1.0))
@@ -2887,7 +3130,10 @@ def is_move_robber_with_victim(action_json: Any) -> bool:
 
 
 def move_robber_victim_outcome_weights(
-    game: Any, action_json: Any, *, cached_spectrum: tuple[tuple[int, float], ...] | None = None
+    game: Any,
+    action_json: Any,
+    *,
+    cached_spectrum: tuple[tuple[int, float], ...] | None = None,
 ) -> list[tuple[int, float, Any]] | None:
     """Return (outcome_index, weight, materialized_child_game) for each native
     MOVE_ROBBER-with-victim outcome, weighted by the victim's REAL hand -- or
@@ -2917,7 +3163,9 @@ def move_robber_victim_outcome_weights(
     search simulation and `catan_zero.rl.gumbel_self_play`'s live-game chance
     resolution.
     """
-    outcomes = cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
+    outcomes = (
+        cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
+    )
     if not _is_legacy_move_robber_spectrum(outcomes):
         return None
 
@@ -2931,13 +3179,14 @@ def move_robber_victim_outcome_weights(
     candidates: list[tuple[int, float, Any]] = []
     for outcome_index, _probability in outcomes:
         candidate_game = game.apply_chance_outcome(raw_json, outcome_index)
-        candidate_hand = json.loads(candidate_game.json_snapshot())["player_state"][victim_index][
-            "resources"
-        ]
+        candidate_hand = json.loads(candidate_game.json_snapshot())["player_state"][
+            victim_index
+        ]["resources"]
         stolen = [
             resource
             for resource in RESOURCES
-            if int(victim_hand.get(resource, 0)) - int(candidate_hand.get(resource, 0)) == 1
+            if int(victim_hand.get(resource, 0)) - int(candidate_hand.get(resource, 0))
+            == 1
         ]
         if len(stolen) != 1:
             continue  # defensive: not a real single-resource steal outcome
@@ -2986,7 +3235,9 @@ def buy_development_card_real_outcomes(
     """
     actor_color = str(action_json[0])
     raw_json = json.dumps(action_json)
-    outcomes = cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
+    outcomes = (
+        cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
+    )
     snapshot = json.loads(game.json_snapshot())
     colors = [str(color) for color in snapshot["colors"]]
     actor_index = colors.index(actor_color)
@@ -3004,7 +3255,8 @@ def buy_development_card_real_outcomes(
             if int(candidate_cards.get(card, 0)) - int(before_cards.get(card, 0)) == 1
         ]
         deck_decreased = (
-            int(candidate_snapshot.get("development_deck_count", 0)) == before_deck_count - 1
+            int(candidate_snapshot.get("development_deck_count", 0))
+            == before_deck_count - 1
         )
         if len(gained) == 1 and deck_decreased:
             real_candidates.append((outcome_index, probability, candidate_game))
@@ -3033,9 +3285,11 @@ def belief_move_robber_outcome_weights(
 ) -> list[tuple[int, float, Any]]:
     """PLANNER-belief variant of `move_robber_victim_outcome_weights`.
 
-    Weights come from :class:`PublicBelief`, so an opponent victim is uniform
-    over all five resource identities and the perspective player's own hand is
-    count-weighted exactly.  On the legacy five-entry Rust spectrum the fixed
+    Weights come from :class:`PublicBelief`: in two-player Catan the opponent
+    hand is count-weighted exactly by bank+own-hand conservation; multiplayer
+    and legacy snapshots without bank counts retain the maximum-entropy
+    fallback. The perspective player's own hand is count-weighted exactly. On
+    the legacy five-entry Rust spectrum the fixed
     resource/index mapping lets us retain all five children, including a no-op
     child when the authoritative hidden hand lacks the sampled type.  This is
     hidden-composition-invariant at the *belief distribution* boundary.
@@ -3047,7 +3301,9 @@ def belief_move_robber_outcome_weights(
     function deliberately does not claim to solve that or opponent legal-action
     leakage (see ``public_belief.OPPONENT_ACTION_SCOPE``).
     """
-    outcomes = cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
+    outcomes = (
+        cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
+    )
     victim_name = str(action_json[2][1])
     actor_name = str(action_json[0])
     raw_json = json.dumps(action_json)
@@ -3073,7 +3329,11 @@ def belief_move_robber_outcome_weights(
             weight = float(public_probabilities.get(resource, 0.0))
             if weight > 0.0:
                 candidates.append(
-                    (outcome_index, weight, game.apply_chance_outcome(raw_json, outcome_index))
+                    (
+                        outcome_index,
+                        weight,
+                        game.apply_chance_outcome(raw_json, outcome_index),
+                    )
                 )
         if candidates:
             return candidates
@@ -3081,13 +3341,14 @@ def belief_move_robber_outcome_weights(
     candidates = []
     for outcome_index, _probability in outcomes:
         candidate_game = game.apply_chance_outcome(raw_json, outcome_index)
-        candidate_hand = json.loads(candidate_game.json_snapshot())["player_state"][victim_index][
-            "resources"
-        ]
+        candidate_hand = json.loads(candidate_game.json_snapshot())["player_state"][
+            victim_index
+        ]["resources"]
         stolen = [
             resource
             for resource in RESOURCES
-            if int(victim_hand.get(resource, 0)) - int(candidate_hand.get(resource, 0)) == 1
+            if int(victim_hand.get(resource, 0)) - int(candidate_hand.get(resource, 0))
+            == 1
         ]
         if len(stolen) != 1:
             continue
@@ -3103,22 +3364,21 @@ def belief_buy_development_card_outcomes(
     *,
     cached_spectrum: tuple[tuple[int, float], ...] | None = None,
     perspective: str | None = None,
+    materialization_seed: int = 0,
 ) -> list[tuple[int, float, Any]]:
     """PLANNER-belief variant of `buy_development_card_real_outcomes`.
 
-    Keeps the same real (card-drawing) outcomes, but reweights each by the
-    posterior predictive distribution from :class:`PublicBelief`: base deck
-    minus the perspective's own unplayed cards and every publicly played card.
-    Opponents' face-down cards and the deck are exchangeable allocations of
-    that pool. Planner-only; the live env keeps true-deck resolution.
-
-    Residual leak (documented, accepted for v1): a card type held 100% face-down
-    by opponents has no drawable engine outcome to materialize, so it cannot
-    appear as a simulated draw even though the belief deck says it could.
+    Weights come from the posterior predictive distribution from
+    :class:`PublicBelief`: base deck minus the perspective's own unplayed cards
+    and every publicly played card. Opponents' face-down cards and the deck are
+    exchangeable allocations of that pool. On a wheel exposing
+    ``apply_public_belief_development_draws`` every positive-belief card gets a
+    sanitized successor even if all authoritative copies are hidden in an
+    opponent hand. Older wheels retain the prior materializable-outcome
+    fallback. Planner-only; the live env keeps true-deck resolution.
     """
     actor_color = str(action_json[0])
     raw_json = json.dumps(action_json)
-    outcomes = cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
     snapshot = json.loads(game.json_snapshot())
     colors = [str(color) for color in snapshot["colors"]]
     actor_index = colors.index(actor_color)
@@ -3131,6 +3391,41 @@ def belief_buy_development_card_outcomes(
     )
     public_probabilities = belief.development_draw_probabilities()
 
+    public_materializer = getattr(game, "apply_public_belief_development_draws", None)
+    if callable(public_materializer):
+        card_names = [
+            card
+            for card in DEVELOPMENT_CARDS
+            if float(public_probabilities.get(card, 0.0)) > 0.0
+        ]
+        if not card_names:
+            return []
+        child_games = list(
+            public_materializer(
+                raw_json,
+                str(perspective) if perspective is not None else actor_color,
+                card_names,
+                int(materialization_seed),
+            )
+        )
+        if len(child_games) != len(card_names):
+            raise RuntimeError(
+                "public-belief dev materializer returned "
+                f"{len(child_games)} children for {len(card_names)} cards"
+            )
+        return [
+            (
+                DEVELOPMENT_CARDS.index(card),
+                float(public_probabilities[card]),
+                child_game,
+            )
+            for card, child_game in zip(card_names, child_games)
+        ]
+
+    outcomes = (
+        cached_spectrum if cached_spectrum is not None else _spectrum(game, action_json)
+    )
+
     candidates: list[tuple[int, float, Any]] = []
     for outcome_index, _probability in outcomes:
         candidate_game = game.apply_chance_outcome(raw_json, outcome_index)
@@ -3142,7 +3437,8 @@ def belief_buy_development_card_outcomes(
             if int(candidate_cards.get(card, 0)) - int(before_cards.get(card, 0)) == 1
         ]
         deck_decreased = (
-            int(candidate_snapshot.get("development_deck_count", 0)) == before_deck_count - 1
+            int(candidate_snapshot.get("development_deck_count", 0))
+            == before_deck_count - 1
         )
         if len(gained) == 1 and deck_decreased:
             weight = float(public_probabilities.get(gained[0], 0.0))

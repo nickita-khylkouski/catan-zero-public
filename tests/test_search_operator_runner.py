@@ -41,6 +41,7 @@ def test_public_regime_literal_is_fail_closed() -> None:
     from catan_zero.search import operator_runner
 
     assert "public_conservation_pimc" in operator_runner.InformationRegime.__args__
+    assert "public_belief_single_tree" in operator_runner.InformationRegime.__args__
     assert "public_observation_policy" in operator_runner.InformationRegime.__args__
     assert "authoritative_hidden_state" in operator_runner.InformationRegime.__args__
 
@@ -95,13 +96,9 @@ def test_game_accumulator_refuses_mixed_information_regimes() -> None:
         counters=SearchCounters(0, 0, 0, 0, 0, 0.0),
     )
     accumulator.add(
-        MeasuredDecision(
-            **common, information_regime="public_conservation_pimc"
-        )
+        MeasuredDecision(**common, information_regime="public_conservation_pimc")
     )
     with pytest.raises(ValueError, match="cannot mix"):
         accumulator.add(
-            MeasuredDecision(
-                **common, information_regime="authoritative_hidden_state"
-            )
+            MeasuredDecision(**common, information_regime="authoritative_hidden_state")
         )

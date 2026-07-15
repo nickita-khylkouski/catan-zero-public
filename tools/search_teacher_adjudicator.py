@@ -51,7 +51,7 @@ CALIBRATION_SCHEMA = "phase-sliced-value-calibration-v2"
 # Schema 4 evidence was sealed before GenerateConfig gained checkpoint-byte
 # provenance. Its typed payload is still self-hashed and semantically checked,
 # so adjudication remains able to replay that immutable historical evidence.
-SUPPORTED_PIPELINE_CONFIG_SCHEMAS = {4, 5, CONFIG_SCHEMA_VERSION}
+SUPPORTED_PIPELINE_CONFIG_SCHEMAS = {4, 5, 12, CONFIG_SCHEMA_VERSION}
 
 S1_ARMS = {
     "D1": (0.03, True),
@@ -1510,7 +1510,9 @@ def _adjudicate_s3(
         budgets_by_role["candidate"].get("wide_roots_always_full") is not True
         or budgets_by_role["baseline"].get("wide_roots_always_full") is not False
     ):
-        raise AdjudicationError("S3 H2H role budget report contradicts always-full split")
+        raise AdjudicationError(
+            "S3 H2H role budget report contradicts always-full split"
+        )
     overhead = _number(
         h2h.get("search_telemetry", {}).get("candidate_over_baseline_elapsed_ratio"),
         where="S3 whole-game role-attributable overhead ratio",

@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 12
+CONFIG_SCHEMA_VERSION = 13
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -342,6 +342,11 @@ class TrainConfig(PipelineConfig):
     per_game_policy_weight: bool = False
     per_game_policy_weight_mode: str = "equal"
     forced_row_value_weight: float = 1.0
+    # Optional canonical ACTION_TYPE=multiplier map applied only to forced
+    # rows, after ``forced_row_value_weight``.  The empty string preserves the
+    # historical objective exactly while making an enabled typed objective
+    # part of the immutable learner identity.
+    forced_row_value_action_type_weights: str = ""
     per_game_value_weight: bool = False
     per_game_value_weight_mode: str = "equal"
     policy_surprise_weight: float = 0.0
@@ -393,9 +398,19 @@ class GenerateConfig(PipelineConfig):
     # These fields are science-bearing provenance because changing either the
     # number of particles or their minimum budget changes the teacher target.
     information_set_search: bool = False
+    # One sanitized two-player public-belief tree using the full search budget.
+    # This is deliberately separate from legacy multi-particle PIMC so a
+    # coherent-tree wave cannot share a config identity with four fragmented
+    # determinizations.
+    coherent_public_belief_search: bool = False
     determinization_particles: int = 1
     determinization_min_simulations: int = 32
     information_set_target_aggregation: str = "mean_improved_policy"
+    # Forced single-action prompts do not need a neural search when their
+    # policy target is masked and the learner uses terminal outcome for value.
+    # Keep the historical full path as the default; the trajectory-only mode
+    # is an explicit producer identity because it intentionally omits root-Q.
+    forced_root_target_mode: str = "full"
     # Seeds.
     base_seed: int = 1
     seed_claim: bool = True
@@ -422,6 +437,10 @@ class GenerateConfig(PipelineConfig):
     max_decisions: int = 600
     max_depth: int = 80
     temperature_decisions: int = 45
+    # ``prompt`` is the historical engine-prompt clock. ``nonforced_choice``
+    # advances only when the acting player has more than one legal action, so
+    # mandatory ROLL/END_TURN plumbing cannot consume the exploration window.
+    temperature_clock: str = "prompt"
     temperature_high: float = 1.0
     temperature_low: float = 0.0
     late_temperature_decisions: int | None = None
@@ -522,6 +541,8 @@ class EvalConfig(PipelineConfig):
     public_observation: bool = False
     belief_chance_spectra: bool = False
     information_set_search: bool = False
+    coherent_public_belief_search: bool = False
+    forced_root_target_mode: str = "full"
     # Explicit implementation arm. False preserves the reference Python tree
     # loop; True requires the matching catanatron_rs native-search binding and
     # fails closed rather than silently changing the evaluation operator.

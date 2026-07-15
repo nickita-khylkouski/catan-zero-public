@@ -8,8 +8,10 @@ from tools.train_bc import (
     _value_component_active_dose_for_batch,
     _value_training_scope_report,
     build_value_sample_weights,
+    forced_action_type_value_mass_quality,
     per_game_weight_quality,
 )
+from catan_zero.rl.action_mask import ActionCatalog
 
 
 def _legal_action_ids(counts: list[int], width: int = 4) -> np.ndarray:
@@ -92,6 +94,95 @@ def test_forced_row_value_weight_default_is_noop() -> None:
     weights = build_value_sample_weights(data)
 
     assert weights[0] == pytest.approx(weights[1])
+
+
+def _catalog_action_id(catalog: ActionCatalog, action_type: str) -> int:
+    return next(
+        action_id
+        for action_id in range(catalog.size)
+        if catalog.describe(action_id)["action_type"] == action_type
+    )
+
+
+def test_forced_row_action_type_weights_compose_after_global_multiplier() -> None:
+    catalog = ActionCatalog(("RED", "BLUE"))
+    roll = _catalog_action_id(catalog, "ROLL")
+    end_turn = _catalog_action_id(catalog, "END_TURN")
+    build_road = _catalog_action_id(catalog, "BUILD_ROAD")
+    data = {
+        "action_taken": np.asarray(
+            [roll, end_turn, build_road, roll], dtype=np.int16
+        ),
+        "legal_action_ids": np.asarray(
+            [
+                [roll, -1],
+                [end_turn, -1],
+                [build_road, -1],
+                [roll, build_road],
+            ],
+            dtype=np.int32,
+        ),
+    }
+
+    weights = build_value_sample_weights(
+        data,
+        forced_row_value_weight=0.5,
+        forced_row_value_action_type_weights={"ROLL": 0.2, "END_TURN": 0.5},
+        action_catalog=catalog,
+    )
+
+    # Ratios survive the final global mean normalization. An unlisted forced
+    # BUILD_ROAD gets only the existing 0.5 global forced multiplier, while a
+    # non-forced ROLL row gets neither forced multiplier.
+    assert weights[0] / weights[2] == pytest.approx(0.2)
+    assert weights[1] / weights[2] == pytest.approx(0.5)
+    assert weights[2] / weights[3] == pytest.approx(0.5)
+
+    report = forced_action_type_value_mass_quality(
+        data,
+        weights,
+        action_catalog=catalog,
+        configured_weights={"ROLL": 0.2, "END_TURN": 0.5},
+    )
+    assert report["forced_rows"] == 3
+    assert report["by_action_type"]["ROLL"]["rows"] == 1
+    assert report["by_action_type"]["ROLL"]["configured_multiplier"] == 0.2
+    assert report["by_action_type"]["BUILD_ROAD"][
+        "configured_multiplier"
+    ] == 1.0
+    assert report["effective_forced_value_mass"] == pytest.approx(
+        sum(float(weights[index]) for index in (0, 1, 2))
+    )
+
+
+def test_empty_forced_row_action_type_map_is_exact_historical_default() -> None:
+    data = {
+        "action_taken": np.asarray([1, 2], dtype=np.int16),
+        "legal_action_ids": _legal_action_ids([1, 3]),
+    }
+    historical = build_value_sample_weights(data, forced_row_value_weight=0.25)
+    explicit_empty = build_value_sample_weights(
+        data,
+        forced_row_value_weight=0.25,
+        forced_row_value_action_type_weights={},
+        action_catalog=None,
+    )
+    assert explicit_empty.tobytes() == historical.tobytes()
+
+
+def test_forced_row_action_type_map_rejects_unknown_catalog_type() -> None:
+    catalog = ActionCatalog(("RED", "BLUE"))
+    roll = _catalog_action_id(catalog, "ROLL")
+    data = {
+        "action_taken": np.asarray([roll], dtype=np.int16),
+        "legal_action_ids": np.asarray([[roll]], dtype=np.int32),
+    }
+    with pytest.raises(SystemExit, match="unknown ActionCatalog types"):
+        build_value_sample_weights(
+            data,
+            forced_row_value_action_type_weights={"DRAW_CARD": 0.0},
+            action_catalog=catalog,
+        )
 
 
 def test_authenticated_value_scope_can_make_replay_anchor_only() -> None:

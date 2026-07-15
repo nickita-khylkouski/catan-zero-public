@@ -62,6 +62,16 @@ class _WrongBatchPublicEvaluator(_ScalarOnlyPublicEvaluator):
         return expected + [({}, 0.0)] * self.delta
 
 
+class _ForcedCountingEvaluator:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def evaluate(self, *args, **kwargs):
+        del args, kwargs
+        self.calls += 1
+        return ({37: 1.0}, 0.625)
+
+
 class _LegacyRepeatedRootD6(NativeGumbelChanceMCTS):
     """Test oracle for the pre-hoist PIMC evaluator schedule."""
 
@@ -285,6 +295,102 @@ def test_native_config_maps_sigma_reference_visits() -> None:
     assert search._native_config()["sigma_reference_visits"] == 12
 
 
+def test_native_config_maps_coherent_public_belief_boundary() -> None:
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(coherent_public_belief_search=True)
+    search.rng = random.Random(7)
+
+    native = search._native_config()
+
+    assert native["coherent_public_belief_search"] is True
+    assert native["stop_at_root_turn_boundary"] is True
+
+
+def test_forced_trajectory_only_keeps_action_and_omits_discarded_targets() -> None:
+    evaluator = _ForcedCountingEvaluator()
+    trajectory = object.__new__(GumbelChanceMCTS)
+    trajectory.config = GumbelChanceMCTSConfig(
+        forced_root_target_mode="trajectory_only"
+    )
+    trajectory.evaluator = evaluator
+
+    result = trajectory._forced_single_action_result(
+        object(),
+        (37,),
+        root_color="RED",
+        action_json_by_id={37: ["RED", "END_TURN", None]},
+    )
+
+    assert result.selected_action == 37
+    assert result.improved_policy == {37: 1.0}
+    assert result.priors == {37: 1.0}
+    assert result.visit_counts == {}
+    assert result.q_values == {}
+    assert result.completed_q_values == {}
+    assert result.afterstate_values == {}
+    assert result.root_value != result.root_value
+    assert result.used_full_search is False
+    assert result.simulations_used == 0
+    assert evaluator.calls == 0
+
+    full = object.__new__(GumbelChanceMCTS)
+    full.config = GumbelChanceMCTSConfig()
+    full.evaluator = evaluator
+    control = full._forced_single_action_result(
+        object(),
+        (37,),
+        root_color="RED",
+        action_json_by_id={37: ["RED", "END_TURN", None]},
+    )
+    assert control.selected_action == result.selected_action
+    assert control.root_value == pytest.approx(0.625)
+    assert evaluator.calls == 1
+
+
+def test_native_forced_trajectory_short_circuits_before_binding(monkeypatch) -> None:
+    binding_calls = 0
+
+    def unexpected_binding(*args, **kwargs):
+        nonlocal binding_calls
+        del args, kwargs
+        binding_calls += 1
+        raise AssertionError("native search binding must not run at a forced root")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(gumbel_search=unexpected_binding),
+    )
+
+    class _ForcedGame:
+        def playable_action_indices(self, colors, map_kind):
+            assert tuple(colors) == ("RED", "BLUE")
+            assert map_kind is None
+            return [37]
+
+    evaluator = _ForcedCountingEvaluator()
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(forced_root_target_mode="trajectory_only")
+    search.evaluator = evaluator
+    search.rng = random.Random(7)
+    search.using_native_hot_loop = True
+
+    result = search._search_single_world(_ForcedGame())
+
+    assert result.selected_action == 37
+    assert result.root_value != result.root_value
+    assert result.completed_q_values == {}
+    assert evaluator.calls == 0
+    assert binding_calls == 0
+
+
+def test_native_config_maps_forced_root_target_mode() -> None:
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(forced_root_target_mode="trajectory_only")
+    search.rng = random.Random(7)
+    assert search._native_config()["forced_root_target_mode"] == "trajectory_only"
+
+
 def test_native_config_binds_authoritative_initial_road_d1_scope() -> None:
     search = object.__new__(NativeGumbelChanceMCTS)
     search.config = GumbelChanceMCTSConfig(
@@ -336,6 +442,42 @@ def test_native_initial_road_d1_refuses_unadvertised_old_wheel(monkeypatch) -> N
     search.using_native_hot_loop = True
 
     with pytest.raises(ValueError, match="initial_road_d1_scope"):
+        search._validate_native_semantics()
+
+
+def test_native_coherent_belief_refuses_unadvertised_old_wheel(monkeypatch) -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    monkeypatch.setattr(
+        rust,
+        "gumbel_search_capabilities",
+        lambda: [
+            "sigma_reference_visits",
+            "belief_target_evidence",
+            "initial_road_d1_scope",
+        ],
+        raising=False,
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(coherent_public_belief_search=True)
+    search.using_native_hot_loop = True
+
+    with pytest.raises(ValueError, match="advertising coherent_public_belief_search"):
+        search._validate_native_semantics()
+
+
+def test_native_forced_trajectory_refuses_unadvertised_old_wheel(monkeypatch) -> None:
+    rust = pytest.importorskip("catanatron_rs")
+    monkeypatch.setattr(
+        rust,
+        "gumbel_search_capabilities",
+        lambda: ["sigma_reference_visits", "belief_target_evidence"],
+        raising=False,
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(forced_root_target_mode="trajectory_only")
+    search.using_native_hot_loop = True
+
+    with pytest.raises(ValueError, match="advertising forced_root_trajectory_only"):
         search._validate_native_semantics()
 
 

@@ -273,10 +273,10 @@ def _validate_science_args(
 ) -> None:
     """Reject invalid science settings before guards, workers, or artifacts.
 
-    Public-observation masking and information-set search are one semantic
-    regime, not independent tuning flags.  Masking only the evaluator while
-    traversing clones of the authoritative game would leak hidden truth into
-    the MCTS targets.  Keep this invariant inside the generator so direct
+    Public-observation masking and a public-state tree operator are one
+    semantic regime, not independent tuning flags. Masking only the evaluator
+    while traversing clones of the authoritative game would leak hidden truth
+    into the MCTS targets. Keep this invariant inside the generator so direct
     callers and intentional guard-skipping smoke tests cannot bypass it.
     """
     finite_names = (
@@ -309,17 +309,25 @@ def _validate_science_args(
             )
     public = bool(args.public_observation)
     information_set = bool(args.information_set_search)
-    if public and not information_set:
+    coherent = bool(getattr(args, "coherent_public_belief_search", False))
+    if information_set and coherent:
         parser.error(
-            "--public-observation requires --information-set-search; masking NN "
-            "features alone does not make MCTS targets public-information safe"
+            "--information-set-search and --coherent-public-belief-search are "
+            "mutually exclusive"
+        )
+    if public and not (information_set or coherent):
+        parser.error(
+            "--public-observation requires --information-set-search or "
+            "--coherent-public-belief-search; masking NN features alone does "
+            "not make MCTS targets public-information safe"
         )
     if information_set and not public:
         parser.error("--information-set-search requires --public-observation")
-    if information_set and bool(args.belief_chance_spectra):
+    if coherent and not public:
+        parser.error("--coherent-public-belief-search requires --public-observation")
+    if (information_set or coherent) and bool(args.belief_chance_spectra):
         parser.error(
-            "--information-set-search cannot be combined with "
-            "--belief-chance-spectra"
+            "public-state search cannot be combined with --belief-chance-spectra"
         )
     n_full_wide = getattr(args, "n_full_wide", None)
     if information_set and n_full_wide is not None:
@@ -374,6 +382,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-full", type=int, default=64)
     parser.add_argument("--n-fast", type=int, default=16)
     parser.add_argument("--p-full", type=float, default=0.25)
+    parser.add_argument(
+        "--forced-root-target-mode",
+        choices=("full", "trajectory_only"),
+        default="full",
+        help=(
+            "Single-legal-action handling. 'full' preserves historical forced "
+            "root value/chance evaluation. 'trajectory_only' selects the exact "
+            "sole action with zero neural/search work and omits root-Q evidence; "
+            "the row still receives its terminal-outcome value target."
+        ),
+    )
     parser.add_argument("--c-visit", type=float, default=50.0)
     parser.add_argument("--c-scale", type=float, default=0.1)
     parser.add_argument(
@@ -488,12 +507,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--temperature-decisions",
         type=int,
         default=45,
-        help="Opening decisions per game played at --temperature-high (sampled from "
+        help="Opening schedule steps per game played at --temperature-high (sampled from "
         "the improved policy for trajectory diversity); --temperature-low thereafter. "
-        "ABSOLUTE decision count -- internally converted to GumbelSelfPlayConfig's "
+        "The step is selected by --temperature-clock. ABSOLUTE count -- internally "
+        "converted to GumbelSelfPlayConfig's "
         "temperature_move_fraction = temperature_decisions / max_decisions, so it stays "
         "invariant when --max-decisions changes. Mirrors "
         "generate_raw_selfplay_data.py's --temperature-decisions.",
+    )
+    parser.add_argument(
+        "--temperature-clock",
+        choices=("prompt", "nonforced_choice"),
+        default="prompt",
+        help=(
+            "Index used by the temperature schedule. 'prompt' preserves the "
+            "historical engine-prompt clock; 'nonforced_choice' advances only "
+            "when more than one legal action exists, so mandatory ROLL/END_TURN "
+            "prompts do not consume exploration."
+        ),
     )
     parser.add_argument(
         "--temperature-move-fraction",
@@ -554,8 +585,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Single-sample INTERIOR chance-node (ROLL) traversal instead of full "
-        "11-outcome enumeration (#52). Root ROLL enumeration and the forced-single-"
-        "action fast path stay full in both modes. ~65x fewer leaf evals per full "
+        "11-outcome enumeration (#52). Root ROLL enumeration stays full unless "
+        "--forced-root-target-mode trajectory_only skips the whole forced root. "
+        "~65x fewer leaf evals per full "
         "search at the cost of noisier interior backups; default off — generation "
         "use is gated on a strength-based H2H A/B.",
     )
@@ -777,6 +809,18 @@ def build_parser() -> argparse.ArgumentParser:
         "determinizations instead of cloning authoritative hidden truth. Requires "
         "a wheel exposing Game.determinize_for_player. This is mandatory for "
         "training-admissible public-observation search targets.",
+    )
+    parser.add_argument(
+        "--coherent-public-belief-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use one sanitized two-player public-belief tree with the full "
+            "n-full/n-fast budget and public robber/dev-draw chance support. "
+            "Requires --public-observation and a matching native wheel; mutually "
+            "exclusive with PIMC --information-set-search and "
+            "--belief-chance-spectra."
+        ),
     )
     parser.add_argument(
         "--determinization-particles",
@@ -1019,6 +1063,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
             "exporting gumbel_search; refusing silent Python fallback"
         )
+    if (
+        bool(args.native_mcts_hot_loop)
+        and str(args.forced_root_target_mode) == "trajectory_only"
+    ):
+        try:
+            import catanatron_rs  # type: ignore
+
+            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+            capabilities = set(capability_fn()) if callable(capability_fn) else set()
+        except ImportError:
+            capabilities = set()
+        if "forced_root_trajectory_only" not in capabilities:
+            parser.error(
+                "--forced-root-target-mode trajectory_only with "
+                "--native-mcts-hot-loop requires a wheel advertising "
+                "forced_root_trajectory_only"
+            )
     if bool(args.rust_featurize):
         try:
             require_rust_feature_path()
@@ -1033,24 +1094,50 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--determinization-particles must be >= 1")
     if int(args.determinization_min_simulations) < 1:
         parser.error("--determinization-min-simulations must be >= 1")
-    if bool(args.information_set_search):
-        if not bool(args.public_observation):
-            parser.error(
-                "--information-set-search requires --public-observation"
-            )
+    if bool(args.information_set_search) or bool(args.coherent_public_belief_search):
         try:
             import catanatron_rs  # type: ignore
 
-            has_determinization = hasattr(
-                catanatron_rs.Game, "determinize_for_player"
+            has_determinization = hasattr(catanatron_rs.Game, "determinize_for_player")
+            has_public_dev_materializer = hasattr(
+                catanatron_rs.Game, "apply_public_belief_development_draws"
+            )
+            capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
+            native_capabilities = (
+                set(capability_fn()) if callable(capability_fn) else set()
             )
         except ImportError:
             has_determinization = False
+            has_public_dev_materializer = False
+            native_capabilities = set()
         if not has_determinization:
             parser.error(
-                "--information-set-search requires a catanatron_rs wheel exposing "
+                "public-state search requires a catanatron_rs wheel exposing "
                 "Game.determinize_for_player"
             )
+        if bool(args.coherent_public_belief_search):
+            if not has_public_dev_materializer:
+                parser.error(
+                    "--coherent-public-belief-search requires a catanatron_rs "
+                    "wheel exposing Game.apply_public_belief_development_draws"
+                )
+            if bool(args.native_mcts_hot_loop) and (
+                "coherent_public_belief_search" not in native_capabilities
+            ):
+                parser.error(
+                    "--coherent-public-belief-search with --native-mcts-hot-loop "
+                    "requires a wheel advertising coherent_public_belief_search"
+                )
+            if (
+                str(args.forced_root_target_mode) == "trajectory_only"
+                and bool(args.native_mcts_hot_loop)
+                and "forced_root_trajectory_only" not in native_capabilities
+            ):
+                parser.error(
+                    "--forced-root-target-mode trajectory_only with the native "
+                    "hot loop requires a wheel advertising "
+                    "forced_root_trajectory_only"
+                )
     if str(args.information_set_target_aggregation) == "aggregate_q_then_improve":
         if not bool(args.information_set_search):
             parser.error(
@@ -1128,8 +1215,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit(
             f"{output} already contains self-play output; use a fresh --out-dir"
         )
-    runtime_checkpoint, args.producer_checkpoint_sha256 = (
-        _stage_producer_checkpoint(args.checkpoint, output)
+    runtime_checkpoint, args.producer_checkpoint_sha256 = _stage_producer_checkpoint(
+        args.checkpoint, output
     )
 
     # CAT-66 typed config + config-hash. Built once in the main process from the
@@ -1269,6 +1356,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "max_decisions": int(args.max_decisions),
                 "max_depth": int(args.max_depth),
                 "temperature_move_fraction": float(args.temperature_move_fraction),
+                "temperature_clock": str(args.temperature_clock),
                 "temperature_high": float(args.temperature_high),
                 "temperature_low": float(args.temperature_low),
                 "late_temperature_move_fraction": args.late_temperature_move_fraction,
@@ -1302,6 +1390,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "eval_cache_size": int(args.eval_cache_size),
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
                 "information_set_search": bool(args.information_set_search),
+                "coherent_public_belief_search": bool(
+                    args.coherent_public_belief_search
+                ),
+                "forced_root_target_mode": str(args.forced_root_target_mode),
                 "determinization_particles": int(args.determinization_particles),
                 "determinization_min_simulations": int(
                     args.determinization_min_simulations
@@ -1353,8 +1445,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     except Exception as error:  # noqa: BLE001 - preserve a launch-level manifest.
         fatal_execution_error = error
         results = [
-            _worker_level_error_summary(worker_arg, error)
-            for worker_arg in worker_args
+            _worker_level_error_summary(worker_arg, error) for worker_arg in worker_args
         ]
 
     summary = _merge_worker_summaries(
@@ -1830,6 +1921,7 @@ def _run_worker(
         obs_width=int(worker_args["obs_width"]),
         max_decisions=int(worker_args["max_decisions"]),
         temperature_move_fraction=float(worker_args["temperature_move_fraction"]),
+        temperature_clock=str(worker_args.get("temperature_clock", "prompt")),
         temperature_high=float(worker_args["temperature_high"]),
         temperature_low=float(worker_args["temperature_low"]),
         late_temperature_move_fraction=(
@@ -1885,6 +1977,10 @@ def _run_worker(
         root_wave_batching=bool(worker_args.get("root_wave_batching", False)),
         belief_chance_spectra=bool(worker_args["belief_chance_spectra"]),
         information_set_search=bool(worker_args.get("information_set_search", False)),
+        coherent_public_belief_search=bool(
+            worker_args.get("coherent_public_belief_search", False)
+        ),
+        forced_root_target_mode=str(worker_args.get("forced_root_target_mode", "full")),
         determinization_particles=int(worker_args.get("determinization_particles", 1)),
         determinization_min_simulations=int(
             worker_args.get("determinization_min_simulations", 32)
@@ -1947,8 +2043,7 @@ def _json_cli_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_cli_value(item) for item in value]
     raise TypeError(
-        "unsupported parsed CLI value in manifest provenance: "
-        f"{type(value).__name__}"
+        f"unsupported parsed CLI value in manifest provenance: {type(value).__name__}"
     )
 
 
@@ -2115,17 +2210,13 @@ def _merge_worker_summaries(
         "exact_budget_sh": bool(getattr(args, "exact_budget_sh", False)),
         "exact_budget_sh_min_n": int(getattr(args, "exact_budget_sh_min_n", 0)),
         "root_wave_batching": bool(getattr(args, "root_wave_batching", False)),
-        "native_mcts_hot_loop": bool(
-            getattr(args, "native_mcts_hot_loop", False)
-        ),
+        "native_mcts_hot_loop": bool(getattr(args, "native_mcts_hot_loop", False)),
         "rust_featurize": bool(args.rust_featurize),
         "value_readout": str(getattr(args, "value_readout", "scalar")),
         "checkpoint": args.checkpoint,
         "base_seed": int(args.base_seed),
         "arm_id": getattr(args, "generation_arm_id", None),
-        "fleet_pipelines_per_gpu": int(
-            getattr(args, "fleet_pipelines_per_gpu", 1)
-        ),
+        "fleet_pipelines_per_gpu": int(getattr(args, "fleet_pipelines_per_gpu", 1)),
         "fleet_pipeline_index": int(getattr(args, "fleet_pipeline_index", 0)),
         "fleet_pipeline_id": getattr(args, "fleet_pipeline_id", None),
         # Complete CLI-argument provenance so a shard batch is auditable after

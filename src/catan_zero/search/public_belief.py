@@ -56,11 +56,16 @@ def _named_counts(value: Any, names: Sequence[str]) -> tuple[int, ...]:
     if isinstance(value, Mapping):
         return tuple(max(0, int(value.get(name, 0) or 0)) for name in names)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-        return tuple(max(0, int(value[index] or 0)) if index < len(value) else 0 for index in range(len(names)))
+        return tuple(
+            max(0, int(value[index] or 0)) if index < len(value) else 0
+            for index in range(len(names))
+        )
     return (0,) * len(names)
 
 
-def _player_states(snapshot: Mapping[str, Any], colors: tuple[str, ...]) -> dict[str, Mapping[str, Any]]:
+def _player_states(
+    snapshot: Mapping[str, Any], colors: tuple[str, ...]
+) -> dict[str, Mapping[str, Any]]:
     raw = snapshot.get("player_state", ())
     if isinstance(raw, Mapping):
         return {
@@ -69,7 +74,9 @@ def _player_states(snapshot: Mapping[str, Any], colors: tuple[str, ...]) -> dict
         }
     if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
         return {
-            color: raw[index] if index < len(raw) and isinstance(raw[index], Mapping) else {}
+            color: raw[index]
+            if index < len(raw) and isinstance(raw[index], Mapping)
+            else {}
             for index, color in enumerate(colors)
         }
     return {color: {} for color in colors}
@@ -87,6 +94,11 @@ class PublicBelief:
     development_card_counts: tuple[int, ...]
     played_development_cards: tuple[tuple[int, ...], ...]
     development_deck_count: int
+    # Public bank composition in canonical RESOURCES order.  Older/synthetic
+    # snapshots may omit it; ``None`` preserves their legacy maximum-entropy
+    # fallback.  In a two-player game this plus the observer's known hand
+    # determines the *entire* opponent hand exactly by conservation.
+    resource_bank: tuple[int, ...] | None = None
 
     @classmethod
     def from_snapshot(
@@ -116,13 +128,17 @@ class PublicBelief:
             state = states[color]
             resources = _named_counts(state.get("resources"), RESOURCES)
             dev_cards = _named_counts(state.get("dev_cards"), DEVELOPMENT_CARDS)
-            resource_counts.append(int(state.get("resource_card_count", sum(resources)) or 0))
+            resource_counts.append(
+                int(state.get("resource_card_count", sum(resources)) or 0)
+            )
             development_counts.append(
                 int(state.get("development_card_count", sum(dev_cards)) or 0)
             )
             played.append(
                 _named_counts(
-                    state.get("played_dev_cards", state.get("played_development_cards")),
+                    state.get(
+                        "played_dev_cards", state.get("played_development_cards")
+                    ),
                     DEVELOPMENT_CARDS,
                 )
             )
@@ -131,12 +147,22 @@ class PublicBelief:
             perspective=perspective,
             colors=colors,
             own_resources=_named_counts(own.get("resources"), RESOURCES),
-            own_development_cards=_named_counts(own.get("dev_cards"), DEVELOPMENT_CARDS),
+            own_development_cards=_named_counts(
+                own.get("dev_cards"), DEVELOPMENT_CARDS
+            ),
             resource_card_counts=tuple(resource_counts),
             development_card_counts=tuple(development_counts),
             played_development_cards=tuple(played),
-            development_deck_count=max(0, int(snapshot.get("development_deck_count", 0) or 0)),
+            development_deck_count=max(
+                0, int(snapshot.get("development_deck_count", 0) or 0)
+            ),
+            resource_bank=(
+                _named_counts(snapshot.get("resource_bank"), RESOURCES)
+                if "resource_bank" in snapshot
+                else None
+            ),
         )
+
     def _player_index(self, color: str) -> int:
         try:
             return self.colors.index(str(color))
@@ -147,11 +173,13 @@ class PublicBelief:
         """Belief over the identity of a card stolen from ``victim``.
 
         The perspective player's own hand is known, so if they are the victim
-        the exact count-weighted Catan distribution is returned.  For an
-        opponent only hand size is public; absent a richer history posterior,
-        the symmetric maximum-entropy prior is uniform over the five resource
-        identities.  This intentionally gives positive mass to types the true
-        hidden hand might not contain--conditioning on that truth would leak it.
+        the exact count-weighted Catan distribution is returned. In a
+        two-player game the opponent's composition is also exact: every
+        one of the 19 cards of each resource is either in the public bank, in
+        our known hand, or in the sole opponent's hand.  For multiplayer or a
+        legacy snapshot without bank counts, only hand size is available here
+        and the symmetric maximum-entropy fallback remains uniform over the
+        five identities.
         """
         victim_index = self._player_index(victim)
         total = self.resource_card_counts[victim_index]
@@ -164,6 +192,25 @@ class PublicBelief:
             return {
                 resource: count / own_total
                 for resource, count in zip(RESOURCES, self.own_resources)
+                if count > 0
+            }
+        if len(self.colors) == 2 and self.resource_bank is not None:
+            opponent_counts = tuple(
+                19 - int(bank_count) - int(own_count)
+                for bank_count, own_count in zip(self.resource_bank, self.own_resources)
+            )
+            if any(count < 0 for count in opponent_counts):
+                raise ValueError(
+                    "public resource conservation exceeds the 19-card bank"
+                )
+            if sum(opponent_counts) != total:
+                raise ValueError(
+                    "two-player public resource counts are not conservation-consistent: "
+                    f"derived={sum(opponent_counts)} public_hand_size={total}"
+                )
+            return {
+                resource: count / total
+                for resource, count in zip(RESOURCES, opponent_counts)
                 if count > 0
             }
         probability = 1.0 / len(RESOURCES)
@@ -181,9 +228,13 @@ class PublicBelief:
             return {}
         remaining: list[int] = []
         for card_index, card in enumerate(DEVELOPMENT_CARDS):
-            public_played = sum(row[card_index] for row in self.played_development_cards)
+            public_played = sum(
+                row[card_index] for row in self.played_development_cards
+            )
             known_own = self.own_development_cards[card_index]
-            remaining.append(max(0, BASE_DEVELOPMENT_DECK[card] - public_played - known_own))
+            remaining.append(
+                max(0, BASE_DEVELOPMENT_DECK[card] - public_played - known_own)
+            )
         total = sum(remaining)
         if total <= 0:
             return {}
@@ -204,8 +255,11 @@ class PublicBelief:
             "development_card_counts": self.development_card_counts,
             "played_development_cards": self.played_development_cards,
             "development_deck_count": self.development_deck_count,
+            "resource_bank": self.resource_bank,
         }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
         return hashlib.blake2b(encoded, digest_size=16).hexdigest()
 
 
@@ -231,14 +285,26 @@ class PublicBeliefSampler:
         if sample_index < 0:
             raise ValueError("sample_index must be non-negative")
         material = "|".join(
-            (str(int(self.seed)), belief.fingerprint(), namespace, context, str(sample_index))
+            (
+                str(int(self.seed)),
+                belief.fingerprint(),
+                namespace,
+                context,
+                str(sample_index),
+            )
         ).encode("utf-8")
-        value = int.from_bytes(hashlib.blake2b(material, digest_size=16).digest(), "big")
+        value = int.from_bytes(
+            hashlib.blake2b(material, digest_size=16).digest(), "big"
+        )
         return random.Random(value)
 
     @staticmethod
     def _choice(probabilities: Mapping[str, float], rng: random.Random) -> str | None:
-        positive = [(name, float(weight)) for name, weight in probabilities.items() if weight > 0.0]
+        positive = [
+            (name, float(weight))
+            for name, weight in probabilities.items()
+            if weight > 0.0
+        ]
         total = sum(weight for _name, weight in positive)
         if total <= 0.0:
             return None
