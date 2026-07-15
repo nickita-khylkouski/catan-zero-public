@@ -77,6 +77,8 @@ CHECKPOINT_STEPS = (8, 12, 16, 32, 64, 128)
 INTERMEDIATE_STEPS = CHECKPOINT_STEPS[:-1]
 TRAIN_DIAGNOSTIC_CADENCE = 16
 OBJECTIVE_GRADIENT_CADENCE = 64
+CAMPAIGN_LR = 6e-5
+CAMPAIGN_LR_WARMUP_STEPS = 16
 BASE_AUX_ACTIVE_BATCH_SIZE = 463
 ARM_MULTIPLIERS = {
     "P10": 0.10,
@@ -302,6 +304,13 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
         if isinstance(item, dict)
         else None
     )
+    # A direct coherent corpus is not a post-wave subsample: the canonical
+    # completion receipt already seals the complete 8,192-game seed interval,
+    # and below we require the memmap's ordered source-shard inventory to match
+    # that receipt byte-for-byte.  Older A1 corpora carry a separate
+    # selected-game manifest, so accept its count when present, but do not make
+    # that legacy sidecar a prerequisite for this completion-bound ingest.
+    selected_games = item.get("selected_games") if isinstance(item, dict) else None
     if (
         inventory.get("required_target_information_regime")
         != TARGET_INFORMATION_REGIME
@@ -311,7 +320,7 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
         or Path(str(meta_ref.get("path", ""))).resolve(strict=True) != corpus_meta
         or meta_ref.get("sha256") != _file_sha256(corpus_meta)
         or not isinstance(meta_ref.get("payload_inventory_sha256"), str)
-        or item.get("selected_games") != EXPECTED_GAMES
+        or selected_games not in {None, EXPECTED_GAMES}
         or not isinstance(active_regimes, dict)
         or set(active_regimes) != {TARGET_INFORMATION_REGIME}
         or int(active_regimes.get(TARGET_INFORMATION_REGIME, 0)) <= 0
@@ -392,6 +401,11 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
             "target_information_regime": TARGET_INFORMATION_REGIME,
             "search_evidence_schema": SEARCH_EVIDENCE_SCHEMA,
             "selected_games": EXPECTED_GAMES,
+            "selected_game_count_evidence": (
+                "legacy_selected_game_seed_manifest"
+                if selected_games is not None
+                else "completion_receipt_plus_exact_memmap_shard_inventory"
+            ),
             "seed_start": int(contract["execution"]["seed_start"]),
             "seed_end": int(contract["execution"]["seed_end"]),
             "source_npz_count": len(completed_shards),
@@ -472,6 +486,8 @@ def _arm_overrides(arm: str, science_recipe: Mapping[str, Any]) -> dict[str, Any
     return {
         "epochs": 1,
         "max_steps": MAX_STEPS,
+        "lr": CAMPAIGN_LR,
+        "lr_warmup_steps": CAMPAIGN_LR_WARMUP_STEPS,
         "public_card_lr_mult": float(science_recipe["public_card_lr_mult"]),
         "per_game_policy_surprise_weighting": bool(
             science_recipe["per_game_policy_surprise_weighting"]
@@ -643,6 +659,13 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         or science_recipe["value_loss_weight"] != 0.25
     ):
         raise CampaignError("canonical coherent learner contract drifted")
+    campaign_recipe = copy.deepcopy(science_recipe)
+    campaign_recipe.update(
+        {
+            "lr": CAMPAIGN_LR,
+            "lr_warmup_steps": CAMPAIGN_LR_WARMUP_STEPS,
+        }
+    )
 
     output_root = args.output_root.expanduser().resolve(strict=False)
     authority_path = output_root / "independent-parent.authority.json"
@@ -701,14 +724,25 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "science_contract_file_sha256": _file_sha256(
                 current_science.CONTRACT_PATH
             ),
-            "training_recipe": copy.deepcopy(science_recipe),
-            "training_recipe_sha256": _value_sha256(science_recipe),
+            "training_recipe": campaign_recipe,
+            "training_recipe_sha256": _value_sha256(campaign_recipe),
+            "lr_frontier_evidence": {
+                "source_campaign": "b200-lr-dose-f7-20260715-r5",
+                "selected_arm": "C",
+                "lr": CAMPAIGN_LR,
+                "lr_warmup_steps": CAMPAIGN_LR_WARMUP_STEPS,
+                "reason": (
+                    "C was the best dual-baseline r5 arm; B overfit the f7 "
+                    "comparison, while A's 100-step warmup delayed the dose and "
+                    "D's 1.2e-4 frontier was more aggressive"
+                ),
+            },
         },
         "arms": {
             arm: {
                 **values,
                 "optimizer_steps": MAX_STEPS,
-                "recipe_overrides": _arm_overrides(arm, science_recipe),
+                "recipe_overrides": _arm_overrides(arm, campaign_recipe),
                 "expected_aux_active_row_draws": (
                     int(values["policy_aux_active_batch_size"])
                     * WORLD_SIZE

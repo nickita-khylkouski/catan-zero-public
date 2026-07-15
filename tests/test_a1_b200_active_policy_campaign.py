@@ -45,6 +45,8 @@ def test_active_policy_arms_change_only_auxiliary_exposure() -> None:
         for recipe in recipes.values()
     )
     assert common["max_steps"] == 128
+    assert common["lr"] == 6e-5
+    assert common["lr_warmup_steps"] == 16
 
 
 def test_independent_parent_authority_keeps_producer_and_f7_distinct(
