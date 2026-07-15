@@ -184,6 +184,63 @@ def _load_authority(
     }
 
 
+def _load_recovery_receipt_at_original_contract(
+    plan: Mapping[str, Any], arm: str, fingerprint: Mapping[str, Any]
+) -> tuple[Path, dict[str, Any]]:
+    """Replay the signed r2 receipt without imposing later aux-executor fields."""
+
+    arm_plan = plan.get("arms", {}).get(arm)
+    if not isinstance(arm_plan, Mapping):
+        raise MatrixError(f"recovery plan lost arm {arm}")
+    command = arm_plan.get("command")
+    recipe = arm_plan.get("recipe_overrides")
+    if (
+        not isinstance(command, list)
+        or not all(isinstance(token, str) for token in command)
+        or not isinstance(recipe, Mapping)
+    ):
+        raise MatrixError(f"recovery arm {arm} command/recipe is malformed")
+    try:
+        rendered_recipe = json.loads(
+            stage_a._option(command, "--recipe-overrides-json")  # noqa: SLF001
+        )
+        receipt_path = Path(
+            stage_a._option(command, "--receipt")  # noqa: SLF001
+        ).expanduser().resolve(strict=True)
+    except (json.JSONDecodeError, stage_a.CampaignError, OSError) as error:
+        raise MatrixError(f"recovery arm {arm} receipt binding is malformed") from error
+    if rendered_recipe != recipe:
+        raise MatrixError(f"recovery arm {arm} rendered recipe drifted")
+    receipt_path, receipt = _read_object(
+        receipt_path, where=f"recovery arm {arm} one-dose receipt"
+    )
+    unsigned = dict(receipt)
+    stated = unsigned.pop("receipt_sha256", None)
+    rows = fingerprint.get("checkpoints")
+    terminal = rows[-1] if isinstance(rows, list) and rows else None
+    lineage = receipt.get("learner_lineage_parent")
+    effective = receipt.get("learner_ablation", {}).get("effective_recipe")
+    if (
+        stated != _digest(unsigned)
+        or stated != fingerprint.get("one_dose_receipt_sha256")
+        or receipt.get("status") != "complete"
+        or receipt.get("returncode") != 0
+        or receipt.get("diagnostic_only") is not True
+        or receipt.get("promotion_eligible") is not False
+        or not isinstance(effective, Mapping)
+        or any(effective.get(key) != value for key, value in recipe.items())
+        or not isinstance(terminal, Mapping)
+        or receipt.get("outputs", {}).get("checkpoint_sha256")
+        != terminal.get("checkpoint_sha256")
+        or not isinstance(lineage, Mapping)
+        or lineage.get("role") != "diagnostic_independent_parent"
+        or lineage.get("checkpoint", {}).get("sha256")
+        != stage_a.EXPECTED_F7_PARENT_SHA256
+    ):
+        raise MatrixError(f"recovery arm {arm} original receipt contract drifted")
+    return receipt_path, receipt
+
+
 def _load_refusal_authority(
     *,
     refusal_path: Path,
@@ -319,7 +376,7 @@ def _load_refusal_authority(
             schema=stage_b.RECOVERY_FINGERPRINT_SCHEMA,
             digest_field="fingerprint_sha256",
         )
-        receipt_path, receipt = stage_b._recovery_arm_receipt(  # noqa: SLF001
+        receipt_path, receipt = _load_recovery_receipt_at_original_contract(
             plan, diagnostic_arm, fingerprint
         )
     except stage_b.CampaignError as error:
