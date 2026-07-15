@@ -667,9 +667,12 @@ def verify_repair_receipt(path: Path, *, contract_path: Path) -> dict[str, Any]:
     receipt = _load_signed(path, schema=RECEIPT_SCHEMA, field="receipt_sha256")
     plan_path = Path(str(receipt.get("plan", {}).get("path", ""))).resolve(strict=True)
     plan, contract, _original = _authenticate_plan(plan_path)
+    requested_contract_path = contract_path.expanduser().resolve(strict=True)
+    requested_contract = _load(requested_contract_path)
     if (
-        Path(str(receipt.get("contract", {}).get("path", ""))).resolve(strict=True)
-        != contract_path.expanduser().resolve(strict=True)
+        requested_contract.get("contract_sha256") != contract["contract_sha256"]
+        or _file_sha256(requested_contract_path)
+        != receipt.get("contract", {}).get("file_sha256")
         or receipt.get("contract", {}).get("contract_sha256")
         != contract["contract_sha256"]
         or receipt.get("plan", {}).get("file_sha256") != _file_sha256(plan_path)

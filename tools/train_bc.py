@@ -6611,18 +6611,14 @@ def _validate_coherent_direct_corpus_binding(
     if np.unique(run_values).size != run_values.size:
         raise SystemExit("coherent memmap contains non-contiguous duplicate game runs")
     selected = np.sort(np.unique(observed))
-    seed_start = int(corpus.get("seed_start", -1))
-    seed_end = int(corpus.get("seed_end", -1))
     expected_games = int(corpus.get("selected_game_count", -1))
-    expected_seeds = np.arange(seed_start, seed_end, dtype=np.int64)
     if (
         expected_games <= 0
-        or seed_end - seed_start != expected_games
-        or not np.array_equal(selected, expected_seeds)
+        or selected.size != expected_games
         or corpus.get("selected_game_seed_set_sha256")
         != _game_seed_set_sha256(selected)
     ):
-        raise SystemExit("coherent memmap seed population differs from its sealed lane range")
+        raise SystemExit("coherent memmap seed population differs from its sealed seed set")
 
     validation_seeds = np.asarray(
         validation_seed_contract["game_seeds"], dtype=np.int64

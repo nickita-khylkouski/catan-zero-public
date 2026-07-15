@@ -32,6 +32,8 @@ import subprocess
 import sys
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
@@ -41,6 +43,7 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
 from tools import a1_b200_lr_dose_campaign as base_campaign  # noqa: E402
+from tools import a1_coherent_corpus_repair as corpus_repair  # noqa: E402
 from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
 from tools import a1_one_dose_train as one_dose  # noqa: E402
@@ -215,6 +218,41 @@ def _verify_completion_receipt(
 ) -> tuple[Path, dict[str, Any]]:
     """Replay the canonical collector instead of duplicating fleet closure."""
 
+    try:
+        candidate = json.loads(path.expanduser().resolve(strict=True).read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CampaignError(f"cannot read coherent completion/repair receipt: {error}") from error
+    if (
+        isinstance(candidate, dict)
+        and candidate.get("schema_version") == corpus_repair.RECEIPT_SCHEMA
+    ):
+        resolved = path.expanduser().resolve(strict=True)
+        try:
+            receipt = corpus_repair.verify_repair_receipt(
+                resolved, contract_path=contract_path
+            )
+        except (corpus_repair.RepairError, OSError, ValueError) as error:
+            raise CampaignError(f"coherent repair receipt refused: {error}") from error
+        expected_selected = int(contract["execution"]["total_games"])
+        excluded = receipt.get("excluded_truncated_seeds")
+        replacements = receipt.get("replacement_seeds")
+        if (
+            receipt.get("contract", {}).get("contract_sha256")
+            != contract["contract_sha256"]
+            or receipt.get("selected_game_count") != expected_selected
+            or not isinstance(receipt.get("selected_game_seed_set_sha256"), str)
+            or receipt.get("target_information_regime") != TARGET_INFORMATION_REGIME
+            or receipt.get("operator_semantic_sha256")
+            != _value_sha256(contract["operator"])
+            or not isinstance(excluded, list)
+            or not isinstance(replacements, list)
+            or len(excluded) != len(replacements)
+            or len(excluded) <= 0
+            or int(receipt.get("selected_row_count", 0)) <= 0
+        ):
+            raise CampaignError("coherent repair receipt semantic closure drift")
+        return resolved, receipt
+
     resolved, receipt = _load_signed(
         path,
         where="coherent completion receipt",
@@ -343,16 +381,40 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
             "coherent inventory does not prove complete two-seat, PIMC-free n128 targets"
         )
 
-    completed_shards = [
-        {
-            "path": str(Path(str(shard["path"])).resolve(strict=True)),
-            "size_bytes": int(shard["size_bytes"]),
-            "sha256": str(shard["sha256"]),
-        }
-        for lane in completion["lanes"]
-        for worker in lane["workers"]
-        for shard in worker["shards"]
-    ]
+    if completion.get("schema_version") == corpus_repair.RECEIPT_SCHEMA:
+        completed_shards = [
+            {
+                "path": str(Path(str(shard["path"])).resolve(strict=True)),
+                "size_bytes": int(shard["size_bytes"]),
+                "sha256": str(shard["sha256"]),
+            }
+            for shard in completion["selected_shards"]
+        ]
+        selected_seed_set_sha256 = completion["selected_game_seed_set_sha256"]
+        selection_mode = "explicit_truncation_repair_seed_set"
+        excluded_truncated_seeds = list(completion["excluded_truncated_seeds"])
+        replacement_seeds = list(completion["replacement_seeds"])
+    else:
+        completed_shards = [
+            {
+                "path": str(Path(str(shard["path"])).resolve(strict=True)),
+                "size_bytes": int(shard["size_bytes"]),
+                "sha256": str(shard["sha256"]),
+            }
+            for lane in completion["lanes"]
+            for worker in lane["workers"]
+            for shard in worker["shards"]
+        ]
+        selected_seed_set_sha256 = one_dose.train_bc._game_seed_set_sha256(  # noqa: SLF001
+            np.arange(
+                int(contract["execution"]["seed_start"]),
+                int(contract["execution"]["seed_end"]),
+                dtype=np.int64,
+            )
+        )
+        selection_mode = "sealed_contiguous_completion"
+        excluded_truncated_seeds = []
+        replacement_seeds = []
     memmap_shards = corpus_meta_payload.get("source_shard_inventory")
     if (
         not isinstance(memmap_shards, list)
@@ -401,6 +463,10 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
             "target_information_regime": TARGET_INFORMATION_REGIME,
             "search_evidence_schema": SEARCH_EVIDENCE_SCHEMA,
             "selected_games": EXPECTED_GAMES,
+            "selected_game_seed_set_sha256": selected_seed_set_sha256,
+            "selection_mode": selection_mode,
+            "excluded_truncated_seeds": excluded_truncated_seeds,
+            "replacement_seeds": replacement_seeds,
             "selected_game_count_evidence": (
                 "legacy_selected_game_seed_manifest"
                 if selected_games is not None
@@ -451,8 +517,9 @@ def _load_admission(path: Path) -> tuple[Path, dict[str, Any]]:
         or corpus.get("target_information_regime") != TARGET_INFORMATION_REGIME
         or corpus.get("search_evidence_schema") != SEARCH_EVIDENCE_SCHEMA
         or corpus.get("selected_games") != EXPECTED_GAMES
-        or corpus.get("seed_end", -1) - corpus.get("seed_start", -1)
-        != EXPECTED_GAMES
+        or not isinstance(corpus.get("selected_game_seed_set_sha256"), str)
+        or corpus.get("selection_mode")
+        not in {"sealed_contiguous_completion", "explicit_truncation_repair_seed_set"}
         or corpus.get("complete_two_seat_trace_games") != EXPECTED_GAMES
         or corpus.get("incompatible_policy_active_rows") != 0
         or not isinstance(policy, dict)

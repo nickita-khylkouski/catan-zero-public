@@ -1266,7 +1266,7 @@ def _verify_coherent_direct_training_inputs(
         != validation_path
         or corpus.get("producer_checkpoint_sha256") != producer.get("sha256")
         or corpus.get("selected_games") != 8_192
-        or corpus.get("seed_end", -1) - corpus.get("seed_start", -1) != 8_192
+        or not isinstance(corpus.get("selected_game_seed_set_sha256"), str)
         or corpus.get("target_information_regime")
         != "public_belief_single_tree_v1"
         or corpus.get("search_evidence_schema")
@@ -1315,14 +1315,13 @@ def _verify_coherent_direct_training_inputs(
     )
     run_values = observed[run_starts]
     selected = np.sort(np.unique(observed))
-    expected = np.arange(
-        int(corpus["seed_start"]), int(corpus["seed_end"]), dtype=np.int64
-    )
     if (
         np.unique(run_values).size != run_values.size
-        or not np.array_equal(selected, expected)
+        or selected.size != int(corpus["selected_games"])
+        or train_bc._game_seed_set_sha256(selected)  # noqa: SLF001
+        != corpus["selected_game_seed_set_sha256"]
     ):
-        raise ExecutorError("coherent corpus does not contain one contiguous run per seed")
+        raise ExecutorError("coherent corpus differs from its explicit selected seed set")
     validation_seeds = np.asarray(validation["game_seeds"], dtype=np.int64)
     if not np.isin(validation_seeds, selected).all():
         raise ExecutorError("coherent holdout includes a seed outside the corpus")
