@@ -57,6 +57,15 @@ MODULE_MEANINGFUL_PUBLIC_HISTORY = "entity_graph.meaningful_public_history.v1"
 MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY = (
     "entity_graph.public_card_count_features+meaningful_public_history.v1"
 )
+MODULE_PUBLIC_CARD_COUNT_FEATURES_V2 = (
+    "entity_graph.public_card_count_features.v2"
+)
+MODULE_TARGET_GATHER_PUBLIC_CARD_COUNT_V2 = (
+    "entity_graph.action_target_gather+public_card_count_features.v2"
+)
+MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2 = (
+    "entity_graph.public_card_count_features+meaningful_public_history.v2"
+)
 
 # This is intentionally code, not caller-controlled configuration.  A new
 # architecture exception must be reviewed and tested before it can initialize
@@ -244,6 +253,67 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
         },
     },
+    # Bias-free v2 variants deliberately retain the v1 feature tensor and
+    # output location, but remove the trainable intercept.  This preserves the
+    # stronger invariant that an unknown/all-zero public-card row contributes
+    # exactly zero throughout training, not only at initialization.  The v1
+    # entries above remain immutable so issued bias-bearing receipts replay.
+    MODULE_PUBLIC_CARD_COUNT_FEATURES_V2: {
+        "flags": {
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+        },
+        "new_parameter_initialization": {
+            "public_card_count_residual.weight": "zeros",
+        },
+        "config_delta": {
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+        },
+    },
+    MODULE_TARGET_GATHER_PUBLIC_CARD_COUNT_V2: {
+        "flags": {
+            "action_target_gather": True,
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+        },
+        "new_parameter_initialization": {
+            "target_gather_proj.0.bias": "zeros",
+            "target_gather_proj.0.weight": "ones",
+            "target_gather_proj.1.bias": "zeros",
+            "target_gather_proj.1.weight": "zeros",
+            "public_card_count_residual.weight": "zeros",
+        },
+        "config_delta": {
+            "action_target_gather": True,
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+        },
+    },
+    MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2: {
+        "flags": {
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        },
+        "new_parameter_initialization": {
+            "public_card_count_residual.weight": "zeros",
+            "meaningful_history_residual_gate": "zeros",
+        },
+        "config_delta": {
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        },
+    },
     MODULE_ACTION_CROSS_ATTENTION_1: {
         "flags": {"action_cross_attention_layers": 1},
         "new_parameter_initialization": {
@@ -302,6 +372,21 @@ def _digest(value: Any) -> str:
         default=_json_default,
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _effective_config_receipt_view(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep pre-v2 receipt config hashes stable across the appended knob.
+
+    ``public_card_count_residual_bias=True`` is the exact historical topology
+    and therefore carries no new semantic information.  Omitting that default
+    from the digest preserves replay of receipts issued before the field
+    existed.  The v2 value (False) is retained and changes the digest.
+    """
+
+    result = dict(value)
+    if result.get("public_card_count_residual_bias") is True:
+        result.pop("public_card_count_residual_bias")
+    return result
 
 
 def _ref(path: Path) -> dict[str, str]:
@@ -586,8 +671,12 @@ def inspect_upgrade(
         "shared_parameter_count": len(before_model),
         "new_parameters": added,
         "new_parameter_initialization": dict(spec["new_parameter_initialization"]),
-        "effective_source_config_sha256": _digest(effective_before),
-        "effective_upgraded_config_sha256": _digest(effective_after),
+        "effective_source_config_sha256": _digest(
+            _effective_config_receipt_view(effective_before)
+        ),
+        "effective_upgraded_config_sha256": _digest(
+            _effective_config_receipt_view(effective_after)
+        ),
     }
     if seeded_names:
         evidence["seeded_parameter_sha256"] = {

@@ -56,12 +56,20 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     ENTITY_FEATURE_ADAPTER_SPECS,
     require_known_entity_feature_adapter,
 )
+from catan_zero.rl.decision_taxonomy import (  # noqa: E402
+    DECISION_TAXONOMY_SCHEMA_VERSION,
+    MANDATORY_CHOICE,
+)
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
     GumbelSelfPlayConfig,
     PLAYER_NAMES,
     TARGET_INFORMATION_REGIME_PUBLIC,
     TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _pool_champion_plays_first_seat,
+)
+from catan_zero.rl.meaningful_history import (  # noqa: E402
+    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
@@ -462,6 +470,7 @@ REQUIRED_GENERATOR_CODE_SUFFIXES = {
     "tools/fleet/systemd/nvidia-mps.service",
     "tools/opponent_mix_registry.py",
     "src/catan_zero/rl/gumbel_self_play.py",
+    "src/catan_zero/rl/decision_taxonomy.py",
     "src/catan_zero/rl/flywheel/opponent_mix.py",
     "src/catan_zero/rl/entity_token_policy.py",
     "src/catan_zero/rl/entity_token_features.py",
@@ -502,8 +511,12 @@ REQUIRED_LEARNER_CODE_SUFFIXES = {
 # wheel inputs added to future draft/runtime closures. Keep its exact file-set
 # contract separate instead of retroactively rewriting already-running data.
 ISSUED_CAMPAIGN_GENERATOR_CODE_SUFFIXES = REQUIRED_GENERATOR_CODE_SUFFIXES - {
+    "src/catan_zero/rl/decision_taxonomy.py",
     "native/gumbel_mcts_rs/Cargo.lock",
     "native/gumbel_mcts_rs/src/python_binding.rs",
+}
+ISSUED_REVISION_GENERATOR_CODE_SUFFIXES = REQUIRED_GENERATOR_CODE_SUFFIXES - {
+    "src/catan_zero/rl/decision_taxonomy.py",
 }
 REQUIRED_RUNTIME_CODE_SUFFIXES = (
     REQUIRED_GENERATOR_CODE_SUFFIXES
@@ -615,7 +628,12 @@ _GENERATION_KEYS = {
 # Same compatibility rule as the search operator: old locks omitted this field
 # and therefore retain the historical prompt clock, while a new lock that
 # carries it binds the selected clock into its digest and rendered argv.
-_OPTIONAL_GENERATION_KEYS = {"temperature_clock"}
+_OPTIONAL_GENERATION_KEYS = {
+    "temperature_clock",
+    "record_automatic_transitions",
+    "meaningful_public_history",
+    "event_history_limit",
+}
 
 
 class ContractError(ValueError):
@@ -845,8 +863,13 @@ def _generation_revision_provenance(commit: str) -> dict[str, Any]:
         "configs/guards/a1_generation_n256_legacy.json",
         "configs/guards/a1_generation_n128_legacy.json",
     ]
+    generator_suffixes = (
+        ISSUED_REVISION_GENERATOR_CODE_SUFFIXES
+        if commit == GENERATION_CAMPAIGN_REVISION_IMPLEMENTATION_COMMIT
+        else REQUIRED_GENERATOR_CODE_SUFFIXES
+    )
     generator = sorted(
-        REQUIRED_GENERATOR_CODE_SUFFIXES
+        generator_suffixes
         | {
             "tools/launcher_guards.py",
             "tools/prelaunch_guard.py",
@@ -2076,6 +2099,14 @@ def _validate_guard_payload(
             required_critical.add(flag)
     if "temperature_clock" in generation:
         required_critical.add("--temperature-clock")
+    optional_generation_flags = {
+        "record_automatic_transitions": "--record-automatic-transitions",
+        "meaningful_public_history": "--meaningful-public-history",
+        "event_history_limit": "--event-history-limit",
+    }
+    for key, flag in optional_generation_flags.items():
+        if key in generation:
+            required_critical.add(flag)
     if not required_critical.issubset(critical):
         raise ContractError(
             f"guard {path} is missing critical flags {sorted(required_critical - critical)}"
@@ -2106,6 +2137,9 @@ def _validate_guard_payload(
             comparisons[flag] = search[key]
     if "temperature_clock" in generation:
         comparisons["--temperature-clock"] = generation["temperature_clock"]
+    for key, flag in optional_generation_flags.items():
+        if key in generation:
+            comparisons[flag] = generation[key]
     if not archived_markerless:
         comparisons[native_flag] = generation["native_mcts_hot_loop"]
         if evaluator["rust_featurize"] is True:
@@ -2477,6 +2511,35 @@ def _validate_generation(generation: dict[str, Any]) -> None:
     for key in ("eval_server", "native_mcts_hot_loop"):
         if type(generation[key]) is not bool:
             raise ContractError(f"generation.{key} must be a JSON boolean")
+    history_keys = {
+        "record_automatic_transitions",
+        "meaningful_public_history",
+        "event_history_limit",
+    }
+    present_history_keys = history_keys.intersection(generation)
+    if present_history_keys and present_history_keys != history_keys:
+        raise ContractError(
+            "generation meaningful-history fields are atomic; missing="
+            f"{sorted(history_keys - present_history_keys)}"
+        )
+    if present_history_keys:
+        for key in ("record_automatic_transitions", "meaningful_public_history"):
+            if type(generation[key]) is not bool:
+                raise ContractError(f"generation.{key} must be a JSON boolean")
+        if type(generation["event_history_limit"]) is not int:
+            raise ContractError("generation.event_history_limit must be an integer")
+        if generation["meaningful_public_history"] is not True:
+            raise ContractError(
+                "current explicit event-history contract requires meaningful_public_history=true"
+            )
+        if generation["record_automatic_transitions"] is not False:
+            raise ContractError(
+                "meaningful-history waves must not emit automatic-transition learner rows"
+            )
+        if int(generation["event_history_limit"]) != MEANINGFUL_PUBLIC_HISTORY_LIMIT:
+            raise ContractError(
+                "meaningful-history waves require the reviewed 32-event bound"
+            )
     for key in (
         "vps_to_win",
         "obs_width",
@@ -6788,11 +6851,12 @@ def build_lock(
         raise ContractError(
             "selected adaptive n256 requires an explicit threshold and always_full=true"
         )
-    elif (
-        int(search["n_full_wide"]) != 256 or int(search["n_full_wide_threshold"]) != 40
-    ):
+    elif int(search["n_full_wide"]) != 256 or int(
+        search["n_full_wide_threshold"]
+    ) not in {20, 40}:
         raise ContractError(
-            "the only permitted n256 arm is adaptive n_full_wide=256 at >=40"
+            "adaptive n256 requires n_full_wide=256 and a reviewed width threshold "
+            "in {20,40}"
         )
     if (
         search["symmetry_averaged_eval"]
@@ -6875,6 +6939,17 @@ def build_lock(
 
     generation = dict(draft["generation"])
     _validate_generation(generation)
+    if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
+        required_history = {
+            "record_automatic_transitions",
+            "meaningful_public_history",
+            "event_history_limit",
+        }
+        if not required_history.issubset(generation):
+            raise ContractError(
+                "coherent-public production waves require the explicit bounded "
+                "meaningful-history/automatic-transition contract"
+            )
     _validate_current_runtime_execution(
         str(draft_schema), evaluator=evaluator, generation=generation
     )
@@ -7065,6 +7140,11 @@ def build_lock(
         for suffix in REQUIRED_GENERATOR_CODE_SUFFIXES
         if not any(path.endswith(suffix) for path in code_paths)
     }
+    if generation.get("meaningful_public_history") is True and not any(
+        path.endswith("src/catan_zero/rl/meaningful_history.py")
+        for path in code_paths
+    ):
+        missing_code.add("src/catan_zero/rl/meaningful_history.py")
     if missing_code:
         raise ContractError(
             f"generator_code_files omits required semantics files: {sorted(missing_code)}"
@@ -7081,6 +7161,11 @@ def build_lock(
         for suffix in REQUIRED_LEARNER_CODE_SUFFIXES
         if not any(path.endswith(suffix) for path in learner_code_paths)
     }
+    if generation.get("meaningful_public_history") is True and not any(
+        path.endswith("src/catan_zero/rl/meaningful_history.py")
+        for path in learner_code_paths
+    ):
+        missing_learner_code.add("src/catan_zero/rl/meaningful_history.py")
     if missing_learner_code:
         raise ContractError(
             "learner_code_files omits required learner semantics files: "
@@ -7978,6 +8063,22 @@ def _generator_argv(
         )
     if "temperature_clock" in generation:
         argv.extend(("--temperature-clock", str(generation["temperature_clock"])))
+    if "record_automatic_transitions" in generation:
+        argv.append(
+            _bool_flag(
+                "--record-automatic-transitions",
+                bool(generation["record_automatic_transitions"]),
+            )
+        )
+    if "meaningful_public_history" in generation:
+        argv.append(
+            _bool_flag(
+                "--meaningful-public-history",
+                bool(generation["meaningful_public_history"]),
+            )
+        )
+    if "event_history_limit" in generation:
+        argv.extend(("--event-history-limit", str(generation["event_history_limit"])))
     if lock.get("schema_version") == GENERATION_ARM_LOCK_SCHEMA:
         argv.extend(
             (
@@ -8923,6 +9024,13 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "temperature_decisions": generation["temperature_decisions"],
         "temperature_decisions_effective": generation["temperature_decisions"],
         "temperature_clock": generation.get("temperature_clock", "prompt"),
+        "record_automatic_transitions": generation.get(
+            "record_automatic_transitions", True
+        ),
+        "meaningful_public_history": generation.get(
+            "meaningful_public_history", False
+        ),
+        "event_history_limit": generation.get("event_history_limit", 64),
         "temperature_move_fraction": float(generation["temperature_decisions"])
         / float(generation["max_decisions"]),
         "temperature_high": generation["temperature_high"],
@@ -8987,6 +9095,13 @@ def _expected_selfplay_config(lock: dict[str, Any]) -> dict[str, Any]:
             max_decisions=int(generation["max_decisions"]),
             temperature_move_fraction=opening_fraction,
             temperature_clock=str(generation.get("temperature_clock", "prompt")),
+            record_automatic_transitions=bool(
+                generation.get("record_automatic_transitions", True)
+            ),
+            meaningful_public_history=bool(
+                generation.get("meaningful_public_history", False)
+            ),
+            event_history_limit=int(generation.get("event_history_limit", 64)),
             temperature_high=float(generation["temperature_high"]),
             temperature_low=float(generation["temperature_low"]),
             late_temperature_move_fraction=late_fraction,
@@ -9153,20 +9268,52 @@ def _authenticated_empty_event_authority() -> dict[str, Any]:
     }
 
 
+def _meaningful_public_event_authority() -> dict[str, Any]:
+    """Return the source-bound opt-in history authority for fresh v1.6 rows."""
+
+    adapter_version = require_known_entity_feature_adapter(
+        CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    native = information_surface.native_meaningful_public_history_capability()
+    if (
+        native.get("available") is not True
+        or native.get("opt_in") is not True
+        or native.get("history_schema")
+        != MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+        or native.get("history_limit") != MEANINGFUL_PUBLIC_HISTORY_LIMIT
+    ):
+        raise ContractError("native meaningful-public-history capability drift")
+    return {
+        "entity_feature_adapter_version": adapter_version,
+        "base_adapter_event_history_semantic": ENTITY_FEATURE_ADAPTER_SPECS[
+            adapter_version
+        ].event_history,
+        "event_history_semantic": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+        "history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        "native_inference": native,
+    }
+
+
 def _require_shard_feature_semantics(
     payload: Any,
     *,
     rows: int,
     where: str,
+    meaningful_public_history: bool = False,
+    event_history_limit: int = 64,
 ) -> dict[str, Any]:
-    """Authenticate adapter identity and the current constant-empty events.
+    """Authenticate adapter identity and the sealed event-history semantic.
 
     All attempts are checked, including reserve/truncated games.  That matters
     because the audit publishes every shard as accepted source material even
     though only a deterministic game subset is selected for this learner.
     """
 
-    authority = _authenticated_empty_event_authority()
+    authority = (
+        _meaningful_public_event_authority()
+        if meaningful_public_history
+        else _authenticated_empty_event_authority()
+    )
     required = {"adapter_version", "event_tokens", "event_mask", "event_target_ids"}
     missing = sorted(required.difference(payload.files))
     if missing:
@@ -9196,6 +9343,49 @@ def _require_shard_feature_semantics(
         )
     if event_mask.dtype.kind != "b":
         raise ContractError(f"{where}: event_mask is not boolean")
+    event_tokens = np.asarray(payload["event_tokens"])
+    event_targets = np.asarray(payload["event_target_ids"])
+    if (
+        event_tokens.ndim != 3
+        or event_tokens.shape[:2] != event_mask.shape
+        or event_targets.ndim != 3
+        or event_targets.shape[:2] != event_mask.shape
+        or event_targets.shape[2] != 4
+    ):
+        raise ContractError(f"{where}: event tensors are not shape-aligned")
+    if event_tokens.dtype.kind not in "fc" or event_targets.dtype.kind not in "iu":
+        raise ContractError(f"{where}: event tensor dtypes violate the entity schema")
+    if np.any(~np.isfinite(event_tokens)):
+        raise ContractError(f"{where}: event_tokens contain non-finite values")
+    if meaningful_public_history:
+        if int(event_history_limit) != MEANINGFUL_PUBLIC_HISTORY_LIMIT:
+            raise ContractError(f"{where}: unreviewed event-history limit")
+        if int(event_mask.shape[1]) != int(event_history_limit):
+            raise ContractError(
+                f"{where}: event width {event_mask.shape[1]} differs from "
+                f"sealed limit {event_history_limit}"
+            )
+        active_markers = np.asarray(event_tokens[..., 0] != 0)
+        if not np.array_equal(active_markers, event_mask):
+            raise ContractError(
+                f"{where}: event token active markers disagree with event_mask"
+            )
+        scan = {
+            "schema": "training-meaningful-public-event-mask-scan-v1",
+            "row_count": rows,
+            "padded_event_width": int(event_mask.shape[1]),
+            "nonzero_event_mask_count": int(np.count_nonzero(event_mask)),
+        }
+        scan["scan_sha256"] = _digest_value(scan)
+        return {
+            "row_count": rows,
+            "entity_feature_adapter_version": expected_adapter,
+            "event_history": {
+                "authenticated_empty": False,
+                "semantic": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+                "event_mask_scan": scan,
+            },
+        }
     if np.any(event_mask):
         raise ContractError(f"{where}: authenticated-empty event_mask has live entries")
     empty_scan = {
@@ -9224,6 +9414,13 @@ _TARGET_ACTIVATION_COUNT_KEYS = (
     "policy_active_rows",
     "policy_inactive_rows",
     "value_active_rows",
+)
+_ADAPTIVE_TARGET_ACTIVATION_COUNT_KEYS = _TARGET_ACTIVATION_COUNT_KEYS + (
+    "randomized_non_forced_rows",
+    "randomized_full_search_non_forced_rows",
+    "randomized_fast_search_non_forced_rows",
+    "wide_full_search_non_forced_rows",
+    "mandatory_full_search_non_forced_rows",
 )
 
 
@@ -9255,6 +9452,7 @@ def _selected_target_activation_chunk(
     game_seeds: np.ndarray,
     selected_mask: np.ndarray,
     where: str,
+    wide_full_threshold: int | None = None,
 ) -> dict[str, Any]:
     """Authenticate the exact selected-row policy/value gradient switches.
 
@@ -9272,6 +9470,10 @@ def _selected_target_activation_chunk(
         "policy_weight_multiplier",
         "value_weight_multiplier",
     }
+    if wide_full_threshold is not None:
+        required.update(
+            {"target_policy_mask", "decision_class", "decision_taxonomy_schema"}
+        )
     missing = sorted(required.difference(payload.files))
     if missing:
         raise ContractError(
@@ -9312,6 +9514,49 @@ def _selected_target_activation_chunk(
     selected_policy = np.asarray(policy[mask], dtype=np.float64)
     selected_value = np.asarray(value[mask], dtype=np.float64)
     expected_policy = np.asarray(used_full & ~forced, dtype=np.uint8)
+    legal_width: np.ndarray | None = None
+    wide_non_forced: np.ndarray | None = None
+    mandatory_non_forced: np.ndarray | None = None
+    if wide_full_threshold is not None:
+        if isinstance(wide_full_threshold, bool) or int(wide_full_threshold) <= 1:
+            raise ContractError(f"{where}: invalid adaptive-wide threshold")
+        raw_target_mask = np.asarray(payload["target_policy_mask"])
+        if (
+            raw_target_mask.ndim != 2
+            or raw_target_mask.shape[0] != seeds.shape[0]
+            or raw_target_mask.dtype.kind != "b"
+        ):
+            raise ContractError(
+                f"{where}: target_policy_mask must be row-aligned boolean"
+            )
+        legal_width = np.asarray(
+            np.count_nonzero(raw_target_mask[mask], axis=1), dtype="<i8"
+        )
+        raw_decision_class = np.asarray(payload["decision_class"])
+        raw_taxonomy = np.asarray(payload["decision_taxonomy_schema"])
+        if (
+            raw_decision_class.shape != seeds.shape
+            or raw_taxonomy.shape != seeds.shape
+            or set(raw_taxonomy.astype(str).tolist())
+            != {DECISION_TAXONOMY_SCHEMA_VERSION}
+        ):
+            raise ContractError(
+                f"{where}: decision taxonomy is not row-aligned/current"
+            )
+        decision_class = np.asarray(raw_decision_class[mask]).astype(str)
+        mandatory_non_forced = np.asarray(
+            (~forced) & (decision_class == MANDATORY_CHOICE), dtype=np.bool_
+        )
+        wide_non_forced = np.asarray(
+            (~forced)
+            & ~mandatory_non_forced
+            & (legal_width >= int(wide_full_threshold)),
+            dtype=np.bool_,
+        )
+        if np.any((wide_non_forced | mandatory_non_forced) & ~used_full):
+            raise ContractError(
+                f"{where}: deterministic-full non-forced row did not receive full search"
+            )
 
     if np.any(~np.isfinite(selected_policy)) or np.any(
         (selected_policy != 0.0) & (selected_policy != 1.0)
@@ -9347,15 +9592,55 @@ def _selected_target_activation_chunk(
         "policy_inactive_rows": rows - full_rows,
         "value_active_rows": rows,
     }
-    row_activation_sha256 = _sha256_labeled_arrays(
-        (
-            ("game_seed", selected_seeds),
-            ("decision_index", selected_decision),
-            ("is_forced", forced.astype(np.uint8)),
-            ("used_full_search", used_full.astype(np.uint8)),
-            ("policy_weight_multiplier", expected_policy),
-            ("value_weight_multiplier", np.ones(rows, dtype=np.uint8)),
+    if wide_non_forced is not None and mandatory_non_forced is not None:
+        randomized = np.asarray(
+            (~forced) & ~wide_non_forced & ~mandatory_non_forced,
+            dtype=np.bool_,
         )
+        randomized_full = randomized & used_full
+        randomized_fast = randomized & ~used_full
+        counts.update(
+            {
+                "randomized_non_forced_rows": int(np.count_nonzero(randomized)),
+                "randomized_full_search_non_forced_rows": int(
+                    np.count_nonzero(randomized_full)
+                ),
+                "randomized_fast_search_non_forced_rows": int(
+                    np.count_nonzero(randomized_fast)
+                ),
+                "wide_full_search_non_forced_rows": int(
+                    np.count_nonzero(wide_non_forced)
+                ),
+                "mandatory_full_search_non_forced_rows": int(
+                    np.count_nonzero(mandatory_non_forced)
+                ),
+            }
+        )
+    activation_arrays: list[tuple[str, np.ndarray]] = [
+        ("game_seed", selected_seeds),
+        ("decision_index", selected_decision),
+        ("is_forced", forced.astype(np.uint8)),
+        ("used_full_search", used_full.astype(np.uint8)),
+        ("policy_weight_multiplier", expected_policy),
+        ("value_weight_multiplier", np.ones(rows, dtype=np.uint8)),
+    ]
+    if (
+        legal_width is not None
+        and wide_non_forced is not None
+        and mandatory_non_forced is not None
+    ):
+        activation_arrays.extend(
+            (
+                ("legal_width", legal_width),
+                ("wide_non_forced", wide_non_forced.astype(np.uint8)),
+                (
+                    "mandatory_non_forced",
+                    mandatory_non_forced.astype(np.uint8),
+                ),
+            )
+        )
+    row_activation_sha256 = _sha256_labeled_arrays(
+        activation_arrays
     )
     chunk: dict[str, Any] = {
         "schema_version": TARGET_ACTIVATION_CHUNK_SCHEMA,
@@ -9389,7 +9674,11 @@ def _normalize_target_activation_chunk(raw: object) -> dict[str, Any]:
         or not isinstance(chunk.get("source_sha256"), str)
         or re.fullmatch(r"sha256:[0-9a-f]{64}", chunk["source_sha256"]) is None
         or not isinstance(counts, Mapping)
-        or set(counts) != set(_TARGET_ACTIVATION_COUNT_KEYS)
+        or set(counts)
+        not in (
+            set(_TARGET_ACTIVATION_COUNT_KEYS),
+            set(_ADAPTIVE_TARGET_ACTIVATION_COUNT_KEYS),
+        )
         or any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in counts.values()
@@ -9413,6 +9702,7 @@ def _build_target_activation_report(
     *,
     categories: Sequence[str],
     sealed_p_full: float,
+    wide_full_threshold: int | None = None,
 ) -> dict[str, Any]:
     """Aggregate chunks and apply a fixed family-wise Bernoulli contract."""
 
@@ -9426,6 +9716,16 @@ def _build_target_activation_report(
     category_count = len(expected_categories)
     if category_count <= 0:
         raise ContractError("target-activation contract has no source categories")
+    adaptive = wide_full_threshold is not None
+    if adaptive and (
+        isinstance(wide_full_threshold, bool) or int(wide_full_threshold) <= 1
+    ):
+        raise ContractError("target-activation adaptive-wide threshold is invalid")
+    count_keys = (
+        _ADAPTIVE_TARGET_ACTIVATION_COUNT_KEYS
+        if adaptive
+        else _TARGET_ACTIVATION_COUNT_KEYS
+    )
     statistical_contract = {
         "method": "two_sided_hoeffding_familywise_v1",
         "familywise_alpha": TARGET_ACTIVATION_FAMILYWISE_ALPHA,
@@ -9433,6 +9733,17 @@ def _build_target_activation_report(
         "expected_non_forced_full_search_rate": 0.25,
         "allowed_count_deviation_formula": (
             "ceil(sqrt(n/2*ln(2*category_count/familywise_alpha)))"
+        ),
+        **(
+            {
+                "randomized_population": (
+                    "non-forced non-mandatory rows with legal_width below "
+                    "adaptive-wide threshold"
+                ),
+                "adaptive_wide_full_threshold": int(wide_full_threshold),
+            }
+            if adaptive
+            else {}
         ),
     }
     category_reports: dict[str, Any] = {}
@@ -9442,9 +9753,13 @@ def _build_target_activation_report(
             _normalize_target_activation_chunk(chunk)
             for chunk in chunks_by_category[category]
         ]
-        counts = {key: 0 for key in _TARGET_ACTIVATION_COUNT_KEYS}
+        counts = {key: 0 for key in count_keys}
         for chunk in chunks:
-            for key in _TARGET_ACTIVATION_COUNT_KEYS:
+            if set(chunk["counts"]) != set(count_keys):
+                raise ContractError(
+                    f"target-activation chunk mode drift for {category}"
+                )
+            for key in count_keys:
                 counts[key] += int(chunk["counts"][key])
         if (
             counts["forced_rows"] + counts["non_forced_rows"] != counts["rows"]
@@ -9460,8 +9775,34 @@ def _build_target_activation_report(
             raise ContractError(
                 f"target-activation counts are internally inconsistent for {category}"
             )
-        n = counts["non_forced_rows"]
-        observed = counts["full_search_non_forced_rows"]
+        if adaptive and (
+            counts["randomized_non_forced_rows"]
+            + counts["wide_full_search_non_forced_rows"]
+            + counts["mandatory_full_search_non_forced_rows"]
+            != counts["non_forced_rows"]
+            or counts["randomized_full_search_non_forced_rows"]
+            + counts["randomized_fast_search_non_forced_rows"]
+            != counts["randomized_non_forced_rows"]
+            or counts["randomized_full_search_non_forced_rows"]
+            + counts["wide_full_search_non_forced_rows"]
+            + counts["mandatory_full_search_non_forced_rows"]
+            != counts["full_search_non_forced_rows"]
+            or counts["randomized_fast_search_non_forced_rows"]
+            != counts["fast_search_non_forced_rows"]
+        ):
+            raise ContractError(
+                f"adaptive target-activation counts are inconsistent for {category}"
+            )
+        n = (
+            counts["randomized_non_forced_rows"]
+            if adaptive
+            else counts["non_forced_rows"]
+        )
+        observed = (
+            counts["randomized_full_search_non_forced_rows"]
+            if adaptive
+            else counts["full_search_non_forced_rows"]
+        )
         expected = float(n) * 0.25
         allowed = (
             0
@@ -9505,6 +9846,11 @@ def _build_target_activation_report(
         ),
         "value_activation_rule": "value_weight_multiplier == 1.0",
         "sealed_p_full": 0.25,
+        **(
+            {"adaptive_wide_full_threshold": int(wide_full_threshold)}
+            if adaptive
+            else {}
+        ),
         "statistical_contract": statistical_contract,
         "categories": category_reports,
         "categories_sha256": _digest_value(category_reports),
@@ -9519,6 +9865,7 @@ def _validate_target_activation_report(
     *,
     categories: Sequence[str],
     sealed_p_full: float,
+    wide_full_threshold: int | None = None,
 ) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise ContractError("post-wave audit has no target-activation contract")
@@ -9537,6 +9884,7 @@ def _validate_target_activation_report(
         chunks_by_category,
         categories=categories,
         sealed_p_full=sealed_p_full,
+        wide_full_threshold=wide_full_threshold,
     )
     if dict(raw) != rebuilt or rebuilt["passed"] is not True:
         raise ContractError("target-activation report/digest/statistical contract drift")
@@ -9618,10 +9966,19 @@ def audit_outputs(
     feature_semantic_rows = 0
     adapter_version_counts: Counter[str] = Counter()
     event_history_width_counts: Counter[int] = Counter()
+    event_history_nonzero_mask_count = 0
     public_award_generation_manifests = 0
     public_award_worker_manifests = 0
     required_target_information_regime = str(
         lock["post_wave_acceptance"]["require_target_information_regime"]
+    )
+    search_operator = lock["science"]["search_operator"]
+    wide_full_threshold = (
+        int(search_operator["n_full_wide_threshold"])
+        if bool(search_operator.get("wide_roots_always_full"))
+        and search_operator.get("n_full_wide") is not None
+        and search_operator.get("n_full_wide_threshold") is not None
+        else None
     )
     producer = _producer(lock)
     checkpoint_by_id = {record["id"]: record for record in lock["checkpoints"]}
@@ -9631,7 +9988,15 @@ def audit_outputs(
     expected_public_award_provenance = _expected_public_award_feature_provenance(
         rust_featurize=rust_featurize
     )
-    empty_event_authority = _authenticated_empty_event_authority()
+    meaningful_public_history = bool(
+        lock["generation"].get("meaningful_public_history", False)
+    )
+    event_history_limit = int(lock["generation"].get("event_history_limit", 64))
+    event_authority = (
+        _meaningful_public_event_authority()
+        if meaningful_public_history
+        else _authenticated_empty_event_authority()
+    )
     for job in lock["fleet"]["jobs"]:
         attestation_source = Path(job["output_dir"]) / "a1_contract.json"
         attestation_path = (
@@ -9815,7 +10180,7 @@ def audit_outputs(
                 errors.append(f"{job['job_id']}: {error}")
             else:
                 public_award_worker_manifests += 1
-            expected_adapter_version = empty_event_authority[
+            expected_adapter_version = event_authority[
                 "entity_feature_adapter_version"
             ]
             if worker_manifest.get("adapter_version") != expected_adapter_version:
@@ -9939,15 +10304,17 @@ def audit_outputs(
                             lock, job
                         )["effective_search_config_sha256"],
                         "evaluator_sha256": lock["science"]["evaluator_sha256"],
-                        "entity_feature_adapter_version": empty_event_authority[
+                        "entity_feature_adapter_version": event_authority[
                             "entity_feature_adapter_version"
                         ],
                         "public_award_feature_contract": (
                             PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
                         ),
-                        "event_history_semantic": empty_event_authority[
-                            "adapter_event_history_semantic"
-                        ],
+                        "event_history_semantic": (
+                            event_authority["event_history_semantic"]
+                            if meaningful_public_history
+                            else event_authority["adapter_event_history_semantic"]
+                        ),
                     }
                 shard_records.append(data_shard_record)
                 job_data_shard_records[canonical_shard] = data_shard_record
@@ -9974,19 +10341,27 @@ def audit_outputs(
                         payload,
                         rows=int(game_seeds.size),
                         where=f"{job['job_id']}:{canonical_shard.name}",
+                        meaningful_public_history=meaningful_public_history,
+                        event_history_limit=event_history_limit,
                     )
                     feature_semantic_rows += int(feature_semantics["row_count"])
                     adapter_version_counts.update(
                         [str(feature_semantics["entity_feature_adapter_version"])]
                         * int(feature_semantics["row_count"])
                     )
-                    event_history_width_counts[
-                        int(
-                            feature_semantics["event_history"][
-                                "empty_event_mask_scan"
-                            ]["padded_event_width"]
+                    event_scan = feature_semantics["event_history"][
+                        (
+                            "event_mask_scan"
+                            if meaningful_public_history
+                            else "empty_event_mask_scan"
                         )
+                    ]
+                    event_history_width_counts[
+                        int(event_scan["padded_event_width"])
                     ] += int(feature_semantics["row_count"])
+                    event_history_nonzero_mask_count += int(
+                        event_scan["nonzero_event_mask_count"]
+                    )
                     data_shard_record["feature_semantics_sha256"] = _digest_value(
                         feature_semantics
                     )
@@ -10159,6 +10534,7 @@ def audit_outputs(
                             game_seeds=game_seeds,
                             selected_mask=selected_mask,
                             where=f"{job['job_id']}:{shard.name}",
+                            wide_full_threshold=wide_full_threshold,
                         )
                         activation_chunk = {
                             "schema_version": TARGET_ACTIVATION_CHUNK_SCHEMA,
@@ -10282,25 +10658,21 @@ def audit_outputs(
         )
     if len(event_history_width_counts) > 1:
         errors.append(
-            "authenticated-empty event history uses mixed padded widths: "
+            "event history uses mixed padded widths: "
             f"{dict(event_history_width_counts)}"
+        )
+    if meaningful_public_history and event_history_nonzero_mask_count <= 0:
+        errors.append(
+            "meaningful-public-history wave contains no active event tokens"
         )
     target_activation_report: dict[str, Any] | None = None
     if enforce_target_activation:
         try:
-            search_operator = lock["science"]["search_operator"]
-            if (
-                search_operator.get("wide_roots_always_full") is not False
-                or search_operator.get("n_full_wide") is not None
-            ):
-                raise ContractError(
-                    "selected target-activation p_full proof requires no wide-root "
-                    "full-search override"
-                )
             target_activation_report = _build_target_activation_report(
                 target_activation_chunks,
                 categories=tuple(expected_games),
                 sealed_p_full=float(search_operator["p_full"]),
+                wide_full_threshold=wide_full_threshold,
             )
             if target_activation_report["passed"] is not True:
                 failed = [
@@ -10414,21 +10786,23 @@ def audit_outputs(
                 else [{**record, "arm_id": arm_id} for record in selected_records]
             ),
         }
-    adapter_version = str(empty_event_authority["entity_feature_adapter_version"])
+    adapter_version = str(event_authority["entity_feature_adapter_version"])
     padded_event_width = (
         next(iter(event_history_width_counts))
         if len(event_history_width_counts) == 1
         else None
     )
-    aggregate_empty_event_scan: dict[str, Any] = {
-        "schema": "training-empty-event-mask-scan-v1",
+    aggregate_event_scan: dict[str, Any] = {
+        "schema": (
+            "training-meaningful-public-event-mask-scan-v1"
+            if meaningful_public_history
+            else "training-empty-event-mask-scan-v1"
+        ),
         "row_count": feature_semantic_rows,
         "padded_event_width": padded_event_width,
-        "nonzero_event_mask_count": 0,
+        "nonzero_event_mask_count": event_history_nonzero_mask_count,
     }
-    aggregate_empty_event_scan["scan_sha256"] = _digest_value(
-        aggregate_empty_event_scan
-    )
+    aggregate_event_scan["scan_sha256"] = _digest_value(aggregate_event_scan)
     feature_semantics_report: dict[str, Any] = {
         "public_award_feature_provenance": {
             "expected": expected_public_award_provenance,
@@ -10445,14 +10819,23 @@ def audit_outputs(
             "row_counts": dict(adapter_version_counts),
         },
         "event_history": {
-            **empty_event_authority,
-            "authenticated_empty": True,
+            **event_authority,
+            "authenticated_empty": not meaningful_public_history,
+            **(
+                {"semantic": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION}
+                if meaningful_public_history
+                else {}
+            ),
             "row_count": feature_semantic_rows,
             "history_width_row_counts": {
                 str(width): count
                 for width, count in sorted(event_history_width_counts.items())
             },
-            "empty_event_mask_scan": aggregate_empty_event_scan,
+            (
+                "event_mask_scan"
+                if meaningful_public_history
+                else "empty_event_mask_scan"
+            ): aggregate_event_scan,
         },
     }
     feature_semantics_report["feature_semantics_sha256"] = _digest_value(
@@ -10540,9 +10923,11 @@ def audit_outputs(
                     expected_public_award_provenance
                 ),
                 "entity_feature_adapter_version": adapter_version,
-                "event_history_semantic": empty_event_authority[
-                    "adapter_event_history_semantic"
-                ],
+                "event_history_semantic": (
+                    event_authority["event_history_semantic"]
+                    if meaningful_public_history
+                    else event_authority["adapter_event_history_semantic"]
+                ),
             }
             for category in expected_games
         },

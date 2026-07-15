@@ -96,6 +96,39 @@ def test_composite_ack_binds_each_named_component_inventory() -> None:
     ]
 
 
+def test_composite_routes_fresh_history_and_acknowledged_legacy_replay() -> None:
+    fresh = _meta("3", implicit_zero=False)
+    fresh["event_history_payload_scan"] = {
+        "row_count": 3,
+        "payload_inventory_sha256": fresh["payload_inventory_sha256"],
+        "columns": {
+            "event_tokens": {"nonzero_count": 9},
+            "event_mask": {"nonzero_count": 3},
+        },
+    }
+    replay = _meta("4")
+    composite = {
+        "schema_version": "memmap_composite_v2",
+        "components": [
+            {"component_id": "fresh", "corpus_meta": fresh},
+            {"component_id": "replay", "corpus_meta": replay},
+        ],
+    }
+    contract = train_bc._a1_training_event_history_contract(
+        _args(
+            arch="entity_graph",
+            acknowledgements=[replay["payload_inventory_sha256"]],
+        ),
+        composite,
+        SimpleNamespace(use_graph_history_features=False),
+    )
+    assert contract["status"] == (
+        "partially_trainable_with_empty_components_acknowledged"
+    )
+    assert contract["training_event_history_trainable"] is True
+    assert contract["event_history_end_to_end_usable"] is True
+
+
 def test_non_event_arch_rejects_meaningless_ack() -> None:
     metadata = _meta("1")
     with pytest.raises(SystemExit, match="consumer is enabled"):

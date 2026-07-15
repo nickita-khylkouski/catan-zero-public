@@ -120,6 +120,22 @@ def test_next_wave_combined_upgrade_is_zero_initialized_and_binds_both_inputs():
     from tools import a1_function_preserving_upgrade as upgrade
 
     spec = upgrade.ALLOWLIST[
+        upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2
+    ]
+    assert spec["new_parameter_initialization"] == {
+        "meaningful_history_residual_gate": "zeros",
+        "public_card_count_residual.weight": "zeros",
+    }
+    assert spec["config_delta"]["public_card_count_features"] is True
+    assert spec["config_delta"]["public_card_count_residual_bias"] is False
+    assert spec["config_delta"]["meaningful_public_history"] is True
+    assert spec["config_delta"]["event_history_limit"] == 32
+
+
+def test_legacy_combined_upgrade_receipt_remains_bias_bearing_v1():
+    from tools import a1_function_preserving_upgrade as upgrade
+
+    spec = upgrade.ALLOWLIST[
         upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY
     ]
     assert spec["new_parameter_initialization"] == {
@@ -127,6 +143,4 @@ def test_next_wave_combined_upgrade_is_zero_initialized_and_binds_both_inputs():
         "public_card_count_residual.bias": "zeros",
         "public_card_count_residual.weight": "zeros",
     }
-    assert spec["config_delta"]["public_card_count_features"] is True
-    assert spec["config_delta"]["meaningful_public_history"] is True
-    assert spec["config_delta"]["event_history_limit"] == 32
+    assert "public_card_count_residual_bias" not in spec["config_delta"]

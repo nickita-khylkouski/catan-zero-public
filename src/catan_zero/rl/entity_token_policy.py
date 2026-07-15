@@ -332,6 +332,12 @@ class EntityGraphConfig:
     meaningful_public_history: bool = False
     meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
     event_history_limit: int = 64
+    # Legacy public-card checkpoints used a biased Linear residual.  Preserve
+    # that topology when this field is absent, while letting the v2 upgrade
+    # select a bias-free map.  With bias=False, an all-zero public-card row is
+    # guaranteed to contribute exactly zero even after the adapter is trained.
+    # Appended last for positional legacy-pickle compatibility.
+    public_card_count_residual_bias: bool = True
 
 
 class EntityGraphNet:
@@ -501,10 +507,15 @@ class EntityGraphNet:
                             f"{PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION!r}"
                         )
                     self.public_card_count_residual = nn.Linear(
-                        DEDUCTION_FEATURE_SIZE, h
+                        DEDUCTION_FEATURE_SIZE,
+                        h,
+                        bias=bool(
+                            getattr(cfg, "public_card_count_residual_bias", True)
+                        ),
                     )
                     nn.init.zeros_(self.public_card_count_residual.weight)
-                    nn.init.zeros_(self.public_card_count_residual.bias)
+                    if self.public_card_count_residual.bias is not None:
+                        nn.init.zeros_(self.public_card_count_residual.bias)
                 self.global_encoder = _token_encoder(GLOBAL_FEATURE_SIZE, h, dropout)
                 self.event_encoder = _token_encoder(EVENT_FEATURE_SIZE, h, dropout)
                 self.meaningful_public_history_enabled = bool(
@@ -1650,6 +1661,7 @@ class EntityGraphPolicy:
         public_card_count_feature_schema: str = (
             PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION
         ),
+        public_card_count_residual_bias: bool = True,
         meaningful_public_history: bool = False,
         meaningful_public_history_schema: str = (
             MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
@@ -1691,6 +1703,9 @@ class EntityGraphPolicy:
                 static_action_residual=bool(static_action_residual),
                 public_card_count_features=bool(public_card_count_features),
                 public_card_count_feature_schema=str(public_card_count_feature_schema),
+                public_card_count_residual_bias=bool(
+                    public_card_count_residual_bias
+                ),
                 meaningful_public_history=bool(meaningful_public_history),
                 meaningful_public_history_schema=str(
                     meaningful_public_history_schema

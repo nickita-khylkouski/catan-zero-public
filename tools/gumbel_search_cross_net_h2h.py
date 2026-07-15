@@ -1975,7 +1975,11 @@ def main() -> None:
     # without waiting for the whole run (the old single-write-at-end blindness).
     from pathlib import Path as _Path
 
-    progress_dir = _Path(args.out).parent / "progress"
+    # A run directory may contain several simultaneous panels (for example,
+    # candidate-vs-incumbent and candidate-vs-generator).  Key live telemetry
+    # by the report path so workers from one panel cannot overwrite another's
+    # otherwise-identical worker_NNN files.
+    progress_dir = _Path(f"{args.out}.progress")
     progress_dir.mkdir(parents=True, exist_ok=True)
 
     worker_args = []

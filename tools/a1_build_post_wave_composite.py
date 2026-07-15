@@ -581,17 +581,18 @@ def _validated_wave_inputs(
     raw_audit = _load_json(Path(audit["path"]))
     try:
         search_operator = lock["science"]["search_operator"]
-        if (
-            search_operator.get("wide_roots_always_full") is not False
-            or search_operator.get("n_full_wide") is not None
-        ):
-            raise contract.ContractError(
-                "current-wave target activation requires no wide-root override"
-            )
+        wide_full_threshold = (
+            int(search_operator["n_full_wide_threshold"])
+            if bool(search_operator.get("wide_roots_always_full"))
+            and search_operator.get("n_full_wide") is not None
+            and search_operator.get("n_full_wide_threshold") is not None
+            else None
+        )
         audit["target_activation"] = contract._validate_target_activation_report(  # noqa: SLF001
             raw_audit.get("target_activation"),
             categories=tuple(lock["game_contract"]["category_games"]),
             sealed_p_full=float(search_operator["p_full"]),
+            wide_full_threshold=wide_full_threshold,
         )
     except (KeyError, TypeError, ValueError, contract.ContractError) as error:
         raise CompositeBuildError(
@@ -914,6 +915,23 @@ def _filter_wave_shards(
                         game_seeds=seeds,
                         selected_mask=selected_mask,
                         where=f"{job_id}:{source.name}",
+                        wide_full_threshold=(
+                            int(
+                                lock["science"]["search_operator"][
+                                    "n_full_wide_threshold"
+                                ]
+                            )
+                            if bool(
+                                lock["science"]["search_operator"].get(
+                                    "wide_roots_always_full"
+                                )
+                            )
+                            and lock["science"]["search_operator"].get(
+                                "n_full_wide"
+                            )
+                            is not None
+                            else None
+                        ),
                     )
                     activation_chunk = {
                         "schema_version": contract.TARGET_ACTIVATION_CHUNK_SCHEMA,
@@ -1048,6 +1066,21 @@ def _filter_wave_shards(
             activation_chunks,
             categories=tuple(expected_games),
             sealed_p_full=float(lock["science"]["search_operator"]["p_full"]),
+            wide_full_threshold=(
+                int(
+                    lock["science"]["search_operator"][
+                        "n_full_wide_threshold"
+                    ]
+                )
+                if bool(
+                    lock["science"]["search_operator"].get(
+                        "wide_roots_always_full"
+                    )
+                )
+                and lock["science"]["search_operator"].get("n_full_wide")
+                is not None
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError, contract.ContractError) as error:
         raise CompositeBuildError(

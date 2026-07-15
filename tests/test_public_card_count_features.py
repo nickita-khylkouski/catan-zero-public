@@ -327,3 +327,38 @@ def test_card_count_residual_is_function_preserving_then_trainable():
         left = upgraded(batch)["logits"]
         right = upgraded(changed)["logits"]
     assert not torch.equal(left, right)
+
+
+def test_bias_free_card_count_residual_keeps_zero_input_exactly_zero_after_training():
+    torch.manual_seed(19)
+    base = EntityGraphNet(_config()).eval()
+    upgraded = EntityGraphNet(
+        _config(
+            public_card_count_features=True,
+            public_card_count_residual_bias=False,
+        )
+    ).eval()
+    missing, unexpected = upgraded.load_state_dict(base.state_dict(), strict=False)
+    assert unexpected == []
+    assert missing == ["public_card_count_residual.weight"]
+    assert upgraded.public_card_count_residual.bias is None
+
+    batch = _batch()
+    with torch.no_grad():
+        control = base(batch, return_q=True)
+        initial = upgraded(batch, return_q=True)
+    for key, expected in control.items():
+        assert torch.equal(initial[key], expected), key
+
+    with torch.no_grad():
+        upgraded.public_card_count_residual.weight.normal_(std=0.1)
+        zero_features = torch.zeros_like(batch[DEDUCTION_FEATURES_KEY])
+        zero_residual = upgraded.public_card_count_residual(zero_features)
+    assert torch.count_nonzero(zero_residual).item() == 0
+
+    changed = {key: value.clone() for key, value in batch.items()}
+    changed[DEDUCTION_FEATURES_KEY].zero_()
+    with torch.no_grad():
+        populated_logits = upgraded(batch)["logits"]
+        zero_input_logits = upgraded(changed)["logits"]
+    assert not torch.equal(populated_logits, zero_input_logits)

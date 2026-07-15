@@ -110,6 +110,19 @@ def test_public_card_count_upgrade_flag_is_explicit_and_default_off():
     assert overrides == {"public_card_count_features": True}
     upgraded = upgrade_tool._build_upgraded_config(base, overrides)
     assert upgraded.public_card_count_features is True
+    assert upgraded.public_card_count_residual_bias is True
+
+
+def test_bias_free_public_card_count_upgrade_is_explicit_v2():
+    base = EntityGraphConfig(action_size=607, static_action_feature_size=1)
+    overrides = upgrade_tool._parse_flags("card_count_v2")
+    assert overrides == {
+        "public_card_count_features": True,
+        "public_card_count_residual_bias": False,
+    }
+    upgraded = upgrade_tool._build_upgraded_config(base, overrides)
+    assert upgraded.public_card_count_features is True
+    assert upgraded.public_card_count_residual_bias is False
 
 
 def test_meaningful_history_upgrade_is_bounded_and_explicit():

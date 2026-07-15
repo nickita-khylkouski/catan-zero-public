@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 
+import numpy as np
 import pytest
 
 from catan_zero.rl.gumbel_self_play import (
@@ -21,6 +22,10 @@ if str(TOOLS) not in sys.path:
 from tools import generate_gumbel_selfplay_data as generator  # noqa: E402
 from tools import a1_pre_wave_contract as contract  # noqa: E402
 from tools import prelaunch_guard  # noqa: E402
+from tools.build_memmap_corpus import (  # noqa: E402
+    EVENT_STORAGE_WIDTH,
+    _normalize_event_storage_width,
+)
 
 
 CONFIG = (
@@ -30,6 +35,24 @@ CONFIG = (
 GUARD = REPO / "configs/guards/a1_generation_coherent_public_n128_adaptive256_v1.json"
 LEARNER = REPO / "configs/experiments/next_wave/one_dose_public_card_overrides.json"
 RUNBOOK = REPO / "configs/operations/a1-next-wave-coherent-public-v1/README.md"
+
+
+def test_meaningful_history_uses_legacy_compatible_memmap_width() -> None:
+    tokens = np.ones((2, 32, 41), dtype=np.float16)
+    targets = np.zeros((2, 32, 4), dtype=np.int16)
+    mask = np.ones((2, 32), dtype=np.bool_)
+    normalized = _normalize_event_storage_width(
+        {
+            "event_tokens": tokens,
+            "event_target_ids": targets,
+            "event_mask": mask,
+        }
+    )
+    assert normalized["event_tokens"].shape == (2, EVENT_STORAGE_WIDTH, 41)
+    assert np.array_equal(normalized["event_tokens"][:, :32], tokens)
+    assert not np.any(normalized["event_tokens"][:, 32:])
+    assert not np.any(normalized["event_mask"][:, 32:])
+    assert np.all(normalized["event_target_ids"][:, 32:] == -1)
 
 
 def test_next_wave_typed_generation_config_is_exact_schema_13_recipe() -> None:
@@ -166,18 +189,20 @@ def test_next_wave_learner_overrides_keep_unlisted_forced_types_at_one() -> None
 def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:
     text = RUNBOOK.read_text()
     assert "tools/generate_gumbel_selfplay_data.py" in text
-    assert "tools/a1_one_dose_train.py" in text
+    assert "tools/a1_iteration_orchestrator.py" in text
     assert "tools/gumbel_search_cross_net_h2h.py" in text
     assert "--forced-root-target-mode trajectory_only" in text
     assert "--coherent-public-belief-search" in text
     assert "--no-record-automatic-transitions" in text
     assert "--meaningful-public-history" in text
     assert "--event-history-limit 32" in text
-    assert "--flags card_count" in text
+    assert "--flags card_count_v2,meaningful_history" in text
     assert (
-        "entity_graph.public_card_count_features+meaningful_public_history.v1"
+        "entity_graph.public_card_count_features+meaningful_public_history.v2"
         in text
     )
+    assert "tools/a1_iteration_orchestrator.py initialize-next" in text
+    assert "tools/fleet/a1_h100_eval_fleet.py" in text
     assert "action-target gather experiment was neutral" in text
 
 
@@ -203,6 +228,13 @@ def _contract_fields(*, coherent: bool) -> tuple[dict, dict, dict]:
             }
         )
         generation["temperature_clock"] = "nonforced_choice"
+        generation.update(
+            {
+                "record_automatic_transitions": False,
+                "meaningful_public_history": True,
+                "event_history_limit": 32,
+            }
+        )
         regime = TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
     else:
         search.update(
@@ -292,10 +324,16 @@ def test_pre_wave_contract_binds_coherent_regime_and_runtime_fields(
     assert "--coherent-public-belief-search" in argv
     assert argv[argv.index("--forced-root-target-mode") + 1] == "trajectory_only"
     assert argv[argv.index("--temperature-clock") + 1] == "nonforced_choice"
+    assert "--no-record-automatic-transitions" in argv
+    assert "--meaningful-public-history" in argv
+    assert argv[argv.index("--event-history-limit") + 1] == "32"
     cli = contract._expected_cli_fields(lock, job)  # noqa: SLF001
     assert cli["coherent_public_belief_search"] is True
     assert cli["forced_root_target_mode"] == "trajectory_only"
     assert cli["temperature_clock"] == "nonforced_choice"
+    assert cli["record_automatic_transitions"] is False
+    assert cli["meaningful_public_history"] is True
+    assert cli["event_history_limit"] == 32
 
     # S1 owns the independent c_scale receipt; this test isolates the guard's
     # exact coherent operator/temperature binding from that evidence fixture.

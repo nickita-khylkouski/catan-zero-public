@@ -53,7 +53,11 @@ def _semantic_column_schema(schema: dict[str, Any]) -> tuple[Any, ...]:
     kind = schema.get("kind")
     common = (kind, np.dtype(schema.get("dtype", "float32")).str)
     if kind in {"fixed", "implicit_constant"}:
-        return (*common, tuple(schema.get("inner_shape", ())), schema.get("fill"))
+        # ``implicit_constant`` is a storage optimization for an ordinary
+        # decoded fixed array.  Fresh meaningful event columns are physical
+        # while legacy replay is authenticated implicit-zero; their decoded
+        # tensor ABI is compatible when dtype/shape agree.
+        return ("fixed", common[1], tuple(schema.get("inner_shape", ())))
     if kind == "ragged3d":
         return (*common, int(schema.get("feat", 0)), schema.get("fill"))
     if kind == "ragged2d":

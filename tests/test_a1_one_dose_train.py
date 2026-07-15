@@ -186,7 +186,7 @@ def _fake_public_card_upgrade(verified: dict, tmp_path: Path) -> dict:
     receipt = tmp_path / "public-card-upgrade.receipt.json"
     receipt.write_text("{}")
     return {
-        "module": executor.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+        "module": executor.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
         "source": dict(verified["producer"]),
         "upgraded_initializer": {
             "path": str(initializer.resolve()),
@@ -1698,7 +1698,7 @@ def test_reviewed_public_card_one_dose_renders_exact_eight_b200_command(
     )
 
     assert arm["function_preserving_upgrade"]["module"] == (
-        executor.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES
+        executor.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2
     )
     assert arm["function_preserving_upgrade"]["module"] != (
         executor.architecture_upgrade.MODULE_TARGET_GATHER

@@ -129,6 +129,13 @@ def _parse_flags(raw: str) -> dict[str, object]:
         elif entry in ("card_count", "public_card_count_features"):
             overrides["public_card_count_features"] = True
         elif entry in (
+            "card_count_v2",
+            "public_card_count_features_v2",
+            "bias_free_card_count",
+        ):
+            overrides["public_card_count_features"] = True
+            overrides["public_card_count_residual_bias"] = False
+        elif entry in (
             "history",
             "meaningful_history",
             "meaningful_public_history",

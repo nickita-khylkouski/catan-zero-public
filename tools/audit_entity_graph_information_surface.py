@@ -343,11 +343,10 @@ def enforce_graph_history_contract(
 def native_inference_event_history_capability() -> dict[str, Any]:
     """Describe the checked-in native inference event-information surface.
 
-    This is deliberately not a caller-controlled boolean.  Both native paths
-    are constant-empty in the current source: the Rust featurizer allocates a
-    false ``event_mask`` and the Rust-snapshot adapter supplies ``event_log=[]``.
-    The entity schema is recorded so a future implementation must deliberately
-    revise this contract when it starts carrying public events end to end.
+    This is deliberately not a caller-controlled boolean.  The legacy/default
+    checkpoint profile leaves meaningful history disabled, so the snapshot
+    adapter supplies ``event_log=[]``.  Fresh opt-in checkpoints are described
+    separately by :func:`native_meaningful_public_history_capability`.
     """
 
     from catan_zero.rl.entity_token_features import ENTITY_TOKEN_SCHEMA_VERSION
@@ -361,8 +360,37 @@ def native_inference_event_history_capability() -> dict[str, Any]:
             "catan_zero.search.neural_rust_mcts._entity_payload_from_rust_snapshot",
         ],
         "evidence": [
-            "native Rust entity featurizer emits constant-zero event_tokens/event_mask",
-            "Rust snapshot adapter emits an empty event_log",
+            "legacy checkpoint profile does not opt into meaningful public history",
+            "Rust snapshot adapter emits an empty event_log when opt-in is false",
+        ],
+    }
+
+
+def native_meaningful_public_history_capability() -> dict[str, Any]:
+    """Describe the reviewed opt-in native public-history surface.
+
+    The legacy adapter contract above remains default-empty for old checkpoints
+    and corpora.  Fresh v1.6 checkpoints opt into a separate bounded semantic:
+    both native feature providers filter public action records before keeping
+    the most recent 32 strategic events.
+    """
+
+    from catan_zero.rl.entity_token_features import ENTITY_TOKEN_SCHEMA_VERSION
+    from catan_zero.rl.meaningful_history import (
+        MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    )
+
+    return {
+        "schema": "native-meaningful-public-history-capability-v1",
+        "entity_token_schema": ENTITY_TOKEN_SCHEMA_VERSION,
+        "available": True,
+        "opt_in": True,
+        "history_schema": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+        "history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        "providers": [
+            "catanatron_rs.build_entity_features_flat",
+            "catan_zero.search.neural_rust_mcts._entity_payload_from_rust_snapshot",
         ],
     }
 
@@ -521,7 +549,11 @@ def build_a1_training_event_history_contract(
         del component["pre_acknowledgement_disposition"]
 
     any_trainable = trainable_components > 0
-    native_capability = native_inference_event_history_capability()
+    native_capability = (
+        native_meaningful_public_history_capability()
+        if any_trainable
+        else native_inference_event_history_capability()
+    )
     if any_trainable and native_capability["available"] is not True:
         raise InformationSurfaceError(
             "A1 corpus proves nonzero event history but native inference does not "

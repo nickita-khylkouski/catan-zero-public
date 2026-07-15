@@ -544,6 +544,12 @@ def initialize_next(
     training_receipt: Path,
     python: Path,
     gpu: int,
+    topology: str = one_dose.LEGACY_SINGLE_GPU_TOPOLOGY,
+    ddp_canary_receipt: Path | None = None,
+    ablation_id: str = "",
+    recipe_overrides_json: str = "",
+    ablation_code_tree_sha256: str = "",
+    reviewed_lock_file_sha256: str = "",
     composite_build_receipt: Path | None = None,
     verify_fn: Callable[..., dict[str, Any]] = one_dose.verify_training_inputs,
     turn_builder: Callable[..., dict[str, Any]] = flywheel.build_turn,
@@ -552,6 +558,33 @@ def initialize_next(
 
     if gpu < 0:
         raise IterationError("gpu must be non-negative")
+    if topology not in one_dose.TRAINING_TOPOLOGIES:
+        raise IterationError(f"unknown one-dose topology {topology!r}")
+    if topology == one_dose.B200_8GPU_DDP_TOPOLOGY and ddp_canary_receipt is None:
+        raise IterationError("8-GPU next-turn dose requires --ddp-canary-receipt")
+    ablation_values = (
+        ablation_id,
+        recipe_overrides_json,
+        ablation_code_tree_sha256,
+        reviewed_lock_file_sha256,
+    )
+    if any(ablation_values) and not all(ablation_values):
+        raise IterationError(
+            "next-turn learner ablation requires id, overrides, code-tree SHA, "
+            "and reviewed lock SHA together"
+        )
+    dose_options = {
+        "topology": topology,
+        "ddp_canary_receipt": (
+            None
+            if ddp_canary_receipt is None
+            else _file_ref(ddp_canary_receipt, where="DDP canary receipt")
+        ),
+        "ablation_id": ablation_id,
+        "recipe_overrides_json": recipe_overrides_json,
+        "ablation_code_tree_sha256": ablation_code_tree_sha256,
+        "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
+    }
     python_ref = _executable_ref(python, where="learner python")
     try:
         verified = _verify_training_binding(
@@ -632,6 +665,7 @@ def initialize_next(
             or actual_paths != expected_paths
             or training.get("python") != python_ref
             or training.get("gpu") != gpu
+            or training.get("dose_options") != dose_options
         ):
             raise IterationError(
                 "existing next-turn state differs from requested initialization"
@@ -700,6 +734,7 @@ def initialize_next(
             "receipt": _new_path(training_receipt, where="training receipt"),
             "python": python_ref,
             "gpu": gpu,
+            "dose_options": dose_options,
         },
         "training_plan": None,
         "training_outputs": None,
@@ -905,6 +940,28 @@ def _dose_argv(state: dict[str, Any], *, go: bool) -> list[str]:
         receipt = initializer.get("receipt") if isinstance(initializer, dict) else None
         if receipt is not None:
             argv.extend(["--architecture-upgrade-receipt", str(receipt["path"])])
+        options = training.get("dose_options")
+        if isinstance(options, dict):
+            topology = str(
+                options.get("topology", one_dose.LEGACY_SINGLE_GPU_TOPOLOGY)
+            )
+            argv.extend(["--topology", topology])
+            canary = options.get("ddp_canary_receipt")
+            if isinstance(canary, dict):
+                argv.extend(["--ddp-canary-receipt", str(canary["path"])])
+            if options.get("ablation_id"):
+                argv.extend(
+                    [
+                        "--ablation-id",
+                        str(options["ablation_id"]),
+                        "--recipe-overrides-json",
+                        str(options["recipe_overrides_json"]),
+                        "--ablation-code-tree-sha256",
+                        str(options["ablation_code_tree_sha256"]),
+                        "--reviewed-lock-file-sha256",
+                        str(options["reviewed_lock_file_sha256"]),
+                    ]
+                )
     if go:
         argv.append("--go")
     return argv
@@ -1802,6 +1859,16 @@ def build_parser() -> argparse.ArgumentParser:
     next_init.add_argument("--training-receipt", required=True, type=Path)
     next_init.add_argument("--python", type=Path, default=Path(sys.executable))
     next_init.add_argument("--gpu", type=int, default=0)
+    next_init.add_argument(
+        "--topology",
+        choices=sorted(one_dose.TRAINING_TOPOLOGIES),
+        default=one_dose.LEGACY_SINGLE_GPU_TOPOLOGY,
+    )
+    next_init.add_argument("--ddp-canary-receipt", type=Path)
+    next_init.add_argument("--ablation-id", default="")
+    next_init.add_argument("--recipe-overrides-json", default="")
+    next_init.add_argument("--ablation-code-tree-sha256", default="")
+    next_init.add_argument("--reviewed-lock-file-sha256", default="")
     retry = sub.add_parser(
         "adopt-retry",
         help="adopt the authorized completed v4 retry without rerunning training",
@@ -1869,6 +1936,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 training_receipt=args.training_receipt,
                 python=args.python,
                 gpu=args.gpu,
+                topology=args.topology,
+                ddp_canary_receipt=args.ddp_canary_receipt,
+                ablation_id=args.ablation_id,
+                recipe_overrides_json=args.recipe_overrides_json,
+                ablation_code_tree_sha256=args.ablation_code_tree_sha256,
+                reviewed_lock_file_sha256=args.reviewed_lock_file_sha256,
             )
         elif args.command == "adopt-retry":
             result = adopt_completed_retry(

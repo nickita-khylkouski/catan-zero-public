@@ -16,6 +16,20 @@ def _module():
     return module
 
 
+def test_fixed_and_implicit_constant_columns_share_decoded_schema() -> None:
+    module = _module()
+    fixed = {"kind": "fixed", "dtype": "<f2", "inner_shape": [64, 41]}
+    implicit = {
+        "kind": "implicit_constant",
+        "dtype": "<f2",
+        "inner_shape": [64, 41],
+        "fill": 0,
+    }
+    assert module._semantic_column_schema(fixed) == (  # noqa: SLF001
+        module._semantic_column_schema(implicit)  # noqa: SLF001
+    )
+
+
 class _TrackedColumn:
     def __init__(self, array: np.ndarray):
         self.array = np.asarray(array)

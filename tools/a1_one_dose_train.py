@@ -1416,6 +1416,7 @@ def _verify_production_composite_inputs(
             "event-history admission"
         )
     component_metadata: dict[str, dict[str, Any]] = {}
+    component_payload_scans: dict[str, dict[str, Any]] = {}
     event_history_component_authority: list[dict[str, str]] = []
     for expected_id, component in zip(expected_ids, raw_components, strict=True):
         nested = component.get("corpus_meta") if isinstance(component, dict) else None
@@ -1436,18 +1437,36 @@ def _verify_production_composite_inputs(
                 f"expected={expected_id!r}"
             )
         component_metadata[expected_id] = nested
+        payload_scan = nested.get("event_history_payload_scan")
+        if payload_scan is not None:
+            if not isinstance(payload_scan, dict):
+                raise ExecutorError(
+                    f"production component {expected_id!r} has malformed "
+                    "event-history payload scan"
+                )
+            component_payload_scans[expected_id] = payload_scan
         event_history_component_authority.append(
             {
                 "component_id": expected_id,
                 "payload_inventory_sha256": inventory_sha256,
             }
         )
-    event_history_acknowledgements = sorted(
-        {
-            str(component["payload_inventory_sha256"])
-            for component in component_metadata.values()
-        }
-    )
+    event_history_acknowledgements: list[str] = []
+    try:
+        for component_id, component in component_metadata.items():
+            corpus_audit = information_surface.audit_memmap_metadata(
+                component,
+                payload_scan=component_payload_scans.get(component_id),
+            )
+            if corpus_audit.get("event_history_trainable") is not True:
+                event_history_acknowledgements.append(
+                    str(component["payload_inventory_sha256"])
+                )
+    except information_surface.InformationSurfaceError as error:
+        raise ExecutorError(
+            f"production component event-history audit refused: {error}"
+        ) from error
+    event_history_acknowledgements.sort()
     try:
         event_history_training_contract = (
             information_surface.build_a1_training_event_history_contract(
@@ -1457,23 +1476,39 @@ def _verify_production_composite_inputs(
                 empty_payload_inventory_acknowledgements=(
                     event_history_acknowledgements
                 ),
+                component_payload_scans=component_payload_scans,
             )
         )
     except (KeyError, information_surface.InformationSurfaceError) as error:
         raise ExecutorError(
             f"production composite event-history admission refused: {error}"
         ) from error
-    if (
-        event_history_training_contract.get("training_event_history_trainable")
-        is not False
-        or event_history_training_contract.get("event_history_end_to_end_usable")
-        is not False
-        or event_history_training_contract.get("status")
-        != "empty_payloads_acknowledged"
+    event_history_trainable = event_history_training_contract.get(
+        "training_event_history_trainable"
+    )
+    event_history_usable = event_history_training_contract.get(
+        "event_history_end_to_end_usable"
+    )
+    event_history_status = event_history_training_contract.get("status")
+    if not (
+        (
+            event_history_trainable is True
+            and event_history_usable is True
+            and event_history_status
+            in {
+                "verified_nonzero",
+                "partially_trainable_with_empty_components_acknowledged",
+            }
+        )
+        or (
+            event_history_trainable is False
+            and event_history_usable is False
+            and event_history_status == "empty_payloads_acknowledged"
+        )
     ):
         raise ExecutorError(
-            "production composite event history is no longer uniformly empty; "
-            "the frozen event-encoder crop is not authorized"
+            "production composite event-history contract is neither the legacy "
+            "authenticated-empty surface nor trainable meaningful public history"
         )
     contract = meta.get("production_mix_contract")
     learner_overrides = meta.get("learner_recipe_overrides")
@@ -2346,8 +2381,10 @@ def bind_learner_ablation(
         in {
             architecture_upgrade.MODULE_TARGET_GATHER,
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
             architecture_upgrade.MODULE_MEANINGFUL_PUBLIC_HISTORY,
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
+            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
         }
     )
     # These reviewed modules are exact zero-output initializers. The generic
@@ -2369,7 +2406,9 @@ def bind_learner_ablation(
         and upgrade.get("module")
         in {
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
+            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
         }
     ):
         raise ExecutorError(
@@ -4119,7 +4158,9 @@ def _build_direct_train_command(
     upgrade_module = verified.get("function_preserving_upgrade", {}).get("module")
     if upgrade_module in {
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+        architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
+        architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
     }:
         # Make the reviewed architecture delta visible in argv as well as the
         # initializer receipt. train_bc independently verifies that this flag
@@ -4128,6 +4169,7 @@ def _build_direct_train_command(
     if upgrade_module in {
         architecture_upgrade.MODULE_MEANINGFUL_PUBLIC_HISTORY,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
+        architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
     }:
         command.extend(
             ["--meaningful-public-history", "--event-history-limit", "32"]
@@ -4310,21 +4352,31 @@ def _build_direct_train_command(
             if isinstance(event_history_contract, dict)
             else None
         )
+        trainable_history = event_history_contract.get(
+            "training_event_history_trainable"
+        )
+        usable_history = event_history_contract.get(
+            "event_history_end_to_end_usable"
+        )
         if (
             not isinstance(acknowledgements, list)
-            or not acknowledgements
             or any(not isinstance(value, str) for value in acknowledgements)
-            or event_history_contract.get("training_event_history_trainable")
-            is not False
-            or event_history_contract.get("event_history_end_to_end_usable")
-            is not False
+            or (trainable_history is True and usable_history is not True)
+            or (trainable_history is False and usable_history is not False)
+            or trainable_history not in {True, False}
         ):
             raise ExecutorError(
-                "production composite lacks its authenticated empty event-history contract"
+                "production composite lacks a coherent authenticated "
+                "event-history contract"
             )
         for acknowledgement in acknowledgements:
             command.extend([EVENT_HISTORY_ACK_FLAG, acknowledgement])
-        command.append(EVENT_HISTORY_CROP_FLAG)
+        if trainable_history is False:
+            if not acknowledgements:
+                raise ExecutorError(
+                    "empty production event history lacks payload acknowledgements"
+                )
+            command.append(EVENT_HISTORY_CROP_FLAG)
     if verified.get("data_kind") != "production_composite_v2":
         command.extend(
             [
@@ -7080,12 +7132,30 @@ def _require_production_event_history_surface(
     row_count: int,
     where: str,
 ) -> None:
-    """Require the authenticated empty-history crop in a report/checkpoint."""
+    """Require the authenticated production history surface in an artifact."""
 
     if not isinstance(surface, dict) or any(
         surface.get(key) != value for key, value in expected_contract.items()
     ):
         raise ExecutorError(f"{where} event-history contract drifted")
+    if expected_contract.get("training_event_history_trainable") is True:
+        native = expected_contract.get("native_inference")
+        expected_width = (
+            native.get("history_limit") if isinstance(native, dict) else None
+        )
+        if (
+            not isinstance(expected_width, int)
+            or expected_width < 1
+            or surface.get("training_event_tensor_width") != expected_width
+            or "empty_event_mask_scan" in surface
+            or "event_encoder_freeze" in surface
+        ):
+            raise ExecutorError(
+                f"{where} did not preserve the authenticated meaningful-history "
+                "axis and trainable event encoder"
+            )
+        return
+
     scan = surface.get("empty_event_mask_scan")
     freeze = surface.get("event_encoder_freeze")
     if (

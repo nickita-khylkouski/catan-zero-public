@@ -274,7 +274,7 @@ def test_a1_training_contract_rejects_unbound_inventory_identity() -> None:
         )
 
 
-def test_a1_training_contract_rejects_nonzero_train_native_empty_skew() -> None:
+def test_a1_training_contract_admits_reviewed_meaningful_public_history() -> None:
     metadata = {"fresh": _a1_meta("3", implicit_zero=False)}
     scan = {
         "payload_inventory_sha256": metadata["fresh"]["payload_inventory_sha256"],
@@ -284,13 +284,17 @@ def test_a1_training_contract_rejects_nonzero_train_native_empty_skew() -> None:
             "event_mask": {"nonzero_count": 2},
         },
     }
-    with pytest.raises(InformationSurfaceError, match="train/deploy"):
-        build_a1_training_event_history_contract(
-            metadata,
-            graph_history_features=True,
-            event_history_consumer_enabled=True,
-            component_payload_scans={"fresh": scan},
-        )
+    report = build_a1_training_event_history_contract(
+        metadata,
+        graph_history_features=True,
+        event_history_consumer_enabled=True,
+        component_payload_scans={"fresh": scan},
+    )
+    assert report["status"] == "verified_nonzero"
+    assert report["training_event_history_trainable"] is True
+    assert report["native_inference"]["available"] is True
+    assert report["native_inference"]["history_limit"] == 32
+    assert report["event_history_end_to_end_usable"] is True
 
 
 def test_a1_training_contract_rejects_scan_for_different_inventory() -> None:
@@ -339,5 +343,5 @@ def test_native_empty_capability_matches_checked_in_feature_sources() -> None:
     adapter = (root / "src/catan_zero/search/neural_rust_mcts.py").read_text()
     capability = native_inference_event_history_capability()
     assert capability["available"] is False
-    assert "let event_mask = vec![false; ENTITY_EVENT_HISTORY_LIMIT]" in rust
-    assert '"event_log": []' in adapter
+    assert "if meaningful_public_history" in rust
+    assert "if meaningful_public_history\n            else []" in adapter

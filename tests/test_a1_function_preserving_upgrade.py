@@ -252,6 +252,58 @@ def test_receipt_replays_exact_allowlisted_zero_diff_upgrade(tmp_path: Path) -> 
         )
 
 
+def test_bias_free_public_card_v2_upgrade_has_only_zero_weight_delta(
+    tmp_path: Path,
+) -> None:
+    source, _gather = _checkpoints(tmp_path)
+    initializer = tmp_path / "champion-public-card-v2.pt"
+    raw = torch.load(source, map_location="cpu", weights_only=False)
+    raw["model"] = {
+        **raw["model"],
+        "public_card_count_residual.weight": torch.zeros(3, 11),
+    }
+    flags = {
+        "public_card_count_features": True,
+        "public_card_count_residual_bias": False,
+    }
+    raw["config"] = {"fields": {**raw["config"]["fields"], **flags}}
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": upgrade._sha(source).removeprefix(  # noqa: SLF001
+            "sha256:"
+        ),
+        "flags": flags,
+        "initialization_seed": 1,
+        "trained_value_readouts_added": [],
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+    }
+    torch.save(raw, initializer)
+
+    evidence = upgrade.inspect_upgrade(
+        source,
+        initializer,
+        module=upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
+    )
+    assert evidence["new_parameters"] == [
+        "public_card_count_residual.weight"
+    ]
+    assert evidence["new_parameter_initialization"] == {
+        "public_card_count_residual.weight": "zeros"
+    }
+    assert evidence["flags"] == flags
+
+
+def test_default_true_card_bias_is_omitted_only_from_legacy_receipt_digest_view():
+    legacy = {"state_layers": 6, "public_card_count_residual_bias": True}
+    bias_free = {"state_layers": 6, "public_card_count_residual_bias": False}
+
+    assert upgrade._effective_config_receipt_view(legacy) == {  # noqa: SLF001
+        "state_layers": 6
+    }
+    assert upgrade._effective_config_receipt_view(bias_free) == bias_free  # noqa: SLF001
+
+
 def test_receipt_replays_combined_topology_target_gather_upgrade(tmp_path: Path) -> None:
     source, initializer = _topology_checkpoints(tmp_path)
     evidence = upgrade.inspect_upgrade(

@@ -909,9 +909,12 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert recipe["training_rng_rank_offset"] is True
     assert recipe["per_game_value_weight"] is False
     assert "$.promotion_handoff.path" in unresolved
-    assert payload["science"]["search"]["n_full_wide"] is None
-    assert payload["science"]["search"]["n_full_wide_threshold"] is None
-    assert payload["science"]["search"]["wide_roots_always_full"] is False
+    assert payload["science"]["search"]["n_full_wide"] == 256
+    assert payload["science"]["search"]["n_full_wide_threshold"] == 20
+    assert payload["science"]["search"]["wide_roots_always_full"] is True
+    assert payload["generation"]["meaningful_public_history"] is True
+    assert payload["generation"]["record_automatic_transitions"] is False
+    assert payload["fleet"]["output_root"] == "__UNRESOLVED__"
     assert "$.science.search.n_full_wide" not in unresolved
     assert "$.science.evaluator.value_readout" in unresolved
     assert "$.checkpoints[1].path" in unresolved
@@ -3284,6 +3287,63 @@ def test_target_activation_rate_contract_rejects_full_search_regression(
     assert report["categories"]["current_producer"][
         "full_search_rate_passed"
     ] is False
+
+
+def test_adaptive_target_activation_excludes_mandatory_full_roots_from_pfull(
+    tmp_path: Path,
+) -> None:
+    randomized_rows = 1_000
+    mandatory_rows = 100
+    rows = randomized_rows + mandatory_rows
+    used_full = np.zeros(rows, dtype=bool)
+    used_full[:250] = True
+    used_full[randomized_rows:] = True
+    decision_class = np.full(rows, "normal_choice", dtype="U32")
+    decision_class[randomized_rows:] = "mandatory_choice"
+    arrays = {
+        "game_seed": np.arange(rows, dtype=np.int64),
+        "decision_index": np.zeros(rows, dtype=np.int32),
+        "is_forced": np.zeros(rows, dtype=bool),
+        "used_full_search": used_full,
+        "policy_weight_multiplier": used_full.astype(np.float32),
+        "value_weight_multiplier": np.ones(rows, dtype=np.float32),
+        "target_policy_mask": np.ones((rows, 5), dtype=bool),
+        "decision_class": decision_class,
+        "decision_taxonomy_schema": np.full(
+            rows,
+            contract.DECISION_TAXONOMY_SCHEMA_VERSION,
+            dtype="U64",
+        ),
+    }
+    shard = tmp_path / "target-activation-mandatory.npz"
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        raw_chunk = contract._selected_target_activation_chunk(  # noqa: SLF001
+            payload,
+            game_seeds=arrays["game_seed"],
+            selected_mask=np.ones(rows, dtype=bool),
+            where="fixture",
+            wide_full_threshold=20,
+        )
+    chunk = {
+        "schema_version": contract.TARGET_ACTIVATION_CHUNK_SCHEMA,
+        "job_id": "gpu0__current_producer",
+        "source_sha256": "sha256:" + "b" * 64,
+        "counts": raw_chunk["counts"],
+        "counts_sha256": raw_chunk["counts_sha256"],
+        "row_activation_sha256": raw_chunk["row_activation_sha256"],
+    }
+    chunk["chunk_sha256"] = contract._digest_value(chunk)  # noqa: SLF001
+    report = contract._build_target_activation_report(  # noqa: SLF001
+        {"current_producer": [chunk]},
+        categories=("current_producer",),
+        sealed_p_full=0.25,
+        wide_full_threshold=20,
+    )
+    counts = report["categories"]["current_producer"]["counts"]
+    assert report["passed"] is True
+    assert counts["randomized_non_forced_rows"] == randomized_rows
+    assert counts["mandatory_full_search_non_forced_rows"] == mandatory_rows
 
 
 def test_single_read_registry_evidence_rejects_in_place_mutation(

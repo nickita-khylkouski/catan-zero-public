@@ -24,6 +24,9 @@ AUDIT_SCHEMAS = {
     "a1-dual-arm-post-wave-audit-v1",
     "a1-dual-arm-derived-post-wave-audit-v1",
 }
+V16_COMBINED_ARCHITECTURE_PROFILE = (
+    "a1-v1.6-public-card-count-meaningful-history-bias-free-v2"
+)
 
 
 class FlywheelTurnError(RuntimeError):
@@ -364,6 +367,13 @@ def build_turn(
             "receipt_sha256": replayed["receipt_sha256"],
             "module": replayed["module"],
         }
+        if (
+            replayed["module"]
+            == upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2
+        ):
+            initializer_binding["architecture_profile"] = (
+                V16_COMBINED_ARCHITECTURE_PROFILE
+            )
 
     dethroned = promotion["champion"]["sha256"]
     value: dict[str, Any] = {

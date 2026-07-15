@@ -196,6 +196,7 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
 # disk -- one corpus serves both masked and unmasked training regimes.
 _MASK_HIDDEN_INFO_PLAYER_TOKENS = False
 _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = False
+_MEANINGFUL_EVENT_HISTORY_LIMIT: int | None = None
 _PUBLIC_AWARD_FEATURE_CONTRACT = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
 _PUBLIC_CARD_COUNT_FEATURES_ENABLED = False
 
@@ -9176,6 +9177,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args, a1_preflight_meta, env_config
     )
     global _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY
+    global _MEANINGFUL_EVENT_HISTORY_LIMIT
     if bool(args.crop_authenticated_empty_event_history):
         if (
             training_information_surface is None
@@ -9201,8 +9203,44 @@ def main(argv: Sequence[str] | None = None) -> None:
             "empty_event_mask_scan": empty_scan,
         }
         _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = True
+        _MEANINGFUL_EVENT_HISTORY_LIMIT = None
     else:
         _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = False
+        _MEANINGFUL_EVENT_HISTORY_LIMIT = None
+        if (
+            training_information_surface is not None
+            and training_information_surface.get("training_event_history_trainable")
+            is True
+        ):
+            token_shape = tuple(int(value) for value in data["event_tokens"].shape)
+            mask_shape = tuple(int(value) for value in data["event_mask"].shape)
+            native = training_information_surface.get("native_inference")
+            expected_width = (
+                native.get("history_limit") if isinstance(native, dict) else None
+            )
+            if (
+                len(token_shape) != 3
+                or len(mask_shape) != 2
+                or token_shape[:2] != mask_shape
+                or not isinstance(expected_width, int)
+                or token_shape[1] < expected_width
+            ):
+                raise SystemExit(
+                    "authenticated meaningful event-history tensor shape drift: "
+                    f"tokens={token_shape} mask={mask_shape} "
+                    f"expected_width={expected_width}"
+                )
+            # Fresh history has a reviewed semantic width of 32, while the
+            # memmap intentionally retains the historical width-64 storage ABI
+            # for zero-copy mixing with replay. Crop batches to the semantic
+            # width so training and native serving consume the same tokens and
+            # do not pay attention cost for the padded tail.
+            _MEANINGFUL_EVENT_HISTORY_LIMIT = int(expected_width)
+            training_information_surface = {
+                **training_information_surface,
+                "training_event_tensor_width": int(expected_width),
+                "event_storage_tensor_width": int(token_shape[1]),
+            }
     _rank0_print(
         json.dumps(
             {
@@ -12684,6 +12722,15 @@ def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
             (batch_size, 0, target_width), dtype=data["event_target_ids"].dtype
         )
         result["event_mask"] = full_mask[:, :0]
+    elif _MEANINGFUL_EVENT_HISTORY_LIMIT is not None:
+        event_keys = {"event_tokens", "event_target_ids", "event_mask"}
+        result = {
+            key: data[key][batch] for key in ENTITY_BATCH_KEYS if key not in event_keys
+        }
+        limit = int(_MEANINGFUL_EVENT_HISTORY_LIMIT)
+        result["event_tokens"] = data["event_tokens"][batch][:, :limit]
+        result["event_target_ids"] = data["event_target_ids"][batch][:, :limit]
+        result["event_mask"] = data["event_mask"][batch][:, :limit]
     else:
         result = {key: data[key][batch] for key in ENTITY_BATCH_KEYS}
     if _PUBLIC_CARD_COUNT_FEATURES_ENABLED:
@@ -16686,6 +16733,11 @@ def _a1_training_event_history_contract(
         }
     else:
         components = {"a1": a1_preflight_meta}
+    component_payload_scans = {
+        component_id: metadata["event_history_payload_scan"]
+        for component_id, metadata in components.items()
+        if isinstance(metadata.get("event_history_payload_scan"), dict)
+    }
     try:
         return build_a1_training_event_history_contract(
             components,
@@ -16696,6 +16748,7 @@ def _a1_training_event_history_contract(
             empty_payload_inventory_acknowledgements=tuple(
                 args.acknowledge_empty_event_history_payload_inventory_sha256
             ),
+            component_payload_scans=component_payload_scans,
         )
     except InformationSurfaceError as error:
         raise SystemExit(f"A1 event-history contract refused training: {error}") from error

@@ -66,6 +66,33 @@ silently inheriting parser defaults. A lane is merge-compatible only when its
 resolved `config.json` differs from its siblings solely in declared operational
 identity fields.
 
+For a real fleet wave, do not hand-fan the lane command above. Resolve the
+checked-in `configs/experiments/a1_pre_wave_contract.template.json`, then use
+the existing sealed control plane end to end:
+
+```bash
+DRAFT=/path/to/resolved.coherent-public.draft.json
+LOCK=/fresh/path/contract.lock.json
+RENDER_DIR=/fresh/path/render
+CLAIM_RECEIPT=/fresh/path/seed-claim.receipt.json
+EXEC_RECEIPT=/fresh/path/executor.receipt.json
+HOSTS=/path/to/private/fleet-hosts.json
+
+"$PY" tools/a1_pre_wave_contract.py seal --draft "$DRAFT" --out "$LOCK"
+"$PY" tools/a1_pre_wave_contract.py render --lock "$LOCK" --out-dir "$RENDER_DIR"
+"$PY" tools/a1_pre_wave_contract.py claim --lock "$LOCK" \
+  --render "$RENDER_DIR/commands.json" --receipt "$CLAIM_RECEIPT"
+"$PY" tools/fleet/a1_production_executor.py run --lock "$LOCK" \
+  --render "$RENDER_DIR/commands.json" --hosts "$HOSTS" \
+  --receipt "$EXEC_RECEIPT" --go
+```
+
+The sealed renderer now emits the same automatic-transition and bounded
+meaningful-history flags as the typed recipe, and its post-wave audit accepts
+non-empty authenticated event tensors. Adaptive-n256 rows are excluded from
+the p=0.25 randomized-root rate test rather than causing the whole wave to be
+rejected.
+
 ## Learner operator
 
 Use the combined public-card-count + zero-gated meaningful-history
@@ -101,12 +128,17 @@ UPGRADE_RECEIPT=/fresh/path/public-cards.receipt.json
 
 "$PY" tools/f69_upgrade_checkpoint_config.py \
   --in-checkpoint "$CHAMPION" --out-checkpoint "$UPGRADED" \
-  --flags card_count,meaningful_history --device cuda:0 --seed 1
+  --flags card_count_v2,meaningful_history --device cuda:0 --seed 1
 "$PY" tools/a1_function_preserving_upgrade.py \
   --source "$CHAMPION" --upgraded "$UPGRADED" \
-  --module entity_graph.public_card_count_features+meaningful_public_history.v1 \
+  --module entity_graph.public_card_count_features+meaningful_public_history.v2 \
   --output "$UPGRADE_RECEIPT"
 ```
+
+The v2 card residual is bias-free. This is not cosmetic: when public-card
+evidence is zero, its residual is structurally zero even after training. The
+legacy v1 module remains replayable for already-issued checkpoints but is not
+the fresh-wave default.
 
 The existing-corpus diagnostic is intentionally card-only because its event
 payloads are authenticated empty. For that one diagnostic use `--flags
@@ -140,23 +172,38 @@ print(_current_ablation_code_binding(lock)["code_tree_sha256"])
 PY
 )"
 
-"$PY" tools/a1_one_dose_train.py \
+STATE=/fresh/path/iteration.state.json
+TURN=/fresh/path/flywheel.turn.json
+HANDOFF=/path/to/post-promotion-handoff.json
+CAMPAIGN=/path/to/post-promotion-generation-campaign.json
+AUDIT=/path/to/new-wave/post-wave.audit.json
+
+"$PY" tools/a1_iteration_orchestrator.py initialize-next \
+  --state "$STATE" --turn "$TURN" \
+  --post-promotion-handoff "$HANDOFF" \
+  --generation-campaign "$CAMPAIGN" --generation-audit "$AUDIT" \
   --lock "$LOCK" --data "$COMPOSITE" \
   --composite-build-receipt "$COMPOSITE_RECEIPT" \
+  --learner-parent "$CHAMPION" --evaluation-parent "$CHAMPION" \
+  --initializer "$UPGRADED" \
   --architecture-upgrade-receipt "$UPGRADE_RECEIPT" \
   --topology b200-8gpu-ddp --gpu 0 --ddp-canary-receipt "$DDP_CANARY" \
-  --ablation-id coherent-public-card-count-v2 \
+  --ablation-id coherent-public-card-count-history-v2 \
   --recipe-overrides-json "$OVERRIDES" \
   --ablation-code-tree-sha256 "$CODE_SHA" \
   --reviewed-lock-file-sha256 "$LOCK_SHA" \
   --checkpoint "$CHECKPOINT_OUT" --report "$REPORT_OUT" \
-  --receipt "$TRAIN_RECEIPT" --python "$PY"
+  --training-receipt "$TRAIN_RECEIPT" --python "$PY"
+
+"$PY" tools/a1_iteration_orchestrator.py dose-dry --state "$STATE"
+"$PY" tools/a1_iteration_orchestrator.py dose-go --state "$STATE"
 ```
 
-That invocation is the executor's plan rendering mode. Review it, then repeat
-the identical command with `--go` appended. This is not candidate chaining:
-the architecture receipt always names the champion bytes, the lock names the
-same parent, and optimizer state is not inherited.
+`initialize-next` now carries the complete one-dose topology/recipe into the
+existing immutable turn state; `dose-dry` and `dose-go` render and execute that
+same binding. This is not candidate chaining: the architecture receipt always
+names the champion bytes, the lock names the same parent, and optimizer state
+is not inherited.
 
 ## Evaluation and loop closure
 
@@ -189,6 +236,28 @@ DEVICES=cuda:0,cuda:1,cuda:2,cuda:3
   --gameplay-policy-aggregation mean_improved_policy \
   --native-mcts-hot-loop --evaluator-rust-featurize \
   --forced-root-target-mode trajectory_only
+```
+
+The command above is the exact single-host role operator. Production
+evaluation is sharded by the existing fleet controller, whose CLI default is
+already `coherent_public` but is stated explicitly here so the plan records it:
+
+```bash
+EVAL_MANIFEST=/path/to/private/eval-fleet.json
+REGISTRY=/path/to/champion-registry.json
+EVAL_PLAN=/fresh/path/eval.plan.json
+
+"$PY" tools/fleet/a1_h100_eval_fleet.py --manifest "$EVAL_MANIFEST" plan \
+  --candidate "$CANDIDATE" --champion "$INCUMBENT" \
+  --candidate-parent "$INCUMBENT" --registry "$REGISTRY" \
+  --operator-mode coherent_public \
+  --candidate-c-scale 0.1 --champion-c-scale 0.1 \
+  --internal-base-seed __VAL_ONLY_INTERNAL_SEED__ \
+  --external-base-seed __VAL_ONLY_EXTERNAL_SEED__ \
+  --iteration-id __ITERATION_ID__ --out "$EVAL_PLAN"
+
+"$PY" tools/fleet/a1_h100_eval_fleet.py --manifest "$EVAL_MANIFEST" launch \
+  --plan "$EVAL_PLAN" --phase internal --go
 ```
 
 Promote only the checkpoint bytes that clear the paired candidate-versus-

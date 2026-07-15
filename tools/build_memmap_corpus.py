@@ -70,6 +70,7 @@ MEMMAP_CORPUS_IMPLICIT_SCHEMA = "memmap_corpus_v2"
 # columns without a data file.  Keep this list deliberately narrow: other
 # constant-looking columns may have different fill semantics.
 IMPLICIT_ZERO_EVENT_COLUMNS = frozenset({"event_tokens", "event_mask"})
+EVENT_STORAGE_WIDTH = 64
 MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
 PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA = "public-award-feature-provenance-v1"
 PUBLIC_AWARD_CORPUS_PROVENANCE_SCHEMA = "public-award-corpus-provenance-v1"
@@ -102,6 +103,38 @@ DUAL_ARM_SUBSET_CATEGORY_COUNTS = {
         "hard_negative": 2_800,
     },
 }
+
+
+def _normalize_event_storage_width(shard: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Keep the established width-64 memmap ABI for mixed fresh/legacy replay.
+
+    Meaningful-history generation intentionally emits only 32 semantic rows.
+    Persist them at the front of the historical 64-row storage axis so a v1.6
+    model (which consumes the first 32 rows) sees every live event while the
+    no-copy composite remains shape-compatible with legacy replay.
+    """
+
+    fills = {"event_tokens": 0, "event_target_ids": -1, "event_mask": False}
+    present = [name for name in fills if name in shard]
+    if not present:
+        return shard
+    widths = {int(np.asarray(shard[name]).shape[1]) for name in present}
+    if len(widths) != 1:
+        raise SystemExit(f"event column widths disagree: {sorted(widths)}")
+    width = widths.pop()
+    if width < 1 or width > EVENT_STORAGE_WIDTH:
+        raise SystemExit(
+            f"event history width {width} is outside storage ABI [1, {EVENT_STORAGE_WIDTH}]"
+        )
+    if width == EVENT_STORAGE_WIDTH:
+        return shard
+    normalized = dict(shard)
+    for name in present:
+        array = np.asarray(shard[name])
+        pad = [(0, 0)] * array.ndim
+        pad[1] = (0, EVENT_STORAGE_WIDTH - width)
+        normalized[name] = np.pad(array, pad, constant_values=fills[name])
+    return normalized
 A1_SELECTION_RULE = "lowest_seed_complete_per_job"
 A1_SELECTED_GAME_COUNT = 12_000
 A1_CATEGORY_GAME_COUNTS = {
@@ -1574,6 +1607,7 @@ def build_memmap_corpus(
         first = {
             name: np.asarray(value)[first_keep] for name, value in first.items()
         }
+    first = _normalize_event_storage_width(first)
     columns = [key for key in LOADER_KEYS if key in first]
     schemas = {name: _classify(name, first[name]) for name in columns}
     implicit_zero_columns: list[str] = []
@@ -1617,6 +1651,9 @@ def build_memmap_corpus(
         "duplicate_game_seed_count": 0,
         "has_duplicate_game_seeds": False,
         "aux_subgoal_target_version_counts": {},
+        "event_token_nonzero_count": 0,
+        "event_mask_nonzero_count": 0,
+        "event_rows_with_history": 0,
     }
     # See _GameSeedRunTracker's docstring for the duplicate-detection contract.
     _seed_tracker = _GameSeedRunTracker()
@@ -1711,6 +1748,7 @@ def build_memmap_corpus(
             dropped_fast_rows += int((~keep).sum())
             if not keep.all():
                 norm = {name: np.asarray(value)[keep] for name, value in norm.items()}
+        norm = _normalize_event_storage_width(norm)
         present = {key for key in LOADER_KEYS if key in norm}
         if present != column_set:
             raise SystemExit(
@@ -1812,6 +1850,17 @@ def build_memmap_corpus(
             ):
                 key = str(int(version))
                 version_counts[key] = int(version_counts.get(key, 0)) + int(count)
+
+        if "event_tokens" in norm and "event_mask" in norm:
+            event_tokens = np.asarray(norm["event_tokens"])
+            event_mask = np.asarray(norm["event_mask"], dtype=np.bool_)
+            stats["event_token_nonzero_count"] += int(
+                np.count_nonzero(event_tokens)
+            )
+            stats["event_mask_nonzero_count"] += int(np.count_nonzero(event_mask))
+            stats["event_rows_with_history"] += int(
+                np.count_nonzero(np.any(event_mask, axis=1))
+            )
 
         for name in columns:
             schema = schemas[name]
@@ -1941,11 +1990,29 @@ def build_memmap_corpus(
 
     payload_inventory = _memmap_payload_inventory(out_dir, schemas)
 
+    event_history_payload_scan = {
+        "row_count": int(row_count),
+        "payload_inventory_sha256": _value_sha256(payload_inventory),
+        "columns": {
+            "event_tokens": {
+                "nonzero_count": int(stats["event_token_nonzero_count"]),
+            },
+            "event_mask": {
+                "nonzero_count": int(stats["event_mask_nonzero_count"]),
+            },
+        },
+        "rows_with_history": int(stats["event_rows_with_history"]),
+    }
+    event_history_payload_scan["scan_sha256"] = _value_sha256(
+        event_history_payload_scan
+    )
+
     meta = {
         "schema": MEMMAP_CORPUS_IMPLICIT_SCHEMA if implicit_zero_columns else MEMMAP_CORPUS_SCHEMA,
         "payload_inventory_schema": MEMMAP_PAYLOAD_INVENTORY_SCHEMA,
         "payload_inventory": payload_inventory,
         "payload_inventory_sha256": _value_sha256(payload_inventory),
+        "event_history_payload_scan": event_history_payload_scan,
         "row_count": int(row_count),
         "flat_count": int(flat_count),
         "legal_width": int(legal_width),
