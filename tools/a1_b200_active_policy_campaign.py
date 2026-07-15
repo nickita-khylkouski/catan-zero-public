@@ -342,13 +342,55 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
         if isinstance(item, dict)
         else None
     )
-    # A direct coherent corpus is not a post-wave subsample: the canonical
-    # completion receipt already seals the complete 8,192-game seed interval,
-    # and below we require the memmap's ordered source-shard inventory to match
-    # that receipt byte-for-byte.  Older A1 corpora carry a separate
-    # selected-game manifest, so accept its count when present, but do not make
-    # that legacy sidecar a prerequisite for this completion-bound ingest.
+    # A direct coherent corpus is not a post-wave subsample. The completion or
+    # repair receipt seals the exact 8,192 selected games, and below we require
+    # the memmap's ordered source-shard inventory to match it byte-for-byte.
     selected_games = item.get("selected_games") if isinstance(item, dict) else None
+    repaired_distillation = (
+        completion.get("schema_version") == corpus_repair.RECEIPT_SCHEMA
+    )
+    if repaired_distillation:
+        # This producer intentionally omits automatic UI transitions while
+        # retaining every meaningful decision for both seats. Consequently,
+        # engine decision_index has gaps and the legacy replay audit also asks
+        # for opponent tags that are redundant for receipt-bound single-model
+        # self-play. This corpus is valid for its stored coherent n128 targets,
+        # but we must not mislabel it as state-reanalysis-ready.
+        trace_ok = (
+            isinstance(trace, dict)
+            and trace.get("game_count") == EXPECTED_GAMES
+            and trace.get("game_run_count") == EXPECTED_GAMES
+            and trace.get("duplicate_game_seed_count") == 0
+            and trace.get("no_completion_game_count") == 0
+            and trace.get("nonzero_start_game_count") == 0
+            and trace.get("gap_game_count") == EXPECTED_GAMES
+            and trace.get("missing_trace_columns") == []
+            and trace.get("missing_round_trip_columns") == []
+            and set(trace.get("blockers", ()))
+            == {
+                "noncontiguous_or_incomplete_action_trajectory",
+                "partial_rows_lack_explicit_opponent_provenance",
+            }
+            and set(trace.get("missing_mirror_provenance_columns", ()))
+            == {
+                "is_pool_game",
+                "opponent_checkpoint_md5",
+                "opponent_tag",
+                "opponent_version",
+            }
+        )
+        search_evidence_ok = item.get("search_evidence_columns") == []
+    else:
+        trace_ok = (
+            isinstance(trace, dict)
+            and trace.get("complete_action_trace_game_count") == EXPECTED_GAMES
+            and trace.get("incomplete_action_trace_game_count") == 0
+            and trace.get("complete_action_trace_fraction") == 1.0
+            and trace.get("full_corpus_replayable") is True
+        )
+        search_evidence_ok = EXPECTED_SEARCH_EVIDENCE_COLUMNS.issubset(
+            set(item.get("search_evidence_columns", ()))
+        )
     if (
         inventory.get("required_target_information_regime")
         != TARGET_INFORMATION_REGIME
@@ -364,14 +406,8 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
         or int(active_regimes.get(TARGET_INFORMATION_REGIME, 0)) <= 0
         or item.get("incompatible_policy_active_rows") != 0
         or item.get("policy_targets_eligible_for_requested_learner") is not True
-        or not EXPECTED_SEARCH_EVIDENCE_COLUMNS.issubset(
-            set(item.get("search_evidence_columns", ()))
-        )
-        or not isinstance(trace, dict)
-        or trace.get("complete_action_trace_game_count") != EXPECTED_GAMES
-        or trace.get("incomplete_action_trace_game_count") != 0
-        or trace.get("complete_action_trace_fraction") != 1.0
-        or trace.get("full_corpus_replayable") is not True
+        or not search_evidence_ok
+        or not trace_ok
         or not isinstance(aggregate, dict)
         or aggregate.get("incompatible_policy_active_rows") != 0
         or aggregate.get("policy_targets_eligible_for_requested_learner") is not True
@@ -482,6 +518,13 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
                 "source_shard_inventory_sha256"
             ],
             "complete_two_seat_trace_games": EXPECTED_GAMES,
+            "stored_policy_target_distillation_eligible": True,
+            "state_reanalysis_eligible": not repaired_distillation,
+            "search_evidence_storage": (
+                "receipt_bound_source_npz_only"
+                if repaired_distillation
+                else "training_memmap"
+            ),
             "incompatible_policy_active_rows": 0,
         },
         "policy_distillation_contract": {
@@ -521,6 +564,15 @@ def _load_admission(path: Path) -> tuple[Path, dict[str, Any]]:
         or corpus.get("selection_mode")
         not in {"sealed_contiguous_completion", "explicit_truncation_repair_seed_set"}
         or corpus.get("complete_two_seat_trace_games") != EXPECTED_GAMES
+        or corpus.get("stored_policy_target_distillation_eligible") is not True
+        or (
+            corpus.get("selection_mode") == "explicit_truncation_repair_seed_set"
+            and (
+                corpus.get("state_reanalysis_eligible") is not False
+                or corpus.get("search_evidence_storage")
+                != "receipt_bound_source_npz_only"
+            )
+        )
         or corpus.get("incompatible_policy_active_rows") != 0
         or not isinstance(policy, dict)
         or policy.get("coherent_public_n128_only") is not True
