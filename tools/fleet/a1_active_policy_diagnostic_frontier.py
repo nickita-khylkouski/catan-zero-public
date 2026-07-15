@@ -7,7 +7,7 @@ artifacts and requires that selector to return its exact no-eligible-candidate
 refusal.  Only then does it nominate three diagnostic frontier points:
 
 * the checkpoint with maximum teacher-gap closure overall; and
-* the positive-closure checkpoint with minimum parent KL.
+* the positive-closure P100 checkpoint with minimum parent KL.
 * the P100 step-64 checkpoint between those two endpoints.
 
 The resulting checkpoint(s) are diagnostic evidence only.  Every comparison,
@@ -46,7 +46,7 @@ NO_WINNER_REASON = (
 )
 CRITERIA = (
     "max_teacher_gap_closure",
-    "min_parent_kl_positive_closure",
+    "p100_min_parent_kl_positive_closure",
     "p100_step64_interpolation",
 )
 BASELINES = ("f7", "v5")
@@ -208,11 +208,15 @@ def _load_frontier_candidates(
             row["arm_order"],
         ),
     )
-    positive = [row for row in candidates if row["teacher_gap_closure"] > 0.0]
+    positive = [
+        row
+        for row in candidates
+        if row["arm"] == "P100" and row["teacher_gap_closure"] > 0.0
+    ]
     if not positive:
         raise FrontierError(
-            "diagnostic frontier has no positive-closure checkpoint; "
-            "min-parent-KL positive frontier is undefined"
+            "diagnostic frontier has no positive-closure P100 checkpoint; "
+            "P100 min-parent-KL positive frontier is undefined"
         )
     min_positive_kl = min(
         positive,
