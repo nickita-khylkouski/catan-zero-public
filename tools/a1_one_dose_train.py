@@ -66,6 +66,9 @@ REPORT_INPUT_BINDING_SCHEMA = "a1-one-dose-input-binding-v1"
 REPORT_INPUT_BINDING_FIELD = "a1_one_dose_input_binding"
 REPORT_LEARNER_LINEAGE_PARENT_FIELD = "a1_learner_lineage_parent"
 LEARNER_LINEAGE_PARENT_SCHEMA = "a1-learner-lineage-parent-v1"
+INDEPENDENT_PARENT_AUTHORITY_SCHEMA = (
+    "a1-independent-diagnostic-learner-parent-authority-v1"
+)
 TRAINING_TRANSACTION_SCHEMA = "a1-one-dose-training-transaction-v1"
 PRODUCTION_TRAINER_AUTHORITY_SCHEMA = "a1-production-trainer-authority-v1"
 PRODUCTION_TRAINER_CODE_SURFACE = tuple(
@@ -897,6 +900,13 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
             payload["diagnostic_training_descriptor_authority"] = copy.deepcopy(
                 verified["diagnostic_training_descriptor_authority"]
             )
+    elif verified.get("data_kind") == "coherent_direct_memmap_v1":
+        payload["coherent_corpus_admission"] = copy.deepcopy(
+            verified["coherent_direct_corpus_binding"]["corpus_admission"]
+        )
+        payload["coherent_direct_corpus_binding_sha256"] = verified[
+            "coherent_direct_corpus_binding"
+        ]["binding_sha256"]
     else:
         payload.update(
             {
@@ -1207,6 +1217,205 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     return recipe, objective
 
 
+def _verify_coherent_direct_training_inputs(
+    *,
+    admission_path: Path,
+    lock: dict[str, Any],
+    lock_path: Path,
+    lock_verifier_authority: dict[str, Any] | None,
+    reviewed_lock_file_sha256: str | None,
+    recipe: dict[str, Any],
+    objective: dict[str, Any],
+    data_path: Path,
+    validation_path: Path | None,
+) -> dict[str, Any]:
+    """Authenticate the diagnostic coherent corpus without legacy 12k claims."""
+
+    if validation_path is None:
+        raise ExecutorError("coherent direct corpus requires a whole-game holdout")
+    try:
+        admission_path = admission_path.expanduser().resolve(strict=True)
+        payload = json.loads(admission_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(f"cannot read coherent corpus admission: {error}") from error
+    if not isinstance(payload, dict):
+        raise ExecutorError("coherent corpus admission must be a JSON object")
+    unsigned = dict(payload)
+    stated = unsigned.pop("admission_sha256", None)
+    if (
+        payload.get("schema_version") != "a1-coherent-n128-corpus-admission-v1"
+        or payload.get("status")
+        != "admitted_for_diagnostic_policy_distillation"
+        or payload.get("diagnostic_only") is not True
+        or payload.get("promotion_eligible") is not False
+        or stated != _value_sha256(unsigned)
+    ):
+        raise ExecutorError("coherent corpus admission schema/digest/role drift")
+    corpus = payload.get("corpus")
+    policy = payload.get("policy_distillation_contract")
+    contract = payload.get("contract")
+    if not all(isinstance(value, dict) for value in (corpus, policy, contract)):
+        raise ExecutorError("coherent corpus admission sections are malformed")
+    producer = _producer(lock)
+    if (
+        Path(str(corpus.get("data_path", ""))).expanduser().resolve(strict=True)
+        != data_path
+        or Path(str(corpus.get("validation_manifest", {}).get("path", "")))
+        .expanduser()
+        .resolve(strict=True)
+        != validation_path
+        or corpus.get("producer_checkpoint_sha256") != producer.get("sha256")
+        or corpus.get("selected_games") != 8_192
+        or corpus.get("seed_end", -1) - corpus.get("seed_start", -1) != 8_192
+        or corpus.get("target_information_regime")
+        != "public_belief_single_tree_v1"
+        or corpus.get("search_evidence_schema")
+        != "gumbel_root_search_evidence_v1"
+        or corpus.get("incompatible_policy_active_rows") != 0
+        or policy.get("coherent_public_n128_only") is not True
+        or policy.get("legacy_pimc_rows_allowed") is not False
+    ):
+        raise ExecutorError("coherent corpus admission identity drift")
+
+    meta_path = data_path / "corpus_meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(f"cannot read coherent corpus metadata: {error}") from error
+    if (
+        not isinstance(meta, dict)
+        or _file_sha256(meta_path) != corpus.get("corpus_meta_file_sha256")
+        or meta.get("payload_inventory_sha256")
+        != corpus.get("payload_inventory_sha256")
+    ):
+        raise ExecutorError("coherent corpus metadata differs from admission")
+    try:
+        train_bc._validate_memmap_payload_inventory(data_path, meta)  # noqa: SLF001
+        validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
+            validation_path,
+            validation_fraction=0.05,
+            validation_seed=17,
+            validation_max_samples=0,
+            validation_game_seed_ranges=[],
+        )
+        data = train_bc.load_teacher_data_memmap(data_path)
+    except (OSError, SystemExit, ValueError) as error:
+        raise ExecutorError(f"coherent corpus bytes/holdout refused: {error}") from error
+    if (
+        validation["a1_contract_sha256"] != contract.get("contract_sha256")
+        or validation["file_sha256"]
+        != corpus["validation_manifest"]["file_sha256"]
+    ):
+        raise ExecutorError("coherent holdout binds a different target contract")
+    observed = np.asarray(data["game_seed"], dtype=np.int64).reshape(-1)
+    if observed.size == 0:
+        raise ExecutorError("coherent corpus has no game rows")
+    run_starts = np.concatenate(
+        (np.asarray([0], dtype=np.int64), np.flatnonzero(observed[1:] != observed[:-1]) + 1)
+    )
+    run_values = observed[run_starts]
+    selected = np.sort(np.unique(observed))
+    expected = np.arange(
+        int(corpus["seed_start"]), int(corpus["seed_end"]), dtype=np.int64
+    )
+    if (
+        np.unique(run_values).size != run_values.size
+        or not np.array_equal(selected, expected)
+    ):
+        raise ExecutorError("coherent corpus does not contain one contiguous run per seed")
+    validation_seeds = np.asarray(validation["game_seeds"], dtype=np.int64)
+    if not np.isin(validation_seeds, selected).all():
+        raise ExecutorError("coherent holdout includes a seed outside the corpus")
+    validation_row_count = int(np.count_nonzero(np.isin(observed, validation_seeds)))
+    if validation_row_count != int(validation["validation_row_count"]):
+        raise ExecutorError("coherent holdout row count differs from actual memmap")
+    training_seeds = selected[~np.isin(selected, validation_seeds)]
+    training_row_count = int(observed.size) - validation_row_count
+    selected_sha = train_bc._game_seed_set_sha256(selected)  # noqa: SLF001
+    training_sha = train_bc._game_seed_set_sha256(training_seeds)  # noqa: SLF001
+    corpus_binding = {
+        "path": str(data_path),
+        "corpus_meta_file_sha256": _file_sha256(meta_path),
+        "payload_inventory_sha256": meta["payload_inventory_sha256"],
+        "selected_game_count": int(selected.size),
+        "seed_start": int(corpus["seed_start"]),
+        "seed_end": int(corpus["seed_end"]),
+        "selected_game_seed_set_sha256": selected_sha,
+        "training_game_count": int(training_seeds.size),
+        "training_game_seed_set_sha256": training_sha,
+    }
+    validation_binding = {
+        "path": str(validation_path),
+        "file_sha256": validation["file_sha256"],
+        "game_count": int(validation["validation_game_seed_count"]),
+        "game_seed_set_sha256": validation["validation_game_seed_set_sha256"],
+        "row_count": validation_row_count,
+    }
+    direct_binding: dict[str, Any] = {
+        "schema_version": train_bc.COHERENT_DIRECT_CORPUS_BINDING_SCHEMA,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "corpus_admission": {
+            "path": str(admission_path),
+            "file_sha256": _file_sha256(admission_path),
+            "admission_sha256": stated,
+        },
+        "target_contract_sha256": contract["contract_sha256"],
+        "producer_checkpoint_sha256": producer["sha256"],
+        # Filled only after the independently authorized f7 architecture
+        # upgrade is replayed.  Keeping the slot in the first binding makes the
+        # later transition an explicit digest-changing operation instead of an
+        # untyped side channel.
+        "learner_initializer": None,
+        "corpus": corpus_binding,
+        "validation": validation_binding,
+        "learner": {
+            "training_recipe": copy.deepcopy(recipe),
+            "training_recipe_sha256": _value_sha256(recipe),
+            "value_objective": copy.deepcopy(objective),
+            "topology": {
+                "name": B200_8GPU_DDP_TOPOLOGY,
+                "world_size": 8,
+                "local_batch_size": 512,
+                "grad_accum_steps": 1,
+                "global_batch_size": 4096,
+            },
+        },
+    }
+    direct_binding["binding_sha256"] = _value_sha256(direct_binding)
+    return {
+        "lock": lock,
+        "lock_path": lock_path,
+        "lock_file_sha256": _file_sha256(lock_path),
+        "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
+        "lock_verifier_authority": lock_verifier_authority,
+        "contract_sha256": contract["contract_sha256"],
+        "learner_lock_contract_sha256": lock["contract_sha256"],
+        "recipe": recipe,
+        "objective": objective,
+        "producer": producer,
+        "data_kind": "coherent_direct_memmap_v1",
+        "data_path": data_path,
+        "corpus_meta_file_sha256": _file_sha256(meta_path),
+        "payload_inventory_sha256": meta["payload_inventory_sha256"],
+        "data_fingerprint": train_bc._training_data_fingerprint(  # noqa: SLF001
+            str(data_path), "memmap"
+        ),
+        "corpus_row_count": int(observed.size),
+        "training_row_count": training_row_count,
+        "validation_row_count": validation_row_count,
+        "selected_game_seed_set_sha256": selected_sha,
+        "training_game_seed_set_sha256": training_sha,
+        "validation_path": validation_path,
+        "validation_file_sha256": validation["file_sha256"],
+        "validation_game_seed_set_sha256": validation[
+            "validation_game_seed_set_sha256"
+        ],
+        "coherent_corpus_admission": copy.deepcopy(payload),
+        "coherent_direct_corpus_binding": direct_binding,
+    }
+
+
 def verify_training_inputs(
     *,
     lock_path: Path,
@@ -1216,6 +1425,7 @@ def verify_training_inputs(
     reviewed_lock_file_sha256: str | None = None,
     frozen_repo: Path | None = None,
     frozen_verifier_sha256: str | None = None,
+    coherent_corpus_admission: Path | None = None,
 ) -> dict[str, Any]:
     """Replay the sealed lock and complete audit→memmap→holdout chain."""
 
@@ -1232,6 +1442,11 @@ def verify_training_inputs(
             if composite_build_receipt is None
             else composite_build_receipt.expanduser().resolve(strict=True)
         )
+        coherent_corpus_admission = (
+            None
+            if coherent_corpus_admission is None
+            else coherent_corpus_admission.expanduser().resolve(strict=True)
+        )
     except OSError as error:
         raise ExecutorError(f"cannot resolve A1 training input: {error}") from error
     if not (data_path.is_dir() or data_path.is_file()):
@@ -1245,6 +1460,22 @@ def verify_training_inputs(
             frozen_verifier_sha256=frozen_verifier_sha256,
         )
         recipe, objective = _require_a1_science(lock)
+        if coherent_corpus_admission is not None:
+            if data_path.is_file() or composite_build_receipt is not None:
+                raise ExecutorError(
+                    "coherent direct-corpus admission requires a memmap directory"
+                )
+            return _verify_coherent_direct_training_inputs(
+                admission_path=coherent_corpus_admission,
+                lock=lock,
+                lock_path=lock_path,
+                lock_verifier_authority=lock_verifier_authority,
+                reviewed_lock_file_sha256=reviewed_lock_file_sha256,
+                recipe=recipe,
+                objective=objective,
+                data_path=data_path,
+                validation_path=validation_path,
+            )
         meta = train_bc._preflight_a1_memmap_metadata(  # noqa: SLF001
             data_path, validation_manifest_path=validation_path
         )
@@ -2431,6 +2662,7 @@ def bind_learner_ablation(
     overrides_json: str,
     reviewed_code_tree_sha256: str,
     diagnostic_dose_curve: bool = False,
+    diagnostic_checkpoint_steps: str = "",
 ) -> dict[str, Any]:
     """Derive a diagnostic learner recipe without weakening the sealed inputs."""
 
@@ -2447,6 +2679,10 @@ def bind_learner_ablation(
         raise ExecutorError(f"invalid --recipe-overrides-json: {error}") from error
     if not isinstance(overrides, dict) or not overrides:
         raise ExecutorError("--recipe-overrides-json must be a nonempty JSON object")
+    if diagnostic_checkpoint_steps and not diagnostic_dose_curve:
+        raise ExecutorError(
+            "--diagnostic-checkpoint-steps requires --diagnostic-dose-curve"
+        )
     forbidden = set(overrides) - A1_LEARNER_ABLATION_FIELDS
     if forbidden:
         raise ExecutorError(
@@ -2653,6 +2889,13 @@ def bind_learner_ablation(
     )
     if active_objective_mass <= 0.0:
         raise ExecutorError("A1 learner ablation disables every active training objective")
+    try:
+        checkpoint_steps = train_bc._parse_checkpoint_steps(  # noqa: SLF001
+            diagnostic_checkpoint_steps,
+            max_steps=int(effective["max_steps"]),
+        )
+    except SystemExit as error:
+        raise ExecutorError(str(error)) from error
     aux_arm: str | None = None
     drift = {
         key: {"contract": bound[key], "effective": effective[key]}
@@ -2769,6 +3012,7 @@ def bind_learner_ablation(
         "reviewed_lock_file_sha256": reviewed_lock_sha,
         "reporting_contract": {
             "diagnostic_dose_curve": bool(diagnostic_dose_curve),
+            "checkpoint_steps": list(checkpoint_steps),
             "train_diagnostics_every_batches": (
                 16 if diagnostic_dose_curve else 0
             ),
@@ -4451,11 +4695,22 @@ def _build_direct_train_command(
         )
     if "sampler_seed" in recipe:
         command.extend(["--sampler-seed", str(recipe["sampler_seed"])])
-    if (
+    max_steps = int(recipe.get("max_steps", 0))
+    reporting = (verified.get("learner_ablation") or {}).get(
+        "reporting_contract", {}
+    )
+    explicit_checkpoints = list(reporting.get("checkpoint_steps", ()))
+    if explicit_checkpoints:
+        # An explicit generic diagnostic schedule is topology/data-kind
+        # independent.  The terminal max-step checkpoint remains the ordinary
+        # output; only strictly earlier steps belong on --checkpoint-steps.
+        command.extend(
+            ["--checkpoint-steps", ",".join(map(str, explicit_checkpoints))]
+        )
+    elif (
         verified.get("data_kind") == "production_composite_v2"
         and verified.get("central_learner_binding") is None
     ):
-        max_steps = int(recipe.get("max_steps", 0))
         if verified.get("learner_ablation") is None and max_steps == 128:
             # Preserve the useful part of the production dose curve without
             # launching chained candidates.
@@ -4541,6 +4796,16 @@ def _build_direct_train_command(
                 str(verified["validation_path"]),
             ]
         )
+    coherent_binding = verified.get("coherent_direct_corpus_binding")
+    if coherent_binding is not None:
+        if verified.get("data_kind") != "coherent_direct_memmap_v1":
+            raise ExecutorError("coherent corpus binding attached to wrong data kind")
+        command.extend(
+            [
+                "--a1-coherent-corpus-binding-json",
+                _canonical_bytes(coherent_binding).decode("ascii"),
+            ]
+        )
     if bool(recipe.get("training_rng_rank_offset", False)):
         command.append("--training-rng-rank-offset")
     if "value_trunk_grad_scale" in recipe:
@@ -4581,7 +4846,10 @@ def _build_direct_train_command(
     learner_ablation = verified.get("learner_ablation")
     if isinstance(central_binding, dict):
         command.append("--allow-concurrent-bc")
-        if verified.get("data_kind") != "production_composite_v2":
+        if verified.get("data_kind") not in {
+            "production_composite_v2",
+            "coherent_direct_memmap_v1",
+        }:
             command.extend(
                 [
                     EVENT_HISTORY_ACK_FLAG,
@@ -4609,7 +4877,10 @@ def _build_direct_train_command(
             )
     elif learner_ablation is not None:
         command.append("--allow-concurrent-bc")
-        if verified.get("data_kind") != "production_composite_v2":
+        if verified.get("data_kind") not in {
+            "production_composite_v2",
+            "coherent_direct_memmap_v1",
+        }:
             command.extend(
                 [
                     EVENT_HISTORY_ACK_FLAG,
@@ -4769,12 +5040,101 @@ def build_train_command(
     return command
 
 
+def _verify_independent_parent_authority(
+    path: Path,
+    *,
+    verified: Mapping[str, Any],
+    upgrade: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate a non-producer initializer for one diagnostic campaign.
+
+    A corpus producer and a learner initializer are different scientific
+    identities.  Production training keeps them identical.  This narrow
+    authority lets a diagnostic campaign compare an independently selected
+    parent without rewriting corpus provenance or pretending that checkpoint
+    generated the data.
+    """
+
+    resolved = path.expanduser().resolve(strict=True)
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ExecutorError(
+            f"independent learner-parent authority must be a regular file: {resolved}"
+        )
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(
+            f"cannot load independent learner-parent authority: {error}"
+        ) from error
+    expected_keys = {
+        "schema_version",
+        "diagnostic_only",
+        "promotion_eligible",
+        "corpus_binding",
+        "learner_parent",
+        "function_preserving_upgrade",
+        "authority_sha256",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        raise ExecutorError("independent learner-parent authority shape drift")
+    unsigned = dict(payload)
+    stated = unsigned.pop("authority_sha256", None)
+    if (
+        payload.get("schema_version") != INDEPENDENT_PARENT_AUTHORITY_SCHEMA
+        or payload.get("diagnostic_only") is not True
+        or payload.get("promotion_eligible") is not False
+        or stated != _value_sha256(unsigned)
+    ):
+        raise ExecutorError("independent learner-parent authority digest/role drift")
+
+    admission = payload.get("corpus_binding", {}).get("coherent_corpus_admission")
+    if not isinstance(admission, dict) or set(admission) != {
+        "path",
+        "file_sha256",
+        "admission_sha256",
+    }:
+        raise ExecutorError("independent parent authority lost corpus admission")
+    admission_path = Path(str(admission["path"])).expanduser().resolve(strict=True)
+    if (
+        admission_path.is_symlink()
+        or not admission_path.is_file()
+        or _file_sha256(admission_path) != admission["file_sha256"]
+    ):
+        raise ExecutorError("independent parent corpus admission bytes drifted")
+
+    data_path = Path(str(verified["data_path"])).expanduser().resolve(strict=True)
+    expected_corpus = {
+        "data_path": str(data_path),
+        "corpus_meta_file_sha256": verified.get("corpus_meta_file_sha256"),
+        "payload_inventory_sha256": verified.get("payload_inventory_sha256"),
+        "data_fingerprint": verified.get("data_fingerprint"),
+        "producer_checkpoint": copy.deepcopy(verified.get("producer")),
+        "coherent_corpus_admission": admission,
+    }
+    expected_upgrade = {
+        "module": upgrade.get("module"),
+        "receipt_file_sha256": upgrade.get("receipt", {}).get("sha256"),
+        "receipt_sha256": upgrade.get("receipt_sha256"),
+        "upgraded_initializer": copy.deepcopy(upgrade.get("upgraded_initializer")),
+    }
+    if (
+        payload.get("corpus_binding") != expected_corpus
+        or payload.get("learner_parent") != upgrade.get("source")
+        or payload.get("function_preserving_upgrade") != expected_upgrade
+    ):
+        raise ExecutorError(
+            "independent learner-parent authority differs from verified corpus/upgrade"
+        )
+    return copy.deepcopy(payload)
+
+
 def bind_function_preserving_upgrade(
     verified: dict[str, Any],
     receipt_path: Path,
     *,
     allow_public_award_transition_source: bool = False,
     allow_diagnostic_recent_history_source: bool = False,
+    independent_parent_authority_path: Path | None = None,
 ) -> dict[str, Any]:
     """Select a non-byte-identical initializer only after replaying its receipt."""
 
@@ -4788,11 +5148,17 @@ def bind_function_preserving_upgrade(
         raise ExecutorError(f"architecture upgrade receipt refused: {error}") from error
     source_transition_evidence = None
     diagnostic_comparison_source = None
+    independent_parent_authority = None
     source_matches_producer = (
         upgrade["source"]["sha256"] == verified["producer"]["sha256"]
         and Path(upgrade["source"]["path"])
         == Path(verified["producer"]["path"])
     )
+    if source_matches_producer and independent_parent_authority_path is not None:
+        raise ExecutorError(
+            "independent learner-parent authority is invalid when initializer "
+            "already equals the sealed corpus producer"
+        )
     if not source_matches_producer:
         recent_history = verified.get("category_semantics", {}).get(
             "recent_history"
@@ -4815,7 +5181,30 @@ def bind_function_preserving_upgrade(
                 architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
             }
         )
-        if diagnostic_recent_history_matches:
+        if independent_parent_authority_path is not None:
+            independent_parent_authority = _verify_independent_parent_authority(
+                independent_parent_authority_path,
+                verified=verified,
+                upgrade=upgrade,
+            )
+            diagnostic_comparison_source = {
+                "schema_version": "a1-diagnostic-independent-parent-v1",
+                "role": "independent_parent",
+                "source": copy.deepcopy(upgrade["source"]),
+                "sealed_producer": copy.deepcopy(verified["producer"]),
+                "authority": {
+                    "path": str(independent_parent_authority_path.resolve(strict=True)),
+                    "sha256": _file_sha256(
+                        independent_parent_authority_path.resolve(strict=True)
+                    ),
+                    "authority_sha256": independent_parent_authority[
+                        "authority_sha256"
+                    ],
+                },
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+            }
+        elif diagnostic_recent_history_matches:
             diagnostic_comparison_source = {
                 "schema_version": "a1-diagnostic-recent-history-parent-v1",
                 "role": "recent_history",
@@ -4886,18 +5275,61 @@ def bind_function_preserving_upgrade(
         # not overload ``producer``: bind the permitted recent-history parent
         # explicitly so dose accounting can authenticate f7 while corpus
         # provenance continues to name the v5 producer.
-        result["learner_lineage_parent"] = {
-            "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
-            "role": "diagnostic_recent_history",
-            "checkpoint": copy.deepcopy(upgrade["source"]),
-            "corpus_producer": copy.deepcopy(verified["producer"]),
-            "category_semantics_sha256": verified.get(
-                "category_semantics_sha256"
-            ),
-            "function_preserving_upgrade_receipt_sha256": receipt["sha256"],
-            "diagnostic_only": True,
-            "promotion_eligible": False,
+        if independent_parent_authority is not None:
+            result["independent_parent_authority"] = copy.deepcopy(
+                independent_parent_authority
+            )
+            result["learner_lineage_parent"] = {
+                "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
+                "role": "diagnostic_independent_parent",
+                "checkpoint": copy.deepcopy(upgrade["source"]),
+                "corpus_producer": copy.deepcopy(verified["producer"]),
+                "independent_parent_authority_sha256": (
+                    independent_parent_authority["authority_sha256"]
+                ),
+                "function_preserving_upgrade_receipt_sha256": receipt["sha256"],
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+            }
+        else:
+            result["learner_lineage_parent"] = {
+                "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
+                "role": "diagnostic_recent_history",
+                "checkpoint": copy.deepcopy(upgrade["source"]),
+                "corpus_producer": copy.deepcopy(verified["producer"]),
+                "category_semantics_sha256": verified.get(
+                    "category_semantics_sha256"
+                ),
+                "function_preserving_upgrade_receipt_sha256": receipt["sha256"],
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+            }
+    coherent_binding = result.get("coherent_direct_corpus_binding")
+    if coherent_binding is not None:
+        if not isinstance(coherent_binding, dict):
+            raise ExecutorError("coherent direct-corpus binding is malformed")
+        if independent_parent_authority is None:
+            raise ExecutorError(
+                "coherent direct corpus requires an independently authorized "
+                "learner parent before rendering training"
+            )
+        coherent_binding = copy.deepcopy(coherent_binding)
+        coherent_binding["learner_initializer"] = {
+            "role": "diagnostic_independent_parent",
+            "parent_checkpoint_sha256": upgrade["source"]["sha256"],
+            "initializer_checkpoint_sha256": upgrade["upgraded_initializer"][
+                "sha256"
+            ],
+            "upgrade_module": upgrade["module"],
+            "upgrade_receipt_file_sha256": receipt["sha256"],
+            "upgrade_receipt_sha256": upgrade["receipt_sha256"],
+            "independent_parent_authority_sha256": independent_parent_authority[
+                "authority_sha256"
+            ],
         }
+        coherent_binding.pop("binding_sha256", None)
+        coherent_binding["binding_sha256"] = _value_sha256(coherent_binding)
+        result["coherent_direct_corpus_binding"] = coherent_binding
     result["claim_identity_sha256"] = _value_sha256(
         {
             "schema_version": "a1-architecture-upgrade-training-identity-v1",
@@ -6829,9 +7261,9 @@ def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
     """Return the authenticated learner parent without changing corpus identity.
 
     Ordinary one-dose training starts from the sealed corpus producer.  The
-    diagnostic recent-history exception is narrower: it is accepted only when
-    the explicit parent record, comparison-source authority, and typed
-    function-preserving upgrade all name the same checkpoint.
+    Diagnostic exceptions are accepted only when the explicit parent record,
+    comparison-source authority, and typed function-preserving upgrade all
+    name the same checkpoint.  Corpus provenance remains a separate identity.
     """
 
     producer = verified.get("producer")
@@ -6847,6 +7279,46 @@ def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
         return str(producer["sha256"])
     upgrade = verified.get("function_preserving_upgrade_lineage")
     checkpoint = parent.get("checkpoint") if isinstance(parent, Mapping) else None
+    if isinstance(parent, Mapping) and parent.get("role") == "diagnostic_independent_parent":
+        authority = verified.get("independent_parent_authority")
+        expected_independent = {
+            "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
+            "role": "diagnostic_independent_parent",
+            "checkpoint": copy.deepcopy(
+                diagnostic.get("source") if isinstance(diagnostic, Mapping) else None
+            ),
+            "corpus_producer": copy.deepcopy(dict(producer)),
+            "independent_parent_authority_sha256": (
+                authority.get("authority_sha256")
+                if isinstance(authority, Mapping)
+                else None
+            ),
+            "function_preserving_upgrade_receipt_sha256": (
+                upgrade.get("receipt_sha256")
+                if isinstance(upgrade, Mapping)
+                else None
+            ),
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+        }
+        if (
+            not isinstance(diagnostic, Mapping)
+            or diagnostic.get("role") != "independent_parent"
+            or diagnostic.get("diagnostic_only") is not True
+            or diagnostic.get("promotion_eligible") is not False
+            or not isinstance(authority, Mapping)
+            or authority.get("schema_version")
+            != INDEPENDENT_PARENT_AUTHORITY_SCHEMA
+            or not isinstance(upgrade, Mapping)
+            or not isinstance(checkpoint, Mapping)
+            or dict(parent) != expected_independent
+            or checkpoint.get("sha256")
+            != upgrade.get("source_checkpoint_sha256")
+        ):
+            raise ExecutorError(
+                "diagnostic learner lineage parent lost independent-parent authority"
+            )
+        return str(checkpoint["sha256"])
     expected = {
         "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
         "role": "diagnostic_recent_history",
@@ -9911,6 +10383,15 @@ def build_parser() -> argparse.ArgumentParser:
             "composite; forbidden for ordinary A1 memmaps"
         ),
     )
+    parser.add_argument(
+        "--coherent-corpus-admission",
+        type=Path,
+        default=None,
+        help=(
+            "diagnostic-only signed admission for one direct coherent-public "
+            "memmap; never interpreted as the historical 12k A1 corpus"
+        ),
+    )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
@@ -9922,6 +10403,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "immutable allowlisted zero-diff initializer receipt; exact producer "
             "bytes remain the default"
+        ),
+    )
+    parser.add_argument(
+        "--independent-parent-authority",
+        type=Path,
+        default=None,
+        help=(
+            "diagnostic-only authority separating an independently selected "
+            "learner parent from the checkpoint that produced the corpus"
         ),
     )
     parser.add_argument(
@@ -9977,6 +10467,15 @@ def build_parser() -> argparse.ArgumentParser:
             "reporting-only learner campaign mode: emit the 64/128/terminal "
             "same-trajectory frontier and module optimizer telemetry; requires "
             "a generic diagnostic ablation"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-checkpoint-steps",
+        default="",
+        help=(
+            "optional strictly increasing intermediate optimizer steps for a "
+            "generic diagnostic dose curve; terminal --max-steps remains the "
+            "final checkpoint"
         ),
     )
     parser.add_argument(
@@ -10170,9 +10669,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         generic_ablation_requested = bool(
             args.ablation_id or args.recipe_overrides_json
         )
+        if args.coherent_corpus_admission is not None and not generic_ablation_requested:
+            raise ExecutorError(
+                "--coherent-corpus-admission requires an explicit diagnostic ablation"
+            )
         if args.diagnostic_dose_curve and not generic_ablation_requested:
             raise ExecutorError(
                 "--diagnostic-dose-curve requires a generic diagnostic ablation"
+            )
+        if args.diagnostic_checkpoint_steps and not args.diagnostic_dose_curve:
+            raise ExecutorError(
+                "--diagnostic-checkpoint-steps requires --diagnostic-dose-curve"
+            )
+        if args.independent_parent_authority is not None and (
+            not args.diagnostic_dose_curve
+            or not generic_ablation_requested
+            or args.architecture_upgrade_receipt is None
+        ):
+            raise ExecutorError(
+                "--independent-parent-authority requires a generic diagnostic "
+                "dose curve and --architecture-upgrade-receipt"
             )
         if args.fresh_policy_distillation_only and not generic_ablation_requested:
             raise ExecutorError(
@@ -10212,6 +10728,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             frozen_verifier_sha256=(
                 args.frozen_verifier_sha256 if frozen_requested else None
             ),
+            coherent_corpus_admission=args.coherent_corpus_admission,
         )
         if args.architecture_upgrade_receipt is not None:
             verified = bind_function_preserving_upgrade(
@@ -10223,6 +10740,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_diagnostic_recent_history_source=bool(
                     args.diagnostic_dose_curve
                 ),
+                independent_parent_authority_path=(
+                    args.independent_parent_authority
+                ),
             )
         if generic_ablation_requested:
             verified = bind_learner_ablation(
@@ -10231,6 +10751,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 overrides_json=args.recipe_overrides_json,
                 reviewed_code_tree_sha256=args.ablation_code_tree_sha256,
                 diagnostic_dose_curve=bool(args.diagnostic_dose_curve),
+                diagnostic_checkpoint_steps=args.diagnostic_checkpoint_steps,
             )
             checkpoint_for_descriptor = Path(
                 os.path.abspath(os.fspath(args.checkpoint.expanduser()))

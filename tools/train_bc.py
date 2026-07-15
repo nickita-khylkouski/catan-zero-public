@@ -1527,6 +1527,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--a1-coherent-corpus-binding-json",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--a1-central-executor-authority",
         default="",
         help=argparse.SUPPRESS,
@@ -6482,6 +6487,219 @@ def _validate_dual_arm_corpus_artifacts_and_seeds(
     }
 
 
+COHERENT_DIRECT_CORPUS_BINDING_SCHEMA = (
+    "a1-coherent-direct-memmap-learner-binding-v1"
+)
+COHERENT_DIRECT_UPGRADE_MODULE = (
+    "entity_graph.public_card_count_features+meaningful_public_history.v2"
+)
+
+
+def _validate_coherent_direct_corpus_binding(
+    raw_binding: str,
+    *,
+    data_path: str | Path,
+    corpus_meta: dict[str, object],
+    validation_seed_contract: dict[str, object],
+    game_seed_column: np.ndarray,
+) -> dict[str, object]:
+    """Replay the typed 8,192-game coherent-corpus binding.
+
+    The historical A1 path intentionally remains frozen at its 12,000-game
+    selected/audit schema.  This diagnostic-only path admits the new coherent
+    public-belief corpus without pretending it is legacy A1 data.  The caller
+    must supply a binding emitted by the sealed one-dose executor; this
+    function independently checks the memmap bytes, exact seed population,
+    holdout, recipe, and non-promotion role before optimizer construction.
+    """
+
+    try:
+        binding = json.loads(raw_binding)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid coherent corpus binding JSON: {error}") from error
+    expected_fields = {
+        "schema_version",
+        "diagnostic_only",
+        "promotion_eligible",
+        "corpus_admission",
+        "target_contract_sha256",
+        "producer_checkpoint_sha256",
+        "learner_initializer",
+        "corpus",
+        "validation",
+        "learner",
+        "binding_sha256",
+    }
+    if not isinstance(binding, dict) or set(binding) != expected_fields:
+        raise SystemExit("coherent corpus binding fields/schema drift")
+    unsigned = dict(binding)
+    stated = unsigned.pop("binding_sha256", None)
+    if (
+        binding.get("schema_version") != COHERENT_DIRECT_CORPUS_BINDING_SCHEMA
+        or binding.get("diagnostic_only") is not True
+        or binding.get("promotion_eligible") is not False
+        or stated != _canonical_json_sha256(unsigned)
+    ):
+        raise SystemExit("coherent corpus binding digest/role drift")
+
+    corpus = binding.get("corpus")
+    validation = binding.get("validation")
+    learner = binding.get("learner")
+    learner_initializer = binding.get("learner_initializer")
+    if not all(
+        isinstance(value, dict)
+        for value in (corpus, validation, learner, learner_initializer)
+    ):
+        raise SystemExit("coherent corpus binding sections are malformed")
+    expected_initializer_fields = {
+        "role",
+        "parent_checkpoint_sha256",
+        "initializer_checkpoint_sha256",
+        "upgrade_module",
+        "upgrade_receipt_file_sha256",
+        "upgrade_receipt_sha256",
+        "independent_parent_authority_sha256",
+    }
+    if (
+        set(learner_initializer) != expected_initializer_fields
+        or learner_initializer.get("role") != "diagnostic_independent_parent"
+        or learner_initializer.get("upgrade_module")
+        != COHERENT_DIRECT_UPGRADE_MODULE
+        or any(
+            not _is_sha256(learner_initializer.get(field))
+            for field in expected_initializer_fields - {"role", "upgrade_module"}
+        )
+        or learner_initializer.get("parent_checkpoint_sha256")
+        == binding.get("producer_checkpoint_sha256")
+    ):
+        raise SystemExit("coherent learner parent/initializer authority drift")
+    root = Path(data_path).expanduser().resolve(strict=True)
+    meta_path = root / "corpus_meta.json"
+    if (
+        corpus.get("path") != str(root)
+        or corpus.get("corpus_meta_file_sha256") != _sha256_existing_file(meta_path)
+        or corpus.get("payload_inventory_sha256")
+        != corpus_meta.get("payload_inventory_sha256")
+    ):
+        raise SystemExit("coherent corpus binding differs from loaded memmap bytes")
+    _validate_memmap_payload_inventory(root, corpus_meta)
+
+    target_contract_sha = binding.get("target_contract_sha256")
+    if (
+        not _is_sha256(target_contract_sha)
+        or validation_seed_contract.get("a1_contract_sha256")
+        != target_contract_sha
+        or validation.get("path") != str(validation_seed_contract["path"])
+        or validation.get("file_sha256")
+        != validation_seed_contract["file_sha256"]
+        or validation.get("game_count")
+        != validation_seed_contract["validation_game_seed_count"]
+        or validation.get("game_seed_set_sha256")
+        != validation_seed_contract["validation_game_seed_set_sha256"]
+        or validation.get("row_count")
+        != validation_seed_contract["validation_row_count"]
+    ):
+        raise SystemExit("coherent corpus binding differs from exact whole-game holdout")
+
+    observed = np.asarray(game_seed_column, dtype=np.int64).reshape(-1)
+    if observed.size == 0:
+        raise SystemExit("coherent memmap corpus has no game_seed rows")
+    run_starts = np.concatenate(
+        (np.asarray([0], dtype=np.int64), np.flatnonzero(observed[1:] != observed[:-1]) + 1)
+    )
+    run_values = observed[run_starts]
+    if np.unique(run_values).size != run_values.size:
+        raise SystemExit("coherent memmap contains non-contiguous duplicate game runs")
+    selected = np.sort(np.unique(observed))
+    seed_start = int(corpus.get("seed_start", -1))
+    seed_end = int(corpus.get("seed_end", -1))
+    expected_games = int(corpus.get("selected_game_count", -1))
+    expected_seeds = np.arange(seed_start, seed_end, dtype=np.int64)
+    if (
+        expected_games <= 0
+        or seed_end - seed_start != expected_games
+        or not np.array_equal(selected, expected_seeds)
+        or corpus.get("selected_game_seed_set_sha256")
+        != _game_seed_set_sha256(selected)
+    ):
+        raise SystemExit("coherent memmap seed population differs from its sealed lane range")
+
+    validation_seeds = np.asarray(
+        validation_seed_contract["game_seeds"], dtype=np.int64
+    )
+    if not np.isin(validation_seeds, selected).all():
+        raise SystemExit("coherent validation holdout contains a seed outside the corpus")
+    training_seeds = selected[~np.isin(selected, validation_seeds)]
+    if (
+        corpus.get("training_game_count") != int(training_seeds.size)
+        or corpus.get("training_game_seed_set_sha256")
+        != _game_seed_set_sha256(training_seeds)
+        or int(np.count_nonzero(np.isin(observed, validation_seeds)))
+        != int(validation_seed_contract["validation_row_count"])
+    ):
+        raise SystemExit("coherent corpus training/validation split binding drift")
+
+    recipe = learner.get("training_recipe")
+    objective = learner.get("value_objective")
+    topology = learner.get("topology")
+    expected_topology = {
+        "name": "b200-8gpu-ddp",
+        "world_size": 8,
+        "local_batch_size": 512,
+        "grad_accum_steps": 1,
+        "global_batch_size": 4096,
+    }
+    if (
+        not isinstance(recipe, dict)
+        or learner.get("training_recipe_sha256")
+        != _canonical_json_sha256(recipe)
+        or objective
+        != {
+            "objective": "mse",
+            "value_readout": "scalar",
+            "value_categorical_bins": None,
+            "hlgauss_sigma_ratio": None,
+        }
+        or topology != expected_topology
+        or not _is_sha256(binding.get("producer_checkpoint_sha256"))
+    ):
+        raise SystemExit("coherent corpus learner recipe/objective binding drift")
+    repo = Path(__file__).resolve().parents[1]
+    learner_snapshot = [
+        {"path": suffix, "sha256": _sha256_existing_file(repo / suffix)}
+        for suffix in sorted(A1_REQUIRED_LEARNER_CODE_SUFFIXES)
+    ]
+    runtime_snapshot = [
+        {"path": suffix, "sha256": _sha256_existing_file(repo / suffix)}
+        for suffix in sorted(A1_REQUIRED_RUNTIME_CODE_SUFFIXES)
+    ]
+    return {
+        "coherent_direct_corpus": True,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "learner_value_objective": objective,
+        "learner_training_recipe": recipe,
+        "learner_training_recipe_sha256": _canonical_json_sha256(recipe),
+        "learner_code_sha256": _canonical_json_sha256(learner_snapshot),
+        "runtime_code_tree_sha256": _canonical_json_sha256(runtime_snapshot),
+        "producer_checkpoint_sha256": binding["producer_checkpoint_sha256"],
+        "learner_parent_checkpoint_sha256": learner_initializer[
+            "parent_checkpoint_sha256"
+        ],
+        "learner_initializer_sha256": learner_initializer[
+            "initializer_checkpoint_sha256"
+        ],
+        "selected_game_seed_set_sha256": corpus[
+            "selected_game_seed_set_sha256"
+        ],
+        "training_game_seed_set_sha256": corpus[
+            "training_game_seed_set_sha256"
+        ],
+        "coherent_corpus_binding_sha256": stated,
+        "coherent_topology": expected_topology,
+    }
+
+
 def _validate_a1_corpus_artifacts_and_seeds(
     corpus_meta: dict[str, object],
     validation_seed_contract: dict[str, object],
@@ -6859,13 +7077,16 @@ def _validate_a1_learner_objective(
         ):
             raise SystemExit("A1 HL-Gauss sigma differs from the contract")
     curriculum_parent = _validate_a1_curriculum_parent(args, bound)
+    expected_initializer_sha256 = bound.get(
+        "learner_initializer_sha256", bound["producer_checkpoint_sha256"]
+    )
     if (
         getattr(args, "init_checkpoint_sha256", None)
-        != bound["producer_checkpoint_sha256"]
+        != expected_initializer_sha256
         and curriculum_parent is None
     ):
         raise SystemExit(
-            "A1 warm-start checkpoint differs from the producer bound by the contract"
+            "A1 warm-start checkpoint differs from its bound learner initializer"
         )
     args.a1_curriculum_parent = curriculum_parent
 
@@ -7449,7 +7670,7 @@ def _validate_a1_learner_training_recipe(
             "central learner projection and executor-authority path/SHA must be "
             "supplied together"
         )
-    if not central_binding_raw and (
+    if not central_binding_raw and bound.get("coherent_direct_corpus") is not True and (
         bool(getattr(args, "per_game_policy_weight", False))
         or str(
         getattr(args, "per_game_policy_weight_mode", "equal")
@@ -7465,6 +7686,25 @@ def _validate_a1_learner_training_recipe(
         raise SystemExit("A1 contract has no typed learner training recipe")
     immutable_expected = expected
     effective = _effective_a1_learner_training_recipe(args, ddp)
+    if bound.get("coherent_direct_corpus") is True:
+        topology = bound.get("coherent_topology")
+        if topology != {
+            "name": "b200-8gpu-ddp",
+            "world_size": 8,
+            "local_batch_size": 512,
+            "grad_accum_steps": 1,
+            "global_batch_size": 4096,
+        }:
+            raise SystemExit("coherent direct learner topology authority drift")
+        expected = dict(expected)
+        expected.update(
+            {
+                "world_size": 8,
+                "batch_size": 512,
+                "grad_accum_steps": 1,
+                "global_batch_size": 4096,
+            }
+        )
     batch_probe = _validate_a1_batch_probe_authorization(args, effective)
     if batch_probe is not None:
         bound["learner_ablation"] = batch_probe
@@ -8896,12 +9136,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     ) = _resolve_effective_meaningful_public_history(args)
     _preflight_init_checkpoint_architecture(args, ddp)
     a1_preflight_meta: dict[str, object] | None = None
+    coherent_corpus_binding_raw = str(
+        getattr(args, "a1_coherent_corpus_binding_json", "") or ""
+    )
     if args.data_format == "memmap":
         a1_preflight_meta = _coordinated_a1_memmap_preflight(
             args.data,
             validation_manifest_path=args.validation_game_seed_manifest or None,
             ddp=ddp,
         )
+        if coherent_corpus_binding_raw and a1_preflight_meta is None:
+            meta_path = Path(args.data).expanduser() / "corpus_meta.json"
+            try:
+                value = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise SystemExit(
+                    f"cannot read coherent memmap metadata {meta_path}: {error}"
+                ) from error
+            if not isinstance(value, dict):
+                raise SystemExit("coherent memmap corpus_meta.json is not an object")
+            a1_preflight_meta = value
 
     validation_game_seed_ranges = _parse_game_seed_ranges(
         args.validation_game_seed_ranges
@@ -9046,10 +9300,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(
                 "--policy-aux-active-batch-size requires --grad-accum-steps 1"
             )
-        if not is_memmap_composite:
+        if not is_memmap_composite and not coherent_corpus_binding_raw:
             raise SystemExit(
                 "--policy-aux-active-batch-size requires an authenticated "
-                "memmap_composite_v2 descriptor"
+                "memmap_composite_v2 descriptor or coherent direct-corpus binding"
             )
         if float(args.policy_loss_weight) <= 0.0:
             raise SystemExit(
@@ -9318,14 +9572,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "central learner sample authority differs from composite bytes"
                 )
     elif validation_seed_contract is not None:
-        _validate_a1_validation_manifest_corpus_binding(
-            getattr(data, "meta", None), validation_seed_contract
-        )
-        a1_training_binding = _validate_a1_corpus_artifacts_and_seeds(
-            getattr(data, "meta"),
-            validation_seed_contract,
-            np.asarray(data["game_seed"], dtype=np.int64),
-        )
+        if coherent_corpus_binding_raw:
+            a1_training_binding = _validate_coherent_direct_corpus_binding(
+                coherent_corpus_binding_raw,
+                data_path=args.data,
+                corpus_meta=getattr(data, "meta"),
+                validation_seed_contract=validation_seed_contract,
+                game_seed_column=np.asarray(data["game_seed"], dtype=np.int64),
+            )
+        else:
+            _validate_a1_validation_manifest_corpus_binding(
+                getattr(data, "meta", None), validation_seed_contract
+            )
+            a1_training_binding = _validate_a1_corpus_artifacts_and_seeds(
+                getattr(data, "meta"),
+                validation_seed_contract,
+                np.asarray(data["game_seed"], dtype=np.int64),
+            )
         _validate_a1_learner_objective(args, a1_training_binding)
         a1_training_binding["effective_learner_training_recipe"] = (
             _validate_a1_learner_training_recipe(args, ddp, a1_training_binding)
@@ -10547,19 +10810,32 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--policy-aux-active-batch-size > 0"
         )
     if int(args.policy_aux_active_batch_size) > 0:
-        if component_game_sampling is None:
+        coherent_direct_policy_aux = bool(
+            isinstance(a1_training_binding, dict)
+            and a1_training_binding.get("coherent_direct_corpus") is True
+        )
+        if component_game_sampling is None and not coherent_direct_policy_aux:
             raise SystemExit(
-                "policy auxiliary sampling requires authenticated composite base weights"
+                "policy auxiliary sampling requires authenticated composite base "
+                "weights or a coherent direct-corpus binding"
             )
         policy_aux_preconditioning_weights = (
             epoch_sample_weights
             if exact_per_game_surprise
-            else component_game_sampling
+            else (
+                np.ones(len(train_indices), dtype=np.float64)
+                if coherent_direct_policy_aux
+                else component_game_sampling
+            )
         )
         if policy_aux_preconditioning_weights is None:
             raise SystemExit("policy auxiliary sampler lost its base measure")
         policy_aux_base_measure = (
-            "authenticated_component_x_exact_per_game_policy_surprise"
+            "coherent_direct_x_exact_per_game_policy_surprise"
+            if coherent_direct_policy_aux and exact_per_game_surprise
+            else "coherent_direct_uniform_row"
+            if coherent_direct_policy_aux
+            else "authenticated_component_x_exact_per_game_policy_surprise"
             if exact_per_game_surprise
             else "authenticated_component"
         )

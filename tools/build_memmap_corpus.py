@@ -1575,6 +1575,14 @@ def build_memmap_corpus(
         # alternate same-seed file from being substituted or reordered.
         file_records = [actual_by_path[path] for path in audited_paths]
     files = [file for file, _source_index in file_records]
+    source_shard_inventory = [
+        {
+            "path": str(file.expanduser().resolve(strict=True)),
+            "size_bytes": file.stat().st_size,
+            "sha256": _file_sha256(file),
+        }
+        for file in files
+    ]
     out_dir.mkdir(parents=True, exist_ok=True)
 
     started = time.perf_counter()
@@ -2022,6 +2030,13 @@ def build_memmap_corpus(
         "source": str(sources[0]),
         "sources": [str(src) for src in sources],
         "shard_count": len(files),
+        # Bind the converted bytes to the exact raw shard inventory. Source
+        # directories alone are mutable and cannot prove that a completed
+        # generation receipt is the corpus actually consumed by the learner.
+        "source_shard_inventory": source_shard_inventory,
+        "source_shard_inventory_sha256": _value_sha256(
+            source_shard_inventory
+        ),
         "columns": schemas,
         "game_seed_present": "game_seed" in column_set,
         # --full-rows-only provenance: whether fast rows were physically dropped,
