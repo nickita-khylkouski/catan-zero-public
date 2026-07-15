@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run the selected-dose Stage-B learner treatment ablation on 8xB200.
 
-Stage A selects an active-policy exposure and optimizer step.  This tool binds
-that signed selection and holds the selected dose, coherent n128 corpus, exact
+Stage A, or a signed direction-corrected recovery after Stage A formally selects
+no winner, selects an active-policy exposure and optimizer step.  This tool
+replays that authority and holds the selected dose, coherent n128 corpus, exact
 f7 function-preserving initializer, optimizer, topology, and every ordinary
 learner setting fixed.  It then varies one treatment at a time:
 
@@ -55,10 +56,19 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import train_bc  # noqa: E402
 
 
-SCHEMA = "a1-b200-stage-b-causal-ablation-campaign-v3"
+SCHEMA = "a1-b200-stage-b-causal-ablation-campaign-v4"
 ARM_RECEIPT_SCHEMA = "a1-b200-stage-b-arm-receipt-v1"
 FINGERPRINT_SCHEMA = "a1-b200-stage-b-fingerprint-v1"
 COMPARISON_SCHEMA = "a1-b200-stage-b-comparison-v3"
+RECOVERY_SELECTION_SCHEMA = "a1-direction-corrected-recovery-selection-v1"
+RECOVERY_CAMPAIGN_SCHEMA = "coherent-n128-trust-recovery-campaign-v1"
+RECOVERY_FINGERPRINT_SCHEMA = "coherent-n128-trust-recovery-fingerprint-v1"
+STAGE_A_NO_WINNER_REASON = (
+    "no active-policy exposure checkpoint remained inside both drift budgets"
+)
+STAGE_A_FORMAL_REFUSAL = (
+    "no_checkpoint_with_positive_teacher_gap_and_parent_kl_lte_0.03"
+)
 WORLD_SIZE = stage_a.WORLD_SIZE
 LOCAL_BATCH_SIZE = stage_a.LOCAL_BATCH_SIZE
 GLOBAL_BATCH_SIZE = stage_a.GLOBAL_BATCH_SIZE
@@ -206,6 +216,25 @@ def _checkpoint_schedule(optimizer_steps: int) -> tuple[int, ...]:
     return tuple(step for step in CHECKPOINT_FRONTIER if step <= optimizer_steps)
 
 
+def _checkpoint_schedule_from_frontier(
+    optimizer_steps: int, frontier: Sequence[object]
+) -> tuple[int, ...]:
+    """Project a signed recovery trajectory through its selected checkpoint."""
+
+    try:
+        normalized = tuple(int(step) for step in frontier)
+    except (TypeError, ValueError) as error:
+        raise CampaignError("recovery checkpoint frontier is malformed") from error
+    if (
+        not normalized
+        or any(step <= 0 for step in normalized)
+        or tuple(sorted(set(normalized))) != normalized
+        or optimizer_steps not in normalized
+    ):
+        raise CampaignError("recovery checkpoint frontier is malformed")
+    return tuple(step for step in normalized if step <= optimizer_steps)
+
+
 def _selected_dose(
     *,
     selection_path: Path,
@@ -245,12 +274,8 @@ def _selected_dose(
         aux_batch = int(winner_recipe["policy_aux_active_batch_size"])
         candidate_step = int(winner_candidate["step"])
         reference_parent_kl = float(winner_candidate["parent_kl"])
-        reference_trunk_relative_l2 = float(
-            winner_candidate["trunk_relative_l2"]
-        )
-        reference_teacher_gap_closure = float(
-            winner_candidate["teacher_gap_closure"]
-        )
+        reference_trunk_relative_l2 = float(winner_candidate["trunk_relative_l2"])
+        reference_teacher_gap_closure = float(winner_candidate["teacher_gap_closure"])
     except (KeyError, TypeError, ValueError) as error:
         raise CampaignError("Stage-A selected dose is malformed") from error
     _checkpoint_schedule(step)
@@ -282,6 +307,17 @@ def _selected_dose(
     ):
         raise CampaignError("Stage-A winner recipe/checkpoint dose binding drifted")
     return {
+        "authority_kind": "stage_a_selection",
+        "selection_authority": {
+            "path": str(selection_path),
+            "file_sha256": _file_sha256(selection_path),
+            "selection_sha256": selection["selection_sha256"],
+        },
+        "source_campaign": {
+            "path": str(campaign_path),
+            "file_sha256": _file_sha256(campaign_path),
+            "campaign_sha256": campaign["campaign_sha256"],
+        },
         "stage_a_selection": {
             "path": str(selection_path),
             "file_sha256": _file_sha256(selection_path),
@@ -301,7 +337,18 @@ def _selected_dose(
         "reference_parent_kl": reference_parent_kl,
         "reference_trunk_relative_l2": reference_trunk_relative_l2,
         "reference_teacher_gap_closure": reference_teacher_gap_closure,
+        "trust_contract": {
+            "policy_kl_anchor_direction": "forward",
+            "policy_kl_target": reference_parent_kl,
+            "policy_kl_dual_lr": TRUST_DUAL_LR,
+            "policy_kl_max_weight": TRUST_MAX_WEIGHT,
+        },
         "stage_a_selected_checkpoint": {
+            "path": str(candidate_path),
+            "sha256": _file_sha256(candidate_path),
+            "role": "dose_evidence_only_never_initializer",
+        },
+        "selected_checkpoint": {
             "path": str(candidate_path),
             "sha256": _file_sha256(candidate_path),
             "role": "dose_evidence_only_never_initializer",
@@ -337,6 +384,552 @@ def _load_stage_a_selection(
     return selection_path, selection, loaded_path, campaign, dose
 
 
+def _replay_stage_a_refusal(
+    evidence: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any], dict[str, Path]]:
+    """Authenticate the failed Stage-A selector that motivated recovery."""
+
+    campaign_ref = evidence.get("campaign")
+    fingerprint_refs = evidence.get("fingerprints")
+    if (
+        not isinstance(campaign_ref, Mapping)
+        or not isinstance(fingerprint_refs, Mapping)
+        or set(fingerprint_refs) != set(stage_a.ARMS)
+        or evidence.get("formal_result") != STAGE_A_FORMAL_REFUSAL
+    ):
+        raise CampaignError("recovery Stage-A refusal evidence is malformed")
+    campaign_path = _regular_file(
+        Path(str(campaign_ref.get("path", ""))),
+        where="recovery source Stage-A campaign",
+    )
+    try:
+        loaded_path, campaign = stage_a._load_campaign(campaign_path)  # noqa: SLF001
+    except stage_a.CampaignError as error:
+        raise CampaignError(
+            f"recovery source Stage-A campaign refused: {error}"
+        ) from error
+    if campaign_ref.get("file_sha256") != _file_sha256(loaded_path) or campaign_ref.get(
+        "campaign_sha256"
+    ) != campaign.get("campaign_sha256"):
+        raise CampaignError("recovery source Stage-A campaign binding drifted")
+
+    bindings: dict[str, Path] = {}
+    for arm in stage_a.ARMS:
+        ref = fingerprint_refs[arm]
+        if not isinstance(ref, Mapping):
+            raise CampaignError(
+                f"recovery source Stage-A {arm} fingerprint is malformed"
+            )
+        path, fingerprint = _load_signed(
+            Path(str(ref.get("path", ""))),
+            where=f"recovery source Stage-A {arm} fingerprint",
+            schema=stage_a.FINGERPRINT_SCHEMA,
+            digest_field="fingerprint_sha256",
+        )
+        checkpoints = fingerprint.get("checkpoints")
+        checkpoint_sha256_by_step = (
+            {
+                str(int(row["step"])): str(row["checkpoint_sha256"])
+                for row in checkpoints
+            }
+            if isinstance(checkpoints, list)
+            and all(isinstance(row, Mapping) for row in checkpoints)
+            else None
+        )
+        if (
+            ref.get("file_sha256") != _file_sha256(path)
+            or ref.get("fingerprint_sha256") != fingerprint.get("fingerprint_sha256")
+            or ref.get("checkpoint_sha256_by_step") != checkpoint_sha256_by_step
+        ):
+            raise CampaignError(
+                f"recovery source Stage-A {arm} fingerprint binding drifted"
+            )
+        bindings[arm] = path
+
+    try:
+        stage_a._select(loaded_path, campaign, bindings)  # noqa: SLF001
+    except stage_a.CampaignError as error:
+        if str(error) != STAGE_A_NO_WINNER_REASON:
+            raise CampaignError(
+                f"recovery source Stage-A selector failed differently: {error}"
+            ) from error
+    else:
+        raise CampaignError(
+            "recovery selection is forbidden because Stage A now has an eligible winner"
+        )
+    return loaded_path, campaign, bindings
+
+
+def _recovery_arm_receipt(
+    plan: Mapping[str, Any], arm: str, fingerprint: Mapping[str, Any]
+) -> tuple[Path, dict[str, Any]]:
+    arms = plan.get("arms")
+    if not isinstance(arms, Mapping) or not isinstance(arms.get(arm), Mapping):
+        raise CampaignError(f"recovery plan lost arm {arm}")
+    command = arms[arm].get("command")
+    if not isinstance(command, list) or not all(
+        isinstance(token, str) for token in command
+    ):
+        raise CampaignError(f"recovery arm {arm} command is malformed")
+    recipe = arms[arm].get("recipe_overrides")
+    if not isinstance(recipe, Mapping):
+        raise CampaignError(f"recovery arm {arm} recipe is malformed")
+    try:
+        rendered_recipe = json.loads(
+            stage_a._option(command, "--recipe-overrides-json")  # noqa: SLF001
+        )
+    except (json.JSONDecodeError, stage_a.CampaignError) as error:
+        raise CampaignError(
+            f"recovery arm {arm} rendered recipe is malformed"
+        ) from error
+    if rendered_recipe != recipe:
+        raise CampaignError(f"recovery arm {arm} command/recipe binding drifted")
+    try:
+        receipt_path = _regular_file(
+            Path(stage_a._option(command, "--receipt")),  # noqa: SLF001
+            where=f"recovery arm {arm} one-dose receipt",
+        )
+        receipt = one_dose._load_authenticated_completed_aux_receipt(  # noqa: SLF001
+            receipt_path
+        )
+    except (stage_a.CampaignError, one_dose.ExecutorError) as error:
+        raise CampaignError(f"recovery arm {arm} receipt refused: {error}") from error
+    lineage = receipt.get("learner_lineage_parent")
+    effective = receipt.get("learner_ablation", {}).get("effective_recipe")
+    rows = fingerprint.get("checkpoints")
+    terminal = rows[-1] if isinstance(rows, list) and rows else None
+    if (
+        receipt.get("status") != "complete"
+        or receipt.get("returncode") != 0
+        or receipt.get("diagnostic_only") is not True
+        or receipt.get("promotion_eligible") is not False
+        or receipt.get("receipt_sha256") != fingerprint.get("one_dose_receipt_sha256")
+        or not isinstance(effective, Mapping)
+        or any(effective.get(key) != value for key, value in recipe.items())
+        or not isinstance(terminal, Mapping)
+        or receipt.get("outputs", {}).get("checkpoint_sha256")
+        != terminal.get("checkpoint_sha256")
+        or not isinstance(lineage, Mapping)
+        or lineage.get("role") != "diagnostic_independent_parent"
+        or lineage.get("checkpoint", {}).get("sha256")
+        != stage_a.EXPECTED_F7_PARENT_SHA256
+    ):
+        raise CampaignError(f"recovery arm {arm} receipt lineage/dose drifted")
+    return receipt_path, receipt
+
+
+def _load_recovery_selection(
+    path: Path,
+) -> tuple[Path, dict[str, Any], Path, dict[str, Any], dict[str, Any]]:
+    """Load the exact direction-corrected selection as Stage-B dose authority."""
+
+    selection_path, selection = _load_signed(
+        path,
+        where="direction-corrected recovery selection",
+        schema=RECOVERY_SELECTION_SCHEMA,
+        digest_field="selection_sha256",
+    )
+    campaign_ref = selection.get("campaign")
+    if not isinstance(campaign_ref, Mapping):
+        raise CampaignError("recovery selection lost its campaign reference")
+    plan_path, plan = _load_signed(
+        Path(str(campaign_ref.get("path", ""))),
+        where="direction-corrected recovery campaign",
+        schema=RECOVERY_CAMPAIGN_SCHEMA,
+        digest_field="campaign_sha256",
+    )
+    outputs = plan.get("outputs")
+    if (
+        campaign_ref.get("file_sha256") != _file_sha256(plan_path)
+        or campaign_ref.get("campaign_sha256") != plan.get("campaign_sha256")
+        or selection.get("source") != plan.get("source")
+        or selection.get("lineage") != plan.get("lineage")
+        or selection.get("stage_a_refusal_evidence")
+        != plan.get("stage_a_refusal_evidence")
+        or selection.get("selection_contract") != plan.get("selection_contract")
+        or selection.get("diagnostic_only") is not True
+        or selection.get("promotion_eligible") is not False
+        or selection.get("playing_strength_evaluation_required") is not True
+        or not isinstance(outputs, Mapping)
+        or Path(str(outputs.get("selection", ""))).expanduser().resolve(strict=False)
+        != selection_path
+        or plan.get("selection_contract", {}).get(
+            "playing_strength_evaluation_required"
+        )
+        is not True
+    ):
+        raise CampaignError("recovery selection campaign/diagnostic binding drifted")
+
+    lineage = plan.get("lineage")
+    if (
+        not isinstance(lineage, Mapping)
+        or lineage.get("learner_parent_sha256") != stage_a.EXPECTED_F7_PARENT_SHA256
+        or lineage.get("every_arm_restarts_from_exact_upgraded_f7") is not True
+        or lineage.get("fresh_adam_every_arm") is not True
+        or lineage.get("candidate_chaining_forbidden") is not True
+    ):
+        raise CampaignError("recovery selection lineage is not fresh f7/fresh Adam")
+
+    operator = plan.get("operator")
+    source_ref = plan.get("source")
+    fixed = plan.get("fixed_surface")
+    if (
+        not isinstance(operator, Mapping)
+        or not isinstance(source_ref, Mapping)
+        or not isinstance(fixed, Mapping)
+    ):
+        raise CampaignError("recovery campaign input surface is malformed")
+    operator_path = _regular_file(
+        Path(str(operator.get("path", ""))), where="recovery campaign operator"
+    )
+    source_root = (
+        Path(str(source_ref.get("path", ""))).expanduser().resolve(strict=True)
+    )
+    if not source_root.is_dir():
+        raise CampaignError("recovery campaign source root is not a directory")
+    if (
+        operator.get("file_sha256") != _file_sha256(operator_path)
+        or source_ref.get("one_dose_trainer_sha256")
+        != _file_sha256(
+            _regular_file(
+                source_root / "tools/a1_one_dose_train.py", where="recovery trainer"
+            )
+        )
+        or source_ref.get("train_bc_sha256")
+        != _file_sha256(
+            _regular_file(source_root / "tools/train_bc.py", where="recovery train_bc")
+        )
+    ):
+        raise CampaignError("recovery campaign code bytes drifted")
+    for path_key, digest_key, label in (
+        ("validation", "validation_file_sha256", "validation manifest"),
+        ("admission", "admission_file_sha256", "coherent admission"),
+        (
+            "architecture_upgrade_receipt",
+            "architecture_upgrade_receipt_file_sha256",
+            "architecture upgrade receipt",
+        ),
+    ):
+        artifact = _regular_file(
+            Path(str(fixed.get(path_key, ""))), where=f"recovery {label}"
+        )
+        if fixed.get(digest_key) != _file_sha256(artifact):
+            raise CampaignError(f"recovery {label} bytes drifted")
+    data = Path(str(fixed.get("data", ""))).expanduser().resolve(strict=True)
+    if (
+        not data.is_dir()
+        or fixed.get("corpus_meta_file_sha256")
+        != _file_sha256(data / "corpus_meta.json")
+        or plan.get("diagnostic_only") is not True
+        or plan.get("promotion_eligible") is not False
+        or plan.get("fixed_surface", {}).get("topology")
+        != {
+            "world_size": WORLD_SIZE,
+            "local_batch_size": LOCAL_BATCH_SIZE,
+            "global_batch_size": GLOBAL_BATCH_SIZE,
+        }
+    ):
+        raise CampaignError("recovery corpus/topology binding drifted")
+
+    stage_a_path, stage_a_campaign, _bindings = _replay_stage_a_refusal(
+        selection["stage_a_refusal_evidence"]
+    )
+    arms = plan.get("arms")
+    refs = selection.get("fingerprints")
+    trajectory = plan.get("trajectory")
+    contract = plan.get("selection_contract")
+    if (
+        not isinstance(arms, Mapping)
+        or not arms
+        or not isinstance(refs, Mapping)
+        or set(refs) != set(arms)
+        or not isinstance(trajectory, Mapping)
+        or not isinstance(contract, Mapping)
+    ):
+        raise CampaignError("recovery selection arm/trajectory surface is malformed")
+    try:
+        frontier = tuple(int(step) for step in trajectory["checkpoint_steps"])
+        terminal = int(trajectory["terminal_step"])
+        parent_kl_cap = float(contract["parent_kl_max"])
+        trunk_cap = float(contract["trunk_relative_l2_max"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError("recovery selection contract is malformed") from error
+    _checkpoint_schedule_from_frontier(terminal, frontier)
+    if (
+        terminal != frontier[-1]
+        or not all(
+            math.isfinite(value) and value > 0.0 for value in (parent_kl_cap, trunk_cap)
+        )
+        or contract.get("positive_teacher_gap_closure_required") is not True
+    ):
+        raise CampaignError("recovery selection contract/trajectory drifted")
+
+    candidates: list[dict[str, Any]] = []
+    arm_receipts: dict[str, dict[str, Any]] = {}
+    for arm in arms:
+        arm_plan = arms[arm]
+        ref = refs[arm]
+        if not isinstance(arm_plan, Mapping) or not isinstance(ref, Mapping):
+            raise CampaignError(f"recovery arm {arm} authority is malformed")
+        fingerprint_path, fingerprint = _load_signed(
+            Path(str(ref.get("path", ""))),
+            where=f"recovery arm {arm} fingerprint",
+            schema=RECOVERY_FINGERPRINT_SCHEMA,
+            digest_field="fingerprint_sha256",
+        )
+        rows = fingerprint.get("checkpoints")
+        recipe = arm_plan.get("recipe_overrides")
+        if (
+            ref.get("file_sha256") != _file_sha256(fingerprint_path)
+            or ref.get("fingerprint_sha256") != fingerprint.get("fingerprint_sha256")
+            or fingerprint.get("campaign_sha256") != plan.get("campaign_sha256")
+            or fingerprint.get("arm") != arm
+            or fingerprint.get("recipe_overrides") != recipe
+            or fingerprint.get("diagnostic_only") is not True
+            or fingerprint.get("promotion_eligible") is not False
+            or not isinstance(rows, list)
+            or [row.get("step") for row in rows] != list(frontier)
+        ):
+            raise CampaignError(f"recovery arm {arm} fingerprint binding drifted")
+        receipt_path, receipt = _recovery_arm_receipt(plan, arm, fingerprint)
+        arm_receipts[arm] = {
+            "path": str(receipt_path),
+            "file_sha256": _file_sha256(receipt_path),
+            "receipt_sha256": receipt["receipt_sha256"],
+        }
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise CampaignError(f"recovery arm {arm} fingerprint row is malformed")
+            try:
+                step = int(row["step"])
+                checkpoint = _regular_file(
+                    Path(str(row["checkpoint"])),
+                    where=f"recovery arm {arm} step {step} checkpoint",
+                )
+                parent_kl = float(row["parent_kl"])
+                closure = float(row["teacher_gap_closure"])
+                trunk = float(row["trunk_relative_l2"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise CampaignError(
+                    f"recovery arm {arm} fingerprint row is malformed"
+                ) from error
+            functional_path = _regular_file(
+                fingerprint_path.parent / f"step{step:04d}.functional.json",
+                where=f"recovery arm {arm} step {step} functional fingerprint",
+            )
+            drift_path = _regular_file(
+                fingerprint_path.parent / f"step{step:04d}.drift.json",
+                where=f"recovery arm {arm} step {step} layer drift",
+            )
+            _functional_path, functional = _load_json(
+                functional_path,
+                where=f"recovery arm {arm} step {step} functional fingerprint",
+            )
+            _drift_path, drift = _load_json(
+                drift_path, where=f"recovery arm {arm} step {step} layer drift"
+            )
+            functional_dose = functional.get("functional_dose_fingerprint")
+            try:
+                measured_parent_kl = float(functional_dose["kl_parent_candidate_mean"])
+                measured_closure = float(
+                    functional["teacher_gap"]["active_policy_teacher_gap_closure"]
+                )
+                measured_trunk = stage_a._trunk_relative_l2(drift)  # noqa: SLF001
+            except (KeyError, TypeError, ValueError, stage_a.CampaignError) as error:
+                raise CampaignError(
+                    f"recovery arm {arm} step {step} metrics are malformed"
+                ) from error
+            if (
+                row.get("checkpoint_sha256") != _file_sha256(checkpoint)
+                or row.get("functional_file_sha256") != _file_sha256(functional_path)
+                or row.get("drift_file_sha256") != _file_sha256(drift_path)
+                or not isinstance(functional_dose, Mapping)
+                or measured_parent_kl != parent_kl
+                or measured_closure != closure
+                or measured_trunk != trunk
+                or functional.get("inputs", {}).get("checkpoint", {}).get("sha256")
+                != _file_sha256(checkpoint)
+                or drift.get("candidate", {}).get("sha256") != _file_sha256(checkpoint)
+                or not all(
+                    math.isfinite(value) for value in (parent_kl, closure, trunk)
+                )
+                or parent_kl < 0.0
+                or trunk < 0.0
+            ):
+                raise CampaignError(
+                    f"recovery arm {arm} step {step} fingerprint drifted"
+                )
+            candidate = {
+                "arm": arm,
+                **copy.deepcopy(dict(row)),
+                "eligible": (
+                    parent_kl <= parent_kl_cap and trunk <= trunk_cap and closure > 0.0
+                ),
+            }
+            candidates.append(candidate)
+
+    claimed_candidates = selection.get("checkpoint_candidates")
+    expected_by_key = {
+        (str(candidate["arm"]), int(candidate["step"])): candidate
+        for candidate in candidates
+    }
+    claimed_by_key = (
+        {
+            (str(candidate.get("arm")), int(candidate.get("step", -1))): candidate
+            for candidate in claimed_candidates
+        }
+        if isinstance(claimed_candidates, list)
+        and all(isinstance(candidate, Mapping) for candidate in claimed_candidates)
+        else {}
+    )
+    if (
+        not isinstance(claimed_candidates, list)
+        or len(claimed_candidates) != len(claimed_by_key)
+        or claimed_by_key != expected_by_key
+    ):
+        raise CampaignError("recovery checkpoint candidate table did not replay")
+    candidates = [copy.deepcopy(dict(candidate)) for candidate in claimed_candidates]
+    eligible = [candidate for candidate in candidates if candidate["eligible"]]
+    if not eligible:
+        raise CampaignError("recovery selection contains no eligible checkpoint")
+    winner = sorted(
+        eligible,
+        key=lambda row: (
+            -float(row["teacher_gap_closure"]),
+            float(row["parent_kl"]),
+            float(row["trunk_relative_l2"]),
+            int(row["step"]),
+            str(row["arm"]),
+        ),
+    )[0]
+    if selection.get("winner") != winner:
+        raise CampaignError("recovery winner does not replay from its frozen contract")
+    winner_arm = str(winner["arm"])
+    winner_recipe = arms[winner_arm].get("recipe_overrides")
+    if not isinstance(winner_recipe, Mapping):
+        raise CampaignError("recovery winner recipe is malformed")
+    try:
+        step = int(winner["step"])
+        aux_batch = int(winner_recipe["policy_aux_active_batch_size"])
+        lr = float(winner_recipe["lr"])
+        warmup = int(winner_recipe["lr_warmup_steps"])
+        reference_parent_kl = float(winner["parent_kl"])
+        reference_trunk = float(winner["trunk_relative_l2"])
+        reference_closure = float(winner["teacher_gap_closure"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError("recovery selected dose is malformed") from error
+    schedule = _checkpoint_schedule_from_frontier(step, frontier)
+    matching_stage_a_arms = [
+        name
+        for name, recipe in stage_a.ARMS.items()
+        if int(recipe["policy_aux_active_batch_size"]) == aux_batch
+    ]
+    checkpoint = _regular_file(
+        Path(str(winner["checkpoint"])), where="recovery selected checkpoint"
+    )
+    if (
+        len(matching_stage_a_arms) != 1
+        or not math.isfinite(lr)
+        or lr <= 0.0
+        or warmup < 0
+        or winner.get("checkpoint_sha256") != _file_sha256(checkpoint)
+        or reference_parent_kl <= 0.0
+        or reference_parent_kl > parent_kl_cap
+        or reference_trunk <= 0.0
+        or reference_trunk > trunk_cap
+        or reference_closure <= 0.0
+    ):
+        raise CampaignError("recovery selected checkpoint/dose binding drifted")
+    stage_a_arm = matching_stage_a_arms[0]
+    selected_fingerprint_ref = refs[winner_arm]
+    trust_keys = {
+        "policy_kl_anchor_direction",
+        "policy_kl_target",
+        "policy_kl_dual_lr",
+        "policy_kl_max_weight",
+    }
+    present_trust_keys = trust_keys & set(winner_recipe)
+    if present_trust_keys and present_trust_keys != trust_keys:
+        raise CampaignError("recovery winner carries a partial trust contract")
+    trust_contract = (
+        {key: copy.deepcopy(winner_recipe[key]) for key in sorted(trust_keys)}
+        if present_trust_keys
+        else {
+            "policy_kl_anchor_direction": "forward",
+            "policy_kl_target": reference_parent_kl,
+            "policy_kl_dual_lr": TRUST_DUAL_LR,
+            "policy_kl_max_weight": TRUST_MAX_WEIGHT,
+        }
+    )
+    try:
+        trust_target = float(trust_contract["policy_kl_target"])
+        trust_dual_lr = float(trust_contract["policy_kl_dual_lr"])
+        trust_max_weight = float(trust_contract["policy_kl_max_weight"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError("recovery winner trust contract is malformed") from error
+    if (
+        trust_contract.get("policy_kl_anchor_direction") != "forward"
+        or not math.isfinite(trust_target)
+        or trust_target <= 0.0
+        or not math.isfinite(trust_dual_lr)
+        or trust_dual_lr <= 0.0
+        or not math.isfinite(trust_max_weight)
+        or trust_max_weight <= 0.0
+    ):
+        raise CampaignError("recovery winner trust contract is malformed")
+    return (
+        selection_path,
+        selection,
+        stage_a_path,
+        stage_a_campaign,
+        {
+            "authority_kind": "direction_corrected_recovery_selection",
+            "selection_authority": {
+                "path": str(selection_path),
+                "file_sha256": _file_sha256(selection_path),
+                "selection_sha256": selection["selection_sha256"],
+            },
+            "source_campaign": {
+                "path": str(stage_a_path),
+                "file_sha256": _file_sha256(stage_a_path),
+                "campaign_sha256": stage_a_campaign["campaign_sha256"],
+            },
+            "recovery_campaign": {
+                "path": str(plan_path),
+                "file_sha256": _file_sha256(plan_path),
+                "campaign_sha256": plan["campaign_sha256"],
+            },
+            "recovery_fingerprint": copy.deepcopy(dict(selected_fingerprint_ref)),
+            "recovery_receipt": copy.deepcopy(arm_receipts[winner_arm]),
+            "selected_arm": winner_arm,
+            "active_policy_branch_multiplier": float(
+                stage_a.ARMS[stage_a_arm]["active_policy_branch_multiplier"]
+            ),
+            "policy_aux_active_batch_size": aux_batch,
+            "optimizer_steps": step,
+            "checkpoint_steps": list(schedule),
+            "expected_aux_active_row_draws": aux_batch * WORLD_SIZE * step,
+            "reference_parent_kl": reference_parent_kl,
+            "reference_trunk_relative_l2": reference_trunk,
+            "reference_teacher_gap_closure": reference_closure,
+            "trust_contract": trust_contract,
+            "selected_recipe_overrides": copy.deepcopy(dict(winner_recipe)),
+            "selected_checkpoint": {
+                "path": str(checkpoint),
+                "sha256": _file_sha256(checkpoint),
+                "role": "dose_evidence_only_never_initializer",
+            },
+        },
+    )
+
+
+def load_recovery_selected_dose(path: Path) -> dict[str, Any]:
+    """Return the authenticated stable dose projection for eval/orchestration."""
+
+    _path, _selection, _stage_a_path, _stage_a, dose = _load_recovery_selection(path)
+    return copy.deepcopy(dose)
+
+
 def _treatment_exposure(data_path: Path) -> dict[str, Any]:
     """Measure the exact rows the typed forced-value treatment can change."""
 
@@ -361,7 +954,9 @@ def _treatment_exposure(data_path: Path) -> dict[str, Any]:
         )
         actions = np.asarray(corpus["action_taken"], dtype=np.int64)
     except (KeyError, OSError, SystemExit, ValueError) as error:
-        raise CampaignError(f"cannot measure Stage-B treatment exposure: {error}") from error
+        raise CampaignError(
+            f"cannot measure Stage-B treatment exposure: {error}"
+        ) from error
     if (
         legal_counts.shape != (len(corpus),)
         or stored_forced.shape != (len(corpus),)
@@ -490,19 +1085,31 @@ def _arm_overrides(
     if typed:
         overrides["forced_row_value_action_type_weights"] = typed
     if arm == "TRUST":
-        target = float(selected_dose["reference_parent_kl"])
-        if not math.isfinite(target) or target <= 0.0:
-            raise CampaignError(
-                "TRUST requires a finite positive Stage-A parent-KL fingerprint"
-            )
-        overrides.update(
-            {
+        contract = selected_dose.get("trust_contract")
+        if not isinstance(contract, Mapping):
+            contract = {
                 "policy_kl_anchor_direction": "forward",
-                "policy_kl_target": target,
+                "policy_kl_target": float(selected_dose["reference_parent_kl"]),
                 "policy_kl_dual_lr": TRUST_DUAL_LR,
                 "policy_kl_max_weight": TRUST_MAX_WEIGHT,
             }
-        )
+        try:
+            target = float(contract["policy_kl_target"])
+            dual_lr = float(contract["policy_kl_dual_lr"])
+            max_weight = float(contract["policy_kl_max_weight"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CampaignError("TRUST contract is malformed") from error
+        if (
+            contract.get("policy_kl_anchor_direction") != "forward"
+            or not math.isfinite(target)
+            or target <= 0.0
+            or not math.isfinite(dual_lr)
+            or dual_lr <= 0.0
+            or not math.isfinite(max_weight)
+            or max_weight <= 0.0
+        ):
+            raise CampaignError("TRUST contract is malformed")
+        overrides.update(copy.deepcopy(dict(contract)))
     return overrides
 
 
@@ -510,11 +1117,12 @@ def _assert_treatment_isolation(arms: Mapping[str, Mapping[str, Any]]) -> None:
     if set(arms) != set(ARM_ORDER):
         raise CampaignError("Stage-B treatment matrix is incomplete")
     recipes = {
-        arm: dict(record.get("recipe_overrides", {}))
-        for arm, record in arms.items()
+        arm: dict(record.get("recipe_overrides", {})) for arm, record in arms.items()
     }
     common = {
-        arm: {key: value for key, value in recipe.items() if key not in TREATMENT_FIELDS}
+        arm: {
+            key: value for key, value in recipe.items() if key not in TREATMENT_FIELDS
+        }
         for arm, recipe in recipes.items()
     }
     if any(value != common["BASE"] for value in common.values()):
@@ -579,9 +1187,10 @@ def _verify_source_campaign_inputs(campaign: Mapping[str, Any]) -> None:
         if _file_sha256(path) != inputs[digest_key]:
             raise CampaignError(f"Stage-A immutable input changed: {path_key}")
     data = Path(str(inputs["data"])).expanduser().resolve(strict=True)
-    if not data.is_dir() or _file_sha256(data / "corpus_meta.json") != inputs[
-        "corpus_meta_file_sha256"
-    ]:
+    if (
+        not data.is_dir()
+        or _file_sha256(data / "corpus_meta.json") != inputs["corpus_meta_file_sha256"]
+    ):
         raise CampaignError("Stage-A coherent corpus changed after selection")
     try:
         stage_a._load_admission(  # noqa: SLF001
@@ -592,14 +1201,29 @@ def _verify_source_campaign_inputs(campaign: Mapping[str, Any]) -> None:
 
 
 def _plan(args: argparse.Namespace) -> dict[str, Any]:
-    selection_path, selection, source_path, source, dose = _load_stage_a_selection(
-        args.stage_a_selection
-    )
+    if args.recovery_selection is not None:
+        selection_path, selection, source_path, source, dose = _load_recovery_selection(
+            args.recovery_selection
+        )
+    else:
+        selection_path, selection, source_path, source, dose = _load_stage_a_selection(
+            args.stage_a_selection
+        )
     _verify_source_campaign_inputs(source)
     source_inputs = source["inputs"]
-    source_recipe = source.get("canonical_learner", {}).get("training_recipe")
-    if not isinstance(source_recipe, Mapping):
+    canonical_source_recipe = source.get("canonical_learner", {}).get("training_recipe")
+    if not isinstance(canonical_source_recipe, Mapping):
         raise CampaignError("Stage-A campaign lost its canonical learner recipe")
+    source_recipe = copy.deepcopy(dict(canonical_source_recipe))
+    selected_recipe = dose.get("selected_recipe_overrides")
+    if isinstance(selected_recipe, Mapping):
+        try:
+            source_recipe["lr"] = float(selected_recipe["lr"])
+            source_recipe["lr_warmup_steps"] = int(selected_recipe["lr_warmup_steps"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CampaignError(
+                "recovery selected common recipe is malformed"
+            ) from error
     data = Path(str(source_inputs["data"])).resolve(strict=True)
 
     trainer = _regular_file(
@@ -630,7 +1254,9 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         or upgrade.get("forward_identical_at_init") is not True
         or upgrade.get("shared_parameters_bit_identical") is not True
     ):
-        raise CampaignError("Stage-B requires the exact Stage-A f7 upgraded initializer")
+        raise CampaignError(
+            "Stage-B requires the exact Stage-A f7 upgraded initializer"
+        )
     upgraded_initializer = _regular_file(
         Path(str(upgrade["upgraded_initializer"]["path"])),
         where="f7 upgraded initializer",
@@ -688,17 +1314,31 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
     _assert_treatment_isolation(arm_records)
 
     output_root = args.output_root.expanduser().resolve(strict=False)
+    dose_authority: dict[str, Any] = {
+        "kind": dose["authority_kind"],
+        "selection": copy.deepcopy(dose["selection_authority"]),
+        "source_stage_a_campaign": copy.deepcopy(dose["source_campaign"]),
+        "selected_arm": dose["selected_arm"],
+        "selected_checkpoint": copy.deepcopy(dose["selected_checkpoint"]),
+    }
+    if dose["authority_kind"] == "direction_corrected_recovery_selection":
+        dose_authority.update(
+            {
+                "recovery_campaign": copy.deepcopy(dose["recovery_campaign"]),
+                "recovery_fingerprint": copy.deepcopy(dose["recovery_fingerprint"]),
+                "recovery_receipt": copy.deepcopy(dose["recovery_receipt"]),
+                "selected_recipe_overrides": copy.deepcopy(
+                    dose["selected_recipe_overrides"]
+                ),
+                "playing_strength_evaluation_required": True,
+            }
+        )
     payload: dict[str, Any] = {
         "schema_version": SCHEMA,
         "purpose": "selected_dose_single_treatment_causal_ablation",
         "diagnostic_only": True,
         "promotion_eligible": False,
-        "stage_a": {
-            "selection": dose["stage_a_selection"],
-            "campaign": dose["stage_a_campaign"],
-            "winner": selection["winner"],
-            "selected_checkpoint": dose["stage_a_selected_checkpoint"],
-        },
+        "dose_authority": dose_authority,
         "selected_dose": {
             key: copy.deepcopy(dose[key])
             for key in (
@@ -711,6 +1351,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
                 "reference_parent_kl",
                 "reference_trunk_relative_l2",
                 "reference_teacher_gap_closure",
+                "trust_contract",
             )
         },
         "lineage_contract": {
@@ -718,7 +1359,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "upgraded_initializer_sha256": upgrade["upgraded_initializer"]["sha256"],
             "every_arm_restarts_from_upgraded_initializer": True,
             "fresh_adam_every_arm": True,
-            "stage_a_winner_checkpoint_is_never_an_initializer": True,
+            "dose_evidence_checkpoint_is_never_an_initializer": True,
             "candidate_chaining_forbidden": True,
         },
         "fixed_experiment_surface": {
@@ -856,6 +1497,7 @@ def _load_campaign(path: Path) -> tuple[Path, dict[str, Any]]:
     )
     _assert_treatment_isolation(campaign.get("arms", {}))
     active = campaign.get("active_arms")
+    dose_authority = campaign.get("dose_authority")
     if (
         not isinstance(active, list)
         or not active
@@ -864,6 +1506,13 @@ def _load_campaign(path: Path) -> tuple[Path, dict[str, Any]]:
         or "BASE" not in active
         or campaign.get("diagnostic_only") is not True
         or campaign.get("promotion_eligible") is not False
+        or not isinstance(dose_authority, Mapping)
+        or dose_authority.get("kind")
+        not in {"stage_a_selection", "direction_corrected_recovery_selection"}
+        or (
+            dose_authority.get("kind") == "direction_corrected_recovery_selection"
+            and dose_authority.get("playing_strength_evaluation_required") is not True
+        )
     ):
         raise CampaignError("Stage-B campaign arm/diagnostic semantics drifted")
     forced_exposure = bool(
@@ -886,9 +1535,7 @@ def _load_campaign(path: Path) -> tuple[Path, dict[str, Any]]:
         )
     )
     if ("VTRUNK25" in active) != value_trunk_exposure:
-        raise CampaignError(
-            "VTRUNK25 launch eligibility differs from signed exposure"
-        )
+        raise CampaignError("VTRUNK25 launch eligibility differs from signed exposure")
     return campaign_path, campaign
 
 
@@ -909,14 +1556,45 @@ def _verify_campaign_inputs(campaign: Mapping[str, Any]) -> None:
     data = Path(str(inputs["data"])).expanduser().resolve(strict=True)
     if (
         not data.is_dir()
-        or _file_sha256(data / "corpus_meta.json")
-        != inputs["corpus_meta_file_sha256"]
+        or _file_sha256(data / "corpus_meta.json") != inputs["corpus_meta_file_sha256"]
     ):
         raise CampaignError("Stage-B coherent corpus changed after planning")
-    selection_ref = campaign["stage_a"]["selection"]
-    _selection_path, _selection, _source_path, _source, dose = (
-        _load_stage_a_selection(Path(str(selection_ref["path"])))
-    )
+    authority = campaign.get("dose_authority")
+    if not isinstance(authority, Mapping):
+        raise CampaignError("Stage-B campaign lost its dose authority")
+    selection_ref = authority.get("selection")
+    if not isinstance(selection_ref, Mapping):
+        raise CampaignError("Stage-B campaign lost its selection authority")
+    kind = authority.get("kind")
+    if kind == "stage_a_selection":
+        _selection_path, _selection, _source_path, _source, dose = (
+            _load_stage_a_selection(Path(str(selection_ref["path"])))
+        )
+    elif kind == "direction_corrected_recovery_selection":
+        _selection_path, _selection, _source_path, _source, dose = (
+            _load_recovery_selection(Path(str(selection_ref["path"])))
+        )
+    else:
+        raise CampaignError(f"unknown Stage-B dose authority {kind!r}")
+    expected_authority: dict[str, Any] = {
+        "kind": dose["authority_kind"],
+        "selection": dose["selection_authority"],
+        "source_stage_a_campaign": dose["source_campaign"],
+        "selected_arm": dose["selected_arm"],
+        "selected_checkpoint": dose["selected_checkpoint"],
+    }
+    if kind == "direction_corrected_recovery_selection":
+        expected_authority.update(
+            {
+                "recovery_campaign": dose["recovery_campaign"],
+                "recovery_fingerprint": dose["recovery_fingerprint"],
+                "recovery_receipt": dose["recovery_receipt"],
+                "selected_recipe_overrides": dose["selected_recipe_overrides"],
+                "playing_strength_evaluation_required": True,
+            }
+        )
+    if authority != expected_authority:
+        raise CampaignError("Stage-B dose authority changed after planning")
     for key in (
         "selected_arm",
         "active_policy_branch_multiplier",
@@ -927,9 +1605,10 @@ def _verify_campaign_inputs(campaign: Mapping[str, Any]) -> None:
         "reference_parent_kl",
         "reference_trunk_relative_l2",
         "reference_teacher_gap_closure",
+        "trust_contract",
     ):
         if dose[key] != campaign["selected_dose"][key]:
-            raise CampaignError(f"Stage-A selected dose changed after planning: {key}")
+            raise CampaignError(f"selected dose changed after planning: {key}")
 
 
 def _effective_treatment_assertion(
@@ -1020,9 +1699,7 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
     has_trust_target = "--policy-kl-target" in command
     expected_trust_target = arm == "TRUST"
     expected_value_trunk_scale = float(
-        campaign["arms"][arm]["recipe_overrides"].get(
-            "value_trunk_grad_scale", 1.0
-        )
+        campaign["arms"][arm]["recipe_overrides"].get("value_trunk_grad_scale", 1.0)
     )
     actual_value_trunk_scale = (
         float(stage_a._option(command, "--value-trunk-grad-scale"))  # noqa: SLF001
@@ -1048,22 +1725,27 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
         or plan.get("learner_ablation", {}).get("promotion_eligible") is not False
     ):
         raise CampaignError(f"Stage-B arm {arm} lost exact f7/fresh-Adam selected dose")
+    trust_contract = campaign["selected_dose"]["trust_contract"]
     if expected_trust_target and (
         float(stage_a._option(command, "--policy-kl-target"))  # noqa: SLF001
-        != float(campaign["selected_dose"]["reference_parent_kl"])
+        != float(trust_contract["policy_kl_target"])
         or float(stage_a._option(command, "--policy-kl-dual-lr"))  # noqa: SLF001
-        != TRUST_DUAL_LR
+        != float(trust_contract["policy_kl_dual_lr"])
         or float(stage_a._option(command, "--policy-kl-max-weight"))  # noqa: SLF001
-        != TRUST_MAX_WEIGHT
+        != float(trust_contract["policy_kl_max_weight"])
         or stage_a._option(command, "--policy-kl-anchor-direction")  # noqa: SLF001
-        != "forward"
+        != trust_contract["policy_kl_anchor_direction"]
     ):
         raise CampaignError("Stage-B TRUST arm lost its projected-dual contract")
     return plan
 
 
 def _step_checkpoint(arm_root: Path, step: int, terminal: int) -> Path:
-    return arm_root / "candidate.pt" if step == terminal else arm_root / f"candidate_step{step:04d}.pt"
+    return (
+        arm_root / "candidate.pt"
+        if step == terminal
+        else arm_root / f"candidate_step{step:04d}.pt"
+    )
 
 
 def _verify_value_trunk_routing(
@@ -1075,8 +1757,7 @@ def _verify_value_trunk_routing(
     if (
         not isinstance(routing, Mapping)
         or report.get("value_trunk_grad_scale") != expected_scale
-        or routing.get("schema_version")
-        != "scalar-value-trunk-gradient-routing-v1"
+        or routing.get("schema_version") != "scalar-value-trunk-gradient-routing-v1"
         or routing.get("scalar_value_trunk_grad_scale") != expected_scale
         or routing.get("shared_state_upstream_gradient_scale") != expected_scale
         or routing.get("active") is not (expected_scale != 1.0)
@@ -1121,9 +1802,7 @@ def _verify_completed_arm(
         report,
         arm=arm,
         expected_scale=float(
-            campaign["arms"][arm]["recipe_overrides"].get(
-                "value_trunk_grad_scale", 1.0
-            )
+            campaign["arms"][arm]["recipe_overrides"].get("value_trunk_grad_scale", 1.0)
         ),
     )
     checkpoint = _regular_file(
@@ -1133,16 +1812,18 @@ def _verify_completed_arm(
     learner_parent = receipt.get("learner_lineage_parent")
     intermediate = report.get("intermediate_checkpoints")
     controller = report.get("adaptive_policy_kl_controller")
+    trust_contract = campaign["selected_dose"]["trust_contract"]
     if arm == "TRUST":
         if (
             not isinstance(controller, Mapping)
-            or controller.get("schema_version")
-            != train_bc.POLICY_KL_CONTROLLER_SCHEMA
+            or controller.get("schema_version") != train_bc.POLICY_KL_CONTROLLER_SCHEMA
             or controller.get("direction") != "forward"
             or float(controller.get("target_kl", math.nan))
-            != float(campaign["selected_dose"]["reference_parent_kl"])
-            or float(controller.get("dual_lr", math.nan)) != TRUST_DUAL_LR
-            or float(controller.get("max_weight", math.nan)) != TRUST_MAX_WEIGHT
+            != float(trust_contract["policy_kl_target"])
+            or float(controller.get("dual_lr", math.nan))
+            != float(trust_contract["policy_kl_dual_lr"])
+            or float(controller.get("max_weight", math.nan))
+            != float(trust_contract["policy_kl_max_weight"])
             or int(controller.get("updates", -1)) != terminal
             or int(controller.get("eligible_rows", 0)) <= 0
         ):
@@ -1274,7 +1955,11 @@ def _fingerprint_arm(
         where="independent parent authority",
     )
     parent = _regular_file(
-        Path(str(authority["function_preserving_upgrade"]["upgraded_initializer"]["path"])),
+        Path(
+            str(
+                authority["function_preserving_upgrade"]["upgraded_initializer"]["path"]
+            )
+        ),
         where="upgraded f7 initializer",
     )
     output_root = arm_root / "fingerprints"
@@ -1317,7 +2002,11 @@ def _fingerprint_arm(
             str(drift_output),
         ]
         commands.append(
-            {"step": int(step), "functional": functional_command, "drift": drift_command}
+            {
+                "step": int(step),
+                "functional": functional_command,
+                "drift": drift_command,
+            }
         )
         if not go:
             continue
@@ -1415,9 +2104,7 @@ def _fingerprint_arm(
     }
 
 
-def _parse_bindings(
-    values: Sequence[str], *, allowed: set[str]
-) -> dict[str, Path]:
+def _parse_bindings(values: Sequence[str], *, allowed: set[str]) -> dict[str, Path]:
     try:
         return stage_a._parse_bindings(  # noqa: SLF001
             values, allowed=allowed, label="Stage-B arm fingerprint"
@@ -1443,9 +2130,7 @@ def _select_dose_matched_checkpoint(
     normalized: list[dict[str, Any]] = []
     for candidate in candidates:
         row = copy.deepcopy(dict(candidate))
-        kl_ratio = positive_ratio(
-            float(row["parent_kl"]), float(reference_parent_kl)
-        )
+        kl_ratio = positive_ratio(float(row["parent_kl"]), float(reference_parent_kl))
         trunk_ratio = positive_ratio(
             float(row["trunk_relative_l2"]),
             float(reference_trunk_relative_l2),
@@ -1481,13 +2166,9 @@ def _compare(
     cap_kl = float(campaign["comparison_contract"]["max_parent_kl"])
     cap_trunk = float(campaign["comparison_contract"]["max_trunk_relative_l2"])
     reference_kl = float(campaign["selected_dose"]["reference_parent_kl"])
-    reference_trunk = float(
-        campaign["selected_dose"]["reference_trunk_relative_l2"]
-    )
+    reference_trunk = float(campaign["selected_dose"]["reference_trunk_relative_l2"])
     max_kl_ratio = float(
-        campaign["comparison_contract"][
-            "max_parent_kl_ratio_to_stage_a_reference"
-        ]
+        campaign["comparison_contract"]["max_parent_kl_ratio_to_stage_a_reference"]
     )
     max_trunk_ratio = float(
         campaign["comparison_contract"][
@@ -1523,7 +2204,9 @@ def _compare(
             len(terminal_rows) != 1
             or terminal_rows[0].get("terminal_selected_dose") is not True
         ):
-            raise CampaignError(f"Stage-B arm {arm} lacks its exact selected-dose result")
+            raise CampaignError(
+                f"Stage-B arm {arm} lacks its exact selected-dose result"
+            )
         candidates: list[dict[str, Any]] = []
         for row in checkpoints:
             step = int(row.get("step", -1))
@@ -1554,9 +2237,7 @@ def _compare(
             parent_kl = float(row["functional"]["parent_kl"])
             closure = float(row["functional"]["teacher_gap_closure"])
             trunk = float(row["layer_drift"]["trunk_relative_l2"])
-            if not all(
-                math.isfinite(value) for value in (parent_kl, closure, trunk)
-            ):
+            if not all(math.isfinite(value) for value in (parent_kl, closure, trunk)):
                 raise CampaignError(
                     f"Stage-B arm {arm} step {step} has non-finite fingerprint"
                 )
@@ -1581,7 +2262,9 @@ def _compare(
             reference_trunk_relative_l2=reference_trunk,
             terminal_step=terminal,
         )
-        within = result["parent_kl"] <= cap_kl and result["trunk_relative_l2"] <= cap_trunk
+        within = (
+            result["parent_kl"] <= cap_kl and result["trunk_relative_l2"] <= cap_trunk
+        )
         matched = (
             result["parent_kl_ratio_to_stage_a_reference"] <= max_kl_ratio
             and result["trunk_ratio_to_stage_a_reference"] <= max_trunk_ratio
@@ -1616,8 +2299,7 @@ def _compare(
                 records[arm]["matched"]["parent_kl"] - base["parent_kl"]
             ),
             "trunk_relative_l2_delta_vs_base": (
-                records[arm]["matched"]["trunk_relative_l2"]
-                - base["trunk_relative_l2"]
+                records[arm]["matched"]["trunk_relative_l2"] - base["trunk_relative_l2"]
             ),
             "matched_step_delta_vs_base": (
                 records[arm]["matched"]["step"] - base["step"]
@@ -1666,7 +2348,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     plan = sub.add_parser("plan", help="seal selected-dose Stage-B arms")
-    plan.add_argument("--stage-a-selection", required=True, type=Path)
+    authority = plan.add_mutually_exclusive_group(required=True)
+    authority.add_argument("--stage-a-selection", type=Path)
+    authority.add_argument("--recovery-selection", type=Path)
     plan.add_argument("--ddp-canary-receipt", required=True, type=Path)
     plan.add_argument("--python", required=True, type=Path)
     plan.add_argument("--one-dose-trainer", type=Path)
@@ -1709,9 +2393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             campaign_path, campaign = _load_campaign(args.campaign)
             if args.command == "run-arm":
-                result = _run_arm(
-                    campaign_path, campaign, args.arm, go=bool(args.go)
-                )
+                result = _run_arm(campaign_path, campaign, args.arm, go=bool(args.go))
             elif args.command == "run-sequence":
                 arms = (
                     [value.strip() for value in args.arms.split(",") if value.strip()]

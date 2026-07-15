@@ -133,25 +133,23 @@ def test_stage_b_arms_change_exactly_one_treatment_at_selected_dose() -> None:
         row["recipe_overrides"]["policy_aux_active_batch_size"] == 232
         for row in arms.values()
     )
-    assert "forced_row_value_action_type_weights" not in arms["BASE"][
-        "recipe_overrides"
-    ]
-    assert arms["FORCED"]["recipe_overrides"][
-        "forced_row_value_action_type_weights"
-    ] == "END_TURN=0.1,ROLL=0.25"
+    assert (
+        "forced_row_value_action_type_weights" not in arms["BASE"]["recipe_overrides"]
+    )
+    assert (
+        arms["FORCED"]["recipe_overrides"]["forced_row_value_action_type_weights"]
+        == "END_TURN=0.1,ROLL=0.25"
+    )
     assert arms["CARD4"]["recipe_overrides"]["public_card_lr_mult"] == 4.0
-    assert arms["SURPRISE"]["recipe_overrides"][
-        "per_game_policy_surprise_weighting"
-    ] is True
+    assert (
+        arms["SURPRISE"]["recipe_overrides"]["per_game_policy_surprise_weighting"]
+        is True
+    )
     assert arms["TRUNK25"]["recipe_overrides"]["trunk_lr_mult"] == 0.25
     assert arms["TRUNK10"]["recipe_overrides"]["trunk_lr_mult"] == 0.10
-    assert arms["VTRUNK25"]["recipe_overrides"][
-        "value_trunk_grad_scale"
-    ] == 0.25
+    assert arms["VTRUNK25"]["recipe_overrides"]["value_trunk_grad_scale"] == 0.25
     assert arms["VTRUNK25"]["recipe_overrides"]["trunk_lr_mult"] == 1.0
-    assert arms["TRUST"]["recipe_overrides"]["policy_kl_target"] == pytest.approx(
-        0.012
-    )
+    assert arms["TRUST"]["recipe_overrides"]["policy_kl_target"] == pytest.approx(0.012)
     assert arms["TRUST"]["recipe_overrides"]["policy_kl_anchor_direction"] == (
         "forward"
     )
@@ -160,6 +158,29 @@ def test_stage_b_arms_change_exactly_one_treatment_at_selected_dose() -> None:
     broken["CARD4"]["recipe_overrides"]["lr"] = 1.2e-4
     with pytest.raises(campaign.CampaignError, match="outside declared treatment"):
         campaign._assert_treatment_isolation(broken)  # noqa: SLF001
+
+
+def test_trust_arm_inherits_the_exact_selected_recovery_contract() -> None:
+    dose = {
+        "optimizer_steps": 32,
+        "policy_aux_active_batch_size": 463,
+        "reference_parent_kl": 0.021,
+        "trust_contract": {
+            "policy_kl_anchor_direction": "forward",
+            "policy_kl_target": 0.027,
+            "policy_kl_dual_lr": 0.75,
+            "policy_kl_max_weight": 1.5,
+        },
+    }
+    recipe = campaign._arm_overrides(  # noqa: SLF001
+        "TRUST",
+        selected_dose=dose,
+        source_recipe={"lr": 6.0e-5, "lr_warmup_steps": 16},
+    )
+
+    assert recipe["policy_kl_target"] == pytest.approx(0.027)
+    assert recipe["policy_kl_dual_lr"] == pytest.approx(0.75)
+    assert recipe["policy_kl_max_weight"] == pytest.approx(1.5)
 
 
 class _FakeLegalColumn:
@@ -178,7 +199,9 @@ class _FakeCorpus:
         action_taken: list[int],
         stored_forced: list[bool],
     ) -> None:
-        prior_policy = np.zeros((len(legal_counts), max(legal_counts)), dtype=np.float32)
+        prior_policy = np.zeros(
+            (len(legal_counts), max(legal_counts)), dtype=np.float32
+        )
         for row, count in enumerate(legal_counts):
             if count > 1:
                 prior_policy[row, :count] = 1.0 / count
@@ -204,9 +227,7 @@ class _FakeCatalog:
 
     @staticmethod
     def describe(action_id: int) -> dict[str, str]:
-        return {
-            "action_type": ("END_TURN", "ROLL", "BUILD_SETTLEMENT")[action_id]
-        }
+        return {"action_type": ("END_TURN", "ROLL", "BUILD_SETTLEMENT")[action_id]}
 
 
 def test_forced_treatment_is_structurally_inactive_without_typed_rows(
@@ -414,3 +435,315 @@ def test_dose_match_uses_parent_kl_and_trunk_drift_not_teacher_outcome() -> None
     assert selected["step"] == 16
     assert selected["teacher_gap_closure"] == pytest.approx(0.01)
     assert selected["parent_kl_ratio_to_stage_a_reference"] == pytest.approx(1.05)
+
+
+def _signed(path: Path, payload: dict, digest_field: str) -> Path:
+    value = copy.deepcopy(payload)
+    value[digest_field] = campaign._value_sha256(value)  # noqa: SLF001
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    return path.resolve()
+
+
+def _recovery_selection_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, dict]:
+    source_root = tmp_path / "source"
+    tools = source_root / "tools"
+    tools.mkdir(parents=True)
+    trainer = tools / "a1_one_dose_train.py"
+    train_bc_path = tools / "train_bc.py"
+    trainer.write_text("# trainer\n", encoding="utf-8")
+    train_bc_path.write_text("# train_bc\n", encoding="utf-8")
+    operator = tmp_path / "recovery_operator.py"
+    operator.write_text("# operator\n", encoding="utf-8")
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "corpus_meta.json").write_text("{}\n", encoding="utf-8")
+    validation = tmp_path / "validation.json"
+    admission = tmp_path / "admission.json"
+    upgrade = tmp_path / "upgrade.json"
+    for artifact in (validation, admission, upgrade):
+        artifact.write_text("{}\n", encoding="utf-8")
+    stage_a_path = tmp_path / "stage-a.json"
+    stage_a_path.write_text("{}\n", encoding="utf-8")
+    stage_a_source = {"campaign_sha256": "sha256:" + "9" * 64}
+    stage_a_evidence = {
+        "campaign": {
+            "path": str(stage_a_path.resolve()),
+            "file_sha256": campaign._file_sha256(stage_a_path),  # noqa: SLF001
+            "campaign_sha256": stage_a_source["campaign_sha256"],
+        },
+        "fingerprints": {},
+        "formal_result": campaign.STAGE_A_FORMAL_REFUSAL,
+        "observed_p100_frontier": {},
+    }
+    monkeypatch.setattr(
+        campaign,
+        "_replay_stage_a_refusal",
+        lambda evidence: (
+            (
+                stage_a_path.resolve(),
+                stage_a_source,
+                {},
+            )
+            if evidence == stage_a_evidence
+            else (_ for _ in ()).throw(AssertionError("wrong Stage-A evidence"))
+        ),
+    )
+
+    frontier = [8, 32]
+    arms: dict[str, dict] = {}
+    fingerprint_refs: dict[str, dict] = {}
+    candidates: list[dict] = []
+    receipt_by_arm: dict[str, tuple[Path, dict]] = {}
+    for arm, lr, closure in (
+        ("TRUST_V25", 6.0e-5, 0.02),
+        ("LOWLR_V25", 3.0e-5, 0.06),
+    ):
+        recipe = {
+            "epochs": 1,
+            "max_steps": 128,
+            "lr": lr,
+            "lr_warmup_steps": 16,
+            "policy_aux_active_batch_size": 463,
+            "per_game_policy_surprise_weighting": False,
+            "public_card_lr_mult": 1.0,
+            "trunk_lr_mult": 1.0,
+            "value_trunk_grad_scale": 0.25,
+        }
+        receipt_path = tmp_path / arm / "one-dose.receipt.json"
+        receipt_path.parent.mkdir(parents=True)
+        receipt_path.write_text("{}\n", encoding="utf-8")
+        receipt = {"receipt_sha256": f"sha256:{arm.lower():0<64}"[:71]}
+        receipt_by_arm[arm] = (receipt_path.resolve(), receipt)
+        arms[arm] = {
+            "recipe_overrides": recipe,
+            "command": ["python", "trainer", "--receipt", str(receipt_path.resolve())],
+        }
+        rows = []
+        fingerprint_dir = tmp_path / arm / "fingerprints"
+        fingerprint_dir.mkdir()
+        for step in frontier:
+            checkpoint = (
+                tmp_path
+                / arm
+                / ("candidate.pt" if step == 32 else f"candidate_step{step:04d}.pt")
+            )
+            checkpoint.write_bytes(f"{arm}-{step}".encode())
+            functional = fingerprint_dir / f"step{step:04d}.functional.json"
+            drift = fingerprint_dir / f"step{step:04d}.drift.json"
+            parent_kl = 0.01 if step == 8 else 0.02
+            teacher_gap_closure = -0.01 if step == 8 else closure
+            trunk_relative_l2 = 0.004 if step == 8 else 0.008
+            functional.write_text(
+                json.dumps(
+                    {
+                        "inputs": {
+                            "checkpoint": {
+                                "sha256": campaign._file_sha256(checkpoint)  # noqa: SLF001
+                            }
+                        },
+                        "functional_dose_fingerprint": {
+                            "kl_parent_candidate_mean": parent_kl
+                        },
+                        "teacher_gap": {
+                            "active_policy_teacher_gap_closure": teacher_gap_closure
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            drift.write_text(
+                json.dumps(
+                    {
+                        "candidate": {
+                            "sha256": campaign._file_sha256(checkpoint)  # noqa: SLF001
+                        },
+                        "groups": {
+                            "shared": {
+                                "delta_energy": trunk_relative_l2**2,
+                                "baseline_l2": 1.0,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            row = {
+                "step": step,
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_sha256": campaign._file_sha256(checkpoint),  # noqa: SLF001
+                "parent_kl": parent_kl,
+                "teacher_gap_closure": teacher_gap_closure,
+                "trunk_relative_l2": trunk_relative_l2,
+                "functional_file_sha256": campaign._file_sha256(functional),  # noqa: SLF001
+                "drift_file_sha256": campaign._file_sha256(drift),  # noqa: SLF001
+            }
+            rows.append(row)
+            candidates.append(
+                {
+                    "arm": arm,
+                    **row,
+                    "eligible": step == 32,
+                }
+            )
+        fingerprint_payload = {
+            "schema_version": campaign.RECOVERY_FINGERPRINT_SCHEMA,
+            "campaign_sha256": "placeholder",
+            "arm": arm,
+            "recipe_overrides": recipe,
+            "one_dose_receipt_sha256": receipt["receipt_sha256"],
+            "checkpoints": rows,
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+        }
+        fingerprint_refs[arm] = {
+            "path": str(fingerprint_dir / "fingerprint.json"),
+            "payload": fingerprint_payload,
+        }
+
+    plan = {
+        "schema_version": campaign.RECOVERY_CAMPAIGN_SCHEMA,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "operator": {
+            "path": str(operator.resolve()),
+            "file_sha256": campaign._file_sha256(operator),  # noqa: SLF001
+        },
+        "source": {
+            "path": str(source_root.resolve()),
+            "git_sha": "a" * 40,
+            "reviewed_code_tree_sha256": "sha256:" + "b" * 64,
+            "one_dose_trainer_sha256": campaign._file_sha256(trainer),  # noqa: SLF001
+            "train_bc_sha256": campaign._file_sha256(train_bc_path),  # noqa: SLF001
+        },
+        "stage_a_refusal_evidence": stage_a_evidence,
+        "lineage": {
+            "learner_parent_sha256": stage_a.EXPECTED_F7_PARENT_SHA256,
+            "every_arm_restarts_from_exact_upgraded_f7": True,
+            "fresh_adam_every_arm": True,
+            "candidate_chaining_forbidden": True,
+        },
+        "fixed_surface": {
+            "data": str(data.resolve()),
+            "corpus_meta_file_sha256": campaign._file_sha256(  # noqa: SLF001
+                data / "corpus_meta.json"
+            ),
+            "validation": str(validation.resolve()),
+            "validation_file_sha256": campaign._file_sha256(validation),  # noqa: SLF001
+            "admission": str(admission.resolve()),
+            "admission_file_sha256": campaign._file_sha256(admission),  # noqa: SLF001
+            "architecture_upgrade_receipt": str(upgrade.resolve()),
+            "architecture_upgrade_receipt_file_sha256": campaign._file_sha256(  # noqa: SLF001
+                upgrade
+            ),
+            "topology": {
+                "world_size": 8,
+                "local_batch_size": 512,
+                "global_batch_size": 4096,
+            },
+        },
+        "trajectory": {"checkpoint_steps": frontier, "terminal_step": 32},
+        "arms": arms,
+        "selection_contract": {
+            "parent_kl_max": 0.03,
+            "trunk_relative_l2_max": 0.03,
+            "positive_teacher_gap_closure_required": True,
+            "objective": "max_teacher_gap_closure_within_frozen_trust_and_trunk_budgets",
+            "tie_break": [
+                "min_parent_kl",
+                "min_trunk_relative_l2",
+                "min_optimizer_step",
+            ],
+            "playing_strength_evaluation_required": True,
+        },
+        "outputs": {"selection": str((tmp_path / "recovery.selection.json").resolve())},
+    }
+    plan_path = _signed(tmp_path / "recovery.plan.json", plan, "campaign_sha256")
+    sealed_plan = json.loads(plan_path.read_text())
+    for arm, ref in fingerprint_refs.items():
+        ref["payload"]["campaign_sha256"] = sealed_plan["campaign_sha256"]
+        fingerprint_path = _signed(
+            Path(ref["path"]), ref["payload"], "fingerprint_sha256"
+        )
+        fingerprint = json.loads(fingerprint_path.read_text())
+        fingerprint_refs[arm] = {
+            "path": str(fingerprint_path),
+            "file_sha256": campaign._file_sha256(fingerprint_path),  # noqa: SLF001
+            "fingerprint_sha256": fingerprint["fingerprint_sha256"],
+        }
+    monkeypatch.setattr(
+        campaign,
+        "_recovery_arm_receipt",
+        lambda _plan, arm, _fingerprint: receipt_by_arm[arm],
+    )
+    winner = next(
+        row for row in candidates if row["arm"] == "LOWLR_V25" and row["step"] == 32
+    )
+    selection = {
+        "schema_version": campaign.RECOVERY_SELECTION_SCHEMA,
+        "campaign": {
+            "path": str(plan_path),
+            "file_sha256": campaign._file_sha256(plan_path),  # noqa: SLF001
+            "campaign_sha256": sealed_plan["campaign_sha256"],
+        },
+        "source": sealed_plan["source"],
+        "lineage": sealed_plan["lineage"],
+        "stage_a_refusal_evidence": sealed_plan["stage_a_refusal_evidence"],
+        "selection_contract": sealed_plan["selection_contract"],
+        "fingerprints": fingerprint_refs,
+        "checkpoint_candidates": candidates,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "playing_strength_evaluation_required": True,
+        "winner": winner,
+    }
+    selection_path = _signed(
+        tmp_path / "recovery.selection.json", selection, "selection_sha256"
+    )
+    return selection_path, selection
+
+
+def test_recovery_selection_binds_exact_winner_fingerprint_and_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selection_path, _selection = _recovery_selection_fixture(tmp_path, monkeypatch)
+
+    _path, _payload, _stage_a_path, _stage_a, dose = campaign._load_recovery_selection(
+        selection_path
+    )  # noqa: SLF001
+
+    assert dose["authority_kind"] == "direction_corrected_recovery_selection"
+    assert dose["selected_arm"] == "LOWLR_V25"
+    assert dose["optimizer_steps"] == 32
+    assert dose["checkpoint_steps"] == [8, 32]
+    assert dose["policy_aux_active_batch_size"] == 463
+    assert dose["active_policy_branch_multiplier"] == pytest.approx(1.0)
+    assert dose["reference_parent_kl"] == pytest.approx(0.02)
+    assert dose["reference_trunk_relative_l2"] == pytest.approx(0.008)
+    assert dose["reference_teacher_gap_closure"] == pytest.approx(0.06)
+    assert dose["selected_recipe_overrides"]["lr"] == pytest.approx(3.0e-5)
+    assert dose["trust_contract"]["policy_kl_target"] == pytest.approx(0.02)
+    assert dose["recovery_receipt"]["receipt_sha256"].startswith("sha256:")
+
+    public_dose = campaign.load_recovery_selected_dose(selection_path)
+    assert public_dose == dose
+
+
+def test_recovery_selection_refuses_a_resigned_nonwinning_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selection_path, _selection = _recovery_selection_fixture(tmp_path, monkeypatch)
+    payload = json.loads(selection_path.read_text())
+    payload.pop("selection_sha256")
+    payload["winner"] = next(
+        row
+        for row in payload["checkpoint_candidates"]
+        if row["arm"] == "TRUST_V25" and row["step"] == 32
+    )
+    payload["selection_sha256"] = campaign._value_sha256(payload)  # noqa: SLF001
+    selection_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(campaign.CampaignError, match="winner does not replay"):
+        campaign._load_recovery_selection(selection_path)  # noqa: SLF001
