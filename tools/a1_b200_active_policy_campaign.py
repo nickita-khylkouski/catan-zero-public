@@ -15,8 +15,10 @@ The tool deliberately has two gates before optimizer launch:
   architecture-upgrade receipt.
 
 Selection is similarly explicit.  Existing read-only tools measure functional
-parent KL and layer drift at steps 8/12/16/32/64/128.  The selected exposure is
-the eligible arm with the largest terminal active-policy teacher-gap closure
+parent KL and layer drift at steps 8/12/16/32/64/128.  Each measured checkpoint
+is an independent dose candidate: a later over-budget checkpoint cannot erase
+an earlier in-budget dose from the same arm.  The selected exposure is the
+eligible arm/checkpoint pair with the largest active-policy teacher-gap closure
 under operator-declared parent-KL and trunk-drift budgets.  Candidate chaining
 is never an allowed transition.
 """
@@ -53,7 +55,7 @@ from tools.fleet import a1_coherent_target_rd_executor as coherent_executor  # n
 SCHEMA = "a1-b200-active-policy-exposure-campaign-v1"
 ADMISSION_SCHEMA = "a1-coherent-n128-corpus-admission-v1"
 FINGERPRINT_SCHEMA = "a1-b200-active-policy-fingerprint-v1"
-SELECTION_SCHEMA = "a1-b200-active-policy-selection-v1"
+SELECTION_SCHEMA = "a1-b200-active-policy-selection-v2"
 INVENTORY_SCHEMA = "a1-target-eligibility-inventory-v1"
 COMPLETION_RECEIPT_SCHEMA = "a1-coherent-target-rd-completion-receipt-v1"
 
@@ -876,8 +878,12 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "max_parent_kl": float(args.max_parent_kl),
             "max_trunk_relative_l2": float(args.max_trunk_relative_l2),
             "all_checkpoint_fingerprints_required": True,
-            "eligibility": "every checkpoint stays within both drift budgets",
-            "objective": "max_terminal_active_policy_teacher_gap_closure",
+            "eligibility": (
+                "each checkpoint is independently eligible when it stays within "
+                "both drift budgets and has positive teacher-gap closure; a later "
+                "over-budget checkpoint does not invalidate an earlier dose"
+            ),
+            "objective": "max_in_budget_checkpoint_teacher_gap_closure",
             "reference_update_frontier": copy.deepcopy(
                 R2_UPDATE_FRONTIER_REFERENCE
             ),
@@ -886,9 +892,10 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
                 "playing-strength evaluation"
             ),
             "tie_break": [
-                "min_terminal_parent_kl",
-                "min_terminal_trunk_relative_l2",
+                "min_checkpoint_parent_kl",
+                "min_checkpoint_trunk_relative_l2",
                 "min_aux_exposure",
+                "min_optimizer_steps",
             ],
             "playing_strength_evaluation_required_before_promotion": True,
         },
@@ -1494,7 +1501,7 @@ def _select(
     bindings: Mapping[str, Path],
 ) -> dict[str, Any]:
     records: dict[str, Any] = {}
-    eligible: list[str] = []
+    eligible_candidates: list[dict[str, Any]] = []
     cap_kl = float(campaign["selection_contract"]["max_parent_kl"])
     cap_trunk = float(campaign["selection_contract"]["max_trunk_relative_l2"])
     for arm in ARMS:
@@ -1532,58 +1539,103 @@ def _select(
             or [item.get("step") for item in checkpoints] != list(CHECKPOINT_STEPS)
         ):
             raise CampaignError(f"arm {arm} fingerprint is not bound to this campaign")
-        try:
-            parent_kls = [
-                float(item["functional"]["parent_kl"]) for item in checkpoints
-            ]
-            trunk_drifts = [
-                float(item["layer_drift"]["trunk_relative_l2"])
-                for item in checkpoints
-            ]
-            closures = [
-                float(item["functional"]["teacher_gap_closure"])
-                for item in checkpoints
-            ]
-        except (KeyError, TypeError, ValueError) as error:
-            raise CampaignError(f"arm {arm} fingerprint metrics are malformed") from error
-        if (
-            not all(math.isfinite(value) and value >= 0.0 for value in parent_kls)
-            or not all(math.isfinite(value) and value >= 0.0 for value in trunk_drifts)
-            or not all(math.isfinite(value) for value in closures)
-        ):
-            raise CampaignError(f"arm {arm} fingerprint metrics are non-finite")
-        closure = closures[-1]
-        within = max(parent_kls) <= cap_kl and max(trunk_drifts) <= cap_trunk
-        positive = math.isfinite(closure) and closure > 0.0
-        if within and positive:
-            eligible.append(arm)
+        candidates: list[dict[str, Any]] = []
+        for item in checkpoints:
+            try:
+                step = int(item["step"])
+                checkpoint = _regular_file(
+                    Path(str(item["checkpoint"])),
+                    where=f"arm {arm} step {step} checkpoint",
+                )
+                checkpoint_sha256 = str(item["checkpoint_sha256"])
+                parent_kl = float(item["functional"]["parent_kl"])
+                trunk = float(item["layer_drift"]["trunk_relative_l2"])
+                closure = float(item["functional"]["teacher_gap_closure"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise CampaignError(
+                    f"arm {arm} fingerprint metrics are malformed"
+                ) from error
+            if checkpoint_sha256 != _file_sha256(checkpoint):
+                raise CampaignError(f"arm {arm} step {step} checkpoint bytes drifted")
+            if (
+                not math.isfinite(parent_kl)
+                or parent_kl < 0.0
+                or not math.isfinite(trunk)
+                or trunk < 0.0
+                or not math.isfinite(closure)
+            ):
+                raise CampaignError(f"arm {arm} step {step} metrics are non-finite")
+            within = parent_kl <= cap_kl and trunk <= cap_trunk
+            positive = closure > 0.0
+            candidate = {
+                "arm": arm,
+                "step": step,
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": checkpoint_sha256,
+                "parent_kl": parent_kl,
+                "trunk_relative_l2": trunk,
+                "teacher_gap_closure": closure,
+                "within_drift_budgets": within,
+                "positive_teacher_gap_closure": positive,
+                "eligible": within and positive,
+            }
+            candidates.append(candidate)
+            if candidate["eligible"]:
+                eligible_candidates.append(candidate)
+        arm_eligible = [candidate for candidate in candidates if candidate["eligible"]]
+        selected = (
+            sorted(
+                arm_eligible,
+                key=lambda candidate: (
+                    -candidate["teacher_gap_closure"],
+                    candidate["parent_kl"],
+                    candidate["trunk_relative_l2"],
+                    candidate["step"],
+                ),
+            )[0]
+            if arm_eligible
+            else None
+        )
         records[arm] = {
             "path": str(path),
             "file_sha256": _file_sha256(path),
             "fingerprint_sha256": fingerprint["fingerprint_sha256"],
-            "max_parent_kl": max(parent_kls),
-            "max_trunk_relative_l2": max(trunk_drifts),
-            "terminal_parent_kl": parent_kls[-1],
-            "terminal_trunk_relative_l2": trunk_drifts[-1],
-            "terminal_teacher_gap_closure": closure,
-            "within_drift_budgets": within,
-            "positive_terminal_teacher_gap_closure": positive,
+            "checkpoint_candidates": candidates,
+            "eligible_checkpoint_steps": [
+                candidate["step"] for candidate in arm_eligible
+            ],
+            "selected_checkpoint": copy.deepcopy(selected),
+            "has_eligible_checkpoint": selected is not None,
+            "all_checkpoints_within_drift_budgets": all(
+                candidate["within_drift_budgets"] for candidate in candidates
+            ),
+            "max_parent_kl": max(candidate["parent_kl"] for candidate in candidates),
+            "max_trunk_relative_l2": max(
+                candidate["trunk_relative_l2"] for candidate in candidates
+            ),
             "dose_telemetry_sha256": fingerprint["dose_telemetry"][
                 "dose_telemetry_sha256"
             ],
         }
-    if not eligible:
-        raise CampaignError("no active-policy exposure arm remained inside both drift budgets")
-    winner = sorted(
-        eligible,
-        key=lambda arm: (
-            -records[arm]["terminal_teacher_gap_closure"],
-            records[arm]["terminal_parent_kl"],
-            records[arm]["terminal_trunk_relative_l2"],
-            ARMS[arm]["policy_aux_active_batch_size"],
-            arm,
+    if not eligible_candidates:
+        raise CampaignError(
+            "no active-policy exposure checkpoint remained inside both drift budgets"
+        )
+    eligible = [arm for arm in ARMS if records[arm]["has_eligible_checkpoint"]]
+    winner_candidate = sorted(
+        eligible_candidates,
+        key=lambda candidate: (
+            -candidate["teacher_gap_closure"],
+            candidate["parent_kl"],
+            candidate["trunk_relative_l2"],
+            ARMS[candidate["arm"]]["policy_aux_active_batch_size"],
+            candidate["step"],
+            candidate["arm"],
         ),
     )[0]
+    winner = str(winner_candidate["arm"])
+    winner_recipe = copy.deepcopy(campaign["arms"][winner])
+    winner_recipe["selected_optimizer_steps"] = int(winner_candidate["step"])
     payload: dict[str, Any] = {
         "schema_version": SELECTION_SCHEMA,
         "campaign": {
@@ -1594,12 +1646,19 @@ def _select(
         "selection_policy": copy.deepcopy(campaign["selection_contract"]),
         "arm_fingerprints": records,
         "eligible_arms": eligible,
+        "eligible_candidates": copy.deepcopy(eligible_candidates),
         "winner": winner,
-        "winner_recipe": copy.deepcopy(campaign["arms"][winner]),
+        "winner_step": int(winner_candidate["step"]),
+        "winner_checkpoint": {
+            "path": winner_candidate["checkpoint"],
+            "sha256": winner_candidate["checkpoint_sha256"],
+        },
+        "winner_candidate": copy.deepcopy(winner_candidate),
+        "winner_recipe": winner_recipe,
         "winner_is_diagnostic_not_promoted": True,
         "playing_strength_evaluation_still_required": True,
         "winner_meets_reference_teacher_gap_closure": (
-            records[winner]["terminal_teacher_gap_closure"]
+            winner_candidate["teacher_gap_closure"]
             >= float(
                 campaign["selection_contract"]["reference_update_frontier"][
                     "active_policy_teacher_gap_closure"
