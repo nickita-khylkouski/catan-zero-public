@@ -1735,6 +1735,58 @@ def test_reviewed_public_card_one_dose_renders_exact_eight_b200_command(
     assert "--per-game-policy-surprise-weighting" in command
     assert "--no-resume-optimizer" in command
 
+    # Replay the exact train_bc-side recipe comparison used by the real DDP
+    # launch.  The immutable parent recipe predates these two fields, whereas
+    # one_dose expands their legacy defaults before applying the interventions.
+    # Both sides must normalize to the same declared shape.
+    trainer_index = command.index(str(Path(executor.train_bc.__file__).resolve()))
+    parsed = executor.train_bc.build_parser().parse_args(command[trainer_index + 1 :])
+    trainer_path = Path(executor.train_bc.__file__).resolve()
+    code_binding = {
+        "schema_version": "test-a1-ablation-code-binding-v1",
+        "repository_root": str(trainer_path.parents[1]),
+        "records": [
+            {
+                "kind": "learner_code",
+                "relative_path": "tools/train_bc.py",
+                "path": str(trainer_path),
+                "sha256": executor._file_sha256(trainer_path),
+            }
+        ],
+    }
+    code_sha = executor.train_bc._canonical_json_sha256(code_binding)
+    code_binding["code_tree_sha256"] = code_sha
+    parsed.a1_ablation_code_binding_json = json.dumps(
+        code_binding, sort_keys=True, separators=(",", ":")
+    )
+    parsed.a1_ablation_code_tree_sha256 = code_sha
+    parsed.a1_reviewed_lock_file_sha256 = "sha256:" + "8" * 64
+    bound_recipe = dict(arm["bound_recipe"])
+    bound = {
+        "learner_training_recipe": bound_recipe,
+        "learner_training_recipe_sha256": (
+            executor.train_bc._canonical_json_sha256(bound_recipe)
+        ),
+        "coherent_direct_corpus": True,
+        "coherent_topology": {
+            "name": "b200-8gpu-ddp",
+            "world_size": 8,
+            "local_batch_size": 512,
+            "grad_accum_steps": 1,
+            "global_batch_size": 4096,
+        },
+    }
+    effective = executor.train_bc._validate_a1_learner_training_recipe(
+        parsed,
+        {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+        bound,
+    )
+    assert effective == arm["recipe"]
+    assert bound["learner_ablation"]["recipe_drift"]["public_card_lr_mult"] == {
+        "contract": 1.0,
+        "effective": 4.0,
+    }
+
 
 def test_public_card_lr_multiplier_refuses_every_non_card_initializer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

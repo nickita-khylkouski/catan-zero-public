@@ -7268,14 +7268,26 @@ def _effective_a1_learner_training_recipe(
     )
     if value_trunk_grad_scale != 1.0:
         effective["value_trunk_grad_scale"] = value_trunk_grad_scale
-    # These axes were added after the historical A1 seal. Keep the old recipe
-    # byte-for-byte unchanged at their exact legacy defaults, while making an
-    # active public-card intervention part of the effective recipe.
+    # These axes were added after the historical A1 seal. Keep ordinary old
+    # recipes byte-for-byte unchanged at their exact legacy defaults. Generic
+    # diagnostic ablations, however, are produced by a1_one_dose_train with
+    # both defaults expanded into the declared effective recipe. Expand them
+    # here for every such ablation as well, so train_bc compares one canonical
+    # recipe shape instead of rejecting a valid intervention merely because
+    # the immutable parent recipe predates the fields.
+    generic_a1_ablation = bool(
+        str(getattr(args, "a1_learner_ablation_id", "") or "")
+    )
     public_card_lr_mult = float(getattr(args, "public_card_lr_mult", 1.0))
-    if public_card_lr_mult != 1.0:
+    if public_card_lr_mult != 1.0 or generic_a1_ablation:
         effective["public_card_lr_mult"] = public_card_lr_mult
-    if bool(getattr(args, "per_game_policy_surprise_weighting", False)):
-        effective["per_game_policy_surprise_weighting"] = True
+    per_game_policy_surprise_weighting = bool(
+        getattr(args, "per_game_policy_surprise_weighting", False)
+    )
+    if per_game_policy_surprise_weighting or generic_a1_ablation:
+        effective["per_game_policy_surprise_weighting"] = (
+            per_game_policy_surprise_weighting
+        )
     if getattr(args, "policy_kl_target", None) is not None:
         # The fixed anchor's historical recipe shape remains untouched.  An
         # adaptive trust region is trajectory-changing and must be explicitly
@@ -7685,6 +7697,14 @@ def _validate_a1_learner_training_recipe(
         raise SystemExit("A1 contract has no typed learner training recipe")
     immutable_expected = expected
     effective = _effective_a1_learner_training_recipe(args, ddp)
+    # Static parent-KL direction was added to newer sealed recipes after the
+    # original effective-recipe field tuple. It is trajectory-relevant when
+    # anchoring is active, so replay it whenever the immutable authority binds
+    # it, while leaving older recipe shapes untouched.
+    if "policy_kl_anchor_direction" in expected:
+        effective["policy_kl_anchor_direction"] = str(
+            getattr(args, "policy_kl_anchor_direction", "forward")
+        )
     if bound.get("coherent_direct_corpus") is True:
         topology = bound.get("coherent_topology")
         if topology != {
@@ -8164,6 +8184,15 @@ def _validate_a1_learner_training_recipe(
         authorized_extra_fields.add("value_trunk_grad_scale")
     if effective.get("forced_row_value_action_type_weights"):
         authorized_extra_fields.add("forced_row_value_action_type_weights")
+    # a1_one_dose_train canonically expands these post-seal defaults for every
+    # generic ablation. They remain fully value-checked below and are absent
+    # from non-ablation historical recipe shapes.
+    for post_seal_field in (
+        "public_card_lr_mult",
+        "per_game_policy_surprise_weighting",
+    ):
+        if post_seal_field in effective:
+            authorized_extra_fields.add(post_seal_field)
     missing = set(expected) - set(effective)
     extra = set(effective) - (set(expected) | authorized_extra_fields)
     drift = {
@@ -8190,6 +8219,16 @@ def _validate_a1_learner_training_recipe(
         drift["forced_row_value_action_type_weights"] = {
             "contract": "disabled (implicit historical default)",
             "effective": effective["forced_row_value_action_type_weights"],
+        }
+    if float(effective.get("public_card_lr_mult", 1.0)) != 1.0:
+        drift["public_card_lr_mult"] = {
+            "contract": 1.0,
+            "effective": float(effective["public_card_lr_mult"]),
+        }
+    if bool(effective.get("per_game_policy_surprise_weighting", False)):
+        drift["per_game_policy_surprise_weighting"] = {
+            "contract": False,
+            "effective": True,
         }
     aux_regularization = _validate_a1_aux_regularization_binding(
         args, recipe_drift=drift
