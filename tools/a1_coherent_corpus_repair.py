@@ -798,6 +798,20 @@ def verify_repair_receipt(path: Path, *, contract_path: Path) -> dict[str, Any]:
         or _digest(replayed) != receipt.get("payload_inventory_sha256")
     ):
         raise RepairError("repair selected shard inventory digest drift")
+    source_inventory = [
+        {
+            "path": item["path"],
+            "size_bytes": item["size_bytes"],
+            "sha256": item["sha256"],
+        }
+        for item in replayed
+    ]
+    if (
+        source_inventory != receipt.get("source_shard_inventory")
+        or _digest(source_inventory)
+        != receipt.get("source_shard_inventory_sha256")
+    ):
+        raise RepairError("repair memmap source inventory binding drift")
     seeds, rows = _row_seed_inventory([Path(str(item["path"])) for item in replayed])
     if (
         len(seeds) != receipt["selected_game_count"]
