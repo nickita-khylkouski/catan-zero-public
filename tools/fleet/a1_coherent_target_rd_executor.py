@@ -242,6 +242,18 @@ def _preflight(
             f"sealed GPUs are unavailable: required={sorted(required_gpus)}, "
             f"visible={sorted(gpu_indices)}"
         )
+    compute_processes = _run_text(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid,process_name,used_memory",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    if compute_processes:
+        raise ExecutorError(
+            "refusing to stack coherent generation on active GPU work: "
+            + compute_processes.replace("\n", "; ")
+        )
     git_commit = _run_text(["git", "rev-parse", "HEAD"], cwd=repo)
     tracked_diff = _run_text(
         ["git", "status", "--porcelain", "--untracked-files=no"], cwd=repo
