@@ -8196,6 +8196,22 @@ def _validate_a1_learner_training_recipe(
     ):
         if post_seal_field in effective:
             authorized_extra_fields.add(post_seal_field)
+    adaptive_policy_kl_fields = {
+        "policy_kl_anchor_direction",
+        "policy_kl_target",
+        "policy_kl_dual_lr",
+        "policy_kl_max_weight",
+    }
+    if getattr(args, "policy_kl_target", None) is not None:
+        # a1_one_dose_train admits an adaptive trust region only when all four
+        # controller fields are sealed together.  They postdate the immutable
+        # production recipe, so the child trainer must authorize that complete
+        # additive shape before comparing its declared effective recipe.
+        if not adaptive_policy_kl_fields <= set(effective):
+            raise SystemExit(
+                "adaptive policy-KL ablation lost its complete controller fields"
+            )
+        authorized_extra_fields.update(adaptive_policy_kl_fields)
     missing = set(expected) - set(effective)
     extra = set(effective) - (set(expected) | authorized_extra_fields)
     drift = {
@@ -8233,6 +8249,16 @@ def _validate_a1_learner_training_recipe(
             "contract": False,
             "effective": True,
         }
+    if getattr(args, "policy_kl_target", None) is not None:
+        # Reconstruct the exact parent marker, including the fields whose
+        # disabled defaults were implicit in the historical recipe.
+        for key in sorted(adaptive_policy_kl_fields):
+            drift[key] = {
+                "contract": expected.get(
+                    key, "disabled (implicit historical default)"
+                ),
+                "effective": effective[key],
+            }
     aux_regularization = _validate_a1_aux_regularization_binding(
         args, recipe_drift=drift
     )
