@@ -9,7 +9,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -227,23 +227,24 @@ def _weight_map(value: Any, field: str) -> dict[str, float]:
     return {str(key): float(weight) for key, weight in value.items()}
 
 
-def run_probe(
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _prepare_probe(
     *,
     report_path: Path,
-    checkpoint_path: Path,
     data_path: Path,
     validation_manifest_path: Path,
     device: str,
     batch_size: int | None = None,
-    parent_checkpoint_path: Path | None = None,
 ) -> dict[str, Any]:
+    """Authenticate and materialize the shared validation surface once."""
+
     report_path = report_path.resolve(strict=True)
-    checkpoint_path = checkpoint_path.resolve(strict=True)
-    parent_checkpoint_path = (
-        None
-        if parent_checkpoint_path is None
-        else parent_checkpoint_path.resolve(strict=True)
-    )
     data_path = data_path.resolve(strict=True)
     validation_manifest_path = validation_manifest_path.resolve(strict=True)
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -277,7 +278,9 @@ def run_probe(
         # Modern reports additionally emit the concrete train-validation seed
         # manifest consumed by this probe; its schema and bytes intentionally
         # differ from the upstream selection sentinel.
-        expected_manifest_sha = report.get("input_validation_game_seed_manifest_sha256")
+        expected_manifest_sha = report.get(
+            "input_validation_game_seed_manifest_sha256"
+        )
         if expected_manifest_sha and manifest_sha != expected_manifest_sha:
             raise SystemExit(
                 "validation manifest bytes differ from training report: "
@@ -338,13 +341,12 @@ def run_probe(
             validation_max_samples=int(_required(report, "validation_max_samples")),
             validation_game_seed_ranges=[tuple(map(int, item)) for item in ranges],
         )
+
     # Production one-dose learners may consume an authenticated no-copy
-    # memmap_composite descriptor rather than a single corpus directory.  The
-    # direct MemmapCorpus constructor treats that JSON file as a directory and
-    # makes posthoc evaluation impossible for the very checkpoints this tool is
-    # meant to diagnose.  Reuse the trainer's fail-closed loader so component
-    # identity, per-component target temperatures, and objective scopes survive
-    # exactly as they did during training.
+    # memmap_composite descriptor rather than a single corpus directory. Reuse
+    # the trainer's fail-closed loader so component identity, target
+    # temperatures, and objective scopes remain exactly as trained. Batch mode
+    # deliberately executes this once for every compared checkpoint.
     data = train_bc.load_teacher_data_memmap(data_path)
     split = train_bc.split_train_validation_indices(
         data,
@@ -366,8 +368,7 @@ def run_probe(
     ):
         raise SystemExit(
             "locked holdout row count differs from validation manifest: "
-            f"split={validation_indices.size} "
-            f"manifest={expected_validation_rows}"
+            f"split={validation_indices.size} manifest={expected_validation_rows}"
         )
 
     policy_weights = train_bc.build_sample_weights(
@@ -395,25 +396,169 @@ def run_probe(
         per_game_value_weight=bool(_required(report, "per_game_value_weight")),
         per_game_value_weight_mode=str(_required(report, "per_game_value_weight_mode")),
     )
-    policy = _load_policy(str(_required(report, "arch")), checkpoint_path, device)
-    train_bc._MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(
-        _required(report, "mask_hidden_info")
-    )
-    # ``train_bc`` routes these features through module globals because the
-    # same on-disk corpus supports multiple information surfaces. Importing the
-    # module outside ``main()`` otherwise leaves the legacy-zero defaults in
-    # place and silently evaluates an authoritative/card-aware checkpoint on
-    # the wrong inputs. Bind the posthoc surface to the checkpoint/report that
-    # actually produced the candidate.
-    train_bc._PUBLIC_AWARD_FEATURE_CONTRACT = str(
-        _required(report, "public_award_feature_contract")
-    )
-    train_bc._PUBLIC_CARD_COUNT_FEATURES_ENABLED = bool(
-        getattr(getattr(policy, "config", None), "public_card_count_features", False)
-    )
     eval_batch_size = int(batch_size or _required(report, "batch_size"))
     if eval_batch_size < 1:
         raise SystemExit("evaluation batch size must be >= 1")
+
+    train_bc._MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(
+        _required(report, "mask_hidden_info")
+    )
+    award_contract = str(_required(report, "public_award_feature_contract"))
+    train_bc._PUBLIC_AWARD_FEATURE_CONTRACT = award_contract
+    holdout_semantics = {
+        "schema_version": "posthoc-shared-holdout-identity/v1",
+        "memmap_fingerprint": actual_fingerprint,
+        "memmap_payload_inventory_sha256": report.get(
+            "a1_memmap_payload_inventory_sha256"
+        ),
+        "validation_manifest_semantic_sha256": validation_contract.get(
+            "manifest_sha256"
+        ),
+        "validation_game_seed_set_sha256": validation_contract[
+            "validation_game_seed_set_sha256"
+        ],
+        "validation_rows": int(validation_indices.size),
+        "validation_fraction": float(report["validation_fraction"]),
+        "validation_seed": int(report["validation_seed"]),
+        "validation_max_samples": int(report["validation_max_samples"]),
+        "validation_game_seed_ranges": ranges,
+    }
+    return {
+        "train_bc": train_bc,
+        "report": report,
+        "data": data,
+        "validation_indices": validation_indices,
+        "policy_weights": policy_weights,
+        "value_weights": value_weights,
+        "device": str(device),
+        "batch_size": eval_batch_size,
+        "award_contract": award_contract,
+        "shared_holdout": {
+            **holdout_semantics,
+            "identity_sha256": _canonical_sha256(holdout_semantics),
+            "training_report": {
+                "path": str(report_path),
+                "sha256": _sha256(report_path),
+            },
+            "memmap": {
+                "path": str(data_path),
+                "fingerprint": actual_fingerprint,
+                "payload_inventory_sha256": report.get(
+                    "a1_memmap_payload_inventory_sha256"
+                ),
+            },
+            "validation_manifest": {
+                "path": str(validation_manifest_path),
+                "sha256": manifest_sha,
+                "manifest_sha256": validation_contract.get("manifest_sha256"),
+            },
+        },
+    }
+
+
+def _policy_input_surface(
+    prepared: Mapping[str, Any], policy, *, role: str
+) -> dict[str, Any]:
+    report = prepared["report"]
+    award_contract = str(prepared["award_contract"])
+    policy_award = str(
+        getattr(policy, "public_award_feature_contract", award_contract)
+    )
+    if policy_award != award_contract:
+        raise SystemExit(
+            f"{role} public-award input contract differs from training report"
+        )
+    card_features = bool(
+        getattr(getattr(policy, "config", None), "public_card_count_features", False)
+    )
+    reported_card_features = report.get("public_card_count_features")
+    if reported_card_features is not None:
+        if not isinstance(reported_card_features, bool):
+            raise SystemExit("training report public_card_count_features is malformed")
+        if card_features != reported_card_features:
+            raise SystemExit(
+                f"{role} public-card input schema differs from training report"
+            )
+    return {
+        "public_award_feature_contract": award_contract,
+        "public_card_count_features": card_features,
+        "mask_hidden_info": bool(_required(report, "mask_hidden_info")),
+    }
+
+
+def _report_parent_binding(report: Mapping[str, Any]) -> tuple[str, str] | None:
+    bindings = [
+        (field, str(report[field]))
+        for field in ("init_checkpoint_sha256", "grow_from_checkpoint_sha256")
+        if report.get(field)
+    ]
+    if len(bindings) > 1:
+        raise SystemExit("training report declares multiple learner parents")
+    if not bindings:
+        return None
+    field, value = bindings[0]
+    if not value.startswith("sha256:") or len(value) != 71:
+        raise SystemExit(f"training report {field} is malformed")
+    return field, value
+
+
+def _load_parent(
+    prepared: Mapping[str, Any],
+    parent_checkpoint_path: Path,
+    *,
+    require_report_binding: bool,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    path = parent_checkpoint_path.resolve(strict=True)
+    sha256 = _sha256(path)
+    binding = _report_parent_binding(prepared["report"])
+    if require_report_binding and binding is None:
+        raise SystemExit(
+            "batch functional-dose probe requires a report-authenticated learner parent"
+        )
+    if binding is not None and sha256 != binding[1]:
+        raise SystemExit(
+            f"--parent-checkpoint bytes differ from training report {binding[0]}"
+        )
+    policy = _load_policy(
+        str(_required(prepared["report"], "arch")), path, str(prepared["device"])
+    )
+    surface = _policy_input_surface(prepared, policy, role="parent checkpoint")
+    return (
+        policy,
+        {
+            "path": str(path),
+            "sha256": sha256,
+            "report_binding_field": None if binding is None else binding[0],
+        },
+        surface,
+    )
+
+
+def _evaluate_candidate(
+    prepared: Mapping[str, Any],
+    *,
+    label: str,
+    checkpoint_path: Path,
+    parent_policy=None,
+    parent_ref: Mapping[str, Any] | None = None,
+    parent_surface: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    path = checkpoint_path.resolve(strict=True)
+    report = prepared["report"]
+    train_bc = prepared["train_bc"]
+    policy = _load_policy(
+        str(_required(report, "arch")), path, str(prepared["device"])
+    )
+    input_surface = _policy_input_surface(
+        prepared, policy, role=f"candidate {label!r}"
+    )
+    if parent_surface is not None and input_surface != dict(parent_surface):
+        raise SystemExit(
+            f"candidate {label!r} and parent use different public input schemas"
+        )
+    train_bc._PUBLIC_CARD_COUNT_FEATURES_ENABLED = bool(
+        input_surface["public_card_count_features"]
+    )
     scalar_weight = float(
         report.get(
             "resolved_scalar_value_loss_weight", report.get("value_loss_weight", 0.0)
@@ -427,11 +572,11 @@ def run_probe(
     )
     metrics = train_bc.evaluate_bc_batches(
         policy,
-        data,
-        validation_indices,
-        policy_weights,
-        value_weights,
-        eval_batch_size,
+        prepared["data"],
+        prepared["validation_indices"],
+        prepared["policy_weights"],
+        prepared["value_weights"],
+        int(prepared["batch_size"]),
         float(_required(report, "soft_target_temperature")),
         float(_required(report, "soft_target_weight")),
         str(_required(report, "soft_target_source")),
@@ -461,92 +606,254 @@ def run_probe(
         value_hlgauss_sigma_ratio=float(_required(report, "value_hlgauss_sigma_ratio")),
         value_target_lambda=float(_required(report, "value_target_lambda")),
     )
-    gap_fields = {
-        key: metrics[key]
-        for key in (
-            "active_policy_teacher_gap_rows",
-            "active_policy_kl_target_model_mean",
-            "active_policy_kl_target_prior_mean",
-            "active_policy_teacher_gap_closure",
-        )
+    result = {
+        "label": label,
+        "checkpoint": {"path": str(path), "sha256": _sha256(path)},
+        "input_surface": input_surface,
+        "teacher_gap": {
+            key: metrics[key]
+            for key in (
+                "active_policy_teacher_gap_rows",
+                "active_policy_kl_target_model_mean",
+                "active_policy_kl_target_prior_mean",
+                "active_policy_teacher_gap_closure",
+            )
+        },
+        "legacy_prior_kl": {
+            key: metrics[key]
+            for key in (
+                "prior_kl_rows",
+                "prior_kl_model_prior_mean",
+                "prior_kl_target_prior_mean",
+                "prior_kl_ratio",
+            )
+        },
+        "metrics": metrics,
     }
-    legacy_fields = {
-        key: metrics[key]
-        for key in (
-            "prior_kl_rows",
-            "prior_kl_model_prior_mean",
-            "prior_kl_target_prior_mean",
-            "prior_kl_ratio",
+    if parent_policy is not None:
+        assert parent_ref is not None and parent_surface is not None
+        result["parent_checkpoint_sha256"] = str(parent_ref["sha256"])
+        result["functional_dose_fingerprint"] = _functional_drift(
+            train_bc=train_bc,
+            parent_policy=parent_policy,
+            candidate_policy=policy,
+            data=prepared["data"],
+            indices=prepared["validation_indices"],
+            policy_weights=prepared["policy_weights"],
+            batch_size=int(prepared["batch_size"]),
         )
-    }
+    return result
+
+
+def run_probe(
+    *,
+    report_path: Path,
+    checkpoint_path: Path,
+    data_path: Path,
+    validation_manifest_path: Path,
+    device: str,
+    batch_size: int | None = None,
+    parent_checkpoint_path: Path | None = None,
+) -> dict[str, Any]:
+    """Single-checkpoint compatibility entry point."""
+
+    prepared = _prepare_probe(
+        report_path=report_path,
+        data_path=data_path,
+        validation_manifest_path=validation_manifest_path,
+        device=device,
+        batch_size=batch_size,
+    )
+    parent_policy = parent_ref = parent_surface = None
+    if parent_checkpoint_path is not None:
+        parent_policy, parent_ref, parent_surface = _load_parent(
+            prepared,
+            parent_checkpoint_path,
+            require_report_binding=False,
+        )
+    candidate = _evaluate_candidate(
+        prepared,
+        label="checkpoint",
+        checkpoint_path=checkpoint_path,
+        parent_policy=parent_policy,
+        parent_ref=parent_ref,
+        parent_surface=parent_surface,
+    )
+    shared = prepared["shared_holdout"]
     result = {
         "schema_version": "posthoc-checkpoint-teacher-gap/v1",
         "inputs": {
-            "training_report": {
-                "path": str(report_path),
-                "sha256": _sha256(report_path),
-            },
-            "checkpoint": {
-                "path": str(checkpoint_path),
-                "sha256": _sha256(checkpoint_path),
-            },
-            "memmap": {
-                "path": str(data_path),
-                "fingerprint": actual_fingerprint,
-                "payload_inventory_sha256": report.get(
-                    "a1_memmap_payload_inventory_sha256"
-                ),
-            },
-            "validation_manifest": {
-                "path": str(validation_manifest_path),
-                "sha256": manifest_sha,
-                "manifest_sha256": validation_contract.get("manifest_sha256"),
-            },
+            "training_report": shared["training_report"],
+            "checkpoint": candidate["checkpoint"],
+            "memmap": shared["memmap"],
+            "validation_manifest": shared["validation_manifest"],
         },
-        "arch": report["arch"],
-        "device": device,
-        "batch_size": eval_batch_size,
-        "validation_rows": int(validation_indices.size),
-        "validation_game_seed_set_sha256": validation_contract[
+        "arch": prepared["report"]["arch"],
+        "device": str(device),
+        "batch_size": int(prepared["batch_size"]),
+        "validation_rows": int(shared["validation_rows"]),
+        "validation_game_seed_set_sha256": shared[
             "validation_game_seed_set_sha256"
         ],
-        "teacher_gap": gap_fields,
-        "legacy_prior_kl": legacy_fields,
-        "metrics": metrics,
+        "teacher_gap": candidate["teacher_gap"],
+        "legacy_prior_kl": candidate["legacy_prior_kl"],
+        "metrics": candidate["metrics"],
     }
-    if parent_checkpoint_path is not None:
-        parent = _load_policy(
-            str(_required(report, "arch")), parent_checkpoint_path, device
-        )
-        if bool(
-            getattr(
-                getattr(parent, "config", None), "public_card_count_features", False
-            )
-        ) != bool(train_bc._PUBLIC_CARD_COUNT_FEATURES_ENABLED):
-            raise SystemExit(
-                "parent and candidate use different public-card input schemas; "
-                "functional-dose fingerprint is not comparable"
-            )
+    if parent_ref is not None:
+        # Keep the established single-checkpoint v1 payload byte-shape
+        # compatible.  Batch mode exposes the training-report binding field in
+        # its richer shared-parent record.
         result["inputs"]["parent_checkpoint"] = {
-            "path": str(parent_checkpoint_path),
-            "sha256": _sha256(parent_checkpoint_path),
+            "path": parent_ref["path"],
+            "sha256": parent_ref["sha256"],
         }
-        result["functional_dose_fingerprint"] = _functional_drift(
-            train_bc=train_bc,
-            parent_policy=parent,
-            candidate_policy=policy,
-            data=data,
-            indices=validation_indices,
-            policy_weights=policy_weights,
-            batch_size=eval_batch_size,
-        )
+        result["functional_dose_fingerprint"] = candidate[
+            "functional_dose_fingerprint"
+        ]
     return result
+
+
+def _step64_128_comparison(
+    checkpoints: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    if "step64" not in checkpoints or "step128" not in checkpoints:
+        return None
+    fields = (
+        "kl_parent_candidate_mean",
+        "kl_candidate_parent_mean",
+        "top1_flip_rate",
+        "candidate_policy_entropy_mean",
+        "policy_entropy_delta",
+        "value_mean_absolute_delta",
+        "value_root_mean_square_delta",
+    )
+    left = checkpoints["step64"]["functional_dose_fingerprint"]
+    right = checkpoints["step128"]["functional_dose_fingerprint"]
+    return {
+        "schema_version": "posthoc-step64-step128-functional-dose-comparison/v1",
+        "from": "step64",
+        "to": "step128",
+        "metrics": {
+            field: {
+                "step64": float(left[field]),
+                "step128": float(right[field]),
+                "step128_minus_step64": float(right[field]) - float(left[field]),
+            }
+            for field in fields
+        },
+    }
+
+
+def run_batch_probe(
+    *,
+    report_path: Path,
+    checkpoints: Sequence[tuple[str, Path]],
+    parent_checkpoint_path: Path,
+    data_path: Path,
+    validation_manifest_path: Path,
+    device: str,
+    batch_size: int | None = None,
+) -> dict[str, Any]:
+    """Evaluate labeled candidates on one corpus against one bound parent."""
+
+    if not checkpoints:
+        raise SystemExit("batch teacher-gap probe requires at least one checkpoint")
+    labels = [str(label).strip() for label, _ in checkpoints]
+    if any(not label for label in labels) or len(set(labels)) != len(labels):
+        raise SystemExit("batch checkpoint labels must be non-empty and unique")
+    prepared = _prepare_probe(
+        report_path=report_path,
+        data_path=data_path,
+        validation_manifest_path=validation_manifest_path,
+        device=device,
+        batch_size=batch_size,
+    )
+    parent_policy, parent_ref, parent_surface = _load_parent(
+        prepared,
+        parent_checkpoint_path,
+        require_report_binding=True,
+    )
+    prepared["train_bc"]._PUBLIC_CARD_COUNT_FEATURES_ENABLED = bool(
+        parent_surface["public_card_count_features"]
+    )
+    results = {
+        label: _evaluate_candidate(
+            prepared,
+            label=label,
+            checkpoint_path=checkpoint_path,
+            parent_policy=parent_policy,
+            parent_ref=parent_ref,
+            parent_surface=parent_surface,
+        )
+        for label, checkpoint_path in checkpoints
+    }
+    shared_holdout = dict(prepared["shared_holdout"])
+    comparison_semantics = {
+        "schema_version": "posthoc-parent-comparison-surface/v1",
+        "holdout_identity_sha256": shared_holdout["identity_sha256"],
+        "parent_checkpoint_sha256": parent_ref["sha256"],
+        "input_surface": parent_surface,
+    }
+    shared_holdout.update(
+        {
+            "parent_checkpoint": parent_ref,
+            "input_surface": parent_surface,
+            "comparison_identity_sha256": _canonical_sha256(
+                comparison_semantics
+            ),
+        }
+    )
+    output = {
+        "schema_version": "posthoc-checkpoint-teacher-gap-batch/v1",
+        "arch": prepared["report"]["arch"],
+        "device": str(device),
+        "batch_size": int(prepared["batch_size"]),
+        "checkpoint_order": labels,
+        "shared_holdout": shared_holdout,
+        "checkpoints": results,
+    }
+    comparison = _step64_128_comparison(results)
+    if comparison is not None:
+        output["dose_comparison"] = comparison
+    return output
+
+
+def _parse_labeled_checkpoint(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError(
+            "labeled checkpoint must use LABEL=PATH (for example step64=/run/step64.pt)"
+        )
+    label, raw_path = value.split("=", 1)
+    label = label.strip()
+    raw_path = raw_path.strip()
+    if not label or not raw_path:
+        raise argparse.ArgumentTypeError(
+            "labeled checkpoint must have a non-empty label and path"
+        )
+    return label, Path(raw_path)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Legacy single-checkpoint mode (output schema remains v1).",
+    )
+    parser.add_argument(
+        "--labeled-checkpoint",
+        "--compare-checkpoint",
+        dest="labeled_checkpoints",
+        action="append",
+        type=_parse_labeled_checkpoint,
+        default=[],
+        metavar="LABEL=PATH",
+        help=(
+            "Evaluate a labeled candidate against the shared parent; repeat the "
+            "flag. step64 and step128 labels also emit a direct dose comparison."
+        ),
+    )
     parser.add_argument(
         "--parent-checkpoint",
         type=Path,
@@ -561,15 +868,34 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    result = run_probe(
-        report_path=args.report,
-        checkpoint_path=args.checkpoint,
-        data_path=args.data,
-        validation_manifest_path=args.validation_manifest,
-        device=args.device,
-        batch_size=args.batch_size,
-        parent_checkpoint_path=args.parent_checkpoint,
-    )
+    if args.checkpoint is not None and args.labeled_checkpoints:
+        parser.error("--checkpoint cannot be combined with --labeled-checkpoint")
+    if args.checkpoint is not None:
+        result = run_probe(
+            report_path=args.report,
+            checkpoint_path=args.checkpoint,
+            data_path=args.data,
+            validation_manifest_path=args.validation_manifest,
+            device=args.device,
+            batch_size=args.batch_size,
+            parent_checkpoint_path=args.parent_checkpoint,
+        )
+    elif args.labeled_checkpoints:
+        if args.parent_checkpoint is None:
+            parser.error("batch mode requires --parent-checkpoint")
+        result = run_batch_probe(
+            report_path=args.report,
+            checkpoints=args.labeled_checkpoints,
+            parent_checkpoint_path=args.parent_checkpoint,
+            data_path=args.data,
+            validation_manifest_path=args.validation_manifest,
+            device=args.device,
+            batch_size=args.batch_size,
+        )
+    else:
+        parser.error(
+            "one --checkpoint or at least one --labeled-checkpoint is required"
+        )
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     args.output.write_text(rendered, encoding="utf-8")
     print(rendered, end="")
