@@ -310,6 +310,11 @@ class TrainConfig(PipelineConfig):
     q_skip_teacher_prefixes: str = "catanatron_ab"
     policy_kl_anchor_weight: float = 0.0
     policy_kl_anchor_direction: str = "forward"
+    # Optional projected-dual controller over the existing authenticated
+    # parent-prior anchor. ``None`` preserves the historical fixed coefficient.
+    policy_kl_target: float | None = None
+    policy_kl_dual_lr: float = 0.01
+    policy_kl_max_weight: float = 1.0
     value_uncertainty_loss_weight: float = 0.0
     value_uncertainty_head: bool = False
     value_lr_mult: float = 1.0

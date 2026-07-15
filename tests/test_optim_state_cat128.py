@@ -77,7 +77,7 @@ def test_load_corrupt_sidecar_never_raises(tmp_path):
     assert load_optimizer_state(ckpt, model, opt, _DDP_SINGLE) is False
 
 
-def _committed_progress(tmp_path: Path, *, recipe=None):
+def _committed_progress(tmp_path: Path, *, recipe=None, controller_state=None):
     ckpt = tmp_path / "checkpoint.pt"
     ckpt.write_bytes(b"model-v1")
     model, optimizer = _stepped_adam()
@@ -102,6 +102,7 @@ def _committed_progress(tmp_path: Path, *, recipe=None):
         ],
         scalar_training_weight_sum=123.5,
         categorical_training_weight_sum=44.0,
+        policy_kl_controller_state=controller_state,
         ddp=_DDP_SINGLE,
     )
     return ckpt, identity, rng.bit_generator.state
@@ -116,6 +117,20 @@ def test_progress_commit_binds_model_optimizer_recipe_and_exact_step(tmp_path):
     assert training_progress_sidecar_path(ckpt).name.endswith(
         ".training-progress.json"
     )
+
+
+def test_progress_round_trips_adaptive_policy_kl_controller_state(tmp_path):
+    state = {
+        "schema_version": "adaptive-parent-policy-kl-controller-v1",
+        "target_kl": 0.05,
+        "coefficient": 0.031,
+        "updates": 17,
+    }
+    ckpt, identity, _ = _committed_progress(
+        tmp_path, controller_state=state
+    )
+    loaded = load_training_progress(ckpt, expected_recipe_identity=identity)
+    assert loaded["policy_kl_controller_state"] == state
 
 
 @pytest.mark.parametrize("mutated", ["model", "optimizer"])

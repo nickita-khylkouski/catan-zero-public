@@ -105,6 +105,7 @@ def save_training_progress(
     rank_torch_rng_states: list[dict[str, Any]],
     scalar_training_weight_sum: float,
     categorical_training_weight_sum: float,
+    policy_kl_controller_state: dict[str, Any] | None = None,
     ddp: dict | None,
 ) -> Path | None:
     """Atomically commit progress after model and optimizer sidecars are durable.
@@ -144,6 +145,12 @@ def save_training_progress(
         "scalar_training_weight_sum": float(scalar_training_weight_sum),
         "categorical_training_weight_sum": float(categorical_training_weight_sum),
     }
+    if policy_kl_controller_state is not None:
+        if not isinstance(policy_kl_controller_state, dict):
+            raise TrainingProgressError(
+                "policy-KL controller progress state must be a JSON object"
+            )
+        payload["policy_kl_controller_state"] = policy_kl_controller_state
     payload["progress_sha256"] = _canonical_sha256(payload)
     output = training_progress_sidecar_path(checkpoint)
     _atomic_json_save(payload, output)
@@ -199,6 +206,12 @@ def load_training_progress(
             raise TrainingProgressError(f"invalid training progress field {field}")
     if not isinstance(payload.get("rng_state"), dict):
         raise TrainingProgressError("training progress lacks numpy RNG state")
+    if "policy_kl_controller_state" in payload and not isinstance(
+        payload["policy_kl_controller_state"], dict
+    ):
+        raise TrainingProgressError(
+            "training progress has malformed policy-KL controller state"
+        )
     expected_world_size = expected_recipe_identity.get("world_size")
     rank_numpy_rng = payload.get("rank_numpy_rng_states")
     if rank_numpy_rng is not None and (
