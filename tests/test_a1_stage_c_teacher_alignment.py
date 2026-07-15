@@ -13,6 +13,23 @@ from catan_zero.rl.target_reliability import (
 from tools import a1_stage_c_teacher_alignment as alignment
 
 
+def test_semantic_bundle_uses_only_explicit_sealed_operator_fallback() -> None:
+    assert alignment._semantic_field_bundle(
+        {"public_observation": True},
+        {"preserve_search_evidence": True},
+        ("public_observation", "preserve_search_evidence"),
+    ) == {
+        "public_observation": True,
+        "preserve_search_evidence": True,
+    }
+    with pytest.raises(alignment.AlignmentError, match="both missing"):
+        alignment._semantic_field_bundle(
+            {"public_observation": True},
+            {},
+            ("public_observation", "preserve_search_evidence"),
+        )
+
+
 def test_operator_mismatch_quarantines_only_stored_policy() -> None:
     active = np.asarray([False, True, True, False], dtype=np.bool_)
 
@@ -73,9 +90,7 @@ def test_reliability_inventory_never_calls_unaudited_one_confidence_audit() -> N
     assert "never audited evidence" in receipt["unaudited_confidence_semantics"]
 
     absent_classes, absent = alignment._reliability_inventory({}, row_count=3)
-    assert absent_classes.tolist() == [
-        alignment.RELIABILITY_CLASS["not_collected"]
-    ] * 3
+    assert absent_classes.tolist() == [alignment.RELIABILITY_CLASS["not_collected"]] * 3
     assert absent["confidence_weighting_authorized"] is False
 
 
@@ -89,9 +104,7 @@ def test_reliability_inventory_refuses_partial_or_forged_evidence() -> None:
     forged = dict(unaudited)
     forged["target_reliability_js_divergence"] = np.float32(0.0)
     with pytest.raises(alignment.AlignmentError, match="neutral typed sentinel"):
-        alignment._reliability_inventory(
-            _reliability_rows(forged), row_count=1
-        )
+        alignment._reliability_inventory(_reliability_rows(forged), row_count=1)
 
 
 def test_policy_surprise_masks_illegal_actions_and_is_finite() -> None:
@@ -139,4 +152,3 @@ def test_stratified_subset_is_deterministic_and_caps_each_game() -> None:
     selected_games = games[first[0]]
     assert len(first[0]) == 8
     assert max(np.unique(selected_games, return_counts=True)[1]) <= 2
-

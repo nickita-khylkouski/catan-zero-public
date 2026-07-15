@@ -165,9 +165,13 @@ def _write_immutable(path: Path, payload: bytes) -> None:
     destination = path.expanduser().resolve(strict=False)
     if destination.exists():
         if destination.is_symlink() or not destination.is_file():
-            raise AlignmentError(f"immutable output is not a regular file: {destination}")
+            raise AlignmentError(
+                f"immutable output is not a regular file: {destination}"
+            )
         if destination.read_bytes() != payload:
-            raise AlignmentError(f"immutable output already exists with drift: {destination}")
+            raise AlignmentError(
+                f"immutable output already exists with drift: {destination}"
+            )
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     tmp = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
@@ -182,7 +186,9 @@ def _write_immutable(path: Path, payload: bytes) -> None:
 
 
 def _write_json_immutable(path: Path, payload: Mapping[str, Any]) -> None:
-    _write_immutable(path, json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n")
+    _write_immutable(
+        path, json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n"
+    )
 
 
 def _write_array_immutable(path: Path, array: np.ndarray) -> None:
@@ -222,6 +228,31 @@ def _field_bundle(fields: Mapping[str, Any], names: Sequence[str]) -> dict[str, 
     return {name: fields[name] for name in names}
 
 
+def _semantic_field_bundle(
+    fields: Mapping[str, Any],
+    operator: Mapping[str, Any],
+    names: Sequence[str],
+) -> dict[str, Any]:
+    """Bind generation semantics from either of the two sealed authorities.
+
+    Schema-13 generation configs predate ``preserve_search_evidence`` as a
+    typed field, while the coherent R&D contract already binds that value in
+    its hash-authenticated ``operator`` block.  Refusing that exact contract
+    makes its Stage-C target identity impossible to construct; inventing a
+    default would be worse.  A semantic is therefore admitted only when it is
+    explicit in the typed config or, for a missing typed field, explicit in
+    the operator block.  Existing overlap-drift checking above still rejects
+    any disagreement between the two authorities.
+    """
+
+    missing = [name for name in names if name not in fields and name not in operator]
+    if missing:
+        raise AlignmentError(
+            f"typed config and sealed operator are both missing {missing}"
+        )
+    return {name: fields[name] if name in fields else operator[name] for name in names}
+
+
 def _operator_identity(
     contract_path: Path,
     checkpoint: Path,
@@ -254,8 +285,7 @@ def _operator_identity(
     contract_unsigned = dict(contract)
     contract_digest = contract_unsigned.pop("contract_sha256", None)
     if (
-        contract.get("schema_version")
-        != target_inventory.RD_CONTRACT_SCHEMA
+        contract.get("schema_version") != target_inventory.RD_CONTRACT_SCHEMA
         or contract_digest != _value_sha256(contract_unsigned)
         or config.get("schema_version") != 13
         or config.get("pipeline") != "generate"
@@ -279,7 +309,7 @@ def _operator_identity(
     belief = _field_bundle(fields, BELIEF_FIELDS)
     chance = _field_bundle(fields, CHANCE_FIELDS)
     symmetry = _field_bundle(fields, SYMMETRY_FIELDS)
-    semantics = _field_bundle(fields, TARGET_SEMANTIC_FIELDS)
+    semantics = _semantic_field_bundle(fields, operator, TARGET_SEMANTIC_FIELDS)
     regime = contract.get("target_information_regime")
     if not isinstance(regime, str) or not regime:
         raise AlignmentError("operator target information regime is missing")
@@ -378,9 +408,7 @@ def _reliability_inventory(
 ) -> tuple[np.ndarray, dict[str, Any]]:
     present = set(TARGET_RELIABILITY_COLUMNS) & set(data.keys())
     if not present:
-        classes = np.full(
-            row_count, RELIABILITY_CLASS["not_collected"], dtype=np.uint8
-        )
+        classes = np.full(row_count, RELIABILITY_CLASS["not_collected"], dtype=np.uint8)
         value = {
             "schema_version": "a1-stage-c-reliability-inventory-v1",
             "storage": "not_collected",
@@ -406,16 +434,12 @@ def _reliability_inventory(
     version = columns["target_reliability_version"].astype(np.int64)
     audited = columns["target_reliability_audited"].astype(np.bool_)
     js = columns["target_reliability_js_divergence"].astype(np.float64)
-    policy_agree = columns[
-        "target_reliability_policy_top1_agreement"
-    ].astype(np.bool_)
+    policy_agree = columns["target_reliability_policy_top1_agreement"].astype(np.bool_)
     q_agree = columns["target_reliability_q_top1_agreement"].astype(np.bool_)
-    margin_primary = columns[
-        "target_reliability_q_margin_primary"
-    ].astype(np.float64)
-    margin_duplicate = columns[
-        "target_reliability_q_margin_duplicate"
-    ].astype(np.float64)
+    margin_primary = columns["target_reliability_q_margin_primary"].astype(np.float64)
+    margin_duplicate = columns["target_reliability_q_margin_duplicate"].astype(
+        np.float64
+    )
     confidence = columns["target_reliability_confidence"].astype(np.float64)
     unaudited = ~audited
     if np.any(version != TARGET_RELIABILITY_VERSION):
@@ -556,7 +580,9 @@ def _select_stratified(
     if any(np.asarray(value).shape != rows.shape for value in arrays):
         raise AlignmentError("stratified subset inputs are not row-aligned")
     if not len(rows):
-        raise AlignmentError("no multi-action policy roots are available for reanalysis")
+        raise AlignmentError(
+            "no multi-action policy roots are available for reanalysis"
+        )
     quantiles = np.quantile(surprise.astype(np.float64), [0.25, 0.5, 0.75])
     surprise_bins = np.searchsorted(quantiles, surprise, side="right")
     candidates: list[tuple[int, int, str]] = []
@@ -643,9 +669,11 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     corpus_root = Path(str(corpus_record["data_path"])).resolve(strict=True)
     source_contract_path = Path(str(admission["contract"]["path"]))
     source_checkpoint = Path(
-        str(_load_json(source_contract_path, where="source operator contract")[1][
-            "producer_checkpoint"
-        ]["path"])
+        str(
+            _load_json(source_contract_path, where="source operator contract")[1][
+                "producer_checkpoint"
+            ]["path"]
+        )
     )
     source_identity = _operator_identity(source_contract_path, source_checkpoint)
     target_identity = _operator_identity(
@@ -667,9 +695,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     rows = len(data)
     policy_weight = np.asarray(data["policy_weight_multiplier"], dtype=np.float32)
     policy_active = policy_weight > 0.0
-    legal_widths_all = np.asarray(
-        data["legal_action_ids"].row_counts(), dtype=np.int64
-    )
+    legal_widths_all = np.asarray(data["legal_action_ids"].row_counts(), dtype=np.int64)
     if policy_weight.shape != (rows,) or legal_widths_all.shape != (rows,):
         raise AlignmentError("corpus policy/legal columns are not row-aligned")
     stored_policy_eligible, policy_status = _classify_policy_rows(
@@ -721,9 +747,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         [
             _value_sha256(
                 {
-                    "corpus_meta_file_sha256": corpus_record[
-                        "corpus_meta_file_sha256"
-                    ],
+                    "corpus_meta_file_sha256": corpus_record["corpus_meta_file_sha256"],
                     "row_index": int(row),
                     "game_seed": int(game_seeds[position]),
                     "decision_index": int(decision_indices[position]),
