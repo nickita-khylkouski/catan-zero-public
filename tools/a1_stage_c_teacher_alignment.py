@@ -441,9 +441,28 @@ def _reliability_inventory(
         np.float64
     )
     confidence = columns["target_reliability_confidence"].astype(np.float64)
-    unaudited = ~audited
-    if np.any(version != TARGET_RELIABILITY_VERSION):
+    if np.any((version != 0) & (version != TARGET_RELIABILITY_VERSION)):
         raise AlignmentError("target reliability version drifted")
+    not_collected = version == 0
+    versioned = version == TARGET_RELIABILITY_VERSION
+    unaudited = versioned & ~audited
+    if np.any(
+        not_collected
+        & (
+            audited
+            | ~np.isnan(js)
+            | policy_agree
+            | q_agree
+            | ~np.isnan(margin_primary)
+            | ~np.isnan(margin_duplicate)
+            | (confidence != 1.0)
+        )
+    ):
+        raise AlignmentError(
+            "version-zero reliability rows are not exact not-collected sentinels"
+        )
+    if np.any(audited & ~versioned):
+        raise AlignmentError("audited reliability row has no versioned evidence")
     if np.any(
         unaudited
         & (
@@ -481,23 +500,25 @@ def _reliability_inventory(
         )
         if not math.isclose(float(confidence[index]), expected, abs_tol=2.0e-6):
             raise AlignmentError("audited reliability confidence formula drifted")
-    classes = np.full(
-        row_count,
-        RELIABILITY_CLASS["unaudited_neutral_sentinel"],
-        dtype=np.uint8,
-    )
+    classes = np.full(row_count, RELIABILITY_CLASS["not_collected"], dtype=np.uint8)
+    classes[unaudited] = RELIABILITY_CLASS["unaudited_neutral_sentinel"]
     classes[audited] = RELIABILITY_CLASS["duplicate_search_audited"]
+    collected = int(np.count_nonzero(versioned))
     value = {
         "schema_version": "a1-stage-c-reliability-inventory-v1",
-        "storage": "typed_duplicate_search_fields",
+        "storage": (
+            "typed_duplicate_search_fields"
+            if collected
+            else "schema_columns_present_but_not_collected"
+        ),
         "reliability_schema": TARGET_RELIABILITY_SCHEMA,
         "reliability_version": TARGET_RELIABILITY_VERSION,
         "rows": row_count,
         "audited_rows": int(np.count_nonzero(audited)),
         "unaudited_rows": int(np.count_nonzero(unaudited)),
-        "not_collected_rows": 0,
+        "not_collected_rows": int(np.count_nonzero(not_collected)),
         "confidence_formula": TARGET_RELIABILITY_CONFIDENCE_FORMULA,
-        "confidence_weighting_authorized": bool(np.all(audited)),
+        "confidence_weighting_authorized": bool(row_count and np.all(audited)),
         "unaudited_confidence_semantics": (
             "neutral sentinel for learner compatibility; never audited evidence"
         ),

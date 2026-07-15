@@ -93,6 +93,17 @@ def test_reliability_inventory_never_calls_unaudited_one_confidence_audit() -> N
     assert absent_classes.tolist() == [alignment.RELIABILITY_CLASS["not_collected"]] * 3
     assert absent["confidence_weighting_authorized"] is False
 
+    materialized_not_collected = dict(unaudited)
+    materialized_not_collected["target_reliability_version"] = np.uint8(0)
+    zero_classes, zero_receipt = alignment._reliability_inventory(
+        _reliability_rows(materialized_not_collected), row_count=1
+    )
+    assert zero_classes.tolist() == [alignment.RELIABILITY_CLASS["not_collected"]]
+    assert zero_receipt["not_collected_rows"] == 1
+    assert zero_receipt["audited_rows"] == 0
+    assert zero_receipt["confidence_weighting_authorized"] is False
+    assert zero_receipt["storage"] == "schema_columns_present_but_not_collected"
+
 
 def test_reliability_inventory_refuses_partial_or_forged_evidence() -> None:
     unaudited = unaudited_target_reliability_fields()
