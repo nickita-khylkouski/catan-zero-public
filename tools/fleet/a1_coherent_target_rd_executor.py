@@ -192,6 +192,25 @@ def _run_text(command: Sequence[str], *, cwd: Path | None = None) -> str:
         raise ExecutorError(f"command failed: {list(command)!r}: {error}") from error
 
 
+def _python_executable(path: Path) -> Path:
+    """Authenticate a venv interpreter without resolving away its prefix.
+
+    Virtualenv Python entry points are commonly symlinks to the base
+    interpreter.  Executing the resolved target silently drops the venv's
+    site-packages, so retain the lexical absolute path after proving that its
+    target exists and the entry point is executable.
+    """
+
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        target = lexical.resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(f"cannot resolve Python executable {lexical}: {error}") from error
+    if not target.is_file() or not os.access(lexical, os.X_OK):
+        raise ExecutorError(f"python is not executable: {lexical}")
+    return lexical
+
+
 def _preflight(
     contract_path: Path,
     *,
@@ -207,15 +226,13 @@ def _preflight(
             f"--host-address {host_address!r} does not match sealed host {execution['host']!r}"
         )
     repo = repo.expanduser().resolve(strict=True)
-    python = python.expanduser().resolve(strict=True)
+    python = _python_executable(python)
     contract_repo = contract_path.resolve(strict=True).parents[3]
     if repo != contract_repo:
         raise ExecutorError(
             f"--repo {repo} differs from the repository authenticated by the "
             f"contract path ({contract_repo})"
         )
-    if not os.access(python, os.X_OK):
-        raise ExecutorError(f"python is not executable: {python}")
     generator = repo / "tools/generate_gumbel_selfplay_data.py"
     if not generator.is_file():
         raise ExecutorError(f"generator is missing: {generator}")
@@ -323,7 +340,7 @@ def execute(
         contract_path, repo=repo, python=python, host_address=host_address
     )
     repo = repo.expanduser().resolve(strict=True)
-    python = python.expanduser().resolve(strict=True)
+    python = _python_executable(python)
     commands = [
         {
             "lane_id": lane["lane_id"],
