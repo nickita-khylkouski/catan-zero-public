@@ -2687,6 +2687,11 @@ pub struct State {
     pub development_listdeck: Vec<DevCard>,
     pub buildings_by_color: HashMap<Color, HashMap<BuildingType, Vec<usize>>>,
     pub action_records: Vec<ActionRecord>,
+    /// Legal-action width aligned with `action_records`, but only when that
+    /// width is derivable from public state. Zero means "unknown/private" and
+    /// must never be used to suppress an event. In particular, regular
+    /// PLAY_TURN and DISCARD widths depend on hidden cards and stay zero.
+    pub action_public_legal_counts: Vec<u16>,
     pub num_turns: usize,
     pub current_player_index: usize,
     pub current_turn_index: usize,
@@ -2743,6 +2748,7 @@ impl State {
             development_listdeck,
             buildings_by_color,
             action_records: Vec::new(),
+            action_public_legal_counts: Vec::new(),
             num_turns: 0,
             current_player_index: 0,
             current_turn_index: 0,
@@ -3600,7 +3606,18 @@ fn apply_action_inner(
         ActionType::CancelTrade => apply_cancel_trade(state, action),
     }?;
     if record_action {
+        // Keep the optional public-width sidecar exactly aligned even when a
+        // caller previously injected records without width metadata. The Game
+        // execution boundary fills the newest zero only when the pre-action
+        // width is public; direct low-level callers remain safely unknown.
+        state
+            .action_public_legal_counts
+            .truncate(state.action_records.len());
+        state
+            .action_public_legal_counts
+            .resize(state.action_records.len(), 0);
         state.action_records.push(record.clone());
+        state.action_public_legal_counts.push(0);
     }
     Ok(record)
 }
@@ -5714,17 +5731,28 @@ impl Game {
         let observer_state = self.state.player_state(observer);
 
         // Results can contain hidden robber steals, development draws, and
-        // discarded resources. Preserve only the public actor sequence and
-        // exact history length using payload-free placeholders. Current neural
-        // features consume only the length, but this also protects snapshots
-        // consumed by custom evaluators.
+        // discarded resources. Preserve the public action sequence while
+        // redacting every result and the two action payloads that themselves
+        // carry a secret identity. This keeps meaningful public history usable
+        // inside determinizations without allowing authoritative hidden truth
+        // to cross the information-set boundary.
         result.state.action_records = self
             .state
             .action_records
             .iter()
-            .map(|record| ActionRecord {
-                action: Action::new(record.action.color, ActionType::EndTurn, ActionValue::None),
-                result: ActionValue::None,
+            .map(|record| {
+                let action = match record.action.action_type {
+                    ActionType::BuyDevelopmentCard | ActionType::DiscardResource => Action::new(
+                        record.action.color,
+                        record.action.action_type,
+                        ActionValue::None,
+                    ),
+                    _ => record.action.clone(),
+                };
+                ActionRecord {
+                    action,
+                    result: ActionValue::None,
+                }
             })
             .collect();
 
@@ -6111,7 +6139,46 @@ impl Game {
         self.execute_known_playable(action)
     }
 
+    /// Return the pre-action legal width only when it is public information.
+    ///
+    /// Initial placement, robber movement, and free-road placement depend on
+    /// the public board. Regular PLAY_TURN and DISCARD choices depend on the
+    /// actor's hidden hand/development cards, so exposing even a sole-action
+    /// bit for those prompts would leak private information.
+    fn public_legal_action_count_before(&self) -> Option<usize> {
+        match self.state.current_prompt {
+            ActionPrompt::BuildInitialSettlement
+            | ActionPrompt::BuildInitialRoad
+            | ActionPrompt::MoveRobber => Some(count_sorted_playable_actions(&self.state)),
+            ActionPrompt::PlayTurn if self.state.is_road_building => {
+                Some(count_sorted_playable_actions(&self.state))
+            }
+            ActionPrompt::Discard
+            | ActionPrompt::PlayTurn
+            | ActionPrompt::DecideTrade
+            | ActionPrompt::DecideAcceptees => None,
+        }
+    }
+
+    fn set_latest_public_legal_action_count(&mut self, count: Option<usize>) {
+        if !self.record_actions {
+            return;
+        }
+        let Some(index) = self.state.action_records.len().checked_sub(1) else {
+            return;
+        };
+        debug_assert_eq!(
+            self.state.action_records.len(),
+            self.state.action_public_legal_counts.len()
+        );
+        self.state.action_public_legal_counts[index] = count
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(0);
+    }
+
     fn execute_known_playable(&mut self, action: Action) -> Result<ActionRecord, String> {
+        let public_legal_action_count = self.public_legal_action_count_before();
         let record = apply_action_known_valid(
             &mut self.state,
             action,
@@ -6119,6 +6186,7 @@ impl Game {
             &mut self.rng,
             self.record_actions,
         )?;
+        self.set_latest_public_legal_action_count(public_legal_action_count);
         if self.materialize_playable_actions {
             self.playable_actions = generate_playable_actions(&self.state);
         } else {
@@ -6136,6 +6204,7 @@ impl Game {
         if validate && !is_valid_action(&self.playable_actions, &self.state, &action) {
             return Err(format!("action not playable: {action:?}"));
         }
+        let public_legal_action_count = self.public_legal_action_count_before();
         let record = apply_action(
             &mut self.state,
             action,
@@ -6143,6 +6212,7 @@ impl Game {
             &mut self.rng,
             self.record_actions,
         )?;
+        self.set_latest_public_legal_action_count(public_legal_action_count);
         if self.materialize_playable_actions {
             self.playable_actions = generate_playable_actions(&self.state);
         } else {
@@ -6447,6 +6517,141 @@ pub fn action_record_to_json_value(action_record: &ActionRecord) -> Value {
     })
 }
 
+fn resource_deck_to_json_value(deck: FreqDeck) -> Value {
+    Value::Object(
+        Resource::ALL
+            .iter()
+            .map(|resource| {
+                (
+                    resource_name(*resource).to_string(),
+                    json!(deck[resource.idx()]),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn development_counts_to_json_value(counts: [u8; 5]) -> Value {
+    Value::Object(
+        DevCard::ALL
+            .iter()
+            .map(|card| (dev_card_name(*card).to_string(), json!(counts[card.idx()])))
+            .collect(),
+    )
+}
+
+/// Observer-scoped public card deductions for the two-player track.
+///
+/// Resource identities are exact in two-player Catan by conservation: every
+/// card not in the public bank or the observer's known hand must be in the
+/// sole opponent's hand. No opponent resource field is read to produce the
+/// composition or total.
+///
+/// Face-down development-card identities are *not* deducible. For them this
+/// returns the exact exchangeable unknown pool (base deck minus public plays
+/// and the observer's known cards). The opponent face-down count is derived
+/// from base-deck conservation and the physical-deck length. It never reads
+/// opponent dev identities or deck order.
+pub fn public_card_deductions_to_json_value(game: &Game, observer: Color) -> Result<Value, String> {
+    if game.state.colors.len() != 2 {
+        return Err("public card deductions v1 require exactly two players".into());
+    }
+    if !game.state.color_to_index.contains_key(&observer) {
+        return Err("public card deduction observer is not a player".into());
+    }
+    if game.state.current_color() != observer {
+        return Err("public card deduction observer must be the current player".into());
+    }
+    let opponent = game
+        .state
+        .colors
+        .iter()
+        .copied()
+        .find(|color| *color != observer)
+        .ok_or("public card deductions require one opponent")?;
+    let observer_state = game.state.player_state(observer);
+
+    let base_resources = starting_resource_bank();
+    let mut opponent_resources = [0_u8; 5];
+    for resource in Resource::ALL {
+        let index = resource.idx();
+        let known = u16::from(game.state.resource_freqdeck[index])
+            + u16::from(observer_state.resources[index]);
+        if known > u16::from(base_resources[index]) {
+            return Err(format!(
+                "public resource conservation exceeds base bank for {}",
+                resource_name(resource)
+            ));
+        }
+        opponent_resources[index] = base_resources[index] - known as u8;
+    }
+    let derived_opponent_total = opponent_resources.iter().copied().sum::<u8>();
+
+    let mut unknown_development_pool = [0_u8; 5];
+    for card in starting_devcard_bank() {
+        unknown_development_pool[card.idx()] += 1;
+    }
+    let mut publicly_played = [0_u8; 5];
+    for color in &game.state.colors {
+        let player = game.state.player_state(*color);
+        for index in 0..5 {
+            publicly_played[index] = publicly_played[index]
+                .checked_add(player.played_dev_cards[index])
+                .ok_or("public played development-card count overflow")?;
+            unknown_development_pool[index] = unknown_development_pool[index]
+                .checked_sub(player.played_dev_cards[index])
+                .ok_or("public played development cards exceed base deck")?;
+        }
+    }
+    for index in 0..5 {
+        unknown_development_pool[index] = unknown_development_pool[index]
+            .checked_sub(observer_state.dev_cards[index])
+            .ok_or("observer development cards exceed public unknown pool")?;
+    }
+    let observer_dev_count = observer_state.dev_cards.iter().copied().sum::<u8>();
+    let publicly_played_count = publicly_played.iter().copied().sum::<u8>();
+    let accounted_development_count = game
+        .state
+        .development_listdeck
+        .len()
+        .checked_add(usize::from(observer_dev_count))
+        .and_then(|count| count.checked_add(usize::from(publicly_played_count)))
+        .ok_or("public development-card count overflow")?;
+    let opponent_dev_count = starting_devcard_bank()
+        .len()
+        .checked_sub(accounted_development_count)
+        .ok_or("public development-card conservation exceeds base deck")?
+        as u8;
+    let unknown_pool_count = unknown_development_pool.iter().copied().sum::<u8>();
+    let expected_unknown_count = opponent_dev_count
+        .checked_add(game.state.development_listdeck.len() as u8)
+        .ok_or("public unknown development-card count overflow")?;
+    if unknown_pool_count != expected_unknown_count {
+        return Err(format!(
+            "public development-card conservation mismatch: pool {unknown_pool_count}, opponent hand + deck {expected_unknown_count}"
+        ));
+    }
+
+    Ok(json!({
+        "contract": "public_card_deductions_2p_v1",
+        "observer": color_name(observer),
+        "opponent": color_name(opponent),
+        "resource_composition_exact": true,
+        "observer_resources": resource_deck_to_json_value(observer_state.resources),
+        "opponent_resources": resource_deck_to_json_value(opponent_resources),
+        "opponent_resource_card_count": derived_opponent_total,
+        "resource_bank": resource_deck_to_json_value(game.state.resource_freqdeck),
+        "development_composition_exact": false,
+        "observer_development_cards": development_counts_to_json_value(observer_state.dev_cards),
+        "observer_development_card_count": observer_dev_count,
+        "opponent_face_down_development_card_count": opponent_dev_count,
+        "development_deck_count": game.state.development_listdeck.len(),
+        "publicly_played_development_cards": development_counts_to_json_value(publicly_played),
+        "unknown_development_pool": development_counts_to_json_value(unknown_development_pool),
+        "unknown_development_pool_count": unknown_pool_count,
+    }))
+}
+
 pub fn action_from_json_value(value: &Value) -> Result<Action, String> {
     let values = value
         .as_array()
@@ -6701,6 +6906,10 @@ pub fn game_to_json_value(game: &Game) -> Value {
             .iter()
             .map(action_record_to_json_value)
             .collect::<Vec<_>>(),
+        // Zero means the old/private-dependent width is intentionally unknown.
+        // Non-zero entries are aligned with action_records and derive only
+        // from public board/prompt state.
+        "action_public_legal_counts": game.state.action_public_legal_counts,
         "player_state": game
             .state
             .player_state
@@ -7619,6 +7828,20 @@ pub mod python_bindings {
         fn json_snapshot(&self) -> PyResult<String> {
             serde_json::to_string(&game_to_json_value(&self.game)).map_err(|error| {
                 PyValueError::new_err(format!("failed to serialize game snapshot: {error}"))
+            })
+        }
+
+        /// Return the observer-scoped 2p card-counting deduction surface.
+        /// Opponent resources are derived from conservation; opponent
+        /// face-down development-card identities and deck order stay hidden.
+        fn public_card_deductions_json(&self, observer: &str) -> PyResult<String> {
+            let observer = parse_color(observer).map_err(py_err)?;
+            let value = public_card_deductions_to_json_value(&self.game, observer)
+                .map_err(PyValueError::new_err)?;
+            serde_json::to_string(&value).map_err(|error| {
+                PyValueError::new_err(format!(
+                    "failed to serialize public card deductions: {error}"
+                ))
             })
         }
 
@@ -8738,9 +8961,9 @@ pub mod python_bindings {
     //
     // Bit-exact companion to `catan_zero.rl.entity_token_features.build_entity_token_features`
     // for the specific "Rust-MCTS adapter" payload shape produced by
-    // `neural_rust_mcts._entity_payload_from_rust_snapshot` (that adapter's
-    // `event_log` is always `[]`, so event tokens/masks are always-zero here
-    // too -- no event-log logic to port for this call site).
+    // `neural_rust_mcts._entity_payload_from_rust_snapshot`. Legacy calls keep
+    // event tokens/masks all-zero; next-wave calls opt into the same bounded
+    // meaningful-public-action history encoded from `state.action_records`.
     //
     // One known, pre-existing quirk of the Python reference this function
     // reproduces verbatim (do not fix here without also fixing the Python
@@ -8826,6 +9049,7 @@ pub mod python_bindings {
     const ENTITY_LEGAL_ACTION_FEATURE_SIZE: usize = 50;
     const ENTITY_EVENT_FEATURE_SIZE: usize = 41;
     const ENTITY_EVENT_HISTORY_LIMIT: usize = 64;
+    const ENTITY_MEANINGFUL_PUBLIC_HISTORY_LIMIT: usize = 32;
     const ENTITY_PLAYERS_ORDER: [&str; 4] = ["BLUE", "RED", "ORANGE", "WHITE"];
     const ENTITY_PROMPTS: [&str; 8] = [
         "BUILD_INITIAL_SETTLEMENT",
@@ -8901,6 +9125,23 @@ pub mod python_bindings {
         }
     }
 
+    fn entity_is_meaningful_public_action(action_type: ActionType) -> bool {
+        matches!(
+            action_type,
+            ActionType::BuildSettlement
+                | ActionType::BuildRoad
+                | ActionType::BuildCity
+                | ActionType::BuyDevelopmentCard
+                | ActionType::MaritimeTrade
+                | ActionType::MoveRobber
+                | ActionType::DiscardResource
+                | ActionType::PlayKnightCard
+                | ActionType::PlayYearOfPlenty
+                | ActionType::PlayMonopoly
+                | ActionType::PlayRoadBuilding
+        )
+    }
+
     /// Per-game entity-feature arrays, unpadded (`legal_action_*` widths vary
     /// with `n_legal`; everything else is fixed-size). Pure Rust, no PyO3
     /// types -- safe to build in parallel (rayon) or sequentially alike.
@@ -8921,6 +9162,7 @@ pub mod python_bindings {
         legal_action_mask: Vec<bool>,
         event_mask: Vec<bool>,
         n_legal: usize,
+        event_history_limit: usize,
     }
 
     /// Core per-game builder shared by the single-item and batch pyfunctions.
@@ -8939,6 +9181,8 @@ pub mod python_bindings {
         action_size: i64,
         topology: &PyEntityTopology,
         public_observation: bool,
+        meaningful_public_history: bool,
+        requested_event_history_limit: usize,
     ) -> PyResult<EntityFeatureArrays> {
         let state = &game.state;
         let actions = &game.playable_actions;
@@ -8951,6 +9195,16 @@ pub mod python_bindings {
         }
         let n_legal = actions.len();
         let perspective_color = state.current_color();
+        if requested_event_history_limit > ENTITY_EVENT_HISTORY_LIMIT {
+            return Err(PyValueError::new_err(format!(
+                "event_history_limit must be <= {ENTITY_EVENT_HISTORY_LIMIT}, got {requested_event_history_limit}"
+            )));
+        }
+        let event_history_limit = if meaningful_public_history {
+            requested_event_history_limit.min(ENTITY_MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+        } else {
+            requested_event_history_limit
+        };
 
         // ---- live per-coordinate tile id lookup (mirrors Python's
         // `_build_topology`'s `coordinate_to_hex`, sourced from THIS game's
@@ -9262,11 +9516,65 @@ pub mod python_bindings {
             legal_action_tokens[base + 49] = entity_scale(0, 3.0); // trade_panel.offers_remaining: hardcoded 0
         }
 
-        // ---- event tokens/masks: always zero/empty in this adapter (see
-        // module-level doc comment above -- `event_log` is always `[]`). ----
-        let event_tokens = vec![0.0f64; ENTITY_EVENT_HISTORY_LIMIT * ENTITY_EVENT_FEATURE_SIZE];
-        let event_target_ids = vec![-1i64; ENTITY_EVENT_HISTORY_LIMIT * 4];
-        let event_mask = vec![false; ENTITY_EVENT_HISTORY_LIMIT];
+        // ---- event tokens/masks: optional bounded meaningful PUBLIC history.
+        // Default-off preserves the historical all-zero 64-token surface.
+        // The enabled path reads only action type/color and the public robber
+        // victim; it never serializes discard resources, bought dev identity,
+        // stolen resource, or any other ActionRecord result/value secret. ----
+        let mut event_tokens = vec![0.0f64; event_history_limit * ENTITY_EVENT_FEATURE_SIZE];
+        let event_target_ids = vec![-1i64; event_history_limit * 4];
+        let mut event_mask = vec![false; event_history_limit];
+        if meaningful_public_history && event_history_limit > 0 {
+            let meaningful = state
+                .action_records
+                .iter()
+                .enumerate()
+                .filter(|(index, record)| {
+                    entity_is_meaningful_public_action(record.action.action_type)
+                        // Only a known-public width of one suppresses an event.
+                        // Missing/zero metadata is private or legacy and must
+                        // remain in history rather than leak a hidden-hand bit.
+                        && state
+                            .action_public_legal_counts
+                            .get(*index)
+                            .copied()
+                            .unwrap_or(0)
+                            != 1
+                })
+                .map(|(_, record)| record)
+                .collect::<Vec<_>>();
+            let retained = meaningful
+                .len()
+                .min(event_history_limit)
+                .min(ENTITY_MEANINGFUL_PUBLIC_HISTORY_LIMIT);
+            let source_start = meaningful.len().saturating_sub(retained);
+            let row_start = event_history_limit - retained;
+            for (index, record) in meaningful[source_start..].iter().enumerate() {
+                let row = row_start + index;
+                let base = row * ENTITY_EVENT_FEATURE_SIZE;
+                event_mask[row] = true;
+                event_tokens[base] = 1.0;
+                event_tokens[base + 1] =
+                    entity_scale((retained - index) as i64, event_history_limit as f64);
+                // EVENT_TYPES[1] == "board_action" in the Python reference.
+                event_tokens[base + 3] = 1.0;
+                if let Some(actor_index) = entity_player_index(color_name(record.action.color)) {
+                    event_tokens[base + 10 + actor_index] = 1.0;
+                }
+                let type_name = action_type_name(record.action.action_type);
+                if let Some(type_index) = ENTITY_ACTION_TYPES
+                    .iter()
+                    .position(|&entry| entry == type_name)
+                {
+                    event_tokens[base + 17 + type_index] = 1.0;
+                }
+                if let ActionValue::Robber(_, Some(victim)) = &record.action.value
+                    && let Some(target_index) = entity_player_index(color_name(*victim))
+                {
+                    event_tokens[base + 36 + target_index] = 1.0;
+                }
+            }
+        }
 
         // ---- masks ----
         let hex_mask = vec![true; 19];
@@ -9297,6 +9605,7 @@ pub mod python_bindings {
             legal_action_mask,
             event_mask,
             n_legal,
+            event_history_limit,
         })
     }
 
@@ -9338,6 +9647,7 @@ pub mod python_bindings {
         arrays: EntityFeatureArrays,
     ) -> PyResult<Py<PyDict>> {
         let n_legal = arrays.n_legal;
+        let event_history_limit = arrays.event_history_limit;
         let dict = PyDict::new(py);
         dict.set_item(
             "hex_tokens",
@@ -9392,14 +9702,14 @@ pub mod python_bindings {
             "event_tokens",
             (
                 f64_vec_to_le_bytes(arrays.event_tokens),
-                (ENTITY_EVENT_HISTORY_LIMIT, ENTITY_EVENT_FEATURE_SIZE),
+                (event_history_limit, ENTITY_EVENT_FEATURE_SIZE),
             ),
         )?;
         dict.set_item(
             "event_target_ids",
             (
                 i64_vec_to_le_bytes(arrays.event_target_ids),
-                (ENTITY_EVENT_HISTORY_LIMIT, 4usize),
+                (event_history_limit, 4usize),
             ),
         )?;
         dict.set_item("hex_mask", arrays.hex_mask)?;
@@ -9419,7 +9729,7 @@ pub mod python_bindings {
     }
 
     #[pyfunction]
-    #[pyo3(signature = (game, colors, policy_action_ids, action_size, topology, public_observation=false))]
+    #[pyo3(signature = (game, colors, policy_action_ids, action_size, topology, public_observation=false, meaningful_public_history=false, event_history_limit=64))]
     fn build_entity_features_flat(
         py: Python<'_>,
         game: &PyGame,
@@ -9428,6 +9738,8 @@ pub mod python_bindings {
         action_size: i64,
         topology: &PyEntityTopology,
         public_observation: bool,
+        meaningful_public_history: bool,
+        event_history_limit: usize,
     ) -> PyResult<Py<PyDict>> {
         let colors = parse_colors_list(&colors)?;
         let arrays = build_entity_feature_arrays(
@@ -9437,6 +9749,8 @@ pub mod python_bindings {
             action_size,
             topology,
             public_observation,
+            meaningful_public_history,
+            event_history_limit,
         )?;
         entity_feature_arrays_to_pydict(py, arrays)
     }
@@ -9498,7 +9812,7 @@ pub mod python_bindings {
     /// process per GPU with a shared model (the phase-2/3 thread
     /// architecture) -- plumbed now, default sequential until then.
     #[pyfunction]
-    #[pyo3(signature = (games, colors, policy_action_ids, action_size, topology, public_observation=false, parallel=false))]
+    #[pyo3(signature = (games, colors, policy_action_ids, action_size, topology, public_observation=false, parallel=false, meaningful_public_history=false, event_history_limit=64))]
     #[allow(clippy::too_many_arguments)]
     fn build_entity_features_batch(
         py: Python<'_>,
@@ -9509,6 +9823,8 @@ pub mod python_bindings {
         topology: &PyEntityTopology,
         public_observation: bool,
         parallel: bool,
+        meaningful_public_history: bool,
+        event_history_limit: usize,
     ) -> PyResult<Py<PyDict>> {
         if games.len() != policy_action_ids.len() {
             return Err(PyValueError::new_err(format!(
@@ -9537,6 +9853,8 @@ pub mod python_bindings {
                         action_size,
                         topology,
                         public_observation,
+                        meaningful_public_history,
+                        event_history_limit,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -9552,6 +9870,8 @@ pub mod python_bindings {
                         action_size,
                         topology,
                         public_observation,
+                        meaningful_public_history,
+                        event_history_limit,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -9565,20 +9885,32 @@ pub mod python_bindings {
         // construction). No behavior change, just removes the redundant
         // heap copies.
         let batch_len = arrays.len();
+        let effective_event_history_limit = arrays
+            .first()
+            .map(|arrays| arrays.event_history_limit)
+            .unwrap_or_else(|| {
+                if meaningful_public_history {
+                    event_history_limit.min(ENTITY_MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+                } else {
+                    event_history_limit
+                }
+            });
         let mut widths: Vec<usize> = Vec::with_capacity(batch_len);
         let mut hex_tokens = Vec::with_capacity(batch_len * 19 * ENTITY_HEX_FEATURE_SIZE);
         let mut vertex_tokens = Vec::with_capacity(batch_len * 54 * ENTITY_VERTEX_FEATURE_SIZE);
         let mut edge_tokens = Vec::with_capacity(batch_len * 72 * ENTITY_EDGE_FEATURE_SIZE);
         let mut player_tokens = Vec::with_capacity(batch_len * 4 * ENTITY_PLAYER_FEATURE_SIZE);
         let mut global_tokens = Vec::with_capacity(batch_len * ENTITY_GLOBAL_FEATURE_SIZE);
-        let mut event_tokens =
-            Vec::with_capacity(batch_len * ENTITY_EVENT_HISTORY_LIMIT * ENTITY_EVENT_FEATURE_SIZE);
-        let mut event_target_ids = Vec::with_capacity(batch_len * ENTITY_EVENT_HISTORY_LIMIT * 4);
+        let mut event_tokens = Vec::with_capacity(
+            batch_len * effective_event_history_limit * ENTITY_EVENT_FEATURE_SIZE,
+        );
+        let mut event_target_ids =
+            Vec::with_capacity(batch_len * effective_event_history_limit * 4);
         let mut hex_mask = Vec::with_capacity(batch_len * 19);
         let mut vertex_mask = Vec::with_capacity(batch_len * 54);
         let mut edge_mask = Vec::with_capacity(batch_len * 72);
         let mut player_mask = Vec::with_capacity(batch_len * 4);
-        let mut event_mask = Vec::with_capacity(batch_len * ENTITY_EVENT_HISTORY_LIMIT);
+        let mut event_mask = Vec::with_capacity(batch_len * effective_event_history_limit);
         let mut legal_action_tokens_rows: Vec<Vec<f64>> = Vec::with_capacity(batch_len);
         let mut legal_action_target_ids_rows: Vec<Vec<i64>> = Vec::with_capacity(batch_len);
         let mut legal_action_mask_rows: Vec<Vec<bool>> = Vec::with_capacity(batch_len);
@@ -9669,7 +10001,7 @@ pub mod python_bindings {
                 f64_vec_to_le_bytes(event_tokens),
                 (
                     batch_size,
-                    ENTITY_EVENT_HISTORY_LIMIT,
+                    effective_event_history_limit,
                     ENTITY_EVENT_FEATURE_SIZE,
                 ),
             ),
@@ -9678,7 +10010,7 @@ pub mod python_bindings {
             "event_target_ids",
             (
                 i64_vec_to_le_bytes(event_target_ids),
-                (batch_size, ENTITY_EVENT_HISTORY_LIMIT, 4usize),
+                (batch_size, effective_event_history_limit, 4usize),
             ),
         )?;
         dict.set_item("hex_mask", (hex_mask, (batch_size, 19usize)))?;
@@ -9691,7 +10023,7 @@ pub mod python_bindings {
         )?;
         dict.set_item(
             "event_mask",
-            (event_mask, (batch_size, ENTITY_EVENT_HISTORY_LIMIT)),
+            (event_mask, (batch_size, effective_event_history_limit)),
         )?;
         dict.set_item("widths", widths)?;
         Ok(dict.into())
@@ -10061,6 +10393,9 @@ pub mod python_bindings {
                         .unwrap()
                         .contains("current_playable_actions")
                 );
+                let actor = game.current_color();
+                let public_cards = game.public_card_deductions_json(&actor).unwrap();
+                assert!(public_cards.contains("public_card_deductions_2p_v1"));
                 let (tensor, shape) = game.board_tensor_flat("RED", false).unwrap();
                 assert_eq!(shape, (21, 11, 16));
                 assert_eq!(tensor.len(), 21 * 11 * 16);
@@ -10108,6 +10443,8 @@ pub mod python_bindings {
                 400,
                 &topology,
                 true,
+                false,
+                ENTITY_EVENT_HISTORY_LIMIT,
             )
             .unwrap();
             let actor_base =
@@ -10120,6 +10457,128 @@ pub mod python_bindings {
             assert_eq!(arrays.player_tokens[opponent_base + 4], 0.0);
             assert_eq!(arrays.player_tokens[opponent_base + 15], 0.0);
             assert_eq!(arrays.player_tokens[opponent_base + 21], 0.0);
+        }
+
+        #[test]
+        fn meaningful_public_history_filters_plumbing_and_caps_at_32() {
+            let mut py_game =
+                PyGame::simple(Some(vec!["RED".to_string(), "BLUE".to_string()]), Some(32))
+                    .unwrap();
+            let actor = py_game.game.state.current_color();
+            py_game.game.state.action_records.clear();
+            py_game.game.state.action_public_legal_counts.clear();
+            for _ in 0..35 {
+                py_game.game.state.action_records.push(ActionRecord {
+                    action: Action::new(actor, ActionType::BuildRoad, ActionValue::Edge((0, 1))),
+                    result: ActionValue::None,
+                });
+                py_game.game.state.action_public_legal_counts.push(3);
+            }
+            py_game.game.state.action_records.push(ActionRecord {
+                action: Action::new(actor, ActionType::Roll, ActionValue::Dice(3, 4)),
+                result: ActionValue::Dice(3, 4),
+            });
+            py_game.game.state.action_public_legal_counts.push(1);
+            py_game.game.state.action_records.push(ActionRecord {
+                action: Action::new(actor, ActionType::EndTurn, ActionValue::None),
+                result: ActionValue::None,
+            });
+            py_game.game.state.action_public_legal_counts.push(1);
+            // A strategic action is still omitted when its sole-choice status
+            // came from a publicly reconstructible prompt.
+            py_game.game.state.action_records.push(ActionRecord {
+                action: Action::new(actor, ActionType::BuildCity, ActionValue::Node(7)),
+                result: ActionValue::None,
+            });
+            py_game.game.state.action_public_legal_counts.push(1);
+            py_game.game.state.action_records.push(ActionRecord {
+                action: Action::new(
+                    actor,
+                    ActionType::DiscardResource,
+                    ActionValue::Resource(Resource::Ore),
+                ),
+                result: ActionValue::Resource(Resource::Ore),
+            });
+            // DISCARD width is hidden-hand-dependent and therefore unknown.
+            py_game.game.state.action_public_legal_counts.push(0);
+
+            let topology = PyEntityTopology {
+                hex_vertex_ids: vec![vec![-1; 6]; 19],
+                hex_edge_ids: vec![vec![-1; 6]; 19],
+                edge_vertex_ids: vec![vec![-1; 2]; 72],
+                port_base_nodes: vec![vec![-1; 2]; 16],
+            };
+            let colors = py_game.game.state.colors.clone();
+            let policy_action_ids = vec![0; py_game.game.playable_actions.len()];
+            let enabled = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &policy_action_ids,
+                400,
+                &topology,
+                true,
+                true,
+                ENTITY_EVENT_HISTORY_LIMIT,
+            )
+            .unwrap();
+            assert_eq!(enabled.event_history_limit, 32);
+            assert_eq!(
+                enabled.event_mask.iter().filter(|&&value| value).count(),
+                32
+            );
+            // The newest retained event is DISCARD_RESOURCE, not ROLL/END_TURN.
+            let last = (enabled.event_history_limit - 1) * ENTITY_EVENT_FEATURE_SIZE;
+            let discard_index = ENTITY_ACTION_TYPES
+                .iter()
+                .position(|&name| name == "DISCARD_RESOURCE")
+                .unwrap();
+            assert_eq!(enabled.event_tokens[last + 17 + discard_index], 1.0);
+            assert_eq!(enabled.event_tokens[last + 35], 0.0);
+
+            let legacy = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &policy_action_ids,
+                400,
+                &topology,
+                true,
+                false,
+                ENTITY_EVENT_HISTORY_LIMIT,
+            )
+            .unwrap();
+            assert_eq!(legacy.event_history_limit, 64);
+            assert!(legacy.event_mask.iter().all(|value| !value));
+            assert!(legacy.event_tokens.iter().all(|value| *value == 0.0));
+        }
+
+        #[test]
+        fn public_legal_width_sidecar_never_records_private_prompt_widths() {
+            let players = vec![Player::simple(Color::Red), Player::simple(Color::Blue)];
+            let mut placement = Game::new(players.clone(), Some(91));
+            let public_width = placement.playable_actions.len();
+            let action = placement.playable_actions[0].clone();
+            placement.execute(action, true, None).unwrap();
+            assert_eq!(
+                placement.state.action_public_legal_counts,
+                vec![u16::try_from(public_width).unwrap()]
+            );
+
+            let mut private_turn = Game::new(players, Some(92));
+            private_turn.state.current_prompt = ActionPrompt::PlayTurn;
+            private_turn.state.is_initial_build_phase = false;
+            let actor = private_turn.state.current_color();
+            private_turn.state.player_state_mut(actor).has_rolled = false;
+            private_turn.playable_actions = generate_playable_actions(&private_turn.state);
+            assert_eq!(private_turn.playable_actions.len(), 1);
+            let roll = private_turn.playable_actions[0].clone();
+            private_turn
+                .execute(roll, true, Some(ActionValue::Dice(3, 4)))
+                .unwrap();
+            assert_eq!(
+                private_turn.state.action_public_legal_counts,
+                vec![0],
+                "even a sole regular-turn action is private-dependent metadata",
+            );
         }
 
         #[test]
@@ -13058,6 +13517,14 @@ mod tests {
         assert!(value["edges"].as_array().unwrap().len() >= 72);
         assert!(value["nodes"].is_object());
         assert!(value["action_records"].is_array());
+        assert!(value["action_public_legal_counts"].is_array());
+        assert_eq!(
+            value["action_public_legal_counts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            value["action_records"].as_array().unwrap().len(),
+        );
         assert!(value["player_state"].is_array());
         assert!(value["colors"].is_array());
         assert!(value["current_playable_actions"].is_array());
@@ -13700,6 +14167,102 @@ mod tests {
     }
 }
 #[cfg(test)]
+mod public_card_deduction_tests {
+    use super::*;
+
+    fn two_player_public_fixture() -> (Game, Color, Color) {
+        let mut game = Game::new(
+            vec![Player::simple(Color::Red), Player::simple(Color::Blue)],
+            Some(91),
+        );
+        let observer = game.state.current_color();
+        let opponent = game
+            .state
+            .colors
+            .iter()
+            .copied()
+            .find(|color| *color != observer)
+            .unwrap();
+
+        let observer_resources = [1, 2, 0, 1, 0];
+        let opponent_resources = [3, 0, 2, 1, 4];
+        game.state.player_state_mut(observer).resources = observer_resources;
+        game.state.player_state_mut(opponent).resources = opponent_resources;
+        for index in 0..5 {
+            game.state.resource_freqdeck[index] = starting_resource_bank()[index]
+                - observer_resources[index]
+                - opponent_resources[index];
+        }
+
+        game.state.player_state_mut(observer).dev_cards[DevCard::Knight.idx()] = 1;
+        game.state.player_state_mut(observer).played_dev_cards[DevCard::YearOfPlenty.idx()] = 1;
+        game.state.player_state_mut(opponent).played_dev_cards[DevCard::Knight.idx()] = 2;
+        game.state.player_state_mut(opponent).dev_cards[DevCard::Monopoly.idx()] = 1;
+        game.state.player_state_mut(opponent).dev_cards[DevCard::VictoryPoint.idx()] = 1;
+        // 25 base - 3 public plays - 1 observer-known - 2 opponent-hidden.
+        // Only the length is public; identities/order must not be consumed.
+        game.state.development_listdeck = vec![DevCard::RoadBuilding; 19];
+        (game, observer, opponent)
+    }
+
+    #[test]
+    fn two_player_public_card_deductions_are_exact_for_resources_only() {
+        let (game, observer, opponent) = two_player_public_fixture();
+        let value = public_card_deductions_to_json_value(&game, observer).unwrap();
+
+        assert_eq!(value["contract"], json!("public_card_deductions_2p_v1"));
+        assert_eq!(value["opponent"], json!(color_name(opponent)));
+        assert_eq!(value["resource_composition_exact"], json!(true));
+        assert_eq!(value["opponent_resource_card_count"], json!(10));
+        assert_eq!(value["opponent_resources"]["WOOD"], json!(3));
+        assert_eq!(value["opponent_resources"]["BRICK"], json!(0));
+        assert_eq!(value["opponent_resources"]["SHEEP"], json!(2));
+        assert_eq!(value["opponent_resources"]["WHEAT"], json!(1));
+        assert_eq!(value["opponent_resources"]["ORE"], json!(4));
+
+        assert_eq!(value["development_composition_exact"], json!(false));
+        assert_eq!(value["opponent_face_down_development_card_count"], json!(2));
+        assert_eq!(value["development_deck_count"], json!(19));
+        assert_eq!(value["unknown_development_pool_count"], json!(21));
+        assert!(value.get("opponent_development_cards").is_none());
+    }
+
+    #[test]
+    fn public_card_deductions_ignore_authoritative_hidden_identities() {
+        let (first, observer, opponent) = two_player_public_fixture();
+        let mut second = first.clone();
+
+        // Preserve every public aggregate while permuting authoritative hidden
+        // resource and development identities and the physical deck order.
+        // The observer-scoped deduction surface must be byte-identical.
+        second.state.player_state_mut(opponent).resources = [0, 4, 1, 2, 3];
+        second.state.player_state_mut(opponent).dev_cards = [0; 5];
+        second.state.player_state_mut(opponent).dev_cards[DevCard::Knight.idx()] = 2;
+        second.state.development_listdeck = vec![DevCard::VictoryPoint; 19];
+
+        assert_eq!(
+            public_card_deductions_to_json_value(&first, observer).unwrap(),
+            public_card_deductions_to_json_value(&second, observer).unwrap(),
+        );
+    }
+
+    #[test]
+    fn public_card_deductions_fail_closed_outside_two_player_track() {
+        let game = Game::new(
+            vec![
+                Player::simple(Color::Red),
+                Player::simple(Color::Blue),
+                Player::simple(Color::Orange),
+            ],
+            Some(92),
+        );
+        let error =
+            public_card_deductions_to_json_value(&game, game.state.current_color()).unwrap_err();
+        assert!(error.contains("exactly two players"));
+    }
+}
+
+#[cfg(test)]
 mod public_belief_determinization_tests {
     use super::*;
 
@@ -13825,7 +14388,7 @@ mod public_belief_determinization_tests {
 
         // Authoritative histories may encode a hidden dev draw/result. The
         // determinized snapshot must redact that payload while retaining public
-        // actor sequence and history length.
+        // actor/action sequence and history length.
         first.state.action_records.push(ActionRecord {
             action: Action::new(observer, ActionType::BuyDevelopmentCard, ActionValue::None),
             result: ActionValue::DevCard(DevCard::Knight),
@@ -13854,6 +14417,14 @@ mod public_belief_determinization_tests {
             game_to_json_value(&sampled_second),
             "same information set + seed must yield the same sampled world",
         );
+        let public_draw = sampled_first.state.action_records.last().unwrap();
+        assert_eq!(
+            public_draw.action.action_type,
+            ActionType::BuyDevelopmentCard,
+            "determinization must preserve the public action taxonomy",
+        );
+        assert_eq!(public_draw.action.value, ActionValue::None);
+        assert_eq!(public_draw.result, ActionValue::None);
         assert_eq!(sampled_first.playable_actions, first.playable_actions);
         assert_eq!(
             sampled_first.state.player_state(observer).dev_cards,

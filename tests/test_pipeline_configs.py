@@ -75,6 +75,15 @@ def test_policy_aux_active_batch_size_changes_typed_train_hash() -> None:
     assert config_from_payload(policy_aux.canonical_payload()) == policy_aux
 
 
+def test_per_game_policy_surprise_changes_typed_train_hash() -> None:
+    baseline = TrainConfig()
+    exact_surprise = TrainConfig(per_game_policy_surprise_weighting=True)
+
+    assert baseline.per_game_policy_surprise_weighting is False
+    assert exact_surprise.config_hash() != baseline.config_hash()
+    assert config_from_payload(exact_surprise.canonical_payload()) == exact_surprise
+
+
 def test_config_from_payload_rejects_unknown_pipeline() -> None:
     with pytest.raises(ValueError, match="unknown pipeline"):
         config_from_payload({"pipeline": "nonsense", "fields": {}})

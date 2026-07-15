@@ -81,7 +81,9 @@ def test_build_upgraded_config_tolerates_missing_field():
 
 def test_build_upgraded_config_preserves_a_full_config():
     """A current (non-stale) config round-trips with only the overrides changed."""
-    base = EntityGraphConfig(action_size=607, static_action_feature_size=1, hidden_size=512)
+    base = EntityGraphConfig(
+        action_size=607, static_action_feature_size=1, hidden_size=512
+    )
     upgraded = upgrade_tool._build_upgraded_config(base, _OVERRIDES)
     assert upgraded.hidden_size == 512
     assert upgraded.action_cross_attention_layers == 2
@@ -99,6 +101,29 @@ def test_topology_upgrade_flag_is_explicit_and_default_off():
     upgraded = upgrade_tool._build_upgraded_config(base, overrides)
     assert upgraded.action_target_gather is True
     assert upgraded.topology_residual_adapter is True
+
+
+def test_public_card_count_upgrade_flag_is_explicit_and_default_off():
+    base = EntityGraphConfig(action_size=607, static_action_feature_size=1)
+    assert base.public_card_count_features is False
+    overrides = upgrade_tool._parse_flags("card_count")
+    assert overrides == {"public_card_count_features": True}
+    upgraded = upgrade_tool._build_upgraded_config(base, overrides)
+    assert upgraded.public_card_count_features is True
+
+
+def test_meaningful_history_upgrade_is_bounded_and_explicit():
+    base = EntityGraphConfig(action_size=607, static_action_feature_size=1)
+    assert base.meaningful_public_history is False
+    overrides = upgrade_tool._parse_flags("meaningful_history")
+    assert overrides == {
+        "meaningful_public_history": True,
+        "meaningful_public_history_schema": "meaningful_public_history_2p_no_trade_v1",
+        "event_history_limit": 32,
+    }
+    upgraded = upgrade_tool._build_upgraded_config(base, overrides)
+    assert upgraded.meaningful_public_history is True
+    assert upgraded.event_history_limit == 32
 
 
 def test_preserve_source_top_level_keys_restores_mask_hidden_info(tmp_path):
@@ -140,7 +165,9 @@ def test_preserve_source_top_level_keys_restores_mask_hidden_info(tmp_path):
         out_ckpt,
     )
 
-    preserved = upgrade_tool._preserve_source_top_level_keys(str(in_ckpt), str(out_ckpt))
+    preserved = upgrade_tool._preserve_source_top_level_keys(
+        str(in_ckpt), str(out_ckpt)
+    )
 
     merged = torch.load(out_ckpt, map_location="cpu", weights_only=False)
     # provenance restored from source
@@ -202,12 +229,15 @@ def test_upgrade_seed_is_deterministic_and_durably_attested(
         key for key in raw_a["model"] if key.startswith("value_categorical_head.")
     )
     assert cat_keys
-    assert all(torch.equal(raw_a["model"][key], raw_b["model"][key]) for key in cat_keys)
+    assert all(
+        torch.equal(raw_a["model"][key], raw_b["model"][key]) for key in cat_keys
+    )
     assert raw_a["upgrade_provenance"]["initialization_seed"] == 73
     assert raw_a["upgrade_provenance"]["trained_value_readouts_added"] == []
-    assert raw_a["upgrade_provenance"]["source_checkpoint_sha256"] == raw_b[
-        "upgrade_provenance"
-    ]["source_checkpoint_sha256"]
+    assert (
+        raw_a["upgrade_provenance"]["source_checkpoint_sha256"]
+        == raw_b["upgrade_provenance"]["source_checkpoint_sha256"]
+    )
 
     monkeypatch.setattr(
         sys,
@@ -230,8 +260,7 @@ def test_upgrade_seed_is_deterministic_and_durably_attested(
     upgrade_tool.main()
     raw_c = torch.load(out_c, map_location="cpu", weights_only=False)
     assert any(
-        not torch.equal(raw_a["model"][key], raw_c["model"][key])
-        for key in cat_keys
+        not torch.equal(raw_a["model"][key], raw_c["model"][key]) for key in cat_keys
     )
 
 
@@ -239,6 +268,7 @@ def test_combined_topology_gather_upgrade_verifies_exact_real_root(
     tmp_path, monkeypatch
 ) -> None:
     import torch
+
     pytest.importorskip("catanatron_rs")
 
     # Some developer environments retain an older importable wheel that

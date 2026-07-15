@@ -60,3 +60,13 @@ Trajectory-only forced roots return the mathematically exact sole action with
 no neural evaluation or invented Q/root-value evidence. Both semantics are
 advertised through `gumbel_search_capabilities()` and production admission
 must reject older wheels when either mode is requested.
+
+Version `0.1.10` adds the coherent learner input boundary. The native
+engine exports an exact observer-scoped two-player public-card audit boundary;
+the v2 model adapter consumes the legacy-compatible public entity-token
+projection plus a public development-card posterior. It also adds an opt-in
+32-event strategic public history. Automatic ROLL/END_TURN/UI
+plumbing is filtered before truncation, and private discard, steal, and
+development-card identities never cross the observation boundary. Legacy
+callers remain byte-for-byte compatible because both new model inputs are
+opt-in and checkpoint upgrades initialize their residuals to exact zero.

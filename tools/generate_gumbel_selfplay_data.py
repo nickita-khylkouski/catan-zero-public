@@ -393,6 +393,17 @@ def build_parser() -> argparse.ArgumentParser:
             "the row still receives its terminal-outcome value target."
         ),
     )
+    parser.add_argument(
+        "--record-automatic-transitions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Whether single-legal-action engine transitions become value-only "
+            "training rows. The coherent 2p no-trade recipe disables this: the "
+            "sole transition is applied directly with no neural/MCTS work and "
+            "no row. Default true preserves historical corpora."
+        ),
+    )
     parser.add_argument("--c-visit", type=float, default=50.0)
     parser.add_argument("--c-scale", type=float, default=0.1)
     parser.add_argument(
@@ -655,6 +666,22 @@ def build_parser() -> argparse.ArgumentParser:
         "(see docs/GEN3_WHEEL_SYNC_RUNBOOK.md) -- passing --rust-featurize "
         "against an older wheel that predates this function raises an error at "
         "the first leaf eval rather than silently falling back.",
+    )
+    parser.add_argument(
+        "--meaningful-public-history",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Populate the existing entity event tokens with only strategic "
+        "public 2p-no-trade actions (build/buy/play/bank-trade/robber/discard), "
+        "excluding ROLL/END_TURN/UI plumbing. Default off preserves legacy "
+        "empty/native history behavior.",
+    )
+    parser.add_argument(
+        "--event-history-limit",
+        type=int,
+        default=64,
+        help="Event-token width. With --meaningful-public-history this is "
+        "capped at 32; legacy default remains 64.",
     )
     parser.add_argument(
         "--eval-server",
@@ -1572,6 +1599,9 @@ def _server_worker_entry(
             action_size=int(action_size),
             trained_with_masked_hidden_info=bool(trained_with_masked_hidden_info),
             entity_feature_adapter=str(entity_feature_adapter),
+            public_card_count_features=bool(
+                worker_args.get("_eval_server_public_card_count_features", False)
+            ),
             needs_action_targets=bool(needs_action_targets),
             needs_relational_topology=bool(needs_relational_topology),
             event_token_limit=event_token_limit,
@@ -1661,6 +1691,14 @@ def _run_eval_server_batch(
         )
         result_queue: Any = ctx.Queue()
         for client_id, wargs in enumerate(worker_args):
+            # Client-side native featurization needs checkpoint architecture
+            # metadata before it sends tensors to the shared forward server.
+            # Carry it in the existing worker payload rather than widening the
+            # process entrypoint's brittle positional argument list.
+            wargs = dict(wargs)
+            wargs["_eval_server_public_card_count_features"] = bool(
+                meta.get("public_card_count_features", False)
+            )
             request_queue_for_client = getattr(server, "request_queue_for_client", None)
             client_request_queue = (
                 request_queue_for_client(client_id)
@@ -1931,6 +1969,17 @@ def _run_worker(
         ),
         late_temperature=float(worker_args.get("late_temperature", 0.0)),
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
+        meaningful_public_history=bool(
+            worker_args.get("meaningful_public_history", False)
+        ),
+        event_history_limit=(
+            min(int(worker_args.get("event_history_limit", 64)), 32)
+            if bool(worker_args.get("meaningful_public_history", False))
+            else int(worker_args.get("event_history_limit", 64))
+        ),
+        record_automatic_transitions=bool(
+            worker_args.get("record_automatic_transitions", True)
+        ),
     )
     search_config = GumbelChanceMCTSConfig(
         colors=colors,

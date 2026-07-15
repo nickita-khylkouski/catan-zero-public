@@ -221,6 +221,15 @@ class TrainConfig(PipelineConfig):
     vps_to_win: int = 10
     # Masking / regime -- the field that is otherwise impossible to grep.
     mask_hidden_info: bool = False
+    # Opt-in public card-count residual. This is an input/architecture change,
+    # not a cosmetic loader flag, so it belongs in the typed science identity.
+    # ``None`` means inherit the checkpoint-owned architecture. Main resolves
+    # it to a concrete bool before the immutable TrainConfig is recorded.
+    public_card_count_features: bool | None = None
+    public_card_count_feature_schema: str = "public_card_state_v2"
+    meaningful_public_history: bool | None = None
+    meaningful_public_history_schema: str = "meaningful_public_history_2p_no_trade_v1"
+    event_history_limit: int | None = None
     # Checkpoint-owned interpretation of player-token longest-road slot 12.
     # This changes the learner's actual input tensor and therefore must be in
     # both the experiment hash and optimizer-resume identity.
@@ -351,6 +360,10 @@ class TrainConfig(PipelineConfig):
     per_game_value_weight_mode: str = "equal"
     policy_surprise_weight: float = 0.0
     policy_surprise_cap: float = 4.0
+    # Exact KataGo-style within-game sampling redistribution.  This is separate
+    # from the older global ``1 + scale * KL`` sampler so legacy configs and
+    # seeded epoch orders remain unchanged unless explicitly opted in.
+    per_game_policy_surprise_weighting: bool = False
     advantage_policy_weighting: str = "none"
     advantage_temperature: float = 1.0
     advantage_weight_cap: float = 5.0
@@ -392,6 +405,12 @@ class GenerateConfig(PipelineConfig):
     obs_width: int = 806
     # Masking / regime.
     public_observation: bool = False
+    # Every new Gumbel shard carries this additive public-only tensor, even
+    # when the producer checkpoint predates/does not consume the adapter.
+    public_card_count_feature_schema: str = "public_card_state_v2"
+    meaningful_public_history: bool = False
+    event_history_limit: int = 64
+    record_automatic_transitions: bool = True
     belief_chance_spectra: bool = False
     # Masking neural features is not sufficient for hidden-information games:
     # the search tree itself must be rooted in public-belief determinizations.

@@ -7,9 +7,11 @@ passes through an operator laptop.
 `tools/fleet/a1_h100_eval_fleet.py` provides a fail-closed SSH backend today and
 can render a Ray cluster specification without installing or starting Ray.
 Capacity is allocated per physical GPU: each of the four 8-GPU hosts receives
-twice the work of each 4-GPU host. The evaluator base recipe is n128, sigma
-0.98, public-observation information-set search with four determinizations,
-and D6 averaging from width 20. `c_scale` is role-bound: the current v5
+twice the work of each 4-GPU host. New CLI plans use the coherent-public
+operator: one public-belief tree (no information-set/PIMC search), n128 with
+adaptive n256 from legal width 20, D6 averaging from width 20, one public
+belief state, `trajectory_only` forced roots, native MCTS, and native Rust
+featurization. `c_scale` is role-bound: the current v5
 candidate and incumbent identities both use 0.10. The 0.03 default remains
 only for replaying an older sealed identity and must not silently override a
 post-promotion role.
@@ -42,6 +44,7 @@ $PY "$CTL" --manifest "$M" plan \
   --champion /immutable/champion/champion.pt \
   --candidate-parent /immutable/champion/champion.pt \
   --registry /immutable/champion/champion_registry.json \
+  --operator-mode coherent_public \
   --candidate-c-scale 0.10 --champion-c-scale 0.10 \
   --internal-base-seed <VAL_ONLY_INTERNAL_BASE> \
   --external-base-seed <VAL_ONLY_EXTERNAL_BASE> \
@@ -58,6 +61,11 @@ $PY "$CTL" --manifest "$M" status --plan /immutable/a1/eval.plan.json \
 $PY "$CTL" --manifest "$M" collect --plan /immutable/a1/eval.plan.json \
   --phase internal --output-dir /immutable/a1/evaluation
 ```
+
+The mode is recorded in the immutable plan and command hashes. Use
+`--operator-mode legacy_pimc` only to replay or deliberately compare against
+the historical four-determinization information-set operator; old sealed plans
+without an operator field are interpreted as that legacy mode.
 
 The default `promotion_parent` mode requires the authenticated candidate
 parent/init checkpoint, the internal baseline, and the registry's

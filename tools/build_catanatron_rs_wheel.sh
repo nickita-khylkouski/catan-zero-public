@@ -6,11 +6,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 OUT_DIR="${OUT_DIR:-$SOURCE_ROOT/dist}"
 SEALED_CANONICAL_BUILD_ROOT="/tmp/catan-zero-catanatron-rs-wheel-src"
 CANONICAL_BUILD_ROOT="${CATAN_RS_CANONICAL_BUILD_ROOT:-$SEALED_CANONICAL_BUILD_ROOT}"
-WHEEL_NAME="catanatron_rs-0.1.9-cp311-cp311-manylinux_2_34_x86_64.whl"
-RECEIPT_NAME="catanatron_rs-0.1.9-build-receipt.json"
+WHEEL_NAME="catanatron_rs-0.1.10-cp311-cp311-manylinux_2_34_x86_64.whl"
+RECEIPT_NAME="catanatron_rs-0.1.10-build-receipt.json"
 SEALED_SOURCE_DATE_EPOCH="1784160000"
 SEALED_RUSTFLAGS="--remap-path-prefix=/tmp/catan-zero-catanatron-rs-wheel-src=/src/catan-zero-public -C link-arg=-Wl,--build-id=none"
-SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.9-coherent-belief-forced-root-wheel-v1"
+SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.10-public-card-meaningful-history-wheel-v1"
 
 die() {
   echo "build_catanatron_rs_wheel: $*" >&2
@@ -157,7 +157,7 @@ echo "$PYTHON_VERSION"
 echo "$STRIP_VERSION"
 
 mkdir -p "$OUT_DIR"
-rm -f "$OUT_DIR"/catanatron_rs-0.1.9-*.whl
+rm -f "$OUT_DIR"/catanatron_rs-0.1.10-*.whl
 rm -f "$OUT_DIR/$RECEIPT_NAME"
 
 # PyO3's Python-enabled Rust tests link libpython, unlike the final extension
@@ -193,8 +193,13 @@ cargo test \
   --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
   public_belief_determinization_tests \
   --lib
+cargo test \
+  --locked \
+  --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
+  public_card_deductions \
+  --lib
 # Capability names are not evidence of semantics.  Run the exact source tests
-# for every corrected 0.1.9 behavior before compiling and hashing the wheel.
+# for every corrected 0.1.10 behavior before compiling and hashing the wheel.
 LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" \
 RUSTFLAGS="$RUSTFLAGS -L native=$PYTHON_TEST_LIBDIR" \
 cargo test \
@@ -202,6 +207,14 @@ cargo test \
   --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
   --features python \
   entity_player_tokens_preserve_public_awards_when_hidden_hands_are_masked \
+  --lib
+LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" \
+RUSTFLAGS="$RUSTFLAGS -L native=$PYTHON_TEST_LIBDIR" \
+cargo test \
+  --locked \
+  --manifest-path "$ROOT/native/catanatron-rs/Cargo.toml" \
+  --features python \
+  meaningful_public_history_filters_plumbing_and_caps_at_32 \
   --lib
 cargo test \
   --locked \
@@ -305,11 +318,18 @@ PY
 # filename. This catches stale same-version artifacts before their digest can be
 # recorded in the release inventory.
 PYTHONPATH="$NORMALIZE_TMP" "$PYTHON_BIN" - <<'PY'
+import json
 from importlib.metadata import version
 
 import catanatron_rs
 
-assert version("catanatron-rs") == "0.1.9"
+assert version("catanatron-rs") == "0.1.10"
+game = catanatron_rs.Game.simple(["RED", "BLUE"], seed=7)
+observer = game.current_color()
+public_cards = json.loads(game.public_card_deductions_json(observer))
+assert public_cards["contract"] == "public_card_deductions_2p_v1", public_cards
+assert public_cards["resource_composition_exact"] is True, public_cards
+assert public_cards["development_composition_exact"] is False, public_cards
 capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
 assert callable(capability_fn), "wheel lacks gumbel_search_capabilities"
 capabilities = set(capability_fn())

@@ -110,6 +110,9 @@ def _worker(
             action_size=action_size,
             trained_with_masked_hidden_info=trained_masked,
             entity_feature_adapter=entity_feature_adapter,
+            public_card_count_features=bool(
+                a.get("server_public_card_count_features", False)
+            ),
             needs_action_targets=needs_targets,
             needs_relational_topology=bool(needs_relational_topology),
             event_token_limit=event_token_limit,
@@ -247,6 +250,9 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
             )
             server.start()
             meta = server.wait_ready(timeout=180.0)
+            a["server_public_card_count_features"] = bool(
+                meta.get("public_card_count_features", False)
+            )
             for wid in range(workers):
                 request_queue_for_client = getattr(
                     server, "request_queue_for_client", None
@@ -459,6 +465,9 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
                 meta["trained_with_masked_hidden_info"]
             ),
             entity_feature_adapter=str(meta["entity_feature_adapter"]),
+            public_card_count_features=bool(
+                meta.get("public_card_count_features", False)
+            ),
             needs_action_targets=bool(meta.get("needs_action_targets", True)),
             needs_relational_topology=bool(
                 meta.get("needs_relational_topology", False)

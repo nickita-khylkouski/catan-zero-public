@@ -31,7 +31,9 @@ def _write_checkpoint(tmp_path, config: EntityGraphConfig):
     path = tmp_path / "checkpoint.pt"
     policy = EntityGraphPolicy(
         config,
-        np.zeros((config.action_size, config.static_action_feature_size), dtype=np.float32),
+        np.zeros(
+            (config.action_size, config.static_action_feature_size), dtype=np.float32
+        ),
         seed=7,
         device="cpu",
     )
@@ -54,6 +56,14 @@ def _remove_first_parameter(path, prefix: str, *, output):
         ({"action_cross_attention_layers": 1}, "action_cross_blocks."),
         ({"edge_policy_head": True}, "edge_policy_mlp."),
         ({"static_action_residual": True}, "static_action_residual_proj."),
+        (
+            {"public_card_count_features": True},
+            "public_card_count_residual.",
+        ),
+        (
+            {"meaningful_public_history": True, "event_history_limit": 32},
+            "meaningful_history_residual_gate",
+        ),
         ({"topology_residual_adapter": True}, "topology_residual_adapter."),
         ({"aux_subgoal_heads": True}, "aux_longest_road_head."),
         ({"belief_resource_head": True}, "belief_resource_head."),
@@ -80,7 +90,9 @@ def test_default_load_rejects_missing_enabled_optional_parameter_but_explicit_wa
     assert removed in warmstart._checkpoint_missing_state_keys
 
 
-def test_explicit_optional_warmstart_does_not_allow_missing_base_tensor(tmp_path) -> None:
+def test_explicit_optional_warmstart_does_not_allow_missing_base_tensor(
+    tmp_path,
+) -> None:
     complete = _write_checkpoint(tmp_path, _config(static_action_residual=True))
     incomplete = tmp_path / "missing-base.pt"
     removed = _remove_first_parameter(complete, "value_head.", output=incomplete)
@@ -93,7 +105,9 @@ def test_explicit_optional_warmstart_does_not_allow_missing_base_tensor(tmp_path
         )
 
 
-def test_legacy_checkpoint_with_all_new_flags_off_keeps_q_head_compatibility(tmp_path) -> None:
+def test_legacy_checkpoint_with_all_new_flags_off_keeps_q_head_compatibility(
+    tmp_path,
+) -> None:
     complete = _write_checkpoint(tmp_path, _config())
     raw = torch.load(complete, map_location="cpu", weights_only=False)
     removed = sorted(key for key in raw["model"] if key.startswith("q_head."))
@@ -108,4 +122,3 @@ def test_legacy_checkpoint_with_all_new_flags_off_keeps_q_head_compatibility(tmp
     assert loaded.config.action_target_gather is False
     assert loaded.config.aux_subgoal_heads is False
     assert loaded.config.static_action_residual is False
-

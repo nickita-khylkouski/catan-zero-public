@@ -4,6 +4,11 @@ from typing import Any
 
 import numpy as np
 
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    meaningful_public_events,
+)
+
 
 GRAPH_HISTORY_FEATURE_SIZE = 192
 
@@ -54,6 +59,7 @@ def build_graph_history_feature_vector(
     actor: str | None = None,
     *,
     history_limit: int = 64,
+    meaningful_public_history: bool = False,
 ) -> np.ndarray:
     """Build a compact public board/history feature suffix for one actor.
 
@@ -70,7 +76,17 @@ def build_graph_history_feature_vector(
     _encode_board(builder, payload)
     _encode_players(builder, payload, actor_name)
     _encode_legal_actions(builder, payload)
-    _encode_history(builder, payload, actor_name, history_limit=history_limit)
+    _encode_history(
+        builder,
+        payload,
+        actor_name,
+        history_limit=(
+            min(int(history_limit), MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+            if meaningful_public_history
+            else int(history_limit)
+        ),
+        meaningful_public_history=meaningful_public_history,
+    )
     return builder.finish()
 
 
@@ -211,8 +227,16 @@ def _encode_history(
     actor_name: str,
     *,
     history_limit: int,
+    meaningful_public_history: bool = False,
 ) -> None:
-    events = tuple(payload.get("event_log", ()))[-history_limit:]
+    if history_limit < 0:
+        raise ValueError("history_limit must be >= 0")
+    raw_events = tuple(payload.get("event_log", ()))
+    events = (
+        meaningful_public_events(raw_events, limit=history_limit)
+        if meaningful_public_history
+        else raw_events[-history_limit:] if history_limit else ()
+    )
     event_counts = {event_type: 0.0 for event_type in EVENT_TYPES}
     action_counts = {action_type: 0.0 for action_type in ACTION_TYPES}
     actor_event_count = 0.0

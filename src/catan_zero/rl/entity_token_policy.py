@@ -8,6 +8,11 @@ from typing import Any
 
 import numpy as np
 
+from catan_zero.deduction_tracker import (
+    DEDUCTION_FEATURE_SIZE,
+    DEDUCTION_FEATURES_KEY,
+    PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION,
+)
 from catan_zero.rl.action_features import (
     CONTEXT_ACTION_FEATURE_SIZE,
     build_action_context_feature_table,
@@ -29,6 +34,10 @@ from catan_zero.rl.entity_token_features import (
     build_entity_token_features,
 )
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+)
 from catan_zero.rl.torch_ppo import build_action_feature_table
 from catan_zero.rl.xdim_lite_policy import (
     _array_sha256,
@@ -98,6 +107,7 @@ def _apply_public_award_feature_contract(
     bridged["player_tokens"] = bridged_players
     return bridged
 
+
 # Fixed board sizes on the standard Catan map: 54 intersections (settlement/city
 # nodes, catanatron node_id 0-53) and 19 hexes (robber targets, hex id 0-18).
 # These match the per-type target-id space in EntityGraphNet._gather_target_tokens
@@ -119,6 +129,7 @@ def _entity_token_start_offsets(batch: dict[str, Any]) -> tuple[int, int, int, i
         1 + n_hex + n_vertex,
         1 + n_hex + n_vertex + n_edge,
     )
+
 
 _NON_MODEL_ENTITY_KEYS = frozenset(
     {
@@ -304,6 +315,23 @@ class EntityGraphConfig:
     # A zero-output projection consumes only the nonredundant catalog columns.
     # Default OFF preserves legacy checkpoint structure and behavior exactly.
     static_action_residual: bool = False
+    # Public-only card-count input. The compact 11-column tensor is projected
+    # as a zero-output residual onto the matching player rows, so enabling this
+    # on an old checkpoint is an exact function-preserving warm start. It uses
+    # the same public entity-token transform in training and serving; 2p
+    # conservation identifies opponent resources whenever legacy counters are
+    # unsaturated, while dev identities remain a hypergeometric posterior.
+    # Appended last for positional pickle compatibility.
+    public_card_count_features: bool = False
+    public_card_count_feature_schema: str = PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION
+    # Reuse the existing event-token encoder with a bounded public-only event
+    # selection. Old corpora masked every event row, so enabling this also
+    # creates a zero-gated pooled-history residual: the incumbent trunk remains
+    # exactly unchanged at activation instead of attending to random/untrained
+    # event embeddings. Default OFF/64 preserves historical checkpoints.
+    meaningful_public_history: bool = False
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    event_history_limit: int = 64
 
 
 class EntityGraphNet:
@@ -406,9 +434,11 @@ class EntityGraphNet:
                 self.config = cfg
                 h = int(cfg.hidden_size)
                 dropout = float(cfg.dropout)
-                self.state_trunk = str(
-                    getattr(cfg, "state_trunk", "transformer") or "transformer"
-                ).strip().lower()
+                self.state_trunk = (
+                    str(getattr(cfg, "state_trunk", "transformer") or "transformer")
+                    .strip()
+                    .lower()
+                )
                 if self.state_trunk not in {"transformer", "rrt", "resrgcn"}:
                     raise ValueError(
                         "state_trunk must be one of transformer/rrt/resrgcn, got "
@@ -418,7 +448,10 @@ class EntityGraphNet:
                 self.topology_residual_adapter_enabled = bool(
                     getattr(cfg, "topology_residual_adapter", False)
                 )
-                if self.uses_relational_topology and self.topology_residual_adapter_enabled:
+                if (
+                    self.uses_relational_topology
+                    and self.topology_residual_adapter_enabled
+                ):
                     raise ValueError(
                         "topology_residual_adapter is a warm-start for the transformer "
                         "trunk and cannot be combined with an already-relational trunk"
@@ -445,17 +478,46 @@ class EntityGraphNet:
                 self.moe_enabled = self.moe_routed_experts > 0
                 if self.moe_enabled:
                     if self.state_trunk != "rrt":
-                        raise ValueError("sparse MoE currently requires state_trunk='rrt'")
-                    if not 1 <= self.moe_top_k <= self.moe_routed_experts:
                         raise ValueError(
-                            "moe_top_k must be in [1, moe_routed_experts]"
+                            "sparse MoE currently requires state_trunk='rrt'"
                         )
+                    if not 1 <= self.moe_top_k <= self.moe_routed_experts:
+                        raise ValueError("moe_top_k must be in [1, moe_routed_experts]")
                 self.hex_encoder = _token_encoder(HEX_FEATURE_SIZE, h, dropout)
                 self.vertex_encoder = _token_encoder(VERTEX_FEATURE_SIZE, h, dropout)
                 self.edge_encoder = _token_encoder(EDGE_FEATURE_SIZE, h, dropout)
                 self.player_encoder = _token_encoder(PLAYER_FEATURE_SIZE, h, dropout)
+                self.public_card_count_features_enabled = bool(
+                    getattr(cfg, "public_card_count_features", False)
+                )
+                if self.public_card_count_features_enabled:
+                    feature_schema = str(
+                        getattr(cfg, "public_card_count_feature_schema", "") or ""
+                    )
+                    if feature_schema != PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION:
+                        raise ValueError(
+                            "unsupported public card-count feature schema: "
+                            f"{feature_schema!r} != "
+                            f"{PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION!r}"
+                        )
+                    self.public_card_count_residual = nn.Linear(
+                        DEDUCTION_FEATURE_SIZE, h
+                    )
+                    nn.init.zeros_(self.public_card_count_residual.weight)
+                    nn.init.zeros_(self.public_card_count_residual.bias)
                 self.global_encoder = _token_encoder(GLOBAL_FEATURE_SIZE, h, dropout)
                 self.event_encoder = _token_encoder(EVENT_FEATURE_SIZE, h, dropout)
+                self.meaningful_public_history_enabled = bool(
+                    getattr(cfg, "meaningful_public_history", False)
+                )
+                if self.meaningful_public_history_enabled:
+                    # Per-channel zero gate is the smallest expressive
+                    # function-preserving adapter: the existing event MLP can
+                    # learn once the gate opens, while step zero contributes
+                    # exactly zero to policy and value.
+                    self.meaningful_history_residual_gate = nn.Parameter(
+                        torch.zeros(h)
+                    )
                 self.type_embedding = nn.Parameter(torch.zeros(7, h))
                 self.cls_token = nn.Parameter(torch.zeros(1, 1, h))
                 if self.state_trunk == "transformer":
@@ -465,7 +527,9 @@ class EntityGraphNet:
                     )
                     self.relational_block_pattern = ""
                     if self.topology_residual_adapter_enabled:
-                        from catan_zero.rl.relational_trunks import TopologyResidualAdapter
+                        from catan_zero.rl.relational_trunks import (
+                            TopologyResidualAdapter,
+                        )
 
                         self.topology_residual_adapter = TopologyResidualAdapter(h)
                 else:
@@ -491,7 +555,10 @@ class EntityGraphNet:
                             raw_pattern = ("RRT" * ((layer_count + 2) // 3))[
                                 :layer_count
                             ]
-                        if len(raw_pattern) != layer_count or set(raw_pattern) - {"R", "T"}:
+                        if len(raw_pattern) != layer_count or set(raw_pattern) - {
+                            "R",
+                            "T",
+                        }:
                             raise ValueError(
                                 "relational_block_pattern must contain exactly "
                                 f"state_layers R/T entries: pattern={raw_pattern!r} "
@@ -742,9 +809,7 @@ class EntityGraphNet:
                 self.edge_policy_head = (
                     self.uses_relational_topology
                     and bool(getattr(cfg, "relational_edge_policy_head", True))
-                ) or bool(
-                    getattr(cfg, "edge_policy_head", False)
-                )
+                ) or bool(getattr(cfg, "edge_policy_head", False))
                 if self.edge_policy_head:
                     # MLP(pooled target entity token) -> per-action scalar logit,
                     # ADDED to the CLIP logits. Zero-init final Linear so the
@@ -767,7 +832,10 @@ class EntityGraphNet:
                 self.aux_settlement_pointer_head_enabled = bool(
                     getattr(cfg, "aux_settlement_pointer_head", False)
                 )
-                if self.aux_settlement_pointer_head_enabled and not self.aux_subgoal_heads:
+                if (
+                    self.aux_settlement_pointer_head_enabled
+                    and not self.aux_subgoal_heads
+                ):
                     raise ValueError(
                         "aux_settlement_pointer_head requires aux_subgoal_heads"
                     )
@@ -912,7 +980,7 @@ class EntityGraphNet:
                         batch,
                         event_token_limit=event_token_limit,
                     )
-                tokens, padding_mask = self._state_tokens(
+                tokens, padding_mask, event_piece, event_mask = self._state_tokens(
                     batch,
                     event_token_limit=event_token_limit,
                 )
@@ -975,9 +1043,21 @@ class EntityGraphNet:
                         )
                     fused = torch.cat((state, plan.mean(dim=1)), dim=-1)
                     state = self.deliberation_fusion(
-                        torch.nn.functional.gelu(
-                            self.deliberation_fusion_norm(fused)
-                        )
+                        torch.nn.functional.gelu(self.deliberation_fusion_norm(fused))
+                    )
+                if self.meaningful_public_history_enabled:
+                    # Event rows stay masked from the mature trunk. Their
+                    # bounded pooled representation enters only through this
+                    # exact-zero gate, so history activation cannot perturb an
+                    # incumbent before the first optimizer step. Scaling by the
+                    # fixed cap preserves event-count mass as well as content.
+                    history_weight = event_mask.to(event_piece.dtype).unsqueeze(-1)
+                    pooled_history = (event_piece * history_weight).sum(dim=1) / float(
+                        MEANINGFUL_PUBLIC_HISTORY_LIMIT
+                    )
+                    state = (
+                        state
+                        + pooled_history * self.meaningful_history_residual_gate
                     )
                 if self.moe_enabled:
                     return (
@@ -1045,8 +1125,9 @@ class EntityGraphNet:
                             "legal_action_static_features shape must be [B,A,22], "
                             f"got {tuple(static_features.shape)}"
                         )
-                    encoded_actions = encoded_actions + self.static_action_residual_proj(
-                        static_features.float()
+                    encoded_actions = (
+                        encoded_actions
+                        + self.static_action_residual_proj(static_features.float())
                     )
                 # Post-trunk target-entity tokens per action, mean-pooled ([B,A,h]).
                 # Shared by action_target_gather (modulates the CLIP embedding) and
@@ -1104,18 +1185,15 @@ class EntityGraphNet:
                     "logits": logits,
                     "value": value,
                 }
-                if (
-                    return_final_vp
-                    and "final_vp_head" not in inactive_training_heads
-                ):
+                if return_final_vp and "final_vp_head" not in inactive_training_heads:
                     outputs["final_vp"] = self.final_vp_head(state).squeeze(-1)
                 if (
                     self.latent_deliberation_steps > 0
                     and "deliberation_halt_head" not in inactive_training_heads
                 ):
-                    outputs["deliberation_halt_logit"] = (
-                        self.deliberation_halt_head(state).squeeze(-1)
-                    )
+                    outputs["deliberation_halt_logit"] = self.deliberation_halt_head(
+                        state
+                    ).squeeze(-1)
                 if self.moe_enabled:
                     outputs["moe_balance_metric"] = encoded_state[3]
                     outputs["moe_routing_load"] = encoded_state[4]
@@ -1181,8 +1259,9 @@ class EntityGraphNet:
                                 :, vertex_start : vertex_start + vertex_count
                             ]
                             outputs["aux_next_settlement"] = (
-                                self.aux_next_settlement_pointer_head(vertex_states)
-                                .squeeze(-1)
+                                self.aux_next_settlement_pointer_head(
+                                    vertex_states
+                                ).squeeze(-1)
                             )
                     elif "aux_next_settlement_head" not in inactive_training_heads:
                         outputs["aux_next_settlement"] = self.aux_next_settlement_head(
@@ -1274,9 +1353,13 @@ class EntityGraphNet:
                         )
                     )
                 else:
-                    event_piece = (
-                        self.event_encoder(event_tokens.float())
-                        + self.type_embedding[6].view(1, 1, -1)
+                    event_piece = self.event_encoder(
+                        event_tokens.float()
+                    ) + self.type_embedding[6].view(1, 1, -1)
+                player_piece = self.player_encoder(batch["player_tokens"].float())
+                if self.public_card_count_features_enabled:
+                    player_piece = player_piece + self.public_card_count_residual(
+                        batch[DEDUCTION_FEATURES_KEY].float()
                     )
                 pieces = [
                     self.cls_token.expand(batch["hex_tokens"].shape[0], -1, -1)
@@ -1287,8 +1370,7 @@ class EntityGraphNet:
                     + self.type_embedding[2].view(1, 1, -1),
                     self.edge_encoder(batch["edge_tokens"].float())
                     + self.type_embedding[3].view(1, 1, -1),
-                    self.player_encoder(batch["player_tokens"].float())
-                    + self.type_embedding[4].view(1, 1, -1),
+                    player_piece + self.type_embedding[4].view(1, 1, -1),
                     self.global_encoder(batch["global_tokens"].float())
                     + self.type_embedding[5].view(1, 1, -1),
                     event_piece,
@@ -1300,6 +1382,11 @@ class EntityGraphNet:
                 # gen-2 CPU evaluator needs a variable batch axis (ragged chance
                 # fan-outs / action counts); in eager mode this is an int anyway.
                 batch_size = tokens.shape[0]
+                event_padding_mask = (
+                    torch.ones_like(event_mask, dtype=torch.bool)
+                    if self.meaningful_public_history_enabled
+                    else ~event_mask.bool()
+                )
                 masks = [
                     torch.zeros(
                         (batch_size, 1), dtype=torch.bool, device=tokens.device
@@ -1311,9 +1398,9 @@ class EntityGraphNet:
                     torch.zeros(
                         (batch_size, 1), dtype=torch.bool, device=tokens.device
                     ),
-                    ~event_mask.bool(),
+                    event_padding_mask,
                 ]
-                return tokens, torch.cat(masks, dim=1)
+                return tokens, torch.cat(masks, dim=1), event_piece, event_mask
 
             def _gather_target_tokens(self, tokens, batch: dict[str, Any]):
                 """Pool post-trunk board tokens for each action's targets.
@@ -1461,6 +1548,22 @@ class EntityGraphPolicy:
 
         torch.manual_seed(seed)
         self.config = config
+        if bool(getattr(config, "meaningful_public_history", False)):
+            history_schema = str(
+                getattr(config, "meaningful_public_history_schema", "") or ""
+            )
+            if history_schema != MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION:
+                raise ValueError(
+                    "unsupported meaningful public-history schema: "
+                    f"{history_schema!r} != "
+                    f"{MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION!r}"
+                )
+            history_limit = int(getattr(config, "event_history_limit", 0) or 0)
+            if not 1 <= history_limit <= MEANINGFUL_PUBLIC_HISTORY_LIMIT:
+                raise ValueError(
+                    "meaningful public history requires event_history_limit in "
+                    f"[1, {MEANINGFUL_PUBLIC_HISTORY_LIMIT}], got {history_limit}"
+                )
         self.architecture = self.policy_type
         # f72 safety net (task #76): whether this policy's weights were trained
         # with train_bc.py --mask-hidden-info. Overwritten by .load() from the
@@ -1482,9 +1585,7 @@ class EntityGraphPolicy:
         # transaction explicitly attests authoritative_v1.  In particular, an
         # old checkpoint loaded and re-saved must not silently opt into a random
         # player_encoder input column merely because the runtime wheel is newer.
-        self.public_award_feature_contract = (
-            PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
-        )
+        self.public_award_feature_contract = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
         self.action_size = int(config.action_size)
         self.context_action_feature_size = int(config.context_action_feature_size)
         self.device = _resolve_device(device)
@@ -1545,6 +1646,15 @@ class EntityGraphPolicy:
         belief_resource_head: bool = False,
         aux_settlement_pointer_head: bool = False,
         static_action_residual: bool = False,
+        public_card_count_features: bool = False,
+        public_card_count_feature_schema: str = (
+            PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION
+        ),
+        meaningful_public_history: bool = False,
+        meaningful_public_history_schema: str = (
+            MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+        ),
+        event_history_limit: int = 64,
         entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
@@ -1579,6 +1689,17 @@ class EntityGraphPolicy:
                 belief_resource_head=bool(belief_resource_head),
                 aux_settlement_pointer_head=bool(aux_settlement_pointer_head),
                 static_action_residual=bool(static_action_residual),
+                public_card_count_features=bool(public_card_count_features),
+                public_card_count_feature_schema=str(public_card_count_feature_schema),
+                meaningful_public_history=bool(meaningful_public_history),
+                meaningful_public_history_schema=str(
+                    meaningful_public_history_schema
+                ),
+                event_history_limit=(
+                    min(int(event_history_limit), MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+                    if meaningful_public_history
+                    else int(event_history_limit)
+                ),
             )
             return cls(
                 config,
@@ -1619,15 +1740,17 @@ class EntityGraphPolicy:
         # inference window on CUDA; base checkpoints also skip action target
         # ids when neither target-aware policy head is enabled.
         needs_action_targets = bool(
-            str(getattr(self.config, "state_trunk", "transformer"))
-            != "transformer"
+            str(getattr(self.config, "state_trunk", "transformer")) != "transformer"
             or getattr(self.config, "action_target_gather", False)
             or getattr(self.config, "edge_policy_head", False)
         )
-        needs_topology = (
-            str(getattr(self.config, "state_trunk", "transformer"))
-            != "transformer"
-            or bool(getattr(self.config, "topology_residual_adapter", False))
+        needs_topology = str(
+            getattr(self.config, "state_trunk", "transformer")
+        ) != "transformer" or bool(
+            getattr(self.config, "topology_residual_adapter", False)
+        )
+        needs_public_card_counts = bool(
+            getattr(self.config, "public_card_count_features", False)
         )
         batch = {
             key: torch.as_tensor(value, device=self.device)
@@ -1640,6 +1763,7 @@ class EntityGraphPolicy:
                 or (needs_topology and key in _RELATIONAL_TOPOLOGY_KEYS)
             )
             and (key != "legal_action_target_ids" or needs_action_targets)
+            and (key != DEDUCTION_FEATURES_KEY or needs_public_card_counts)
         }
         batch["legal_action_context"] = torch.as_tensor(
             legal_action_context,
@@ -1699,9 +1823,7 @@ class EntityGraphPolicy:
             "return_aux_subgoals": return_aux_subgoals,
         }
         if float(value_trunk_grad_scale) != 1.0:
-            model_kwargs["value_trunk_grad_scale"] = float(
-                value_trunk_grad_scale
-            )
+            model_kwargs["value_trunk_grad_scale"] = float(value_trunk_grad_scale)
         outputs = self.model(batch, **model_kwargs)
         outputs["logits"] = outputs["logits"].masked_fill(~valid, -1.0e9)
         return outputs
@@ -1821,6 +1943,10 @@ class EntityGraphPolicy:
             env,
             actor=str(info.get("current_player") or env.current_player_name()),
             include_event_log=True,
+            history_limit=int(getattr(self.config, "event_history_limit", 64)),
+            meaningful_public_history=bool(
+                getattr(self.config, "meaningful_public_history", False)
+            ),
         )
         if int(entity["legal_action_tokens"].shape[0]) != len(valid_actions):
             raise ValueError(
@@ -1889,44 +2015,40 @@ class EntityGraphPolicy:
         )
 
         payload = {
-                "policy_type": self.policy_type,
-                # Durable name-keyed form (task #74): never pickle the frozen+slots
-                # dataclass itself -- positional state is crash/shift-prone across
-                # field-list changes. Loaders accept both this and legacy pickles.
-                "config": config_to_dict(self.config),
-                "action_mask_version": str(
-                    getattr(self.config, "action_mask_version", "")
-                ),
-                # f72 safety net (task #76): whether train_bc.py --mask-hidden-info
-                # was used for this training run. Absent/False on any checkpoint
-                # predating this field (legacy checkpoints deserialize as
-                # untrained-with-masking, the safe default -- see
-                # EntityGraphRustEvaluator.__init__'s public_observation guard).
-                "mask_hidden_info": durable_mask_hidden_info,
-                "entity_feature_adapter": (
-                    checkpoint_entity_feature_adapter_metadata(
-                        self.entity_feature_adapter_version
-                    )
-                ),
-                "public_award_feature_contract": award_contract,
-                # OPT-8 provenance: which soft policy target this run trained
-                # against ("policy" = Gumbel visit counts; "prefer_scores" was the
-                # degenerate-target footgun). Empty string on checkpoints predating
-                # this field. report.json also carries it; this makes the
-                # checkpoint self-describing without the sidecar.
-                "soft_target_source": durable_soft_target_source,
-                "static_action_features_sha256": _array_sha256(
-                    self.static_action_features.detach().cpu().numpy()
-                ),
-                "static_action_features": self.static_action_features.detach().cpu(),
-                "model": self.model.state_dict(),
-            }
+            "policy_type": self.policy_type,
+            # Durable name-keyed form (task #74): never pickle the frozen+slots
+            # dataclass itself -- positional state is crash/shift-prone across
+            # field-list changes. Loaders accept both this and legacy pickles.
+            "config": config_to_dict(self.config),
+            "action_mask_version": str(getattr(self.config, "action_mask_version", "")),
+            # f72 safety net (task #76): whether train_bc.py --mask-hidden-info
+            # was used for this training run. Absent/False on any checkpoint
+            # predating this field (legacy checkpoints deserialize as
+            # untrained-with-masking, the safe default -- see
+            # EntityGraphRustEvaluator.__init__'s public_observation guard).
+            "mask_hidden_info": durable_mask_hidden_info,
+            "entity_feature_adapter": (
+                checkpoint_entity_feature_adapter_metadata(
+                    self.entity_feature_adapter_version
+                )
+            ),
+            "public_award_feature_contract": award_contract,
+            # OPT-8 provenance: which soft policy target this run trained
+            # against ("policy" = Gumbel visit counts; "prefer_scores" was the
+            # degenerate-target footgun). Empty string on checkpoints predating
+            # this field. report.json also carries it; this makes the
+            # checkpoint self-describing without the sidecar.
+            "soft_target_source": durable_soft_target_source,
+            "static_action_features_sha256": _array_sha256(
+                self.static_action_features.detach().cpu().numpy()
+            ),
+            "static_action_features": self.static_action_features.detach().cpu(),
+            "model": self.model.state_dict(),
+        }
         if durable_value_training is not None:
             trained_readouts = tuple(
                 str(readout)
-                for readout in durable_value_training.get(
-                    "trained_value_readouts", ()
-                )
+                for readout in durable_value_training.get("trained_value_readouts", ())
                 if str(readout) in {"scalar", "categorical"}
             )
             payload["value_training"] = durable_value_training
@@ -2041,7 +2163,9 @@ class EntityGraphPolicy:
         # requested against a checkpoint that doesn't report having been trained
         # for it, so an old/legacy checkpoint correctly fails closed rather than
         # silently running mismatched.
-        policy.trained_with_masked_hidden_info = bool(data.get("mask_hidden_info", False))
+        policy.trained_with_masked_hidden_info = bool(
+            data.get("mask_hidden_info", False)
+        )
         policy.entity_feature_adapter_binding_source = adapter_binding_source
         award_contract = str(
             data.get(
@@ -2051,9 +2175,7 @@ class EntityGraphPolicy:
             or ""
         )
         try:
-            award_contract = _validate_public_award_feature_contract(
-                award_contract
-            )
+            award_contract = _validate_public_award_feature_contract(award_contract)
         except ValueError as error:
             raise ValueError(f"{checkpoint} has {error}") from error
         policy.public_award_feature_contract = award_contract
@@ -2064,9 +2186,7 @@ class EntityGraphPolicy:
         )
         information_surface = data.get("training_information_surface")
         policy.training_information_surface = (
-            dict(information_surface)
-            if isinstance(information_surface, dict)
-            else None
+            dict(information_surface) if isinstance(information_surface, dict) else None
         )
         raw_trained_readouts = data.get("trained_value_readouts")
         echo_readouts = (
@@ -2122,7 +2242,9 @@ class EntityGraphPolicy:
                     f"non-numeric value-training metadata: {error}"
                 )
                 optimizer_steps = completed_epochs = metadata_bins = 0
-                scalar_weight = categorical_weight = scalar_mass = categorical_mass = 0.0
+                scalar_weight = categorical_weight = scalar_mass = categorical_mass = (
+                    0.0
+                )
             base_valid = (
                 schema == "value-training-v1"
                 and not provenance_errors
@@ -2194,6 +2316,8 @@ class EntityGraphPolicy:
             "belief_resource_head.",
             "topology_residual_adapter.",
             "static_action_residual_proj.",
+            "public_card_count_residual.",
+            "meaningful_history_residual_gate",
         )
         if bool(allow_missing_optional_parameters):
             allowed_missing_prefixes += optional_warmstart_prefixes
@@ -2253,6 +2377,27 @@ def _assert_entity_batch_shapes(
             raise ValueError(f"{key} dim1 {value.shape[1]} != {expected[1]}")
         if int(value.shape[2]) != int(expected[2]):
             raise ValueError(f"{key} width {value.shape[2]} != {expected[2]}")
+    if bool(getattr(config, "public_card_count_features", False)):
+        if DEDUCTION_FEATURES_KEY not in entity_batch:
+            raise ValueError(
+                "public_card_count_features requires entity batch field "
+                f"{DEDUCTION_FEATURES_KEY}"
+            )
+        deductions = np.asarray(entity_batch[DEDUCTION_FEATURES_KEY])
+        expected_deduction_shape = (
+            batch_size,
+            int(np.asarray(entity_batch["player_tokens"]).shape[1]),
+            DEDUCTION_FEATURE_SIZE,
+        )
+        if deductions.shape != expected_deduction_shape:
+            raise ValueError(
+                f"{DEDUCTION_FEATURES_KEY} shape {deductions.shape} != "
+                f"{expected_deduction_shape}"
+            )
+        if not bool(np.isfinite(deductions).all()):
+            raise ValueError(
+                f"{DEDUCTION_FEATURES_KEY} must contain only finite values"
+            )
     if np.asarray(entity_batch["legal_action_tokens"]).shape[1] != legal_width:
         raise ValueError(
             "legal_action_tokens candidate width must match legal_action_ids: "
@@ -2305,9 +2450,7 @@ def _assert_entity_batch_shapes(
             ),
             dtype=np.int64,
         )
-        invalid = (target_ids < -1) | (
-            target_ids >= namespace_widths.reshape(1, 1, 4)
-        )
+        invalid = (target_ids < -1) | (target_ids >= namespace_widths.reshape(1, 1, 4))
         if bool(np.any(invalid)):
             row, action, column = np.argwhere(invalid)[0]
             raise ValueError(
@@ -2324,9 +2467,8 @@ def _assert_entity_batch_shapes(
                 f"row={int(row)} action={int(action)} column={int(column)}"
             )
 
-    if (
-        str(getattr(config, "state_trunk", "transformer")) != "transformer"
-        or bool(getattr(config, "topology_residual_adapter", False))
+    if str(getattr(config, "state_trunk", "transformer")) != "transformer" or bool(
+        getattr(config, "topology_residual_adapter", False)
     ):
         topology_shapes = {
             "hex_vertex_ids": (batch_size, 19, 6),

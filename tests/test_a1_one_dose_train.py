@@ -180,6 +180,26 @@ def _fake_aux_upgrade(verified: dict, tmp_path: Path) -> dict:
     }
 
 
+def _fake_public_card_upgrade(verified: dict, tmp_path: Path) -> dict:
+    initializer = tmp_path / "public-card-initializer.pt"
+    initializer.write_bytes(b"function-preserving public-card residual")
+    receipt = tmp_path / "public-card-upgrade.receipt.json"
+    receipt.write_text("{}")
+    return {
+        "module": executor.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+        "source": dict(verified["producer"]),
+        "upgraded_initializer": {
+            "path": str(initializer.resolve()),
+            "sha256": executor._file_sha256(initializer),
+        },
+        "receipt_sha256": "sha256:" + "4" * 64,
+        "receipt": {
+            "path": str(receipt.resolve()),
+            "sha256": executor._file_sha256(receipt),
+        },
+    }
+
+
 def _patch_valid_aux_admission(
     monkeypatch: pytest.MonkeyPatch, verified: dict
 ) -> dict[str, np.ndarray]:
@@ -1632,6 +1652,128 @@ def test_forced_action_type_value_map_derives_and_replays_descriptor(
     assert replayed["learner_recipe_overrides"][
         "forced_row_value_action_type_weights"
     ] == canonical
+
+
+def test_reviewed_public_card_one_dose_renders_exact_eight_b200_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, _base_path, _base = _descriptor_bound_production_verified(tmp_path)
+    verified["training_row_count"] = 600_000
+    upgrade = _fake_public_card_upgrade(verified, tmp_path)
+    monkeypatch.setattr(
+        executor.architecture_upgrade, "verify_receipt", lambda _path: upgrade
+    )
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    overrides_path = (
+        Path(executor.__file__).resolve().parents[1]
+        / "configs/experiments/next_wave/one_dose_public_card_overrides.json"
+    )
+
+    upgraded = executor.bind_function_preserving_upgrade(
+        verified, Path(upgrade["receipt"]["path"])
+    )
+    arm = executor.bind_learner_ablation(
+        upgraded,
+        ablation_id="coherent-public-card-count-v2",
+        overrides_json=overrides_path.read_text(encoding="utf-8"),
+        reviewed_code_tree_sha256=code_sha,
+    )
+    arm = executor.bind_diagnostic_training_descriptor(
+        arm,
+        descriptor_path=tmp_path / "public-card.training-descriptor.json",
+    )
+    arm = executor.bind_training_topology(
+        arm, topology=executor.B200_8GPU_DDP_TOPOLOGY, gpu=0
+    )
+    command = executor.build_train_command(
+        arm,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    assert arm["function_preserving_upgrade"]["module"] == (
+        executor.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES
+    )
+    assert arm["function_preserving_upgrade"]["module"] != (
+        executor.architecture_upgrade.MODULE_TARGET_GATHER
+    )
+    assert arm["recipe"]["max_steps"] == 128
+    assert arm["recipe"]["world_size"] == 8
+    assert arm["recipe"]["batch_size"] == 512
+    assert arm["recipe"]["global_batch_size"] == 4096
+    assert arm["recipe"]["resume_optimizer"] is False
+    assert arm["recipe"]["public_card_lr_mult"] == pytest.approx(4.0)
+    assert arm["recipe"]["per_game_policy_surprise_weighting"] is True
+    assert arm["learner_ablation"]["recipe_drift"]["public_card_lr_mult"] == {
+        "contract": 1.0,
+        "effective": 4.0,
+    }
+    assert arm["learner_ablation"]["recipe_drift"][
+        "per_game_policy_surprise_weighting"
+    ] == {"contract": False, "effective": True}
+    dose = executor._direct_lineage_dose(arm)
+    assert dose["current_optimizer_steps"] == 128
+    assert dose["current_sampled_rows"] == 524_288
+
+    assert command[:5] == [
+        str(Path(sys.executable)),
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=8",
+    ]
+    assert _option(command, "--max-steps") == "128"
+    assert _option(command, "--batch-size") == "512"
+    assert _option(command, "--public-card-lr-mult") == "4.0"
+    assert "--public-card-count-features" in command
+    assert "--per-game-policy-surprise-weighting" in command
+    assert "--no-resume-optimizer" in command
+
+
+def test_public_card_lr_multiplier_refuses_every_non_card_initializer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, _base_path, _base = _descriptor_bound_production_verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    with pytest.raises(executor.ExecutorError, match="public-card"):
+        executor.bind_learner_ablation(
+            verified,
+            ablation_id="missing-card-initializer",
+            overrides_json='{"public_card_lr_mult":4.0}',
+            reviewed_code_tree_sha256=code_sha,
+        )
+
+    target_gather = {
+        **_fake_public_card_upgrade(verified, tmp_path),
+        "module": executor.architecture_upgrade.MODULE_TARGET_GATHER,
+    }
+    monkeypatch.setattr(
+        executor.architecture_upgrade,
+        "verify_receipt",
+        lambda _path: target_gather,
+    )
+    target_gather_bound = executor.bind_function_preserving_upgrade(
+        verified, Path(target_gather["receipt"]["path"])
+    )
+    with pytest.raises(executor.ExecutorError, match="public-card"):
+        executor.bind_learner_ablation(
+            target_gather_bound,
+            ablation_id="target-gather-is-not-card",
+            overrides_json='{"public_card_lr_mult":4.0}',
+            reviewed_code_tree_sha256=code_sha,
+        )
 
 
 def test_target_gather_upgrade_combines_with_typed_forced_value_recipe(

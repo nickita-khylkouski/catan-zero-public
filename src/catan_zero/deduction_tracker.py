@@ -91,7 +91,9 @@ SETTLEMENT_COST: dict[str, int] = {"WOOD": 1, "BRICK": 1, "SHEEP": 1, "WHEAT": 1
 CITY_COST: dict[str, int] = {"WHEAT": 2, "ORE": 3}
 DEV_CARD_COST: dict[str, int] = {"SHEEP": 1, "WHEAT": 1, "ORE": 1}
 
-BANK_STARTING_RESOURCE_COUNT = 19  # per-resource bank size; used as a feature denominator
+BANK_STARTING_RESOURCE_COUNT = (
+    19  # per-resource bank size; used as a feature denominator
+)
 
 
 def _neg(cost: Mapping[str, int]) -> dict[str, int]:
@@ -132,7 +134,10 @@ class ResourceBounds:
         `total` (the player's public `resource_card_count` at the same
         point in time) is supplied, also checks that `true_hand` sums to it
         -- per-resource bounds alone don't capture that joint constraint."""
-        if total is not None and sum(int(true_hand.get(r, 0)) for r in RESOURCES) != total:
+        if (
+            total is not None
+            and sum(int(true_hand.get(r, 0)) for r in RESOURCES) != total
+        ):
             return False
         return all(
             self.lower[r] <= int(true_hand.get(r, 0)) <= self.upper[r]
@@ -209,7 +214,9 @@ def _hypergeom_at_least_one(population: int, successes: int, draws: int) -> floa
     return 1.0 - p_zero
 
 
-def _resource_hand(payload_players: Mapping[str, Any], name: str) -> dict[str, int] | None:
+def _resource_hand(
+    payload_players: Mapping[str, Any], name: str
+) -> dict[str, int] | None:
     entry = payload_players.get(name)
     if not isinstance(entry, Mapping):
         return None
@@ -261,7 +268,8 @@ def _settlement_count(board: Mapping[str, Any], player: str) -> int:
     return sum(
         1
         for building in board.get("buildings", ())
-        if building.get("player") == player and building.get("building_type") == "SETTLEMENT"
+        if building.get("player") == player
+        and building.get("building_type") == "SETTLEMENT"
     )
 
 
@@ -359,11 +367,17 @@ class DeductionTracker:
         see module docstring."""
         payload = payload if payload is not None else self._last_payload
         if payload is None:
-            return DevCardPosterior(unknown_pool=dict(STARTING_DEV_DECK), opponent_hidden_count=0)
+            return DevCardPosterior(
+                unknown_pool=dict(STARTING_DEV_DECK), opponent_hidden_count=0
+            )
         players = payload.get("players", {})
         played_by_type = {card: 0 for card in PLAYABLE_DEV_CARD_TYPES}
         for name, entry in players.items():
-            played = entry.get("played_development_cards") if isinstance(entry, Mapping) else None
+            played = (
+                entry.get("played_development_cards")
+                if isinstance(entry, Mapping)
+                else None
+            )
             if not isinstance(played, Mapping):
                 continue
             for card in PLAYABLE_DEV_CARD_TYPES:
@@ -372,23 +386,35 @@ class DeductionTracker:
         unknown_pool = {
             card: max(
                 0,
-                STARTING_DEV_DECK[card] - played_by_type.get(card, 0) - self_hand.get(card, 0),
+                STARTING_DEV_DECK[card]
+                - played_by_type.get(card, 0)
+                - self_hand.get(card, 0),
             )
             for card in DEV_CARD_TYPES
         }
         opponent_entry = players.get(opponent, {})
-        hidden_count = int(opponent_entry.get("development_card_count", 0) or 0) if isinstance(opponent_entry, Mapping) else 0
-        return DevCardPosterior(unknown_pool=unknown_pool, opponent_hidden_count=hidden_count)
+        hidden_count = (
+            int(opponent_entry.get("development_card_count", 0) or 0)
+            if isinstance(opponent_entry, Mapping)
+            else 0
+        )
+        return DevCardPosterior(
+            unknown_pool=unknown_pool, opponent_hidden_count=hidden_count
+        )
 
     def observe_frames(self, frames: Sequence[Mapping[str, Any]]) -> None:
         for frame in frames:
             self._observe_one(frame)
 
-    def feature_vector_for(self, opponent: str, payload: Mapping[str, Any] | None = None) -> np.ndarray:
+    def feature_vector_for(
+        self, opponent: str, payload: Mapping[str, Any] | None = None
+    ) -> np.ndarray:
         """Fixed-size (`DEDUCTION_FEATURE_SIZE`,) float32 vector for one
         opponent. See `DEDUCTION_FEATURE_SIZE` docstring for the slot layout.
         """
-        return _feature_vector(self.bounds[opponent], self.dev_card_posterior_for(opponent, payload))
+        return _feature_vector(
+            self.bounds[opponent], self.dev_card_posterior_for(opponent, payload)
+        )
 
     def feature_table(
         self,
@@ -424,7 +450,11 @@ class DeductionTracker:
 
     def _public_total(self, payload: Mapping[str, Any], name: str) -> int:
         entry = payload.get("players", {}).get(name, {})
-        return int(entry.get("resource_card_count", 0) or 0) if isinstance(entry, Mapping) else 0
+        return (
+            int(entry.get("resource_card_count", 0) or 0)
+            if isinstance(entry, Mapping)
+            else 0
+        )
 
     def _clip(self, opponent: str, total: int) -> None:
         bounds = self.bounds[opponent]
@@ -481,17 +511,29 @@ class DeductionTracker:
         after_players = after.get("players", {})
 
         if action_type == "BUILD_ROAD":
-            self._apply_fixed_cost_build(actor, before_players, after_players, ROAD_COST, "BUILD_ROAD")
+            self._apply_fixed_cost_build(
+                actor, before_players, after_players, ROAD_COST, "BUILD_ROAD"
+            )
         elif action_type == "BUILD_SETTLEMENT":
             self._apply_settlement_build(actor, value, before, after)
         elif action_type == "BUILD_CITY":
-            self._apply_fixed_cost_build(actor, before_players, after_players, CITY_COST, "BUILD_CITY")
+            self._apply_fixed_cost_build(
+                actor, before_players, after_players, CITY_COST, "BUILD_CITY"
+            )
         elif action_type == "BUY_DEVELOPMENT_CARD":
-            self._apply_fixed_cost_build(actor, before_players, after_players, DEV_CARD_COST, "BUY_DEVELOPMENT_CARD")
+            self._apply_fixed_cost_build(
+                actor,
+                before_players,
+                after_players,
+                DEV_CARD_COST,
+                "BUY_DEVELOPMENT_CARD",
+            )
         elif action_type == "ROLL":
             self._apply_roll(before, after, payload)
         elif action_type == "MOVE_ROBBER":
-            self._apply_move_robber(actor, value, payload, before_players, after_players)
+            self._apply_move_robber(
+                actor, value, payload, before_players, after_players
+            )
         elif action_type == "DISCARD_RESOURCE":
             self._apply_discard(actor, before_players, after_players)
         elif action_type == "PLAY_YEAR_OF_PLENTY":
@@ -519,8 +561,12 @@ class DeductionTracker:
     ) -> None:
         if actor is None or actor not in self.bounds:
             return
-        total_before = int(before_players.get(actor, {}).get("resource_card_count", 0) or 0)
-        total_after = int(after_players.get(actor, {}).get("resource_card_count", 0) or 0)
+        total_before = int(
+            before_players.get(actor, {}).get("resource_card_count", 0) or 0
+        )
+        total_after = int(
+            after_players.get(actor, {}).get("resource_card_count", 0) or 0
+        )
         delta_total = total_after - total_before
         cost_total = sum(cost.values())
         if delta_total == 0:
@@ -529,7 +575,11 @@ class DeductionTracker:
             self._apply_exact_vector(actor, _neg(cost))
             return
         self._record_anomaly(
-            "unexpected_build_delta", action=label, actor=actor, delta_total=delta_total, expected=-cost_total
+            "unexpected_build_delta",
+            action=label,
+            actor=actor,
+            delta_total=delta_total,
+            expected=-cost_total,
         )
         if delta_total < 0:
             self._apply_unknown_removal(actor, -delta_total, total_after)
@@ -547,8 +597,12 @@ class DeductionTracker:
             return
         before_players = before.get("players", {})
         after_players = after.get("players", {})
-        total_before = int(before_players.get(actor, {}).get("resource_card_count", 0) or 0)
-        total_after = int(after_players.get(actor, {}).get("resource_card_count", 0) or 0)
+        total_before = int(
+            before_players.get(actor, {}).get("resource_card_count", 0) or 0
+        )
+        total_after = int(
+            after_players.get(actor, {}).get("resource_card_count", 0) or 0
+        )
         delta_total = total_after - total_before
         if delta_total == 0:
             return  # 1st initial settlement, or 2nd next to only desert/no tiles
@@ -557,7 +611,9 @@ class DeductionTracker:
                 self._apply_exact_vector(actor, _neg(SETTLEMENT_COST))
             else:
                 self._record_anomaly(
-                    "unexpected_settlement_cost_delta", actor=actor, delta_total=delta_total
+                    "unexpected_settlement_cost_delta",
+                    actor=actor,
+                    delta_total=delta_total,
                 )
                 self._apply_unknown_removal(actor, -delta_total, total_after)
             return
@@ -611,14 +667,18 @@ class DeductionTracker:
         if victim is None or actor is None:
             return
         if actor == self.self_name and victim in self.bounds:
-            gained = _infer_single_resource_delta(self._last_self_resources, _resource_hand(after_players, self.self_name))
+            gained = _infer_single_resource_delta(
+                self._last_self_resources, _resource_hand(after_players, self.self_name)
+            )
             if gained is not None and gained[1] == 1:
                 self._apply_exact_delta(victim, gained[0], -1)
             else:
                 total_after = self._public_total({"players": after_players}, victim)
                 self._apply_unknown_removal(victim, 1, total_after)
         elif victim == self.self_name and actor in self.bounds:
-            lost = _infer_single_resource_delta(self._last_self_resources, _resource_hand(after_players, self.self_name))
+            lost = _infer_single_resource_delta(
+                self._last_self_resources, _resource_hand(after_players, self.self_name)
+            )
             if lost is not None and lost[1] == -1:
                 self._apply_exact_delta(actor, lost[0], 1)
             else:
@@ -641,7 +701,9 @@ class DeductionTracker:
     ) -> None:
         if actor is None or actor == self.self_name or actor not in self.bounds:
             return  # our own discards don't inform opponent tracking
-        total_after = int(after_players.get(actor, {}).get("resource_card_count", 0) or 0)
+        total_after = int(
+            after_players.get(actor, {}).get("resource_card_count", 0) or 0
+        )
         self._apply_unknown_removal(actor, 1, total_after)
 
     def _apply_year_of_plenty(self, actor: str | None, value: Any) -> None:
@@ -668,8 +730,12 @@ class DeductionTracker:
         for name in before_players:
             if name == actor:
                 continue
-            before_total = int(before_players.get(name, {}).get("resource_card_count", 0) or 0)
-            after_total = int(after_players.get(name, {}).get("resource_card_count", 0) or 0)
+            before_total = int(
+                before_players.get(name, {}).get("resource_card_count", 0) or 0
+            )
+            after_total = int(
+                after_players.get(name, {}).get("resource_card_count", 0) or 0
+            )
             lost = before_total - after_total
             if lost <= 0:
                 continue
@@ -731,35 +797,215 @@ class DeductionTracker:
 
 # -- feature vector -------------------------------------------------------
 
-# Slot layout (17 floats total), documented so a later ticket can wire this
-# in as near-zero-init extra columns on the corresponding player token row
-# (see `entity_token_features.PLAYER_FEATURE_SIZE` for the existing layout
-# this is meant to sit alongside):
-#   0-4   resource lower bound / BANK_STARTING_RESOURCE_COUNT, one per RESOURCES entry
-#   5-9   resource upper bound / BANK_STARTING_RESOURCE_COUNT, one per RESOURCES entry
-#   10-14 expected hidden dev-card count / STARTING_DEV_DECK[card], one per DEV_CARD_TYPES entry
-#   15    P(opponent holds >= 1 hidden VICTORY_POINT dev card)
-#   16    resource-hand exactness flag (1.0 if fully pinned, else 0.0)
-DEDUCTION_FEATURE_SIZE = 17
+# Compact two-player public-card state:
+#   0-4   exact opponent resource count / 19, one per RESOURCES entry
+#   5-9   expected hidden dev-card count / starting count for that card type
+#   10    P(opponent holds >= 1 hidden VICTORY_POINT dev card)
+#
+# Resource slots are populated only when the hand is exact. In the production
+# two-player game this follows directly from conservation (19 - bank - own
+# hand); retaining interval endpoints and a separate exactness flag merely
+# duplicated that information and enlarged the model input.
+DEDUCTION_FEATURE_SIZE = 11
+DEDUCTION_FEATURES_KEY = "deduction_features"
+PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION = "public_card_state_v2"
 
 
 def _clip01(value: float) -> float:
     return 0.0 if value < 0.0 else 1.0 if value > 1.0 else value
 
 
-def _feature_vector(bounds: ResourceBounds, posterior: DevCardPosterior) -> np.ndarray:
+def _feature_vector(bounds: ResourceBounds, posterior: Any) -> np.ndarray:
     vector = np.zeros(DEDUCTION_FEATURE_SIZE, dtype=np.float32)
-    for offset, resource in enumerate(RESOURCES):
-        vector[offset] = _clip01(bounds.lower[resource] / BANK_STARTING_RESOURCE_COUNT)
-        vector[5 + offset] = _clip01(bounds.upper[resource] / BANK_STARTING_RESOURCE_COUNT)
+    exact_resources = bounds.exact()
+    if exact_resources is not None:
+        for offset, resource in enumerate(RESOURCES):
+            vector[offset] = _clip01(
+                exact_resources[resource] / BANK_STARTING_RESOURCE_COUNT
+            )
     for offset, card in enumerate(DEV_CARD_TYPES):
-        vector[10 + offset] = _clip01(posterior.expected_count(card) / STARTING_DEV_DECK[card])
-    vector[15] = _clip01(posterior.victory_point_probability())
-    vector[16] = 1.0 if bounds.exact() is not None else 0.0
+        vector[5 + offset] = _clip01(
+            posterior.expected_count(card) / STARTING_DEV_DECK[card]
+        )
+    vp_probability = posterior.victory_point_probability
+    if callable(vp_probability):
+        vp_probability = vp_probability()
+    vector[10] = _clip01(float(vp_probability))
     return vector
 
 
-def true_state_label(payload: Mapping[str, Any], opponent: str) -> dict[str, Any] | None:
+def public_card_count_feature_table(
+    payload: Mapping[str, Any],
+    actor: str,
+    *,
+    players: tuple[str, ...] = PLAYERS,
+) -> np.ndarray:
+    """Build the public-only card-count tensor consumed by the policy.
+
+    This is deliberately a *deduction* surface, not an omniscient feature
+    surface.  It never reads an opponent's ``resources`` or
+    ``development_cards`` mappings, even if an unsafe caller leaves those
+    fields in ``payload``.
+
+    In a two-player game the opponent's resource composition is exactly
+    recoverable from conservation: 19 cards of each resource minus the public
+    bank minus the acting player's own hand. Resource slots remain zero when
+    that exact two-player deduction is unavailable. Development-card identity
+    remains genuinely uncertain; the five dev slots use the existing exact
+    multivariate-hypergeometric marginal conditioned on the public played-card
+    history, the actor's own hand, and each opponent's public card count.
+
+    The output has one row per canonical player slot and the existing
+    ``DEDUCTION_FEATURE_SIZE`` layout.  The actor row and absent-player rows are
+    zero.  Consequently changing authoritative opponent hidden truth while
+    holding the public observation fixed cannot change this tensor.
+    """
+
+    table = np.zeros((len(players), DEDUCTION_FEATURE_SIZE), dtype=np.float32)
+    raw_players = payload.get("players")
+    if not isinstance(raw_players, Mapping) or actor not in raw_players:
+        return table
+
+    present = tuple(name for name in players if name in raw_players)
+    actor_entry = raw_players.get(actor)
+    if not isinstance(actor_entry, Mapping):
+        return table
+
+    actor_resources, actor_resources_valid = _public_named_counts(
+        actor_entry.get("resources"), RESOURCES
+    )
+    bank = payload.get("bank")
+    bank_resources_raw = bank.get("resources") if isinstance(bank, Mapping) else None
+    bank_resources, bank_resources_valid = _public_named_counts(
+        bank_resources_raw, RESOURCES
+    )
+
+    unseen_resources = {
+        resource: max(
+            0,
+            BANK_STARTING_RESOURCE_COUNT
+            - bank_resources[resource]
+            - actor_resources[resource],
+        )
+        for resource in RESOURCES
+    }
+    exact_two_player = (
+        len(present) == 2 and actor_resources_valid and bank_resources_valid
+    )
+
+    own_devs, own_devs_valid = _public_named_counts(
+        actor_entry.get("development_cards"), DEV_CARD_TYPES
+    )
+    played_totals = {card: 0 for card in DEV_CARD_TYPES}
+    played_valid = True
+    for name in present:
+        entry = raw_players.get(name)
+        if not isinstance(entry, Mapping):
+            played_valid = False
+            continue
+        played, valid = _public_named_counts(
+            entry.get("played_development_cards"),
+            DEV_CARD_TYPES,
+            missing_is_zero=True,
+        )
+        played_valid = played_valid and valid
+        for card in DEV_CARD_TYPES:
+            played_totals[card] += played[card]
+    unknown_pool = {
+        card: max(
+            0,
+            STARTING_DEV_DECK[card]
+            - (own_devs[card] if own_devs_valid else 0)
+            - played_totals[card],
+        )
+        for card in DEV_CARD_TYPES
+    }
+
+    for row, name in enumerate(players):
+        if name == actor or name not in raw_players:
+            continue
+        entry = raw_players.get(name)
+        if not isinstance(entry, Mapping):
+            continue
+        total = _public_nonnegative_int(entry.get("resource_card_count"))
+        bounds = ResourceBounds(
+            lower={resource: 0 for resource in RESOURCES},
+            upper={resource: 0 for resource in RESOURCES},
+        )
+        if total is not None:
+            if exact_two_player and sum(unseen_resources.values()) == total:
+                bounds = ResourceBounds(
+                    lower=dict(unseen_resources),
+                    upper=dict(unseen_resources),
+                )
+            else:
+                # One opponent's hand is a size-``total`` subset of the shared
+                # unseen pool.  These are the tight per-resource marginals
+                # implied by that public constraint; they intentionally do not
+                # pretend the joint allocation is known in 3p/4p.
+                for resource in RESOURCES:
+                    other_capacity = sum(
+                        unseen_resources[other]
+                        for other in RESOURCES
+                        if other != resource
+                    )
+                    bounds.lower[resource] = max(0, total - other_capacity)
+                    bounds.upper[resource] = min(total, unseen_resources[resource])
+
+        hidden_dev_count = _public_nonnegative_int(entry.get("development_card_count"))
+        # Import lazily because the standalone belief module reuses this
+        # module's canonical card constants. This is the exact joint
+        # multivariate-hypergeometric public rule prior, not five independent
+        # marginals and never an authoritative hidden hand.
+        from catan_zero.rl.public_dev_belief import build_public_dev_belief
+
+        posterior = build_public_dev_belief(
+            unknown_pool=(
+                dict(unknown_pool)
+                if own_devs_valid and played_valid
+                else dict(STARTING_DEV_DECK)
+            ),
+            opponent_count=hidden_dev_count or 0,
+        )
+        table[row] = _feature_vector(bounds, posterior)
+    return table
+
+
+def _public_nonnegative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _public_named_counts(
+    raw: Any,
+    names: tuple[str, ...],
+    *,
+    missing_is_zero: bool = False,
+) -> tuple[dict[str, int], bool]:
+    """Normalize enum/string keyed public count maps without reading extras."""
+
+    counts = {name: 0 for name in names}
+    if not isinstance(raw, Mapping):
+        return counts, bool(missing_is_zero)
+    seen: set[str] = set()
+    for key, value in raw.items():
+        normalized = str(getattr(key, "name", key)).upper().rsplit(".", 1)[-1]
+        if normalized not in counts:
+            continue
+        parsed = _public_nonnegative_int(value)
+        if parsed is None:
+            return counts, False
+        counts[normalized] = parsed
+        seen.add(normalized)
+    return counts, bool(missing_is_zero or seen == set(names))
+
+
+def true_state_label(
+    payload: Mapping[str, Any], opponent: str
+) -> dict[str, Any] | None:
     """Omniscient ground-truth label for `opponent`, for aux-head training.
 
     Legal to read directly at TRAINING time only, from a payload where

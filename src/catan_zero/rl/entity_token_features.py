@@ -4,6 +4,16 @@ from typing import Any
 
 import numpy as np
 
+from catan_zero.deduction_tracker import (
+    DEDUCTION_FEATURE_SIZE,
+    DEDUCTION_FEATURES_KEY,
+    STARTING_DEV_DECK,
+)
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    meaningful_public_events,
+)
+
 
 ENTITY_TOKEN_SCHEMA_VERSION = "entity_tokens_v1"
 
@@ -73,7 +83,22 @@ PLAYER_ACTOR_FLAG_SLOT = 1
 #   21 has_development_cards flag        22-26 unplayed dev-card identities
 # Deliberately EXCLUDED (public, kept): 6 resource_card_count, 7 development_card_count,
 # 3 public_victory_points, 27-30 played dev cards, and all board/road/army slots.
-PUBLIC_MASK_PLAYER_SLOTS: tuple[int, ...] = (4, 5, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26)
+PUBLIC_MASK_PLAYER_SLOTS: tuple[int, ...] = (
+    4,
+    5,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+)
 
 
 def mask_player_tokens_public(player_tokens: np.ndarray) -> np.ndarray:
@@ -107,6 +132,161 @@ def mask_player_tokens_public(player_tokens: np.ndarray) -> np.ndarray:
     return arr[0] if single else arr
 
 
+def public_card_count_features_from_entity_tokens(
+    player_tokens: np.ndarray,
+    global_tokens: np.ndarray,
+) -> np.ndarray:
+    """Deterministically backfill card-count features from public entity rows.
+
+    The source columns are all already public: player presence/actor identity,
+    public hand totals, the actor's own exact hand, publicly played dev cards,
+    and the bank. Opponent private slots ``4:6`` and ``15:27`` are never read.
+    This makes historical public-observation corpora immediately usable by the
+    opt-in residual without replaying games or consulting authoritative hidden
+    state. Historical token normalizers clip unusually large hands; when that
+    prevents exact conservation, the corresponding exact-resource slice fails
+    closed to zero. Online inference deliberately uses this same transform so
+    those rare saturated states cannot create train/serve skew.
+
+    Accepts ``(P,F)/(1,G)`` or batched ``(B,P,F)/(B,1,G)`` arrays and returns
+    the matching ``(P,11)`` or ``(B,P,11)`` float32 tensor.
+    """
+
+    players = np.asarray(player_tokens)
+    globals_ = np.asarray(global_tokens)
+    single = players.ndim == 2
+    if single:
+        players = players[None, ...]
+    if globals_.ndim == 2:
+        globals_ = globals_[None, ...]
+    if players.ndim != 3 or players.shape[-1] < PLAYER_FEATURE_SIZE:
+        raise ValueError(
+            "player_tokens must be (P,F) or (B,P,F) with "
+            f"F >= {PLAYER_FEATURE_SIZE}; got {players.shape}"
+        )
+    if globals_.ndim != 3 or globals_.shape[1] != 1 or globals_.shape[-1] < 32:
+        raise ValueError(
+            f"global_tokens must be (1,G) or (B,1,G) with G >= 32; got {globals_.shape}"
+        )
+    if globals_.shape[0] != players.shape[0]:
+        raise ValueError(
+            "player/global token batch sizes differ: "
+            f"{players.shape[0]} != {globals_.shape[0]}"
+        )
+
+    p = players.astype(np.float32, copy=False)
+    g = globals_.astype(np.float32, copy=False)
+    present = p[..., 0] > 0.5
+    actor = p[..., PLAYER_ACTOR_FLAG_SLOT] > 0.5
+    if not bool(np.all(actor.sum(axis=1) == 1)):
+        raise ValueError(
+            "public card-count backfill requires exactly one actor row per batch"
+        )
+    eligible = present & ~actor
+    batch_index = np.arange(p.shape[0], dtype=np.int64)
+    actor_index = actor.argmax(axis=1)
+
+    # Only the actor row's private composition is read. Multiplication by the
+    # actor one-hot happens before reduction, so opponent hidden columns can be
+    # arbitrary (or masked zeros) without influencing the result.
+    own_resources = np.rint(p[batch_index, actor_index, 16:21] * 10.0)
+    bank_resources = np.rint(g[:, 0, 26:31] * 19.0)
+    unseen_resources = np.clip(19.0 - bank_resources - own_resources, 0.0, 19.0)
+    resource_total = np.rint(p[..., 6] * 20.0)
+
+    two_player = present.sum(axis=1) == 2
+    exact = (
+        eligible
+        & two_player[:, None]
+        & np.isclose(
+            resource_total,
+            unseen_resources.sum(axis=-1)[:, None],
+            rtol=0.0,
+            atol=0.01,
+        )
+    )
+    exact_resources = np.where(
+        exact[..., None], unseen_resources[:, None, :], 0.0
+    )
+
+    starting_dev = np.asarray(
+        [
+            STARTING_DEV_DECK[card]
+            for card in (
+                "KNIGHT",
+                "YEAR_OF_PLENTY",
+                "MONOPOLY",
+                "ROAD_BUILDING",
+                "VICTORY_POINT",
+            )
+        ],
+        dtype=np.float32,
+    )
+    own_devs = np.rint(p[batch_index, actor_index, 22:27] * 5.0)
+    played = np.zeros((p.shape[0], 5), dtype=np.float32)
+    # YOP/MONOPOLY/ROAD_BUILDING have only two copies apiece, so their /5
+    # player-token counters are lossless. KNIGHT has fourteen copies and its
+    # historical /5 slot clips after five plays. Recover the exact aggregate
+    # KNIGHT count from the public deck-size conservation identity instead:
+    #   played = 25 - cards still in deck - all public face-down hand counts.
+    # This reads only public aggregates. It is exact for every unsaturated
+    # hand-count row; when a legacy row itself clipped a >=10-card face-down
+    # hand, clamp to the physically possible deck rather than consulting any
+    # opponent identity slot.
+    played[:, 1:4] = np.rint(p[..., 28:31].sum(axis=1) * 5.0)
+    development_deck_count = np.rint(g[:, 0, 31] * 25.0)
+    public_face_down_counts = np.rint(p[..., 7] * 10.0)
+    total_played = np.clip(
+        25.0 - development_deck_count - public_face_down_counts.sum(axis=1),
+        0.0,
+        20.0,
+    )
+    played[:, 0] = np.clip(total_played - played[:, 1:4].sum(axis=1), 0.0, 14.0)
+    unknown_dev = np.clip(starting_dev - own_devs - played, 0.0, None)
+    pool_total = unknown_dev.sum(axis=-1)
+    dev_draws = np.rint(p[..., 7] * 10.0)
+    clipped_draws = np.minimum(np.maximum(dev_draws, 0.0), pool_total[:, None])
+    expected_dev = np.divide(
+        clipped_draws[..., None] * unknown_dev[:, None, :],
+        pool_total[:, None, None],
+        out=np.zeros((*clipped_draws.shape, 5), dtype=np.float32),
+        where=pool_total[:, None, None] > 0.0,
+    )
+
+    # Vectorized hypergeometric P(VP >= 1). There are at most 25 draws, so a
+    # fixed step axis avoids Python/game loops while retaining the exact
+    # without-replacement posterior.
+    steps = np.arange(25, dtype=np.float32).reshape(1, 1, -1)
+    active_draw = steps < clipped_draws[..., None]
+    failures = (pool_total - unknown_dev[:, 4])[:, None, None]
+    denominator = pool_total[:, None, None] - steps
+    numerator = failures - steps
+    denominator = np.broadcast_to(denominator, active_draw.shape)
+    numerator = np.broadcast_to(numerator, active_draw.shape)
+    ratios = np.where(
+        active_draw,
+        np.divide(
+            numerator,
+            denominator,
+            out=np.zeros_like(denominator),
+            where=denominator > 0.0,
+        ),
+        1.0,
+    )
+    ratios = np.clip(ratios, 0.0, 1.0)
+    vp_probability = 1.0 - ratios.prod(axis=-1)
+    vp_probability = np.where(clipped_draws > 0.0, vp_probability, 0.0)
+
+    result = np.zeros(
+        (p.shape[0], p.shape[1], DEDUCTION_FEATURE_SIZE),
+        dtype=np.float32,
+    )
+    result[..., 0:5] = exact_resources / 19.0
+    result[..., 5:10] = expected_dev / starting_dev.reshape(1, 1, 5)
+    result[..., 10] = vp_probability
+    result *= eligible[..., None]
+    return result[0] if single else result
+
 
 def build_entity_token_features(
     env: Any,
@@ -114,6 +294,7 @@ def build_entity_token_features(
     *,
     include_event_log: bool = True,
     history_limit: int = 64,
+    meaningful_public_history: bool = False,
 ) -> dict[str, np.ndarray]:
     """Build typed Catan entity-token tensors from the public env payload.
 
@@ -124,6 +305,15 @@ def build_entity_token_features(
     actor_name = actor or env.current_player_name()
     payload = env.observation_payload(actor_name, include_event_log=include_event_log)
     topology = _topology(payload)
+    effective_history_limit = (
+        min(int(history_limit), MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+        if meaningful_public_history
+        else int(history_limit)
+    )
+    if effective_history_limit < 0:
+        raise ValueError("history_limit must be >= 0")
+    player_tokens = _player_tokens(payload, actor_name)
+    global_tokens = _global_tokens(env, payload, actor_name)
     return {
         "schema": np.asarray(ENTITY_TOKEN_SCHEMA_VERSION),
         "hex_tokens": _hex_tokens(payload, topology),
@@ -132,18 +322,40 @@ def build_entity_token_features(
         "vertex_tokens": _vertex_tokens(env, payload, topology, actor_name),
         "edge_tokens": _edge_tokens(payload, topology, actor_name),
         "edge_vertex_ids": topology["edge_vertex_ids"],
-        "player_tokens": _player_tokens(payload, actor_name),
-        "global_tokens": _global_tokens(env, payload, actor_name),
+        "player_tokens": player_tokens,
+        # Derive through the same public token surface used to backfill old
+        # corpora and by the native serving path. The separate exact native
+        # JSON contract remains available for auditing/future authenticated
+        # schemas, but never silently changes this checkpoint's input measure.
+        DEDUCTION_FEATURES_KEY: public_card_count_features_from_entity_tokens(
+            player_tokens, global_tokens
+        ),
+        "global_tokens": global_tokens,
         "legal_action_tokens": _legal_action_tokens(env, payload, topology),
         "legal_action_target_ids": _legal_action_target_ids(payload, topology),
-        "event_tokens": _event_tokens(payload, topology, history_limit=history_limit),
-        "event_target_ids": _event_target_ids(payload, topology, history_limit=history_limit),
+        "event_tokens": _event_tokens(
+            payload,
+            topology,
+            history_limit=effective_history_limit,
+            meaningful_public_history=meaningful_public_history,
+        ),
+        "event_target_ids": _event_target_ids(
+            payload, topology, history_limit=effective_history_limit
+        ),
         "hex_mask": np.ones(19, dtype=np.bool_),
         "vertex_mask": np.ones(54, dtype=np.bool_),
         "edge_mask": np.ones(72, dtype=np.bool_),
-        "player_mask": np.asarray([name in payload.get("players", {}) for name in PLAYERS], dtype=np.bool_),
-        "legal_action_mask": np.ones(len(payload.get("structured_legal_actions", ())), dtype=np.bool_),
-        "event_mask": _event_mask(payload, history_limit=history_limit),
+        "player_mask": np.asarray(
+            [name in payload.get("players", {}) for name in PLAYERS], dtype=np.bool_
+        ),
+        "legal_action_mask": np.ones(
+            len(payload.get("structured_legal_actions", ())), dtype=np.bool_
+        ),
+        "event_mask": _event_mask(
+            payload,
+            history_limit=effective_history_limit,
+            meaningful_public_history=meaningful_public_history,
+        ),
     }
 
 
@@ -292,7 +504,9 @@ def _hex_tokens(payload: dict[str, Any], topology: dict[str, Any]) -> np.ndarray
     return tokens
 
 
-def _vertex_tokens(env: Any, payload: dict[str, Any], topology: dict[str, Any], actor_name: str) -> np.ndarray:
+def _vertex_tokens(
+    env: Any, payload: dict[str, Any], topology: dict[str, Any], actor_name: str
+) -> np.ndarray:
     del topology
     tokens = np.zeros((54, VERTEX_FEATURE_SIZE), dtype=np.float16)
     board = payload.get("board") if isinstance(payload.get("board"), dict) else {}
@@ -311,7 +525,9 @@ def _vertex_tokens(env: Any, payload: dict[str, Any], topology: dict[str, Any], 
             tokens[node, 1] = 1.0
         else:
             tokens[node, 2 + owner_index] = 1.0
-        building_type = str(building.get("building_type")) if isinstance(building, dict) else ""
+        building_type = (
+            str(building.get("building_type")) if isinstance(building, dict) else ""
+        )
         if building_type == "SETTLEMENT":
             tokens[node, 7] = 1.0
         elif building_type == "CITY":
@@ -338,7 +554,9 @@ def _vertex_tokens(env: Any, payload: dict[str, Any], topology: dict[str, Any], 
     return tokens
 
 
-def _edge_tokens(payload: dict[str, Any], topology: dict[str, Any], actor_name: str) -> np.ndarray:
+def _edge_tokens(
+    payload: dict[str, Any], topology: dict[str, Any], actor_name: str
+) -> np.ndarray:
     tokens = np.zeros((72, EDGE_FEATURE_SIZE), dtype=np.float16)
     board = payload.get("board") if isinstance(payload.get("board"), dict) else {}
     road_owner: dict[tuple[int, int], str] = {}
@@ -379,7 +597,9 @@ def _player_tokens(payload: dict[str, Any], actor_name: str) -> np.ndarray:
         tokens[idx, 3] = _scale(player.get("public_victory_points"), 10)
         has_actual = "actual_victory_points" in player
         tokens[idx, 4] = 1.0 if has_actual else 0.0
-        tokens[idx, 5] = _scale(player.get("actual_victory_points"), 10) if has_actual else 0.0
+        tokens[idx, 5] = (
+            _scale(player.get("actual_victory_points"), 10) if has_actual else 0.0
+        )
         tokens[idx, 6] = _scale(player.get("resource_card_count"), 20)
         tokens[idx, 7] = _scale(player.get("development_card_count"), 10)
         tokens[idx, 8] = _scale(player.get("roads_left"), 15)
@@ -389,16 +609,32 @@ def _player_tokens(payload: dict[str, Any], actor_name: str) -> np.ndarray:
         tokens[idx, 12] = float(bool(player.get("has_longest_road")))
         tokens[idx, 13] = float(bool(player.get("has_rolled")))
         tokens[idx, 14] = _scale(player.get("longest_road_length"), 15)
-        resources = player.get("resources") if isinstance(player.get("resources"), dict) else None
+        resources = (
+            player.get("resources")
+            if isinstance(player.get("resources"), dict)
+            else None
+        )
         tokens[idx, 15] = 1.0 if resources is not None else 0.0
         for offset, resource in enumerate(RESOURCES):
             tokens[idx, 16 + offset] = _scale(_resource_count(resources, resource), 10)
-        dev_cards = player.get("development_cards") if isinstance(player.get("development_cards"), dict) else None
+        dev_cards = (
+            player.get("development_cards")
+            if isinstance(player.get("development_cards"), dict)
+            else None
+        )
         tokens[idx, 21] = 1.0 if dev_cards is not None else 0.0
-        for offset, card in enumerate(("KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING", "VICTORY_POINT")):
+        for offset, card in enumerate(
+            ("KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING", "VICTORY_POINT")
+        ):
             tokens[idx, 22 + offset] = _scale(_lookup_count(dev_cards, card), 5)
-        played = player.get("played_development_cards") if isinstance(player.get("played_development_cards"), dict) else {}
-        for offset, card in enumerate(("KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING")):
+        played = (
+            player.get("played_development_cards")
+            if isinstance(player.get("played_development_cards"), dict)
+            else {}
+        )
+        for offset, card in enumerate(
+            ("KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING")
+        ):
             tokens[idx, 27 + offset] = _scale(_lookup_count(played, card), 5)
     return tokens
 
@@ -418,11 +654,17 @@ def _global_tokens(env: Any, payload: dict[str, Any], actor_name: str) -> np.nda
     token[0, 24] = _scale(len(payload.get("legal_actions", ())), 607)
     token[0, 25] = _scale(payload.get("replay_frame_count"), 512)
     bank = payload.get("bank") if isinstance(payload.get("bank"), dict) else {}
-    bank_resources = bank.get("resources") if isinstance(bank.get("resources"), dict) else {}
+    bank_resources = (
+        bank.get("resources") if isinstance(bank.get("resources"), dict) else {}
+    )
     for offset, resource in enumerate(RESOURCES):
         token[0, 26 + offset] = _scale(_resource_count(bank_resources, resource), 19)
     token[0, 31] = _scale(bank.get("development_cards_remaining"), 25)
-    trade_panel = payload.get("trade_panel") if isinstance(payload.get("trade_panel"), dict) else {}
+    trade_panel = (
+        payload.get("trade_panel")
+        if isinstance(payload.get("trade_panel"), dict)
+        else {}
+    )
     token[0, 32] = _scale(trade_panel.get("offers_remaining"), 3)
     token[0, 33] = float(bool(trade_panel.get("current_offer")))
     token[0, 34] = float(bool(trade_panel.get("is_resolving")))
@@ -434,7 +676,9 @@ def _global_tokens(env: Any, payload: dict[str, Any], actor_name: str) -> np.nda
     return token
 
 
-def _legal_action_tokens(env: Any, payload: dict[str, Any], topology: dict[str, Any]) -> np.ndarray:
+def _legal_action_tokens(
+    env: Any, payload: dict[str, Any], topology: dict[str, Any]
+) -> np.ndarray:
     legal = tuple(payload.get("structured_legal_actions", ()))
     tokens = np.zeros((len(legal), LEGAL_ACTION_FEATURE_SIZE), dtype=np.float16)
     for row, action in enumerate(legal):
@@ -448,7 +692,9 @@ def _legal_action_tokens(env: Any, payload: dict[str, Any], topology: dict[str, 
         if category_index is not None:
             tokens[row, 20 + category_index] = 1.0
         target_kind = _target_kind(action, topology)
-        kind_index = _index(("none", "hex", "vertex", "edge", "player", "resource"), target_kind)
+        kind_index = _index(
+            ("none", "hex", "vertex", "edge", "player", "resource"), target_kind
+        )
         if kind_index is not None:
             tokens[row, 25 + kind_index] = 1.0
         args = action.get("args") if isinstance(action.get("args"), dict) else {}
@@ -457,13 +703,21 @@ def _legal_action_tokens(env: Any, payload: dict[str, Any], topology: dict[str, 
         _fill_resource_bundle(tokens[row, 41:46], args.get("want"), divisor=4)
         tokens[row, 46] = _priority(action_type)
         tokens[row, 47] = 1.0 if action_type == "END_TURN" else 0.0
-        tokens[row, 48] = 1.0 if "INITIAL" in str(payload.get("current_prompt", "")) else 0.0
-        trade_panel = payload.get("trade_panel") if isinstance(payload.get("trade_panel"), dict) else {}
+        tokens[row, 48] = (
+            1.0 if "INITIAL" in str(payload.get("current_prompt", "")) else 0.0
+        )
+        trade_panel = (
+            payload.get("trade_panel")
+            if isinstance(payload.get("trade_panel"), dict)
+            else {}
+        )
         tokens[row, 49] = _scale(trade_panel.get("offers_remaining"), 3)
     return tokens
 
 
-def _legal_action_target_ids(payload: dict[str, Any], topology: dict[str, Any]) -> np.ndarray:
+def _legal_action_target_ids(
+    payload: dict[str, Any], topology: dict[str, Any]
+) -> np.ndarray:
     legal = tuple(payload.get("structured_legal_actions", ()))
     targets = np.full((len(legal), 4), -1, dtype=np.int16)
     for row, action in enumerate(legal):
@@ -476,7 +730,9 @@ def _legal_action_target_ids(payload: dict[str, Any], topology: dict[str, Any]) 
             targets[row, 1] = _safe_int(args.get("node"), default=-1)
         if "edge" in args:
             edge = _edge_pair(args.get("edge"))
-            targets[row, 2] = topology["edge_to_id"].get(edge, -1) if edge is not None else -1
+            targets[row, 2] = (
+                topology["edge_to_id"].get(edge, -1) if edge is not None else -1
+            )
         victim = args.get("victim", args.get("target"))
         player_id = _player_index(str(victim)) if victim is not None else None
         if player_id is not None:
@@ -484,9 +740,19 @@ def _legal_action_target_ids(payload: dict[str, Any], topology: dict[str, Any]) 
     return targets
 
 
-def _event_tokens(payload: dict[str, Any], topology: dict[str, Any], *, history_limit: int) -> np.ndarray:
+def _event_tokens(
+    payload: dict[str, Any],
+    topology: dict[str, Any],
+    *,
+    history_limit: int,
+    meaningful_public_history: bool = False,
+) -> np.ndarray:
     del topology
-    events = tuple(payload.get("event_log", ()))[-history_limit:]
+    events = _selected_history_events(
+        payload,
+        history_limit=history_limit,
+        meaningful_public_history=meaningful_public_history,
+    )
     tokens = np.zeros((history_limit, EVENT_FEATURE_SIZE), dtype=np.float16)
     offset = history_limit - len(events)
     for idx, event in enumerate(events):
@@ -517,17 +783,44 @@ def _event_tokens(payload: dict[str, Any], topology: dict[str, Any], *, history_
     return tokens
 
 
-def _event_target_ids(payload: dict[str, Any], topology: dict[str, Any], *, history_limit: int) -> np.ndarray:
+def _event_target_ids(
+    payload: dict[str, Any], topology: dict[str, Any], *, history_limit: int
+) -> np.ndarray:
     del topology
     return np.full((history_limit, 4), -1, dtype=np.int16)
 
 
-def _event_mask(payload: dict[str, Any], *, history_limit: int) -> np.ndarray:
-    count = min(len(tuple(payload.get("event_log", ()))), history_limit)
+def _event_mask(
+    payload: dict[str, Any],
+    *,
+    history_limit: int,
+    meaningful_public_history: bool = False,
+) -> np.ndarray:
+    count = len(
+        _selected_history_events(
+            payload,
+            history_limit=history_limit,
+            meaningful_public_history=meaningful_public_history,
+        )
+    )
     mask = np.zeros(history_limit, dtype=np.bool_)
     if count:
         mask[-count:] = True
     return mask
+
+
+def _selected_history_events(
+    payload: dict[str, Any],
+    *,
+    history_limit: int,
+    meaningful_public_history: bool,
+) -> tuple[dict[str, Any], ...]:
+    events = tuple(payload.get("event_log", ()))
+    if meaningful_public_history:
+        return meaningful_public_events(events, limit=history_limit)
+    if history_limit <= 0:
+        return ()
+    return tuple(event for event in events[-history_limit:] if isinstance(event, dict))
 
 
 def _target_kind(action: dict[str, Any], topology: dict[str, Any]) -> str:
@@ -638,7 +931,11 @@ def _adjacent_robber(payload: dict[str, Any], node: int) -> float:
     for tile in board.get("tiles", ()):
         if not isinstance(tile, dict) or not bool(tile.get("has_robber")):
             continue
-        if node in {int(raw) for raw in dict(tile.get("nodes", {})).values() if _safe_int(raw) is not None}:
+        if node in {
+            int(raw)
+            for raw in dict(tile.get("nodes", {})).values()
+            if _safe_int(raw) is not None
+        }:
             return 1.0
     return 0.0
 

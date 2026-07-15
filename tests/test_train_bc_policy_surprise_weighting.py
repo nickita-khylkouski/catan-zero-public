@@ -4,8 +4,11 @@ import numpy as np
 import pytest
 
 from tools.train_bc import (
+    _compose_per_game_policy_surprise_sampling_weights,
     _epoch_order,
     compute_policy_surprise_kl,
+    per_game_capped_policy_surprise_sampling_weights,
+    per_game_policy_surprise_sampling_report,
     policy_surprise_sampling_weights,
 )
 
@@ -118,6 +121,91 @@ def test_cap_bounds_the_maximum_weight():
     weights = policy_surprise_sampling_weights(kl, has_prior, weight_scale=1.0, cap=4.0)
 
     assert weights[0] == pytest.approx(1.0 + 1.0 * 4.0)
+
+
+# ------------------------------------------------ exact per-game policy surprise
+
+
+def test_per_game_capped_surprise_is_exact_and_mass_preserving():
+    seeds = np.asarray([11, 11, 11, 11, 22, 22], dtype=np.int64)
+    kl = np.asarray([0.0, 1.0, 100.0, 100.0, 0.0, 0.0], dtype=np.float32)
+    # Row 3 models a forced/fast row: its KL is irrelevant because it is not a
+    # policy-active root. Game 22 exercises the all-zero-KL fallback.
+    active = np.asarray([True, True, True, False, True, True])
+
+    factors = per_game_capped_policy_surprise_sampling_weights(seeds, kl, active)
+
+    # m=3, clipped KL=[0,1,2], sum=3 -> [0.5,1.0,1.5].
+    assert factors.tolist() == pytest.approx([0.5, 1.0, 1.5, 1.0, 1.0, 1.0])
+    assert float(factors[seeds == 11].sum()) == pytest.approx(4.0)
+    assert float(factors[seeds == 22].sum()) == pytest.approx(2.0)
+
+
+def test_per_game_surprise_does_not_create_policy_loss_on_inactive_rows():
+    seeds = np.asarray([7, 7, 7], dtype=np.int64)
+    kl = np.asarray([0.0, 2.0, 2.0], dtype=np.float32)
+    policy_loss_weights = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+
+    factors = per_game_capped_policy_surprise_sampling_weights(
+        seeds, kl, policy_loss_weights > 0.0
+    )
+
+    assert factors[1:].tolist() == [1.0, 1.0]
+    assert (policy_loss_weights * factors)[1:].tolist() == [0.0, 0.0]
+
+
+class _CompositeData:
+    component_game_sampling_ratios = (0.6, 0.4)
+
+    def __init__(self) -> None:
+        self._components = np.asarray([0, 0, 0, 0, 0, 1, 1, 1, 1])
+
+    def component_indices_for_rows(self, indices):
+        return self._components[np.asarray(indices, dtype=np.int64)]
+
+
+def test_per_game_surprise_composes_without_changing_component_proportions():
+    data = _CompositeData()
+    indices = np.arange(9, dtype=np.int64)
+    # Component 0 has games of 3 and 2 rows; component 1 has one 4-row game.
+    seeds = np.asarray([1, 1, 1, 2, 2, 3, 3, 3, 3], dtype=np.int64)
+    active = np.asarray([True, True, False, True, True, True, True, True, False])
+    kl = np.asarray([0.0, 2.0, 99.0, 0.5, 1.5, 0.0, 0.5, 2.0, 99.0])
+    factors = per_game_capped_policy_surprise_sampling_weights(seeds, kl, active)
+    base = np.asarray(
+        [0.1, 0.1, 0.1, 0.15, 0.15, 0.1, 0.1, 0.1, 0.1],
+        dtype=np.float64,
+    )
+
+    combined = _compose_per_game_policy_surprise_sampling_weights(
+        data, indices, factors, base
+    )
+
+    assert float(combined[:5].sum()) == pytest.approx(0.6)
+    assert float(combined[5:].sum()) == pytest.approx(0.4)
+    assert float(combined.sum()) == pytest.approx(1.0)
+
+
+def test_per_game_surprise_report_binds_formula_and_mass_error():
+    seeds = np.asarray([1, 1, 1], dtype=np.int64)
+    active = np.asarray([True, True, False])
+    factors = per_game_capped_policy_surprise_sampling_weights(
+        seeds, np.asarray([0.0, 2.0, 9.0]), active
+    )
+
+    report = per_game_policy_surprise_sampling_report(
+        seeds,
+        factors,
+        active,
+        enabled=True,
+        authenticated_component_sampling=True,
+    )
+
+    assert report["schema_version"] == "train-policy-surprise-sampling-v2"
+    assert report["mode"] == "per_game_capped"
+    assert report["kl_cap"] == pytest.approx(2.0)
+    assert report["max_per_game_active_mass_error"] == pytest.approx(0.0)
+    assert report["authenticated_component_proportions_preserved"] is True
 
 
 # --------------------------------------------------------------------------- _epoch_order

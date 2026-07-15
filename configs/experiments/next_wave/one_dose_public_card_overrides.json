@@ -2,5 +2,8 @@
   "forced_action_weight": 0.0,
   "forced_row_value_action_type_weights": "END_TURN=0.1,ROLL=0.25",
   "forced_row_value_weight": 1.0,
+  "max_steps": 128,
+  "per_game_policy_surprise_weighting": true,
+  "public_card_lr_mult": 4.0,
   "value_loss_weight": 0.25
 }

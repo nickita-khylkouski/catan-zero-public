@@ -212,6 +212,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "lr_warmup_steps",
         "lr_schedule",
         "value_lr_mult",
+        "public_card_lr_mult",
         "value_trunk_grad_scale",
         "policy_loss_weight",
         "policy_aux_active_batch_size",
@@ -224,6 +225,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "aux_subgoal_loss_weight",
         "policy_kl_anchor_weight",
         "policy_surprise_weight",
+        "per_game_policy_surprise_weighting",
         "advantage_policy_weighting",
         "per_game_policy_weight",
         "per_game_policy_weight_mode",
@@ -2338,26 +2340,49 @@ def bind_learner_ablation(
             "authority; generic ablation ids and caller-chosen coefficients are "
             "not admissible"
         )
-    target_gather_upgrade = bool(
+    generic_ablation_upgrade = bool(
         isinstance(upgrade, dict)
-        and upgrade.get("module") == architecture_upgrade.MODULE_TARGET_GATHER
+        and upgrade.get("module")
+        in {
+            architecture_upgrade.MODULE_TARGET_GATHER,
+            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+            architecture_upgrade.MODULE_MEANINGFUL_PUBLIC_HISTORY,
+            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
+        }
     )
-    # Target gather is an exact zero-output initializer, and the generic
-    # ablation receipt already binds both its upgrade identity and the full
-    # effective loss recipe. Keep this combination diagnostic-only below; do
-    # not extend the exception to arbitrary architecture deltas.
-    if upgrade is not None and not target_gather_upgrade:
+    # These reviewed modules are exact zero-output initializers. The generic
+    # ablation receipt binds the initializer identity and full effective loss
+    # recipe; arbitrary architecture deltas remain inadmissible.
+    if upgrade is not None and not generic_ablation_upgrade:
         raise ExecutorError(
-            "a generic learner ablation may be combined only with the reviewed "
-            "function-preserving action-target-gather upgrade"
+            "a generic learner ablation may be combined only with a reviewed "
+            "function-preserving action-target-gather, public-card, or "
+            "meaningful-history upgrade"
         )
     if "aux_subgoal_loss_weight" in overrides and not aux_upgrade:
         raise ExecutorError(
             "aux_subgoal_loss_weight ablation requires the receipt-backed "
             "shared aux-head initializer"
         )
+    if "public_card_lr_mult" in overrides and not (
+        isinstance(upgrade, dict)
+        and upgrade.get("module")
+        in {
+            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
+        }
+    ):
+        raise ExecutorError(
+            "public_card_lr_mult requires the receipt-backed public-card "
+            "function-preserving initializer"
+        )
     bound = dict(verified["recipe"])
     effective = dict(bound)
+    # Added after the original sealed A1 lock. Default 1.0 is the exact
+    # historical behavior; only a receipt-backed public-card initializer may
+    # request a different value below.
+    effective["public_card_lr_mult"] = 1.0
+    effective["per_game_policy_surprise_weighting"] = False
     # Historical A1 omitted this typed knob because per-game weighting was
     # locked off. Bind the then-current train_bc default explicitly in every
     # derived recipe so enabling the existing CAT-60 path can never silently
@@ -2399,7 +2424,9 @@ def bind_learner_ablation(
             int
             if key == "policy_aux_active_batch_size"
             else float
-            if key == "value_trunk_grad_scale"
+            if key in {"value_trunk_grad_scale", "public_card_lr_mult"}
+            else bool
+            if key == "per_game_policy_surprise_weighting"
             else type(bound[key])
         )
         if type(value) is not expected_type:
@@ -2414,6 +2441,7 @@ def bind_learner_ablation(
         "lr": (0.0, None, False),
         "lr_warmup_steps": (0.0, None, True),
         "value_lr_mult": (0.0, None, False),
+        "public_card_lr_mult": (0.0, None, False),
         "value_trunk_grad_scale": (0.0, 1.0, True),
         "policy_loss_weight": (0.0, None, True),
         "policy_aux_active_batch_size": (0.0, None, True),
@@ -2508,6 +2536,16 @@ def bind_learner_ablation(
         drift["value_trunk_grad_scale"] = {
             "contract": 1.0,
             "effective": effective["value_trunk_grad_scale"],
+        }
+    if effective.get("public_card_lr_mult", 1.0) != 1.0:
+        drift["public_card_lr_mult"] = {
+            "contract": 1.0,
+            "effective": effective["public_card_lr_mult"],
+        }
+    if effective.get("per_game_policy_surprise_weighting", False):
+        drift["per_game_policy_surprise_weighting"] = {
+            "contract": False,
+            "effective": True,
         }
     if effective.get("forced_row_value_action_type_weights", ""):
         drift["forced_row_value_action_type_weights"] = {
@@ -4078,6 +4116,22 @@ def _build_direct_train_command(
         # authority; train_bc reports requested and effective architecture.
         command.append("--aux-subgoal-heads")
         command.append("--aux-settlement-pointer-head")
+    upgrade_module = verified.get("function_preserving_upgrade", {}).get("module")
+    if upgrade_module in {
+        architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+        architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
+    }:
+        # Make the reviewed architecture delta visible in argv as well as the
+        # initializer receipt. train_bc independently verifies that this flag
+        # agrees with the checkpoint-owned architecture.
+        command.append("--public-card-count-features")
+    if upgrade_module in {
+        architecture_upgrade.MODULE_MEANINGFUL_PUBLIC_HISTORY,
+        architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
+    }:
+        command.extend(
+            ["--meaningful-public-history", "--event-history-limit", "32"]
+        )
     command.extend(
         [
             "--data",
@@ -4121,6 +4175,8 @@ def _build_direct_train_command(
             str(recipe["value_lr_mult"]),
             "--action-module-lr-mult",
             str(recipe["action_module_lr_mult"]),
+            "--public-card-lr-mult",
+            str(recipe.get("public_card_lr_mult", 1.0)),
             "--trunk-lr-mult",
             str(recipe.get("trunk_lr_mult", 1.0)),
             "--policy-loss-weight",
@@ -4202,6 +4258,8 @@ def _build_direct_train_command(
             "--trust-curated-data-quality",
         ]
     )
+    if bool(recipe.get("per_game_policy_surprise_weighting", False)):
+        command.append("--per-game-policy-surprise-weighting")
     if recipe.get("forced_row_value_action_type_weights"):
         command.extend(
             [
@@ -6872,6 +6930,9 @@ def _verify_matched_aux_torch_artifacts(
             value_lr_mult=float(recipe["value_lr_mult"]),
             action_module_lr_mult=float(
                 recipe.get("action_module_lr_mult", 1.0)
+            ),
+            public_card_lr_mult=float(
+                recipe.get("public_card_lr_mult", 1.0)
             ),
             trunk_lr_mult=float(recipe.get("trunk_lr_mult", 1.0)),
             architecture="entity_graph",

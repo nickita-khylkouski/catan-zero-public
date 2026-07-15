@@ -47,6 +47,7 @@ def test_future_plan_default_uses_validated_16_worker_packing() -> None:
         ]
     )
     assert args.workers_per_gpu == fleet.DEFAULT_WORKERS_PER_GPU
+    assert args.operator_mode == fleet.COHERENT_PUBLIC_OPERATOR
 
 
 def test_remote_transport_retries_transient_failure_but_local_commands_do_not(
@@ -719,6 +720,82 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
     assert "forced_root_trajectory_only" in all_shell
     assert "/home/ubuntu/catan-zero-v1/tools/fleet/launch_detached.sh" in all_shell
     assert "\ntools/fleet/launch_detached.sh " not in all_shell
+
+
+def test_explicit_coherent_public_plan_matches_next_wave_operator_exactly(
+    tmp_path: Path,
+) -> None:
+    manifest, legacy = _plan(tmp_path)
+    coherent = fleet.build_plan(
+        manifest,
+        candidate=Path(legacy["candidate"]["source"]),
+        champion=Path(legacy["champion"]["source"]),
+        **_binding_kwargs(legacy),
+        internal_pairs=600,
+        external_pairs=500,
+        internal_base_seed=6_190_010_000,
+        external_base_seed=6_191_010_000,
+        workers_per_gpu=8,
+        iteration_id="coherent-public-current",
+        operator_mode=fleet.COHERENT_PUBLIC_OPERATOR,
+        candidate_c_scale=0.1,
+        champion_c_scale=0.1,
+        candidate_sigma_eval=0.79,
+        champion_sigma_eval=0.79,
+        comparison_mode="historical_comparison",
+        historical_comparison_reason="coherent-operator contract test",
+        repo_commit="a" * 40,
+        tool_hashes=legacy["tool_hashes"],
+    )
+
+    assert coherent["operator_mode"] == fleet.COHERENT_PUBLIC_OPERATOR
+    assert coherent["science_config"] == fleet.COHERENT_PUBLIC_SCIENCE_CONFIG
+    assert coherent["run_id"] != legacy["run_id"]
+    for job in coherent["jobs"]:
+        argv = job["argv"]
+        expected_values = {
+            "--n-full": "128",
+            "--n-full-wide": "256",
+            "--n-full-wide-threshold": "20",
+            "--determinization-particles": "1",
+            "--forced-root-target-mode": "trajectory_only",
+            "--symmetry-averaged-eval-threshold": "20",
+        }
+        for flag, expected in expected_values.items():
+            assert argv.count(flag) == 1
+            assert argv[argv.index(flag) + 1] == expected
+        for flag in (
+            "--public-observation",
+            "--no-information-set-search",
+            "--coherent-public-belief-search",
+            "--no-belief-chance-spectra",
+            "--wide-roots-always-full",
+            "--symmetry-averaged-eval",
+            "--evaluator-rust-featurize",
+            "--native-mcts-hot-loop",
+        ):
+            assert argv.count(flag) == 1
+        assert "--information-set-search" not in argv
+        if job["phase"] == "internal":
+            assert argv[argv.index("--candidate-sigma-eval") + 1] == "0.79"
+            assert argv[argv.index("--baseline-sigma-eval") + 1] == "0.79"
+        else:
+            assert argv[argv.index("--sigma-eval") + 1] == "0.79"
+    fleet._validate_planned_jobs(coherent, manifest)  # noqa: SLF001
+
+
+def test_programmatic_legacy_mode_remains_exact_pimc_compatibility(
+    tmp_path: Path,
+) -> None:
+    _manifest, plan = _plan(tmp_path)
+    assert plan["operator_mode"] == fleet.LEGACY_PIMC_OPERATOR
+    assert plan["science_config"] == fleet.LEGACY_PIMC_SCIENCE_CONFIG
+    for job in plan["jobs"]:
+        argv = job["argv"]
+        assert argv.count("--information-set-search") == 1
+        assert argv[argv.index("--determinization-particles") + 1] == "4"
+        assert "--coherent-public-belief-search" not in argv
+        assert "--forced-root-target-mode" not in argv
 
 
 def test_role_specific_search_calibration_is_sealed_into_jobs_and_identity(

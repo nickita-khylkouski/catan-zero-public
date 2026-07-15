@@ -33,6 +33,11 @@ sys.path.insert(0, str(REPO_SRC))
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
 
+from catan_zero.rl.meaningful_history import (  # noqa: E402
+    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+)
+
 
 SCHEMA = "a1-function-preserving-architecture-upgrade-v1"
 MODULE_TARGET_GATHER = "entity_graph.action_target_gather.v1"
@@ -44,6 +49,14 @@ MODULE_AUX_SUBGOAL_HEADS = "entity_graph.aux_subgoal_heads.v1"
 MODULE_AUX_SUBGOAL_POINTER_HEADS = "entity_graph.aux_subgoal_pointer_heads.v1"
 MODULE_STATIC_ACTION_RESIDUAL = "entity_graph.static_action_residual.v1"
 MODULE_ACTION_CROSS_ATTENTION_1 = "entity_graph.action_cross_attention.1.v1"
+MODULE_PUBLIC_CARD_COUNT_FEATURES = "entity_graph.public_card_count_features.v1"
+MODULE_TARGET_GATHER_PUBLIC_CARD_COUNT = (
+    "entity_graph.action_target_gather+public_card_count_features.v1"
+)
+MODULE_MEANINGFUL_PUBLIC_HISTORY = "entity_graph.meaningful_public_history.v1"
+MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY = (
+    "entity_graph.public_card_count_features+meaningful_public_history.v1"
+)
 
 # This is intentionally code, not caller-controlled configuration.  A new
 # architecture exception must be reviewed and tested before it can initialize
@@ -163,6 +176,74 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
         },
         "config_delta": {"static_action_residual": True},
     },
+    MODULE_PUBLIC_CARD_COUNT_FEATURES: {
+        "flags": {"public_card_count_features": True},
+        "new_parameter_initialization": {
+            "public_card_count_residual.bias": "zeros",
+            "public_card_count_residual.weight": "zeros",
+        },
+        "config_delta": {"public_card_count_features": True},
+    },
+    MODULE_TARGET_GATHER_PUBLIC_CARD_COUNT: {
+        "flags": {
+            "action_target_gather": True,
+            "public_card_count_features": True,
+        },
+        "new_parameter_initialization": {
+            "target_gather_proj.0.bias": "zeros",
+            "target_gather_proj.0.weight": "ones",
+            "target_gather_proj.1.bias": "zeros",
+            "target_gather_proj.1.weight": "zeros",
+            "public_card_count_residual.bias": "zeros",
+            "public_card_count_residual.weight": "zeros",
+        },
+        "config_delta": {
+            "action_target_gather": True,
+            "public_card_count_features": True,
+        },
+    },
+    MODULE_MEANINGFUL_PUBLIC_HISTORY: {
+        "flags": {
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        },
+        "new_parameter_initialization": {
+            "meaningful_history_residual_gate": "zeros",
+        },
+        "config_delta": {
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        },
+    },
+    MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY: {
+        "flags": {
+            "public_card_count_features": True,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        },
+        "new_parameter_initialization": {
+            "public_card_count_residual.bias": "zeros",
+            "public_card_count_residual.weight": "zeros",
+            "meaningful_history_residual_gate": "zeros",
+        },
+        "config_delta": {
+            "public_card_count_features": True,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        },
+    },
     MODULE_ACTION_CROSS_ATTENTION_1: {
         "flags": {"action_cross_attention_layers": 1},
         "new_parameter_initialization": {
@@ -209,7 +290,9 @@ def _digest(value: Any) -> str:
 
         if isinstance(item, np.generic):
             return item.item()
-        raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+        raise TypeError(
+            f"Object of type {type(item).__name__} is not JSON serializable"
+        )
 
     encoded = json.dumps(
         value,
@@ -259,7 +342,11 @@ def _equal(left: Any, right: Any) -> bool:
     import torch
 
     if torch.is_tensor(left) or torch.is_tensor(right):
-        return torch.is_tensor(left) and torch.is_tensor(right) and torch.equal(left, right)
+        return (
+            torch.is_tensor(left)
+            and torch.is_tensor(right)
+            and torch.equal(left, right)
+        )
     if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
         return (
             isinstance(left, np.ndarray)
@@ -303,8 +390,7 @@ def _reconstruct_seeded_parameters(
     module_path = Path(str(module.__file__)).resolve(strict=True)
     if REPO_SRC not in module_path.parents:
         raise UpgradeError(
-            "receipt replayer imported catan_zero outside its checkout: "
-            f"{module_path}"
+            f"receipt replayer imported catan_zero outside its checkout: {module_path}"
         )
 
     base = EntityGraphPolicy.load(str(source), device="cpu")
@@ -339,7 +425,10 @@ def _tensor_sha256(tensor: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return "sha256:" + hashlib.sha256(metadata + b"\0" + value.numpy().tobytes()).hexdigest()
+    return (
+        "sha256:"
+        + hashlib.sha256(metadata + b"\0" + value.numpy().tobytes()).hexdigest()
+    )
 
 
 def _tensor_equal_exact(left: Any, right: Any) -> bool:
@@ -372,11 +461,16 @@ def inspect_upgrade(
     if spec is None:
         raise UpgradeError(f"architecture module is not allowlisted: {module!r}")
     source_ref, upgraded_ref = _ref(source), _ref(upgraded)
-    before, after = _load_checkpoint(Path(source_ref["path"])), _load_checkpoint(
-        Path(upgraded_ref["path"])
+    before, after = (
+        _load_checkpoint(Path(source_ref["path"])),
+        _load_checkpoint(Path(upgraded_ref["path"])),
     )
     provenance = after.get("upgrade_provenance")
-    seed = provenance.get("initialization_seed") if isinstance(provenance, Mapping) else None
+    seed = (
+        provenance.get("initialization_seed")
+        if isinstance(provenance, Mapping)
+        else None
+    )
     if (
         not isinstance(provenance, Mapping)
         or provenance.get("schema_version") != "entity-graph-upgrade-v1"
@@ -399,7 +493,9 @@ def inspect_upgrade(
     removed = sorted(set(before_model) - set(after_model))
     expected_added = sorted(spec["new_parameter_initialization"])
     if removed or added != expected_added:
-        raise UpgradeError(f"parameter key delta is not allowlisted: added={added} removed={removed}")
+        raise UpgradeError(
+            f"parameter key delta is not allowlisted: added={added} removed={removed}"
+        )
     changed = [
         name
         for name in before_model
@@ -441,7 +537,10 @@ def inspect_upgrade(
         if not _tensor_equal_exact(tensor, expected):
             raise UpgradeError(f"new parameter is not deterministic {kind}: {name}")
 
-    before_config, after_config = _config(before.get("config")), _config(after.get("config"))
+    before_config, after_config = (
+        _config(before.get("config")),
+        _config(after.get("config")),
+    )
     expected_config = dict(before_config)
     expected_config.update(spec["config_delta"])
     # Old checkpoints omit default-valued fields while the upgrade utility may
@@ -456,15 +555,9 @@ def inspect_upgrade(
             "checkpoint config contains fields unknown to this checkout: "
             f"source={unknown_before} upgraded={unknown_after}"
         )
-    effective_before = dataclasses.asdict(
-        EntityGraphConfig(**before_config)
-    )
-    effective_expected = dataclasses.asdict(
-        EntityGraphConfig(**expected_config)
-    )
-    effective_after = dataclasses.asdict(
-        EntityGraphConfig(**after_config)
-    )
+    effective_before = dataclasses.asdict(EntityGraphConfig(**before_config))
+    effective_expected = dataclasses.asdict(EntityGraphConfig(**expected_config))
+    effective_after = dataclasses.asdict(EntityGraphConfig(**after_config))
     if effective_after != effective_expected:
         raise UpgradeError("effective checkpoint config delta is not allowlisted")
 
@@ -473,7 +566,8 @@ def inspect_upgrade(
     drift = [
         key
         for key in before
-        if key not in ignored and (key not in after or not _equal(before[key], after[key]))
+        if key not in ignored
+        and (key not in after or not _equal(before[key], after[key]))
     ]
     if unexpected_metadata or drift:
         raise UpgradeError(
@@ -523,7 +617,9 @@ def issue_receipt(
             os.fsync(handle.fileno())
         os.link(tmp, output)
     except FileExistsError as error:
-        raise UpgradeError(f"refusing to overwrite architecture upgrade receipt: {output}") from error
+        raise UpgradeError(
+            f"refusing to overwrite architecture upgrade receipt: {output}"
+        ) from error
     finally:
         tmp.unlink(missing_ok=True)
     return payload
@@ -536,7 +632,9 @@ def verify_receipt(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise UpgradeError(f"cannot decode architecture upgrade receipt: {error}") from error
+        raise UpgradeError(
+            f"cannot decode architecture upgrade receipt: {error}"
+        ) from error
     if not isinstance(value, dict) or value.get("schema_version") != SCHEMA:
         raise UpgradeError("architecture upgrade receipt schema drift")
     stated = value.get("receipt_sha256")
@@ -562,14 +660,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--upgraded", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--module", default=MODULE_TARGET_GATHER, choices=tuple(ALLOWLIST))
+    parser.add_argument(
+        "--module", default=MODULE_TARGET_GATHER, choices=tuple(ALLOWLIST)
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        payload = issue_receipt(args.source, args.upgraded, args.output, module=args.module)
+        payload = issue_receipt(
+            args.source, args.upgraded, args.output, module=args.module
+        )
     except UpgradeError as error:
         raise SystemExit(f"REFUSED: {error}") from error
     print(json.dumps(payload, indent=2, sort_keys=True))

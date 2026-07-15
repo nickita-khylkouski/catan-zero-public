@@ -31,9 +31,7 @@ import numpy as np
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 _REPO_SRC = (_TOOLS_DIR.parent / "src").resolve(strict=True)
-sys.path[:] = [
-    entry for entry in sys.path if Path(entry or ".").resolve() != _REPO_SRC
-]
+sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != _REPO_SRC]
 sys.path.insert(0, str(_REPO_SRC))
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
@@ -41,6 +39,10 @@ if str(_TOOLS_DIR) not in sys.path:
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
     EntityGraphConfig,
     EntityGraphPolicy,
+)
+from catan_zero.rl.meaningful_history import (  # noqa: E402
+    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
 
 _ENTITY_POLICY_MODULE = sys.modules[EntityGraphPolicy.__module__]
@@ -70,10 +72,14 @@ NEW_PARAM_PREFIXES = (
     "value_categorical_head.",
     "topology_residual_adapter.",
     "static_action_residual_proj.",
+    "public_card_count_residual.",
+    "meaningful_history_residual_gate",
 )
 
 
-def _build_upgraded_config(base_config, overrides: dict[str, object]) -> EntityGraphConfig:
+def _build_upgraded_config(
+    base_config, overrides: dict[str, object]
+) -> EntityGraphConfig:
     """Reconstruct an EntityGraphConfig from a possibly-STALE base config.
 
     `dataclasses.replace(base_config, **overrides)` reads EVERY current field
@@ -120,6 +126,18 @@ def _parse_flags(raw: str) -> dict[str, object]:
             overrides["belief_resource_head"] = True
         elif entry in ("static", "static_action_residual"):
             overrides["static_action_residual"] = True
+        elif entry in ("card_count", "public_card_count_features"):
+            overrides["public_card_count_features"] = True
+        elif entry in (
+            "history",
+            "meaningful_history",
+            "meaningful_public_history",
+        ):
+            overrides["meaningful_public_history"] = True
+            overrides["meaningful_public_history_schema"] = (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            )
+            overrides["event_history_limit"] = MEANINGFUL_PUBLIC_HISTORY_LIMIT
         elif entry.startswith("catbins"):
             # CAT-39: build the HL-Gauss categorical value head with N win-loss
             # bins (plus the truncation class, which the config enables by
@@ -134,7 +152,9 @@ def _parse_flags(raw: str) -> dict[str, object]:
     return overrides
 
 
-def _verify_forward_identical(base: EntityGraphPolicy, upgraded: EntityGraphPolicy, device: str) -> float:
+def _verify_forward_identical(
+    base: EntityGraphPolicy, upgraded: EntityGraphPolicy, device: str
+) -> float:
     """Max abs diff of logits/q over one real 54-wide placement root."""
     import torch
 
@@ -149,21 +169,47 @@ def _verify_forward_identical(base: EntityGraphPolicy, upgraded: EntityGraphPoli
     catanatron_rs = _require_rust_module()
     game = find_placement_roots(catanatron_rs, n_states=1, base_seed=500001)[0]
     acting_color = str(game.current_color())
-    legal_actions = tuple(int(a) for a in game.playable_action_indices(list(COLORS), None))
-    pids = rust_policy_action_ids(game, legal_actions, colors=COLORS, action_size=int(base.action_size))
-    entity = rust_game_to_entity_batch(
-        game, legal_actions, actor=acting_color, colors=COLORS,
-        action_size=int(base.action_size), policy_action_ids=pids,
+    legal_actions = tuple(
+        int(a) for a in game.playable_action_indices(list(COLORS), None)
+    )
+    pids = rust_policy_action_ids(
+        game, legal_actions, colors=COLORS, action_size=int(base.action_size)
+    )
+    base_entity = rust_game_to_entity_batch(
+        game,
+        legal_actions,
+        actor=acting_color,
+        colors=COLORS,
+        action_size=int(base.action_size),
+        policy_action_ids=pids,
+    )
+    upgraded_entity = rust_game_to_entity_batch(
+        game,
+        legal_actions,
+        actor=acting_color,
+        colors=COLORS,
+        action_size=int(base.action_size),
+        policy_action_ids=pids,
+        meaningful_public_history=bool(
+            getattr(upgraded.config, "meaningful_public_history", False)
+        ),
+        history_limit=int(getattr(upgraded.config, "event_history_limit", 64)),
     )
     context = rust_action_context_batch(
-        game, legal_actions, actor=acting_color, colors=COLORS,
-        action_size=int(base.action_size), policy_action_ids=pids,
+        game,
+        legal_actions,
+        actor=acting_color,
+        colors=COLORS,
+        action_size=int(base.action_size),
+        policy_action_ids=pids,
     )
     legal_ids = np.asarray(pids, dtype=np.int64)[None, :]
     max_diff = 0.0
     with torch.no_grad():
-        ob = base.forward_legal_np(entity, legal_ids, context, return_q=True)
-        ou = upgraded.forward_legal_np(entity, legal_ids, context, return_q=True)
+        ob = base.forward_legal_np(base_entity, legal_ids, context, return_q=True)
+        ou = upgraded.forward_legal_np(
+            upgraded_entity, legal_ids, context, return_q=True
+        )
         for key in ("logits", "value", "final_vp", "q_values"):
             max_diff = max(max_diff, float((ob[key] - ou[key]).abs().max().item()))
     return max_diff
@@ -279,17 +325,25 @@ def main() -> None:
         seed=int(args.seed),
         device=args.device,
     )
-    missing, unexpected = upgraded.model.load_state_dict(base.model.state_dict(), strict=False)
-    disallowed = [k for k in missing if not k.startswith(NEW_PARAM_PREFIXES + ("q_head.",))]
+    missing, unexpected = upgraded.model.load_state_dict(
+        base.model.state_dict(), strict=False
+    )
+    disallowed = [
+        k for k in missing if not k.startswith(NEW_PARAM_PREFIXES + ("q_head.",))
+    ]
     if disallowed or unexpected:
-        raise SystemExit(f"warm-start mismatch: missing={disallowed[:8]} unexpected={unexpected[:8]}")
+        raise SystemExit(
+            f"warm-start mismatch: missing={disallowed[:8]} unexpected={unexpected[:8]}"
+        )
     upgraded.model.eval()
 
     max_diff = None
     if not args.no_verify:
         max_diff = _verify_forward_identical(base, upgraded, args.device)
         if max_diff != 0.0:
-            raise SystemExit(f"forward not identical at init: max_diff={max_diff} (expected 0.0)")
+            raise SystemExit(
+                f"forward not identical at init: max_diff={max_diff} (expected 0.0)"
+            )
 
     upgraded.save(args.out_checkpoint)
     # CAT-80: restore top-level provenance keys the fresh-policy save() drops
@@ -304,16 +358,26 @@ def main() -> None:
         seed=int(args.seed),
         forward_max_diff=max_diff,
     )
-    print(json.dumps({
-        "in_checkpoint": args.in_checkpoint,
-        "out_checkpoint": args.out_checkpoint,
-        "flags": overrides,
-        "new_params_added": sorted(set(k for k in missing if k.startswith(NEW_PARAM_PREFIXES))),
-        "forward_max_diff": max_diff,
-        "forward_identical_at_init": (max_diff == 0.0) if max_diff is not None else "skipped",
-        "preserved_source_keys": preserved_source_keys,
-        "initialization_seed": int(args.seed),
-    }, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "in_checkpoint": args.in_checkpoint,
+                "out_checkpoint": args.out_checkpoint,
+                "flags": overrides,
+                "new_params_added": sorted(
+                    set(k for k in missing if k.startswith(NEW_PARAM_PREFIXES))
+                ),
+                "forward_max_diff": max_diff,
+                "forward_identical_at_init": (max_diff == 0.0)
+                if max_diff is not None
+                else "skipped",
+                "preserved_source_keys": preserved_source_keys,
+                "initialization_seed": int(args.seed),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

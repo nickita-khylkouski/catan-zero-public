@@ -34,10 +34,16 @@ topologically correct for BASE-layout boards, and is unaffected by this port
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import numpy as np
 
+from catan_zero.deduction_tracker import (
+    DEDUCTION_FEATURE_SIZE,
+    DEDUCTION_FEATURES_KEY,
+    public_card_count_feature_table,
+)
 from catan_zero.rl.entity_token_features import (
     EDGE_FEATURE_SIZE,
     EVENT_FEATURE_SIZE,
@@ -46,6 +52,7 @@ from catan_zero.rl.entity_token_features import (
     LEGAL_ACTION_FEATURE_SIZE,
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
+    public_card_count_features_from_entity_tokens,
 )
 
 
@@ -117,7 +124,13 @@ class RustTopology:
     into every Rust call -- built once here, never re-marshalled per leaf).
     """
 
-    __slots__ = ("hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "port_base_nodes", "rust")
+    __slots__ = (
+        "hex_vertex_ids",
+        "hex_edge_ids",
+        "edge_vertex_ids",
+        "port_base_nodes",
+        "rust",
+    )
 
     def __init__(
         self,
@@ -177,7 +190,14 @@ _FLOAT16_KEYS = (
     "event_tokens",
 )
 _INT16_KEYS = ("legal_action_target_ids", "event_target_ids")
-_BOOL_KEYS = ("hex_mask", "vertex_mask", "edge_mask", "player_mask", "legal_action_mask", "event_mask")
+_BOOL_KEYS = (
+    "hex_mask",
+    "vertex_mask",
+    "edge_mask",
+    "player_mask",
+    "legal_action_mask",
+    "event_mask",
+)
 
 _FEATURE_SIZE_BY_KEY = {
     "hex_tokens": HEX_FEATURE_SIZE,
@@ -232,6 +252,9 @@ def build_entity_features_rust(
     action_size: int,
     topology: RustTopology,
     public_observation: bool = False,
+    public_card_count_features: bool = False,
+    meaningful_public_history: bool = False,
+    history_limit: int = 64,
 ) -> dict[str, np.ndarray]:
     """Rust-backed equivalent of `build_entity_token_features`'s output dict
     (minus the `"schema"` entry) for the Rust-MCTS adapter payload shape.
@@ -256,9 +279,21 @@ def build_entity_features_rust(
         int(action_size),
         topology.rust,
         public_observation,
+        meaningful_public_history,
+        int(history_limit),
     )
 
     result = _reshape_raw(raw, mask_has_shape=False)
+    if public_card_count_features:
+        # Existing-data one-dose training reconstructs this tensor from the
+        # checkpoint's public entity-token surface. Serving must use that same
+        # transform: calling the exact JSON API here created train/serve skew
+        # on legacy clipped counts and added serialization to every MCTS leaf.
+        result[DEDUCTION_FEATURES_KEY] = (
+            public_card_count_features_from_entity_tokens(
+                result["player_tokens"], result["global_tokens"]
+            )
+        )
     result["hex_vertex_ids"] = topology.hex_vertex_ids.copy()
     result["hex_edge_ids"] = topology.hex_edge_ids.copy()
     result["edge_vertex_ids"] = topology.edge_vertex_ids.copy()
@@ -273,7 +308,10 @@ def build_entity_features_batch_rust(
     action_size: int,
     topology: RustTopology,
     public_observation: bool = False,
+    public_card_count_features: bool = False,
     parallel: bool = False,
+    meaningful_public_history: bool = False,
+    history_limit: int = 64,
 ) -> tuple[dict[str, np.ndarray], list[int]]:
     """Batched companion to `build_entity_features_rust`: one call builds
     entity features for MANY games sharing the same board/colors (a Gumbel
@@ -308,6 +346,9 @@ def build_entity_features_batch_rust(
             action_size=action_size,
             topology=topology,
             public_observation=public_observation,
+            public_card_count_features=public_card_count_features,
+            meaningful_public_history=meaningful_public_history,
+            history_limit=history_limit,
         )
         return {key: value[None, ...] for key, value in single.items()}, [
             int(single["legal_action_mask"].shape[0])
@@ -323,10 +364,18 @@ def build_entity_features_batch_rust(
         topology.rust,
         public_observation,
         parallel,
+        meaningful_public_history,
+        int(history_limit),
     )
     widths = [int(w) for w in raw["widths"]]
 
     result = _reshape_raw(raw, mask_has_shape=True)
+    if public_card_count_features:
+        result[DEDUCTION_FEATURES_KEY] = (
+            public_card_count_features_from_entity_tokens(
+                result["player_tokens"], result["global_tokens"]
+            )
+        )
     batch_size = len(rust_games)
     result["hex_vertex_ids"] = np.broadcast_to(
         topology.hex_vertex_ids, (batch_size, *topology.hex_vertex_ids.shape)
@@ -338,3 +387,69 @@ def build_entity_features_batch_rust(
         topology.edge_vertex_ids, (batch_size, *topology.edge_vertex_ids.shape)
     ).copy()
     return result, widths
+
+
+def _public_card_count_features_from_rust_game(
+    rust_game: Any,
+    *,
+    colors: tuple[str, ...],
+) -> np.ndarray:
+    """Construct exact audit features from the native public-only boundary.
+
+    The native API itself performs two-player conservation and never serializes
+    opponent resource/dev identities or deck order. Requiring that API here is
+    intentional for contract tests and offline schema audits. The live model
+    path above does not call this JSON helper: v2 serving must match the legacy
+    entity-token backfill used by its training corpus and stay off the MCTS
+    serialization hot path.
+    """
+
+    actor = str(rust_game.current_color())
+    if actor not in colors:
+        return np.zeros((4, DEDUCTION_FEATURE_SIZE), dtype=np.float32)
+    if len(colors) != 2 or not hasattr(rust_game, "public_card_deductions_json"):
+        raise RuntimeError(
+            "public card-count features require the 2p native "
+            "public_card_deductions_json capability"
+        )
+    deduction = json.loads(rust_game.public_card_deductions_json(actor))
+    if (
+        deduction.get("contract") != "public_card_deductions_2p_v1"
+        or str(deduction.get("observer", "")) != actor
+    ):
+        raise RuntimeError("native public card-deduction contract drift")
+    opponent = str(deduction.get("opponent", ""))
+    if opponent not in colors or opponent == actor:
+        raise RuntimeError("native public card-deduction opponent drift")
+
+    actor_resources = dict(deduction.get("observer_resources", {}))
+    actor_dev_cards = dict(deduction.get("observer_development_cards", {}))
+    public_plays = dict(deduction.get("publicly_played_development_cards", {}))
+    players: dict[str, dict[str, Any]] = {
+        actor: {
+            "resource_card_count": sum(map(int, actor_resources.values())),
+            "development_card_count": int(
+                deduction.get("observer_development_card_count", 0)
+            ),
+            "resources": actor_resources,
+            "development_cards": actor_dev_cards,
+            # The feature builder only sums these counters over all players.
+            # Assigning the public aggregate to one row avoids reintroducing
+            # per-player engine state while preserving the exact posterior.
+            "played_development_cards": public_plays,
+        },
+        opponent: {
+            "resource_card_count": int(
+                deduction.get("opponent_resource_card_count", 0)
+            ),
+            "development_card_count": int(
+                deduction.get("opponent_face_down_development_card_count", 0)
+            ),
+            "played_development_cards": {},
+        },
+    }
+    payload = {
+        "players": players,
+        "bank": {"resources": dict(deduction.get("resource_bank", {}))},
+    }
+    return public_card_count_feature_table(payload, actor)

@@ -15,7 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILDER = REPO_ROOT / "tools" / "build_catanatron_rs_wheel.sh"
 CHECKSUM_INVENTORY = "native/catanatron-rs/WHEEL_SHA256SUMS"
-RECEIPT_NAME = "catanatron_rs-0.1.9-build-receipt.json"
+RECEIPT_NAME = "catanatron_rs-0.1.10-build-receipt.json"
 RECEIPT_SCHEMA = "catanatron-rs-wheel-build-receipt-v2"
 
 
@@ -89,8 +89,8 @@ def test_all_cargo_resolution_is_locked() -> None:
     assert "native/gumbel_mcts_rs/Cargo.lock" in _script()
 
 
-def test_native_mcts_wheel_has_one_unique_019_package_identity() -> None:
-    expected = "0.1.9"
+def test_native_mcts_wheel_has_one_unique_0110_package_identity() -> None:
+    expected = "0.1.10"
     manifests = (
         REPO_ROOT / "native/catanatron-rs/Cargo.toml",
         REPO_ROOT / "native/catanatron-rs/python/Cargo.toml",
@@ -102,8 +102,8 @@ def test_native_mcts_wheel_has_one_unique_019_package_identity() -> None:
         assert match.group(1) == expected
 
     script = _script()
-    assert "catanatron_rs-0.1.9-cp311-cp311-manylinux_2_34_x86_64.whl" in script
-    assert "catanatron_rs-0.1.9-build-receipt.json" in script
+    assert "catanatron_rs-0.1.10-cp311-cp311-manylinux_2_34_x86_64.whl" in script
+    assert "catanatron_rs-0.1.10-build-receipt.json" in script
     assert "catanatron_rs-0.1.4-cp311" not in script
 
     gumbel_manifest = REPO_ROOT / "native/gumbel_mcts_rs/Cargo.toml"
@@ -146,7 +146,10 @@ def test_source_identity_is_bound_only_after_compilation() -> None:
     assert 'CATAN_RS_SOURCE_TREE="$SEALED_COMPILE_IDENTITY"' in staged_environment
     assert 'CATAN_RS_SOURCE_COMMIT="$SOURCE_COMMIT"' not in staged_environment
     assert 'CATAN_RS_SOURCE_TREE="$SOURCE_TREE"' not in staged_environment
-    assert 'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.9-coherent-belief-forced-root-wheel-v1"' in script
+    assert (
+        'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.10-'
+        'public-card-meaningful-history-wheel-v1"' in script
+    )
     assert 'payload["source_commit"] = sys.argv[2]' in script
     assert 'payload["source_tree"] = sys.argv[3]' in script
     assert '"source_commit": None' in script
@@ -191,7 +194,9 @@ def test_builder_smokes_the_compiled_capability_contract_before_hashing() -> Non
     digest = script.index('WHEEL_SHA256="$(sha256sum "$WHEEL_PATH"')
 
     assert smoke < digest
-    assert 'version("catanatron-rs") == "0.1.9"' in script
+    assert 'version("catanatron-rs") == "0.1.10"' in script
+    assert "public_card_deductions_json" in script
+    assert "public_card_deductions_2p_v1" in script
     assert "gumbel_search_capabilities" in script
     assert "sigma_reference_visits" in script
     assert "belief_target_evidence" in script
@@ -210,6 +215,10 @@ def test_builder_runs_semantic_tests_for_advertised_corrected_capabilities() -> 
         "entity_player_tokens_preserve_public_awards_when_hidden_hands_are_masked"
     )
     public_belief = script.index("public_belief_determinization_tests")
+    public_cards = script.index("public_card_deductions")
+    meaningful_history = script.index(
+        "meaningful_public_history_filters_plumbing_and_caps_at_32"
+    )
     temperature = script.index("native/gumbel_mcts_rs/Cargo.toml")
     coherent_belief = script.index(
         "coherent_public_belief_dev_chance_ignores_concrete_hidden_support"
@@ -220,6 +229,8 @@ def test_builder_runs_semantic_tests_for_advertised_corrected_capabilities() -> 
 
     assert public_award < build
     assert public_belief < build
+    assert public_cards < build
+    assert meaningful_history < build
     assert temperature < build
     assert coherent_belief < build
     assert forced_root < build

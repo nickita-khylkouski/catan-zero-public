@@ -22,6 +22,10 @@ from catan_zero.rl.entity_feature_adapter import (
 )
 from catan_zero.rl.entity_token_features import build_entity_token_features
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    public_events_from_native_action_records,
+)
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
 
 
@@ -29,6 +33,15 @@ from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMulti
 # definition lives in the dependency-free contract module so policy checkpoint
 # code and search cannot drift or form a circular import.
 RUST_ENTITY_ADAPTER_VERSION = CURRENT_RUST_ENTITY_ADAPTER_VERSION
+
+
+def _policy_history_options(policy: EntityGraphPolicy) -> tuple[bool, int]:
+    config = getattr(policy, "config", None)
+    enabled = bool(getattr(config, "meaningful_public_history", False))
+    limit = int(getattr(config, "event_history_limit", 64) or 0)
+    if enabled:
+        limit = min(limit, MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+    return enabled, limit
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,9 +151,7 @@ def _assert_value_readout_available(
         elif not categorical_provenance:
             provenance_errors = tuple(
                 str(error)
-                for error in getattr(
-                    policy, "_value_training_provenance_errors", ()
-                )
+                for error in getattr(policy, "_value_training_provenance_errors", ())
             )
             error_detail = (
                 f"; validation errors: {', '.join(provenance_errors)}"
@@ -252,8 +263,7 @@ def _fetch_leaf_decision_inputs(
     """
     snapshot_text = game.json_snapshot() if include_snapshot else None
     action_ids = [
-        int(action)
-        for action in game.playable_action_indices(list(colors), None)
+        int(action) for action in game.playable_action_indices(list(colors), None)
     ]
     raw_actions = json.loads(game.playable_actions_json())
     return snapshot_text, dict(zip(action_ids, raw_actions))
@@ -276,7 +286,9 @@ def _assert_public_observation_matches_checkpoint_training(
     trained_masked = bool(getattr(policy, "trained_with_masked_hidden_info", False))
     if requested:
         print(
-            json.dumps({"progress": "public_observation_enabled", "public_observation": True}),
+            json.dumps(
+                {"progress": "public_observation_enabled", "public_observation": True}
+            ),
             flush=True,
         )
     if requested != trained_masked:
@@ -398,6 +410,15 @@ class EntityGraphRustEvaluator:
             action_size=int(self.policy.action_size),
             topology=topology,
             public_observation=bool(self.config.public_observation),
+            public_card_count_features=bool(
+                getattr(
+                    getattr(self.policy, "config", None),
+                    "public_card_count_features",
+                    getattr(self.policy, "public_card_count_features", False),
+                )
+            ),
+            meaningful_public_history=_policy_history_options(self.policy)[0],
+            history_limit=_policy_history_options(self.policy)[1],
         )
         return {key: np.asarray(value)[None, ...] for key, value in entity.items()}
 
@@ -467,7 +488,9 @@ class EntityGraphRustEvaluator:
             return float(np.tanh(scaled))
         if squash == "clip":
             return scaled
-        raise ValueError(f"unknown value_squash mode: {squash!r} (expected 'tanh' or 'clip')")
+        raise ValueError(
+            f"unknown value_squash mode: {squash!r} (expected 'tanh' or 'clip')"
+        )
 
     def _value_output(self, outputs: dict[str, Any]) -> Any:
         """Return the configured value tensor, never silently falling back."""
@@ -551,8 +574,8 @@ class EntityGraphRustEvaluator:
         acting_color = str(game.current_color())
         cache_enabled = int(self.config.cache_size) > 0
         need_adapter_resolve = (
-            (not bool(self.config.rust_featurize)) or self._rust_topology is None
-        )
+            not bool(self.config.rust_featurize)
+        ) or self._rust_topology is None
         # B1 dedup: fetch once, share across the policy-id translation, the
         # cache key, and (on a miss) both featurizer calls below. A warm native
         # evaluator with caching disabled needs only the action map: avoid
@@ -602,7 +625,9 @@ class EntityGraphRustEvaluator:
         # dead weight on every non-bootstrap Rust-path leaf. Skip it once
         # topology is warm; the legacy (non-rust_featurize) path still needs
         # `resolved` every leaf, unchanged.
-        resolved: tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]] | None = None
+        resolved: (
+            tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]] | None
+        ) = None
         if need_adapter_resolve:
             assert snapshot_text is not None
             snapshot = json.loads(snapshot_text)
@@ -620,6 +645,7 @@ class EntityGraphRustEvaluator:
                 action_by_id=action_by_id,
                 public_observation=bool(self.config.public_observation),
                 perspective=acting_color,
+                meaningful_public_history=_policy_history_options(self.policy)[0],
             )
         if bool(self.config.rust_featurize):
             entity = self._entity_batch_via_rust(
@@ -638,6 +664,8 @@ class EntityGraphRustEvaluator:
                 action_size=int(self.policy.action_size),
                 policy_action_ids=policy_action_ids,
                 public_observation=bool(self.config.public_observation),
+                meaningful_public_history=_policy_history_options(self.policy)[0],
+                history_limit=_policy_history_options(self.policy)[1],
                 resolved=resolved,
             )
         legal_ids = np.asarray(policy_action_ids, dtype=np.int64)[None, :]
@@ -715,11 +743,11 @@ class EntityGraphRustEvaluator:
         # and action mapping once and share them with both translation and
         # resolution, matching evaluate().
         need_adapter_resolve = (
-            (not bool(self.config.rust_featurize)) or self._rust_topology is None
-        )
-        resolved: tuple[
-            dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]
-        ] | None = None
+            not bool(self.config.rust_featurize)
+        ) or self._rust_topology is None
+        resolved: (
+            tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]] | None
+        ) = None
         if need_adapter_resolve:
             snapshot_text, action_by_id = _fetch_leaf_decision_inputs(
                 game,
@@ -743,6 +771,7 @@ class EntityGraphRustEvaluator:
                 action_by_id=action_by_id,
                 public_observation=bool(self.config.public_observation),
                 perspective=acting_color,
+                meaningful_public_history=_policy_history_options(self.policy)[0],
             )
         else:
             policy_action_ids = rust_policy_action_ids(
@@ -781,6 +810,8 @@ class EntityGraphRustEvaluator:
                 action_size=int(self.policy.action_size),
                 policy_action_ids=policy_action_ids,
                 public_observation=bool(self.config.public_observation),
+                meaningful_public_history=_policy_history_options(self.policy)[0],
+                history_limit=_policy_history_options(self.policy)[1],
                 resolved=resolved,
             )
             context = rust_action_context_batch(
@@ -807,7 +838,12 @@ class EntityGraphRustEvaluator:
                 )
             return {
                 "logits": out["logits"].detach().float().cpu().numpy(),
-                "value": self._value_output(out).detach().float().cpu().numpy().reshape(-1),
+                "value": self._value_output(out)
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+                .reshape(-1),
             }
 
         sym = build_hex_symmetry()
@@ -873,8 +909,8 @@ class EntityGraphRustEvaluator:
             acting_color = str(game.current_color())
             cache_enabled = int(self.config.cache_size) > 0
             need_adapter_resolve = (
-                (not bool(self.config.rust_featurize)) or self._rust_topology is None
-            )
+                not bool(self.config.rust_featurize)
+            ) or self._rust_topology is None
             # B1 dedup: see evaluate() -- one fetch shared by everything below.
             snapshot_text, action_by_id = _fetch_leaf_decision_inputs(
                 game,
@@ -912,9 +948,10 @@ class EntityGraphRustEvaluator:
             # where it bootstraps the immutable BASE-map topology. Rebuilding the
             # adapter after that point performs json.loads + per-player state JSON
             # + payload construction for data neither native call reads.
-            resolved: tuple[
-                dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]
-            ] | None = None
+            resolved: (
+                tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]]
+                | None
+            ) = None
             if need_adapter_resolve:
                 assert snapshot_text is not None
                 snapshot = json.loads(snapshot_text)
@@ -929,6 +966,7 @@ class EntityGraphRustEvaluator:
                     action_by_id=action_by_id,
                     public_observation=bool(self.config.public_observation),
                     perspective=acting_color,
+                    meaningful_public_history=_policy_history_options(self.policy)[0],
                 )
             if bool(self.config.rust_featurize):
                 entity = self._entity_batch_via_rust(
@@ -947,6 +985,8 @@ class EntityGraphRustEvaluator:
                     action_size=int(self.policy.action_size),
                     policy_action_ids=policy_action_ids,
                     public_observation=bool(self.config.public_observation),
+                    meaningful_public_history=_policy_history_options(self.policy)[0],
+                    history_limit=_policy_history_options(self.policy)[1],
                     resolved=resolved,
                 )
             if bool(self.config.rust_featurize):
@@ -971,7 +1011,9 @@ class EntityGraphRustEvaluator:
             pending_batch_requests.append(
                 _BatchedEvalRequest(
                     entity=entity,
-                    legal_action_ids=np.asarray(policy_action_ids, dtype=np.int64)[None, :],
+                    legal_action_ids=np.asarray(policy_action_ids, dtype=np.int64)[
+                        None, :
+                    ],
                     legal_action_context=context,
                     legal_actions=tuple(int(action) for action in legal_actions),
                     acting_color=acting_color,
@@ -982,7 +1024,9 @@ class EntityGraphRustEvaluator:
             )
 
         if pending_batch_requests:
-            entity_batch, legal_ids, context = _merge_batched_eval_requests(pending_batch_requests)
+            entity_batch, legal_ids, context = _merge_batched_eval_requests(
+                pending_batch_requests
+            )
             import torch
 
             with torch.no_grad():
@@ -1004,10 +1048,15 @@ class EntityGraphRustEvaluator:
                 priors_arr = _softmax(logits / temperature)
                 priors = {
                     int(action): float(probability)
-                    for action, probability in zip(batch_request.legal_actions, priors_arr)
+                    for action, probability in zip(
+                        batch_request.legal_actions, priors_arr
+                    )
                 }
                 value = self._apply_value_squash(float(values[batch_row]))
-                if batch_request.acting_color != batch_request.root_color and len(batch_request.colors) == 2:
+                if (
+                    batch_request.acting_color != batch_request.root_color
+                    and len(batch_request.colors) == 2
+                ):
                     value = -value
                 value = float(np.clip(value, -1.0, 1.0))
                 uncertainty = _uncertainty_from_outputs(outputs, batch_row)
@@ -1089,13 +1138,15 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
         if not legal_actions:
             return self._eval_result({}, _terminal_or_zero(game, root_color), 0.0)
         if self.max_batch_size <= 1:
-            return super().evaluate(game, legal_actions, root_color=root_color, colors=colors)
+            return super().evaluate(
+                game, legal_actions, root_color=root_color, colors=colors
+            )
 
         acting_color = str(game.current_color())
         cache_enabled = int(self.config.cache_size) > 0
         need_adapter_resolve = (
-            (not bool(self.config.rust_featurize)) or self._rust_topology is None
-        )
+            not bool(self.config.rust_featurize)
+        ) or self._rust_topology is None
         # B1 dedup: fetch once, share across the policy-id translation, the
         # cache key, and (on a miss) both featurizer calls below.
         snapshot_text, action_by_id = _fetch_leaf_decision_inputs(
@@ -1132,9 +1183,9 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
         # is dead work. This preamble runs in every caller thread before the
         # request reaches the batching queue, so skipping it also improves the
         # cross-game EvalServer client path inherited from this evaluator.
-        resolved: tuple[
-            dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]
-        ] | None = None
+        resolved: (
+            tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]] | None
+        ) = None
         if need_adapter_resolve:
             assert snapshot_text is not None
             snapshot = json.loads(snapshot_text)
@@ -1150,6 +1201,7 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 action_by_id=action_by_id,
                 public_observation=bool(self.config.public_observation),
                 perspective=acting_color,
+                meaningful_public_history=_policy_history_options(self.policy)[0],
             )
         if bool(self.config.rust_featurize):
             entity = self._entity_batch_via_rust(
@@ -1168,6 +1220,8 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 action_size=int(self.policy.action_size),
                 policy_action_ids=policy_action_ids,
                 public_observation=bool(self.config.public_observation),
+                meaningful_public_history=_policy_history_options(self.policy)[0],
+                history_limit=_policy_history_options(self.policy)[1],
                 resolved=resolved,
             )
         if bool(self.config.rust_featurize):
@@ -1291,7 +1345,10 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                     for action, probability in zip(request.legal_actions, priors_arr)
                 }
                 value = self._apply_value_squash(float(values[index]))
-                if request.acting_color != request.root_color and len(request.colors) == 2:
+                if (
+                    request.acting_color != request.root_color
+                    and len(request.colors) == 2
+                ):
                     value = -value
                 value = float(np.clip(value, -1.0, 1.0))
                 uncertainty = _uncertainty_from_outputs(outputs, index)
@@ -1299,7 +1356,9 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                     self._cache_store(request.cache_key, priors, value, uncertainty)
                 request.result = self._eval_result(priors, value, uncertainty)
                 request.done.set()
-        except BaseException as error:  # pragma: no cover - exercised in remote runtime.
+        except (
+            BaseException
+        ) as error:  # pragma: no cover - exercised in remote runtime.
             for request in requests:
                 request.error = error
                 request.done.set()
@@ -1316,7 +1375,9 @@ class _BatchedEvalRequest:
     colors: tuple[str, ...]
     cache_key: tuple[str, str, tuple[str, ...], tuple[int, ...]] | None
     done: threading.Event = field(init=False)
-    result: tuple[dict[int, float], float] | tuple[dict[int, float], float, float] | None = None
+    result: (
+        tuple[dict[int, float], float] | tuple[dict[int, float], float, float] | None
+    ) = None
     error: BaseException | None = None
 
     def __post_init__(self) -> None:
@@ -1328,13 +1389,18 @@ def _merge_batched_eval_requests(
 ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]:
     max_legal = max(int(request.legal_action_ids.shape[1]) for request in requests)
     legal_ids = np.stack(
-        [_pad_1d_np(request.legal_action_ids[0], max_legal, fill=-1) for request in requests],
+        [
+            _pad_1d_np(request.legal_action_ids[0], max_legal, fill=-1)
+            for request in requests
+        ],
         axis=0,
     )
     context_width = int(requests[0].legal_action_context.shape[2])
     context = np.stack(
         [
-            _pad_2d_np(request.legal_action_context[0], max_legal, context_width, fill=0.0)
+            _pad_2d_np(
+                request.legal_action_context[0], max_legal, context_width, fill=0.0
+            )
             for request in requests
         ],
         axis=0,
@@ -1345,13 +1411,19 @@ def _merge_batched_eval_requests(
         if key == "legal_action_tokens":
             feature_size = int(values[0].shape[2])
             entity_batch[key] = np.stack(
-                [_pad_2d_np(value[0], max_legal, feature_size, fill=0.0) for value in values],
+                [
+                    _pad_2d_np(value[0], max_legal, feature_size, fill=0.0)
+                    for value in values
+                ],
                 axis=0,
             ).astype(values[0].dtype, copy=False)
         elif key == "legal_action_target_ids":
             feature_size = int(values[0].shape[2])
             entity_batch[key] = np.stack(
-                [_pad_2d_np(value[0], max_legal, feature_size, fill=-1) for value in values],
+                [
+                    _pad_2d_np(value[0], max_legal, feature_size, fill=-1)
+                    for value in values
+                ],
                 axis=0,
             ).astype(values[0].dtype, copy=False)
         elif key == "legal_action_mask":
@@ -1372,7 +1444,9 @@ def _pad_1d_np(value: np.ndarray, width: int, *, fill: Any) -> np.ndarray:
     return out
 
 
-def _pad_2d_np(value: np.ndarray, width: int, feature_size: int, *, fill: Any) -> np.ndarray:
+def _pad_2d_np(
+    value: np.ndarray, width: int, feature_size: int, *, fill: Any
+) -> np.ndarray:
     value = np.asarray(value)
     out = np.full((int(width), int(feature_size)), fill, dtype=value.dtype)
     rows = min(int(width), int(value.shape[0]))
@@ -1392,6 +1466,7 @@ def _resolve_entity_adapter(
     action_by_id: dict[int, Any] | None,
     public_observation: bool = False,
     perspective: str | None = None,
+    meaningful_public_history: bool = False,
 ) -> tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]]:
     """Shared preamble for `rust_game_to_entity_batch`/`rust_action_context_batch`:
     resolve the game snapshot and the rust-action-id -> raw-json mapping (accepting
@@ -1405,16 +1480,16 @@ def _resolve_entity_adapter(
     if snapshot is None:
         snapshot = json.loads(game.json_snapshot())
     states_by_color = {
-        str(color): json.loads(game.player_state_json(str(color)))
-        for color in colors
+        str(color): json.loads(game.player_state_json(str(color))) for color in colors
     }
     if action_by_id is None:
         action_ids = [
-            int(action)
-            for action in game.playable_action_indices(list(colors), None)
+            int(action) for action in game.playable_action_indices(list(colors), None)
         ]
         raw_actions = json.loads(game.playable_actions_json())
-        action_by_id = {action_id: raw for action_id, raw in zip(action_ids, raw_actions)}
+        action_by_id = {
+            action_id: raw for action_id, raw in zip(action_ids, raw_actions)
+        }
     translated = policy_action_ids or rust_policy_action_ids(
         game,
         legal_actions,
@@ -1432,6 +1507,7 @@ def _resolve_entity_adapter(
         legal_action_ids=legal_actions,
         public_observation=public_observation,
         perspective=perspective,
+        meaningful_public_history=meaningful_public_history,
     )
     adapter = _RustEntityFeatureEnv(payload, action_size=action_size)
     return payload, adapter, structured
@@ -1448,7 +1524,10 @@ def rust_game_to_entity_batch(
     snapshot: dict[str, Any] | None = None,
     action_by_id: dict[int, Any] | None = None,
     public_observation: bool = False,
-    resolved: tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]] | None = None,
+    meaningful_public_history: bool = False,
+    history_limit: int = 64,
+    resolved: tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]]
+    | None = None,
 ) -> dict[str, np.ndarray]:
     # B2 dedup: `resolved` lets a caller that already built the shared
     # (payload, adapter, structured) tuple -- e.g. because it also needs it
@@ -1471,11 +1550,18 @@ def rust_game_to_entity_batch(
             action_by_id=action_by_id,
             public_observation=public_observation,
             perspective=str(actor),
+            meaningful_public_history=meaningful_public_history,
         )
     entity = build_entity_token_features(
         adapter,
         actor=actor,
         include_event_log=True,
+        history_limit=(
+            min(int(history_limit), MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+            if meaningful_public_history
+            else int(history_limit)
+        ),
+        meaningful_public_history=meaningful_public_history,
     )
     return {
         key: np.asarray(value)[None, ...]
@@ -1496,7 +1582,8 @@ def rust_action_context_batch(
     snapshot: dict[str, Any] | None = None,
     action_by_id: dict[int, Any] | None = None,
     public_observation: bool = False,
-    resolved: tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]] | None = None,
+    resolved: tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]]
+    | None = None,
 ) -> np.ndarray:
     # f72-class leak, found by audit: this preamble used to call
     # `_resolve_entity_adapter` with neither `public_observation` nor
@@ -1559,8 +1646,7 @@ def rust_policy_action_ids(
 ) -> tuple[int, ...]:
     if action_by_id is None:
         action_ids = [
-            int(action)
-            for action in game.playable_action_indices(list(colors), None)
+            int(action) for action in game.playable_action_indices(list(colors), None)
         ]
         raw_actions = json.loads(game.playable_actions_json())
         raw_by_id = {action_id: raw for action_id, raw in zip(action_ids, raw_actions)}
@@ -1573,9 +1659,13 @@ def rust_policy_action_ids(
         key = _raw_action_key(raw)
         mapped = catalog.get(key)
         if mapped is None:
-            raise ValueError(f"could not map Rust action to policy action id: {raw!r} key={key!r}")
+            raise ValueError(
+                f"could not map Rust action to policy action id: {raw!r} key={key!r}"
+            )
         if not 0 <= int(mapped) < int(action_size):
-            raise ValueError(f"mapped action id out of range: rust={action} mapped={mapped}")
+            raise ValueError(
+                f"mapped action id out of range: rust={action} mapped={mapped}"
+            )
         translated.append(int(mapped))
     return tuple(translated)
 
@@ -1584,7 +1674,9 @@ def rust_policy_action_ids(
 def _policy_action_index_by_key(colors: tuple[str, ...]) -> dict[tuple[str, Any], int]:
     catalog = ActionCatalog(colors)
     return {
-        (str(descriptor["action_type"]), _canonical_value(descriptor["value"])): int(index)
+        (str(descriptor["action_type"]), _canonical_value(descriptor["value"])): int(
+            index
+        )
         for index in range(catalog.size)
         for descriptor in (catalog.describe(index),)
     }
@@ -1600,10 +1692,20 @@ def _raw_action_key(raw: Any) -> tuple[str, Any]:
             return action_type, (_canonical_value(coordinate), _canonical_value(victim))
         victim = parts[3] if len(parts) > 3 else None
         return action_type, (_canonical_value(value), _canonical_value(victim))
-    if action_type in {"ROLL", "END_TURN", "BUY_DEVELOPMENT_CARD", "PLAY_KNIGHT_CARD", "PLAY_ROAD_BUILDING"}:
+    if action_type in {
+        "ROLL",
+        "END_TURN",
+        "BUY_DEVELOPMENT_CARD",
+        "PLAY_KNIGHT_CARD",
+        "PLAY_ROAD_BUILDING",
+    }:
         return action_type, None
     if action_type == "BUILD_ROAD":
-        edge = tuple(sorted(int(node) for node in value)) if isinstance(value, (list, tuple)) else value
+        edge = (
+            tuple(sorted(int(node) for node in value))
+            if isinstance(value, (list, tuple))
+            else value
+        )
         return action_type, _canonical_value(edge)
     return action_type, _canonical_value(value)
 
@@ -1613,15 +1715,31 @@ def _canonical_value(value: Any) -> Any:
         return None
     if isinstance(value, str):
         upper = value.upper()
-        if upper in {"WOOD", "BRICK", "SHEEP", "WHEAT", "ORE", "BLUE", "RED", "ORANGE", "WHITE"}:
+        if upper in {
+            "WOOD",
+            "BRICK",
+            "SHEEP",
+            "WHEAT",
+            "ORE",
+            "BLUE",
+            "RED",
+            "ORANGE",
+            "WHITE",
+        }:
             return upper
         return value
     if isinstance(value, (int, float, bool)):
-        return int(value) if isinstance(value, bool) is False and float(value).is_integer() else value
+        return (
+            int(value)
+            if isinstance(value, bool) is False and float(value).is_integer()
+            else value
+        )
     if isinstance(value, (list, tuple)):
         return tuple(_canonical_value(item) for item in value)
     if isinstance(value, dict):
-        return tuple(sorted((str(key), _canonical_value(raw)) for key, raw in value.items()))
+        return tuple(
+            sorted((str(key), _canonical_value(raw)) for key, raw in value.items())
+        )
     name = getattr(value, "name", None)
     if name is not None:
         return _canonical_value(str(name))
@@ -1635,7 +1753,9 @@ class _RustEntityFeatureEnv:
         self.game = SimpleNamespace(
             state=SimpleNamespace(
                 board=SimpleNamespace(
-                    map=SimpleNamespace(node_production=payload.get("_node_production", {}))
+                    map=SimpleNamespace(
+                        node_production=payload.get("_node_production", {})
+                    )
                 )
             )
         )
@@ -1661,6 +1781,7 @@ def _entity_payload_from_rust_snapshot(
     legal_action_ids: tuple[int, ...],
     public_observation: bool = False,
     perspective: str | None = None,
+    meaningful_public_history: bool = False,
 ) -> dict[str, Any]:
     colors = tuple(str(color) for color in snapshot.get("colors", ()))
     robber = tuple(snapshot.get("robber_coordinate") or ())
@@ -1733,14 +1854,23 @@ def _entity_payload_from_rust_snapshot(
         "current_prompt": str(snapshot.get("current_prompt", "")),
         "structured_legal_actions": structured_legal_actions,
         "legal_actions": list(legal_action_ids),
-        "event_log": [],
+        "event_log": (
+            public_events_from_native_action_records(
+                snapshot.get("action_records", ()),
+                snapshot.get("action_public_legal_counts", ()),
+            )
+            if meaningful_public_history
+            else []
+        ),
         "replay_frame_count": int(snapshot.get("state_index", 0) or 0),
         "bank": {
             "resources": {
                 _resource_name(key): int(value)
                 for key, value in dict(snapshot.get("resource_bank", {})).items()
             },
-            "development_cards_remaining": int(snapshot.get("development_deck_count", 0) or 0),
+            "development_cards_remaining": int(
+                snapshot.get("development_deck_count", 0) or 0
+            ),
         },
         "trade_panel": {
             "offers_remaining": 0,
@@ -1831,7 +1961,11 @@ def _structured_action(action_id: int, raw: Any) -> dict[str, Any]:
     elif action_type == "BUILD_ROAD":
         args["edge"] = value
     elif action_type == "MOVE_ROBBER":
-        if isinstance(value, (list, tuple)) and len(value) >= 2 and isinstance(value[0], (list, tuple)):
+        if (
+            isinstance(value, (list, tuple))
+            and len(value) >= 2
+            and isinstance(value[0], (list, tuple))
+        ):
             args["tile_coordinate"] = list(value[0][:3])
             args["victim"] = value[1]
         elif isinstance(value, (list, tuple)) and len(value) >= 3:
@@ -1945,7 +2079,9 @@ def _node_production(tiles: list[dict[str, Any]]) -> dict[int, dict[str, int]]:
         for node in dict(tile.get("nodes", {})).values():
             node_id = int(node)
             out.setdefault(node_id, {})
-            out[node_id][str(resource).lower()] = out[node_id].get(str(resource).lower(), 0) + pips
+            out[node_id][str(resource).lower()] = (
+                out[node_id].get(str(resource).lower(), 0) + pips
+            )
     return out
 
 
@@ -1987,7 +2123,13 @@ def _resource_name(value: Any) -> str | None:
     if value is None:
         return None
     raw = str(value).lower()
-    return {"wood": "wood", "brick": "brick", "sheep": "sheep", "wheat": "wheat", "ore": "ore"}.get(raw)
+    return {
+        "wood": "wood",
+        "brick": "brick",
+        "sheep": "sheep",
+        "wheat": "wheat",
+        "ore": "ore",
+    }.get(raw)
 
 
 def _resource_counts(value: Any) -> dict[str, int]:
@@ -1995,15 +2137,17 @@ def _resource_counts(value: Any) -> dict[str, int]:
         return {
             str(name): int(count)
             for name, count in (
-                (_resource_name(key), raw)
-                for key, raw in value.items()
+                (_resource_name(key), raw) for key, raw in value.items()
             )
             if name is not None
         }
     if isinstance(value, (list, tuple)):
         # Rust serializes player hands in Resource enum order.
         names = ("wood", "brick", "sheep", "wheat", "ore")
-        return {name: int(value[index] or 0) for index, name in enumerate(names[: len(value)])}
+        return {
+            name: int(value[index] or 0)
+            for index, name in enumerate(names[: len(value)])
+        }
     return {}
 
 
@@ -2011,8 +2155,17 @@ def _dev_card_counts(value: Any) -> dict[str, int]:
     if isinstance(value, dict):
         return {str(key): int(raw) for key, raw in value.items()}
     if isinstance(value, (list, tuple)):
-        names = ("KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING", "VICTORY_POINT")
-        return {name: int(value[index] or 0) for index, name in enumerate(names[: len(value)])}
+        names = (
+            "KNIGHT",
+            "YEAR_OF_PLENTY",
+            "MONOPOLY",
+            "ROAD_BUILDING",
+            "VICTORY_POINT",
+        )
+        return {
+            name: int(value[index] or 0)
+            for index, name in enumerate(names[: len(value)])
+        }
     return {}
 
 

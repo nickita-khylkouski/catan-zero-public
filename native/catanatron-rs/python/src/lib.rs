@@ -4,7 +4,10 @@ use pyo3::prelude::*;
 // Use :: to disambiguate from the pymodule function name
 use ::catanatron_rs as ctrs;
 use ctrs::python_bindings::PyGame;
-use ctrs::{Color, Game, action_to_json_value, game_to_json_value, generate_playable_actions};
+use ctrs::{
+    Color, Game, action_to_json_value, game_to_json_value, generate_playable_actions,
+    public_card_deductions_to_json_value,
+};
 
 #[path = "../../../gumbel_mcts_rs/src/python_binding.rs"]
 mod gumbel_binding;
@@ -23,6 +26,17 @@ impl GameWrapper {
     fn json_snapshot(&self) -> PyResult<String> {
         serde_json::to_string(&game_to_json_value(&self.game))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("snapshot: {}", e)))
+    }
+
+    fn public_card_deductions_json(&self, observer: &str) -> PyResult<String> {
+        let observer = parse_public_color(observer)?;
+        let value = public_card_deductions_to_json_value(&self.game, observer)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        serde_json::to_string(&value).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "public card deductions: {error}"
+            ))
+        })
     }
 
     fn current_color(&self) -> PyResult<String> {
@@ -90,6 +104,18 @@ fn color_to_string(c: Color) -> String {
         Color::White => "WHITE",
     }
     .into()
+}
+
+fn parse_public_color(value: &str) -> PyResult<Color> {
+    match value.to_ascii_uppercase().as_str() {
+        "RED" => Ok(Color::Red),
+        "BLUE" => Ok(Color::Blue),
+        "ORANGE" => Ok(Color::Orange),
+        "WHITE" => Ok(Color::White),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown color: {value}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------

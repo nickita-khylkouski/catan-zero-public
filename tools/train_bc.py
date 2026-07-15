@@ -61,17 +61,23 @@ from catan_zero.rl.entity_token_policy import (
     _validate_public_award_feature_contract,
 )
 from catan_zero.rl.entity_token_features import (
+    DEDUCTION_FEATURES_KEY,
     EDGE_FEATURE_SIZE,
     EVENT_FEATURE_SIZE,
     GLOBAL_FEATURE_SIZE,
     HEX_FEATURE_SIZE,
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
+    public_card_count_features_from_entity_tokens,
 )
 from catan_zero.rl.entity_feature_adapter import (
     checkpoint_entity_feature_adapter_metadata,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
+)
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
 from catan_zero.rl import optim_state as _checkout_optim_state
 from catan_zero.rl.flywheel.composite_contract import (
@@ -191,6 +197,7 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
 _MASK_HIDDEN_INFO_PLAYER_TOKENS = False
 _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY = False
 _PUBLIC_AWARD_FEATURE_CONTRACT = PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
+_PUBLIC_CARD_COUNT_FEATURES_ENABLED = False
 
 # The only mixed-corpus transition that can produce an authoritative checkpoint.
 # Each component remains semantically homogeneous; routing is derived from the
@@ -326,6 +333,7 @@ ENTITY_FIELD_DTYPES = {
     "edge_tokens": np.float16,
     "edge_vertex_ids": np.int16,
     "player_tokens": np.float16,
+    DEDUCTION_FEATURES_KEY: np.float32,
     "global_tokens": np.float16,
     "legal_action_tokens": np.float16,
     "legal_action_target_ids": np.int16,
@@ -399,6 +407,40 @@ def build_parser() -> argparse.ArgumentParser:
             "corpus trainable on public-only inputs WITHOUT regeneration; pair with "
             "EntityGraphRustEvaluatorConfig.public_observation=True at inference."
         ),
+    )
+    parser.add_argument(
+        "--public-card-count-features",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable the public-only 11-slot card-count residual on entity player "
+            "tokens. In 2p, opponent resources are reconstructed by public "
+            "conservation whenever legacy count slots are unsaturated; face-down "
+            "development cards remain a hypergeometric posterior. Existing corpora "
+            "are backfilled from their "
+            "public entity columns, and stored deduction_features are recomputed "
+            "rather than trusted. Requires --mask-hidden-info. With an init/grow "
+            "checkpoint the omitted default inherits its saved architecture flag."
+        ),
+    )
+    parser.add_argument(
+        "--meaningful-public-history",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Bind the entity model to meaningful_public_history_2p_no_trade_v1. "
+            "This reuses the existing event encoder but consumes only the latest "
+            "32 strategic public events through a zero-gated residual, so an old "
+            "incumbent is function-preserving at activation. Omitted inherits an "
+            "init checkpoint; enabling on one requires the function-preserving "
+            "meaningful_history checkpoint upgrade."
+        ),
+    )
+    parser.add_argument(
+        "--event-history-limit",
+        type=int,
+        default=None,
+        help="Event-token limit; meaningful public history requires exactly 32.",
     )
     parser.add_argument(
         "--public-award-feature-contract",
@@ -741,6 +783,18 @@ def build_parser() -> argparse.ArgumentParser:
             "value (for example 0.3) de-risks newly initialized action-local "
             "modules during a warm-start A/B. Fails closed when the checkpoint "
             "does not contain those modules."
+        ),
+    )
+    parser.add_argument(
+        "--public-card-lr-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "LR multiplier for the opt-in public-card-count residual only. "
+            "This keeps a freshly zero-initialized public-information adapter "
+            "independent from both the mature trunk and action-local modules. "
+            "1.0 preserves the historical flat/base LR and fails closed when "
+            "a non-unit value is requested without that residual."
         ),
     )
     parser.add_argument(
@@ -1330,6 +1384,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=4.0,
         help="KL cap for --policy-surprise-weight; prevents a handful of extreme-"
         "surprise rows (e.g. wide/contested roots) from dominating the sampler.",
+    )
+    parser.add_argument(
+        "--per-game-policy-surprise-weighting",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Opt in to exact, mass-preserving policy-surprise sampling within each "
+            "game. Among policy-active roots, assigns "
+            "0.5 + 0.5*m*clip(KL(search||prior),0,2)/sum(clip(KL,0,2)); "
+            "all-zero-KL games fall back to weight 1. Forced/fast rows retain "
+            "sampling factor 1 and their existing zero policy-loss weight. This "
+            "mode composes after authenticated component sampling without changing "
+            "component or game proportions. Default OFF preserves legacy order."
+        ),
     )
     parser.add_argument(
         "--forced-row-value-weight",
@@ -2077,6 +2145,44 @@ def _checkpoint_value_categorical_bins(checkpoint_path: str) -> int:
             "expected 0 (disabled) or >=2"
         )
     return bins
+
+
+def _checkpoint_public_card_count_features(checkpoint_path: str) -> bool:
+    """Read the public card-count input contract from a policy checkpoint."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --public-card-count-features"
+        )
+    config = config_attr_view(checkpoint["config"])
+    return bool(getattr(config, "public_card_count_features", False))
+
+
+def _checkpoint_meaningful_public_history(
+    checkpoint_path: str,
+) -> tuple[bool, int]:
+    """Read the bounded event-history input contract from a checkpoint."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --meaningful-public-history"
+        )
+    config = config_attr_view(checkpoint["config"])
+    enabled = bool(getattr(config, "meaningful_public_history", False))
+    limit = int(getattr(config, "event_history_limit", 64) or 0)
+    return enabled, limit
 
 
 def _sha256_existing_file(path: str | Path) -> str:
@@ -6782,6 +6888,14 @@ def _effective_a1_learner_training_recipe(
     )
     if value_trunk_grad_scale != 1.0:
         effective["value_trunk_grad_scale"] = value_trunk_grad_scale
+    # These axes were added after the historical A1 seal. Keep the old recipe
+    # byte-for-byte unchanged at their exact legacy defaults, while making an
+    # active public-card intervention part of the effective recipe.
+    public_card_lr_mult = float(getattr(args, "public_card_lr_mult", 1.0))
+    if public_card_lr_mult != 1.0:
+        effective["public_card_lr_mult"] = public_card_lr_mult
+    if bool(getattr(args, "per_game_policy_surprise_weighting", False)):
+        effective["per_game_policy_surprise_weighting"] = True
     world_size = int(ddp["world_size"])
     effective["world_size"] = world_size
     effective["global_batch_size"] = (
@@ -7826,6 +7940,94 @@ def _resolve_effective_value_categorical_bins(args: argparse.Namespace) -> int:
     return 0 if requested is None else requested
 
 
+def _resolve_effective_public_card_count_features(
+    args: argparse.Namespace,
+) -> bool:
+    """Resolve the card-count adapter exactly like other checkpoint-owned heads."""
+
+    requested_raw = getattr(args, "public_card_count_features", None)
+    requested = None if requested_raw is None else bool(requested_raw)
+    if str(args.arch) != "entity_graph":
+        if requested:
+            raise SystemExit(
+                "--public-card-count-features is supported only for "
+                "--arch entity_graph"
+            )
+        return False
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_public_card_count_features(init_checkpoint)
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "--public-card-count-features does not match --init-checkpoint: "
+                f"checkpoint={inherited} cli={requested}. Upgrade the checkpoint "
+                "first or omit the flag to inherit its exact architecture."
+            )
+        return inherited
+    if grow_checkpoint:
+        inherited = _checkpoint_public_card_count_features(grow_checkpoint)
+        return inherited if requested is None else requested
+    return False if requested is None else requested
+
+
+def _resolve_effective_meaningful_public_history(
+    args: argparse.Namespace,
+) -> tuple[bool, int]:
+    requested_raw = getattr(args, "meaningful_public_history", None)
+    requested = None if requested_raw is None else bool(requested_raw)
+    requested_limit_raw = getattr(args, "event_history_limit", None)
+    requested_limit = (
+        None if requested_limit_raw is None else int(requested_limit_raw)
+    )
+    if str(args.arch) != "entity_graph":
+        if requested:
+            raise SystemExit(
+                "--meaningful-public-history is supported only for --arch entity_graph"
+            )
+        return False, 64
+
+    checkpoint_path = str(
+        getattr(args, "init_checkpoint", "")
+        or getattr(args, "grow_from_checkpoint", "")
+        or ""
+    )
+    inherited_enabled, inherited_limit = (
+        _checkpoint_meaningful_public_history(checkpoint_path)
+        if checkpoint_path
+        else (False, 64)
+    )
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    if init_checkpoint and requested is not None and requested != inherited_enabled:
+        raise SystemExit(
+            "--meaningful-public-history does not match --init-checkpoint: "
+            f"checkpoint={inherited_enabled} cli={requested}. Upgrade the "
+            "checkpoint with --flags meaningful_history or omit the flag."
+        )
+    if (
+        init_checkpoint
+        and requested_limit is not None
+        and requested_limit != inherited_limit
+    ):
+        raise SystemExit(
+            "--event-history-limit does not match --init-checkpoint: "
+            f"checkpoint={inherited_limit} cli={requested_limit}. Use the "
+            "function-preserving meaningful_history checkpoint upgrade."
+        )
+    enabled = inherited_enabled if requested is None else requested
+    if enabled:
+        if requested_limit not in (None, MEANINGFUL_PUBLIC_HISTORY_LIMIT):
+            raise SystemExit(
+                "--meaningful-public-history requires --event-history-limit 32"
+            )
+        return True, MEANINGFUL_PUBLIC_HISTORY_LIMIT
+    limit = inherited_limit if requested_limit is None else requested_limit
+    if not 0 <= int(limit) <= 64:
+        raise SystemExit("--event-history-limit must be in [0, 64]")
+    return False, int(limit)
+
+
 def _validate_outcome_conditioned_policy_distillation(
     args: argparse.Namespace,
     *,
@@ -8426,7 +8628,7 @@ def _bind_composite_validation_provenance(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    global _PUBLIC_AWARD_FEATURE_CONTRACT
+    global _PUBLIC_AWARD_FEATURE_CONTRACT, _PUBLIC_CARD_COUNT_FEATURES_ENABLED
     checkout_runtime_binding = _assert_checkout_runtime_binding()
     initial_checkout_runtime_binding = checkout_runtime_binding
     parser = build_parser()
@@ -8443,6 +8645,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         argv=raw_argv,
         expected_pipeline=TrainConfig.PIPELINE,
     )
+    if bool(args.per_game_policy_surprise_weighting) and float(
+        args.policy_surprise_weight
+    ) > 0.0:
+        raise SystemExit(
+            "--per-game-policy-surprise-weighting and the legacy "
+            "--policy-surprise-weight sampler are mutually exclusive"
+        )
     args.max_grad_norm = _validate_max_grad_norm(args.max_grad_norm)
     if float(args.belief_resource_loss_weight) < 0.0:
         raise SystemExit("--belief-resource-loss-weight must be >= 0")
@@ -8503,6 +8712,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.grow_from_checkpoint and args.arch != "entity_graph":
         raise SystemExit("--grow-from-checkpoint currently supports --arch entity_graph only")
     args.value_categorical_bins = _resolve_effective_value_categorical_bins(args)
+    args.public_card_count_features = (
+        _resolve_effective_public_card_count_features(args)
+    )
+    (
+        args.meaningful_public_history,
+        args.event_history_limit,
+    ) = _resolve_effective_meaningful_public_history(args)
     _preflight_init_checkpoint_architecture(args, ddp)
     a1_preflight_meta: dict[str, object] | None = None
     if args.data_format == "memmap":
@@ -8679,6 +8895,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.grow_from_checkpoint and args.arch != "entity_graph":
         raise SystemExit("--grow-from-checkpoint currently supports --arch entity_graph only")
     args.value_categorical_bins = _resolve_effective_value_categorical_bins(args)
+    args.public_card_count_features = (
+        _resolve_effective_public_card_count_features(args)
+    )
+    (
+        args.meaningful_public_history,
+        args.event_history_limit,
+    ) = _resolve_effective_meaningful_public_history(args)
     args.policy_target_reanalysis = None
     if str(args.data_format) != "memmap":
         reanalysis_manifest = Path(args.data) / "manifest.json"
@@ -8772,7 +8995,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     global _MASK_HIDDEN_INFO_PLAYER_TOKENS
     if bool(args.mask_hidden_info) and args.arch != "entity_graph":
         raise SystemExit("--mask-hidden-info requires --arch entity_graph (masks player_tokens)")
+    if bool(args.public_card_count_features) and not bool(args.mask_hidden_info):
+        raise SystemExit(
+            "--public-card-count-features requires --mask-hidden-info; the derived "
+            "features are public-only, but the base opponent player slots must also "
+            "be masked to keep the complete model input non-cheating"
+        )
     _MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(args.mask_hidden_info)
+    _PUBLIC_CARD_COUNT_FEATURES_ENABLED = bool(args.public_card_count_features)
 
     sampler_seed = _resolved_sampler_seed(args)
     rng = np.random.default_rng(sampler_seed)
@@ -8832,6 +9062,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             value_target_lambda=float(args.value_target_lambda),
             policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
             policy_surprise_weight=float(args.policy_surprise_weight),
+            per_game_policy_surprise_weighting=bool(
+                args.per_game_policy_surprise_weighting
+            ),
         ),
     )
     _rank0_print(
@@ -9073,6 +9306,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "--trunk-lr-mult is supported only for --arch entity_graph, not "
                 "--arch candidate"
             )
+        if float(args.public_card_lr_mult) != 1.0:
+            raise SystemExit(
+                "--public-card-lr-mult is supported only for --arch entity_graph"
+            )
         params = []
         for name in ("model", "actor", "action_encoder", "action_id_embedding", "action_bias"):
             module = getattr(policy, name, None)
@@ -9095,6 +9332,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                     device=args.device,
                     strict_metadata=not bool(args.allow_legacy_action_mask_upgrade),
                 )
+                policy.config = dataclasses.replace(
+                    policy.config,
+                    meaningful_public_history=bool(
+                        args.meaningful_public_history
+                    ),
+                    meaningful_public_history_schema=(
+                        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+                    ),
+                    event_history_limit=int(args.event_history_limit),
+                )
+                policy.model.config = policy.config
             else:
                 policy = XDimLitePolicy.load(
                     args.init_checkpoint,
@@ -9127,6 +9375,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                     belief_resource_head=bool(
                         getattr(args, "belief_resource_head", False)
                     ),
+                    public_card_count_features=bool(
+                        args.public_card_count_features
+                    ),
+                    meaningful_public_history=bool(
+                        args.meaningful_public_history
+                    ),
+                    meaningful_public_history_schema=(
+                        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+                    ),
+                    event_history_limit=int(args.event_history_limit),
                     state_trunk=str(args.entity_state_trunk),
                     relational_block_pattern=str(args.relational_block_pattern),
                     relational_ff_size=int(args.relational_ff_size),
@@ -9484,6 +9742,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 base_lr=float(args.lr),
                 value_lr_mult=float(args.value_lr_mult),
                 action_module_lr_mult=float(args.action_module_lr_mult),
+                public_card_lr_mult=float(args.public_card_lr_mult),
                 trunk_lr_mult=float(args.trunk_lr_mult),
                 architecture=str(args.arch),
             )
@@ -9669,18 +9928,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         value_weights = _apply_authenticated_value_training_scope(
             data, value_weights
         )
-        # Flag-off must remain exact rng.permutation, so these all-ones are only
-        # retained for reporting and are not passed to _epoch_order.
-        if float(args.policy_surprise_weight) == 0.0:
-            surprise_weights = np.ones(n, dtype=np.float32)
-        else:
-            surprise_kl, surprise_has_prior = compute_policy_surprise_kl(data)
-            surprise_weights = policy_surprise_sampling_weights(
-                surprise_kl,
-                surprise_has_prior,
-                weight_scale=args.policy_surprise_weight,
-                cap=args.policy_surprise_cap,
-            )
         split_result = split_train_validation_indices(
             data,
             validation_fraction=args.validation_fraction,
@@ -9708,14 +9955,50 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.allow_missing_game_seed_validation_split
             ),
         )
+        train_indices = np.asarray(split_result["train"], dtype=np.int64)
+        validation_indices = np.asarray(split_result["validation"], dtype=np.int64)
+
+        # Flag-off must remain exact rng.permutation, so these all-ones are only
+        # retained for reporting and are not passed to _epoch_order. The exact
+        # per-game mode is computed over the training split itself so even a
+        # nonstandard partial-game holdout cannot perturb its mass invariant.
+        surprise_weights = np.ones(
+            n,
+            dtype=(
+                np.float64
+                if bool(args.per_game_policy_surprise_weighting)
+                else np.float32
+            ),
+        )
+        if bool(args.per_game_policy_surprise_weighting):
+            if "game_seed" not in data:
+                raise SystemExit(
+                    "--per-game-policy-surprise-weighting requires game_seed"
+                )
+            surprise_kl, _surprise_has_prior = compute_policy_surprise_kl(
+                data, batch=train_indices
+            )
+            surprise_weights[train_indices] = (
+                per_game_capped_policy_surprise_sampling_weights(
+                    np.asarray(data["game_seed"][train_indices]),
+                    surprise_kl,
+                    np.asarray(policy_weights[train_indices]) > 0.0,
+                )
+            )
+        elif float(args.policy_surprise_weight) > 0.0:
+            surprise_kl, surprise_has_prior = compute_policy_surprise_kl(data)
+            surprise_weights = policy_surprise_sampling_weights(
+                surprise_kl,
+                surprise_has_prior,
+                weight_scale=args.policy_surprise_weight,
+                cap=args.policy_surprise_cap,
+            )
         result = {
             "policy_sample_weights": policy_weights,
             "value_sample_weights": value_weights,
             "policy_surprise_weights_full": surprise_weights,
-            "train_indices": np.asarray(split_result["train"], dtype=np.int64),
-            "validation_indices": np.asarray(
-                split_result["validation"], dtype=np.int64
-            ),
+            "train_indices": train_indices,
+            "validation_indices": validation_indices,
         }
         if "game_seed" in data:
             result["held_out_game_seeds"] = np.sort(
@@ -9758,6 +10041,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
             "policy_surprise_weight": float(args.policy_surprise_weight),
             "policy_surprise_cap": float(args.policy_surprise_cap),
+            "per_game_policy_surprise_weighting": bool(
+                args.per_game_policy_surprise_weighting
+            ),
             "validation_fraction": float(args.validation_fraction),
             "validation_seed": int(args.validation_seed),
             "validation_max_samples": int(args.validation_max_samples),
@@ -9994,20 +10280,33 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "game_seeds": [int(seed) for seed in held_out_game_seeds],
                 },
             )
+    exact_per_game_surprise = bool(args.per_game_policy_surprise_weighting)
+    legacy_policy_surprise = float(args.policy_surprise_weight) > 0.0
     epoch_sample_weights = (
         policy_surprise_weights_full[train_indices]
-        if float(args.policy_surprise_weight) > 0.0
+        if exact_per_game_surprise or legacy_policy_surprise
         else None
     )
     component_game_sampling = derived.get("component_game_sampling")
     if component_game_sampling is not None:
-        if epoch_sample_weights is not None:
+        if legacy_policy_surprise:
             raise SystemExit(
                 "authenticated component game sampling cannot be combined with "
-                "--policy-surprise-weight yet; their joint probability semantics "
-                "must be explicitly specified"
+                "the legacy --policy-surprise-weight sampler; use the exact "
+                "--per-game-policy-surprise-weighting mode whose per-game mass "
+                "preservation defines the joint measure"
             )
-        epoch_sample_weights = component_game_sampling
+        if exact_per_game_surprise:
+            epoch_sample_weights = (
+                _compose_per_game_policy_surprise_sampling_weights(
+                    data,
+                    train_indices,
+                    policy_surprise_weights_full[train_indices],
+                    component_game_sampling,
+                )
+            )
+        else:
+            epoch_sample_weights = component_game_sampling
     policy_aux_sampling_weights = None
     policy_aux_phase_sampling_weights = getattr(
         data, "policy_aux_phase_sampling_weights", None
@@ -10044,6 +10343,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy_surprise_weight_report = sample_weight_quality(
             data, policy_surprise_weights_full
         )
+        if exact_per_game_surprise:
+            policy_surprise_sampling_report = (
+                per_game_policy_surprise_sampling_report(
+                    np.asarray(data["game_seed"][train_indices]),
+                    np.asarray(policy_surprise_weights_full[train_indices]),
+                    np.asarray(policy_sample_weights[train_indices]) > 0.0,
+                    enabled=True,
+                    authenticated_component_sampling=(
+                        component_game_sampling is not None
+                    ),
+                )
+            )
+        elif legacy_policy_surprise:
+            policy_surprise_sampling_report = {
+                "schema_version": "train-policy-surprise-sampling-v2",
+                "mode": "legacy_global",
+                "enabled": True,
+                "formula": "1+weight_scale*min(KL(search||prior),cap)",
+                "weight_scale": float(args.policy_surprise_weight),
+                "kl_cap": float(args.policy_surprise_cap),
+                "authenticated_component_proportions_preserved": False,
+            }
+        else:
+            policy_surprise_sampling_report = {
+                "schema_version": "train-policy-surprise-sampling-v2",
+                "mode": "off",
+                "enabled": False,
+            }
         value_sample_weight_report["by_game"] = per_game_weight_quality(
             data, value_sample_weights
         )
@@ -10062,6 +10389,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy_sample_weight_report = {}
         value_sample_weight_report = {}
         policy_surprise_weight_report = {}
+        policy_surprise_sampling_report = {}
     _rank0_print(
         json.dumps(
             {
@@ -10077,6 +10405,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_surprise_weight": float(args.policy_surprise_weight),
                 "policy_surprise_cap": float(args.policy_surprise_cap),
                 "policy_surprise_weight_quality": policy_surprise_weight_report,
+                "policy_surprise_sampling": policy_surprise_sampling_report,
             },
             sort_keys=True,
         ),
@@ -11769,7 +12098,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_sample_weight_quality": value_sample_weight_report,
         "policy_surprise_weight": float(args.policy_surprise_weight),
         "policy_surprise_cap": float(args.policy_surprise_cap),
+        "per_game_policy_surprise_weighting": bool(
+            args.per_game_policy_surprise_weighting
+        ),
         "policy_surprise_weight_quality": policy_surprise_weight_report,
+        "policy_surprise_sampling": policy_surprise_sampling_report,
         "first_batch_profile": first_batch_profile,
         # Backward-compatible headline: ``parameter_count`` remains the TOTAL
         # serialized/checkpoint-compatible architecture size. Never interpret
@@ -11843,6 +12176,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         # ``lr=3e-5`` even when the actual value readout trained at 0.3x.
         "value_lr_mult": args.value_lr_mult,
         "action_module_lr_mult": args.action_module_lr_mult,
+        "public_card_lr_mult": args.public_card_lr_mult,
         "trunk_lr_mult": args.trunk_lr_mult,
         "value_trunk_grad_scale": args.value_trunk_grad_scale,
         "value_gradient_routing": args.value_gradient_routing,
@@ -12352,6 +12686,17 @@ def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
         result["event_mask"] = full_mask[:, :0]
     else:
         result = {key: data[key][batch] for key in ENTITY_BATCH_KEYS}
+    if _PUBLIC_CARD_COUNT_FEATURES_ENABLED:
+        # Recompute from the strict public allowlist even when a shard stores
+        # deduction_features. This simultaneously backfills historical n128/
+        # n256 corpora and prevents a malformed column from smuggling opponent
+        # hidden identities into the model. The helper never reads opponent
+        # private player-token slots.
+        result[DEDUCTION_FEATURES_KEY] = (
+            public_card_count_features_from_entity_tokens(
+                result["player_tokens"], result["global_tokens"]
+            )
+        )
     if _MASK_HIDDEN_INFO_PLAYER_TOKENS:
         # Load-time public-observation masking: zero non-actor hidden slots so a
         # model trained here matches the public-observation evaluator (task #72).
@@ -16167,6 +16512,7 @@ def _validate_target_information_admission(
     value_target_lambda: float,
     policy_kl_anchor_weight: float,
     policy_surprise_weight: float,
+    per_game_policy_surprise_weighting: bool = False,
 ) -> dict[str, object]:
     """Fail closed before public-information training consumes search targets.
 
@@ -16229,6 +16575,10 @@ def _validate_target_information_admission(
         "target_policy" in data or "prior_policy" in data
     ):
         objectives.append("policy_surprise_sampling")
+    if bool(per_game_policy_surprise_weighting) and (
+        "target_policy" in data or "prior_policy" in data
+    ):
+        objectives.append("per_game_capped_policy_surprise_sampling")
 
     report: dict[str, object] = {
         "mask_hidden_info": bool(mask_hidden_info),
@@ -18516,6 +18866,121 @@ def policy_surprise_sampling_weights(
     if weight_scale > 0.0:
         weights[has_prior] = 1.0 + weight_scale * np.minimum(kl_target_prior[has_prior], cap)
     return weights.astype(np.float32, copy=False)
+
+
+_PER_GAME_POLICY_SURPRISE_CAP = 2.0
+
+
+def per_game_capped_policy_surprise_sampling_weights(
+    game_seeds: np.ndarray,
+    kl_target_prior: np.ndarray,
+    policy_active: np.ndarray,
+) -> np.ndarray:
+    """Return exact mass-preserving surprise factors within each game.
+
+    For the ``m`` policy-active roots in one game, the enabled formula is::
+
+        0.5 + 0.5 * m * clip(KL(search || prior), 0, 2) / sum(clip(KL), 0, 2)
+
+    When every active KL in a game is zero, every factor in that game is 1.
+    Policy-inactive rows also remain exactly 1: their sample frequency is not
+    starved, while their existing zero policy-loss weight remains authoritative.
+    Consequently the factors sum to the original row count in every game, which
+    lets callers multiply them into a component->game->row base measure without
+    changing either the game or component sampling proportions.
+    """
+
+    seeds = np.asarray(game_seeds)
+    surprise = np.asarray(kl_target_prior, dtype=np.float64)
+    active = np.asarray(policy_active, dtype=np.bool_)
+    if seeds.ndim != 1 or surprise.ndim != 1 or active.ndim != 1:
+        raise ValueError("per-game policy-surprise inputs must be one-dimensional")
+    if seeds.shape != surprise.shape or seeds.shape != active.shape:
+        raise ValueError("per-game policy-surprise input shape drift")
+    if not np.isfinite(surprise).all():
+        raise ValueError("per-game policy-surprise KL contains non-finite values")
+
+    factors = np.ones(seeds.shape[0], dtype=np.float64)
+    active_positions = np.flatnonzero(active)
+    if active_positions.size == 0:
+        return factors
+
+    _games, inverse = np.unique(seeds[active_positions], return_inverse=True)
+    active_counts = np.bincount(inverse).astype(np.float64, copy=False)
+    clipped = np.clip(
+        surprise[active_positions], 0.0, _PER_GAME_POLICY_SURPRISE_CAP
+    )
+    surprise_sums = np.bincount(inverse, weights=clipped)
+    denominators = surprise_sums[inverse]
+    positive = denominators > 0.0
+    active_factors = np.ones(active_positions.size, dtype=np.float64)
+    active_factors[positive] = 0.5 + (
+        0.5
+        * active_counts[inverse[positive]]
+        * clipped[positive]
+        / denominators[positive]
+    )
+    factors[active_positions] = active_factors
+
+    realized_active_mass = np.bincount(inverse, weights=active_factors)
+    if not np.allclose(
+        realized_active_mass, active_counts, rtol=0.0, atol=1.0e-10
+    ):
+        raise RuntimeError("per-game policy-surprise active mass drift")
+    return factors
+
+
+def per_game_policy_surprise_sampling_report(
+    game_seeds: np.ndarray,
+    sampling_factors: np.ndarray,
+    policy_active: np.ndarray,
+    *,
+    enabled: bool,
+    authenticated_component_sampling: bool,
+) -> dict[str, object]:
+    """Build the stable report schema for the exact within-game sampler."""
+
+    seeds = np.asarray(game_seeds)
+    factors = np.asarray(sampling_factors, dtype=np.float64)
+    active = np.asarray(policy_active, dtype=np.bool_)
+    if seeds.shape != factors.shape or seeds.shape != active.shape:
+        raise ValueError("per-game policy-surprise report shape drift")
+    active_positions = np.flatnonzero(active)
+    max_active_mass_error = 0.0
+    active_games = 0
+    if active_positions.size:
+        _games, inverse = np.unique(seeds[active_positions], return_inverse=True)
+        expected = np.bincount(inverse).astype(np.float64, copy=False)
+        realized = np.bincount(inverse, weights=factors[active_positions])
+        max_active_mass_error = float(np.max(np.abs(realized - expected)))
+        active_games = int(expected.size)
+    return {
+        "schema_version": "train-policy-surprise-sampling-v2",
+        "mode": "per_game_capped" if enabled else "off",
+        "enabled": bool(enabled),
+        "formula": (
+            "0.5+0.5*m*clip(KL(search||prior),0,2)/sum(clip(KL),0,2)"
+        ),
+        "kl_cap": _PER_GAME_POLICY_SURPRISE_CAP,
+        "uniform_mass_fraction": 0.5,
+        "surprise_mass_fraction": 0.5,
+        "all_zero_kl_fallback_weight": 1.0,
+        "policy_active_rows": int(active_positions.size),
+        "policy_inactive_rows": int(active.size - active_positions.size),
+        "policy_active_games": active_games,
+        "max_per_game_active_mass_error": max_active_mass_error,
+        "policy_inactive_factor_is_one": bool(
+            np.all(factors[~active] == 1.0) if np.any(~active) else True
+        ),
+        "application_order": (
+            "authenticated_component_then_game_then_row_then_within_game_surprise"
+            if authenticated_component_sampling
+            else "legacy_row_measure_then_within_game_surprise"
+        ),
+        "authenticated_component_proportions_preserved": bool(
+            authenticated_component_sampling and enabled
+        ),
+    }
 
 
 def _policy_kl_anchor_loss(
@@ -21575,6 +22040,46 @@ def _checkpoint_config_mismatches(
                 "aux_settlement_pointer_head checkpoint=False cli=True; upgrade "
                 "the checkpoint with --flags aux_settlement_pointer"
             )
+        checkpoint_card_counts = bool(
+            getattr(config, "public_card_count_features", False)
+        )
+        requested_card_counts = bool(
+            getattr(args, "public_card_count_features", False)
+        )
+        if checkpoint_card_counts != requested_card_counts:
+            mismatches.append(
+                "public_card_count_features "
+                f"checkpoint={checkpoint_card_counts} cli={requested_card_counts}; "
+                "use a function-preserving card_count checkpoint upgrade"
+            )
+        checkpoint_history = bool(
+            getattr(config, "meaningful_public_history", False)
+        )
+        requested_history_raw = getattr(args, "meaningful_public_history", None)
+        requested_history = (
+            checkpoint_history
+            if requested_history_raw is None
+            else bool(requested_history_raw)
+        )
+        checkpoint_history_limit = int(
+            getattr(config, "event_history_limit", 64) or 0
+        )
+        requested_history_limit_raw = getattr(args, "event_history_limit", None)
+        requested_history_limit = (
+            checkpoint_history_limit
+            if requested_history_limit_raw is None
+            else int(requested_history_limit_raw)
+        )
+        if (
+            checkpoint_history != requested_history
+            or checkpoint_history_limit != requested_history_limit
+        ):
+            mismatches.append(
+                "meaningful_public_history "
+                f"checkpoint={checkpoint_history}/{checkpoint_history_limit} "
+                f"cli={requested_history}/{requested_history_limit}; upgrade "
+                "the checkpoint with --flags meaningful_history"
+            )
     return mismatches
 
 
@@ -21778,8 +22283,10 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "vertex_encoder",
         "edge_encoder",
         "player_encoder",
+        "public_card_count_residual",
         "global_encoder",
         "event_encoder",
+        "meaningful_history_residual_gate",
         "type_embedding",
         "cls_token",
         "blocks",
@@ -21864,6 +22371,9 @@ def _effective_entity_graph_architecture_report(
             ),
             "topology_residual_adapter": False,
             "static_action_residual": False,
+            "public_card_count_features": False,
+            "meaningful_public_history": False,
+            "event_history_limit": 64,
             "requested_edge_policy_head": bool(requested_edge_policy_head),
             "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
             "requested_aux_settlement_pointer_head": bool(
@@ -21891,6 +22401,15 @@ def _effective_entity_graph_architecture_report(
         ),
         "static_action_residual": bool(
             getattr(config, "static_action_residual", False)
+        ),
+        "public_card_count_features": bool(
+            getattr(config, "public_card_count_features", False)
+        ),
+        "meaningful_public_history": bool(
+            getattr(config, "meaningful_public_history", False)
+        ),
+        "event_history_limit": int(
+            getattr(config, "event_history_limit", 64) or 0
         ),
         "belief_resource_head": bool(
             getattr(config, "belief_resource_head", False)
@@ -22124,6 +22643,7 @@ def _build_optimizer_param_groups(
     base_lr: float,
     value_lr_mult: float,
     action_module_lr_mult: float = 1.0,
+    public_card_lr_mult: float = 1.0,
     trunk_lr_mult: float = 1.0,
     architecture: str | None = None,
 ):
@@ -22142,11 +22662,13 @@ def _build_optimizer_param_groups(
     multipliers = {
         "value-lr-mult": float(value_lr_mult),
         "action-module-lr-mult": float(action_module_lr_mult),
+        "public-card-lr-mult": float(public_card_lr_mult),
         "trunk-lr-mult": float(trunk_lr_mult),
     }
     if any(not math.isfinite(value) or value <= 0.0 for value in multipliers.values()):
         raise SystemExit(
-            "--value-lr-mult, --action-module-lr-mult, and --trunk-lr-mult "
+            "--value-lr-mult, --action-module-lr-mult, "
+            "--public-card-lr-mult, and --trunk-lr-mult "
             "must all be > 0; "
             "freeze modules explicitly instead of encoding a freeze as LR 0"
         )
@@ -22182,6 +22704,11 @@ def _build_optimizer_param_groups(
         if float(action_module_lr_mult) != 1.0
         else []
     )
+    public_card_params = (
+        _params_under(("public_card_count_residual",))
+        if float(public_card_lr_mult) != 1.0
+        else []
+    )
     trunk_params = (
         _params_under(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"])
         if float(trunk_lr_mult) != 1.0
@@ -22197,6 +22724,11 @@ def _build_optimizer_param_groups(
             "--action-module-lr-mult != 1.0 but the model has no trainable "
             f"parameters under any of {ACTION_LOCAL_MODULE_ATTRS}"
         )
+    if float(public_card_lr_mult) != 1.0 and not public_card_params:
+        raise SystemExit(
+            "--public-card-lr-mult != 1.0 but the model has no trainable "
+            "public_card_count_residual parameters"
+        )
     if float(trunk_lr_mult) != 1.0 and not trunk_params:
         raise SystemExit(
             "--trunk-lr-mult != 1.0 but the entity-graph model has no trainable "
@@ -22204,11 +22736,15 @@ def _build_optimizer_param_groups(
         )
     value_param_ids = {id(p) for p in value_params}
     action_param_ids = {id(p) for p in action_params}
+    public_card_param_ids = {id(p) for p in public_card_params}
     trunk_param_ids = {id(p) for p in trunk_params}
     pairwise_overlaps = {
         "value/action": value_param_ids & action_param_ids,
+        "value/public_card": value_param_ids & public_card_param_ids,
         "value/trunk": value_param_ids & trunk_param_ids,
+        "action/public_card": action_param_ids & public_card_param_ids,
         "action/trunk": action_param_ids & trunk_param_ids,
+        "public_card/trunk": public_card_param_ids & trunk_param_ids,
     }
     overlapping = {name: ids for name, ids in pairwise_overlaps.items() if ids}
     if overlapping:
@@ -22216,7 +22752,12 @@ def _build_optimizer_param_groups(
             "optimizer parameter groups overlap: "
             + ", ".join(f"{name}={len(ids)}" for name, ids in overlapping.items())
         )
-    grouped_ids = value_param_ids | action_param_ids | trunk_param_ids
+    grouped_ids = (
+        value_param_ids
+        | action_param_ids
+        | public_card_param_ids
+        | trunk_param_ids
+    )
     base_params = [p for p in trainable if id(p) not in grouped_ids]
     groups = [
         {
@@ -22244,6 +22785,16 @@ def _build_optimizer_param_groups(
                 "lr": action_lr,
                 "base_lr": action_lr,
                 "_group_name": "action_local",
+            }
+        )
+    if public_card_params:
+        public_card_lr = float(base_lr) * float(public_card_lr_mult)
+        groups.append(
+            {
+                "params": public_card_params,
+                "lr": public_card_lr,
+                "base_lr": public_card_lr,
+                "_group_name": "public_card",
             }
         )
     if trunk_params:
@@ -22998,6 +23549,54 @@ def _composite_game_sampling_weights(
     if not math.isclose(float(weights.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9):
         raise SystemExit("authenticated component game sampling mass drift")
     return weights
+
+
+def _compose_per_game_policy_surprise_sampling_weights(
+    data,
+    train_indices: np.ndarray,
+    surprise_factors: np.ndarray,
+    base_sampling_weights: np.ndarray | None,
+) -> np.ndarray:
+    """Apply within-game surprise after the established source measure.
+
+    ``surprise_factors`` is aligned to ``train_indices`` and has total factor
+    mass equal to the row count of every game.  With no authenticated composite,
+    it directly defines the weighted epoch order.  With a composite base measure,
+    multiplication redistributes rows only *inside* each game; this helper also
+    verifies that every authenticated component retains its exact bound mass.
+    """
+
+    indices = np.asarray(train_indices, dtype=np.int64)
+    factors = np.asarray(surprise_factors, dtype=np.float64)
+    if factors.shape != indices.shape:
+        raise ValueError("per-game policy-surprise factor alignment drift")
+    if not np.isfinite(factors).all() or np.any(factors <= 0.0):
+        raise ValueError("per-game policy-surprise factors must be finite and positive")
+    if base_sampling_weights is None:
+        return factors
+
+    base = np.asarray(base_sampling_weights, dtype=np.float64)
+    if base.shape != indices.shape:
+        raise ValueError("component and policy-surprise sampling alignment drift")
+    if not np.isfinite(base).all() or np.any(base <= 0.0):
+        raise ValueError("authenticated component sampling measure is invalid")
+    combined = base * factors
+
+    components = np.asarray(data.component_indices_for_rows(indices), dtype=np.int64)
+    component_count = len(getattr(data, "component_game_sampling_ratios", tuple()))
+    if component_count <= 0:
+        raise ValueError("component sampling metadata disappeared during composition")
+    before = np.bincount(components, weights=base, minlength=component_count)
+    after = np.bincount(components, weights=combined, minlength=component_count)
+    if not np.allclose(after, before, rtol=0.0, atol=1.0e-9):
+        raise RuntimeError(
+            "per-game policy-surprise changed authenticated component proportions"
+        )
+    total = float(combined.sum())
+    if not math.isfinite(total) or total <= 0.0:
+        raise ValueError("composed policy-surprise sampling measure has no mass")
+    combined *= float(base.sum()) / total
+    return combined
 
 
 def _conditioned_policy_aux_sampling_weights(

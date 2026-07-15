@@ -52,7 +52,14 @@ from typing import Any, Callable
 
 import numpy as np
 
+from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY
 from catan_zero.rl.action_mask import ActionCatalog
+from catan_zero.rl.decision_taxonomy import (
+    AUTOMATIC_TRANSITION,
+    DECISION_TAXONOMY_SCHEMA_VERSION,
+    classify_public_decision,
+    decision_requires_full_search,
+)
 from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_SEMANTIC,
     AUX_SUBGOAL_TARGET_VERSION,
@@ -176,6 +183,7 @@ ENTITY_KEYS = (
     "edge_tokens",
     "edge_vertex_ids",
     "player_tokens",
+    DEDUCTION_FEATURES_KEY,
     "global_tokens",
     "legal_action_tokens",
     "legal_action_target_ids",
@@ -205,6 +213,8 @@ EXTRA_KEYS = (
     "used_full_search",
     "simulations_used",
     "is_forced",
+    "decision_class",
+    "decision_taxonomy_schema",
     "prior_policy",
     # CAT-100: realized-trajectory auxiliary targets. These are present on
     # every production row; unavailable targets use NaN (binary/scalar) or -1
@@ -292,6 +302,15 @@ class GumbelSelfPlayConfig:
     # (and thus training data) valid. Set False to A/B against a future
     # corrected Rust wheel.
     correct_rust_chance_spectra: bool = True
+    # Next-wave input surface: filter the existing event-token stream to the
+    # strategic public taxonomy and retain at most the latest 32 events.
+    # Defaults preserve legacy shard shape/contents.
+    meaningful_public_history: bool = False
+    event_history_limit: int = 64
+    # Legacy corpora recorded one-action UI/chance prompts as value-only rows.
+    # The coherent next wave omits them entirely; keep the default only for
+    # replay/backward-compatible callers.
+    record_automatic_transitions: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -669,6 +688,9 @@ def _build_decision_row(
     snapshot: dict[str, Any] | None = None,
     action_by_id: dict[int, Any] | None = None,
     target_information_regime: str = TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+    meaningful_public_history: bool = False,
+    event_history_limit: int = 64,
+    decision_class: str = "normal_choice",
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     if target_information_regime not in TARGET_INFORMATION_REGIMES:
         raise ValueError(
@@ -718,6 +740,8 @@ def _build_decision_row(
         # not happen to pass ``--mask-hidden-info`` must never see opponents'
         # resource composition, hidden development cards, or actual VP.
         public_observation=True,
+        meaningful_public_history=meaningful_public_history,
+        history_limit=event_history_limit,
     )
     features = {key: value[0] for key, value in entity.items()}
     context = rust_action_context_batch(
@@ -814,6 +838,8 @@ def _build_decision_row(
         "value_weight_multiplier": np.float32(1.0),
         "used_full_search": bool(result.used_full_search),
         "is_forced": bool(is_forced),
+        "decision_class": str(decision_class),
+        "decision_taxonomy_schema": DECISION_TAXONOMY_SCHEMA_VERSION,
         "simulations_used": np.int32(result.simulations_used),
         # Search-root supervision is admitted only for real, non-forced FULL
         # searches. Fast PCR rows and forced-action fast paths still advance
@@ -1040,12 +1066,12 @@ def play_one_game(
     behavior: both seats use `evaluator`, every decision is recorded, and
     `_build_decision_row` omits the two provenance columns entirely.
 
-    Forced (single-legal-action) decisions ARE recorded, with zero policy
-    weight and terminal-outcome value weight. In historical ``full`` mode the
-    search also computes root-Q/afterstate evidence. In ``trajectory_only``
-    mode it selects the sole action without evaluator/search work and omits
-    that unused evidence; the eventual game outcome still supplies the value
-    target, so phase coverage is retained.
+    Single-legal-action prompts are engine transitions, not policy decisions:
+    they are applied directly without neural inference, MCTS, or a training
+    row. Public mandatory multi-choice prompts (initial placement, discard,
+    robber placement, and Road Building placements) always use the full search
+    budget. Other roots retain playout-cap randomization; wide roots are
+    upgraded by the MCTS configuration.
 
     Both seats are driven by the same `mcts`. Its RNG advances naturally across
     decisions inside this game; `run_worker_games` assigns each absolute game a
@@ -1093,6 +1119,46 @@ def play_one_game(
         if not legal_rust:
             break
 
+        if len(legal_rust) == 1 and not bool(config.record_automatic_transitions):
+            # Do not turn UI/chance plumbing into half of the learner corpus.
+            # We still route the sole transition through the deterministic
+            # chance sampler so game_seed replay semantics remain identical.
+            action_ids = [
+                int(action)
+                for action in game.playable_action_indices(list(config.colors), None)
+            ]
+            raw_actions = json.loads(game.playable_actions_json())
+            action_by_id = dict(zip(action_ids, raw_actions))
+            selected_action_id = int(legal_rust[0])
+            selected_action = action_by_id.get(selected_action_id)
+            if selected_action is None:
+                raise RuntimeError(
+                    f"automatic action {selected_action_id} is not legal"
+                )
+            automatic_class = classify_public_decision(
+                None,
+                legal_action_count=1,
+                wide_threshold=max(
+                    2,
+                    int(getattr(mcts.config, "n_full_wide_threshold", 20) or 20),
+                ),
+            )
+            if automatic_class != AUTOMATIC_TRANSITION:
+                raise RuntimeError("single-action root lost automatic classification")
+            game = _apply_selected_action(
+                game,
+                selected_action_id,
+                colors=config.colors,
+                rng=chance_rng,
+                correct_rust_chance_spectra=config.correct_rust_chance_spectra,
+                action_json=selected_action,
+            )
+            # This is deliberately not counted as a forced *decision*. The
+            # telemetry field tracks retained one-action learner rows; this
+            # transition has neither a policy decision nor a row.
+            decision_index += 1
+            continue
+
         # Capture one authoritative pre-action snapshot/action map per ply.
         # _build_decision_row and _apply_selected_action consume the same
         # objects below, avoiding the duplicate Rust JSON/FFI calls that aux
@@ -1104,6 +1170,14 @@ def play_one_game(
         ]
         raw_actions = json.loads(game.playable_actions_json())
         action_by_id = dict(zip(action_ids, raw_actions))
+        decision_class = classify_public_decision(
+            snapshot,
+            legal_action_count=len(legal_rust),
+            wide_threshold=max(
+                2,
+                int(getattr(mcts.config, "n_full_wide_threshold", 20) or 20),
+            ),
+        )
         aux_states.append(rust_aux_state_from_snapshot(snapshot))
         if aux_hex_ids is None:
             aux_hex_ids = rust_hex_id_by_coordinate(snapshot)
@@ -1133,7 +1207,14 @@ def play_one_game(
         else:
             mcts.evaluator = evaluator
 
-        result = mcts.search(game, force_full=True if eval_override else None)
+        result = mcts.search(
+            game,
+            force_full=(
+                True
+                if eval_override or decision_requires_full_search(decision_class)
+                else None
+            ),
+        )
         if len(legal_rust) > 1:
             nonforced_choice_index += 1
         simulations_used_total += int(result.simulations_used)
@@ -1171,6 +1252,9 @@ def play_one_game(
                 ),
                 snapshot=snapshot,
                 action_by_id=action_by_id,
+                meaningful_public_history=bool(config.meaningful_public_history),
+                event_history_limit=int(config.event_history_limit),
+                decision_class=decision_class,
             )
             decisions.append(DecisionRecord(row=row, features=features))
             recorded_aux_indices.append(len(aux_states) - 1)

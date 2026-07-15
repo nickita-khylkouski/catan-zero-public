@@ -163,7 +163,11 @@ class ColonistMultiAgentEnv:
         self._require_game()
         actor = self.current_player_name()
         catan_action = self._decode_action(int(action))
-        if catan_action is None or int(action) not in set(self.valid_actions()):
+        valid_actions_before = tuple(self.valid_actions())
+        public_legal_action_count_before = self._public_legal_action_count_before(
+            valid_actions_before
+        )
+        if catan_action is None or int(action) not in set(valid_actions_before):
             self.invalid_actions_count += 1
             self._record_event(
                 "invalid_action",
@@ -198,6 +202,21 @@ class ColonistMultiAgentEnv:
             payload={
                 "action_index": int(action),
                 "action": self.describe_action(int(action)),
+                # Never publish regular turn/discard widths: those depend on
+                # hidden hand/dev-card contents. Public prompt widths can
+                # safely remove sole-action plumbing from meaningful history.
+                **(
+                    {
+                        "public_legal_action_count_before": (
+                            public_legal_action_count_before
+                        ),
+                        "public_was_sole_legal_action": (
+                            public_legal_action_count_before == 1
+                        ),
+                    }
+                    if public_legal_action_count_before is not None
+                    else {}
+                ),
                 "result": _serialize_value(action_record.result),
                 "next_player": self.current_player_name()
                 if not (self.terminated() or self.truncated())
@@ -989,6 +1008,22 @@ class ColonistMultiAgentEnv:
     def _current_turn_key(self) -> tuple[int, int]:
         state = self.game.state
         return int(state.num_turns), int(state.current_turn_index)
+
+    def _public_legal_action_count_before(
+        self,
+        valid_actions: tuple[int, ...],
+    ) -> int | None:
+        """Return an exact width only when it cannot reveal hidden cards."""
+
+        state = self.game.state
+        prompt = state.current_prompt.name
+        if prompt in {
+            "BUILD_INITIAL_SETTLEMENT",
+            "BUILD_INITIAL_ROAD",
+            "MOVE_ROBBER",
+        } or (prompt == "PLAY_TURN" and bool(state.is_road_building)):
+            return len(valid_actions)
+        return None
 
     def _turn_key_for_action_record(self) -> tuple[int, int]:
         state = self.game.state

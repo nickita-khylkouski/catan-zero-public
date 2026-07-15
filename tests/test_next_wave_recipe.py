@@ -28,7 +28,7 @@ CONFIG = (
     / "configs/experiments/next_wave/coherent_public_n128_adaptive256.schema13.json"
 )
 GUARD = REPO / "configs/guards/a1_generation_coherent_public_n128_adaptive256_v1.json"
-LEARNER = REPO / "configs/experiments/next_wave/one_dose_action_gather_overrides.json"
+LEARNER = REPO / "configs/experiments/next_wave/one_dose_public_card_overrides.json"
 RUNBOOK = REPO / "configs/operations/a1-next-wave-coherent-public-v1/README.md"
 
 
@@ -40,6 +40,7 @@ def test_next_wave_typed_generation_config_is_exact_schema_13_recipe() -> None:
     cfg = GenerateConfig(**payload["fields"])
     assert cfg.canonical_payload() == payload
     assert cfg.public_observation is True
+    assert cfg.public_card_count_feature_schema == "public_card_state_v2"
     assert cfg.coherent_public_belief_search is True
     assert cfg.information_set_search is False
     assert cfg.belief_chance_spectra is False
@@ -51,6 +52,9 @@ def test_next_wave_typed_generation_config_is_exact_schema_13_recipe() -> None:
     assert cfg.symmetry_averaged_eval_threshold == 20
     assert cfg.eval_cache_size == 0
     assert cfg.shard_size == 512
+    assert cfg.meaningful_public_history is True
+    assert cfg.event_history_limit == 32
+    assert cfg.record_automatic_transitions is False
     assert cfg.temperature_clock == "nonforced_choice"
     assert (cfg.temperature_decisions, cfg.late_temperature_decisions) == (40, 100)
     assert cfg.late_temperature == 0.1
@@ -77,6 +81,7 @@ def test_next_wave_guard_pins_the_same_science_values() -> None:
         "--information-set-search": "information_set_search",
         "--late-temperature": "late_temperature",
         "--late-temperature-decisions": "late_temperature_decisions",
+        "--meaningful-public-history": "meaningful_public_history",
         "--max-decisions": "max_decisions",
         "--max-depth": "max_depth",
         "--n-fast": "n_fast",
@@ -86,7 +91,9 @@ def test_next_wave_guard_pins_the_same_science_values() -> None:
         "--native-mcts-hot-loop": "native_mcts_hot_loop",
         "--p-full": "p_full",
         "--public-observation": "public_observation",
+        "--record-automatic-transitions": "record_automatic_transitions",
         "--rust-featurize": "rust_featurize",
+        "--sigma-eval": "sigma_eval",
         "--symmetry-averaged-eval": "symmetry_averaged_eval",
         "--symmetry-averaged-eval-threshold": "symmetry_averaged_eval_threshold",
         "--temperature-clock": "temperature_clock",
@@ -96,6 +103,7 @@ def test_next_wave_guard_pins_the_same_science_values() -> None:
         "--track": "track",
         "--vps-to-win": "vps_to_win",
         "--wide-roots-always-full": "wide_roots_always_full",
+        "--event-history-limit": "event_history_limit",
     }
     for flag, field in mapping.items():
         assert expected[flag] == config[field]
@@ -147,6 +155,9 @@ def test_next_wave_learner_overrides_keep_unlisted_forced_types_at_one() -> None
         "forced_action_weight": 0.0,
         "forced_row_value_action_type_weights": "END_TURN=0.1,ROLL=0.25",
         "forced_row_value_weight": 1.0,
+        "max_steps": 128,
+        "per_game_policy_surprise_weighting": True,
+        "public_card_lr_mult": 4.0,
         "value_loss_weight": 0.25,
     }
     assert "DISCARD_RESOURCE" not in recipe["forced_row_value_action_type_weights"]
@@ -159,6 +170,15 @@ def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:
     assert "tools/gumbel_search_cross_net_h2h.py" in text
     assert "--forced-root-target-mode trajectory_only" in text
     assert "--coherent-public-belief-search" in text
+    assert "--no-record-automatic-transitions" in text
+    assert "--meaningful-public-history" in text
+    assert "--event-history-limit 32" in text
+    assert "--flags card_count" in text
+    assert (
+        "entity_graph.public_card_count_features+meaningful_public_history.v1"
+        in text
+    )
+    assert "action-target gather experiment was neutral" in text
 
 
 def _contract_fields(*, coherent: bool) -> tuple[dict, dict, dict]:

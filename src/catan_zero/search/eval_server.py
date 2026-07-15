@@ -948,6 +948,9 @@ def _server_main(
     handshake["trained_with_masked_hidden_info"] = bool(
         getattr(policy, "trained_with_masked_hidden_info", False)
     )
+    handshake["public_card_count_features"] = bool(
+        getattr(getattr(policy, "config", None), "public_card_count_features", False)
+    )
     handshake["needs_action_targets"] = _policy_needs_action_targets(policy)
     handshake["needs_relational_topology"] = _policy_needs_relational_topology(policy)
     handshake["matmul_precision"] = precision
@@ -1426,6 +1429,9 @@ class EvalServer:
             "trained_with_masked_hidden_info": bool(
                 self._handshake["trained_with_masked_hidden_info"]
             ),
+            "public_card_count_features": bool(
+                self._handshake.get("public_card_count_features", False)
+            ),
             "needs_action_targets": bool(
                 self._handshake.get("needs_action_targets", True)
             ),
@@ -1524,12 +1530,19 @@ class _RemoteForwardProxy:
         trained_masked: bool,
         *,
         entity_feature_adapter: str,
+        public_card_count_features: bool = False,
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
     ) -> None:
         self._client = client
         self.action_size = int(action_size)
         self.trained_with_masked_hidden_info = bool(trained_masked)
+        # The proxy owns client-side featurization metadata.  In particular,
+        # native featurization must emit the optional deduction tensor before
+        # the request crosses IPC; the server cannot reconstruct it from the
+        # already-featurized payload.  Keep this as a direct attribute so the
+        # base evaluator does not need a fake full checkpoint config object.
+        self.public_card_count_features = bool(public_card_count_features)
         self.entity_feature_adapter_version = (
             _require_implemented_entity_feature_adapter(
                 entity_feature_adapter,
@@ -1583,6 +1596,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         action_size: int,
         trained_with_masked_hidden_info: bool,
         entity_feature_adapter: str,
+        public_card_count_features: bool = False,
         needs_action_targets: bool = True,
         needs_relational_topology: bool = False,
         event_token_limit: int | None = None,
@@ -1598,6 +1612,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             action_size,
             trained_with_masked_hidden_info,
             entity_feature_adapter=entity_feature_adapter,
+            public_card_count_features=public_card_count_features,
             value_categorical_bins=value_categorical_bins,
             value_categorical_head_available=value_categorical_head_available,
         )

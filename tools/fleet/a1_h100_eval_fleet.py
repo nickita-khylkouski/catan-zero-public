@@ -102,7 +102,14 @@ NATIVE_REQUIRED_CAPABILITIES = frozenset(
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SAFE_ADDRESS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
 
-SCIENCE_CONFIG: dict[str, Any] = {
+LEGACY_PIMC_OPERATOR = "legacy_pimc"
+COHERENT_PUBLIC_OPERATOR = "coherent_public"
+OPERATOR_MODES = (LEGACY_PIMC_OPERATOR, COHERENT_PUBLIC_OPERATOR)
+
+# Keep the issued PIMC recipe byte-for-byte replayable.  New coherent-public
+# plans carry their operator mode explicitly and bind the corresponding config
+# below into both the plan hash and every lane command.
+LEGACY_PIMC_SCIENCE_CONFIG: dict[str, Any] = {
     # Deliberate two-stratum evaluation: broad randomized BASE maps for direct
     # candidate-vs-incumbent strength; fixed TOURNAMENT for the cross-engine
     # Python referee, whose map parity is certified only there.
@@ -135,6 +142,39 @@ SCIENCE_CONFIG: dict[str, Any] = {
     "external_vps_to_win": 10,
     "external_max_player_trade_offers_per_turn": 0,
 }
+
+COHERENT_PUBLIC_SCIENCE_CONFIG: dict[str, Any] = {
+    **LEGACY_PIMC_SCIENCE_CONFIG,
+    "c_scale": 0.1,
+    "sigma_eval": 0.79,
+    "information_set_search": False,
+    "coherent_public_belief_search": True,
+    "determinization_particles": 1,
+    "forced_root_target_mode": "trajectory_only",
+    "n_full_wide": 256,
+    "n_full_wide_threshold": 20,
+    "wide_roots_always_full": True,
+}
+
+# Historical fixed-panel receipt code below intentionally continues to name
+# this alias.  It verifies already-issued PIMC panels, not new fleet plans.
+SCIENCE_CONFIG = LEGACY_PIMC_SCIENCE_CONFIG
+
+
+def _science_config_for_operator(operator_mode: str) -> dict[str, Any]:
+    if operator_mode == LEGACY_PIMC_OPERATOR:
+        return LEGACY_PIMC_SCIENCE_CONFIG
+    if operator_mode == COHERENT_PUBLIC_OPERATOR:
+        return COHERENT_PUBLIC_SCIENCE_CONFIG
+    raise FleetError(f"unknown evaluation operator mode {operator_mode!r}")
+
+
+def _plan_operator_mode(plan: dict[str, Any]) -> str:
+    # Plans issued before this field existed were all the exact four-particle
+    # information-set/PIMC recipe.
+    mode = str(plan.get("operator_mode", LEGACY_PIMC_OPERATOR))
+    _science_config_for_operator(mode)
+    return mode
 
 
 class FleetError(RuntimeError):
@@ -217,6 +257,10 @@ def _run_id_from_plan_fields(plan: dict[str, Any]) -> str:
     # synthetic field while replaying their immutable run IDs.
     if "role_search_config" in plan:
         run_key["role_search_config"] = plan["role_search_config"]
+    # The absent field is the immutable legacy PIMC operator.  New plans bind
+    # the explicit mode without changing historical run IDs.
+    if "operator_mode" in plan:
+        run_key["operator_mode"] = plan["operator_mode"]
     # Optional host subsets were added after the original immutable fleet
     # plans.  Bind them into new run IDs without changing legacy replay.
     if "host_aliases" in plan:
@@ -520,6 +564,7 @@ def _split_ranges(total: int, lanes: int, base_seed: int) -> list[tuple[int, int
 
 def _science_args(
     *,
+    operator_mode: str = LEGACY_PIMC_OPERATOR,
     c_scale: float | None = 0.03,
     gameplay_policy_aggregation: str | None = None,
     rescale_noise_floor_c: float = 0.0,
@@ -529,9 +574,10 @@ def _science_args(
     n_full_wide_threshold: int | None = None,
     wide_roots_always_full: bool = False,
 ) -> list[str]:
+    science = _science_config_for_operator(operator_mode)
     args = [
         "--n-full",
-        "128",
+        str(science["n_full"]),
         "--c-visit",
         "50.0",
         "--sigma-eval",
@@ -541,15 +587,14 @@ def _science_args(
         "--lazy-interior-chance",
         "--correct-rust-chance-spectra",
         "--public-observation",
-        "--information-set-search",
         "--no-belief-chance-spectra",
         "--determinization-particles",
-        "4",
+        str(science["determinization_particles"]),
         "--determinization-min-simulations",
-        "32",
+        str(science["determinization_min_simulations"]),
         "--symmetry-averaged-eval",
         "--symmetry-averaged-eval-threshold",
-        "20",
+        str(science["symmetry_averaged_eval_threshold"]),
         "--evaluator-rust-featurize",
         "--native-mcts-hot-loop",
         "--value-readout",
@@ -569,6 +614,20 @@ def _science_args(
         "--gate-config",
         "flywheel",
     ]
+    if operator_mode == COHERENT_PUBLIC_OPERATOR:
+        args += [
+            "--no-information-set-search",
+            "--coherent-public-belief-search",
+            "--forced-root-target-mode",
+            str(science["forced_root_target_mode"]),
+            "--n-full-wide",
+            str(science["n_full_wide"]),
+            "--n-full-wide-threshold",
+            str(science["n_full_wide_threshold"]),
+            "--wide-roots-always-full",
+        ]
+    else:
+        args += ["--information-set-search"]
     if c_scale is not None:
         args[2:2] = ["--c-scale", str(float(c_scale))]
     if gameplay_policy_aggregation is not None:
@@ -790,11 +849,14 @@ def _plan_role_search_config(
 
 
 def _science_hash(plan: dict[str, Any]) -> str:
+    science_config = plan.get(
+        "science_config", _science_config_for_operator(_plan_operator_mode(plan))
+    )
     if "role_search_config" not in plan:
-        return _digest(SCIENCE_CONFIG)
+        return _digest(science_config)
     return _digest(
         {
-            "science_config": SCIENCE_CONFIG,
+            "science_config": science_config,
             # Preserve the exact historical c_scale-only identity when loading
             # an old plan; new plans bind the enriched role evaluator config.
             "role_search_config": plan["role_search_config"],
@@ -831,7 +893,9 @@ def _internal_argv(
     champion_wide_roots_always_full: bool = False,
     engine_identity: dict[str, str] | None = None,
     evaluator_sha256: str | None = None,
+    operator_mode: str = LEGACY_PIMC_OPERATOR,
 ) -> list[str]:
+    science = _science_config_for_operator(operator_mode)
     argv = [
         python,
         "tools/gumbel_search_cross_net_h2h.py",
@@ -850,8 +914,9 @@ def _internal_argv(
         "--device",
         "cuda",
         "--map-kind",
-        str(SCIENCE_CONFIG["internal_map_kind"]),
+        str(science["internal_map_kind"]),
         *_science_args(
+            operator_mode=operator_mode,
             c_scale=(
                 0.03
                 if candidate_c_scale is None and champion_c_scale is None
@@ -985,6 +1050,7 @@ def _external_argv(
     n_full_wide_threshold: int | None = None,
     wide_roots_always_full: bool = False,
     engine_identity: dict[str, str],
+    operator_mode: str = LEGACY_PIMC_OPERATOR,
 ) -> list[str]:
     return [
         python,
@@ -1016,6 +1082,7 @@ def _external_argv(
         "--device",
         "cuda",
         *_science_args(
+            operator_mode=operator_mode,
             c_scale=c_scale,
             gameplay_policy_aggregation=gameplay_policy_aggregation,
             rescale_noise_floor_c=rescale_noise_floor_c,
@@ -1173,7 +1240,9 @@ def build_plan(
     champion_wide_roots_always_full: bool = False,
     comparison_mode: str = "promotion_parent",
     historical_comparison_reason: str | None = None,
+    operator_mode: str = LEGACY_PIMC_OPERATOR,
 ) -> dict[str, Any]:
+    science_config = _science_config_for_operator(operator_mode)
     candidate = candidate.expanduser().resolve(strict=True)
     champion = champion.expanduser().resolve(strict=True)
     candidate_sha = _sha256(candidate)
@@ -1198,6 +1267,39 @@ def build_plan(
         candidate_wide_roots_always_full=candidate_wide_roots_always_full,
         champion_wide_roots_always_full=champion_wide_roots_always_full,
     )
+    if operator_mode == COHERENT_PUBLIC_OPERATOR:
+        for role in ("candidate", "champion"):
+            role_config = role_search_config[role]
+            if float(role_config["c_scale"]) != float(science_config["c_scale"]):
+                raise FleetError(
+                    "coherent-public evaluation requires c_scale=0.1 for both "
+                    f"roles; {role} requested {role_config['c_scale']}"
+                )
+            if float(role_config.get("sigma_eval", 0.98)) != float(
+                science_config["sigma_eval"]
+            ):
+                raise FleetError(
+                    "coherent-public evaluation requires sigma_eval=0.79 for both "
+                    f"roles; {role} requested {role_config.get('sigma_eval', 0.98)}"
+                )
+        if any(
+            role_search_config[role].get("gameplay_policy_aggregation")
+            == "aggregate_q_then_improve"
+            for role in ("candidate", "champion")
+        ):
+            raise FleetError(
+                "coherent-public evaluation cannot use PIMC Q aggregation"
+            )
+        if any(
+            role_search_config[role].get("n_full_wide") is not None
+            or role_search_config[role].get("n_full_wide_threshold") is not None
+            or bool(role_search_config[role].get("wide_roots_always_full", False))
+            for role in ("candidate", "champion")
+        ):
+            raise FleetError(
+                "coherent-public evaluation owns one shared exact adaptive-n256 "
+                "width-20 recipe; role-specific wide overrides are forbidden"
+            )
     if candidate_sha == champion_sha:
         if role_search_config["candidate"] == role_search_config["champion"]:
             raise FleetError(
@@ -1275,7 +1377,7 @@ def build_plan(
     )
     science_hash = _digest(
         {
-            "science_config": SCIENCE_CONFIG,
+            "science_config": science_config,
             "role_search_config": role_search_config,
         }
     )
@@ -1312,6 +1414,7 @@ def build_plan(
         "seed_cohort_id": seed_cohort_id,
         "scope": scope,
         "workers_per_gpu": workers_per_gpu,
+        "operator_mode": operator_mode,
     }
     if selected_aliases is not None:
         run_identity["host_aliases"] = selected_aliases
@@ -1379,6 +1482,7 @@ def build_plan(
             evaluator_sha256=resolved_tool_hashes[
                 "tools/gumbel_search_cross_net_h2h.py"
             ],
+            operator_mode=operator_mode,
         )
         jobs.append(
             {
@@ -1438,6 +1542,7 @@ def build_plan(
                     role_search_config[role].get("wide_roots_always_full", False)
                 ),
                 engine_identity=engine_identity,
+                operator_mode=operator_mode,
             )
             jobs.append(
                 {
@@ -1463,7 +1568,8 @@ def build_plan(
         "manifest_hash": manifest["manifest_hash"],
         "repo_commit": resolved_repo_commit,
         "tool_hashes": resolved_tool_hashes,
-        "science_config": SCIENCE_CONFIG,
+        "operator_mode": operator_mode,
+        "science_config": science_config,
         "science_config_hash": science_hash,
         "role_search_config": role_search_config,
         "evaluation_binding": evaluation_binding,
@@ -1573,7 +1679,8 @@ def load_plan(path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         raise FleetError(
             "evaluation plan was built for a different private fleet manifest"
         )
-    if plan.get("science_config") != SCIENCE_CONFIG:
+    operator_mode = _plan_operator_mode(plan)
+    if plan.get("science_config") != _science_config_for_operator(operator_mode):
         raise FleetError("evaluation plan science config drift")
     _plan_role_search_config(plan)
     _verify_plan_evaluation_binding(plan)
@@ -1658,6 +1765,7 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
     job_ids: set[str] = set()
     by_phase: dict[str, list[dict[str, Any]]] = {"internal": [], "external": []}
     role_search_config = _plan_role_search_config(plan)
+    operator_mode = _plan_operator_mode(plan)
     legacy_shared_search = "role_search_config" not in plan
     legacy_shared_squash = legacy_shared_search or "value_squash" not in plan[
         "role_search_config"
@@ -1801,6 +1909,7 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
             evaluator_sha256=plan["tool_hashes"][
                 "tools/gumbel_search_cross_net_h2h.py"
             ],
+            operator_mode=operator_mode,
         )
         if job["pairs"] != pairs or job["base_seed"] != seed or job["argv"] != expected:
             raise FleetError(f"internal shard contract drift: {job['job_id']}")
@@ -1843,6 +1952,7 @@ def _validate_planned_jobs(plan: dict[str, Any], manifest: dict[str, Any]) -> No
                     role_search_config[role].get("wide_roots_always_full", False)
                 ),
                 engine_identity=plan["engine_identity"],
+                operator_mode=operator_mode,
             )
             if (
                 job["role"] != role
@@ -3366,6 +3476,16 @@ def _parser() -> argparse.ArgumentParser:
         default="promotion_parent",
     )
     plan.add_argument("--historical-comparison-reason")
+    plan.add_argument(
+        "--operator-mode",
+        choices=OPERATOR_MODES,
+        default=COHERENT_PUBLIC_OPERATOR,
+        help=(
+            "Search operator sealed into every lane. New CLI plans default to the "
+            "current coherent-public tree; legacy_pimc exists only for replay and "
+            "explicit historical comparisons."
+        ),
+    )
     plan.add_argument("--internal-pairs", type=int, default=600)
     plan.add_argument("--external-pairs", type=int, default=500)
     plan.add_argument("--internal-base-seed", type=int, required=True)
@@ -3424,7 +3544,15 @@ def _parser() -> argparse.ArgumentParser:
         plan.add_argument(
             f"--{role}-rescale-noise-floor-c", type=float, default=0.0
         )
-        plan.add_argument(f"--{role}-sigma-eval", type=float, default=0.98)
+        plan.add_argument(
+            f"--{role}-sigma-eval",
+            type=float,
+            default=None,
+            help=(
+                "Role evaluator sigma. Defaults to 0.79 for coherent_public "
+                "and 0.98 for legacy_pimc."
+            ),
+        )
         plan.add_argument(
             f"--{role}-sigma-reference-visits", type=int, default=None
         )
@@ -3497,6 +3625,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "state_sha256": value["state_sha256"],
             }
         elif args.command == "plan":
+            operator_defaults = _science_config_for_operator(args.operator_mode)
+            candidate_sigma_eval = (
+                float(args.candidate_sigma_eval)
+                if args.candidate_sigma_eval is not None
+                else float(operator_defaults["sigma_eval"])
+            )
+            champion_sigma_eval = (
+                float(args.champion_sigma_eval)
+                if args.champion_sigma_eval is not None
+                else float(operator_defaults["sigma_eval"])
+            )
             value = build_plan(
                 manifest,
                 candidate=args.candidate,
@@ -3528,8 +3667,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 candidate_rescale_noise_floor_c=args.candidate_rescale_noise_floor_c,
                 champion_rescale_noise_floor_c=args.champion_rescale_noise_floor_c,
-                candidate_sigma_eval=args.candidate_sigma_eval,
-                champion_sigma_eval=args.champion_sigma_eval,
+                candidate_sigma_eval=candidate_sigma_eval,
+                champion_sigma_eval=champion_sigma_eval,
                 candidate_sigma_reference_visits=(
                     args.candidate_sigma_reference_visits
                 ),
@@ -3552,6 +3691,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 comparison_mode=args.comparison_mode,
                 historical_comparison_reason=args.historical_comparison_reason,
+                operator_mode=args.operator_mode,
             )
             write_new_readonly(args.out, value)
             result = {

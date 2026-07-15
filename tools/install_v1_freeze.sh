@@ -373,7 +373,7 @@ python -m pip install modal
 
 # 5. env-doctor — fail LOUD if the canonical stack is incomplete
 python - <<'PY'
-import importlib, platform, subprocess, sys
+import importlib, json, platform, subprocess, sys
 from importlib.metadata import version, PackageNotFoundError
 from tools.production_runtime_contract import load_runtime_contract
 
@@ -395,6 +395,14 @@ assert rs == expected["catanatron_rs_version"], (
 )
 import catanatron_rs
 assert hasattr(catanatron_rs.Game, "determinize_for_player"), "wheel lacks information-set determinization"
+assert hasattr(catanatron_rs.Game, "public_card_deductions_json"), "wheel lacks public-card deduction boundary"
+_card_game = catanatron_rs.Game.simple(["RED", "BLUE"], seed=7)
+_card_actor = str(_card_game.current_color())
+_card_payload = json.loads(_card_game.public_card_deductions_json(_card_actor))
+assert _card_payload.get("contract") == "public_card_deductions_2p_v1"
+assert _card_payload.get("observer") == _card_actor
+assert _card_payload.get("resource_composition_exact") is True
+assert _card_payload.get("development_composition_exact") is False
 assert callable(getattr(catanatron_rs, "gumbel_search", None)), "wheel lacks native Gumbel MCTS"
 capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
 assert callable(capability_fn), "wheel lacks native Gumbel capability contract"
@@ -629,6 +637,14 @@ except PackageNotFoundError:
     rust_version = version("catanatron_rs")
 
 determinize_api = hasattr(catanatron_rs.Game, "determinize_for_player")
+public_card_api = hasattr(catanatron_rs.Game, "public_card_deductions_json")
+public_card_contract = None
+if public_card_api:
+    card_game = catanatron_rs.Game.simple(["RED", "BLUE"], seed=7)
+    card_actor = str(card_game.current_color())
+    public_card_contract = json.loads(
+        card_game.public_card_deductions_json(card_actor)
+    )
 native_mcts_api = callable(getattr(catanatron_rs, "gumbel_search", None))
 capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
 native_mcts_capabilities = set(capability_fn()) if callable(capability_fn) else set()
@@ -672,6 +688,11 @@ if (
     or rust_version != expected_runtime["catanatron_rs_version"]
     or not torch.cuda.is_available()
     or not determinize_api
+    or not public_card_api
+    or public_card_contract.get("contract") != "public_card_deductions_2p_v1"
+    or public_card_contract.get("observer") != card_actor
+    or public_card_contract.get("resource_composition_exact") is not True
+    or public_card_contract.get("development_composition_exact") is not False
     or not native_mcts_api
     or not required_capabilities <= native_mcts_capabilities
 ):
@@ -709,6 +730,16 @@ payload = {
         "native_mcts_capabilities": sorted(native_mcts_capabilities),
         "determinize_for_player": bool(determinize_api),
         "gumbel_search": bool(native_mcts_api),
+        "public_card_deductions": {
+            "available": bool(public_card_api),
+            "contract": public_card_contract.get("contract"),
+            "resource_composition_exact": public_card_contract.get(
+                "resource_composition_exact"
+            ),
+            "development_composition_exact": public_card_contract.get(
+                "development_composition_exact"
+            ),
+        },
     },
     "services": {
         "nvidia_mps_active": os.environ["CATAN_MPS_ACTIVE"],

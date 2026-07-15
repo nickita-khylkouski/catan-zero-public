@@ -70,6 +70,7 @@ def test_policy_surprise_weight_defaults_off() -> None:
     parser = _capture_parser()
     assert parser.get_default("policy_surprise_weight") == pytest.approx(0.0)
     assert parser.get_default("policy_surprise_cap") == pytest.approx(4.0)
+    assert parser.get_default("per_game_policy_surprise_weighting") is False
 
 
 def test_soft_target_source_default_is_policy() -> None:
