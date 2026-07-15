@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import resource
+import signal
 import stat
 import subprocess
 import sys
@@ -45,8 +46,16 @@ REQUIRED_NOFILE_LIMIT = 65_536
 LAUNCH_RECEIPT_SCHEMA = "a1-coherent-target-rd-launch-receipt-v1"
 STATUS_SCHEMA = "a1-coherent-target-rd-status-v1"
 COMPLETION_RECEIPT_SCHEMA = "a1-coherent-target-rd-completion-receipt-v1"
+ABORT_RECEIPT_SCHEMA = "a1-coherent-target-rd-abort-receipt-v1"
 DEFAULT_STALE_SECONDS = 900.0
 NATIVE_RUNTIME_IDENTITY_SCHEMA = native_identity.RUNTIME_IDENTITY_SCHEMA
+DEFAULT_TERM_TIMEOUT_SECONDS = 10.0
+DEFAULT_KILL_TIMEOUT_SECONDS = 5.0
+COHERENT_WORKER_SELFPLAY_CONFIG = {
+    "meaningful_public_history": True,
+    "event_history_limit": 32,
+    "record_automatic_transitions": False,
+}
 
 
 def _canonical(value: object) -> bytes:
@@ -445,9 +454,11 @@ def _argv(
     ]
 
 
-def _proc_start_ticks(pid: int) -> int:
+def _proc_stat_identity(pid: int) -> dict[str, Any] | None:
     try:
         text = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
     except OSError as error:
         raise ExecutorError(
             f"cannot read process identity for PID {pid}: {error}"
@@ -456,10 +467,31 @@ def _proc_start_ticks(pid: int) -> int:
     if closing < 0:
         raise ExecutorError(f"malformed /proc/{pid}/stat")
     fields_after_comm = text[closing + 2 :].split()
-    # starttime is field 22; fields_after_comm begins at field 3.
+    # state/pgrp/session are fields 3/5/6 and starttime is field 22;
+    # fields_after_comm begins at field 3.
     if len(fields_after_comm) <= 19:
         raise ExecutorError(f"truncated /proc/{pid}/stat")
-    return int(fields_after_comm[19])
+    try:
+        return {
+            "pid": pid,
+            "state": fields_after_comm[0],
+            "pgid": int(fields_after_comm[2]),
+            "session_id": int(fields_after_comm[3]),
+            "start_ticks": int(fields_after_comm[19]),
+        }
+    except ValueError as error:
+        raise ExecutorError(f"malformed /proc/{pid}/stat identity") from error
+
+
+def _proc_start_ticks(pid: int) -> int:
+    process = _proc_stat_identity(pid)
+    if process is None:
+        raise ExecutorError(f"cannot read process identity for exited PID {pid}")
+    return int(process["start_ticks"])
+
+
+def _boot_id() -> str:
+    return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
 
 
 def _process_identity(
@@ -468,12 +500,19 @@ def _process_identity(
     argv: Sequence[str],
     environment: Mapping[str, str],
 ) -> dict[str, Any]:
-    boot_id = (
-        Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-    )
+    process = _proc_stat_identity(pid)
+    if process is None:
+        raise ExecutorError(f"launch process exited before identity seal: PID {pid}")
+    if process["state"] == "Z" or process["pgid"] != pid or process["session_id"] != pid:
+        raise ExecutorError(
+            f"launch PID {pid} is not a live start_new_session group/session leader"
+        )
+    boot_id = _boot_id()
     value = {
         "boot_id": boot_id,
-        "start_ticks": _proc_start_ticks(pid),
+        "start_ticks": process["start_ticks"],
+        "pgid": process["pgid"],
+        "session_id": process["session_id"],
         "argv_sha256": _digest(list(argv)),
         "environment": {
             key: environment[key]
@@ -506,10 +545,11 @@ def _live_process_status(command: Mapping[str, Any]) -> dict[str, Any]:
                 continue
             key, value = raw.split(b"=", 1)
             environment[key.decode("utf-8")] = value.decode("utf-8")
-        start_ticks = _proc_start_ticks(pid)
-        boot_id = (
-            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-        )
+        process = _proc_stat_identity(pid)
+        if process is None:
+            return {"state": "exited", "pid": pid, "authenticated": False}
+        start_ticks = int(process["start_ticks"])
+        boot_id = _boot_id()
     except (OSError, UnicodeError, ExecutorError) as error:
         return {
             "state": "unverifiable",
@@ -521,6 +561,10 @@ def _live_process_status(command: Mapping[str, Any]) -> dict[str, Any]:
     issues: list[str] = []
     if cmdline != list(command["argv"]):
         issues.append("argv_mismatch_or_pid_reuse")
+    if process["state"] == "Z":
+        issues.append("zombie_group_leader")
+    if process["pgid"] != pid or process["session_id"] != pid:
+        issues.append("process_group_or_session_mismatch")
     expected_environment = {
         "CUDA_VISIBLE_DEVICES": str(command["gpu"]),
         "CATAN_LEDGER_CLAIM_ID": str(command["claim_label"]),
@@ -547,6 +591,12 @@ def _live_process_status(command: Mapping[str, Any]) -> dict[str, Any]:
             issues.append("pid_reuse_identity_mismatch")
         if sealed.get("argv_sha256") != _digest(cmdline):
             issues.append("sealed_process_argv_mismatch")
+        if "pgid" in sealed and int(sealed.get("pgid", -1)) != process["pgid"]:
+            issues.append("sealed_process_group_mismatch")
+        if "session_id" in sealed and int(
+            sealed.get("session_id", -1)
+        ) != process["session_id"]:
+            issues.append("sealed_process_session_mismatch")
     return {
         "state": "alive_authenticated" if not issues else "alive_mismatch",
         "pid": pid,
@@ -557,6 +607,8 @@ def _live_process_status(command: Mapping[str, Any]) -> dict[str, Any]:
             else "argv_environment"
         ),
         "start_ticks": start_ticks,
+        "pgid": process["pgid"],
+        "session_id": process["session_id"],
         "issues": issues,
     }
 
@@ -591,7 +643,7 @@ def execute(
         for lane in contract["execution"]["lanes"]
     ]
     plan = {
-        "schema_version": "a1-coherent-target-rd-launch-receipt-v1",
+        "schema_version": LAUNCH_RECEIPT_SCHEMA,
         "status": "dry_run" if not go else "launching",
         "contract": {
             "path": str(contract_path),
@@ -794,6 +846,281 @@ def _authenticate_launch(
     return contract, launch, launch_file_sha256, commands
 
 
+def _non_zombie_group_members(pgid: int, session_id: int) -> list[dict[str, Any]]:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        raise ExecutorError("authenticated abort requires Linux /proc")
+    members: list[dict[str, Any]] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        process = _proc_stat_identity(int(entry.name))
+        if (
+            process is not None
+            and process["state"] != "Z"
+            and process["pgid"] == pgid
+            and process["session_id"] == session_id
+        ):
+            members.append(process)
+    return sorted(members, key=lambda item: int(item["pid"]))
+
+
+def _group_authority(command: Mapping[str, Any]) -> dict[str, Any]:
+    """Authenticate one receipt-bound start_new_session process group."""
+
+    pid = int(command["pid"])
+    sealed = command.get("process_identity")
+    if not isinstance(sealed, Mapping):
+        raise ExecutorError(f"launch command lacks process identity for PID {pid}")
+    unhashed = dict(sealed)
+    declared = unhashed.pop("identity_sha256", None)
+    if declared != _digest(unhashed):
+        raise ExecutorError(f"sealed process identity digest mismatch for PID {pid}")
+    boot_id = _boot_id()
+    if sealed.get("boot_id") != boot_id or sealed.get("argv_sha256") != _digest(
+        list(command["argv"])
+    ):
+        raise ExecutorError(f"sealed process boot/argv identity drift for PID {pid}")
+
+    process = _proc_stat_identity(pid)
+    if process is None:
+        members = _non_zombie_group_members(pid, pid)
+        if members and (
+            int(sealed.get("pgid", -1)) != pid
+            or int(sealed.get("session_id", -1)) != pid
+        ):
+            raise ExecutorError(
+                f"cannot authenticate orphaned legacy process group for PID {pid}"
+            )
+    else:
+        if (
+            int(process["start_ticks"]) != int(sealed.get("start_ticks", -1))
+            or int(process["pgid"]) != pid
+            or int(process["session_id"]) != pid
+        ):
+            raise ExecutorError(
+                f"launch PID {pid} was reused or is not its sealed group/session leader"
+            )
+        if process["state"] != "Z":
+            live = _live_process_status(command)
+            if live.get("state") != "alive_authenticated":
+                raise ExecutorError(
+                    f"launch PID {pid} failed argv/environment authentication: "
+                    f"{live.get('issues', live.get('reason'))}"
+                )
+        members = _non_zombie_group_members(pid, pid)
+    return {
+        "lane_id": str(command["lane_id"]),
+        "pid": pid,
+        "pgid": pid,
+        "session_id": pid,
+        "boot_id": str(sealed["boot_id"]),
+        "start_ticks": int(sealed["start_ticks"]),
+        "process_identity_sha256": str(sealed["identity_sha256"]),
+        "initial_member_pids": [int(item["pid"]) for item in members],
+    }
+
+
+def _authority_members(authority: Mapping[str, Any]) -> list[dict[str, Any]]:
+    pid = int(authority["pid"])
+    process = _proc_stat_identity(pid)
+    if (
+        process is not None
+        and process["pgid"] == pid
+        and process["session_id"] == pid
+        and int(process["start_ticks"]) != int(authority["start_ticks"])
+    ):
+        raise ExecutorError(f"process-group ID {pid} was reused during abort")
+    return _non_zombie_group_members(pid, pid)
+
+
+def _wait_for_group_exit(
+    authorities: Sequence[Mapping[str, Any]],
+    *,
+    timeout_seconds: float,
+    observed_pids: set[int],
+) -> dict[int, list[dict[str, Any]]]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining: dict[int, list[dict[str, Any]]] = {}
+        for authority in authorities:
+            members = _authority_members(authority)
+            observed_pids.update(int(item["pid"]) for item in members)
+            if members:
+                remaining[int(authority["pid"])] = members
+        if not remaining or time.monotonic() >= deadline:
+            return remaining
+        time.sleep(0.1)
+
+
+def _gpu_compute_pids() -> set[int]:
+    raw = _run_text(
+        [
+            "nvidia-smi",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+        ]
+    )
+    try:
+        return {int(line.strip()) for line in raw.splitlines() if line.strip()}
+    except ValueError as error:
+        raise ExecutorError("nvidia-smi returned a malformed compute PID") from error
+
+
+def _wait_for_gpu_clients(
+    target_pids: set[int], *, timeout_seconds: float
+) -> set[int]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = _gpu_compute_pids() & target_pids
+        if not remaining or time.monotonic() >= deadline:
+            return remaining
+        time.sleep(0.1)
+
+
+def abort(
+    contract_path: Path,
+    *,
+    host_address: str,
+    term_timeout_seconds: float = DEFAULT_TERM_TIMEOUT_SECONDS,
+    kill_timeout_seconds: float = DEFAULT_KILL_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Abort only the exact process groups authenticated by one launch receipt."""
+
+    if term_timeout_seconds <= 0.0 or kill_timeout_seconds <= 0.0:
+        raise ExecutorError("abort timeouts must be positive")
+    contract_path = contract_path.expanduser().resolve(strict=True)
+    contract, launch, launch_file_sha256, commands = _authenticate_launch(
+        contract_path, host_address=host_address
+    )
+    output_root = Path(str(contract["execution"]["output_root"]))
+    if (output_root / "completion.receipt.json").exists():
+        raise ExecutorError("refusing to abort a corpus with a completion receipt")
+    abort_path = output_root / "abort.receipt.json"
+    lock_path = output_root / ".abort.lock"
+    lock_descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        if abort_path.exists():
+            prior, file_sha256 = _authenticated_receipt(
+                abort_path, expected_schema=ABORT_RECEIPT_SCHEMA
+            )
+            if (
+                prior.get("status") != "aborted"
+                or prior.get("contract", {}).get("contract_sha256")
+                != contract["contract_sha256"]
+                or prior.get("launch_receipt", {}).get("file_sha256")
+                != launch_file_sha256
+            ):
+                raise ExecutorError("abort receipt binds a different launch")
+            target_pids = set(map(int, prior.get("observed_member_pids", ())))
+            live_groups = {
+                int(command["pid"]): _non_zombie_group_members(
+                    int(command["pid"]), int(command["pid"])
+                )
+                for command in commands
+            }
+            live_groups = {pid: rows for pid, rows in live_groups.items() if rows}
+            gpu_clients = _gpu_compute_pids() & target_pids
+            if live_groups or gpu_clients:
+                raise ExecutorError(
+                    "aborted receipt replay found live group members/GPU clients: "
+                    f"groups={sorted(live_groups)} gpu={sorted(gpu_clients)}"
+                )
+            return {**prior, "path": str(abort_path), "file_sha256": file_sha256}
+
+        # Authenticate every group before signaling any group. One mismatched
+        # PID therefore cannot leave a half-aborted fleet.
+        authorities = [_group_authority(command) for command in commands]
+        observed_pids = {
+            pid
+            for authority in authorities
+            for pid in authority["initial_member_pids"]
+        }
+        term_sent: set[int] = set()
+        for authority in authorities:
+            if authority["initial_member_pids"]:
+                try:
+                    os.killpg(int(authority["pgid"]), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                else:
+                    term_sent.add(int(authority["pgid"]))
+        remaining = _wait_for_group_exit(
+            authorities,
+            timeout_seconds=term_timeout_seconds,
+            observed_pids=observed_pids,
+        )
+        kill_sent: set[int] = set()
+        for authority in authorities:
+            pgid = int(authority["pgid"])
+            if pgid not in remaining:
+                continue
+            # Re-authenticate the exact group immediately before escalation.
+            members = _authority_members(authority)
+            observed_pids.update(int(item["pid"]) for item in members)
+            if not members:
+                continue
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            else:
+                kill_sent.add(pgid)
+        remaining = _wait_for_group_exit(
+            authorities,
+            timeout_seconds=kill_timeout_seconds,
+            observed_pids=observed_pids,
+        )
+        if remaining:
+            raise ExecutorError(
+                "authenticated process groups survived SIGKILL: "
+                f"{ {pid: [item['pid'] for item in rows] for pid, rows in remaining.items()} }"
+            )
+        gpu_clients = _wait_for_gpu_clients(
+            observed_pids, timeout_seconds=kill_timeout_seconds
+        )
+        if gpu_clients:
+            raise ExecutorError(
+                f"aborted process groups still own GPU clients: {sorted(gpu_clients)}"
+            )
+        receipt = {
+            "schema_version": ABORT_RECEIPT_SCHEMA,
+            "status": "aborted",
+            "aborted_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "contract": {
+                "path": str(contract_path),
+                "file_sha256": _file_sha256(contract_path),
+                "contract_sha256": contract["contract_sha256"],
+            },
+            "launch_receipt": {
+                "path": str(output_root / "launch.receipt.json"),
+                "file_sha256": launch_file_sha256,
+                "receipt_sha256": launch["receipt_sha256"],
+            },
+            "term_timeout_seconds": float(term_timeout_seconds),
+            "kill_timeout_seconds": float(kill_timeout_seconds),
+            "groups": [
+                {
+                    **authority,
+                    "sigterm_sent": int(authority["pgid"]) in term_sent,
+                    "sigkill_sent": int(authority["pgid"]) in kill_sent,
+                }
+                for authority in authorities
+            ],
+            "observed_member_pids": sorted(observed_pids),
+            "final_non_zombie_group_members": [],
+            "final_target_gpu_clients": [],
+        }
+        _write_receipt(abort_path, receipt)
+        value, file_sha256 = _authenticated_receipt(
+            abort_path, expected_schema=ABORT_RECEIPT_SCHEMA
+        )
+        return {**value, "path": str(abort_path), "file_sha256": file_sha256}
+    finally:
+        os.close(lock_descriptor)
+
+
 def _parse_time(value: str) -> dt.datetime:
     try:
         parsed = dt.datetime.fromisoformat(value)
@@ -950,6 +1277,7 @@ def _validate_lane_manifest(
         "preserve_search_evidence": True,
         "record_automatic_transitions": False,
         "meaningful_public_history": True,
+        "event_history_limit": 32,
     }
     if not isinstance(cli, Mapping):
         issues.append("missing_cli_args")
@@ -1227,6 +1555,7 @@ def _resolved_config_record(
         "opponent_pool_manifest": None,
         "record_automatic_transitions": False,
         "meaningful_public_history": True,
+        "event_history_limit": 32,
     }
     drift = {
         key: {"expected": value, "actual": fields.get(key)}
@@ -1253,6 +1582,22 @@ def _resolved_config_record(
 def _normalized_sha256(value: object) -> str:
     text = str(value)
     return text if text.startswith("sha256:") else "sha256:" + text
+
+
+def _verify_coherent_worker_selfplay_config(
+    manifest: Mapping[str, Any], *, where: str
+) -> None:
+    selfplay_config = manifest.get("selfplay_config")
+    if not isinstance(selfplay_config, Mapping):
+        raise ExecutorError(f"worker manifest lacks selfplay_config: {where}")
+    drift = {
+        key: {"expected": expected, "actual": selfplay_config.get(key)}
+        for key, expected in COHERENT_WORKER_SELFPLAY_CONFIG.items()
+        if type(selfplay_config.get(key)) is not type(expected)
+        or selfplay_config.get(key) != expected
+    }
+    if drift:
+        raise ExecutorError(f"worker coherent row-surface drift at {where}: {drift}")
 
 
 def _verify_shard_arrays(
@@ -1431,6 +1776,7 @@ def _verify_worker_payload(
         raise ExecutorError(
             f"worker manifest drift for {lane['lane_id']}/{worker_id}: {drift}"
         )
+    _verify_coherent_worker_selfplay_config(manifest, where=str(manifest_path))
     if (
         int(progress.get("games_succeeded", -1)) != expected_games
         or int(progress.get("games_failed", -1)) != 0
@@ -1584,9 +1930,18 @@ def _verify_existing_completion(
             for record_name in ("manifest", "progress"):
                 record = worker.get(record_name, {})
                 artifact = Path(str(record.get("path", "")))
-                if not artifact.is_file() or _file_sha256(artifact) != record.get(
-                    "sha256"
-                ):
+                if record_name == "manifest":
+                    worker_manifest, artifact_sha256, _metadata = _read_stable_json(
+                        artifact
+                    )
+                    _verify_coherent_worker_selfplay_config(
+                        worker_manifest, where=str(artifact)
+                    )
+                else:
+                    artifact_sha256 = (
+                        _file_sha256(artifact) if artifact.is_file() else None
+                    )
+                if artifact_sha256 != record.get("sha256"):
                     raise ExecutorError(
                         f"completion-bound worker {record_name} drift: {artifact}"
                     )
@@ -1930,6 +2285,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="verify a completed corpus and write its immutable completion receipt",
     )
+    action.add_argument(
+        "--abort",
+        "--stop",
+        dest="abort",
+        action="store_true",
+        help="terminate only receipt-authenticated generator process groups",
+    )
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument("--stale-seconds", type=float, default=DEFAULT_STALE_SECONDS)
     parser.add_argument(
@@ -1937,6 +2299,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="wait timeout; zero means no timeout",
+    )
+    parser.add_argument(
+        "--term-timeout-seconds",
+        type=float,
+        default=DEFAULT_TERM_TIMEOUT_SECONDS,
+    )
+    parser.add_argument(
+        "--kill-timeout-seconds",
+        type=float,
+        default=DEFAULT_KILL_TIMEOUT_SECONDS,
     )
     return parser
 
@@ -1963,6 +2335,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.contract,
                 host_address=args.host_address,
                 stale_seconds=args.stale_seconds,
+            )
+        elif args.abort:
+            result = abort(
+                args.contract,
+                host_address=args.host_address,
+                term_timeout_seconds=args.term_timeout_seconds,
+                kill_timeout_seconds=args.kill_timeout_seconds,
             )
         else:
             if args.python is None:

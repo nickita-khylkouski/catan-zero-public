@@ -193,12 +193,14 @@ def test_cli_preserves_launch_and_adds_lifecycle_modes() -> None:
         ]
     )
     lifecycle = parser.parse_args(["--host-address", "b200", "--status"])
+    abort = parser.parse_args(["--host-address", "b200", "--abort"])
 
     assert launch.go is True
     assert launch.python == Path("/venv/bin/python")
     assert launch.native_wheel_receipt == Path("/wheels/build-receipt.json")
     assert lifecycle.status is True
     assert lifecycle.python is None
+    assert abort.abort is True
 
 
 def test_native_runtime_record_binds_loaded_extension_to_wheel_member() -> None:
@@ -224,3 +226,150 @@ def test_native_runtime_record_binds_loaded_extension_to_wheel_member() -> None:
     drifted["identity_sha256"] = executor._digest(unhashed)
     with pytest.raises(executor.ExecutorError, match="malformed"):
         executor._verify_native_runtime_record(drifted)
+
+
+def test_worker_manifest_requires_actual_coherent_row_surface() -> None:
+    executor._verify_coherent_worker_selfplay_config(
+        {"selfplay_config": dict(executor.COHERENT_WORKER_SELFPLAY_CONFIG)},
+        where="worker_000/manifest.json",
+    )
+
+    with pytest.raises(executor.ExecutorError, match="coherent row-surface drift"):
+        executor._verify_coherent_worker_selfplay_config(
+            {
+                "selfplay_config": {
+                    "meaningful_public_history": False,
+                    "event_history_limit": 64,
+                    "record_automatic_transitions": True,
+                }
+            },
+            where="worker_000/manifest.json",
+        )
+
+
+def test_group_authority_requires_exact_session_leader_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv = ["/venv/bin/python", "generator.py"]
+    sealed = {
+        "boot_id": "boot-a",
+        "start_ticks": 1234,
+        "pgid": 4100,
+        "session_id": 4100,
+        "argv_sha256": executor._digest(argv),
+        "environment": {},
+    }
+    sealed["identity_sha256"] = executor._digest(sealed)
+    command = {
+        "lane_id": "gpu0",
+        "pid": 4100,
+        "argv": argv,
+        "process_identity": sealed,
+    }
+    monkeypatch.setattr(executor, "_boot_id", lambda: "boot-a")
+    monkeypatch.setattr(
+        executor,
+        "_proc_stat_identity",
+        lambda _pid: {
+            "pid": 4100,
+            "state": "S",
+            "pgid": 4100,
+            "session_id": 4100,
+            "start_ticks": 1234,
+        },
+    )
+    monkeypatch.setattr(
+        executor,
+        "_live_process_status",
+        lambda _command: {"state": "alive_authenticated"},
+    )
+    monkeypatch.setattr(
+        executor,
+        "_non_zombie_group_members",
+        lambda _pgid, _session: [{"pid": 4100}, {"pid": 4101}],
+    )
+
+    authority = executor._group_authority(command)
+
+    assert authority["pgid"] == authority["session_id"] == authority["pid"] == 4100
+    assert authority["initial_member_pids"] == [4100, 4101]
+
+
+def test_abort_signals_authenticated_groups_and_escalates_before_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text("{}", encoding="utf-8")
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    contract = {
+        "contract_sha256": "sha256:contract",
+        "execution": {"output_root": str(output_root)},
+    }
+    launch = {"receipt_sha256": "sha256:launch"}
+    commands = [
+        {"lane_id": "gpu0", "pid": 5100},
+        {"lane_id": "gpu1", "pid": 5200},
+    ]
+    monkeypatch.setattr(
+        executor,
+        "_authenticate_launch",
+        lambda *_args, **_kwargs: (contract, launch, "sha256:launch-file", commands),
+    )
+    authorities = {
+        5100: {
+            "lane_id": "gpu0",
+            "pid": 5100,
+            "pgid": 5100,
+            "session_id": 5100,
+            "boot_id": "boot",
+            "start_ticks": 1,
+            "process_identity_sha256": "sha256:i0",
+            "initial_member_pids": [5100, 5101],
+        },
+        5200: {
+            "lane_id": "gpu1",
+            "pid": 5200,
+            "pgid": 5200,
+            "session_id": 5200,
+            "boot_id": "boot",
+            "start_ticks": 2,
+            "process_identity_sha256": "sha256:i1",
+            "initial_member_pids": [5200, 5201],
+        },
+    }
+    monkeypatch.setattr(
+        executor, "_group_authority", lambda command: authorities[int(command["pid"])]
+    )
+    waits = iter(({5200: [{"pid": 5201}]}, {}))
+
+    def fake_wait(_authorities, *, timeout_seconds, observed_pids):
+        del timeout_seconds
+        observed_pids.update({5100, 5101, 5200, 5201})
+        return next(waits)
+
+    monkeypatch.setattr(executor, "_wait_for_group_exit", fake_wait)
+    monkeypatch.setattr(
+        executor,
+        "_authority_members",
+        lambda authority: ([{"pid": 5201}] if authority["pid"] == 5200 else []),
+    )
+    monkeypatch.setattr(executor, "_wait_for_gpu_clients", lambda *_a, **_k: set())
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        executor.os, "killpg", lambda pgid, signum: signals.append((pgid, signum))
+    )
+
+    receipt = executor.abort(
+        contract_path,
+        host_address="b200",
+        term_timeout_seconds=0.1,
+        kill_timeout_seconds=0.1,
+    )
+
+    assert receipt["status"] == "aborted"
+    assert (5100, executor.signal.SIGTERM) in signals
+    assert (5200, executor.signal.SIGTERM) in signals
+    assert (5200, executor.signal.SIGKILL) in signals
+    assert (5100, executor.signal.SIGKILL) not in signals
+    assert (output_root / "abort.receipt.json").is_file()
