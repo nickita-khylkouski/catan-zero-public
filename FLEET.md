@@ -48,10 +48,11 @@ table is not a teacher/volume role split.
 
 ## 3. Canonical code + environment (CAT-117)
 - Repo: **`github.com/nickita-khylkouski/catan-zero-public`** (**PUBLIC**, no
-  auth required). `v1.5-coherent-public` seals `catanatron_rs 0.1.9` with
-  `gumbel-mcts 0.2.3` and the coherent public-belief search operator.
+  auth required). `v1.6-public-card-history` seals `catanatron_rs 0.1.10` with
+  `gumbel-mcts 0.2.3`, the coherent public-belief search operator, public card
+  deductions, and meaningful public history.
 - Env target: **Python 3.11.15**, **torch cu128** (all H100 + B200),
-  **catanatron_rs 0.1.9 cp311**.
+  **catanatron_rs 0.1.10 cp311**.
 - Verification snapshot (2026-07-09): local full suite **1,737 passed / 200
   skipped**; H100 full suite **1,913 passed / 24 skipped**; native
   feature/context/symmetry acceptance **19/19 passed**. The final handoff delta
@@ -97,7 +98,7 @@ the checksum update into the source commit.
    documentation change. Run `tools/build_catanatron_rs_wheel.sh` twice from
    independent clean build state. The builder stages commit A at its sealed
    canonical path and emits both the wheel and
-   `catanatron_rs-0.1.9-build-receipt.json`. Require byte-identical wheel
+   `catanatron_rs-0.1.10-build-receipt.json`. Require byte-identical wheel
    SHA-256 values and matching sealed toolchain/environment provenance. The
    receipt schema is `catanatron-rs-wheel-build-receipt-v2`; in addition to
    both catanatron lockfiles it must bind
@@ -137,8 +138,14 @@ seals `catanatron_rs-0.1.9-cp311-cp311-manylinux_2_34_x86_64.whl` at SHA-256
 `c25b3bc2532ea2914666952c19aed05e971a071b6210dd3e8de6232e8fc4ba74`.
 The production runtime contract names the same version, filename, and digest.
 
+The 0.1.10 transaction is complete. Source commit `d267947` produced the sealed
+public-card and meaningful-history wheel; the follow-up runtime commit records
+`catanatron_rs-0.1.10-cp311-cp311-manylinux_2_34_x86_64.whl` at SHA-256
+`1e4087072802a5429f7c873efda773c96f4bee63a95e62d7e172b255855f9ef8`.
+The final tagged tree must reproduce that digest before the release is used.
+
 ## 4. Rust engine (CAT-133)
-- `native/catanatron-rs` v0.1.9 is the canonical wheel source and builds `catanatron_rs-0.1.9-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` v0.2.3 is its linked native-search dependency. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. Fleet deployment must be uniform 0.1.9 with `sigma_reference_visits`, `belief_target_evidence`, `initial_road_d1_scope`, `public_award_feature_parity`, `policy_temperature_semantics`, `coherent_public_belief_search`, and `forced_root_trajectory_only`.
+- `native/catanatron-rs` v0.1.10 is the canonical wheel source and builds `catanatron_rs-0.1.10-cp311-…manylinux_2_34`; `native/gumbel_mcts_rs` v0.2.3 is its linked native-search dependency. The build receipt seals the source commit/tree, builder and lockfiles, exact toolchain/environment, and wheel digest. Fleet deployment must be uniform 0.1.10 with `sigma_reference_visits`, `belief_target_evidence`, `initial_road_d1_scope`, `public_award_feature_parity`, `policy_temperature_semantics`, `coherent_public_belief_search`, `forced_root_trajectory_only`, `public_card_deductions_json`, and `meaningful_public_history`.
 - **Licensing posture: pending user decision — see CAT-138.**
 
 ## 5. Seed ledger (CAT-125)
