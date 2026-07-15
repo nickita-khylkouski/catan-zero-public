@@ -376,6 +376,61 @@ def test_train_command_and_child_validation_preserve_bound_recipe() -> None:
     assert metadata["learner_ablation"] == result["learner_ablation"]
 
 
+def test_coherent_ddp_child_preserves_exact_outer_ablation_marker() -> None:
+    verified = _verified()
+    code = executor._current_ablation_code_binding(verified["lock"])
+    result = executor.bind_learner_ablation(
+        verified,
+        ablation_id="coherent-active-policy-p10",
+        overrides_json=json.dumps(
+            {
+                "lr": 6e-5,
+                "lr_warmup_steps": 16,
+                "max_steps": 128,
+                "policy_aux_active_batch_size": 46,
+            }
+        ),
+        reviewed_code_tree_sha256=code["code_tree_sha256"],
+        diagnostic_dose_curve=True,
+        diagnostic_checkpoint_steps="8,12,16,32,64",
+    )
+    result = executor.bind_training_topology(
+        result,
+        topology=executor.B200_8GPU_DDP_TOPOLOGY,
+        gpu=0,
+    )
+    command = executor.build_train_command(
+        result,
+        python=Path(sys.executable),
+        checkpoint=Path("/tmp/coherent-p10.pt"),
+        report=Path("/tmp/coherent-p10.json"),
+    )
+    trainer = str(executor._REPO_ROOT / "tools" / "train_bc.py")
+    args = train_bc.build_parser().parse_args(command[command.index(trainer) + 1 :])
+    child_bound = {
+        "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "learner_training_recipe_sha256": executor._value_sha256(
+            contract.EXPECTED_LEARNER_TRAINING_RECIPE
+        ),
+        "coherent_direct_corpus": True,
+        "coherent_topology": {
+            "name": executor.B200_8GPU_DDP_TOPOLOGY,
+            "world_size": 8,
+            "local_batch_size": 512,
+            "grad_accum_steps": 1,
+            "global_batch_size": 4096,
+        },
+    }
+    effective = train_bc._validate_a1_learner_training_recipe(
+        args,
+        {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": True},
+        child_bound,
+    )
+
+    assert effective == result["recipe"]
+    assert child_bound["learner_ablation"] == result["learner_ablation"]
+
+
 def test_default_command_never_disables_the_host_training_lock(tmp_path: Path) -> None:
     verified = _verified()
     sealed_train = tmp_path / "tools" / "train_bc.py"

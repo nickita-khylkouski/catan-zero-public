@@ -1457,7 +1457,7 @@ def test_policy_aux_active_dose_is_typed_and_command_bound(
     assert derived["learner_ablation"]["recipe_drift"][
         "policy_aux_active_batch_size"
     ] == {
-        "contract": "0 (implicit historical train_bc default)",
+        "contract": 0,
         "effective": 128,
     }
     command = executor.build_train_command(

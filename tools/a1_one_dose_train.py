@@ -2544,6 +2544,19 @@ def bind_training_topology(
     learner_ablation = result.get("learner_ablation")
     if isinstance(learner_ablation, dict):
         learner_ablation = copy.deepcopy(learner_ablation)
+        topology_bound_recipe = dict(learner_ablation["bound_recipe"])
+        topology_bound_recipe.update(
+            {
+                "world_size": int(spec["world_size"]),
+                "batch_size": int(spec["local_batch_size"]),
+                "grad_accum_steps": int(spec["grad_accum_steps"]),
+                "global_batch_size": int(spec["global_batch_size"]),
+            }
+        )
+        learner_ablation["bound_recipe"] = topology_bound_recipe
+        learner_ablation["bound_recipe_sha256"] = _value_sha256(
+            topology_bound_recipe
+        )
         learner_ablation["effective_recipe"] = dict(effective)
         learner_ablation["effective_recipe_sha256"] = _value_sha256(effective)
         matched_aux = learner_ablation.get("matched_aux_regularization")
@@ -3298,7 +3311,7 @@ def bind_learner_ablation(
         }
     if effective.get("policy_aux_active_batch_size", 0) != 0:
         drift["policy_aux_active_batch_size"] = {
-            "contract": "0 (implicit historical train_bc default)",
+            "contract": 0,
             "effective": effective["policy_aux_active_batch_size"],
         }
     if effective.get("value_trunk_grad_scale", 1.0) != 1.0:
