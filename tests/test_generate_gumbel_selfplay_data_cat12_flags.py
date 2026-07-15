@@ -55,6 +55,9 @@ def _worker_args(**overrides) -> dict:
         "track": "2p_no_trade",
         "vps_to_win": 10,
         "obs_width": 806,
+        "meaningful_public_history": False,
+        "event_history_limit": 64,
+        "record_automatic_transitions": True,
         "base_seed": 1,
         "worker_seed": 1,
         "shard_size": 2048,
@@ -331,10 +334,16 @@ def test_strategic_clock_and_forced_trajectory_mode_thread_through(monkeypatch) 
             temperature_clock="nonforced_choice",
             coherent_public_belief_search=True,
             forced_root_target_mode="trajectory_only",
+            meaningful_public_history=True,
+            event_history_limit=32,
+            record_automatic_transitions=False,
         )
     )
 
     assert captured["config"].temperature_clock == "nonforced_choice"
+    assert captured["config"].meaningful_public_history is True
+    assert captured["config"].event_history_limit == 32
+    assert captured["config"].record_automatic_transitions is False
     assert captured["search_config"].coherent_public_belief_search is True
     assert captured["search_config"].information_set_search is False
     assert captured["search_config"].forced_root_target_mode == "trajectory_only"

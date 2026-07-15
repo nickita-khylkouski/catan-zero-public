@@ -208,6 +208,49 @@ def test_config_is_applied_before_auto_shard_and_science_validation(tmp_path):
     assert manifest["cli_args"]["shard_size"] == 777
 
 
+def test_coherent_row_surface_is_copied_into_spawned_worker_payload(
+    tmp_path, monkeypatch
+):
+    captured: dict[str, object] = {}
+
+    def _capture(worker_args):
+        captured.update(worker_args)
+        return {
+            "worker_index": worker_args["worker_index"],
+            "out_dir": worker_args["out_dir"],
+            "games_completed": 1,
+            "games_failed": 0,
+            "games_truncated": 0,
+            "rows": 0,
+            "decisions_total": 0,
+            "forced_decisions_total": 0,
+            "simulations_used_total": 0,
+            "wins_by_color": {},
+            "shards": [],
+            "errors": [],
+        }
+
+    monkeypatch.setattr(cli, "_worker_entry", _capture)
+    cli.main(
+        [
+            "--skip-guards",
+            "--no-seed-claim",
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--games",
+            "1",
+            "--meaningful-public-history",
+            "--event-history-limit",
+            "32",
+            "--no-record-automatic-transitions",
+        ]
+    )
+
+    assert captured["meaningful_public_history"] is True
+    assert captured["event_history_limit"] == 32
+    assert captured["record_automatic_transitions"] is False
+
+
 def test_config_filled_values_are_explicit_to_prelaunch_guard(tmp_path):
     parser = cli.build_parser()
     config = GenerateConfig(
