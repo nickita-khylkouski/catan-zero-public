@@ -252,7 +252,7 @@ def _load_frontier_candidates(
         by_sha.values(),
         key=lambda row: (
             CRITERIA.index(row["criteria"][0]),
-            active_campaign.ARMS.index(row["arm"]),
+            list(active_campaign.ARMS).index(row["arm"]),
             row["step"],
         ),
     )
