@@ -10,11 +10,90 @@ from tools import a1_b200_active_policy_campaign as campaign
 from tools import a1_current_science_contract as current_science
 from tools import a1_one_dose_train as one_dose
 from tools import train_bc
+from tools.fleet import a1_coherent_target_rd_executor as coherent_executor
 
 
 def _write_signed(path: Path, value: dict, field: str) -> None:
     value[field] = campaign._value_sha256(value)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def test_completion_fallback_replays_native_runtime_from_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text("{}\n", encoding="utf-8")
+    contract_sha256 = "sha256:" + "1" * 64
+    contract = {"contract_sha256": contract_sha256}
+    native_runtime = {
+        "schema_version": coherent_executor.NATIVE_RUNTIME_IDENTITY_SCHEMA,
+        "wheel_build_receipt": {"source_commit": "a" * 40},
+        "distribution": {"wheel_sha256": "sha256:" + "b" * 64},
+        "extension": {
+            "sha256": "sha256:" + "c" * 64,
+            "wheel_member_sha256": "sha256:" + "c" * 64,
+        },
+        "capabilities": ["coherent_public_belief_search"],
+    }
+    native_runtime["identity_sha256"] = coherent_executor._digest(native_runtime)
+
+    launch_path = tmp_path / "launch.receipt.json"
+    launch = {
+        "schema_version": coherent_executor.LAUNCH_RECEIPT_SCHEMA,
+        "status": "launched",
+        "contract": {
+            "path": str(contract_path),
+            "file_sha256": campaign._file_sha256(contract_path),
+            "contract_sha256": contract_sha256,
+        },
+        "preflight": {
+            "native_runtime": native_runtime,
+            "checkpoint_sha256": campaign.EXPECTED_CORPUS_PRODUCER_SHA256,
+        },
+        "commands": [],
+    }
+    _write_signed(launch_path, launch, "receipt_sha256")
+
+    completion_path = tmp_path / "completion.receipt.json"
+    completion = {
+        "schema_version": campaign.COMPLETION_RECEIPT_SCHEMA,
+        "launch_receipt": {
+            "path": str(launch_path),
+            "file_sha256": campaign._file_sha256(launch_path),
+        },
+    }
+    _write_signed(completion_path, completion, "receipt_sha256")
+
+    observed: dict[str, object] = {}
+
+    def replay_completion(
+        path: Path,
+        *,
+        contract: dict,
+        launch_file_sha256: str,
+        native_runtime: dict,
+    ) -> dict:
+        observed.update(
+            path=path,
+            contract=contract,
+            launch_file_sha256=launch_file_sha256,
+            native_runtime=native_runtime,
+        )
+        raise coherent_executor.ExecutorError("replay reached")
+
+    monkeypatch.setattr(
+        coherent_executor, "_verify_existing_completion", replay_completion
+    )
+
+    with pytest.raises(campaign.CampaignError, match="replay reached"):
+        campaign._verify_completion_receipt(
+            completion_path,
+            contract_path=contract_path.resolve(),
+            contract=contract,
+        )
+
+    assert observed["native_runtime"] == native_runtime
+    assert observed["launch_file_sha256"] == campaign._file_sha256(launch_path)
 
 
 def test_active_policy_arms_change_only_auxiliary_exposure() -> None:

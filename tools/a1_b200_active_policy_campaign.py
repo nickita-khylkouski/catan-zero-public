@@ -265,13 +265,35 @@ def _verify_completion_receipt(
     launch_path = _regular_file(
         Path(str(launch.get("path", ""))), where="completion-bound launch receipt"
     )
-    if _file_sha256(launch_path) != launch.get("file_sha256"):
-        raise CampaignError("completion-bound launch receipt bytes drifted")
     try:
+        launch_receipt, launch_file_sha256 = coherent_executor._authenticated_receipt(  # noqa: SLF001
+            launch_path,
+            expected_schema=coherent_executor.LAUNCH_RECEIPT_SCHEMA,
+        )
+        launch_contract = launch_receipt.get("contract")
+        preflight = launch_receipt.get("preflight")
+        if (
+            launch_file_sha256 != launch.get("file_sha256")
+            or launch_receipt.get("status") != "launched"
+            or not isinstance(launch_contract, Mapping)
+            or launch_contract.get("contract_sha256")
+            != contract["contract_sha256"]
+            or launch_contract.get("file_sha256") != _file_sha256(contract_path)
+            or not isinstance(preflight, Mapping)
+            or preflight.get("checkpoint_sha256")
+            != EXPECTED_CORPUS_PRODUCER_SHA256
+        ):
+            raise CampaignError(
+                "completion-bound launch receipt identity drifted"
+            )
+        native_runtime = coherent_executor._verify_native_runtime_record(  # noqa: SLF001
+            preflight.get("native_runtime")
+        )
         replayed = coherent_executor._verify_existing_completion(  # noqa: SLF001
             resolved,
             contract=contract,
-            launch_file_sha256=_file_sha256(launch_path),
+            launch_file_sha256=launch_file_sha256,
+            native_runtime=native_runtime,
         )
     except (coherent_executor.ExecutorError, OSError, ValueError) as error:
         raise CampaignError(f"coherent completion receipt refused: {error}") from error
