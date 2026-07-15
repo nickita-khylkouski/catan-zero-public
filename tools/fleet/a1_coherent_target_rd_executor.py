@@ -33,6 +33,7 @@ for import_root in (REPO_ROOT / "tools", REPO_ROOT):
         sys.path.insert(0, str(import_root))
 
 from tools import a1_target_eligibility_inventory as identity  # noqa: E402
+from tools.fleet import a1_native_runtime_identity as native_identity  # noqa: E402
 from tools.prelaunch_guard import parse_seed_ledger  # noqa: E402
 
 
@@ -45,6 +46,7 @@ LAUNCH_RECEIPT_SCHEMA = "a1-coherent-target-rd-launch-receipt-v1"
 STATUS_SCHEMA = "a1-coherent-target-rd-status-v1"
 COMPLETION_RECEIPT_SCHEMA = "a1-coherent-target-rd-completion-receipt-v1"
 DEFAULT_STALE_SECONDS = 900.0
+NATIVE_RUNTIME_IDENTITY_SCHEMA = native_identity.RUNTIME_IDENTITY_SCHEMA
 
 
 def _canonical(value: object) -> bytes:
@@ -286,6 +288,22 @@ def _python_executable(path: Path) -> Path:
     return lexical
 
 
+def _native_runtime_identity(
+    receipt_path: Path, *, repo: Path, python: Path
+) -> dict[str, Any]:
+    try:
+        return native_identity.inspect(receipt_path, repo=repo, python=python)
+    except native_identity.RuntimeIdentityError as error:
+        raise ExecutorError(str(error)) from error
+
+
+def _verify_native_runtime_record(value: object) -> Mapping[str, Any]:
+    try:
+        return native_identity.verify_record(value)
+    except native_identity.RuntimeIdentityError as error:
+        raise ExecutorError(str(error)) from error
+
+
 def _ensure_worker_fd_limit() -> tuple[int, int]:
     """Raise the inherited soft fd limit required by multi-worker generation."""
 
@@ -311,6 +329,7 @@ def _preflight(
     *,
     repo: Path,
     python: Path,
+    native_wheel_receipt: Path,
     host_address: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     verified = identity.inspect_rd_contract(contract_path)
@@ -382,6 +401,9 @@ def _preflight(
         "tracked_diff_present": bool(tracked_diff),
         "checkpoint_sha256": _file_sha256(checkpoint),
         "required_gpus": sorted(required_gpus),
+        "native_runtime": _native_runtime_identity(
+            native_wheel_receipt, repo=repo, python=python
+        ),
     }
 
 
@@ -544,12 +566,17 @@ def execute(
     *,
     repo: Path,
     python: Path,
+    native_wheel_receipt: Path,
     host_address: str,
     go: bool,
 ) -> dict[str, Any]:
     contract_path = contract_path.expanduser().resolve(strict=True)
     contract, preflight = _preflight(
-        contract_path, repo=repo, python=python, host_address=host_address
+        contract_path,
+        repo=repo,
+        python=python,
+        native_wheel_receipt=native_wheel_receipt,
+        host_address=host_address,
     )
     repo = repo.expanduser().resolve(strict=True)
     # Keep the authenticated lexical venv entry point. Resolving this symlink
@@ -725,6 +752,7 @@ def _authenticate_launch(
     preflight = launch.get("preflight")
     if not isinstance(preflight, Mapping):
         raise ExecutorError("launch receipt has no preflight identity")
+    _verify_native_runtime_record(preflight.get("native_runtime"))
     if preflight.get("checkpoint_sha256") != contract["producer_checkpoint"]["sha256"]:
         raise ExecutorError("launch receipt checkpoint identity drift")
     launch_repo = Path(str(preflight.get("repo", "")))
@@ -1061,8 +1089,11 @@ def status(
             != contract["contract_sha256"]
             or receipt.get("launch_receipt", {}).get("file_sha256")
             != launch_file_sha256
+            or receipt.get("native_runtime")
+            != launch["preflight"]["native_runtime"]
         ):
             raise ExecutorError("completion receipt binds a different launch")
+        _verify_native_runtime_record(receipt.get("native_runtime"))
         completion = {
             "path": str(completion_path),
             "file_sha256": receipt_file_sha256,
@@ -1085,6 +1116,7 @@ def status(
             "file_sha256": launch_file_sha256,
             "receipt_sha256": launch["receipt_sha256"],
         },
+        "native_runtime": dict(launch["preflight"]["native_runtime"]),
         "totals": aggregate,
         "complete_lanes": complete,
         "failed_lanes": failed,
@@ -1488,6 +1520,7 @@ def _verify_existing_completion(
     *,
     contract: Mapping[str, Any],
     launch_file_sha256: str,
+    native_runtime: Mapping[str, Any],
 ) -> dict[str, Any]:
     receipt, file_sha256 = _authenticated_receipt(
         path, expected_schema=COMPLETION_RECEIPT_SCHEMA
@@ -1505,6 +1538,9 @@ def _verify_existing_completion(
         != contract["acceptance"]["require_search_evidence_schema"]
     ):
         raise ExecutorError("completion receipt binds a different transaction")
+    _verify_native_runtime_record(receipt.get("native_runtime"))
+    if receipt.get("native_runtime") != native_runtime:
+        raise ExecutorError("completion receipt native runtime differs from launch")
     totals = receipt.get("totals", {})
     seeds = receipt.get("seed_inventory", {})
     expected_games = int(contract["execution"]["total_games"])
@@ -1616,6 +1652,7 @@ def collect(
             completion_path,
             contract=contract,
             launch_file_sha256=launch_file_sha256,
+            native_runtime=launch["preflight"]["native_runtime"],
         )
     snapshot = status(
         contract_path,
@@ -1802,6 +1839,7 @@ def collect(
             "file_sha256": launch_file_sha256,
             "receipt_sha256": launch["receipt_sha256"],
         },
+        "native_runtime": dict(launch["preflight"]["native_runtime"]),
         "producer_checkpoint": dict(contract["producer_checkpoint"]),
         "producer_source": {
             "repo": str(launch["preflight"]["repo"]),
@@ -1848,6 +1886,7 @@ def collect(
         completion_path,
         contract=contract,
         launch_file_sha256=launch_file_sha256,
+        native_runtime=launch["preflight"]["native_runtime"],
     )
 
 
@@ -1861,6 +1900,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo", type=Path, default=REPO_ROOT)
     parser.add_argument("--python", type=Path)
+    parser.add_argument(
+        "--native-wheel-receipt",
+        type=Path,
+        help=(
+            "build receipt beside the one exact catanatron-rs wheel installed "
+            "in --python; required for launch/dry-run"
+        ),
+    )
     parser.add_argument("--host-address", required=True)
     action = parser.add_mutually_exclusive_group()
     action.add_argument(
@@ -1920,10 +1967,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             if args.python is None:
                 raise ExecutorError("--python is required for launch/dry-run")
+            if args.native_wheel_receipt is None:
+                raise ExecutorError(
+                    "--native-wheel-receipt is required for launch/dry-run"
+                )
             result = execute(
                 args.contract,
                 repo=args.repo,
                 python=args.python,
+                native_wheel_receipt=args.native_wheel_receipt,
                 host_address=args.host_address,
                 go=bool(args.go),
             )

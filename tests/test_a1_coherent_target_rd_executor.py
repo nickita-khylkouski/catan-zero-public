@@ -182,11 +182,45 @@ def test_wait_polls_existing_launch_then_collects_without_execute(
 def test_cli_preserves_launch_and_adds_lifecycle_modes() -> None:
     parser = executor.build_parser()
     launch = parser.parse_args(
-        ["--host-address", "b200", "--python", "/venv/bin/python", "--go"]
+        [
+            "--host-address",
+            "b200",
+            "--python",
+            "/venv/bin/python",
+            "--native-wheel-receipt",
+            "/wheels/build-receipt.json",
+            "--go",
+        ]
     )
     lifecycle = parser.parse_args(["--host-address", "b200", "--status"])
 
     assert launch.go is True
     assert launch.python == Path("/venv/bin/python")
+    assert launch.native_wheel_receipt == Path("/wheels/build-receipt.json")
     assert lifecycle.status is True
     assert lifecycle.python is None
+
+
+def test_native_runtime_record_binds_loaded_extension_to_wheel_member() -> None:
+    record = {
+        "schema_version": executor.NATIVE_RUNTIME_IDENTITY_SCHEMA,
+        "wheel_build_receipt": {"source_commit": "a" * 40},
+        "distribution": {"wheel_sha256": "sha256:" + "b" * 64},
+        "extension": {
+            "sha256": "sha256:" + "c" * 64,
+            "wheel_member_sha256": "sha256:" + "c" * 64,
+        },
+        "capabilities": ["coherent_public_belief_search"],
+    }
+    record["identity_sha256"] = executor._digest(record)
+
+    assert executor._verify_native_runtime_record(record) == record
+
+    drifted = dict(record)
+    drifted["extension"] = dict(record["extension"])
+    drifted["extension"]["sha256"] = "sha256:" + "d" * 64
+    unhashed = dict(drifted)
+    unhashed.pop("identity_sha256")
+    drifted["identity_sha256"] = executor._digest(unhashed)
+    with pytest.raises(executor.ExecutorError, match="malformed"):
+        executor._verify_native_runtime_record(drifted)
