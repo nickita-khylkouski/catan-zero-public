@@ -344,6 +344,7 @@ def test_loads_exact_a1_validation_manifest_and_binds_file_bytes(tmp_path: Path)
     loaded = _load(path)
 
     np.testing.assert_array_equal(loaded["game_seeds"], np.asarray([11, 13]))
+    assert loaded["validation_game_seed_count"] == 2
     assert loaded["a1_contract_sha256"] == _CONTRACT_SHA
     assert loaded["validation_game_seed_set_sha256"] == payload[
         "validation_game_seed_set_sha256"

@@ -5925,6 +5925,7 @@ def _load_validation_game_seed_manifest_for_training(
         "file_sha256": f"sha256:{hashlib.sha256(raw).hexdigest()}",
         "manifest_sha256": _canonical_json_sha256(payload),
         "a1_contract_sha256": payload["a1_contract_sha256"],
+        "validation_game_seed_count": int(count),
         "validation_row_count": int(row_count),
         "validation_game_seed_set_sha256": actual_digest,
         "game_seeds": seeds,
