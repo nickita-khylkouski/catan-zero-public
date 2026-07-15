@@ -18,6 +18,7 @@ import fcntl
 import hashlib
 import json
 import os
+import resource
 import stat
 import subprocess
 import sys
@@ -36,6 +37,9 @@ from tools.prelaunch_guard import parse_seed_ledger  # noqa: E402
 
 class ExecutorError(RuntimeError):
     """The sealed R&D transaction cannot be launched exactly."""
+
+
+REQUIRED_NOFILE_LIMIT = 65_536
 
 
 def _canonical(value: object) -> bytes:
@@ -191,6 +195,43 @@ def _run_text(command: Sequence[str], *, cwd: Path | None = None) -> str:
         raise ExecutorError(f"command failed: {list(command)!r}: {error}") from error
 
 
+def _python_executable(path: Path) -> Path:
+    """Authenticate a venv interpreter without resolving away its prefix.
+
+    Virtualenv Python entry points are commonly symlinks to the base
+    interpreter.  Executing the resolved target silently drops the venv's
+    site-packages, so retain the lexical absolute path after proving that its
+    target exists and the entry point is executable.
+    """
+
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        target = lexical.resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(f"cannot resolve Python executable {lexical}: {error}") from error
+    if not target.is_file() or not os.access(lexical, os.X_OK):
+        raise ExecutorError(f"python is not executable: {lexical}")
+    return lexical
+
+
+def _ensure_worker_fd_limit() -> tuple[int, int]:
+    """Raise the inherited soft fd limit required by multi-worker generation."""
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard < REQUIRED_NOFILE_LIMIT:
+        raise ExecutorError(
+            "hard RLIMIT_NOFILE is below the generator contract: "
+            f"hard={hard} required={REQUIRED_NOFILE_LIMIT}"
+        )
+    if soft < REQUIRED_NOFILE_LIMIT:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (REQUIRED_NOFILE_LIMIT, hard))
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < REQUIRED_NOFILE_LIMIT:
+        raise ExecutorError(
+            "could not raise soft RLIMIT_NOFILE for generation: "
+            f"soft={soft} required={REQUIRED_NOFILE_LIMIT}"
+        )
+    return int(soft), int(hard)
 def _preflight(
     contract_path: Path,
     *,
@@ -206,7 +247,7 @@ def _preflight(
             f"--host-address {host_address!r} does not match sealed host {execution['host']!r}"
         )
     repo = repo.expanduser().resolve(strict=True)
-    python = python.expanduser().resolve(strict=True)
+    python = _python_executable(python)
     contract_repo = contract_path.resolve(strict=True).parents[3]
     if repo != contract_repo:
         raise ExecutorError(
@@ -358,6 +399,8 @@ def execute(
     ).returncode != 0:
         raise ExecutorError(f"MPS service is not active: {service}")
 
+    nofile_soft, nofile_hard = _ensure_worker_fd_limit()
+
     _rendered_claims, claim_receipt = _claim_rows(contract)
     output_root = Path(str(execution["output_root"]))
     output_root.mkdir(parents=True, exist_ok=False)
@@ -367,6 +410,11 @@ def execute(
     base_env.update({str(key): str(value) for key, value in execution["mps_environment"].items()})
     base_env["CATAN_SEED_LEDGER"] = str(execution["seed_ledger"])
     base_env["PYTHONUNBUFFERED"] = "1"
+    import_roots = [str(repo / "src"), str(repo / "tools")]
+    inherited_pythonpath = base_env.get("PYTHONPATH")
+    if inherited_pythonpath:
+        import_roots.append(inherited_pythonpath)
+    base_env["PYTHONPATH"] = os.pathsep.join(import_roots)
     try:
         for command in commands:
             lane_id = str(command["lane_id"])
@@ -419,6 +467,7 @@ def execute(
             "status": "launched",
             "launched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "mps_service": service,
+            "rlimit_nofile": {"soft": nofile_soft, "hard": nofile_hard},
             "claim_receipt": claim_receipt,
             "commands": launched,
         }
