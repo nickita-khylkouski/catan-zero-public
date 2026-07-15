@@ -368,6 +368,15 @@ def execute(
     base_env.update({str(key): str(value) for key, value in execution["mps_environment"].items()})
     base_env["CATAN_SEED_LEDGER"] = str(execution["seed_ledger"])
     base_env["PYTHONUNBUFFERED"] = "1"
+    # The executor may intentionally use a clean source checkout with the
+    # already-provisioned production virtualenv.  Bind imports to that exact
+    # checkout instead of whichever older catan-zero wheel happens to be
+    # installed in the environment.
+    import_roots = [str(repo / "src"), str(repo / "tools")]
+    inherited_pythonpath = base_env.get("PYTHONPATH")
+    if inherited_pythonpath:
+        import_roots.append(inherited_pythonpath)
+    base_env["PYTHONPATH"] = os.pathsep.join(import_roots)
     try:
         for command in commands:
             lane_id = str(command["lane_id"])
