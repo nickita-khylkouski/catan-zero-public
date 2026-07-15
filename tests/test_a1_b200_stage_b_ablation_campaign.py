@@ -46,6 +46,9 @@ def _selected_fixture(tmp_path: Path) -> tuple[Path, dict, Path, dict]:
             "checkpoint": str(checkpoint.resolve()),
             "checkpoint_sha256": campaign._file_sha256(checkpoint),
             "eligible": True,
+            "parent_kl": 0.012,
+            "trunk_relative_l2": 0.006,
+            "teacher_gap_closure": 0.05,
         },
         "winner_checkpoint": {
             "path": str(checkpoint.resolve()),
@@ -77,6 +80,8 @@ def test_selected_dose_binds_stage_a_arm_multiplier_step_and_checkpoint(
     assert dose["optimizer_steps"] == 32
     assert dose["checkpoint_steps"] == [8, 12, 16, 32]
     assert dose["expected_aux_active_row_draws"] == 232 * 8 * 32
+    assert dose["reference_parent_kl"] == pytest.approx(0.012)
+    assert dose["reference_trunk_relative_l2"] == pytest.approx(0.006)
     assert dose["stage_a_selected_checkpoint"]["role"] == (
         "dose_evidence_only_never_initializer"
     )
@@ -109,6 +114,7 @@ def test_stage_b_arms_change_exactly_one_treatment_at_selected_dose() -> None:
     dose = {
         "optimizer_steps": 32,
         "policy_aux_active_batch_size": 232,
+        "reference_parent_kl": 0.012,
     }
     source_recipe = {"lr": 6.0e-5, "lr_warmup_steps": 16}
     arms = {
@@ -137,10 +143,18 @@ def test_stage_b_arms_change_exactly_one_treatment_at_selected_dose() -> None:
     assert arms["SURPRISE"]["recipe_overrides"][
         "per_game_policy_surprise_weighting"
     ] is True
+    assert arms["TRUNK25"]["recipe_overrides"]["trunk_lr_mult"] == 0.25
+    assert arms["TRUNK10"]["recipe_overrides"]["trunk_lr_mult"] == 0.10
+    assert arms["TRUST"]["recipe_overrides"]["policy_kl_target"] == pytest.approx(
+        0.012
+    )
+    assert arms["TRUST"]["recipe_overrides"]["policy_kl_anchor_direction"] == (
+        "forward"
+    )
 
     broken = copy.deepcopy(arms)
     broken["CARD4"]["recipe_overrides"]["lr"] = 1.2e-4
-    with pytest.raises(campaign.CampaignError, match="outside the three treatment"):
+    with pytest.raises(campaign.CampaignError, match="outside declared treatment"):
         campaign._assert_treatment_isolation(broken)  # noqa: SLF001
 
 
@@ -160,10 +174,15 @@ class _FakeCorpus:
         action_taken: list[int],
         stored_forced: list[bool],
     ) -> None:
+        prior_policy = np.zeros((len(legal_counts), max(legal_counts)), dtype=np.float32)
+        for row, count in enumerate(legal_counts):
+            if count > 1:
+                prior_policy[row, :count] = 1.0 / count
         self._values = {
             "legal_action_ids": _FakeLegalColumn(legal_counts),
             "action_taken": np.asarray(action_taken, dtype=np.int64),
             "is_forced": np.asarray(stored_forced, dtype=np.bool_),
+            "prior_policy": prior_policy,
         }
 
     def __contains__(self, key: str) -> bool:
@@ -207,10 +226,15 @@ def test_forced_treatment_is_structurally_inactive_without_typed_rows(
     assert exposure["one_legal_action_rows"] == 0
     assert exposure["typed_forced_rows"] == 0
     assert exposure["forced_treatment_structurally_active"] is False
+    assert exposure["policy_kl_anchor_multi_action_rows"] == 3
+    assert exposure["trust_treatment_structurally_active"] is True
     assert campaign._active_arms_for_exposure(exposure) == [  # noqa: SLF001
         "BASE",
         "CARD4",
         "SURPRISE",
+        "TRUNK25",
+        "TRUNK10",
+        "TRUST",
     ]
     assert exposure["exposure_sha256"] == campaign._value_sha256(  # noqa: SLF001
         {key: value for key, value in exposure.items() if key != "exposure_sha256"}
@@ -248,11 +272,18 @@ def test_forced_treatment_activates_only_for_typed_one_legal_action_rows(
         "FORCED",
         "CARD4",
         "SURPRISE",
+        "TRUNK25",
+        "TRUNK10",
+        "TRUST",
     ]
 
 
 def test_effective_recipe_refuses_hidden_second_treatment() -> None:
-    dose = {"optimizer_steps": 64, "policy_aux_active_batch_size": 116}
+    dose = {
+        "optimizer_steps": 64,
+        "policy_aux_active_batch_size": 116,
+        "reference_parent_kl": 0.012,
+    }
     source_recipe = {"lr": 6.0e-5, "lr_warmup_steps": 16}
     arms = {
         arm: {
@@ -270,3 +301,29 @@ def test_effective_recipe_refuses_hidden_second_treatment() -> None:
         campaign._effective_treatment_assertion(  # noqa: SLF001
             plan, "CARD4", effective
         )
+
+
+def test_dose_match_uses_parent_kl_and_trunk_drift_not_teacher_outcome() -> None:
+    selected = campaign._select_dose_matched_checkpoint(  # noqa: SLF001
+        [
+            {
+                "step": 16,
+                "parent_kl": 0.0105,
+                "trunk_relative_l2": 0.0055,
+                "teacher_gap_closure": 0.01,
+            },
+            {
+                "step": 32,
+                "parent_kl": 0.030,
+                "trunk_relative_l2": 0.015,
+                "teacher_gap_closure": 0.90,
+            },
+        ],
+        reference_parent_kl=0.010,
+        reference_trunk_relative_l2=0.005,
+        terminal_step=32,
+    )
+
+    assert selected["step"] == 16
+    assert selected["teacher_gap_closure"] == pytest.approx(0.01)
+    assert selected["parent_kl_ratio_to_stage_a_reference"] == pytest.approx(1.05)

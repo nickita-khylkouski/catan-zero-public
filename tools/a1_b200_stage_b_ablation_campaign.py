@@ -10,6 +10,8 @@ learner setting fixed.  It then varies one treatment at a time:
 * ``FORCED``: only END_TURN=0.1 and ROLL=0.25 forced-value weighting;
 * ``CARD4``: only public-card residual LR 4x;
 * ``SURPRISE``: only exact per-game policy-surprise weighting.
+* ``TRUNK25`` / ``TRUNK10``: only reduce the shared-trunk LR to 0.25x / 0.10x;
+* ``TRUST``: only enable a forward-KL projected-dual parent trust region.
 
 The FORCED arm is structurally inactive when the authenticated corpus contains
 no one-legal-action END_TURN/ROLL rows.  It is recorded in the signed plan but
@@ -51,43 +53,81 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import train_bc  # noqa: E402
 
 
-SCHEMA = "a1-b200-stage-b-causal-ablation-campaign-v1"
+SCHEMA = "a1-b200-stage-b-causal-ablation-campaign-v2"
 ARM_RECEIPT_SCHEMA = "a1-b200-stage-b-arm-receipt-v1"
 FINGERPRINT_SCHEMA = "a1-b200-stage-b-fingerprint-v1"
-COMPARISON_SCHEMA = "a1-b200-stage-b-comparison-v1"
+COMPARISON_SCHEMA = "a1-b200-stage-b-comparison-v2"
 WORLD_SIZE = stage_a.WORLD_SIZE
 LOCAL_BATCH_SIZE = stage_a.LOCAL_BATCH_SIZE
 GLOBAL_BATCH_SIZE = stage_a.GLOBAL_BATCH_SIZE
 CHECKPOINT_FRONTIER = stage_a.CHECKPOINT_STEPS
 FORCED_TYPED_SPEC = "END_TURN=0.1,ROLL=0.25"
+TRUST_DUAL_LR = 1.0
+TRUST_MAX_WEIGHT = 1.0
+DISTANCE_RATIO_LIMIT = 2.0
 TREATMENT_FIELDS = frozenset(
     {
         "forced_row_value_action_type_weights",
         "public_card_lr_mult",
         "per_game_policy_surprise_weighting",
+        "trunk_lr_mult",
+        "policy_kl_target",
+        "policy_kl_dual_lr",
+        "policy_kl_max_weight",
+        "policy_kl_anchor_direction",
     }
 )
-ARM_ORDER = ("BASE", "FORCED", "CARD4", "SURPRISE")
+ARM_ORDER = (
+    "BASE",
+    "FORCED",
+    "CARD4",
+    "SURPRISE",
+    "TRUNK25",
+    "TRUNK10",
+    "TRUST",
+)
 TREATMENTS: dict[str, dict[str, Any]] = {
     "BASE": {
         "forced_row_value_action_type_weights": "",
         "public_card_lr_mult": 1.0,
         "per_game_policy_surprise_weighting": False,
+        "trunk_lr_mult": 1.0,
     },
     "FORCED": {
         "forced_row_value_action_type_weights": FORCED_TYPED_SPEC,
         "public_card_lr_mult": 1.0,
         "per_game_policy_surprise_weighting": False,
+        "trunk_lr_mult": 1.0,
     },
     "CARD4": {
         "forced_row_value_action_type_weights": "",
         "public_card_lr_mult": 4.0,
         "per_game_policy_surprise_weighting": False,
+        "trunk_lr_mult": 1.0,
     },
     "SURPRISE": {
         "forced_row_value_action_type_weights": "",
         "public_card_lr_mult": 1.0,
         "per_game_policy_surprise_weighting": True,
+        "trunk_lr_mult": 1.0,
+    },
+    "TRUNK25": {
+        "forced_row_value_action_type_weights": "",
+        "public_card_lr_mult": 1.0,
+        "per_game_policy_surprise_weighting": False,
+        "trunk_lr_mult": 0.25,
+    },
+    "TRUNK10": {
+        "forced_row_value_action_type_weights": "",
+        "public_card_lr_mult": 1.0,
+        "per_game_policy_surprise_weighting": False,
+        "trunk_lr_mult": 0.10,
+    },
+    "TRUST": {
+        "forced_row_value_action_type_weights": "",
+        "public_card_lr_mult": 1.0,
+        "per_game_policy_surprise_weighting": False,
+        "trunk_lr_mult": 1.0,
     },
 }
 
@@ -193,6 +233,13 @@ def _selected_dose(
         multiplier = float(winner_recipe["active_policy_branch_multiplier"])
         aux_batch = int(winner_recipe["policy_aux_active_batch_size"])
         candidate_step = int(winner_candidate["step"])
+        reference_parent_kl = float(winner_candidate["parent_kl"])
+        reference_trunk_relative_l2 = float(
+            winner_candidate["trunk_relative_l2"]
+        )
+        reference_teacher_gap_closure = float(
+            winner_candidate["teacher_gap_closure"]
+        )
     except (KeyError, TypeError, ValueError) as error:
         raise CampaignError("Stage-A selected dose is malformed") from error
     _checkpoint_schedule(step)
@@ -215,6 +262,12 @@ def _selected_dose(
         or multiplier
         != float(source_arm.get("active_policy_branch_multiplier", math.nan))
         or aux_batch != int(source_arm.get("policy_aux_active_batch_size", -1))
+        or not math.isfinite(reference_parent_kl)
+        or reference_parent_kl <= 0.0
+        or not math.isfinite(reference_trunk_relative_l2)
+        or reference_trunk_relative_l2 <= 0.0
+        or not math.isfinite(reference_teacher_gap_closure)
+        or reference_teacher_gap_closure <= 0.0
     ):
         raise CampaignError("Stage-A winner recipe/checkpoint dose binding drifted")
     return {
@@ -234,6 +287,9 @@ def _selected_dose(
         "optimizer_steps": step,
         "checkpoint_steps": list(_checkpoint_schedule(step)),
         "expected_aux_active_row_draws": aux_batch * WORLD_SIZE * step,
+        "reference_parent_kl": reference_parent_kl,
+        "reference_trunk_relative_l2": reference_trunk_relative_l2,
+        "reference_teacher_gap_closure": reference_teacher_gap_closure,
         "stage_a_selected_checkpoint": {
             "path": str(candidate_path),
             "sha256": _file_sha256(candidate_path),
@@ -309,6 +365,17 @@ def _treatment_exposure(data_path: Path) -> dict[str, Any]:
         if action_type in typed_counts:
             typed_counts[action_type] += 1
     typed_rows = sum(typed_counts.values())
+    anchor_rows = 0
+    if "prior_policy" in corpus:
+        for start in range(0, len(corpus), 8192):
+            rows = np.arange(start, min(start + 8192, len(corpus)), dtype=np.int64)
+            prior = np.asarray(corpus["prior_policy"][rows], dtype=np.float32)
+            counts = legal_counts[rows]
+            if prior.ndim != 2 or prior.shape[0] != len(rows):
+                raise CampaignError("policy-KL prior surface has malformed shape")
+            valid = np.arange(prior.shape[1])[None, :] < counts[:, None]
+            mass = np.where(valid, prior, 0.0).sum(axis=1)
+            anchor_rows += int(np.count_nonzero((counts > 1) & (mass > 1.0e-6)))
     payload: dict[str, Any] = {
         "schema_version": "a1-stage-b-treatment-exposure-v1",
         "corpus": {
@@ -321,6 +388,8 @@ def _treatment_exposure(data_path: Path) -> dict[str, Any]:
         "typed_forced_rows": int(typed_rows),
         "typed_forced_rows_by_action_type": typed_counts,
         "forced_treatment_structurally_active": typed_rows > 0,
+        "policy_kl_anchor_multi_action_rows": anchor_rows,
+        "trust_treatment_structurally_active": anchor_rows > 0,
         "weighting_semantics": (
             "train_bc legal_action_count==1 joined through authoritative "
             "ActionCatalog action_taken type"
@@ -335,11 +404,16 @@ def _active_arms_for_exposure(exposure: Mapping[str, Any]) -> list[str]:
     stated_active = exposure.get("forced_treatment_structurally_active")
     if typed_rows < 0 or stated_active is not (typed_rows > 0):
         raise CampaignError("forced treatment exposure count/status is inconsistent")
-    return (
-        ["BASE", "FORCED", "CARD4", "SURPRISE"]
-        if stated_active
-        else ["BASE", "CARD4", "SURPRISE"]
-    )
+    anchor_rows = int(exposure.get("policy_kl_anchor_multi_action_rows", -1))
+    trust_active = exposure.get("trust_treatment_structurally_active")
+    if anchor_rows < 0 or trust_active is not (anchor_rows > 0):
+        raise CampaignError("trust treatment exposure count/status is inconsistent")
+    return [
+        arm
+        for arm in ARM_ORDER
+        if (arm != "FORCED" or stated_active)
+        and (arm != "TRUST" or trust_active)
+    ]
 
 
 def _arm_overrides(
@@ -355,6 +429,7 @@ def _arm_overrides(
         "lr_warmup_steps": int(source_recipe["lr_warmup_steps"]),
         "forced_row_value_weight": 1.0,
         "public_card_lr_mult": float(treatment["public_card_lr_mult"]),
+        "trunk_lr_mult": float(treatment["trunk_lr_mult"]),
         "per_game_policy_surprise_weighting": bool(
             treatment["per_game_policy_surprise_weighting"]
         ),
@@ -365,6 +440,20 @@ def _arm_overrides(
     typed = str(treatment["forced_row_value_action_type_weights"])
     if typed:
         overrides["forced_row_value_action_type_weights"] = typed
+    if arm == "TRUST":
+        target = float(selected_dose["reference_parent_kl"])
+        if not math.isfinite(target) or target <= 0.0:
+            raise CampaignError(
+                "TRUST requires a finite positive Stage-A parent-KL fingerprint"
+            )
+        overrides.update(
+            {
+                "policy_kl_anchor_direction": "forward",
+                "policy_kl_target": target,
+                "policy_kl_dual_lr": TRUST_DUAL_LR,
+                "policy_kl_max_weight": TRUST_MAX_WEIGHT,
+            }
+        )
     return overrides
 
 
@@ -380,11 +469,19 @@ def _assert_treatment_isolation(arms: Mapping[str, Mapping[str, Any]]) -> None:
         for arm, recipe in recipes.items()
     }
     if any(value != common["BASE"] for value in common.values()):
-        raise CampaignError("Stage-B arms differ outside the three treatment fields")
+        raise CampaignError("Stage-B arms differ outside declared treatment fields")
     expected_deltas = {
         "FORCED": {"forced_row_value_action_type_weights"},
         "CARD4": {"public_card_lr_mult"},
         "SURPRISE": {"per_game_policy_surprise_weighting"},
+        "TRUNK25": {"trunk_lr_mult"},
+        "TRUNK10": {"trunk_lr_mult"},
+        "TRUST": {
+            "policy_kl_anchor_direction",
+            "policy_kl_target",
+            "policy_kl_dual_lr",
+            "policy_kl_max_weight",
+        },
     }
     base = recipes["BASE"]
     for arm, expected in expected_deltas.items():
@@ -406,6 +503,11 @@ def _assert_treatment_isolation(arms: Mapping[str, Mapping[str, Any]]) -> None:
         != FORCED_TYPED_SPEC
         or recipes["CARD4"].get("public_card_lr_mult") != 4.0
         or recipes["SURPRISE"].get("per_game_policy_surprise_weighting") is not True
+        or recipes["TRUNK25"].get("trunk_lr_mult") != 0.25
+        or recipes["TRUNK10"].get("trunk_lr_mult") != 0.10
+        or recipes["TRUST"].get("policy_kl_anchor_direction") != "forward"
+        or recipes["TRUST"].get("policy_kl_dual_lr") != TRUST_DUAL_LR
+        or recipes["TRUST"].get("policy_kl_max_weight") != TRUST_MAX_WEIGHT
     ):
         raise CampaignError("Stage-B treatment definitions drifted")
 
@@ -493,7 +595,11 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "inactive_reason": (
                 None
                 if active
-                else "zero_END_TURN_or_ROLL_one_legal_action_rows_in_bound_corpus"
+                else (
+                    "zero_END_TURN_or_ROLL_one_legal_action_rows_in_bound_corpus"
+                    if arm == "FORCED"
+                    else "zero_authenticated_multi_action_parent_prior_rows"
+                )
             ),
             "expected_aux_active_row_draws": dose["expected_aux_active_row_draws"],
             "output_subdir": f"arms/{arm}",
@@ -521,6 +627,9 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
                 "optimizer_steps",
                 "checkpoint_steps",
                 "expected_aux_active_row_draws",
+                "reference_parent_kl",
+                "reference_trunk_relative_l2",
+                "reference_teacher_gap_closure",
             )
         },
         "lineage_contract": {
@@ -552,13 +661,17 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         "inactive_arms": [arm for arm in ARM_ORDER if arm not in active_arms],
         "arms": arm_records,
         "comparison_contract": {
-            "exact_selected_optimizer_step_only": True,
-            "intermediate_checkpoints_are_diagnostic_not_alternate_doses": True,
+            "same_optimizer_step_is_not_a_dose_match": True,
+            "checkpoint_selected_by_parent_kl_and_trunk_drift": True,
+            "max_parent_kl_ratio_to_stage_a_reference": DISTANCE_RATIO_LIMIT,
+            "max_trunk_relative_l2_ratio_to_stage_a_reference": DISTANCE_RATIO_LIMIT,
             "max_parent_kl": float(source["selection_contract"]["max_parent_kl"]),
             "max_trunk_relative_l2": float(
                 source["selection_contract"]["max_trunk_relative_l2"]
             ),
-            "objective": "terminal_teacher_gap_closure_subject_to_stage_a_drift_budgets",
+            "objective": (
+                "max_teacher_gap_closure_at_nearest_stage_a_parent_kl_and_trunk_drift"
+            ),
             "playing_strength_evaluation_required": True,
         },
         "inputs": {
@@ -679,6 +792,13 @@ def _load_campaign(path: Path) -> tuple[Path, dict[str, Any]]:
     )
     if ("FORCED" in active) != forced_exposure:
         raise CampaignError("FORCED launch eligibility differs from signed exposure")
+    trust_exposure = bool(
+        campaign.get("treatment_exposure", {}).get(
+            "trust_treatment_structurally_active"
+        )
+    )
+    if ("TRUST" in active) != trust_exposure:
+        raise CampaignError("TRUST launch eligibility differs from signed exposure")
     return campaign_path, campaign
 
 
@@ -714,6 +834,9 @@ def _verify_campaign_inputs(campaign: Mapping[str, Any]) -> None:
         "optimizer_steps",
         "checkpoint_steps",
         "expected_aux_active_row_draws",
+        "reference_parent_kl",
+        "reference_trunk_relative_l2",
+        "reference_teacher_gap_closure",
     ):
         if dose[key] != campaign["selected_dose"][key]:
             raise CampaignError(f"Stage-A selected dose changed after planning: {key}")
@@ -730,6 +853,7 @@ def _effective_treatment_assertion(
         "lr_warmup_steps",
         "forced_row_value_weight",
         "public_card_lr_mult",
+        "trunk_lr_mult",
         "per_game_policy_surprise_weighting",
         "policy_aux_active_batch_size",
     )
@@ -745,6 +869,26 @@ def _effective_treatment_assertion(
             "expected": expected_typed,
             "actual": actual_typed,
         }
+    for key in (
+        "policy_kl_target",
+        "policy_kl_dual_lr",
+        "policy_kl_max_weight",
+        "policy_kl_anchor_direction",
+    ):
+        expected_value = expected.get(key)
+        actual_value = effective.get(key)
+        if actual_value != expected_value:
+            # Historical BASE recipes may carry the inert forward direction but
+            # never an adaptive target. It is not a second treatment.
+            if not (
+                key == "policy_kl_anchor_direction"
+                and expected_value is None
+                and actual_value in {None, "forward"}
+            ):
+                drift[key] = {
+                    "expected": expected_value,
+                    "actual": actual_value,
+                }
     if drift:
         raise CampaignError(
             f"Stage-B arm {arm} effective treatment/dose drift: "
@@ -776,6 +920,8 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
     expected_checkpoint_options = (
         [",".join(map(str, expected_intermediate))] if expected_intermediate else []
     )
+    has_trust_target = "--policy-kl-target" in command
+    expected_trust_target = arm == "TRUST"
     if (
         _file_sha256(initializer)
         != campaign["lineage_contract"]["upgraded_initializer_sha256"]
@@ -783,6 +929,9 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
         or not any(token == "--nproc_per_node=8" for token in command)
         or int(stage_a._option(command, "--max-steps")) != expected_steps  # noqa: SLF001
         or actual_checkpoint_options != expected_checkpoint_options
+        or has_trust_target is not expected_trust_target
+        or float(stage_a._option(command, "--trunk-lr-mult"))  # noqa: SLF001
+        != float(campaign["arms"][arm]["recipe_overrides"]["trunk_lr_mult"])
         or not isinstance(learner_parent, Mapping)
         or learner_parent.get("role") != "diagnostic_independent_parent"
         or learner_parent.get("checkpoint", {}).get("sha256")
@@ -791,6 +940,17 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
         or plan.get("learner_ablation", {}).get("promotion_eligible") is not False
     ):
         raise CampaignError(f"Stage-B arm {arm} lost exact f7/fresh-Adam selected dose")
+    if expected_trust_target and (
+        float(stage_a._option(command, "--policy-kl-target"))  # noqa: SLF001
+        != float(campaign["selected_dose"]["reference_parent_kl"])
+        or float(stage_a._option(command, "--policy-kl-dual-lr"))  # noqa: SLF001
+        != TRUST_DUAL_LR
+        or float(stage_a._option(command, "--policy-kl-max-weight"))  # noqa: SLF001
+        != TRUST_MAX_WEIGHT
+        or stage_a._option(command, "--policy-kl-anchor-direction")  # noqa: SLF001
+        != "forward"
+    ):
+        raise CampaignError("Stage-B TRUST arm lost its projected-dual contract")
     return plan
 
 
@@ -829,6 +989,23 @@ def _verify_completed_arm(
     outputs = receipt.get("outputs")
     learner_parent = receipt.get("learner_lineage_parent")
     intermediate = report.get("intermediate_checkpoints")
+    controller = report.get("adaptive_policy_kl_controller")
+    if arm == "TRUST":
+        if (
+            not isinstance(controller, Mapping)
+            or controller.get("schema_version")
+            != train_bc.POLICY_KL_CONTROLLER_SCHEMA
+            or controller.get("direction") != "forward"
+            or float(controller.get("target_kl", math.nan))
+            != float(campaign["selected_dose"]["reference_parent_kl"])
+            or float(controller.get("dual_lr", math.nan)) != TRUST_DUAL_LR
+            or float(controller.get("max_weight", math.nan)) != TRUST_MAX_WEIGHT
+            or int(controller.get("updates", -1)) != terminal
+            or int(controller.get("eligible_rows", 0)) <= 0
+        ):
+            raise CampaignError("Stage-B TRUST arm did not execute its KL controller")
+    elif controller is not None:
+        raise CampaignError(f"Stage-B arm {arm} unexpectedly ran a KL controller")
     if (
         receipt.get("status") != "complete"
         or receipt.get("returncode") != 0
@@ -886,6 +1063,7 @@ def _verify_completed_arm(
         "learner_parent_sha256": stage_a.EXPECTED_F7_PARENT_SHA256,
         "fresh_adam": True,
         "policy_aux_active_rows": expected_aux_rows,
+        "adaptive_policy_kl_controller": copy.deepcopy(controller),
     }
     arm_receipt["receipt_sha256"] = _value_sha256(arm_receipt)
     wrapper_path = arm_root / "stage-b.receipt.json"
@@ -1104,6 +1282,52 @@ def _parse_bindings(
         raise CampaignError(str(error)) from error
 
 
+def _select_dose_matched_checkpoint(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    reference_parent_kl: float,
+    reference_trunk_relative_l2: float,
+    terminal_step: int,
+) -> dict[str, Any]:
+    """Choose a checkpoint using update geometry only, never outcome quality."""
+
+    def positive_ratio(value: float, reference: float) -> float:
+        if value <= 0.0 or reference <= 0.0:
+            return math.inf
+        return max(value / reference, reference / value)
+
+    normalized: list[dict[str, Any]] = []
+    for candidate in candidates:
+        row = copy.deepcopy(dict(candidate))
+        kl_ratio = positive_ratio(
+            float(row["parent_kl"]), float(reference_parent_kl)
+        )
+        trunk_ratio = positive_ratio(
+            float(row["trunk_relative_l2"]),
+            float(reference_trunk_relative_l2),
+        )
+        row.update(
+            {
+                "parent_kl_ratio_to_stage_a_reference": kl_ratio,
+                "trunk_ratio_to_stage_a_reference": trunk_ratio,
+                "dose_match_log_distance": math.hypot(
+                    math.log(kl_ratio), math.log(trunk_ratio)
+                ),
+            }
+        )
+        normalized.append(row)
+    if not normalized:
+        raise CampaignError("cannot dose-match an empty checkpoint frontier")
+    return sorted(
+        normalized,
+        key=lambda row: (
+            row["dose_match_log_distance"],
+            abs(int(row["step"]) - int(terminal_step)),
+            int(row["step"]),
+        ),
+    )[0]
+
+
 def _compare(
     campaign_path: Path,
     campaign: Mapping[str, Any],
@@ -1112,6 +1336,21 @@ def _compare(
     terminal = int(campaign["selected_dose"]["optimizer_steps"])
     cap_kl = float(campaign["comparison_contract"]["max_parent_kl"])
     cap_trunk = float(campaign["comparison_contract"]["max_trunk_relative_l2"])
+    reference_kl = float(campaign["selected_dose"]["reference_parent_kl"])
+    reference_trunk = float(
+        campaign["selected_dose"]["reference_trunk_relative_l2"]
+    )
+    max_kl_ratio = float(
+        campaign["comparison_contract"][
+            "max_parent_kl_ratio_to_stage_a_reference"
+        ]
+    )
+    max_trunk_ratio = float(
+        campaign["comparison_contract"][
+            "max_trunk_relative_l2_ratio_to_stage_a_reference"
+        ]
+    )
+
     records: dict[str, Any] = {}
     eligible: list[dict[str, Any]] = []
     for arm in campaign["active_arms"]:
@@ -1136,64 +1375,108 @@ def _compare(
         ):
             raise CampaignError(f"Stage-B arm {arm} fingerprint binding drifted")
         terminal_rows = [row for row in checkpoints if row.get("step") == terminal]
-        if len(terminal_rows) != 1 or terminal_rows[0].get("terminal_selected_dose") is not True:
-            raise CampaignError(f"Stage-B arm {arm} lacks its exact selected-dose result")
-        row = terminal_rows[0]
-        checkpoint = _regular_file(
-            Path(str(row.get("checkpoint", ""))),
-            where=f"Stage-B arm {arm} terminal checkpoint",
-        )
-        if row.get("checkpoint_sha256") != _file_sha256(checkpoint):
-            raise CampaignError(f"Stage-B arm {arm} terminal checkpoint bytes drifted")
-        for section, label in (
-            (row.get("functional"), "functional fingerprint"),
-            (row.get("layer_drift"), "layer drift"),
+        if (
+            len(terminal_rows) != 1
+            or terminal_rows[0].get("terminal_selected_dose") is not True
         ):
-            if not isinstance(section, Mapping):
-                raise CampaignError(f"Stage-B arm {arm} {label} is malformed")
-            artifact = _regular_file(
-                Path(str(section.get("path", ""))),
-                where=f"Stage-B arm {arm} {label}",
+            raise CampaignError(f"Stage-B arm {arm} lacks its exact selected-dose result")
+        candidates: list[dict[str, Any]] = []
+        for row in checkpoints:
+            step = int(row.get("step", -1))
+            checkpoint = _regular_file(
+                Path(str(row.get("checkpoint", ""))),
+                where=f"Stage-B arm {arm} step {step} checkpoint",
             )
-            if section.get("file_sha256") != _file_sha256(artifact):
-                raise CampaignError(f"Stage-B arm {arm} {label} bytes drifted")
-        parent_kl = float(row["functional"]["parent_kl"])
-        closure = float(row["functional"]["teacher_gap_closure"])
-        trunk = float(row["layer_drift"]["trunk_relative_l2"])
-        within = parent_kl <= cap_kl and trunk <= cap_trunk
-        result = {
-            "arm": arm,
-            "treatment": copy.deepcopy(campaign["arms"][arm]["treatment"]),
-            "checkpoint": row["checkpoint"],
-            "checkpoint_sha256": row["checkpoint_sha256"],
-            "parent_kl": parent_kl,
-            "trunk_relative_l2": trunk,
-            "teacher_gap_closure": closure,
-            "within_stage_a_drift_budgets": within,
-            "positive_teacher_gap_closure": closure > 0.0,
-            "fingerprint_eligible": within and closure > 0.0,
-        }
+            if row.get("checkpoint_sha256") != _file_sha256(checkpoint):
+                raise CampaignError(
+                    f"Stage-B arm {arm} step {step} checkpoint bytes drifted"
+                )
+            for section, label in (
+                (row.get("functional"), "functional fingerprint"),
+                (row.get("layer_drift"), "layer drift"),
+            ):
+                if not isinstance(section, Mapping):
+                    raise CampaignError(
+                        f"Stage-B arm {arm} step {step} {label} is malformed"
+                    )
+                artifact = _regular_file(
+                    Path(str(section.get("path", ""))),
+                    where=f"Stage-B arm {arm} step {step} {label}",
+                )
+                if section.get("file_sha256") != _file_sha256(artifact):
+                    raise CampaignError(
+                        f"Stage-B arm {arm} step {step} {label} bytes drifted"
+                    )
+            parent_kl = float(row["functional"]["parent_kl"])
+            closure = float(row["functional"]["teacher_gap_closure"])
+            trunk = float(row["layer_drift"]["trunk_relative_l2"])
+            if not all(
+                math.isfinite(value) for value in (parent_kl, closure, trunk)
+            ):
+                raise CampaignError(
+                    f"Stage-B arm {arm} step {step} has non-finite fingerprint"
+                )
+            candidates.append(
+                {
+                    "arm": arm,
+                    "step": step,
+                    "terminal_selected_dose": step == terminal,
+                    "treatment": copy.deepcopy(campaign["arms"][arm]["treatment"]),
+                    "checkpoint": row["checkpoint"],
+                    "checkpoint_sha256": row["checkpoint_sha256"],
+                    "parent_kl": parent_kl,
+                    "trunk_relative_l2": trunk,
+                    "teacher_gap_closure": closure,
+                }
+            )
+        # Match dose using only parent KL and trunk drift. Teacher closure is an
+        # outcome and must never influence which checkpoint is selected.
+        result = _select_dose_matched_checkpoint(
+            candidates,
+            reference_parent_kl=reference_kl,
+            reference_trunk_relative_l2=reference_trunk,
+            terminal_step=terminal,
+        )
+        within = result["parent_kl"] <= cap_kl and result["trunk_relative_l2"] <= cap_trunk
+        matched = (
+            result["parent_kl_ratio_to_stage_a_reference"] <= max_kl_ratio
+            and result["trunk_ratio_to_stage_a_reference"] <= max_trunk_ratio
+        )
+        result.update(
+            {
+                "within_stage_a_drift_budgets": within,
+                "dose_matched_to_stage_a_reference": matched,
+                "positive_teacher_gap_closure": result["teacher_gap_closure"] > 0.0,
+                "fingerprint_eligible": (
+                    within and matched and result["teacher_gap_closure"] > 0.0
+                ),
+            }
+        )
         if result["fingerprint_eligible"]:
             eligible.append(result)
         records[arm] = {
             "path": str(path),
             "file_sha256": _file_sha256(path),
             "fingerprint_sha256": fingerprint["fingerprint_sha256"],
-            "terminal": result,
+            "checkpoint_candidates": candidates,
+            "matched": result,
         }
-    base = records["BASE"]["terminal"]
+    base = records["BASE"]["matched"]
     effects = {
         arm: {
             "teacher_gap_closure_delta_vs_base": (
-                records[arm]["terminal"]["teacher_gap_closure"]
+                records[arm]["matched"]["teacher_gap_closure"]
                 - base["teacher_gap_closure"]
             ),
             "parent_kl_delta_vs_base": (
-                records[arm]["terminal"]["parent_kl"] - base["parent_kl"]
+                records[arm]["matched"]["parent_kl"] - base["parent_kl"]
             ),
             "trunk_relative_l2_delta_vs_base": (
-                records[arm]["terminal"]["trunk_relative_l2"]
+                records[arm]["matched"]["trunk_relative_l2"]
                 - base["trunk_relative_l2"]
+            ),
+            "matched_step_delta_vs_base": (
+                records[arm]["matched"]["step"] - base["step"]
             ),
         }
         for arm in campaign["active_arms"]
@@ -1220,6 +1503,7 @@ def _compare(
             "campaign_sha256": campaign["campaign_sha256"],
         },
         "selected_dose": copy.deepcopy(campaign["selected_dose"]),
+        "dose_match_contract": copy.deepcopy(campaign["comparison_contract"]),
         "treatment_exposure": copy.deepcopy(campaign["treatment_exposure"]),
         "active_arms": list(campaign["active_arms"]),
         "inactive_arms": list(campaign["inactive_arms"]),
