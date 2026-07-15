@@ -175,6 +175,13 @@ def test_selection_maximizes_teacher_gap_inside_explicit_drift_budgets(
                     },
                 }
             )
+        dose_telemetry = {
+            "schema_version": "a1-active-policy-dose-telemetry-v1",
+            "active_rows": {"policy_aux": 1},
+        }
+        dose_telemetry["dose_telemetry_sha256"] = campaign._value_sha256(
+            dose_telemetry
+        )
         payload = {
             "schema_version": campaign.FINGERPRINT_SCHEMA,
             "campaign": {
@@ -192,6 +199,7 @@ def test_selection_maximizes_teacher_gap_inside_explicit_drift_budgets(
             "parent_checkpoint_sha256": campaign_payload["lineage_contract"][
                 "upgraded_initializer_sha256"
             ],
+            "dose_telemetry": dose_telemetry,
             "checkpoints": rows,
         }
         _write_signed(path, payload, "fingerprint_sha256")
@@ -250,6 +258,98 @@ def test_explicit_diagnostic_checkpoint_schedule_excludes_terminal(
     assert one_dose._literal_option_values(command, "--checkpoint-steps") == [
         "8,12,16,32,64"
     ]
+    assert one_dose._literal_option_values(
+        command, "--train-diagnostics-every-batches"
+    ) == ["16"]
+    assert one_dose._literal_option_values(
+        command, "--objective-gradient-interference-every-batches"
+    ) == ["64"]
+
+
+def test_arm_dose_telemetry_seals_exposure_grad_clip_and_update_rms() -> None:
+    expected_aux = 46 * campaign.WORLD_SIZE * campaign.MAX_STEPS
+    report = {
+        "policy_base_active_rows": 10_000,
+        "policy_aux_active_rows": expected_aux,
+        "policy_total_active_rows": 10_000 + expected_aux,
+        "policy_base_effective_weight_sum": 20_000.0,
+        "policy_aux_effective_weight_sum": 30_000.0,
+        "policy_total_effective_weight_sum": 50_000.0,
+        "value_active_rows": 500_000,
+        "metrics": [
+            {
+                "loss_denominators": {
+                    "policy_loss": 50_000.0,
+                    "value_loss": 400_000.0,
+                    "final_vp_loss": 0.0,
+                },
+                "optimizer_observability": {
+                    "observed_steps": 128,
+                    "clipped_steps": 4,
+                    "clipped_fraction": 4 / 128,
+                    "mean_pre_clip_total_grad_norm": 0.8,
+                    "max_pre_clip_total_grad_norm": 1.2,
+                },
+            }
+        ],
+        "module_optimizer_observability": {
+            "observed_steps": 8,
+            "cadence_batches": 16,
+            "norm_scope": "global_replicated",
+            "modules": {
+                "blocks": {
+                    "mean_pre_clip_grad_norm": 0.7,
+                    "max_pre_clip_grad_norm": 1.1,
+                    "mean_parameter_delta_norm": 0.01,
+                    "mean_parameter_update_rms": 1.0e-6,
+                    "mean_relative_parameter_delta": 2.0e-5,
+                    "parameter_count": 1_000_000,
+                }
+            },
+        },
+        "objective_gradient_interference": {
+            "cadence_batches": 64,
+            "observed_steps": 2,
+            "observations": [
+                {
+                    "available": True,
+                    "scope": "rank_local_microbatch",
+                    "policy_trunk_grad_norm": 0.7,
+                    "policy_base_trunk_grad_norm": 0.5,
+                    "policy_aux_trunk_grad_norm": 0.2,
+                    "value_trunk_grad_norm": 0.3,
+                    "policy_aux_to_base_grad_norm_ratio": 0.4,
+                    "trunk_gradient_cosine": -0.1,
+                    "policy_base_aux_gradient_cosine": 0.2,
+                },
+                {
+                    "available": True,
+                    "scope": "rank_local_microbatch",
+                    "policy_trunk_grad_norm": 0.8,
+                    "policy_base_trunk_grad_norm": 0.5,
+                    "policy_aux_trunk_grad_norm": 0.3,
+                    "value_trunk_grad_norm": 0.25,
+                    "policy_aux_to_base_grad_norm_ratio": 0.6,
+                    "trunk_gradient_cosine": -0.2,
+                    "policy_base_aux_gradient_cosine": 0.1,
+                },
+            ],
+        },
+    }
+
+    telemetry = campaign._arm_dose_telemetry(  # noqa: SLF001
+        report, expected_aux_rows=expected_aux
+    )
+
+    assert telemetry["active_rows"]["policy_aux"] == expected_aux
+    assert telemetry["policy_effective_weight_sums"]["aux"] == 30_000.0
+    assert telemetry["objective_effective_weight_sums"]["value_loss"] == 400_000.0
+    assert telemetry["optimizer"]["clipped_fraction"] == pytest.approx(4 / 128)
+    assert telemetry["module_optimizer_observability"]["modules"]["blocks"][
+        "mean_parameter_update_rms"
+    ] == pytest.approx(1.0e-6)
+    assert telemetry["shared_trunk_objective_gradients"]["observed_steps"] == 2
+    assert telemetry["dose_telemetry_sha256"].startswith("sha256:")
 
 
 def test_coherent_binding_authorizes_exact_independent_initializer(
