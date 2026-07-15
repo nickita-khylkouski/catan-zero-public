@@ -8321,6 +8321,23 @@ def _validate_a1_learner_training_recipe(
         raise SystemExit(
             "dual corrective ablation code binding differs from reviewed runtime closure"
         )
+    reporting_checkpoint_steps = list(
+        _parse_checkpoint_steps(
+            str(getattr(args, "checkpoint_steps", "") or ""),
+            max_steps=int(effective["max_steps"]),
+        )
+    )
+    train_diagnostics_cadence = int(
+        getattr(args, "train_diagnostics_every_batches", 0)
+    )
+    objective_gradient_cadence = int(
+        getattr(args, "objective_gradient_interference_every_batches", 0)
+    )
+    diagnostic_dose_curve = bool(
+        reporting_checkpoint_steps
+        or train_diagnostics_cadence
+        or objective_gradient_cadence
+    )
     bound["learner_ablation"] = {
         "schema_version": "a1-learner-ablation-v1",
         "ablation_id": ablation_id,
@@ -8336,6 +8353,15 @@ def _validate_a1_learner_training_recipe(
         "code_binding": code_binding,
         "code_tree_sha256": declared_code_sha,
         "reviewed_lock_file_sha256": reviewed_lock_sha,
+        "reporting_contract": {
+            "diagnostic_dose_curve": diagnostic_dose_curve,
+            "checkpoint_steps": reporting_checkpoint_steps,
+            "train_diagnostics_every_batches": train_diagnostics_cadence,
+            "objective_gradient_interference_every_batches": (
+                objective_gradient_cadence
+            ),
+            "optimizer_trajectory_unchanged": True,
+        },
         **(
             {"matched_aux_regularization": aux_regularization}
             if aux_regularization is not None
