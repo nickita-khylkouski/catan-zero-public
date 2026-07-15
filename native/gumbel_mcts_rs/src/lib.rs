@@ -17,6 +17,79 @@ use catanatron_rs::{
 pub type Evaluation = (HashMap<usize, f64>, f64, f64);
 pub type EvaluationRequest<'a> = (&'a Game, Vec<usize>, Color);
 
+const IMPOSSIBLE_PUBLIC_DEV_DRAW: &str =
+    "no non-terminal hidden allocation can condition on requested dev draw";
+
+/// Materialize public-belief development draws, conditioning away only cards
+/// that cannot participate in any non-terminal hidden allocation.
+///
+/// The engine API is deliberately attempted as one batch first. If and only
+/// if it returns the exact impossible-support error, every card is retried
+/// independently through the same caller-supplied materializer. This keeps
+/// the seed/domain separation identical to the batch path while allowing the
+/// supported public mass to survive a single impossible card.
+fn materialize_conditioned_public_dev_support<T, F>(
+    cards: &[DevCard],
+    public_unknown: &[u8; 5],
+    mut materialize: F,
+) -> Result<Vec<(T, f64)>, String>
+where
+    F: FnMut(&[DevCard]) -> Result<Vec<T>, String>,
+{
+    let (supported_cards, children) = match materialize(cards) {
+        Ok(children) => {
+            if children.len() != cards.len() {
+                return Err(format!(
+                    "public-belief dev materializer returned {} children for {} cards",
+                    children.len(),
+                    cards.len()
+                ));
+            }
+            (cards.to_vec(), children)
+        }
+        Err(error) if error == IMPOSSIBLE_PUBLIC_DEV_DRAW => {
+            let mut supported_cards = Vec::with_capacity(cards.len());
+            let mut children = Vec::with_capacity(cards.len());
+            for card in cards {
+                match materialize(std::slice::from_ref(card)) {
+                    Ok(mut card_children) => {
+                        if card_children.len() != 1 {
+                            return Err(format!(
+                                "public-belief dev materializer returned {} children for one card",
+                                card_children.len()
+                            ));
+                        }
+                        supported_cards.push(*card);
+                        children.push(card_children.pop().unwrap());
+                    }
+                    Err(card_error) if card_error == IMPOSSIBLE_PUBLIC_DEV_DRAW => {}
+                    Err(card_error) => return Err(card_error),
+                }
+            }
+            (supported_cards, children)
+        }
+        Err(error) => return Err(error),
+    };
+
+    let supported_total = supported_cards
+        .iter()
+        .map(|card| usize::from(public_unknown[card.idx()]))
+        .sum::<usize>();
+    if supported_total == 0 {
+        return Err("coherent public-belief dev posterior has no materializable support".into());
+    }
+    Ok(supported_cards
+        .into_iter()
+        .zip(children)
+        .map(|(card, child)| {
+            (
+                child,
+                f64::from(public_unknown[card.idx()]) / supported_total as f64,
+            )
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Evaluator trait — implemented by the Python binding
 // ---------------------------------------------------------------------------
@@ -1114,20 +1187,9 @@ impl GumbelMctsEngine {
             .into_iter()
             .filter(|card| public_unknown[card.idx()] > 0)
             .collect::<Vec<_>>();
-        let children =
-            game.public_belief_development_draws(root_color, action, &cards, self.config.seed)?;
-        if children.len() != cards.len() {
-            return Err(format!(
-                "public-belief dev materializer returned {} children for {} cards",
-                children.len(),
-                cards.len()
-            ));
-        }
-        Ok(cards
-            .into_iter()
-            .zip(children)
-            .map(|(card, child)| (child, f64::from(public_unknown[card.idx()]) / total as f64))
-            .collect())
+        materialize_conditioned_public_dev_support(&cards, &public_unknown, |requested| {
+            game.public_belief_development_draws(root_color, action, requested, self.config.seed)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1878,6 +1940,62 @@ mod tests {
             vec![Player::simple(Color::Red), Player::simple(Color::Blue)],
             Some(seed),
         )
+    }
+
+    #[test]
+    fn impossible_public_dev_support_is_pruned_and_renormalized() {
+        let cards = DevCard::ALL;
+        let public_unknown = [4_u8, 2, 3, 1, 5];
+        let mut calls: Vec<Vec<DevCard>> = Vec::new();
+        let outcomes =
+            materialize_conditioned_public_dev_support(&cards, &public_unknown, |requested| {
+                calls.push(requested.to_vec());
+                if requested.contains(&DevCard::VictoryPoint) {
+                    Err(IMPOSSIBLE_PUBLIC_DEV_DRAW.into())
+                } else {
+                    Ok(requested.to_vec())
+                }
+            })
+            .unwrap();
+
+        assert_eq!(calls[0], cards);
+        assert_eq!(calls.len(), 1 + cards.len());
+        assert_eq!(
+            outcomes.iter().map(|(card, _)| *card).collect::<Vec<_>>(),
+            vec![
+                DevCard::Knight,
+                DevCard::YearOfPlenty,
+                DevCard::Monopoly,
+                DevCard::RoadBuilding,
+            ]
+        );
+        assert!((outcomes.iter().map(|(_, mass)| mass).sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!((outcomes[0].1 - 4.0 / 10.0).abs() < 1e-12);
+        assert!((outcomes[1].1 - 2.0 / 10.0).abs() < 1e-12);
+        assert!((outcomes[2].1 - 3.0 / 10.0).abs() < 1e-12);
+        assert!((outcomes[3].1 - 1.0 / 10.0).abs() < 1e-12);
+
+        let no_support = materialize_conditioned_public_dev_support::<DevCard, _>(
+            &cards,
+            &public_unknown,
+            |_requested| Err(IMPOSSIBLE_PUBLIC_DEV_DRAW.into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            no_support,
+            "coherent public-belief dev posterior has no materializable support"
+        );
+    }
+
+    #[test]
+    fn public_dev_support_fallback_propagates_unrelated_errors() {
+        let error = materialize_conditioned_public_dev_support::<Game, _>(
+            &DevCard::ALL,
+            &[14_u8, 2, 2, 2, 5],
+            |_requested| Err("unrelated materializer failure".into()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "unrelated materializer failure");
     }
 
     #[test]
