@@ -35,10 +35,11 @@ _SRC = _REPO_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from tools import a1_pre_wave_contract as contract  # noqa: E402
+from tools import a1_current_science_contract as current_science  # noqa: E402
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
     TARGET_INFORMATION_REGIME_PUBLIC,
 )
-from tools import a1_pre_wave_contract as contract  # noqa: E402
 from tools.fleet import a1_exact_canary as static_canary  # noqa: E402
 from tools.fleet import a1_production_executor as executor  # noqa: E402
 
@@ -67,7 +68,7 @@ for item in items:
  m=json.loads(mpath.read_text())
  if int(m.get('games_requested',-1))!=item['games'] or int(m.get('games_completed',-1))!=item['games'] or int(m.get('games_failed',-1))!=0 or m.get('errors') not in ([],None): raise SystemExit('unclean canary manifest: '+item['job_id'])
  if int(m.get('base_seed',-1))!=item['base_seed'] or int(m.get('rows',0))<=0 or int(m.get('simulations_used_total',0))<=0: raise SystemExit('empty/drifted canary manifest: '+item['job_id'])
- if m.get('target_information_regime')!='public_conservation_pimc_v1': raise SystemExit('unsafe target regime: '+item['job_id'])
+ if m.get('target_information_regime')!=item.get('target_information_regime','public_conservation_pimc_v1'): raise SystemExit('unsafe target regime: '+item['job_id'])
  if sha(apath)!=item['attestation_sha256']: raise SystemExit('canary attestation drift: '+item['job_id'])
  before=rpath.stat();mode=before.st_mode
  if not stat.S_ISREG(mode) or mode&0o222: raise SystemExit('canary config registry is not sealed: '+item['job_id'])
@@ -231,11 +232,78 @@ def _assert_exact_recipe(
     for flag in set(original_values) - MUTABLE_VALUE_FLAGS:
         if original_values[flag] != derived_values[flag]:
             raise CanaryError(f"canary changed immutable recipe flag {flag}")
-    for flag, expected in static_canary.EXPECTED_VALUE_FLAGS.items():
+    coherent_public = "--coherent-public-belief-search" in derived_switches
+    if coherent_public:
+        search = current_science.search()
+        generation = current_science.generation()
+        expected_value_flags = {
+            "--n-full": str(search["n_full"]),
+            "--n-fast": str(search["n_fast"]),
+            "--p-full": str(search["p_full"]),
+            "--n-full-wide": str(search["n_full_wide"]),
+            "--n-full-wide-threshold": str(search["n_full_wide_threshold"]),
+            "--c-scale": str(search["c_scale"]),
+            "--c-visit": str(search["c_visit"]),
+            "--sigma-eval": str(search["sigma_eval"]),
+            "--max-depth": str(search["max_depth"]),
+            "--max-decisions": str(generation["max_decisions"]),
+            "--workers": str(generation["workers_per_gpu"]),
+            "--device": str(generation["device"]),
+            "--symmetry-averaged-eval-threshold": str(
+                search["symmetry_averaged_eval_threshold"]
+            ),
+            "--rescale-noise-floor-c": str(search["rescale_noise_floor_c"]),
+            "--determinization-particles": str(
+                search["determinization_particles"]
+            ),
+            "--determinization-min-simulations": str(
+                search["determinization_min_simulations"]
+            ),
+            "--forced-root-target-mode": str(search["forced_root_target_mode"]),
+            "--temperature-clock": str(generation["temperature_clock"]),
+            "--temperature-decisions": str(generation["temperature_decisions"]),
+            "--late-temperature-decisions": str(
+                generation["late_temperature_decisions"]
+            ),
+            "--late-temperature": str(generation["late_temperature"]),
+            "--event-history-limit": str(generation["event_history_limit"]),
+        }
+        required_switches = {
+            "--symmetry-averaged-eval",
+            "--public-observation",
+            "--no-information-set-search",
+            "--coherent-public-belief-search",
+            "--lazy-interior-chance",
+            "--correct-rust-chance-spectra",
+            "--no-belief-chance-spectra",
+            "--wide-roots-always-full",
+            "--native-mcts-hot-loop",
+            "--rust-featurize",
+            "--no-eval-server",
+            "--no-record-automatic-transitions",
+            "--meaningful-public-history",
+            "--score-actions",
+            "--seed-claim",
+            "--resume",
+        }
+        forbidden_flags = {
+            "--information-set-search",
+            "--belief-chance-spectra",
+            "--no-coherent-public-belief-search",
+            "--no-wide-roots-always-full",
+            "--record-automatic-transitions",
+            "--no-meaningful-public-history",
+            "--no-public-observation",
+        }
+    else:
+        expected_value_flags = static_canary.EXPECTED_VALUE_FLAGS
+        required_switches = static_canary.REQUIRED_SWITCHES
+        forbidden_flags = static_canary.FORBIDDEN_FLAGS
+    for flag, expected in expected_value_flags.items():
         if derived_values.get(flag) != expected:
             raise CanaryError(f"canary exact recipe requires {flag}={expected}")
-    missing = static_canary.REQUIRED_SWITCHES - derived_switches
-    forbidden = static_canary.FORBIDDEN_FLAGS & (set(derived_values) | derived_switches)
+    missing = required_switches - derived_switches
+    forbidden = forbidden_flags & (set(derived_values) | derived_switches)
     if missing or forbidden:
         raise CanaryError(
             f"canary guard/recipe switch drift: missing={sorted(missing)} "
@@ -367,6 +435,12 @@ def derive_canary_plan(
     if not SAFE_ID.fullmatch(canary_id):
         raise CanaryError("--canary-id must match [a-z0-9][a-z0-9-]{2,47}")
     _validate_scalar_attestation(lock)
+    search_operator = lock.get("science", {}).get("search_operator")
+    target_information_regime = (
+        contract._target_information_regime_for_search(search_operator)  # noqa: SLF001
+        if isinstance(search_operator, dict)
+        else TARGET_INFORMATION_REGIME_PUBLIC
+    )
     allowed = allowed_root.resolve()
     root = canary_root.resolve()
     if root.parent != allowed or root.name != f"a1-live-canary-{canary_id}":
@@ -439,14 +513,16 @@ def derive_canary_plan(
                 },
             )
             if native_runtime:
-                if argv.count("--no-native-mcts-hot-loop") != 1:
+                if argv.count("--no-native-mcts-hot-loop") == 1:
+                    argv[argv.index("--no-native-mcts-hot-loop")] = (
+                        "--native-mcts-hot-loop"
+                    )
+                elif argv.count("--native-mcts-hot-loop") != 1:
                     raise CanaryError("source command lacks explicit native-loop binding")
-                if argv.count("--no-rust-featurize") != 1:
+                if argv.count("--no-rust-featurize") == 1:
+                    argv[argv.index("--no-rust-featurize")] = "--rust-featurize"
+                elif argv.count("--rust-featurize") != 1:
                     raise CanaryError("source command lacks explicit Rust-featurizer binding")
-                argv[argv.index("--no-native-mcts-hot-loop")] = (
-                    "--native-mcts-hot-loop"
-                )
-                argv[argv.index("--no-rust-featurize")] = "--rust-featurize"
             _assert_exact_recipe(
                 source_command["argv"], argv, native_runtime=native_runtime
             )
@@ -469,7 +545,7 @@ def derive_canary_plan(
             attestation: dict[str, Any] = {
                 "schema_version": ATTESTATION_SCHEMA,
                 "validation_only": True,
-                "target_information_regime": TARGET_INFORMATION_REGIME_PUBLIC,
+                "target_information_regime": target_information_regime,
                 "canary_id": canary_id,
                 "contract_sha256": lock["contract_sha256"],
                 "source_render_sha256": rendered["render_sha256"],
@@ -558,6 +634,7 @@ def derive_canary_plan(
         "validation_only": True,
         "canary_id": canary_id,
         "source_contract_sha256": lock["contract_sha256"],
+        "target_information_regime": target_information_regime,
         "source_render": {
             "path": str(render_path.resolve()),
             "sha256": _sha256(render_path),
@@ -611,6 +688,7 @@ def derive_canary_plan(
         "validation_only": True,
         "canary_id": canary_id,
         "contract_sha256": lock["contract_sha256"],
+        "target_information_regime": target_information_regime,
         "render_sha256": canary_render["render_sha256"],
         "source_render_sha256": rendered["render_sha256"],
         "lock": str(lock_path.resolve()),
@@ -733,12 +811,17 @@ def validate_canary_plan(plan: Mapping[str, Any]) -> None:
             declared = unhashed.pop("provenance_sha256", None)
             config = unhashed.get("config")
             fields = config.get("fields") if isinstance(config, Mapping) else None
+            argv_switches = static_canary._flag_map(  # noqa: SLF001
+                command["argv"], job_id=str(command["job_id"])
+            )[1]
             if (
                 declared != _digest(unhashed)
                 or not isinstance(fields, Mapping)
                 or fields.get("games") != games_per_job
-                or bool(fields.get("native_mcts_hot_loop", False)) != native_runtime
-                or bool(fields.get("rust_featurize", False)) != native_runtime
+                or bool(fields.get("native_mcts_hot_loop", False))
+                != ("--native-mcts-hot-loop" in argv_switches)
+                or bool(fields.get("rust_featurize", False))
+                != ("--rust-featurize" in argv_switches)
                 or fields.get("base_seed")
                 != int(_flag_value(command["argv"], "--base-seed"))
             ):
@@ -899,6 +982,7 @@ def audit_canary(plan: dict[str, Any]) -> dict[str, Any]:
                 "config_provenance": command["config_provenance"],
                 "games": int(_flag_value(command["argv"], "--games")),
                 "base_seed": int(_flag_value(command["argv"], "--base-seed")),
+                "target_information_regime": plan["target_information_regime"],
             }
             for command in commands
         ]

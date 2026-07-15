@@ -1,0 +1,71 @@
+{
+  "schema_version": "teacher-operator-causal-campaign-v1",
+  "campaign_id": "coherent-public-n128-adaptive-n256-v1",
+  "track": "2p_no_trade",
+  "checkpoint_contract": "same_checkpoint_both_roles",
+  "base_arm": {
+    "id": "base_n128_d6",
+    "config": "base_n128_d6.json"
+  },
+  "adaptive_arms": [
+    {
+      "id": "adaptive_n256_w20_d6",
+      "config": "adaptive_n256_w20_d6.json",
+      "activation_legal_width": 20,
+      "root_search_seed_base": 3200001,
+      "h2h_base_seed": 930000000000
+    },
+    {
+      "id": "adaptive_n256_w40_d6",
+      "config": "adaptive_n256_w40_d6.json",
+      "activation_legal_width": 40,
+      "root_search_seed_base": 4200001,
+      "h2h_base_seed": 930000000000
+    }
+  ],
+  "evaluator_config": "evaluator_public_scalar.json",
+  "fixed_root_protocol": {
+    "n_roots": 64,
+    "decisions_per_game": [0, 1, 2, 3, 12, 20, 28, 36, 44, 52, 60, 68, 76, 84, 92, 100, 108, 116, 124, 132, 140, 148, 156, 164, 172, 180, 188, 196, 204, 212, 220],
+    "root_base_seed": 9400001,
+    "base_search_seed": 2200001,
+    "repeats": 4,
+    "min_legal_actions": 2,
+    "min_width_40_roots": 8,
+    "max_root_games": 512,
+    "root_stratum_quotas": [
+      {
+        "phase": "play_turn",
+        "min_legal_width": 2,
+        "max_legal_width": 19,
+        "count": 24
+      },
+      {
+        "phase": "play_turn",
+        "min_legal_width": 20,
+        "max_legal_width": 39,
+        "count": 16
+      },
+      {
+        "phase": "play_turn",
+        "min_legal_width": 40,
+        "max_legal_width": null,
+        "count": 8
+      }
+    ],
+    "max_batch_size": 64,
+    "max_wait_ms": 3.0
+  },
+  "paired_game_protocol": {
+    "pairs": 100,
+    "max_decisions": 600,
+    "workers": 16,
+    "gate_config": "flywheel"
+  },
+  "selection_policy": {
+    "max_whole_game_search_cost_ratio": 1.2,
+    "min_relative_cross_seed_js_reduction": 0.15,
+    "min_top1_agreement_delta": 0.0,
+    "prefer_positive_elo_h1": true
+  }
+}

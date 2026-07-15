@@ -21,6 +21,7 @@ from fixed_root_search_stability import (  # type: ignore  # noqa: E402
     COLORS,
     EVALUATOR_CONFIG_SCHEMA,
     PANEL_SCHEMA,
+    RootStratumQuota,
     SEARCH_CONFIG_SCHEMA,
     SNAPSHOT_CANONICALIZATION,
     CountingEvaluator,
@@ -112,7 +113,9 @@ def _role(runs: list[dict]) -> dict:
     return {"runs": runs, "stability": summarize_cross_seed_runs(runs)}
 
 
-def _root_record(index: int, width: int, phase: str, a_runs: list[dict], b_runs: list[dict]):
+def _root_record(
+    index: int, width: int, phase: str, a_runs: list[dict], b_runs: list[dict]
+):
     return {
         "root_index": index,
         "legal_width": width,
@@ -217,13 +220,9 @@ def test_cross_seed_summary_rejects_selected_action_outside_support():
 
 def test_cross_seed_summary_fails_on_seed_or_support_drift():
     with pytest.raises(ValueError, match="distinct search seeds"):
-        summarize_cross_seed_runs(
-            [_run(10, {1: 1.0}), _run(10, {1: 1.0})]
-        )
+        summarize_cross_seed_runs([_run(10, {1: 1.0}), _run(10, {1: 1.0})])
     with pytest.raises(ValueError, match="incompatible legal-action supports"):
-        summarize_cross_seed_runs(
-            [_run(10, {1: 1.0}), _run(11, {2: 1.0})]
-        )
+        summarize_cross_seed_runs([_run(10, {1: 1.0}), _run(11, {2: 1.0})])
 
 
 def test_seed_manifests_are_disjoint_and_hashed():
@@ -302,9 +301,7 @@ def test_checked_in_s3_r3_profiles_bind_only_the_intended_search_dose():
         n128_p4,
         n256_p4,
         allowed_differences={"n_full"},
-    ) == {
-        "n_full": {"global_n128_p4": 128, "global_n256_p4": 256}
-    }
+    ) == {"n_full": {"global_n128_p4": 128, "global_n256_p4": 256}}
     assert n128_p4["effective_search_config"]["determinization_particles"] == 4
     assert n256_p4["effective_search_config"]["determinization_particles"] == 4
 
@@ -381,9 +378,7 @@ def test_comparison_rejects_undeclared_operator_drift(tmp_path):
         )
     )
     with pytest.raises(ValueError, match="outside the predeclared"):
-        validate_search_comparison(
-            n64, n128, allowed_differences={"n_full", "n_fast"}
-        )
+        validate_search_comparison(n64, n128, allowed_differences={"n_full", "n_fast"})
     differences = validate_search_comparison(
         n64,
         n128,
@@ -494,11 +489,16 @@ class _FakeRustModule:
 
 class _FakeRawEvaluator:
     def evaluate(self, _game, legal, **_kwargs):
-        return ({int(action): float(index + 1) for index, action in enumerate(legal)}, 0.0)
+        return (
+            {int(action): float(index + 1) for index, action in enumerate(legal)},
+            0.0,
+        )
 
 
 def test_real_root_panel_transcript_round_trips_before_search(monkeypatch):
-    monkeypatch.setattr(stability_module, "_require_rust_module", lambda: _FakeRustModule)
+    monkeypatch.setattr(
+        stability_module, "_require_rust_module", lambda: _FakeRustModule
+    )
 
     def _advance(game, action, **_kwargs):
         assert int(action) in game.playable_action_indices(list(COLORS), None)
@@ -523,6 +523,39 @@ def test_real_root_panel_transcript_round_trips_before_search(monkeypatch):
     assert [root.decision for root in roots] == [0, 1]
     assert panel["roots"][1]["action_prefix"] == [20]
     assert panel["roots"][0]["phase"] == "opening_placement"
+
+
+def test_real_root_panel_reserves_preregistered_play_turn_stratum(monkeypatch):
+    monkeypatch.setattr(
+        stability_module, "_require_rust_module", lambda: _FakeRustModule
+    )
+
+    def _advance(game, action, **_kwargs):
+        assert int(action) in game.playable_action_indices(list(COLORS), None)
+        return _FakeGame(game.seed, game.decision + 1)
+
+    monkeypatch.setattr(stability_module, "_apply_selected_action", _advance)
+    quota = RootStratumQuota("play_turn", 2, 19, 2)
+    panel = build_root_panel(
+        _FakeRawEvaluator(),
+        checkpoint_sha256="sha256:checkpoint",
+        evaluator_config_sha256="sha256:evaluator",
+        n_roots=2,
+        decisions_per_game=(0, 1, 2),
+        base_seed=50,
+        min_legal_actions=2,
+        root_stratum_quotas=(quota,),
+        max_games=4,
+    )
+
+    validate_root_panel_payload(
+        panel,
+        checkpoint_sha256="sha256:checkpoint",
+        evaluator_config_sha256="sha256:evaluator",
+    )
+    assert [root["phase"] for root in panel["roots"]] == ["play_turn", "play_turn"]
+    assert panel["root_stratum_counts"] == {"play_turn:2-19": 2}
+    assert panel["provenance"]["candidate_root_count"] == 3
 
 
 class _NonCanonicalGame(_FakeGame):
@@ -704,9 +737,7 @@ def test_aggregate_slices_include_exact_cost_and_ge40_slice():
     comparison = slices["global"]["comparison"]
     assert comparison["role_b_over_role_a_simulations_ratio"] == pytest.approx(2.0)
     assert comparison["role_b_minus_role_a_top1_agreement"] < 0.0
-    assert global_roles["n64"]["target_top_probability"]["mean"] == pytest.approx(
-        0.75
-    )
+    assert global_roles["n64"]["target_top_probability"]["mean"] == pytest.approx(0.75)
     assert global_roles["n64"]["completed_q_top_margin"]["median"] == pytest.approx(
         1.0e-6
     )
@@ -725,6 +756,7 @@ def test_cli_help_is_cpu_only_and_imports_the_local_source_tree():
     assert result.returncode == 0, result.stderr
     assert "--create-root-panel" in result.stdout
     assert "--min-wide-roots" in result.stdout
+    assert "--root-stratum-quota" in result.stdout
     assert "--allowed-search-config-differences" in result.stdout
 
     source_result = subprocess.run(

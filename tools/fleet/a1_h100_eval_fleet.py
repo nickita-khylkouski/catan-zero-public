@@ -42,6 +42,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_evaluation_pool as evaluation_pool  # noqa: E402
+from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import production_runtime_contract as runtime_contract  # noqa: E402
 from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
 from tools.champion_registry import ChampionRegistry  # noqa: E402
@@ -143,18 +144,9 @@ LEGACY_PIMC_SCIENCE_CONFIG: dict[str, Any] = {
     "external_max_player_trade_offers_per_turn": 0,
 }
 
-COHERENT_PUBLIC_SCIENCE_CONFIG: dict[str, Any] = {
-    **LEGACY_PIMC_SCIENCE_CONFIG,
-    "c_scale": 0.1,
-    "sigma_eval": 0.79,
-    "information_set_search": False,
-    "coherent_public_belief_search": True,
-    "determinization_particles": 1,
-    "forced_root_target_mode": "trajectory_only",
-    "n_full_wide": 256,
-    "n_full_wide_threshold": 20,
-    "wide_roots_always_full": True,
-}
+COHERENT_PUBLIC_SCIENCE_CONFIG: dict[str, Any] = (
+    current_science.fleet_evaluation_science_config()
+)
 
 # Historical fixed-panel receipt code below intentionally continues to name
 # this alias.  It verifies already-issued PIMC panels, not new fleet plans.

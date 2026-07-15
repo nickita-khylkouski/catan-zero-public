@@ -43,6 +43,7 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
+from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import a1_build_post_wave_composite as composite_builder  # noqa: E402
 from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
 from tools import train_bc  # noqa: E402
@@ -159,6 +160,31 @@ TRUSTED_A1_VERIFIER_PATH = Path(
 )
 TRUSTED_A1_VERIFIER_SHA256 = (
     "sha256:45594de3835242904a7c3257c5ff644531c4a3c70a447880b20b3b1a23d8c9cc"
+)
+# The current v5 production composite is sealed to this recovery lock and its
+# immutable verifier.  This is a second explicit trust anchor, not a mutable
+# replacement for the historical 20260710 anchor above.
+V5_PRODUCTION_A1_LOCK_FILE_SHA256 = (
+    "sha256:ce9553336a4b5e25311e4aad40e307e713652d6d11a779d830ce8ea28b05dee2"
+)
+V5_PRODUCTION_A1_LOCK_PATH = Path(
+    "/home/ubuntu/catan-zero-production/private/"
+    "a1-v5-recovery-n128-p4-64000games-64gpu-20260714-r2/lock.json"
+)
+V5_PRODUCTION_A1_VERIFIER_PATH = Path(
+    "/home/ubuntu/catan-zero-wave-5ba993a/tools/a1_pre_wave_contract.py"
+)
+V5_PRODUCTION_A1_VERIFIER_SHA256 = (
+    "sha256:ab5d4ef8d4a3f82ecacb6c94ff613e24041ec9d1d4e2722ae6c65a19220f101c"
+)
+V5_PRODUCTION_CONTRACT_ID = (
+    "a1-v5-recovery-n128-p4-64000games-64gpu-20260714-r2"
+)
+V5_PRODUCTION_CONTRACT_SHA256 = (
+    "sha256:2becf946235fb55dff606b90906acee6c6933eba21d507d49a258690a371891a"
+)
+V5_PRODUCTION_PARENT_SHA256 = (
+    "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c"
 )
 SEALED_A1_MODEL_CLI: dict[str, str] = {
     "--hidden-size": "640",
@@ -281,6 +307,33 @@ CENTRAL_LEARNER_BINDING_SCHEMA = "a1-central-learner-binding-v3"
 
 class ExecutorError(RuntimeError):
     """A fail-closed A1 executor refusal."""
+
+
+def _reviewed_lock_trust_anchors() -> dict[str, dict[str, Any]]:
+    """Return explicit replay authorities for issued production locks.
+
+    The historical constants remain separate so existing replay tests and
+    issued receipts retain their original trust identity.
+    """
+
+    return {
+        TRUSTED_A1_LOCK_FILE_SHA256: {
+            "lock_path": TRUSTED_A1_LOCK_PATH,
+            "verifier_path": TRUSTED_A1_VERIFIER_PATH,
+            "verifier_sha256": TRUSTED_A1_VERIFIER_SHA256,
+            "contract_id": None,
+            "contract_sha256": None,
+            "producer_sha256": None,
+        },
+        V5_PRODUCTION_A1_LOCK_FILE_SHA256: {
+            "lock_path": V5_PRODUCTION_A1_LOCK_PATH,
+            "verifier_path": V5_PRODUCTION_A1_VERIFIER_PATH,
+            "verifier_sha256": V5_PRODUCTION_A1_VERIFIER_SHA256,
+            "contract_id": V5_PRODUCTION_CONTRACT_ID,
+            "contract_sha256": V5_PRODUCTION_CONTRACT_SHA256,
+            "producer_sha256": V5_PRODUCTION_PARENT_SHA256,
+        },
+    }
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -793,6 +846,11 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
             )
             else None
         ),
+        "diagnostic_comparison_source": (
+            copy.deepcopy(verified["diagnostic_comparison_source"])
+            if isinstance(verified.get("diagnostic_comparison_source"), dict)
+            else None
+        ),
     }
     if verified.get("data_kind") == "production_composite_v2":
         trainer_authority = _require_current_production_trainer_authority(verified)
@@ -926,12 +984,14 @@ def _verify_lock_with_sealed_runtime(
         return a1_contract.verify_lock(lock_path, require_all_job_claims=True)
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", reviewed_lock_file_sha256):
         raise ExecutorError("reviewed A1 lock file sha256 is malformed")
-    if reviewed_lock_file_sha256 != TRUSTED_A1_LOCK_FILE_SHA256:
+    authority = _reviewed_lock_trust_anchors().get(reviewed_lock_file_sha256)
+    if authority is None:
         raise ExecutorError(
-            "reviewed A1 lock digest is not the pinned A1 lineage trust anchor"
+            "reviewed A1 lock digest is not an issued production trust anchor"
         )
-    if lock_path.resolve(strict=True) != TRUSTED_A1_LOCK_PATH.resolve(strict=True):
-        raise ExecutorError("A1 lock path is not the pinned A1 lineage trust anchor")
+    trusted_lock_path = Path(authority["lock_path"])
+    if lock_path.resolve(strict=True) != trusted_lock_path.resolve(strict=True):
+        raise ExecutorError("A1 lock path does not match its production trust anchor")
     actual_lock_sha = _file_sha256(lock_path)
     if actual_lock_sha != reviewed_lock_file_sha256:
         raise ExecutorError(
@@ -946,6 +1006,21 @@ def _verify_lock_with_sealed_runtime(
     provenance = raw.get("provenance")
     if not isinstance(provenance, dict):
         raise ExecutorError("reviewed A1 lock has no code provenance")
+    expected_contract_id = authority.get("contract_id")
+    expected_contract_sha = authority.get("contract_sha256")
+    expected_producer_sha = authority.get("producer_sha256")
+    if expected_contract_id is not None and (
+        raw.get("contract_id") != expected_contract_id
+        or raw.get("contract_sha256") != expected_contract_sha
+        or _producer(raw).get("sha256") != expected_producer_sha
+        or raw.get("promotion_handoff", {})
+        .get("producer_checkpoint", {})
+        .get("sha256")
+        != expected_producer_sha
+    ):
+        raise ExecutorError(
+            "reviewed production lock differs from its sealed handoff/contract identity"
+        )
     # Authenticate every dependency the sealed verifier may import before
     # starting its interpreter. The raw lock is already pinned/authenticated,
     # so these paths/digests are trusted declarations rather than attacker
@@ -974,19 +1049,19 @@ def _verify_lock_with_sealed_runtime(
         record
         for record in runtime or []
         if isinstance(record, dict)
-        and str(record.get("path", "")) == str(TRUSTED_A1_VERIFIER_PATH)
+        and str(record.get("path", "")) == str(authority["verifier_path"])
     ]
     if (
         len(matches) != 1
-        or matches[0].get("sha256") != TRUSTED_A1_VERIFIER_SHA256
+        or matches[0].get("sha256") != authority["verifier_sha256"]
     ):
-        raise ExecutorError("reviewed A1 lock does not bind the pinned sealed verifier")
-    verifier = TRUSTED_A1_VERIFIER_PATH.expanduser().resolve(strict=True)
+        raise ExecutorError("reviewed A1 lock does not bind its sealed verifier")
+    verifier = Path(authority["verifier_path"]).expanduser().resolve(strict=True)
     actual_verifier_sha = _file_sha256(verifier)
-    if actual_verifier_sha != TRUSTED_A1_VERIFIER_SHA256:
+    if actual_verifier_sha != authority["verifier_sha256"]:
         raise ExecutorError(
             "pinned sealed verifier digest mismatch: "
-            f"expected={TRUSTED_A1_VERIFIER_SHA256} actual={actual_verifier_sha}"
+            f"expected={authority['verifier_sha256']} actual={actual_verifier_sha}"
         )
     sealed_root = verifier.parents[1]
     script = (
@@ -1080,10 +1155,25 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
             "current A1 operator decision requires global n_full=128; "
             "n64 and global n196/n256 are not authorized"
         )
+    if current_science.is_coherent_search(search):
+        try:
+            current_science.require_current_operator(
+                search_value=search,
+                evaluator_value=science.get("evaluator"),
+                generation_value=lock.get("generation"),
+                learner_recipe_value=science.get("learner_training_recipe"),
+                target_regime=lock.get("post_wave_acceptance", {}).get(
+                    "require_target_information_regime"
+                ),
+                require_adopted=True,
+            )
+        except current_science.ScienceContractError as error:
+            raise ExecutorError(str(error)) from error
     recipe = science.get("learner_training_recipe")
     if recipe not in (
         a1_contract.EXPECTED_LEARNER_TRAINING_RECIPE,
         a1_contract.CURRENT_LEARNER_TRAINING_RECIPE,
+        a1_contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE,
     ):
         raise ExecutorError(
             "sealed A1 learner recipe differs from the exact one-dose recipe"
@@ -2333,6 +2423,7 @@ def bind_learner_ablation(
     ablation_id: str,
     overrides_json: str,
     reviewed_code_tree_sha256: str,
+    diagnostic_dose_curve: bool = False,
 ) -> dict[str, Any]:
     """Derive a diagnostic learner recipe without weakening the sealed inputs."""
 
@@ -2669,6 +2760,13 @@ def bind_learner_ablation(
         "code_binding": code_binding,
         "code_tree_sha256": code_binding["code_tree_sha256"],
         "reviewed_lock_file_sha256": reviewed_lock_sha,
+        "reporting_contract": {
+            "diagnostic_dose_curve": bool(diagnostic_dose_curve),
+            "train_diagnostics_every_batches": (
+                16 if diagnostic_dose_curve else 0
+            ),
+            "optimizer_trajectory_unchanged": True,
+        },
         **(
             {"matched_aux_regularization": matched_aux_regularization}
             if matched_aux_regularization is not None
@@ -2682,7 +2780,7 @@ def bind_learner_ablation(
         result = bind_aux_subgoal_preclaim_contract(result)
     result["claim_identity_sha256"] = _value_sha256(
         {
-            "schema_version": "a1-learner-ablation-claim-identity-v2",
+            "schema_version": "a1-learner-ablation-claim-identity-v3",
             "contract_sha256": verified["contract_sha256"],
             "function_preserving_upgrade": (
                 None
@@ -2695,6 +2793,9 @@ def bind_learner_ablation(
                         "sha256"
                     ],
                 }
+            ),
+            "diagnostic_comparison_source": result.get(
+                "diagnostic_comparison_source"
             ),
             "ablation": result["learner_ablation"],
         }
@@ -2785,6 +2886,29 @@ def bind_diagnostic_training_descriptor(
         # immutable production descriptor. Its canonical value is carried by
         # the derived descriptor and replayed by train_bc before optimizer use.
         derived_overrides[typed_forced_key] = effective_recipe[typed_forced_key]
+    reporting_contract = learner_ablation.get("reporting_contract")
+    lr_dose_campaign = bool(
+        isinstance(reporting_contract, dict)
+        and reporting_contract.get("diagnostic_dose_curve") is True
+    )
+    if lr_dose_campaign:
+        # This is the narrow, diagnostic-only LR/dose campaign surface.  These
+        # optimizer fields are absent from the immutable production composite,
+        # so copy their exact effective values into the derived descriptor for
+        # an independent train_bc replay instead of relying on argv alone.
+        for key in (
+            "epochs",
+            "max_steps",
+            "lr",
+            "lr_warmup_steps",
+            "lr_schedule",
+        ):
+            derived_overrides[key] = effective_recipe[key]
+        policy_aux_batch = int(
+            effective_recipe.get("policy_aux_active_batch_size", 0)
+        )
+        if policy_aux_batch > 0:
+            derived_overrides["policy_aux_active_batch_size"] = policy_aux_batch
 
     derived = copy.deepcopy(base)
     derived["learner_recipe_overrides"] = derived_overrides
@@ -4320,11 +4444,28 @@ def _build_direct_train_command(
             # Preserve the useful part of the production dose curve without
             # launching chained candidates.
             command.extend(["--checkpoint-steps", "64,96"])
+        elif (
+            verified.get("learner_ablation", {})
+            .get("reporting_contract", {})
+            .get("diagnostic_dose_curve")
+            and max_steps >= 128
+        ):
+            # Diagnostic trajectories expose their within-run dose curve.  A
+            # 128-step arm emits step 64 plus its terminal; the selected
+            # 256-step replay emits 64/128 plus its terminal.  Every trajectory
+            # still initializes independently from the sealed parent with fresh
+            # Adam -- none consumes another candidate checkpoint.
+            checkpoints = [64]
+            step = 128
+            while step < max_steps:
+                checkpoints.append(step)
+                step *= 2
+            command.extend(
+                ["--checkpoint-steps", ",".join(map(str, checkpoints))]
+            )
         elif verified.get("learner_ablation") is not None and max_steps > 128:
-            # Long diagnostic trajectories retain the predeclared short-dose
-            # frontier from the same fresh-Adam/sample-order trajectory. This
-            # makes dose observable without chaining a terminal candidate into
-            # another learner or paying for four redundant prefixes.
+            # Historical diagnostic behavior, retained for non-campaign
+            # ablations that did not request the explicit 64-step frontier.
             checkpoints = []
             step = 128
             while step < max_steps:
@@ -4462,6 +4603,17 @@ def _build_direct_train_command(
             )
         command.extend(
             [
+                # Module gradient/update attribution is reporting-only and
+                # leaves the optimizer trajectory unchanged. Sample every 16th
+                # batch so a short 128-step dose gets eight observations without
+                # cloning the 35M parameter set on every update.
+                *(
+                    ["--train-diagnostics-every-batches", "16"]
+                    if learner_ablation.get("reporting_contract", {}).get(
+                        "diagnostic_dose_curve"
+                    )
+                    else []
+                ),
                 # Each executor child sees exactly one physical GPU through
                 # CUDA_VISIBLE_DEVICES and owns a distinct durable ablation
                 # claim/output set.  The generic host-wide BC lock would
@@ -4606,6 +4758,7 @@ def bind_function_preserving_upgrade(
     receipt_path: Path,
     *,
     allow_public_award_transition_source: bool = False,
+    allow_diagnostic_recent_history_source: bool = False,
 ) -> dict[str, Any]:
     """Select a non-byte-identical initializer only after replaying its receipt."""
 
@@ -4618,45 +4771,81 @@ def bind_function_preserving_upgrade(
     except architecture_upgrade.UpgradeError as error:
         raise ExecutorError(f"architecture upgrade receipt refused: {error}") from error
     source_transition_evidence = None
+    diagnostic_comparison_source = None
     source_matches_producer = (
         upgrade["source"]["sha256"] == verified["producer"]["sha256"]
         and Path(upgrade["source"]["path"])
         == Path(verified["producer"]["path"])
     )
     if not source_matches_producer:
-        if not allow_public_award_transition_source:
+        recent_history = verified.get("category_semantics", {}).get(
+            "recent_history"
+        )
+        recent_checkpoint = (
+            recent_history.get("checkpoint")
+            if isinstance(recent_history, dict)
+            else None
+        )
+        diagnostic_recent_history_matches = bool(
+            allow_diagnostic_recent_history_source
+            and verified.get("data_kind") == "production_composite_v2"
+            and isinstance(recent_checkpoint, dict)
+            and upgrade["source"]["sha256"] == recent_checkpoint.get("sha256")
+            and Path(upgrade["source"]["path"])
+            == Path(str(recent_checkpoint.get("path", "")))
+            and upgrade.get("module")
+            in {
+                architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+                architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
+            }
+        )
+        if diagnostic_recent_history_matches:
+            diagnostic_comparison_source = {
+                "schema_version": "a1-diagnostic-recent-history-parent-v1",
+                "role": "recent_history",
+                "source": copy.deepcopy(upgrade["source"]),
+                "sealed_producer": copy.deepcopy(verified["producer"]),
+                "category_semantics_sha256": verified.get(
+                    "category_semantics_sha256"
+                ),
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+            }
+        elif not allow_public_award_transition_source:
             raise ExecutorError(
                 "architecture upgrade source differs from sealed producer checkpoint"
             )
-        try:
-            source_transition_evidence = (
-                aux_coordinator.scientific_evidence._public_award_transition_evidence(  # noqa: SLF001
-                    Path(verified["producer"]["path"]),
-                    Path(upgrade["source"]["path"]),
+        elif diagnostic_comparison_source is None:
+            try:
+                source_transition_evidence = (
+                    aux_coordinator.scientific_evidence._public_award_transition_evidence(  # noqa: SLF001
+                        Path(verified["producer"]["path"]),
+                        Path(upgrade["source"]["path"]),
+                    )
                 )
-            )
-        except (
-            OSError,
-            ValueError,
-            aux_coordinator.scientific_evidence.EvidenceError,
-        ) as error:
-            raise ExecutorError(
-                f"architecture upgrade transition source refused: {error}"
-            ) from error
-        if (
-            source_transition_evidence["source_checkpoint_sha256"]
-            != verified["producer"]["sha256"]
-            or source_transition_evidence["transitioned_checkpoint_sha256"]
-            != upgrade["source"]["sha256"]
-            or source_transition_evidence["optimizer_steps"] != 0
-            or source_transition_evidence[
-                "legacy_zero_input_function_preserving"
-            ]
-            is not True
-        ):
-            raise ExecutorError(
-                "architecture upgrade transition source lost exact parent lineage"
-            )
+            except (
+                OSError,
+                ValueError,
+                aux_coordinator.scientific_evidence.EvidenceError,
+            ) as error:
+                raise ExecutorError(
+                    f"architecture upgrade transition source refused: {error}"
+                ) from error
+        if diagnostic_comparison_source is None and source_transition_evidence is not None:
+            if (
+                source_transition_evidence["source_checkpoint_sha256"]
+                != verified["producer"]["sha256"]
+                or source_transition_evidence["transitioned_checkpoint_sha256"]
+                != upgrade["source"]["sha256"]
+                or source_transition_evidence["optimizer_steps"] != 0
+                or source_transition_evidence[
+                    "legacy_zero_input_function_preserving"
+                ]
+                is not True
+            ):
+                raise ExecutorError(
+                    "architecture upgrade transition source lost exact parent lineage"
+                )
     receipt = upgrade["receipt"]
     lineage_binding = {
         "schema_version": "a1-lineage-function-preserving-upgrade-v1",
@@ -4674,6 +4863,8 @@ def bind_function_preserving_upgrade(
         result["public_award_transition_source_evidence"] = (
             source_transition_evidence
         )
+    if diagnostic_comparison_source is not None:
+        result["diagnostic_comparison_source"] = diagnostic_comparison_source
     result["claim_identity_sha256"] = _value_sha256(
         {
             "schema_version": "a1-architecture-upgrade-training-identity-v1",
@@ -9680,6 +9871,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--diagnostic-dose-curve",
+        action="store_true",
+        help=(
+            "reporting-only learner campaign mode: emit the 64/128/terminal "
+            "same-trajectory frontier and module optimizer telemetry; requires "
+            "a generic diagnostic ablation"
+        ),
+    )
+    parser.add_argument(
         "--fresh-value-training-only",
         action="store_true",
         help=(
@@ -9870,6 +10070,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         generic_ablation_requested = bool(
             args.ablation_id or args.recipe_overrides_json
         )
+        if args.diagnostic_dose_curve and not generic_ablation_requested:
+            raise ExecutorError(
+                "--diagnostic-dose-curve requires a generic diagnostic ablation"
+            )
         if args.fresh_policy_distillation_only and not generic_ablation_requested:
             raise ExecutorError(
                 "--fresh-policy-distillation-only requires a generic diagnostic ablation"
@@ -9916,6 +10120,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_public_award_transition_source=(
                     aux_requested or final_requested
                 ),
+                allow_diagnostic_recent_history_source=bool(
+                    args.diagnostic_dose_curve
+                ),
             )
         if generic_ablation_requested:
             verified = bind_learner_ablation(
@@ -9923,6 +10130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ablation_id=args.ablation_id,
                 overrides_json=args.recipe_overrides_json,
                 reviewed_code_tree_sha256=args.ablation_code_tree_sha256,
+                diagnostic_dose_curve=bool(args.diagnostic_dose_curve),
             )
             checkpoint_for_descriptor = Path(
                 os.path.abspath(os.fspath(args.checkpoint.expanduser()))
@@ -10162,6 +10370,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "receipt": str(receipt),
             "function_preserving_upgrade": verified.get(
                 "function_preserving_upgrade"
+            ),
+            "diagnostic_comparison_source": verified.get(
+                "diagnostic_comparison_source"
             ),
         }
         if verified.get("learner_ablation") is not None:

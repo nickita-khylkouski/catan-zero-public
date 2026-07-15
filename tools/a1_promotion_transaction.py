@@ -41,6 +41,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
+from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
 from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import _a1_promotion_lock_state as promotion_lock_state  # noqa: E402
@@ -4320,13 +4321,29 @@ def _verify_contract_with_snapshot(
         raise PromotionError(
             f"current A1 promotion requires global n_full=128, got {search.get('n_full')!r}"
         )
-    if (
+    if current_science.is_coherent_search(search):
+        try:
+            current_science.require_current_operator(
+                search_value=search,
+                evaluator_value=lock.get("science", {}).get("evaluator"),
+                generation_value=lock.get("generation"),
+                learner_recipe_value=lock.get("science", {}).get(
+                    "learner_training_recipe"
+                ),
+                target_regime=lock.get("post_wave_acceptance", {}).get(
+                    "require_target_information_regime"
+                ),
+                require_adopted=True,
+            )
+        except current_science.ScienceContractError as error:
+            raise PromotionError(str(error)) from error
+    elif (
         search.get("n_full_wide") is not None
         or search.get("wide_roots_always_full") is not False
     ):
         raise PromotionError(
-            "current A1 promotion is global n128 only; adaptive/global alternate "
-            "budgets are forbidden"
+            "historical PIMC promotion is global n128 only; adaptive budgets "
+            "require the current coherent-public science contract"
         )
     contract_sha = lock.get("contract_sha256")
     _validate_sha256(contract_sha, where="contract.contract_sha256")
@@ -5602,6 +5619,16 @@ def _sealed_evaluation_semantics(contract: dict[str, Any]) -> dict[str, Any]:
         "evaluator_rust_featurize": evaluator_value("rust_featurize"),
         "evaluator_emit_uncertainty": evaluator_value("emit_uncertainty"),
     }
+    # These fields did not exist in issued PIMC locks.  Bind them when and only
+    # when the sealed operator carries the coherent-public implementation so a
+    # current evaluation cannot silently fall back to PIMC or full forced-root
+    # targets while historical evidence remains byte-replayable.
+    for optional_field in (
+        "coherent_public_belief_search",
+        "forced_root_target_mode",
+    ):
+        if optional_field in search:
+            semantics[optional_field] = search[optional_field]
     return semantics
 
 
@@ -5867,10 +5894,28 @@ def _verify_internal_h2h_source(
     )
     if fields.get("public_observation") is not True:
         raise PromotionError(f"{where} typed config is not public-observation")
+    coherent_public = (
+        sealed_semantics.get("coherent_public_belief_search") is True
+    )
     expected_information_recipe = {
-        "information_set_search": True,
-        "determinization_particles": 4,
-        "determinization_min_simulations": 32,
+        "information_set_search": sealed_semantics["information_set_search"],
+        "determinization_particles": sealed_semantics[
+            "determinization_particles"
+        ],
+        "determinization_min_simulations": sealed_semantics[
+            "determinization_min_simulations"
+        ],
+        **(
+            {
+                "coherent_public_belief_search": True,
+                "belief_chance_spectra": False,
+                "forced_root_target_mode": sealed_semantics[
+                    "forced_root_target_mode"
+                ],
+            }
+            if coherent_public
+            else {}
+        ),
     }
     for key, expected in expected_information_recipe.items():
         if fields.get(key) != expected:
@@ -5885,17 +5930,23 @@ def _verify_internal_h2h_source(
         raise PromotionError(
             f"{where} typed config is not global n{int(required_n_full)}"
         )
-    for key in (
-        "n_full_wide",
-        "candidate_n_full_wide",
-        "baseline_n_full_wide",
-        "n_full_wide_threshold",
-        "candidate_n_full_wide_threshold",
-        "baseline_n_full_wide_threshold",
-    ):
-        if fields.get(key) is not None:
+    expected_wide_fields = {
+        "n_full_wide": sealed_semantics["n_full_wide"],
+        "candidate_n_full_wide": sealed_semantics["n_full_wide"],
+        "baseline_n_full_wide": sealed_semantics["n_full_wide"],
+        "n_full_wide_threshold": sealed_semantics["n_full_wide_threshold"],
+        "candidate_n_full_wide_threshold": sealed_semantics[
+            "n_full_wide_threshold"
+        ],
+        "baseline_n_full_wide_threshold": sealed_semantics[
+            "n_full_wide_threshold"
+        ],
+    }
+    for key, expected in expected_wide_fields.items():
+        if fields.get(key) != expected:
             raise PromotionError(
-                f"{where} typed config enables forbidden wide budget {key}"
+                f"{where} typed config wide-budget drift: "
+                f"{key}={fields.get(key)!r}, expected {expected!r}"
             )
     allowed_decisions = (
         {"H1"}
@@ -5922,9 +5973,11 @@ def _verify_internal_h2h_source(
     budgets = payload.get("search_budgets_by_role")
     expected_budget = {
         "n_full": int(required_n_full),
-        "n_full_wide": None,
-        "n_full_wide_threshold": None,
-        "wide_roots_always_full": False,
+        "n_full_wide": sealed_semantics["n_full_wide"],
+        "n_full_wide_threshold": sealed_semantics["n_full_wide_threshold"],
+        "wide_roots_always_full": sealed_semantics[
+            "wide_roots_always_full"
+        ],
     }
     normalized_budgets: dict[str, Any] = {}
     if isinstance(budgets, dict):
@@ -5941,7 +5994,7 @@ def _verify_internal_h2h_source(
         normalized_budgets.get("candidate") != expected_budget
         or normalized_budgets.get("baseline") != expected_budget
     ):
-        raise PromotionError(f"{where} does not use the sealed global n128 budget")
+        raise PromotionError(f"{where} does not use the sealed n128 operator budget")
     sprt = payload.get("pentanomial_sprt")
     if not isinstance(sprt, dict) or sprt.get("decision") not in allowed_decisions:
         raise PromotionError(
@@ -6169,10 +6222,28 @@ def _verify_external_panel_source(
         raise PromotionError(f"{where} uses an unexpected referee harness")
     if payload.get("mode") != "search" or payload.get("public_observation") is not True:
         raise PromotionError(f"{where} must use public-observation search")
+    coherent_public = (
+        sealed_semantics.get("coherent_public_belief_search") is True
+    )
     expected_information_recipe = {
-        "information_set_search": True,
-        "determinization_particles": 4,
-        "determinization_min_simulations": 32,
+        "information_set_search": sealed_semantics["information_set_search"],
+        "determinization_particles": sealed_semantics[
+            "determinization_particles"
+        ],
+        "determinization_min_simulations": sealed_semantics[
+            "determinization_min_simulations"
+        ],
+        **(
+            {
+                "coherent_public_belief_search": True,
+                "belief_chance_spectra": False,
+                "forced_root_target_mode": sealed_semantics[
+                    "forced_root_target_mode"
+                ],
+            }
+            if coherent_public
+            else {}
+        ),
     }
     for key, expected in expected_information_recipe.items():
         if payload.get(key) != expected:
@@ -6185,8 +6256,11 @@ def _verify_external_panel_source(
     trained = payload.get("trained_value_readouts")
     if not isinstance(trained, list) or "scalar" not in trained:
         raise PromotionError(f"{where} does not prove scalar value training")
-    if payload.get("n_full") != 128 or payload.get("n_full_wide") is not None:
-        raise PromotionError(f"{where} does not use the sealed global n128 budget")
+    if (
+        payload.get("n_full") != 128
+        or payload.get("n_full_wide") != sealed_semantics["n_full_wide"]
+    ):
+        raise PromotionError(f"{where} does not use the sealed n128 operator budget")
     if (
         _absolute(payload.get("candidate_checkpoint"), base=checkpoint.parent)
         != checkpoint
@@ -8648,7 +8722,9 @@ def prepare_promotion(
             "path": str(contract_lock.resolve()),
             "contract_sha256": contract["contract_sha256"],
             "n_full": 128,
-            "n_full_wide": None,
+            "n_full_wide": contract["science"]["search_operator"].get(
+                "n_full_wide"
+            ),
             "legacy_contract_attestation": legacy_attestation_ref,
             "verifier_authority": verifier_authority,
             "recovery_gate_authority": recovery_gate_ref,

@@ -83,6 +83,7 @@ from tools import a0_binding_verdict as a0_binding  # noqa: E402
 from tools import search_teacher_adjudicator as search_adjudicator  # noqa: E402
 from tools import search_operator_binding as operator_binding  # noqa: E402
 from tools import a1_post_promotion_handoff as promotion_handoff  # noqa: E402
+from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE, parse_seed_ledger  # noqa: E402
 from tools.seed_fleet_planner import assert_disjoint_seed_blocks  # noqa: E402
 from tools.sprt_gate import evaluate_pentanomial_sprt  # noqa: E402
@@ -318,6 +319,13 @@ CURRENT_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
     # DDP ranks must share one NumPy epoch order but use independent PyTorch
     # dropout streams after identical model construction/loading.
     "training_rng_rank_offset": True,
+}
+# The selected coherent-public learner is a production recipe, not a generic
+# diagnostic ablation.  Keeping it separate from CURRENT preserves replay of
+# already-issued PIMC v3 locks while making a fresh coherent candidate
+# promotion-eligible without caller-supplied recipe overrides.
+COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
+    **current_science.learner_training_recipe(),
 }
 REQUIRED_EVIDENCE = {"a0", "s1", "s2", "s3"}
 HISTORICAL_HANDOFF_MODE = "historical_pre_promotion"
@@ -6800,13 +6808,18 @@ def build_lock(
     learner_objective = dict(science["learner_value_objective"])
     _validate_learner_objective(learner_objective)
     learner_training_recipe = dict(science["learner_training_recipe"])
+    expected_learner_recipe = (
+        EXPECTED_LEARNER_TRAINING_RECIPE
+        if draft_schema == LEGACY_DRAFT_SCHEMA
+        else (
+            COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE
+            if current_science.is_coherent_search(raw_search)
+            else CURRENT_LEARNER_TRAINING_RECIPE
+        )
+    )
     _validate_learner_training_recipe(
         learner_training_recipe,
-        expected_recipe=(
-            EXPECTED_LEARNER_TRAINING_RECIPE
-            if draft_schema == LEGACY_DRAFT_SCHEMA
-            else CURRENT_LEARNER_TRAINING_RECIPE
-        ),
+        expected_recipe=expected_learner_recipe,
     )
     if evaluator["public_observation"] is not True:
         raise ContractError("science.evaluator.public_observation must be true")
@@ -6950,6 +6963,17 @@ def build_lock(
                 "coherent-public production waves require the explicit bounded "
                 "meaningful-history/automatic-transition contract"
             )
+        try:
+            current_science.require_current_operator(
+                search_value=raw_search,
+                evaluator_value=evaluator,
+                generation_value=generation,
+                learner_recipe_value=learner_training_recipe,
+                target_regime=target_information_regime,
+                require_adopted=True,
+            )
+        except current_science.ScienceContractError as error:
+            raise ContractError(str(error)) from error
     _validate_current_runtime_execution(
         str(draft_schema), evaluator=evaluator, generation=generation
     )
@@ -7145,6 +7169,13 @@ def build_lock(
         for path in code_paths
     ):
         missing_code.add("src/catan_zero/rl/meaningful_history.py")
+    if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
+        for suffix in (
+            "tools/a1_current_science_contract.py",
+            "configs/operations/a1-next-wave-coherent-public-v1/science.contract.json",
+        ):
+            if not any(path.endswith(suffix) for path in code_paths):
+                missing_code.add(suffix)
     if missing_code:
         raise ContractError(
             f"generator_code_files omits required semantics files: {sorted(missing_code)}"
@@ -7166,6 +7197,13 @@ def build_lock(
         for path in learner_code_paths
     ):
         missing_learner_code.add("src/catan_zero/rl/meaningful_history.py")
+    if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
+        for suffix in (
+            "tools/a1_current_science_contract.py",
+            "configs/operations/a1-next-wave-coherent-public-v1/science.contract.json",
+        ):
+            if not any(path.endswith(suffix) for path in learner_code_paths):
+                missing_learner_code.add(suffix)
     if missing_learner_code:
         raise ContractError(
             "learner_code_files omits required learner semantics files: "
@@ -7459,23 +7497,40 @@ def verify_lock(
     ):
         raise ContractError("learner value-objective digest mismatch")
     learner_training_recipe = dict(lock["science"]["learner_training_recipe"])
-    _validate_learner_training_recipe(
-        learner_training_recipe,
-        expected_recipe=(
-            HISTORICAL_MARKERLESS_LEARNER_TRAINING_RECIPE
-            if historical_markerless
+    expected_learner_recipe = (
+        HISTORICAL_MARKERLESS_LEARNER_TRAINING_RECIPE
+        if historical_markerless
+        else (
+            EXPECTED_LEARNER_TRAINING_RECIPE
+            if lock_schema == LEGACY_LOCK_SCHEMA
             else (
-                EXPECTED_LEARNER_TRAINING_RECIPE
-                if lock_schema == LEGACY_LOCK_SCHEMA
+                COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE
+                if current_science.is_coherent_search(search)
                 else CURRENT_LEARNER_TRAINING_RECIPE
             )
-        ),
+        )
+    )
+    _validate_learner_training_recipe(
+        learner_training_recipe,
+        expected_recipe=expected_learner_recipe,
     )
     if (
         _digest_value(learner_training_recipe)
         != lock["science"]["learner_training_recipe_sha256"]
     ):
         raise ContractError("learner training-recipe digest mismatch")
+    if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
+        try:
+            current_science.require_current_operator(
+                search_value=search,
+                evaluator_value=evaluator,
+                generation_value=lock.get("generation"),
+                learner_recipe_value=learner_training_recipe,
+                target_regime=target_information_regime,
+                require_adopted=True,
+            )
+        except current_science.ScienceContractError as error:
+            raise ContractError(str(error)) from error
     if lock_schema == LOCK_SCHEMA:
         fleet_manifest = lock["fleet"].get("fleet_manifest")
         if not isinstance(fleet_manifest, dict):
@@ -8088,6 +8143,20 @@ def _generator_argv(
                 str(job["arm_id"]),
             )
         )
+    elif search.get("coherent_public_belief_search") is True:
+        # The generator's process-wide default guard is the immutable legacy
+        # PIMC guard.  A coherent-public lock must therefore carry its own
+        # sealed guard explicitly or the production renderer would either be
+        # refused by PIMC values or (if defaults changed later) run unguarded.
+        guard_record = lock.get("provenance", {}).get("guard_config")
+        if isinstance(guard_record, dict) and "path" in guard_record:
+            argv.extend(
+                (
+                    "--prelaunch-guard-config",
+                    str(guard_record["path"]),
+                )
+            )
+        argv.append("--score-actions")
     optional = (
         ("--n-full-wide", search["n_full_wide"]),
         ("--n-full-wide-threshold", search["n_full_wide_threshold"]),

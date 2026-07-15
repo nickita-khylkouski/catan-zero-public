@@ -84,6 +84,33 @@ _PHASE_LABELS = {
 }
 
 
+@dataclasses.dataclass(frozen=True)
+class RootStratumQuota:
+    """Minimum real-root count for one disjoint phase/width stratum."""
+
+    phase: str
+    min_legal_width: int
+    max_legal_width: int | None
+    count: int
+
+    @property
+    def name(self) -> str:
+        width = (
+            f"{self.min_legal_width}+"
+            if self.max_legal_width is None
+            else f"{self.min_legal_width}-{self.max_legal_width}"
+        )
+        return f"{self.phase}:{width}"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "min_legal_width": self.min_legal_width,
+            "max_legal_width": self.max_legal_width,
+            "count": self.count,
+        }
+
+
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -145,8 +172,7 @@ def jensen_shannon_divergence(
 
     def _kl(left: dict[int, float]) -> float:
         return sum(
-            probability
-            * math.log((probability + eps) / (midpoint[action] + eps))
+            probability * math.log((probability + eps) / (midpoint[action] + eps))
             for action, probability in left.items()
             if probability > 0.0
         )
@@ -156,9 +182,7 @@ def jensen_shannon_divergence(
 
 def _policy_top1(policy: dict[int, float]) -> int:
     normalized = _normalize_policy(policy)
-    return int(
-        max(normalized, key=lambda action: (normalized[action], -int(action)))
-    )
+    return int(max(normalized, key=lambda action: (normalized[action], -int(action))))
 
 
 def summarize_cross_seed_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
@@ -171,7 +195,9 @@ def summarize_cross_seed_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
 
     supports = [set(int(key) for key in run["improved_policy"]) for run in runs]
     if any(support != supports[0] for support in supports[1:]):
-        raise ValueError("repeated searches returned incompatible legal-action supports")
+        raise ValueError(
+            "repeated searches returned incompatible legal-action supports"
+        )
 
     pairwise: list[dict[str, Any]] = []
     policy_top1s = [_policy_top1(run["improved_policy"]) for run in runs]
@@ -249,6 +275,77 @@ def _phase_label(raw_phase: str) -> str:
     return _PHASE_LABELS.get(str(raw_phase), str(raw_phase).lower() or "unknown")
 
 
+def _root_matches_stratum(root: dict[str, Any], quota: RootStratumQuota) -> bool:
+    width = int(root["legal_width"])
+    return (
+        str(root["phase"]) == quota.phase
+        and width >= quota.min_legal_width
+        and (quota.max_legal_width is None or width <= quota.max_legal_width)
+    )
+
+
+def validate_root_stratum_quota_specs(
+    quotas: tuple[RootStratumQuota, ...], *, n_roots: int
+) -> None:
+    if sum(quota.count for quota in quotas) > n_roots:
+        raise ValueError("root stratum quota counts exceed n_roots")
+    names: set[str] = set()
+    for quota in quotas:
+        if not quota.phase:
+            raise ValueError("root stratum quota phase must be non-empty")
+        if quota.min_legal_width < 1:
+            raise ValueError("root stratum quota minimum width must be positive")
+        if (
+            quota.max_legal_width is not None
+            and quota.max_legal_width < quota.min_legal_width
+        ):
+            raise ValueError("root stratum quota maximum width is below its minimum")
+        if quota.count <= 0:
+            raise ValueError("root stratum quota count must be positive")
+        if quota.name in names:
+            raise ValueError(f"duplicate root stratum quota {quota.name}")
+        names.add(quota.name)
+
+    # A candidate may satisfy at most one quota. This makes the promised sample
+    # size auditable and prevents one attractive root from paying two quotas.
+    for left, right in itertools.combinations(quotas, 2):
+        if left.phase != right.phase:
+            continue
+        left_max = (
+            left.max_legal_width if left.max_legal_width is not None else math.inf
+        )
+        right_max = (
+            right.max_legal_width if right.max_legal_width is not None else math.inf
+        )
+        if max(left.min_legal_width, right.min_legal_width) <= min(left_max, right_max):
+            raise ValueError(
+                f"overlapping root stratum quotas {left.name} and {right.name}"
+            )
+
+
+def root_stratum_counts(
+    roots: list[dict[str, Any]], quotas: tuple[RootStratumQuota, ...]
+) -> dict[str, int]:
+    return {
+        quota.name: sum(1 for root in roots if _root_matches_stratum(root, quota))
+        for quota in quotas
+    }
+
+
+def enforce_root_stratum_quotas(
+    roots: list[dict[str, Any]], quotas: tuple[RootStratumQuota, ...]
+) -> dict[str, int]:
+    counts = root_stratum_counts(roots, quotas)
+    shortfalls = {
+        quota.name: {"required": quota.count, "actual": counts[quota.name]}
+        for quota in quotas
+        if counts[quota.name] < quota.count
+    }
+    if shortfalls:
+        raise ValueError(f"root panel stratum quota shortfall: {shortfalls}")
+    return counts
+
+
 class CountingEvaluator:
     """Transparent evaluator adapter with exact logical-evaluation counters."""
 
@@ -320,9 +417,7 @@ def load_search_spec(path: str | Path) -> dict[str, Any]:
     if unknown_top:
         raise ValueError(f"{path}: unknown top-level keys: {sorted(unknown_top)}")
     if payload.get("schema_version") != SEARCH_CONFIG_SCHEMA:
-        raise ValueError(
-            f"{path}: schema_version must be {SEARCH_CONFIG_SCHEMA!r}"
-        )
+        raise ValueError(f"{path}: schema_version must be {SEARCH_CONFIG_SCHEMA!r}")
     name = payload.get("name")
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{path}: non-empty string name is required")
@@ -333,7 +428,9 @@ def load_search_spec(path: str | Path) -> dict[str, Any]:
     field_names = {field.name for field in dataclasses.fields(GumbelChanceMCTSConfig)}
     unknown = set(overrides) - field_names
     if unknown:
-        raise ValueError(f"{path}: unknown GumbelChanceMCTSConfig keys: {sorted(unknown)}")
+        raise ValueError(
+            f"{path}: unknown GumbelChanceMCTSConfig keys: {sorted(unknown)}"
+        )
     if "seed" in overrides:
         raise ValueError(
             f"{path}: search_config.seed is forbidden; the probe assigns disjoint seeds"
@@ -374,13 +471,13 @@ def load_evaluator_spec(path: str | Path) -> dict[str, Any]:
     if unknown_top:
         raise ValueError(f"{path}: unknown top-level keys: {sorted(unknown_top)}")
     if payload.get("schema_version") != EVALUATOR_CONFIG_SCHEMA:
-        raise ValueError(
-            f"{path}: schema_version must be {EVALUATOR_CONFIG_SCHEMA!r}"
-        )
+        raise ValueError(f"{path}: schema_version must be {EVALUATOR_CONFIG_SCHEMA!r}")
     overrides = payload.get("evaluator_config")
     if not isinstance(overrides, dict):
         raise ValueError(f"{path}: evaluator_config must be an object")
-    field_names = {field.name for field in dataclasses.fields(EntityGraphRustEvaluatorConfig)}
+    field_names = {
+        field.name for field in dataclasses.fields(EntityGraphRustEvaluatorConfig)
+    }
     unknown = set(overrides) - field_names
     if unknown:
         raise ValueError(
@@ -519,7 +616,9 @@ def _canonicalize_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     adjacent = canonical.get("adjacent_tiles")
     if isinstance(adjacent, dict):
         canonical["adjacent_tiles"] = {
-            key: _sorted_json_values(value) if isinstance(value, (list, tuple)) else value
+            key: _sorted_json_values(value)
+            if isinstance(value, (list, tuple))
+            else value
             for key, value in adjacent.items()
         }
     return canonical
@@ -531,8 +630,7 @@ def _root_material(game: Any) -> dict[str, Any]:
         raise ValueError("Rust game json_snapshot() must decode to an object")
     snapshot = _canonicalize_snapshot(raw_snapshot)
     legal = sorted(
-        int(action)
-        for action in game.playable_action_indices(list(COLORS), None)
+        int(action) for action in game.playable_action_indices(list(COLORS), None)
     )
     return {
         "snapshot": snapshot,
@@ -587,15 +685,23 @@ def validate_root_panel_payload(
     if not isinstance(provenance, dict):
         raise ValueError("root panel provenance must be an object")
     if provenance.get("checkpoint_sha256") != checkpoint_sha256:
-        raise ValueError("root panel checkpoint hash is incompatible with requested checkpoint")
+        raise ValueError(
+            "root panel checkpoint hash is incompatible with requested checkpoint"
+        )
     if provenance.get("evaluator_config_sha256") != evaluator_config_sha256:
-        raise ValueError("root panel evaluator config hash is incompatible with this run")
+        raise ValueError(
+            "root panel evaluator config hash is incompatible with this run"
+        )
     if tuple(provenance.get("colors", ())) != COLORS:
         raise ValueError("root panel colors are incompatible with this probe")
     if int(provenance.get("chance_seed_xor", -1)) != CHANCE_SEED_XOR:
-        raise ValueError("root panel chance-seed reconstruction protocol is incompatible")
+        raise ValueError(
+            "root panel chance-seed reconstruction protocol is incompatible"
+        )
     if provenance.get("snapshot_canonicalization") != SNAPSHOT_CANONICALIZATION:
-        raise ValueError("root panel snapshot canonicalization protocol is incompatible")
+        raise ValueError(
+            "root panel snapshot canonicalization protocol is incompatible"
+        )
     roots = panel.get("roots")
     if not isinstance(roots, list) or not roots:
         raise ValueError("root panel must contain at least one root")
@@ -624,13 +730,10 @@ def validate_root_panel_payload(
         if not isinstance(material["snapshot"], dict) or material[
             "snapshot"
         ] != _canonicalize_snapshot(material["snapshot"]):
-            raise ValueError(
-                f"root {root.get('root_index')} snapshot is not canonical"
-            )
+            raise ValueError(f"root {root.get('root_index')} snapshot is not canonical")
         legal_action_ids = material["legal_action_ids"]
-        if (
-            not isinstance(legal_action_ids, list)
-            or legal_action_ids != sorted(set(int(action) for action in legal_action_ids))
+        if not isinstance(legal_action_ids, list) or legal_action_ids != sorted(
+            set(int(action) for action in legal_action_ids)
         ):
             raise ValueError(
                 f"root {root.get('root_index')} legal_action_ids must be sorted and unique"
@@ -655,6 +758,33 @@ def validate_root_panel_payload(
     if len(set(root_hashes)) != len(root_hashes):
         raise ValueError("root panel contains duplicate root hashes")
 
+    raw_quotas = provenance.get("root_stratum_quotas", [])
+    if not isinstance(raw_quotas, list):
+        raise ValueError("root panel root_stratum_quotas must be a list")
+    try:
+        quotas = tuple(
+            RootStratumQuota(
+                phase=str(raw["phase"]),
+                min_legal_width=int(raw["min_legal_width"]),
+                max_legal_width=(
+                    None
+                    if raw.get("max_legal_width") is None
+                    else int(raw["max_legal_width"])
+                ),
+                count=int(raw["count"]),
+            )
+            for raw in raw_quotas
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("root panel contains an invalid root stratum quota") from error
+    validate_root_stratum_quota_specs(quotas, n_roots=len(roots))
+    actual_stratum_counts = enforce_root_stratum_quotas(roots, quotas)
+    recorded_stratum_counts = panel.get("root_stratum_counts", {})
+    if recorded_stratum_counts != actual_stratum_counts:
+        raise ValueError(
+            "root panel root_stratum_counts do not match the selected roots"
+        )
+
 
 def build_root_panel(
     evaluator: Any,
@@ -665,6 +795,8 @@ def build_root_panel(
     decisions_per_game: tuple[int, ...],
     base_seed: int,
     min_legal_actions: int,
+    root_stratum_quotas: tuple[RootStratumQuota, ...] = (),
+    max_games: int | None = None,
 ) -> dict[str, Any]:
     if n_roots <= 0:
         raise ValueError("n_roots must be positive")
@@ -672,14 +804,28 @@ def build_root_panel(
         raise ValueError("decisions_per_game must contain non-negative indices")
     if min_legal_actions < 1:
         raise ValueError("min_legal_actions must be positive")
+    validate_root_stratum_quota_specs(root_stratum_quotas, n_roots=n_roots)
+    if max_games is not None and max_games <= 0:
+        raise ValueError("max_games must be positive")
 
     catanatron_rs = _require_rust_module()
     targets = set(int(index) for index in decisions_per_game)
     max_target = max(targets)
-    roots: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    candidate_hashes: set[str] = set()
     game_index = 0
-    max_games = max(100, n_roots * 20)
-    while len(roots) < n_roots and game_index < max_games:
+    effective_max_games = (
+        int(max_games) if max_games is not None else max(100, n_roots * 20)
+    )
+
+    def _selection_ready() -> bool:
+        return len(candidates) >= n_roots and not any(
+            sum(1 for root in candidates if _root_matches_stratum(root, quota))
+            < quota.count
+            for quota in root_stratum_quotas
+        )
+
+    while not _selection_ready() and game_index < effective_max_games:
         game_seed = int(base_seed) + game_index
         game = catanatron_rs.Game.simple(list(COLORS), seed=game_seed)
         chance_rng = random.Random(game_seed ^ CHANCE_SEED_XOR)
@@ -697,24 +843,27 @@ def build_root_panel(
             if decision_index in targets and len(legal) >= min_legal_actions:
                 material = _root_material(game)
                 raw_phase = str(material["snapshot"].get("current_prompt", ""))
-                roots.append(
-                    {
-                        "root_index": len(roots),
-                        "game_seed": game_seed,
-                        "decision_index": decision_index,
-                        "action_prefix": list(action_prefix),
-                        **material,
-                        "legal_width": len(material["legal_action_ids"]),
-                        "legal_width_bucket": _legal_width_bucket(
-                            len(material["legal_action_ids"])
-                        ),
-                        "wide_ge_40": len(material["legal_action_ids"]) >= 40,
-                        "phase_raw": raw_phase,
-                        "phase": _phase_label(raw_phase),
-                        "root_sha256": _root_hash(material),
-                    }
-                )
-                if len(roots) >= n_roots:
+                root_hash = _root_hash(material)
+                if root_hash not in candidate_hashes:
+                    candidate_hashes.add(root_hash)
+                    candidates.append(
+                        {
+                            "root_index": len(candidates),
+                            "game_seed": game_seed,
+                            "decision_index": decision_index,
+                            "action_prefix": list(action_prefix),
+                            **material,
+                            "legal_width": len(material["legal_action_ids"]),
+                            "legal_width_bucket": _legal_width_bucket(
+                                len(material["legal_action_ids"])
+                            ),
+                            "wide_ge_40": len(material["legal_action_ids"]) >= 40,
+                            "phase_raw": raw_phase,
+                            "phase": _phase_label(raw_phase),
+                            "root_sha256": root_hash,
+                        }
+                    )
+                if _selection_ready():
                     break
             selected = _select_raw_action(evaluator, game, legal)
             action_prefix.append(int(selected))
@@ -727,10 +876,33 @@ def build_root_panel(
             )
             decision_index += 1
         game_index += 1
-    if len(roots) != n_roots:
+    if not _selection_ready():
+        observed = root_stratum_counts(candidates, root_stratum_quotas)
         raise RuntimeError(
-            f"collected {len(roots)}/{n_roots} roots after {game_index} games"
+            f"could not satisfy real-root panel after {game_index}/{effective_max_games} "
+            f"games: candidates={len(candidates)}/{n_roots}, strata={observed}"
         )
+
+    # Reserve each preregistered stratum first, then fill the remaining panel
+    # slots in discovery order. Strata are required to be disjoint above.
+    selected_indices: set[int] = set()
+    for quota in root_stratum_quotas:
+        matches = [
+            index
+            for index, root in enumerate(candidates)
+            if _root_matches_stratum(root, quota)
+        ]
+        selected_indices.update(matches[: quota.count])
+    for index in range(len(candidates)):
+        if len(selected_indices) >= n_roots:
+            break
+        selected_indices.add(index)
+    roots = [candidates[index] for index in sorted(selected_indices)]
+    if len(roots) != n_roots:
+        raise RuntimeError(f"selected {len(roots)}/{n_roots} roots")
+    for root_index, root in enumerate(roots):
+        root["root_index"] = root_index
+    selected_stratum_counts = enforce_root_stratum_quotas(roots, root_stratum_quotas)
     panel = {
         "schema_version": PANEL_SCHEMA,
         "provenance": {
@@ -744,9 +916,13 @@ def build_root_panel(
             "root_base_seed": int(base_seed),
             "decisions_per_game": list(sorted(targets)),
             "min_legal_actions": int(min_legal_actions),
+            "max_root_games": effective_max_games,
+            "candidate_root_count": len(candidates),
+            "root_stratum_quotas": [quota.as_dict() for quota in root_stratum_quotas],
         },
         "root_count": len(roots),
         "wide_ge_40_count": sum(1 for root in roots if root["wide_ge_40"]),
+        "root_stratum_counts": selected_stratum_counts,
         "roots": roots,
     }
     return seal_root_panel(panel)
@@ -762,8 +938,7 @@ def reconstruct_roots(panel: dict[str, Any]) -> list[Any]:
         chance_rng = random.Random(game_seed ^ CHANCE_SEED_XOR)
         for decision_index, action in enumerate(record["action_prefix"]):
             legal = tuple(
-                int(item)
-                for item in game.playable_action_indices(list(COLORS), None)
+                int(item) for item in game.playable_action_indices(list(COLORS), None)
             )
             if int(action) not in legal:
                 raise ValueError(
@@ -878,7 +1053,9 @@ def _run_one_search(
     }
 
 
-def _aggregate_role(root_records: list[dict[str, Any]], role_name: str) -> dict[str, Any]:
+def _aggregate_role(
+    root_records: list[dict[str, Any]], role_name: str
+) -> dict[str, Any]:
     runs = [run for root in root_records for run in root["roles"][role_name]["runs"]]
     pairwise = [
         pair
@@ -888,9 +1065,7 @@ def _aggregate_role(root_records: list[dict[str, Any]], role_name: str) -> dict[
     simulations = sum(int(run["simulations_used"]) for run in runs)
     wall = sum(float(run["wall_sec"]) for run in runs)
     logical_evals = sum(int(run["logical_leaf_evaluations"]) for run in runs)
-    orientation_evals = sum(
-        int(run["orientation_evaluation_rows"]) for run in runs
-    )
+    orientation_evals = sum(int(run["orientation_evaluation_rows"]) for run in runs)
     evaluator_calls = sum(int(run["evaluator_method_calls"]) for run in runs)
     js_values = [float(pair["js_divergence"]) for pair in pairwise]
     agreements = [1.0 if pair["top1_agreement"] else 0.0 for pair in pairwise]
@@ -937,7 +1112,9 @@ def _aggregate_role(root_records: list[dict[str, Any]], role_name: str) -> dict[
     }
 
 
-def _safe_ratio(numerator: float | int | None, denominator: float | int | None) -> float | None:
+def _safe_ratio(
+    numerator: float | int | None, denominator: float | int | None
+) -> float | None:
     if numerator is None or denominator is None or float(denominator) <= 0.0:
         return None
     return float(numerator) / float(denominator)
@@ -994,9 +1171,7 @@ def _comparison_slice(
             ),
             "role_b_minus_role_a_target_entropy": _mean_delta("target_entropy"),
             "role_b_minus_role_a_target_prior_js": _mean_delta("target_prior_js"),
-            "role_b_minus_role_a_completed_q_range": _mean_delta(
-                "completed_q_range"
-            ),
+            "role_b_minus_role_a_completed_q_range": _mean_delta("completed_q_range"),
             "role_b_minus_role_a_completed_q_top_margin": _mean_delta(
                 "completed_q_top_margin"
             ),
@@ -1098,7 +1273,9 @@ def run_fixed_root_comparison(
 def _parse_int_tuple(text: str) -> tuple[int, ...]:
     values = tuple(int(item.strip()) for item in text.split(",") if item.strip())
     if not values:
-        raise argparse.ArgumentTypeError("expected at least one comma-separated integer")
+        raise argparse.ArgumentTypeError(
+            "expected at least one comma-separated integer"
+        )
     if any(value < 0 for value in values):
         raise argparse.ArgumentTypeError("decision indices must be non-negative")
     return values
@@ -1107,8 +1284,36 @@ def _parse_int_tuple(text: str) -> tuple[int, ...]:
 def _parse_name_set(text: str) -> set[str]:
     values = {item.strip() for item in text.split(",") if item.strip()}
     if not values:
-        raise argparse.ArgumentTypeError("expected at least one comma-separated field name")
+        raise argparse.ArgumentTypeError(
+            "expected at least one comma-separated field name"
+        )
     return values
+
+
+def _parse_root_stratum_quota(text: str) -> RootStratumQuota:
+    """Parse ``PHASE:MIN-MAX=COUNT`` or ``PHASE:MIN+=COUNT``."""
+    try:
+        phase, width_and_count = text.split(":", 1)
+        width_text, count_text = width_and_count.rsplit("=", 1)
+        if width_text.endswith("+"):
+            min_width = int(width_text[:-1])
+            max_width = None
+        else:
+            min_text, max_text = width_text.split("-", 1)
+            min_width = int(min_text)
+            max_width = int(max_text)
+        quota = RootStratumQuota(
+            phase=phase.strip(),
+            min_legal_width=min_width,
+            max_legal_width=max_width,
+            count=int(count_text),
+        )
+        validate_root_stratum_quota_specs((quota,), n_roots=quota.count)
+        return quota
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(
+            "expected PHASE:MIN-MAX=COUNT or PHASE:MIN+=COUNT"
+        ) from error
 
 
 def main() -> None:
@@ -1146,6 +1351,22 @@ def main() -> None:
     )
     parser.add_argument("--root-base-seed", type=int, default=DEFAULT_ROOT_BASE_SEED)
     parser.add_argument("--min-legal-actions", type=int, default=2)
+    parser.add_argument(
+        "--root-stratum-quota",
+        type=_parse_root_stratum_quota,
+        action="append",
+        default=[],
+        help=(
+            "Minimum real roots in a disjoint phase/width stratum, repeated as "
+            "PHASE:MIN-MAX=COUNT or PHASE:MIN+=COUNT."
+        ),
+    )
+    parser.add_argument(
+        "--max-root-games",
+        type=int,
+        default=None,
+        help="Bound real-game trajectories inspected while satisfying root quotas.",
+    )
     parser.add_argument(
         "--min-wide-roots",
         type=int,
@@ -1190,6 +1411,8 @@ def main() -> None:
         "max_batch_size": max(1, int(args.max_batch_size)),
         "max_wait_ms": max(0.0, float(args.max_wait_ms)),
     }
+    root_stratum_quotas = tuple(args.root_stratum_quota)
+    validate_root_stratum_quota_specs(root_stratum_quotas, n_roots=int(args.n_roots))
 
     root_panel_path = Path(args.root_panel)
     protected_inputs = {
@@ -1230,6 +1453,8 @@ def main() -> None:
                 decisions_per_game=tuple(args.decisions_per_game),
                 base_seed=int(args.root_base_seed),
                 min_legal_actions=int(args.min_legal_actions),
+                root_stratum_quotas=root_stratum_quotas,
+                max_games=args.max_root_games,
             )
             write_json(root_panel_path, panel)
         else:
@@ -1248,10 +1473,15 @@ def main() -> None:
         validate_root_panel_payload(
             panel,
             checkpoint_sha256=checkpoint_hash,
-            evaluator_config_sha256=evaluator_spec[
-                "effective_evaluator_config_sha256"
-            ],
+            evaluator_config_sha256=evaluator_spec["effective_evaluator_config_sha256"],
         )
+        panel_quotas = panel.get("provenance", {}).get("root_stratum_quotas", [])
+        requested_quotas = [quota.as_dict() for quota in root_stratum_quotas]
+        if panel_quotas != requested_quotas:
+            raise ValueError(
+                "root panel stratum quota contract differs from the requested probe"
+            )
+        enforce_root_stratum_quotas(panel["roots"], root_stratum_quotas)
         if int(panel.get("wide_ge_40_count", 0)) < int(args.min_wide_roots):
             raise ValueError(
                 f"root panel has {panel.get('wide_ge_40_count', 0)} >=40-action roots, "
@@ -1295,6 +1525,10 @@ def main() -> None:
             "content_sha256": panel["panel_content_sha256"],
             "root_count": len(panel["roots"]),
             "wide_ge_40_count": int(panel.get("wide_ge_40_count", 0)),
+            "root_stratum_quotas": panel.get("provenance", {}).get(
+                "root_stratum_quotas", []
+            ),
+            "root_stratum_counts": panel.get("root_stratum_counts", {}),
             "root_sha256s": [root["root_sha256"] for root in panel["roots"]],
         },
         "evaluator": evaluator_spec,

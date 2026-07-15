@@ -3662,11 +3662,12 @@ def _preflight_flywheel_diagnostic_derivative(
     """Authenticate one narrow diagnostic projection of a production composite.
 
     The production descriptor remains immutable and retains its strict recipe.
-    A diagnostic learner may change only the proven policy-game weighting
-    treatment, add the explicit forced-action-type value weighting treatment,
-    and/or remove historical replay from an objective. Components, sampling,
-    source authority, and every other byte are inherited unchanged from the
-    fully replayed production descriptor.
+    A diagnostic learner may change only one of the explicitly enumerated
+    treatments below: the proven policy-game weighting treatment, the explicit
+    forced-action-type value weighting treatment, the exact A/B/C/D LR-dose
+    campaign profile, and/or removal of historical replay from an objective.
+    Components, sampling, source authority, and every other byte are inherited
+    unchanged from the fully replayed production descriptor.
     """
 
     authority = descriptor.get("diagnostic_derivation_authority")
@@ -3758,11 +3759,59 @@ def _preflight_flywheel_diagnostic_derivative(
             if base_overrides.get(key) != effective_overrides.get(key)
         }
         typed_key = "forced_row_value_action_type_weights"
+        lr_dose_keys = {
+            "epochs",
+            "max_steps",
+            "lr",
+            "lr_warmup_steps",
+            "lr_schedule",
+        }
+        optional_lr_dose_keys = {"policy_aux_active_batch_size"}
+        allowed_additions = {typed_key, *lr_dose_keys, *optional_lr_dose_keys}
+        lr_dose_present = bool(changed & (lr_dose_keys | optional_lr_dose_keys))
+        lr_dose_valid = True
+        if lr_dose_present:
+            # A campaign descriptor carries the complete optimizer profile so
+            # LR/warmup/dose can never be authenticated piecemeal.  Values are
+            # the preregistered four short arms plus the selected 256-step
+            # replay; this is not a generic recipe-override escape hatch.
+            lr_dose_valid = (
+                lr_dose_keys.issubset(effective_overrides)
+                and not (lr_dose_keys | optional_lr_dose_keys).intersection(
+                    base_overrides
+                )
+                and type(effective_overrides.get("epochs")) is int
+                and effective_overrides.get("epochs") == 1
+                and type(effective_overrides.get("max_steps")) is int
+                and effective_overrides.get("max_steps") in {128, 256}
+                and type(effective_overrides.get("lr")) is float
+                and effective_overrides.get("lr") in {3e-5, 6e-5, 1.2e-4}
+                and type(effective_overrides.get("lr_warmup_steps")) is int
+                and effective_overrides.get("lr_warmup_steps") in {16, 100}
+                and effective_overrides.get("lr_schedule") == "flat"
+                and (
+                    effective_overrides.get("lr") == 3e-5
+                    or effective_overrides.get("lr_warmup_steps") == 16
+                )
+            )
+            if "policy_aux_active_batch_size" in effective_overrides:
+                policy_aux = effective_overrides["policy_aux_active_batch_size"]
+                lr_dose_valid = (
+                    lr_dose_valid
+                    and type(policy_aux) is int
+                    and 1 <= policy_aux <= 512
+                )
         if (
             set(base_overrides) - set(effective_overrides)
-            or set(effective_overrides) - set(base_overrides) - {typed_key}
+            or set(effective_overrides) - set(base_overrides) - allowed_additions
             or not changed
-            or changed - {"per_game_policy_weight", typed_key}
+            or changed
+            - {
+                "per_game_policy_weight",
+                typed_key,
+                *lr_dose_keys,
+                *optional_lr_dose_keys,
+            }
             or (
                 "per_game_policy_weight" in changed
                 and (
@@ -3786,10 +3835,12 @@ def _preflight_flywheel_diagnostic_derivative(
                     )
                 )
             )
+            or not lr_dose_valid
         ):
             raise SystemExit(
                 "flywheel diagnostic recipe may only disable per-game policy "
-                "weighting and/or add a canonical forced-action-type value map"
+                "weighting, add a canonical forced-action-type value map, "
+                "and/or use the exact authenticated A/B/C/D LR-dose profile"
             )
         expected["learner_recipe_overrides"] = copy.deepcopy(effective_overrides)
         expected["learner_recipe_overrides_sha256"] = _canonical_json_sha256(
@@ -10864,6 +10915,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_policy_component_dose: dict[str, float] = {}
         epoch_policy_component_phase_dose: dict[str, float] = {}
         epoch_value_component_dose: dict[str, float] = {}
+        # The science-campaign attribution walks several string/categorical
+        # columns for every realized draw.  Keep that cost entirely out of the
+        # production learner unless diagnostics were explicitly requested.
+        collect_training_strata_dose = (
+            int(args.train_diagnostics_every_batches) > 0
+        )
+        epoch_training_strata_dose: dict[str, float] = {}
+        epoch_module_grad_norm_sums: dict[str, float] = {}
+        epoch_module_grad_norm_max: dict[str, float] = {}
+        epoch_module_delta_norm_sums: dict[str, float] = {}
+        epoch_module_observations = 0
+        epoch_module_norm_scope: str | None = None
         if bool(getattr(data, "policy_distillation_scope_authenticated", False)):
             component_ids = tuple(data.component_ids)
             base_rows = train_indices[np.asarray(order, dtype=np.int64)]
@@ -11134,13 +11197,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             value_active_row_mask = batch_metrics.pop(
                 "_value_active_row_mask", None
             )
-            source_global_rows = batch
-            if bool(
-                getattr(data, "value_training_scope_authenticated", False)
-            ):
-                source_global_rows = _source_global_rows_for_training_batch(
-                    batch_data, batch
-                )
+            source_global_rows = _source_global_rows_for_training_batch(
+                batch_data, batch
+            )
             batch_value_component_dose = (
                 _value_component_active_dose_for_batch(
                     data, source_global_rows, value_active_row_mask
@@ -11149,6 +11208,42 @@ def main(argv: Sequence[str] | None = None) -> None:
             if batch_value_component_dose is not None:
                 for component_id, active_rows in batch_value_component_dose.items():
                     epoch_value_component_dose[component_id] += active_rows
+            if value_active_row_mask is None:
+                value_active_row_mask = np.zeros(len(source_global_rows), dtype=np.bool_)
+            if collect_training_strata_dose:
+                realized_strata = _flatten_training_strata_dose(
+                    _training_strata_dose_for_batch(
+                        data,
+                        source_global_rows,
+                        policy_weights=np.asarray(policy_sample_weights)[
+                            source_global_rows
+                        ],
+                        value_weights=np.asarray(value_sample_weights)[
+                            source_global_rows
+                        ],
+                        value_active_mask=value_active_row_mask,
+                        draw_stream="base",
+                    )
+                )
+                for key, value in realized_strata.items():
+                    epoch_training_strata_dose[key] = (
+                        epoch_training_strata_dose.get(key, 0.0) + float(value)
+                    )
+                if aux_batch is not None:
+                    realized_aux_strata = _flatten_training_strata_dose(
+                        _training_strata_dose_for_batch(
+                            data,
+                            np.asarray(aux_batch, dtype=np.int64),
+                            policy_weights=np.asarray(policy_sample_weights)[aux_batch],
+                            value_weights=np.zeros(len(aux_batch), dtype=np.float32),
+                            value_active_mask=np.zeros(len(aux_batch), dtype=np.bool_),
+                            draw_stream="policy_aux",
+                        )
+                    )
+                    for key, value in realized_aux_strata.items():
+                        epoch_training_strata_dose[key] = (
+                            epoch_training_strata_dose.get(key, 0.0) + float(value)
+                        )
             optimizer_observability = batch_metrics.get("optimizer_observability")
             optimizer_step_applied = bool(
                 batch_metrics.get("optimizer_step_applied", accum_do_step)
@@ -11172,6 +11267,30 @@ def main(argv: Sequence[str] | None = None) -> None:
                 # the verbose progress record only on the existing diagnostics
                 # cadence, identified by the detailed module norms.
                 if "module_pre_clip_grad_norms" in optimizer_observability:
+                    module_grad_norms = optimizer_observability[
+                        "module_pre_clip_grad_norms"
+                    ]
+                    module_delta_norms = optimizer_observability[
+                        "module_parameter_delta_norms"
+                    ]
+                    epoch_module_observations += 1
+                    scope = str(optimizer_observability["module_norm_scope"])
+                    if epoch_module_norm_scope not in {None, scope}:
+                        raise RuntimeError("optimizer module norm scope changed mid-dose")
+                    epoch_module_norm_scope = scope
+                    for module, norm in module_grad_norms.items():
+                        value = float(norm)
+                        epoch_module_grad_norm_sums[module] = (
+                            epoch_module_grad_norm_sums.get(module, 0.0) + value
+                        )
+                        epoch_module_grad_norm_max[module] = max(
+                            epoch_module_grad_norm_max.get(module, 0.0), value
+                        )
+                    for module, norm in module_delta_norms.items():
+                        epoch_module_delta_norm_sums[module] = (
+                            epoch_module_delta_norm_sums.get(module, 0.0)
+                            + float(norm)
+                        )
                     _rank0_print(
                         json.dumps(
                             {
@@ -11416,6 +11535,35 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_value_component_dose = _reduce_named_sums(
             epoch_value_component_dose, ddp
         )
+        training_strata_dose = (
+            _nest_training_strata_dose(
+                _reduce_sparse_named_sums(epoch_training_strata_dose, ddp)
+            )
+            if collect_training_strata_dose
+            else None
+        )
+        module_optimizer_observability = None
+        if epoch_module_observations:
+            module_optimizer_observability = {
+                "schema_version": "module-optimizer-observability-v1",
+                "observed_steps": int(epoch_module_observations),
+                "cadence_batches": int(args.train_diagnostics_every_batches),
+                "norm_scope": epoch_module_norm_scope,
+                "modules": {
+                    module: {
+                        "mean_pre_clip_grad_norm": (
+                            epoch_module_grad_norm_sums[module]
+                            / epoch_module_observations
+                        ),
+                        "max_pre_clip_grad_norm": epoch_module_grad_norm_max[module],
+                        "mean_parameter_delta_norm": (
+                            epoch_module_delta_norm_sums.get(module, 0.0)
+                            / epoch_module_observations
+                        ),
+                    }
+                    for module in sorted(epoch_module_grad_norm_sums)
+                },
+            }
         policy_component_active_dose = {
             component_id: {
                 "base_active_rows": int(
@@ -11559,6 +11707,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     policy_component_phase_active_dose
                 ),
                 "value_component_active_dose": value_component_active_dose,
+                "training_strata_dose": training_strata_dose,
+                "module_optimizer_observability": module_optimizer_observability,
                 "value_loss": value_loss_epoch,
                 "scalar_value_mse_diagnostic": value_loss_epoch,
                 "final_vp_loss": final_vp_loss_epoch,
@@ -11863,6 +12013,73 @@ def main(argv: Sequence[str] | None = None) -> None:
         }
         for component_id in getattr(data, "component_ids", tuple())
     }
+    training_strata_dose = None
+    if int(args.train_diagnostics_every_batches) > 0:
+        training_strata_flat: dict[str, float] = {}
+        for metric in metrics:
+            strata = metric.get("training_strata_dose")
+            if not isinstance(strata, dict) or not isinstance(
+                strata.get("dimensions"), dict
+            ):
+                continue
+            for key, value in _flatten_training_strata_dose(
+                strata["dimensions"]
+            ).items():
+                training_strata_flat[key] = (
+                    training_strata_flat.get(key, 0.0) + value
+                )
+        training_strata_dose = _nest_training_strata_dose(training_strata_flat)
+
+    module_observation_count = sum(
+        int((metric.get("module_optimizer_observability") or {}).get("observed_steps", 0))
+        for metric in metrics
+    )
+    module_optimizer_observability = None
+    if module_observation_count:
+        modules = sorted(
+            {
+                module
+                for metric in metrics
+                for module in (
+                    (metric.get("module_optimizer_observability") or {})
+                    .get("modules", {})
+                )
+            }
+        )
+        module_optimizer_observability = {
+            "schema_version": "module-optimizer-observability-v1",
+            "observed_steps": module_observation_count,
+            "cadence_batches": int(args.train_diagnostics_every_batches),
+            "norm_scope": next(
+                (
+                    (metric.get("module_optimizer_observability") or {}).get(
+                        "norm_scope"
+                    )
+                    for metric in metrics
+                    if metric.get("module_optimizer_observability")
+                ),
+                None,
+            ),
+            "modules": {},
+        }
+        for module in modules:
+            weighted_grad = 0.0
+            weighted_delta = 0.0
+            maximum = 0.0
+            for metric in metrics:
+                observation = metric.get("module_optimizer_observability") or {}
+                count = int(observation.get("observed_steps", 0))
+                row = observation.get("modules", {}).get(module)
+                if not isinstance(row, dict) or count <= 0:
+                    continue
+                weighted_grad += float(row["mean_pre_clip_grad_norm"]) * count
+                weighted_delta += float(row["mean_parameter_delta_norm"]) * count
+                maximum = max(maximum, float(row["max_pre_clip_grad_norm"]))
+            module_optimizer_observability["modules"][module] = {
+                "mean_pre_clip_grad_norm": weighted_grad / module_observation_count,
+                "max_pre_clip_grad_norm": maximum,
+                "mean_parameter_delta_norm": weighted_delta / module_observation_count,
+            }
     value_component_active_dose = None
     if bool(getattr(data, "value_training_scope_authenticated", False)):
         value_component_active_dose = {
@@ -12128,6 +12345,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_training_scope": value_training_scope_report,
         "aux_subgoal_training_contract": aux_subgoal_training_contract,
         "policy_component_active_dose": policy_component_active_dose,
+        "training_strata_dose": training_strata_dose,
+        "module_optimizer_observability": module_optimizer_observability,
         "value_component_active_dose": value_component_active_dose,
         "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
         "policy_component_phase_active_dose": policy_component_phase_active_dose,
@@ -17044,6 +17263,18 @@ def _normalize_teacher_shard(
             path,
             leading=n,
         ).astype(str),
+        # Search/learner taxonomy is science provenance, not merely a
+        # generation audit field.  Keeping it through normalization lets the
+        # learner prove which semantic decision classes actually received its
+        # finite optimizer dose.  Old corpora remain explicit rather than
+        # guessed: they decode as ``legacy_unknown``.
+        "decision_class": _field_or_default(
+            shard,
+            "decision_class",
+            np.full(n, "legacy_unknown", dtype="<U14"),
+            path,
+            leading=n,
+        ).astype(str),
         "decision_index": _field_or_default(
             shard,
             "decision_index",
@@ -21222,6 +21453,190 @@ def _source_global_rows_for_training_batch(
     return rows
 
 
+def _legal_width_bucket(width: int) -> str:
+    value = int(width)
+    if value <= 1:
+        return "1"
+    if value <= 3:
+        return "2_3"
+    if value <= 7:
+        return "4_7"
+    if value <= 19:
+        return "8_19"
+    if value <= 39:
+        return "20_39"
+    return "40_plus"
+
+
+def _simulation_budget_bucket(simulations: int) -> str:
+    value = int(simulations)
+    if value <= 0:
+        return "0_or_unrecorded"
+    if value < 64:
+        return "1_63"
+    if value < 128:
+        return "64_127"
+    if value == 128:
+        return "128"
+    if value < 256:
+        return "129_255"
+    return "256_plus"
+
+
+def _training_source_labels(data: object, rows: np.ndarray) -> np.ndarray:
+    """Map sampled rows to the learner's fresh/replay source contract."""
+
+    component_lookup = getattr(data, "component_indices_for_rows", None)
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    if not callable(component_lookup) or not component_ids:
+        return np.full(len(rows), "single_corpus", dtype="<U16")
+    indices = np.asarray(component_lookup(rows), dtype=np.int64)
+    if indices.shape != rows.shape or np.any(indices < 0) or np.any(
+        indices >= len(component_ids)
+    ):
+        raise RuntimeError("training source-component mapping is invalid")
+    return np.asarray(
+        [
+            "replay" if component_ids[index] == HISTORICAL_REPLAY_CATEGORY else "fresh"
+            for index in indices
+        ],
+        dtype="<U8",
+    )
+
+
+def _training_strata_dose_for_batch(
+    data: object,
+    rows: np.ndarray,
+    *,
+    policy_weights: np.ndarray,
+    value_weights: np.ndarray,
+    value_active_mask: np.ndarray,
+    draw_stream: str = "base",
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Attribute one realized training draw to science-relevant strata.
+
+    This is draw accounting, not a corpus histogram: weighted sampling may
+    revisit a row, and every revisit is counted because it contributes another
+    optimizer exposure.  Policy activity is kept separate from total row dose;
+    the old headline ``524288 samples`` hid that only ~10% of those rows could
+    affect policy CE.
+    """
+
+    rows = np.asarray(rows, dtype=np.int64)
+    policy = np.asarray(policy_weights, dtype=np.float64)
+    value = np.asarray(value_weights, dtype=np.float64)
+    value_active = np.asarray(value_active_mask, dtype=np.bool_)
+    expected = (len(rows),)
+    if (
+        rows.ndim != 1
+        or policy.shape != expected
+        or value.shape != expected
+        or value_active.shape != expected
+        or np.any(rows < 0)
+        or not np.isfinite(policy).all()
+        or not np.isfinite(value).all()
+    ):
+        raise RuntimeError("training stratum dose inputs are misaligned")
+
+    legal = np.asarray(data["legal_action_ids"][rows])
+    if legal.ndim != 2 or legal.shape[0] != len(rows):
+        raise RuntimeError("training legal-width attribution is malformed")
+    legal_widths = np.sum(legal >= 0, axis=1, dtype=np.int64)
+    full_labels = (
+        np.where(
+            np.asarray(data["used_full_search"][rows], dtype=np.bool_),
+            "full",
+            "fast",
+        )
+        if "used_full_search" in data
+        else np.full(len(rows), "unrecorded", dtype="<U10")
+    )
+    simulations = (
+        np.asarray(data["simulations_used"][rows], dtype=np.int64)
+        if "simulations_used" in data
+        else np.zeros(len(rows), dtype=np.int64)
+    )
+    phases = np.asarray(data["phase"][rows]).astype(str, copy=False)
+    decisions = (
+        np.asarray(data["decision_class"][rows]).astype(str, copy=False)
+        if "decision_class" in data
+        else np.full(len(rows), "legacy_unknown", dtype="<U14")
+    )
+    sources = _training_source_labels(data, rows)
+    dimensions = {
+        "draw_stream": np.full(len(rows), str(draw_stream)),
+        "full_vs_fast": full_labels,
+        "simulation_budget": np.asarray(
+            [_simulation_budget_bucket(value) for value in simulations]
+        ),
+        "decision_class": decisions,
+        "legal_width": np.asarray(
+            [_legal_width_bucket(value) for value in legal_widths]
+        ),
+        "phase": phases,
+        "fresh_vs_replay": sources,
+    }
+    policy_active = policy > 0.0
+    result: dict[str, dict[str, dict[str, float]]] = {}
+    for dimension, labels in dimensions.items():
+        groups: dict[str, dict[str, float]] = {}
+        for label in np.unique(labels):
+            mask = labels == label
+            active_value = mask & value_active
+            groups[str(label)] = {
+                "sampled_rows": float(np.count_nonzero(mask)),
+                "policy_active_rows": float(np.count_nonzero(mask & policy_active)),
+                "policy_weight_sum": float(policy[mask].sum()),
+                "value_active_rows": float(np.count_nonzero(active_value)),
+                "value_weight_sum": float(value[active_value].sum()),
+            }
+        result[dimension] = groups
+    return result
+
+
+def _flatten_training_strata_dose(
+    report: dict[str, dict[str, dict[str, float]]]
+) -> dict[str, float]:
+    return {
+        f"{dimension}\0{label}\0{metric}": float(value)
+        for dimension, groups in report.items()
+        for label, metrics in groups.items()
+        for metric, value in metrics.items()
+    }
+
+
+def _nest_training_strata_dose(values: dict[str, float]) -> dict[str, object]:
+    dimensions: dict[str, dict[str, dict[str, float | int]]] = {}
+    for key, value in sorted(values.items()):
+        dimension, label, metric = key.split("\0", 2)
+        converted: float | int = (
+            int(round(value)) if metric.endswith("_rows") else float(value)
+        )
+        dimensions.setdefault(dimension, {}).setdefault(label, {})[metric] = converted
+    headline = dimensions.get("fresh_vs_replay", {})
+    total_rows = sum(int(row.get("sampled_rows", 0)) for row in headline.values())
+    policy_rows = sum(
+        int(row.get("policy_active_rows", 0)) for row in headline.values()
+    )
+    value_rows = sum(
+        int(row.get("value_active_rows", 0)) for row in headline.values()
+    )
+    streams = dimensions.get("draw_stream", {})
+    base_rows = int(streams.get("base", {}).get("sampled_rows", 0))
+    auxiliary_rows = int(streams.get("policy_aux", {}).get("sampled_rows", 0))
+    return {
+        "schema_version": "training-strata-dose-v1",
+        "total_row_draws": total_rows,
+        "base_row_draws": base_rows,
+        "policy_aux_row_draws": auxiliary_rows,
+        "policy_active_row_draws": policy_rows,
+        "policy_active_fraction": policy_rows / max(total_rows, 1),
+        "value_active_row_draws": value_rows,
+        "value_active_fraction": value_rows / max(total_rows, 1),
+        "dimensions": dimensions,
+    }
+
+
 def _value_component_active_dose_for_batch(
     data, batch: np.ndarray, active_mask: np.ndarray | None
 ) -> dict[str, float] | None:
@@ -24354,6 +24769,33 @@ def _reduce_named_sums(
     )
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
     return {name: float(values[index].item()) for index, name in enumerate(names)}
+
+
+def _reduce_sparse_named_sums(
+    values_by_name: dict[str, float],
+    ddp: dict[str, int | bool],
+) -> dict[str, float]:
+    """Reduce a small sparse map whose observed labels may differ by rank.
+
+    Dynamic phase/decision strata are not guaranteed to appear on every rank's
+    finite sample prefix. A dense NCCL vector keyed from each rank's local map
+    would therefore misalign or hang. Gather the small telemetry maps as
+    objects and merge their union; this path never carries tensor payloads.
+    """
+
+    if not ddp["enabled"]:
+        return dict(values_by_name)
+    import torch.distributed as dist
+
+    gathered: list[dict[str, float] | None] = [None] * int(ddp["world_size"])
+    dist.all_gather_object(gathered, dict(values_by_name))
+    merged: dict[str, float] = {}
+    for record in gathered:
+        if not record:
+            continue
+        for name, value in record.items():
+            merged[str(name)] = merged.get(str(name), 0.0) + float(value)
+    return merged
 
 
 def _reduce_scalar_sum(value: float, ddp: dict[str, int | bool]) -> float:

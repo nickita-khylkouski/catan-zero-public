@@ -6,6 +6,25 @@ config has `games=0` and `checkpoint=null` deliberately: checkpoint identity,
 output path, seed range, lane quota, and worker count are operational inputs
 that every real lane must pass explicitly.
 
+`science.contract.json` is the single machine-readable authority consumed by
+generation sealing, one-dose learning, fleet evaluation, and promotion. Its
+adaptive width-20 dose is provisional until the causal teacher campaign is
+aggregated and adopted. No coherent production lock can be sealed while the
+status is provisional. Adopt the campaign winner (base n128, width 20, or
+width 40) with:
+
+```bash
+python3 tools/a1_current_science_contract.py adopt-teacher \
+  --report /path/to/teacher-operator-report.json \
+  --receipt /path/to/teacher-operator-adoption.receipt.json
+```
+
+That transaction verifies the report against the exact provisional contract
+bytes and updates only `n_full_wide`, `n_full_wide_threshold`, and
+`wide_roots_always_full` in the science contract, draft template, typed
+generator config, and generator guard. The receipt records the before/after
+contract identities.
+
 ## Generation operator
 
 The teacher uses one sanitized two-player public-belief tree. It does not split
@@ -18,8 +37,9 @@ robber movement, and Road Building placement) always receive full search. The
 exploration clock advances only on real choices: temperature 1.0 for the first
 40 choices, 0.1 through choice 99, then argmax.
 
-Run one lane with explicit operational values (the fleet renderer may emit the
-same argv once per pinned GPU):
+The following width-20 lane is illustrative while the contract is provisional.
+After adoption, use the sealed fleet renderer described below; it emits the
+selected base/width-20/width-40 argv once per pinned GPU:
 
 ```bash
 set -euo pipefail
@@ -109,9 +129,9 @@ corpus regeneration is required. Every candidate starts independently from the c
 champion; never use a candidate from this wave as another candidate's parent.
 The one-dose executor enforces fresh Adam (`resume_optimizer=false`) and the
 fixed 8-rank batch (`512/rank`, global `4096`) and exactly 128 optimizer steps
-(`524,288` sampled rows). The selected loss delta is in
-`one_dose_public_card_overrides.json`: policy mass remains zero on forced
-rows, value loss is 0.25, END_TURN forced values receive 0.1x, ROLL receives
+(`524,288` sampled rows). The selected optimizer/loss recipe is sealed in
+`science.contract.json` (including LR `3e-5` and 100 warmup steps): policy
+mass remains zero on forced rows, value loss is 0.25, END_TURN forced values receive 0.1x, ROLL receives
 0.25x, every unlisted forced type (including DISCARD_RESOURCE) retains the
 global 1.0x value weight, and only the new zero-initialized card residual uses
 the 4x LR group; the 640-parameter history gate remains in the ordinary trunk
@@ -158,19 +178,6 @@ DDP_CANARY=/path/to/current/b200-8gpu-ddp.canary.json
 CHECKPOINT_OUT=/fresh/path/candidate.pt
 REPORT_OUT=/fresh/path/train.report.json
 TRAIN_RECEIPT=/fresh/path/train.receipt.json
-OVERRIDES="$(tr -d '\n' < configs/experiments/next_wave/one_dose_public_card_overrides.json)"
-LOCK_SHA="sha256:$(sha256sum "$LOCK" | awk '{print $1}')"
-CODE_SHA="$("$PY" - "$LOCK" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-from tools.a1_one_dose_train import _current_ablation_code_binding
-
-lock = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(_current_ablation_code_binding(lock)["code_tree_sha256"])
-PY
-)"
 
 STATE=/fresh/path/iteration.state.json
 TURN=/fresh/path/flywheel.turn.json
@@ -188,10 +195,6 @@ AUDIT=/path/to/new-wave/post-wave.audit.json
   --initializer "$UPGRADED" \
   --architecture-upgrade-receipt "$UPGRADE_RECEIPT" \
   --topology b200-8gpu-ddp --gpu 0 --ddp-canary-receipt "$DDP_CANARY" \
-  --ablation-id coherent-public-card-count-history-v2 \
-  --recipe-overrides-json "$OVERRIDES" \
-  --ablation-code-tree-sha256 "$CODE_SHA" \
-  --reviewed-lock-file-sha256 "$LOCK_SHA" \
   --checkpoint "$CHECKPOINT_OUT" --report "$REPORT_OUT" \
   --training-receipt "$TRAIN_RECEIPT" --python "$PY"
 
@@ -204,6 +207,12 @@ existing immutable turn state; `dose-dry` and `dose-go` render and execute that
 same binding. This is not candidate chaining: the architecture receipt always
 names the champion bytes, the lock names the same parent, and optimizer state
 is not inherited.
+
+The three selected learner deltas (4x public-card LR, exact per-game policy
+surprise weighting, and typed forced-row value weights) are fields of the
+sealed coherent-production learner recipe. They are deliberately **not**
+passed through the generic ablation interface: that interface is diagnostic
+only and its receipts are promotion-ineligible.
 
 ## Evaluation and loop closure
 

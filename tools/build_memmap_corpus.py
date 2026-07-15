@@ -1152,6 +1152,7 @@ LOADER_KEYS: tuple[str, ...] = (
     "player",
     "seat",
     "phase",
+    "decision_class",
     "decision_index",
     "action_mask_version",
     "adapter_version",

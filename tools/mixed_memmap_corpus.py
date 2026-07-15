@@ -28,6 +28,10 @@ SYNTHESIZABLE_COLUMNS = frozenset(
     {
         "is_forced",
         "used_full_search",
+        # Strict-future waves preserve the public decision taxonomy. Historical
+        # replay predates it, so its only honest decoded value is unknown; never
+        # infer a mandatory/normal label from action width after the fact.
+        "decision_class",
         "root_value",
         "root_value_mask",
         # The sealed gen3 replay corpus predates preserved search-accounting
@@ -317,6 +321,8 @@ def _synthesized_column(corpus: Any, key: str):
         return _DerivedBooleanColumn(corpus["legal_action_ids"], mode=key)
     if key == "used_full_search":
         return _DerivedBooleanColumn(corpus["policy_weight_multiplier"], mode=key)
+    if key == "decision_class":
+        return _ConstantColumn(corpus.row_count, "legacy_unknown", "<U14")
     if key == "root_value":
         return _ConstantColumn(corpus.row_count, 0.0, np.float32)
     if key == "root_value_mask":

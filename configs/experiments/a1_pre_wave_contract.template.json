@@ -98,9 +98,12 @@
       "symmetry_augment": false,
       "forced_action_weight": 0.0,
       "forced_row_value_weight": 1.0,
+      "forced_row_value_action_type_weights": "END_TURN=0.1,ROLL=0.25",
       "per_game_policy_weight": true,
       "per_game_policy_weight_mode": "equal",
+      "per_game_policy_surprise_weighting": true,
       "training_rng_rank_offset": true,
+      "public_card_lr_mult": 4.0,
       "winner_sample_weight": 1.0,
       "loser_sample_weight": 1.0,
       "teacher_weights": "",
@@ -200,6 +203,8 @@
   "provenance": {
     "guard_config": "../guards/a1_generation_coherent_public_n128_adaptive256_v1.json",
     "generator_code_files": [
+      "../../tools/a1_current_science_contract.py",
+      "../operations/a1-next-wave-coherent-public-v1/science.contract.json",
       "../../tools/generate_gumbel_selfplay_data.py",
       "../../tools/fleet/systemd/nvidia-mps.service",
       "../../tools/opponent_mix_registry.py",
@@ -224,6 +229,8 @@
       "../../native/gumbel_mcts_rs/src/python_binding.rs"
     ],
     "learner_code_files": [
+      "../../tools/a1_current_science_contract.py",
+      "../operations/a1-next-wave-coherent-public-v1/science.contract.json",
       "../guards/train_bc.json",
       "../../tools/factory_common.py",
       "../../tools/launcher_guards.py",

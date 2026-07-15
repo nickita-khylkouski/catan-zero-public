@@ -1,0 +1,38 @@
+{
+  "schema_version": "a1-b200-lr-dose-campaign-template-v1",
+  "scope": "diagnostic_only_not_a_production_parent_default",
+  "parent_contract": {
+    "expected_parent_sha256": "REQUIRED_OPERATOR_INPUT",
+    "all_arms_restart_from_parent": true,
+    "fresh_adam": true,
+    "candidate_chaining": false
+  },
+  "topology": {
+    "name": "b200-8gpu-ddp",
+    "world_size": 8,
+    "local_batch_size": 512,
+    "global_batch_size": 4096
+  },
+  "arms": {
+    "A": {"lr": 0.00003, "lr_warmup_steps": 100, "max_steps": 128},
+    "B": {"lr": 0.00003, "lr_warmup_steps": 16, "max_steps": 128},
+    "C": {"lr": 0.00006, "lr_warmup_steps": 16, "max_steps": 128},
+    "D": {"lr": 0.00012, "lr_warmup_steps": 16, "max_steps": 128}
+  },
+  "dose_curve": {
+    "short_intermediate_steps": [64],
+    "winner_replay_steps": [64, 128, 256],
+    "winner_replays_from_original_parent": true
+  },
+  "policy_active_dose": {
+    "base_total_row_draws": 524288,
+    "observed_base_policy_active_fraction": "MEASURE_FROM_CURRENT_COMPOSITE",
+    "target_policy_active_rows": "OPTIONAL_EXPLICIT_TARGET",
+    "policy_aux_sampler": "authenticated_base_measure_conditioned_on_positive_policy_weight"
+  },
+  "selection": {
+    "primary": "paired_playing_strength",
+    "validation_loss_selects_only_within_arm": true,
+    "all_arm_training_and_evaluation_receipts_required": true
+  }
+}

@@ -37,6 +37,8 @@ if str(_REPO_ROOT) not in sys.path:
 from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_promotion_transaction as promotion  # noqa: E402
 from tools import a1_flywheel_turn as flywheel  # noqa: E402
+from tools import a1_current_science_contract as current_science  # noqa: E402
+from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
 
 
 STATE_SCHEMA = "a1-iteration-state-v1"
@@ -594,6 +596,48 @@ def initialize_next(
             validation_path=validation_path,
             composite_build_receipt=composite_build_receipt,
         )
+        search = verified.get("lock", {}).get("science", {}).get(
+            "search_operator", {}
+        )
+        if current_science.is_coherent_search(search):
+            learner_contract = current_science.learner()
+            if (
+                topology != learner_contract["topology"]
+                or architecture_upgrade_receipt is None
+            ):
+                raise IterationError(
+                    "current coherent-public turn must use the contract-bound "
+                    "8xB200 topology and architecture receipt"
+                )
+            if any(ablation_values):
+                raise IterationError(
+                    "current coherent-public learner delta is sealed in the "
+                    "production lock; generic diagnostic ablation arguments would "
+                    "make the candidate promotion-ineligible"
+                )
+            try:
+                upgrade = architecture_upgrade.verify_receipt(
+                    architecture_upgrade_receipt
+                )
+            except architecture_upgrade.UpgradeError as error:
+                raise IterationError(
+                    f"current coherent-public architecture receipt refused: {error}"
+                ) from error
+            if upgrade.get("module") != learner_contract["architecture_upgrade_module"]:
+                raise IterationError(
+                    "current coherent-public turn requires the combined bias-free "
+                    "public-card + meaningful-history v2 initializer"
+                )
+            history = verified.get("event_history_training_contract")
+            if (
+                not isinstance(history, dict)
+                or history.get("training_event_history_trainable") is not True
+                or history.get("event_history_end_to_end_usable") is not True
+            ):
+                raise IterationError(
+                    "current coherent-public corpus does not expose trainable, "
+                    "end-to-end meaningful public history"
+                )
         one_dose._require_unconsumed_contract(verified)  # noqa: SLF001
         claim = one_dose._claim_path(verified)  # noqa: SLF001
         one_dose._require_fresh_outputs(  # noqa: SLF001
