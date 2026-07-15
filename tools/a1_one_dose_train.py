@@ -1346,7 +1346,7 @@ def _verify_coherent_direct_training_inputs(
     validation_binding = {
         "path": str(validation_path),
         "file_sha256": validation["file_sha256"],
-        "game_count": int(validation["validation_game_seed_count"]),
+        "game_count": int(validation_seeds.size),
         "game_seed_set_sha256": validation["validation_game_seed_set_sha256"],
         "row_count": validation_row_count,
     }
