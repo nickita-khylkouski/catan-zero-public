@@ -49,6 +49,7 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_VERSION_KEY,
     AUX_TARGET_KEYS,
 )
+from catan_zero.rl.target_reliability import TARGET_RELIABILITY_COLUMNS
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
@@ -1138,6 +1139,7 @@ LOADER_KEYS: tuple[str, ...] = (
     "target_scores_mask",
     "target_score_source",
     "target_information_regime",
+    *TARGET_RELIABILITY_COLUMNS,
     "root_value",
     "root_value_mask",
     # Preserve the search products even while the canonical learner keeps

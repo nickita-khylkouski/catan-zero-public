@@ -74,6 +74,16 @@ from catan_zero.rl.aux_subgoal_targets import (
 )
 from catan_zero.rl.flywheel import ChampionRef, OpponentPolicy, choose_opponent
 from catan_zero.rl.flywheel.opponent_mix import OpponentMixConfig, choose_mix_opponent
+from catan_zero.rl.target_reliability import (
+    TARGET_RELIABILITY_COLUMNS,
+    TARGET_RELIABILITY_SCHEMA,
+    TARGET_RELIABILITY_VERSION,
+    duplicate_search_reliability_fields,
+    target_reliability_contract,
+    target_reliability_root_seed,
+    target_reliability_root_selected,
+    unaudited_target_reliability_fields,
+)
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
     GumbelChanceMCTSConfig,
@@ -102,6 +112,8 @@ __all__ = [
     "GumbelShardWriter",
     "SEARCH_EVIDENCE_SCHEMA",
     "SEARCH_EVIDENCE_VERSION",
+    "TARGET_RELIABILITY_SCHEMA",
+    "TARGET_RELIABILITY_VERSION",
     "search_evidence_for_row",
     "WorkerProgress",
     "PROGRESS_FILENAME",
@@ -248,6 +260,11 @@ EXTRA_KEYS = (
     # `exploiter_lockstep.play_one_exploiter_game`); absent on every self-play /
     # neural-pool / neural-mix row, so those shard schemas are unchanged.
     "opponent_type",
+    # Duplicate coherent-n128 audit evidence.  A reliability-enabled producer
+    # writes these typed scalars on every row; unaudited rows are explicit and
+    # neutral.  A producer with audit fraction zero omits the columns entirely,
+    # preserving historical shard bytes.
+    *TARGET_RELIABILITY_COLUMNS,
 )
 
 
@@ -311,6 +328,12 @@ class GumbelSelfPlayConfig:
     # The coherent next wave omits them entirely; keep the default only for
     # replay/backward-compatible callers.
     record_automatic_transitions: bool = True
+    # Deterministic fraction of eligible policy-active coherent n128 roots that
+    # receive a second, independently seeded search.  The duplicate produces
+    # evidence only and never drives the live trajectory.  Zero is an exact
+    # schema/compute no-op.
+    target_reliability_audit_fraction: float = 0.0
+    target_reliability_audit_seed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1049,6 +1072,7 @@ def play_one_game(
     action_size: int,
     eval_override: bool = False,
     pool_assignment: PoolGameAssignment | None = None,
+    target_reliability_mcts: GumbelChanceMCTS | None = None,
 ) -> GameRecord:
     """Play one full self-play game, recording one row per decision.
 
@@ -1081,6 +1105,13 @@ def play_one_game(
     search's internal RNG, so a game's board/chance trajectory is
     reproducible from `game_seed` alone given the same sequence of chosen
     actions.
+
+    When ``config.target_reliability_audit_fraction`` is nonzero, eligible
+    recorded exact-n128 roots may run one diagnostic duplicate through
+    ``target_reliability_mcts``.  Its three stochastic roles are domain
+    separated, its RNG is reset from (audit_seed, game_seed, decision_index),
+    and only typed evidence is recorded; the primary result remains the sole
+    source of the applied action.
     """
     started = time.perf_counter()
     catanatron_rs = _gumbel_chance_mcts._require_rust_module()
@@ -1093,6 +1124,13 @@ def play_one_game(
         ),
     )
     chance_rng = random.Random(int(game_seed) ^ 0xA17E)
+    reliability_fraction = float(config.target_reliability_audit_fraction)
+    if not math.isfinite(reliability_fraction) or not 0.0 <= reliability_fraction <= 1.0:
+        raise ValueError("target reliability audit fraction must be in [0, 1]")
+    if reliability_fraction > 0.0 and target_reliability_mcts is None:
+        raise ValueError(
+            "target reliability audit requires an independent duplicate-search object"
+        )
 
     decisions: list[DecisionRecord] = []
     aux_states = []
@@ -1224,6 +1262,53 @@ def play_one_game(
         aux_actor_colors.append(acting_color)
         aux_actions.append(selected_action)
 
+        reliability_fields: dict[str, Any] | None = None
+        if reliability_fraction > 0.0 and record_row:
+            reliability_fields = unaudited_target_reliability_fields()
+            eligible_exact_n128 = (
+                len(legal_rust) > 1
+                and bool(result.used_full_search)
+                and int(result.simulations_used) == 128
+            )
+            if eligible_exact_n128 and target_reliability_root_selected(
+                game_seed=int(game_seed),
+                decision_index=int(decision_index),
+                audit_seed=int(config.target_reliability_audit_seed),
+                audit_fraction=reliability_fraction,
+            ):
+                assert target_reliability_mcts is not None
+                # Record-row routing guarantees this is the producer evaluator,
+                # not an archived opponent's model.  Keep the duplicate's
+                # temperature at zero: reliability concerns the distilled
+                # target/operator, not the intentionally stochastic live move.
+                target_reliability_mcts.evaluator = evaluator
+                target_reliability_mcts.config = dataclasses.replace(
+                    target_reliability_mcts.config, temperature=0.0
+                )
+                target_reliability_mcts.seed_search_rngs(
+                    target_reliability_root_seed(
+                        game_seed=int(game_seed),
+                        decision_index=int(decision_index),
+                        audit_seed=int(config.target_reliability_audit_seed),
+                    )
+                )
+                duplicate = target_reliability_mcts.search(game.copy(), force_full=True)
+                if (
+                    not bool(duplicate.used_full_search)
+                    or int(duplicate.simulations_used) != 128
+                ):
+                    raise RuntimeError(
+                        "target reliability duplicate was not an exact n128 full search: "
+                        f"used_full={duplicate.used_full_search!r} "
+                        f"simulations={duplicate.simulations_used!r}"
+                    )
+                reliability_fields = duplicate_search_reliability_fields(
+                    primary_policy=result.improved_policy,
+                    duplicate_policy=duplicate.improved_policy,
+                    primary_completed_q=result.completed_q_values,
+                    duplicate_completed_q=duplicate.completed_q_values,
+                )
+
         if record_row:
             if len(legal_rust) <= 1:
                 forced_decisions += 1
@@ -1256,6 +1341,8 @@ def play_one_game(
                 event_history_limit=int(config.event_history_limit),
                 decision_class=decision_class,
             )
+            if reliability_fields is not None:
+                row.update(reliability_fields)
             decisions.append(DecisionRecord(row=row, features=features))
             recorded_aux_indices.append(len(aux_states) - 1)
 
@@ -2372,6 +2459,25 @@ def run_worker_games(
             "run_worker_games got both opponent_pool and opponent_mix -- pass at most one "
             "(they both resolve the same PoolGameAssignment; running both is ambiguous)"
         )
+    reliability_fraction = float(config.target_reliability_audit_fraction)
+    if not math.isfinite(reliability_fraction) or not 0.0 <= reliability_fraction <= 1.0:
+        raise ValueError("target reliability audit fraction must be in [0, 1]")
+    if reliability_fraction > 0.0:
+        if not bool(search_config.coherent_public_belief_search):
+            raise ValueError(
+                "target reliability audit requires coherent_public_belief_search"
+            )
+        if int(search_config.n_full) != 128:
+            raise ValueError(
+                "target reliability audit is contracted for n_full=128, got "
+                f"{search_config.n_full!r}"
+            )
+        if not bool(search_config.exact_budget_sh) or int(
+            search_config.exact_budget_sh_min_n
+        ) > 128:
+            raise ValueError(
+                "target reliability audit requires exact-budget n128 search"
+            )
     if resume and resume_semantics_sha256 is None:
         raise ValueError(
             "resume=True requires resume_semantics_sha256 binding immutable "
@@ -2420,6 +2526,38 @@ def run_worker_games(
         evaluator,
         native_hot_loop=bool(native_mcts_hot_loop),
     )
+    target_reliability_mcts: GumbelChanceMCTS | None = None
+    target_reliability_manifest = target_reliability_contract(
+        audit_fraction=reliability_fraction,
+        audit_seed=int(config.target_reliability_audit_seed),
+    )
+    if reliability_fraction > 0.0:
+        # The replica is deliberately the feature-complete Python reference:
+        # this gives it explicit Gumbel/chance/belief substreams even when the
+        # primary trajectory uses the parity-gated native hot loop.  Adaptive
+        # wide-root budgets are disabled because only primary roots that
+        # actually spent exact n128 are eligible for this contract.
+        reliability_search_config = dataclasses.replace(
+            search_config,
+            seed=int(config.target_reliability_audit_seed),
+            n_full=128,
+            n_fast=128,
+            p_full=1.0,
+            n_full_wide=None,
+            wide_roots_always_full=False,
+            raw_policy_above_width=None,
+            exact_budget_sh=True,
+            exact_budget_sh_min_n=0,
+            temperature=0.0,
+            rng_stream_separation=True,
+        )
+        target_reliability_mcts = GumbelChanceMCTS(
+            reliability_search_config, evaluator
+        )
+        assert target_reliability_manifest is not None
+        target_reliability_manifest["duplicate_search_config"] = dataclasses.asdict(
+            reliability_search_config
+        )
 
     resume_offset = 0
     games_completed = 0
@@ -2661,7 +2799,7 @@ def run_worker_games(
             # game's draw count/failure history. Resume can therefore jump to
             # any confirmed offset without resetting the suffix's Gumbel or
             # chance-sampling stream relative to an uninterrupted worker.
-            mcts.rng.seed(
+            mcts.seed_search_rngs(
                 _game_search_seed(
                     worker_seed=int(worker_seed), game_index=int(game_index)
                 )
@@ -2783,6 +2921,7 @@ def run_worker_games(
                         game_index=game_index,
                         action_size=action_size,
                         pool_assignment=pool_assignment,
+                        target_reliability_mcts=target_reliability_mcts,
                     )
             except Exception as error:  # noqa: BLE001 - isolate one bad game from the worker.
                 games_failed += 1
@@ -2911,6 +3050,7 @@ def run_worker_games(
             "resume_invariant": True,
         },
         "target_information_regime": target_information_regime,
+        "target_reliability_contract": target_reliability_manifest,
         AUX_SUBGOAL_TARGET_VERSION_KEY: AUX_SUBGOAL_TARGET_VERSION,
         "aux_subgoal_target_semantic": AUX_SUBGOAL_TARGET_SEMANTIC,
         "elapsed_sec": elapsed,

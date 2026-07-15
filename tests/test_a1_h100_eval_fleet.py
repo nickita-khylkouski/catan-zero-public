@@ -723,8 +723,13 @@ def test_every_job_is_cuda_pinned_and_has_exact_n128_infoset_d6_recipe(
 
 
 def test_explicit_coherent_public_plan_matches_next_wave_operator_exactly(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        fleet.current_science,
+        "operator_selection_status",
+        lambda: "adopted_teacher_campaign",
+    )
     manifest, legacy = _plan(tmp_path)
     coherent = fleet.build_plan(
         manifest,
@@ -754,23 +759,40 @@ def test_explicit_coherent_public_plan_matches_next_wave_operator_exactly(
     for job in coherent["jobs"]:
         argv = job["argv"]
         expected_values = {
-            "--n-full": "128",
-            "--n-full-wide": "256",
-            "--n-full-wide-threshold": "20",
-            "--determinization-particles": "1",
-            "--forced-root-target-mode": "trajectory_only",
-            "--symmetry-averaged-eval-threshold": "20",
+            "--n-full": str(coherent["science_config"]["n_full"]),
+            "--determinization-particles": str(
+                coherent["science_config"]["determinization_particles"]
+            ),
+            "--forced-root-target-mode": str(
+                coherent["science_config"]["forced_root_target_mode"]
+            ),
+            "--symmetry-averaged-eval-threshold": str(
+                coherent["science_config"]["symmetry_averaged_eval_threshold"]
+            ),
         }
         for flag, expected in expected_values.items():
             assert argv.count(flag) == 1
             assert argv[argv.index(flag) + 1] == expected
+        if coherent["science_config"]["n_full_wide"] is None:
+            assert "--n-full-wide" not in argv
+            assert "--n-full-wide-threshold" not in argv
+            assert "--wide-roots-always-full" not in argv
+        else:
+            assert argv[argv.index("--n-full-wide") + 1] == str(
+                coherent["science_config"]["n_full_wide"]
+            )
+            assert argv[argv.index("--n-full-wide-threshold") + 1] == str(
+                coherent["science_config"]["n_full_wide_threshold"]
+            )
+            assert (
+                "--wide-roots-always-full" in argv
+            ) == coherent["science_config"]["wide_roots_always_full"]
         for flag in (
             "--public-observation",
-            "--no-information-set-search",
-            "--coherent-public-belief-search",
-            "--no-belief-chance-spectra",
-            "--wide-roots-always-full",
-            "--symmetry-averaged-eval",
+                "--no-information-set-search",
+                "--coherent-public-belief-search",
+                "--no-belief-chance-spectra",
+                "--symmetry-averaged-eval",
             "--evaluator-rust-featurize",
             "--native-mcts-hot-loop",
         ):

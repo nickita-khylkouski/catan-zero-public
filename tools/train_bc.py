@@ -79,6 +79,11 @@ from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
+from catan_zero.rl.target_reliability import (
+    TARGET_RELIABILITY_COLUMNS,
+    TARGET_RELIABILITY_VERSION,
+    target_reliability_confidence,
+)
 from catan_zero.rl import optim_state as _checkout_optim_state
 from catan_zero.rl.flywheel.composite_contract import (
     FRESH_SOURCE_GAME_RATIOS,
@@ -1362,6 +1367,28 @@ def build_parser() -> argparse.ArgumentParser:
             "proportional to sqrt(the game's original positive policy mass). "
             "For composite-v2, mass is measured under its authenticated "
             "component->game->row sampler rather than uniform-row counting."
+        ),
+    )
+    parser.add_argument(
+        "--target-reliability-confidence-weighting",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Explicitly opt policy loss into the versioned duplicate-search "
+            "confidence column. Audited rows are multiplied by their stored "
+            "confidence (floored by --target-reliability-confidence-floor); "
+            "unaudited/version-0 rows remain neutral. The trainer refuses this "
+            "flag unless coherent-search version-1 evidence is present and "
+            "internally consistent. Default off is an exact objective no-op."
+        ),
+    )
+    parser.add_argument(
+        "--target-reliability-confidence-floor",
+        type=float,
+        default=0.25,
+        help=(
+            "Minimum policy-loss multiplier for audited rows when reliability "
+            "weighting is enabled. Ignored while weighting is off."
         ),
     )
     parser.add_argument(
@@ -3759,6 +3786,8 @@ def _preflight_flywheel_diagnostic_derivative(
             if base_overrides.get(key) != effective_overrides.get(key)
         }
         typed_key = "forced_row_value_action_type_weights"
+        public_card_key = "public_card_lr_mult"
+        surprise_key = "per_game_policy_surprise_weighting"
         lr_dose_keys = {
             "epochs",
             "max_steps",
@@ -3767,7 +3796,26 @@ def _preflight_flywheel_diagnostic_derivative(
             "lr_schedule",
         }
         optional_lr_dose_keys = {"policy_aux_active_batch_size"}
-        allowed_additions = {typed_key, *lr_dose_keys, *optional_lr_dose_keys}
+        science_profile_keys = {public_card_key, surprise_key}
+        allowed_additions = {
+            typed_key,
+            *science_profile_keys,
+            *lr_dose_keys,
+            *optional_lr_dose_keys,
+        }
+        science_profile_present = bool(changed & science_profile_keys)
+        science_profile_valid = True
+        if science_profile_present:
+            # Existing authenticated corpora may use the canonical card-only
+            # learner treatment, but not the meaningful-history architecture
+            # whose event payloads are absent from these shards.  Bind the
+            # three coupled learner semantics as one exact profile.
+            science_profile_valid = (
+                effective_overrides.get(public_card_key) == 4.0
+                and effective_overrides.get(surprise_key) is True
+                and effective_overrides.get(typed_key)
+                == "END_TURN=0.1,ROLL=0.25"
+            )
         lr_dose_present = bool(changed & (lr_dose_keys | optional_lr_dose_keys))
         lr_dose_valid = True
         if lr_dose_present:
@@ -3809,6 +3857,7 @@ def _preflight_flywheel_diagnostic_derivative(
             - {
                 "per_game_policy_weight",
                 typed_key,
+                *science_profile_keys,
                 *lr_dose_keys,
                 *optional_lr_dose_keys,
             }
@@ -3835,11 +3884,13 @@ def _preflight_flywheel_diagnostic_derivative(
                     )
                 )
             )
+            or not science_profile_valid
             or not lr_dose_valid
         ):
             raise SystemExit(
                 "flywheel diagnostic recipe may only disable per-game policy "
                 "weighting, add a canonical forced-action-type value map, "
+                "use the exact existing-corpus card/surprise learner profile, "
                 "and/or use the exact authenticated A/B/C/D LR-dose profile"
             )
         expected["learner_recipe_overrides"] = copy.deepcopy(effective_overrides)
@@ -4938,21 +4989,33 @@ def _validate_composite_learner_recipe_authorization(
     if not isinstance(expected, dict):
         raise SystemExit("memmap composite has no authenticated learner recipe override")
     converters = {
+        "advantage_policy_weighting": str,
+        "aux_subgoal_loss_weight": float,
+        "epochs": int,
+        "final_vp_loss_weight": float,
         "forced_action_weight": float,
         "forced_row_value_weight": float,
         "forced_row_value_action_type_weights": str,
         "hlgauss_scalar_aux_loss_weight": float,
         "loser_sample_weight": float,
         "lr": float,
+        "lr_schedule": str,
+        "lr_warmup_steps": int,
+        "max_steps": int,
+        "per_game_policy_surprise_weighting": bool,
         "per_game_policy_weight": bool,
         "per_game_policy_weight_mode": str,
         "per_game_value_weight": bool,
         "per_game_value_weight_mode": str,
+        "policy_aux_active_batch_size": int,
         "policy_loss_weight": float,
+        "policy_surprise_weight": float,
+        "public_card_lr_mult": float,
         "policy_kl_anchor_direction": str,
         "policy_kl_anchor_weight": float,
         "q_loss_weight": float,
         "soft_target_source": str,
+        "soft_target_min_legal_coverage": float,
         "soft_target_temperature": float,
         "soft_target_weight": float,
         "truncated_vp_margin_value_weight": float,
@@ -4962,7 +5025,17 @@ def _validate_composite_learner_recipe_authorization(
         "value_head_type": str,
         "value_hlgauss_sigma_ratio": float,
         "value_loss_weight": float,
+        "value_lr_mult": float,
+        "value_trunk_grad_scale": float,
+        "vp_margin_weight": float,
+        "winner_sample_weight": float,
     }
+    missing_converters = sorted(set(expected) - set(converters))
+    if missing_converters:
+        raise SystemExit(
+            "memmap composite authenticated learner recipe contains fields "
+            "without command converters: " + ", ".join(missing_converters)
+        )
     actual = {
         key: converters[key](getattr(args, key))
         for key in expected
@@ -8704,6 +8777,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--per-game-policy-surprise-weighting and the legacy "
             "--policy-surprise-weight sampler are mutually exclusive"
         )
+    if not math.isfinite(float(args.target_reliability_confidence_floor)) or not (
+        0.0 <= float(args.target_reliability_confidence_floor) <= 1.0
+    ):
+        raise SystemExit("--target-reliability-confidence-floor must be in [0, 1]")
     args.max_grad_norm = _validate_max_grad_norm(args.max_grad_norm)
     if float(args.belief_resource_loss_weight) < 0.0:
         raise SystemExit("--belief-resource-loss-weight must be >= 0")
@@ -9999,6 +10076,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             vps_to_win=args.vps_to_win,
             per_game_policy_weight=bool(args.per_game_policy_weight),
             per_game_policy_weight_mode=str(args.per_game_policy_weight_mode),
+            target_reliability_confidence_weighting=bool(
+                args.target_reliability_confidence_weighting
+            ),
+            target_reliability_confidence_floor=float(
+                args.target_reliability_confidence_floor
+            ),
         )
         policy_weights = _apply_authenticated_policy_distillation_scope(
             data, policy_weights
@@ -10125,6 +10208,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "vps_to_win": int(args.vps_to_win),
             "per_game_policy_weight": bool(args.per_game_policy_weight),
             "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
+            "target_reliability_confidence_weighting": bool(
+                args.target_reliability_confidence_weighting
+            ),
+            "target_reliability_confidence_floor": float(
+                args.target_reliability_confidence_floor
+            ),
             "forced_row_value_weight": float(args.forced_row_value_weight),
             "per_game_value_weight": bool(args.per_game_value_weight),
             "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
@@ -10397,6 +10486,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         else:
             epoch_sample_weights = component_game_sampling
     policy_aux_sampling_weights = None
+    policy_aux_preconditioning_weights = None
+    policy_aux_base_measure = "off"
     policy_aux_phase_sampling_weights = getattr(
         data, "policy_aux_phase_sampling_weights", None
     )
@@ -10413,8 +10504,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(
                 "policy auxiliary sampling requires authenticated composite base weights"
             )
+        policy_aux_preconditioning_weights = (
+            epoch_sample_weights
+            if exact_per_game_surprise
+            else component_game_sampling
+        )
+        if policy_aux_preconditioning_weights is None:
+            raise SystemExit("policy auxiliary sampler lost its base measure")
+        policy_aux_base_measure = (
+            "authenticated_component_x_exact_per_game_policy_surprise"
+            if exact_per_game_surprise
+            else "authenticated_component"
+        )
         policy_aux_sampling_weights = _conditioned_policy_aux_sampling_weights(
-            component_game_sampling,
+            policy_aux_preconditioning_weights,
             np.asarray(policy_sample_weights)[train_indices],
         )
         if bool(getattr(data, "policy_aux_phase_scope_authenticated", False)):
@@ -10460,6 +10563,40 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "mode": "off",
                 "enabled": False,
             }
+        if policy_aux_sampling_weights is None:
+            policy_aux_sampling_report = {
+                "schema_version": "train-policy-aux-sampling-v1",
+                "enabled": False,
+                "base_measure": "off",
+            }
+        else:
+            assert policy_aux_preconditioning_weights is not None
+            policy_aux_sampling_report = {
+                "schema_version": "train-policy-aux-sampling-v1",
+                "enabled": True,
+                "base_measure": policy_aux_base_measure,
+                "exact_per_game_policy_surprise_weighting": (
+                    exact_per_game_surprise
+                ),
+                "conditioned_on_positive_policy_loss_weight": True,
+                "authenticated_phase_allocation_applied": bool(
+                    getattr(data, "policy_aux_phase_scope_authenticated", False)
+                ),
+                "preconditioning_weights": {
+                    "shape": list(policy_aux_preconditioning_weights.shape),
+                    "dtype": str(policy_aux_preconditioning_weights.dtype),
+                    "content_sha256": _array_content_sha256(
+                        policy_aux_preconditioning_weights
+                    ),
+                },
+                "final_sampling_weights": {
+                    "shape": list(policy_aux_sampling_weights.shape),
+                    "dtype": str(policy_aux_sampling_weights.dtype),
+                    "content_sha256": _array_content_sha256(
+                        policy_aux_sampling_weights
+                    ),
+                },
+            }
         value_sample_weight_report["by_game"] = per_game_weight_quality(
             data, value_sample_weights
         )
@@ -10479,6 +10616,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         value_sample_weight_report = {}
         policy_surprise_weight_report = {}
         policy_surprise_sampling_report = {}
+        policy_aux_sampling_report = {}
     _rank0_print(
         json.dumps(
             {
@@ -10495,6 +10633,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_surprise_cap": float(args.policy_surprise_cap),
                 "policy_surprise_weight_quality": policy_surprise_weight_report,
                 "policy_surprise_sampling": policy_surprise_sampling_report,
+                "policy_aux_sampling": policy_aux_sampling_report,
             },
             sort_keys=True,
         ),
@@ -11078,20 +11217,38 @@ def main(argv: Sequence[str] | None = None) -> None:
             value_sample_weights,
             num_workers=int(args.data_loader_workers),
             prefetch=int(args.data_loader_prefetch),
+            policy_aux_rows=(
+                None
+                if aux_order is None
+                else train_indices[np.asarray(aux_order, dtype=np.int64)]
+            ),
+            policy_aux_batch_size=int(args.policy_aux_active_batch_size),
         )
         for batch_number, (_batch_tuple, _is_last_batch) in enumerate(
             _iter_with_last(batch_iterator), start=1
         ):
-            batch_data, batch, batch_policy_weights, batch_value_weights = _batch_tuple
+            if aux_order is None:
+                (
+                    batch_data,
+                    batch,
+                    batch_policy_weights,
+                    batch_value_weights,
+                ) = _batch_tuple
+                policy_aux_data = None
+                policy_aux_batch = None
+                aux_source_rows = None
+            else:
+                (
+                    batch_data,
+                    batch,
+                    batch_policy_weights,
+                    batch_value_weights,
+                    policy_aux_data,
+                    policy_aux_batch,
+                    aux_source_rows,
+                ) = _batch_tuple
             if len(batch) == 0:
                 continue
-            aux_batch = None
-            if aux_order is not None:
-                aux_start = (batch_number - 1) * int(args.policy_aux_active_batch_size)
-                aux_stop = aux_start + int(args.policy_aux_active_batch_size)
-                aux_batch = train_indices[aux_order[aux_start:aux_stop]]
-                if len(aux_batch) != int(args.policy_aux_active_batch_size):
-                    raise RuntimeError("policy auxiliary draw dose drift")
             # C1 grad-accum bookkeeping. At accum==1 do_zero_grad and do_step are
             # both True every batch (identical to pre-C1). The LR schedule uses
             # global_step (optimizer steps), so within an accumulation group every
@@ -11184,11 +11341,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     **objective_interference_kwargs,
                     **(
                         {
-                            "policy_aux_data": data,
-                            "policy_aux_batch": aux_batch,
-                            "policy_aux_sample_weights": policy_sample_weights,
+                            "policy_aux_data": policy_aux_data,
+                            "policy_aux_batch": policy_aux_batch,
+                            "policy_aux_sample_weights": batch_policy_weights,
                         }
-                        if aux_batch is not None
+                        if policy_aux_batch is not None
                         else {}
                     ),
                 )
@@ -11229,14 +11386,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                     epoch_training_strata_dose[key] = (
                         epoch_training_strata_dose.get(key, 0.0) + float(value)
                     )
-                if aux_batch is not None:
+                if aux_source_rows is not None:
                     realized_aux_strata = _flatten_training_strata_dose(
                         _training_strata_dose_for_batch(
                             data,
-                            np.asarray(aux_batch, dtype=np.int64),
-                            policy_weights=np.asarray(policy_sample_weights)[aux_batch],
-                            value_weights=np.zeros(len(aux_batch), dtype=np.float32),
-                            value_active_mask=np.zeros(len(aux_batch), dtype=np.bool_),
+                            np.asarray(aux_source_rows, dtype=np.int64),
+                            policy_weights=np.asarray(policy_sample_weights)[
+                                aux_source_rows
+                            ],
+                            value_weights=np.zeros(
+                                len(aux_source_rows), dtype=np.float32
+                            ),
+                            value_active_mask=np.zeros(
+                                len(aux_source_rows), dtype=np.bool_
+                            ),
                             draw_stream="policy_aux",
                         )
                     )
@@ -12360,6 +12523,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "policy_surprise_weight_quality": policy_surprise_weight_report,
         "policy_surprise_sampling": policy_surprise_sampling_report,
+        "policy_aux_sampling": policy_aux_sampling_report,
         "first_batch_profile": first_batch_profile,
         # Backward-compatible headline: ``parameter_count`` remains the TOTAL
         # serialized/checkpoint-compatible architecture size. Never interpret
@@ -12382,6 +12546,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "forced_action_weight": args.forced_action_weight,
         "per_game_policy_weight": bool(args.per_game_policy_weight),
         "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
+        "target_reliability_confidence_weighting": bool(
+            args.target_reliability_confidence_weighting
+        ),
+        "target_reliability_confidence_floor": float(
+            args.target_reliability_confidence_floor
+        ),
         "forced_row_value_weight": args.forced_row_value_weight,
         "per_game_value_weight": bool(args.per_game_value_weight),
         "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
@@ -15957,6 +16127,11 @@ MEMMAP_LAZY_COLUMNS = frozenset(
         "target_policy_mask",
         "target_scores",
         "target_scores_mask",
+        # These are ragged per-action columns. Leaving them out of this set
+        # made MemmapCorpus reconstruct the full legal-width-padded arrays in
+        # every DDP rank even when the active objective never reads them.
+        "afterstate_target",
+        "afterstate_target_mask",
     }
 )
 
@@ -16533,6 +16708,8 @@ def _iterate_training_batches(
     *,
     num_workers: int,
     prefetch: int,
+    policy_aux_rows: np.ndarray | None = None,
+    policy_aux_batch_size: int = 0,
 ):
     """Yield ``(data, batch, policy_weights, value_weights)`` tuples for one epoch.
 
@@ -16542,11 +16719,14 @@ def _iterate_training_batches(
 
     Prefetch path (MemmapCorpus + num_workers>0): background threads materialise
     each batch's columns into a plain dict while the GPU trains the previous
-    batch, overlapping the per-batch ragged reconstruction. train_fn then sees a
-    materialised dict indexed by a local ``arange``, which is element-for-element
-    identical to indexing the corpus with the global batch. Threads (not
-    processes) share the read-only memmaps safely and avoid the fork-duplication
-    pitfall of DataLoader workers.
+    batch, overlapping the per-batch ragged reconstruction. If policy-auxiliary
+    rows are supplied, their corresponding batch is gathered in the *same*
+    materialisation. This removes the old synchronous second memmap gather from
+    the rank main thread without changing either sampled row stream. train_fn
+    then sees a materialised dict indexed by local positions, which is
+    element-for-element identical to indexing the corpus with the global rows.
+    Threads (not processes) share the read-only memmaps safely and avoid the
+    fork-duplication pitfall of DataLoader workers.
     """
     batches = [
         train_indices[order[start : start + batch_size]]
@@ -16554,30 +16734,80 @@ def _iterate_training_batches(
     ]
     batches = [b for b in batches if len(b) > 0]
 
+    aux_batches: list[np.ndarray] | None = None
+    if policy_aux_rows is not None:
+        aux_rows = np.asarray(policy_aux_rows, dtype=np.int64)
+        aux_size = int(policy_aux_batch_size)
+        if aux_size <= 0 or aux_rows.ndim != 1:
+            raise RuntimeError("policy auxiliary prefetch shape is invalid")
+        expected = len(batches) * aux_size
+        if len(aux_rows) != expected:
+            raise RuntimeError(
+                "policy auxiliary draw dose drift: "
+                f"rows={len(aux_rows)} expected={expected}"
+            )
+        aux_batches = [
+            aux_rows[start : start + aux_size]
+            for start in range(0, len(aux_rows), aux_size)
+        ]
+
     if num_workers <= 0 or not isinstance(data, (MemmapCorpus, ConcatMemmapCorpus)):
-        for batch in batches:
-            yield data, batch, policy_sample_weights, value_sample_weights
+        for index, batch in enumerate(batches):
+            if aux_batches is None:
+                yield data, batch, policy_sample_weights, value_sample_weights
+            else:
+                aux_batch = aux_batches[index]
+                yield (
+                    data,
+                    batch,
+                    policy_sample_weights,
+                    value_sample_weights,
+                    data,
+                    aux_batch,
+                    aux_batch,
+                )
         return
 
     keys = list(data.keys())
 
-    def _materialize(batch: np.ndarray):
-        materialized = {key: data[key][batch] for key in keys}
+    def _materialize(batch: np.ndarray, aux_batch: np.ndarray | None):
+        rows = (
+            batch
+            if aux_batch is None
+            else np.concatenate((batch, aux_batch))
+        )
+        materialized = {}
+        for key in keys:
+            if _CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY and key in {
+                "event_tokens",
+                "event_target_ids",
+                "event_mask",
+            }:
+                # The full-corpus mask was authenticated as empty before this
+                # optimization is enabled. Preserve the exact decoded tensor
+                # ABI while avoiding reads of the two largest all-zero payloads.
+                column = data[key]
+                materialized[key] = np.empty(
+                    (len(rows), 0, *tuple(column.shape[2:])),
+                    dtype=column.dtype,
+                )
+            else:
+                materialized[key] = data[key][rows]
         # train_fn indexes a materialized batch with local ``0..N-1`` rows.
         # Preserve the immutable global source rows separately so post-loss
         # provenance (notably component dose) cannot reinterpret those local
         # positions as rows from component zero of the full composite.
         materialized["_source_global_row_indices"] = np.asarray(
-            batch, dtype=np.int64
+            rows, dtype=np.int64
         ).copy()
         stored_policy_temperatures = _stored_policy_temperatures_for_batch(
-            data, batch
+            data, rows
         )
         if stored_policy_temperatures is not None:
             materialized["_stored_policy_temperature"] = (
                 stored_policy_temperatures
             )
-        policy_kl_anchor_eligible = _policy_kl_anchor_scope_mask(data, batch)
+        policy_kl_anchor_eligible = _policy_kl_anchor_scope_mask(data, rows)
         if policy_kl_anchor_eligible is not None:
             # A materialised batch is a plain dict, so authenticated composite
             # attributes (and component_indices_for_rows) no longer exist by
@@ -16588,13 +16818,13 @@ def _iterate_training_batches(
             materialized["_policy_kl_anchor_eligible"] = (
                 policy_kl_anchor_eligible
             )
-        aux_subgoal_eligible = _aux_subgoal_scope_mask(data, batch)
+        aux_subgoal_eligible = _aux_subgoal_scope_mask(data, rows)
         if aux_subgoal_eligible is not None:
             # Preserve the authenticated component scope after global memmap
             # rows are materialized into a local plain dict.
             materialized["_aux_subgoal_eligible"] = aux_subgoal_eligible
         public_award_authoritative = _public_award_authoritative_row_mask(
-            data, batch
+            data, rows
         )
         if public_award_authoritative is not None:
             # Threaded prefetch replaces the authenticated composite object with
@@ -16605,19 +16835,49 @@ def _iterate_training_batches(
                 public_award_authoritative
             )
         local = np.arange(len(batch), dtype=np.int64)
-        return materialized, local, policy_sample_weights[batch], value_sample_weights[batch]
+        local_policy_weights = policy_sample_weights[rows]
+        local_value_weights = value_sample_weights[rows]
+        if aux_batch is None:
+            return (
+                materialized,
+                local,
+                local_policy_weights,
+                local_value_weights,
+            )
+        aux_local = np.arange(len(batch), len(rows), dtype=np.int64)
+        return (
+            materialized,
+            local,
+            local_policy_weights,
+            local_value_weights,
+            materialized,
+            aux_local,
+            aux_batch,
+        )
 
     prefetch = max(1, int(prefetch))
     with ThreadPoolExecutor(max_workers=int(num_workers)) as executor:
         pending: deque = deque()
         next_index = 0
         while next_index < len(batches) and len(pending) < prefetch:
-            pending.append(executor.submit(_materialize, batches[next_index]))
+            pending.append(
+                executor.submit(
+                    _materialize,
+                    batches[next_index],
+                    None if aux_batches is None else aux_batches[next_index],
+                )
+            )
             next_index += 1
         while pending:
             future = pending.popleft()
             if next_index < len(batches):
-                pending.append(executor.submit(_materialize, batches[next_index]))
+                pending.append(
+                    executor.submit(
+                        _materialize,
+                        batches[next_index],
+                        None if aux_batches is None else aux_batches[next_index],
+                    )
+                )
                 next_index += 1
             yield future.result()
 
@@ -16675,6 +16935,7 @@ def load_teacher_data(
         "target_scores_mask",
         "target_score_source",
         "target_information_regime",
+        *TARGET_RELIABILITY_COLUMNS,
         "root_value",
         "root_value_mask",
         "afterstate_target",
@@ -17355,6 +17616,62 @@ def _normalize_teacher_shard(
         "value_weight_multiplier": _field_or_default(
             shard,
             "value_weight_multiplier",
+            np.ones(n, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+        "target_reliability_version": _field_or_default(
+            shard,
+            "target_reliability_version",
+            np.zeros(n, dtype=np.uint8),
+            path,
+            leading=n,
+        ).astype(np.uint8, copy=False),
+        "target_reliability_audited": _field_or_default(
+            shard,
+            "target_reliability_audited",
+            np.zeros(n, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "target_reliability_js_divergence": _field_or_default(
+            shard,
+            "target_reliability_js_divergence",
+            np.full(n, np.nan, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+        "target_reliability_policy_top1_agreement": _field_or_default(
+            shard,
+            "target_reliability_policy_top1_agreement",
+            np.zeros(n, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "target_reliability_q_top1_agreement": _field_or_default(
+            shard,
+            "target_reliability_q_top1_agreement",
+            np.zeros(n, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "target_reliability_q_margin_primary": _field_or_default(
+            shard,
+            "target_reliability_q_margin_primary",
+            np.full(n, np.nan, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+        "target_reliability_q_margin_duplicate": _field_or_default(
+            shard,
+            "target_reliability_q_margin_duplicate",
+            np.full(n, np.nan, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False),
+        "target_reliability_confidence": _field_or_default(
+            shard,
+            "target_reliability_confidence",
             np.ones(n, dtype=np.float32),
             path,
             leading=n,
@@ -21218,6 +21535,127 @@ def _torch_ppo_masked_logits(logits, valid_actions, action_size):
     return _masked_logits(logits, valid_actions, action_size)
 
 
+def target_reliability_policy_factors(
+    data,
+    *,
+    enabled: bool,
+    confidence_floor: float,
+) -> np.ndarray:
+    """Return neutral or explicitly contracted per-row policy multipliers."""
+
+    n = int(len(data["action_taken"]))
+    factors = np.ones(n, dtype=np.float32)
+    if not bool(enabled):
+        return factors
+    floor = float(confidence_floor)
+    if not math.isfinite(floor) or not 0.0 <= floor <= 1.0:
+        raise SystemExit("--target-reliability-confidence-floor must be in [0, 1]")
+    missing = [name for name in TARGET_RELIABILITY_COLUMNS if name not in data]
+    if missing:
+        raise SystemExit(
+            "--target-reliability-confidence-weighting requires the complete "
+            f"typed reliability row contract; missing={missing}"
+        )
+
+    version = np.asarray(data["target_reliability_version"], dtype=np.uint8)
+    audited = np.asarray(data["target_reliability_audited"], dtype=np.bool_)
+    js = np.asarray(data["target_reliability_js_divergence"], dtype=np.float32)
+    policy_agreement = np.asarray(
+        data["target_reliability_policy_top1_agreement"], dtype=np.bool_
+    )
+    q_agreement = np.asarray(
+        data["target_reliability_q_top1_agreement"], dtype=np.bool_
+    )
+    primary_margin = np.asarray(
+        data["target_reliability_q_margin_primary"], dtype=np.float32
+    )
+    duplicate_margin = np.asarray(
+        data["target_reliability_q_margin_duplicate"], dtype=np.float32
+    )
+    confidence = np.asarray(
+        data["target_reliability_confidence"], dtype=np.float32
+    )
+    columns = {
+        "version": version,
+        "audited": audited,
+        "js": js,
+        "policy_agreement": policy_agreement,
+        "q_agreement": q_agreement,
+        "primary_margin": primary_margin,
+        "duplicate_margin": duplicate_margin,
+        "confidence": confidence,
+    }
+    malformed_shapes = {
+        name: value.shape for name, value in columns.items() if value.shape != (n,)
+    }
+    if malformed_shapes:
+        raise SystemExit(
+            "target reliability columns must be one-dimensional and row-aligned: "
+            f"{malformed_shapes}"
+        )
+    unsupported = set(map(int, np.unique(version))) - {
+        0,
+        TARGET_RELIABILITY_VERSION,
+    }
+    if unsupported:
+        raise SystemExit(
+            f"unsupported target reliability versions: {sorted(unsupported)}"
+        )
+    contracted = version == TARGET_RELIABILITY_VERSION
+    if not bool(np.any(contracted)):
+        raise SystemExit(
+            "--target-reliability-confidence-weighting found no version-1 rows"
+        )
+    if bool(np.any(audited & ~contracted)):
+        raise SystemExit("audited reliability rows must carry version 1")
+    if "target_information_regime" not in data:
+        raise SystemExit(
+            "target reliability weighting requires target_information_regime"
+        )
+    regimes = np.asarray(data["target_information_regime"]).astype(str)
+    if regimes.shape != (n,) or bool(
+        np.any(contracted & (regimes != TARGET_INFORMATION_REGIME_PUBLIC_COHERENT))
+    ):
+        raise SystemExit(
+            "version-1 target reliability rows require coherent public-belief targets"
+        )
+
+    observed = contracted & audited
+    if not bool(np.any(observed)):
+        raise SystemExit(
+            "--target-reliability-confidence-weighting found no audited version-1 rows"
+        )
+    if (
+        bool(np.any(~np.isfinite(js[observed])))
+        or bool(np.any((js[observed] < 0.0) | (js[observed] > math.log(2.0) + 1e-6)))
+        or bool(np.any(~np.isfinite(primary_margin[observed])))
+        or bool(np.any(~np.isfinite(duplicate_margin[observed])))
+        or bool(np.any(primary_margin[observed] < 0.0))
+        or bool(np.any(duplicate_margin[observed] < 0.0))
+        or bool(np.any(~np.isfinite(confidence[observed])))
+        or bool(np.any((confidence[observed] < 0.0) | (confidence[observed] > 1.0)))
+    ):
+        raise SystemExit("audited target reliability evidence is malformed")
+
+    expected = np.asarray(
+        [
+            target_reliability_confidence(
+                float(divergence), policy_top1_agreement=bool(agreement)
+            )
+            for divergence, agreement in zip(
+                js[observed], policy_agreement[observed], strict=True
+            )
+        ],
+        dtype=np.float32,
+    )
+    if not bool(np.allclose(confidence[observed], expected, rtol=0.0, atol=2e-6)):
+        raise SystemExit(
+            "stored target reliability confidence differs from its version-1 formula"
+        )
+    factors[observed] = np.maximum(floor, confidence[observed])
+    return factors
+
+
 def build_sample_weights(
     data: dict,
     *,
@@ -21230,6 +21668,8 @@ def build_sample_weights(
     vps_to_win: int,
     per_game_policy_weight: bool = False,
     per_game_policy_weight_mode: str = "equal",
+    target_reliability_confidence_weighting: bool = False,
+    target_reliability_confidence_floor: float = 0.25,
 ) -> np.ndarray:
     n = len(data["action_taken"])
     weights = np.ones(n, dtype=np.float32)
@@ -21298,6 +21738,13 @@ def build_sample_weights(
     mean = float(np.mean(weights)) if len(weights) else 1.0
     if "policy_weight_multiplier" in data:
         weights *= np.asarray(data["policy_weight_multiplier"], dtype=np.float32)
+        mean = float(np.mean(weights)) if len(weights) else 1.0
+    if bool(target_reliability_confidence_weighting):
+        weights *= target_reliability_policy_factors(
+            data,
+            enabled=True,
+            confidence_floor=float(target_reliability_confidence_floor),
+        )
         mean = float(np.mean(weights)) if len(weights) else 1.0
     if per_game_policy_weight and len(weights):
         # Only rows that already carry policy loss are redistributed. In

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.fixed_root_search_stability import content_sha256
+from tools.fixed_root_search_stability import content_sha256, root_phase_width_summary
 from tools.teacher_operator_campaign import (
     CampaignError,
     aggregate_campaign,
@@ -52,8 +52,9 @@ def test_campaign_is_n128_coherent_public_and_commands_change_only_wide_budget(
     ]
     assert quota_values == [
         "play_turn:2-19=24",
-        "play_turn:20-39=16",
-        "play_turn:40+=8",
+        "play_turn:20-31=16",
+        "play_turn:32-39=8",
+        "opening_placement:40+=8",
     ]
 
 
@@ -100,8 +101,9 @@ def _fixed_report(arm_id: str, threshold: int, *, candidate_js: float) -> dict:
     strata = (
         *((10, "play_turn") for _ in range(24)),
         *((20, "play_turn") for _ in range(16)),
-        *((40, "play_turn") for _ in range(8)),
-        *((54, "opening_placement") for _ in range(16)),
+        *((32, "play_turn") for _ in range(8)),
+        *((54, "opening_placement") for _ in range(8)),
+        *((2, "opening_placement") for _ in range(8)),
     )
     for index, (width, phase) in enumerate(strata):
         if width <= 10:
@@ -149,9 +151,11 @@ def _fixed_report(arm_id: str, threshold: int, *, candidate_js: float) -> dict:
             ],
             "root_stratum_counts": {
                 "play_turn:2-19": 24,
-                "play_turn:20-39": 16,
-                "play_turn:40+": 8,
+                "play_turn:20-31": 16,
+                "play_turn:32-39": 8,
+                "opening_placement:40+": 8,
             },
+            "root_phase_width_summary": root_phase_width_summary(roots),
         },
         "roles": {
             "base_n128_d6": {
@@ -254,6 +258,25 @@ def _h2h_report(threshold: int) -> dict:
     }
 
 
+def test_h2h_checkpoint_digest_accepts_canonical_sha256_prefix(tmp_path: Path) -> None:
+    loaded = load_campaign(_CAMPAIGN)
+    for arm_id, threshold in (
+        ("adaptive_n256_w20_d6", 20),
+        ("adaptive_n256_w40_d6", 40),
+    ):
+        (tmp_path / f"fixed.{arm_id}.json").write_text(
+            json.dumps(_fixed_report(arm_id, threshold, candidate_js=0.05)),
+            encoding="utf-8",
+        )
+        h2h = _h2h_report(threshold)
+        h2h["candidate_checkpoint_sha256"] = _CHECKPOINT_SHA
+        h2h["baseline_checkpoint_sha256"] = _CHECKPOINT_SHA
+        (tmp_path / f"h2h.{arm_id}.json").write_text(json.dumps(h2h), encoding="utf-8")
+
+    report = aggregate_campaign(loaded, out_dir=tmp_path)
+    assert report["checkpoint_sha256"] == _CHECKPOINT_SHA
+
+
 def test_aggregate_selects_cost_bounded_stability_winner(tmp_path: Path) -> None:
     loaded = load_campaign(_CAMPAIGN)
     for arm_id, threshold, candidate_js in (
@@ -271,6 +294,13 @@ def test_aggregate_selects_cost_bounded_stability_winner(tmp_path: Path) -> None
     report = aggregate_campaign(loaded, out_dir=tmp_path)
 
     assert report["checkpoint_sha256"] == _CHECKPOINT_SHA
+    assert report["root_distribution"]["width_40_classification"] == "opening_only"
+    assert (
+        report["root_distribution"]["phase_width_summary"]["play_turn"][
+            "max_legal_width"
+        ]
+        == 32
+    )
     assert report["selection"]["selected_operator"] == "adaptive_n256_w20_d6"
     assert report["results"]["adaptive_n256_w20_d6"]["selection_evidence"] == {
         "cost_ok": True,

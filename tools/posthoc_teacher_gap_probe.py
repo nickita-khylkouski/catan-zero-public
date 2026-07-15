@@ -58,6 +58,169 @@ def _required(report: dict[str, Any], key: str) -> Any:
     return report[key]
 
 
+def _functional_drift_batch(
+    parent_logits,
+    candidate_logits,
+    parent_values,
+    candidate_values,
+    *,
+    legal_mask,
+    eligible,
+) -> dict[str, float]:
+    """Return additive parent→candidate functional-distance statistics.
+
+    The caller supplies logits in the shared legal-action row order.  Padded
+    actions are removed explicitly before either KL is evaluated, avoiding the
+    undefined ``0 * (-inf - -inf)`` arithmetic that otherwise turns a valid
+    ragged policy batch into NaNs.  Only multi-action, policy-active anchor rows
+    are eligible; value drift is reported over that identical state surface so
+    policy and value movement remain directly comparable.
+    """
+
+    import torch
+
+    legal = legal_mask.bool()
+    active = eligible.bool()
+    if legal.ndim != 2 or active.ndim != 1 or legal.shape[0] != active.shape[0]:
+        raise ValueError("functional-drift batch shape mismatch")
+    active = active & (legal.sum(dim=-1) > 1)
+    count = int(active.sum().item())
+    if count == 0:
+        return {
+            "rows": 0.0,
+            "parent_candidate_kl_sum": 0.0,
+            "candidate_parent_kl_sum": 0.0,
+            "top1_flip_sum": 0.0,
+            "parent_entropy_sum": 0.0,
+            "candidate_entropy_sum": 0.0,
+            "value_abs_delta_sum": 0.0,
+            "value_squared_delta_sum": 0.0,
+        }
+
+    floor = torch.finfo(torch.float32).min
+    parent_log = torch.log_softmax(
+        parent_logits.float().masked_fill(~legal, floor), dim=-1
+    )
+    candidate_log = torch.log_softmax(
+        candidate_logits.float().masked_fill(~legal, floor), dim=-1
+    )
+    parent_prob = parent_log.exp().masked_fill(~legal, 0.0)
+    candidate_prob = candidate_log.exp().masked_fill(~legal, 0.0)
+    parent_log_finite = parent_log.masked_fill(~legal, 0.0)
+    candidate_log_finite = candidate_log.masked_fill(~legal, 0.0)
+    kl_parent_candidate = (
+        parent_prob * (parent_log_finite - candidate_log_finite)
+    ).sum(dim=-1)
+    kl_candidate_parent = (
+        candidate_prob * (candidate_log_finite - parent_log_finite)
+    ).sum(dim=-1)
+    parent_entropy = -(parent_prob * parent_log_finite).sum(dim=-1)
+    candidate_entropy = -(candidate_prob * candidate_log_finite).sum(dim=-1)
+    parent_top1 = parent_logits.float().masked_fill(~legal, floor).argmax(dim=-1)
+    candidate_top1 = candidate_logits.float().masked_fill(~legal, floor).argmax(dim=-1)
+    value_delta = candidate_values.float() - parent_values.float()
+    return {
+        "rows": float(count),
+        "parent_candidate_kl_sum": float(kl_parent_candidate[active].sum().item()),
+        "candidate_parent_kl_sum": float(kl_candidate_parent[active].sum().item()),
+        "top1_flip_sum": float((parent_top1[active] != candidate_top1[active]).sum().item()),
+        "parent_entropy_sum": float(parent_entropy[active].sum().item()),
+        "candidate_entropy_sum": float(candidate_entropy[active].sum().item()),
+        "value_abs_delta_sum": float(value_delta[active].abs().sum().item()),
+        "value_squared_delta_sum": float(value_delta[active].square().sum().item()),
+    }
+
+
+def _functional_drift(
+    *,
+    train_bc,
+    parent_policy,
+    candidate_policy,
+    data,
+    indices: np.ndarray,
+    policy_weights: np.ndarray,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Measure functional distance on one immutable validation anchor."""
+
+    import math
+    import torch
+
+    totals = {
+        "rows": 0.0,
+        "parent_candidate_kl_sum": 0.0,
+        "candidate_parent_kl_sum": 0.0,
+        "top1_flip_sum": 0.0,
+        "parent_entropy_sum": 0.0,
+        "candidate_entropy_sum": 0.0,
+        "value_abs_delta_sum": 0.0,
+        "value_squared_delta_sum": 0.0,
+    }
+    parent_modes = train_bc._set_policy_training(parent_policy, False)
+    candidate_modes = train_bc._set_policy_training(candidate_policy, False)
+    try:
+        with torch.no_grad():
+            for start in range(0, len(indices), int(batch_size)):
+                batch = np.asarray(indices[start : start + int(batch_size)], dtype=np.int64)
+                legal_ids = np.asarray(data["legal_action_ids"][batch])
+                parent = train_bc._forward_legal_np_for_batch(
+                    parent_policy,
+                    data,
+                    batch,
+                    legal_ids,
+                    return_q=False,
+                    return_final_vp=False,
+                )
+                candidate = train_bc._forward_legal_np_for_batch(
+                    candidate_policy,
+                    data,
+                    batch,
+                    legal_ids,
+                    return_q=False,
+                    return_final_vp=False,
+                )
+                if "value" not in parent or "value" not in candidate:
+                    raise SystemExit("functional-dose fingerprint requires scalar value outputs")
+                parts = _functional_drift_batch(
+                    parent["logits"],
+                    candidate["logits"],
+                    parent["value"],
+                    candidate["value"],
+                    legal_mask=torch.as_tensor(legal_ids >= 0, device=parent_policy.device),
+                    eligible=torch.as_tensor(
+                        np.asarray(policy_weights[batch]) > 0.0,
+                        device=parent_policy.device,
+                    ),
+                )
+                for key, value in parts.items():
+                    totals[key] += float(value)
+    finally:
+        train_bc._restore_policy_training(parent_policy, parent_modes)
+        train_bc._restore_policy_training(candidate_policy, candidate_modes)
+
+    rows = totals["rows"]
+    if rows <= 0:
+        raise SystemExit("functional-dose fingerprint has no active multi-action rows")
+    return {
+        "schema_version": "checkpoint-functional-dose-fingerprint-v1",
+        "eligible_rows": int(round(rows)),
+        "surface": "validation_policy_active_multi_action_rows",
+        "kl_parent_candidate_mean": totals["parent_candidate_kl_sum"] / rows,
+        "kl_candidate_parent_mean": totals["candidate_parent_kl_sum"] / rows,
+        "top1_flip_rate": totals["top1_flip_sum"] / rows,
+        "parent_policy_entropy_mean": totals["parent_entropy_sum"] / rows,
+        "candidate_policy_entropy_mean": totals["candidate_entropy_sum"] / rows,
+        "policy_entropy_delta": (
+            totals["candidate_entropy_sum"] - totals["parent_entropy_sum"]
+        )
+        / rows,
+        "value_mean_absolute_delta": totals["value_abs_delta_sum"] / rows,
+        "value_root_mean_square_delta": math.sqrt(
+            totals["value_squared_delta_sum"] / rows
+        ),
+    }
+
+
 def _weight_map(value: Any, field: str) -> dict[str, float]:
     if not isinstance(value, dict):
         raise SystemExit(f"training report {field!r} must be an object")
@@ -72,9 +235,15 @@ def run_probe(
     validation_manifest_path: Path,
     device: str,
     batch_size: int | None = None,
+    parent_checkpoint_path: Path | None = None,
 ) -> dict[str, Any]:
     report_path = report_path.resolve(strict=True)
     checkpoint_path = checkpoint_path.resolve(strict=True)
+    parent_checkpoint_path = (
+        None
+        if parent_checkpoint_path is None
+        else parent_checkpoint_path.resolve(strict=True)
+    )
     data_path = data_path.resolve(strict=True)
     validation_manifest_path = validation_manifest_path.resolve(strict=True)
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -226,10 +395,22 @@ def run_probe(
         per_game_value_weight=bool(_required(report, "per_game_value_weight")),
         per_game_value_weight_mode=str(_required(report, "per_game_value_weight_mode")),
     )
+    policy = _load_policy(str(_required(report, "arch")), checkpoint_path, device)
     train_bc._MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(
         _required(report, "mask_hidden_info")
     )
-    policy = _load_policy(str(_required(report, "arch")), checkpoint_path, device)
+    # ``train_bc`` routes these features through module globals because the
+    # same on-disk corpus supports multiple information surfaces. Importing the
+    # module outside ``main()`` otherwise leaves the legacy-zero defaults in
+    # place and silently evaluates an authoritative/card-aware checkpoint on
+    # the wrong inputs. Bind the posthoc surface to the checkpoint/report that
+    # actually produced the candidate.
+    train_bc._PUBLIC_AWARD_FEATURE_CONTRACT = str(
+        _required(report, "public_award_feature_contract")
+    )
+    train_bc._PUBLIC_CARD_COUNT_FEATURES_ENABLED = bool(
+        getattr(getattr(policy, "config", None), "public_card_count_features", False)
+    )
     eval_batch_size = int(batch_size or _required(report, "batch_size"))
     if eval_batch_size < 1:
         raise SystemExit("evaluation batch size must be >= 1")
@@ -298,7 +479,7 @@ def run_probe(
             "prior_kl_ratio",
         )
     }
-    return {
+    result = {
         "schema_version": "posthoc-checkpoint-teacher-gap/v1",
         "inputs": {
             "training_report": {
@@ -333,12 +514,47 @@ def run_probe(
         "legacy_prior_kl": legacy_fields,
         "metrics": metrics,
     }
+    if parent_checkpoint_path is not None:
+        parent = _load_policy(
+            str(_required(report, "arch")), parent_checkpoint_path, device
+        )
+        if bool(
+            getattr(
+                getattr(parent, "config", None), "public_card_count_features", False
+            )
+        ) != bool(train_bc._PUBLIC_CARD_COUNT_FEATURES_ENABLED):
+            raise SystemExit(
+                "parent and candidate use different public-card input schemas; "
+                "functional-dose fingerprint is not comparable"
+            )
+        result["inputs"]["parent_checkpoint"] = {
+            "path": str(parent_checkpoint_path),
+            "sha256": _sha256(parent_checkpoint_path),
+        }
+        result["functional_dose_fingerprint"] = _functional_drift(
+            train_bc=train_bc,
+            parent_policy=parent,
+            candidate_policy=policy,
+            data=data,
+            indices=validation_indices,
+            policy_weights=policy_weights,
+            batch_size=eval_batch_size,
+        )
+    return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--parent-checkpoint",
+        type=Path,
+        help=(
+            "Authenticated function-preserving learner initializer. When supplied, "
+            "emit parent→candidate KL/top-1/entropy/value movement on the exact holdout."
+        ),
+    )
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--validation-manifest", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -352,6 +568,7 @@ def main() -> None:
         validation_manifest_path=args.validation_manifest,
         device=args.device,
         batch_size=args.batch_size,
+        parent_checkpoint_path=args.parent_checkpoint,
     )
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     args.output.write_text(rendered, encoding="utf-8")

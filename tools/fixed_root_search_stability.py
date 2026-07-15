@@ -125,6 +125,18 @@ def content_sha256(value: Any) -> str:
     return "sha256:" + hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
+def json_artifact_content_sha256(value: Any) -> str:
+    """Hash the semantic value that survives a JSON artifact round trip.
+
+    Search policies use integer action ids as mapping keys. JSON necessarily
+    reloads those keys as strings, whose lexicographic sort order differs from
+    integer order. Normalize through JSON before sealing file content so the
+    producer and an independent reader compute the same digest.
+    """
+    normalized = json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    return content_sha256(normalized)
+
+
 def file_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -329,6 +341,24 @@ def root_stratum_counts(
     return {
         quota.name: sum(1 for root in roots if _root_matches_stratum(root, quota))
         for quota in quotas
+    }
+
+
+def root_phase_width_summary(roots: list[dict[str, Any]]) -> dict[str, Any]:
+    """Exact, content-sealed phase/width support of a selected root panel."""
+    phases: dict[str, list[int]] = {}
+    for root in roots:
+        phases.setdefault(str(root["phase"]), []).append(int(root["legal_width"]))
+    return {
+        phase: {
+            "root_count": len(widths),
+            "min_legal_width": min(widths),
+            "max_legal_width": max(widths),
+            "legal_width_counts": {
+                str(width): widths.count(width) for width in sorted(set(widths))
+            },
+        }
+        for phase, widths in sorted(phases.items())
     }
 
 
@@ -784,6 +814,12 @@ def validate_root_panel_payload(
         raise ValueError(
             "root panel root_stratum_counts do not match the selected roots"
         )
+    if quotas and panel.get("root_phase_width_summary") != root_phase_width_summary(
+        roots
+    ):
+        raise ValueError(
+            "root panel root_phase_width_summary does not match the selected roots"
+        )
 
 
 def build_root_panel(
@@ -923,6 +959,7 @@ def build_root_panel(
         "root_count": len(roots),
         "wide_ge_40_count": sum(1 for root in roots if root["wide_ge_40"]),
         "root_stratum_counts": selected_stratum_counts,
+        "root_phase_width_summary": root_phase_width_summary(roots),
         "roots": roots,
     }
     return seal_root_panel(panel)
@@ -1529,6 +1566,7 @@ def main() -> None:
                 "root_stratum_quotas", []
             ),
             "root_stratum_counts": panel.get("root_stratum_counts", {}),
+            "root_phase_width_summary": panel.get("root_phase_width_summary", {}),
             "root_sha256s": [root["root_sha256"] for root in panel["roots"]],
         },
         "evaluator": evaluator_spec,
@@ -1566,7 +1604,7 @@ def main() -> None:
         "slices": slices,
         "per_root": per_root,
     }
-    report["report_content_sha256"] = content_sha256(report)
+    report["report_content_sha256"] = json_artifact_content_sha256(report)
     write_json(args.out, report)
     print(
         json.dumps(
