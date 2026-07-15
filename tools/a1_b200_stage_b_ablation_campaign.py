@@ -11,6 +11,8 @@ learner setting fixed.  It then varies one treatment at a time:
 * ``CARD4``: only public-card residual LR 4x;
 * ``SURPRISE``: only exact per-game policy-surprise weighting.
 * ``TRUNK25`` / ``TRUNK10``: only reduce the shared-trunk LR to 0.25x / 0.10x;
+* ``VTRUNK25``: only scale the scalar-value gradient entering the shared trunk
+  to 0.25x, leaving policy gradients and value-head gradients unchanged;
 * ``TRUST``: only enable a forward-KL projected-dual parent trust region.
 
 The FORCED arm is structurally inactive when the authenticated corpus contains
@@ -53,10 +55,10 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import train_bc  # noqa: E402
 
 
-SCHEMA = "a1-b200-stage-b-causal-ablation-campaign-v2"
+SCHEMA = "a1-b200-stage-b-causal-ablation-campaign-v3"
 ARM_RECEIPT_SCHEMA = "a1-b200-stage-b-arm-receipt-v1"
 FINGERPRINT_SCHEMA = "a1-b200-stage-b-fingerprint-v1"
-COMPARISON_SCHEMA = "a1-b200-stage-b-comparison-v2"
+COMPARISON_SCHEMA = "a1-b200-stage-b-comparison-v3"
 WORLD_SIZE = stage_a.WORLD_SIZE
 LOCAL_BATCH_SIZE = stage_a.LOCAL_BATCH_SIZE
 GLOBAL_BATCH_SIZE = stage_a.GLOBAL_BATCH_SIZE
@@ -71,6 +73,7 @@ TREATMENT_FIELDS = frozenset(
         "public_card_lr_mult",
         "per_game_policy_surprise_weighting",
         "trunk_lr_mult",
+        "value_trunk_grad_scale",
         "policy_kl_target",
         "policy_kl_dual_lr",
         "policy_kl_max_weight",
@@ -84,6 +87,7 @@ ARM_ORDER = (
     "SURPRISE",
     "TRUNK25",
     "TRUNK10",
+    "VTRUNK25",
     "TRUST",
 )
 TREATMENTS: dict[str, dict[str, Any]] = {
@@ -122,6 +126,13 @@ TREATMENTS: dict[str, dict[str, Any]] = {
         "public_card_lr_mult": 1.0,
         "per_game_policy_surprise_weighting": False,
         "trunk_lr_mult": 0.10,
+    },
+    "VTRUNK25": {
+        "forced_row_value_action_type_weights": "",
+        "public_card_lr_mult": 1.0,
+        "per_game_policy_surprise_weighting": False,
+        "trunk_lr_mult": 1.0,
+        "value_trunk_grad_scale": 0.25,
     },
     "TRUST": {
         "forced_row_value_action_type_weights": "",
@@ -377,7 +388,7 @@ def _treatment_exposure(data_path: Path) -> dict[str, Any]:
             mass = np.where(valid, prior, 0.0).sum(axis=1)
             anchor_rows += int(np.count_nonzero((counts > 1) & (mass > 1.0e-6)))
     payload: dict[str, Any] = {
-        "schema_version": "a1-stage-b-treatment-exposure-v1",
+        "schema_version": "a1-stage-b-treatment-exposure-v2",
         "corpus": {
             "path": str(data_path),
             "corpus_meta_file_sha256": _file_sha256(data_path / "corpus_meta.json"),
@@ -399,6 +410,37 @@ def _treatment_exposure(data_path: Path) -> dict[str, Any]:
     return payload
 
 
+def _value_trunk_treatment_exposure(
+    source_recipe: Mapping[str, Any], *, value_attention_pool: bool
+) -> dict[str, Any]:
+    """Prove the value-boundary treatment can change an active objective."""
+
+    try:
+        scalar_weight = float(source_recipe["value_loss_weight"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError(
+            f"cannot bind Stage-B value-trunk treatment exposure: {error}"
+        ) from error
+    if not math.isfinite(scalar_weight) or scalar_weight < 0.0:
+        raise CampaignError("Stage-B scalar value objective weight is malformed")
+    active = scalar_weight > 0.0 and not value_attention_pool
+    return {
+        "value_objective_contract": "scalar_mse",
+        "scalar_value_loss_weight": scalar_weight,
+        "value_attention_pool": bool(value_attention_pool),
+        "value_trunk_treatment_structurally_active": active,
+        "value_trunk_treatment_inactive_reason": (
+            None
+            if active
+            else (
+                "zero_scalar_mse_value_objective"
+                if scalar_weight <= 0.0
+                else "value_attention_pool_bypasses_single_shared_state_boundary"
+            )
+        ),
+    }
+
+
 def _active_arms_for_exposure(exposure: Mapping[str, Any]) -> list[str]:
     typed_rows = int(exposure.get("typed_forced_rows", -1))
     stated_active = exposure.get("forced_treatment_structurally_active")
@@ -408,11 +450,15 @@ def _active_arms_for_exposure(exposure: Mapping[str, Any]) -> list[str]:
     trust_active = exposure.get("trust_treatment_structurally_active")
     if anchor_rows < 0 or trust_active is not (anchor_rows > 0):
         raise CampaignError("trust treatment exposure count/status is inconsistent")
+    value_trunk_active = exposure.get("value_trunk_treatment_structurally_active")
+    if type(value_trunk_active) is not bool:
+        raise CampaignError("value-trunk treatment exposure status is missing")
     return [
         arm
         for arm in ARM_ORDER
         if (arm != "FORCED" or stated_active)
         and (arm != "TRUST" or trust_active)
+        and (arm != "VTRUNK25" or value_trunk_active)
     ]
 
 
@@ -437,6 +483,9 @@ def _arm_overrides(
             selected_dose["policy_aux_active_batch_size"]
         ),
     }
+    value_trunk_scale = float(treatment.get("value_trunk_grad_scale", 1.0))
+    if value_trunk_scale != 1.0:
+        overrides["value_trunk_grad_scale"] = value_trunk_scale
     typed = str(treatment["forced_row_value_action_type_weights"])
     if typed:
         overrides["forced_row_value_action_type_weights"] = typed
@@ -476,6 +525,7 @@ def _assert_treatment_isolation(arms: Mapping[str, Mapping[str, Any]]) -> None:
         "SURPRISE": {"per_game_policy_surprise_weighting"},
         "TRUNK25": {"trunk_lr_mult"},
         "TRUNK10": {"trunk_lr_mult"},
+        "VTRUNK25": {"value_trunk_grad_scale"},
         "TRUST": {
             "policy_kl_anchor_direction",
             "policy_kl_target",
@@ -505,6 +555,8 @@ def _assert_treatment_isolation(arms: Mapping[str, Mapping[str, Any]]) -> None:
         or recipes["SURPRISE"].get("per_game_policy_surprise_weighting") is not True
         or recipes["TRUNK25"].get("trunk_lr_mult") != 0.25
         or recipes["TRUNK10"].get("trunk_lr_mult") != 0.10
+        or base.get("value_trunk_grad_scale", 1.0) != 1.0
+        or recipes["VTRUNK25"].get("value_trunk_grad_scale") != 0.25
         or recipes["TRUST"].get("policy_kl_anchor_direction") != "forward"
         or recipes["TRUST"].get("policy_kl_dual_lr") != TRUST_DUAL_LR
         or recipes["TRUST"].get("policy_kl_max_weight") != TRUST_MAX_WEIGHT
@@ -549,8 +601,6 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(source_recipe, Mapping):
         raise CampaignError("Stage-A campaign lost its canonical learner recipe")
     data = Path(str(source_inputs["data"])).resolve(strict=True)
-    exposure = _treatment_exposure(data)
-    active_arms = _active_arms_for_exposure(exposure)
 
     trainer = _regular_file(
         args.one_dose_trainer or (REPO_ROOT / "tools" / "a1_one_dose_train.py"),
@@ -581,6 +631,33 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         or upgrade.get("shared_parameters_bit_identical") is not True
     ):
         raise CampaignError("Stage-B requires the exact Stage-A f7 upgraded initializer")
+    upgraded_initializer = _regular_file(
+        Path(str(upgrade["upgraded_initializer"]["path"])),
+        where="f7 upgraded initializer",
+    )
+    try:
+        checkpoint = architecture_upgrade._load_checkpoint(  # noqa: SLF001
+            upgraded_initializer
+        )
+        checkpoint_config = architecture_upgrade._config(  # noqa: SLF001
+            checkpoint.get("config")
+        )
+    except architecture_upgrade.UpgradeError as error:
+        raise CampaignError(
+            f"cannot inspect f7 value-gradient boundary: {error}"
+        ) from error
+    exposure = _treatment_exposure(data)
+    exposure.update(
+        _value_trunk_treatment_exposure(
+            source_recipe,
+            value_attention_pool=bool(
+                checkpoint_config.get("value_attention_pool", False)
+            ),
+        )
+    )
+    exposure.pop("exposure_sha256", None)
+    exposure["exposure_sha256"] = _value_sha256(exposure)
+    active_arms = _active_arms_for_exposure(exposure)
 
     arm_records: dict[str, Any] = {}
     for arm in ARM_ORDER:
@@ -598,7 +675,11 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
                 else (
                     "zero_END_TURN_or_ROLL_one_legal_action_rows_in_bound_corpus"
                     if arm == "FORCED"
-                    else "zero_authenticated_multi_action_parent_prior_rows"
+                    else (
+                        "zero_authenticated_multi_action_parent_prior_rows"
+                        if arm == "TRUST"
+                        else exposure["value_trunk_treatment_inactive_reason"]
+                    )
                 )
             ),
             "expected_aux_active_row_draws": dose["expected_aux_active_row_draws"],
@@ -799,6 +880,15 @@ def _load_campaign(path: Path) -> tuple[Path, dict[str, Any]]:
     )
     if ("TRUST" in active) != trust_exposure:
         raise CampaignError("TRUST launch eligibility differs from signed exposure")
+    value_trunk_exposure = bool(
+        campaign.get("treatment_exposure", {}).get(
+            "value_trunk_treatment_structurally_active"
+        )
+    )
+    if ("VTRUNK25" in active) != value_trunk_exposure:
+        raise CampaignError(
+            "VTRUNK25 launch eligibility differs from signed exposure"
+        )
     return campaign_path, campaign
 
 
@@ -862,6 +952,13 @@ def _effective_treatment_assertion(
         for key in fixed_keys
         if effective.get(key) != expected[key]
     }
+    expected_value_trunk_scale = float(expected.get("value_trunk_grad_scale", 1.0))
+    actual_value_trunk_scale = float(effective.get("value_trunk_grad_scale", 1.0))
+    if actual_value_trunk_scale != expected_value_trunk_scale:
+        drift["value_trunk_grad_scale"] = {
+            "expected": expected_value_trunk_scale,
+            "actual": actual_value_trunk_scale,
+        }
     expected_typed = expected.get("forced_row_value_action_type_weights", "")
     actual_typed = effective.get("forced_row_value_action_type_weights", "")
     if actual_typed != expected_typed:
@@ -922,6 +1019,16 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
     )
     has_trust_target = "--policy-kl-target" in command
     expected_trust_target = arm == "TRUST"
+    expected_value_trunk_scale = float(
+        campaign["arms"][arm]["recipe_overrides"].get(
+            "value_trunk_grad_scale", 1.0
+        )
+    )
+    actual_value_trunk_scale = (
+        float(stage_a._option(command, "--value-trunk-grad-scale"))  # noqa: SLF001
+        if "--value-trunk-grad-scale" in command
+        else 1.0
+    )
     if (
         _file_sha256(initializer)
         != campaign["lineage_contract"]["upgraded_initializer_sha256"]
@@ -932,6 +1039,7 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
         or has_trust_target is not expected_trust_target
         or float(stage_a._option(command, "--trunk-lr-mult"))  # noqa: SLF001
         != float(campaign["arms"][arm]["recipe_overrides"]["trunk_lr_mult"])
+        or actual_value_trunk_scale != expected_value_trunk_scale
         or not isinstance(learner_parent, Mapping)
         or learner_parent.get("role") != "diagnostic_independent_parent"
         or learner_parent.get("checkpoint", {}).get("sha256")
@@ -956,6 +1064,32 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
 
 def _step_checkpoint(arm_root: Path, step: int, terminal: int) -> Path:
     return arm_root / "candidate.pt" if step == terminal else arm_root / f"candidate_step{step:04d}.pt"
+
+
+def _verify_value_trunk_routing(
+    report: Mapping[str, Any], *, arm: str, expected_scale: float
+) -> dict[str, Any]:
+    """Require runtime proof that the requested derivative boundary executed."""
+
+    routing = report.get("value_gradient_routing")
+    if (
+        not isinstance(routing, Mapping)
+        or report.get("value_trunk_grad_scale") != expected_scale
+        or routing.get("schema_version")
+        != "scalar-value-trunk-gradient-routing-v1"
+        or routing.get("scalar_value_trunk_grad_scale") != expected_scale
+        or routing.get("shared_state_upstream_gradient_scale") != expected_scale
+        or routing.get("active") is not (expected_scale != 1.0)
+        or routing.get("forward_value_identity") is not True
+        or routing.get("value_head_parameter_gradient_scale") != 1.0
+        or routing.get("policy_gradient_unchanged") is not True
+        or routing.get("optimizer_parameter_groups_unchanged") is not True
+        or routing.get("scope") != "scalar_value_head_state_input_only"
+    ):
+        raise CampaignError(
+            f"Stage-B arm {arm} did not execute its value-trunk routing contract"
+        )
+    return copy.deepcopy(dict(routing))
 
 
 def _verify_completed_arm(
@@ -983,6 +1117,15 @@ def _verify_completed_arm(
     if not isinstance(effective, Mapping):
         raise CampaignError(f"Stage-B arm {arm} receipt lost its effective recipe")
     _effective_treatment_assertion(campaign, arm, effective)
+    value_gradient_routing = _verify_value_trunk_routing(
+        report,
+        arm=arm,
+        expected_scale=float(
+            campaign["arms"][arm]["recipe_overrides"].get(
+                "value_trunk_grad_scale", 1.0
+            )
+        ),
+    )
     checkpoint = _regular_file(
         arm_root / "candidate.pt", where=f"Stage-B arm {arm} checkpoint"
     )
@@ -1064,6 +1207,7 @@ def _verify_completed_arm(
         "fresh_adam": True,
         "policy_aux_active_rows": expected_aux_rows,
         "adaptive_policy_kl_controller": copy.deepcopy(controller),
+        "value_gradient_routing": value_gradient_routing,
     }
     arm_receipt["receipt_sha256"] = _value_sha256(arm_receipt)
     wrapper_path = arm_root / "stage-b.receipt.json"

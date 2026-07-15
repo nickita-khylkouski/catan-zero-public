@@ -145,6 +145,10 @@ def test_stage_b_arms_change_exactly_one_treatment_at_selected_dose() -> None:
     ] is True
     assert arms["TRUNK25"]["recipe_overrides"]["trunk_lr_mult"] == 0.25
     assert arms["TRUNK10"]["recipe_overrides"]["trunk_lr_mult"] == 0.10
+    assert arms["VTRUNK25"]["recipe_overrides"][
+        "value_trunk_grad_scale"
+    ] == 0.25
+    assert arms["VTRUNK25"]["recipe_overrides"]["trunk_lr_mult"] == 1.0
     assert arms["TRUST"]["recipe_overrides"]["policy_kl_target"] == pytest.approx(
         0.012
     )
@@ -221,6 +225,13 @@ def test_forced_treatment_is_structurally_inactive_without_typed_rows(
     )
 
     exposure = campaign._treatment_exposure(corpus.resolve())  # noqa: SLF001
+    exposure.update(
+        campaign._value_trunk_treatment_exposure(  # noqa: SLF001
+            {"value_loss_weight": 0.25}, value_attention_pool=False
+        )
+    )
+    exposure.pop("exposure_sha256")
+    exposure["exposure_sha256"] = campaign._value_sha256(exposure)  # noqa: SLF001
 
     assert exposure["stored_is_forced_rows"] == 0
     assert exposure["one_legal_action_rows"] == 0
@@ -234,6 +245,7 @@ def test_forced_treatment_is_structurally_inactive_without_typed_rows(
         "SURPRISE",
         "TRUNK25",
         "TRUNK10",
+        "VTRUNK25",
         "TRUST",
     ]
     assert exposure["exposure_sha256"] == campaign._value_sha256(  # noqa: SLF001
@@ -259,6 +271,13 @@ def test_forced_treatment_activates_only_for_typed_one_legal_action_rows(
     )
 
     exposure = campaign._treatment_exposure(corpus.resolve())  # noqa: SLF001
+    exposure.update(
+        campaign._value_trunk_treatment_exposure(  # noqa: SLF001
+            {"value_loss_weight": 0.25}, value_attention_pool=False
+        )
+    )
+    exposure.pop("exposure_sha256")
+    exposure["exposure_sha256"] = campaign._value_sha256(exposure)  # noqa: SLF001
 
     assert exposure["one_legal_action_rows"] == 3
     assert exposure["typed_forced_rows"] == 2
@@ -274,8 +293,76 @@ def test_forced_treatment_activates_only_for_typed_one_legal_action_rows(
         "SURPRISE",
         "TRUNK25",
         "TRUNK10",
+        "VTRUNK25",
         "TRUST",
     ]
+
+
+@pytest.mark.parametrize(
+    ("value_loss_weight", "value_attention_pool", "active", "reason"),
+    [
+        (0.25, False, True, None),
+        (0.0, False, False, "zero_scalar_mse_value_objective"),
+        (
+            0.25,
+            True,
+            False,
+            "value_attention_pool_bypasses_single_shared_state_boundary",
+        ),
+    ],
+)
+def test_value_trunk_arm_is_excluded_when_its_boundary_is_inert_or_bypassed(
+    value_loss_weight: float,
+    value_attention_pool: bool,
+    active: bool,
+    reason: str | None,
+) -> None:
+    exposure = {
+        "typed_forced_rows": 0,
+        "forced_treatment_structurally_active": False,
+        "policy_kl_anchor_multi_action_rows": 1,
+        "trust_treatment_structurally_active": True,
+    }
+    exposure.update(
+        campaign._value_trunk_treatment_exposure(  # noqa: SLF001
+            {"value_loss_weight": value_loss_weight},
+            value_attention_pool=value_attention_pool,
+        )
+    )
+
+    arms = campaign._active_arms_for_exposure(exposure)  # noqa: SLF001
+
+    assert ("VTRUNK25" in arms) is active
+    assert exposure["value_trunk_treatment_inactive_reason"] == reason
+
+
+def test_value_trunk_runtime_receipt_must_prove_exact_boundary() -> None:
+    report = {
+        "value_trunk_grad_scale": 0.25,
+        "value_gradient_routing": {
+            "schema_version": "scalar-value-trunk-gradient-routing-v1",
+            "scalar_value_trunk_grad_scale": 0.25,
+            "active": True,
+            "forward_value_identity": True,
+            "value_head_parameter_gradient_scale": 1.0,
+            "shared_state_upstream_gradient_scale": 0.25,
+            "scope": "scalar_value_head_state_input_only",
+            "policy_gradient_unchanged": True,
+            "optimizer_parameter_groups_unchanged": True,
+        },
+    }
+
+    routing = campaign._verify_value_trunk_routing(  # noqa: SLF001
+        report, arm="VTRUNK25", expected_scale=0.25
+    )
+    assert routing["active"] is True
+
+    broken = copy.deepcopy(report)
+    broken["value_gradient_routing"]["shared_state_upstream_gradient_scale"] = 1.0
+    with pytest.raises(campaign.CampaignError, match="did not execute"):
+        campaign._verify_value_trunk_routing(  # noqa: SLF001
+            broken, arm="VTRUNK25", expected_scale=0.25
+        )
 
 
 def test_effective_recipe_refuses_hidden_second_treatment() -> None:
