@@ -60,6 +60,10 @@ from catan_zero.search.neural_rust_mcts import (  # noqa: E402
 
 RECEIPT_SCHEMA = "a1-stage-c-sparse-reconstruction-receipt-v1"
 READY_SUBSET_SCHEMA = "a1-stage-c-reconstructable-subset-v1"
+QUALIFICATION_PARTITION_RECEIPT_SCHEMA = (
+    "a1-stage-c-sparse-reconstruction-partition-receipt-v1"
+)
+QUALIFICATION_PARTITION_SCHEMA = "a1-stage-c-sparse-reconstruction-partition-v1"
 EXECUTION_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-chunk-receipt-v1"
 PATCH_SCHEMA = "a1-stage-c-coherent-reanalysis-target-patch-v1"
 MERGE_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-merge-receipt-v1"
@@ -74,6 +78,14 @@ STATUS = {
     "malformed_sequence": 6,
     "runtime_error": 7,
 }
+QUALIFICATION_PARTITION_COLUMNS = (
+    "selected_ordinal",
+    "status",
+    "omitted_automatic_transitions",
+    "omitted_roll_transitions",
+    "omitted_end_turn_transitions",
+    "omitted_other_ui_transitions",
+)
 REQUIRED_COHERENT_CAPABILITIES = frozenset(
     {
         "coherent_public_belief_search",
@@ -275,50 +287,72 @@ def _checkpoint_action_size(path: Path) -> int:
     return action_size
 
 
-def _qualify(args: argparse.Namespace) -> dict[str, Any]:
-    try:
-        plan = alignment._verify_plan(args.plan)  # noqa: SLF001
-    except alignment.AlignmentError as error:
-        raise ExecutorError(f"Stage-C plan refused: {error}") from error
-    plan_path = Path(plan["path"])
-    subset_path = Path(str(plan["subset"]["artifact"]["path"]))
-    overlay_path = Path(str(plan["eligibility_overlay"]["path"]))
-    _overlay_path, overlay = alignment._load_json(  # noqa: SLF001
-        overlay_path, where="Stage-C eligibility overlay"
-    )
-    corpus_root = Path(str(overlay["corpus"]["path"])).resolve(strict=True)
-    if (
-        alignment._file_sha256(corpus_root / "corpus_meta.json")
-        != overlay[  # noqa: SLF001
-            "corpus"
-        ]["corpus_meta_file_sha256"]
-    ):
-        raise ExecutorError("Stage-C corpus metadata drifted")
-    data = train_bc.MemmapCorpus(corpus_root)
-    with np.load(subset_path, allow_pickle=False) as subset_file:
-        subset = {name: np.asarray(subset_file[name]) for name in subset_file.files}
-    count = len(subset["row_index"])
-    if count != int(plan["subset"]["selected_rows"]):
-        raise ExecutorError("Stage-C selected subset row count drifted")
-    sequences = _sequence_rows(data, subset["game_seed"])
+def _qualification_partition_ordinals(
+    game_seeds: np.ndarray, *, partition_index: int, partitions: int
+) -> np.ndarray:
+    """Assign whole games to deterministic qualification partitions.
 
-    status = np.full(count, STATUS["unclassified"], dtype=np.uint8)
-    omitted = np.zeros(count, dtype=np.uint16)
-    omitted_roll = np.zeros(count, dtype=np.uint16)
-    omitted_end_turn = np.zeros(count, dtype=np.uint16)
-    omitted_other_ui = np.zeros(count, dtype=np.uint16)
+    Selected roots from one game must never be replayed by multiple workers.
+    Ownership therefore follows the ordinal of the sorted unique game seed,
+    not the selected-row ordinal and not Python's process-randomized hash.
+    """
+
+    values = np.asarray(game_seeds, dtype=np.int64)
+    if values.ndim != 1 or values.size == 0:
+        raise ExecutorError("qualification requires a non-empty game_seed column")
+    if partitions <= 0 or not 0 <= partition_index < partitions:
+        raise ExecutorError("invalid qualification partition index/count")
+    unique_games = np.unique(values)
+    if partitions > len(unique_games):
+        raise ExecutorError(
+            "qualification partition count exceeds selected unique games"
+        )
+    owned_games = unique_games[
+        np.arange(len(unique_games), dtype=np.int64) % partitions == partition_index
+    ]
+    return np.flatnonzero(np.isin(values, owned_games)).astype(np.int64)
+
+
+def _qualify_ordinals(
+    *,
+    data: Mapping[str, Any],
+    subset: Mapping[str, np.ndarray],
+    selected_ordinals: np.ndarray,
+    action_size: int,
+    meaningful_public_history: bool,
+    history_limit: int,
+    correct_chance: bool,
+) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
+    """Replay and public-roundtrip one complete set of game-owned roots."""
+
+    ordinals = np.asarray(selected_ordinals, dtype=np.int64)
+    count = len(subset["row_index"])
+    if (
+        ordinals.ndim != 1
+        or ordinals.size == 0
+        or np.any(ordinals < 0)
+        or np.any(ordinals >= count)
+        or np.unique(ordinals).size != ordinals.size
+        or np.any(ordinals[1:] <= ordinals[:-1])
+    ):
+        raise ExecutorError("qualification selected ordinals are malformed")
+    selected_game_seeds = np.asarray(subset["game_seed"], dtype=np.int64)[ordinals]
+    sequences = _sequence_rows(data, selected_game_seeds)
+    status = np.full(len(ordinals), STATUS["unclassified"], dtype=np.uint8)
+    omitted = np.zeros(len(ordinals), dtype=np.uint16)
+    omitted_roll = np.zeros(len(ordinals), dtype=np.uint16)
+    omitted_end_turn = np.zeros(len(ordinals), dtype=np.uint16)
+    omitted_other_ui = np.zeros(len(ordinals), dtype=np.uint16)
     failures: list[dict[str, Any]] = []
-    source_checkpoint = Path(
-        str(plan["source_policy_target_identity"]["producer_checkpoint"]["path"])
-    )
-    action_size = _checkpoint_action_size(source_checkpoint)
-    history = plan["target_policy_target_identity"]["target_semantics"]
-    correct_chance = bool(
-        plan["target_policy_target_identity"]["chance"]["correct_rust_chance_spectra"]
-    )
+    local_by_global = {
+        int(selected_ordinal): local
+        for local, selected_ordinal in enumerate(ordinals.tolist())
+    }
     ordinals_by_game: dict[int, list[int]] = {}
-    for ordinal, game_seed in enumerate(subset["game_seed"].astype(np.int64)):
-        ordinals_by_game.setdefault(int(game_seed), []).append(ordinal)
+    for selected_ordinal in ordinals.tolist():
+        game_seed = int(subset["game_seed"][selected_ordinal])
+        ordinals_by_game.setdefault(game_seed, []).append(int(selected_ordinal))
+
     for game_seed, game_ordinals in sorted(ordinals_by_game.items()):
         sequence, game_rows = sequences[game_seed]
         target_decisions = [
@@ -330,9 +364,10 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
             correct_rust_chance_spectra=correct_chance,
             action_size=action_size,
         )
-        for ordinal in game_ordinals:
-            row = int(subset["row_index"][ordinal])
-            decision = int(subset["decision_index"][ordinal])
+        for selected_ordinal in game_ordinals:
+            local_ordinal = local_by_global[selected_ordinal]
+            row = int(subset["row_index"][selected_ordinal])
+            decision = int(subset["decision_index"][selected_ordinal])
             local = int(np.searchsorted(game_rows, row))
             if local >= len(game_rows) or int(game_rows[local]) != row:
                 raise ExecutorError(
@@ -345,10 +380,10 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
                 error = batch.failure or ExecutorError(
                     "sparse reconstruction stopped without a classified failure"
                 )
-                status[ordinal], detail = _status_for_error(error)
+                status[local_ordinal], detail = _status_for_error(error)
                 failures.append(
                     {
-                        "ordinal": ordinal,
+                        "ordinal": selected_ordinal,
                         "row_index": row,
                         "game_seed": game_seed,
                         "decision_index": decision,
@@ -359,16 +394,16 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
             omitted_count = batch.omitted_automatic_transitions[decision]
             if omitted_count > np.iinfo(np.uint16).max:
                 raise ExecutorError("omitted automatic-transition count overflow")
-            omitted[ordinal] = np.uint16(omitted_count)
+            omitted[local_ordinal] = np.uint16(omitted_count)
             omitted_types = batch.omitted_automatic_transition_types[decision]
             roll_count = int(omitted_types.get("ROLL", 0))
             end_turn_count = int(omitted_types.get("END_TURN", 0))
             other_count = omitted_count - roll_count - end_turn_count
             if min(roll_count, end_turn_count, other_count) < 0:
                 raise ExecutorError("omitted automatic-transition type counts drifted")
-            omitted_roll[ordinal] = np.uint16(roll_count)
-            omitted_end_turn[ordinal] = np.uint16(end_turn_count)
-            omitted_other_ui[ordinal] = np.uint16(other_count)
+            omitted_roll[local_ordinal] = np.uint16(roll_count)
+            omitted_end_turn[local_ordinal] = np.uint16(end_turn_count)
+            omitted_other_ui[local_ordinal] = np.uint16(other_count)
             try:
                 result = reconstruct_state.round_trip_row(
                     sequence,
@@ -377,17 +412,15 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
                     _one_row(data["legal_action_ids"], row),
                     correct_rust_chance_spectra=correct_chance,
                     action_size=action_size,
-                    meaningful_public_history=bool(
-                        history["meaningful_public_history"]
-                    ),
-                    history_limit=int(history["event_history_limit"]),
+                    meaningful_public_history=meaningful_public_history,
+                    history_limit=history_limit,
                     reconstructed_game=reconstructed_game,
                 )
             except Exception as error:  # noqa: BLE001 - classify row, continue.
-                status[ordinal], detail = _status_for_error(error)
+                status[local_ordinal], detail = _status_for_error(error)
                 failures.append(
                     {
-                        "ordinal": ordinal,
+                        "ordinal": selected_ordinal,
                         "row_index": row,
                         "game_seed": game_seed,
                         "decision_index": decision,
@@ -396,10 +429,10 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 continue
             if not result.ok:
-                status[ordinal] = STATUS["public_surface_mismatch"]
+                status[local_ordinal] = STATUS["public_surface_mismatch"]
                 failures.append(
                     {
-                        "ordinal": ordinal,
+                        "ordinal": selected_ordinal,
                         "row_index": row,
                         "game_seed": game_seed,
                         "decision_index": decision,
@@ -417,9 +450,46 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
                     }
                 )
                 continue
-            status[ordinal] = STATUS["reconstructable_public_roundtrip"]
+            status[local_ordinal] = STATUS["reconstructable_public_roundtrip"]
 
-    output_root = args.output_root.expanduser().resolve(strict=False)
+    return (
+        {
+            "selected_ordinal": ordinals,
+            "status": status,
+            "omitted_automatic_transitions": omitted,
+            "omitted_roll_transitions": omitted_roll,
+            "omitted_end_turn_transitions": omitted_end_turn,
+            "omitted_other_ui_transitions": omitted_other_ui,
+        },
+        failures,
+    )
+
+
+def _write_qualification_artifacts(
+    *,
+    plan: Mapping[str, Any],
+    plan_path: Path,
+    subset: Mapping[str, np.ndarray],
+    status: np.ndarray,
+    omitted: np.ndarray,
+    omitted_roll: np.ndarray,
+    omitted_end_turn: np.ndarray,
+    omitted_other_ui: np.ndarray,
+    failures: Sequence[Mapping[str, Any]],
+    action_size: int,
+    runtime: Mapping[str, Any],
+    output_root: Path,
+    partition_receipts: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    """Write the canonical qualification surface from ordered global arrays."""
+
+    count = len(subset["row_index"])
+    arrays = (status, omitted, omitted_roll, omitted_end_turn, omitted_other_ui)
+    if any(np.asarray(value).shape != (count,) for value in arrays):
+        raise ExecutorError("merged qualification arrays are not globally aligned")
+    if np.any(status == STATUS["unclassified"]):
+        raise ExecutorError("merged qualification left unclassified roots")
+    output_root = output_root.expanduser().resolve(strict=False)
     output_root.mkdir(parents=True, exist_ok=True)
     status_path = output_root / "selected_reconstruction_status.u8.dat"
     omitted_path = output_root / "selected_omitted_automatic_count.u16.dat"
@@ -462,13 +532,10 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
         "target_policy_target_identity_sha256": plan["target_policy_target_identity"][
             "identity_sha256"
         ],
-        "runtime": _runtime_attestation(),
+        "runtime": dict(runtime),
         "source_checkpoint_action_size": action_size,
         "status_codes": STATUS,
-        "counts": {
-            "selected_rows": count,
-            **counts,
-        },
+        "counts": {"selected_rows": count, **counts},
         "artifacts": {
             "status": alignment._artifact_ref(status_path),  # noqa: SLF001
             "omitted_automatic_transition_count": alignment._artifact_ref(  # noqa: SLF001
@@ -502,10 +569,329 @@ def _qualify(args: argparse.Namespace) -> dict[str, Any]:
             "coherent_root_sanitization_required_before_evaluation": True,
             "event_history_compared": True,
         },
+        "failure_examples": [dict(item) for item in failures[:100]],
+    }
+    if partition_receipts:
+        receipt["qualification_partitions"] = list(partition_receipts)
+    receipt["receipt_sha256"] = _value_sha256(receipt)
+    return receipt
+
+
+def _qualify(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        plan = alignment._verify_plan(args.plan)  # noqa: SLF001
+    except alignment.AlignmentError as error:
+        raise ExecutorError(f"Stage-C plan refused: {error}") from error
+    plan_path = Path(plan["path"])
+    subset_path = Path(str(plan["subset"]["artifact"]["path"]))
+    overlay_path = Path(str(plan["eligibility_overlay"]["path"]))
+    _overlay_path, overlay = alignment._load_json(  # noqa: SLF001
+        overlay_path, where="Stage-C eligibility overlay"
+    )
+    corpus_root = Path(str(overlay["corpus"]["path"])).resolve(strict=True)
+    if (
+        alignment._file_sha256(corpus_root / "corpus_meta.json")
+        != overlay[  # noqa: SLF001
+            "corpus"
+        ]["corpus_meta_file_sha256"]
+    ):
+        raise ExecutorError("Stage-C corpus metadata drifted")
+    data = train_bc.MemmapCorpus(corpus_root)
+    with np.load(subset_path, allow_pickle=False) as subset_file:
+        subset = {name: np.asarray(subset_file[name]) for name in subset_file.files}
+    count = len(subset["row_index"])
+    if count != int(plan["subset"]["selected_rows"]):
+        raise ExecutorError("Stage-C selected subset row count drifted")
+    source_checkpoint = Path(
+        str(plan["source_policy_target_identity"]["producer_checkpoint"]["path"])
+    )
+    action_size = _checkpoint_action_size(source_checkpoint)
+    history = plan["target_policy_target_identity"]["target_semantics"]
+    correct_chance = bool(
+        plan["target_policy_target_identity"]["chance"]["correct_rust_chance_spectra"]
+    )
+    qualification, failures = _qualify_ordinals(
+        data=data,
+        subset=subset,
+        selected_ordinals=np.arange(count, dtype=np.int64),
+        action_size=action_size,
+        meaningful_public_history=bool(history["meaningful_public_history"]),
+        history_limit=int(history["event_history_limit"]),
+        correct_chance=correct_chance,
+    )
+    status = qualification["status"]
+    omitted = qualification["omitted_automatic_transitions"]
+    omitted_roll = qualification["omitted_roll_transitions"]
+    omitted_end_turn = qualification["omitted_end_turn_transitions"]
+    omitted_other_ui = qualification["omitted_other_ui_transitions"]
+
+    return _write_qualification_artifacts(
+        plan=plan,
+        plan_path=plan_path,
+        subset=subset,
+        status=status,
+        omitted=omitted,
+        omitted_roll=omitted_roll,
+        omitted_end_turn=omitted_end_turn,
+        omitted_other_ui=omitted_other_ui,
+        failures=failures,
+        action_size=action_size,
+        runtime=_runtime_attestation(),
+        output_root=args.output_root,
+    )
+
+
+def _load_qualification_inputs(
+    plan_path: Path,
+) -> tuple[dict[str, Any], Path, dict[str, np.ndarray], Any, int]:
+    try:
+        plan = alignment._verify_plan(plan_path)  # noqa: SLF001
+    except alignment.AlignmentError as error:
+        raise ExecutorError(f"Stage-C plan refused: {error}") from error
+    resolved_plan = Path(str(plan["path"]))
+    subset_path = Path(str(plan["subset"]["artifact"]["path"]))
+    overlay_path = Path(str(plan["eligibility_overlay"]["path"]))
+    _overlay_path, overlay = alignment._load_json(  # noqa: SLF001
+        overlay_path, where="Stage-C eligibility overlay"
+    )
+    corpus_root = Path(str(overlay["corpus"]["path"])).resolve(strict=True)
+    if (
+        alignment._file_sha256(corpus_root / "corpus_meta.json")
+        != overlay["corpus"]["corpus_meta_file_sha256"]  # noqa: SLF001
+    ):
+        raise ExecutorError("Stage-C corpus metadata drifted")
+    data = train_bc.MemmapCorpus(corpus_root)
+    with np.load(subset_path, allow_pickle=False) as subset_file:
+        subset = {name: np.asarray(subset_file[name]) for name in subset_file.files}
+    if len(subset["row_index"]) != int(plan["subset"]["selected_rows"]):
+        raise ExecutorError("Stage-C selected subset row count drifted")
+    source_checkpoint = Path(
+        str(plan["source_policy_target_identity"]["producer_checkpoint"]["path"])
+    )
+    return plan, resolved_plan, subset, data, _checkpoint_action_size(source_checkpoint)
+
+
+def _qualify_partition(args: argparse.Namespace) -> dict[str, Any]:
+    """Qualify all roots from one deterministic set of whole games."""
+
+    plan, plan_path, subset, data, action_size = _load_qualification_inputs(args.plan)
+    selected_ordinals = _qualification_partition_ordinals(
+        subset["game_seed"],
+        partition_index=int(args.partition_index),
+        partitions=int(args.partitions),
+    )
+    history = plan["target_policy_target_identity"]["target_semantics"]
+    arrays, failures = _qualify_ordinals(
+        data=data,
+        subset=subset,
+        selected_ordinals=selected_ordinals,
+        action_size=action_size,
+        meaningful_public_history=bool(history["meaningful_public_history"]),
+        history_limit=int(history["event_history_limit"]),
+        correct_chance=bool(
+            plan["target_policy_target_identity"]["chance"][
+                "correct_rust_chance_spectra"
+            ]
+        ),
+    )
+    artifact_path = args.artifact.expanduser().resolve(strict=False)
+    alignment._write_immutable(  # noqa: SLF001
+        artifact_path,
+        alignment._npz_bytes(arrays),  # noqa: SLF001
+    )
+    status = arrays["status"]
+    counts = {
+        name: int(np.count_nonzero(status == code)) for name, code in STATUS.items()
+    }
+    receipt: dict[str, Any] = {
+        "schema_version": QUALIFICATION_PARTITION_RECEIPT_SCHEMA,
+        "artifact_schema_version": QUALIFICATION_PARTITION_SCHEMA,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "stage_c_plan": {
+            "path": str(plan_path),
+            "file_sha256": alignment._file_sha256(plan_path),  # noqa: SLF001
+            "plan_sha256": plan["plan_sha256"],
+        },
+        "source_subset": plan["subset"]["artifact"],
+        "target_policy_target_identity_sha256": plan["target_policy_target_identity"][
+            "identity_sha256"
+        ],
+        "runtime": _runtime_attestation(),
+        "source_checkpoint_action_size": action_size,
+        "status_codes": STATUS,
+        "partition": {
+            "partition_index": int(args.partition_index),
+            "partitions": int(args.partitions),
+            "assignment": "sorted_unique_game_seed_ordinal_mod_partitions",
+            "selected_games": int(
+                np.unique(subset["game_seed"][selected_ordinals]).size
+            ),
+        },
+        "counts": {"selected_rows": len(selected_ordinals), **counts},
+        "columns": sorted(arrays),
+        "artifact": alignment._artifact_ref(artifact_path),  # noqa: SLF001
         "failure_examples": failures[:100],
     }
     receipt["receipt_sha256"] = _value_sha256(receipt)
     return receipt
+
+
+def _verify_qualification_partition(path: Path) -> dict[str, Any]:
+    receipt_path, receipt = alignment._load_json(  # noqa: SLF001
+        path, where="Stage-C qualification partition receipt"
+    )
+    unsigned = dict(receipt)
+    stated = unsigned.pop("receipt_sha256", None)
+    if (
+        receipt.get("schema_version") != QUALIFICATION_PARTITION_RECEIPT_SCHEMA
+        or receipt.get("artifact_schema_version") != QUALIFICATION_PARTITION_SCHEMA
+        or stated != _value_sha256(unsigned)
+    ):
+        raise ExecutorError("Stage-C qualification partition digest drifted")
+    plan_ref = receipt.get("stage_c_plan")
+    if not isinstance(plan_ref, Mapping):
+        raise ExecutorError("qualification partition lost its plan")
+    plan = alignment._verify_plan(Path(str(plan_ref["path"])))  # noqa: SLF001
+    plan_path = Path(str(plan["path"]))
+    if (
+        plan_ref.get("file_sha256") != alignment._file_sha256(plan_path)  # noqa: SLF001
+        or plan_ref.get("plan_sha256") != plan["plan_sha256"]
+        or receipt.get("target_policy_target_identity_sha256")
+        != plan["target_policy_target_identity"]["identity_sha256"]
+    ):
+        raise ExecutorError("qualification partition plan binding drifted")
+    runtime = receipt.get("runtime")
+    if not isinstance(runtime, Mapping) or runtime != _runtime_attestation():
+        raise ExecutorError("qualification partition runtime drifted")
+    artifact = receipt.get("artifact")
+    if not isinstance(artifact, Mapping):
+        raise ExecutorError("qualification partition lost its artifact")
+    artifact_path = Path(str(artifact["path"])).resolve(strict=True)
+    if (
+        artifact.get("file_sha256") != alignment._file_sha256(artifact_path)  # noqa: SLF001
+        or artifact.get("size_bytes") != artifact_path.stat().st_size
+    ):
+        raise ExecutorError("qualification partition artifact bytes drifted")
+    with np.load(artifact_path, allow_pickle=False) as source:
+        arrays = {name: np.asarray(source[name]) for name in source.files}
+    if set(arrays) != set(QUALIFICATION_PARTITION_COLUMNS) or sorted(
+        arrays
+    ) != receipt.get("columns"):
+        raise ExecutorError("qualification partition column contract drifted")
+    with np.load(
+        Path(str(plan["subset"]["artifact"]["path"])), allow_pickle=False
+    ) as source:
+        subset = {name: np.asarray(source[name]) for name in source.files}
+    partition = receipt.get("partition", {})
+    index = int(partition.get("partition_index", -1))
+    partitions = int(partition.get("partitions", 0))
+    if partition.get("assignment") != "sorted_unique_game_seed_ordinal_mod_partitions":
+        raise ExecutorError("qualification partition assignment contract drifted")
+    expected = _qualification_partition_ordinals(
+        subset["game_seed"], partition_index=index, partitions=partitions
+    )
+    actual = np.asarray(arrays["selected_ordinal"], dtype=np.int64)
+    if not np.array_equal(actual, expected):
+        raise ExecutorError("qualification partition root ownership drifted")
+    count = len(expected)
+    if any(np.asarray(value).shape != (count,) for value in arrays.values()):
+        raise ExecutorError("qualification partition columns are misaligned")
+    status = np.asarray(arrays["status"], dtype=np.uint8)
+    if np.any(status == STATUS["unclassified"]) or np.any(
+        ~np.isin(status, np.fromiter(STATUS.values(), dtype=np.uint8))
+    ):
+        raise ExecutorError("qualification partition has invalid status values")
+    counts = {
+        name: int(np.count_nonzero(status == code)) for name, code in STATUS.items()
+    }
+    if receipt.get("counts") != {"selected_rows": count, **counts}:
+        raise ExecutorError("qualification partition counts drifted")
+    expected_games = int(np.unique(subset["game_seed"][expected]).size)
+    if int(partition.get("selected_games", -1)) != expected_games:
+        raise ExecutorError("qualification partition game count drifted")
+    return {
+        "path": str(receipt_path),
+        "file_sha256": alignment._file_sha256(receipt_path),  # noqa: SLF001
+        "plan": plan,
+        "subset": subset,
+        "arrays": arrays,
+        **receipt,
+    }
+
+
+def _merge_qualification_partitions(args: argparse.Namespace) -> dict[str, Any]:
+    partitions = [_verify_qualification_partition(path) for path in args.receipt]
+    if not partitions:
+        raise ExecutorError("qualification merge requires partition receipts")
+    first = partitions[0]
+    expected_partitions = int(first["partition"]["partitions"])
+    indices = [int(item["partition"]["partition_index"]) for item in partitions]
+    if sorted(indices) != list(range(expected_partitions)):
+        raise ExecutorError(
+            "qualification merge requires exactly one receipt for every partition"
+        )
+    if any(
+        int(item["partition"]["partitions"]) != expected_partitions
+        or item["stage_c_plan"]["plan_sha256"] != first["stage_c_plan"]["plan_sha256"]
+        or item["target_policy_target_identity_sha256"]
+        != first["target_policy_target_identity_sha256"]
+        or item["runtime"] != first["runtime"]
+        or int(item["source_checkpoint_action_size"])
+        != int(first["source_checkpoint_action_size"])
+        for item in partitions[1:]
+    ):
+        raise ExecutorError("qualification merge received foreign partitions")
+    subset = first["subset"]
+    count = len(subset["row_index"])
+    status = np.full(count, STATUS["unclassified"], dtype=np.uint8)
+    omitted = np.zeros(count, dtype=np.uint16)
+    omitted_roll = np.zeros(count, dtype=np.uint16)
+    omitted_end_turn = np.zeros(count, dtype=np.uint16)
+    omitted_other_ui = np.zeros(count, dtype=np.uint16)
+    claimed = np.zeros(count, dtype=np.uint8)
+    failures: list[dict[str, Any]] = []
+    for item in partitions:
+        arrays = item["arrays"]
+        ordinals = np.asarray(arrays["selected_ordinal"], dtype=np.int64)
+        if np.any(claimed[ordinals]):
+            raise ExecutorError("qualification merge has duplicate selected roots")
+        claimed[ordinals] = 1
+        status[ordinals] = arrays["status"]
+        omitted[ordinals] = arrays["omitted_automatic_transitions"]
+        omitted_roll[ordinals] = arrays["omitted_roll_transitions"]
+        omitted_end_turn[ordinals] = arrays["omitted_end_turn_transitions"]
+        omitted_other_ui[ordinals] = arrays["omitted_other_ui_transitions"]
+        failures.extend(item.get("failure_examples", ()))
+    if not np.all(claimed):
+        raise ExecutorError("qualification merge has incomplete selected-root coverage")
+    references = [
+        {
+            "path": item["path"],
+            "file_sha256": item["file_sha256"],
+            "receipt_sha256": item["receipt_sha256"],
+            "partition_index": item["partition"]["partition_index"],
+        }
+        for item in sorted(
+            partitions, key=lambda value: int(value["partition"]["partition_index"])
+        )
+    ]
+    failures.sort(key=lambda item: int(item.get("ordinal", -1)))
+    return _write_qualification_artifacts(
+        plan=first["plan"],
+        plan_path=Path(str(first["plan"]["path"])),
+        subset=subset,
+        status=status,
+        omitted=omitted,
+        omitted_roll=omitted_roll,
+        omitted_end_turn=omitted_end_turn,
+        omitted_other_ui=omitted_other_ui,
+        failures=failures,
+        action_size=int(first["source_checkpoint_action_size"]),
+        runtime=first["runtime"],
+        output_root=args.output_root,
+        partition_receipts=references,
+    )
 
 
 def _verify_receipt(path: Path) -> dict[str, Any]:
@@ -1369,6 +1755,24 @@ def build_parser() -> argparse.ArgumentParser:
     qualify.add_argument("--plan", required=True, type=Path)
     qualify.add_argument("--output-root", required=True, type=Path)
     qualify.add_argument("--write", required=True, type=Path)
+    qualify_partition = commands.add_parser(
+        "qualify-partition",
+        help="qualify one deterministic whole-game CPU partition",
+    )
+    qualify_partition.add_argument("--plan", required=True, type=Path)
+    qualify_partition.add_argument("--partition-index", required=True, type=int)
+    qualify_partition.add_argument("--partitions", required=True, type=int)
+    qualify_partition.add_argument("--artifact", required=True, type=Path)
+    qualify_partition.add_argument("--write", required=True, type=Path)
+    merge_qualification = commands.add_parser(
+        "merge-qualification",
+        help="merge complete whole-game qualification partitions",
+    )
+    merge_qualification.add_argument(
+        "--receipt", action="append", required=True, type=Path
+    )
+    merge_qualification.add_argument("--output-root", required=True, type=Path)
+    merge_qualification.add_argument("--write", required=True, type=Path)
     verify = commands.add_parser("verify")
     verify.add_argument("--receipt", required=True, type=Path)
     execute = commands.add_parser(
@@ -1398,6 +1802,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "qualify":
             result = _qualify(args)
+            alignment._write_json_immutable(args.write, result)  # noqa: SLF001
+        elif args.command == "qualify-partition":
+            result = _qualify_partition(args)
+            alignment._write_json_immutable(args.write, result)  # noqa: SLF001
+        elif args.command == "merge-qualification":
+            result = _merge_qualification_partitions(args)
             alignment._write_json_immutable(args.write, result)  # noqa: SLF001
         elif args.command == "verify":
             result = _verify_receipt(args.receipt)

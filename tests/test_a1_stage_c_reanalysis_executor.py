@@ -134,6 +134,105 @@ def test_checkpoint_action_size_uses_model_contract_not_catalog_size(
     assert executor._checkpoint_action_size(checkpoint) == 567
 
 
+def test_qualification_partition_owns_whole_games_and_covers_once() -> None:
+    game_seeds = np.asarray([5, 5, 7, 10, 10, 11], dtype=np.int64)
+
+    first = executor._qualification_partition_ordinals(
+        game_seeds, partition_index=0, partitions=2
+    )
+    second = executor._qualification_partition_ordinals(
+        game_seeds, partition_index=1, partitions=2
+    )
+
+    assert first.tolist() == [0, 1, 3, 4]
+    assert second.tolist() == [2, 5]
+    assert sorted(np.concatenate([first, second]).tolist()) == list(range(6))
+    for seed in np.unique(game_seeds):
+        owners = {
+            partition
+            for partition, ordinals in enumerate((first, second))
+            if np.any(game_seeds[ordinals] == seed)
+        }
+        assert len(owners) == 1
+
+
+def test_qualification_merge_restores_global_selected_order(
+    monkeypatch, tmp_path
+) -> None:
+    subset = {
+        "row_index": np.asarray([10, 11, 12, 13], dtype=np.int64),
+        "game_seed": np.asarray([5, 5, 7, 10], dtype=np.int64),
+    }
+
+    def partition(index: int, ordinals: list[int], statuses: list[int]) -> dict:
+        arrays = {
+            "selected_ordinal": np.asarray(ordinals, dtype=np.int64),
+            "status": np.asarray(statuses, dtype=np.uint8),
+            "omitted_automatic_transitions": np.asarray(ordinals, dtype=np.uint16),
+            "omitted_roll_transitions": np.zeros(len(ordinals), dtype=np.uint16),
+            "omitted_end_turn_transitions": np.zeros(len(ordinals), dtype=np.uint16),
+            "omitted_other_ui_transitions": np.zeros(len(ordinals), dtype=np.uint16),
+        }
+        return {
+            "path": str(tmp_path / f"part-{index}.json"),
+            "file_sha256": f"file-{index}",
+            "receipt_sha256": f"receipt-{index}",
+            "stage_c_plan": {"plan_sha256": "plan"},
+            "target_policy_target_identity_sha256": "target",
+            "runtime": {"runtime_sha256": "runtime"},
+            "source_checkpoint_action_size": 567,
+            "partition": {"partition_index": index, "partitions": 2},
+            "failure_examples": [],
+            "plan": {"path": str(tmp_path / "plan.json")},
+            "subset": subset,
+            "arrays": arrays,
+        }
+
+    receipts = {
+        tmp_path / "part-0.json": partition(
+            0,
+            [0, 1, 3],
+            [
+                executor.STATUS["reconstructable_public_roundtrip"],
+                executor.STATUS["missing_nonautomatic_decision"],
+                executor.STATUS["reconstructable_public_roundtrip"],
+            ],
+        ),
+        tmp_path / "part-1.json": partition(
+            1, [2], [executor.STATUS["recorded_action_illegal"]]
+        ),
+    }
+    monkeypatch.setattr(
+        executor,
+        "_verify_qualification_partition",
+        lambda path: receipts[path],
+    )
+    captured = {}
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        return {"receipt_sha256": "merged"}
+
+    monkeypatch.setattr(executor, "_write_qualification_artifacts", capture)
+
+    result = executor._merge_qualification_partitions(
+        SimpleNamespace(receipt=list(receipts), output_root=tmp_path / "qualification")
+    )
+
+    assert result == {"receipt_sha256": "merged"}
+    assert captured["status"].tolist() == [
+        executor.STATUS["reconstructable_public_roundtrip"],
+        executor.STATUS["missing_nonautomatic_decision"],
+        executor.STATUS["recorded_action_illegal"],
+        executor.STATUS["reconstructable_public_roundtrip"],
+    ]
+    assert captured["omitted"].tolist() == [0, 1, 2, 3]
+    assert [item["partition_index"] for item in captured["partition_receipts"]] == [
+        0,
+        1,
+    ]
+
+
 def test_effective_search_config_replays_sealed_coherent_native_fields(
     tmp_path,
 ) -> None:
