@@ -1446,6 +1446,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "track": args.track,
                 "vps_to_win": int(args.vps_to_win),
                 "obs_width": int(args.obs_width),
+                # These fields determine which positions and public-history
+                # tensors enter the learner corpus.  They must be copied into
+                # the spawned-worker payload explicitly; GenerateConfig and
+                # top-level CLI provenance alone do not configure workers.
+                "meaningful_public_history": bool(
+                    args.meaningful_public_history
+                ),
+                "event_history_limit": int(args.event_history_limit),
+                "record_automatic_transitions": bool(
+                    args.record_automatic_transitions
+                ),
                 "base_seed": int(args.base_seed),
                 "worker_seed": int(args.base_seed) + 0x9E3779B9 * (worker_index + 1),
                 "shard_size": int(args.shard_size),
@@ -1872,6 +1883,18 @@ def _run_worker(
     *,
     champion_evaluator: Any | None = None,
 ) -> dict[str, Any]:
+    coherent_row_fields = (
+        "meaningful_public_history",
+        "event_history_limit",
+        "record_automatic_transitions",
+    )
+    if worker_args.get("resume_semantics_sha256") is not None:
+        missing = [name for name in coherent_row_fields if name not in worker_args]
+        if missing:
+            raise ValueError(
+                "authenticated worker payload lost coherent row-surface fields: "
+                f"{missing}"
+            )
     checkpoint = worker_args["checkpoint"]
     if (
         str(worker_args.get("value_readout", "scalar")) == "categorical"
