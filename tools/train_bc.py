@@ -233,6 +233,9 @@ TARGET_INFORMATION_REGIMES_PUBLIC = frozenset(
 )
 TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
 
+CHECKPOINT_DOSE_TELEMETRY_SCHEMA = "train-bc-checkpoint-dose-telemetry-v1"
+CHECKPOINT_DOSE_TRAJECTORY_SCHEMA = "train-bc-checkpoint-dose-trajectory-v1"
+
 MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
 MEMMAP_PAYLOAD_AUTH_CACHE_SCHEMA = "memmap-payload-auth-cache-v1"
 # Bump whenever the inventory validation semantics or cache identity changes.
@@ -11209,6 +11212,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     optimizer_pre_clip_grad_norm_max = 0.0
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
     intermediate_checkpoints: list[dict[str, object]] = []
+    checkpoint_dose_snapshots: list[dict[str, object]] = []
     saved_checkpoint_steps: set[int] = set()
     # C1 gradient accumulation. accum==1 (default) preserves the pre-C1 path
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
@@ -11891,6 +11895,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "objective_gradient_interference"
                     )
                     if isinstance(objective_observation, dict):
+                        objective_observation = {
+                            **objective_observation,
+                            "optimizer_step": global_step
+                            + int(optimizer_step_applied),
+                        }
                         epoch_objective_gradient_observations.append(
                             objective_observation
                         )
@@ -12061,6 +12070,110 @@ def main(argv: Sequence[str] | None = None) -> None:
                 global_step in checkpoint_steps
                 and global_step not in saved_checkpoint_steps
             ):
+                # Bind the exact cumulative objective exposure to this model
+                # snapshot.  The extra reductions happen only for explicitly
+                # requested dose checkpoints and reuse counters already paid
+                # for by the learner.
+                checkpoint_counts = _reduce_named_sums(
+                    {
+                        "samples": float(epoch_count),
+                        "policy_base_active_rows": float(epoch_active_count),
+                        "policy_aux_active_rows": float(epoch_aux_active_count),
+                        "policy_base_effective_weight_sum": float(
+                            epoch_policy_base_effective_weight
+                        ),
+                        "policy_aux_effective_weight_sum": float(
+                            epoch_policy_aux_effective_weight
+                        ),
+                        "value_active_rows": float(epoch_value_active_count),
+                        "policy_kl_anchor_eligible_rows": float(
+                            epoch_anchor_eligible_count
+                        ),
+                    },
+                    ddp,
+                )
+                checkpoint_denominator_inputs = {
+                    name: value
+                    for name, value in epoch_extra_denominators.items()
+                    if name not in {"aux_subgoal_loss", "moe_balance_loss"}
+                }
+                checkpoint_denominator_inputs.update(
+                    {
+                        f"aux_subgoal.{name}": value
+                        for name, value in epoch_aux_subgoal_denominators.items()
+                    }
+                )
+                checkpoint_denominators = _reduce_named_sums(
+                    checkpoint_denominator_inputs, ddp
+                )
+                checkpoint_module_observability = (
+                    _module_optimizer_observability_from_accumulators(
+                        observations=epoch_module_observations,
+                        cadence_batches=int(args.train_diagnostics_every_batches),
+                        norm_scope=epoch_module_norm_scope,
+                        grad_norm_sums=epoch_module_grad_norm_sums,
+                        grad_norm_max=epoch_module_grad_norm_max,
+                        delta_norm_sums=epoch_module_delta_norm_sums,
+                        update_rms_sums=epoch_module_update_rms_sums,
+                        relative_delta_sums=epoch_module_relative_delta_sums,
+                        parameter_counts=epoch_module_parameter_counts,
+                    )
+                )
+                checkpoint_partial_metric = {
+                    "samples": int(round(checkpoint_counts["samples"])),
+                    "policy_base_active_rows": int(
+                        round(checkpoint_counts["policy_base_active_rows"])
+                    ),
+                    "policy_aux_active_rows": int(
+                        round(checkpoint_counts["policy_aux_active_rows"])
+                    ),
+                    "policy_base_effective_weight_sum": checkpoint_counts[
+                        "policy_base_effective_weight_sum"
+                    ],
+                    "policy_aux_effective_weight_sum": checkpoint_counts[
+                        "policy_aux_effective_weight_sum"
+                    ],
+                    "value_active_rows": int(
+                        round(checkpoint_counts["value_active_rows"])
+                    ),
+                    "policy_kl_anchor_eligible_rows": int(
+                        round(
+                            checkpoint_counts["policy_kl_anchor_eligible_rows"]
+                        )
+                    ),
+                    "loss_denominators": checkpoint_denominators,
+                    "module_optimizer_observability": (
+                        checkpoint_module_observability
+                    ),
+                    "objective_gradient_interference": {
+                        "observations": list(
+                            epoch_objective_gradient_observations
+                        )
+                    },
+                }
+                snapshot_dose_telemetry = _checkpoint_dose_telemetry(
+                    [*metrics, checkpoint_partial_metric],
+                    optimizer_step=global_step,
+                    optimizer_observed_steps=optimizer_observed_steps,
+                    optimizer_clipped_steps=optimizer_clipped_steps,
+                    optimizer_zero_objective_steps=optimizer_zero_objective_steps,
+                    optimizer_pre_clip_grad_norm_sum=(
+                        optimizer_pre_clip_grad_norm_sum
+                    ),
+                    optimizer_pre_clip_grad_norm_max=(
+                        optimizer_pre_clip_grad_norm_max
+                    ),
+                    objective_gradient_cadence_batches=int(
+                        args.objective_gradient_interference_every_batches
+                    ),
+                    train_diagnostic_cadence_batches=int(
+                        args.train_diagnostics_every_batches
+                    ),
+                    public_card_enabled=bool(args.public_card_count_features),
+                    meaningful_history_enabled=bool(
+                        args.meaningful_public_history
+                    ),
+                )
                 # These are model-selection snapshots from the SAME optimizer
                 # trajectory.  They deliberately have no optimizer sidecar so
                 # nobody can accidentally turn step 64/96 into a chained second
@@ -12129,6 +12242,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             "optimizer_sidecar": None,
                         }
                     )
+                    checkpoint_dose_snapshots.append(snapshot_dose_telemetry)
                 saved_checkpoint_steps.add(global_step)
             if args.progress_every_batches and batch_number % int(args.progress_every_batches) == 0:
                 _rank0_print(
@@ -12220,37 +12334,19 @@ def main(argv: Sequence[str] | None = None) -> None:
             if collect_training_strata_dose
             else None
         )
-        module_optimizer_observability = None
-        if epoch_module_observations:
-            module_optimizer_observability = {
-                "schema_version": "module-optimizer-observability-v1",
-                "observed_steps": int(epoch_module_observations),
-                "cadence_batches": int(args.train_diagnostics_every_batches),
-                "norm_scope": epoch_module_norm_scope,
-                "modules": {
-                    module: {
-                        "mean_pre_clip_grad_norm": (
-                            epoch_module_grad_norm_sums[module]
-                            / epoch_module_observations
-                        ),
-                        "max_pre_clip_grad_norm": epoch_module_grad_norm_max[module],
-                        "mean_parameter_delta_norm": (
-                            epoch_module_delta_norm_sums.get(module, 0.0)
-                            / epoch_module_observations
-                        ),
-                        "mean_parameter_update_rms": (
-                            epoch_module_update_rms_sums.get(module, 0.0)
-                            / epoch_module_observations
-                        ),
-                        "mean_relative_parameter_delta": (
-                            epoch_module_relative_delta_sums.get(module, 0.0)
-                            / epoch_module_observations
-                        ),
-                        "parameter_count": epoch_module_parameter_counts[module],
-                    }
-                    for module in sorted(epoch_module_grad_norm_sums)
-                },
-            }
+        module_optimizer_observability = (
+            _module_optimizer_observability_from_accumulators(
+                observations=epoch_module_observations,
+                cadence_batches=int(args.train_diagnostics_every_batches),
+                norm_scope=epoch_module_norm_scope,
+                grad_norm_sums=epoch_module_grad_norm_sums,
+                grad_norm_max=epoch_module_grad_norm_max,
+                delta_norm_sums=epoch_module_delta_norm_sums,
+                update_rms_sums=epoch_module_update_rms_sums,
+                relative_delta_sums=epoch_module_relative_delta_sums,
+                parameter_counts=epoch_module_parameter_counts,
+            )
+        )
         policy_component_active_dose = {
             component_id: {
                 "base_active_rows": int(
@@ -12808,76 +12904,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
         training_strata_dose = _nest_training_strata_dose(training_strata_flat)
 
-    module_observation_count = sum(
-        int((metric.get("module_optimizer_observability") or {}).get("observed_steps", 0))
-        for metric in metrics
+    module_optimizer_observability = _aggregate_module_optimizer_observability(
+        metrics, cadence_batches=int(args.train_diagnostics_every_batches)
     )
-    module_optimizer_observability = None
-    if module_observation_count:
-        modules = sorted(
-            {
-                module
-                for metric in metrics
-                for module in (
-                    (metric.get("module_optimizer_observability") or {})
-                    .get("modules", {})
-                )
-            }
-        )
-        module_optimizer_observability = {
-            "schema_version": "module-optimizer-observability-v1",
-            "observed_steps": module_observation_count,
-            "cadence_batches": int(args.train_diagnostics_every_batches),
-            "norm_scope": next(
-                (
-                    (metric.get("module_optimizer_observability") or {}).get(
-                        "norm_scope"
-                    )
-                    for metric in metrics
-                    if metric.get("module_optimizer_observability")
-                ),
-                None,
-            ),
-            "modules": {},
-        }
-        for module in modules:
-            weighted_grad = 0.0
-            weighted_delta = 0.0
-            weighted_update_rms = 0.0
-            weighted_relative_delta = 0.0
-            maximum = 0.0
-            parameter_count: int | None = None
-            for metric in metrics:
-                observation = metric.get("module_optimizer_observability") or {}
-                count = int(observation.get("observed_steps", 0))
-                row = observation.get("modules", {}).get(module)
-                if not isinstance(row, dict) or count <= 0:
-                    continue
-                weighted_grad += float(row["mean_pre_clip_grad_norm"]) * count
-                weighted_delta += float(row["mean_parameter_delta_norm"]) * count
-                weighted_update_rms += float(row["mean_parameter_update_rms"]) * count
-                weighted_relative_delta += (
-                    float(row["mean_relative_parameter_delta"]) * count
-                )
-                maximum = max(maximum, float(row["max_pre_clip_grad_norm"]))
-                observed_parameter_count = int(row["parameter_count"])
-                if parameter_count not in {None, observed_parameter_count}:
-                    raise RuntimeError(
-                        "optimizer module parameter count changed across epochs"
-                    )
-                parameter_count = observed_parameter_count
-            module_optimizer_observability["modules"][module] = {
-                "mean_pre_clip_grad_norm": weighted_grad / module_observation_count,
-                "max_pre_clip_grad_norm": maximum,
-                "mean_parameter_delta_norm": weighted_delta / module_observation_count,
-                "mean_parameter_update_rms": (
-                    weighted_update_rms / module_observation_count
-                ),
-                "mean_relative_parameter_delta": (
-                    weighted_relative_delta / module_observation_count
-                ),
-                "parameter_count": parameter_count,
-            }
     objective_gradient_observations = [
         observation
         for metric in metrics
@@ -12894,6 +12923,37 @@ def main(argv: Sequence[str] | None = None) -> None:
         "observed_steps": len(objective_gradient_observations),
         "observations": objective_gradient_observations,
     }
+    checkpoint_dose_trajectory = None
+    if checkpoint_steps and int(args.train_diagnostics_every_batches) > 0:
+        terminal_dose_telemetry = _checkpoint_dose_telemetry(
+            metrics,
+            optimizer_step=global_step,
+            optimizer_observed_steps=optimizer_observed_steps,
+            optimizer_clipped_steps=optimizer_clipped_steps,
+            optimizer_zero_objective_steps=optimizer_zero_objective_steps,
+            optimizer_pre_clip_grad_norm_sum=optimizer_pre_clip_grad_norm_sum,
+            optimizer_pre_clip_grad_norm_max=optimizer_pre_clip_grad_norm_max,
+            objective_gradient_cadence_batches=int(
+                args.objective_gradient_interference_every_batches
+            ),
+            train_diagnostic_cadence_batches=int(
+                args.train_diagnostics_every_batches
+            ),
+            public_card_enabled=bool(args.public_card_count_features),
+            meaningful_history_enabled=bool(args.meaningful_public_history),
+        )
+        dose_by_step = {
+            int(record["optimizer_step"]): record
+            for record in checkpoint_dose_snapshots
+        }
+        dose_by_step[int(global_step)] = terminal_dose_telemetry
+        checkpoint_dose_trajectory = {
+            "schema_version": CHECKPOINT_DOSE_TRAJECTORY_SCHEMA,
+            "checkpoint_steps": [
+                step for step in sorted(dose_by_step) if step <= int(global_step)
+            ],
+            "checkpoints": [dose_by_step[step] for step in sorted(dose_by_step)],
+        }
     value_component_active_dose = None
     if bool(getattr(data, "value_training_scope_authenticated", False)):
         value_component_active_dose = {
@@ -13136,6 +13196,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "checkpoint": args.checkpoint,
         "checkpoint_steps_requested": list(checkpoint_steps),
         "intermediate_checkpoints": intermediate_checkpoints,
+        "checkpoint_dose_trajectory": checkpoint_dose_trajectory,
         "init_checkpoint": args.init_checkpoint or None,
         "init_checkpoint_sha256": str(args.init_checkpoint_sha256) or None,
         "a1_curriculum_parent": getattr(args, "a1_curriculum_parent", None),
@@ -14812,11 +14873,21 @@ def _train_xdim_batch(
                 + float(aux_subgoal_loss_weight) * aux_subgoal_loss
                 + float(belief_resource_loss_weight) * belief_resource_loss
             )
+            additional_objectives = {}
+            if float(aux_subgoal_loss_weight) != 0.0:
+                additional_objectives["aux_subgoal"] = (
+                    float(aux_subgoal_loss_weight) * aux_subgoal_loss
+                )
+            if float(belief_resource_loss_weight) != 0.0:
+                additional_objectives["belief_resource"] = (
+                    float(belief_resource_loss_weight) * belief_resource_loss
+                )
             objective_gradient_interference = _objective_gradient_interference(
                 policy,
                 policy_objective=policy_objective,
                 value_objective=value_objective,
                 policy_aux_objective=policy_aux_objective,
+                additional_objectives=additional_objectives,
                 value_trunk_grad_scale=value_trunk_grad_scale,
             )
         aux_gradient_geometry = None
@@ -21591,6 +21662,7 @@ def _objective_gradient_interference(
     policy_objective,
     value_objective,
     policy_aux_objective=None,
+    additional_objectives: Mapping[str, object] | None = None,
     value_trunk_grad_scale: float = 1.0,
 ) -> dict[str, object]:
     """Measure weighted policy/value gradient interaction in the shared trunk.
@@ -21631,6 +21703,11 @@ def _objective_gradient_interference(
         policy_aux_objective is not None
         and getattr(policy_aux_objective, "requires_grad", False)
     )
+    active_additional_objectives = {
+        str(name): objective
+        for name, objective in sorted((additional_objectives or {}).items())
+        if getattr(objective, "requires_grad", False)
+    }
     try:
         policy_grads = torch.autograd.grad(
             policy_objective, parameters, retain_graph=True, allow_unused=True
@@ -21648,6 +21725,15 @@ def _objective_gradient_interference(
             if aux_active
             else (None,) * len(parameters)
         )
+        additional_gradients = {
+            name: torch.autograd.grad(
+                objective,
+                parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            for name, objective in active_additional_objectives.items()
+        }
     except RuntimeError as exc:
         return {
             "available": False,
@@ -21662,18 +21748,25 @@ def _objective_gradient_interference(
     policy_base_sq = zero.clone()
     policy_aux_sq = zero.clone()
     policy_base_aux_dot = zero.clone()
+    additional_squared_norms = {
+        name: zero.clone() for name in active_additional_objectives
+    }
     conflict_coordinates = zero.clone()
     joint_coordinates = zero.clone()
     by_module: dict[str, dict[str, object]] = {}
-    for (name, _), policy_grad, value_grad, policy_aux_grad in zip(
-        named, policy_grads, value_grads, policy_aux_grads, strict=True
+    for parameter_index, ((name, parameter), policy_grad, value_grad, policy_aux_grad) in enumerate(
+        zip(named, policy_grads, value_grads, policy_aux_grads, strict=True)
     ):
         if policy_grad is None and value_grad is None and policy_aux_grad is None:
-            continue
+            if not any(
+                gradients[parameter_index] is not None
+                for gradients in additional_gradients.values()
+            ):
+                continue
         if policy_grad is None:
-            policy_grad = torch.zeros_like(value_grad)
+            policy_grad = torch.zeros_like(parameter)
         if value_grad is None:
-            value_grad = torch.zeros_like(policy_grad)
+            value_grad = torch.zeros_like(parameter)
         pg = policy_grad.detach().double()
         vg = value_grad.detach().double()
         ag = (
@@ -21695,6 +21788,12 @@ def _objective_gradient_interference(
         policy_base_sq += b_sq
         policy_aux_sq += a_sq
         policy_base_aux_dot += ba
+        for objective_name, gradients in additional_gradients.items():
+            objective_gradient = gradients[parameter_index]
+            if objective_gradient is not None:
+                additional_squared_norms[objective_name] += (
+                    objective_gradient.detach().double().square().sum()
+                )
         joint_coordinates += jointly_nonzero.sum(dtype=torch.float64)
         conflict_coordinates += (
             jointly_nonzero & ((pg * vg) < 0)
@@ -21709,6 +21808,10 @@ def _objective_gradient_interference(
                 "policy_base_sq": zero.clone(),
                 "policy_aux_sq": zero.clone(),
                 "policy_base_aux_dot": zero.clone(),
+                "additional_squared_norms": {
+                    objective_name: zero.clone()
+                    for objective_name in active_additional_objectives
+                },
             },
         )
         row["policy_sq"] += p_sq
@@ -21717,6 +21820,12 @@ def _objective_gradient_interference(
         row["policy_base_sq"] += b_sq
         row["policy_aux_sq"] += a_sq
         row["policy_base_aux_dot"] += ba
+        for objective_name, gradients in additional_gradients.items():
+            objective_gradient = gradients[parameter_index]
+            if objective_gradient is not None:
+                row["additional_squared_norms"][objective_name] += (
+                    objective_gradient.detach().double().square().sum()
+                )
 
     epsilon = torch.finfo(torch.float64).eps
     policy_norm = torch.sqrt(policy_sq)
@@ -21740,6 +21849,12 @@ def _objective_gradient_interference(
             "cosine": _float(row["dot"] / denom.clamp_min(epsilon))
             if _float(denom) > 0.0
             else None,
+            "additional_objective_grad_norms": {
+                name: _float(torch.sqrt(squared_norm))
+                for name, squared_norm in sorted(
+                    row["additional_squared_norms"].items()
+                )
+            },
         }
         if aux_active:
             base_norm = torch.sqrt(row["policy_base_sq"])
@@ -21760,6 +21875,22 @@ def _objective_gradient_interference(
                 }
             )
     combined_sq = policy_sq + value_sq + 2.0 * dot
+    objective_trunk_grad_l2 = {
+        "policy": _float(policy_norm),
+        "value": _float(value_norm),
+        **(
+            {
+                "policy_base": _float(policy_base_norm),
+                "active_policy": _float(policy_aux_norm),
+            }
+            if aux_active
+            else {}
+        ),
+        **{
+            name: _float(torch.sqrt(squared_norm))
+            for name, squared_norm in sorted(additional_squared_norms.items())
+        },
+    }
     return {
         "available": True,
         "scope": (
@@ -21789,6 +21920,11 @@ def _objective_gradient_interference(
             else None
         ),
         "combined_trunk_grad_norm": _float(torch.sqrt(combined_sq.clamp_min(0.0))),
+        "objective_trunk_grad_l2": objective_trunk_grad_l2,
+        "feature_path_objective_contract": {
+            "public_card": "input_feature_path_not_independent_loss_objective",
+            "meaningful_history": "input_feature_path_not_independent_loss_objective",
+        },
         "modules": modules,
         **(
             {
@@ -26111,6 +26247,299 @@ def _training_draw_accounting(metrics: list[dict]) -> dict[str, int | str | None
         "value_active_training_row_draws": int(value_active),
         "total_training_row_draws": int(base + policy_aux),
         "unique_training_rows_drawn": None,
+    }
+
+
+def _module_optimizer_observability_from_accumulators(
+    *,
+    observations: int,
+    cadence_batches: int,
+    norm_scope: str | None,
+    grad_norm_sums: dict[str, float],
+    grad_norm_max: dict[str, float],
+    delta_norm_sums: dict[str, float],
+    update_rms_sums: dict[str, float],
+    relative_delta_sums: dict[str, float],
+    parameter_counts: dict[str, int],
+) -> dict[str, object] | None:
+    """Materialize one bounded diagnostic prefix from running accumulators."""
+
+    if int(observations) <= 0:
+        return None
+    count = int(observations)
+    return {
+        "schema_version": "module-optimizer-observability-v1",
+        "observed_steps": count,
+        "cadence_batches": int(cadence_batches),
+        "norm_scope": norm_scope,
+        "modules": {
+            module: {
+                "mean_pre_clip_grad_norm": grad_norm_sums[module] / count,
+                "max_pre_clip_grad_norm": grad_norm_max[module],
+                "mean_parameter_delta_norm": (
+                    delta_norm_sums.get(module, 0.0) / count
+                ),
+                "mean_parameter_update_rms": (
+                    update_rms_sums.get(module, 0.0) / count
+                ),
+                "mean_relative_parameter_delta": (
+                    relative_delta_sums.get(module, 0.0) / count
+                ),
+                "parameter_count": int(parameter_counts[module]),
+            }
+            for module in sorted(grad_norm_sums)
+        },
+    }
+
+
+def _aggregate_module_optimizer_observability(
+    metrics: list[dict], *, cadence_batches: int
+) -> dict[str, object] | None:
+    """Merge per-epoch module diagnostics without changing their cadence."""
+
+    observation_count = sum(
+        int(
+            (metric.get("module_optimizer_observability") or {}).get(
+                "observed_steps", 0
+            )
+        )
+        for metric in metrics
+    )
+    if observation_count <= 0:
+        return None
+    modules = sorted(
+        {
+            module
+            for metric in metrics
+            for module in (
+                (metric.get("module_optimizer_observability") or {}).get(
+                    "modules", {}
+                )
+            )
+        }
+    )
+    aggregate: dict[str, object] = {
+        "schema_version": "module-optimizer-observability-v1",
+        "observed_steps": int(observation_count),
+        "cadence_batches": int(cadence_batches),
+        "norm_scope": next(
+            (
+                (metric.get("module_optimizer_observability") or {}).get(
+                    "norm_scope"
+                )
+                for metric in metrics
+                if metric.get("module_optimizer_observability")
+            ),
+            None,
+        ),
+        "modules": {},
+    }
+    aggregate_modules = aggregate["modules"]
+    assert isinstance(aggregate_modules, dict)
+    for module in modules:
+        weighted_grad = 0.0
+        weighted_delta = 0.0
+        weighted_update_rms = 0.0
+        weighted_relative_delta = 0.0
+        maximum = 0.0
+        parameter_count: int | None = None
+        for metric in metrics:
+            observation = metric.get("module_optimizer_observability") or {}
+            count = int(observation.get("observed_steps", 0))
+            row = observation.get("modules", {}).get(module)
+            if not isinstance(row, dict) or count <= 0:
+                continue
+            weighted_grad += float(row["mean_pre_clip_grad_norm"]) * count
+            weighted_delta += float(row["mean_parameter_delta_norm"]) * count
+            weighted_update_rms += float(row["mean_parameter_update_rms"]) * count
+            weighted_relative_delta += (
+                float(row["mean_relative_parameter_delta"]) * count
+            )
+            maximum = max(maximum, float(row["max_pre_clip_grad_norm"]))
+            observed_parameter_count = int(row["parameter_count"])
+            if parameter_count not in {None, observed_parameter_count}:
+                raise RuntimeError(
+                    "optimizer module parameter count changed across epochs"
+                )
+            parameter_count = observed_parameter_count
+        aggregate_modules[module] = {
+            "mean_pre_clip_grad_norm": weighted_grad / observation_count,
+            "max_pre_clip_grad_norm": maximum,
+            "mean_parameter_delta_norm": weighted_delta / observation_count,
+            "mean_parameter_update_rms": weighted_update_rms / observation_count,
+            "mean_relative_parameter_delta": (
+                weighted_relative_delta / observation_count
+            ),
+            "parameter_count": parameter_count,
+        }
+    return aggregate
+
+
+def _checkpoint_dose_telemetry(
+    metrics: list[dict],
+    *,
+    optimizer_step: int,
+    optimizer_observed_steps: int,
+    optimizer_clipped_steps: int,
+    optimizer_zero_objective_steps: int,
+    optimizer_pre_clip_grad_norm_sum: float,
+    optimizer_pre_clip_grad_norm_max: float,
+    objective_gradient_cadence_batches: int,
+    train_diagnostic_cadence_batches: int,
+    public_card_enabled: bool,
+    meaningful_history_enabled: bool,
+) -> dict[str, object]:
+    """Build the exact cumulative learning dose at one saved checkpoint.
+
+    This consumes telemetry already collected by the learner.  It performs no
+    forward/backward pass and is reached only by explicit checkpoint-dose runs.
+    """
+
+    denominators: dict[str, float] = {}
+    observations: list[dict[str, object]] = []
+    for metric in metrics:
+        for name, value in (metric.get("loss_denominators") or {}).items():
+            denominators[str(name)] = denominators.get(str(name), 0.0) + float(
+                value
+            )
+        observations.extend(
+            observation
+            for observation in (
+                (metric.get("objective_gradient_interference") or {}).get(
+                    "observations", []
+                )
+            )
+            if isinstance(observation, dict)
+        )
+
+    active_rows = {
+        "policy_base": int(
+            sum(int(metric.get("policy_base_active_rows", 0)) for metric in metrics)
+        ),
+        "policy_aux": int(
+            sum(int(metric.get("policy_aux_active_rows", 0)) for metric in metrics)
+        ),
+        "value": int(
+            sum(int(metric.get("value_active_rows", 0)) for metric in metrics)
+        ),
+        "policy_kl_anchor": int(
+            sum(
+                int(metric.get("policy_kl_anchor_eligible_rows", 0))
+                for metric in metrics
+            )
+        ),
+    }
+    active_rows["policy_total"] = (
+        active_rows["policy_base"] + active_rows["policy_aux"]
+    )
+    policy_effective = {
+        "base": float(
+            sum(
+                float(metric.get("policy_base_effective_weight_sum", 0.0))
+                for metric in metrics
+            )
+        ),
+        "aux": float(
+            sum(
+                float(metric.get("policy_aux_effective_weight_sum", 0.0))
+                for metric in metrics
+            )
+        ),
+    }
+    policy_effective["total"] = policy_effective["base"] + policy_effective["aux"]
+    denominators["policy_base_loss"] = policy_effective["base"]
+    denominators["active_policy_loss"] = policy_effective["aux"]
+    for metric in metrics:
+        for name, parts in (metric.get("aux_subgoal_loss_parts") or {}).items():
+            if isinstance(parts, dict):
+                key = f"aux_subgoal.{name}"
+                denominators[key] = denominators.get(key, 0.0) + float(
+                    parts.get("weight_sum", 0.0)
+                )
+    module_observability = _aggregate_module_optimizer_observability(
+        metrics, cadence_batches=train_diagnostic_cadence_batches
+    )
+    module_rows = (
+        {}
+        if module_observability is None
+        else module_observability.get("modules", {})
+    )
+    assert isinstance(module_rows, dict)
+
+    def _feature_path(
+        enabled: bool, module_names: tuple[str, ...]
+    ) -> dict[str, object]:
+        selected = {
+            name: module_rows[name] for name in module_names if name in module_rows
+        }
+        return {
+            "enabled": bool(enabled),
+            "independent_loss_objective": False,
+            "measurement": "total_objective_parameter_path_gradient",
+            "status": (
+                "observed"
+                if selected
+                else (
+                    "awaiting_diagnostic_cadence"
+                    if enabled
+                    else "not_configured"
+                )
+            ),
+            "modules": selected,
+        }
+
+    observed_steps = int(optimizer_observed_steps)
+    draws = _training_draw_accounting(metrics)
+    return {
+        "schema_version": CHECKPOINT_DOSE_TELEMETRY_SCHEMA,
+        "optimizer_step": int(optimizer_step),
+        "training_row_draws": {
+            key: draws[key]
+            for key in (
+                "base_training_row_draws",
+                "policy_aux_training_row_draws",
+                "policy_active_training_row_draws",
+                "value_active_training_row_draws",
+                "total_training_row_draws",
+            )
+        },
+        "active_rows": active_rows,
+        "policy_effective_weight_sums": policy_effective,
+        "objective_effective_weight_sums": denominators,
+        "optimizer": {
+            "observed_steps": observed_steps,
+            "clipped_steps": int(optimizer_clipped_steps),
+            "clipped_fraction": (
+                float(optimizer_clipped_steps) / observed_steps
+                if observed_steps > 0
+                else None
+            ),
+            "zero_objective_steps_skipped": int(optimizer_zero_objective_steps),
+            "mean_pre_clip_total_grad_norm": (
+                float(optimizer_pre_clip_grad_norm_sum) / observed_steps
+                if observed_steps > 0
+                else None
+            ),
+            "max_pre_clip_total_grad_norm": float(
+                optimizer_pre_clip_grad_norm_max
+            ),
+        },
+        "shared_trunk_objective_gradients": {
+            "schema_version": "objective-gradient-dose-observations-v2",
+            "cadence_batches": int(objective_gradient_cadence_batches),
+            "observed_steps": len(observations),
+            "observations": observations,
+        },
+        "module_optimizer_observability": module_observability,
+        "feature_path_gradients": {
+            "public_card": _feature_path(
+                public_card_enabled, ("public_card_count_residual",)
+            ),
+            "meaningful_history": _feature_path(
+                meaningful_history_enabled,
+                ("event_encoder", "meaningful_history_residual_gate"),
+            ),
+        },
     }
 
 

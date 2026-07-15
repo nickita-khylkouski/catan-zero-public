@@ -54,7 +54,8 @@ from tools.fleet import a1_coherent_target_rd_executor as coherent_executor  # n
 
 SCHEMA = "a1-b200-active-policy-exposure-campaign-v1"
 ADMISSION_SCHEMA = "a1-coherent-n128-corpus-admission-v1"
-FINGERPRINT_SCHEMA = "a1-b200-active-policy-fingerprint-v1"
+FINGERPRINT_SCHEMA = "a1-b200-active-policy-fingerprint-v2"
+DOSE_TELEMETRY_SCHEMA = "a1-active-policy-dose-telemetry-v2"
 SELECTION_SCHEMA = "a1-b200-active-policy-selection-v2"
 INVENTORY_SCHEMA = "a1-target-eligibility-inventory-v1"
 COMPLETION_RECEIPT_SCHEMA = "a1-coherent-target-rd-completion-receipt-v1"
@@ -1094,6 +1095,82 @@ def _arm_dose_telemetry(
     metrics = report.get("metrics")
     if not isinstance(metrics, list) or not metrics:
         raise CampaignError("active-policy arm report has no epoch metrics")
+    trajectory = report.get("checkpoint_dose_trajectory")
+    if (
+        not isinstance(trajectory, dict)
+        or trajectory.get("schema_version")
+        != one_dose.train_bc.CHECKPOINT_DOSE_TRAJECTORY_SCHEMA
+        or trajectory.get("checkpoint_steps") != list(CHECKPOINT_STEPS)
+        or not isinstance(trajectory.get("checkpoints"), list)
+        or len(trajectory["checkpoints"]) != len(CHECKPOINT_STEPS)
+        or not all(isinstance(row, dict) for row in trajectory["checkpoints"])
+        or [
+            row.get("optimizer_step")
+            for row in trajectory["checkpoints"]
+        ]
+        != list(CHECKPOINT_STEPS)
+    ):
+        raise CampaignError("active-policy checkpoint dose trajectory drifted")
+    checkpoint_trajectory: list[dict[str, Any]] = []
+    previous_active = -1
+    previous_objective_weights: dict[str, float] = {}
+    for expected_step, row in zip(
+        CHECKPOINT_STEPS, trajectory["checkpoints"], strict=True
+    ):
+        if (
+            not isinstance(row, dict)
+            or row.get("schema_version")
+            != one_dose.train_bc.CHECKPOINT_DOSE_TELEMETRY_SCHEMA
+            or int(row.get("optimizer_step", -1)) != expected_step
+            or not isinstance(row.get("active_rows"), dict)
+            or not isinstance(row.get("objective_effective_weight_sums"), dict)
+            or not isinstance(row.get("optimizer"), dict)
+            or not isinstance(row.get("shared_trunk_objective_gradients"), dict)
+        ):
+            raise CampaignError("active-policy checkpoint dose row is malformed")
+        active_total = int(row["active_rows"].get("policy_total", -1))
+        if active_total < previous_active:
+            raise CampaignError("active-policy row exposure is non-monotonic")
+        previous_active = active_total
+        objective_weights = {
+            str(name): float(value)
+            for name, value in row["objective_effective_weight_sums"].items()
+        }
+        if any(
+            not math.isfinite(value)
+            or value < previous_objective_weights.get(name, 0.0)
+            for name, value in objective_weights.items()
+        ) or (
+            previous_objective_weights
+            and objective_weights.keys() != previous_objective_weights.keys()
+        ):
+            raise CampaignError("active-policy objective exposure is non-monotonic")
+        previous_objective_weights = objective_weights
+        optimizer_row = row["optimizer"]
+        observed_steps = int(optimizer_row.get("observed_steps", -1))
+        clipped_steps = int(optimizer_row.get("clipped_steps", -1))
+        clipped_fraction = optimizer_row.get("clipped_fraction")
+        if (
+            observed_steps != expected_step
+            or clipped_steps < 0
+            or clipped_steps > observed_steps
+            or not isinstance(clipped_fraction, (int, float))
+            or abs(float(clipped_fraction) - clipped_steps / observed_steps)
+            > 1.0e-12
+        ):
+            raise CampaignError("active-policy checkpoint clipping dose is invalid")
+        gradient_rows = row["shared_trunk_objective_gradients"].get(
+            "observations"
+        )
+        if not isinstance(gradient_rows, list) or any(
+            int(observation.get("optimizer_step", -1)) > expected_step
+            for observation in gradient_rows
+            if isinstance(observation, dict)
+        ):
+            raise CampaignError(
+                "active-policy checkpoint objective gradient dose is invalid"
+            )
+        checkpoint_trajectory.append(row)
     denominators: dict[str, float] = {}
     for metric in metrics:
         if not isinstance(metric, dict):
@@ -1106,6 +1183,14 @@ def _arm_dose_telemetry(
             if not math.isfinite(numeric) or numeric < 0.0:
                 raise CampaignError("active-policy objective exposure is invalid")
             denominators[str(name)] = denominators.get(str(name), 0.0) + numeric
+        for name, parts in (metric.get("aux_subgoal_loss_parts") or {}).items():
+            if not isinstance(parts, dict):
+                raise CampaignError("active-policy auxiliary objective dose is malformed")
+            key = f"aux_subgoal.{name}"
+            numeric = float(parts.get("weight_sum", math.nan))
+            if not math.isfinite(numeric) or numeric < 0.0:
+                raise CampaignError("active-policy auxiliary objective dose is invalid")
+            denominators[key] = denominators.get(key, 0.0) + numeric
 
     optimizer = metrics[-1].get("optimizer_observability")
     modules = report.get("module_optimizer_observability")
@@ -1171,19 +1256,44 @@ def _arm_dose_telemetry(
         "value_trunk_grad_norm",
         "policy_aux_to_base_grad_norm_ratio",
     )
-    for row in gradient_rows:
+    expected_gradient_steps = tuple(
+        range(OBJECTIVE_GRADIENT_CADENCE, MAX_STEPS + 1, OBJECTIVE_GRADIENT_CADENCE)
+    )
+    for expected_step, row in zip(
+        expected_gradient_steps, gradient_rows, strict=True
+    ):
         if not isinstance(row, dict) or row.get("available") is not True:
             raise CampaignError("active-policy objective gradient probe unavailable")
         values = {key: float(row[key]) for key in required_gradient_fields}
-        if not all(math.isfinite(value) and value >= 0.0 for value in values.values()):
+        objective_norms = row.get("objective_trunk_grad_l2")
+        if (
+            int(row.get("optimizer_step", -1)) != expected_step
+            or not isinstance(objective_norms, dict)
+            or not {"policy", "policy_base", "active_policy", "value"}.issubset(
+                objective_norms
+            )
+            or not all(
+                math.isfinite(float(value)) and float(value) >= 0.0
+                for value in objective_norms.values()
+            )
+            or not all(
+                math.isfinite(value) and value >= 0.0
+                for value in values.values()
+            )
+        ):
             raise CampaignError("active-policy objective gradient metric is invalid")
         normalized_gradients.append(
             {
                 **values,
+                "optimizer_step": int(row.get("optimizer_step", -1)),
                 "scope": str(row.get("scope")),
                 "trunk_gradient_cosine": row.get("trunk_gradient_cosine"),
                 "policy_base_aux_gradient_cosine": row.get(
                     "policy_base_aux_gradient_cosine"
+                ),
+                "objective_trunk_grad_l2": objective_norms,
+                "feature_path_objective_contract": row.get(
+                    "feature_path_objective_contract"
                 ),
             }
         )
@@ -1193,11 +1303,15 @@ def _arm_dose_telemetry(
         "policy_aux": int(report.get("policy_aux_active_rows", -1)),
         "policy_total": int(report.get("policy_total_active_rows", -1)),
         "value": int(report.get("value_active_rows", -1)),
+        "policy_kl_anchor": int(
+            report.get("policy_kl_anchor_eligible_rows", -1)
+        ),
     }
     if (
         active_rows["policy_aux"] != expected_aux_rows
         or active_rows["policy_base"] < 0
         or active_rows["value"] < 0
+        or active_rows["policy_kl_anchor"] < 0
         or active_rows["policy_total"]
         != active_rows["policy_base"] + active_rows["policy_aux"]
     ):
@@ -1225,11 +1339,25 @@ def _arm_dose_telemetry(
         > 1.0e-6 * max(1.0, effective_policy_weights["total"])
     ):
         raise CampaignError("active-policy effective policy mass is invalid")
+    denominators["policy_base_loss"] = effective_policy_weights["base"]
+    denominators["active_policy_loss"] = effective_policy_weights["aux"]
+    terminal_checkpoint_dose = checkpoint_trajectory[-1]
+    if (
+        terminal_checkpoint_dose["active_rows"] != active_rows
+        or terminal_checkpoint_dose["policy_effective_weight_sums"]
+        != effective_policy_weights
+        or terminal_checkpoint_dose["objective_effective_weight_sums"]
+        != denominators
+    ):
+        raise CampaignError(
+            "active-policy terminal checkpoint dose does not match report totals"
+        )
     payload = {
-        "schema_version": "a1-active-policy-dose-telemetry-v1",
+        "schema_version": DOSE_TELEMETRY_SCHEMA,
         "active_rows": active_rows,
         "policy_effective_weight_sums": effective_policy_weights,
         "objective_effective_weight_sums": denominators,
+        "checkpoint_trajectory": checkpoint_trajectory,
         "optimizer": {
             "observed_steps": MAX_STEPS,
             "clipped_steps": clipped,
@@ -1250,6 +1378,9 @@ def _arm_dose_telemetry(
             "observed_steps": len(normalized_gradients),
             "observations": normalized_gradients,
         },
+        "feature_path_gradients": terminal_checkpoint_dose.get(
+            "feature_path_gradients"
+        ),
     }
     payload["dose_telemetry_sha256"] = _value_sha256(payload)
     return payload
@@ -1382,6 +1513,10 @@ def _fingerprint_arm(
     output_root = arm_root / "fingerprints"
     commands: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
+    checkpoint_dose_by_step = {
+        int(row["optimizer_step"]): row
+        for row in completed["dose_telemetry"]["checkpoint_trajectory"]
+    }
     for step in CHECKPOINT_STEPS:
         checkpoint = _regular_file(
             _step_checkpoint(arm_root, step), where=f"arm {arm} step {step} checkpoint"
@@ -1435,18 +1570,46 @@ def _fingerprint_arm(
             drift_output, where=f"arm {arm} step {step} layer drift"
         )
         fingerprint = functional.get("functional_dose_fingerprint")
+        if not isinstance(fingerprint, dict):
+            raise CampaignError(
+                f"arm {arm} step {step} functional fingerprint is malformed"
+            )
         parent_kl = (
             fingerprint.get("kl_parent_candidate_mean")
-            if isinstance(fingerprint, dict)
-            else None
         )
         closure = functional.get("teacher_gap", {}).get(
             "active_policy_teacher_gap_closure"
         )
         trunk = _trunk_relative_l2(drift)
+        functional_metrics = {
+            key: fingerprint.get(key)
+            for key in (
+                "eligible_rows",
+                "kl_parent_candidate_mean",
+                "kl_candidate_parent_mean",
+                "top1_flip_rate",
+                "parent_policy_entropy_mean",
+                "candidate_policy_entropy_mean",
+                "policy_entropy_delta",
+                "value_mean_absolute_delta",
+                "value_root_mean_square_delta",
+            )
+        }
+        drift_groups = drift.get("groups")
+        if not isinstance(drift_groups, dict) or not drift_groups:
+            raise CampaignError(
+                f"arm {arm} step {step} has no layerwise drift groups"
+            )
+        relative_l2_by_group = {
+            str(name): row.get("relative_l2")
+            for name, row in sorted(drift_groups.items())
+            if isinstance(row, dict)
+        }
         if (
             functional.get("schema_version") != "posthoc-checkpoint-teacher-gap/v1"
             or not isinstance(fingerprint, dict)
+            or fingerprint.get("schema_version")
+            != "checkpoint-functional-dose-fingerprint-v1"
             or fingerprint.get("surface")
             != "validation_policy_active_multi_action_rows"
             or functional.get("inputs", {}).get("checkpoint", {}).get("sha256")
@@ -1461,8 +1624,18 @@ def _fingerprint_arm(
                 isinstance(value, (int, float)) and math.isfinite(float(value))
                 for value in (parent_kl, closure, trunk)
             )
+            or not all(
+                isinstance(value, (int, float)) and math.isfinite(float(value))
+                for value in functional_metrics.values()
+            )
+            or not all(
+                value is None
+                or (isinstance(value, (int, float)) and math.isfinite(float(value)))
+                for value in relative_l2_by_group.values()
+            )
             or float(parent_kl) < 0.0
             or trunk < 0.0
+            or step not in checkpoint_dose_by_step
         ):
             raise CampaignError(f"arm {arm} step {step} fingerprint semantics drifted")
         records.append(
@@ -1473,16 +1646,23 @@ def _fingerprint_arm(
                 "functional": {
                     "path": str(functional_path),
                     "file_sha256": _file_sha256(functional_path),
+                    "schema_version": fingerprint["schema_version"],
+                    "surface": fingerprint["surface"],
                     "parent_kl": float(parent_kl),
                     "teacher_gap_closure": float(closure),
                     "eligible_rows": int(fingerprint["eligible_rows"]),
+                    "metrics": functional_metrics,
                 },
                 "layer_drift": {
                     "path": str(drift_path),
                     "file_sha256": _file_sha256(drift_path),
+                    "schema_version": drift["schema_version"],
                     "trunk_relative_l2": trunk,
                     "global_relative_l2": float(drift["global"]["relative_l2"]),
+                    "relative_l2_by_group": relative_l2_by_group,
+                    "groups": drift_groups,
                 },
+                "dose_telemetry": checkpoint_dose_by_step[step],
             }
         )
     if not go:
@@ -1545,7 +1725,7 @@ def _select(
             != campaign["lineage_contract"]["upgraded_initializer_sha256"]
             or not isinstance(fingerprint.get("dose_telemetry"), dict)
             or fingerprint["dose_telemetry"].get("schema_version")
-            != "a1-active-policy-dose-telemetry-v1"
+            != DOSE_TELEMETRY_SCHEMA
             or fingerprint["dose_telemetry"].get("dose_telemetry_sha256")
             != _value_sha256(
                 {
@@ -1554,6 +1734,20 @@ def _select(
                     if key != "dose_telemetry_sha256"
                 }
             )
+            or not isinstance(
+                fingerprint["dose_telemetry"].get("checkpoint_trajectory"), list
+            )
+            or len(fingerprint["dose_telemetry"]["checkpoint_trajectory"])
+            != len(CHECKPOINT_STEPS)
+            or not all(
+                isinstance(row, dict)
+                for row in fingerprint["dose_telemetry"]["checkpoint_trajectory"]
+            )
+            or [
+                row.get("optimizer_step")
+                for row in fingerprint["dose_telemetry"]["checkpoint_trajectory"]
+            ]
+            != list(CHECKPOINT_STEPS)
             or not isinstance(campaign_ref, dict)
             or campaign_ref.get("campaign_sha256") != campaign["campaign_sha256"]
             or campaign_ref.get("file_sha256") != _file_sha256(campaign_path)
@@ -1561,6 +1755,10 @@ def _select(
             or [item.get("step") for item in checkpoints] != list(CHECKPOINT_STEPS)
         ):
             raise CampaignError(f"arm {arm} fingerprint is not bound to this campaign")
+        top_level_dose_by_step = {
+            int(row["optimizer_step"]): row
+            for row in fingerprint["dose_telemetry"]["checkpoint_trajectory"]
+        }
         candidates: list[dict[str, Any]] = []
         for item in checkpoints:
             try:
@@ -1573,12 +1771,23 @@ def _select(
                 parent_kl = float(item["functional"]["parent_kl"])
                 trunk = float(item["layer_drift"]["trunk_relative_l2"])
                 closure = float(item["functional"]["teacher_gap_closure"])
+                checkpoint_dose = item["dose_telemetry"]
             except (KeyError, TypeError, ValueError) as error:
                 raise CampaignError(
                     f"arm {arm} fingerprint metrics are malformed"
                 ) from error
             if checkpoint_sha256 != _file_sha256(checkpoint):
                 raise CampaignError(f"arm {arm} step {step} checkpoint bytes drifted")
+            if (
+                not isinstance(checkpoint_dose, dict)
+                or checkpoint_dose.get("schema_version")
+                != one_dose.train_bc.CHECKPOINT_DOSE_TELEMETRY_SCHEMA
+                or int(checkpoint_dose.get("optimizer_step", -1)) != step
+                or checkpoint_dose != top_level_dose_by_step.get(step)
+            ):
+                raise CampaignError(
+                    f"arm {arm} step {step} checkpoint dose drifted"
+                )
             if (
                 not math.isfinite(parent_kl)
                 or parent_kl < 0.0

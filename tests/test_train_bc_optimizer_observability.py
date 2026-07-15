@@ -207,12 +207,14 @@ def test_objective_gradient_interference_separates_active_policy_aux_branch() ->
     base = shared.sum()
     aux = 2.0 * shared.sum()
     value = -shared.sum()
+    belief = 3.0 * shared.sum()
 
     observed = train_bc._objective_gradient_interference(
         SimpleNamespace(model=model),
         policy_objective=base + aux,
         policy_aux_objective=aux,
         value_objective=value,
+        additional_objectives={"belief_resource": belief},
     )
 
     root5 = 5.0**0.5
@@ -221,7 +223,91 @@ def test_objective_gradient_interference_separates_active_policy_aux_branch() ->
     assert observed["policy_trunk_grad_norm"] == pytest.approx(3.0 * root5)
     assert observed["policy_aux_to_base_grad_norm_ratio"] == pytest.approx(2.0)
     assert observed["policy_base_aux_gradient_cosine"] == pytest.approx(1.0)
+    assert observed["objective_trunk_grad_l2"] == pytest.approx(
+        {
+            "policy": 3.0 * root5,
+            "policy_base": root5,
+            "active_policy": 2.0 * root5,
+            "value": root5,
+            "belief_resource": 3.0 * root5,
+        }
+    )
     assert observed["modules"]["blocks.0"]["policy_aux_grad_norm"] == pytest.approx(
         2.0 * root5
     )
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
+    metric = {
+        "samples": 64,
+        "policy_base_active_rows": 20,
+        "policy_aux_active_rows": 12,
+        "policy_base_effective_weight_sum": 18.0,
+        "policy_aux_effective_weight_sum": 9.0,
+        "value_active_rows": 60,
+        "policy_kl_anchor_eligible_rows": 16,
+        "loss_denominators": {"policy_loss": 27.0, "value_loss": 51.0},
+        "objective_gradient_interference": {
+            "observations": [
+                {
+                    "available": True,
+                    "optimizer_step": 8,
+                    "objective_trunk_grad_l2": {"policy": 0.5, "value": 0.25},
+                }
+            ]
+        },
+        "module_optimizer_observability": {
+            "observed_steps": 1,
+            "norm_scope": "global_replicated",
+            "modules": {
+                "public_card_count_residual": {
+                    "mean_pre_clip_grad_norm": 0.4,
+                    "max_pre_clip_grad_norm": 0.4,
+                    "mean_parameter_delta_norm": 0.01,
+                    "mean_parameter_update_rms": 0.001,
+                    "mean_relative_parameter_delta": 0.02,
+                    "parameter_count": 8,
+                },
+                "event_encoder": {
+                    "mean_pre_clip_grad_norm": 0.3,
+                    "max_pre_clip_grad_norm": 0.3,
+                    "mean_parameter_delta_norm": 0.02,
+                    "mean_parameter_update_rms": 0.002,
+                    "mean_relative_parameter_delta": 0.03,
+                    "parameter_count": 16,
+                },
+            },
+        },
+    }
+
+    dose = train_bc._checkpoint_dose_telemetry(
+        [metric],
+        optimizer_step=8,
+        optimizer_observed_steps=8,
+        optimizer_clipped_steps=2,
+        optimizer_zero_objective_steps=0,
+        optimizer_pre_clip_grad_norm_sum=4.0,
+        optimizer_pre_clip_grad_norm_max=0.8,
+        objective_gradient_cadence_batches=8,
+        train_diagnostic_cadence_batches=8,
+        public_card_enabled=True,
+        meaningful_history_enabled=True,
+    )
+
+    assert dose["schema_version"] == train_bc.CHECKPOINT_DOSE_TELEMETRY_SCHEMA
+    assert dose["active_rows"]["policy_total"] == 32
+    assert dose["policy_effective_weight_sums"]["total"] == pytest.approx(27.0)
+    assert dose["optimizer"]["clipped_fraction"] == pytest.approx(0.25)
+    assert dose["shared_trunk_objective_gradients"]["observed_steps"] == 1
+    assert dose["feature_path_gradients"]["public_card"]["status"] == "observed"
+    assert (
+        dose["feature_path_gradients"]["meaningful_history"]["status"]
+        == "observed"
+    )
+    assert (
+        dose["feature_path_gradients"]["public_card"][
+            "independent_loss_objective"
+        ]
+        is False
+    )
