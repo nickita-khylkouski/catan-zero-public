@@ -75,6 +75,8 @@ GLOBAL_BATCH_SIZE = WORLD_SIZE * LOCAL_BATCH_SIZE
 MAX_STEPS = 128
 CHECKPOINT_STEPS = (8, 12, 16, 32, 64, 128)
 INTERMEDIATE_STEPS = CHECKPOINT_STEPS[:-1]
+TRAIN_DIAGNOSTIC_CADENCE = 16
+OBJECTIVE_GRADIENT_CADENCE = 64
 BASE_AUX_ACTIVE_BATCH_SIZE = 463
 ARM_MULTIPLIERS = {
     "P10": 0.10,
@@ -842,6 +844,12 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
         != ",".join(map(str, INTERMEDIATE_STEPS))
         or int(_option(command, "--policy-aux-active-batch-size"))
         != int(ARMS[arm]["policy_aux_active_batch_size"])
+        or int(_option(command, "--train-diagnostics-every-batches"))
+        != TRAIN_DIAGNOSTIC_CADENCE
+        or int(
+            _option(command, "--objective-gradient-interference-every-batches")
+        )
+        != OBJECTIVE_GRADIENT_CADENCE
         # Parent KL is an observed selection fingerprint in this campaign, not
         # an optimizer constraint.  Enabling the adaptive controller would
         # cause each exposure arm to follow a different effective objective.
@@ -896,6 +904,175 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
     return plan
 
 
+def _arm_dose_telemetry(
+    report: Mapping[str, Any], *, expected_aux_rows: int
+) -> dict[str, Any]:
+    """Project already-collected learner evidence into one comparable dose row."""
+
+    metrics = report.get("metrics")
+    if not isinstance(metrics, list) or not metrics:
+        raise CampaignError("active-policy arm report has no epoch metrics")
+    denominators: dict[str, float] = {}
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            raise CampaignError("active-policy arm epoch metric is malformed")
+        rows = metric.get("loss_denominators")
+        if not isinstance(rows, dict):
+            raise CampaignError("active-policy arm lacks objective denominators")
+        for name, value in rows.items():
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric < 0.0:
+                raise CampaignError("active-policy objective exposure is invalid")
+            denominators[str(name)] = denominators.get(str(name), 0.0) + numeric
+
+    optimizer = metrics[-1].get("optimizer_observability")
+    modules = report.get("module_optimizer_observability")
+    gradients = report.get("objective_gradient_interference")
+    if (
+        not isinstance(optimizer, dict)
+        or int(optimizer.get("observed_steps", -1)) != MAX_STEPS
+        or not isinstance(modules, dict)
+        or int(modules.get("observed_steps", -1))
+        != MAX_STEPS // TRAIN_DIAGNOSTIC_CADENCE
+        or int(modules.get("cadence_batches", -1)) != TRAIN_DIAGNOSTIC_CADENCE
+        or not isinstance(gradients, dict)
+        or int(gradients.get("cadence_batches", -1))
+        != OBJECTIVE_GRADIENT_CADENCE
+        or int(gradients.get("observed_steps", -1))
+        != MAX_STEPS // OBJECTIVE_GRADIENT_CADENCE
+    ):
+        raise CampaignError("active-policy optimizer telemetry cadence drifted")
+    clipped = int(optimizer.get("clipped_steps", -1))
+    clipped_fraction = float(optimizer.get("clipped_fraction", math.nan))
+    if (
+        clipped < 0
+        or clipped > MAX_STEPS
+        or not math.isfinite(clipped_fraction)
+        or not 0.0 <= clipped_fraction <= 1.0
+        or abs(clipped_fraction - clipped / MAX_STEPS) > 1.0e-12
+    ):
+        raise CampaignError("active-policy clipping telemetry is invalid")
+
+    module_rows = modules.get("modules")
+    if not isinstance(module_rows, dict) or not module_rows:
+        raise CampaignError("active-policy module update telemetry is empty")
+    normalized_modules: dict[str, Any] = {}
+    for name, row in sorted(module_rows.items()):
+        if not isinstance(row, dict):
+            raise CampaignError("active-policy module update row is malformed")
+        numeric = {
+            key: float(row[key])
+            for key in (
+                "mean_pre_clip_grad_norm",
+                "max_pre_clip_grad_norm",
+                "mean_parameter_delta_norm",
+                "mean_parameter_update_rms",
+                "mean_relative_parameter_delta",
+            )
+        }
+        parameter_count = int(row.get("parameter_count", 0))
+        if (
+            parameter_count <= 0
+            or not all(math.isfinite(value) and value >= 0.0 for value in numeric.values())
+        ):
+            raise CampaignError("active-policy module update metric is invalid")
+        normalized_modules[str(name)] = {**numeric, "parameter_count": parameter_count}
+
+    gradient_rows = gradients.get("observations")
+    if not isinstance(gradient_rows, list) or len(gradient_rows) != 2:
+        raise CampaignError("active-policy objective gradient observations are incomplete")
+    normalized_gradients = []
+    required_gradient_fields = (
+        "policy_trunk_grad_norm",
+        "policy_base_trunk_grad_norm",
+        "policy_aux_trunk_grad_norm",
+        "value_trunk_grad_norm",
+        "policy_aux_to_base_grad_norm_ratio",
+    )
+    for row in gradient_rows:
+        if not isinstance(row, dict) or row.get("available") is not True:
+            raise CampaignError("active-policy objective gradient probe unavailable")
+        values = {key: float(row[key]) for key in required_gradient_fields}
+        if not all(math.isfinite(value) and value >= 0.0 for value in values.values()):
+            raise CampaignError("active-policy objective gradient metric is invalid")
+        normalized_gradients.append(
+            {
+                **values,
+                "scope": str(row.get("scope")),
+                "trunk_gradient_cosine": row.get("trunk_gradient_cosine"),
+                "policy_base_aux_gradient_cosine": row.get(
+                    "policy_base_aux_gradient_cosine"
+                ),
+            }
+        )
+
+    active_rows = {
+        "policy_base": int(report.get("policy_base_active_rows", -1)),
+        "policy_aux": int(report.get("policy_aux_active_rows", -1)),
+        "policy_total": int(report.get("policy_total_active_rows", -1)),
+        "value": int(report.get("value_active_rows", -1)),
+    }
+    if (
+        active_rows["policy_aux"] != expected_aux_rows
+        or active_rows["policy_base"] < 0
+        or active_rows["value"] < 0
+        or active_rows["policy_total"]
+        != active_rows["policy_base"] + active_rows["policy_aux"]
+    ):
+        raise CampaignError("active-policy objective row dose is invalid")
+    effective_policy_weights = {
+        "base": float(report.get("policy_base_effective_weight_sum", math.nan)),
+        "aux": float(report.get("policy_aux_effective_weight_sum", math.nan)),
+        "total": float(report.get("policy_total_effective_weight_sum", math.nan)),
+    }
+    if (
+        not all(
+            math.isfinite(value) and value >= 0.0
+            for value in effective_policy_weights.values()
+        )
+        or abs(
+            effective_policy_weights["total"]
+            - effective_policy_weights["base"]
+            - effective_policy_weights["aux"]
+        )
+        > 1.0e-6 * max(1.0, effective_policy_weights["total"])
+        or abs(
+            effective_policy_weights["total"]
+            - denominators.get("policy_loss", math.nan)
+        )
+        > 1.0e-6 * max(1.0, effective_policy_weights["total"])
+    ):
+        raise CampaignError("active-policy effective policy mass is invalid")
+    payload = {
+        "schema_version": "a1-active-policy-dose-telemetry-v1",
+        "active_rows": active_rows,
+        "policy_effective_weight_sums": effective_policy_weights,
+        "objective_effective_weight_sums": denominators,
+        "optimizer": {
+            "observed_steps": MAX_STEPS,
+            "clipped_steps": clipped,
+            "clipped_fraction": clipped_fraction,
+            "mean_pre_clip_total_grad_norm": float(
+                optimizer["mean_pre_clip_total_grad_norm"]
+            ),
+            "max_pre_clip_total_grad_norm": float(
+                optimizer["max_pre_clip_total_grad_norm"]
+            ),
+        },
+        "module_optimizer_observability": {
+            "observed_steps": int(modules["observed_steps"]),
+            "norm_scope": str(modules.get("norm_scope")),
+            "modules": normalized_modules,
+        },
+        "shared_trunk_objective_gradients": {
+            "observed_steps": len(normalized_gradients),
+            "observations": normalized_gradients,
+        },
+    }
+    payload["dose_telemetry_sha256"] = _value_sha256(payload)
+    return payload
+
+
 def _verify_completed_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
     arm_root = Path(campaign["output_root"]) / "arms" / arm
     receipt_path, receipt = _load_json(
@@ -938,6 +1115,9 @@ def _verify_completed_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, An
             or record.get("same_training_trajectory") is not True
         ):
             raise CampaignError(f"arm {arm} step {step} checkpoint drifted")
+    dose_telemetry = _arm_dose_telemetry(
+        report, expected_aux_rows=expected_aux_rows
+    )
     return {
         "arm": arm,
         "receipt": str(receipt_path),
@@ -947,6 +1127,7 @@ def _verify_completed_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, An
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": _file_sha256(checkpoint),
         "policy_aux_active_rows": expected_aux_rows,
+        "dose_telemetry": dose_telemetry,
     }
 
 
@@ -1138,6 +1319,7 @@ def _fingerprint_arm(
         "policy_aux_active_batch_size": ARMS[arm][
             "policy_aux_active_batch_size"
         ],
+        "dose_telemetry": completed["dose_telemetry"],
         "parent_checkpoint_sha256": _file_sha256(parent),
         "checkpoints": records,
     }
@@ -1179,6 +1361,17 @@ def _select(
             != ARMS[arm]["policy_aux_active_batch_size"]
             or fingerprint.get("parent_checkpoint_sha256")
             != campaign["lineage_contract"]["upgraded_initializer_sha256"]
+            or not isinstance(fingerprint.get("dose_telemetry"), dict)
+            or fingerprint["dose_telemetry"].get("schema_version")
+            != "a1-active-policy-dose-telemetry-v1"
+            or fingerprint["dose_telemetry"].get("dose_telemetry_sha256")
+            != _value_sha256(
+                {
+                    key: value
+                    for key, value in fingerprint["dose_telemetry"].items()
+                    if key != "dose_telemetry_sha256"
+                }
+            )
             or not isinstance(campaign_ref, dict)
             or campaign_ref.get("campaign_sha256") != campaign["campaign_sha256"]
             or campaign_ref.get("file_sha256") != _file_sha256(campaign_path)
@@ -1222,6 +1415,9 @@ def _select(
             "terminal_teacher_gap_closure": closure,
             "within_drift_budgets": within,
             "positive_terminal_teacher_gap_closure": positive,
+            "dose_telemetry_sha256": fingerprint["dose_telemetry"][
+                "dose_telemetry_sha256"
+            ],
         }
     if not eligible:
         raise CampaignError("no active-policy exposure arm remained inside both drift budgets")

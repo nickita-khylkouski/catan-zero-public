@@ -11406,8 +11406,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_module_grad_norm_sums: dict[str, float] = {}
         epoch_module_grad_norm_max: dict[str, float] = {}
         epoch_module_delta_norm_sums: dict[str, float] = {}
+        epoch_module_update_rms_sums: dict[str, float] = {}
+        epoch_module_relative_delta_sums: dict[str, float] = {}
+        epoch_module_parameter_counts: dict[str, int] = {}
         epoch_module_observations = 0
         epoch_module_norm_scope: str | None = None
+        epoch_objective_gradient_observations: list[dict[str, object]] = []
         if bool(getattr(data, "policy_distillation_scope_authenticated", False)):
             component_ids = tuple(data.component_ids)
             base_rows = train_indices[np.asarray(order, dtype=np.int64)]
@@ -11499,6 +11503,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_count = 0
         epoch_active_count = 0.0
         epoch_aux_active_count = 0.0
+        epoch_policy_base_effective_weight = 0.0
+        epoch_policy_aux_effective_weight = 0.0
         epoch_value_active_count = 0.0
         epoch_anchor_eligible_count = 0.0
         epoch_policy_kl_weighted_objective_sum = 0.0
@@ -11801,6 +11807,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     module_delta_norms = optimizer_observability[
                         "module_parameter_delta_norms"
                     ]
+                    module_update_rms = optimizer_observability[
+                        "module_parameter_update_rms"
+                    ]
+                    module_relative_delta = optimizer_observability[
+                        "module_relative_parameter_delta"
+                    ]
+                    module_parameter_counts = optimizer_observability[
+                        "module_parameter_counts"
+                    ]
                     epoch_module_observations += 1
                     scope = str(optimizer_observability["module_norm_scope"])
                     if epoch_module_norm_scope not in {None, scope}:
@@ -11818,6 +11833,28 @@ def main(argv: Sequence[str] | None = None) -> None:
                         epoch_module_delta_norm_sums[module] = (
                             epoch_module_delta_norm_sums.get(module, 0.0)
                             + float(norm)
+                        )
+                        epoch_module_update_rms_sums[module] = (
+                            epoch_module_update_rms_sums.get(module, 0.0)
+                            + float(module_update_rms[module])
+                        )
+                        epoch_module_relative_delta_sums[module] = (
+                            epoch_module_relative_delta_sums.get(module, 0.0)
+                            + float(module_relative_delta[module])
+                        )
+                        count = int(module_parameter_counts[module])
+                        previous_count = epoch_module_parameter_counts.get(module)
+                        if previous_count not in {None, count}:
+                            raise RuntimeError(
+                                "optimizer module parameter count changed mid-dose"
+                            )
+                        epoch_module_parameter_counts[module] = count
+                    objective_observation = optimizer_observability.get(
+                        "objective_gradient_interference"
+                    )
+                    if isinstance(objective_observation, dict):
+                        epoch_objective_gradient_observations.append(
+                            objective_observation
                         )
                     _rank0_print(
                         json.dumps(
@@ -11860,6 +11897,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             epoch_active_count += active_count
             epoch_aux_active_count += float(
                 batch_metrics.get("policy_aux_active_count", 0)
+            )
+            epoch_policy_base_effective_weight += float(
+                batch_metrics.get("policy_base_loss_weight_sum", 0.0)
+            )
+            epoch_policy_aux_effective_weight += float(
+                batch_metrics.get("policy_aux_loss_weight_sum", 0.0)
             )
             epoch_value_active_count += float(
                 batch_metrics.get("value_active_count", 0)
@@ -12111,6 +12154,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         active_count_total = _reduce_scalar_sum(float(epoch_active_count), ddp)
         aux_active_count_total = _reduce_scalar_sum(float(epoch_aux_active_count), ddp)
+        policy_base_effective_weight_total = _reduce_scalar_sum(
+            float(epoch_policy_base_effective_weight), ddp
+        )
+        policy_aux_effective_weight_total = _reduce_scalar_sum(
+            float(epoch_policy_aux_effective_weight), ddp
+        )
         value_active_count_total = _reduce_scalar_sum(
             float(epoch_value_active_count), ddp
         )
@@ -12151,6 +12200,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                             epoch_module_delta_norm_sums.get(module, 0.0)
                             / epoch_module_observations
                         ),
+                        "mean_parameter_update_rms": (
+                            epoch_module_update_rms_sums.get(module, 0.0)
+                            / epoch_module_observations
+                        ),
+                        "mean_relative_parameter_delta": (
+                            epoch_module_relative_delta_sums.get(module, 0.0)
+                            / epoch_module_observations
+                        ),
+                        "parameter_count": epoch_module_parameter_counts[module],
                     }
                     for module in sorted(epoch_module_grad_norm_sums)
                 },
@@ -12340,6 +12398,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_total_active_rows": int(
                     active_count_total + aux_active_count_total
                 ),
+                "policy_base_effective_weight_sum": (
+                    policy_base_effective_weight_total
+                ),
+                "policy_aux_effective_weight_sum": (
+                    policy_aux_effective_weight_total
+                ),
+                "policy_total_effective_weight_sum": (
+                    policy_base_effective_weight_total
+                    + policy_aux_effective_weight_total
+                ),
                 "value_active_rows": int(value_active_count_total),
                 "policy_kl_anchor_eligible_rows": int(
                     anchor_eligible_count_total
@@ -12358,6 +12426,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "value_component_active_dose": value_component_active_dose,
                 "training_strata_dose": training_strata_dose,
                 "module_optimizer_observability": module_optimizer_observability,
+                "objective_gradient_interference": {
+                    "schema_version": "objective-gradient-dose-observations-v1",
+                    "observed_steps": len(epoch_objective_gradient_observations),
+                    "observations": epoch_objective_gradient_observations,
+                },
                 "value_loss": value_loss_epoch,
                 "scalar_value_mse_diagnostic": value_loss_epoch,
                 "final_vp_loss": final_vp_loss_epoch,
@@ -12732,7 +12805,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         for module in modules:
             weighted_grad = 0.0
             weighted_delta = 0.0
+            weighted_update_rms = 0.0
+            weighted_relative_delta = 0.0
             maximum = 0.0
+            parameter_count: int | None = None
             for metric in metrics:
                 observation = metric.get("module_optimizer_observability") or {}
                 count = int(observation.get("observed_steps", 0))
@@ -12741,12 +12817,45 @@ def main(argv: Sequence[str] | None = None) -> None:
                     continue
                 weighted_grad += float(row["mean_pre_clip_grad_norm"]) * count
                 weighted_delta += float(row["mean_parameter_delta_norm"]) * count
+                weighted_update_rms += float(row["mean_parameter_update_rms"]) * count
+                weighted_relative_delta += (
+                    float(row["mean_relative_parameter_delta"]) * count
+                )
                 maximum = max(maximum, float(row["max_pre_clip_grad_norm"]))
+                observed_parameter_count = int(row["parameter_count"])
+                if parameter_count not in {None, observed_parameter_count}:
+                    raise RuntimeError(
+                        "optimizer module parameter count changed across epochs"
+                    )
+                parameter_count = observed_parameter_count
             module_optimizer_observability["modules"][module] = {
                 "mean_pre_clip_grad_norm": weighted_grad / module_observation_count,
                 "max_pre_clip_grad_norm": maximum,
                 "mean_parameter_delta_norm": weighted_delta / module_observation_count,
+                "mean_parameter_update_rms": (
+                    weighted_update_rms / module_observation_count
+                ),
+                "mean_relative_parameter_delta": (
+                    weighted_relative_delta / module_observation_count
+                ),
+                "parameter_count": parameter_count,
             }
+    objective_gradient_observations = [
+        observation
+        for metric in metrics
+        for observation in (
+            (metric.get("objective_gradient_interference") or {}).get(
+                "observations", []
+            )
+        )
+        if isinstance(observation, dict)
+    ]
+    objective_gradient_interference = {
+        "schema_version": "objective-gradient-dose-observations-v1",
+        "cadence_batches": int(args.objective_gradient_interference_every_batches),
+        "observed_steps": len(objective_gradient_observations),
+        "observations": objective_gradient_observations,
+    }
     value_component_active_dose = None
     if bool(getattr(data, "value_training_scope_authenticated", False)):
         value_component_active_dose = {
@@ -13016,6 +13125,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_component_active_dose": policy_component_active_dose,
         "training_strata_dose": training_strata_dose,
         "module_optimizer_observability": module_optimizer_observability,
+        "objective_gradient_interference": objective_gradient_interference,
         "value_component_active_dose": value_component_active_dose,
         "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
         "policy_component_phase_active_dose": policy_component_phase_active_dose,
@@ -13090,6 +13200,24 @@ def main(argv: Sequence[str] | None = None) -> None:
             sum(
                 int(metric.get("policy_base_active_rows", 0))
                 + int(metric.get("policy_aux_active_rows", 0))
+                for metric in metrics
+            )
+        ),
+        "policy_base_effective_weight_sum": float(
+            sum(
+                float(metric.get("policy_base_effective_weight_sum", 0.0))
+                for metric in metrics
+            )
+        ),
+        "policy_aux_effective_weight_sum": float(
+            sum(
+                float(metric.get("policy_aux_effective_weight_sum", 0.0))
+                for metric in metrics
+            )
+        ),
+        "policy_total_effective_weight_sum": float(
+            sum(
+                float(metric.get("policy_total_effective_weight_sum", 0.0))
                 for metric in metrics
             )
         ),
@@ -13517,6 +13645,8 @@ def _train_candidate_batch(
         "q_loss": 0.0,
         "policy_loss_weighted_sum": float(policy_loss_sum.item()),
         "policy_loss_weight_sum": float(policy_loss_denominator.item()),
+        "policy_base_loss_weight_sum": float(policy_loss_denominator.item()),
+        "policy_aux_loss_weight_sum": 0.0,
         "value_loss_weighted_sum": float(value_loss_sum.item()),
         "value_loss_weight_sum": float(value_loss_denominator.item()),
         "final_vp_loss_weighted_sum": 0.0,
@@ -14265,6 +14395,8 @@ def _train_xdim_batch(
         policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(
             per_sample_loss, policy_weights
         )
+        policy_base_loss_denominator = policy_loss_denominator
+        policy_aux_loss_sum, _ = _zero_loss_parts(policy.device)
         policy_aux_active_count = 0
         if policy_aux_batch is not None:
             if policy_aux_data is None or policy_aux_sample_weights is None:
@@ -14319,6 +14451,7 @@ def _train_xdim_batch(
             else:
                 aux_per_sample = aux_hard
             aux_sum, aux_denominator = _weighted_loss_parts(aux_per_sample, aux_weights)
+            policy_aux_loss_sum = aux_sum
             policy_loss_sum = policy_loss_sum + aux_sum
             policy_loss_denominator = policy_loss_denominator + aux_denominator
             policy_aux_active_count = int(len(policy_aux_batch))
@@ -14620,6 +14753,19 @@ def _train_xdim_batch(
                 + float(q_loss_weight) * q_loss
                 + float(policy_kl_anchor_weight) * kl_anchor_loss
             )
+            policy_aux_objective = None
+            if policy_aux_batch is not None:
+                # The auxiliary active-policy branch is normalized jointly with
+                # the base branch.  Its effective objective contribution must
+                # therefore use the *combined* denominator, not an independent
+                # auxiliary mean.  This is reporting-only and reuses the exact
+                # forward graph consumed by the real optimizer update.
+                policy_aux_objective = float(policy_loss_weight) * (
+                    _weighted_mean_from_parts(
+                        policy_aux_loss_sum,
+                        policy_loss_denominator,
+                    )
+                )
             value_objective = (
                 float(value_loss_weight) * value_loss
                 + float(final_vp_loss_weight) * final_vp_loss
@@ -14632,6 +14778,7 @@ def _train_xdim_batch(
                 policy,
                 policy_objective=policy_objective,
                 value_objective=value_objective,
+                policy_aux_objective=policy_aux_objective,
                 value_trunk_grad_scale=value_trunk_grad_scale,
             )
         aux_gradient_geometry = None
@@ -14826,6 +14973,12 @@ def _train_xdim_batch(
         "scalar_value_mse_diagnostic": float(value_loss.item()),
         "policy_loss_weighted_sum": float(policy_loss_sum.item()),
         "policy_loss_weight_sum": float(policy_loss_denominator.item()),
+        "policy_base_loss_weight_sum": float(
+            policy_base_loss_denominator.item()
+        ),
+        "policy_aux_loss_weight_sum": float(aux_denominator.item())
+        if policy_aux_batch is not None
+        else 0.0,
         "value_loss_weighted_sum": float(value_loss_sum.item()),
         "value_loss_weight_sum": float(value_loss_denominator.item()),
         "final_vp_loss_weighted_sum": float(final_vp_loss_sum.item()),
@@ -21318,6 +21471,7 @@ def _objective_gradient_interference(
     *,
     policy_objective,
     value_objective,
+    policy_aux_objective=None,
     value_trunk_grad_scale: float = 1.0,
 ) -> dict[str, object]:
     """Measure weighted policy/value gradient interaction in the shared trunk.
@@ -21354,12 +21508,26 @@ def _objective_gradient_interference(
     ):
         return {"available": False, "reason": "inactive_policy_or_value_objective"}
     parameters = [parameter for _, parameter in named]
+    aux_active = bool(
+        policy_aux_objective is not None
+        and getattr(policy_aux_objective, "requires_grad", False)
+    )
     try:
         policy_grads = torch.autograd.grad(
             policy_objective, parameters, retain_graph=True, allow_unused=True
         )
         value_grads = torch.autograd.grad(
             value_objective, parameters, retain_graph=True, allow_unused=True
+        )
+        policy_aux_grads = (
+            torch.autograd.grad(
+                policy_aux_objective,
+                parameters,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            if aux_active
+            else (None,) * len(parameters)
         )
     except RuntimeError as exc:
         return {
@@ -21372,11 +21540,16 @@ def _objective_gradient_interference(
     policy_sq = zero.clone()
     value_sq = zero.clone()
     dot = zero.clone()
+    policy_base_sq = zero.clone()
+    policy_aux_sq = zero.clone()
+    policy_base_aux_dot = zero.clone()
     conflict_coordinates = zero.clone()
     joint_coordinates = zero.clone()
     by_module: dict[str, dict[str, object]] = {}
-    for (name, _), policy_grad, value_grad in zip(named, policy_grads, value_grads):
-        if policy_grad is None and value_grad is None:
+    for (name, _), policy_grad, value_grad, policy_aux_grad in zip(
+        named, policy_grads, value_grads, policy_aux_grads, strict=True
+    ):
+        if policy_grad is None and value_grad is None and policy_aux_grad is None:
             continue
         if policy_grad is None:
             policy_grad = torch.zeros_like(value_grad)
@@ -21384,13 +21557,25 @@ def _objective_gradient_interference(
             value_grad = torch.zeros_like(policy_grad)
         pg = policy_grad.detach().double()
         vg = value_grad.detach().double()
+        ag = (
+            torch.zeros_like(pg)
+            if policy_aux_grad is None
+            else policy_aux_grad.detach().double()
+        )
+        bg = pg - ag
         p_sq = pg.square().sum()
         v_sq = vg.square().sum()
         pv = (pg * vg).sum()
+        b_sq = bg.square().sum()
+        a_sq = ag.square().sum()
+        ba = (bg * ag).sum()
         jointly_nonzero = (pg != 0) & (vg != 0)
         policy_sq += p_sq
         value_sq += v_sq
         dot += pv
+        policy_base_sq += b_sq
+        policy_aux_sq += a_sq
+        policy_base_aux_dot += ba
         joint_coordinates += jointly_nonzero.sum(dtype=torch.float64)
         conflict_coordinates += (
             jointly_nonzero & ((pg * vg) < 0)
@@ -21398,16 +21583,29 @@ def _objective_gradient_interference(
         group = _objective_gradient_module_name(name)
         row = by_module.setdefault(
             group,
-            {"policy_sq": zero.clone(), "value_sq": zero.clone(), "dot": zero.clone()},
+            {
+                "policy_sq": zero.clone(),
+                "value_sq": zero.clone(),
+                "dot": zero.clone(),
+                "policy_base_sq": zero.clone(),
+                "policy_aux_sq": zero.clone(),
+                "policy_base_aux_dot": zero.clone(),
+            },
         )
         row["policy_sq"] += p_sq
         row["value_sq"] += v_sq
         row["dot"] += pv
+        row["policy_base_sq"] += b_sq
+        row["policy_aux_sq"] += a_sq
+        row["policy_base_aux_dot"] += ba
 
     epsilon = torch.finfo(torch.float64).eps
     policy_norm = torch.sqrt(policy_sq)
     value_norm = torch.sqrt(value_sq)
     denominator = policy_norm * value_norm
+    policy_base_norm = torch.sqrt(policy_base_sq)
+    policy_aux_norm = torch.sqrt(policy_aux_sq)
+    policy_base_aux_denominator = policy_base_norm * policy_aux_norm
 
     def _float(value) -> float:
         return float(value.detach().cpu().item())
@@ -21424,6 +21622,24 @@ def _objective_gradient_interference(
             if _float(denom) > 0.0
             else None,
         }
+        if aux_active:
+            base_norm = torch.sqrt(row["policy_base_sq"])
+            aux_norm = torch.sqrt(row["policy_aux_sq"])
+            base_aux_denominator = base_norm * aux_norm
+            modules[group].update(
+                {
+                    "policy_base_grad_norm": _float(base_norm),
+                    "policy_aux_grad_norm": _float(aux_norm),
+                    "policy_base_aux_cosine": (
+                        _float(
+                            row["policy_base_aux_dot"]
+                            / base_aux_denominator.clamp_min(epsilon)
+                        )
+                        if _float(base_aux_denominator) > 0.0
+                        else None
+                    ),
+                }
+            )
     combined_sq = policy_sq + value_sq + 2.0 * dot
     return {
         "available": True,
@@ -21455,6 +21671,33 @@ def _objective_gradient_interference(
         ),
         "combined_trunk_grad_norm": _float(torch.sqrt(combined_sq.clamp_min(0.0))),
         "modules": modules,
+        **(
+            {
+                "policy_aux_objective": _float(policy_aux_objective.detach()),
+                "policy_base_objective": _float(
+                    (policy_objective - policy_aux_objective).detach()
+                ),
+                "policy_base_trunk_grad_norm": _float(policy_base_norm),
+                "policy_aux_trunk_grad_norm": _float(policy_aux_norm),
+                "policy_aux_to_base_grad_norm_ratio": (
+                    _float(
+                        policy_aux_norm / policy_base_norm.clamp_min(epsilon)
+                    )
+                    if _float(policy_base_norm) > 0.0
+                    else None
+                ),
+                "policy_base_aux_gradient_cosine": (
+                    _float(
+                        policy_base_aux_dot
+                        / policy_base_aux_denominator.clamp_min(epsilon)
+                    )
+                    if _float(policy_base_aux_denominator) > 0.0
+                    else None
+                ),
+            }
+            if aux_active
+            else {}
+        ),
     }
 
 
@@ -21868,10 +22111,19 @@ def _capture_optimizer_observability(policy) -> dict:
         for name, parameter in named_parameters
     ]
     grad_squared_sums: dict[str, object] = {}
+    parameter_squared_sums: dict[str, object] = {}
+    parameter_counts: dict[str, int] = {}
     for name, parameter in named_parameters:
         group = _optimizer_observability_module_name(name)
         squared = parameter.grad.detach().float().square().sum()
         grad_squared_sums[group] = grad_squared_sums.get(group, 0.0) + squared
+        parameter_squared = parameter.detach().float().square().sum()
+        parameter_squared_sums[group] = (
+            parameter_squared_sums.get(group, 0.0) + parameter_squared
+        )
+        parameter_counts[group] = parameter_counts.get(group, 0) + int(
+            parameter.numel()
+        )
     import torch
 
     is_fsdp = callable(getattr(model, "clip_grad_norm_", None)) and not isinstance(
@@ -21882,6 +22134,10 @@ def _capture_optimizer_observability(policy) -> dict:
         "module_pre_clip_grad_norms": _norms_from_squared_sums(
             grad_squared_sums
         ),
+        "module_parameter_l2_before": _norms_from_squared_sums(
+            parameter_squared_sums
+        ),
+        "module_parameter_counts": parameter_counts,
         "module_norm_scope": "rank_local_shard" if is_fsdp else "global_replicated",
     }
 
@@ -21903,6 +22159,7 @@ def _finish_optimizer_observability(
         total_norm = float(pre_clip_total_grad_norm.detach().cpu().item())
     else:
         total_norm = float(pre_clip_total_grad_norm)
+    delta_norms = _norms_from_squared_sums(delta_squared_sums)
     return {
         "pre_clip_total_grad_norm": total_norm,
         "max_grad_norm": float(max_grad_norm),
@@ -21912,9 +22169,22 @@ def _finish_optimizer_observability(
             and (not math.isfinite(total_norm) or total_norm > max_grad_norm)
         ),
         "module_pre_clip_grad_norms": state["module_pre_clip_grad_norms"],
-        "module_parameter_delta_norms": _norms_from_squared_sums(
-            delta_squared_sums
-        ),
+        "module_parameter_delta_norms": delta_norms,
+        "module_parameter_update_rms": {
+            group: (
+                float(delta_norm)
+                / math.sqrt(float(state["module_parameter_counts"][group]))
+            )
+            for group, delta_norm in delta_norms.items()
+        },
+        "module_relative_parameter_delta": {
+            group: (
+                float(delta_norm)
+                / max(float(state["module_parameter_l2_before"][group]), 1.0e-30)
+            )
+            for group, delta_norm in delta_norms.items()
+        },
+        "module_parameter_counts": state["module_parameter_counts"],
         "module_norm_scope": state["module_norm_scope"],
     }
 

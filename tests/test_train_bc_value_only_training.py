@@ -484,15 +484,17 @@ def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
     batch = np.arange(len(data["action_taken"]))
     weights = np.ones(len(batch), dtype=np.float32)
     calls = 0
+    aux_objectives = []
 
-    def interference(*_args, **_kwargs):
+    def interference(*_args, **kwargs):
         nonlocal calls
         calls += 1
+        aux_objectives.append(kwargs.get("policy_aux_objective"))
         return {"available": True, "sentinel": True}
 
     monkeypatch.setattr(train_bc, "_objective_gradient_interference", interference)
 
-    def run(*, measure: bool) -> dict:
+    def run(*, measure: bool, auxiliary: bool = False) -> dict:
         policy = _make_entity_policy()
         optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
         return _train_xdim_batch(
@@ -519,6 +521,15 @@ def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
             amp="none",
             diagnostics=True,
             measure_objective_gradient_interference=measure,
+            **(
+                {
+                    "policy_aux_data": data,
+                    "policy_aux_batch": batch,
+                    "policy_aux_sample_weights": weights,
+                }
+                if auxiliary
+                else {}
+            ),
         )
 
     ordinary = run(measure=False)
@@ -530,6 +541,14 @@ def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
     explicit = run(measure=True)
     assert calls == 1
     assert explicit["optimizer_observability"][
+        "objective_gradient_interference"
+    ] == {"available": True, "sentinel": True}
+    explicit_aux = run(measure=True, auxiliary=True)
+    assert calls == 2
+    assert aux_objectives[0] is None
+    assert aux_objectives[1] is not None
+    assert bool(aux_objectives[1].requires_grad)
+    assert explicit_aux["optimizer_observability"][
         "objective_gradient_interference"
     ] == {"available": True, "sentinel": True}
 
@@ -979,6 +998,12 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
     )
     assert auxiliary["policy_loss_weight_sum"] == pytest.approx(
         2.0 * control["policy_loss_weight_sum"], rel=1e-6
+    )
+    assert auxiliary["policy_base_loss_weight_sum"] == pytest.approx(
+        control["policy_loss_weight_sum"], rel=1e-6
+    )
+    assert auxiliary["policy_aux_loss_weight_sum"] == pytest.approx(
+        control["policy_loss_weight_sum"], rel=1e-6
     )
     # Value telemetry/dose is base-only and value-head parameters receive no
     # gradient from the policy-only auxiliary forward.

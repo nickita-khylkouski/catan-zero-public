@@ -118,6 +118,11 @@ def test_optimizer_observability_reports_preclip_norm_clip_and_module_updates() 
     )
     assert observed["module_parameter_delta_norms"]["trunk"] > 0.0
     assert observed["module_parameter_delta_norms"]["value_head"] > 0.0
+    assert observed["module_parameter_counts"] == {"trunk": 4, "value_head": 2}
+    assert observed["module_parameter_update_rms"]["trunk"] == pytest.approx(
+        observed["module_parameter_delta_norms"]["trunk"] / 2.0
+    )
+    assert observed["module_relative_parameter_delta"]["trunk"] > 0.0
 
 
 def test_optimizer_observability_name_normalizes_ddp_and_fsdp_prefixes() -> None:
@@ -185,3 +190,38 @@ def test_objective_gradient_interference_is_explicit_when_objective_inactive() -
         "available": False,
         "reason": "inactive_policy_or_value_objective",
     }
+
+
+def test_objective_gradient_interference_separates_active_policy_aux_branch() -> None:
+    torch = pytest.importorskip("torch")
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 1, bias=False)])
+
+    model = TinyModel()
+    with torch.no_grad():
+        model.blocks[0].weight.copy_(torch.tensor([[1.0, 1.0]]))
+    shared = model.blocks[0](torch.tensor([[1.0, -2.0]]))
+    base = shared.sum()
+    aux = 2.0 * shared.sum()
+    value = -shared.sum()
+
+    observed = train_bc._objective_gradient_interference(
+        SimpleNamespace(model=model),
+        policy_objective=base + aux,
+        policy_aux_objective=aux,
+        value_objective=value,
+    )
+
+    root5 = 5.0**0.5
+    assert observed["policy_base_trunk_grad_norm"] == pytest.approx(root5)
+    assert observed["policy_aux_trunk_grad_norm"] == pytest.approx(2.0 * root5)
+    assert observed["policy_trunk_grad_norm"] == pytest.approx(3.0 * root5)
+    assert observed["policy_aux_to_base_grad_norm_ratio"] == pytest.approx(2.0)
+    assert observed["policy_base_aux_gradient_cosine"] == pytest.approx(1.0)
+    assert observed["modules"]["blocks.0"]["policy_aux_grad_norm"] == pytest.approx(
+        2.0 * root5
+    )
+    assert all(parameter.grad is None for parameter in model.parameters())

@@ -3016,6 +3016,13 @@ def bind_learner_ablation(
             "train_diagnostics_every_batches": (
                 16 if diagnostic_dose_curve else 0
             ),
+            # Two observations (steps 64 and 128) are enough to compare the
+            # four exposure arms without turning objective attribution into a
+            # material fraction of the dose. Each observation reuses the real
+            # forward graph and never mutates Parameter.grad or optimizer state.
+            "objective_gradient_interference_every_batches": (
+                64 if diagnostic_dose_curve else 0
+            ),
             "optimizer_trajectory_unchanged": True,
         },
         **(
@@ -4899,6 +4906,31 @@ def _build_direct_train_command(
                     if learner_ablation.get("reporting_contract", {}).get(
                         "diagnostic_dose_curve"
                     )
+                    else []
+                ),
+                *(
+                    [
+                        "--objective-gradient-interference-every-batches",
+                        str(
+                            learner_ablation.get("reporting_contract", {}).get(
+                                "objective_gradient_interference_every_batches",
+                                64,
+                            )
+                        ),
+                    ]
+                    if int(
+                        learner_ablation.get("reporting_contract", {}).get(
+                            "objective_gradient_interference_every_batches",
+                            (
+                                64
+                                if learner_ablation.get("reporting_contract", {}).get(
+                                    "diagnostic_dose_curve"
+                                )
+                                else 0
+                            ),
+                        )
+                    )
+                    > 0
                     else []
                 ),
                 # Each executor child sees exactly one physical GPU through
