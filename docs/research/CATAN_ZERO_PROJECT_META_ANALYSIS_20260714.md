@@ -1175,3 +1175,121 @@ Both questions are answerable quickly on the existing fleet. The completed old-g
 | H100 evaluation orchestration | ../../tools/fleet/a1_h100_eval_fleet.py |
 | Native engine release | ../../tools/build_catanatron_rs_wheel.sh |
 | Retired experimental continuous loop | ../../tools/continuous_flywheel.py |
+
+## Appendix D: July 15 coherent-loop addendum
+
+This addendum records the next day of integration and live experimentation.
+It supersedes the paper wherever the older text describes the current loop as
+only conceptual or still PIMC-based. Results explicitly marked in progress are
+not promotion evidence.
+
+### D.1 One executable science contract
+
+Canonical GitHub `main` reached commit
+`206c2be05d8b837d4f234838110254adbe40dbb0` with one machine-readable
+coherent-public contract for generation, learning, evaluation, and promotion:
+
+- `configs/operations/a1-next-wave-coherent-public-v1/science.contract.json`
+- `tools/a1_current_science_contract.py`
+
+The contract makes the agent identity a checkpoint plus an exact search
+operator. The current operator searches one coherent public-belief tree; it
+does not search a clone containing authoritative hidden cards, and it does not
+silently fall back to the older PIMC operator. Production sealing remains
+closed until the teacher-budget campaign is adopted into this contract.
+
+The learner contract now distinguishes mechanical forced rows from strategic
+policy rows. Forced rows have zero policy mass. Their realised-outcome value
+signal is retained, but `END_TURN` receives 0.1x and `ROLL` 0.25x value weight;
+unlisted forced types retain 1.0x. Policy-active rows use capped, within-game
+search-surprise redistribution so a long game cannot steal total mass from
+other games. The public-card residual has a separate 4x LR group.
+
+### D.2 Teacher-budget result: n256 has not earned production
+
+The whole-game common-random-number comparisons used the exact v5 checkpoint
+for both agents and changed only the wide-root simulation rule:
+
+| Arm | Adaptive wins | Base n128 wins | Adaptive rate |
+|---|---:|---:|---:|
+| n256 when legal width >=20 | 97 | 103 | 48.5% |
+| n256 when legal width >=40 | 99 | 101 | 49.5% |
+
+Neither adaptive arm improved playing strength. The corrected fixed-root audit
+also exposed an important Catan-specific semantic fact: in roughly 300 real
+champion trajectories it observed more than 3,700 `PLAY_TURN` roots, including
+hundreds at width >=20, but none at width >=40; the observed play-turn maximum
+was 39. Therefore a width-40 trigger is effectively an opening-placement-only
+operator in this distribution. Earlier panels accidentally populated their
+"wide" bucket mostly with opening placements and could not support a generic
+hard-turn claim.
+
+The replacement panel is stratified by reachable phase and width:
+`PLAY_TURN` 2--19, 20--31, and 32--39, plus
+`OPENING_PLACEMENT` 40+. Until that panel is aggregated and adopted, the formal
+selection is pending. The current causal evidence favors base n128+D6; it does
+not justify spending the production wave on global or adaptive n256.
+
+### D.3 Learner-dose audit found two more causal bugs
+
+The 8xB200 campaign independently reloads the exact f7 parent with fresh Adam
+for every arm. It compares LR/warmup recipes at 128 optimizer steps and a fixed
+global batch of 4,096; no arm may initialize from another candidate. The old
+base sampler delivered only about 50,875 policy-active rows in 524,288 draws,
+because most Catan rows are mechanical or otherwise carry zero policy mass.
+The new auxiliary active sampler targets about 524,987 policy-active rows so
+the LR comparison measures an actual policy update rather than mostly value
+rehearsal.
+
+Live command inspection stopped the first sweep before accepting a result. It
+was still inheriting three old-composite defaults instead of the current
+learner semantics:
+
+1. the typed `ROLL`/`END_TURN` forced-value map was absent;
+2. the public-card LR multiplier was 1x rather than 4x;
+3. exact per-game surprise weighting was disabled.
+
+A deeper sampler inspection found that the auxiliary policy-active batch also
+conditioned only on component mix and positive policy mass. Because that
+auxiliary batch supplies roughly 90% of the intended policy-active dose, it
+would have ignored the hard/search-disagreement prioritization for most policy
+updates. The repair conditions the already-composed authenticated
+component-plus-surprise measure on policy-active rows, then applies any sealed
+phase allocation. This is a substantive learner fix, not an observability
+change.
+
+The old composite has authenticated-empty meaningful-event histories.
+Consequently this pre-wave diagnostic correctly uses the receipt-backed
+card-only function-preserving initializer; pretending to train the history
+gate on those rows would be false. Fresh coherent-wave data will use the
+combined bias-free public-card-count v2 plus meaningful-public-history v2
+initializer.
+
+As of this addendum the corrected four-arm learner sweep is being rebound; no
+checkpoint from the stopped mismatched sweep is accepted as evidence.
+
+### D.4 Evaluation and next execution boundary
+
+A 64-H100 evaluation matrix is implemented for the four independent learner
+arms. It assigns every GPU exactly once and runs eight concurrent, seat-swapped
+comparisons: each arm versus f7 and versus the recovered v5 incumbent, using
+one common-random-number cohort and the teacher operator adopted above. The
+matrix deliberately refuses to launch while teacher selection is provisional.
+
+The immediate sequence is therefore:
+
+1. finish the reachable fixed-root panel and adopt base n128 or an adaptive
+   rule only if its preregistered evidence passes;
+2. run all four corrected 8xB200 learner arms from f7 with equal realised
+   policy-active dose;
+3. evaluate all arms concurrently against both f7 and v5 on 64 H100s;
+4. replay only the playing-strength winner for the longer 256-step dose from
+   the original parent, never from its short-dose candidate;
+5. promote only after the matched coherent-public gate passes;
+6. generate the next fresh wave with the promoted checkpoint and the combined
+   card-count/history v2 input surface.
+
+The project is no longer asking whether "more MCTS" or "more epochs" helps in
+the abstract. It is testing one teacher operator, one independently initialized
+learner dose, and one matched agent identity at a time. That is the minimum
+causal unit required for a reliable self-improvement loop.
