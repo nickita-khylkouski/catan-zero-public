@@ -807,8 +807,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if not state_ready:
         blockers.extend(
             [
-                "source_admission_does_not_prove_exact_state_reanalysis",
-                "omitted_automatic_transitions_require_a_reviewed_reconstructor_or_serialized_state",
+                "per_row_sparse_reconstruction_qualification_required",
             ]
         )
     plan: dict[str, Any] = {
@@ -866,6 +865,14 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         },
         "execution": {
             "executor_semantics": "coherent_public_belief_n128_reanalysis_v1",
+            "reconstruction_qualifier": (
+                "tools/a1_stage_c_reanalysis_executor.py qualify"
+            ),
+            "sparse_gap_rule": (
+                "an omitted decision is executable iff replay proves exactly "
+                "one legal action at that index"
+            ),
+            "readiness_scope": "per_selected_row_not_whole_corpus",
             "legacy_public_conservation_pimc_executor_allowed": False,
             "authoritative_hidden_state_search_allowed": False,
             "execution_ready": state_ready,

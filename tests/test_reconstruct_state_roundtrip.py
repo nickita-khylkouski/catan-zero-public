@@ -70,6 +70,8 @@ def _sequence() -> rs.GameActionSequence:
 def _reconstructed_features(*, legal_ids=(5, 6)):
     return {
         "legal_policy_ids": tuple(legal_ids),
+        "phase": "ROLL",
+        "acting_color": "RED",
         "features": {
             "hex_tokens": np.array([[1.0, 2.0]], dtype=np.float32),
             "legal_action_tokens": np.array(
@@ -200,3 +202,119 @@ def test_round_trip_cli_refuses_mismatch(monkeypatch, capsys):
     assert calls
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["round_trip"]["rows_passed"] == 0
+
+
+class _SparseGame:
+    def __init__(self, legal_by_step, step=0):
+        self.legal_by_step = legal_by_step
+        self.step = step
+
+    def playable_action_indices(self, _colors, _prompt):
+        return self.legal_by_step[self.step]
+
+    def playable_actions_json(self):
+        action_type = "ROLL" if self.step == 1 else "END_TURN"
+        return json.dumps(
+            [["RED", action_type, None] for _action in self.legal_by_step[self.step]]
+        )
+
+    def winning_color(self):
+        return None
+
+    def copy(self):
+        return _SparseGame(self.legal_by_step, self.step)
+
+
+class _SparseGameModule:
+    class Game:
+        legal_by_step = [[10, 11], [20], [30], [40, 41]]
+
+        @classmethod
+        def simple(cls, _colors, seed):
+            assert seed == 91
+            return _SparseGame(cls.legal_by_step)
+
+
+def _patch_sparse_replay(monkeypatch):
+    _SparseGameModule.Game.legal_by_step = [[10, 11], [20], [30], [40, 41]]
+    applied = []
+    monkeypatch.setattr(rs, "_require_rust_module", lambda: _SparseGameModule)
+    monkeypatch.setattr(
+        rs,
+        "_policy_id_to_rust_id",
+        lambda _game, policy, **_kwargs: int(policy),
+    )
+
+    def apply(game, action, **_kwargs):
+        applied.append((game.step, action))
+        return _SparseGame(game.legal_by_step, game.step + 1)
+
+    monkeypatch.setattr(rs, "_apply_selected_action", apply)
+    return applied
+
+
+def test_sparse_reconstruction_fills_only_unique_automatic_gaps(monkeypatch):
+    applied = _patch_sparse_replay(monkeypatch)
+    sequence = rs.GameActionSequence(
+        game_seed=91,
+        colors=("RED", "BLUE"),
+        actions=[10, 40],
+        decision_indices=[0, 3],
+        phases=["BUILD_INITIAL_SETTLEMENT", "PLAY_TURN"],
+        players=["RED", "BLUE"],
+    )
+
+    game = rs.reconstruct_state_from_sequence(sequence, 3)
+
+    assert game.step == 3
+    assert applied == [(0, 10), (1, 20), (2, 30)]
+
+    batch = rs.reconstruct_states_from_sequence(sequence, [3])
+    assert batch.failure is None
+    assert batch.omitted_automatic_transitions == {3: 2}
+    assert batch.omitted_automatic_transition_types == {
+        3: {"ROLL": 1, "END_TURN": 1}
+    }
+
+
+def test_sparse_reconstruction_proves_missing_multi_action_is_ambiguous(
+    monkeypatch,
+):
+    _patch_sparse_replay(monkeypatch)
+    _SparseGameModule.Game.legal_by_step = [[10], [20, 21], [30], [40, 41]]
+    sequence = rs.GameActionSequence(
+        game_seed=91,
+        colors=("RED", "BLUE"),
+        actions=[10, 40],
+        decision_indices=[0, 3],
+        phases=["BUILD_INITIAL_SETTLEMENT", "PLAY_TURN"],
+        players=["RED", "BLUE"],
+    )
+
+    with pytest.raises(rs.SparseReconstructionError) as captured:
+        rs.reconstruct_state_from_sequence(sequence, 3)
+
+    assert captured.value.code == "missing_nonautomatic_decision"
+    assert captured.value.decision_index == 1
+    assert captured.value.legal_action_count == 2
+
+
+def test_sparse_batch_keeps_roots_before_first_ambiguous_gap(monkeypatch):
+    _patch_sparse_replay(monkeypatch)
+    _SparseGameModule.Game.legal_by_step = [[10], [20, 21], [30], [40, 41]]
+    sequence = rs.GameActionSequence(
+        game_seed=91,
+        colors=("RED", "BLUE"),
+        actions=[10, 40],
+        decision_indices=[0, 3],
+        phases=["BUILD_INITIAL_SETTLEMENT", "PLAY_TURN"],
+        players=["RED", "BLUE"],
+    )
+
+    result = rs.reconstruct_states_from_sequence(sequence, [0, 3])
+
+    assert set(result.states) == {0}
+    assert result.omitted_automatic_transitions == {0: 0}
+    assert result.omitted_automatic_transition_types == {0: {}}
+    assert result.failure is not None
+    assert result.failure.code == "missing_nonautomatic_decision"
