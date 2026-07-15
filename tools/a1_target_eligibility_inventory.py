@@ -701,6 +701,11 @@ def inspect_rd_contract(contract_path: Path) -> dict[str, Any]:
         raise InventoryError(f"{path}: search evidence is not required")
     if expected.get("--coherent-public-belief-search") is not True:
         raise InventoryError(f"{path}: coherent public search is not guard-required")
+    if (
+        value.get("acceptance", {}).get("require_search_evidence_schema")
+        != "gumbel_root_search_evidence_v1"
+    ):
+        raise InventoryError(f"{path}: search-evidence acceptance schema drift")
 
     execution = value.get("execution")
     if not isinstance(execution, Mapping):
