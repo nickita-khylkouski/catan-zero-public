@@ -245,6 +245,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "lr_schedule",
         "value_lr_mult",
         "public_card_lr_mult",
+        "trunk_lr_mult",
         "value_trunk_grad_scale",
         "policy_loss_weight",
         "policy_aux_active_batch_size",
@@ -256,6 +257,10 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "final_vp_loss_weight",
         "aux_subgoal_loss_weight",
         "policy_kl_anchor_weight",
+        "policy_kl_anchor_direction",
+        "policy_kl_target",
+        "policy_kl_dual_lr",
+        "policy_kl_max_weight",
         "policy_surprise_weight",
         "per_game_policy_surprise_weighting",
         "advantage_policy_weighting",
@@ -3186,9 +3191,19 @@ def bind_learner_ablation(
             int
             if key == "policy_aux_active_batch_size"
             else float
-            if key in {"value_trunk_grad_scale", "public_card_lr_mult"}
+            if key
+            in {
+                "value_trunk_grad_scale",
+                "public_card_lr_mult",
+                "trunk_lr_mult",
+                "policy_kl_target",
+                "policy_kl_dual_lr",
+                "policy_kl_max_weight",
+            }
             else bool
             if key == "per_game_policy_surprise_weighting"
+            else str
+            if key == "policy_kl_anchor_direction"
             else type(bound[key])
         )
         if type(value) is not expected_type:
@@ -3204,6 +3219,7 @@ def bind_learner_ablation(
         "lr_warmup_steps": (0.0, None, True),
         "value_lr_mult": (0.0, None, False),
         "public_card_lr_mult": (0.0, None, False),
+        "trunk_lr_mult": (0.0, 1.0, False),
         "value_trunk_grad_scale": (0.0, 1.0, True),
         "policy_loss_weight": (0.0, None, True),
         "policy_aux_active_batch_size": (0.0, None, True),
@@ -3214,6 +3230,9 @@ def bind_learner_ablation(
         "final_vp_loss_weight": (0.0, None, True),
         "aux_subgoal_loss_weight": (0.0, 0.05, True),
         "policy_kl_anchor_weight": (0.0, None, True),
+        "policy_kl_target": (0.0, None, True),
+        "policy_kl_dual_lr": (0.0, None, False),
+        "policy_kl_max_weight": (0.0, None, False),
         "policy_surprise_weight": (0.0, None, True),
         "vp_margin_weight": (0.0, None, True),
         "truncated_vp_margin_value_weight": (0.0, None, True),
@@ -3228,6 +3247,7 @@ def bind_learner_ablation(
         "advantage_policy_weighting": {"none", "outcome_value"},
         "per_game_policy_weight_mode": {"equal", "sqrt"},
         "per_game_value_weight_mode": {"equal", "sqrt"},
+        "policy_kl_anchor_direction": {"forward"},
     }
     for key, value in overrides.items():
         if key in numeric_domains:
@@ -3267,6 +3287,34 @@ def bind_learner_ablation(
             "soft_target_temperature is inert for soft_target_source=policy; "
             "do not encode a fake ablation drift"
         )
+    adaptive_fields = {
+        "policy_kl_target",
+        "policy_kl_dual_lr",
+        "policy_kl_max_weight",
+        "policy_kl_anchor_direction",
+    }
+    requested_adaptive_fields = adaptive_fields & set(overrides)
+    if requested_adaptive_fields:
+        if "policy_kl_target" not in requested_adaptive_fields:
+            raise ExecutorError(
+                "adaptive policy-KL options require policy_kl_target"
+            )
+        missing = adaptive_fields - requested_adaptive_fields
+        if missing:
+            raise ExecutorError(
+                "adaptive policy-KL ablation must bind its complete controller: "
+                f"missing {sorted(missing)}"
+            )
+        if effective["policy_kl_anchor_direction"] != "forward":
+            raise ExecutorError(
+                "adaptive policy-KL ablation requires forward parent KL"
+            )
+        if float(effective["policy_kl_anchor_weight"]) > float(
+            effective["policy_kl_max_weight"]
+        ):
+            raise ExecutorError(
+                "adaptive policy-KL initial weight exceeds its maximum"
+            )
     active_objective_mass = sum(
         float(effective[key])
         for key in (
@@ -3311,6 +3359,11 @@ def bind_learner_ablation(
             "contract": 1.0,
             "effective": effective["public_card_lr_mult"],
         }
+    if effective.get("trunk_lr_mult", 1.0) != 1.0:
+        drift["trunk_lr_mult"] = {
+            "contract": float(bound.get("trunk_lr_mult", 1.0)),
+            "effective": effective["trunk_lr_mult"],
+        }
     if effective.get("per_game_policy_surprise_weighting", False):
         drift["per_game_policy_surprise_weighting"] = {
             "contract": False,
@@ -3321,6 +3374,17 @@ def bind_learner_ablation(
             "contract": "disabled (implicit historical default)",
             "effective": effective["forced_row_value_action_type_weights"],
         }
+    if effective.get("policy_kl_target") is not None:
+        for key in (
+            "policy_kl_target",
+            "policy_kl_dual_lr",
+            "policy_kl_max_weight",
+            "policy_kl_anchor_direction",
+        ):
+            drift[key] = {
+                "contract": bound.get(key, "disabled (implicit historical default)"),
+                "effective": effective[key],
+            }
     if not drift and aux_arm != "AUX0":
         raise ExecutorError("A1 learner ablation is a no-op")
     code_binding = _current_ablation_code_binding(verified["lock"])
@@ -3536,11 +3600,21 @@ def bind_diagnostic_training_descriptor(
         derived_overrides[typed_forced_key] = effective_recipe[typed_forced_key]
     for key, disabled_value in (
         ("public_card_lr_mult", 1.0),
+        ("trunk_lr_mult", 1.0),
         ("per_game_policy_surprise_weighting", False),
     ):
         if effective_recipe.get(key, disabled_value) != disabled_value:
             # These are coupled to the receipt-backed public-card initializer
             # and exact per-game sampler by the generic ablation authority.
+            derived_overrides[key] = effective_recipe[key]
+    if effective_recipe.get("policy_kl_target") is not None:
+        for key in (
+            "policy_kl_anchor_weight",
+            "policy_kl_anchor_direction",
+            "policy_kl_target",
+            "policy_kl_dual_lr",
+            "policy_kl_max_weight",
+        ):
             derived_overrides[key] = effective_recipe[key]
     reporting_contract = learner_ablation.get("reporting_contract")
     lr_dose_campaign = bool(
@@ -5080,6 +5154,17 @@ def _build_direct_train_command(
             "--trust-curated-data-quality",
         ]
     )
+    if recipe.get("policy_kl_target") is not None:
+        command.extend(
+            [
+                "--policy-kl-target",
+                str(recipe["policy_kl_target"]),
+                "--policy-kl-dual-lr",
+                str(recipe["policy_kl_dual_lr"]),
+                "--policy-kl-max-weight",
+                str(recipe["policy_kl_max_weight"]),
+            ]
+        )
     if bool(recipe.get("per_game_policy_surprise_weighting", False)):
         command.append("--per-game-policy-surprise-weighting")
     if recipe.get("forced_row_value_action_type_weights"):
@@ -8803,6 +8888,24 @@ def _verify_training_outputs(
         "steps_completed": expected_steps,
         "total_training_steps": expected_steps,
     }
+    if isinstance(learner_ablation, dict):
+        # These post-seal optimizer axes are required evidence for diagnostic
+        # arms, while legacy production reports retain their historical shape.
+        expected["trunk_lr_mult"] = float(recipe.get("trunk_lr_mult", 1.0))
+        if recipe.get("policy_kl_target") is not None:
+            expected.update(
+                {
+                    "policy_kl_anchor_weight": float(
+                        recipe["policy_kl_anchor_weight"]
+                    ),
+                    "policy_kl_anchor_direction": str(
+                        recipe["policy_kl_anchor_direction"]
+                    ),
+                    "policy_kl_target": float(recipe["policy_kl_target"]),
+                    "policy_kl_dual_lr": float(recipe["policy_kl_dual_lr"]),
+                    "policy_kl_max_weight": float(recipe["policy_kl_max_weight"]),
+                }
+            )
     if recipe.get("forced_row_value_action_type_weights"):
         expected["forced_row_value_action_type_weights"] = (
             train_bc._parse_forced_row_value_action_type_weights(

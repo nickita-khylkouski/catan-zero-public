@@ -1828,6 +1828,75 @@ def test_public_card_lr_multiplier_refuses_every_non_card_initializer(
         )
 
 
+def test_generic_ablation_can_bind_trunk_lr_and_adaptive_parent_kl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+
+    trunk = executor.bind_learner_ablation(
+        verified,
+        ablation_id="trunk25",
+        overrides_json='{"trunk_lr_mult":0.25}',
+        reviewed_code_tree_sha256=code_sha,
+    )
+    assert trunk["recipe"]["trunk_lr_mult"] == pytest.approx(0.25)
+    assert trunk["learner_ablation"]["recipe_drift"]["trunk_lr_mult"] == {
+        "contract": 1.0,
+        "effective": 0.25,
+    }
+
+    trust = executor.bind_learner_ablation(
+        verified,
+        ablation_id="adaptive-parent-kl",
+        overrides_json=json.dumps(
+            {
+                "policy_kl_anchor_direction": "forward",
+                "policy_kl_target": 0.012,
+                "policy_kl_dual_lr": 1.0,
+                "policy_kl_max_weight": 1.0,
+            }
+        ),
+        reviewed_code_tree_sha256=code_sha,
+    )
+    command = executor.build_train_command(
+        trust,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "trust.pt",
+        report=tmp_path / "trust.report.json",
+    )
+    assert _option(command, "--policy-kl-target") == "0.012"
+    assert _option(command, "--policy-kl-dual-lr") == "1.0"
+    assert _option(command, "--policy-kl-max-weight") == "1.0"
+    assert _option(command, "--policy-kl-anchor-direction") == "forward"
+
+
+def test_adaptive_parent_kl_ablation_requires_complete_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified = _verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    with pytest.raises(executor.ExecutorError, match="complete controller"):
+        executor.bind_learner_ablation(
+            verified,
+            ablation_id="incomplete-parent-kl",
+            overrides_json='{"policy_kl_target":0.012}',
+            reviewed_code_tree_sha256=code_sha,
+        )
+
+
 def test_target_gather_upgrade_combines_with_typed_forced_value_recipe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
