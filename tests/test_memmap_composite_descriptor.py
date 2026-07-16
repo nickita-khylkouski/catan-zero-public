@@ -845,6 +845,46 @@ def test_policy_aux_order_is_exact_and_ddp_rank_sliced() -> None:
     assert np.array_equal(orders[2], global_draw[2::3])
 
 
+def test_policy_aux_phase_allocation_is_not_multiplied_twice_in_loss() -> None:
+    data = {
+        "phase": np.asarray(["PLAY_TURN", "MOVE_ROBBER", "PLAY_TURN"]),
+    }
+    source_weights = np.asarray([4.0, 2.0, 8.0], dtype=np.float32)
+    adjusted = train_bc._policy_aux_loss_weights_without_phase_multiplication(
+        data,
+        np.arange(3, dtype=np.int64),
+        source_weights,
+        {"PLAY_TURN": 4.0},
+    )
+    assert adjusted.tolist() == pytest.approx([1.0, 2.0, 2.0])
+    assert source_weights.tolist() == pytest.approx([4.0, 2.0, 8.0])
+
+
+def test_policy_aux_phase_allocation_rejects_invalid_loss_multiplier() -> None:
+    with pytest.raises(ValueError, match="finite positive"):
+        train_bc._policy_aux_loss_weights_without_phase_multiplication(
+            {"phase": np.asarray(["PLAY_TURN"])},
+            np.asarray([0], dtype=np.int64),
+            np.asarray([1.0], dtype=np.float32),
+            {"PLAY_TURN": 0.0},
+        )
+
+
+def test_policy_aux_source_reuse_reports_actual_root_and_game_coverage() -> None:
+    report = train_bc._policy_aux_source_reuse_summary(
+        {11: 3, 12: 1},
+        game_seeds={101, 102},
+        ddp={"enabled": False, "world_size": 1, "rank": 0},
+        data_sharded=False,
+    )
+    assert report["draws"] == 4
+    assert report["unique_source_rows"] == 2
+    assert report["unique_source_games"] == 2
+    assert report["draws_per_unique_row"] == pytest.approx(2.0)
+    assert report["max_source_row_reuse"] == 3
+    assert report["source_row_reuse_p50"] == pytest.approx(2.0)
+
+
 def test_global_epoch_shuffle_interleaves_component_rows_with_prefetch():
     data = ConcatMemmapCorpus([_TinyCorpus([0, 1, 2]), _TinyCorpus([10, 11, 12])])
     # Positions deliberately alternate across the component boundary. The

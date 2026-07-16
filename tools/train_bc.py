@@ -12929,6 +12929,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     policy_aux_phase_sampling_weights = getattr(
         data, "policy_aux_phase_sampling_weights", None
     )
+    policy_aux_phase_loss_weights = None
+    if bool(getattr(data, "policy_aux_phase_scope_authenticated", False)):
+        policy_aux_phase_loss_weights = dict(policy_phase_weight_map)
+        invalid_phase_loss_weights = {
+            phase: multiplier
+            for phase, multiplier in policy_aux_phase_loss_weights.items()
+            if not math.isfinite(float(multiplier)) or float(multiplier) <= 0.0
+        }
+        if invalid_phase_loss_weights:
+            raise SystemExit(
+                "authenticated policy AUX phase allocation cannot undo non-positive "
+                f"--phase-weights: {invalid_phase_loss_weights}"
+            )
     if (
         bool(getattr(data, "policy_aux_phase_scope_authenticated", False))
         and int(args.policy_aux_active_batch_size) <= 0
@@ -13129,6 +13142,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "conditioned_on_positive_policy_loss_weight": True,
                 "authenticated_phase_allocation_applied": bool(
                     getattr(data, "policy_aux_phase_scope_authenticated", False)
+                ),
+                "phase_loss_weight_semantics": (
+                    "allocation_only_remove_duplicate_loss_multiplier_v1"
+                    if bool(
+                        getattr(data, "policy_aux_phase_scope_authenticated", False)
+                    )
+                    else "ordinary_policy_loss_weights"
+                ),
+                "removed_policy_phase_loss_weights": (
+                    policy_aux_phase_loss_weights
                 ),
                 "preconditioning_weights": {
                     "shape": list(policy_aux_preconditioning_weights.shape),
@@ -13422,7 +13445,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     # stream.  Short Stage-C doses sample with replacement; draw count alone
     # cannot distinguish broad target coverage from repeatedly replaying a
     # small handful of roots.
-    policy_aux_seen_global_rows: set[int] = set()
+    policy_aux_source_row_counts: Counter[int] = Counter()
+    policy_aux_seen_game_seeds: set[int] = set()
     # C1 gradient accumulation. accum==1 (default) preserves the pre-C1 path
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
     # and steps, and global_step (== optimizer steps) advances once per batch.
@@ -13897,9 +13921,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                     policy_aux_batch,
                     aux_source_rows,
                 ) = _batch_tuple
-                policy_aux_seen_global_rows.update(
-                    int(row) for row in np.asarray(aux_source_rows, dtype=np.int64)
+                aux_source_rows_array = np.asarray(
+                    aux_source_rows, dtype=np.int64
                 )
+                policy_aux_source_row_counts.update(
+                    int(row) for row in aux_source_rows_array
+                )
+                if "game_seed" in data:
+                    policy_aux_seen_game_seeds.update(
+                        int(seed)
+                        for seed in np.asarray(
+                            data["game_seed"][aux_source_rows_array],
+                            dtype=np.int64,
+                        )
+                    )
             if len(batch) == 0:
                 continue
             # C1 grad-accum bookkeeping. At accum==1 do_zero_grad and do_step are
@@ -14021,6 +14056,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                             "policy_aux_sample_weights": batch_policy_weights,
                             "policy_aux_loss_weight": float(
                                 args.policy_aux_loss_weight
+                            ),
+                            "policy_aux_phase_loss_weights": (
+                                policy_aux_phase_loss_weights
                             ),
                         }
                         if policy_aux_batch is not None
@@ -14416,7 +14454,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
                 checkpoint_aux_unique_rows = (
                     _reduce_unique_row_count(
-                        policy_aux_seen_global_rows,
+                        set(policy_aux_source_row_counts),
                         total_rows=n,
                         ddp=ddp,
                     )
@@ -15021,6 +15059,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise RuntimeError(
                 "policy soft-target sufficient statistics drifted from headline counts"
             )
+        policy_aux_source_reuse = (
+            _policy_aux_source_reuse_summary(
+                policy_aux_source_row_counts,
+                game_seeds=policy_aux_seen_game_seeds,
+                ddp=ddp,
+                data_sharded=bool(args.ddp_shard_data),
+            )
+            if int(args.policy_aux_active_batch_size) > 0
+            else None
+        )
         metrics.append(
             {
                 "epoch": epoch + 1,
@@ -15037,14 +15085,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_base_active_rows": int(active_count_total),
                 "policy_aux_active_rows": int(aux_active_count_total),
                 "policy_aux_unique_source_rows": (
-                    _reduce_unique_row_count(
-                        policy_aux_seen_global_rows,
-                        total_rows=n,
-                        ddp=ddp,
-                    )
-                    if int(args.policy_aux_active_batch_size) > 0
+                    int(policy_aux_source_reuse["unique_source_rows"])
+                    if policy_aux_source_reuse is not None
                     else 0
                 ),
+                "policy_aux_source_reuse": policy_aux_source_reuse,
                 "policy_total_active_rows": int(
                     active_count_total + aux_active_count_total
                 ),
@@ -16154,6 +16199,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "objective_gradient_interference": objective_gradient_interference,
         "value_component_active_dose": value_component_active_dose,
         "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,
+        "policy_aux_phase_loss_weight_semantics": (
+            "allocation_only_remove_duplicate_loss_multiplier_v1"
+            if policy_aux_phase_loss_weights is not None
+            else "ordinary_policy_loss_weights"
+        ),
         "policy_component_phase_active_dose": policy_component_phase_active_dose,
         "sample_weight_quality": policy_sample_weight_report,
         "policy_sample_weight_quality": policy_sample_weight_report,
@@ -16246,6 +16296,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 int(metric.get("policy_aux_unique_source_rows", 0)) > 0
                 for metric in metrics
             )
+            else None
+        ),
+        "policy_aux_source_reuse": (
+            metrics[-1].get("policy_aux_source_reuse")
+            if metrics
             else None
         ),
         "policy_base_active_rows": int(
@@ -17560,6 +17615,7 @@ def _train_xdim_batch(
     policy_aux_batch: np.ndarray | None = None,
     policy_aux_sample_weights: np.ndarray | None = None,
     policy_aux_loss_weight: float = 1.0,
+    policy_aux_phase_loss_weights: Mapping[str, float] | None = None,
     measure_objective_gradient_interference: bool = False,
     measure_aux_gradient_geometry_only: bool = False,
     value_trunk_grad_scale: float = 1.0,
@@ -17750,8 +17806,16 @@ def _train_xdim_batch(
                 dtype=torch.long,
                 device=policy.device,
             )
+            aux_loss_weights = (
+                _policy_aux_loss_weights_without_phase_multiplication(
+                    policy_aux_data,
+                    policy_aux_batch,
+                    policy_aux_sample_weights,
+                    policy_aux_phase_loss_weights,
+                )
+            )
             aux_weights = torch.as_tensor(
-                policy_aux_sample_weights[policy_aux_batch],
+                aux_loss_weights,
                 dtype=torch.float32,
                 device=policy.device,
             )
@@ -32590,6 +32654,94 @@ def _policy_aux_epoch_order(
         int(n), size=int(local_draws) * world, replace=True, p=weights / total
     )
     return np.asarray(global_order[rank::world], dtype=np.int64)
+
+
+def _policy_aux_loss_weights_without_phase_multiplication(
+    data,
+    batch: np.ndarray,
+    sample_weights: np.ndarray,
+    phase_loss_weights: Mapping[str, float] | None,
+) -> np.ndarray:
+    """Undo policy phase loss weights after phase-stratified AUX sampling.
+
+    An authenticated AUX phase allocation already defines the Monte-Carlo
+    measure over phases. Applying ``--phase-weights`` again inside the loss
+    squares that treatment (for example 2/3 PLAY_TURN sampled at 4x becomes
+    8/9 of gradient mass). Base-policy training retains the phase repair; only
+    the separately stratified AUX stream removes the duplicate multiplier.
+    """
+
+    rows = np.asarray(batch, dtype=np.int64)
+    weights = np.asarray(sample_weights[rows], dtype=np.float32).copy()
+    if not phase_loss_weights:
+        return weights
+    if "phase" not in data:
+        raise ValueError("phase-stratified AUX loss requires a phase column")
+    phases = np.asarray(data["phase"][rows]).astype(str, copy=False)
+    for phase, raw_multiplier in phase_loss_weights.items():
+        multiplier = float(raw_multiplier)
+        if not math.isfinite(multiplier) or multiplier <= 0.0:
+            raise ValueError(
+                "phase-stratified AUX loss can only undo finite positive phase "
+                f"multipliers; got {phase}={raw_multiplier}"
+            )
+        weights[phases == str(phase)] /= multiplier
+    return weights
+
+
+def _policy_aux_source_reuse_summary(
+    row_counts: Mapping[int, int],
+    *,
+    game_seeds: set[int],
+    ddp: Mapping[str, int | bool],
+    data_sharded: bool,
+) -> dict[str, object]:
+    """Return exact cumulative AUX source reuse across every learner rank."""
+
+    local = {
+        "rank": int(ddp.get("rank", 0)),
+        "row_counts": {int(row): int(count) for row, count in row_counts.items()},
+        "game_seeds": sorted(int(seed) for seed in game_seeds),
+    }
+    gathered = [local]
+    if bool(ddp.get("enabled", False)):
+        import torch.distributed as dist
+
+        gathered = [None for _ in range(int(ddp["world_size"]))]
+        dist.all_gather_object(gathered, local)
+    merged: Counter[object] = Counter()
+    merged_games: set[int] = set()
+    for record in gathered:
+        if not isinstance(record, dict):
+            raise RuntimeError("policy AUX reuse gather returned malformed rank data")
+        rank = int(record["rank"])
+        for row, count in dict(record["row_counts"]).items():
+            identity: object = (rank, int(row)) if data_sharded else int(row)
+            merged[identity] += int(count)
+        merged_games.update(int(seed) for seed in record["game_seeds"])
+    counts = np.asarray(tuple(merged.values()), dtype=np.int64)
+    draws = int(counts.sum()) if counts.size else 0
+    unique_rows = int(counts.size)
+    return {
+        "schema_version": "policy-aux-source-reuse-v1",
+        "draws": draws,
+        "unique_source_rows": unique_rows,
+        "unique_source_games": len(merged_games),
+        "draws_per_unique_row": (
+            float(draws / unique_rows) if unique_rows else 0.0
+        ),
+        "max_source_row_reuse": int(counts.max()) if counts.size else 0,
+        "source_row_reuse_p50": (
+            float(np.percentile(counts, 50)) if counts.size else 0.0
+        ),
+        "source_row_reuse_p95": (
+            float(np.percentile(counts, 95)) if counts.size else 0.0
+        ),
+        "source_row_reuse_p99": (
+            float(np.percentile(counts, 99)) if counts.size else 0.0
+        ),
+        "data_sharded_identity": bool(data_sharded),
+    }
 
 
 def _a1_canonical_sample_row_identity(
