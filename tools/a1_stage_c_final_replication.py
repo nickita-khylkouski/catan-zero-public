@@ -1150,6 +1150,15 @@ def build_final_corpus_admission(
             "naive_root_blend_authorized": False,
             "terminal_target_remains_authoritative": True,
         },
+        "teacher_experiment_role": {
+            "role": "current_coherent_operator_control",
+            "current_operator_policy_targets_are_final_production_winner": False,
+            "target_policy_uses_d1_reanalysis": False,
+            "target_policy_uses_reliability_weighting": False,
+            "completed_q_and_reliability_evidence_preserved": True,
+            "future_d1_or_reliability_teacher_treatment_requires_distinct_corpus": True,
+            "future_treatment_may_not_relabel_or_mutate_these_target_bytes": True,
+        },
         "fresh_independent_target_bytes": True,
         "diagnostic_overlay_or_target_bytes_reused": False,
         "low_level_diagnostic_schema_used_only_as_transform": True,
@@ -1174,6 +1183,16 @@ def verify_final_corpus_admission(path: Path) -> dict[str, Any]:
         or payload.get("auto_promotion") is not False
         or payload.get("fresh_independent_target_bytes") is not True
         or payload.get("diagnostic_overlay_or_target_bytes_reused") is not False
+        or payload.get("teacher_experiment_role")
+        != {
+            "role": "current_coherent_operator_control",
+            "current_operator_policy_targets_are_final_production_winner": False,
+            "target_policy_uses_d1_reanalysis": False,
+            "target_policy_uses_reliability_weighting": False,
+            "completed_q_and_reliability_evidence_preserved": True,
+            "future_d1_or_reliability_teacher_treatment_requires_distinct_corpus": True,
+            "future_treatment_may_not_relabel_or_mutate_these_target_bytes": True,
+        }
     ):
         raise FinalReplicationError("Stage-C final corpus role drifted")
     rebuilt = build_final_corpus_admission(
@@ -1363,6 +1382,14 @@ def build_final_authority(
             "code_tree_sha256": reviewed_code_tree_sha256,
             "lock": _artifact(lock_path),
         },
+        "teacher_status": {
+            "role": "current_coherent_operator_control",
+            "strength_winner_claimed": False,
+            "noise_floor_finding_requires_separate_teacher_treatment": True,
+            "d1_or_reliability_targets_mixed_into_this_corpus": False,
+            "future_teacher_treatment_requires_new_corpus_admission_and_authority": True,
+            "completed_q_and_reliability_evidence_retained_for_followup": True,
+        },
         "diagnostic_only": False,
         "promotion_eligible": False,
         "promotion_eligible_after_full_gate": True,
@@ -1465,6 +1492,15 @@ def verify_final_authority(path: Path) -> dict[str, Any]:
             "selected_diagnostic_checkpoint_loaded"
         )
         is not False
+        or payload.get("teacher_status")
+        != {
+            "role": "current_coherent_operator_control",
+            "strength_winner_claimed": False,
+            "noise_floor_finding_requires_separate_teacher_treatment": True,
+            "d1_or_reliability_targets_mixed_into_this_corpus": False,
+            "future_teacher_treatment_requires_new_corpus_admission_and_authority": True,
+            "completed_q_and_reliability_evidence_retained_for_followup": True,
+        }
     ):
         raise FinalReplicationError("Stage-C final authority role drifted")
     rebuilt = build_final_authority(
