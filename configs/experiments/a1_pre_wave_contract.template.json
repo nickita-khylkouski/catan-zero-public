@@ -124,7 +124,7 @@
       "soft_target_source": "policy",
       "soft_target_weight": 1.0,
       "policy_target_blend_semantics": "policy_target_fallback_v2",
-      "soft_target_temperature": 0.7,
+      "soft_target_temperature": 1.0,
       "soft_target_min_legal_coverage": 1.0,
       "value_loss_weight": 0.25,
       "scalar_value_loss_readout": "deployed_tanh",

@@ -270,6 +270,7 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     ]
     assert recipe["soft_target_source"] == "policy"
     assert recipe["soft_target_weight"] == 1.0
+    assert recipe["soft_target_temperature"] == 1.0
     assert recipe["soft_target_min_legal_coverage"] == 1.0
     assert recipe["train_diagnostics_every_batches"] == 16
     assert recipe["objective_gradient_interference_every_batches"] == 16
@@ -285,10 +286,10 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     ]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:d48cee3f9f4a2c7024bedae479a9d81d8fbe5a59f3cd5d4ab2d5ecd683044a75"
+        "sha256:2d4fdfd6cbfca0a99fa564675eb9792e3be232e9de783f0c3f52a17b2f368938"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:533d96a2cd9ac28134f03efbe6bb5d7e1013ca990b2ae57c96dc76cc5230077b"
+        "sha256:7072aed22bc118c9afac6f463416a04d26480ff09de96a623ba4a96ff03a5b3f"
     )
 
 

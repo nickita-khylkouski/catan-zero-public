@@ -97,6 +97,12 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     ),
     "minimum_feature_learning_signal_observations": 2,
     "final_vp_loss_weight": 0.05,
+    # Stored coherent search policies are already normalized teacher targets.
+    # train_bc's scalar temperature applies only to score-derived targets;
+    # sealing 0.7 here previously described an objective the optimizer never
+    # received. Per-component policy calibration must be separately
+    # authenticated in the corpus descriptor.
+    "soft_target_temperature": 1.0,
     "symmetry_augment": True,
     # History action ids and board-entity target ids must rotate with the board.
     # Sealing this separately prevents a future parser-default change from

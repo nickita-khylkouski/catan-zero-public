@@ -52,6 +52,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     assert recipe["base_sampler"] == "coverage_importance_v1"
     assert recipe["soft_target_source"] == "policy"
     assert recipe["soft_target_weight"] == 1.0
+    assert recipe["soft_target_temperature"] == 1.0
     assert recipe["soft_target_min_legal_coverage"] == 1.0
     assert recipe["train_diagnostics_every_batches"] == 16
     assert recipe["objective_gradient_interference_every_batches"] == 16
