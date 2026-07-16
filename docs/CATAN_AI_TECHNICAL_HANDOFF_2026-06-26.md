@@ -364,8 +364,12 @@ Important command:
 
 ```bash
 cd <verified-local-checkout>
-.venv/bin/python tools/reanalysis_orchestrator.py gate-ready --manifest runs/self_play/reanalysis_v1/manifest.json --promote-if-better
+.venv/bin/python tools/reanalysis_orchestrator.py gate-ready --manifest runs/self_play/reanalysis_v1/manifest.json
 ```
+
+This legacy command is diagnostic-only by default. Use the canonical promotion
+transaction for production champion changes; the old direct-copy path now
+requires an explicit acknowledgement plus guarded, freshly rerun evidence.
 
 ### 5. Tests added/updated
 
@@ -561,7 +565,7 @@ Pull/gate ready reanalysis checkpoints:
 
 ```bash
 cd <verified-local-checkout>
-.venv/bin/python tools/reanalysis_orchestrator.py gate-ready --manifest runs/self_play/reanalysis_v1/manifest.json --promote-if-better
+.venv/bin/python tools/reanalysis_orchestrator.py gate-ready --manifest runs/self_play/reanalysis_v1/manifest.json
 ```
 
 Generate sparse reanalysis locally for smoke:

@@ -10,7 +10,12 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.league_orchestrator import gate_checkpoints, read_manifest, run
+from tools.league_orchestrator import (
+    LEGACY_OVERWRITE_ACK_FLAG,
+    gate_checkpoints,
+    read_manifest,
+    run,
+)
 
 
 def main() -> None:
@@ -62,9 +67,19 @@ def main() -> None:
         "--skip-evaluate-champion",
         dest="evaluate_champion",
         action="store_false",
+        help="Diagnostic-only; incompatible with champion writes.",
     )
     gate_parser.set_defaults(evaluate_champion=True)
     gate_parser.add_argument("--promote-if-better", action="store_true")
+    gate_parser.add_argument(
+        LEGACY_OVERWRITE_ACK_FLAG,
+        action="store_true",
+        help=(
+            "Explicitly acknowledge the non-production legacy overwrite path. "
+            "The shared league guard still requires canonical gate settings and "
+            "fresh candidate/champion evaluations."
+        ),
+    )
     gate_parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
@@ -100,6 +115,7 @@ def main() -> None:
             champion_value_wins=args.champion_value_wins,
             evaluate_champion=args.evaluate_champion,
             promote_if_better=args.promote_if_better,
+            allow_legacy_champion_overwrite=args.allow_legacy_champion_overwrite,
             dry_run=args.dry_run,
         )
         gated = gate_checkpoints(gate_args) if pulled["checkpoints"] else []

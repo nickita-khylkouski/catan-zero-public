@@ -4,15 +4,23 @@ import argparse
 import json
 from pathlib import Path
 
+import pytest
+
 from tools.league_orchestrator import (
+    CANONICAL_GATE_VPS_TO_WIN,
     DEFAULT_BRANCHES,
+    LEGACY_OVERWRITE_ACK_FLAG,
+    MIN_PROMOTION_GAMES_PER_LEG,
+    MIN_PROMOTION_MAX_DECISIONS,
     _parse_poll_stdout,
+    atomic_replace_checkpoint,
     build_eval_command,
     build_branch_specs,
     build_manifest,
     build_remote_launch_command,
     cleanup_local_wrappers,
     gate_checkpoint,
+    gate_checkpoints,
     write_manifest,
     read_manifest,
     should_promote_gate,
@@ -232,3 +240,118 @@ def test_gate_checkpoint_can_evaluate_champion_on_same_legs(monkeypatch, tmp_pat
     assert summary["champion_value_wins"] == 5
     assert summary["promote"] is True
     assert summary["champion_reports"]
+
+
+def _gate_args(tmp_path: Path, **overrides) -> argparse.Namespace:
+    values = {
+        "checkpoint": [str(tmp_path / "candidate.pt")],
+        "eval_dir": str(tmp_path / "eval"),
+        "champion": str(tmp_path / "champion.pt"),
+        "games": MIN_PROMOTION_GAMES_PER_LEG,
+        "workers": 1,
+        "vps_to_win": CANONICAL_GATE_VPS_TO_WIN,
+        "max_decisions": MIN_PROMOTION_MAX_DECISIONS,
+        "common_heuristic_seed": 1,
+        "common_value_seed": 2,
+        "verify_heuristic_seed": 3,
+        "verify_value_seed": 4,
+        "champion_heuristic_wins": 0,
+        "champion_value_wins": 0,
+        "evaluate_champion": True,
+        "promote_if_better": True,
+        "allow_legacy_champion_overwrite": True,
+        "dry_run": False,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_legacy_promotion_write_fails_closed_before_evaluation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    args = _gate_args(
+        tmp_path,
+        vps_to_win=6,
+        games=12,
+        max_decisions=300,
+        evaluate_champion=False,
+        allow_legacy_champion_overwrite=False,
+    )
+    called = False
+
+    def fail_if_called(**kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("unsafe gate reached evaluation")
+
+    monkeypatch.setattr("tools.league_orchestrator.gate_checkpoint", fail_if_called)
+
+    with pytest.raises(SystemExit) as exc:
+        gate_checkpoints(args)
+
+    message = str(exc.value)
+    assert LEGACY_OVERWRITE_ACK_FLAG in message
+    assert "--vps-to-win=6" in message
+    assert "--games=12" in message
+    assert "--max-decisions=300" in message
+    assert "--skip-evaluate-champion" in message
+    assert called is False
+    assert not (tmp_path / "eval").exists()
+
+
+def test_authorized_promotion_forces_fresh_candidate_and_champion_reports(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    candidate = tmp_path / "candidate.pt"
+    champion = tmp_path / "champion.pt"
+    candidate.write_bytes(b"candidate")
+    champion.write_bytes(b"champion")
+    args = _gate_args(tmp_path)
+    eval_dir = Path(args.eval_dir)
+    eval_dir.mkdir()
+    stale_report = {"wins": 999}
+    for prefix, opponent, seed in (
+        ("common", "catanatron_ab3", 1),
+        ("common", "catanatron_search", 2),
+        ("verify2", "jsettlers_lite", 3),
+        ("verify2", "value", 4),
+    ):
+        for stem in ("candidate", "champion"):
+            path = (
+                eval_dir
+                / f"{prefix}_{stem}_vs_{opponent}{MIN_PROMOTION_GAMES_PER_LEG}_s{seed}.json"
+            )
+            path.write_text(json.dumps(stale_report), encoding="utf-8")
+
+    calls: list[Path] = []
+
+    def fake_run(command, *, dry_run, check=True):
+        output = Path(command[-1])
+        calls.append(output)
+        wins = 2 if "candidate" in output.name else 1
+        output.write_text(json.dumps({"wins": wins}), encoding="utf-8")
+
+    monkeypatch.setattr("tools.league_orchestrator.run", fake_run)
+
+    summaries = gate_checkpoints(args)
+
+    assert len(calls) == 8
+    assert summaries[0]["fresh_evaluation"] is True
+    assert summaries[0]["promote"] is True
+    assert champion.read_bytes() == b"candidate"
+
+
+def test_atomic_replace_checkpoint_preserves_source_bytes(tmp_path) -> None:
+    source = tmp_path / "candidate.pt"
+    destination = tmp_path / "champions" / "current.pt"
+    source.write_bytes(b"new checkpoint")
+    destination.parent.mkdir()
+    destination.write_bytes(b"old checkpoint")
+
+    atomic_replace_checkpoint(source, destination)
+
+    assert source.read_bytes() == b"new checkpoint"
+    assert destination.read_bytes() == b"new checkpoint"
+    assert list(destination.parent.glob(f".{destination.name}.tmp-*")) == []

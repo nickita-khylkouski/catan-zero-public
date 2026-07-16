@@ -13,6 +13,10 @@ from typing import Any
 
 
 MANIFEST_VERSION = 1
+CANONICAL_GATE_VPS_TO_WIN = 10
+MIN_PROMOTION_GAMES_PER_LEG = 200
+MIN_PROMOTION_MAX_DECISIONS = 1200
+LEGACY_OVERWRITE_ACK_FLAG = "--allow-legacy-champion-overwrite"
 DEFAULT_BRANCHES = (
     "adaptive_ema_qoff",
     "search_ema_dagger_qoff",
@@ -79,7 +83,23 @@ def main() -> None:
         ),
     )
     gate_parser.set_defaults(evaluate_champion=True)
-    gate_parser.add_argument("--promote-if-better", action="store_true")
+    gate_parser.add_argument(
+        "--promote-if-better",
+        action="store_true",
+        help=(
+            "Replace the legacy champion when the panel improves. Real writes "
+            f"also require {LEGACY_OVERWRITE_ACK_FLAG} and the guarded gate settings."
+        ),
+    )
+    gate_parser.add_argument(
+        LEGACY_OVERWRITE_ACK_FLAG,
+        action="store_true",
+        help=(
+            "Acknowledge that this is a legacy, non-production promotion path. "
+            "Promotion still requires 10 VP, at least 200 games per leg, a "
+            "1200-decision cap, a same-leg champion evaluation, and fresh reports."
+        ),
+    )
     gate_parser.add_argument("--dry-run", action="store_true")
 
     cleanup_parser = subparsers.add_parser("cleanup-local-wrappers")
@@ -461,6 +481,16 @@ def pull_manifest_checkpoints(manifest: dict[str, Any], output_dir: Path) -> lis
 
 
 def gate_checkpoints(args: argparse.Namespace) -> list[dict[str, Any]]:
+    promotion_write_enabled = bool(args.promote_if_better and not args.dry_run)
+    if promotion_write_enabled:
+        safety_issues = legacy_promotion_safety_issues(args)
+        if safety_issues:
+            raise SystemExit(
+                "refusing legacy champion overwrite: "
+                + "; ".join(safety_issues)
+                + ". Run without --promote-if-better for diagnostics, or use the "
+                "canonical promotion transaction for production."
+            )
     results = []
     for checkpoint in args.checkpoint:
         summary = gate_checkpoint(
@@ -479,14 +509,48 @@ def gate_checkpoints(args: argparse.Namespace) -> list[dict[str, Any]]:
             champion=Path(args.champion),
             evaluate_champion=args.evaluate_champion,
             dry_run=args.dry_run,
+            force_fresh_evaluation=promotion_write_enabled,
         )
-        if summary["promote"] and args.promote_if_better and not args.dry_run:
+        if summary["promote"] and promotion_write_enabled:
             champion = Path(args.champion)
-            champion.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(checkpoint, champion)
+            atomic_replace_checkpoint(Path(checkpoint), champion)
             summary["promoted_to"] = str(champion)
         results.append(summary)
     return results
+
+
+def legacy_promotion_safety_issues(args: argparse.Namespace) -> tuple[str, ...]:
+    issues: list[str] = []
+    if not getattr(args, "allow_legacy_champion_overwrite", False):
+        issues.append(f"missing explicit {LEGACY_OVERWRITE_ACK_FLAG} acknowledgement")
+    if int(args.vps_to_win) != CANONICAL_GATE_VPS_TO_WIN:
+        issues.append(
+            f"--vps-to-win={args.vps_to_win}, expected {CANONICAL_GATE_VPS_TO_WIN}"
+        )
+    if int(args.games) < MIN_PROMOTION_GAMES_PER_LEG:
+        issues.append(
+            f"--games={args.games}, minimum is {MIN_PROMOTION_GAMES_PER_LEG} per leg"
+        )
+    if int(args.max_decisions) < MIN_PROMOTION_MAX_DECISIONS:
+        issues.append(
+            f"--max-decisions={args.max_decisions}, minimum is "
+            f"{MIN_PROMOTION_MAX_DECISIONS}"
+        )
+    if not bool(args.evaluate_champion):
+        issues.append("--skip-evaluate-champion is diagnostic-only")
+    return tuple(issues)
+
+
+def atomic_replace_checkpoint(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.tmp-{os.getpid()}"
+    )
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def gate_checkpoint(
@@ -506,6 +570,7 @@ def gate_checkpoint(
     champion: Path,
     evaluate_champion: bool,
     dry_run: bool,
+    force_fresh_evaluation: bool = False,
 ) -> dict[str, Any]:
     eval_dir.mkdir(parents=True, exist_ok=True)
     stem = checkpoint.stem
@@ -521,7 +586,7 @@ def gate_checkpoint(
         if dry_run:
             reports[f"{prefix}_{opponent}"] = {"output": str(output), "dry_run": True}
             continue
-        if not output.exists():
+        if force_fresh_evaluation or not output.exists():
             run(
                 build_eval_command(
                     checkpoint=checkpoint,
@@ -543,7 +608,7 @@ def gate_checkpoint(
         champion_stem = champion.stem
         for prefix, opponent, seed in legs:
             output = eval_dir / f"{prefix}_{champion_stem}_vs_{opponent}{games}_s{seed}.json"
-            if not output.exists():
+            if force_fresh_evaluation or not output.exists():
                 run(
                     build_eval_command(
                         checkpoint=champion,
@@ -589,6 +654,7 @@ def gate_checkpoint(
         "reason": reason,
         "reports": reports,
         "champion_reports": champion_reports,
+        "fresh_evaluation": force_fresh_evaluation,
     }
 
 
