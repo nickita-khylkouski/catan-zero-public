@@ -7719,6 +7719,7 @@ def _effective_a1_learner_training_recipe(
         "weight_decay",
         "fused_optimizer",
         "value_lr_mult",
+        "value_trunk_grad_scale",
         "action_module_lr_mult",
         "trunk_lr_mult",
         "policy_loss_weight",
