@@ -75,7 +75,7 @@ def test_supported_train_script_ignores_ambient_stale_pythonpath(
     assert "ambient stale package imported" not in completed.stderr
 
 
-def test_direct_internal_engine_refuses_after_binding_its_checkout(
+def test_direct_internal_engine_binds_checkout_for_sealed_compatibility(
     tmp_path: Path,
 ) -> None:
     environment = _stale_pythonpath_environment(tmp_path)
@@ -89,8 +89,8 @@ def test_direct_internal_engine_refuses_after_binding_its_checkout(
         check=False,
     )
 
-    assert completed.returncode != 0
-    assert "internal training engine, not a supported CLI" in completed.stderr
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
     assert "ambient stale package imported" not in completed.stderr
 
 
