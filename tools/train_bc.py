@@ -16809,10 +16809,17 @@ def _objective_measure_validation_aggregate(
         "prior_kl_model_prior_mean": "prior_kl_rows",
         "prior_kl_prior_model_mean": "prior_kl_rows",
         "prior_kl_target_prior_mean": "prior_kl_rows",
-        "active_policy_kl_target_model_mean": "active_policy_teacher_gap_rows",
-        "active_policy_kl_target_prior_mean": "active_policy_teacher_gap_rows",
+        "active_policy_kl_target_model_mean": "active_policy_teacher_gap_weight_sum",
+        "active_policy_kl_target_prior_mean": "active_policy_teacher_gap_weight_sum",
     }
     for key, denominator_key in conditional_metrics.items():
+        if denominator_key == "active_policy_teacher_gap_weight_sum" and not all(
+            denominator_key in report for report in reports
+        ):
+            # Historical validation artifacts predate explicit policy-measure
+            # mass. Their closure was uniform over eligible rows; retain that
+            # replay semantics while all new reports carry the exact weights.
+            denominator_key = "active_policy_teacher_gap_rows"
         if not all(
             key in report
             and denominator_key in report
@@ -17092,6 +17099,7 @@ def evaluate_bc_batches(
             "prior_kl_prior_model_sum": 0.0,
             "prior_kl_target_prior_sum": 0.0,
             "active_policy_teacher_gap_rows": 0.0,
+            "active_policy_teacher_gap_weight_sum": 0.0,
             "active_policy_kl_target_model_sum": 0.0,
             "active_policy_kl_target_prior_sum": 0.0,
         }
@@ -17258,6 +17266,9 @@ def evaluate_bc_batches(
             )
             extra_sums["active_policy_teacher_gap_rows"] += float(
                 batch_metrics.get("active_policy_teacher_gap_rows", 0.0)
+            )
+            extra_sums["active_policy_teacher_gap_weight_sum"] += float(
+                batch_metrics.get("active_policy_teacher_gap_weight_sum", 0.0)
             )
             extra_sums["active_policy_kl_target_model_sum"] += float(
                 batch_metrics.get("active_policy_kl_target_model_sum", 0.0)
@@ -17452,6 +17463,7 @@ def evaluate_bc_batches(
             # multi-action soft target + a recorded prior.
             **_active_policy_teacher_gap_report(
                 rows=extra_sums["active_policy_teacher_gap_rows"],
+                weight_sum=extra_sums["active_policy_teacher_gap_weight_sum"],
                 kl_target_model_sum=extra_sums[
                     "active_policy_kl_target_model_sum"
                 ],
@@ -17770,11 +17782,9 @@ def _eval_xdim_batch(
             else:
                 per_sample_loss = hard_loss
             # Teacher-gap telemetry must follow the rows the POLICY objective can
-            # actually update.  In PCR corpora, fast-search and forced rows still
-            # carry stored target/prior distributions but have zero policy weight;
-            # including them made the historical prior_kl_ratio compare against a
-            # much larger, untrained target population.
-            policy_active_for_teacher_gap = policy_weights > 0.0
+            # actually update. The exact positive policy weights are also the
+            # teacher-gap measure; reducing them to a boolean made weighted
+            # learner recipes report an unrelated uniform-row closure.
             (
                 outcome_targets,
                 vp_targets,
@@ -18129,18 +18139,28 @@ def _eval_xdim_batch(
             policy.device,
             soft_targets=soft_targets,
             has_soft=has_soft,
-            policy_active=policy_active_for_teacher_gap,
+            policy_weights=policy_weights,
         )
         if teacher_gap is not None:
             teacher_gap_rows = int(teacher_gap["eligible"].sum().item())
+            teacher_gap_weight_sum = float(
+                teacher_gap["measure_weights"].sum().item()
+            )
             teacher_kl_target_model_sum = float(
-                teacher_gap["kl_target_model"][teacher_gap["eligible"]].sum().item()
+                (
+                    teacher_gap["kl_target_model"]
+                    * teacher_gap["measure_weights"]
+                ).sum().item()
             )
             teacher_kl_target_prior_sum = float(
-                teacher_gap["kl_target_prior"][teacher_gap["eligible"]].sum().item()
+                (
+                    teacher_gap["kl_target_prior"]
+                    * teacher_gap["measure_weights"]
+                ).sum().item()
             )
         else:
             teacher_gap_rows = 0
+            teacher_gap_weight_sum = 0.0
             teacher_kl_target_model_sum = 0.0
             teacher_kl_target_prior_sum = 0.0
         return {
@@ -18265,6 +18285,7 @@ def _eval_xdim_batch(
             "prior_kl_prior_model_sum": kl_prior_model_sum,
             "prior_kl_target_prior_sum": kl_target_prior_sum,
             "active_policy_teacher_gap_rows": teacher_gap_rows,
+            "active_policy_teacher_gap_weight_sum": teacher_gap_weight_sum,
             "active_policy_kl_target_model_sum": teacher_kl_target_model_sum,
             "active_policy_kl_target_prior_sum": teacher_kl_target_prior_sum,
         }
@@ -21814,7 +21835,7 @@ def _active_policy_teacher_gap_telemetry(
     *,
     soft_targets,
     has_soft,
-    policy_active,
+    policy_weights,
 ):
     """Measure how much of the active soft-policy teacher gap was closed.
 
@@ -21858,8 +21879,9 @@ def _active_policy_teacher_gap_telemetry(
     prior = prior / torch.clamp(prior_mass.unsqueeze(-1), min=eps)
 
     has_multi_action_target = ((target > 0.0) & valid).sum(dim=-1) > 1
+    measure_weights = policy_weights.to(device=device, dtype=torch.float32)
     eligible = (
-        policy_active.to(device=device, dtype=torch.bool)
+        (measure_weights > 0.0)
         & has_soft.to(device=device, dtype=torch.bool)
         & has_multi_action_target
         & (prior_mass > eps)
@@ -21880,26 +21902,35 @@ def _active_policy_teacher_gap_telemetry(
     ).sum(dim=-1).clamp_min(0.0)
     return {
         "eligible": eligible,
+        "measure_weights": torch.where(
+            eligible, measure_weights, torch.zeros_like(measure_weights)
+        ),
         "kl_target_model": kl_target_model,
         "kl_target_prior": kl_target_prior,
     }
 
 
 def _active_policy_teacher_gap_report(
-    *, rows: float, kl_target_model_sum: float, kl_target_prior_sum: float
+    *,
+    rows: float,
+    weight_sum: float | None = None,
+    kl_target_model_sum: float,
+    kl_target_prior_sum: float,
 ) -> dict[str, float | int]:
     """Reduce additive teacher-gap statistics into report-level metrics."""
 
     count = max(float(rows), 0.0)
+    denominator = count if weight_sum is None else max(float(weight_sum), 0.0)
     target_model = float(kl_target_model_sum)
     target_prior = float(kl_target_prior_sum)
     return {
         "active_policy_teacher_gap_rows": int(round(count)),
-        "active_policy_kl_target_model_mean": target_model / max(count, 1.0),
-        "active_policy_kl_target_prior_mean": target_prior / max(count, 1.0),
+        "active_policy_teacher_gap_weight_sum": denominator,
+        "active_policy_kl_target_model_mean": target_model / max(denominator, 1.0e-12),
+        "active_policy_kl_target_prior_mean": target_prior / max(denominator, 1.0e-12),
         "active_policy_teacher_gap_closure": (
             1.0 - target_model / target_prior
-            if count > 0.0 and target_prior > 1.0e-8
+            if denominator > 0.0 and target_prior > 1.0e-8
             else 0.0
         ),
     }

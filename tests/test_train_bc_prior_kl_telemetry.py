@@ -152,7 +152,7 @@ def _active_teacher_gap(
         torch.device("cpu"),
         soft_targets=soft_targets,
         has_soft=has_soft,
-        policy_active=policy_active,
+        policy_weights=policy_active.to(dtype=torch.float32),
     )
 
 
@@ -228,7 +228,7 @@ def test_active_teacher_gap_is_unavailable_without_soft_targets_or_prior():
             torch.device("cpu"),
             soft_targets=None,
             has_soft=torch.ones(3, dtype=torch.bool),
-            policy_active=torch.ones(3, dtype=torch.bool),
+            policy_weights=torch.ones(3, dtype=torch.float32),
         )
         is None
     )
@@ -244,6 +244,7 @@ def test_active_teacher_gap_report_uses_additive_sums_and_handles_empty_input():
     )
     assert report == {
         "active_policy_teacher_gap_rows": 4,
+        "active_policy_teacher_gap_weight_sum": 4.0,
         "active_policy_kl_target_model_mean": pytest.approx(0.125),
         "active_policy_kl_target_prior_mean": pytest.approx(0.5),
         "active_policy_teacher_gap_closure": pytest.approx(0.75),
@@ -255,7 +256,42 @@ def test_active_teacher_gap_report_uses_additive_sums_and_handles_empty_input():
         kl_target_prior_sum=0.0,
     ) == {
         "active_policy_teacher_gap_rows": 0,
+        "active_policy_teacher_gap_weight_sum": 0.0,
         "active_policy_kl_target_model_mean": 0.0,
         "active_policy_kl_target_prior_mean": 0.0,
         "active_policy_teacher_gap_closure": 0.0,
     }
+
+
+def test_active_teacher_gap_uses_effective_policy_weights() -> None:
+    data = _base_data()
+    logits = _uniform_logits()
+    result = _active_policy_teacher_gap_telemetry(
+        data,
+        np.arange(3),
+        logits,
+        torch.device("cpu"),
+        soft_targets=torch.as_tensor(data["target_policy"], dtype=torch.float32),
+        has_soft=torch.ones(3, dtype=torch.bool),
+        policy_weights=torch.tensor([4.0, 1.0, 0.0]),
+    )
+
+    assert result is not None
+    assert result["eligible"].tolist() == [True, True, False]
+    assert result["measure_weights"].tolist() == [4.0, 1.0, 0.0]
+    weighted_model = float(
+        (result["kl_target_model"] * result["measure_weights"]).sum()
+    )
+    weighted_prior = float(
+        (result["kl_target_prior"] * result["measure_weights"]).sum()
+    )
+    report = _active_policy_teacher_gap_report(
+        rows=2,
+        weight_sum=5.0,
+        kl_target_model_sum=weighted_model,
+        kl_target_prior_sum=weighted_prior,
+    )
+    assert report["active_policy_teacher_gap_weight_sum"] == pytest.approx(5.0)
+    assert report["active_policy_kl_target_model_mean"] == pytest.approx(
+        weighted_model / 5.0
+    )
