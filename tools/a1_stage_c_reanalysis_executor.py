@@ -51,6 +51,9 @@ from catan_zero.rl.gumbel_self_play import (  # noqa: E402
 )
 from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
     GumbelChanceMCTSConfig,
+    _root_candidate_count,
+    exact_budget_sh_phases,
+    sequential_halving_schedule,
 )
 from catan_zero.search.native_gumbel_mcts import (  # noqa: E402
     create_gumbel_search,
@@ -1156,6 +1159,33 @@ def _effective_search_config(
     return config
 
 
+def _expected_forced_full_simulations(
+    legal_width: int, effective_config: Mapping[str, Any]
+) -> int:
+    """Replay the exact root-budget accounting sealed by Stage C."""
+
+    kwargs = dict(effective_config)
+    kwargs["seed"] = 0
+    if "colors" in kwargs:
+        kwargs["colors"] = tuple(str(value) for value in kwargs["colors"])
+    try:
+        config = GumbelChanceMCTSConfig(**kwargs)
+    except (TypeError, ValueError) as error:
+        raise ExecutorError(f"invalid effective search config: {error}") from error
+    nominal = int(config.n_full)
+    candidates = _root_candidate_count(int(legal_width), config)
+    exact = bool(config.exact_budget_sh) and (
+        int(config.exact_budget_sh_min_n) <= 0
+        or nominal >= int(config.exact_budget_sh_min_n)
+    )
+    schedule = (
+        exact_budget_sh_phases(candidates, nominal)
+        if exact
+        else sequential_halving_schedule(candidates, nominal)
+    )
+    return sum(int(count) * int(per_candidate) for count, per_candidate in schedule)
+
+
 def _evaluator_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
     fields = _sealed_typed_fields(plan)
     target = plan["target_policy_target_identity"]
@@ -1257,9 +1287,11 @@ def _search_patch(
     execution = plan["target_policy_target_identity"].get("target_execution")
     if execution != alignment.STAGE_C_TARGET_EXECUTION:
         raise ExecutorError("Stage-C forced-full target execution identity drifted")
+    effective_config = plan["target_policy_target_identity"]["effective_gumbel_config"]
     if (
         not bool(result.used_full_search)
-        or int(result.simulations_used) != int(execution["effective_simulations"])
+        or int(result.simulations_used)
+        != _expected_forced_full_simulations(len(legal_rust), effective_config)
         or not math.isfinite(float(result.root_value))
         or not bool(result.q_values_root_perspective)
         or not np.all(np.isfinite(completed))
@@ -1621,6 +1653,14 @@ def _verify_patch_arrays(
             valid = np.all(values == expected_value)
         if not valid:
             raise ExecutorError("Stage-C patch reliability sentinel drifted")
+    effective_config = None
+    if patch_schema == PATCH_SCHEMA:
+        search = receipt.get("search")
+        if not isinstance(search, Mapping) or not isinstance(
+            search.get("effective_config_without_row_seed"), Mapping
+        ):
+            raise ExecutorError("Stage-C v2 patch lost its effective search config")
+        effective_config = search["effective_config_without_row_seed"]
     for row in range(count):
         start, stop = int(offsets[row]), int(offsets[row + 1])
         legal = np.asarray(arrays["legal_action_ids_flat"])[start:stop]
@@ -1654,9 +1694,9 @@ def _verify_patch_arrays(
             or not bool(arrays["q_values_root_perspective"][row])
             or (
                 int(arrays["simulations_used"][row]) <= 0
-                if patch_schema == PATCH_SCHEMA_V1
+                if effective_config is None
                 else int(arrays["simulations_used"][row])
-                != int(alignment.STAGE_C_TARGET_EXECUTION["effective_simulations"])
+                != _expected_forced_full_simulations(stop - start, effective_config)
             )
         ):
             raise ExecutorError("Stage-C patch contains invalid search evidence")
@@ -1946,10 +1986,7 @@ def _rebind_legacy_merge(args: argparse.Namespace) -> dict[str, Any]:
         arrays = {name: np.asarray(source[name]).copy() for name in source.files}
     if (
         not np.all(arrays["used_full_search"])
-        or not np.all(
-            arrays["simulations_used"]
-            == int(alignment.STAGE_C_TARGET_EXECUTION["effective_simulations"])
-        )
+        or np.any(arrays["simulations_used"] <= 0)
         or not np.all(arrays["completed_q_mask_flat"])
     ):
         raise ExecutorError("legacy patch lacks exact forced-full per-row evidence")

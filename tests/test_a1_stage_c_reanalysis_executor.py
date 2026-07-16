@@ -324,6 +324,11 @@ def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
     arrays = executor._patch_arrays([record])
     receipt = {
         "patch_schema_version": executor.PATCH_SCHEMA,
+        "search": {
+            "effective_config_without_row_seed": executor.alignment._complete_effective_search_config(  # noqa: SLF001
+                {"n_full": 128}
+            )
+        },
         "patch_columns": sorted(arrays),
         "counts": {"rows": 1, "legal_actions": 2},
         "target_policy_target_identity_sha256": provenance[
@@ -342,6 +347,18 @@ def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
     assert arrays["target_reliability_audited"].tolist() == [False]
     assert arrays["target_reliability_confidence"].tolist() == [1.0]
     assert arrays["target_policy_mask_flat"].tolist() == [True, True]
+
+
+def test_forced_full_simulation_accounting_replays_width_dependent_sh() -> None:
+    effective = executor.alignment._complete_effective_search_config(  # noqa: SLF001
+        {"n_full": 128, "max_root_candidates_wide": 54}
+    )
+
+    assert executor._expected_forced_full_simulations(3, effective) == 127
+    assert executor._expected_forced_full_simulations(16, effective) == 128
+    assert executor._expected_forced_full_simulations(26, effective) == 112
+    assert executor._expected_forced_full_simulations(40, effective) == 141
+    assert executor._expected_forced_full_simulations(54, effective) == 154
 
 
 def test_portable_runtime_verifies_historical_git_blobs_not_current_tree(

@@ -75,8 +75,15 @@ STAGE_C_TARGET_EXECUTION = {
     "schema_version": "a1-stage-c-target-execution-v1",
     "mode": "forced_full_root_reanalysis",
     "force_full_override": True,
-    "effective_simulations": 128,
-    "budget_source": "force_full_overrides_playout_cap_and_wide_root_gates",
+    "nominal_n_full": 128,
+    "actual_simulations": "authoritative_per_row_deterministic_schedule_result",
+    "simulation_accounting_schema": (
+        "gumbel_root_candidate_count_plus_sequential_halving_v1"
+    ),
+    "budget_semantics": (
+        "force_full selects n_full; legacy Sequential-Halving schedule accounting "
+        "can realize a legal-width-dependent count different from nominal_n_full"
+    ),
     "row_seed_schema": STAGE_C_ROW_SEED_SCHEMA,
 }
 POLICY_STATUS = {
