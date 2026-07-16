@@ -54,6 +54,8 @@ def _report(seed_sha: str) -> dict:
         "data_format": "memmap",
         "data_fingerprint": "sha256:descriptor",
         "a1_memmap_payload_inventory_sha256": "sha256:inventory",
+        "track": "2p_no_trade",
+        "graph_history_features": False,
         "validation_game_seed_set_sha256": seed_sha,
         "validation_samples": 6,
         "arch": "entity_graph",
@@ -69,6 +71,7 @@ def _report(seed_sha: str) -> dict:
         "per_game_policy_weight": False,
         "per_game_policy_weight_mode": "equal",
         "forced_row_value_weight": 1.0,
+        "forced_row_value_action_type_weights": {"END_TURN": 0.1, "ROLL": 0.25},
         "per_game_value_weight": False,
         "per_game_value_weight_mode": "equal",
         "mask_hidden_info": True,
@@ -92,6 +95,7 @@ def _report(seed_sha: str) -> dict:
         "policy_kl_anchor_direction": "forward",
         "value_uncertainty_loss_weight": 0.0,
         "aux_subgoal_loss_weight": 0.0,
+        "belief_resource_loss_weight": 0.4,
         "moe_balance_loss_weight": 0.0,
         "value_hlgauss_sigma_ratio": 0.75,
         "value_target_lambda": 1.0,
@@ -119,6 +123,23 @@ def test_locked_validation_indices_reject_seed_identity_drift(tmp_path: Path) ->
         posthoc._locked_validation_indices(
             _Composite(), manifest, _report("sha256:wrong")
         )
+
+
+def test_forced_row_value_recipe_preserves_legacy_disabled_reports(
+    monkeypatch,
+) -> None:
+    report = _report("sha256:unused")
+    del report["forced_row_value_action_type_weights"]
+    monkeypatch.setattr(
+        posthoc.train_bc,
+        "_action_catalog_for_env_config",
+        lambda config: pytest.fail("disabled legacy recipe must not build a catalog"),
+    )
+
+    weights, catalog = posthoc._forced_row_value_recipe(report)
+
+    assert weights == {}
+    assert catalog is None
 
 
 def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch) -> None:
@@ -161,15 +182,32 @@ def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch
         "_apply_authenticated_policy_distillation_scope",
         lambda corpus, weights: scope_calls.append(corpus) or weights,
     )
+    value_weight_calls = []
     monkeypatch.setattr(
         posthoc.train_bc,
         "build_value_sample_weights",
-        lambda *a, **k: np.ones(6, dtype=np.float32),
+        lambda *a, **k: value_weight_calls.append((a, k))
+        or np.ones(6, dtype=np.float32),
+    )
+    action_catalog = object()
+    monkeypatch.setattr(
+        posthoc.train_bc,
+        "_action_catalog_for_env_config",
+        lambda config: action_catalog,
+    )
+    value_scope_calls = []
+    monkeypatch.setattr(
+        posthoc.train_bc,
+        "_apply_authenticated_value_training_scope",
+        lambda corpus, weights: value_scope_calls.append(corpus) or weights,
     )
     monkeypatch.setattr(posthoc, "_load_policy", lambda *a, **k: SimpleNamespace())
 
+    evaluate_calls = []
+
     def evaluate(policy, corpus, indices, *args, **kwargs):
-        del policy, corpus, args, kwargs
+        del policy, corpus, args
+        evaluate_calls.append(kwargs)
         value = float(np.asarray(indices).mean() + 1.0)
         return {
             "samples": int(len(indices)),
@@ -199,6 +237,17 @@ def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch
     assert result["read_only"] is True
     assert result["optimizer_steps"] == 0
     assert scope_calls == [data]
+    assert value_scope_calls == [data]
+    assert len(value_weight_calls) == 1
+    assert value_weight_calls[0][1]["forced_row_value_action_type_weights"] == {
+        "END_TURN": 0.1,
+        "ROLL": 0.25,
+    }
+    assert value_weight_calls[0][1]["action_catalog"] is action_catalog
+    assert evaluate_calls
+    assert all(
+        call["belief_resource_loss_weight"] == 0.4 for call in evaluate_calls
+    )
     assert result["checkpoint_mutated"] is False
     assert result["evaluation_repo_commit"] == "abc123"
     assert result["evaluation_tool_sha256"].startswith("sha256:")

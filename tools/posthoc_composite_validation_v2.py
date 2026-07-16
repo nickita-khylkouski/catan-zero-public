@@ -144,6 +144,27 @@ def _root_blend_args(report: dict[str, Any]) -> tuple[tuple[str, ...], bool]:
     return tuple(phases), mode == "global_compat"
 
 
+def _forced_row_value_recipe(
+    report: dict[str, Any],
+) -> tuple[dict[str, float], object | None]:
+    """Rebuild the optional typed forced-row weighting contract."""
+    raw = report.get("forced_row_value_action_type_weights")
+    if raw is None:
+        return {}, None
+    weights = _weight_map(raw, "forced_row_value_action_type_weights")
+    if not weights:
+        return {}, None
+    graph_history_features = _required(report, "graph_history_features")
+    if type(graph_history_features) is not bool:  # noqa: E721
+        raise SystemExit("training report 'graph_history_features' must be a boolean")
+    env_config = train_bc.parse_track(
+        str(_required(report, "track")),
+        vps_to_win=int(_required(report, "vps_to_win")),
+        use_graph_history_features=graph_history_features,
+    )
+    return weights, train_bc._action_catalog_for_env_config(env_config)
+
+
 def run_rescore(
     *,
     report_path: Path,
@@ -207,14 +228,20 @@ def run_rescore(
     policy_weights = train_bc._apply_authenticated_policy_distillation_scope(
         data, policy_weights
     )
+    forced_type_weights, forced_action_catalog = _forced_row_value_recipe(report)
     value_weights = train_bc.build_value_sample_weights(
         data,
         phase_weights=_weight_map(
             _required(report, "value_phase_weights"), "value_phase_weights"
         ),
         forced_row_value_weight=float(_required(report, "forced_row_value_weight")),
+        forced_row_value_action_type_weights=forced_type_weights,
+        action_catalog=forced_action_catalog,
         per_game_value_weight=bool(_required(report, "per_game_value_weight")),
         per_game_value_weight_mode=str(_required(report, "per_game_value_weight_mode")),
+    )
+    value_weights = train_bc._apply_authenticated_value_training_scope(
+        data, value_weights
     )
     train_bc._MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(
         _required(report, "mask_hidden_info")
@@ -274,6 +301,9 @@ def run_rescore(
                 _required(report, "value_uncertainty_loss_weight")
             ),
             aux_subgoal_loss_weight=float(_required(report, "aux_subgoal_loss_weight")),
+            belief_resource_loss_weight=float(
+                report.get("belief_resource_loss_weight", 0.0)
+            ),
             moe_balance_loss_weight=float(_required(report, "moe_balance_loss_weight")),
             value_categorical_loss_weight=categorical_weight,
             value_hlgauss_sigma_ratio=float(
