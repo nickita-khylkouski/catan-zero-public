@@ -2093,6 +2093,26 @@ def test_generic_ablation_can_bind_trunk_lr_and_adaptive_parent_kl(
         "effective": 0.25,
     }
 
+    shared_action = executor.bind_learner_ablation(
+        verified,
+        ablation_id="shared-action25",
+        overrides_json='{"shared_action_lr_mult":0.25}',
+        reviewed_code_tree_sha256=code_sha,
+    )
+    assert shared_action["recipe"]["shared_action_lr_mult"] == pytest.approx(0.25)
+    assert shared_action["learner_ablation"]["recipe_drift"][
+        "shared_action_lr_mult"
+    ] == {
+        "contract": 1.0,
+        "effective": 0.25,
+    }
+    assert "--shared-action-lr-mult" in executor.build_train_command(
+        shared_action,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "shared-action.pt",
+        report=tmp_path / "shared-action.json",
+    )
+
     trust = executor.bind_learner_ablation(
         verified,
         ablation_id="adaptive-parent-kl",

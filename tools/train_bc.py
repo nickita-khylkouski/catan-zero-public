@@ -1010,6 +1010,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--shared-action-lr-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "LR multiplier for the mature shared legal-action encoder only. "
+            "This is distinct from --action-module-lr-mult, which controls "
+            "fresh opt-in target-gather/cross-attention modules. 1.0 preserves "
+            "the historical optimizer topology exactly; a non-unit value is "
+            "supported only for --arch entity_graph and fails closed when the "
+            "action encoder is absent or frozen."
+        ),
+    )
+    parser.add_argument(
         "--public-card-lr-mult",
         type=float,
         default=1.0,
@@ -6338,6 +6351,7 @@ def _validate_composite_learner_recipe_authorization(
         "policy_loss_weight": float,
         "policy_surprise_weight": float,
         "public_card_lr_mult": float,
+        "shared_action_lr_mult": float,
         "policy_kl_anchor_direction": str,
         "policy_kl_anchor_weight": float,
         "policy_kl_target": float,
@@ -8777,6 +8791,11 @@ def _effective_a1_learner_training_recipe(
     public_card_lr_mult = float(getattr(args, "public_card_lr_mult", 1.0))
     if public_card_lr_mult != 1.0 or generic_a1_ablation:
         effective["public_card_lr_mult"] = public_card_lr_mult
+    shared_action_lr_mult = float(
+        getattr(args, "shared_action_lr_mult", 1.0)
+    )
+    if shared_action_lr_mult != 1.0 or generic_a1_ablation:
+        effective["shared_action_lr_mult"] = shared_action_lr_mult
     per_game_policy_surprise_weighting = bool(
         getattr(args, "per_game_policy_surprise_weighting", False)
     )
@@ -10358,6 +10377,7 @@ def _validate_a1_learner_training_recipe(
     # from non-ablation historical recipe shapes.
     for post_seal_field in (
         "public_card_lr_mult",
+        "shared_action_lr_mult",
         "per_game_policy_surprise_weighting",
         "target_reliability_confidence_weighting",
         "target_reliability_confidence_floor",
@@ -10427,6 +10447,11 @@ def _validate_a1_learner_training_recipe(
         drift["public_card_lr_mult"] = {
             "contract": 1.0,
             "effective": float(effective["public_card_lr_mult"]),
+        }
+    if float(effective.get("shared_action_lr_mult", 1.0)) != 1.0:
+        drift["shared_action_lr_mult"] = {
+            "contract": 1.0,
+            "effective": float(effective["shared_action_lr_mult"]),
         }
     if bool(effective.get("per_game_policy_surprise_weighting", False)):
         drift["per_game_policy_surprise_weighting"] = {
@@ -11707,6 +11732,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy_group_multipliers = {
             "--trunk-lr-mult": float(args.trunk_lr_mult),
             "--action-module-lr-mult": float(args.action_module_lr_mult),
+            "--shared-action-lr-mult": float(args.shared_action_lr_mult),
             "--public-card-lr-mult": float(args.public_card_lr_mult),
         }
         drift = {
@@ -12611,6 +12637,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "--trunk-lr-mult is supported only for --arch entity_graph, not "
                 "--arch candidate"
             )
+        if float(args.shared_action_lr_mult) != 1.0:
+            raise SystemExit(
+                "--shared-action-lr-mult is supported only for "
+                "--arch entity_graph, not --arch candidate"
+            )
         if float(args.public_card_lr_mult) != 1.0:
             raise SystemExit(
                 "--public-card-lr-mult is supported only for --arch entity_graph"
@@ -13173,6 +13204,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 base_lr=float(args.lr),
                 value_lr_mult=float(args.value_lr_mult),
                 action_module_lr_mult=float(args.action_module_lr_mult),
+                shared_action_lr_mult=float(args.shared_action_lr_mult),
                 public_card_lr_mult=float(args.public_card_lr_mult),
                 trunk_lr_mult=float(args.trunk_lr_mult),
                 architecture=str(args.arch),
@@ -18336,6 +18368,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         # ``lr=3e-5`` even when the actual value readout trained at 0.3x.
         "value_lr_mult": args.value_lr_mult,
         "action_module_lr_mult": args.action_module_lr_mult,
+        "shared_action_lr_mult": args.shared_action_lr_mult,
         "public_card_lr_mult": args.public_card_lr_mult,
         "trunk_lr_mult": args.trunk_lr_mult,
         "value_trunk_grad_scale": args.value_trunk_grad_scale,
@@ -34603,6 +34636,13 @@ ACTION_LOCAL_MODULE_ATTRS: tuple[str, ...] = (
     "static_action_residual_proj",
 )
 
+# Mature action-side representation shared by every legal action scored by the
+# EntityGraph policy.  It is intentionally separate from the new action-local
+# adapters above: warm-start experiments often need to commission new adapters
+# quickly while protecting this already-trained encoder from a full base-LR
+# update.
+SHARED_ACTION_MODULE_ATTRS: tuple[str, ...] = ("action_encoder",)
+
 
 def _optimizer_param_group_report(params, *, base_lr: float) -> list[dict[str, object]]:
     """Describe optimizer groups without mutating the objects passed to torch.
@@ -34715,6 +34755,7 @@ def _build_optimizer_param_groups(
     base_lr: float,
     value_lr_mult: float,
     action_module_lr_mult: float = 1.0,
+    shared_action_lr_mult: float = 1.0,
     public_card_lr_mult: float = 1.0,
     trunk_lr_mult: float = 1.0,
     architecture: str | None = None,
@@ -34734,21 +34775,27 @@ def _build_optimizer_param_groups(
     multipliers = {
         "value-lr-mult": float(value_lr_mult),
         "action-module-lr-mult": float(action_module_lr_mult),
+        "shared-action-lr-mult": float(shared_action_lr_mult),
         "public-card-lr-mult": float(public_card_lr_mult),
         "trunk-lr-mult": float(trunk_lr_mult),
     }
     if any(not math.isfinite(value) or value <= 0.0 for value in multipliers.values()):
         raise SystemExit(
             "--value-lr-mult, --action-module-lr-mult, "
-            "--public-card-lr-mult, and --trunk-lr-mult "
+            "--shared-action-lr-mult, --public-card-lr-mult, and "
+            "--trunk-lr-mult "
             "must all be > 0; "
             "freeze modules explicitly instead of encoding a freeze as LR 0"
         )
     if all(value == 1.0 for value in multipliers.values()):
         return trainable
-    if float(trunk_lr_mult) != 1.0 and architecture != "entity_graph":
+    if (
+        float(trunk_lr_mult) != 1.0
+        or float(shared_action_lr_mult) != 1.0
+    ) and architecture != "entity_graph":
         raise SystemExit(
-            "--trunk-lr-mult != 1.0 is supported only for --arch entity_graph; "
+            "--trunk-lr-mult and --shared-action-lr-mult are supported only "
+            "for --arch entity_graph; "
             f"received architecture={architecture!r}"
         )
 
@@ -34774,6 +34821,11 @@ def _build_optimizer_param_groups(
     action_params = (
         _params_under(ACTION_LOCAL_MODULE_ATTRS)
         if float(action_module_lr_mult) != 1.0
+        else []
+    )
+    shared_action_params = (
+        _params_under(SHARED_ACTION_MODULE_ATTRS)
+        if float(shared_action_lr_mult) != 1.0
         else []
     )
     public_card_params = (
@@ -34820,6 +34872,11 @@ def _build_optimizer_param_groups(
             "--action-module-lr-mult != 1.0 but the model has no trainable "
             f"parameters under any of {ACTION_LOCAL_MODULE_ATTRS}"
         )
+    if float(shared_action_lr_mult) != 1.0 and not shared_action_params:
+        raise SystemExit(
+            "--shared-action-lr-mult != 1.0 but the model has no trainable "
+            f"parameters under any of {SHARED_ACTION_MODULE_ATTRS}"
+        )
     if float(public_card_lr_mult) != 1.0 and not public_card_params:
         raise SystemExit(
             "--public-card-lr-mult != 1.0 but the model has no trainable "
@@ -34832,13 +34889,20 @@ def _build_optimizer_param_groups(
         )
     value_param_ids = {id(p) for p in value_params}
     action_param_ids = {id(p) for p in action_params}
+    shared_action_param_ids = {id(p) for p in shared_action_params}
     trunk_param_ids = {id(p) for p in trunk_params}
     pairwise_overlaps = {
         "value/action": value_param_ids & action_param_ids,
+        "value/shared_action": value_param_ids & shared_action_param_ids,
         "value/public_card": value_param_ids & public_card_param_ids,
         "value/trunk": value_param_ids & trunk_param_ids,
+        "action/shared_action": action_param_ids & shared_action_param_ids,
         "action/public_card": action_param_ids & public_card_param_ids,
         "action/trunk": action_param_ids & trunk_param_ids,
+        "shared_action/public_card": (
+            shared_action_param_ids & public_card_param_ids
+        ),
+        "shared_action/trunk": shared_action_param_ids & trunk_param_ids,
         "public_card/trunk": public_card_param_ids & trunk_param_ids,
     }
     overlapping = {name: ids for name, ids in pairwise_overlaps.items() if ids}
@@ -34850,6 +34914,7 @@ def _build_optimizer_param_groups(
     grouped_ids = (
         value_param_ids
         | action_param_ids
+        | shared_action_param_ids
         | public_card_param_ids
         | trunk_param_ids
     )
@@ -34880,6 +34945,16 @@ def _build_optimizer_param_groups(
                 "lr": action_lr,
                 "base_lr": action_lr,
                 "_group_name": "action_local",
+            }
+        )
+    if shared_action_params:
+        shared_action_lr = float(base_lr) * float(shared_action_lr_mult)
+        groups.append(
+            {
+                "params": shared_action_params,
+                "lr": shared_action_lr,
+                "base_lr": shared_action_lr,
+                "_group_name": "shared_action",
             }
         )
     if public_card_params:

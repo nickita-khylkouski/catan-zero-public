@@ -579,6 +579,7 @@ def build_train_command(
         ("max_grad_norm", "--max-grad-norm"),
         ("value_lr_mult", "--value-lr-mult"),
         ("action_module_lr_mult", "--action-module-lr-mult"),
+        ("shared_action_lr_mult", "--shared-action-lr-mult"),
         ("public_card_lr_mult", "--public-card-lr-mult"),
         ("trunk_lr_mult", "--trunk-lr-mult"),
         ("value_trunk_grad_scale", "--value-trunk-grad-scale"),
@@ -640,6 +641,7 @@ def build_train_command(
     )
     optional_scalar_defaults = {
         "public_card_lr_mult": 1.0,
+        "shared_action_lr_mult": 1.0,
         "scalar_value_objective": "mse",
         "target_reliability_confidence_floor": 0.25,
         "policy_dose_lr_area": 0.0,

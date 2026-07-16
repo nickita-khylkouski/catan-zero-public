@@ -243,6 +243,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "lr_schedule",
         "value_lr_mult",
         "public_card_lr_mult",
+        "shared_action_lr_mult",
         "trunk_lr_mult",
         "value_trunk_grad_scale",
         "policy_loss_weight",
@@ -3359,6 +3360,7 @@ def bind_learner_ablation(
     # historical behavior; only a receipt-backed public-card initializer may
     # request a different value below.
     effective["public_card_lr_mult"] = 1.0
+    effective["shared_action_lr_mult"] = 1.0
     effective["per_game_policy_surprise_weighting"] = False
     effective.setdefault("target_reliability_confidence_weighting", False)
     effective.setdefault("target_reliability_confidence_floor", 0.25)
@@ -3416,6 +3418,7 @@ def bind_learner_ablation(
                 "value_trunk_grad_scale",
                 "policy_aux_loss_weight",
                 "public_card_lr_mult",
+                "shared_action_lr_mult",
                 "trunk_lr_mult",
                 "policy_kl_target",
                 "policy_kl_dual_lr",
@@ -3446,6 +3449,7 @@ def bind_learner_ablation(
         "lr_warmup_steps": (0.0, None, True),
         "value_lr_mult": (0.0, None, False),
         "public_card_lr_mult": (0.0, None, False),
+        "shared_action_lr_mult": (0.0, 1.0, False),
         "trunk_lr_mult": (0.0, 1.0, False),
         "value_trunk_grad_scale": (0.0, 1.0, True),
         "policy_loss_weight": (0.0, None, True),
@@ -3598,6 +3602,11 @@ def bind_learner_ablation(
         drift["public_card_lr_mult"] = {
             "contract": 1.0,
             "effective": effective["public_card_lr_mult"],
+        }
+    if effective.get("shared_action_lr_mult", 1.0) != 1.0:
+        drift["shared_action_lr_mult"] = {
+            "contract": 1.0,
+            "effective": effective["shared_action_lr_mult"],
         }
     if effective.get("trunk_lr_mult", 1.0) != 1.0:
         drift["trunk_lr_mult"] = {
@@ -3867,6 +3876,7 @@ def bind_diagnostic_training_descriptor(
         derived_overrides[typed_forced_key] = effective_recipe[typed_forced_key]
     for key, disabled_value in (
         ("public_card_lr_mult", 1.0),
+        ("shared_action_lr_mult", 1.0),
         ("trunk_lr_mult", 1.0),
         ("per_game_policy_surprise_weighting", False),
     ):
@@ -5506,6 +5516,8 @@ def _build_direct_train_command(
             str(recipe["value_lr_mult"]),
             "--action-module-lr-mult",
             str(recipe["action_module_lr_mult"]),
+            "--shared-action-lr-mult",
+            str(recipe.get("shared_action_lr_mult", 1.0)),
             "--public-card-lr-mult",
             str(recipe.get("public_card_lr_mult", 1.0)),
             "--trunk-lr-mult",
@@ -8711,6 +8723,9 @@ def _verify_matched_aux_torch_artifacts(
             base_lr=float(recipe["lr"]),
             value_lr_mult=float(recipe["value_lr_mult"]),
             action_module_lr_mult=float(recipe.get("action_module_lr_mult", 1.0)),
+            shared_action_lr_mult=float(
+                recipe.get("shared_action_lr_mult", 1.0)
+            ),
             public_card_lr_mult=float(recipe.get("public_card_lr_mult", 1.0)),
             trunk_lr_mult=float(recipe.get("trunk_lr_mult", 1.0)),
             architecture="entity_graph",
@@ -9414,6 +9429,9 @@ def _verify_training_outputs(
         # These post-seal optimizer axes are required evidence for diagnostic
         # arms, while legacy production reports retain their historical shape.
         expected["trunk_lr_mult"] = float(recipe.get("trunk_lr_mult", 1.0))
+        expected["shared_action_lr_mult"] = float(
+            recipe.get("shared_action_lr_mult", 1.0)
+        )
         if recipe.get("policy_kl_target") is not None:
             expected.update(
                 {

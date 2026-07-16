@@ -6,10 +6,12 @@ from dataclasses import replace
 from tools.train_bc import (
     ACTION_LOCAL_MODULE_ATTRS,
     ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS,
+    SHARED_ACTION_MODULE_ATTRS,
     VALUE_HEAD_MODULE_ATTRS,
     _apply_lr_schedule,
     _build_optimizer_param_groups,
     _make_optimizer,
+    _optimizer_param_group_report,
     _set_scalar_value_head_trainable,
 )
 
@@ -328,6 +330,103 @@ def test_trunk_lr_multiplier_changes_only_canonical_entity_graph_trunk() -> None
     expected = [id(p) for p in policy.model.parameters() if p.requires_grad]
     assert len(assigned) == len(set(assigned))
     assert set(assigned) == set(expected)
+
+
+def test_shared_action_multiplier_is_independent_of_trunk_and_new_action_modules() -> (
+    None
+):
+    policy = _make_entity_policy(action_local=True)
+    groups = _build_optimizer_param_groups(
+        policy.model,
+        base_lr=2e-4,
+        value_lr_mult=1.0,
+        action_module_lr_mult=0.5,
+        shared_action_lr_mult=0.25,
+        trunk_lr_mult=0.1,
+        architecture="entity_graph",
+    )
+
+    by_name = {group["_group_name"]: group for group in groups}
+    assert set(by_name) == {"base", "action_local", "shared_action", "trunk"}
+    assert by_name["action_local"]["lr"] == pytest.approx(1e-4)
+    assert by_name["shared_action"]["lr"] == pytest.approx(5e-5)
+    assert by_name["trunk"]["lr"] == pytest.approx(2e-5)
+
+    direct_shared_action_ids = {
+        id(parameter)
+        for attr_name in SHARED_ACTION_MODULE_ATTRS
+        for parameter in getattr(policy.model, attr_name).parameters()
+        if parameter.requires_grad
+    }
+    shared_action_ids = {
+        id(parameter) for parameter in by_name["shared_action"]["params"]
+    }
+    assert shared_action_ids == direct_shared_action_ids
+    assert shared_action_ids.isdisjoint(
+        {id(parameter) for parameter in by_name["action_local"]["params"]}
+    )
+    assert shared_action_ids.isdisjoint(
+        {id(parameter) for parameter in by_name["trunk"]["params"]}
+    )
+
+    assigned = [id(parameter) for group in groups for parameter in group["params"]]
+    expected = [
+        id(parameter)
+        for parameter in policy.model.parameters()
+        if parameter.requires_grad
+    ]
+    assert len(assigned) == len(set(assigned))
+    assert set(assigned) == set(expected)
+
+
+def test_shared_action_multiplier_fails_closed_when_encoder_is_frozen() -> None:
+    policy = _make_entity_policy()
+    for parameter in policy.model.action_encoder.parameters():
+        parameter.requires_grad = False
+
+    with pytest.raises(SystemExit, match="shared-action-lr-mult"):
+        _build_optimizer_param_groups(
+            policy.model,
+            base_lr=2e-4,
+            value_lr_mult=1.0,
+            shared_action_lr_mult=0.25,
+            architecture="entity_graph",
+        )
+
+
+def test_shared_action_multiplier_rejects_non_entity_graph_architecture() -> None:
+    policy = _make_entity_policy()
+    with pytest.raises(SystemExit, match="shared-action-lr-mult"):
+        _build_optimizer_param_groups(
+            policy.model,
+            base_lr=2e-4,
+            value_lr_mult=1.0,
+            shared_action_lr_mult=0.25,
+            architecture="xdim_graph",
+        )
+
+
+def test_shared_action_group_is_visible_in_optimizer_report() -> None:
+    policy = _make_entity_policy()
+    groups = _build_optimizer_param_groups(
+        policy.model,
+        base_lr=2e-4,
+        value_lr_mult=1.0,
+        shared_action_lr_mult=0.25,
+        architecture="entity_graph",
+    )
+
+    report = {
+        row["group"]: row
+        for row in _optimizer_param_group_report(groups, base_lr=2e-4)
+    }
+    assert report["shared_action"]["lr"] == pytest.approx(5e-5)
+    assert report["shared_action"]["parameter_tensors"] == sum(
+        1 for _ in policy.model.action_encoder.parameters()
+    )
+    assert report["shared_action"]["parameters"] == sum(
+        parameter.numel() for parameter in policy.model.action_encoder.parameters()
+    )
 
 
 def test_public_card_lr_multiplier_overrides_trunk_group_for_shared_freeze_surface() -> (
