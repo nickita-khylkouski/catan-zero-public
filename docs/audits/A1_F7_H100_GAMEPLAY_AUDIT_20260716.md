@@ -3,7 +3,12 @@
 ## Scope and identity
 
 - Track: two-player, no trading.
-- Compute host: `ubuntu@192.222.54.137` only for new GPU work.
+- This gameplay diagnostic was completed on `ubuntu@192.222.54.137` before the
+  exclusive GPU assignment changed. It is retained as historical gameplay
+  evidence, not as current hardware-validation authority.
+- All continuing experiments and every new H100 result used for current
+  production decisions run on `ubuntu@192.222.55.12`; other GPU hosts are no
+  longer used.
 - Hardware: eight NVIDIA H100 80GB HBM3 GPUs; CUDA preflight passed.
 - Public/tournament checkpoint: f7, SHA-256
   `f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4`.
