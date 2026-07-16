@@ -4,12 +4,16 @@
 This is deliberately a trajectory replayer, not a tensor guesser.  Adapter-v2
 did not store ``owned_at_start`` or turn-local development-card state, so the
 actor public-rule slots cannot all be recovered from one row in isolation.
-Production self-play shards do retain the game seed, every selected action,
-and a contiguous decision index.  The native game's chance stream is derived
+Production self-play shards do retain the game seed, every selected strategic
+action, and the absolute decision index. Historical producers could omit
+single-legal automatic transitions while still incrementing that index. The
+native game's chance stream is derived
 solely from ``game_seed ^ 0xA17E``; replay therefore reconstructs the exact
 authoritative pre-action state without running MCTS again.
 
-The tool refuses partial or opponent-mixed trajectories.  Before emitting any
+The tool replays an index gap only when every missing state has exactly one
+legal action; a missing multi-action choice remains unrecoverable and fails
+closed. Before emitting any
 row it proves replay identity against the immutable adapter-v2 board/player/
 global tensors, legal action IDs, actor, and phase.  It then regenerates every
 adapter-owned tensor whose semantics changed through v5.  Input files are
@@ -169,12 +173,11 @@ def _game_row_spans(
         if seed in seen:
             raise BackfillError(f"game seed {seed} reappears non-contiguously")
         seen.add(seed)
-        expected = np.arange(stop - start, dtype=decisions.dtype)
         actual = decisions[start:stop]
-        if not np.array_equal(actual, expected):
+        if int(actual[0]) != 0 or bool(np.any(actual[1:] <= actual[:-1])):
             raise BackfillError(
-                f"game seed {seed} is not a complete contiguous trajectory: "
-                f"expected decision_index 0..{len(expected)-1}, got "
+                f"game seed {seed} decision indices must start at zero and "
+                f"increase strictly; got "
                 f"{actual[:4].tolist()}..{actual[-4:].tolist()}"
             )
         game_terminated = terminated[start:stop]
@@ -191,10 +194,10 @@ def _game_row_spans(
             raise BackfillError(
                 f"game seed {seed} must be exactly one of terminated/truncated"
             )
-        if bool(game_truncated[0]) and len(expected) != int(max_decisions):
+        if bool(game_truncated[0]) and int(actual[-1]) >= int(max_decisions):
             raise BackfillError(
-                f"truncated game seed {seed} has {len(expected)} decisions, "
-                f"expected sealed cutoff {max_decisions}"
+                f"truncated game seed {seed} ends at invalid decision index "
+                f"{int(actual[-1])} for sealed cutoff {max_decisions}"
             )
         spans.append(slice(start, stop))
     return spans
@@ -218,6 +221,45 @@ def _padded(value: np.ndarray, target_shape: tuple[int, ...], *, fill: int | flo
     slices = tuple(slice(0, min(a, b)) for a, b in zip(value.shape, target_shape))
     result[slices] = value[slices]
     return result
+
+
+def _apply_missing_automatic_transition(
+    game: Any,
+    *,
+    chance_rng: random.Random,
+    seed: int,
+    decision_index: int,
+) -> Any:
+    """Replay one omitted row only when its action is mathematically forced."""
+
+    legal = tuple(
+        int(action)
+        for action in game.playable_action_indices(list(COLORS), None)
+    )
+    if len(legal) != 1:
+        raise BackfillError(
+            f"game seed {seed} omits decision {decision_index} with "
+            f"{len(legal)} legal actions; only single-legal automatic gaps "
+            "are replayable"
+        )
+    raw_ids = [
+        int(action)
+        for action in game.playable_action_indices(list(COLORS), None)
+    ]
+    action_by_id = dict(zip(raw_ids, json.loads(game.playable_actions_json())))
+    selected = int(legal[0])
+    if selected not in action_by_id:
+        raise BackfillError(
+            f"game seed {seed} automatic decision {decision_index} lost action JSON"
+        )
+    return _apply_selected_action(
+        game,
+        selected,
+        colors=COLORS,
+        rng=chance_rng,
+        correct_rust_chance_spectra=True,
+        action_json=action_by_id[selected],
+    )
 
 
 def _replay_archive(
@@ -267,10 +309,22 @@ def _replay_archive(
             seed = int(archive["game_seed"][first])
             game = catanatron_rs.Game.simple(list(COLORS), seed=seed)
             chance_rng = random.Random(seed ^ CHANCE_SEED_XOR)
+            live_decision = 0
             for row in range(first, int(span.stop)):
-                expected_decision = row - first
-                if int(archive["decision_index"][row]) != expected_decision:
-                    raise BackfillError("decision index changed after span validation")
+                expected_decision = int(archive["decision_index"][row])
+                while live_decision < expected_decision:
+                    game = _apply_missing_automatic_transition(
+                        game,
+                        chance_rng=chance_rng,
+                        seed=seed,
+                        decision_index=live_decision,
+                    )
+                    live_decision += 1
+                if live_decision != expected_decision:
+                    raise BackfillError(
+                        f"game seed {seed} replay index {live_decision} passed "
+                        f"stored decision {expected_decision}"
+                    )
                 legal_rust = tuple(
                     sorted(
                         int(action)
@@ -377,21 +431,40 @@ def _replay_archive(
                     correct_rust_chance_spectra=True,
                     action_json=action_by_id[selected_native],
                 )
+                live_decision += 1
 
             final_row = int(span.stop) - 1
-            native_winner = game.winning_color()
             if bool(archive["terminated"][final_row]):
+                while game.winning_color() is None and live_decision < SEALED_MAX_DECISIONS:
+                    game = _apply_missing_automatic_transition(
+                        game,
+                        chance_rng=chance_rng,
+                        seed=seed,
+                        decision_index=live_decision,
+                    )
+                    live_decision += 1
+                native_winner = game.winning_color()
                 expected_winner = str(archive["winner"][final_row])
                 if native_winner is None or str(native_winner) != expected_winner:
                     raise BackfillError(
                         f"game seed {seed} terminal replay winner drift: "
                         f"replay={native_winner} source={expected_winner}"
                     )
-            elif native_winner is not None:
-                raise BackfillError(
-                    f"game seed {seed} is labeled truncated but replay terminates "
-                    f"with winner {native_winner}"
-                )
+            else:
+                while live_decision < SEALED_MAX_DECISIONS:
+                    game = _apply_missing_automatic_transition(
+                        game,
+                        chance_rng=chance_rng,
+                        seed=seed,
+                        decision_index=live_decision,
+                    )
+                    live_decision += 1
+                native_winner = game.winning_color()
+                if native_winner is not None:
+                    raise BackfillError(
+                        f"game seed {seed} is labeled truncated but replay "
+                        f"terminates with winner {native_winner}"
+                    )
 
         for key, values in replacements.items():
             output[key] = np.stack(values, axis=0).astype(
@@ -451,9 +524,7 @@ def _source_paths(source: Path) -> list[Path]:
     return paths
 
 
-def _write_receipt(path: Path, payload: dict[str, Any]) -> None:
-    body = dict(payload)
-    body["receipt_sha256"] = _canonical_sha256(payload)
+def _write_json_atomic(path: Path, body: dict[str, Any]) -> None:
     encoded = (json.dumps(body, indent=2, sort_keys=True) + "\n").encode()
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw_tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -466,6 +537,41 @@ def _write_receipt(path: Path, payload: dict[str, Any]) -> None:
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _write_receipt(path: Path, payload: dict[str, Any]) -> None:
+    body = dict(payload)
+    body["receipt_sha256"] = _canonical_sha256(payload)
+    _write_json_atomic(path, body)
+
+
+def _write_output_manifest(output_dir: Path, receipt_path: Path) -> Path:
+    """Bind adapter-v5 public-award authority for memmap admission.
+
+    Deliberately omit ``shards``: the rebuilt tree preserves nested source
+    paths and the memmap builder's recursive discovery remains authoritative.
+    """
+
+    payload: dict[str, Any] = {
+        "public_award_feature_provenance": {
+            "schema_version": "public-award-feature-provenance-v1",
+            "contract": "authoritative_v1",
+            "feature_producer": "catanatron_rs_public_award_v1",
+            "native_capability": "public_award_feature_parity",
+        },
+        "entity_adapter_backfill": {
+            "schema": BACKFILL_SCHEMA,
+            "source_adapter": RUST_ENTITY_ADAPTER_V2,
+            "output_adapter": RUST_ENTITY_ADAPTER_V5,
+            "receipt": receipt_path.name,
+            "receipt_file_sha256": _sha256(receipt_path),
+        },
+    }
+    body = dict(payload)
+    body["manifest_sha256"] = _canonical_sha256(payload)
+    path = output_dir / "manifest.json"
+    _write_json_atomic(path, body)
+    return path
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -525,7 +631,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         receipt_path = Path(args.output_dir) / "adapter_v5_backfill_receipt.json"
         _write_receipt(receipt_path, aggregate)
-        print(receipt_path)
+        manifest_path = _write_output_manifest(Path(args.output_dir), receipt_path)
+        print(json.dumps({"receipt": str(receipt_path), "manifest": str(manifest_path)}))
     return 0
 
 
