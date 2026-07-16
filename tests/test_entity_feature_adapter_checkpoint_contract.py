@@ -13,11 +13,18 @@ from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
     EntityFeatureAdapterContractError,
+    RUST_ENTITY_ADAPTER_V2,
     checkpoint_entity_feature_adapter_metadata,
 )
 from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
-from catan_zero.search.eval_server import RemoteEvalClient
-from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluator
+from catan_zero.search.eval_server import (
+    RemoteEvalClient,
+    _require_implemented_entity_feature_adapter,
+)
+from catan_zero.search.neural_rust_mcts import (
+    EntityGraphRustEvaluator,
+    EntityGraphRustEvaluatorConfig,
+)
 
 
 TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
@@ -87,20 +94,32 @@ def test_missing_legacy_metadata_maps_explicitly_to_v2_and_resaves_canonically(
     torch.save(payload, legacy)
 
     loaded = EntityGraphPolicy.load(legacy, device="cpu")
-    assert (
-        loaded.entity_feature_adapter_version
-        == CURRENT_RUST_ENTITY_ADAPTER_VERSION
-    )
+    assert loaded.entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V2
     assert (
         loaded.entity_feature_adapter_binding_source
         == "legacy_missing_metadata_explicit_v2_mapping"
     )
-    EntityGraphRustEvaluator(loaded)
+    evaluator = EntityGraphRustEvaluator(loaded)
+    assert evaluator.config.entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V2
+    with pytest.raises(ValueError, match="adapter/checkpoint mismatch"):
+        EntityGraphRustEvaluator(
+            loaded,
+            config=EntityGraphRustEvaluatorConfig(
+                entity_feature_adapter_version=CURRENT_RUST_ENTITY_ADAPTER_VERSION
+            ),
+        )
+    assert (
+        _require_implemented_entity_feature_adapter(
+            loaded.entity_feature_adapter_version,
+            context="legacy checkpoint regression",
+        )
+        == RUST_ENTITY_ADAPTER_V2
+    )
 
     loaded.save(resaved)
     assert _raw(resaved)["entity_feature_adapter"] == {
         "schema_version": ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
-        "version": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        "version": RUST_ENTITY_ADAPTER_V2,
     }
 
 

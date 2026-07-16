@@ -8,7 +8,10 @@ import types
 import numpy as np
 import pytest
 
-from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
+)
 from catan_zero.search.eval_server import (
     RemoteEvalClient,
     _crop_masked_event_tail,
@@ -18,6 +21,7 @@ from catan_zero.search.eval_server import (
     _policy_needs_action_targets,
     _policy_needs_relational_topology,
 )
+from catan_zero.search.neural_rust_mcts import _policy_history_options
 
 
 def _payload(*, marker: int, rows: int, legal_width: int) -> dict:
@@ -261,6 +265,112 @@ def test_policy_target_requirement_handshake_is_safe(config, expected: bool) -> 
 def test_policy_topology_requirement_handshake_is_safe(config, expected: bool) -> None:
     policy = types.SimpleNamespace(config=config) if config is not None else object()
     assert _policy_needs_relational_topology(policy) is expected
+
+
+def test_remote_client_preserves_checkpoint_history_featurization_contract() -> None:
+    """Remote and local evaluators must select the identical history surface."""
+    local_policy = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            meaningful_public_history=True,
+            event_history_limit=32,
+        )
+    )
+    remote = RemoteEvalClient(
+        queue.SimpleQueue(),
+        queue.SimpleQueue(),
+        0,
+        action_size=332,
+        trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        meaningful_public_history=True,
+        event_history_limit=32,
+    )
+
+    assert _policy_history_options(local_policy) == (True, 32)
+    assert _policy_history_options(remote.policy) == _policy_history_options(
+        local_policy
+    )
+
+
+def test_remote_client_rejects_fallback_history_mismatch(monkeypatch) -> None:
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    fallback_policy = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            meaningful_public_history=False,
+            event_history_limit=64,
+        )
+    )
+    monkeypatch.setattr(
+        EntityGraphPolicy,
+        "load",
+        lambda *_args, **_kwargs: fallback_policy,
+    )
+    monkeypatch.setattr(
+        "catan_zero.search.eval_server.policy_entity_feature_adapter_version",
+        lambda _policy: CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    )
+    client = RemoteEvalClient(
+        queue.SimpleQueue(),
+        queue.SimpleQueue(),
+        0,
+        action_size=332,
+        trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        meaningful_public_history=True,
+        event_history_limit=32,
+        fallback_checkpoint="/fallback.pt",
+    )
+
+    with pytest.raises(ValueError, match="local fallback public-history contract"):
+        client._ensure_local_policy()
+
+    assert client._local_policy is None
+
+
+def test_remote_client_rejects_fallback_adapter_mismatch(monkeypatch) -> None:
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    fallback_policy = types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            meaningful_public_history=True,
+            event_history_limit=32,
+        )
+    )
+    fallback_adapter = next(
+        version
+        for version in IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS
+        if version != CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    monkeypatch.setattr(
+        EntityGraphPolicy,
+        "load",
+        lambda *_args, **_kwargs: fallback_policy,
+    )
+    monkeypatch.setattr(
+        "catan_zero.search.eval_server.policy_entity_feature_adapter_version",
+        lambda policy: (
+            fallback_adapter
+            if policy is fallback_policy
+            else CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        ),
+    )
+    client = RemoteEvalClient(
+        queue.SimpleQueue(),
+        queue.SimpleQueue(),
+        0,
+        action_size=332,
+        trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        meaningful_public_history=True,
+        event_history_limit=32,
+        fallback_checkpoint="/fallback.pt",
+    )
+
+    with pytest.raises(ValueError, match="fallback entity feature adapter"):
+        client._ensure_local_policy()
+
+    assert client._local_policy is None
 
 
 @pytest.mark.parametrize("needs_action_targets", [False, True])

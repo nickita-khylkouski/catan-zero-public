@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
 from catan_zero.search import eval_server
 
 _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
@@ -118,11 +119,107 @@ def test_wait_ready_fails_fast_when_server_process_has_exited() -> None:
     assert 0.0 <= ready.wait_calls[0] <= 0.1
 
 
+@pytest.mark.parametrize(
+    "missing_field", ["meaningful_public_history", "event_history_limit"]
+)
+def test_wait_ready_requires_history_handshake_fields(missing_field: str) -> None:
+    class _Ready:
+        def wait(self, *, timeout: float) -> bool:
+            assert timeout >= 0.0
+            return True
+
+    server = object.__new__(eval_server.EvalServer)
+    server._ready = _Ready()
+    server._proc = types.SimpleNamespace(exitcode=None)
+    server._handshake = {
+        "action_size": 332,
+        "entity_feature_adapter": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        "trained_with_masked_hidden_info": False,
+        "public_card_count_features": False,
+        "meaningful_public_history": True,
+        "event_history_limit": 32,
+        "needs_action_targets": True,
+        "needs_relational_topology": False,
+        "matmul_precision": "highest",
+        "transport": "mp_queue",
+        "max_neural_rows": None,
+        "event_token_limit": None,
+        "cuda_graph": False,
+        "cuda_graph_batch_buckets": (),
+        "cuda_graph_warmup_iterations": 0,
+        "value_categorical_bins": 0,
+        "value_categorical_head_available": False,
+    }
+    del server._handshake[missing_field]
+
+    with pytest.raises(KeyError, match=missing_field):
+        server.wait_ready(timeout=0.1)
+
+
+def test_history_handshake_mismatch_aborts_before_worker_spawn(monkeypatch) -> None:
+    events: list[str] = []
+
+    class _Context:
+        def Queue(self):
+            raise AssertionError("result queue must not be created on mismatch")
+
+        def Process(self, **_kwargs):
+            raise AssertionError("worker must not be spawned on mismatch")
+
+    class _Server:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            events.append("start")
+
+        def wait_ready(self, *, timeout: float) -> dict[str, object]:
+            assert timeout > 0.0
+            events.append("ready")
+            return {
+                "meaningful_public_history": False,
+                "event_history_limit": 64,
+            }
+
+        def stop(self) -> dict[str, object]:
+            events.append("stop")
+            return {}
+
+    monkeypatch.setattr(
+        generator.multiprocessing, "get_context", lambda _kind: _Context()
+    )
+    monkeypatch.setattr(eval_server, "EvalServer", _Server)
+    args = types.SimpleNamespace(
+        checkpoint="/checkpoint.pt",
+        eval_server_max_batch=64,
+        eval_server_max_wait_ms=0.0,
+        device="cuda:0",
+        eval_server_matmul_precision="highest",
+        eval_server_request_collector=False,
+        public_observation=False,
+    )
+
+    with pytest.raises(ValueError, match="checkpoint public-history contract"):
+        generator._run_eval_server_batch(
+            [
+                {
+                    "worker_index": 3,
+                    "meaningful_public_history": True,
+                    "event_history_limit": 32,
+                }
+            ],
+            args,
+        )
+
+    assert events == ["start", "ready", "stop"]
+
+
 def test_no_fallback_batch_aborts_workers_when_ready_server_exits(
     monkeypatch,
 ) -> None:
     """A post-ready server crash must not become one timeout per remaining game."""
     events: list[tuple[str, object]] = []
+    process_kwargs: list[dict[str, object]] = []
 
     class _ResultQueue:
         def get(self, *, timeout: float):
@@ -157,6 +254,7 @@ def test_no_fallback_batch_aborts_workers_when_ready_server_exits(
             return _ResultQueue()
 
         def Process(self, **kwargs):
+            process_kwargs.append(kwargs)
             return _WorkerProcess(**kwargs)
 
     class _Server:
@@ -174,6 +272,9 @@ def test_no_fallback_batch_aborts_workers_when_ready_server_exits(
             return {
                 "action_size": 332,
                 "trained_with_masked_hidden_info": False,
+                "entity_feature_adapter": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+                "meaningful_public_history": True,
+                "event_history_limit": 32,
                 "matmul_precision": "highest",
             }
 
@@ -203,6 +304,8 @@ def test_no_fallback_batch_aborts_workers_when_ready_server_exits(
             "games": 1_500,
             "max_decisions": 600,
             "out_dir": "/tmp/worker-0",
+            "meaningful_public_history": True,
+            "event_history_limit": 32,
         }
     ]
 
@@ -210,6 +313,9 @@ def test_no_fallback_batch_aborts_workers_when_ready_server_exits(
 
     assert stats == {}
     assert len(results) == 1
+    spawned_worker_args = process_kwargs[0]["args"][0]
+    assert spawned_worker_args["_eval_server_meaningful_public_history"] is True
+    assert spawned_worker_args["_eval_server_event_history_limit"] == 32
     assert "exited after ready (exitcode=73)" in results[0]["errors"][0]["error"]
     result_get = next(value for event, value in events if event == "result.get")
     assert 0.0 < float(result_get) <= 0.25

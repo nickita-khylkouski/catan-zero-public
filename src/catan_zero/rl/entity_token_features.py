@@ -9,6 +9,11 @@ from catan_zero.deduction_tracker import (
     DEDUCTION_FEATURES_KEY,
     STARTING_DEV_DECK,
 )
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    RUST_ENTITY_ADAPTER_V3,
+    require_known_entity_feature_adapter,
+)
 from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     meaningful_public_events,
@@ -295,6 +300,7 @@ def build_entity_token_features(
     include_event_log: bool = True,
     history_limit: int = 64,
     meaningful_public_history: bool = False,
+    entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 ) -> dict[str, np.ndarray]:
     """Build typed Catan entity-token tensors from the public env payload.
 
@@ -302,6 +308,9 @@ def build_entity_token_features(
     keeps the existing flat observation path untouched.
     """
 
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
     actor_name = actor or env.current_player_name()
     payload = env.observation_payload(actor_name, include_event_log=include_event_log)
     topology = _topology(payload)
@@ -331,7 +340,14 @@ def build_entity_token_features(
             player_tokens, global_tokens
         ),
         "global_tokens": global_tokens,
-        "legal_action_tokens": _legal_action_tokens(env, payload, topology),
+        "legal_action_tokens": _legal_action_tokens(
+            env,
+            payload,
+            topology,
+            encode_structured_action_resources=(
+                adapter_version == RUST_ENTITY_ADAPTER_V3
+            ),
+        ),
         "legal_action_target_ids": _legal_action_target_ids(payload, topology),
         "event_tokens": _event_tokens(
             payload,
@@ -677,7 +693,11 @@ def _global_tokens(env: Any, payload: dict[str, Any], actor_name: str) -> np.nda
 
 
 def _legal_action_tokens(
-    env: Any, payload: dict[str, Any], topology: dict[str, Any]
+    env: Any,
+    payload: dict[str, Any],
+    topology: dict[str, Any],
+    *,
+    encode_structured_action_resources: bool = True,
 ) -> np.ndarray:
     legal = tuple(payload.get("structured_legal_actions", ()))
     tokens = np.zeros((len(legal), LEGAL_ACTION_FEATURE_SIZE), dtype=np.float16)
@@ -698,7 +718,10 @@ def _legal_action_tokens(
         if kind_index is not None:
             tokens[row, 25 + kind_index] = 1.0
         args = action.get("args") if isinstance(action.get("args"), dict) else {}
-        _fill_resource_bundle(tokens[row, 31:36], args.get("resources"), divisor=2)
+        resource_bundle = args.get("resources")
+        if resource_bundle is None and encode_structured_action_resources:
+            resource_bundle = args.get("resource")
+        _fill_resource_bundle(tokens[row, 31:36], resource_bundle, divisor=2)
         _fill_resource_bundle(tokens[row, 36:41], args.get("give"), divisor=4)
         _fill_resource_bundle(tokens[row, 41:46], args.get("want"), divisor=4)
         tokens[row, 46] = _priority(action_type)
@@ -964,6 +987,10 @@ def _fill_resource_bundle(target: np.ndarray, bundle: Any, *, divisor: float) ->
             idx = _resource_index(item)
             if idx is not None:
                 target[idx] = min(float(target[idx]) + 1.0 / float(divisor), 1.0)
+    else:
+        idx = _resource_index(bundle)
+        if idx is not None:
+            target[idx] = min(float(target[idx]) + 1.0 / float(divisor), 1.0)
 
 
 def _priority(action_type: str) -> float:

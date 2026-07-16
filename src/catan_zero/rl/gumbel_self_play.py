@@ -518,6 +518,17 @@ def action_size_for_evaluator(evaluator: RustEvaluator, colors: tuple[str, ...])
     return int(ActionCatalog(colors).size)
 
 
+def entity_adapter_for_evaluator(evaluator: RustEvaluator) -> str:
+    """Return the feature contract actually selected by the evaluator."""
+
+    version = getattr(
+        getattr(evaluator, "config", None),
+        "entity_feature_adapter_version",
+        None,
+    )
+    return str(version or RUST_ENTITY_ADAPTER_VERSION)
+
+
 def _temperature_for_decision(
     decision_index: int,
     *,
@@ -714,6 +725,7 @@ def _build_decision_row(
     meaningful_public_history: bool = False,
     event_history_limit: int = 64,
     decision_class: str = "normal_choice",
+    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     if target_information_regime not in TARGET_INFORMATION_REGIMES:
         raise ValueError(
@@ -765,6 +777,7 @@ def _build_decision_row(
         public_observation=True,
         meaningful_public_history=meaningful_public_history,
         history_limit=event_history_limit,
+        entity_feature_adapter_version=entity_feature_adapter_version,
     )
     features = {key: value[0] for key, value in entity.items()}
     context = rust_action_context_batch(
@@ -777,6 +790,7 @@ def _build_decision_row(
         snapshot=snapshot,
         action_by_id=action_by_id,
         public_observation=True,
+        entity_feature_adapter_version=entity_feature_adapter_version,
     )[0]
 
     # F4: fp32, not fp16. improved_policy assigns real (non-zero, non-one-hot)
@@ -830,7 +844,7 @@ def _build_decision_row(
         "target_information_regime": target_information_regime,
         "game_seed": np.int64(game_seed),
         "teacher_name": TEACHER_NAME,
-        "adapter_version": RUST_ENTITY_ADAPTER_VERSION,
+        "adapter_version": entity_feature_adapter_version,
         "player": acting_color,
         # NOTE: "seat" must index into PLAYER_NAMES ("BLUE","RED","ORANGE","WHITE")
         # order, NOT `colors` order -- that's the same order final_public_vps/
@@ -1391,6 +1405,7 @@ def play_one_game(
                 meaningful_public_history=bool(config.meaningful_public_history),
                 event_history_limit=int(config.event_history_limit),
                 decision_class=decision_class,
+                entity_feature_adapter_version=entity_adapter_for_evaluator(evaluator),
             )
             if reliability_fields is not None:
                 row.update(reliability_fields)
@@ -2538,6 +2553,7 @@ def run_worker_games(
     )
     out_dir = Path(out_dir)
     action_size = action_size_for_evaluator(evaluator, config.colors)
+    entity_feature_adapter_version = entity_adapter_for_evaluator(evaluator)
     engine_supports_determinization = False
     engine_supports_public_belief_development_draws = False
     if bool(getattr(search_config, "information_set_search", False)) or bool(
@@ -3076,7 +3092,7 @@ def run_worker_games(
         "worker_seed": int(worker_seed),
         "base_seed": int(base_seed),
         "game_index_start": int(game_index_start),
-        "adapter_version": RUST_ENTITY_ADAPTER_VERSION,
+        "adapter_version": entity_feature_adapter_version,
         # Full provenance of what this worker ACTUALLY constructed (not what
         # the CLI was asked for): catches argparse-default-vs-dataclass-default
         # divergence after the fact -- the exact class of gap behind the

@@ -29,8 +29,14 @@ ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA = "entity-feature-adapter-v1"
 RUST_ENTITY_ADAPTER_V2 = (
     "rust_entity_adapter_v2_land_topology_ports_maritime"
 )
+RUST_ENTITY_ADAPTER_V3 = (
+    "rust_entity_adapter_v3_structured_action_resources"
+)
 LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION = RUST_ENTITY_ADAPTER_V2
-CURRENT_RUST_ENTITY_ADAPTER_VERSION = RUST_ENTITY_ADAPTER_V2
+CURRENT_RUST_ENTITY_ADAPTER_VERSION = RUST_ENTITY_ADAPTER_V3
+IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS = frozenset(
+    {RUST_ENTITY_ADAPTER_V2, RUST_ENTITY_ADAPTER_V3}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +51,7 @@ class EntityFeatureAdapterSpec:
     context_trade_totals: str
     topology: str
     event_history: str
+    structured_action_resources: str
 
 
 # These strings are executable documentation: tests and checkpoint/runtime
@@ -62,7 +69,21 @@ ENTITY_FEATURE_ADAPTER_SPECS: Mapping[str, EntityFeatureAdapterSpec] = (
                 context_trade_totals="legacy_maritime_list_cardinality",
                 topology="base_layout_static_lookup",
                 event_history="empty",
-            )
+                structured_action_resources="legacy_yop_and_singular_identity_omitted",
+            ),
+            RUST_ENTITY_ADAPTER_V3: EntityFeatureAdapterSpec(
+                version=RUST_ENTITY_ADAPTER_V3,
+                player_has_longest_road="constant_false",
+                trade_action_type_one_hot="legacy_case_sensitive_miss",
+                trade_prompt_one_hot="legacy_prompt_name_miss",
+                trade_panel="offers_remaining_zero_current_offer_none",
+                context_trade_totals="legacy_maritime_list_cardinality",
+                topology="base_layout_static_lookup",
+                event_history="empty",
+                structured_action_resources=(
+                    "yop_bundle_and_discard_monopoly_singular_identity"
+                ),
+            ),
         }
     )
 )

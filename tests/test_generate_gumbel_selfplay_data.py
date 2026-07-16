@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,163 @@ from catan_zero.rl.aux_subgoal_targets import (  # noqa: E402
     AUX_SUBGOAL_TARGET_VERSION,
     AUX_SUBGOAL_TARGET_VERSION_KEY,
 )
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
+)
 from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
+
+
+def test_evaluator_history_contract_rejects_mislabeled_teacher_features() -> None:
+    evaluator = types.SimpleNamespace(
+        policy=types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                meaningful_public_history=False,
+                event_history_limit=64,
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="public-history contract"):
+        cli._assert_evaluator_history_contract(
+            evaluator,
+            {
+                "meaningful_public_history": True,
+                "event_history_limit": 32,
+            },
+        )
+
+
+def test_evaluator_history_contract_accepts_normalized_matching_limit() -> None:
+    evaluator = types.SimpleNamespace(
+        policy=types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                meaningful_public_history=True,
+                event_history_limit=32,
+            )
+        )
+    )
+
+    cli._assert_evaluator_history_contract(
+        evaluator,
+        {
+            "meaningful_public_history": True,
+            "event_history_limit": 64,
+        },
+    )
+
+
+def test_evaluator_history_contract_ignores_limit_when_history_is_disabled() -> None:
+    evaluator = types.SimpleNamespace(
+        policy=types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                meaningful_public_history=False,
+                event_history_limit=7,
+            )
+        )
+    )
+
+    cli._assert_evaluator_history_contract(
+        evaluator,
+        {
+            "meaningful_public_history": False,
+            "event_history_limit": 64,
+        },
+    )
+
+
+@pytest.mark.parametrize("lane", ["pool", "mix"])
+@pytest.mark.parametrize("mismatch", ["history", "adapter"])
+def test_archived_opponent_feature_contract_mismatch_is_rejected(
+    monkeypatch, lane: str, mismatch: str
+) -> None:
+    champion = types.SimpleNamespace(
+        policy=types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                meaningful_public_history=True,
+                event_history_limit=32,
+            )
+        )
+    )
+    mismatched_opponent = types.SimpleNamespace(
+        policy=types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                meaningful_public_history=mismatch == "adapter",
+                event_history_limit=32 if mismatch == "adapter" else 64,
+            )
+        )
+    )
+    opponent_adapter = next(
+        version
+        for version in IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS
+        if version != CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    loaded: list[str] = []
+
+    def _from_checkpoint(checkpoint, *, device, config):
+        assert device == "cpu"
+        assert config is not None
+        loaded.append(str(checkpoint))
+        return mismatched_opponent
+
+    monkeypatch.setattr(
+        cli,
+        "BatchedEntityGraphRustEvaluator",
+        types.SimpleNamespace(from_checkpoint=_from_checkpoint),
+    )
+    monkeypatch.setattr(
+        cli,
+        "policy_entity_feature_adapter_version",
+        lambda policy: (
+            opponent_adapter
+            if mismatch == "adapter" and policy is mismatched_opponent.policy
+            else CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        ),
+    )
+    worker_args = {
+        "checkpoint": "/champion.pt",
+        "value_readout": "scalar",
+        "meaningful_public_history": True,
+        "event_history_limit": 32,
+        "device": "cpu",
+        "value_scale": 1.0,
+        "prior_temperature": 1.0,
+        "public_observation": False,
+        "rust_featurize": True,
+        "eval_cache_size": 16,
+    }
+    if lane == "pool":
+        worker_args["opponent_pool_manifest"] = "/pool.json"
+        monkeypatch.setattr(
+            cli,
+            "read_opponent_pool_manifest",
+            lambda _path: (object(), object(), object()),
+        )
+        monkeypatch.setattr(
+            cli,
+            "OpponentPoolRuntime",
+            lambda **kwargs: kwargs["evaluator_factory"]("/pool-opponent.pt"),
+        )
+        expected_checkpoint = "/pool-opponent.pt"
+    else:
+        worker_args["opponent_mix_manifest"] = "/mix.json"
+        worker_args["opponent_mix_config"] = object()
+        monkeypatch.setattr(
+            cli,
+            "MixRuntime",
+            lambda **kwargs: kwargs["evaluator_factory"]("/mix-opponent.pt"),
+        )
+        expected_checkpoint = "/mix-opponent.pt"
+
+    error_pattern = (
+        "public-history contract"
+        if mismatch == "history"
+        else "opponent entity feature adapter"
+    )
+    with pytest.raises(ValueError, match=error_pattern):
+        cli._run_worker(worker_args, champion_evaluator=champion)
+
+    assert loaded == [expected_checkpoint]
 
 
 def _base_args(**overrides):

@@ -44,6 +44,10 @@ from catan_zero.deduction_tracker import (
     DEDUCTION_FEATURES_KEY,
     public_card_count_feature_table,
 )
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    require_known_entity_feature_adapter,
+)
 from catan_zero.rl.entity_token_features import (
     EDGE_FEATURE_SIZE,
     EVENT_FEATURE_SIZE,
@@ -255,6 +259,7 @@ def build_entity_features_rust(
     public_card_count_features: bool = False,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
+    entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 ) -> dict[str, np.ndarray]:
     """Rust-backed equivalent of `build_entity_token_features`'s output dict
     (minus the `"schema"` entry) for the Rust-MCTS adapter payload shape.
@@ -272,6 +277,9 @@ def build_entity_features_rust(
     """
     import catanatron_rs
 
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
     raw = catanatron_rs.build_entity_features_flat(
         rust_game,
         list(colors),
@@ -281,6 +289,7 @@ def build_entity_features_rust(
         public_observation,
         meaningful_public_history,
         int(history_limit),
+        adapter_version,
     )
 
     result = _reshape_raw(raw, mask_has_shape=False)
@@ -312,6 +321,7 @@ def build_entity_features_batch_rust(
     parallel: bool = False,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
+    entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 ) -> tuple[dict[str, np.ndarray], list[int]]:
     """Batched companion to `build_entity_features_rust`: one call builds
     entity features for MANY games sharing the same board/colors (a Gumbel
@@ -349,6 +359,7 @@ def build_entity_features_batch_rust(
             public_card_count_features=public_card_count_features,
             meaningful_public_history=meaningful_public_history,
             history_limit=history_limit,
+            entity_feature_adapter_version=entity_feature_adapter_version,
         )
         return {key: value[None, ...] for key, value in single.items()}, [
             int(single["legal_action_mask"].shape[0])
@@ -356,6 +367,9 @@ def build_entity_features_batch_rust(
 
     import catanatron_rs
 
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
     raw = catanatron_rs.build_entity_features_batch(
         list(rust_games),
         list(colors),
@@ -366,6 +380,7 @@ def build_entity_features_batch_rust(
         parallel,
         meaningful_public_history,
         int(history_limit),
+        adapter_version,
     )
     widths = [int(w) for w in raw["widths"]]
 

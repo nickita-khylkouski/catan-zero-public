@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +17,8 @@ from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE, _context_
 from catan_zero.rl.action_mask import ActionCatalog
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
+    RUST_ENTITY_ADAPTER_V3,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
 )
@@ -57,7 +59,9 @@ class EntityGraphRustEvaluatorConfig:
     prior_temperature: float = 1.0
     context_fill: float = 0.0
     cache_size: int = 100_000
-    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION
+    # None binds runtime featurization to the loaded checkpoint's exact
+    # version. Explicit values remain a fail-closed override/mismatch check.
+    entity_feature_adapter_version: str | None = None
     # #60 A/B knob. The entity_graph value head is a raw Linear trained with
     # MSE on z in {-1,+1} (no tanh in the model or the loss), so applying
     # tanh at inference double-squashes: monotonic (root argmax and rescaled
@@ -310,11 +314,11 @@ def _assert_feature_adapter_matches_checkpoint(
     requested = require_known_entity_feature_adapter(
         config.entity_feature_adapter_version
     )
-    if requested != RUST_ENTITY_ADAPTER_VERSION:
+    if requested not in IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS:
         raise ValueError(
             "requested entity feature adapter is known but not implemented by "
             f"this runtime: requested={requested!r} "
-            f"implemented={RUST_ENTITY_ADAPTER_VERSION!r}"
+            f"implemented={sorted(IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS)!r}"
         )
     checkpoint_version = policy_entity_feature_adapter_version(policy)
     if requested != checkpoint_version:
@@ -338,7 +342,15 @@ class EntityGraphRustEvaluator:
         config: EntityGraphRustEvaluatorConfig | None = None,
     ) -> None:
         self.policy = policy
-        self.config = config or EntityGraphRustEvaluatorConfig()
+        requested = config or EntityGraphRustEvaluatorConfig()
+        if requested.entity_feature_adapter_version is None:
+            requested = replace(
+                requested,
+                entity_feature_adapter_version=(
+                    policy_entity_feature_adapter_version(policy)
+                ),
+            )
+        self.config = requested
         _assert_feature_adapter_matches_checkpoint(policy, self.config)
         _assert_public_observation_matches_checkpoint_training(policy, self.config)
         _assert_value_readout_available(policy, self.config)
@@ -419,6 +431,9 @@ class EntityGraphRustEvaluator:
             ),
             meaningful_public_history=_policy_history_options(self.policy)[0],
             history_limit=_policy_history_options(self.policy)[1],
+            entity_feature_adapter_version=(
+                self.config.entity_feature_adapter_version
+            ),
         )
         return {key: np.asarray(value)[None, ...] for key, value in entity.items()}
 
@@ -646,6 +661,7 @@ class EntityGraphRustEvaluator:
                 public_observation=bool(self.config.public_observation),
                 perspective=acting_color,
                 meaningful_public_history=_policy_history_options(self.policy)[0],
+                entity_feature_adapter_version=self.config.entity_feature_adapter_version,
             )
         if bool(self.config.rust_featurize):
             entity = self._entity_batch_via_rust(
@@ -666,6 +682,7 @@ class EntityGraphRustEvaluator:
                 public_observation=bool(self.config.public_observation),
                 meaningful_public_history=_policy_history_options(self.policy)[0],
                 history_limit=_policy_history_options(self.policy)[1],
+                entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 resolved=resolved,
             )
         legal_ids = np.asarray(policy_action_ids, dtype=np.int64)[None, :]
@@ -772,6 +789,7 @@ class EntityGraphRustEvaluator:
                 public_observation=bool(self.config.public_observation),
                 perspective=acting_color,
                 meaningful_public_history=_policy_history_options(self.policy)[0],
+                entity_feature_adapter_version=self.config.entity_feature_adapter_version,
             )
         else:
             policy_action_ids = rust_policy_action_ids(
@@ -812,6 +830,7 @@ class EntityGraphRustEvaluator:
                 public_observation=bool(self.config.public_observation),
                 meaningful_public_history=_policy_history_options(self.policy)[0],
                 history_limit=_policy_history_options(self.policy)[1],
+                entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 resolved=resolved,
             )
             context = rust_action_context_batch(
@@ -967,6 +986,7 @@ class EntityGraphRustEvaluator:
                     public_observation=bool(self.config.public_observation),
                     perspective=acting_color,
                     meaningful_public_history=_policy_history_options(self.policy)[0],
+                    entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 )
             if bool(self.config.rust_featurize):
                 entity = self._entity_batch_via_rust(
@@ -987,6 +1007,7 @@ class EntityGraphRustEvaluator:
                     public_observation=bool(self.config.public_observation),
                     meaningful_public_history=_policy_history_options(self.policy)[0],
                     history_limit=_policy_history_options(self.policy)[1],
+                    entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                     resolved=resolved,
                 )
             if bool(self.config.rust_featurize):
@@ -1202,6 +1223,7 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 public_observation=bool(self.config.public_observation),
                 perspective=acting_color,
                 meaningful_public_history=_policy_history_options(self.policy)[0],
+                entity_feature_adapter_version=self.config.entity_feature_adapter_version,
             )
         if bool(self.config.rust_featurize):
             entity = self._entity_batch_via_rust(
@@ -1222,6 +1244,7 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 public_observation=bool(self.config.public_observation),
                 meaningful_public_history=_policy_history_options(self.policy)[0],
                 history_limit=_policy_history_options(self.policy)[1],
+                entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 resolved=resolved,
             )
         if bool(self.config.rust_featurize):
@@ -1467,6 +1490,7 @@ def _resolve_entity_adapter(
     public_observation: bool = False,
     perspective: str | None = None,
     meaningful_public_history: bool = False,
+    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
 ) -> tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]]:
     """Shared preamble for `rust_game_to_entity_batch`/`rust_action_context_batch`:
     resolve the game snapshot and the rust-action-id -> raw-json mapping (accepting
@@ -1497,7 +1521,11 @@ def _resolve_entity_adapter(
         action_size=action_size,
     )
     structured = [
-        _structured_action(int(policy_action), action_by_id[int(rust_action)])
+        _structured_action(
+            int(policy_action),
+            action_by_id[int(rust_action)],
+            entity_feature_adapter_version=entity_feature_adapter_version,
+        )
         for rust_action, policy_action in zip(legal_actions, translated)
     ]
     payload = _entity_payload_from_rust_snapshot(
@@ -1526,6 +1554,7 @@ def rust_game_to_entity_batch(
     public_observation: bool = False,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
+    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
     resolved: tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]]
     | None = None,
 ) -> dict[str, np.ndarray]:
@@ -1551,6 +1580,7 @@ def rust_game_to_entity_batch(
             public_observation=public_observation,
             perspective=str(actor),
             meaningful_public_history=meaningful_public_history,
+            entity_feature_adapter_version=entity_feature_adapter_version,
         )
     entity = build_entity_token_features(
         adapter,
@@ -1562,6 +1592,7 @@ def rust_game_to_entity_batch(
             else int(history_limit)
         ),
         meaningful_public_history=meaningful_public_history,
+        entity_feature_adapter_version=entity_feature_adapter_version,
     )
     return {
         key: np.asarray(value)[None, ...]
@@ -1582,6 +1613,7 @@ def rust_action_context_batch(
     snapshot: dict[str, Any] | None = None,
     action_by_id: dict[int, Any] | None = None,
     public_observation: bool = False,
+    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
     resolved: tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]]
     | None = None,
 ) -> np.ndarray:
@@ -1614,6 +1646,7 @@ def rust_action_context_batch(
             action_by_id=action_by_id,
             public_observation=public_observation,
             perspective=str(actor),
+            entity_feature_adapter_version=entity_feature_adapter_version,
         )
     actor_public_vp = float(
         payload.get("players", {}).get(actor, {}).get("public_victory_points", 0)
@@ -1951,7 +1984,15 @@ def _mask_players_to_public(
     return masked
 
 
-def _structured_action(action_id: int, raw: Any) -> dict[str, Any]:
+def _structured_action(
+    action_id: int,
+    raw: Any,
+    *,
+    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
+) -> dict[str, Any]:
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
+    )
     parts = list(raw) if isinstance(raw, (list, tuple)) else []
     action_type = str(parts[1] if len(parts) > 1 else "")
     value = parts[2] if len(parts) > 2 else None
@@ -1974,6 +2015,16 @@ def _structured_action(action_id: int, raw: Any) -> dict[str, Any]:
             args["victim"] = parts[3]
     elif action_type in {"DISCARD_RESOURCE", "PLAY_MONOPOLY"}:
         args["resource"] = _resource_name(value)
+    elif (
+        action_type == "PLAY_YEAR_OF_PLENTY"
+        and adapter_version == RUST_ENTITY_ADAPTER_V3
+    ):
+        resources = value if isinstance(value, (list, tuple)) else ()
+        args["resources"] = [
+            resource
+            for item in resources
+            if (resource := _resource_name(item)) is not None
+        ]
     elif action_type == "MARITIME_TRADE":
         if isinstance(value, dict):
             args.update(value)

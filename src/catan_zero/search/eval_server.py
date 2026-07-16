@@ -46,18 +46,20 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 
 from catan_zero.rl.entity_feature_adapter import (
-    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
 )
 from catan_zero.search.neural_rust_mcts import (
     EntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
+    _policy_history_options,
 )
 
 _DESIGN_DOC = "docs/designs/CAT67_eval_server.md"
@@ -77,10 +79,10 @@ def _require_implemented_entity_feature_adapter(
     version: object, *, context: str
 ) -> str:
     resolved = require_known_entity_feature_adapter(version)
-    if resolved != CURRENT_RUST_ENTITY_ADAPTER_VERSION:
+    if resolved not in IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS:
         raise ValueError(
             f"{context} does not implement entity feature adapter {resolved!r}; "
-            f"implemented={CURRENT_RUST_ENTITY_ADAPTER_VERSION!r}"
+            f"implemented={sorted(IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS)!r}"
         )
     return resolved
 
@@ -951,6 +953,10 @@ def _server_main(
     handshake["public_card_count_features"] = bool(
         getattr(getattr(policy, "config", None), "public_card_count_features", False)
     )
+    (
+        handshake["meaningful_public_history"],
+        handshake["event_history_limit"],
+    ) = _policy_history_options(policy)
     handshake["needs_action_targets"] = _policy_needs_action_targets(policy)
     handshake["needs_relational_topology"] = _policy_needs_relational_topology(policy)
     handshake["matmul_precision"] = precision
@@ -1432,6 +1438,10 @@ class EvalServer:
             "public_card_count_features": bool(
                 self._handshake.get("public_card_count_features", False)
             ),
+            "meaningful_public_history": bool(
+                self._handshake["meaningful_public_history"]
+            ),
+            "event_history_limit": int(self._handshake["event_history_limit"]),
             "needs_action_targets": bool(
                 self._handshake.get("needs_action_targets", True)
             ),
@@ -1531,6 +1541,8 @@ class _RemoteForwardProxy:
         *,
         entity_feature_adapter: str,
         public_card_count_features: bool = False,
+        meaningful_public_history: bool = False,
+        event_history_limit: int = 64,
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
     ) -> None:
@@ -1538,11 +1550,17 @@ class _RemoteForwardProxy:
         self.action_size = int(action_size)
         self.trained_with_masked_hidden_info = bool(trained_masked)
         # The proxy owns client-side featurization metadata.  In particular,
-        # native featurization must emit the optional deduction tensor before
-        # the request crosses IPC; the server cannot reconstruct it from the
-        # already-featurized payload.  Keep this as a direct attribute so the
-        # base evaluator does not need a fake full checkpoint config object.
+        # native featurization must emit checkpoint-selected optional tensors
+        # before the request crosses IPC; the server cannot reconstruct them
+        # from the already-featurized payload. Mirror the small config surface
+        # read by the inherited evaluator so local and remote feature builders
+        # choose identical public-history semantics.
         self.public_card_count_features = bool(public_card_count_features)
+        self.config = SimpleNamespace(
+            public_card_count_features=bool(public_card_count_features),
+            meaningful_public_history=bool(meaningful_public_history),
+            event_history_limit=int(event_history_limit),
+        )
         self.entity_feature_adapter_version = (
             _require_implemented_entity_feature_adapter(
                 entity_feature_adapter,
@@ -1597,6 +1615,8 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         trained_with_masked_hidden_info: bool,
         entity_feature_adapter: str,
         public_card_count_features: bool = False,
+        meaningful_public_history: bool = False,
+        event_history_limit: int = 64,
         needs_action_targets: bool = True,
         needs_relational_topology: bool = False,
         event_token_limit: int | None = None,
@@ -1613,6 +1633,8 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             trained_with_masked_hidden_info,
             entity_feature_adapter=entity_feature_adapter,
             public_card_count_features=public_card_count_features,
+            meaningful_public_history=meaningful_public_history,
+            event_history_limit=event_history_limit,
             value_categorical_bins=value_categorical_bins,
             value_categorical_head_available=value_categorical_head_available,
         )
@@ -1645,13 +1667,38 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         if self._local_policy is None:
             from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 
-            self._local_policy = EntityGraphPolicy.load(
+            local_policy = EntityGraphPolicy.load(
                 self._fallback_checkpoint, device=self._fallback_device
             )
-            _require_implemented_entity_feature_adapter(
-                policy_entity_feature_adapter_version(self._local_policy),
+            expected_adapter = _require_implemented_entity_feature_adapter(
+                policy_entity_feature_adapter_version(self.policy),
+                context="RemoteEvalClient eval-server proxy",
+            )
+            actual_adapter = _require_implemented_entity_feature_adapter(
+                policy_entity_feature_adapter_version(local_policy),
                 context="RemoteEvalClient local fallback",
             )
+            if actual_adapter != expected_adapter:
+                raise ValueError(
+                    "RemoteEvalClient local fallback entity feature adapter "
+                    "does not match eval-server featurization: "
+                    f"fallback={actual_adapter!r}; eval-server={expected_adapter!r}"
+                )
+            expected_history = _policy_history_options(self.policy)
+            actual_history = _policy_history_options(local_policy)
+            history_matches = actual_history[0] == expected_history[0] and (
+                not actual_history[0] or actual_history[1] == expected_history[1]
+            )
+            if not history_matches:
+                raise ValueError(
+                    "RemoteEvalClient local fallback public-history contract "
+                    "does not match eval-server featurization: "
+                    f"fallback meaningful_public_history={actual_history[0]}, "
+                    f"event_history_limit={actual_history[1]}; eval-server "
+                    f"meaningful_public_history={expected_history[0]}, "
+                    f"event_history_limit={expected_history[1]}"
+                )
+            self._local_policy = local_policy
         return self._local_policy
 
     def _forward_local(

@@ -50,6 +50,7 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_VERSION,
     AUX_SUBGOAL_TARGET_VERSION_KEY,
 )
+from catan_zero.rl.entity_feature_adapter import policy_entity_feature_adapter_version
 from catan_zero.rl.gumbel_self_play import (
     COLORS,
     GumbelSelfPlayConfig,
@@ -80,6 +81,7 @@ from catan_zero.rl.pipeline_configs import GenerateConfig
 from catan_zero.search.neural_rust_mcts import (
     BatchedEntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
+    _policy_history_options,
 )
 from factory_common import write_json
 from opponent_mix_registry import resolve_opponent_mix_manifest
@@ -90,6 +92,76 @@ import launcher_guards
 
 PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA = "public-award-feature-provenance-v1"
 PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE = "authoritative_v1"
+
+
+def _requested_history_options(worker_args: dict[str, Any]) -> tuple[bool, int]:
+    """Normalize the row contract exactly as self-play/native featurization do."""
+    enabled = bool(worker_args.get("meaningful_public_history", False))
+    limit = int(worker_args.get("event_history_limit", 64) or 0)
+    if enabled:
+        limit = min(limit, 32)
+    return enabled, limit
+
+
+def _history_contracts_match(
+    left: tuple[bool, int], right: tuple[bool, int]
+) -> bool:
+    """Limits affect features only while meaningful public history is enabled."""
+    if left[0] != right[0]:
+        return False
+    return not left[0] or left[1] == right[1]
+
+
+def _assert_evaluator_history_contract(
+    evaluator: Any, worker_args: dict[str, Any]
+) -> None:
+    """Refuse targets whose teacher features disagree with emitted row features."""
+    policy = getattr(evaluator, "policy", None)
+    if policy is None:
+        # HeuristicRustEvaluator consumes the game directly and has no neural
+        # feature surface to reconcile with the emitted training rows.
+        return
+    requested = _requested_history_options(worker_args)
+    actual = _policy_history_options(policy)
+    if not _history_contracts_match(actual, requested):
+        raise ValueError(
+            "teacher evaluator public-history contract does not match requested "
+            "self-play rows: "
+            f"evaluator meaningful_public_history={actual[0]}, "
+            f"event_history_limit={actual[1]}; requested "
+            f"meaningful_public_history={requested[0]}, "
+            f"event_history_limit={requested[1]}"
+        )
+
+
+def _load_compatible_archived_evaluator(
+    checkpoint: str,
+    *,
+    device: str,
+    config: EntityGraphRustEvaluatorConfig,
+    worker_args: dict[str, Any],
+    reference_evaluator: Any,
+) -> BatchedEntityGraphRustEvaluator:
+    """Load an archived evaluator only if producer feature contracts match."""
+    evaluator = BatchedEntityGraphRustEvaluator.from_checkpoint(
+        checkpoint, device=device, config=config
+    )
+    producer_policy = getattr(reference_evaluator, "policy", None)
+    opponent_policy = getattr(evaluator, "policy", None)
+    if producer_policy is None or opponent_policy is None:
+        raise ValueError(
+            "archived neural evaluator is missing policy metadata required for "
+            "entity feature adapter attestation"
+        )
+    producer_adapter = policy_entity_feature_adapter_version(producer_policy)
+    opponent_adapter = policy_entity_feature_adapter_version(opponent_policy)
+    if opponent_adapter != producer_adapter:
+        raise ValueError(
+            "archived opponent entity feature adapter does not match producer: "
+            f"opponent={opponent_adapter!r}; producer={producer_adapter!r}"
+        )
+    _assert_evaluator_history_contract(evaluator, worker_args)
+    return evaluator
 
 
 def _public_award_feature_provenance(*, rust_featurize: bool) -> dict[str, Any]:
@@ -1666,6 +1738,10 @@ def _server_worker_entry(
             public_card_count_features=bool(
                 worker_args.get("_eval_server_public_card_count_features", False)
             ),
+            meaningful_public_history=bool(
+                worker_args["_eval_server_meaningful_public_history"]
+            ),
+            event_history_limit=int(worker_args["_eval_server_event_history_limit"]),
             needs_action_targets=bool(needs_action_targets),
             needs_relational_topology=bool(needs_relational_topology),
             event_token_limit=event_token_limit,
@@ -1743,6 +1819,22 @@ def _run_eval_server_batch(
     try:
         server.start()
         meta = server.wait_ready(timeout=300.0)
+        server_history = (
+            bool(meta["meaningful_public_history"]),
+            int(meta["event_history_limit"]),
+        )
+        for wargs in worker_args:
+            requested_history = _requested_history_options(wargs)
+            if not _history_contracts_match(requested_history, server_history):
+                raise ValueError(
+                    "eval-server checkpoint public-history contract does not match "
+                    "requested self-play rows: "
+                    f"checkpoint meaningful_public_history={server_history[0]}, "
+                    f"event_history_limit={server_history[1]}; requested "
+                    f"meaningful_public_history={requested_history[0]}, "
+                    f"event_history_limit={requested_history[1]} for worker "
+                    f"{wargs.get('worker_index', '?')}"
+                )
         print(
             json.dumps(
                 {
@@ -1763,6 +1855,8 @@ def _run_eval_server_batch(
             wargs["_eval_server_public_card_count_features"] = bool(
                 meta.get("public_card_count_features", False)
             )
+            wargs["_eval_server_meaningful_public_history"] = server_history[0]
+            wargs["_eval_server_event_history_limit"] = server_history[1]
             request_queue_for_client = getattr(server, "request_queue_for_client", None)
             client_request_queue = (
                 request_queue_for_client(client_id)
@@ -1930,6 +2024,8 @@ def _run_worker(
             score_actions=bool(worker_args["score_actions"])
         )
 
+    _assert_evaluator_history_contract(evaluator, worker_args)
+
     # A configured teacher-side denoiser must never degrade silently to the
     # plain evaluator.  ``GumbelChanceMCTS`` intentionally keeps a graceful
     # fallback for generic/legacy callers, but the generation manifest is a
@@ -1977,8 +2073,12 @@ def _run_worker(
             _config: EntityGraphRustEvaluatorConfig = opponent_eval_config,
             _device: str = opponent_device,
         ) -> BatchedEntityGraphRustEvaluator:
-            return BatchedEntityGraphRustEvaluator.from_checkpoint(
-                opponent_checkpoint, device=_device, config=_config
+            return _load_compatible_archived_evaluator(
+                opponent_checkpoint,
+                device=_device,
+                config=_config,
+                worker_args=worker_args,
+                reference_evaluator=evaluator,
             )
 
         opponent_pool = OpponentPoolRuntime(
@@ -2020,8 +2120,12 @@ def _run_worker(
             _config: EntityGraphRustEvaluatorConfig = mix_eval_config,
             _device: str = mix_device,
         ) -> BatchedEntityGraphRustEvaluator:
-            return BatchedEntityGraphRustEvaluator.from_checkpoint(
-                opponent_checkpoint, device=_device, config=_config
+            return _load_compatible_archived_evaluator(
+                opponent_checkpoint,
+                device=_device,
+                config=_config,
+                worker_args=worker_args,
+                reference_evaluator=evaluator,
             )
 
         opponent_mix = MixRuntime(

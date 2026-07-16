@@ -9050,6 +9050,8 @@ pub mod python_bindings {
     const ENTITY_EVENT_FEATURE_SIZE: usize = 41;
     const ENTITY_EVENT_HISTORY_LIMIT: usize = 64;
     const ENTITY_MEANINGFUL_PUBLIC_HISTORY_LIMIT: usize = 32;
+    const ENTITY_ADAPTER_V2: &str = "rust_entity_adapter_v2_land_topology_ports_maritime";
+    const ENTITY_ADAPTER_V3: &str = "rust_entity_adapter_v3_structured_action_resources";
     const ENTITY_PLAYERS_ORDER: [&str; 4] = ["BLUE", "RED", "ORANGE", "WHITE"];
     const ENTITY_PROMPTS: [&str; 8] = [
         "BUILD_INITIAL_SETTLEMENT",
@@ -9081,6 +9083,36 @@ pub mod python_bindings {
         "ROLL",
         "END_TURN",
     ];
+
+    fn entity_adapter_encodes_action_resources(version: &str) -> PyResult<bool> {
+        match version {
+            ENTITY_ADAPTER_V2 => Ok(false),
+            ENTITY_ADAPTER_V3 => Ok(true),
+            _ => Err(PyValueError::new_err(format!(
+                "unknown entity feature adapter version {version:?}; expected {ENTITY_ADAPTER_V2:?} or {ENTITY_ADAPTER_V3:?}"
+            ))),
+        }
+    }
+
+    fn entity_action_resource_bundle(action: &Action, enabled: bool) -> [f64; 5] {
+        let mut bundle = [0.0; 5];
+        if !enabled {
+            return bundle;
+        }
+        match (&action.action_type, &action.value) {
+            (
+                ActionType::DiscardResource | ActionType::PlayMonopoly,
+                ActionValue::Resource(resource),
+            ) => bundle[resource.idx()] = 0.5,
+            (ActionType::PlayYearOfPlenty, ActionValue::Resources(resources)) => {
+                for resource in resources {
+                    bundle[resource.idx()] = (bundle[resource.idx()] + 0.5f64).min(1.0);
+                }
+            }
+            _ => {}
+        }
+        bundle
+    }
     const ENTITY_CATEGORIES: [&str; 5] = ["build", "trade", "development", "robber", "turn"];
 
     fn entity_player_index(name: &str) -> Option<usize> {
@@ -9183,6 +9215,7 @@ pub mod python_bindings {
         public_observation: bool,
         meaningful_public_history: bool,
         requested_event_history_limit: usize,
+        encode_structured_action_resources: bool,
     ) -> PyResult<EntityFeatureArrays> {
         let state = &game.state;
         let actions = &game.playable_actions;
@@ -9497,12 +9530,24 @@ pub mod python_bindings {
                 }
                 (ActionType::DiscardResource, ActionValue::Resource(_))
                 | (ActionType::PlayMonopoly, ActionValue::Resource(_)) => 5, // "resource"
+                (ActionType::PlayYearOfPlenty, ActionValue::Resources(_))
+                    if encode_structured_action_resources =>
+                {
+                    5
+                }
                 _ => 0, // "none" -- includes MARITIME_TRADE: `_target_kind` never
                         // inspects "give"/"want", only "node"/"edge"/"tile_coordinate"/
                         // "victim"/"resource"/"resources", none of which
                         // `_structured_action` sets for MARITIME_TRADE.
             };
             legal_action_tokens[base + 25 + kind_index] = 1.0;
+            for (offset, value) in
+                entity_action_resource_bundle(action, encode_structured_action_resources)
+                    .iter()
+                    .enumerate()
+            {
+                legal_action_tokens[base + 31 + offset] = *value;
+            }
             if let ActionValue::MaritimeTrade(offering, asking) = &action.value {
                 for resource in offering.iter().flatten() {
                     let slot = base + 36 + resource.idx();
@@ -9729,7 +9774,7 @@ pub mod python_bindings {
     }
 
     #[pyfunction]
-    #[pyo3(signature = (game, colors, policy_action_ids, action_size, topology, public_observation=false, meaningful_public_history=false, event_history_limit=64))]
+    #[pyo3(signature = (game, colors, policy_action_ids, action_size, topology, public_observation=false, meaningful_public_history=false, event_history_limit=64, entity_feature_adapter_version=ENTITY_ADAPTER_V3))]
     fn build_entity_features_flat(
         py: Python<'_>,
         game: &PyGame,
@@ -9740,8 +9785,11 @@ pub mod python_bindings {
         public_observation: bool,
         meaningful_public_history: bool,
         event_history_limit: usize,
+        entity_feature_adapter_version: &str,
     ) -> PyResult<Py<PyDict>> {
         let colors = parse_colors_list(&colors)?;
+        let encode_structured_action_resources =
+            entity_adapter_encodes_action_resources(entity_feature_adapter_version)?;
         let arrays = build_entity_feature_arrays(
             &game.game,
             &colors,
@@ -9751,6 +9799,7 @@ pub mod python_bindings {
             public_observation,
             meaningful_public_history,
             event_history_limit,
+            encode_structured_action_resources,
         )?;
         entity_feature_arrays_to_pydict(py, arrays)
     }
@@ -9812,7 +9861,7 @@ pub mod python_bindings {
     /// process per GPU with a shared model (the phase-2/3 thread
     /// architecture) -- plumbed now, default sequential until then.
     #[pyfunction]
-    #[pyo3(signature = (games, colors, policy_action_ids, action_size, topology, public_observation=false, parallel=false, meaningful_public_history=false, event_history_limit=64))]
+    #[pyo3(signature = (games, colors, policy_action_ids, action_size, topology, public_observation=false, parallel=false, meaningful_public_history=false, event_history_limit=64, entity_feature_adapter_version=ENTITY_ADAPTER_V3))]
     #[allow(clippy::too_many_arguments)]
     fn build_entity_features_batch(
         py: Python<'_>,
@@ -9825,6 +9874,7 @@ pub mod python_bindings {
         parallel: bool,
         meaningful_public_history: bool,
         event_history_limit: usize,
+        entity_feature_adapter_version: &str,
     ) -> PyResult<Py<PyDict>> {
         if games.len() != policy_action_ids.len() {
             return Err(PyValueError::new_err(format!(
@@ -9834,6 +9884,8 @@ pub mod python_bindings {
             )));
         }
         let colors = parse_colors_list(&colors)?;
+        let encode_structured_action_resources =
+            entity_adapter_encodes_action_resources(entity_feature_adapter_version)?;
         let batch_size = games.len();
 
         // Borrow every game's inner `Game` up front (needs the GIL) so the
@@ -9855,6 +9907,7 @@ pub mod python_bindings {
                         public_observation,
                         meaningful_public_history,
                         event_history_limit,
+                        encode_structured_action_resources,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -9872,6 +9925,7 @@ pub mod python_bindings {
                         public_observation,
                         meaningful_public_history,
                         event_history_limit,
+                        encode_structured_action_resources,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -10445,6 +10499,7 @@ pub mod python_bindings {
                 true,
                 false,
                 ENTITY_EVENT_HISTORY_LIMIT,
+                false,
             )
             .unwrap();
             let actor_base =
@@ -10519,6 +10574,7 @@ pub mod python_bindings {
                 true,
                 true,
                 ENTITY_EVENT_HISTORY_LIMIT,
+                true,
             )
             .unwrap();
             assert_eq!(enabled.event_history_limit, 32);
@@ -10544,11 +10600,126 @@ pub mod python_bindings {
                 true,
                 false,
                 ENTITY_EVENT_HISTORY_LIMIT,
+                false,
             )
             .unwrap();
             assert_eq!(legacy.event_history_limit, 64);
             assert!(legacy.event_mask.iter().all(|value| !value));
             assert!(legacy.event_tokens.iter().all(|value| *value == 0.0));
+        }
+
+        #[test]
+        fn structured_action_resource_bundle_is_versioned_and_semantic() {
+            let monopoly_wood = Action::new(
+                Color::Red,
+                ActionType::PlayMonopoly,
+                ActionValue::Resource(Resource::Wood),
+            );
+            let discard_ore = Action::new(
+                Color::Red,
+                ActionType::DiscardResource,
+                ActionValue::Resource(Resource::Ore),
+            );
+            let plenty = Action::new(
+                Color::Red,
+                ActionType::PlayYearOfPlenty,
+                ActionValue::Resources(vec![Resource::Wood, Resource::Ore]),
+            );
+
+            assert_eq!(
+                entity_action_resource_bundle(&monopoly_wood, false),
+                [0.0; 5]
+            );
+            assert_eq!(entity_action_resource_bundle(&discard_ore, false), [0.0; 5]);
+            assert_eq!(entity_action_resource_bundle(&plenty, false), [0.0; 5]);
+            assert_eq!(
+                entity_action_resource_bundle(&monopoly_wood, true),
+                [0.5, 0.0, 0.0, 0.0, 0.0]
+            );
+            assert_eq!(
+                entity_action_resource_bundle(&discard_ore, true),
+                [0.0, 0.0, 0.0, 0.0, 0.5]
+            );
+            assert_eq!(
+                entity_action_resource_bundle(&plenty, true),
+                [0.5, 0.0, 0.0, 0.0, 0.5]
+            );
+        }
+
+        #[test]
+        fn entity_action_tokens_encode_v3_resources_but_preserve_v2() {
+            let mut py_game =
+                PyGame::simple(Some(vec!["RED".to_string(), "BLUE".to_string()]), Some(33))
+                    .unwrap();
+            py_game.game.playable_actions = vec![
+                Action::new(
+                    Color::Red,
+                    ActionType::PlayYearOfPlenty,
+                    ActionValue::Resources(vec![Resource::Wood, Resource::Ore]),
+                ),
+                Action::new(
+                    Color::Red,
+                    ActionType::PlayMonopoly,
+                    ActionValue::Resource(Resource::Wood),
+                ),
+                Action::new(
+                    Color::Red,
+                    ActionType::DiscardResource,
+                    ActionValue::Resource(Resource::Ore),
+                ),
+            ];
+            let topology = PyEntityTopology {
+                hex_vertex_ids: vec![vec![-1; 6]; 19],
+                hex_edge_ids: vec![vec![-1; 6]; 19],
+                edge_vertex_ids: vec![vec![-1; 2]; 72],
+                port_base_nodes: vec![vec![-1; 2]; 16],
+            };
+            let colors = py_game.game.state.colors.clone();
+            let ids = vec![311, 305, 185];
+
+            let v2 = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &ids,
+                567,
+                &topology,
+                false,
+                false,
+                ENTITY_EVENT_HISTORY_LIMIT,
+                false,
+            )
+            .unwrap();
+            let v3 = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &ids,
+                567,
+                &topology,
+                false,
+                false,
+                ENTITY_EVENT_HISTORY_LIMIT,
+                true,
+            )
+            .unwrap();
+
+            for row in 0..3 {
+                let base = row * ENTITY_LEGAL_ACTION_FEATURE_SIZE;
+                assert_eq!(&v2.legal_action_tokens[base + 31..base + 36], &[0.0; 5]);
+                assert_eq!(v3.legal_action_tokens[base + 30], 1.0);
+            }
+            assert_eq!(v2.legal_action_tokens[25], 1.0);
+            assert_eq!(v2.legal_action_tokens[30], 0.0);
+            assert_eq!(&v3.legal_action_tokens[31..36], &[0.5, 0.0, 0.0, 0.0, 0.5]);
+            assert_eq!(
+                &v3.legal_action_tokens
+                    [ENTITY_LEGAL_ACTION_FEATURE_SIZE + 31..ENTITY_LEGAL_ACTION_FEATURE_SIZE + 36],
+                &[0.5, 0.0, 0.0, 0.0, 0.0]
+            );
+            assert_eq!(
+                &v3.legal_action_tokens[2 * ENTITY_LEGAL_ACTION_FEATURE_SIZE + 31
+                    ..2 * ENTITY_LEGAL_ACTION_FEATURE_SIZE + 36],
+                &[0.0, 0.0, 0.0, 0.0, 0.5]
+            );
         }
 
         #[test]
