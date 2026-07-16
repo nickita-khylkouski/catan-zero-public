@@ -344,6 +344,7 @@ def test_train_bc_authenticates_exact_probe_command_before_memmap_scan(
         "batch_size",
         "global_batch_size",
         "max_steps",
+        "train_diagnostics_every_batches",
     }
 
 

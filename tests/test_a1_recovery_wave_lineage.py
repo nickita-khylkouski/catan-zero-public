@@ -5,6 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+)
+
 from tools import a1_build_post_wave_composite as composite
 from tools import a1_pre_wave_contract as contract
 from tools import search_operator_binding as binding
@@ -292,6 +296,10 @@ def test_composite_descriptor_carries_exact_recovery_semantics(
             "provenance_manifest": str(provenance),
             "provenance_manifest_sha256": composite._file_sha256(provenance),  # noqa: SLF001
         }
+        if component_id == composite.HISTORICAL_REPLAY_CATEGORY:
+            component["entity_feature_adapter_version"] = (
+                CURRENT_RUST_ENTITY_ADAPTER_VERSION
+            )
         if component_id in composite.FRESH_SOURCE_GAME_RATIOS:
             corpus = tmp_path / f"{component_id}.corpus"
             corpus.mkdir()
@@ -299,6 +307,12 @@ def test_composite_descriptor_carries_exact_recovery_semantics(
                 json.dumps(
                     {
                         "row_count": 10,
+                        "columns": {
+                            "adapter_version": {
+                                "kind": "string",
+                                "categories": [CURRENT_RUST_ENTITY_ADAPTER_VERSION],
+                            }
+                        },
                         "aux_subgoal_target_contract": {
                             "version_key": composite.AUX_SUBGOAL_TARGET_VERSION_KEY,
                             "supported_version": composite.AUX_SUBGOAL_TARGET_VERSION,

@@ -3656,6 +3656,26 @@ def bind_learner_ablation(
             }
     if not drift and aux_arm != "AUX0":
         raise ExecutorError("A1 learner ablation is a no-op")
+    train_diagnostic_cadence = 16 if diagnostic_dose_curve else 0
+    objective_gradient_cadence = (
+        min(64, max(1, int(effective["max_steps"]) // 2))
+        if diagnostic_dose_curve
+        else 0
+    )
+    if train_diagnostic_cadence or objective_gradient_cadence:
+        # train_bc authenticates enabled diagnostic instrumentation in the
+        # effective recipe. Bind the exact reporting-only command delta here
+        # so the child cannot run telemetry absent from its sealed declaration.
+        effective.update(
+            {
+                "train_diagnostics_every_batches": train_diagnostic_cadence,
+                "objective_gradient_interference_every_batches": (
+                    objective_gradient_cadence
+                ),
+                "require_feature_learning_signal_modules": "",
+                "minimum_feature_learning_signal_observations": 0,
+            }
+        )
     code_binding = (
         _current_ablation_code_binding(verified["lock"])
         if _authenticated_completed_code_binding is None
@@ -3737,17 +3757,13 @@ def bind_learner_ablation(
         "reporting_contract": {
             "diagnostic_dose_curve": bool(diagnostic_dose_curve),
             "checkpoint_steps": list(checkpoint_steps),
-            "train_diagnostics_every_batches": (16 if diagnostic_dose_curve else 0),
+            "train_diagnostics_every_batches": train_diagnostic_cadence,
             # Two observations (steps 64 and 128) are enough to compare the
             # four exposure arms without turning objective attribution into a
             # material fraction of the dose. Each observation reuses the real
             # forward graph and never mutates Parameter.grad or optimizer state.
             "objective_gradient_interference_every_batches": (
-                (
-                    min(64, max(1, int(effective["max_steps"]) // 2))
-                    if diagnostic_dose_curve
-                    else 0
-                )
+                objective_gradient_cadence
             ),
             "optimizer_trajectory_unchanged": True,
         },

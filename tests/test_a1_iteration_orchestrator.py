@@ -28,6 +28,7 @@ def _verified(tmp_path: Path) -> tuple[dict, dict[str, Path]]:
     producer = _write(tmp_path / "producer.pt", "producer")
     contract_sha = "sha256:" + "a" * 64
     recipe = dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE)
+    recipe["policy_target_blend_semantics"] = "legacy_interpolate_v1"
     objective = {
         "objective": "mse",
         "value_readout": "scalar",
@@ -658,6 +659,7 @@ def _training_report(verified: dict, checkpoint: Path) -> dict:
         "fused_optimizer": False,
         "epochs": 1,
         "max_steps": 0,
+        "exact_max_steps": False,
         "batch_size": recipe["batch_size"],
         "grad_accum_steps": recipe["grad_accum_steps"],
         "effective_global_batch_size": recipe["global_batch_size"],

@@ -29,6 +29,8 @@ def _source(tmp_path: Path) -> tuple[Path, Path]:
         else:
             outcomes = (True, False)
         for orientation, won in zip(("candidate_red", "candidate_blue"), outcomes):
+            candidate_color = "RED" if orientation == "candidate_red" else "BLUE"
+            baseline_color = "BLUE" if candidate_color == "RED" else "RED"
             games.append(
                 {
                     "pair_id": pair,
@@ -42,6 +44,16 @@ def _source(tmp_path: Path) -> tuple[Path, Path]:
                     "error": None,
                     "engine_divergence": False,
                     "decisions": 100,
+                    "search_seeds_by_role": {
+                        "candidate": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                            game_seed=6_199_952_000 + pair,
+                            seat_color=candidate_color,
+                        ),
+                        "baseline": promotion._internal_h2h_search_seed(  # noqa: SLF001
+                            game_seed=6_199_952_000 + pair,
+                            seat_color=baseline_color,
+                        ),
+                    },
                 }
             )
     scores, diagnostics = pair_scores_from_h2h_games(games)
@@ -95,9 +107,14 @@ def _source(tmp_path: Path) -> tuple[Path, Path]:
         "wide_selected_vs_prior_disagreement_rate": 0.5,
     }
     source = tmp_path / "source.json"
+    internal_engine_identity = (
+        promotion._canonical_internal_h2h_engine_identity()  # noqa: SLF001
+    )
     _write(
         source,
         {
+            "planned_engine_identity": internal_engine_identity,
+            "engine_identity": dict(internal_engine_identity),
             "candidate_checkpoint": str(checkpoint.resolve()),
             "candidate_checkpoint_sha256": promotion._sha256(checkpoint),
             "baseline_checkpoint": str(checkpoint.resolve()),
@@ -111,6 +128,7 @@ def _source(tmp_path: Path) -> tuple[Path, Path]:
             "base_seed": 6_199_952_000,
             "games_played": 400,
             "games_with_winner": 400,
+            "complete_pairs": 200,
             "games_truncated": 0,
             "candidate_wins": 202,
             "baseline_wins": 198,
@@ -126,6 +144,7 @@ def _source(tmp_path: Path) -> tuple[Path, Path]:
             "determinization_particles": 4,
             "determinization_min_simulations": 32,
             "native_mcts_hot_loop": True,
+            "search_rng_contract": promotion.INTERNAL_H2H_SEARCH_RNG_CONTRACT,
             "mcts_implementation": "rust_native_hot_loop_v1",
             **{
                 f"candidate_{key}": value for key, value in common_role.items()
@@ -183,12 +202,6 @@ def _source(tmp_path: Path) -> tuple[Path, Path]:
             "agent_identity_sha256": "sha256:" + "1" * 64,
             "search_config": {},
         },
-    }
-    pooled["planned_engine_identity"] = {
-        "schema_version": "a1-neutral-engine-identity-v1",
-        "repo_commit": "a" * 40,
-        "native_wheel_sha256": "sha256:" + "b" * 64,
-        "python_referee_sha256": "sha256:" + "c" * 64,
     }
     pooled_path = tmp_path / "pooled.json"
     _write(pooled_path, pooled)

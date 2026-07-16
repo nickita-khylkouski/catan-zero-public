@@ -128,8 +128,8 @@ def test_prepares_and_replays_exact_four_rank_adapter_operator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifest, path = _fixture(tmp_path, monkeypatch)
-    assert manifest["operator"]["global_base_draws"] == 4_194_304
-    assert manifest["operator"]["optimizer_steps"] == 2048
+    assert manifest["operator"]["global_base_draws"] == gather.GLOBAL_DRAWS
+    assert manifest["operator"]["optimizer_steps"] == gather.OPTIMIZER_STEPS
     assert manifest["operator"]["current_fraction"] == 0.8
     assert manifest["operator"]["exact_predecessor_replay_fraction"] == 0.2
     assert manifest["corpus_producer"] != manifest["learner_source_incumbent"]
@@ -161,22 +161,24 @@ def test_default_profile_remains_structurally_unchanged(
     ) == "0"
 
 
-def test_prepares_and_replays_sealed_aux64_profile_on_disjoint_devices(
+def test_prepares_and_replays_sealed_policy_aux_profile_on_disjoint_devices(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifest, path = _fixture(
         tmp_path,
         monkeypatch,
-        policy_aux_active_batch_size=64,
-        visible_devices=gather.AUX64_VISIBLE_DEVICES,
+        policy_aux_active_batch_size=128,
+        visible_devices=gather.POLICY_AUX_VISIBLE_DEVICES,
     )
     assert manifest["visible_devices"] == [4, 5, 6, 7]
-    assert manifest["operator"]["global_base_draws"] == 4_194_304
-    assert manifest["operator"]["policy_aux_active_batch_size_per_rank"] == 64
-    assert manifest["operator"]["global_policy_aux_active_draws"] == 524_288
+    assert manifest["operator"]["global_base_draws"] == gather.GLOBAL_DRAWS
+    assert manifest["operator"]["policy_aux_active_batch_size_per_rank"] == 128
+    assert manifest["operator"]["global_policy_aux_active_draws"] == (
+        gather.WORLD_SIZE * 128 * gather.OPTIMIZER_STEPS
+    )
     assert gather.base._option(  # noqa: SLF001
         manifest["command"], "--policy-aux-active-batch-size"
-    ) == "64"
+    ) == "128"
     verified = gather.verify(path)
     binding = gather._execution_binding(verified)  # noqa: SLF001
     assert binding["environment"]["CUDA_VISIBLE_DEVICES"] == "4,5,6,7"
@@ -185,14 +187,14 @@ def test_prepares_and_replays_sealed_aux64_profile_on_disjoint_devices(
     )
 
 
-def test_rejects_aux64_profile_on_wrong_devices(
+def test_rejects_policy_aux_profile_on_wrong_devices(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with pytest.raises(gather.GatherRetrainError, match="visible devices"):
         _fixture(
             tmp_path,
             monkeypatch,
-            policy_aux_active_batch_size=64,
+            policy_aux_active_batch_size=128,
             visible_devices=gather.DEFAULT_VISIBLE_DEVICES,
         )
 
@@ -222,7 +224,12 @@ def test_rejects_semantically_rehashed_geometry_command_and_identity_tampering(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _, path = _fixture(tmp_path, monkeypatch)
-    _rewrite(path, lambda value: value["operator"].__setitem__("optimizer_steps", 2047))
+    _rewrite(
+        path,
+        lambda value: value["operator"].__setitem__(
+            "optimizer_steps", gather.OPTIMIZER_STEPS - 1
+        ),
+    )
     with pytest.raises(gather.GatherRetrainError, match="geometry"):
         gather.verify(path)
 
@@ -230,7 +237,7 @@ def test_rejects_semantically_rehashed_geometry_command_and_identity_tampering(
     _, path = _fixture(tmp_path / "command", monkeypatch)
     def command_drift(value):
         index = value["command"].index("--max-steps")
-        value["command"][index + 1] = "2047"
+        value["command"][index + 1] = str(gather.OPTIMIZER_STEPS - 1)
         value["command_sha256"] = gather.base._digest(value["command"])  # noqa: SLF001
     _rewrite(path, command_drift)
     with pytest.raises(gather.GatherRetrainError, match="geometry"):
@@ -263,7 +270,7 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
     checkpoint = root / "candidate.pt"
     checkpoint.write_bytes(b"trained gather candidate")
     optimizer = root / "candidate.pt.optimizer.pt"
-    optimizer.write_bytes(b"fresh adam state at step 2048")
+    optimizer.write_bytes(b"fresh adam state at bounded terminal step")
     report = {
         "checkpoint": str(checkpoint),
         "init_checkpoint": manifest["function_preserving_upgrade"][
@@ -272,12 +279,12 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
         "init_checkpoint_sha256": manifest["function_preserving_upgrade"][
             "upgraded_initializer"
         ]["sha256"],
-        "world_size": 4,
-        "batch_size": 512,
-        "effective_global_batch_size": 2048,
-        "max_steps": 2048,
-        "steps_completed": 2048,
-        "training_row_draws": 4_194_304,
+        "world_size": gather.WORLD_SIZE,
+        "batch_size": gather.LOCAL_BATCH,
+        "effective_global_batch_size": gather.WORLD_SIZE * gather.LOCAL_BATCH,
+        "max_steps": gather.OPTIMIZER_STEPS,
+        "steps_completed": gather.OPTIMIZER_STEPS,
+        "training_row_draws": gather.GLOBAL_DRAWS,
         "soft_target_weight": 0.9,
         "policy_target_blend_semantics": "legacy_interpolate_v1",
         "value_loss_weight": 0.25,
@@ -312,8 +319,17 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
         report.update(
             {
                 "policy_aux_active_batch_size": policy_aux_active_batch_size,
-                "policy_aux_training_row_draws": 524_288,
-                "total_training_row_draws": 4_718_592,
+                "policy_aux_training_row_draws": (
+                    gather.WORLD_SIZE
+                    * policy_aux_active_batch_size
+                    * gather.OPTIMIZER_STEPS
+                ),
+                "total_training_row_draws": (
+                    gather.GLOBAL_DRAWS
+                    + gather.WORLD_SIZE
+                    * policy_aux_active_batch_size
+                    * gather.OPTIMIZER_STEPS
+                ),
             }
         )
     (root / "train.report.json").write_text(json.dumps(report), encoding="utf-8")
@@ -325,7 +341,7 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
         "checkpoint_role": "terminal_admitted",
         "checkpoint": {"path": checkpoint.name, "sha256": _ref(checkpoint)["sha256"]},
         "optimizer": {"path": optimizer.name, "sha256": _ref(optimizer)["sha256"]},
-        "optimizer_step": 2048,
+        "optimizer_step": gather.OPTIMIZER_STEPS,
         "completed_epochs": 1,
         "rank_torch_rng_states": [f"rank-{index}" for index in range(4)],
     }
@@ -387,14 +403,14 @@ def test_finalize_binds_exact_progress_rng_and_fresh_optimizer(
     assert completion["optimizer"]["path"].endswith("candidate.pt.optimizer.pt")
 
 
-def test_finalize_binds_aux64_dose(
+def test_finalize_binds_policy_aux_dose(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manifest, path = _fixture(
         tmp_path,
         monkeypatch,
-        policy_aux_active_batch_size=64,
-        visible_devices=gather.AUX64_VISIBLE_DEVICES,
+        policy_aux_active_batch_size=128,
+        visible_devices=gather.POLICY_AUX_VISIBLE_DEVICES,
     )
     unit = "a1-gather-aux64-test"
     _completion_outputs(manifest, path, unit=unit)
@@ -425,7 +441,7 @@ def test_finalize_rejects_rehashed_progress_geometry_tamper(
         lambda *_args: {"inherited_parameters_bit_identical": True},
     )
     progress = json.loads(progress_path.read_text(encoding="utf-8"))
-    progress["optimizer_step"] = 2047
+    progress["optimizer_step"] = gather.OPTIMIZER_STEPS - 1
     progress.pop("progress_sha256")
     progress["progress_sha256"] = gather.base._digest(progress)  # noqa: SLF001
     progress_path.write_text(json.dumps(progress), encoding="utf-8")

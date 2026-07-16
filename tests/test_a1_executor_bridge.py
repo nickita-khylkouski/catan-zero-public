@@ -42,6 +42,17 @@ def test_frozen_plan_bridge_preserves_public_plan_and_binds_both_executors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original = _plan()
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text(
+        json.dumps({"contract_sha256": original["contract_sha256"]}),
+        encoding="utf-8",
+    )
+    original["operator_manifests"] = {
+        "lock": {"sha256": executor._sha256(lock_path)}
+    }
+    public = executor._public(original)
+    public.pop("plan_sha256")
+    original["plan_sha256"] = executor._digest(public)
     root = _frozen_repo(tmp_path, original)
     monkeypatch.setenv("PYTHONPATH", str(Path(executor.__file__).resolve().parents[2]))
     monkeypatch.setenv("PYTHONHOME", "/invalid/hardened-python-home")
@@ -53,7 +64,7 @@ def test_frozen_plan_bridge_preserves_public_plan_and_binds_both_executors(
         frozen_executor_sha256=executor._sha256(frozen_executor),
         hardened_executor_sha256=executor._sha256(Path(executor.__file__)),
         bridge_sha256=executor._sha256(Path(bridge.__file__)),
-        lock_path=tmp_path / "lock.json",
+        lock_path=lock_path,
         render_path=tmp_path / "render.json",
         hosts_path=tmp_path / "hosts.json",
         receipt_path=tmp_path / "executor.receipt.json",

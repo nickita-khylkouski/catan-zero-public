@@ -9233,7 +9233,19 @@ def _validate_a1_batch_probe_authorization(
     baseline = receipt.get("inputs", {}).get("learner_ablation", {}).get(
         "effective_recipe"
     )
-    allowed = {"batch_size", "global_batch_size", "max_steps"}
+    # The probe deliberately enables per-batch learner telemetry.  These four
+    # fields became part of the effective recipe when diagnostic provenance
+    # was made explicit; authenticate that exact monitoring delta instead of
+    # treating it as an unexplained recipe-shape change.
+    allowed = {
+        "batch_size",
+        "global_batch_size",
+        "max_steps",
+        "minimum_feature_learning_signal_observations",
+        "objective_gradient_interference_every_batches",
+        "require_feature_learning_signal_modules",
+        "train_diagnostics_every_batches",
+    }
     if (
         not isinstance(baseline, dict)
         or authorization.get("baseline_effective_recipe") != baseline
@@ -9248,12 +9260,28 @@ def _validate_a1_batch_probe_authorization(
         actual["value_player_outcome_balance_mode"] = str(
             args.value_player_outcome_balance_mode
         )
-    if set(actual) != set(baseline):
+    diagnostic_defaults: dict[str, object] = {
+        "minimum_feature_learning_signal_observations": 0,
+        "objective_gradient_interference_every_batches": 0,
+        "require_feature_learning_signal_modules": "",
+        "train_diagnostics_every_batches": 0,
+    }
+    shape_drift = set(actual) ^ set(baseline)
+    if shape_drift - set(diagnostic_defaults):
         raise SystemExit("A1 batch-probe effective recipe shape drift")
+    comparison_baseline = dict(baseline)
+    for key in set(actual) - set(baseline):
+        comparison_baseline[key] = diagnostic_defaults[key]
+    comparison_actual = dict(actual)
+    for key in set(baseline) - set(actual):
+        comparison_actual[key] = diagnostic_defaults[key]
     drift = {
-        key: {"baseline": baseline[key], "effective": actual[key]}
-        for key in baseline
-        if baseline[key] != actual[key]
+        key: {
+            "baseline": comparison_baseline[key],
+            "effective": comparison_actual[key],
+        }
+        for key in comparison_baseline
+        if comparison_baseline[key] != comparison_actual[key]
     }
     if not drift or set(drift) - allowed:
         raise SystemExit(
@@ -10517,8 +10545,16 @@ def _validate_a1_learner_training_recipe(
         authorized_extra_fields.add("policy_aux_loss_weight")
         if "policy_aux_sampling_mode" in effective:
             authorized_extra_fields.add("policy_aux_sampling_mode")
-        if "value_trunk_grad_scale" in effective:
-            authorized_extra_fields.add("value_trunk_grad_scale")
+    if "value_trunk_grad_scale" in effective:
+        authorized_extra_fields.add("value_trunk_grad_scale")
+    for diagnostic_field in (
+        "minimum_feature_learning_signal_observations",
+        "objective_gradient_interference_every_batches",
+        "require_feature_learning_signal_modules",
+        "train_diagnostics_every_batches",
+    ):
+        if diagnostic_field in effective:
+            authorized_extra_fields.add(diagnostic_field)
     if "policy_target_blend_semantics" in effective:
         authorized_extra_fields.add("policy_target_blend_semantics")
     if effective.get("forced_row_value_action_type_weights"):

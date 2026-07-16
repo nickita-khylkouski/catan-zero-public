@@ -83,6 +83,7 @@ def _verified(tmp_path: Path) -> dict:
         "value_lr_mult": 0.3, "action_module_lr_mult": 1.0,
         "trunk_lr_mult": 1.0,
         "policy_loss_weight": 1.0, "soft_target_source": "policy",
+        "policy_target_blend_semantics": "legacy_interpolate_v1",
         "soft_target_weight": 0.9, "soft_target_temperature": 0.7,
         "soft_target_min_legal_coverage": 0.5, "value_loss_weight": 0.25,
         "value_target_lambda": 1.0, "value_categorical_loss_weight": 0.0,
@@ -1015,6 +1016,7 @@ def test_promotion_receipt_verifier_accepts_dual_transaction(
         contract_lock=contract_lock.resolve(),
         contract={
             "contract_sha256": SHA,
+            "science": {},
             "checkpoints": [{"role": "producer", "sha256": dual._sha256(producer)}],  # noqa: SLF001
         },
         candidate_path=candidate.resolve(),

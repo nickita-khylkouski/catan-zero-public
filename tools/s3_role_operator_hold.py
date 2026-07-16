@@ -150,13 +150,13 @@ def _validate_and_replay(pooled_path: Path) -> dict[str, Any]:
         )
     except evaluation_pool.PoolError as error:
         raise HoldError(f"S3 pool replay failed: {error}") from error
-    # The fleet controller appends these two authenticated provenance records
-    # after generic pooling.  Replay every science/game/statistics field, then
-    # validate the append-only records independently instead of pretending the
-    # generic pooler emitted them.
+    # The fleet controller appends the evaluation binding after generic
+    # pooling. The pooler now emits the canonical planned/runtime engine
+    # identities itself, so those identities must remain in the exact replay
+    # projection as well as pass the independent checks below.
     replay_projection = dict(pooled)
     evaluation_binding = replay_projection.pop("evaluation_binding", None)
-    planned_engine = replay_projection.pop("planned_engine_identity", None)
+    planned_engine = replay_projection.get("planned_engine_identity")
     _require(
         _canonical(replayed) == _canonical(replay_projection),
         "S3 pooled result does not replay",
@@ -198,9 +198,11 @@ def _validate_and_replay(pooled_path: Path) -> dict[str, Any]:
             "schema_version",
             "repo_commit",
             "native_wheel_sha256",
-            "python_referee_sha256",
+            "evaluator_sha256",
+            "native_runtime_sha256",
         }
-        and planned_engine.get("schema_version") == "a1-neutral-engine-identity-v1"
+        and planned_engine.get("schema_version")
+        == "a1-internal-h2h-engine-identity-v1"
         and isinstance(planned_engine.get("repo_commit"), str)
         and len(planned_engine["repo_commit"]) == 40
         and all(character in "0123456789abcdef" for character in planned_engine["repo_commit"])
@@ -208,7 +210,11 @@ def _validate_and_replay(pooled_path: Path) -> dict[str, Any]:
             isinstance(planned_engine.get(key), str)
             and len(planned_engine[key]) == 71
             and planned_engine[key].startswith("sha256:")
-            for key in ("native_wheel_sha256", "python_referee_sha256")
+            for key in (
+                "native_wheel_sha256",
+                "evaluator_sha256",
+                "native_runtime_sha256",
+            )
         ),
         "S3 planned engine identity is malformed",
     )

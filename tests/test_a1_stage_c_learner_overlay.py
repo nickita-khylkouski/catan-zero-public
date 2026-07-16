@@ -376,4 +376,5 @@ def test_clean_stage_c_recipe_commissions_new_adapters() -> None:
         "meaningful_history_residual_gate",
         "meaningful_history_ordered_gate",
         "meaningful_history_sequence",
+        "meaningful_history_target_proj",
     )

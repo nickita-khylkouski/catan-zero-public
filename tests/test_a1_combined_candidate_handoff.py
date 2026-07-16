@@ -225,7 +225,7 @@ def test_promotion_plan_requires_passing_handoff_and_full_transaction_preflight(
         handoff.build_promotion_plan(handoff_path, manifest_path)
 
 
-def test_promotion_report_accepts_only_exact_authenticated_curriculum_parent(
+def test_promotion_report_rejects_curriculum_parent_chaining(
     tmp_path: Path,
 ) -> None:
     producer = _file(tmp_path, "producer.pt", b"producer")
@@ -325,35 +325,16 @@ def test_promotion_report_accepts_only_exact_authenticated_curriculum_parent(
         "symmetry_augment": False,
     }
     report.write_text(json.dumps(payload))
-    verified = handoff.promotion._verify_training_report(  # noqa: SLF001
-        report,
-        contract={"checkpoints": [{"role": "producer", "sha256": producer_sha}]},
-        contract_sha256="sha256:contract",
-        candidate_path=candidate.resolve(),
-        candidate_sha256=handoff.promotion._sha256(candidate),  # noqa: SLF001
-    )
-    assert verified["a1_curriculum_parent"] == parent_binding
-
-    ordinary = dict(payload)
-    ordinary.pop("a1_curriculum_parent")
-    report.write_text(json.dumps(ordinary))
     with pytest.raises(
-        handoff.promotion.PromotionError, match="init checkpoint differs from producer"
+        handoff.promotion.PromotionError,
+        match="candidate chaining/curriculum lineage is not promotion-eligible",
     ):
         handoff.promotion._verify_training_report(  # noqa: SLF001
             report,
-            contract={"checkpoints": [{"role": "producer", "sha256": producer_sha}]},
-            contract_sha256="sha256:contract",
-            candidate_path=candidate.resolve(),
-            candidate_sha256=handoff.promotion._sha256(candidate),  # noqa: SLF001
-        )
-
-    report.write_text(json.dumps(payload))
-    parent.write_bytes(b"drift")
-    with pytest.raises(handoff.promotion.PromotionError, match="bytes drifted"):
-        handoff.promotion._verify_training_report(  # noqa: SLF001
-            report,
-            contract={"checkpoints": [{"role": "producer", "sha256": producer_sha}]},
+            contract={
+                "science": {},
+                "checkpoints": [{"role": "producer", "sha256": producer_sha}],
+            },
             contract_sha256="sha256:contract",
             candidate_path=candidate.resolve(),
             candidate_sha256=handoff.promotion._sha256(candidate),  # noqa: SLF001

@@ -7,7 +7,25 @@ import pytest
 from tools import a1_value_trunk_scale_adjudication as adjudication
 
 
-def test_contract_exposes_authority_conflict_without_changing_production() -> None:
+@pytest.fixture
+def legacy_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    recipe = adjudication.current_science.learner_training_recipe()
+    recipe["value_trunk_grad_scale"] = adjudication.CONTROL_SCALE
+    monkeypatch.setattr(
+        adjudication.current_science,
+        "learner_training_recipe",
+        lambda: recipe,
+    )
+
+
+def test_superseded_contract_refuses_changed_production_authority() -> None:
+    with pytest.raises(adjudication.ValueTrunkScaleError, match="authority conflict"):
+        adjudication.build_contract()
+
+
+def test_archival_contract_exposes_authority_conflict_without_changing_production(
+    legacy_authority: None,
+) -> None:
     contract = adjudication.build_contract()
 
     assert contract["diagnostic_only"] is True
@@ -60,7 +78,9 @@ def test_self_asserted_claims_have_no_adjudication_entrypoint() -> None:
         )
 
 
-def test_forged_boolean_and_count_claims_cannot_be_added_to_contract() -> None:
+def test_forged_boolean_and_count_claims_cannot_be_added_to_contract(
+    legacy_authority: None,
+) -> None:
     contract = adjudication.build_contract()
     forged = copy.deepcopy(contract)
     forged["self_asserted_receipt"] = {
@@ -77,7 +97,9 @@ def test_forged_boolean_and_count_claims_cannot_be_added_to_contract() -> None:
         adjudication.verify_contract(forged)
 
 
-def test_plan_requires_artifact_replay_and_derived_evidence() -> None:
+def test_plan_requires_artifact_replay_and_derived_evidence(
+    legacy_authority: None,
+) -> None:
     contract = adjudication.build_contract()
     learner = contract["required_learner_evidence"]
     gameplay = contract["required_gameplay_evidence"]
@@ -99,7 +121,7 @@ def test_plan_requires_artifact_replay_and_derived_evidence() -> None:
     )
 
 
-def test_contract_digest_tamper_is_rejected() -> None:
+def test_contract_digest_tamper_is_rejected(legacy_authority: None) -> None:
     contract = adjudication.build_contract()
     tampered = copy.deepcopy(contract)
     tampered["required_gameplay_evidence"]["minimum_complete_pairs"] = 1

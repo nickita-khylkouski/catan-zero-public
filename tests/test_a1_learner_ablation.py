@@ -11,6 +11,12 @@ from tools import a1_pre_wave_contract as contract
 from tools import train_bc
 
 
+def _executable_legacy_recipe() -> dict[str, object]:
+    recipe = dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE)
+    recipe["policy_target_blend_semantics"] = train_bc.POLICY_TARGET_BLEND_LEGACY_V1
+    return recipe
+
+
 def _verified() -> dict[str, object]:
     train_path = Path(train_bc.__file__).resolve()
     selfplay_path = (
@@ -24,7 +30,7 @@ def _verified() -> dict[str, object]:
         }
     }
     return {
-        "recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "recipe": _executable_legacy_recipe(),
         "contract_sha256": "sha256:" + "a" * 64,
         "lock": lock,
         "producer": {"path": "/sealed/champion.pt", "sha256": "sha256:" + "b" * 64},
@@ -58,7 +64,7 @@ def test_ablation_reuses_existing_weighting_knobs_and_binds_exact_drift() -> Non
         forced_row_value_weight=0.1,
     )
     ablation = result["learner_ablation"]
-    assert result["bound_recipe"] == contract.EXPECTED_LEARNER_TRAINING_RECIPE
+    assert result["bound_recipe"] == _executable_legacy_recipe()
     assert result["recipe"]["per_game_value_weight"] is True
     assert set(ablation["recipe_drift"]) == {
         "forced_row_value_weight",
@@ -74,9 +80,11 @@ def test_ablation_reuses_existing_weighting_knobs_and_binds_exact_drift() -> Non
     assert result["claim_identity_sha256"] != result["contract_sha256"]
 
 
-def test_historical_a1_recipe_renders_explicit_legacy_blend_semantics() -> None:
+def test_executable_legacy_recipe_renders_explicit_blend_semantics() -> None:
     result = _bind(value_loss_weight=1.0)
-    assert "policy_target_blend_semantics" not in result["bound_recipe"]
+    assert result["bound_recipe"]["policy_target_blend_semantics"] == (
+        train_bc.POLICY_TARGET_BLEND_LEGACY_V1
+    )
     command = executor.build_train_command(
         result,
         python=Path(sys.executable),
@@ -121,9 +129,9 @@ def test_value_trunk_gradient_ablation_is_typed_bound_and_rendered() -> None:
     assert command[command.index("--value-trunk-grad-scale") + 1] == "0.0"
     args = train_bc.build_parser().parse_args(command[2:])
     bound = {
-        "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "learner_training_recipe": _executable_legacy_recipe(),
         "learner_training_recipe_sha256": executor._value_sha256(
-            contract.EXPECTED_LEARNER_TRAINING_RECIPE
+            _executable_legacy_recipe()
         ),
     }
     effective = train_bc._validate_a1_learner_training_recipe(
@@ -159,9 +167,9 @@ def test_forced_action_type_value_map_is_receipt_bound_and_rendered() -> None:
     ] == canonical
     args = train_bc.build_parser().parse_args(command[2:])
     bound = {
-        "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "learner_training_recipe": _executable_legacy_recipe(),
         "learner_training_recipe_sha256": executor._value_sha256(
-            contract.EXPECTED_LEARNER_TRAINING_RECIPE
+            _executable_legacy_recipe()
         ),
     }
     effective = train_bc._validate_a1_learner_training_recipe(
@@ -379,9 +387,9 @@ def test_train_command_and_child_validation_preserve_bound_recipe() -> None:
     assert command[command.index("--loser-sample-weight") + 1] == "1.0"
     args = train_bc.build_parser().parse_args(command[2:])
     bound = {
-        "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "learner_training_recipe": _executable_legacy_recipe(),
         "learner_training_recipe_sha256": executor._value_sha256(
-            contract.EXPECTED_LEARNER_TRAINING_RECIPE
+            _executable_legacy_recipe()
         ),
     }
     effective = train_bc._validate_a1_learner_training_recipe(
@@ -439,9 +447,9 @@ def test_coherent_ddp_child_preserves_exact_outer_ablation_marker() -> None:
     trainer = str(executor._REPO_ROOT / "tools" / "train_bc.py")
     args = train_bc.build_parser().parse_args(command[command.index(trainer) + 1 :])
     child_bound = {
-        "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "learner_training_recipe": _executable_legacy_recipe(),
         "learner_training_recipe_sha256": executor._value_sha256(
-            contract.EXPECTED_LEARNER_TRAINING_RECIPE
+            _executable_legacy_recipe()
         ),
         "coherent_direct_corpus": True,
         "coherent_topology": {
@@ -525,9 +533,9 @@ def test_coherent_ddp_child_preserves_adaptive_policy_kl_marker() -> None:
     trainer = str(executor._REPO_ROOT / "tools" / "train_bc.py")
     args = train_bc.build_parser().parse_args(command[command.index(trainer) + 1 :])
     child_bound = {
-        "learner_training_recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "learner_training_recipe": _executable_legacy_recipe(),
         "learner_training_recipe_sha256": executor._value_sha256(
-            contract.EXPECTED_LEARNER_TRAINING_RECIPE
+            _executable_legacy_recipe()
         ),
         "coherent_direct_corpus": True,
         "coherent_topology": {

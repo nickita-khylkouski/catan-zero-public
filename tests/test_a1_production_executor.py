@@ -1804,6 +1804,8 @@ def test_staged_catanatron_import_origin_is_inside_content_addressed_repo(
     vendor = root / "vendor/catanatron/catanatron/catanatron"
     models = vendor / "models"
     rl.mkdir(parents=True)
+    (root / "src/catan_zero/__init__.py").write_text("", encoding="utf-8")
+    (rl / "__init__.py").write_text("", encoding="utf-8")
     models.mkdir(parents=True)
     (rl / "_catanatron.py").write_bytes(
         (executor._REPO_ROOT / "src/catan_zero/rl/_catanatron.py").read_bytes()

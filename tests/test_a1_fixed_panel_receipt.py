@@ -69,6 +69,11 @@ def _write_report(
         ),
         "evaluation_binding": evaluation_binding,
         "planned_engine_identity": planned_engine_identity,
+        **(
+            {"engine_identity": dict(planned_engine_identity)}
+            if panel_kind == "internal"
+            else {}
+        ),
         "games": games,
         "fleet_merge": {
             "sources": [
@@ -134,9 +139,18 @@ def _aux_inputs(tmp_path: Path, *, panel_kind: str):
         historical_comparison_reason=None,
         champion_c_scale=0.10,
     )
-    planned_engine_identity = fleet._engine_identity(  # noqa: SLF001
+    neutral_engine_identity = fleet._engine_identity(  # noqa: SLF001
         fleet._REPO_ROOT, fleet._git_commit(fleet._REPO_ROOT)  # noqa: SLF001
     )
+    planned_engine_identity = neutral_engine_identity
+    if panel_kind == "internal":
+        planned_engine_identity = fleet._internal_engine_identity(  # noqa: SLF001
+            repo_commit=neutral_engine_identity["repo_commit"],
+            wheel_sha256=neutral_engine_identity["native_wheel_sha256"],
+            evaluator_sha256=fleet._tool_hashes(fleet._REPO_ROOT)[  # noqa: SLF001
+                "tools/gumbel_search_cross_net_h2h.py"
+            ],
+        )
     plan = coordinator.canonical_aux_evaluation_plan(
         baseline_checkpoint_sha256=baseline_sha
     )
@@ -173,7 +187,6 @@ def _mock_repool(
         assert champion.is_file()
         result = json.loads(reports[candidate.stem].read_text())
         result.pop("evaluation_binding")
-        result.pop("planned_engine_identity")
         return result
 
     monkeypatch.setattr(fleet.evaluation_pool, "pool_internal", replay)
@@ -185,7 +198,6 @@ def _mock_neutral_repool(
     def replay(_sources, *, checkpoint: Path):
         result = json.loads(reports[checkpoint.stem].read_text())
         result.pop("evaluation_binding")
-        result.pop("planned_engine_identity")
         return result
 
     monkeypatch.setattr(fleet.evaluation_pool, "pool_neutral", replay)
