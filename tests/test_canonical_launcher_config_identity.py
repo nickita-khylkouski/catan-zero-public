@@ -90,3 +90,14 @@ def test_canonical_launchers_ignore_ambient_stale_pythonpath(
     assert completed.returncode == 0, completed.stderr
     assert "usage:" in completed.stdout
     assert "ambient stale package imported" not in completed.stderr
+
+
+def test_canonical_evaluation_uses_the_production_promotion_gate() -> None:
+    payload = json.loads(
+        (
+            ROOT / "configs/eval/coherent_public_n128.schema18.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert payload["fields"]["elo0"] == -10.0
+    assert payload["fields"]["elo1"] == 15.0

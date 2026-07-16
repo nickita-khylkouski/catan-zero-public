@@ -28,7 +28,7 @@ from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION, EvalConfig
 
 CANONICAL_OPTION_COUNT = 9
 CANONICAL_CONFIG_SHA256 = (
-    "ccfb45ab4b5b3842f0601f5145d2c3f9f7c28ba935361107d2094a6e2222df9a"
+    "00e001f832cbfc5464aa32efef0a6db980bd37709f1924b833bdc61c6d4b1efd"
 )
 
 
@@ -127,6 +127,8 @@ def _validate_config(path: Path) -> None:
         "force_full_every_decision": True,
         "use_batch_api": True,
         "map_kind": "BASE",
+        "elo0": -10.0,
+        "elo1": 15.0,
     }
     for name, expected in required.items():
         if fields.get(name) != expected:
