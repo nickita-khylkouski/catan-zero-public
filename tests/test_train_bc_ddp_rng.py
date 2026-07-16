@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 import numpy as np
+import pytest
 import torch
 
 from tools import train_bc
@@ -83,6 +84,26 @@ def test_same_seed_without_rank_offset_reproduces_identical_rank_masks() -> None
         torch.manual_seed(44)
         draws.append(_dropout_draw())
     assert torch.equal(draws[0], draws[1])
+
+
+@pytest.mark.parametrize("world_size", (2, 8))
+def test_independent_rank_masks_recover_world_size_noise_reduction(
+    world_size: int,
+) -> None:
+    """Averaging W independent dropout masks should divide noise variance by W."""
+
+    rng = np.random.default_rng(20260716 + world_size)
+    independent_noise = (
+        rng.integers(0, 2, size=(200_000, world_size), dtype=np.int8) * 2 - 1
+    )
+    identical_noise = np.repeat(independent_noise[:, :1], world_size, axis=1)
+
+    independent_variance = np.var(independent_noise.mean(axis=1))
+    identical_variance = np.var(identical_noise.mean(axis=1))
+
+    assert identical_variance / independent_variance == pytest.approx(
+        world_size, rel=0.02
+    )
 
 
 def test_auxiliary_readout_must_not_advance_shared_dropout_stream() -> None:

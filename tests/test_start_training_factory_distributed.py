@@ -66,8 +66,10 @@ def test_factory_keeps_default_global_batch_constant_across_world_sizes(
         "grad_accum_steps": 1,
         "effective_global_batch_size": 4096,
         "batch_size_source": "derived_from_global_batch",
+        "training_rng_rank_offset": world_size > 1,
     }
     command = _train_command(manifest)
+    assert command.count("--training-rng-rank-offset") == int(world_size > 1)
     assert command[command.index("--batch-size") + 1] == str(expected_local_batch)
     assert command[command.index("--grad-accum-steps") + 1] == "1"
     assert command[command.index("--soft-target-weight") + 1] == "1.0"
@@ -151,4 +153,5 @@ def test_explicit_local_batch_override_is_manifested_without_reinterpretation(
         "grad_accum_steps": 2,
         "effective_global_batch_size": 4096,
         "batch_size_source": "explicit_rank_local_override",
+        "training_rng_rank_offset": True,
     }

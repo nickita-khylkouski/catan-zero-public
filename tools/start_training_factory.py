@@ -410,6 +410,7 @@ def main() -> None:
             if args.arch in {"xdim_graph", "entity_graph"}
             else []
         )
+        + (["--training-rng-rank-offset"] if world_size > 1 else [])
         + [
             "--checkpoint",
             str(bc_checkpoint),
@@ -490,6 +491,7 @@ def main() -> None:
                 if args.bc_batch_size is not None
                 else "derived_from_global_batch"
             ),
+            "training_rng_rank_offset": world_size > 1,
         },
     }
     write_json(run_dir / "pipeline_manifest.json", manifest)
