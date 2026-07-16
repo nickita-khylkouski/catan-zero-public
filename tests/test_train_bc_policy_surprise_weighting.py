@@ -6,6 +6,7 @@ import pytest
 from tools.train_bc import (
     _component_game_identities,
     _compose_per_game_policy_surprise_sampling_weights,
+    _coverage_fixed_loss_normalizers,
     _coverage_importance_weights,
     _epoch_order,
     compute_policy_surprise_kl,
@@ -262,6 +263,38 @@ def test_coverage_importance_preserves_weighted_population_objective() -> None:
 
     assert importance.mean() == pytest.approx(1.0)
     assert permutation_objective == pytest.approx(weighted_target)
+
+
+def test_coverage_normalizers_match_effective_policy_and_value_masks() -> None:
+    data = {
+        "action_taken": np.zeros(3, dtype=np.int16),
+        "winner": np.asarray(["RED", "", ""]),
+        "player": np.asarray(["RED", "BLUE", "RED"]),
+        "truncated": np.asarray([False, False, True]),
+        "seat": np.asarray([1, 0, 1], dtype=np.int8),
+        "final_actual_vps": np.asarray(
+            [[0, 10, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]], dtype=np.int16
+        ),
+        "has_final_actual_vps": np.asarray([True, False, False]),
+        "final_public_vps": np.asarray(
+            [[0, 10, 0, 0], [0, 0, 0, 0], [8, 6, 0, 0]], dtype=np.int16
+        ),
+        "has_final_public_vps": np.asarray([True, False, False]),
+    }
+
+    normalizers = _coverage_fixed_loss_normalizers(
+        data,
+        np.arange(3, dtype=np.int64),
+        policy_sample_weights=np.asarray([1.0, 0.0, 2.0], dtype=np.float32),
+        value_sample_weights=np.ones(3, dtype=np.float32),
+        truncated_vp_margin_value_weight=0.25,
+        vps_to_win=10,
+        public_information_only=True,
+    )
+
+    assert normalizers["policy_effective_weight_mean"] == pytest.approx(1.0)
+    assert normalizers["value_effective_weight_mean"] == pytest.approx(1.25 / 3.0)
+    assert normalizers["final_vp_effective_weight_mean"] == pytest.approx(1.0 / 3.0)
 
 
 def test_coverage_permutation_visits_every_row_once() -> None:

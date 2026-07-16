@@ -12943,6 +12943,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         training_policy_sample_weights[train_indices] *= np.asarray(
             policy_surprise_weights_full[train_indices], dtype=np.float32
         )
+    coverage_loss_normalizers: dict[str, float] | None = None
     base_sampler = str(args.base_sampler)
     if base_sampler == BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1:
         epoch_sample_weights = component_game_sampling
@@ -12966,6 +12967,35 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "learner only; policy AUX sampling needs a separate coverage "
                 "contract"
             )
+        unsupported_coverage_objectives = {
+            "advantage_policy_weighting": str(args.advantage_policy_weighting)
+            != "none",
+            "q_loss_weight": float(args.q_loss_weight) != 0.0,
+            "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight) != 0.0,
+            "policy_kl_target": args.policy_kl_target is not None,
+            "value_uncertainty_loss_weight": float(
+                args.value_uncertainty_loss_weight
+            )
+            != 0.0,
+            "aux_subgoal_loss_weight": float(args.aux_subgoal_loss_weight) != 0.0,
+            "belief_resource_loss_weight": float(
+                args.belief_resource_loss_weight
+            )
+            != 0.0,
+            "value_categorical_loss_weight": float(
+                resolved_categorical_value_weight
+            )
+            != 0.0,
+            "moe_balance_loss_weight": float(args.moe_balance_loss_weight) != 0.0,
+        }
+        enabled_unsupported = sorted(
+            key for key, enabled in unsupported_coverage_objectives.items() if enabled
+        )
+        if enabled_unsupported:
+            raise SystemExit(
+                "coverage_importance_v1 fixed-measure normalization does not yet "
+                "bind these objectives: " + ",".join(enabled_unsupported)
+            )
         importance = _coverage_importance_weights(component_game_sampling)
         training_policy_sample_weights = np.asarray(
             training_policy_sample_weights, dtype=np.float32
@@ -12979,6 +13009,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         training_value_sample_weights[train_indices] *= importance.astype(
             np.float32
         )
+        coverage_loss_normalizers = _coverage_fixed_loss_normalizers(
+            data,
+            train_indices,
+            policy_sample_weights=training_policy_sample_weights,
+            value_sample_weights=training_value_sample_weights,
+            truncated_vp_margin_value_weight=float(
+                args.truncated_vp_margin_value_weight
+            ),
+            vps_to_win=int(args.vps_to_win),
+            public_information_only=bool(args.mask_hidden_info),
+        )
+        if (
+            float(resolved_scalar_value_weight) > 0.0
+            and coverage_loss_normalizers["value_effective_weight_mean"] <= 0.0
+        ):
+            raise SystemExit("coverage value objective has zero population weight")
+        if (
+            float(args.final_vp_loss_weight) > 0.0
+            and coverage_loss_normalizers["final_vp_effective_weight_mean"] <= 0.0
+        ):
+            raise SystemExit("coverage final-VP objective has zero population weight")
         epoch_sample_weights = None
         base_sampler_report = {
             "schema_version": "train-base-sampler-v1",
@@ -12987,12 +13038,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             "objective_measure": "authenticated_component_game_row_sampling",
             "complete_row_coverage_per_epoch": True,
             "importance_weighting": True,
-            "importance_estimator": "self_normalized_minibatch_v1",
+            "importance_estimator": "fixed_population_denominator_v1",
             "importance_formula": "train_row_count * authenticated_row_probability",
             "importance_mean": float(importance.mean()),
             "importance_min": float(importance.min()),
             "importance_max": float(importance.max()),
             "importance_content_sha256": _array_content_sha256(importance),
+            "fixed_loss_normalizers": dict(coverage_loss_normalizers),
             "validation_measure_unchanged": True,
         }
     else:
@@ -13952,6 +14004,27 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "moe_balance_loss_weight": float(args.moe_balance_loss_weight),
                 "value_trunk_grad_scale": float(args.value_trunk_grad_scale),
+                "fixed_policy_weight_mean": (
+                    None
+                    if coverage_loss_normalizers is None
+                    else coverage_loss_normalizers[
+                        "policy_effective_weight_mean"
+                    ]
+                ),
+                "fixed_value_effective_weight_mean": (
+                    None
+                    if coverage_loss_normalizers is None
+                    else coverage_loss_normalizers[
+                        "value_effective_weight_mean"
+                    ]
+                ),
+                "fixed_final_vp_effective_weight_mean": (
+                    None
+                    if coverage_loss_normalizers is None
+                    else coverage_loss_normalizers[
+                        "final_vp_effective_weight_mean"
+                    ]
+                ),
             }
         batch_iterator = _iterate_training_batches(
             data,
@@ -17727,6 +17800,9 @@ def _train_xdim_batch(
     value_trunk_grad_scale: float = 1.0,
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
+    fixed_policy_weight_mean: float | None = None,
+    fixed_value_effective_weight_mean: float | None = None,
+    fixed_final_vp_effective_weight_mean: float | None = None,
 ) -> dict:
     import torch
     from torch import nn
@@ -17873,7 +17949,9 @@ def _train_xdim_batch(
             advantage_weight_floor,
         )
         policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(
-            per_sample_loss, policy_weights
+            per_sample_loss,
+            policy_weights,
+            fixed_weight_mean=fixed_policy_weight_mean,
         )
         policy_base_loss_denominator = policy_loss_denominator
         policy_base_loss = _weighted_mean_from_parts(
@@ -18063,11 +18141,13 @@ def _train_xdim_batch(
                 value_error,
                 value_weights * outcome_confidence,
                 mask=value_has_outcome,
+                fixed_weight_mean=fixed_value_effective_weight_mean,
             )
             value_loss_sum, value_loss_denominator = _weighted_loss_parts(
                 value_error,
                 value_weights * outcome_confidence,
                 mask=value_has_outcome,
+                fixed_weight_mean=fixed_value_effective_weight_mean,
             )
             value_active_mask = value_has_outcome & (
                 (value_weights * outcome_confidence) > 0.0
@@ -18082,11 +18162,13 @@ def _train_xdim_batch(
                 vp_error,
                 value_weights,
                 mask=has_vp_target,
+                fixed_weight_mean=fixed_final_vp_effective_weight_mean,
             )
             final_vp_loss_sum, final_vp_loss_denominator = _weighted_loss_parts(
                 vp_error,
                 value_weights,
                 mask=has_vp_target,
+                fixed_weight_mean=fixed_final_vp_effective_weight_mean,
             )
         else:
             final_vp_loss_sum, final_vp_loss_denominator = _zero_loss_parts(policy.device)
@@ -26108,8 +26190,19 @@ def _validate_aux_subgoal_training_contract(
     }
 
 
-def _weighted_mean_loss(values, weights, *, mask=None):
-    numerator, denominator = _weighted_loss_parts(values, weights, mask=mask)
+def _weighted_mean_loss(
+    values,
+    weights,
+    *,
+    mask=None,
+    fixed_weight_mean: float | None = None,
+):
+    numerator, denominator = _weighted_loss_parts(
+        values,
+        weights,
+        mask=mask,
+        fixed_weight_mean=fixed_weight_mean,
+    )
     return _weighted_mean_from_parts(numerator, denominator)
 
 
@@ -26176,14 +26269,34 @@ def _weighted_mean_from_parts(numerator, denominator):
     return numerator / torch.clamp(denominator, min=1.0e-6)
 
 
-def _weighted_loss_parts(values, weights, *, mask=None):
+def _weighted_loss_parts(
+    values,
+    weights,
+    *,
+    mask=None,
+    fixed_weight_mean: float | None = None,
+):
     effective_weights = weights
     if mask is not None:
         effective_weights = effective_weights * mask.to(
             device=weights.device,
             dtype=weights.dtype,
         )
-    return (values * effective_weights).sum(), effective_weights.sum()
+    numerator = (values * effective_weights).sum()
+    if fixed_weight_mean is None:
+        denominator = effective_weights.sum()
+    else:
+        import torch
+
+        resolved = float(fixed_weight_mean)
+        if not math.isfinite(resolved) or resolved < 0.0:
+            raise ValueError("fixed loss weight mean must be finite and non-negative")
+        denominator = torch.as_tensor(
+            resolved * float(values.shape[0]),
+            dtype=effective_weights.dtype,
+            device=effective_weights.device,
+        )
+    return numerator, denominator
 
 
 def _zero_loss_parts(device):
@@ -32533,6 +32646,105 @@ def _coverage_importance_weights(
     ):
         raise RuntimeError("coverage importance mean drift")
     return factors
+
+
+def _coverage_fixed_loss_normalizers(
+    data,
+    train_indices: np.ndarray,
+    *,
+    policy_sample_weights: np.ndarray,
+    value_sample_weights: np.ndarray,
+    truncated_vp_margin_value_weight: float,
+    vps_to_win: int,
+    public_information_only: bool,
+    chunk_rows: int = 262_144,
+) -> dict[str, float]:
+    """Compute fixed proposal-measure denominators for coverage importance.
+
+    A uniform full-coverage permutation with importance factor ``N*p_i`` has
+    an unbiased minibatch gradient only when the random minibatch weight sum is
+    not used as its own denominator.  These population means make every batch
+    use ``batch_rows * E_q[effective_weight]`` while preserving the exact
+    policy/value masks used by the learner.
+    """
+
+    rows = np.asarray(train_indices, dtype=np.int64)
+    if rows.ndim != 1 or rows.size == 0:
+        raise ValueError("coverage loss normalization requires training rows")
+    policy_weights = np.asarray(policy_sample_weights, dtype=np.float64)
+    value_weights = np.asarray(value_sample_weights, dtype=np.float64)
+    if (
+        policy_weights.shape != (len(data["action_taken"]),)
+        or value_weights.shape != policy_weights.shape
+    ):
+        raise ValueError("coverage loss weight arrays are not corpus-aligned")
+
+    policy_total = float(np.sum(policy_weights[rows], dtype=np.float64))
+    value_total = 0.0
+    final_vp_total = 0.0
+    for start in range(0, rows.size, max(1, int(chunk_rows))):
+        batch = rows[start : start + max(1, int(chunk_rows))]
+        weights = value_weights[batch]
+        if "winner" in data and "player" in data:
+            winners = np.asarray(data["winner"][batch]).astype(str)
+            truncated = _batch_array_or_fill(
+                data, "truncated", batch, False, dtype=np.bool_
+            )
+            has_outcome = (winners != "") & ~truncated
+            confidence = has_outcome.astype(np.float64)
+            if (
+                float(truncated_vp_margin_value_weight) > 0.0
+                and np.any(truncated)
+            ):
+                soft_mask, _soft_outcome = _truncated_vp_margin_outcome(
+                    data,
+                    batch,
+                    truncated,
+                    int(vps_to_win),
+                    public_information_only=bool(public_information_only),
+                )
+                fill = soft_mask & ~has_outcome
+                confidence[fill] = float(truncated_vp_margin_value_weight)
+            value_total += float(np.sum(weights * confidence, dtype=np.float64))
+
+        if "seat" in data:
+            seats = np.asarray(data["seat"][batch], dtype=np.int64)
+            valid_vp = np.zeros(batch.size, dtype=np.bool_)
+            truncated = _batch_array_or_fill(
+                data, "truncated", batch, False, dtype=np.bool_
+            )
+            for value_key, present_key in (
+                ("final_actual_vps", "has_final_actual_vps"),
+                ("final_public_vps", "has_final_public_vps"),
+            ):
+                if value_key not in data:
+                    continue
+                values = np.asarray(data[value_key][batch])
+                present = _batch_array_or_fill(
+                    data, present_key, batch, False, dtype=np.bool_
+                )
+                valid_vp |= (
+                    ~valid_vp
+                    & ~truncated
+                    & present
+                    & (seats >= 0)
+                    & (seats < values.shape[1])
+                )
+            final_vp_total += float(
+                np.sum(weights * valid_vp.astype(np.float64), dtype=np.float64)
+            )
+
+    normalizers = {
+        "policy_effective_weight_mean": policy_total / float(rows.size),
+        "value_effective_weight_mean": value_total / float(rows.size),
+        "final_vp_effective_weight_mean": final_vp_total / float(rows.size),
+    }
+    for name, value in normalizers.items():
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"coverage {name} is invalid")
+    if normalizers["policy_effective_weight_mean"] <= 0.0:
+        raise SystemExit("coverage policy objective has zero population weight")
+    return normalizers
 
 
 def _compose_per_game_policy_surprise_sampling_weights(

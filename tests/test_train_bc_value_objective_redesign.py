@@ -121,6 +121,32 @@ def test_weighted_objective_uses_ddp_global_denominator(monkeypatch) -> None:
     assert value.grad.item() == pytest.approx(0.5)
 
 
+def test_fixed_population_denominator_preserves_importance_at_batch_one() -> None:
+    torch = pytest.importorskip("torch")
+
+    low = _weighted_mean_loss(
+        torch.tensor([2.0]),
+        torch.tensor([0.25]),
+        fixed_weight_mean=1.0,
+    )
+    high = _weighted_mean_loss(
+        torch.tensor([2.0]),
+        torch.tensor([1.75]),
+        fixed_weight_mean=1.0,
+    )
+    self_normalized_low = _weighted_mean_loss(
+        torch.tensor([2.0]), torch.tensor([0.25])
+    )
+    self_normalized_high = _weighted_mean_loss(
+        torch.tensor([2.0]), torch.tensor([1.75])
+    )
+
+    assert low.item() == pytest.approx(0.5)
+    assert high.item() == pytest.approx(3.5)
+    assert self_normalized_low.item() == pytest.approx(2.0)
+    assert self_normalized_high.item() == pytest.approx(2.0)
+
+
 def test_weighted_objective_fails_closed_on_collective_error(monkeypatch) -> None:
     torch = pytest.importorskip("torch")
     import torch.distributed as dist
