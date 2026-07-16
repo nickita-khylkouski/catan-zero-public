@@ -2833,8 +2833,8 @@ def _policy_microbatch_weight_for_lr_area(
     consumed_lr_area: float,
     target_lr_area: float,
     pending_group_lr_area_weight: float,
-    globally_base_active: bool,
-    globally_aux_active: bool,
+    globally_base_objective_mass: float,
+    globally_aux_objective_mass: float,
     policy_aux_loss_weight: float,
     accumulation_group_size: int,
 ) -> float:
@@ -2851,6 +2851,8 @@ def _policy_microbatch_weight_for_lr_area(
     coefficient = _validate_policy_loss_weight(base_weight)
     learning_rate = float(scheduled_base_lr)
     pending_weight = float(pending_group_lr_area_weight)
+    base_mass = float(globally_base_objective_mass)
+    aux_mass = float(globally_aux_objective_mass)
     aux_weight = float(policy_aux_loss_weight)
     group_size = int(accumulation_group_size)
     if not math.isfinite(pending_weight) or pending_weight < 0.0:
@@ -2859,13 +2861,18 @@ def _policy_microbatch_weight_for_lr_area(
         )
     if not math.isfinite(aux_weight) or aux_weight < 0.0:
         raise ValueError("policy AUX objective weight must be finite and non-negative")
+    if (
+        not math.isfinite(base_mass)
+        or base_mass < 0.0
+        or not math.isfinite(aux_mass)
+        or aux_mass < 0.0
+    ):
+        raise ValueError("policy objective masses must be finite and non-negative")
     if group_size < 1:
         raise ValueError("policy accumulation group size must be positive")
     pending_area = learning_rate * pending_weight
     effective_consumed = float(consumed_lr_area) + pending_area
-    stream_multiplier = float(bool(globally_base_active)) + (
-        aux_weight * float(bool(globally_aux_active))
-    )
+    stream_multiplier = base_mass + aux_weight * aux_mass
     # An objective-empty microbatch spends no policy dose. Keep the configured
     # coefficient while the boundary remains open so value-only work cannot
     # trigger post-dose representation freezing.
@@ -2962,12 +2969,73 @@ def _global_policy_stream_presence(
     return bool(global_presence[0].item()), bool(global_presence[1].item())
 
 
+def _global_policy_stream_objective_masses(
+    *,
+    local_base_effective_weight_sum: float,
+    local_base_fixed_denominator: float | None,
+    local_aux_active_rows: int,
+    ddp: Mapping[str, int | bool],
+) -> tuple[float, float]:
+    """Return the exact normalized base/AUX policy mass applied by DDP.
+
+    Ordinary base and AUX losses normalize by their realized global weight
+    sums, so any positive stream contributes one full independently normalized
+    objective. Coverage importance instead uses a fixed population
+    denominator. Its base objective mass is therefore
+    ``global_effective_weight_sum / global_fixed_denominator``; reducing it to
+    a boolean would overstate sparse batches and make the LR-area ledger diverge
+    from the coefficient actually multiplying the gradient.
+    """
+
+    base_weight_sum = float(local_base_effective_weight_sum)
+    aux_rows = int(local_aux_active_rows)
+    fixed = (
+        None
+        if local_base_fixed_denominator is None
+        else float(local_base_fixed_denominator)
+    )
+    if not math.isfinite(base_weight_sum) or base_weight_sum < 0.0:
+        raise ValueError(
+            "base policy effective weight sum must be finite and non-negative"
+        )
+    if aux_rows < 0:
+        raise ValueError("policy AUX active rows must be non-negative")
+    if fixed is not None and (not math.isfinite(fixed) or fixed <= 0.0):
+        raise ValueError(
+            "fixed base policy denominator must be finite and positive"
+        )
+
+    totals = [base_weight_sum, 0.0 if fixed is None else fixed, float(aux_rows)]
+    if bool(ddp.get("enabled", False)):
+        import torch
+        import torch.distributed as dist
+
+        device = (
+            f"cuda:{int(ddp.get('local_rank', 0))}"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+        tensor = torch.tensor(totals, dtype=torch.float64, device=device)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        totals = [float(value) for value in tensor.cpu().tolist()]
+    global_base_weight, global_fixed_denominator, global_aux_rows = totals
+    base_mass = (
+        global_base_weight / global_fixed_denominator
+        if fixed is not None
+        else float(global_base_weight > 0.0)
+    )
+    aux_mass = float(global_aux_rows > 0.0)
+    if not math.isfinite(base_mass) or base_mass < 0.0:
+        raise RuntimeError("global base policy objective mass is invalid")
+    return base_mass, aux_mass
+
+
 def _realized_policy_microbatch_dose(
     *,
     policy_loss_weight: float,
     policy_objective_fraction: float,
-    globally_base_active: bool,
-    globally_aux_active: bool,
+    globally_base_objective_mass: float,
+    globally_aux_objective_mass: float,
     policy_aux_loss_weight: float,
     accumulation_group_size: int,
 ) -> tuple[float, float]:
@@ -2975,24 +3043,33 @@ def _realized_policy_microbatch_dose(
 
     The learner divides every microbatch objective by the actual accumulation
     group size, including a short trailing group. Policy LR-area and equivalent
-    optimizer updates must use the same divisor and the same independently
-    normalized base/AUX coefficients, or value-only/empty microbatches and
-    two-stream batches silently spend the wrong dose.
+    optimizer updates must use the same divisor and the same realized
+    base/AUX objective masses. The base mass is normally one for its
+    independently normalized mean, but coverage importance can contribute a
+    fractional or super-unit population-denominator mass in one microbatch.
+    Collapsing that mass to presence silently spends the wrong dose.
     """
 
     weight = _validate_policy_loss_weight(policy_loss_weight)
     fraction = float(policy_objective_fraction)
+    base_mass = float(globally_base_objective_mass)
+    aux_mass = float(globally_aux_objective_mass)
     aux_weight = float(policy_aux_loss_weight)
     group_size = int(accumulation_group_size)
     if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
         raise ValueError("policy objective fraction must be finite and in [0, 1]")
     if not math.isfinite(aux_weight) or aux_weight < 0.0:
         raise ValueError("policy AUX objective weight must be finite and non-negative")
+    if (
+        not math.isfinite(base_mass)
+        or base_mass < 0.0
+        or not math.isfinite(aux_mass)
+        or aux_mass < 0.0
+    ):
+        raise ValueError("policy objective masses must be finite and non-negative")
     if group_size < 1:
         raise ValueError("policy accumulation group size must be positive")
-    objective_multiplier = float(bool(globally_base_active)) + (
-        aux_weight * float(bool(globally_aux_active))
-    )
+    objective_multiplier = base_mass + aux_weight * aux_mass
     if objective_multiplier == 0.0:
         return 0.0, 0.0
     return (
@@ -15349,10 +15426,22 @@ def main(
                 0 if policy_aux_batch is None else int(len(policy_aux_batch))
             )
             (
-                globally_base_policy_active,
-                globally_aux_policy_active,
-            ) = _global_policy_stream_presence(
-                local_base_active_rows=local_base_policy_active_rows,
+                globally_base_policy_objective_mass,
+                globally_aux_policy_objective_mass,
+            ) = _global_policy_stream_objective_masses(
+                local_base_effective_weight_sum=float(
+                    np.sum(batch_policy_weights, dtype=np.float64)
+                ),
+                local_base_fixed_denominator=(
+                    None
+                    if coverage_loss_normalizers is None
+                    else float(
+                        coverage_loss_normalizers[
+                            "policy_effective_weight_mean"
+                        ]
+                    )
+                    * len(batch_policy_weights)
+                ),
                 local_aux_active_rows=local_aux_policy_active_rows,
                 ddp=ddp,
             )
@@ -15362,8 +15451,12 @@ def main(
                 consumed_lr_area=policy_objective_lr_area,
                 target_lr_area=float(args.policy_dose_lr_area),
                 pending_group_lr_area_weight=policy_group_lr_area_weight,
-                globally_base_active=globally_base_policy_active,
-                globally_aux_active=globally_aux_policy_active,
+                globally_base_objective_mass=(
+                    globally_base_policy_objective_mass
+                ),
+                globally_aux_objective_mass=(
+                    globally_aux_policy_objective_mass
+                ),
                 policy_aux_loss_weight=float(args.policy_aux_loss_weight),
                 accumulation_group_size=accumulation_group_size,
             )
@@ -15617,7 +15710,9 @@ def main(
             )
             if bool(realized_local_base_active) != bool(
                 local_base_policy_active_rows
-            ) or bool(realized_local_aux_active) != bool(local_aux_policy_active_rows):
+            ) or bool(realized_local_aux_active) != bool(
+                local_aux_policy_active_rows
+            ):
                 raise RuntimeError(
                     "pre-forward policy stream presence drifted from the "
                     "realized objective"
@@ -15628,8 +15723,12 @@ def main(
             ) = _realized_policy_microbatch_dose(
                 policy_loss_weight=batch_policy_loss_weight,
                 policy_objective_fraction=batch_policy_objective_fraction,
-                globally_base_active=globally_base_policy_active,
-                globally_aux_active=globally_aux_policy_active,
+                globally_base_objective_mass=(
+                    globally_base_policy_objective_mass
+                ),
+                globally_aux_objective_mass=(
+                    globally_aux_policy_objective_mass
+                ),
                 policy_aux_loss_weight=float(args.policy_aux_loss_weight),
                 accumulation_group_size=accumulation_group_size,
             )

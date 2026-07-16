@@ -39,15 +39,15 @@ def test_policy_lr_area_accounts_for_independent_aux_objective() -> None:
 
 
 @pytest.mark.parametrize(
-    ("base_active", "aux_active", "expected_weight"),
+    ("base_mass", "aux_mass", "expected_weight"),
     [
-        (True, False, 0.25),
-        (False, True, 1.0),
+        (1.0, 0.0, 0.25),
+        (0.0, 1.0, 1.0),
     ],
 )
 def test_policy_lr_area_boundary_uses_realized_streams(
-    base_active: bool,
-    aux_active: bool,
+    base_mass: float,
+    aux_mass: float,
     expected_weight: float,
 ) -> None:
     assert train_bc._policy_microbatch_weight_for_lr_area(  # noqa: SLF001
@@ -56,8 +56,8 @@ def test_policy_lr_area_boundary_uses_realized_streams(
         consumed_lr_area=0.0,
         target_lr_area=0.0025,
         pending_group_lr_area_weight=0.0,
-        globally_base_active=base_active,
-        globally_aux_active=aux_active,
+        globally_base_objective_mass=base_mass,
+        globally_aux_objective_mass=aux_mass,
         policy_aux_loss_weight=0.25,
         accumulation_group_size=1,
     ) == pytest.approx(expected_weight)
@@ -73,11 +73,47 @@ def test_policy_lr_area_boundary_accounts_for_pending_accumulation_dose() -> Non
         consumed_lr_area=0.0,
         target_lr_area=0.006,
         pending_group_lr_area_weight=0.5,
-        globally_base_active=True,
-        globally_aux_active=False,
+        globally_base_objective_mass=1.0,
+        globally_aux_objective_mass=0.0,
         policy_aux_loss_weight=1.0,
         accumulation_group_size=2,
     ) == pytest.approx(0.2)
+
+
+def test_sparse_fixed_denominator_policy_batch_has_exact_lr_area_ledger() -> None:
+    base_mass, aux_mass = train_bc._global_policy_stream_objective_masses(  # noqa: SLF001
+        local_base_effective_weight_sum=1.0,
+        local_base_fixed_denominator=4.0,
+        local_aux_active_rows=0,
+        ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+    )
+    coefficient = train_bc._policy_microbatch_weight_for_lr_area(  # noqa: SLF001
+        1.0,
+        scheduled_base_lr=0.01,
+        consumed_lr_area=0.0,
+        target_lr_area=0.0025,
+        pending_group_lr_area_weight=0.0,
+        globally_base_objective_mass=base_mass,
+        globally_aux_objective_mass=aux_mass,
+        policy_aux_loss_weight=0.25,
+        accumulation_group_size=1,
+    )
+    lr_area_weight, objective_fraction = (
+        train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
+            policy_loss_weight=coefficient,
+            policy_objective_fraction=coefficient,
+            globally_base_objective_mass=base_mass,
+            globally_aux_objective_mass=aux_mass,
+            policy_aux_loss_weight=0.25,
+            accumulation_group_size=1,
+        )
+    )
+
+    assert base_mass == pytest.approx(0.25)
+    assert coefficient == pytest.approx(1.0)
+    assert lr_area_weight == pytest.approx(0.25)
+    assert objective_fraction == pytest.approx(0.25)
+    assert 0.01 * lr_area_weight == pytest.approx(0.0025)
 
 
 def test_zero_policy_dose_preserves_historical_constant_weight() -> None:
@@ -172,8 +208,8 @@ def test_policy_group_dose_follows_realized_active_microbatches(
             train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
                 policy_loss_weight=1.0,
                 policy_objective_fraction=1.0,
-                globally_base_active=base_active,
-                globally_aux_active=aux_active,
+                globally_base_objective_mass=float(base_active),
+                globally_aux_objective_mass=float(aux_active),
                 policy_aux_loss_weight=aux_weight,
                 accumulation_group_size=group_size,
             )
@@ -223,8 +259,8 @@ def test_value_only_group_does_not_trigger_post_policy_freeze() -> None:
     weight, _fraction = train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
         policy_loss_weight=1.0,
         policy_objective_fraction=1.0,
-        globally_base_active=False,
-        globally_aux_active=False,
+        globally_base_objective_mass=0.0,
+        globally_aux_objective_mass=0.0,
         policy_aux_loss_weight=1.0,
         accumulation_group_size=1,
     )
