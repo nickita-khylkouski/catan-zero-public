@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -34,7 +35,20 @@ CONFIG = (
 )
 GUARD = REPO / "configs/guards/a1_generation_coherent_public_n128_adaptive256_v1.json"
 LEARNER = REPO / "configs/experiments/next_wave/one_dose_public_card_overrides.json"
-RUNBOOK = REPO / "configs/operations/a1-next-wave-coherent-public-v1/README.md"
+OPERATION = REPO / "configs/operations/a1-next-wave-coherent-public-v1"
+RUNBOOK = OPERATION / "README.md"
+SCIENCE_CONTRACT = OPERATION / "science.contract.json"
+
+
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def test_meaningful_history_uses_legacy_compatible_memmap_width() -> None:
@@ -189,6 +203,24 @@ def test_next_wave_learner_preserves_all_forced_value_states() -> None:
     assert "DISCARD_RESOURCE" not in recipe["forced_row_value_action_type_weights"]
 
 
+def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> None:
+    payload = json.loads(SCIENCE_CONTRACT.read_text(encoding="utf-8"))
+    recipe = payload["learner"]["training_recipe"]
+
+    assert recipe["max_steps"] == 128
+    assert recipe["lr"] == 6e-5
+    assert recipe["lr_warmup_steps"] == 16
+    assert recipe["lr_warmup_steps"] <= recipe["max_steps"] // 8
+    assert recipe["per_game_value_weight"] is True
+    assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
+    assert _canonical_sha256(recipe) == (
+        "sha256:f5845e2bb93feeb5d1bc9c4ce3a5f1eb65c4c37d95245297002fdee0a3afee9b"
+    )
+    assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
+        "sha256:c183adbebca74ba78703d5a3c085eff1ed024828f4819f58002ddf85185d64bd"
+    )
+
+
 def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:
     text = RUNBOOK.read_text()
     assert "tools/generate_gumbel_selfplay_data.py" in text
@@ -207,6 +239,9 @@ def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:
     assert "tools/a1_iteration_orchestrator.py initialize-next" in text
     assert "tools/fleet/a1_h100_eval_fleet.py" in text
     assert "action-target gather experiment was neutral" in text
+    assert "LR `6e-5` and 16 warmup steps" in text
+    assert "Value rows are normalized to equal" in text
+    assert "total mass per game" in text
 
 
 def _contract_fields(*, coherent: bool) -> tuple[dict, dict, dict]:

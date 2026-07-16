@@ -7,7 +7,9 @@
 > isolation. Large execution is paused under
 > `docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md` and
 > `docs/plans/A1_REPRESENTATION_VALUE_RECOVERY_PLAN_20260715.md`. Preserve this
-> historical contract; do not reinterpret its issued artifacts.
+> contract's issued artifacts as historical; do not reinterpret them using the
+> repaired learner recipe below. New retraining locks must bind the current
+> `science.contract.json` bytes.
 
 This is the versioned next-wave recipe. It does not reinterpret or modify any
 issued A1 generation guard, contract, seed claim, or corpus. The generation
@@ -139,14 +141,16 @@ champion; never use a candidate from this wave as another candidate's parent.
 The one-dose executor enforces fresh Adam (`resume_optimizer=false`) and the
 fixed 8-rank batch (`512/rank`, global `4096`) and exactly 128 optimizer steps
 (`524,288` sampled rows). The selected optimizer/loss recipe is sealed in
-`science.contract.json` (including LR `3e-5` and 100 warmup steps): policy
-mass remains zero on forced rows, value loss is 0.25, END_TURN forced values receive 0.1x, ROLL receives
-0.25x, every unlisted forced type (including DISCARD_RESOURCE) retains the
-global 1.0x value weight, and only the new zero-initialized card residual uses
-the 4x LR group; the 640-parameter history gate remains in the ordinary trunk
-group. Policy-active roots use capped per-game surprise weighting;
-the redistribution preserves each game's total sample mass and therefore does
-not let one long or pathological game dominate the dose.
+`science.contract.json` (including LR `6e-5` and 16 warmup steps): policy
+mass remains zero on forced rows, value loss is 0.25, END_TURN forced values
+receive 0.1x, ROLL receives 0.25x, every unlisted forced type (including
+DISCARD_RESOURCE) retains the global 1.0x value weight, and only the new
+zero-initialized card residual uses the 4x LR group; the 640-parameter history
+gate remains in the ordinary trunk group. Value rows are normalized to equal
+total mass per game, so long games cannot dominate the scalar outcome target.
+Policy-active roots use capped per-game surprise weighting; the redistribution
+preserves each game's total sample mass and therefore does not let one long or
+pathological game dominate the dose.
 
 Create an exactly function-preserving initializer and receipt:
 
@@ -217,11 +221,11 @@ same binding. This is not candidate chaining: the architecture receipt always
 names the champion bytes, the lock names the same parent, and optimizer state
 is not inherited.
 
-The three selected learner deltas (4x public-card LR, exact per-game policy
-surprise weighting, and typed forced-row value weights) are fields of the
-sealed coherent-production learner recipe. They are deliberately **not**
-passed through the generic ablation interface: that interface is diagnostic
-only and its receipts are promotion-ineligible.
+The repaired short-dose LR/warmup, equal per-game value mass, 4x public-card
+LR, exact per-game policy surprise weighting, and typed forced-row value
+weights are fields of the sealed coherent-production learner recipe. They are
+deliberately **not** passed through the generic ablation interface: that
+interface is diagnostic only and its receipts are promotion-ineligible.
 
 ## Evaluation and loop closure
 
