@@ -163,11 +163,15 @@ def test_scratch_ordered_history_is_live_on_the_first_backward() -> None:
         model, scratch=True
     )
 
-    assert report["masked_mean_gate_initialization"] == "ones"
-    assert report["ordered_additive_gate_initialization"] == "ones"
+    assert report["masked_mean_gate_initialization"] == "small_nonzero_constant"
+    assert report["ordered_additive_gate_initialization"] == (
+        "small_nonzero_constant"
+    )
+    assert report["masked_mean_gate_initial_scale"] == 0.1
+    assert report["ordered_additive_gate_initial_scale"] == 0.1
     assert torch.equal(
         model.meaningful_history_ordered_gate,
-        torch.ones_like(model.meaningful_history_ordered_gate),
+        torch.full_like(model.meaningful_history_ordered_gate, 0.1),
     )
 
     output = model(_batch(history=True))
@@ -179,6 +183,15 @@ def test_scratch_ordered_history_is_live_on_the_first_backward() -> None:
     ]
     assert all(gradient is not None for gradient in gradients)
     assert sum(float(gradient.abs().sum()) for gradient in gradients) > 0.0
+    event_gradients = [
+        parameter.grad for parameter in model.event_encoder.parameters()
+    ]
+    assert all(gradient is not None for gradient in event_gradients)
+    assert sum(float(gradient.abs().sum()) for gradient in event_gradients) > 0.0
+    assert model.meaningful_history_residual_gate.grad is not None
+    assert model.meaningful_history_residual_gate.grad.abs().sum().item() > 0.0
+    assert model.meaningful_history_ordered_gate.grad is not None
+    assert model.meaningful_history_ordered_gate.grad.abs().sum().item() > 0.0
 
 
 def test_ordered_upgrade_has_typed_function_preserving_receipt() -> None:

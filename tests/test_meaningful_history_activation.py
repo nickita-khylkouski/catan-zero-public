@@ -201,10 +201,14 @@ def test_scratch_training_activates_history_but_warm_start_preserves_zero():
     scratch_report = train_bc._initialize_scratch_meaningful_history_path(
         scratch, scratch=True
     )
-    assert scratch_report["masked_mean_gate_initialization"] == "ones"
+    assert (
+        scratch_report["masked_mean_gate_initialization"]
+        == "small_nonzero_constant"
+    )
+    assert scratch_report["masked_mean_gate_initial_scale"] == 0.1
     assert torch.equal(
         scratch.meaningful_history_residual_gate,
-        torch.ones_like(scratch.meaningful_history_residual_gate),
+        torch.full_like(scratch.meaningful_history_residual_gate, 0.1),
     )
 
     warm_start = EntityGraphNet(_config(history=True)).train()
