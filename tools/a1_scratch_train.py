@@ -354,6 +354,19 @@ def build_train_command(
         ("public_card_lr_mult", "--public-card-lr-mult"),
         ("trunk_lr_mult", "--trunk-lr-mult"),
         ("value_trunk_grad_scale", "--value-trunk-grad-scale"),
+        ("train_diagnostics_every_batches", "--train-diagnostics-every-batches"),
+        (
+            "objective_gradient_interference_every_batches",
+            "--objective-gradient-interference-every-batches",
+        ),
+        (
+            "require_feature_learning_signal_modules",
+            "--require-feature-learning-signal-modules",
+        ),
+        (
+            "minimum_feature_learning_signal_observations",
+            "--minimum-feature-learning-signal-observations",
+        ),
         ("policy_loss_weight", "--policy-loss-weight"),
         ("soft_target_source", "--soft-target-source"),
         ("soft_target_weight", "--soft-target-weight"),

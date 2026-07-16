@@ -102,3 +102,11 @@ frontier, step 32 scored 56.25% against f7 and 51.17% against v5, while the
 step-128 checkpoint fell to 51.95% and 45.31%. The denser current sampler
 changes what one optimizer step means, so continuing to 128 erased the useful
 early update.
+
+The native scratch launcher must also render the four admission fields from
+`learner.training_recipe` exactly: diagnostics and policy/value interference
+every 16 batches, at least two observations, and the complete commissioned
+module list. `train_bc.py` verifies those observations before writing the
+terminal checkpoint. A run is refused if any required module has a missing,
+zero, non-finite, or malformed gradient/update signal, or if the global
+policy/value trunk geometry probe is absent or malformed.

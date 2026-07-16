@@ -50,6 +50,20 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     assert recipe["soft_target_source"] == "policy"
     assert recipe["soft_target_weight"] == 1.0
     assert recipe["soft_target_min_legal_coverage"] == 1.0
+    assert recipe["train_diagnostics_every_batches"] == 16
+    assert recipe["objective_gradient_interference_every_batches"] == 16
+    assert recipe["minimum_feature_learning_signal_observations"] == 2
+    assert set(
+        recipe["require_feature_learning_signal_modules"].split(",")
+    ) == {
+        "event_encoder",
+        "legal_action_value_residual_proj",
+        "legal_action_value_static_proj",
+        "meaningful_history_residual_gate",
+        "public_card_count_residual",
+        "public_rule_state_residual",
+        "static_action_residual_proj",
+    }
 
 
 @pytest.mark.parametrize(

@@ -267,12 +267,21 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
     assert recipe["soft_target_source"] == "policy"
     assert recipe["soft_target_weight"] == 1.0
     assert recipe["soft_target_min_legal_coverage"] == 1.0
+    assert recipe["train_diagnostics_every_batches"] == 16
+    assert recipe["objective_gradient_interference_every_batches"] == 16
+    assert recipe["minimum_feature_learning_signal_observations"] == 2
+    assert "public_rule_state_residual" in recipe[
+        "require_feature_learning_signal_modules"
+    ]
+    assert "event_encoder" in recipe[
+        "require_feature_learning_signal_modules"
+    ]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:285bde6feb7ec1d28754387a8d462a4d832169b1b611f23149168e427d6498fb"
+        "sha256:ff7a80f1269ddfeef5e1c5e2002b0261c29e7701b461aea691a687c5ef323ad8"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:3eec106b9de9b3fec4dd06676de4dcfaed89d9ca4b1f4946484101d5f3e686c1"
+        "sha256:d5de0569c8a3f756f7a36ab13ae3811c89915e675074a6b8a9083d618922840b"
     )
 
 

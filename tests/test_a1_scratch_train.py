@@ -175,6 +175,28 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--no-public-card-count-residual-bias") == 1
     assert command.count("--public-rule-state-features") == 1
     assert command.count("--required-target-information-regime") == 1
+    assert command[command.index("--train-diagnostics-every-batches") + 1] == "16"
+    assert (
+        command[
+            command.index(
+                "--objective-gradient-interference-every-batches"
+            )
+            + 1
+        ]
+        == "16"
+    )
+    assert (
+        command[
+            command.index("--minimum-feature-learning-signal-observations")
+            + 1
+        ]
+        == "2"
+    )
+    required_modules = command[
+        command.index("--require-feature-learning-signal-modules") + 1
+    ].split(",")
+    assert "event_encoder" in required_modules
+    assert "public_rule_state_residual" in required_modules
     assert "--ddp-shard-data" not in command
     marker = json.loads(command[command.index("--a1-scratch-authority-json") + 1])
     assert marker == authority

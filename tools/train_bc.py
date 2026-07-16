@@ -37,6 +37,11 @@ sys.path.insert(0, str(_REPO_SRC))
 
 import numpy as np
 
+try:
+    from tools import a1_feature_signal_admission as feature_signal_admission
+except ModuleNotFoundError:
+    import a1_feature_signal_admission as feature_signal_admission
+
 from catan_zero.rl.config_cli import add_config_flags, apply_config_file, resolve_config
 from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_SEMANTIC,
@@ -1850,6 +1855,25 @@ def build_parser() -> argparse.ArgumentParser:
             "separate from --train-diagnostics-every-batches: optimizer/module "
             "telemetry must not silently triple the backward work in throughput "
             "probes. 0 disables the interference probe."
+        ),
+    )
+    parser.add_argument(
+        "--require-feature-learning-signal-modules",
+        default="",
+        help=(
+            "Comma-separated top-level module names that must each demonstrate "
+            "positive gradient and optimizer-update telemetry before the terminal "
+            "checkpoint is saved. Requires --train-diagnostics-every-batches > 0."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-feature-learning-signal-observations",
+        type=int,
+        default=0,
+        help=(
+            "Minimum diagnostic observations required for every module named by "
+            "--require-feature-learning-signal-modules. 0 is valid only when no "
+            "required modules are configured."
         ),
     )
     parser.add_argument(
@@ -8138,6 +8162,36 @@ def _effective_a1_learner_training_recipe(
     # bind the trajectory-changing opt-in explicitly.
     if bool(getattr(args, "training_rng_rank_offset", False)):
         effective["training_rng_rank_offset"] = True
+    train_diagnostic_cadence = int(
+        getattr(args, "train_diagnostics_every_batches", 0)
+    )
+    objective_gradient_cadence = int(
+        getattr(args, "objective_gradient_interference_every_batches", 0)
+    )
+    required_feature_modules = str(
+        getattr(args, "require_feature_learning_signal_modules", "") or ""
+    )
+    minimum_feature_observations = int(
+        getattr(args, "minimum_feature_learning_signal_observations", 0)
+    )
+    if (
+        train_diagnostic_cadence
+        or objective_gradient_cadence
+        or required_feature_modules
+        or minimum_feature_observations
+    ):
+        effective["train_diagnostics_every_batches"] = (
+            train_diagnostic_cadence
+        )
+        effective["objective_gradient_interference_every_batches"] = (
+            objective_gradient_cadence
+        )
+        effective["require_feature_learning_signal_modules"] = (
+            required_feature_modules
+        )
+        effective["minimum_feature_learning_signal_observations"] = (
+            minimum_feature_observations
+        )
     return effective
 
 
@@ -15470,6 +15524,81 @@ def main(argv: Sequence[str] | None = None) -> None:
             "scalar-MSE objective completed without any effective value training "
             "mass and optimizer update; refusing to save false provenance"
         )
+    module_optimizer_observability = _aggregate_module_optimizer_observability(
+        metrics, cadence_batches=int(args.train_diagnostics_every_batches)
+    )
+    objective_gradient_observations = [
+        observation
+        for metric in metrics
+        for observation in (
+            (metric.get("objective_gradient_interference") or {}).get(
+                "observations", []
+            )
+        )
+        if isinstance(observation, dict)
+    ]
+    objective_gradient_interference = {
+        "schema_version": "objective-gradient-dose-observations-v1",
+        "cadence_batches": int(
+            args.objective_gradient_interference_every_batches
+        ),
+        "observed_steps": len(objective_gradient_observations),
+        "observations": objective_gradient_observations,
+    }
+    required_feature_modules = tuple(
+        sorted(
+            {
+                name.strip()
+                for name in str(
+                    args.require_feature_learning_signal_modules or ""
+                ).split(",")
+                if name.strip()
+            }
+        )
+    )
+    minimum_feature_observations = int(
+        args.minimum_feature_learning_signal_observations
+    )
+    feature_learning_signal_admission = None
+    objective_gradient_signal_admission = None
+    if required_feature_modules:
+        try:
+            feature_signal_contract = feature_signal_admission.contract_from_cli(
+                module_names=required_feature_modules,
+                cadence_batches=int(args.train_diagnostics_every_batches),
+                minimum_observations=minimum_feature_observations,
+            )
+            feature_learning_signal_admission = (
+                feature_signal_admission.verify_observability(
+                    module_optimizer_observability,
+                    contract=feature_signal_contract,
+                    where="completed training dose",
+                )
+            )
+            objective_gradient_signal_admission = (
+                feature_signal_admission.verify_objective_interference(
+                    objective_gradient_interference,
+                    cadence_batches=int(
+                        args.objective_gradient_interference_every_batches
+                    ),
+                    minimum_observations=minimum_feature_observations,
+                    expected_world_size=int(ddp["world_size"]),
+                    expected_value_trunk_grad_scale=float(
+                        args.value_trunk_grad_scale
+                    ),
+                    where="completed training dose",
+                )
+            )
+        except feature_signal_admission.FeatureSignalError as error:
+            raise RuntimeError(
+                "terminal checkpoint refused by feature learning-signal "
+                f"admission: {error}"
+            ) from error
+    elif minimum_feature_observations != 0:
+        raise RuntimeError(
+            "--minimum-feature-learning-signal-observations requires "
+            "--require-feature-learning-signal-modules"
+        )
     policy_training_signal = _policy_training_signal_attestation(
         metrics,
         policy_loss_weight=float(args.policy_loss_weight),
@@ -15552,25 +15681,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
         training_strata_dose = _nest_training_strata_dose(training_strata_flat)
 
-    module_optimizer_observability = _aggregate_module_optimizer_observability(
-        metrics, cadence_batches=int(args.train_diagnostics_every_batches)
-    )
-    objective_gradient_observations = [
-        observation
-        for metric in metrics
-        for observation in (
-            (metric.get("objective_gradient_interference") or {}).get(
-                "observations", []
-            )
-        )
-        if isinstance(observation, dict)
-    ]
-    objective_gradient_interference = {
-        "schema_version": "objective-gradient-dose-observations-v1",
-        "cadence_batches": int(args.objective_gradient_interference_every_batches),
-        "observed_steps": len(objective_gradient_observations),
-        "observations": objective_gradient_observations,
-    }
     checkpoint_dose_trajectory = None
     if checkpoint_steps and int(args.train_diagnostics_every_batches) > 0:
         terminal_dose_telemetry = _checkpoint_dose_telemetry(
@@ -15882,6 +15992,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_component_active_dose": policy_component_active_dose,
         "training_strata_dose": training_strata_dose,
         "module_optimizer_observability": module_optimizer_observability,
+        "feature_learning_signal_admission": (
+            feature_learning_signal_admission
+        ),
+        "objective_gradient_signal_admission": (
+            objective_gradient_signal_admission
+        ),
         "objective_gradient_interference": objective_gradient_interference,
         "value_component_active_dose": value_component_active_dose,
         "policy_aux_phase_sampling_weights": policy_aux_phase_sampling_weights,

@@ -75,6 +75,18 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "lr_schedule": "flat",
     "value_lr_mult": 1.0,
     "value_trunk_grad_scale": 1.0,
+    # Reporting is part of production admission even though it does not alter
+    # the optimizer trajectory. Two observations over the 32-step dose must
+    # prove every commissioned v4 path received gradient and an actual update.
+    "train_diagnostics_every_batches": 16,
+    "objective_gradient_interference_every_batches": 16,
+    "require_feature_learning_signal_modules": (
+        "event_encoder,legal_action_value_residual_proj,"
+        "legal_action_value_static_proj,meaningful_history_residual_gate,"
+        "public_card_count_residual,public_rule_state_residual,"
+        "static_action_residual_proj"
+    ),
+    "minimum_feature_learning_signal_observations": 2,
     # The coherent corpus's natural policy-active distribution assigns only
     # 34.16% of policy objective mass to ordinary PLAY_TURN decisions; the
     # successful selected-dose corpus assigned 66.08%.  Fourfold PLAY_TURN
