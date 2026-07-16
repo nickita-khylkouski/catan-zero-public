@@ -79,6 +79,11 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # never the training loss.
     "checkpoint_steps": "8,16,32,64,128,256,512,1024",
     "base_sampler": "coverage_importance_v1",
+    # The commissioned scratch model has no routed experts.  The generic
+    # trainer default is intentionally useful for MoE experiments, but leaving
+    # it implicit here makes coverage_importance_v1 reject the production
+    # recipe before the first optimizer step.
+    "moe_balance_loss_weight": 0.0,
     "resume_optimizer": False,
     "optimizer": "adamw",
     "lr": 6e-5,

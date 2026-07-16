@@ -497,6 +497,8 @@ def test_resume_identity_rejects_gradient_or_precision_recipe_drift(
 def _resume_identity_args(**overrides):
     values = {
         "arch": "entity_graph",
+        "amp": "none",
+        "float32_matmul_precision": None,
         "seed": 1,
         "sampler_seed": None,
         "grad_accum_steps": 1,
@@ -557,6 +559,7 @@ def _resume_identity_args(**overrides):
             "accepted_policy_target_identity_sha256",
             ["sha256:" + "a" * 64],
         ),
+        ("float32_matmul_precision", "medium"),
     ],
 )
 def test_resume_identity_rejects_untyped_trajectory_or_admission_drift(
@@ -579,6 +582,43 @@ def test_resume_identity_rejects_untyped_trajectory_or_admission_drift(
     )
 
     assert changed != baseline
+
+
+def test_resume_identity_rejects_checkout_code_drift() -> None:
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    first_binding = {
+        "trainer_sha256": "sha256:" + "a" * 64,
+        "modules": {
+            "catan_zero": {"sha256": "sha256:" + "b" * 64},
+            "catan_zero.rl.optim_state": {"sha256": "sha256:" + "c" * 64},
+        },
+    }
+    second_binding = {
+        **first_binding,
+        "modules": {
+            **first_binding["modules"],
+            "catan_zero.rl.optim_state": {"sha256": "sha256:" + "d" * 64},
+        },
+    }
+
+    first = tb._training_resume_recipe_identity(
+        TrainConfig(),
+        _resume_identity_args(checkout_runtime_binding=first_binding),
+        ddp,
+    )
+    second = tb._training_resume_recipe_identity(
+        TrainConfig(),
+        _resume_identity_args(checkout_runtime_binding=second_binding),
+        ddp,
+    )
+
+    assert first["checkout_runtime_code_sha256"] != second[
+        "checkout_runtime_code_sha256"
+    ]
+    assert first != second
 
 
 def test_resume_progress_rejects_public_card_group_multiplier_4x_to_2x(

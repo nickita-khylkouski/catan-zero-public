@@ -18,9 +18,10 @@ from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src"
-for import_root in (SRC_ROOT, REPO_ROOT):
-    if str(import_root) not in sys.path:
-        sys.path.insert(0, str(import_root))
+for import_root in (REPO_ROOT, SRC_ROOT):
+    while str(import_root) in sys.path:
+        sys.path.remove(str(import_root))
+    sys.path.insert(0, str(import_root))
 
 from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION, EvalConfig
 

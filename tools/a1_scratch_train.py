@@ -569,6 +569,7 @@ def build_train_command(
         ("max_steps", "--max-steps"),
         ("checkpoint_steps", "--checkpoint-steps"),
         ("base_sampler", "--base-sampler"),
+        ("moe_balance_loss_weight", "--moe-balance-loss-weight"),
         ("batch_size", "--batch-size"),
         ("grad_accum_steps", "--grad-accum-steps"),
         ("optimizer", "--optimizer"),

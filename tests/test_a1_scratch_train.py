@@ -203,6 +203,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command[command.index("--base-sampler") + 1] == (
         "coverage_importance_v1"
     )
+    assert command[command.index("--moe-balance-loss-weight") + 1] == "0.0"
     assert "--init-checkpoint" not in command
     assert "--grow-from-checkpoint" not in command
     assert "--resume-optimizer" not in command

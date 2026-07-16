@@ -149,6 +149,7 @@
       "max_steps": 0,
       "checkpoint_steps": "8,16,32,64,128,256,512,1024",
       "base_sampler": "coverage_importance_v1",
+      "moe_balance_loss_weight": 0.0,
       "batch_size": 512,
       "grad_accum_steps": 1,
       "world_size": 1,

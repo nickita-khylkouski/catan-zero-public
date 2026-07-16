@@ -86,7 +86,7 @@
       "meaningful_public_history_pooling": "ordered_attention_v2",
       "meaningful_public_history_schema": "meaningful_public_history_2p_no_trade_v2",
       "meaningful_public_history_target_gather": true,
-      "moe_balance_loss_weight": 0.01,
+      "moe_balance_loss_weight": 0.0,
       "moe_expert_ff_size": 0,
       "moe_routed_experts": 0,
       "moe_top_k": 2,

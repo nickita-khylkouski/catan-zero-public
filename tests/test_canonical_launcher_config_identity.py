@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -59,3 +61,32 @@ def test_canonical_training_accepts_only_exact_payload(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit, match="exact commissioned payload"):
         train._load_recipe(drifted)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("launcher", ("generate.py", "evaluate.py", "train.py"))
+def test_canonical_launchers_ignore_ambient_stale_pythonpath(
+    launcher: str, tmp_path: Path
+) -> None:
+    stale = tmp_path / "stale"
+    package = stale / "catan_zero"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        "raise RuntimeError('ambient stale package imported')\n",
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(stale)
+
+    completed = subprocess.run(
+        [sys.executable, str(TOOLS / launcher), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout
+    assert "ambient stale package imported" not in completed.stderr

@@ -19,10 +19,10 @@ from typing import Any, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _REPO_SRC = _REPO_ROOT / "src"
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-if str(_REPO_SRC) not in sys.path:
-    sys.path.insert(0, str(_REPO_SRC))
+for import_root in (_REPO_ROOT, _REPO_SRC):
+    while str(import_root) in sys.path:
+        sys.path.remove(str(import_root))
+    sys.path.insert(0, str(import_root))
 
 from catan_zero.rl.pipeline_configs import (  # noqa: E402
     CONFIG_SCHEMA_VERSION,
@@ -33,7 +33,7 @@ from catan_zero.rl.pipeline_configs import (  # noqa: E402
 
 CANONICAL_TRAIN_LAUNCH_SCHEMA = 1
 CANONICAL_CONFIG_SHA256 = (
-    "767dacec14134114dea0c9ff105bb42b76509a2593c4dfbea8cd008f7ac5923f"
+    "e31e2fab6467530a1f057d5e0c05d28dc1b0c96d8e2d76fec477d0bd209559d3"
 )
 _ENGINE_SETTING_KEYS = frozenset(
     {

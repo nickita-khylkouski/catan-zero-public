@@ -9056,6 +9056,11 @@ def _effective_a1_learner_training_recipe(
         != BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1
     ):
         effective["base_sampler"] = str(args.base_sampler)
+    moe_balance_loss_weight = float(
+        getattr(args, "moe_balance_loss_weight", 0.01)
+    )
+    if moe_balance_loss_weight != 0.01 or generic_a1_ablation:
+        effective["moe_balance_loss_weight"] = moe_balance_loss_weight
     train_diagnostic_cadence = int(
         getattr(args, "train_diagnostics_every_batches", 0)
     )
@@ -39263,9 +39268,50 @@ def _training_resume_recipe_identity(
         if resume_entity_adapter
         else ""
     )
+    runtime_binding = getattr(args, "checkout_runtime_binding", None)
+    runtime_modules = (
+        runtime_binding.get("modules")
+        if isinstance(runtime_binding, dict)
+        else None
+    )
+    runtime_code_identity = {
+        "schema_version": CHECKOUT_RUNTIME_BINDING_SCHEMA,
+        "trainer_sha256": (
+            str(runtime_binding.get("trainer_sha256", ""))
+            if isinstance(runtime_binding, dict)
+            else ""
+        ),
+        "modules": {
+            str(name): str(record.get("sha256", ""))
+            for name, record in sorted(
+                runtime_modules.items() if isinstance(runtime_modules, dict) else ()
+            )
+            if isinstance(record, dict)
+        },
+    }
+    runtime_code_sha256 = "sha256:" + hashlib.sha256(
+        json.dumps(
+            runtime_code_identity, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    requested_matmul_precision = getattr(
+        args, "float32_matmul_precision", None
+    )
+    if requested_matmul_precision is not None:
+        effective_matmul_precision = str(requested_matmul_precision)
+    elif str(getattr(args, "amp", "none")) == "bf16":
+        effective_matmul_precision = "high"
+    else:
+        import torch
+
+        effective_matmul_precision = str(
+            torch.get_float32_matmul_precision()
+        )
     identity: dict[str, object] = {
         "schema_version": "train-bc-resume-recipe-v1",
         "normalized_train_config_sha256": normalized.full_config_hash(),
+        "checkout_runtime_code_sha256": runtime_code_sha256,
+        "float32_matmul_precision": effective_matmul_precision,
         "grad_accum_steps": int(args.grad_accum_steps),
         "world_size": int(ddp["world_size"]),
         "ddp_shard_data": bool(args.ddp_shard_data),
