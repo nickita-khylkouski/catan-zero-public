@@ -230,6 +230,12 @@ def main() -> None:
     )
     parser.add_argument("--value-loss-weight", type=float, default=0.25)
     parser.add_argument(
+        "--truncated-vp-margin-value-weight",
+        type=float,
+        default=0.25,
+        help="Value supervision weight for truncated-game VP-margin targets.",
+    )
+    parser.add_argument(
         "--scalar-value-loss-readout",
         choices=("raw", "deployed_tanh"),
         default="deployed_tanh",
@@ -539,6 +545,8 @@ def main() -> None:
             str(args.loser_sample_weight),
             "--value-loss-weight",
             str(args.value_loss_weight),
+            "--truncated-vp-margin-value-weight",
+            str(args.truncated_vp_margin_value_weight),
             "--scalar-value-loss-readout",
             args.scalar_value_loss_readout,
             "--scalar-value-loss-scale",

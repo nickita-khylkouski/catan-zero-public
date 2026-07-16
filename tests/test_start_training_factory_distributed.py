@@ -269,6 +269,50 @@ def test_production_factory_refuses_unbounded_epoch_only_training(
     assert command[command.index("--max-steps") + 1] == "0"
 
 
+def test_factory_explicitly_binds_guarded_optimizer_and_hard_target_recipe(
+    tmp_path: Path,
+) -> None:
+    result = _dry_run(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    expected = {
+        "--optimizer": "adam",
+        "--weight-decay": "0.0",
+        "--truncated-vp-margin-value-weight": "0.25",
+        "--lr-schedule": "flat",
+        "--soft-target-weight": "0.0",
+    }
+    for flag, value in expected.items():
+        assert command.count(flag) == 1
+        assert command[command.index(flag) + 1] == value
+
+    train_argv = command[command.index("tools/train_bc.py") + 1 :]
+    resolved = train_bc.build_parser().parse_args(train_argv)
+    unknown_teacher_rows = {
+        "action_taken": np.asarray([0, 1], dtype=np.int16),
+        "target_policy": np.asarray([[0.8, 0.2], [0.4, 0.6]], dtype=np.float32),
+        "target_scores": np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+        "target_information_regime": np.asarray(["unknown", "unknown"]),
+    }
+    admission = train_bc._validate_target_information_admission(
+        unknown_teacher_rows,
+        mask_hidden_info=resolved.mask_hidden_info,
+        soft_target_weight=resolved.soft_target_weight,
+        policy_target_blend_semantics=resolved.policy_target_blend_semantics,
+        policy_loss_weight=resolved.policy_loss_weight,
+        q_loss_weight=resolved.q_loss_weight,
+        value_target_lambda=resolved.value_target_lambda,
+        policy_kl_anchor_weight=resolved.policy_kl_anchor_weight,
+        policy_surprise_weight=resolved.policy_surprise_weight,
+        required_target_information_regime=(
+            resolved.required_target_information_regime
+        ),
+    )
+    assert admission["unsafe_or_unknown_rows"] == 2
+    assert admission["search_target_objectives"] == []
+
+
 def test_factory_converts_teacher_rows_before_entity_training(tmp_path: Path) -> None:
     result = _dry_run(tmp_path)
 
