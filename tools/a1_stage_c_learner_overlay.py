@@ -863,9 +863,14 @@ def _selected_sampling_weights(
         weights[train] = _unit_mean_capped_weights(
             raw[train], cap=float(production_weight_cap)
         )
-        # Validation rows are not sampled by the optimizer.  Keep them positive
-        # for corpus-scope invariants without letting them alter train scaling.
-        weights[validation] = 1.0
+        # Normalize held-out roots independently. Reusing the training scale or
+        # forcing validation to uniform changes the policy measure being
+        # validated and made the production-weighted learner look as though it
+        # trained on the strategic-balanced objective.
+        if np.any(validation):
+            weights[validation] = _unit_mean_capped_weights(
+                raw[validation], cap=float(production_weight_cap)
+            )
 
     def _mass_by(values: Sequence[str]) -> dict[str, float]:
         labels = np.asarray(values).astype(str)
@@ -887,7 +892,7 @@ def _selected_sampling_weights(
         "selected_training_rows": int(np.count_nonzero(train)),
         "selected_validation_rows": int(np.count_nonzero(validation)),
         "inverse_inclusion_formula": "candidate_count / selected_count",
-        "normalization_scope": "selected_training_roots_only",
+        "normalization_scope": "training_and_validation_roots_independently",
         "production_weight_cap": (
             float(production_weight_cap) if arm == "PRODUCTION_WEIGHTED" else None
         ),
@@ -903,6 +908,18 @@ def _selected_sampling_weights(
             "mean": float(train_weights.mean()),
             "effective_sample_size": _effective_sample_size(train_weights),
         },
+        "final_validation_weights": (
+            {
+                "min": float(weights[validation].min()),
+                "max": float(weights[validation].max()),
+                "mean": float(weights[validation].mean()),
+                "effective_sample_size": _effective_sample_size(
+                    weights[validation]
+                ),
+            }
+            if np.any(validation)
+            else None
+        ),
         "training_mass_by_phase": _mass_by(phases),
         "training_mass_by_legal_width_bucket": _mass_by(width_buckets),
     }

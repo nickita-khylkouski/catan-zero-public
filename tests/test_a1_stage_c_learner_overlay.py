@@ -182,8 +182,40 @@ def test_two_stage_c_sampling_arms_share_roots_but_not_measure() -> None:
     assert np.mean(production[~validation]) == pytest.approx(1.0)
     assert np.max(production[~validation]) <= 4.0
     assert production[2] > production[0]
+    assert np.mean(production[validation]) == pytest.approx(1.0)
     assert balanced_report["arm"] == "STRATEGIC_BALANCED"
     assert production_report["arm"] == "PRODUCTION_WEIGHTED"
+    assert production_report["normalization_scope"] == (
+        "training_and_validation_roots_independently"
+    )
+
+
+def test_production_stage_c_validation_preserves_its_weighted_measure() -> None:
+    subset = {
+        "row_index": np.asarray([10, 11, 12, 13, 14, 15], dtype=np.int64),
+        "stratum": np.asarray(["a", "b", "a", "b", "a", "b"]),
+        "phase": np.asarray(["P", "Q", "P", "Q", "P", "Q"]),
+        "legal_width": np.asarray([2, 8, 2, 8, 2, 8], dtype=np.int64),
+    }
+    export = {
+        "sampling_population": {
+            "candidate_counts_by_stratum": {"a": 20, "b": 300},
+            "selected_counts_by_stratum": {"a": 3, "b": 3},
+        }
+    }
+    validation = np.asarray([False, False, False, False, True, True])
+    weights, report = overlay._selected_sampling_weights(  # noqa: SLF001
+        export=export,
+        subset=subset,
+        patch={"row_index": subset["row_index"]},
+        selected_validation=validation,
+        arm="PRODUCTION_WEIGHTED",
+        production_weight_cap=4.0,
+    )
+
+    assert np.mean(weights[validation]) == pytest.approx(1.0)
+    assert weights[5] > weights[4]
+    assert report["final_validation_weights"]["max"] > 1.0
 
 
 def test_clean_stage_c_recipe_freezes_only_new_adapters() -> None:
