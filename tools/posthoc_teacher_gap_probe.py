@@ -754,7 +754,11 @@ def _prepare_probe(
         validation_fraction=float(report["validation_fraction"]),
         validation_seed=int(report["validation_seed"]),
         validation_max_samples=int(report["validation_max_samples"]),
-        validation_game_seed_ranges=[tuple(map(int, item)) for item in ranges],
+        # The authenticated manifest above resolves ranges to the exact seed
+        # set actually held out by training.  Forward only that concrete set:
+        # split_train_validation_indices intentionally rejects receiving both
+        # ranges and seeds because they are competing selection authorities.
+        validation_game_seed_ranges=[],
         validation_game_seeds=np.asarray(
             validation_contract["game_seeds"], dtype=np.int64
         ),
