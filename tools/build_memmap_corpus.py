@@ -56,6 +56,8 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from train_bc import (  # noqa: E402  (sibling module bootstrap above)
+    OPPONENT_PROVENANCE_KEYS,
+    TRAINING_SOURCE_PROVENANCE_KEYS,
     _load_validation_game_seed_manifest_for_training,
     _load_npz,
     _normalize_teacher_shard,
@@ -623,6 +625,10 @@ def _load_a1_selected_game_manifest(
         "selected_game_seeds": np.asarray(all_seeds, dtype=np.int64),
         "training_game_seeds": np.asarray(training_seeds, dtype=np.int64),
         "validation_game_seeds": np.asarray(validation_seeds, dtype=np.int64),
+        "selected_game_categories": {
+            int(record["game_seed"]): str(record["category"])
+            for record in normalized_records
+        },
     }
 
 
@@ -725,7 +731,47 @@ def _load_dual_arm_selected_game_manifest(
         "validation_game_count": len(validation), "validation_game_seed_set_sha256": checks["validation_game_seed_set_sha256"],
         "records_sha256": checks["records_sha256"], "selected_game_seeds": np.asarray(all_seeds, dtype=np.int64),
         "training_game_seeds": np.asarray(training, dtype=np.int64), "validation_game_seeds": np.asarray(validation, dtype=np.int64),
+        "selected_game_categories": {
+            int(record["game_seed"]): str(record["category"])
+            for record in records
+        },
     }
+
+
+def _stamp_selected_game_source_provenance(
+    normalized: dict[str, np.ndarray],
+    *,
+    category_by_seed: dict[int, str],
+    path: Path,
+) -> None:
+    """Bind every selected row to its authenticated source-mixture role."""
+
+    seeds = np.asarray(normalized["game_seed"], dtype=np.int64)
+    missing = sorted({int(seed) for seed in seeds if int(seed) not in category_by_seed})
+    if missing:
+        raise SystemExit(
+            f"{path}: selected rows lack authenticated source-category records "
+            f"for game seeds {missing[:10]}"
+        )
+    categories = np.asarray([category_by_seed[int(seed)] for seed in seeds], dtype=str)
+    if any(category not in A1_CATEGORY_GAME_COUNTS for category in categories):
+        raise SystemExit(f"{path}: selected-game source category is invalid")
+
+    tags = np.asarray(normalized["opponent_tag"]).astype(str)
+    raw_provenance = np.asarray(
+        normalized["opponent_provenance_present"], dtype=np.bool_
+    )
+    opponent_rows = categories != "current_producer"
+    tagged_rows = raw_provenance & (tags != "")
+    if np.any(opponent_rows & tagged_rows & (tags != categories)):
+        raise SystemExit(f"{path}: opponent_tag contradicts authenticated source category")
+    if np.any((~opponent_rows) & tagged_rows):
+        raise SystemExit(f"{path}: current-producer row carries a contradictory opponent_tag")
+
+    normalized["training_source_category"] = categories
+    normalized["training_source_category_verified"] = np.ones(
+        seeds.shape[0], dtype=np.bool_
+    )
 
 
 def _load_a1_post_wave_audit(
@@ -1167,6 +1213,8 @@ LOADER_KEYS: tuple[str, ...] = (
     "has_final_actual_vps",
     "policy_weight_multiplier",
     "value_weight_multiplier",
+    *OPPONENT_PROVENANCE_KEYS,
+    *TRAINING_SOURCE_PROVENANCE_KEYS,
     "is_forced",
     "used_full_search",
     *AUX_TARGET_KEYS,
@@ -1668,6 +1716,11 @@ def build_memmap_corpus(
         if selected_manifest is None
         else np.asarray(selected_manifest["selected_game_seeds"], dtype=np.int64)
     )
+    selected_game_categories = (
+        {}
+        if selected_manifest is None
+        else dict(selected_manifest["selected_game_categories"])
+    )
     expected_selected_seed_set = (
         set()
         if selected_game_seeds is None
@@ -1764,6 +1817,11 @@ def build_memmap_corpus(
         first = {
             name: np.asarray(value)[first_keep] for name, value in first.items()
         }
+        _stamp_selected_game_source_provenance(
+            first,
+            category_by_seed=selected_game_categories,
+            path=files[0],
+        )
         if first_search_evidence is not None:
             first_search_evidence = _filter_row_aligned_search_evidence(
                 first_search_evidence, first_keep
@@ -1915,6 +1973,11 @@ def build_memmap_corpus(
                 name: np.asarray(value)[selected_row_mask]
                 for name, value in norm.items()
             }
+            _stamp_selected_game_source_provenance(
+                norm,
+                category_by_seed=selected_game_categories,
+                path=file,
+            )
             if search_evidence is not None:
                 search_evidence = _filter_row_aligned_search_evidence(
                     search_evidence, selected_row_mask

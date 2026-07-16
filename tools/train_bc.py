@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import copy
@@ -363,6 +363,23 @@ AUX_SUBGOAL_FIELD_DTYPES = {
     "aux_next_settlement": np.int16,
     "aux_robber_target": np.int16,
 }
+
+# Opponent identity and source-mixture provenance are learner inputs, not
+# disposable generation telemetry.  Keep a uniform normalized schema so plain
+# producer self-play and tagged pool/exploiter shards can be mixed without
+# erasing which opponent produced each row.
+OPPONENT_PROVENANCE_KEYS = (
+    "is_pool_game",
+    "opponent_version",
+    "opponent_tag",
+    "opponent_checkpoint_md5",
+    "opponent_type",
+)
+TRAINING_SOURCE_PROVENANCE_KEYS = (
+    "opponent_provenance_present",
+    "training_source_category",
+    "training_source_category_verified",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -9790,6 +9807,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "trusted_curated_data_quality": True,
             "quality_report_skipped": True,
             "reason": "caller asserted corpus already passed external quality gate",
+            **_rank0_authoritative_call(
+                ddp,
+                "teacher mixture provenance scan",
+                lambda: teacher_provenance_quality(data),
+            ),
         }
     else:
         data_quality = teacher_data_quality(
@@ -18013,6 +18035,8 @@ def load_teacher_data(
         "has_final_actual_vps",
         "policy_weight_multiplier",
         "value_weight_multiplier",
+        *OPPONENT_PROVENANCE_KEYS,
+        *TRAINING_SOURCE_PROVENANCE_KEYS,
         *AUX_TARGET_KEYS,
         AUX_SUBGOAL_TARGET_VERSION_KEY,
         "hex_tokens",
@@ -18732,6 +18756,68 @@ def _normalize_teacher_shard(
             path,
             leading=n,
         ).astype(np.float32, copy=False),
+        "is_pool_game": _field_or_default(
+            shard,
+            "is_pool_game",
+            np.zeros(n, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "opponent_version": _field_or_default(
+            shard,
+            "opponent_version",
+            np.full(n, -1, dtype=np.int32),
+            path,
+            leading=n,
+        ).astype(np.int32, copy=False),
+        "opponent_tag": _field_or_default(
+            shard,
+            "opponent_tag",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        "opponent_checkpoint_md5": _field_or_default(
+            shard,
+            "opponent_checkpoint_md5",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        "opponent_type": _field_or_default(
+            shard,
+            "opponent_type",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        # An explicit presence bit distinguishes a recorded self-play/default
+        # identity from legacy shards for which opponent identity is unknown.
+        "opponent_provenance_present": _field_or_default(
+            shard,
+            "opponent_provenance_present",
+            np.full(
+                n,
+                any(key in shard for key in OPPONENT_PROVENANCE_KEYS),
+                dtype=np.bool_,
+            ),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
+        "training_source_category": _field_or_default(
+            shard,
+            "training_source_category",
+            np.full(n, "", dtype="<U1"),
+            path,
+            leading=n,
+        ).astype(str),
+        "training_source_category_verified": _field_or_default(
+            shard,
+            "training_source_category_verified",
+            np.zeros(n, dtype=np.bool_),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False),
     }
     if "root_value" in shard:
         result["root_value"] = _field_or_default(
@@ -18864,6 +18950,65 @@ def _field_or_default(
     return value
 
 
+def teacher_provenance_quality(data, *, chunk_rows: int = 262_144) -> dict:
+    """Summarize opponent/source provenance without decoding a whole memmap."""
+
+    n = int(len(data["action_taken"]))
+    opponent_rows = 0
+    verified_rows = 0
+    opponent_tags: Counter[str] = Counter()
+    source_categories: Counter[str] = Counter()
+    step = max(1, int(chunk_rows))
+    for start in range(0, n, step):
+        stop = min(start + step, n)
+        index = np.arange(start, stop, dtype=np.int64)
+        present = (
+            np.asarray(data["opponent_provenance_present"][index], dtype=np.bool_)
+            if "opponent_provenance_present" in data
+            else np.zeros(stop - start, dtype=np.bool_)
+        )
+        verified = (
+            np.asarray(
+                data["training_source_category_verified"][index], dtype=np.bool_
+            )
+            if "training_source_category_verified" in data
+            else np.zeros(stop - start, dtype=np.bool_)
+        )
+        tags = (
+            np.asarray(data["opponent_tag"][index]).astype(str)
+            if "opponent_tag" in data
+            else np.full(stop - start, "")
+        )
+        categories = (
+            np.asarray(data["training_source_category"][index]).astype(str)
+            if "training_source_category" in data
+            else np.full(stop - start, "")
+        )
+        for name, value in (
+            ("opponent_provenance_present", present),
+            ("training_source_category_verified", verified),
+            ("opponent_tag", tags),
+            ("training_source_category", categories),
+        ):
+            if value.shape != (stop - start,):
+                raise SystemExit(
+                    f"{name} must be a row-aligned scalar column; got "
+                    f"{value.shape} for rows [{start}, {stop})"
+                )
+        opponent_rows += int(np.sum(present))
+        verified_rows += int(np.sum(verified))
+        opponent_tags.update(tags[tags != ""].tolist())
+        source_categories.update(categories[verified & (categories != "")].tolist())
+    return {
+        "opponent_provenance_rows": opponent_rows,
+        "opponent_provenance_fraction": opponent_rows / max(n, 1),
+        "opponent_tag_counts": dict(sorted(opponent_tags.items())),
+        "training_source_category_verified_rows": verified_rows,
+        "training_source_category_verified_fraction": verified_rows / max(n, 1),
+        "training_source_category_counts": dict(sorted(source_categories.items())),
+    }
+
+
 def teacher_data_quality(
     data: dict,
     *,
@@ -18962,6 +19107,7 @@ def teacher_data_quality(
     usable_q_score_rows_ge2 = int(np.sum(usable_q_rows_ge2))
     return {
         "samples": n,
+        **teacher_provenance_quality(data),
         "soft_policy_rows": int(policy_rows),
         "soft_policy_fraction": float(policy_rows / max(n, 1)),
         "soft_score_rows": int(score_rows),
