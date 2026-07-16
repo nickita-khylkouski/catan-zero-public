@@ -1,0 +1,88 @@
+{
+  "schema": "canonical_entity_ppo_run_v2",
+  "status": "template",
+  "spec": {
+    "actor": {
+      "action_temperature": 1.0,
+      "gae_lambda": 0.95,
+      "games_per_shard": 8,
+      "gamma": 1.0,
+      "max_decisions": 1000,
+      "opponent_mode": "league",
+      "opponents": [
+        "random",
+        "heuristic",
+        "jsettlers_lite",
+        "catanatron_ab3"
+      ],
+      "pfsp_mode": "pfsp",
+      "seat_schedule": "round_robin",
+      "seed": 1,
+      "value_shaping_coef": 0.0,
+      "value_shaping_opponent_penalty": 0.05,
+      "value_shaping_scale": 100.0
+    },
+    "checkpoint": {
+      "every_steps": 1,
+      "keep_last": 20,
+      "milestone_every": 500
+    },
+    "evaluation": {
+      "dev_games": 2000,
+      "device": "cpu",
+      "max_decisions": 1000,
+      "opponents": [
+        "random",
+        "heuristic",
+        "jsettlers_lite",
+        "catanatron_ab3",
+        "catanatron_ab4",
+        "catanatron_ab5",
+        "catanatron_value"
+      ],
+      "promotion_games": 20000,
+      "timeout_secs": 1200.0,
+      "tracks": [
+        "2p_no_trade"
+      ],
+      "workers": 8
+    },
+    "identity": {
+      "architecture": "entity_graph",
+      "initializer_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "track": "2p_no_trade",
+      "vps_to_win": 10
+    },
+    "learner": {
+      "advantage_group_weights": [],
+      "advantage_normalization": "global",
+      "clip_ratio": 0.1,
+      "entropy_coef": 0.01,
+      "kl_to_bc_anneal_steps": 2000,
+      "kl_to_bc_final": 0.1,
+      "kl_to_bc_init": 1.0,
+      "lr": 0.0002,
+      "max_staleness": 4,
+      "max_steps": 0,
+      "min_advantage_samples": 1,
+      "minibatch_size": 65536,
+      "ppo_epochs": 2,
+      "resume": true,
+      "shards_per_step": 16,
+      "target_kl": 0.0075,
+      "top_advantage_fraction": 1.0,
+      "trunk_lr_mult": 0.1,
+      "use_vtrace": true,
+      "value_clip_range": 0.2,
+      "value_coef": 0.5,
+      "vtrace_clip_pg_rho": 1.0,
+      "vtrace_clip_rho": 1.0,
+      "vtrace_forward_chunk": 8192,
+      "vtrace_use_current_values": true
+    },
+    "league": {
+      "promote_winrate": 0.7,
+      "snapshot_interval": 200
+    }
+  }
+}
