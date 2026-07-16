@@ -24457,10 +24457,13 @@ def _objective_gradient_interference(
 
     FSDP flattens logical parameters, so it cannot provide a faithful block-level
     decomposition here. Report that limitation instead of plausible false data;
-    run this high-information diagnostic on one GPU or DDP. DDP results are
-    explicitly rank-local because ranks see different microbatches.
+    run this high-information diagnostic on one GPU or DDP. ``autograd.grad``
+    does not trigger DDP's reducer, so DDP gradients are manually all-reduced and
+    world-averaged before any norms or cosines are computed. This reconstructs
+    the gradient that the optimizer actually applies.
     """
     import torch
+    import torch.distributed as dist
 
     model = policy.model
     is_fsdp = "FullyShardedDataParallel" in type(model).__name__ or (
@@ -24523,6 +24526,50 @@ def _objective_gradient_interference(
             "reason": "autograd_probe_failed",
             "detail": str(exc)[:240],
         }
+
+    distributed = (
+        isinstance(model, torch.nn.parallel.DistributedDataParallel)
+        and dist.is_available()
+        and dist.is_initialized()
+    )
+    world_size = int(dist.get_world_size()) if distributed else 1
+
+    def _ddp_average_gradients(gradients):
+        if not distributed:
+            return gradients
+        averaged = []
+        for parameter, gradient in zip(parameters, gradients, strict=True):
+            materialized = (
+                torch.zeros_like(parameter)
+                if gradient is None
+                else gradient.detach().clone()
+            )
+            dist.all_reduce(materialized, op=dist.ReduceOp.SUM)
+            materialized.div_(world_size)
+            averaged.append(materialized)
+        return tuple(averaged)
+
+    policy_grads = _ddp_average_gradients(policy_grads)
+    value_grads = _ddp_average_gradients(value_grads)
+    if aux_active:
+        policy_aux_grads = _ddp_average_gradients(policy_aux_grads)
+    additional_gradients = {
+        name: _ddp_average_gradients(gradients)
+        for name, gradients in additional_gradients.items()
+    }
+
+    def _objective_metric(objective):
+        metric = objective.detach().double().clone()
+        if distributed:
+            dist.all_reduce(metric, op=dist.ReduceOp.SUM)
+            metric.div_(world_size)
+        return metric
+
+    policy_objective_metric = _objective_metric(policy_objective)
+    value_objective_metric = _objective_metric(value_objective)
+    policy_aux_objective_metric = (
+        _objective_metric(policy_aux_objective) if aux_active else None
+    )
 
     zero = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
     policy_sq = zero.clone()
@@ -24677,14 +24724,20 @@ def _objective_gradient_interference(
     return {
         "available": True,
         "scope": (
-            "rank_local_microbatch"
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel)
+            "global_ddp_microbatch"
+            if distributed
             else "single_process_microbatch"
         ),
+        "aggregation": (
+            "manual_all_reduce_then_world_average_of_ddp_scaled_gradients"
+            if distributed
+            else "single_process_exact_gradient"
+        ),
+        "world_size": world_size,
         "value_lr_mult_scales_shared_trunk": False,
         "scalar_value_trunk_grad_scale": float(value_trunk_grad_scale),
-        "policy_objective": _float(policy_objective.detach()),
-        "value_objective": _float(value_objective.detach()),
+        "policy_objective": _float(policy_objective_metric),
+        "value_objective": _float(value_objective_metric),
         "policy_trunk_grad_norm": _float(policy_norm),
         "value_trunk_grad_norm": _float(value_norm),
         "value_to_policy_grad_norm_ratio": (
@@ -24711,9 +24764,9 @@ def _objective_gradient_interference(
         "modules": modules,
         **(
             {
-                "policy_aux_objective": _float(policy_aux_objective.detach()),
+                "policy_aux_objective": _float(policy_aux_objective_metric),
                 "policy_base_objective": _float(
-                    (policy_objective - policy_aux_objective).detach()
+                    policy_objective_metric - policy_aux_objective_metric
                 ),
                 "policy_base_trunk_grad_norm": _float(policy_base_norm),
                 "policy_aux_trunk_grad_norm": _float(policy_aux_norm),

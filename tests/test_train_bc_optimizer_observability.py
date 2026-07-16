@@ -1,10 +1,59 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tools import a1_b200_stage_c_learner_campaign as stage_c_campaign
 from tools import train_bc
+
+
+def _ddp_cancelling_objective_gradient_worker(
+    rank: int,
+    world_size: int,
+    init_file: str,
+    out_dir: str,
+) -> None:
+    import torch
+    import torch.distributed as dist
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = torch.nn.ModuleList(
+                [torch.nn.Linear(1, 1, bias=False)]
+            )
+
+        def forward(self, value):
+            return self.blocks[0](value)
+
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        init_method=f"file://{init_file}",
+    )
+    try:
+        model = torch.nn.parallel.DistributedDataParallel(TinyModel())
+        weight = model.module.blocks[0].weight
+        sign = 1.0 if rank == 0 else -1.0
+        policy_base = sign * weight.sum()
+        policy_aux = 2.0 * sign * weight.sum()
+        value = 3.0 * sign * weight.sum()
+        result = train_bc._objective_gradient_interference(
+            SimpleNamespace(model=model),
+            policy_objective=policy_base + policy_aux,
+            policy_aux_objective=policy_aux,
+            value_objective=value,
+        )
+        Path(out_dir, f"rank-{rank}.json").write_text(
+            json.dumps(result, sort_keys=True),
+            encoding="utf-8",
+        )
+    finally:
+        dist.destroy_process_group()
 
 
 def test_optimizer_observability_reuses_default_off_diagnostics_cadence() -> None:
@@ -291,6 +340,66 @@ def test_objective_gradient_interference_separates_active_policy_aux_branch() ->
         2.0 * root5
     )
     assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_objective_gradient_interference_rejects_rank_local_signal_that_cancels_globally(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("torch")
+    import torch.multiprocessing as mp
+
+    init_file = tmp_path / "gloo-init"
+    mp.spawn(
+        _ddp_cancelling_objective_gradient_worker,
+        args=(2, str(init_file), str(tmp_path)),
+        nprocs=2,
+        join=True,
+    )
+    results = [
+        json.loads((tmp_path / f"rank-{rank}.json").read_text(encoding="utf-8"))
+        for rank in range(2)
+    ]
+    assert results[0] == results[1]
+    observed = results[0]
+    assert observed["scope"] == "global_ddp_microbatch"
+    assert observed["aggregation"] == (
+        "manual_all_reduce_then_world_average_of_ddp_scaled_gradients"
+    )
+    assert observed["world_size"] == 2
+    assert observed["policy_objective"] == pytest.approx(0.0)
+    assert observed["value_objective"] == pytest.approx(0.0)
+    assert observed["policy_base_trunk_grad_norm"] == pytest.approx(0.0)
+    assert observed["policy_aux_trunk_grad_norm"] == pytest.approx(0.0)
+    assert observed["policy_trunk_grad_norm"] == pytest.approx(0.0)
+    assert observed["value_trunk_grad_norm"] == pytest.approx(0.0)
+
+    report = {
+        "objective_gradient_interference_every_batches": (
+            stage_c_campaign.OBJECTIVE_GRADIENT_CADENCE_BATCHES
+        ),
+        "objective_gradient_interference": {
+            "cadence_batches": (
+                stage_c_campaign.OBJECTIVE_GRADIENT_CADENCE_BATCHES
+            ),
+            "observations": [
+                {
+                    **observed,
+                    "optimizer_step": (
+                        stage_c_campaign.OBJECTIVE_GRADIENT_CADENCE_BATCHES
+                    ),
+                },
+                {
+                    **observed,
+                    "optimizer_step": stage_c_campaign.MAX_STEPS,
+                },
+            ],
+        },
+    }
+    with pytest.raises(
+        stage_c_campaign.CampaignError,
+        match="policy-base/AUX/value",
+    ):
+        stage_c_campaign._verify_completed_objective_gradient_signal(report)
 
 
 def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:

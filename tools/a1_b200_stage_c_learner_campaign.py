@@ -310,6 +310,14 @@ def _verify_completed_objective_gradient_signal(
         step = _integer(observation.get("optimizer_step"), default=-1)
         steps.append(step)
         bad_fields = []
+        if observation.get("scope") != "global_ddp_microbatch":
+            bad_fields.append("scope")
+        if observation.get("aggregation") != (
+            "manual_all_reduce_then_world_average_of_ddp_scaled_gradients"
+        ):
+            bad_fields.append("aggregation")
+        if _integer(observation.get("world_size"), default=-1) <= 1:
+            bad_fields.append("world_size")
         for field in positive_fields:
             try:
                 value = float(observation.get(field, math.nan))

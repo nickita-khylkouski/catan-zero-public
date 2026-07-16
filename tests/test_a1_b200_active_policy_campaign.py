@@ -760,7 +760,11 @@ def test_arm_dose_telemetry_seals_exposure_grad_clip_and_update_rms() -> None:
                 {
                     "available": True,
                     "optimizer_step": 64,
-                    "scope": "rank_local_microbatch",
+                    "scope": "global_ddp_microbatch",
+                    "aggregation": (
+                        "manual_all_reduce_then_world_average_of_ddp_scaled_gradients"
+                    ),
+                    "world_size": campaign.WORLD_SIZE,
                     "policy_trunk_grad_norm": 0.7,
                     "policy_base_trunk_grad_norm": 0.5,
                     "policy_aux_trunk_grad_norm": 0.2,
@@ -778,7 +782,11 @@ def test_arm_dose_telemetry_seals_exposure_grad_clip_and_update_rms() -> None:
                 {
                     "available": True,
                     "optimizer_step": 128,
-                    "scope": "rank_local_microbatch",
+                    "scope": "global_ddp_microbatch",
+                    "aggregation": (
+                        "manual_all_reduce_then_world_average_of_ddp_scaled_gradients"
+                    ),
+                    "world_size": campaign.WORLD_SIZE,
                     "policy_trunk_grad_norm": 0.8,
                     "policy_base_trunk_grad_norm": 0.5,
                     "policy_aux_trunk_grad_norm": 0.3,

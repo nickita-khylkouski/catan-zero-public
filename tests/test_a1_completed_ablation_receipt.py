@@ -80,6 +80,11 @@ def _completed_feature_signal_report() -> dict[str, object]:
         {
             "available": True,
             "optimizer_step": step,
+            "scope": "global_ddp_microbatch",
+            "aggregation": (
+                "manual_all_reduce_then_world_average_of_ddp_scaled_gradients"
+            ),
+            "world_size": campaign.WORLD_SIZE,
             "policy_trunk_grad_norm": 0.8,
             "policy_base_trunk_grad_norm": 0.6,
             "policy_aux_trunk_grad_norm": 0.2,
@@ -314,6 +319,15 @@ def test_stage_c_objective_gradient_signal_is_evidence_backed() -> None:
     with pytest.raises(campaign.CampaignError, match="policy-base/AUX/value"):
         campaign._verify_completed_objective_gradient_signal(  # noqa: SLF001
             missing_value
+        )
+
+    rank_local = copy.deepcopy(report)
+    rank_local["objective_gradient_interference"]["observations"][0][  # type: ignore[index]
+        "scope"
+    ] = "rank_local_microbatch"
+    with pytest.raises(campaign.CampaignError, match="scope"):
+        campaign._verify_completed_objective_gradient_signal(  # noqa: SLF001
+            rank_local
         )
 
 
