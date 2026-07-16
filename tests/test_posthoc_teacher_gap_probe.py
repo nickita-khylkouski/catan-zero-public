@@ -228,13 +228,14 @@ def test_functional_drift_uses_only_active_multi_action_rows():
     assert np.isfinite(parts["candidate_parent_kl_sum"])
 
 
-def test_single_checkpoint_parent_mode_keeps_v1_payload_compatibility(
-    tmp_path, monkeypatch
-):
+def test_single_checkpoint_parent_mode_uses_report_bound_parent(tmp_path, monkeypatch):
     module = _module()
     report_path, candidate, data, manifest = _paths(tmp_path, _report())
     parent = tmp_path / "legacy-parent.pt"
     parent.write_bytes(b"parent")
+    report = _report()
+    report["init_checkpoint_sha256"] = module._sha256(parent)  # noqa: SLF001
+    report_path.write_text(json.dumps(report), encoding="utf-8")
     fake = _FakeTrainBC()
     monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
     monkeypatch.setattr(
@@ -265,6 +266,32 @@ def test_single_checkpoint_parent_mode_keeps_v1_payload_compatibility(
     assert result["functional_dose_fingerprint"]["schema_version"] == (
         "checkpoint-functional-dose-fingerprint-v1"
     )
+    assert result["parent_target_kl_mean"] == pytest.approx(0.2)
+    assert result["paired_parent_teacher_gap"]["absolute_teacher_gap_closure"] == (
+        pytest.approx(0.0)
+    )
+    assert (
+        result["legacy_stored_generation_prior_teacher_gap"]["selection_authority"]
+        is False
+    )
+
+
+def test_single_checkpoint_parent_mode_refuses_unbound_parent(tmp_path, monkeypatch):
+    module = _module()
+    report_path, candidate, data, manifest = _paths(tmp_path, _report())
+    parent = tmp_path / "unbound-parent.pt"
+    parent.write_bytes(b"parent")
+    monkeypatch.setattr(module, "_load_train_bc", lambda: _FakeTrainBC())
+
+    with pytest.raises(SystemExit, match="report-authenticated learner parent"):
+        module.run_probe(
+            report_path=report_path,
+            checkpoint_path=candidate,
+            parent_checkpoint_path=parent,
+            data_path=data,
+            validation_manifest_path=manifest,
+            device="cpu",
+        )
 
 
 def test_batch_loads_corpus_and_parent_once_and_compares_all_candidates(
@@ -323,7 +350,9 @@ def test_batch_loads_corpus_and_parent_once_and_compares_all_candidates(
     )
 
     assert fake.corpus_loads == 1
-    assert len(fake.evaluate_calls) == 2
+    # The exact report-bound parent is evaluated once on the shared holdout,
+    # then each candidate is evaluated on that identical row surface.
+    assert len(fake.evaluate_calls) == 3
     assert loaded == ["parent.pt", "step64.pt", "step128.pt"]
     assert result["checkpoint_order"] == ["step64", "step128"]
     assert (
@@ -336,6 +365,7 @@ def test_batch_loads_corpus_and_parent_once_and_compares_all_candidates(
         "mask_hidden_info": True,
     }
     assert result["shared_holdout"]["comparison_identity_sha256"].startswith("sha256:")
+    assert result["shared_holdout"]["parent_target_kl_mean"] == pytest.approx(0.2)
     assert set(result["checkpoints"]) == {"step64", "step128"}
     assert (
         result["checkpoints"]["step64"]["parent_checkpoint_sha256"]
@@ -343,6 +373,48 @@ def test_batch_loads_corpus_and_parent_once_and_compares_all_candidates(
     )
     delta = result["dose_comparison"]["metrics"]["kl_parent_candidate_mean"]
     assert delta["step128_minus_step64"] == pytest.approx(0.064)
+
+
+def _teacher_gap_metrics(*, target_model: float, target_prior: float) -> dict:
+    return {
+        "active_policy_teacher_gap_rows": 11,
+        "active_policy_kl_target_model_mean": target_model,
+        "active_policy_kl_target_prior_mean": target_prior,
+        "active_policy_teacher_gap_closure": 1.0 - target_model / target_prior,
+    }
+
+
+def test_fresh_parent_gap_is_zero_for_parent_bytes_despite_different_stored_prior():
+    module = _module()
+    # The generation-time prior is much closer to the target than the raw
+    # learner parent.  That must not fabricate improvement when the candidate
+    # is byte/function identical to the parent.
+    parent = _teacher_gap_metrics(target_model=0.4, target_prior=0.1)
+    result = module._paired_parent_teacher_gap(  # noqa: SLF001
+        candidate=dict(parent), parent=parent
+    )
+
+    assert result["schema_version"] == module.PAIRED_PARENT_GAP_SCHEMA
+    assert result["parent_active_policy_kl_target_model_mean"] == pytest.approx(0.4)
+    assert result["stored_generation_prior"][
+        "active_policy_kl_target_prior_mean"
+    ] == pytest.approx(0.1)
+    assert result["absolute_teacher_gap_closure"] == pytest.approx(0.0)
+    assert result["relative_teacher_gap_closure"] == pytest.approx(0.0)
+    assert result["improved_over_exact_parent"] is False
+
+
+def test_fresh_parent_gap_is_positive_when_candidate_moves_toward_teacher():
+    module = _module()
+    parent = _teacher_gap_metrics(target_model=0.4, target_prior=0.1)
+    candidate = _teacher_gap_metrics(target_model=0.2, target_prior=0.1)
+    result = module._paired_parent_teacher_gap(  # noqa: SLF001
+        candidate=candidate, parent=parent
+    )
+
+    assert result["absolute_teacher_gap_closure"] == pytest.approx(0.2)
+    assert result["relative_teacher_gap_closure"] == pytest.approx(0.5)
+    assert result["improved_over_exact_parent"] is True
 
 
 def test_batch_refuses_parent_not_bound_by_training_report(tmp_path, monkeypatch):

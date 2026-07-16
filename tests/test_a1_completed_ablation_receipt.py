@@ -235,3 +235,76 @@ def test_stage_c_fingerprint_binds_report_emitted_holdout(
         == str(emitted_manifest)
         for command in result["commands"]
     )
+
+
+def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -> None:
+    records = [
+        {
+            "step": 8,
+            "parent_kl": 0.01,
+            "trunk_relative_l2": 0.01,
+            # This looks excellent only against the stale generation prior.
+            "legacy_stored_generation_prior_teacher_gap_closure": 0.99,
+            "teacher_gap_closure": 0.99,
+            "fresh_parent_teacher_gap_absolute_closure": -0.02,
+            "fresh_parent_teacher_gap_relative_closure": -0.10,
+        },
+        {
+            "step": 12,
+            "parent_kl": 0.02,
+            "trunk_relative_l2": 0.02,
+            # The legacy metric is deliberately worse, while the exact fresh
+            # parent comparison proves real movement toward the teacher.
+            "legacy_stored_generation_prior_teacher_gap_closure": -0.50,
+            "teacher_gap_closure": -0.50,
+            "fresh_parent_teacher_gap_absolute_closure": 0.04,
+            "fresh_parent_teacher_gap_relative_closure": 0.25,
+        },
+    ]
+
+    selected = campaign._select_fingerprint_winner(records)  # noqa: SLF001
+
+    assert selected is not None
+    assert selected["step"] == 12
+    assert selected["fresh_parent_teacher_gap_relative_closure"] == pytest.approx(0.25)
+
+
+def test_stage_c_reuses_authenticated_transitional_fresh_parent_evidence() -> None:
+    parent_kl = 0.8053631416613536
+    candidate_kl = 0.7514737349905842
+    stored_prior_kl = 0.6984388223118919
+    absolute = parent_kl - candidate_kl
+    functional = {
+        "teacher_gap": {
+            "active_policy_teacher_gap_rows": 100,
+            "active_policy_kl_target_model_mean": candidate_kl,
+            "active_policy_kl_target_prior_mean": stored_prior_kl,
+            "active_policy_teacher_gap_closure": 1.0 - candidate_kl / stored_prior_kl,
+        },
+        "parent_teacher_gap": {
+            "active_policy_teacher_gap_rows": 100,
+            "active_policy_kl_target_model_mean": parent_kl,
+            "active_policy_kl_target_prior_mean": stored_prior_kl,
+            "active_policy_teacher_gap_closure": 1.0 - parent_kl / stored_prior_kl,
+        },
+        "paired_parent_teacher_gap": {
+            "schema_version": campaign.TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA,
+            "surface": "same_holdout_same_targets_fresh_exact_parent_forward",
+            "rows": 100,
+            "parent_active_policy_kl_target_model_mean": parent_kl,
+            "candidate_active_policy_kl_target_model_mean": candidate_kl,
+            "absolute_target_kl_improvement": absolute,
+            "relative_teacher_gap_closure": absolute / parent_kl,
+            "improved_over_exact_parent": True,
+            "stored_prior_active_policy_kl_target_mean": stored_prior_kl,
+            "stored_prior_closure_is_legacy_diagnostic_only": True,
+        },
+    }
+
+    result = campaign._fresh_parent_teacher_gap(functional)  # noqa: SLF001
+
+    assert result["evidence_schema_version"] == (
+        campaign.TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA
+    )
+    assert result["relative_closure"] == pytest.approx(0.0669131767)
+    assert result["legacy_stored_prior_closure"] < 0.0

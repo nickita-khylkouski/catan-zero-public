@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -15,6 +16,7 @@ import numpy as np
 
 
 REPO = Path(__file__).resolve().parents[1]
+PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
@@ -123,7 +125,9 @@ def _functional_drift_batch(
         "rows": float(count),
         "parent_candidate_kl_sum": float(kl_parent_candidate[active].sum().item()),
         "candidate_parent_kl_sum": float(kl_candidate_parent[active].sum().item()),
-        "top1_flip_sum": float((parent_top1[active] != candidate_top1[active]).sum().item()),
+        "top1_flip_sum": float(
+            (parent_top1[active] != candidate_top1[active]).sum().item()
+        ),
         "parent_entropy_sum": float(parent_entropy[active].sum().item()),
         "candidate_entropy_sum": float(candidate_entropy[active].sum().item()),
         "value_abs_delta_sum": float(value_delta[active].abs().sum().item()),
@@ -161,7 +165,9 @@ def _functional_drift(
     try:
         with torch.no_grad():
             for start in range(0, len(indices), int(batch_size)):
-                batch = np.asarray(indices[start : start + int(batch_size)], dtype=np.int64)
+                batch = np.asarray(
+                    indices[start : start + int(batch_size)], dtype=np.int64
+                )
                 legal_ids = np.asarray(data["legal_action_ids"][batch])
                 parent = train_bc._forward_legal_np_for_batch(
                     parent_policy,
@@ -180,13 +186,17 @@ def _functional_drift(
                     return_final_vp=False,
                 )
                 if "value" not in parent or "value" not in candidate:
-                    raise SystemExit("functional-dose fingerprint requires scalar value outputs")
+                    raise SystemExit(
+                        "functional-dose fingerprint requires scalar value outputs"
+                    )
                 parts = _functional_drift_batch(
                     parent["logits"],
                     candidate["logits"],
                     parent["value"],
                     candidate["value"],
-                    legal_mask=torch.as_tensor(legal_ids >= 0, device=parent_policy.device),
+                    legal_mask=torch.as_tensor(
+                        legal_ids >= 0, device=parent_policy.device
+                    ),
                     eligible=torch.as_tensor(
                         np.asarray(policy_weights[batch]) > 0.0,
                         device=parent_policy.device,
@@ -278,9 +288,7 @@ def _prepare_probe(
         # Modern reports additionally emit the concrete train-validation seed
         # manifest consumed by this probe; its schema and bytes intentionally
         # differ from the upstream selection sentinel.
-        expected_manifest_sha = report.get(
-            "input_validation_game_seed_manifest_sha256"
-        )
+        expected_manifest_sha = report.get("input_validation_game_seed_manifest_sha256")
         if expected_manifest_sha and manifest_sha != expected_manifest_sha:
             raise SystemExit(
                 "validation manifest bytes differ from training report: "
@@ -461,9 +469,7 @@ def _policy_input_surface(
 ) -> dict[str, Any]:
     report = prepared["report"]
     award_contract = str(prepared["award_contract"])
-    policy_award = str(
-        getattr(policy, "public_award_feature_contract", award_contract)
-    )
+    policy_award = str(getattr(policy, "public_award_feature_contract", award_contract))
     if policy_award != award_contract:
         raise SystemExit(
             f"{role} public-award input contract differs from training report"
@@ -513,7 +519,7 @@ def _load_parent(
     binding = _report_parent_binding(prepared["report"])
     if require_report_binding and binding is None:
         raise SystemExit(
-            "batch functional-dose probe requires a report-authenticated learner parent"
+            "teacher-gap probe requires a report-authenticated learner parent"
         )
     if binding is not None and sha256 != binding[1]:
         raise SystemExit(
@@ -534,28 +540,13 @@ def _load_parent(
     )
 
 
-def _evaluate_candidate(
-    prepared: Mapping[str, Any],
-    *,
-    label: str,
-    checkpoint_path: Path,
-    parent_policy=None,
-    parent_ref: Mapping[str, Any] | None = None,
-    parent_surface: Mapping[str, Any] | None = None,
+def _evaluate_policy_metrics(
+    prepared: Mapping[str, Any], policy, *, input_surface: Mapping[str, Any]
 ) -> dict[str, Any]:
-    path = checkpoint_path.resolve(strict=True)
+    """Evaluate one policy on the already-authenticated shared holdout."""
+
     report = prepared["report"]
     train_bc = prepared["train_bc"]
-    policy = _load_policy(
-        str(_required(report, "arch")), path, str(prepared["device"])
-    )
-    input_surface = _policy_input_surface(
-        prepared, policy, role=f"candidate {label!r}"
-    )
-    if parent_surface is not None and input_surface != dict(parent_surface):
-        raise SystemExit(
-            f"candidate {label!r} and parent use different public input schemas"
-        )
     train_bc._PUBLIC_CARD_COUNT_FEATURES_ENABLED = bool(
         input_surface["public_card_count_features"]
     )
@@ -570,7 +561,7 @@ def _evaluate_candidate(
             report.get("value_categorical_loss_weight", 0.0),
         )
     )
-    metrics = train_bc.evaluate_bc_batches(
+    return train_bc.evaluate_bc_batches(
         policy,
         prepared["data"],
         prepared["validation_indices"],
@@ -606,18 +597,104 @@ def _evaluate_candidate(
         value_hlgauss_sigma_ratio=float(_required(report, "value_hlgauss_sigma_ratio")),
         value_target_lambda=float(_required(report, "value_target_lambda")),
     )
+
+
+def _teacher_gap_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: metrics[key]
+        for key in (
+            "active_policy_teacher_gap_rows",
+            "active_policy_kl_target_model_mean",
+            "active_policy_kl_target_prior_mean",
+            "active_policy_teacher_gap_closure",
+        )
+    }
+
+
+def _paired_parent_teacher_gap(
+    *, candidate: Mapping[str, Any], parent: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Compare candidate and exact parent on one identical target surface.
+
+    The stored ``prior_policy`` can represent a generation-time inference
+    operator (for example D6 averaging) rather than the learner parent's raw
+    forward pass.  It therefore remains useful telemetry but is not a valid
+    checkpoint-selection baseline.
+    """
+
+    candidate_rows = int(candidate["active_policy_teacher_gap_rows"])
+    parent_rows = int(parent["active_policy_teacher_gap_rows"])
+    candidate_prior = float(candidate["active_policy_kl_target_prior_mean"])
+    parent_prior = float(parent["active_policy_kl_target_prior_mean"])
+    if candidate_rows <= 0 or candidate_rows != parent_rows:
+        raise SystemExit("candidate and parent teacher-gap row surfaces differ")
+    if not math.isclose(candidate_prior, parent_prior, rel_tol=0.0, abs_tol=1.0e-9):
+        raise SystemExit("candidate and parent stored-prior target surfaces differ")
+    candidate_kl = float(candidate["active_policy_kl_target_model_mean"])
+    parent_kl = float(parent["active_policy_kl_target_model_mean"])
+    if (
+        not math.isfinite(candidate_kl)
+        or not math.isfinite(parent_kl)
+        or candidate_kl < -1.0e-9
+        or parent_kl < -1.0e-9
+    ):
+        raise SystemExit("candidate or parent target KL is invalid")
+    improvement = parent_kl - candidate_kl
+    relative = improvement / parent_kl if parent_kl > 1.0e-8 else 0.0
+    return {
+        "schema_version": PAIRED_PARENT_GAP_SCHEMA,
+        "selection_authority": True,
+        "authority": "fresh_exact_report_bound_parent_forward",
+        "surface": "same_holdout_same_targets_fresh_exact_parent_forward",
+        "rows": candidate_rows,
+        "parent_active_policy_kl_target_model_mean": parent_kl,
+        "candidate_active_policy_kl_target_model_mean": candidate_kl,
+        "absolute_teacher_gap_closure": improvement,
+        "relative_teacher_gap_closure": relative,
+        "improved_over_exact_parent": bool(improvement > 0.0),
+        "stored_generation_prior": {
+            "active_policy_kl_target_prior_mean": candidate_prior,
+            "selection_authority": False,
+            "semantic_role": "legacy_generation_operator_diagnostic_only",
+        },
+    }
+
+
+def _evaluate_candidate(
+    prepared: Mapping[str, Any],
+    *,
+    label: str,
+    checkpoint_path: Path,
+    parent_policy=None,
+    parent_ref: Mapping[str, Any] | None = None,
+    parent_surface: Mapping[str, Any] | None = None,
+    parent_teacher_gap: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    path = checkpoint_path.resolve(strict=True)
+    report = prepared["report"]
+    train_bc = prepared["train_bc"]
+    policy = _load_policy(str(_required(report, "arch")), path, str(prepared["device"]))
+    input_surface = _policy_input_surface(prepared, policy, role=f"candidate {label!r}")
+    if parent_surface is not None and input_surface != dict(parent_surface):
+        raise SystemExit(
+            f"candidate {label!r} and parent use different public input schemas"
+        )
+    metrics = _evaluate_policy_metrics(prepared, policy, input_surface=input_surface)
+    teacher_gap = _teacher_gap_projection(metrics)
     result = {
         "label": label,
         "checkpoint": {"path": str(path), "sha256": _sha256(path)},
         "input_surface": input_surface,
-        "teacher_gap": {
-            key: metrics[key]
-            for key in (
-                "active_policy_teacher_gap_rows",
-                "active_policy_kl_target_model_mean",
-                "active_policy_kl_target_prior_mean",
-                "active_policy_teacher_gap_closure",
-            )
+        "teacher_gap": teacher_gap,
+        "teacher_gap_semantics": {
+            "selection_authority": False,
+            "semantic_role": "legacy_generation_operator_diagnostic_only",
+            "authoritative_replacement": "paired_parent_teacher_gap",
+        },
+        "legacy_stored_generation_prior_teacher_gap": {
+            **teacher_gap,
+            "selection_authority": False,
+            "semantic_role": "legacy_generation_operator_diagnostic_only",
         },
         "legacy_prior_kl": {
             key: metrics[key]
@@ -631,8 +708,19 @@ def _evaluate_candidate(
         "metrics": metrics,
     }
     if parent_policy is not None:
-        assert parent_ref is not None and parent_surface is not None
+        assert (
+            parent_ref is not None
+            and parent_surface is not None
+            and parent_teacher_gap is not None
+        )
         result["parent_checkpoint_sha256"] = str(parent_ref["sha256"])
+        result["parent_teacher_gap"] = dict(parent_teacher_gap)
+        result["parent_target_kl_mean"] = float(
+            parent_teacher_gap["active_policy_kl_target_model_mean"]
+        )
+        result["paired_parent_teacher_gap"] = _paired_parent_teacher_gap(
+            candidate=teacher_gap, parent=parent_teacher_gap
+        )
         result["functional_dose_fingerprint"] = _functional_drift(
             train_bc=train_bc,
             parent_policy=parent_policy,
@@ -655,7 +743,7 @@ def run_probe(
     batch_size: int | None = None,
     parent_checkpoint_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Single-checkpoint compatibility entry point."""
+    """Evaluate one checkpoint and, when supplied, its report-bound parent."""
 
     prepared = _prepare_probe(
         report_path=report_path,
@@ -664,13 +752,17 @@ def run_probe(
         device=device,
         batch_size=batch_size,
     )
-    parent_policy = parent_ref = parent_surface = None
+    parent_policy = parent_ref = parent_surface = parent_teacher_gap = None
     if parent_checkpoint_path is not None:
         parent_policy, parent_ref, parent_surface = _load_parent(
             prepared,
             parent_checkpoint_path,
-            require_report_binding=False,
+            require_report_binding=True,
         )
+        parent_metrics = _evaluate_policy_metrics(
+            prepared, parent_policy, input_surface=parent_surface
+        )
+        parent_teacher_gap = _teacher_gap_projection(parent_metrics)
     candidate = _evaluate_candidate(
         prepared,
         label="checkpoint",
@@ -678,6 +770,7 @@ def run_probe(
         parent_policy=parent_policy,
         parent_ref=parent_ref,
         parent_surface=parent_surface,
+        parent_teacher_gap=parent_teacher_gap,
     )
     shared = prepared["shared_holdout"]
     result = {
@@ -692,24 +785,26 @@ def run_probe(
         "device": str(device),
         "batch_size": int(prepared["batch_size"]),
         "validation_rows": int(shared["validation_rows"]),
-        "validation_game_seed_set_sha256": shared[
-            "validation_game_seed_set_sha256"
-        ],
+        "validation_game_seed_set_sha256": shared["validation_game_seed_set_sha256"],
         "teacher_gap": candidate["teacher_gap"],
+        "teacher_gap_semantics": candidate["teacher_gap_semantics"],
+        "legacy_stored_generation_prior_teacher_gap": candidate[
+            "legacy_stored_generation_prior_teacher_gap"
+        ],
         "legacy_prior_kl": candidate["legacy_prior_kl"],
         "metrics": candidate["metrics"],
     }
     if parent_ref is not None:
-        # Keep the established single-checkpoint v1 payload byte-shape
-        # compatible.  Batch mode exposes the training-report binding field in
-        # its richer shared-parent record.
+        # Keep the established parent input projection small. Batch mode
+        # exposes the training-report binding field in its richer shared record.
         result["inputs"]["parent_checkpoint"] = {
             "path": parent_ref["path"],
             "sha256": parent_ref["sha256"],
         }
-        result["functional_dose_fingerprint"] = candidate[
-            "functional_dose_fingerprint"
-        ]
+        result["functional_dose_fingerprint"] = candidate["functional_dose_fingerprint"]
+        result["parent_teacher_gap"] = candidate["parent_teacher_gap"]
+        result["parent_target_kl_mean"] = candidate["parent_target_kl_mean"]
+        result["paired_parent_teacher_gap"] = candidate["paired_parent_teacher_gap"]
     return result
 
 
@@ -776,6 +871,10 @@ def run_batch_probe(
     prepared["train_bc"]._PUBLIC_CARD_COUNT_FEATURES_ENABLED = bool(
         parent_surface["public_card_count_features"]
     )
+    parent_metrics = _evaluate_policy_metrics(
+        prepared, parent_policy, input_surface=parent_surface
+    )
+    parent_teacher_gap = _teacher_gap_projection(parent_metrics)
     results = {
         label: _evaluate_candidate(
             prepared,
@@ -784,6 +883,7 @@ def run_batch_probe(
             parent_policy=parent_policy,
             parent_ref=parent_ref,
             parent_surface=parent_surface,
+            parent_teacher_gap=parent_teacher_gap,
         )
         for label, checkpoint_path in checkpoints
     }
@@ -797,10 +897,12 @@ def run_batch_probe(
     shared_holdout.update(
         {
             "parent_checkpoint": parent_ref,
-            "input_surface": parent_surface,
-            "comparison_identity_sha256": _canonical_sha256(
-                comparison_semantics
+            "parent_teacher_gap": parent_teacher_gap,
+            "parent_target_kl_mean": float(
+                parent_teacher_gap["active_policy_kl_target_model_mean"]
             ),
+            "input_surface": parent_surface,
+            "comparison_identity_sha256": _canonical_sha256(comparison_semantics),
         }
     )
     output = {

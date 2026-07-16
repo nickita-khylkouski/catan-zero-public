@@ -39,7 +39,10 @@ from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 
 SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v2"
 EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v1"
-FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v1"
+FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v2"
+PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
+TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v1"
+SEPARATE_PARENT_GAP_SCHEMA = "posthoc-separate-parent-teacher-gap-v1"
 WORLD_SIZE = 8
 LOCAL_BATCH_SIZE = 512
 GLOBAL_BATCH_SIZE = WORLD_SIZE * LOCAL_BATCH_SIZE
@@ -320,8 +323,12 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "checkpoint_steps": list(CHECKPOINT_STEPS),
             "max_parent_kl": MAX_PARENT_KL,
             "max_trunk_relative_l2": MAX_TRUNK_RELATIVE_L2,
-            "requires_positive_teacher_gap_closure": True,
-            "objective": "best_external_play_among_posthoc_in_budget_checkpoints",
+            "requires_positive_fresh_parent_teacher_gap_closure": True,
+            "stored_generation_prior_selection_authority": False,
+            "objective": (
+                "max_fresh_parent_relative_teacher_gap_closure_within_posthoc_"
+                "trust_budgets_then_external_play"
+            ),
             "playing_strength_evaluation_required": True,
         },
         "optimizer_surface_contract": {
@@ -369,7 +376,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "report": str(output_root / "learner" / "train.report.json"),
             "one_dose_receipt": str(output_root / "learner" / "one-dose.receipt.json"),
             "execution_receipt": str(output_root / "learner.execution.receipt.json"),
-            "fingerprint": str(output_root / "fingerprint.json"),
+            "fingerprint": str(output_root / "fingerprint.fresh-parent.json"),
         },
     }
     payload["command"] = _one_dose_command(payload)
@@ -546,6 +553,356 @@ def _trunk_relative_l2(report: Mapping[str, Any]) -> float:
     return math.sqrt(delta / baseline)
 
 
+def _posthoc_evaluation_surface(report: Mapping[str, Any]) -> dict[str, Any]:
+    inputs = report.get("inputs")
+    if not isinstance(inputs, dict):
+        raise CampaignError("posthoc functional report has no input bindings")
+    try:
+        return {
+            "schema_version": report["schema_version"],
+            "arch": report["arch"],
+            "batch_size": int(report["batch_size"]),
+            "validation_rows": int(report["validation_rows"]),
+            "validation_game_seed_set_sha256": report[
+                "validation_game_seed_set_sha256"
+            ],
+            "training_report_sha256": inputs["training_report"]["sha256"],
+            "memmap_fingerprint": inputs["memmap"]["fingerprint"],
+            "memmap_payload_inventory_sha256": inputs["memmap"][
+                "payload_inventory_sha256"
+            ],
+            "validation_manifest_sha256": inputs["validation_manifest"]["sha256"],
+            "validation_manifest_semantic_sha256": inputs["validation_manifest"][
+                "manifest_sha256"
+            ],
+        }
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError("posthoc evaluation surface is malformed") from error
+
+
+def _pair_separate_parent_evidence(
+    functional: Mapping[str, Any], parent_functional: Mapping[str, Any]
+) -> tuple[dict[str, Any], Mapping[str, Any], Mapping[str, Any]]:
+    """Bind separately emitted parent/candidate forwards on one exact surface."""
+
+    if _posthoc_evaluation_surface(functional) != _posthoc_evaluation_surface(
+        parent_functional
+    ):
+        raise CampaignError("separate parent and candidate holdout surfaces differ")
+    candidate_inputs = functional["inputs"]
+    parent_inputs = parent_functional["inputs"]
+    parent_checkpoint = parent_inputs.get("checkpoint")
+    if not isinstance(parent_checkpoint, dict):
+        raise CampaignError("separate parent report has no checkpoint binding")
+    parent_sha = parent_checkpoint.get("sha256")
+    if (
+        candidate_inputs.get("parent_checkpoint", {}).get("sha256") != parent_sha
+        or parent_inputs.get("parent_checkpoint", {}).get("sha256") != parent_sha
+    ):
+        raise CampaignError("separate functional reports bind different parents")
+    candidate_gap = functional.get("teacher_gap")
+    parent_gap = parent_functional.get("teacher_gap")
+    if not isinstance(candidate_gap, dict) or not isinstance(parent_gap, dict):
+        raise CampaignError("separate functional report has no teacher-gap metrics")
+    try:
+        rows = int(candidate_gap["active_policy_teacher_gap_rows"])
+        parent_rows = int(parent_gap["active_policy_teacher_gap_rows"])
+        candidate_kl = float(candidate_gap["active_policy_kl_target_model_mean"])
+        parent_kl = float(parent_gap["active_policy_kl_target_model_mean"])
+        candidate_prior = float(candidate_gap["active_policy_kl_target_prior_mean"])
+        parent_prior = float(parent_gap["active_policy_kl_target_prior_mean"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError("separate teacher-gap metrics are malformed") from error
+    if (
+        rows <= 0
+        or rows != parent_rows
+        or not math.isclose(candidate_prior, parent_prior, rel_tol=0.0, abs_tol=1.0e-12)
+    ):
+        raise CampaignError("separate teacher-gap row/target surfaces differ")
+    absolute = parent_kl - candidate_kl
+    paired = {
+        "schema_version": SEPARATE_PARENT_GAP_SCHEMA,
+        "selection_authority": True,
+        "authority": "fresh_exact_report_bound_parent_forward",
+        "surface": "same_holdout_same_targets_fresh_exact_parent_forward",
+        "rows": rows,
+        "parent_active_policy_kl_target_model_mean": parent_kl,
+        "candidate_active_policy_kl_target_model_mean": candidate_kl,
+        "absolute_teacher_gap_closure": absolute,
+        "relative_teacher_gap_closure": absolute / parent_kl
+        if parent_kl > 1.0e-8
+        else 0.0,
+        "improved_over_exact_parent": bool(absolute > 0.0),
+        "stored_generation_prior": {
+            "active_policy_kl_target_prior_mean": candidate_prior,
+            "selection_authority": False,
+            "semantic_role": "legacy_generation_operator_diagnostic_only",
+        },
+    }
+    return paired, candidate_gap, parent_gap
+
+
+def _fresh_parent_teacher_gap(
+    functional: Mapping[str, Any],
+    *,
+    parent_functional: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Authenticate the only teacher-gap surface allowed for selection.
+
+    Historical rows retain a generation-time ``prior_policy`` distribution.
+    That distribution may include a different inference operator (notably D6
+    averaging), so its closure is useful telemetry but cannot establish that a
+    checkpoint improved over the learner's exact parent bytes.
+    """
+
+    paired = functional.get("paired_parent_teacher_gap")
+    separate_legacy = separate_parent_projection = None
+    if not isinstance(paired, dict):
+        if parent_functional is None:
+            raise CampaignError(
+                "functional report has no authoritative fresh-parent gap"
+            )
+        paired, separate_legacy, separate_parent_projection = (
+            _pair_separate_parent_evidence(functional, parent_functional)
+        )
+    evidence_schema = paired.get("schema_version")
+    if evidence_schema in {PAIRED_PARENT_GAP_SCHEMA, SEPARATE_PARENT_GAP_SCHEMA}:
+        if (
+            paired.get("selection_authority") is not True
+            or paired.get("authority") != "fresh_exact_report_bound_parent_forward"
+        ):
+            raise CampaignError("fresh-parent evidence authority is malformed")
+        stored_prior = paired.get("stored_generation_prior")
+        if (
+            not isinstance(stored_prior, dict)
+            or stored_prior.get("selection_authority") is not False
+            or stored_prior.get("semantic_role")
+            != "legacy_generation_operator_diagnostic_only"
+        ):
+            raise CampaignError(
+                "stored generation prior was not marked diagnostic-only"
+            )
+        absolute_key = "absolute_teacher_gap_closure"
+        stored_prior_value = stored_prior.get(
+            "active_policy_kl_target_prior_mean", math.nan
+        )
+    elif evidence_schema == TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA:
+        # The first live Stage-C fingerprint run emitted this transition shape
+        # before checkpoint selection was corrected. Its exact parent and
+        # candidate forwards remain valid, expensive evidence. Authenticate
+        # those values while quarantining its stored-prior closure.
+        if (
+            paired.get("surface")
+            != "same_holdout_same_targets_fresh_exact_parent_forward"
+            or paired.get("stored_prior_closure_is_legacy_diagnostic_only") is not True
+        ):
+            raise CampaignError("transitional fresh-parent evidence is malformed")
+        absolute_key = "absolute_target_kl_improvement"
+        stored_prior_value = paired.get(
+            "stored_prior_active_policy_kl_target_mean", math.nan
+        )
+    else:
+        raise CampaignError("functional report fresh-parent schema is unsupported")
+    try:
+        parent_kl = float(paired["parent_active_policy_kl_target_model_mean"])
+        candidate_kl = float(paired["candidate_active_policy_kl_target_model_mean"])
+        absolute = float(paired[absolute_key])
+        relative = float(paired["relative_teacher_gap_closure"])
+        stored_prior_value = float(stored_prior_value)
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError("fresh-parent teacher-gap fields are malformed") from error
+    if (
+        int(paired.get("rows", 0)) <= 0
+        or not all(
+            math.isfinite(value)
+            for value in (parent_kl, candidate_kl, absolute, relative)
+        )
+        or parent_kl < -1.0e-9
+        or candidate_kl < -1.0e-9
+        or not math.isclose(
+            absolute,
+            parent_kl - candidate_kl,
+            rel_tol=1.0e-9,
+            abs_tol=1.0e-12,
+        )
+    ):
+        raise CampaignError("fresh-parent teacher-gap arithmetic is invalid")
+    expected_relative = absolute / parent_kl if parent_kl > 1.0e-8 else 0.0
+    if not math.isclose(
+        relative, expected_relative, rel_tol=1.0e-9, abs_tol=1.0e-12
+    ) or bool(paired.get("improved_over_exact_parent")) != bool(absolute > 0.0):
+        raise CampaignError("fresh-parent teacher-gap closure is inconsistent")
+    if evidence_schema == PAIRED_PARENT_GAP_SCHEMA:
+        legacy = functional.get("legacy_stored_generation_prior_teacher_gap")
+        if (
+            not isinstance(legacy, dict)
+            or legacy.get("selection_authority") is not False
+            or legacy.get("semantic_role")
+            != "legacy_generation_operator_diagnostic_only"
+        ):
+            raise CampaignError("functional report did not quarantine legacy closure")
+        compatibility_semantics = functional.get("teacher_gap_semantics")
+        if (
+            not isinstance(compatibility_semantics, dict)
+            or compatibility_semantics.get("selection_authority") is not False
+            or compatibility_semantics.get("authoritative_replacement")
+            != "paired_parent_teacher_gap"
+        ):
+            raise CampaignError(
+                "compatibility teacher gap was not marked non-authoritative"
+            )
+    elif evidence_schema == TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA:
+        legacy = functional.get("teacher_gap")
+        if not isinstance(legacy, dict):
+            raise CampaignError("transitional report lacks stored-prior diagnostics")
+    else:
+        assert separate_legacy is not None and separate_parent_projection is not None
+        legacy = separate_legacy
+    parent_projection = (
+        separate_parent_projection
+        if evidence_schema == SEPARATE_PARENT_GAP_SCHEMA
+        else functional.get("parent_teacher_gap")
+    )
+    if (
+        not isinstance(parent_projection, dict)
+        or int(parent_projection.get("active_policy_teacher_gap_rows", 0))
+        != int(paired["rows"])
+        or not math.isclose(
+            float(
+                parent_projection.get("active_policy_kl_target_model_mean", math.nan)
+            ),
+            parent_kl,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+        or not math.isclose(
+            float(legacy.get("active_policy_kl_target_model_mean", math.nan)),
+            candidate_kl,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+        or not math.isclose(
+            float(legacy.get("active_policy_kl_target_prior_mean", math.nan)),
+            stored_prior_value,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+    ):
+        raise CampaignError("fresh-parent gap differs from its emitted projections")
+    legacy_closure = float(legacy.get("active_policy_teacher_gap_closure", math.nan))
+    if not math.isfinite(legacy_closure):
+        raise CampaignError("legacy stored-prior closure is malformed")
+    return {
+        "parent_target_kl_mean": parent_kl,
+        "candidate_target_kl_mean": candidate_kl,
+        "absolute_closure": absolute,
+        "relative_closure": relative,
+        "improved": bool(absolute > 0.0),
+        "rows": int(paired["rows"]),
+        "evidence_schema_version": str(evidence_schema),
+        "legacy_stored_prior_closure": legacy_closure,
+    }
+
+
+def _fresh_parent_fingerprint_path(plan: Mapping[str, Any]) -> Path:
+    configured = Path(str(plan["expected_artifacts"]["fingerprint"]))
+    if configured.name.endswith(".fresh-parent.json"):
+        return configured
+    if configured.suffix == ".json":
+        return configured.with_name(f"{configured.stem}.fresh-parent.json")
+    return configured.with_name(f"{configured.name}.fresh-parent.json")
+
+
+def _legacy_fingerprint_path(plan: Mapping[str, Any]) -> Path:
+    configured = Path(str(plan["expected_artifacts"]["fingerprint"]))
+    if configured.name.endswith(".fresh-parent.json"):
+        stem = configured.name.removesuffix(".fresh-parent.json")
+        return configured.with_name(f"{stem}.json")
+    return configured
+
+
+def _parent_functional_artifact(
+    output_root: Path,
+) -> tuple[Path, dict[str, Any]] | None:
+    candidates = (
+        output_root / "parent.functional.json",
+        output_root.parent / "fingerprints-direct" / "parent.functional.json",
+    )
+    for candidate in candidates:
+        if candidate.is_symlink():
+            raise CampaignError(
+                f"parent functional artifact must not be a symlink: {candidate}"
+            )
+        if candidate.is_file():
+            return (
+                candidate.resolve(strict=True),
+                _load_json(candidate, where="separate exact-parent functional")[1],
+            )
+    return None
+
+
+def _functional_artifact_path(
+    output_root: Path, step: int, *, allow_separate_parent: bool
+) -> Path:
+    """Prefer reusable fresh-parent evidence; never overwrite existing bytes."""
+
+    fresh = output_root / f"step{step:04d}.functional.fresh-parent.json"
+    legacy = output_root / f"step{step:04d}.functional.json"
+    for candidate in (fresh, legacy):
+        if candidate.is_symlink():
+            raise CampaignError(
+                f"functional artifact must not be a symlink: {candidate}"
+            )
+        if not candidate.is_file():
+            continue
+        payload = _load_json(candidate, where=f"step {step} functional evidence")[1]
+        paired = payload.get("paired_parent_teacher_gap")
+        if isinstance(paired, dict) and paired.get("schema_version") in {
+            PAIRED_PARENT_GAP_SCHEMA,
+            TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA,
+        }:
+            return candidate
+        if (
+            allow_separate_parent
+            and candidate == legacy
+            and payload.get("schema_version") == "posthoc-checkpoint-teacher-gap/v1"
+            and isinstance(payload.get("teacher_gap"), dict)
+        ):
+            return candidate
+        if candidate == fresh:
+            raise CampaignError(
+                f"fresh-parent functional artifact is malformed: {fresh}"
+            )
+    return fresh
+
+
+def _select_fingerprint_winner(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Choose maximum fresh-parent closure inside both trust budgets."""
+
+    eligible = [
+        row
+        for row in records
+        if float(row["parent_kl"]) <= MAX_PARENT_KL
+        and float(row["trunk_relative_l2"]) <= MAX_TRUNK_RELATIVE_L2
+        and float(row["fresh_parent_teacher_gap_relative_closure"]) > 0.0
+        and float(row["fresh_parent_teacher_gap_absolute_closure"]) > 0.0
+    ]
+    if not eligible:
+        return None
+    return dict(
+        max(
+            eligible,
+            key=lambda row: (
+                float(row["fresh_parent_teacher_gap_relative_closure"]),
+                float(row["fresh_parent_teacher_gap_absolute_closure"]),
+                -int(row["step"]),
+            ),
+        )
+    )
+
+
 def _fingerprint(
     plan_path: Path, plan: Mapping[str, Any], *, go: bool, device: str
 ) -> dict[str, Any]:
@@ -617,12 +974,26 @@ def _fingerprint(
     parent = Path(
         str(authority["function_preserving_upgrade"]["upgraded_initializer"]["path"])
     ).resolve(strict=True)
+    separate_parent = _parent_functional_artifact(output_root)
+    separate_parent_path = None if separate_parent is None else separate_parent[0]
+    separate_parent_payload = None if separate_parent is None else separate_parent[1]
+    if separate_parent_payload is not None and (
+        separate_parent_payload.get("inputs", {}).get("checkpoint", {}).get("sha256")
+        != _file_sha256(parent)
+    ):
+        raise CampaignError("separate parent functional used the wrong checkpoint")
     records = []
     commands = []
     for step in CHECKPOINT_STEPS:
         checkpoint = _checkpoint_path(plan, step).resolve(strict=True)
-        functional_path = output_root / f"step{step:04d}.functional.json"
+        functional_path = _functional_artifact_path(
+            output_root,
+            step,
+            allow_separate_parent=separate_parent_payload is not None,
+        )
         drift_path = output_root / f"step{step:04d}.drift.json"
+        if drift_path.is_symlink():
+            raise CampaignError(f"drift artifact must not be a symlink: {drift_path}")
         functional_command = [
             str(plan["inputs"]["python"]),
             str(REPO_ROOT / "tools" / "posthoc_teacher_gap_probe.py"),
@@ -657,7 +1028,12 @@ def _fingerprint(
         if not go:
             continue
         output_root.mkdir(parents=True, exist_ok=True)
-        for command in (functional_command, drift_command):
+        for command, artifact in (
+            (functional_command, functional_path),
+            (drift_command, drift_path),
+        ):
+            if artifact.is_file() and not artifact.is_symlink():
+                continue
             result = subprocess.run(command, check=False)
             if result.returncode != 0:
                 raise CampaignError(
@@ -665,25 +1041,49 @@ def _fingerprint(
                 )
         functional = _load_json(functional_path, where=f"step {step} functional")[1]
         drift = _load_json(drift_path, where=f"step {step} drift")[1]
+        functional_parent = functional.get("inputs", {}).get("parent_checkpoint")
+        if not isinstance(functional_parent, dict) or functional_parent.get(
+            "sha256"
+        ) != _file_sha256(parent):
+            raise CampaignError(
+                f"checkpoint {step} functional report used the wrong parent"
+            )
         fingerprint = functional.get("functional_dose_fingerprint")
         if not isinstance(fingerprint, dict):
             raise CampaignError(f"checkpoint {step} has no functional fingerprint")
         parent_kl = float(fingerprint["kl_parent_candidate_mean"])
-        closure = float(functional["teacher_gap"]["active_policy_teacher_gap_closure"])
+        fresh_gap = _fresh_parent_teacher_gap(
+            functional, parent_functional=separate_parent_payload
+        )
+        legacy_closure = fresh_gap["legacy_stored_prior_closure"]
         trunk = _trunk_relative_l2(drift)
+        eligible = bool(
+            parent_kl <= MAX_PARENT_KL
+            and trunk <= MAX_TRUNK_RELATIVE_L2
+            and fresh_gap["absolute_closure"] > 0.0
+            and fresh_gap["relative_closure"] > 0.0
+        )
         records.append(
             {
                 "step": step,
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": _file_sha256(checkpoint),
                 "parent_kl": parent_kl,
-                "teacher_gap_closure": closure,
+                "fresh_parent_target_kl_mean": fresh_gap["parent_target_kl_mean"],
+                "candidate_target_kl_mean": fresh_gap["candidate_target_kl_mean"],
+                "fresh_parent_teacher_gap_absolute_closure": fresh_gap[
+                    "absolute_closure"
+                ],
+                "fresh_parent_teacher_gap_relative_closure": fresh_gap[
+                    "relative_closure"
+                ],
+                "fresh_parent_evidence_schema_version": fresh_gap[
+                    "evidence_schema_version"
+                ],
+                "legacy_stored_generation_prior_teacher_gap_closure": legacy_closure,
+                "stored_generation_prior_selection_authority": False,
                 "trunk_relative_l2": trunk,
-                "eligible": bool(
-                    parent_kl <= MAX_PARENT_KL
-                    and trunk <= MAX_TRUNK_RELATIVE_L2
-                    and closure > 0.0
-                ),
+                "eligible": eligible,
                 "functional": {
                     "path": str(functional_path),
                     "file_sha256": _file_sha256(functional_path),
@@ -700,12 +1100,7 @@ def _fingerprint(
             "validation_holdout": validation_binding,
             "commands": commands,
         }
-    eligible = [row for row in records if row["eligible"]]
-    winner = (
-        max(eligible, key=lambda row: (row["teacher_gap_closure"], -row["step"]))
-        if eligible
-        else None
-    )
+    winner = _select_fingerprint_winner(records)
     payload: dict[str, Any] = {
         "schema_version": FINGERPRINT_SCHEMA,
         "campaign": {
@@ -716,16 +1111,43 @@ def _fingerprint(
         "metric_scope": "frozen_whole_game_validation_policy_active_multi_action_rows",
         "validation_holdout": validation_binding,
         "optimizer_batch_kl_used_as_trust_authority": False,
+        "stored_generation_prior_used_as_selection_authority": False,
+        "selection_objective": (
+            "max_fresh_parent_relative_teacher_gap_closure_within_parent_kl_"
+            "and_trunk_drift_budgets"
+        ),
+        "output": str(_fresh_parent_fingerprint_path(plan)),
         "checkpoints": records,
         "winner": winner,
         "formal_result": (
             "posthoc_in_budget_candidate_requires_playing_evaluation"
             if winner is not None
-            else "no_positive_closure_checkpoint_within_posthoc_trust_budget"
+            else "no_positive_fresh_parent_closure_checkpoint_within_posthoc_trust_budget"
         ),
     }
+    if separate_parent_path is not None:
+        payload["separate_exact_parent_evidence"] = {
+            "path": str(separate_parent_path),
+            "file_sha256": _file_sha256(separate_parent_path),
+            "selection_authority": True,
+            "surface": "same_holdout_same_targets_fresh_exact_parent_forward",
+        }
+    legacy_fingerprint = _legacy_fingerprint_path(plan)
+    if legacy_fingerprint.is_symlink():
+        raise CampaignError("legacy fingerprint must not be a symlink")
+    if legacy_fingerprint.is_file():
+        legacy_payload = _load_json(
+            legacy_fingerprint, where="superseded legacy Stage-C fingerprint"
+        )[1]
+        payload["superseded_legacy_fingerprint"] = {
+            "path": str(legacy_fingerprint.resolve(strict=True)),
+            "file_sha256": _file_sha256(legacy_fingerprint),
+            "schema_version": legacy_payload.get("schema_version"),
+            "selection_authority": False,
+            "reason": "used_generation_time_stored_prior_as_teacher_gap_baseline",
+        }
     payload["fingerprint_sha256"] = _value_sha256(payload)
-    _write_json(Path(str(plan["expected_artifacts"]["fingerprint"])), payload)
+    _write_json(_fresh_parent_fingerprint_path(plan), payload)
     return payload
 
 
