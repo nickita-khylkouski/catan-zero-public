@@ -15,7 +15,7 @@ import generate_gumbel_selfplay_data as generator  # type: ignore  # noqa: E402
 from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
 
 
-def test_native_generation_flags_are_explicit_and_default_off(tmp_path: Path) -> None:
+def test_native_generation_flags_bind_commissioned_rust_default(tmp_path: Path) -> None:
     parser = generator.build_parser()
     defaults = parser.parse_args(["--out-dir", str(tmp_path / "default")])
     native = parser.parse_args(
@@ -26,13 +26,21 @@ def test_native_generation_flags_are_explicit_and_default_off(tmp_path: Path) ->
             "--evaluator-rust-featurize",
         ]
     )
+    historical_python = parser.parse_args(
+        [
+            "--out-dir",
+            str(tmp_path / "historical-python"),
+            "--no-rust-featurize",
+        ]
+    )
 
     assert defaults.native_mcts_hot_loop is False
-    assert defaults.rust_featurize is False
+    assert defaults.rust_featurize is True
     assert native.native_mcts_hot_loop is True
     # The canonical name and historical --rust-featurize alias intentionally
     # share one config/provenance destination.
     assert native.rust_featurize is True
+    assert historical_python.rust_featurize is False
 
 
 def test_native_generation_flags_change_config_hash(tmp_path: Path) -> None:

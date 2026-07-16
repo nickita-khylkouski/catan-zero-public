@@ -163,7 +163,7 @@ def test_c7_c8_allocate_only_at_their_audited_commit(tmp_path):
     plan = fleet.build_plan(
         manifest,
         jobs,
-        repo_commit="3c84b8be7052cf052648d95c4b581c7123ef60d3",
+        repo_commit="4e95bc0cc81cf3d121410aeb0093f3975c492af6",
     )
     assert [row["alias"] for row in plan["assignments"]] == ["c7", "c8"]
 
@@ -180,7 +180,7 @@ def test_exact64_new_hosts_allocate_only_at_their_deployed_commit(tmp_path):
     plan = fleet.build_plan(
         manifest,
         jobs,
-        repo_commit="3c84b8be7052cf052648d95c4b581c7123ef60d3",
+        repo_commit="4e95bc0cc81cf3d121410aeb0093f3975c492af6",
     )
     assert [row["alias"] for row in plan["assignments"]] == ["h100-8c", "h100-8d"]
 

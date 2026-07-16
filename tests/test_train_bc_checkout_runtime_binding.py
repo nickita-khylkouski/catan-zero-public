@@ -45,7 +45,7 @@ def test_runtime_binding_refuses_preloaded_foreign_project_module(
         train_bc._assert_checkout_runtime_binding()
 
 
-def test_direct_script_ignores_ambient_stale_pythonpath(tmp_path: Path) -> None:
+def _stale_pythonpath_environment(tmp_path: Path) -> dict[str, str]:
     stale = tmp_path / "stale"
     package = stale / "catan_zero"
     package.mkdir(parents=True)
@@ -54,6 +54,31 @@ def test_direct_script_ignores_ambient_stale_pythonpath(tmp_path: Path) -> None:
     )
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(stale)
+    return environment
+
+
+def test_supported_train_script_ignores_ambient_stale_pythonpath(
+    tmp_path: Path,
+) -> None:
+    environment = _stale_pythonpath_environment(tmp_path)
+    completed = subprocess.run(
+        [sys.executable, str(REPO / "tools" / "train.py"), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "ambient stale package imported" not in completed.stderr
+
+
+def test_direct_internal_engine_refuses_after_binding_its_checkout(
+    tmp_path: Path,
+) -> None:
+    environment = _stale_pythonpath_environment(tmp_path)
     completed = subprocess.run(
         [sys.executable, str(REPO / "tools" / "train_bc.py"), "--help"],
         cwd=tmp_path,
@@ -64,7 +89,8 @@ def test_direct_script_ignores_ambient_stale_pythonpath(tmp_path: Path) -> None:
         check=False,
     )
 
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode != 0
+    assert "internal training engine, not a supported CLI" in completed.stderr
     assert "ambient stale package imported" not in completed.stderr
 
 
