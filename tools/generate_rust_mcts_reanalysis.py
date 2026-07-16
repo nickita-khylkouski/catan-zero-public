@@ -15,10 +15,13 @@ from catan_zero.search import RustMCTS, RustMCTSConfig
 from catan_zero.search.neural_rust_mcts import (
     EntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
-    RUST_ENTITY_ADAPTER_VERSION,
+    _policy_history_options,
     rust_action_context_batch,
     rust_game_to_entity_batch,
     rust_policy_action_ids,
+)
+from catan_zero.rl.entity_feature_adapter import (
+    policy_entity_feature_adapter_version,
 )
 
 # Make the sibling ``tools/`` modules importable whether this module is run as a script or
@@ -93,6 +96,7 @@ def main() -> None:
             prior_temperature=float(args.prior_temperature),
         ),
     )
+    feature_contract = _evaluator_feature_contract(evaluator)
     search = RustMCTS(
         RustMCTSConfig(
             colors=COLORS,
@@ -122,7 +126,6 @@ def main() -> None:
             if rows >= int(args.samples):
                 break
             candidate_color = COLORS[game_index % 2]
-            opponent_color = COLORS[1 - (game_index % 2)]
             player_kinds = [
                 "random" if color == candidate_color else str(args.opponent)
                 for color in COLORS
@@ -229,7 +232,7 @@ def main() -> None:
         "max_depth": int(args.max_depth),
         "prior_temperature": float(args.prior_temperature),
         "value_scale": float(args.value_scale),
-        "adapter_version": RUST_ENTITY_ADAPTER_VERSION,
+        **_feature_contract_manifest_fields(feature_contract),
         "seed": int(args.seed),
         "skipped_forced": int(skipped_forced),
         "skipped_phase": int(skipped_phase),
@@ -264,6 +267,50 @@ def _target_scores_and_mask(
     return target_scores, target_scores_mask
 
 
+def _evaluator_feature_contract(
+    evaluator: EntityGraphRustEvaluator,
+) -> dict[str, Any]:
+    """Return the exact input semantics already enforced by the evaluator."""
+
+    adapter_version = policy_entity_feature_adapter_version(evaluator.policy)
+    requested_adapter = evaluator.config.entity_feature_adapter_version
+    if requested_adapter != adapter_version:
+        raise RuntimeError(
+            "reanalysis evaluator feature adapter drift: "
+            f"checkpoint={adapter_version!r} runtime={requested_adapter!r}"
+        )
+    history_enabled, history_limit, history_schema = _policy_history_options(
+        evaluator.policy
+    )
+    return {
+        "entity_feature_adapter_version": adapter_version,
+        "public_observation": bool(evaluator.config.public_observation),
+        "action_context_fill": float(evaluator.config.context_fill),
+        "meaningful_public_history": bool(history_enabled),
+        "meaningful_public_history_schema": str(history_schema),
+        "event_history_limit": int(history_limit),
+    }
+
+
+def _feature_contract_manifest_fields(
+    feature_contract: dict[str, Any],
+) -> dict[str, Any]:
+    """Serialize one evaluator contract identically in every reanalysis CLI."""
+
+    return {
+        "adapter_version": feature_contract["entity_feature_adapter_version"],
+        "public_observation": feature_contract["public_observation"],
+        "action_context_fill": feature_contract["action_context_fill"],
+        "meaningful_public_history": feature_contract[
+            "meaningful_public_history"
+        ],
+        "meaningful_public_history_schema": feature_contract[
+            "meaningful_public_history_schema"
+        ],
+        "event_history_limit": feature_contract["event_history_limit"],
+    }
+
+
 def _mcts_row(
     game: Any,
     *,
@@ -275,6 +322,7 @@ def _mcts_row(
     decision_index: int,
     obs_width: int,
 ) -> dict[str, Any]:
+    feature_contract = _evaluator_feature_contract(evaluator)
     mapped = rust_policy_action_ids(
         game,
         legal_rust,
@@ -303,6 +351,17 @@ def _mcts_row(
         colors=COLORS,
         action_size=int(evaluator.policy.action_size),
         policy_action_ids=mapped,
+        public_observation=feature_contract["public_observation"],
+        meaningful_public_history=feature_contract[
+            "meaningful_public_history"
+        ],
+        history_limit=feature_contract["event_history_limit"],
+        meaningful_public_history_schema=feature_contract[
+            "meaningful_public_history_schema"
+        ],
+        entity_feature_adapter_version=feature_contract[
+            "entity_feature_adapter_version"
+        ],
     )
     features = {key: value[0] for key, value in entity.items()}
     context = rust_action_context_batch(
@@ -311,7 +370,12 @@ def _mcts_row(
         actor=str(game.current_color()),
         colors=COLORS,
         action_size=int(evaluator.policy.action_size),
+        fill=feature_contract["action_context_fill"],
         policy_action_ids=mapped,
+        public_observation=feature_contract["public_observation"],
+        entity_feature_adapter_version=feature_contract[
+            "entity_feature_adapter_version"
+        ],
     )[0]
     actual_vps = {
         color: _actual_victory_points(json.loads(game.player_state_json(color)))
@@ -329,7 +393,7 @@ def _mcts_row(
         "target_score_source": "rust_mcts_visit_q",
         "game_seed": np.int64(game_seed),
         "teacher_name": "rust_mcts_reanalysis",
-        "adapter_version": RUST_ENTITY_ADAPTER_VERSION,
+        "adapter_version": feature_contract["entity_feature_adapter_version"],
         "player": str(game.current_color()),
         "seat": np.int8(COLORS.index(str(game.current_color()))),
         "phase": str(json.loads(game.json_snapshot()).get("current_prompt", "")),

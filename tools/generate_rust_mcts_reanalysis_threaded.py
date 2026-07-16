@@ -13,13 +13,14 @@ from catan_zero.search import RustMCTS, RustMCTSConfig
 from catan_zero.search.neural_rust_mcts import (
     BatchedEntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
-    RUST_ENTITY_ADAPTER_VERSION,
 )
 from convert_teacher_to_entity_tokens import EntityShardWriter
 from generate_rust_mcts_reanalysis import (
     COLORS,
     _apply_action_with_sampled_chance,
     _csv_patterns,
+    _evaluator_feature_contract,
+    _feature_contract_manifest_fields,
     _game_outcome_fields,
     _mcts_row,
     _phase_selected,
@@ -99,6 +100,7 @@ def main() -> None:
         max_batch_size=int(args.batch_size),
         max_wait_ms=float(args.batch_wait_ms),
     )
+    feature_contract = _evaluator_feature_contract(evaluator)
 
     def reserve_game() -> int | None:
         with lock:
@@ -244,7 +246,9 @@ def main() -> None:
                     "progress": "threaded_rust_mcts_reanalysis",
                     "elapsed_sec": time.perf_counter() - started,
                     "rows_per_sec": float(payload["written_rows"]) / max(time.perf_counter() - started, 1.0e-9),
-                    "adapter_version": RUST_ENTITY_ADAPTER_VERSION,
+                    "adapter_version": feature_contract[
+                        "entity_feature_adapter_version"
+                    ],
                     "threads": int(args.threads),
                     "batch_size": int(args.batch_size),
                 }
@@ -281,7 +285,7 @@ def main() -> None:
             "max_depth": int(args.max_depth),
             "prior_temperature": float(args.prior_temperature),
             "value_scale": float(args.value_scale),
-            "adapter_version": RUST_ENTITY_ADAPTER_VERSION,
+            **_feature_contract_manifest_fields(feature_contract),
             "seed": int(args.seed),
             "threads": int(args.threads),
             "batch_size": int(args.batch_size),
