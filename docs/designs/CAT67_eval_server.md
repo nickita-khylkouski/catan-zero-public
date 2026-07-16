@@ -1,9 +1,9 @@
 # CAT-67 — Eval server / cross-game leaf batching (Phase D, profile-gated)
 
-**Status:** DESIGN-COMPLETE, BUILD-DEFERRED. This document is the deliverable for
-CAT-67. No production eval server is built by this ticket. Building is gated on a
-specific, measured trigger condition (see [BUILD TRIGGER](#build-trigger)) that
-consumes CAT-71's per-leaf profiler output.
+**Status:** PROTOTYPE BUILT; NATIVE FEATURE PATH COMMISSIONED. The historical
+build trigger fired after the Rust featurizer landed. Current acceptance is
+stricter: on the canonical native path, neural forward must account for at least
+50% of steady-state leaf wall time.
 
 **Linear:** [CAT-67](https://linear.app/catann/issue/CAT-67)
 · blocked by [CAT-65](https://linear.app/catann/issue/CAT-65) (Rust featurizer)
@@ -88,27 +88,23 @@ implementation*, not a change to search or to the existing batcher.
 
 ---
 
-## 3. Why the premise may already be dead (read before building)
+## 3. Measured premise after native featurization
 
-The Rust featurizer work (CAT-65 / task #81) is expected to leave the per-leaf
-cost split at roughly (CAT-71 baseline to validate against):
+The old Python-feature path measured neural forward at only about 4% of leaf
+cost. That number is historical and must not be used to describe the active
+path.
 
-- **GPU per-leaf ≈ 3.4 ms, of which NN forward is only ~4%; featurize + FFI ≈ 96%.**
-- CPU int8 ≈ 38 ms/eval, forward-pass-dominated.
+The accepted real-checkpoint B200 measurement in
+`docs/profiling/EVAL_FLAMEGRAPH_2026-07-11.md` is:
 
-Cross-game batching **only helps the NN-forward fraction** — it packs more leaves
-into one `forward_legal_np()`. If, after the Rust featurizer lands, featurize+FFI
-is still ~96% of GPU leaf cost, then even driving NN-forward to zero would cut
-leaf cost by ≤4%, and this entire architecture is not worth building on the GPU
-path. The CPU path (forward-dominated) is where cross-game batching could pay off,
-**if** generation is CPU-bound at that point.
+- total native-feature leaf p50: **4.500 ms**;
+- neural forward p50: **3.726 ms**;
+- neural share: **82.8%**.
 
-This is the single most important thing this design says: **do not build until
-CAT-71's post-Rust profile shows NN-forward is actually a meaningful, GPU-bound
-fraction of leaf cost.** The ticket's own scope text says the same
-("confirm this ticket's premise still holds after that work lands before
-investing heavily here"). This document exists so that when someone picks this up
-they re-run the profile *first* instead of trusting the pre-Rust 3.4ms number.
+The native feature path therefore already clears the current ≥50% acceptance
+target. Cross-game batching is now correctly aimed at the dominant neural
+portion, while native feature construction and the native MCTS loop reduce the
+remaining per-leaf and traversal boundaries.
 
 ---
 
@@ -239,11 +235,9 @@ Build CAT-67 (move from design-complete to active implementation) **only when
 all** of the following are measured true from CAT-71's standing per-leaf
 profiler output, on the post-Rust-featurizer (CAT-65) code:
 
-1. **NN-forward is a material fraction of leaf cost.** CAT-71's per-leaf split
-   (featurize / FFI / NN-forward / tree-op) shows **NN-forward ≥ 25%** of total
-   per-leaf time on the path generation actually runs. (Pre-Rust baseline was
-   ~4% on GPU — at ~4% this ticket is dead on the GPU path regardless of anything
-   else below.)
+1. **NN-forward dominates canonical leaf cost.** CAT-71's per-leaf split
+   (featurize / FFI / NN-forward / tree-op) shows **NN-forward ≥ 50%** of total
+   per-leaf time on the native path generation actually runs.
 2. **Generation is GPU-forward-bound, not featurize-bound.** After the Rust
    featurizer lands, featurize+FFI is **no longer the dominant** per-leaf term on
    the active path (i.e. featurize+FFI < NN-forward + tree-op), so that improving

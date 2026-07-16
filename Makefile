@@ -1,5 +1,5 @@
-# CAT-129 canonical test/CI gate.
-# `make test` = the ONE mandatory pre-deploy + post-deploy (CAT-130) check.
+# Explicit local/cluster acceptance gate. There is no GitHub Actions CI.
+# `make test` runs the optional broad pre-deploy + post-deploy check.
 # Exit 0 iff: full suite green (GPU tests self-skip; CAT-94 concat + modal
 # quarantined) AND champion no-op BIT-IDENTICAL AND featurizer parity 19/19
 # AND CAT-75 CLI goldens. See docs/TESTGATE.md.

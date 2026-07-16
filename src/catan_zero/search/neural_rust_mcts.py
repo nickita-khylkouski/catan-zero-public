@@ -130,7 +130,12 @@ class EntityGraphRustEvaluatorConfig:
     # payload -- that port is a separate phase. Default OFF = exact current
     # behavior; ON fails loudly (no silent fallback) if the installed wheel
     # lacks `build_entity_features_flat`.
-    rust_featurize: bool = False
+    # The native feature path is the canonical evaluator. Accepted B200
+    # evidence measures the real 35M forward at 3.726ms of a 4.500ms leaf
+    # (82.8% neural wall share), versus the legacy Python feature path where
+    # Python/FFI dominated. Historical replay may explicitly request False;
+    # new evaluator construction must not silently select the slow path.
+    rust_featurize: bool = True
     # CAT-61: surface the policy's value-uncertainty head to the searcher. When
     # True, evaluate()/evaluate_many() return a 3-tuple (priors, value,
     # uncertainty) instead of the default 2-tuple, where `uncertainty` is the

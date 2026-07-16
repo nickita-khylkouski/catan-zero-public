@@ -1,6 +1,7 @@
-# CAT-129 — canonical test/CI gate
+# CAT-129 — explicit local/cluster acceptance
 
-One command turns the v1.0-freeze clean run into a **repeatable** gate. This is
+One command turns the v1.0-freeze clean run into a **repeatable** acceptance
+check. It is intentionally invoked by an operator rather than by hosted CI. This is
 the mandatory **pre-deploy** check, the **post-deploy** check (CAT-130) run on
 each box, and the **re-gate** consolidator runs on every Wave-2 merge.
 

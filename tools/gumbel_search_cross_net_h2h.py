@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""CLI: cross-checkpoint search-vs-search H2H gate (gen-1 flywheel G1 gate).
+"""Internal/replay cross-checkpoint search-vs-search H2H executor.
+
+New production candidate-versus-champion panels use the nine-option
+``tools/evaluate.py`` entrypoint and a schema-versioned EvalConfig.
 
 Adapted from tools/gumbel_search_vs_raw_h2h.py (task #53 part 2), which plays
 GumbelChanceMCTS search vs the SAME checkpoint's raw policy to test whether
@@ -51,7 +54,11 @@ if str(_REPO_ROOT) not in sys.path:
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from catan_zero.rl.config_cli import add_config_flags, resolve_config  # noqa: E402
+from catan_zero.rl.config_cli import (  # noqa: E402
+    add_config_flags,
+    apply_config_file,
+    resolve_config,
+)
 from catan_zero.rl.entity_token_features_rust import (  # noqa: E402
     require_rust_feature_path,
 )
@@ -1003,7 +1010,7 @@ def _build_evaluator(
             value_squash=value_squash,
             value_readout=value_readout,
             public_observation=bool(worker_args.get("public_observation", False)),
-            rust_featurize=bool(worker_args.get("evaluator_rust_featurize", False)),
+            rust_featurize=bool(worker_args.get("evaluator_rust_featurize", True)),
             emit_uncertainty=bool(worker_args.get("evaluator_emit_uncertainty", False)),
         ),
     )
@@ -1473,9 +1480,10 @@ def _validate_information_set_recipe(args: Any) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Cross-checkpoint H2H gate: candidate checkpoint vs baseline checkpoint, "
-        "both using GumbelChanceMCTS search with identical config by default; "
-        "role-specific budget/c_scale flags are explicit search-operator overrides."
+        description=(
+            "INTERNAL/REPLAY cross-checkpoint H2H executor. New production "
+            "panels use tools/evaluate.py with a schema-versioned config."
+        )
     )
     parser.add_argument("--candidate", required=True, help="Candidate checkpoint path.")
     parser.add_argument("--baseline", required=True, help="Baseline checkpoint path.")
@@ -1864,10 +1872,11 @@ def main() -> None:
     parser.add_argument(
         "--evaluator-rust-featurize",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Build entity and legal-action context tensors with the bit-exact "
-            "native featurizer. Opt-in and fail-closed; no Python fallback."
+            "native featurizer. Default on and fail-closed; authenticated "
+            "historical Python-feature replay must pass the explicit negative flag."
         ),
     )
     parser.add_argument("--base-seed", type=int, default=1)
@@ -1918,6 +1927,16 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     add_config_flags(parser, default_purpose="gumbel_search_cross_net_h2h")
     args = parser.parse_args()
+    # Config is the canonical science input. Apply it before any validation or
+    # derived-role resolution; the previous late application validated parser
+    # defaults and could then enable native/coherent modes after their
+    # capability checks had already been skipped.
+    apply_config_file(
+        args,
+        parser,
+        argv=sys.argv[1:],
+        expected_pipeline=EvalConfig.PIPELINE,
+    )
     for role in ("candidate", "baseline"):
         threshold = getattr(args, f"{role}_raw_policy_above_width")
         if threshold is not None and int(threshold) < 0:
@@ -2010,11 +2029,7 @@ def main() -> None:
             ],
         )
 
-    eval_config = resolve_config(
-        args,
-        _build_eval_config,
-        parser=parser,
-    )
+    eval_config = resolve_config(args, _build_eval_config)
     eval_config_hash = eval_config.config_hash()
     eval_full_config_hash = eval_config.full_config_hash()
     candidate_checkpoint_sha256 = _checkpoint_sha256(args.candidate)

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CAT-129 canonical test/CI gate — the ONE mandatory pre-deploy + post-deploy
+# CAT-129 explicit local/cluster acceptance — the mandatory pre/post-deploy
 # (CAT-130) check, and consolidator's Wave-2 re-gate. Exit 0 IFF ALL stages pass:
 #   suite  — full pytest suite green (GPU tests self-skip; CAT-94 concat + modal
 #            collection-quarantined via conftest.py). This is the comprehensive

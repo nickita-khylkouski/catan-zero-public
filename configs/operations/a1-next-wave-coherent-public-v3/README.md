@@ -60,36 +60,17 @@ learner and retains a digest-bound checkpoint for every epoch.
 Generate through the sealed pre-wave control plane. For a direct lane command:
 
 ```bash
-"$PY" tools/generate_gumbel_selfplay_data.py \
-  --config configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema17.json \
-  --prelaunch-guard-config configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json \
+"$PY" tools/generate.py \
+  --config configs/generation/coherent_public_n128.schema17.json \
+  --guard configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json \
   --checkpoint "$CHECKPOINT" --out-dir "$OUT" \
   --base-seed "$BASE_SEED" --games "$GAMES" --workers "$WORKERS" \
-  --ledger-claim-label "$CLAIM_ID" --device cuda \
-  --track 2p_no_trade --vps-to-win 10 --format npz --score-actions \
-  --n-full 128 --n-fast 16 --p-full 0.25 \
-  --c-visit 50.0 --c-scale 0.1 --sigma-eval 0.79 \
-  --max-decisions 600 --max-depth 80 \
-  --temperature-clock nonforced_choice --temperature-decisions 40 \
-  --temperature-high 1.0 --temperature-low 0.0 \
-  --late-temperature-decisions 100 --late-temperature 0.1 \
-  --public-observation --coherent-public-belief-search \
-  --no-information-set-search --no-belief-chance-spectra \
-  --determinization-particles 1 --determinization-min-simulations 32 \
-  --correct-rust-chance-spectra --lazy-interior-chance \
-  --symmetry-averaged-eval --symmetry-averaged-eval-threshold 20 \
-  --no-exact-budget-sh --exact-budget-sh-min-n 0 \
-  --native-mcts-hot-loop --forced-root-target-mode trajectory_only \
-  --target-reliability-audit-fraction 0.05 \
-  --target-reliability-audit-seed 20260716 \
-  --preserve-search-evidence \
-  --record-automatic-transitions \
-  --meaningful-public-history --event-history-limit 64 \
-  --learner-entity-feature-adapter-version \
-    rust_entity_adapter_v5_meaningful_history_v2 \
-  --rust-featurize --eval-cache-size 0 \
-  --dump-config "$OUT/config.json" --config-purpose a1-next-wave-coherent-public-v3
+  --claim-label "$CLAIM_ID"
 ```
+
+`tools/generate_gumbel_selfplay_data.py` remains the internal historical replay
+executor. New launches must not address its experiment-by-flag interface
+directly; the schema-17 config above is the complete science contract.
 
 Post-wave admission must prove every worker used teacher v2 and emitted learner
 rows v5, with the legacy `adapter_version` row column equal to the learner

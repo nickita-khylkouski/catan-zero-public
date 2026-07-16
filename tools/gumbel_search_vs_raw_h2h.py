@@ -83,7 +83,7 @@ def _build_evaluator_config(worker_args: dict[str, Any]) -> EntityGraphRustEvalu
         value_squash=str(worker_args.get("value_squash", "tanh")),
         value_readout=str(worker_args.get("value_readout", "scalar")),
         public_observation=bool(worker_args.get("public_observation", False)),
-        rust_featurize=bool(worker_args.get("evaluator_rust_featurize", False)),
+        rust_featurize=bool(worker_args.get("evaluator_rust_featurize", True)),
     )
 
 
@@ -407,8 +407,12 @@ def main() -> None:
     parser.add_argument(
         "--evaluator-rust-featurize",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use the bit-exact native entity/action featurizer; fail closed if unavailable.",
+        default=True,
+        help=(
+            "Use the bit-exact native entity/action featurizer (default); fail "
+            "closed if unavailable. Historical Python-feature replay must pass "
+            "--no-evaluator-rust-featurize explicitly."
+        ),
     )
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(

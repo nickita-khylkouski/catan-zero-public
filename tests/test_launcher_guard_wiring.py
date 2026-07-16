@@ -36,6 +36,7 @@ import continuous_flywheel  # type: ignore  # noqa: E402
 import generate_gumbel_selfplay_data as gen_cli  # type: ignore  # noqa: E402
 import launcher_guards  # type: ignore  # noqa: E402
 import prelaunch_guard  # type: ignore  # noqa: E402
+import train as train_cli  # type: ignore  # noqa: E402
 import train_bc  # type: ignore  # noqa: E402
 
 VAL_ONLY_SEED = 6_195_000_000  # inside prelaunch_guard.VAL_ONLY_SEED_RANGE
@@ -48,6 +49,17 @@ VAL_ONLY_SEED = 6_195_000_000  # inside prelaunch_guard.VAL_ONLY_SEED_RANGE
 # ---------------------------------------------------------------------------
 
 GOLDEN_OPTION_STRINGS = {
+    "train": {
+        ("--allow-concurrent-bc",),
+        ("--checkpoint",),
+        ("--config",),
+        ("--data",),
+        ("--device",),
+        ("--help", "-h"),
+        ("--host-lock-file",),
+        ("--init-checkpoint",),
+        ("--report",),
+    },
     "generate_gumbel_selfplay_data": {
         ("--base-seed",),
         ("--belief-chance-spectra", "--no-belief-chance-spectra"),
@@ -372,22 +384,21 @@ def _option_strings(parser: argparse.ArgumentParser) -> set[tuple[str, ...]]:
     }
 
 
-@pytest.mark.parametrize(
-    "module, launcher",
-    [
-        (gen_cli, "generate_gumbel_selfplay_data"),
-        (train_bc, "train_bc"),
-        (continuous_flywheel, "continuous_flywheel"),
-    ],
-)
-def test_build_parser_option_strings_match_golden_set(module, launcher):
-    parser = module.build_parser()
-    assert _option_strings(parser) == GOLDEN_OPTION_STRINGS[launcher]
+def test_canonical_train_cli_has_at_most_ten_options() -> None:
+    """The old exact-flag golden fossilized experimental parser growth.
+
+    New training runs have one intentionally small config-first surface.
+    Internal compatibility parsers are not a supported product interface.
+    """
+
+    options = _option_strings(train_cli.build_parser())
+    assert options == GOLDEN_OPTION_STRINGS["train"]
+    assert len(options - {("--help", "-h")}) <= 10
 
 
 @pytest.mark.parametrize(
     "module",
-    [gen_cli, train_bc, continuous_flywheel],
+    [gen_cli, train_cli, continuous_flywheel],
 )
 def test_build_parser_is_import_safe_and_side_effect_free(module):
     """Calling build_parser() twice must not raise or leak state -- pure
@@ -512,7 +523,10 @@ def test_static_guard_config_critical_flags_are_not_stale(module, launcher):
 def _write_fake_checkpoint(path: Path, *, mask_hidden_info: bool) -> None:
     import torch
 
-    torch.save({"mask_hidden_info": mask_hidden_info, "model": {}}, path)
+    torch.save(
+        {"mask_hidden_info": mask_hidden_info, "config": {}, "model": {}},
+        path,
+    )
 
 
 def _write_generation_manifest(data_dir: Path, *, base_seed: int, games: int) -> None:
@@ -1059,13 +1073,17 @@ def test_train_bc_config_values_count_as_explicit_guard_inputs(tmp_path):
     assert result.passed, result.reason
 
 
-def test_train_bc_checkpoint_topology_runs_before_memmap_preflight(monkeypatch):
+def test_train_bc_checkpoint_topology_runs_before_memmap_preflight(
+    monkeypatch, tmp_path
+):
     """A warm-start topology mismatch must not first hash the data payload."""
 
     class TopologyRefused(RuntimeError):
         pass
 
     preflight_calls: list[object] = []
+    init_checkpoint = tmp_path / "init.pt"
+    _write_fake_checkpoint(init_checkpoint, mask_hidden_info=False)
     monkeypatch.setattr(launcher_guards, "run_or_refuse", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         train_bc, "_resolve_effective_value_categorical_bins", lambda args: 0
@@ -1091,7 +1109,7 @@ def test_train_bc_checkpoint_topology_runs_before_memmap_preflight(monkeypatch):
                 "--data-format",
                 "memmap",
                 "--init-checkpoint",
-                "/does/not/need/to/exist.pt",
+                str(init_checkpoint),
                 "--checkpoint",
                 "/does/not/need/to/exist-output.pt",
                 "--report",

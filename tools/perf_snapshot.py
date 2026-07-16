@@ -17,10 +17,10 @@ leaf
     checkpoint instead -- required for a real baseline-reproduction claim,
     see the docstring on `_baseline_check`).
 
-    Known baseline to validate against (docs/plans/
-    CATAN_ZERO_RESEARCH_CHRONICLE.md section 10.1 / 10.2): GPU per-leaf
-    ~3.4ms with NN at only ~4% of that (featurize+FFI = ~96%); CPU int8
-    ~38ms/eval, forward-pass dominated.
+    The historical Python-feature GPU baseline had NN at only ~4% of leaf
+    latency.  The canonical native-feature acceptance target is now the
+    opposite: neural forward must account for at least 50% of measured
+    steady-state leaf wall time.
 
     Example (dev smoke test, tiny policy, fast):
         tools/perf_snapshot.py leaf --device cpu --num-evals 32
@@ -87,10 +87,19 @@ def _policy_id_from_path(path: str) -> str:
 # --- leaf mode ---------------------------------------------------------------
 
 
-def _baseline_check(stage_pct: dict[str, float], *, device: str, has_real_checkpoint: bool) -> dict[str, Any]:
-    """Compare a measured stage-percentage split against the documented
-    baseline (GPU: NN forward ~4%, featurize+FFI ~96%; CPU: forward-pass
-    dominated). Only meaningful with a real (not tiny-fast-policy)
+def _baseline_check(
+    stage_pct: dict[str, float],
+    *,
+    device: str,
+    has_real_checkpoint: bool,
+    rust_featurize: bool = False,
+) -> dict[str, Any]:
+    """Evaluate a measured split against the active-path acceptance regime.
+
+    The legacy Python-feature GPU path is retained as a diagnostic baseline.
+    The canonical Rust-feature path passes only when neural forward is at
+    least half of steady-state leaf wall time. Only meaningful with a real
+    (not tiny-fast-policy)
     checkpoint -- bench_leaf_eval_batching.py's own docstring notes the fast
     policy's forward pass (~1ms) is deliberately too small to reproduce the
     CPU-forward-dominated regime, so `matches_baseline` is left `None`
@@ -111,12 +120,20 @@ def _baseline_check(stage_pct: dict[str, float], *, device: str, has_real_checkp
     )
     is_gpu = device.startswith("cuda") or device == "gpu"
     if is_gpu:
-        expected_regime = "gpu"
-        notes = (
-            "expect featurize+FFI to dominate (~96%), NN forward small (~4%) "
-            "per CATAN_ZERO_RESEARCH_CHRONICLE.md section 10.1/10.2"
-        )
-        matches = nn_pct <= 15.0 and featurize_ffi_pct >= 80.0
+        if rust_featurize:
+            expected_regime = "gpu_native_features"
+            notes = (
+                "canonical native-feature acceptance requires neural forward "
+                "to account for >=50% of steady-state leaf wall time"
+            )
+            matches = nn_pct >= 50.0
+        else:
+            expected_regime = "gpu_legacy_python_features"
+            notes = (
+                "legacy diagnostic baseline: featurize+FFI dominates and NN "
+                "forward is small; this path is not the production target"
+            )
+            matches = nn_pct <= 15.0 and featurize_ffi_pct >= 80.0
     else:
         expected_regime = "cpu"
         notes = (
@@ -329,7 +346,12 @@ def profile_leaf_eval(
         "topology_bootstrap_ms": (
             perf_common.summarize_latencies(topology_bootstrap_ms) if rust_featurize else None
         ),
-        "baseline_check": _baseline_check(stage_pct, device=device, has_real_checkpoint=bool(checkpoint)),
+        "baseline_check": _baseline_check(
+            stage_pct,
+            device=device,
+            has_real_checkpoint=bool(checkpoint),
+            rust_featurize=bool(rust_featurize),
+        ),
         "key": perf_common.stable_key(
             "leaf", device, checkpoint_label, bool(rust_featurize), _now_iso(), os.getpid()
         ),

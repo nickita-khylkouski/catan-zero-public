@@ -351,7 +351,7 @@ def _build_evaluator(checkpoint: str, worker_args: dict[str, Any]) -> Any:
             prior_temperature=float(worker_args["prior_temperature"]),
             value_squash=str(worker_args.get("value_squash", "tanh")),
             public_observation=bool(worker_args.get("public_observation", False)),
-            rust_featurize=bool(worker_args.get("evaluator_rust_featurize", False)),
+            rust_featurize=bool(worker_args.get("evaluator_rust_featurize", True)),
         ),
     )
 
@@ -565,10 +565,11 @@ def main() -> None:
     parser.add_argument(
         "--evaluator-rust-featurize",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Build entity and legal-action context tensors with the bit-exact "
-            "native featurizer. Opt-in and fail-closed; no Python fallback."
+            "native featurizer (default) and fail closed; historical Python-"
+            "feature replay must pass the explicit negative flag."
         ),
     )
     parser.add_argument("--base-seed", type=int, default=1)

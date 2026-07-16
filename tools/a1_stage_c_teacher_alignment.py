@@ -358,7 +358,7 @@ def _complete_effective_evaluator_config(
         "prior_temperature": float(fields.get("prior_temperature", 1.0)),
         "value_readout": str(fields.get("value_readout", "scalar")),
         "public_observation": bool(fields.get("public_observation", False)),
-        "rust_featurize": bool(fields.get("rust_featurize", False)),
+        "rust_featurize": bool(fields.get("rust_featurize", True)),
     }
     resolved = dataclasses.asdict(EntityGraphRustEvaluatorConfig(**kwargs))
     # Cache capacity changes storage/layout only.  Every other resolved field

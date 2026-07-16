@@ -11,7 +11,7 @@
 |------|--------|
 | Type | Single Python package plus research/operations tools |
 | Main Framework | Python 3.11, NumPy, PyTorch, Catanatron, and `catanatron_rs` |
-| API Style | CLI-driven research pipeline; in-process environment/search contracts |
+| API Style | Config-first production pipeline; compact launch CLIs and in-process environment/search contracts |
 | Database | Filesystem artifacts: NPZ shards, memmap corpora, JSON/JSONL registries |
 | Auth | SSH fleet config outside the repository; no application auth layer |
 | Where to start | `src/catan_zero/search` for MCTS, `src/catan_zero/rl` for simulation/training, `tools/` for pipelines |
@@ -43,13 +43,13 @@
 
 ### `multiprocessing` + native/MPS inference
 - **Category:** Parallel inference
-- **How it's used here:** Independent game workers retain CPU parallelism. The current generator supports direct per-process CUDA/MPS operation and retains EvalServer as an experimental batching path.
-- **What you need to follow:** One generator belongs to one physical GPU. Do not assume the legacy EvalServer path is the commissioned production operator without checking the current science contract.
+- **How it's used here:** Independent game workers retain CPU parallelism. Native Rust search and feature construction feed CUDA inference; the current generator supports direct per-process CUDA/MPS operation and retains EvalServer as a measured batching alternative.
+- **What you need to follow:** One generator belongs to one physical GPU. Native feature construction is the default. Do not silently return to the Python/JSON feature path.
 
-### pytest + canonical shell gate
+### Explicit local/cluster verification
 - **Category:** Verification
-- **How it's used here:** `make test` runs the champion no-op, native feature parity, CLI goldens, and the main suite.
-- **What you need to follow:** Performance-only changes still require semantic parity. Search-policy changes additionally require paired H2H gates.
+- **How it's used here:** Targeted local commands and cluster acceptance runs verify the changed subsystem. GitHub Actions are intentionally absent.
+- **What you need to follow:** Performance-only changes still require semantic parity. Search-policy changes additionally require paired H2H gates. Do not rebuild a broad CI matrix.
 
 ---
 
@@ -65,15 +65,16 @@ The repository also contains a richer 2–4 player Python environment with struc
 
 ```text
 Fleet launcher
+  → tools/generate.py + one checked-in science config
   → one generator per physical GPU
   → multiprocessing game workers
-  → catanatron_rs.Game
-  → Python GumbelChanceMCTS
+  → catanatron_rs.Game + native Gumbel MCTS
   → native entity/context features
   → batched EntityGraphPolicy forward
   → NPZ decision shards
   → curated memmap corpus
-  → train_bc.py via 8-rank B200 DDP
+  → tools/train.py + one checked-in learner config via 8-rank B200 DDP
+  → tools/evaluate.py + one checked-in evaluator config
   → paired H2H + SPRT/promotion gate
   → generator/public champion registries
 ```
@@ -131,10 +132,13 @@ Fleet launcher
 
 ### `/tools`
 - **Owns:** Generation, training, evaluation, curation, profiling, gates, and experiment orchestration.
-- **Entry point:** There is no single entry point; use the task-specific CLI.
+- **Entry point:** Use the compact production launchers `generate.py`, `train.py`, and `evaluate.py`.
 - **Key files:**
-  - `generate_gumbel_selfplay_data.py` — production generation CLI.
-  - `train_bc.py` — behavior-cloning/DDP/FSDP trainer.
+  - `generate.py` — nine-option config-first generation launcher.
+  - `train.py` — eight-option config-first learner launcher.
+  - `evaluate.py` — nine-option config-first candidate/champion evaluator.
+  - `generate_gumbel_selfplay_data.py` — internal generation/replay engine.
+  - `train_bc.py` — internal behavior-cloning/DDP/FSDP engine; it is not a supported CLI.
   - `a1_scratch_train.py` — current native-v5 scratch-plan executor.
   - `a1_current_science_contract.py` — current search/learner authority.
   - `a1_iteration_orchestrator.py` — durable turn state machine; currently not connected to the from-scratch executor.
@@ -154,14 +158,14 @@ Fleet launcher
 
 ### `/configs`
 - **Owns:** Typed pipeline settings, guard expectations, and experiment manifests.
-- **Entry point:** `configs/RECOMMENDED_FLAGS.md`
-- **Key files:** Guard JSON under `configs/guards/` and self-play/opponent manifests.
+- **Entry point:** `configs/generation/`, `configs/training/`, and `configs/eval/`.
+- **Key files:** The canonical generation, learner, and evaluator JSON documents plus guard JSON under `configs/guards/`.
 - **Connects to:** Prelaunch guards and config-hash registry.
 - **Contribute here if:** A production default or explicit safety invariant changes.
 
 ### `/tests`
 - **Owns:** Rule, feature, search, training, gate, CLI, provenance, and fleet regressions.
-- **Entry point:** `make test`
+- **Entry point:** Run the smallest subsystem-specific command that exercises the change.
 - **Key files:** Test selection follows the modified subsystem; native parity tests are mandatory for feature-path work.
 - **Connects to:** All modules and release acceptance.
 - **Contribute here if:** Any code behavior changes.
@@ -187,6 +191,11 @@ Fleet launcher
 - **Current evidence:** Production generation has used direct per-GPU MPS workers; EvalServer remains available but is not the current sealed default.
 - **Action:** Read the current operation contract before changing inference topology.
 
+### [HIGH CONFIDENCE] Native feature construction is the current default
+- **Evidence:** The canonical generation/evaluation configs and evaluator dataclass select Rust features. Accepted B200 evidence measures neural forward at 3.726 ms of a 4.500 ms native-feature leaf, or 82.8%.
+- **If correct →** Treat the older 4%-neural profile as historical evidence for the retired Python-feature path.
+- **Verify:** `docs/profiling/EVAL_FLAMEGRAPH_2026-07-11.md`, `tools/perf_snapshot.py`, and `src/catan_zero/search/neural_rust_mcts.py`.
+
 ### [MEDIUM CONFIDENCE] Eval cache should be disabled for volume self-play
 - **Evidence:** Code comments and prior profiles report negligible transpositions but nonzero snapshot hashing/key cost.
 - **If correct →** Use `--eval-cache-size 0` for independent self-play generation.
@@ -209,7 +218,7 @@ Fleet launcher
 
 ### Must-Know Patterns
 1. **Performance-only versus search-semantic changes** — only the former can use parity alone; the latter need paired strength gates.
-2. **Explicit production configuration** — masking, seed ranges, c-scale, temperature, chance handling, and feature path must not rely on parser defaults.
+2. **Config-first production configuration** — masking, search, architecture, optimizer, and feature settings live in complete checked-in typed configs. The public CLI is only run identity and placement.
 3. **One owner and one canonical path per box** — use alias-based fleet tools, fresh outputs, explicit PIDs, and heartbeat supervision.
 
 ### Common Mistakes to Avoid
@@ -227,10 +236,11 @@ Fleet launcher
 
 **To contribute here, start with:**
 1. `tools/fleet/fleet_launch.sh` — physical GPU/process placement and guarded production configuration.
-2. `tools/generate_gumbel_selfplay_data.py` — worker orchestration and manifest contract.
-3. `src/catan_zero/rl/gumbel_self_play.py` — game loop and decision rows.
-4. `src/catan_zero/search/gumbel_chance_mcts.py` — simulation traversal and search semantics.
-5. `src/catan_zero/search/neural_rust_mcts.py` — native features and neural leaf evaluation.
+2. `tools/generate.py` — canonical generation interface and accepted science config.
+3. `tools/generate_gumbel_selfplay_data.py` — internal worker orchestration and manifest engine.
+4. `src/catan_zero/rl/gumbel_self_play.py` — game loop and decision rows.
+5. `src/catan_zero/search/native_gumbel_mcts.py` — production native traversal.
+6. `src/catan_zero/search/neural_rust_mcts.py` — native features and neural leaf evaluation.
 
 **Before touching this feature:**
 - Preserve seed determinism, hidden-information boundaries, forced-action weights, chance spectra, and pre-action feature capture.

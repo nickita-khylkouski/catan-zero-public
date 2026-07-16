@@ -11676,14 +11676,21 @@ def _bind_composite_validation_provenance(
     )
 
 
-def main(argv: Sequence[str] | None = None) -> None:
+def main(
+    argv: Sequence[str] | argparse.Namespace | None = None,
+) -> None:
     global _PUBLIC_AWARD_FEATURE_CONTRACT, _PUBLIC_CARD_COUNT_FEATURES_ENABLED
     checkout_runtime_binding = _assert_checkout_runtime_binding()
     initial_checkout_runtime_binding = checkout_runtime_binding
     parser = build_parser()
-    args = parser.parse_args(argv)
+    canonical_namespace = isinstance(argv, argparse.Namespace)
+    args = argv if canonical_namespace else parser.parse_args(argv)
     args.checkout_runtime_binding = checkout_runtime_binding
-    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    raw_argv = (
+        list(getattr(args, "_canonical_guard_argv", ()))
+        if canonical_namespace
+        else (list(argv) if argv is not None else sys.argv[1:])
+    )
     # Resolve file-supplied architecture values before derived defaults and
     # checkpoint inheritance. ``resolve_config`` calls this again later, which
     # is idempotent; doing it here prevents a config's categorical-bin/width
@@ -39110,4 +39117,7 @@ def _write_entity_checkpoint(
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        "tools/train_bc.py is an internal training engine, not a supported CLI. "
+        "Launch new runs with tools/train.py and a checked-in canonical config."
+    )

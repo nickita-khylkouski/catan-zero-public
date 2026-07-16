@@ -660,7 +660,7 @@ def _build_evaluator(worker_args: dict[str, Any]) -> Any:
             value_squash=str(worker_args["value_squash"]),
             value_readout=str(worker_args["value_readout"]),
             public_observation=bool(worker_args["public_observation"]),
-            rust_featurize=bool(worker_args.get("evaluator_rust_featurize", False)),
+            rust_featurize=bool(worker_args.get("evaluator_rust_featurize", True)),
             emit_uncertainty=bool(worker_args.get("evaluator_emit_uncertainty", False)),
         ),
     )

@@ -82,15 +82,15 @@ def test_native_feature_path_rejects_stale_adapter_abi(
 
 
 def test_eval_config_hash_seals_native_feature_choice() -> None:
-    reference = EvalConfig(mode="cross_net", candidate="a.pt", baseline="b.pt")
-    native = EvalConfig(
+    native = EvalConfig(mode="cross_net", candidate="a.pt", baseline="b.pt")
+    legacy_python = EvalConfig(
         mode="cross_net",
         candidate="a.pt",
         baseline="b.pt",
-        evaluator_rust_featurize=True,
+        evaluator_rust_featurize=False,
     )
-    assert reference.evaluator_rust_featurize is False
-    assert native.config_hash() != reference.config_hash()
+    assert native.evaluator_rust_featurize is True
+    assert native.config_hash() != legacy_python.config_hash()
 
 
 def test_neutral_harness_seals_native_feature_path_in_recipe() -> None:

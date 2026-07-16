@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""CLI: generate Gumbel self-play training shards.
+"""Internal/replay executor for Gumbel self-play training shards.
 
 Plays full 2p self-play games with `catan_zero.rl.gumbel_self_play.play_one_game`
 (both seats searched with `GumbelChanceMCTS`), writing entity-token shards
-compatible with `tools/train_bc.py`'s loader. See
+compatible with `tools/train_bc.py`'s loader. New production launches use the
+nine-option config-first ``tools/generate.py`` entrypoint; this large parser is
+retained only so authenticated historical commands and specialized R&D
+executors remain replayable. See
 `src/catan_zero/rl/gumbel_self_play.py` for the driver/schema details.
 
 Note: `tools/build_combined_entity_manifest.py` (referenced as the tool this
@@ -510,7 +513,10 @@ def _guard_argv_with_config_values(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate entity-token self-play shards via Gumbel + true-chance-node MCTS."
+        description=(
+            "INTERNAL/REPLAY executor. New runs use tools/generate.py with a "
+            "schema-versioned config."
+        )
     )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--games", type=int, default=8)
@@ -798,14 +804,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--evaluator-rust-featurize",
         dest="rust_featurize",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Build the ENTITY-TOKEN arrays via the native Rust featurizer "
         "(catanatron_rs.build_entity_features_flat) instead of the Python "
         "per-token loops (task #81). Bit-exact parity-gated (see "
         "entity_token_features_rust.py + tests/test_rust_featurize_parity.py); "
         "fails loudly, no silent fallback, if the installed wheel lacks the "
         "Rust featurizer. Threads to EntityGraphRustEvaluatorConfig.rust_featurize. "
-        "Default off = exact current behavior. Requires the gen-3 Rust wheel "
+        "Default on; authenticated historical Python-feature replay must pass "
+        "--no-rust-featurize explicitly. Requires the gen-3 Rust wheel "
         "(see docs/GEN3_WHEEL_SYNC_RUNBOOK.md) -- passing --rust-featurize "
         "against an older wheel that predates this function raises an error at "
         "the first leaf eval rather than silently falling back.",

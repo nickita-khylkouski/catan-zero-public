@@ -529,7 +529,10 @@ class GenerateConfig(PipelineConfig):
     # Evaluator/transport choices can change batching composition and numeric
     # results, so they are part of provenance rather than "mere performance"
     # flags. In particular TF32 was measured to diverge self-play trajectories.
-    rust_featurize: bool = False
+    # Native featurization is the canonical production evaluator path. Legacy
+    # sealed replay manifests bind False explicitly; an omitted setting on a
+    # new run must not fall back to the Python/JSON hot path.
+    rust_featurize: bool = True
     eval_server: bool = False
     eval_server_max_batch: int = 64
     eval_server_max_neural_rows: int | None = None
@@ -727,7 +730,9 @@ class EvalConfig(PipelineConfig):
     variance_aware_closed_form_js: bool = False
     evaluator_context_fill: float = 0.0
     evaluator_cache_size: int = 0
-    evaluator_rust_featurize: bool = False
+    # Match generation: new evaluations use the native feature surface unless
+    # a historical replay contract explicitly binds the legacy path.
+    evaluator_rust_featurize: bool = True
     evaluator_emit_uncertainty: bool = False
 
     @classmethod
