@@ -72,6 +72,7 @@ from catan_zero.rl.entity_token_features import (
 )
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
     checkpoint_entity_feature_adapter_metadata,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
@@ -4818,6 +4819,28 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
                 raise SystemExit(
                     "memmap composite v2 cannot mix entity feature adapter semantics"
                 )
+            for component_id, component in zip(
+                component_ids, components, strict=True
+            ):
+                corpus_meta = component["corpus_meta"]
+                assert isinstance(corpus_meta, dict)
+                columns = corpus_meta.get("columns")
+                stored_adapter = (
+                    isinstance(columns, dict) and "adapter_version" in columns
+                )
+                version = entity_feature_adapter_component_versions[component_id]
+                if (
+                    not stored_adapter
+                    and version != LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION
+                ):
+                    raise SystemExit(
+                        "memmap composite v2 cannot backfill a current/future "
+                        "entity-adapter version onto rows with no stored "
+                        "adapter_version: "
+                        f"component={component_id!r} descriptor={version!r}; only "
+                        "the explicit legacy missing-metadata mapping "
+                        f"{LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION!r} is allowed"
+                    )
         raw_value_ids = descriptor.get("value_training_component_ids", component_ids)
         if (
             not isinstance(raw_value_ids, list)

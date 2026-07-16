@@ -19,6 +19,9 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_VERSION_KEY,
     AUX_TARGET_KEYS,
 )
+from catan_zero.rl.entity_feature_adapter import (
+    LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
+)
 
 
 # These columns were added after the original gen3 corpus was converted. Their
@@ -530,6 +533,13 @@ class ConcatMemmapCorpus:
                             )
                 elif key == "adapter_version" and adapter_versions is not None:
                     value = adapter_versions[index]
+                    if value != LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION:
+                        raise SystemExit(
+                            "component without stored adapter_version may only use the "
+                            "explicit legacy missing-metadata mapping: "
+                            f"component={index} descriptor={value!r} "
+                            f"legacy={LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION!r}"
+                        )
                     column = _ConstantColumn(
                         corpus.row_count, value, f"<U{max(1, len(value))}"
                     )

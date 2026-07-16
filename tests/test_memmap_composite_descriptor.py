@@ -86,6 +86,7 @@ def _descriptor_v2(
     policy_distillation_component_ids: list[str] | None = None,
     policy_aux_phase_sampling_weights: dict[str, float] | None = None,
     stored_policy_component_temperatures: dict[str, float] | None = None,
+    entity_feature_adapter_component_versions: dict[str, str] | None = None,
     value_training_component_ids: list[str] | None = None,
     aux_subgoal_component_ids: list[str] | None = None,
 ) -> Path:
@@ -122,6 +123,10 @@ def _descriptor_v2(
     if stored_policy_component_temperatures is not None:
         payload["stored_policy_component_temperatures"] = (
             stored_policy_component_temperatures
+        )
+    if entity_feature_adapter_component_versions is not None:
+        payload["entity_feature_adapter_component_versions"] = (
+            entity_feature_adapter_component_versions
         )
     if value_training_component_ids is not None:
         payload["value_training_component_ids"] = value_training_component_ids
@@ -213,6 +218,36 @@ def test_v2_authenticates_stored_policy_component_temperatures(tmp_path):
 
     corpus = train_bc.load_teacher_data_memmap(path, composite_meta=verified)
     assert corpus.stored_policy_component_temperatures == temperatures
+
+
+def test_v2_descriptor_cannot_synthesize_current_adapter_to_bypass_schema_gate(
+    tmp_path,
+):
+    component_ids = ("n128", "n256", "gen3")
+    legacy = "rust_entity_adapter_v2_land_topology_ports_maritime"
+    current = "rust_entity_adapter_v3_structured_action_resources"
+    path = _descriptor_v2(
+        tmp_path,
+        entity_feature_adapter_component_versions={
+            component_id: legacy for component_id in component_ids
+        },
+    )
+    verified = train_bc._preflight_memmap_composite_descriptor(path)
+    assert verified["entity_feature_adapter_component_versions"] == {
+        component_id: legacy for component_id in component_ids
+    }
+    corpus = train_bc.load_teacher_data_memmap(path, composite_meta=verified)
+    assert corpus["adapter_version"].present_values() == {legacy}
+
+    payload = json.loads(path.read_text())
+    payload["entity_feature_adapter_component_versions"] = {
+        component_id: current for component_id in component_ids
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(
+        SystemExit, match="cannot backfill a current/future entity-adapter version"
+    ):
+        train_bc._preflight_memmap_composite_descriptor(path)
 
 
 @pytest.mark.parametrize(

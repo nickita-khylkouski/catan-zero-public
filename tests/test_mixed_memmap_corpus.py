@@ -386,6 +386,19 @@ def test_authenticated_adapter_version_backfills_only_legacy_component():
         )
 
 
+def test_adapter_version_backfill_refuses_current_semantics_without_stored_rows():
+    module = _module()
+    current = "rust_entity_adapter_v3_structured_action_resources"
+
+    with pytest.raises(
+        SystemExit, match="may only use the explicit legacy missing-metadata mapping"
+    ):
+        module.ConcatMemmapCorpus(
+            [_Corpus(0, 2), _Corpus(2, 3)],
+            component_adapter_versions=[current, current],
+        )
+
+
 def test_invalid_indices_match_numpy_fail_closed_behavior(composite):
     mixed, _, _ = composite
     with pytest.raises(IndexError):
