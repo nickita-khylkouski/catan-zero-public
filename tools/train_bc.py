@@ -12860,6 +12860,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         train_indices = np.asarray(split_result["train"], dtype=np.int64)
         validation_indices = np.asarray(split_result["validation"], dtype=np.int64)
+        coverage_scope_arrays: dict[str, np.ndarray] = {}
+        if str(args.base_sampler) == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1:
+            train_indices, coverage_scope_arrays = (
+                _coverage_objective_active_training_scope(
+                    data,
+                    train_indices,
+                    policy_loss_weight=float(args.policy_loss_weight),
+                    scalar_value_loss_weight=float(resolved_scalar_value_weight),
+                    final_vp_loss_weight=float(args.final_vp_loss_weight),
+                )
+            )
         value_balance_mode = str(args.value_player_outcome_balance_mode)
         value_weights_before_balance = (
             np.asarray(value_weights, dtype=np.float32).copy()
@@ -12946,6 +12957,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "policy_surprise_weights_full": surprise_weights,
             "train_indices": train_indices,
             "validation_indices": validation_indices,
+            **coverage_scope_arrays,
         }
         if str(args.value_player_outcome_balance_mode) != "none":
             result["value_sample_weights_before_player_outcome_balance"] = (
@@ -12961,7 +12973,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             ).astype(np.int64, copy=False)
         component_weights = _composite_game_sampling_weights(
-            data, result["train_indices"]
+            data,
+            result["train_indices"],
+            component_indices=(
+                None
+                if "coverage_objective_component_indices" not in result
+                else tuple(
+                    int(value)
+                    for value in result["coverage_objective_component_indices"]
+                )
+            ),
         )
         if component_weights is not None:
             result["component_game_sampling"] = component_weights
@@ -13044,6 +13065,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     data, "value_training_component_indices", tuple()
                 )
             ],
+            "base_sampler": str(args.base_sampler),
+            "policy_loss_weight": float(args.policy_loss_weight),
+            "resolved_scalar_value_loss_weight": float(
+                resolved_scalar_value_weight
+            ),
+            "final_vp_loss_weight": float(args.final_vp_loss_weight),
         }
         if forced_row_value_action_type_weight_map:
             # Preserve historical cache identities at the disabled default.
@@ -13170,6 +13197,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     policy_surprise_weights_full = derived["policy_surprise_weights_full"]
     train_indices = derived["train_indices"]
     validation_indices = derived["validation_indices"]
+    coverage_objective_scope_report = (
+        _coverage_objective_active_scope_report(data, derived)
+        if str(args.base_sampler) == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1
+        else None
+    )
     if int(ddp["rank"]) == 0:
         value_player_outcome_balance_report = {
             "application_scope": "training_only_natural_validation_v1",
@@ -13462,6 +13494,19 @@ def main(argv: Sequence[str] | None = None) -> None:
             "importance_content_sha256": _array_content_sha256(importance),
             "fixed_loss_normalizers": dict(coverage_loss_normalizers),
             "validation_measure_unchanged": True,
+            "objective_active_scope": coverage_objective_scope_report,
+            "objective_active_schedule": (
+                _coverage_objective_schedule_accounting(
+                    coverage_objective_scope_report,
+                    local_batch_size=int(args.batch_size),
+                    world_size=(
+                        int(ddp["world_size"]) if bool(ddp["enabled"]) else 1
+                    ),
+                    grad_accum_steps=int(args.grad_accum_steps),
+                    epochs=int(args.epochs),
+                    max_steps=int(args.max_steps),
+                )
+            ),
         }
     else:
         raise SystemExit(f"unsupported --base-sampler {base_sampler!r}")
@@ -34067,28 +34112,359 @@ def _load_derived_array_cache(
     return loaded
 
 
+def _coverage_objective_active_training_scope(
+    data,
+    train_indices: np.ndarray,
+    *,
+    policy_loss_weight: float,
+    scalar_value_loss_weight: float,
+    final_vp_loss_weight: float,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Remove composite components that feed no enabled coverage objective.
+
+    ``coverage_importance_v1`` traverses every admitted row exactly once.  A
+    component outside both authenticated policy and value scopes therefore
+    consumes a full forward/backward slot while contributing exactly zero to
+    every supported loss.  Condition the authenticated component-game measure
+    on the union of scopes for objectives that are actually enabled.
+
+    Ordinary and weighted-replacement samplers never call this helper and
+    preserve their historical row set exactly.
+    """
+
+    ratios = np.asarray(
+        getattr(data, "component_game_sampling_ratios", tuple()),
+        dtype=np.float64,
+    )
+    component_count = len(getattr(data, "corpora", tuple()))
+    if (
+        ratios.ndim != 1
+        or ratios.size == 0
+        or ratios.size != component_count
+        or not np.isfinite(ratios).all()
+        or np.any(ratios <= 0.0)
+        or not math.isclose(
+            float(ratios.sum()), 1.0, rel_tol=0.0, abs_tol=1.0e-9
+        )
+    ):
+        raise SystemExit(
+            "coverage objective scope requires authenticated component ratios"
+        )
+    all_components = set(range(component_count))
+    active_components: set[int] = set()
+    enabled_objectives: list[int] = []
+    if float(policy_loss_weight) > 0.0:
+        enabled_objectives.append(0)
+        active_components.update(
+            (
+                int(value)
+                for value in getattr(
+                    data, "policy_distillation_component_indices", tuple()
+                )
+            )
+            if bool(
+                getattr(data, "policy_distillation_scope_authenticated", False)
+            )
+            else all_components
+        )
+    if (
+        float(scalar_value_loss_weight) > 0.0
+        or float(final_vp_loss_weight) > 0.0
+    ):
+        enabled_objectives.append(1)
+        active_components.update(
+            (
+                int(value)
+                for value in getattr(
+                    data, "value_training_component_indices", tuple()
+                )
+            )
+            if bool(getattr(data, "value_training_scope_authenticated", False))
+            else all_components
+        )
+    if not enabled_objectives:
+        raise SystemExit(
+            "coverage_importance_v1 has no enabled supported training objective"
+        )
+    if (
+        not active_components
+        or any(
+            component < 0 or component >= component_count
+            for component in active_components
+        )
+    ):
+        raise SystemExit(
+            "coverage_importance_v1 objective-active component scope is invalid"
+        )
+
+    indices = np.asarray(train_indices, dtype=np.int64)
+    components = np.asarray(
+        data.component_indices_for_rows(indices), dtype=np.int64
+    )
+    if components.shape != indices.shape:
+        raise SystemExit("coverage objective component row lookup shape drift")
+    active = np.asarray(sorted(active_components), dtype=np.int64)
+    keep = np.isin(components, active)
+    filtered = indices[keep]
+    if filtered.size == 0:
+        raise SystemExit(
+            "coverage_importance_v1 objective-active training split is empty"
+        )
+    before_counts = np.bincount(components, minlength=component_count).astype(
+        np.int64, copy=False
+    )
+    after_counts = np.bincount(
+        components[keep], minlength=component_count
+    ).astype(np.int64, copy=False)
+    if np.any(after_counts[active] <= 0):
+        missing = active[after_counts[active] <= 0]
+        raise SystemExit(
+            "coverage objective-active component(s) have no training rows: "
+            + ",".join(str(int(value)) for value in missing)
+        )
+    active_mass = float(ratios[active].sum())
+    if not math.isfinite(active_mass) or active_mass <= 0.0:
+        raise SystemExit("coverage objective-active component mass is invalid")
+    conditional_ratios = np.zeros(component_count, dtype=np.float64)
+    conditional_ratios[active] = ratios[active] / active_mass
+    if not math.isclose(
+        float(conditional_ratios.sum()),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1.0e-9,
+    ):
+        raise SystemExit("coverage objective-active conditional ratio drift")
+    return filtered, {
+        "coverage_objective_component_indices": active,
+        "coverage_objective_component_rows_before": before_counts,
+        "coverage_objective_component_rows_after": after_counts,
+        "coverage_objective_conditional_ratios": conditional_ratios,
+        "coverage_objective_scope_summary": np.asarray(
+            [
+                int(indices.size),
+                int(filtered.size),
+                int(indices.size - filtered.size),
+                active_mass,
+                int(0 in enabled_objectives),
+                int(1 in enabled_objectives),
+            ],
+            dtype=np.float64,
+        ),
+    }
+
+
+def _coverage_objective_active_scope_report(
+    data, derived: Mapping[str, np.ndarray]
+) -> dict[str, object]:
+    """Decode and bind the cached objective-active coverage scope."""
+
+    required = {
+        "coverage_objective_component_indices",
+        "coverage_objective_component_rows_before",
+        "coverage_objective_component_rows_after",
+        "coverage_objective_conditional_ratios",
+        "coverage_objective_scope_summary",
+    }
+    missing = sorted(required.difference(derived))
+    if missing:
+        raise SystemExit(
+            "coverage objective-active derived arrays are missing: "
+            + ",".join(missing)
+        )
+    component_ids = tuple(
+        str(value)
+        for value in getattr(
+            data,
+            "component_ids",
+            tuple(str(index) for index in range(len(data.corpora))),
+        )
+    )
+    active = np.asarray(
+        derived["coverage_objective_component_indices"], dtype=np.int64
+    )
+    before = np.asarray(
+        derived["coverage_objective_component_rows_before"], dtype=np.int64
+    )
+    after = np.asarray(
+        derived["coverage_objective_component_rows_after"], dtype=np.int64
+    )
+    conditional = np.asarray(
+        derived["coverage_objective_conditional_ratios"], dtype=np.float64
+    )
+    summary = np.asarray(
+        derived["coverage_objective_scope_summary"], dtype=np.float64
+    )
+    component_count = len(component_ids)
+    if (
+        before.shape != (component_count,)
+        or after.shape != (component_count,)
+        or conditional.shape != (component_count,)
+        or summary.shape != (6,)
+        or np.any(active < 0)
+        or np.any(active >= component_count)
+        or len(np.unique(active)) != len(active)
+    ):
+        raise SystemExit("coverage objective-active report shape drift")
+    active_set = {int(value) for value in active}
+    components = {
+        component_id: {
+            "component_index": int(index),
+            "objective_active": bool(index in active_set),
+            "authenticated_training_rows": int(before[index]),
+            "objective_active_training_rows": int(after[index]),
+            "excluded_training_rows": int(before[index] - after[index]),
+            "conditional_component_game_sampling_ratio": float(
+                conditional[index]
+            ),
+        }
+        for index, component_id in enumerate(component_ids)
+    }
+    report: dict[str, object] = {
+        "schema_version": "coverage-objective-active-scope-v1",
+        "enabled_objectives": [
+            name
+            for enabled, name in (
+                (bool(summary[4]), "policy"),
+                (bool(summary[5]), "value_or_final_vp"),
+            )
+            if enabled
+        ],
+        "authenticated_training_split_row_count": int(summary[0]),
+        "objective_active_training_row_count": int(summary[1]),
+        "excluded_zero_objective_training_row_count": int(summary[2]),
+        "objective_active_target_mass_before_conditioning": float(summary[3]),
+        "active_component_ids": [
+            component_ids[index] for index in sorted(active_set)
+        ],
+        "excluded_component_ids": [
+            component_ids[index]
+            for index in range(component_count)
+            if index not in active_set
+        ],
+        "conditional_component_game_sampling_ratios": {
+            component_ids[index]: float(conditional[index])
+            for index in sorted(active_set)
+        },
+        "components": components,
+        "schedule_row_count_semantics": (
+            "optimizer_schedule_and_epoch_updates_use_objective_active_training_rows"
+        ),
+    }
+    report["scope_sha256"] = _canonical_json_sha256(report)
+    return report
+
+
+def _coverage_objective_schedule_accounting(
+    scope_report: Mapping[str, object],
+    *,
+    local_batch_size: int,
+    world_size: int,
+    grad_accum_steps: int,
+    epochs: int,
+    max_steps: int,
+) -> dict[str, object]:
+    """Bind the optimizer horizon to rows that can produce an enabled loss."""
+
+    local = int(local_batch_size)
+    world = int(world_size)
+    accumulation = int(grad_accum_steps)
+    epoch_count = int(epochs)
+    step_cap = int(max_steps)
+    if min(local, world, accumulation, epoch_count) <= 0 or step_cap < 0:
+        raise ValueError("coverage objective-active schedule inputs are invalid")
+    authenticated_rows = int(
+        scope_report["authenticated_training_split_row_count"]
+    )
+    active_rows = int(scope_report["objective_active_training_row_count"])
+    if authenticated_rows <= 0 or not 0 < active_rows <= authenticated_rows:
+        raise ValueError("coverage objective-active row accounting is invalid")
+    global_batch = local * world * accumulation
+    authenticated_steps = math.ceil(authenticated_rows / global_batch)
+    active_steps = math.ceil(active_rows / global_batch)
+    schedule_steps = step_cap if step_cap > 0 else epoch_count * active_steps
+    return {
+        "schema_version": "coverage-objective-active-schedule-v1",
+        "local_batch_size": local,
+        "world_size": world,
+        "grad_accum_steps": accumulation,
+        "effective_global_batch_size": global_batch,
+        "epochs": epoch_count,
+        "max_steps": step_cap,
+        "authenticated_optimizer_steps_per_epoch": authenticated_steps,
+        "objective_active_optimizer_steps_per_epoch": active_steps,
+        "excluded_zero_objective_optimizer_slots_per_epoch": (
+            authenticated_steps - active_steps
+        ),
+        "lr_schedule_total_steps": schedule_steps,
+        "lr_schedule_total_steps_semantics": (
+            "max_steps_if_positive_else_epochs_x_objective_active_steps_per_epoch"
+        ),
+    }
+
+
 def _composite_game_sampling_weights(
-    data, train_indices: np.ndarray
+    data,
+    train_indices: np.ndarray,
+    *,
+    component_indices: Sequence[int] | None = None,
 ) -> np.ndarray | None:
     """Return authenticated component->game->row sampling probabilities.
 
     For a v2 composite, a draw first selects a component by its bound ratio,
     then a training game uniformly within that component, then a row uniformly
-    within that game.  Returning weights aligned to ``train_indices`` lets the
-    existing seeded weighted epoch sampler perform that hierarchy without
-    copying any corpus payload. V1 and ordinary corpora return ``None`` and
-    therefore retain the historical permutation path exactly.
+    within that game. ``component_indices`` optionally conditions those ratios
+    on an authenticated objective-active component subset. Returning weights
+    aligned to ``train_indices`` lets the existing seeded weighted epoch sampler
+    perform that hierarchy without copying any corpus payload. V1 and ordinary
+    corpora return ``None`` and therefore retain the historical permutation
+    path exactly.
     """
     ratios = tuple(getattr(data, "component_game_sampling_ratios", tuple()))
     if not ratios:
         return None
     if len(ratios) != len(getattr(data, "corpora", tuple())):
         raise SystemExit("authenticated component sampling ratio count drift")
+    if component_indices is None:
+        selected_components = tuple(range(len(ratios)))
+    else:
+        selected_components = tuple(
+            sorted({int(value) for value in component_indices})
+        )
+        if (
+            not selected_components
+            or any(
+                value < 0 or value >= len(ratios)
+                for value in selected_components
+            )
+        ):
+            raise SystemExit(
+                "authenticated component sampling selection is invalid"
+            )
+    selected_mass = float(
+        sum(float(ratios[index]) for index in selected_components)
+    )
+    if not math.isfinite(selected_mass) or selected_mass <= 0.0:
+        raise SystemExit("authenticated selected component mass is invalid")
+    conditional_ratios = {
+        component: float(ratios[component]) / selected_mass
+        for component in selected_components
+    }
     indices = np.asarray(train_indices, dtype=np.int64)
     components = np.asarray(data.component_indices_for_rows(indices), dtype=np.int64)
+    unexpected = sorted(
+        set(int(value) for value in np.unique(components)).difference(
+            selected_components
+        )
+    )
+    if unexpected:
+        raise SystemExit(
+            "authenticated component sampling rows include excluded component(s): "
+            + ",".join(str(value) for value in unexpected)
+        )
     seeds = np.asarray(data["game_seed"][indices], dtype=np.int64)
     weights = np.zeros(indices.shape[0], dtype=np.float64)
-    for component, ratio in enumerate(ratios):
+    for component in selected_components:
+        ratio = conditional_ratios[component]
         positions = np.flatnonzero(components == component)
         if positions.size == 0:
             raise SystemExit(

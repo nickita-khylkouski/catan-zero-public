@@ -562,6 +562,146 @@ def test_component_sampling_is_component_then_game_then_row_uniform():
     assert weights[3] == pytest.approx(0.25)
 
 
+def _objective_scoped_composite() -> ConcatMemmapCorpus:
+    data = ConcatMemmapCorpus(
+        [
+            _TinyGameCorpus([1, 1, 2, 2]),
+            _TinyGameCorpus([10, 11]),
+            _TinyGameCorpus([20, 20]),
+            _TinyGameCorpus([30, 31, 31, 32]),
+        ]
+    )
+    data.component_ids = ("fresh_n128", "fresh_n256", "hard", "replay")
+    data.component_game_sampling_ratios = (0.64, 0.12, 0.04, 0.20)
+    data.policy_distillation_component_indices = (0, 1, 2)
+    data.policy_distillation_scope_authenticated = True
+    data.value_training_component_indices = (0, 1, 2)
+    data.value_training_scope_authenticated = True
+    return data
+
+
+def test_coverage_scope_excludes_zero_objective_replay_and_conditions_measure():
+    data = _objective_scoped_composite()
+    authenticated = np.arange(len(data), dtype=np.int64)
+
+    active, arrays = train_bc._coverage_objective_active_training_scope(
+        data,
+        authenticated,
+        policy_loss_weight=1.0,
+        scalar_value_loss_weight=0.25,
+        final_vp_loss_weight=0.05,
+    )
+
+    assert active.tolist() == list(range(8))
+    assert arrays["coverage_objective_component_indices"].tolist() == [0, 1, 2]
+    assert arrays["coverage_objective_component_rows_before"].tolist() == [
+        4,
+        2,
+        2,
+        4,
+    ]
+    assert arrays["coverage_objective_component_rows_after"].tolist() == [
+        4,
+        2,
+        2,
+        0,
+    ]
+    assert arrays["coverage_objective_conditional_ratios"] == pytest.approx(
+        [0.80, 0.15, 0.05, 0.0]
+    )
+    report = train_bc._coverage_objective_active_scope_report(data, arrays)
+    assert report["authenticated_training_split_row_count"] == 12
+    assert report["objective_active_training_row_count"] == 8
+    assert report["excluded_zero_objective_training_row_count"] == 4
+    assert report["excluded_component_ids"] == ["replay"]
+    assert report["objective_active_target_mass_before_conditioning"] == pytest.approx(
+        0.80
+    )
+    assert report["conditional_component_game_sampling_ratios"] == pytest.approx(
+        {"fresh_n128": 0.80, "fresh_n256": 0.15, "hard": 0.05}
+    )
+    assert report["schedule_row_count_semantics"].startswith("optimizer_schedule")
+    schedule = train_bc._coverage_objective_schedule_accounting(
+        report,
+        local_batch_size=2,
+        world_size=2,
+        grad_accum_steps=1,
+        epochs=3,
+        max_steps=0,
+    )
+    assert schedule["authenticated_optimizer_steps_per_epoch"] == 3
+    assert schedule["objective_active_optimizer_steps_per_epoch"] == 2
+    assert schedule["excluded_zero_objective_optimizer_slots_per_epoch"] == 1
+    assert schedule["lr_schedule_total_steps"] == 6
+
+
+def test_coverage_conditioned_component_game_measure_has_exact_active_ratios():
+    data = _objective_scoped_composite()
+    active, arrays = train_bc._coverage_objective_active_training_scope(
+        data,
+        np.arange(len(data), dtype=np.int64),
+        policy_loss_weight=1.0,
+        scalar_value_loss_weight=0.25,
+        final_vp_loss_weight=0.05,
+    )
+    weights = train_bc._composite_game_sampling_weights(
+        data,
+        active,
+        component_indices=tuple(
+            int(value)
+            for value in arrays["coverage_objective_component_indices"]
+        ),
+    )
+
+    assert weights is not None
+    offsets = data.component_offsets
+    assert [
+        weights[
+            np.flatnonzero(
+                (active >= offsets[index]) & (active < offsets[index + 1])
+            )
+        ].sum()
+        for index in range(3)
+    ] == pytest.approx([0.80, 0.15, 0.05])
+    assert weights.sum() == pytest.approx(1.0)
+
+
+def test_coverage_scope_uses_union_of_enabled_authenticated_objectives():
+    data = _objective_scoped_composite()
+    data.policy_distillation_component_indices = (0,)
+    data.value_training_component_indices = (1, 2)
+
+    active, arrays = train_bc._coverage_objective_active_training_scope(
+        data,
+        np.arange(len(data), dtype=np.int64),
+        policy_loss_weight=1.0,
+        scalar_value_loss_weight=0.25,
+        final_vp_loss_weight=0.0,
+    )
+
+    assert active.tolist() == list(range(8))
+    assert arrays["coverage_objective_component_indices"].tolist() == [0, 1, 2]
+
+
+def test_coverage_scope_preserves_all_components_for_unscoped_enabled_objective():
+    data = _objective_scoped_composite()
+    data.policy_distillation_scope_authenticated = False
+
+    active, arrays = train_bc._coverage_objective_active_training_scope(
+        data,
+        np.arange(len(data), dtype=np.int64),
+        policy_loss_weight=1.0,
+        scalar_value_loss_weight=0.0,
+        final_vp_loss_weight=0.0,
+    )
+
+    assert active.tolist() == list(range(len(data)))
+    assert arrays["coverage_objective_component_indices"].tolist() == [0, 1, 2, 3]
+    assert arrays["coverage_objective_conditional_ratios"] == pytest.approx(
+        [0.64, 0.12, 0.04, 0.20]
+    )
+
+
 def test_policy_aux_conditioning_preserves_authenticated_base_measure() -> None:
     base = np.asarray([0.30, 0.20, 0.10, 0.40], dtype=np.float64)
     multiplier = np.asarray([0.0, 1.0, 2.0, 1.0], dtype=np.float32)
