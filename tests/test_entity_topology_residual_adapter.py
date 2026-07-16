@@ -107,6 +107,25 @@ def test_combined_topology_gather_upgrade_is_bit_identical_at_init():
         assert torch.equal(control[name], treatment[name]), name
 
 
+def test_topology_treatment_preserves_every_shared_random_initialization():
+    torch.manual_seed(20260716)
+    control = EntityGraphNet(_config(action_target_gather=True))
+    torch.manual_seed(20260716)
+    treatment = EntityGraphNet(
+        _config(topology_residual_adapter=True, action_target_gather=True)
+    )
+
+    control_state = control.state_dict()
+    treatment_shared = {
+        name: value
+        for name, value in treatment.state_dict().items()
+        if not name.startswith("topology_residual_adapter.")
+    }
+    assert control_state.keys() == treatment_shared.keys()
+    for name, expected in control_state.items():
+        assert torch.equal(expected, treatment_shared[name]), name
+
+
 def test_topology_gather_and_belief_head_compose_without_main_output_drift():
     torch.manual_seed(17)
     base = EntityGraphNet(_config()).eval()

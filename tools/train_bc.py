@@ -580,6 +580,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--topology-residual-adapter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable the zero-output direct-incidence residual before the entity "
+            "Transformer. Default off; sealed production scratch rejects it. "
+            "Only the bounded topology diagnostic authority may opt in."
+        ),
+    )
+    parser.add_argument(
         "--legal-action-value-residual",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -9473,6 +9483,8 @@ def _validate_a1_scratch_runtime_projection(
     ddp: Mapping[str, int | bool],
     model: Mapping[str, object],
     topology: Mapping[str, object],
+    *,
+    diagnostic_authority: Mapping[str, object] | None = None,
 ) -> None:
     """Fail closed unless argv constructs every field of sealed scratch science."""
 
@@ -9483,6 +9495,18 @@ def _validate_a1_scratch_runtime_projection(
         else RUST_ENTITY_ADAPTER_V4
         if bool(args.public_rule_state_features)
         else CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    expected_topology_residual = bool(
+        diagnostic_authority.get("topology_residual_adapter", False)
+        if isinstance(diagnostic_authority, Mapping)
+        else False
+    )
+    expected_max_parameter_count = int(
+        diagnostic_authority.get(
+            "max_parameter_count", model["max_parameter_count"]
+        )
+        if isinstance(diagnostic_authority, Mapping)
+        else model["max_parameter_count"]
     )
     drift = {
         "fresh_initialization": bool(
@@ -9498,6 +9522,10 @@ def _validate_a1_scratch_runtime_projection(
         != model["entity_state_trunk"],
         "action_target_gather": bool(args.action_target_gather)
         != model["action_target_gather"],
+        "topology_residual_adapter": bool(
+            getattr(args, "topology_residual_adapter", False)
+        )
+        != expected_topology_residual,
         "static_action_residual": bool(args.static_action_residual)
         != model["static_action_residual"],
         "legal_action_value_residual": bool(args.legal_action_value_residual)
@@ -9539,7 +9567,7 @@ def _validate_a1_scratch_runtime_projection(
         "require_35m_model": bool(args.require_35m_model)
         != model["require_35m_model"],
         "max_35m_params": int(args.max_35m_params)
-        != model["max_parameter_count"],
+        != expected_max_parameter_count,
         "topology_world_size": int(ddp.get("world_size", 0))
         != topology["world_size"],
         "topology_local_batch": int(args.batch_size)
@@ -9584,6 +9612,185 @@ _A1_SCRATCH_VALUE_ROUTING_ARMS = {
     "V25": 0.25,
     "V100": 1.0,
 }
+_A1_SCRATCH_TOPOLOGY_DIAGNOSTIC_FIELDS = (
+    _A1_SCRATCH_DIAGNOSTIC_AUTHORITY_FIELDS
+    | {
+        "topology_residual_adapter",
+        "max_parameter_count",
+        "effective_recipe_sha256",
+        "code_surface_sha256",
+        "required_accelerator_family",
+        "required_cuda_device_count",
+    }
+)
+_A1_SCRATCH_TOPOLOGY_ARMS = {"C640": False, "T640": True}
+_A1_SCRATCH_TOPOLOGY_CODE_SURFACE = (
+    "tools/a1_h100_scratch_canary.py",
+    "tools/a1_scratch_train.py",
+    "tools/a1_current_science_contract.py",
+    "tools/train_bc.py",
+    "src/catan_zero/rl/entity_token_policy.py",
+    "src/catan_zero/rl/relational_trunks.py",
+)
+
+
+def _a1_scratch_topology_expected_effective_recipe(
+    *,
+    source_recipe: Mapping[str, object],
+    source_model: Mapping[str, object],
+    source_topology: Mapping[str, object],
+    max_steps: int,
+) -> dict[str, object]:
+    """Project current V25 science into the one allowed H100 diagnostic dose."""
+
+    expected = copy.deepcopy(dict(source_recipe))
+    expected.update(
+        {
+            "epochs": 1,
+            "max_steps": int(max_steps),
+            "world_size": int(source_topology["world_size"]),
+            "batch_size": int(source_topology["local_batch_size"]),
+            "grad_accum_steps": int(source_topology["grad_accum_steps"]),
+            "global_batch_size": int(source_topology["global_batch_size"]),
+        }
+    )
+    # These are authenticated separately because the generic effective-recipe
+    # projection intentionally omits late-bound execution/reporting fields.
+    for field in (
+        "checkpoint_steps",
+        "max_grad_norm",
+        "post_policy_dose_value_trunk_grad_scale",
+        "value_player_outcome_balance_mode",
+    ):
+        expected.pop(field, None)
+    expected.update(
+        {
+            "per_game_value_weight_mode": "equal",
+            "public_card_lr_mult": 1.0,
+            "shared_action_lr_mult": 1.0,
+            "per_game_policy_surprise_weighting": False,
+            "target_reliability_confidence_weighting": False,
+            "target_reliability_confidence_floor": 0.25,
+            "public_rule_state_features": bool(
+                source_model["public_rule_state_features"]
+            ),
+            "static_action_residual": bool(
+                source_model["static_action_residual"]
+            ),
+            "legal_action_value_residual": bool(
+                source_model["legal_action_value_residual"]
+            ),
+            "legal_action_value_set_statistics": bool(
+                source_model["legal_action_value_set_statistics"]
+            ),
+            "value_tower_split_layers": int(
+                source_model["value_tower_split_layers"]
+            ),
+        }
+    )
+    return expected
+
+
+def _validate_a1_scratch_topology_code_binding(
+    args: argparse.Namespace,
+    *,
+    expected_code_tree_sha256: str,
+) -> None:
+    """Require the exact reviewed runtime closure for the topology canary."""
+
+    raw = str(getattr(args, "a1_ablation_code_binding_json", "") or "")
+    try:
+        binding = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(
+            f"invalid A1 topology diagnostic code binding: {error}"
+        ) from error
+    if not isinstance(binding, dict) or set(binding) != {
+        "schema_version",
+        "records",
+        "code_tree_sha256",
+    }:
+        raise SystemExit("A1 topology diagnostic code binding shape drift")
+    unhashed = dict(binding)
+    embedded_sha = unhashed.pop("code_tree_sha256", None)
+    if (
+        binding.get("schema_version")
+        != "a1-scratch-topology-code-binding-v1"
+        or embedded_sha != expected_code_tree_sha256
+        or _canonical_json_sha256(unhashed) != expected_code_tree_sha256
+    ):
+        raise SystemExit("A1 topology diagnostic code binding digest drift")
+    records = binding.get("records")
+    if not isinstance(records, list) or [
+        record.get("relative_path") if isinstance(record, dict) else None
+        for record in records
+    ] != list(_A1_SCRATCH_TOPOLOGY_CODE_SURFACE):
+        raise SystemExit("A1 topology diagnostic code surface drift")
+    for relative, record in zip(
+        _A1_SCRATCH_TOPOLOGY_CODE_SURFACE, records, strict=True
+    ):
+        if not isinstance(record, dict) or set(record) != {
+            "kind",
+            "relative_path",
+            "path",
+            "sha256",
+        }:
+            raise SystemExit("A1 topology diagnostic code record is malformed")
+        expected_path = (_REPO_ROOT / relative).resolve(strict=True)
+        if (
+            record["kind"] != "learner_code"
+            or record["relative_path"] != relative
+            or record["path"] != str(expected_path)
+            or record["sha256"] != _sha256_existing_file(str(expected_path))
+        ):
+            raise SystemExit(
+                f"A1 topology diagnostic code record drift: {relative}"
+            )
+
+
+def _require_a1_scratch_topology_h100_runtime(
+    diagnostic: Mapping[str, object],
+    ddp: Mapping[str, int | bool],
+) -> list[dict[str, object]]:
+    """Bind the trainer-side exception to eight CUDA-visible H100 devices."""
+
+    if diagnostic.get("schema_version") != (
+        "a1-scratch-topology-diagnostic-authority-v1"
+    ):
+        return []
+    import torch
+
+    required_count = int(diagnostic["required_cuda_device_count"])
+    if not torch.cuda.is_available() or torch.cuda.device_count() != required_count:
+        raise SystemExit(
+            "A1 topology diagnostic requires exactly eight CUDA-visible H100 GPUs"
+        )
+    inventory: list[dict[str, object]] = []
+    for index in range(required_count):
+        properties = torch.cuda.get_device_properties(index)
+        uuid = str(getattr(properties, "uuid", "") or "")
+        record = {
+            "index": index,
+            "uuid": uuid,
+            "name": str(properties.name),
+            "total_memory_bytes": int(properties.total_memory),
+            "compute_capability": [int(properties.major), int(properties.minor)],
+        }
+        inventory.append(record)
+    if (
+        any("H100" not in str(record["name"]).upper() for record in inventory)
+        or any(not record["uuid"] for record in inventory)
+        or len({str(record["uuid"]) for record in inventory}) != required_count
+        or any(
+            record["compute_capability"] != [9, 0] for record in inventory
+        )
+        or any(int(record["total_memory_bytes"]) <= 0 for record in inventory)
+        or int(ddp.get("local_rank", -1)) not in range(required_count)
+    ):
+        raise SystemExit(
+            "A1 topology diagnostic requires exactly eight unique CUDA-visible H100 GPUs"
+        )
+    return inventory
 
 
 def _validate_a1_scratch_diagnostic_authority(
@@ -9602,20 +9809,38 @@ def _validate_a1_scratch_diagnostic_authority(
         raise SystemExit(
             f"invalid A1 scratch diagnostic authority JSON: {error}"
         ) from error
+    if not isinstance(authority, dict):
+        raise SystemExit("A1 scratch diagnostic authority fields/schema drift")
+    schema = authority.get("schema_version")
+    campaign_id = authority.get("campaign_id")
+    value_routing = (
+        schema == "a1-scratch-bounded-diagnostic-authority-v1"
+        and campaign_id == "scratch-value-routing-v0-v25-v100"
+        and set(authority) == _A1_SCRATCH_DIAGNOSTIC_AUTHORITY_FIELDS
+    )
+    topology_campaign = (
+        schema == "a1-scratch-topology-diagnostic-authority-v1"
+        and campaign_id == "scratch-topology-c640-t640"
+        and set(authority) == _A1_SCRATCH_TOPOLOGY_DIAGNOSTIC_FIELDS
+    )
     if (
-        not isinstance(authority, dict)
-        or set(authority) != _A1_SCRATCH_DIAGNOSTIC_AUTHORITY_FIELDS
-        or authority.get("schema_version")
-        != "a1-scratch-bounded-diagnostic-authority-v1"
-        or authority.get("campaign_id")
-        != "scratch-value-routing-v0-v25-v100"
+        not (value_routing or topology_campaign)
         or authority.get("diagnostic_only") is not True
         or authority.get("promotion_eligible") is not False
         or authority.get("exact_max_steps") is not True
     ):
         raise SystemExit("A1 scratch diagnostic authority fields/schema drift")
     arm_id = str(authority.get("arm_id", ""))
-    expected_scale = _A1_SCRATCH_VALUE_ROUTING_ARMS.get(arm_id)
+    expected_scale = (
+        _A1_SCRATCH_VALUE_ROUTING_ARMS.get(arm_id)
+        if value_routing
+        else 0.25 if arm_id in _A1_SCRATCH_TOPOLOGY_ARMS else None
+    )
+    expected_topology_residual = (
+        False
+        if value_routing
+        else _A1_SCRATCH_TOPOLOGY_ARMS.get(arm_id)
+    )
     max_steps = authority.get("max_steps")
     epochs = authority.get("epochs")
     checkpoint_steps = authority.get("checkpoint_steps")
@@ -9624,7 +9849,7 @@ def _validate_a1_scratch_diagnostic_authority(
         expected_scale is None
         or isinstance(max_steps, bool)
         or not isinstance(max_steps, int)
-        or not 1 <= max_steps <= 256
+        or not (128 <= max_steps <= 256 if topology_campaign else 1 <= max_steps <= 256)
         or isinstance(epochs, bool)
         or not isinstance(epochs, int)
         or epochs != 1
@@ -9635,12 +9860,35 @@ def _validate_a1_scratch_diagnostic_authority(
         or isinstance(scale, bool)
         or not isinstance(scale, (int, float))
         or float(scale) != expected_scale
+        or (
+            topology_campaign
+            and authority.get("topology_residual_adapter")
+            is not expected_topology_residual
+        )
+        or (
+            topology_campaign
+            and authority.get("max_parameter_count") != 43_000_000
+        )
+        or (
+            topology_campaign
+            and authority.get("required_accelerator_family") != "NVIDIA H100"
+        )
+        or (
+            topology_campaign
+            and authority.get("required_cuda_device_count") != 8
+        )
+        or (
+            topology_campaign
+            and authority.get("code_surface_sha256")
+            != _canonical_json_sha256(list(_A1_SCRATCH_TOPOLOGY_CODE_SURFACE))
+        )
         or any(
             not _is_sha256(authority.get(field))
             for field in (
                 "source_recipe_sha256",
                 "source_execution_topology_sha256",
                 "code_tree_sha256",
+                *(("effective_recipe_sha256",) if topology_campaign else ()),
             )
         )
     ):
@@ -9657,13 +9905,24 @@ def _validate_a1_scratch_diagnostic_authority(
             raise SystemExit(
                 "A1 scratch diagnostic runtime fields are malformed"
             ) from error
-        expected_ablation_id = f"scratch-value-routing-{arm_id.lower()}"
+        expected_ablation_id = (
+            f"scratch-value-routing-{arm_id.lower()}"
+            if value_routing
+            else f"scratch-topology-{arm_id.lower()}"
+        )
         if (
             int(args.max_steps) != max_steps
             or bool(args.exact_max_steps) is not True
             or int(args.epochs) != epochs
             or parsed_steps != checkpoint_steps
             or float(args.value_trunk_grad_scale) != expected_scale
+            or bool(getattr(args, "topology_residual_adapter", False))
+            is not bool(expected_topology_residual)
+            or (
+                topology_campaign
+                and int(getattr(args, "max_35m_params", -1))
+                != int(authority["max_parameter_count"])
+            )
             or str(args.a1_learner_ablation_id or "") != expected_ablation_id
             or str(args.a1_ablation_code_tree_sha256 or "")
             != authority["code_tree_sha256"]
@@ -9671,16 +9930,98 @@ def _validate_a1_scratch_diagnostic_authority(
             raise SystemExit("A1 scratch diagnostic command/authority drift")
     if science is not None:
         source_recipe = science.get("learner_training_recipe")
+        source_model = science.get("learner_model_construction")
         source_topology = science.get("learner_execution_topology")
         if (
             not isinstance(source_recipe, dict)
             or not isinstance(source_topology, dict)
+            or (topology_campaign and not isinstance(source_model, dict))
             or authority["source_recipe_sha256"]
             != _canonical_json_sha256(source_recipe)
             or authority["source_execution_topology_sha256"]
             != _canonical_json_sha256(source_topology)
         ):
             raise SystemExit("A1 scratch diagnostic source authority drift")
+        if topology_campaign:
+            assert isinstance(source_model, dict)
+            expected_checkpoints = list(
+                step
+                for step in _parse_checkpoint_steps(
+                    str(source_recipe.get("checkpoint_steps", "") or ""),
+                    max_steps=0,
+                )
+                if step < int(max_steps)
+            )
+            expected_effective = (
+                _a1_scratch_topology_expected_effective_recipe(
+                    source_recipe=source_recipe,
+                    source_model=source_model,
+                    source_topology=source_topology,
+                    max_steps=int(max_steps),
+                )
+            )
+            expected_effective_sha = _canonical_json_sha256(expected_effective)
+            if (
+                checkpoint_steps != expected_checkpoints
+                or authority.get("effective_recipe_sha256")
+                != expected_effective_sha
+            ):
+                raise SystemExit(
+                    "A1 topology diagnostic matched V25 recipe drift"
+                )
+            if args is not None:
+                actual_effective = _effective_a1_learner_training_recipe(
+                    args,
+                    {
+                        "world_size": int(source_topology["world_size"]),
+                        "rank": 0,
+                        "local_rank": 0,
+                        "enabled": True,
+                    },
+                )
+                actual_effective["per_game_value_weight_mode"] = str(
+                    args.per_game_value_weight_mode
+                )
+                if str(args.value_player_outcome_balance_mode) != "none":
+                    actual_effective["value_player_outcome_balance_mode"] = str(
+                        args.value_player_outcome_balance_mode
+                    )
+                declared_raw = str(
+                    getattr(args, "a1_effective_learner_recipe_json", "") or ""
+                )
+                declared_sha = str(
+                    getattr(args, "a1_effective_learner_recipe_sha256", "") or ""
+                )
+                try:
+                    declared_effective = json.loads(declared_raw)
+                except json.JSONDecodeError as error:
+                    raise SystemExit(
+                        f"invalid A1 topology effective recipe JSON: {error}"
+                    ) from error
+                if (
+                    actual_effective != expected_effective
+                    or declared_effective != expected_effective
+                    or declared_sha != expected_effective_sha
+                    or _canonical_json_sha256(declared_effective)
+                    != expected_effective_sha
+                    or float(args.max_grad_norm)
+                    != float(source_recipe["max_grad_norm"])
+                    or float(args.post_policy_dose_value_trunk_grad_scale)
+                    != float(
+                        source_recipe[
+                            "post_policy_dose_value_trunk_grad_scale"
+                        ]
+                    )
+                    or str(args.value_player_outcome_balance_mode)
+                    != str(source_recipe["value_player_outcome_balance_mode"])
+                ):
+                    raise SystemExit(
+                        "A1 topology diagnostic command differs from exact V25 recipe"
+                    )
+                _validate_a1_scratch_topology_code_binding(
+                    args,
+                    expected_code_tree_sha256=str(authority["code_tree_sha256"]),
+                )
     return authority
 
 
@@ -9929,12 +10270,6 @@ def _validate_production_composite_scratch_binding(
     binding = _validate_a1_scratch_plan_binding(
         authority, data_path=str(args.data), composite_meta=composite_meta
     )
-    _validate_a1_scratch_runtime_projection(
-        args,
-        ddp,
-        binding["science"]["learner_model_construction"],
-        binding["science"]["learner_execution_topology"],
-    )
     diagnostic = _validate_a1_scratch_diagnostic_authority(
         str(
             getattr(args, "a1_scratch_diagnostic_authority_json", "")
@@ -9943,6 +10278,17 @@ def _validate_production_composite_scratch_binding(
         args=args,
         science=binding["science"],
     )
+    _validate_a1_scratch_runtime_projection(
+        args,
+        ddp,
+        binding["science"]["learner_model_construction"],
+        binding["science"]["learner_execution_topology"],
+        diagnostic_authority=diagnostic,
+    )
+    if isinstance(diagnostic, Mapping):
+        binding["diagnostic_accelerator_inventory"] = (
+            _require_a1_scratch_topology_h100_runtime(diagnostic, ddp)
+        )
     topology = binding["science"]["learner_execution_topology"]
     if diagnostic is None:
         _require_a1_scratch_execution_schedule(topology)
@@ -12929,6 +13275,9 @@ def main(
                     ),
                     belief_resource_head=bool(
                         getattr(args, "belief_resource_head", False)
+                    ),
+                    topology_residual_adapter=bool(
+                        getattr(args, "topology_residual_adapter", False)
                     ),
                     public_card_count_features=bool(
                         args.public_card_count_features

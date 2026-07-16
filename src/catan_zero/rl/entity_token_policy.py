@@ -680,12 +680,6 @@ class EntityGraphNet:
                         for _ in range(max(1, int(cfg.state_layers)))
                     )
                     self.relational_block_pattern = ""
-                    if self.topology_residual_adapter_enabled:
-                        from catan_zero.rl.relational_trunks import (
-                            TopologyResidualAdapter,
-                        )
-
-                        self.topology_residual_adapter = TopologyResidualAdapter(h)
                 else:
                     from catan_zero.rl.relational_trunks import (
                         RelationalTransformerBlock,
@@ -1133,6 +1127,16 @@ class EntityGraphNet:
                         nn.GELU(),
                         nn.Linear(h, 5),
                     )
+                if self.topology_residual_adapter_enabled:
+                    # Construct treatment-only parameters after every shared
+                    # parameter. With an identical process seed, enabling this
+                    # diagnostic bit must not advance RNG before any C640/T640
+                    # shared initialization and confound the matched canary.
+                    from catan_zero.rl.relational_trunks import (
+                        TopologyResidualAdapter,
+                    )
+
+                    self.topology_residual_adapter = TopologyResidualAdapter(h)
 
             def forward(
                 self,
