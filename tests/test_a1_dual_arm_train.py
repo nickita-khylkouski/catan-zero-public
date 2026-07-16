@@ -16,6 +16,10 @@ from tools import a1_dual_learner_contract as learner_contract
 
 SHA = "sha256:" + "a" * 64
 DUAL_RUNTIME = [
+    {"path": "src/catan_zero/rl/entity_token_policy.py"},
+    {"path": "tools/a1_ddp_epoch_canary.py"},
+    {"path": "tools/a1_function_preserving_upgrade.py"},
+    {"path": "tools/a1_stage_c_final_replication.py"},
     {"path": "tools/train_bc.py"},
     {"path": "tools/a1_dual_arm_train.py"},
     {"path": "tools/a1_dual_learner_contract.py"},

@@ -20,6 +20,22 @@ from catan_zero.rl.optim_state import save_training_progress
 _SHA = "sha256:" + "a" * 64
 
 
+def _reviewed_ablation_code_binding() -> dict[str, object]:
+    """Build the same authenticated code closure used by a real ablation."""
+
+    repo = Path(executor.__file__).resolve().parents[1]
+    return executor._current_ablation_code_binding(  # noqa: SLF001
+        {
+            "provenance": {
+                "learner_code": [{"path": str(repo / "tools/train_bc.py")}],
+                "runtime_code_tree": [
+                    {"path": str(repo / "tools/a1_one_dose_train.py")}
+                ],
+            }
+        }
+    )
+
+
 def _objective() -> dict[str, object]:
     return {
         "objective": "mse",
@@ -1416,10 +1432,11 @@ def test_future_production_per_game_value_mode_is_explicit(tmp_path: Path) -> No
 def test_latest_main_ablation_command_binds_inventory_ack_and_crop(tmp_path: Path) -> None:
     verified = _verified(tmp_path)
     verified["recipe"]["per_game_value_weight_mode"] = "equal"
+    code_binding = _reviewed_ablation_code_binding()
     verified["learner_ablation"] = {
         "ablation_id": "new-main-arm",
-        "code_binding": {},
-        "code_tree_sha256": "sha256:" + "8" * 64,
+        "code_binding": code_binding,
+        "code_tree_sha256": code_binding["code_tree_sha256"],
         "reviewed_lock_file_sha256": "sha256:" + "9" * 64,
     }
     command = executor.build_train_command(
@@ -1440,11 +1457,12 @@ def test_policy_aux_active_dose_is_typed_and_command_bound(
 ) -> None:
     verified = _verified(tmp_path)
     verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
-    code_sha = "sha256:" + "7" * 64
+    code_binding = _reviewed_ablation_code_binding()
+    code_sha = code_binding["code_tree_sha256"]
     monkeypatch.setattr(
         executor,
         "_current_ablation_code_binding",
-        lambda lock: {"code_tree_sha256": code_sha, "records": []},
+        lambda lock: code_binding,
     )
     derived = executor.bind_learner_ablation(
         verified,
@@ -1480,11 +1498,12 @@ def test_policy_game_weight_can_be_isolated_as_a_generic_ablation(
     verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
     verified["recipe"]["per_game_policy_weight"] = True
     verified["recipe"]["per_game_policy_weight_mode"] = "equal"
-    code_sha = "sha256:" + "7" * 64
+    code_binding = _reviewed_ablation_code_binding()
+    code_sha = code_binding["code_tree_sha256"]
     monkeypatch.setattr(
         executor,
         "_current_ablation_code_binding",
-        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+        lambda _lock: code_binding,
     )
 
     derived = executor.bind_learner_ablation(
@@ -1833,11 +1852,12 @@ def test_generic_ablation_can_bind_trunk_lr_and_adaptive_parent_kl(
 ) -> None:
     verified = _verified(tmp_path)
     verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
-    code_sha = "sha256:" + "7" * 64
+    code_binding = _reviewed_ablation_code_binding()
+    code_sha = code_binding["code_tree_sha256"]
     monkeypatch.setattr(
         executor,
         "_current_ablation_code_binding",
-        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+        lambda _lock: code_binding,
     )
 
     trunk = executor.bind_learner_ablation(

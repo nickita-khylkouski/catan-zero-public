@@ -408,6 +408,17 @@ def test_selection_can_choose_an_earlier_checkpoint_over_overdosed_terminals(
 def test_explicit_diagnostic_checkpoint_schedule_excludes_terminal(
     tmp_path: Path,
 ) -> None:
+    repo = Path(one_dose.__file__).resolve().parents[1]
+    code_binding = one_dose._current_ablation_code_binding(  # noqa: SLF001
+        {
+            "provenance": {
+                "learner_code": [{"path": str(repo / "tools/train_bc.py")}],
+                "runtime_code_tree": [
+                    {"path": str(repo / "tools/a1_one_dose_train.py")}
+                ],
+            }
+        }
+    )
     assert one_dose.train_bc._parse_checkpoint_steps(
         "8,12,16,32,64", max_steps=128
     ) == (8, 12, 16, 32, 64)
@@ -437,8 +448,8 @@ def test_explicit_diagnostic_checkpoint_schedule_excludes_terminal(
                 "diagnostic_dose_curve": True,
                 "checkpoint_steps": [8, 12, 16, 32, 64],
             },
-            "code_binding": {},
-            "code_tree_sha256": "sha256:" + "9" * 64,
+            "code_binding": code_binding,
+            "code_tree_sha256": code_binding["code_tree_sha256"],
             "reviewed_lock_file_sha256": "sha256:" + "a" * 64,
         },
     }
