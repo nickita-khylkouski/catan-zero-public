@@ -669,8 +669,8 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
     production_plan = tmp_path / "production-plan.json"
     production_plan.write_text("{}")
     subset = tmp_path / "production-roots.npz"
-    training_games = np.arange(100_000, 100_020, dtype=np.int64)
-    validation_games = np.arange(200_000, 200_004, dtype=np.int64)
+    training_games = np.arange(100_000, 107_782, dtype=np.int64)
+    validation_games = np.arange(200_000, 200_410, dtype=np.int64)
     selected_games = np.repeat(
         np.concatenate((training_games, validation_games)), 8
     )
@@ -714,6 +714,30 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
     ]
     validation_manifest_sha = "sha256:" + "a" * 64
     validation_seed_set_sha = "sha256:" + "b" * 64
+    validation_split = {
+        "validation_row_count": 4_096,
+        "validation_game_seed_count": len(validation_games),
+        "validation_game_seed_set_sha256": validation_seed_set_sha,
+    }
+    trainer_exclusion = {
+        "schema_version": final.alignment.TRAINER_EXCLUSION_CONTRACT_SCHEMA,
+        "input_validation_manifest_file_sha256": validation_manifest_sha,
+        "training_excluded_game_seed_count": len(validation_games),
+        "training_excluded_game_seed_set_sha256": validation_seed_set_sha,
+    }
+    learner_validation_scope = {
+        "schema_version": final.alignment.LEARNER_VALIDATION_SCOPE_SCHEMA,
+        "manifest": {
+            "path": str(tmp_path / "validation.json"),
+            "file_sha256": validation_manifest_sha,
+            "manifest_sha256": "sha256:" + "c" * 64,
+            "a1_contract_sha256": "sha256:" + "d" * 64,
+        },
+        "split_receipt": validation_split,
+        "trainer_exclusion_contract": trainer_exclusion,
+        "target_coverage_receipt": {},
+        "external_final_gate_authority": False,
+    }
     prep_value = {
         "schema_version": final.PREP_INVENTORY_SCHEMA,
         "authority": {"is_authority": False, "may_launch_search": False},
@@ -723,9 +747,14 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
             "independent_from_all_declared_eval_pair_seeds": True,
             "independent_from_diagnostic_selected_rows": True,
             "learner_validation_manifest_file_sha256": validation_manifest_sha,
-            "learner_validation_game_seed_set_sha256": validation_seed_set_sha,
-            "learner_validation_target_covered": True,
-            "learner_validation_optimizer_excluded": True,
+            "learner_validation_scope_sha256": "",
+            "learner_validation_split_receipt_sha256": final.value_sha256(
+                validation_split
+            ),
+            "learner_trainer_exclusion_contract_sha256": final.value_sha256(
+                trainer_exclusion
+            ),
+            "policy_root_breadth_inventory_sha256": "",
             "required_fully_reconstructable_strategic_roots": realized_count,
             "observed_fully_reconstructable_strategic_roots": realized_count,
             "ready_root_prefix_count": realized_count,
@@ -741,23 +770,32 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
         selected_decision_indices=decision_indices,
         selected_phases=phases,
     )
+    learner_validation_scope["target_coverage_receipt"] = {
+        "root_breadth_inventory_sha256": root_breadth["inventory_sha256"],
+        "selected_validation_root_count": root_breadth["scopes"]["validation"][
+            "selected_root_count"
+        ],
+        "selected_validation_game_count": root_breadth["scopes"]["validation"][
+            "selected_game_count"
+        ],
+    }
+    learner_validation_scope["scope_sha256"] = final.value_sha256(
+        learner_validation_scope
+    )
+    prep_value["proof"]["learner_validation_scope_sha256"] = (
+        learner_validation_scope["scope_sha256"]
+    )
+    prep_value["proof"]["policy_root_breadth_inventory_sha256"] = root_breadth[
+        "inventory_sha256"
+    ]
+    _write_sealed(prep, prep_value, "inventory_sha256")
     plan = {
         "plan_sha256": "sha256:" + "p" * 64,
-        "learner_validation_scope": {
-            "manifest": {
-                "path": str(tmp_path / "validation.json"),
-                "file_sha256": validation_manifest_sha,
-            },
-            "validation_game_seed_count": len(validation_games),
-            "validation_game_seed_set_sha256": validation_seed_set_sha,
-            "target_covered": True,
-            "optimizer_excluded": True,
-            "external_final_gate_authority": False,
-        },
+        "learner_validation_scope": learner_validation_scope,
         "subset": {
             "artifact": {"path": str(subset)},
             "selected_rows": realized_count,
-            "requested_rows": realized_count + 8,
+            "requested_rows": realized_count,
             "chunks": 7,
             "selection_seed": 42,
             "game_first_selection": {"root_breadth": root_breadth},
@@ -794,9 +832,12 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
         forbidden_eval_paths=[eval_report],
     )
     assert manifest["root_count"] == realized_count
-    assert manifest["requested_root_budget"] == realized_count + 8
+    assert manifest["requested_root_budget"] == realized_count
     assert manifest["partition_count"] == 7
-    assert manifest["learner_validation_scope"]["target_covered"] is True
+    assert (
+        manifest["learner_validation_scope"]["scope_sha256"]
+        == learner_validation_scope["scope_sha256"]
+    )
     assert manifest["diagnostic_root_overlap_count"] == 0
 
     bad_prep_value = copy.deepcopy(prep_value)

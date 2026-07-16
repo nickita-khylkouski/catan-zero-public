@@ -276,3 +276,29 @@ def test_stage_c_alignment_defaults_fund_game_first_breadth() -> None:
 
     assert args.subset_rows == 65_536
     assert args.max_rows_per_game == 16
+
+
+def test_production_plan_rejects_diagnostic_root_budget_before_loading_inputs() -> None:
+    args = alignment.build_parser().parse_args(
+        [
+            "plan",
+            "--coherent-corpus-admission",
+            "missing-admission.json",
+            "--target-operator-contract",
+            "missing-operator.json",
+            "--target-checkpoint",
+            "missing-checkpoint.pt",
+            "--output-root",
+            "output",
+            "--subset-rows",
+            "184",
+            "--write",
+            "plan.json",
+        ]
+    )
+
+    with pytest.raises(
+        alignment.AlignmentError,
+        match="require exactly 65,536 requested roots",
+    ):
+        alignment._build_plan(args)  # noqa: SLF001

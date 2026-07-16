@@ -861,7 +861,7 @@ def verify_outputs(
             validation_metrics.append(
                 {
                     **train_bc.objective_matched_validation_metrics(
-                        row, require_matched=True
+                        row, require_matched=True, require_provenance=True
                     ),
                     # Wrapper coverage is authoritative; a metric named
                     # ``samples`` must not be able to shadow it.

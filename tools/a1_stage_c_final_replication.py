@@ -46,9 +46,9 @@ from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 
 ADJUDICATION_SCHEMA = "a1-stage-c-recipe-adjudication-v2"
 TIEBREAK_SCHEMA = "a1-stage-c-v5-dose-tiebreak-common-crn-v1"
-ROOT_MANIFEST_SCHEMA = "a1-stage-c-independent-root-manifest-v2"
-FINAL_CORPUS_ADMISSION_SCHEMA = "a1-stage-c-final-corpus-admission-v2"
-FINAL_AUTHORITY_SCHEMA = "a1-stage-c-final-matched-replication-authority-v3"
+ROOT_MANIFEST_SCHEMA = "a1-stage-c-independent-root-manifest-v3"
+FINAL_CORPUS_ADMISSION_SCHEMA = "a1-stage-c-final-corpus-admission-v3"
+FINAL_AUTHORITY_SCHEMA = "a1-stage-c-final-matched-replication-authority-v4"
 FRESH_FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
 CAMPAIGN_SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v6"
 EXPECTED_ARM = "STRATEGIC_BALANCED"
@@ -59,7 +59,8 @@ EXPECTED_ENGINE_SCHEMA = "a1-internal-h2h-engine-identity-v1"
 EXPECTED_POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
 EXPECTED_OPERATOR = "public_belief_single_tree_v1"
 EXPECTED_EXECUTOR = "coherent_public_belief_n128_reanalysis_v1"
-PREP_INVENTORY_SCHEMA = "a1-stage-c-final-prep-independent-root-inventory-v2"
+PREP_INVENTORY_SCHEMA = "a1-stage-c-final-prep-independent-root-inventory-v3"
+EXPECTED_ROOTS = alignment.PRODUCTION_ROOT_COUNT
 EXPECTED_SELECTION_RULE = (
     "select_step16_as_recipe_only_when_common_crn_v5_score_exceeds_step8_on_"
     "fresh256_and_combined384;retain_all_incumbent_h0_negative_evidence;"
@@ -1113,7 +1114,13 @@ def build_root_manifest(
     if not isinstance(learner_validation, dict):
         raise FinalReplicationError("final plan lost learner validation scope")
     validation_manifest = learner_validation.get("manifest")
-    if not isinstance(validation_manifest, dict):
+    validation_split = learner_validation.get("split_receipt")
+    trainer_exclusion = learner_validation.get("trainer_exclusion_contract")
+    if (
+        not isinstance(validation_manifest, dict)
+        or not isinstance(validation_split, dict)
+        or not isinstance(trainer_exclusion, dict)
+    ):
         raise FinalReplicationError("final plan learner validation binding is malformed")
     try:
         plan_root_breadth = overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
@@ -1137,8 +1144,8 @@ def build_root_manifest(
         prep.get("schema_version") != PREP_INVENTORY_SCHEMA
         or prep_stated != value_sha256(prep_unsigned)
         or not isinstance(ready, list)
-        or selected_count <= 0
-        or requested_count < selected_count
+        or selected_count != EXPECTED_ROOTS
+        or requested_count != EXPECTED_ROOTS
         or partition_count <= 0
         or partition_count > selected_count
         or len(ready) < selected_count
@@ -1148,10 +1155,14 @@ def build_root_manifest(
         or proof.get("independent_from_diagnostic_selected_rows") is not True
         or proof.get("learner_validation_manifest_file_sha256")
         != validation_manifest.get("file_sha256")
-        or proof.get("learner_validation_game_seed_set_sha256")
-        != learner_validation.get("validation_game_seed_set_sha256")
-        or proof.get("learner_validation_target_covered") is not True
-        or proof.get("learner_validation_optimizer_excluded") is not True
+        or proof.get("learner_validation_scope_sha256")
+        != learner_validation.get("scope_sha256")
+        or proof.get("learner_validation_split_receipt_sha256")
+        != value_sha256(validation_split)
+        or proof.get("learner_trainer_exclusion_contract_sha256")
+        != value_sha256(trainer_exclusion)
+        or proof.get("policy_root_breadth_inventory_sha256")
+        != plan_root_breadth["inventory_sha256"]
         or int(proof.get("required_fully_reconstructable_strategic_roots", -1))
         != selected_count
         or int(proof.get("observed_fully_reconstructable_strategic_roots", -1))
@@ -1317,7 +1328,9 @@ def build_final_corpus_admission(
         != merge.get("target_policy_target_identity_sha256")
         or export.get("target_reanalyzer_checkpoint", {}).get("sha256")
         != admission.get("corpus", {}).get("producer_checkpoint_sha256")
-        or selected_rows != int(roots["root_count"])
+        or selected_rows != EXPECTED_ROOTS
+        or int(roots["root_count"]) != EXPECTED_ROOTS
+        or int(roots.get("requested_root_budget", -1)) != EXPECTED_ROOTS
         or len(subset_identities) != selected_rows
         or _set_sha(subset_identities.tolist()) != roots["root_identity_set_sha256"]
         or admission.get("stage_c_policy_overlay", {}).get(
@@ -1372,8 +1385,12 @@ def build_final_corpus_admission(
             admission["policy_distillation_contract"]
         ),
         "policy_root_breadth": root_breadth,
-        "selected_root_count": int(roots["root_count"]),
+        "selected_root_count": EXPECTED_ROOTS,
+        "requested_root_count": EXPECTED_ROOTS,
         "partition_count": int(roots["partition_count"]),
+        "learner_validation_scope": copy.deepcopy(
+            roots["learner_validation_scope"]
+        ),
         "target_policy_target_identity_sha256": merge[
             "target_policy_target_identity_sha256"
         ],
@@ -1445,7 +1462,9 @@ def verify_final_corpus_admission(path: Path) -> dict[str, Any]:
         or payload.get("auto_promotion") is not False
         or payload.get("fresh_independent_target_bytes") is not True
         or payload.get("diagnostic_overlay_or_target_bytes_reused") is not False
-        or int(payload.get("selected_root_count", -1)) != root_manifest_count
+        or root_manifest_count != EXPECTED_ROOTS
+        or int(payload.get("selected_root_count", -1)) != EXPECTED_ROOTS
+        or int(payload.get("requested_root_count", -1)) != EXPECTED_ROOTS
         or int(payload.get("partition_count", -1)) <= 0
         or payload.get("teacher_experiment_role")
         != {
@@ -1606,8 +1625,12 @@ def build_final_authority(
             "max_optimizer_steps": 32,
             "checkpoint_steps": [8, 12, 16, 32],
             "policy_root_breadth": copy.deepcopy(corpus["policy_root_breadth"]),
-            "selected_root_count": int(corpus["selected_root_count"]),
+            "selected_root_count": EXPECTED_ROOTS,
+            "requested_root_count": EXPECTED_ROOTS,
             "partition_count": int(corpus["partition_count"]),
+            "learner_validation_scope": copy.deepcopy(
+                corpus["learner_validation_scope"]
+            ),
             "topology": {
                 "name": "b200-8gpu-ddp",
                 "world_size": 8,
@@ -1748,8 +1771,11 @@ def verify_final_authority(path: Path) -> dict[str, Any]:
         or payload.get("training", {}).get("diagnostic_recipe_selected_step") != 16
         or payload.get("training", {}).get("max_optimizer_steps") != 32
         or payload.get("training", {}).get("checkpoint_steps") != [8, 12, 16, 32]
+        or selected_root_count != EXPECTED_ROOTS
         or int(payload.get("training", {}).get("selected_root_count", -1))
-        != selected_root_count
+        != EXPECTED_ROOTS
+        or int(payload.get("training", {}).get("requested_root_count", -1))
+        != EXPECTED_ROOTS
         or int(payload.get("training", {}).get("partition_count", -1)) <= 0
         or differing(treatment_recipe)
         != {"value_lr_mult", "value_trunk_grad_scale"}

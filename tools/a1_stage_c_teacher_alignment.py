@@ -63,7 +63,7 @@ from catan_zero.search.neural_rust_mcts import (  # noqa: E402
 )
 
 
-PLAN_SCHEMA = "a1-stage-c-teacher-alignment-plan-v2"
+PLAN_SCHEMA = "a1-stage-c-teacher-alignment-plan-v3"
 OVERLAY_SCHEMA = "a1-stage-c-target-eligibility-overlay-v1"
 SUBSET_SCHEMA = "a1-stage-c-reanalysis-subset-v2"
 COHERENT_REGIME = "public_belief_single_tree_v1"
@@ -96,6 +96,9 @@ RELIABILITY_CLASS = {
     "duplicate_search_audited": 2,
 }
 ROOT_BREADTH_SCHEMA = "a1-stage-c-policy-root-breadth-v1"
+PRODUCTION_ROOT_COUNT = 65_536
+LEARNER_VALIDATION_SCOPE_SCHEMA = "a1-stage-c-learner-validation-scope-v2"
+TRAINER_EXCLUSION_CONTRACT_SCHEMA = "a1-stage-c-trainer-exclusion-contract-v1"
 ROOT_BREADTH_REQUIRED_PHASES = (
     "BUILD_INITIAL_ROAD",
     "BUILD_INITIAL_SETTLEMENT",
@@ -1188,6 +1191,12 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     # alignment cycle and makes the selector CLI depend on import order.
     from tools import a1_b200_active_policy_campaign as active_campaign
 
+    if int(args.subset_rows) != PRODUCTION_ROOT_COUNT:
+        raise AlignmentError(
+            "production Stage-C plans require exactly "
+            f"{PRODUCTION_ROOT_COUNT:,} requested roots"
+        )
+
     try:
         admission_path, admission = active_campaign._load_admission(  # noqa: SLF001
             args.coherent_corpus_admission
@@ -1292,6 +1301,11 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         max_rows_per_game=int(args.max_rows_per_game),
     )
     selected_rows = candidate_rows[selected_positions]
+    if len(selected_rows) != PRODUCTION_ROOT_COUNT:
+        raise AlignmentError(
+            "production Stage-C selection did not realize exactly "
+            f"{PRODUCTION_ROOT_COUNT:,} roots: realized={len(selected_rows)}"
+        )
     chunks = int(args.chunks)
     if chunks <= 0:
         raise AlignmentError("chunks must be positive")
@@ -1387,6 +1401,51 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 "per_row_sparse_reconstruction_qualification_required",
             ]
         )
+    validation_scope: dict[str, Any] = {
+        "schema_version": LEARNER_VALIDATION_SCOPE_SCHEMA,
+        "manifest": {
+            "path": str(Path(str(validation_ref["path"])).resolve(strict=True)),
+            "file_sha256": str(validation["file_sha256"]),
+            "manifest_sha256": str(validation["manifest_sha256"]),
+            "a1_contract_sha256": str(validation["a1_contract_sha256"]),
+        },
+        "split_receipt": {
+            "validation_row_count": int(validation["validation_row_count"]),
+            "validation_game_seed_count": int(
+                validation["validation_game_seed_count"]
+            ),
+            "validation_game_seed_set_sha256": str(
+                validation["validation_game_seed_set_sha256"]
+            ),
+        },
+        "trainer_exclusion_contract": {
+            "schema_version": TRAINER_EXCLUSION_CONTRACT_SCHEMA,
+            "input_validation_manifest_file_sha256": str(validation["file_sha256"]),
+            "training_excluded_game_seed_count": int(
+                validation["validation_game_seed_count"]
+            ),
+            "training_excluded_game_seed_set_sha256": str(
+                validation["validation_game_seed_set_sha256"]
+            ),
+        },
+        "target_coverage_receipt": {
+            "root_breadth_inventory_sha256": game_first_selection["root_breadth"][
+                "inventory_sha256"
+            ],
+            "selected_validation_root_count": int(
+                game_first_selection["root_breadth"]["scopes"]["validation"][
+                    "selected_root_count"
+                ]
+            ),
+            "selected_validation_game_count": int(
+                game_first_selection["root_breadth"]["scopes"]["validation"][
+                    "selected_game_count"
+                ]
+            ),
+        },
+        "external_final_gate_authority": False,
+    }
+    validation_scope["scope_sha256"] = _value_sha256(validation_scope)
     plan: dict[str, Any] = {
         "schema_version": PLAN_SCHEMA,
         "purpose": "current_coherent_n128_operator_aligned_reanalysis_subset",
@@ -1397,21 +1456,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "file_sha256": _file_sha256(admission_path),
             "admission_sha256": admission["admission_sha256"],
         },
-        "learner_validation_scope": {
-            "manifest": {
-                "path": str(Path(str(validation_ref["path"])).resolve(strict=True)),
-                "file_sha256": str(validation["file_sha256"]),
-            },
-            "validation_game_seed_count": int(
-                validation["validation_game_seed_count"]
-            ),
-            "validation_game_seed_set_sha256": str(
-                validation["validation_game_seed_set_sha256"]
-            ),
-            "target_covered": True,
-            "optimizer_excluded": True,
-            "external_final_gate_authority": False,
-        },
+        "learner_validation_scope": validation_scope,
         "evidence_lifetimes": {
             "state_evidence": "reusable_if_information_surface_and_reconstruction_hold",
             "terminal_value_evidence": "reusable_independent_of_search_operator",
@@ -1488,9 +1533,17 @@ def _verify_plan(path: Path) -> dict[str, Any]:
     validation_scope = plan.get("learner_validation_scope")
     if not isinstance(validation_scope, Mapping):
         raise AlignmentError("Stage-C plan lacks learner validation scope")
+    validation_scope_unsigned = dict(validation_scope)
+    validation_scope_stated = validation_scope_unsigned.pop("scope_sha256", None)
     validation_ref = validation_scope.get("manifest")
+    split_receipt = validation_scope.get("split_receipt")
+    exclusion_contract = validation_scope.get("trainer_exclusion_contract")
     if not isinstance(validation_ref, Mapping):
         raise AlignmentError("Stage-C learner validation manifest binding is malformed")
+    if not isinstance(split_receipt, Mapping) or not isinstance(
+        exclusion_contract, Mapping
+    ):
+        raise AlignmentError("Stage-C learner validation split binding is malformed")
     validation_path = _regular_file(
         Path(str(validation_ref["path"])), where="Stage-C learner validation manifest"
     )
@@ -1507,13 +1560,27 @@ def _verify_plan(path: Path) -> dict[str, Any]:
             f"Stage-C learner validation manifest refused: {error}"
         ) from error
     if (
-        validation_ref.get("file_sha256") != _file_sha256(validation_path)
-        or validation_scope.get("validation_game_seed_count")
+        validation_scope.get("schema_version") != LEARNER_VALIDATION_SCOPE_SCHEMA
+        or validation_scope_stated != _value_sha256(validation_scope_unsigned)
+        or validation_ref.get("file_sha256") != _file_sha256(validation_path)
+        or validation_ref.get("file_sha256") != validation["file_sha256"]
+        or validation_ref.get("manifest_sha256") != validation["manifest_sha256"]
+        or validation_ref.get("a1_contract_sha256")
+        != validation["a1_contract_sha256"]
+        or split_receipt.get("validation_row_count")
+        != validation["validation_row_count"]
+        or split_receipt.get("validation_game_seed_count")
         != validation["validation_game_seed_count"]
-        or validation_scope.get("validation_game_seed_set_sha256")
+        or split_receipt.get("validation_game_seed_set_sha256")
         != validation["validation_game_seed_set_sha256"]
-        or validation_scope.get("target_covered") is not True
-        or validation_scope.get("optimizer_excluded") is not True
+        or exclusion_contract.get("schema_version")
+        != TRAINER_EXCLUSION_CONTRACT_SCHEMA
+        or exclusion_contract.get("input_validation_manifest_file_sha256")
+        != validation["file_sha256"]
+        or exclusion_contract.get("training_excluded_game_seed_count")
+        != validation["validation_game_seed_count"]
+        or exclusion_contract.get("training_excluded_game_seed_set_sha256")
+        != validation["validation_game_seed_set_sha256"]
         or validation_scope.get("external_final_gate_authority") is not False
     ):
         raise AlignmentError("Stage-C learner validation scope drifted")
@@ -1585,6 +1652,9 @@ def _verify_plan(path: Path) -> dict[str, Any]:
         selection_stated = selection_unsigned.pop("selection_sha256", None)
         if (
             count != int(plan["subset"]["selected_rows"])
+            or count != PRODUCTION_ROOT_COUNT
+            or int(plan["subset"].get("requested_rows", -1))
+            != PRODUCTION_ROOT_COUNT
             or any(len(arrays[name]) != count for name in arrays.files)
             or np.unique(arrays["identity_sha256"]).size != count
             or selection.get("schema_version")
@@ -1604,6 +1674,18 @@ def _verify_plan(path: Path) -> dict[str, Any]:
             selection.get("root_breadth"),
             selected_rows=count,
         )
+        target_coverage = validation_scope.get("target_coverage_receipt")
+        validation_breadth = sealed_breadth["scopes"]["validation"]
+        if (
+            not isinstance(target_coverage, Mapping)
+            or target_coverage.get("root_breadth_inventory_sha256")
+            != sealed_breadth["inventory_sha256"]
+            or target_coverage.get("selected_validation_root_count")
+            != validation_breadth["selected_root_count"]
+            or target_coverage.get("selected_validation_game_count")
+            != validation_breadth["selected_game_count"]
+        ):
+            raise AlignmentError("Stage-C learner validation target coverage drifted")
         source_data = train_bc.MemmapCorpus(
             Path(str(overlay["corpus"]["path"])).resolve(strict=True)
         )

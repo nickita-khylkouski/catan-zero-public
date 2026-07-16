@@ -515,10 +515,10 @@ def summarize(run: dict[str, Any]) -> dict[str, Any]:
     steps = int(report["steps_completed"])
     samples = steps * int(run["global_batch_size"])
     validation = train_bc.objective_matched_validation_metrics(
-        report["metrics"][-1], require_matched=True
+        report["metrics"][-1], require_matched=True, require_provenance=True
     )
     component_validation = train_bc.objective_matched_validation_component_metrics(
-        report["metrics"][-1], require_matched=True
+        report["metrics"][-1], require_matched=True, require_provenance=True
     )
     component_closures = {
         component_id: float(metrics["active_policy_teacher_gap_closure"])

@@ -27,6 +27,41 @@ DUAL_RUNTIME = [
 ]
 
 
+def _seal_matched_validation(matched: dict, *, epoch: int) -> dict:
+    coverage = {
+        component_id: {
+            key: report[key]
+            for key in (
+                "component_index",
+                "authenticated_sampling_ratio",
+                "rows",
+                "games",
+                "min_rows_per_game",
+                "max_rows_per_game",
+            )
+        }
+        for component_id, report in matched["components"].items()
+    }
+    identity = dual.train_bc.objective_matched_validation_evaluation_identity(
+        model_state_sha256="sha256:" + "1" * 64,
+        runtime_binding={"test": "dual-arm"},
+        epoch=epoch,
+        optimizer_step=epoch,
+    )
+    matched["provenance"] = {
+        "schema_version": dual.train_bc.COMPOSITE_VALIDATION_PROVENANCE_SCHEMA,
+        "measure": dual.train_bc.COMPOSITE_VALIDATION_MEASURE,
+        "descriptor_fingerprint": "sha256:" + "2" * 64,
+        "payload_inventory_sha256": "sha256:" + "3" * 64,
+        "source_authority_semantic_sha256": None,
+        "validation_game_seed_set_sha256": "sha256:" + "4" * 64,
+        "component_coverage_sha256": dual.train_bc._canonical_json_sha256(coverage),
+        "evaluation_schema_version": identity["schema_version"],
+        **{key: value for key, value in identity.items() if key != "schema_version"},
+    }
+    return dual.train_bc._reseal_objective_matched_validation_wrapper(matched)
+
+
 def _verified(tmp_path: Path) -> dict:
     producer = tmp_path / "producer.pt"
     producer.write_bytes(b"producer")
@@ -790,7 +825,7 @@ def test_epoch_outputs_prefer_objective_matched_validation_when_present(
         metric["validation"]["loss"] = 90.0 + epoch
         first_rows = verified["validation_rows"] // 2
         second_rows = verified["validation_rows"] - first_rows
-        metric["validation_objective_matched"] = {
+        metric["validation_objective_matched"] = _seal_matched_validation({
             "schema_version": "composite-validation-measure-v2",
             "measure": dual.train_bc.COMPOSITE_VALIDATION_MEASURE,
             "objective_matched": True,
@@ -820,7 +855,7 @@ def test_epoch_outputs_prefer_objective_matched_validation_when_present(
                     "metrics": {"loss": 1.0},
                 },
             },
-        }
+        }, epoch=epoch)
     report.write_text(json.dumps(payload), encoding="utf-8")
 
     outputs = dual.verify_outputs(

@@ -9064,6 +9064,53 @@ def _verify_production_checkout_runtime_binding(
     return copy.deepcopy(binding)
 
 
+def _verify_objective_matched_evaluation_identity(
+    *,
+    provenance: Mapping[str, object],
+    checkpoint: Path,
+    runtime_binding: Mapping[str, object],
+    epoch: int,
+    optimizer_step: int,
+) -> None:
+    """Replay the validation identity from the durable production checkpoint."""
+
+    try:
+        actual_model_state_sha256 = (
+            train_bc._checkpoint_model_tensor_state_sha256(checkpoint)  # noqa: SLF001
+        )
+        expected = train_bc.objective_matched_validation_evaluation_identity(
+            model_state_sha256=actual_model_state_sha256,
+            runtime_binding=runtime_binding,
+            epoch=epoch,
+            optimizer_step=optimizer_step,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        raise ExecutorError(
+            "production acceptance cannot externally replay the evaluated "
+            "checkpoint/runtime identity"
+        ) from error
+    if any(
+        provenance.get(provenance_key) != expected[identity_key]
+        for provenance_key, identity_key in (
+            ("evaluated_model_state_sha256", "evaluated_model_state_sha256"),
+            (
+                "evaluated_checkpoint_identity_sha256",
+                "evaluated_checkpoint_identity_sha256",
+            ),
+            (
+                "evaluation_runtime_binding_sha256",
+                "evaluation_runtime_binding_sha256",
+            ),
+            ("evaluation_epoch", "evaluation_epoch"),
+            ("evaluation_optimizer_step", "evaluation_optimizer_step"),
+        )
+    ):
+        raise ExecutorError(
+            "production acceptance requires validation from the durable "
+            "checkpoint/runtime/step identity"
+        )
+
+
 def _verify_training_outputs(
     *,
     checkpoint: Path,
@@ -9874,6 +9921,23 @@ def _verify_training_outputs(
         matched_provenance = (
             matched.get("provenance") if isinstance(matched, dict) else None
         )
+        try:
+            runtime_binding = report_payload["checkout_runtime_binding"]
+            evaluation_epoch = int(metrics[0]["epoch"])
+            evaluation_optimizer_step = int(report_payload["steps_completed"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ExecutorError(
+                "production acceptance cannot externally replay the evaluated "
+                "checkpoint/runtime identity"
+            ) from error
+        if isinstance(matched_provenance, dict):
+            _verify_objective_matched_evaluation_identity(
+                provenance=matched_provenance,
+                checkpoint=checkpoint,
+                runtime_binding=runtime_binding,
+                epoch=evaluation_epoch,
+                optimizer_step=evaluation_optimizer_step,
+            )
         if (
             not isinstance(matched, dict)
             or matched.get("schema_version") != "composite-validation-measure-v2"

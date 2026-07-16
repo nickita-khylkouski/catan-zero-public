@@ -4210,6 +4210,52 @@ def test_production_strict_checkpoint_reconstruction_is_mandatory(
         )
 
 
+def test_production_acceptance_rejects_self_consistent_validation_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "candidate.pt"
+    checkpoint.write_bytes(b"durable checkpoint")
+    runtime = {"repo_commit": "current", "trainer": "bound"}
+    actual_model_sha256 = "sha256:" + "1" * 64
+    replayed_model_sha256 = "sha256:" + "2" * 64
+    monkeypatch.setattr(
+        executor.train_bc,
+        "_checkpoint_model_tensor_state_sha256",
+        lambda _path: actual_model_sha256,
+    )
+    expected = executor.train_bc.objective_matched_validation_evaluation_identity(
+        model_state_sha256=actual_model_sha256,
+        runtime_binding=runtime,
+        epoch=1,
+        optimizer_step=32,
+    )
+    executor._verify_objective_matched_evaluation_identity(  # noqa: SLF001
+        provenance=expected,
+        checkpoint=checkpoint,
+        runtime_binding=runtime,
+        epoch=1,
+        optimizer_step=32,
+    )
+
+    replayed = executor.train_bc.objective_matched_validation_evaluation_identity(
+        model_state_sha256=replayed_model_sha256,
+        runtime_binding=runtime,
+        epoch=1,
+        optimizer_step=32,
+    )
+    with pytest.raises(
+        executor.ExecutorError,
+        match="durable checkpoint/runtime/step identity",
+    ):
+        executor._verify_objective_matched_evaluation_identity(  # noqa: SLF001
+            provenance=replayed,
+            checkpoint=checkpoint,
+            runtime_binding=runtime,
+            epoch=1,
+            optimizer_step=32,
+        )
+
+
 @pytest.mark.parametrize("alias", ["checkpoint", "report", "receipt"])
 def test_output_paths_cannot_alias_the_contract_claim(
     tmp_path: Path, alias: str

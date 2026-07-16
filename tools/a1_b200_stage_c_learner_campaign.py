@@ -54,6 +54,9 @@ TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v1"
 SEPARATE_PARENT_GAP_SCHEMA = "posthoc-separate-parent-teacher-gap-v1"
 VALUE_QUALITY_SCHEMA = "posthoc-objective-matched-value-quality-v1"
 PAIRED_PARENT_VALUE_SCHEMA = "posthoc-paired-parent-value-quality-v1"
+LEARNER_VALIDATION_CONTRACT_SCHEMA = (
+    "a1-stage-c-learner-validation-execution-contract-v1"
+)
 WORLD_SIZE = 8
 LOCAL_BATCH_SIZE = 512
 GLOBAL_BATCH_SIZE = WORLD_SIZE * LOCAL_BATCH_SIZE
@@ -730,6 +733,18 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         raise CampaignError("campaign arm differs from overlay sampling distribution")
     data = Path(str(corpus["data_path"])).resolve(strict=True)
     validation = Path(str(corpus["validation_manifest"]["path"])).resolve(strict=True)
+    try:
+        validation_contract = (
+            one_dose.train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
+                validation,
+                validation_fraction=0.05,
+                validation_seed=17,
+                validation_max_samples=0,
+                validation_game_seed_ranges=[],
+            )
+        )
+    except SystemExit as error:
+        raise CampaignError(f"Stage-C learner validation refused: {error}") from error
     lock = args.lock.expanduser().resolve(strict=True)
     try:
         python = stage_a.base_campaign._python_executable(args.python)  # noqa: SLF001
@@ -833,6 +848,27 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "surprise_weighting": False,
             "sampling_distribution": copy.deepcopy(sampling),
             "root_breadth": root_breadth,
+        },
+        "learner_validation_contract": {
+            "schema_version": LEARNER_VALIDATION_CONTRACT_SCHEMA,
+            "input_validation_manifest_file_sha256": validation_contract[
+                "file_sha256"
+            ],
+            "input_validation_manifest_sha256": validation_contract[
+                "manifest_sha256"
+            ],
+            "validation_game_seed_count": validation_contract[
+                "validation_game_seed_count"
+            ],
+            "validation_game_seed_set_sha256": validation_contract[
+                "validation_game_seed_set_sha256"
+            ],
+            "training_excluded_game_seed_count": validation_contract[
+                "validation_game_seed_count"
+            ],
+            "training_excluded_game_seed_set_sha256": validation_contract[
+                "validation_game_seed_set_sha256"
+            ],
         },
         "topology": {
             "name": "b200-8gpu-ddp",
@@ -975,6 +1011,7 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
     feature_signal = plan.get("feature_learning_signal_contract")
     value_gate = plan.get("selection_contract", {}).get("value_quality_gate")
     target_contract = plan.get("policy_target_contract", {})
+    validation_contract = plan.get("learner_validation_contract")
     try:
         overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
             target_contract.get("root_breadth"),
@@ -1015,6 +1052,15 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
             "required_positive_fields": list(POSITIVE_OPTIMIZER_SIGNAL_FIELDS),
         }
         or not isinstance(value_gate, dict)
+        or not isinstance(validation_contract, dict)
+        or validation_contract.get("schema_version")
+        != LEARNER_VALIDATION_CONTRACT_SCHEMA
+        or validation_contract.get("input_validation_manifest_file_sha256")
+        != inputs["validation_manifest_file_sha256"]
+        or validation_contract.get("validation_game_seed_count")
+        != validation_contract.get("training_excluded_game_seed_count")
+        or validation_contract.get("validation_game_seed_set_sha256")
+        != validation_contract.get("training_excluded_game_seed_set_sha256")
         or value_gate.get("policy") not in VALUE_GATE_POLICIES
         or value_gate.get("metric") != "primary_value_loss"
         or value_gate.get("metric_kind") != "scalar_mse"
@@ -1083,6 +1129,23 @@ def _authenticate_completed_stage_c_dose(
     ):
         raise CampaignError(
             "completed learner did not keep both feature adapters trainable"
+        )
+    validation_contract = plan.get("learner_validation_contract")
+    if (
+        not isinstance(validation_contract, Mapping)
+        or report.get("input_validation_game_seed_manifest_sha256")
+        != validation_contract.get("input_validation_manifest_file_sha256")
+        or report.get("validation_game_seed_count")
+        != validation_contract.get("validation_game_seed_count")
+        or report.get("validation_game_seed_set_sha256")
+        != validation_contract.get("validation_game_seed_set_sha256")
+        or report.get("training_excluded_game_seed_count")
+        != validation_contract.get("training_excluded_game_seed_count")
+        or report.get("training_excluded_game_seed_set_sha256")
+        != validation_contract.get("training_excluded_game_seed_set_sha256")
+    ):
+        raise CampaignError(
+            "completed learner did not execute the bound validation exclusion contract"
         )
     _verify_completed_feature_learning_signal(report)
     _verify_completed_objective_gradient_signal(report)

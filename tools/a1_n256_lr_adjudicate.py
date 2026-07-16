@@ -292,10 +292,10 @@ def _arm_metrics(
     if not isinstance(metrics, list) or not metrics:
         raise AdjudicationError(f"{label} report has no epoch metrics")
     validation = train_bc.objective_matched_validation_metrics(
-        metrics[-1], require_matched=True
+        metrics[-1], require_matched=True, require_provenance=True
     )
     component_validation = train_bc.objective_matched_validation_component_metrics(
-        metrics[-1], require_matched=True
+        metrics[-1], require_matched=True, require_provenance=True
     )
     component_closures = {
         component_id: float(values["active_policy_teacher_gap_closure"])

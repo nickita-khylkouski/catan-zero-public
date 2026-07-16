@@ -14322,11 +14322,22 @@ def main(argv: Sequence[str] | None = None) -> None:
         if is_memmap_composite and tuple(
             getattr(data, "component_game_sampling_ratios", tuple())
         ):
+            evaluation_identity = objective_matched_validation_evaluation_identity(
+                model_state_sha256=_rank0_authoritative_call(
+                    ddp,
+                    "objective-matched validation model identity",
+                    lambda: _a1_model_tensor_state_sha256(policy.model),
+                ),
+                runtime_binding=checkout_runtime_binding,
+                epoch=epoch + 1,
+                optimizer_step=global_step,
+            )
             metrics[-1]["validation_objective_matched"] = (
                 evaluate_composite_validation_measure(
                     data,
                     validation_indices,
                     _evaluate_validation_indices,
+                    evaluation_identity=evaluation_identity,
                 )
             )
         if policy_aux_validation_sampling_weights is not None:
@@ -14488,7 +14499,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     },
                 }
             )
-            metrics[-1]["validation_objective_matched"] = objective_wrapper
+            metrics[-1]["validation_objective_matched"] = (
+                _reseal_objective_matched_validation_wrapper(objective_wrapper)
+            )
         _rank0_print(
             json.dumps(
                 {
@@ -17548,7 +17561,10 @@ COMPOSITE_VALIDATION_MEASURE = (
     "authenticated_component_then_uniform_game_then_uniform_row_"
     "with_objective_weight_density"
 )
-COMPOSITE_VALIDATION_PROVENANCE_SCHEMA = "composite-validation-provenance-v1"
+COMPOSITE_VALIDATION_PROVENANCE_SCHEMA = "composite-validation-provenance-v2"
+COMPOSITE_VALIDATION_EVALUATION_SCHEMA = (
+    "objective-matched-validation-evaluation-identity-v1"
+)
 
 
 class _IndexedValidationWeights:
@@ -17702,6 +17718,83 @@ def _combine_policy_aux_validation_metrics(
     return combined
 
 
+def objective_matched_validation_evaluation_identity(
+    *,
+    model_state_sha256: str,
+    runtime_binding: Mapping[str, object],
+    epoch: int,
+    optimizer_step: int,
+) -> dict[str, object]:
+    """Bind validation to the exact model state and runtime that produced it."""
+
+    if not _is_sha256(model_state_sha256):
+        raise ValueError("objective-matched validation model identity is malformed")
+    if not isinstance(runtime_binding, Mapping) or not runtime_binding:
+        raise ValueError("objective-matched validation runtime binding is malformed")
+    if (
+        isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or epoch < 0
+        or isinstance(optimizer_step, bool)
+        or not isinstance(optimizer_step, int)
+        or optimizer_step < 0
+    ):
+        raise ValueError("objective-matched validation step identity is malformed")
+    runtime_sha256 = _canonical_json_sha256(dict(runtime_binding))
+    checkpoint_identity = {
+        "model_state_sha256": model_state_sha256,
+        "runtime_binding_sha256": runtime_sha256,
+        "epoch": epoch,
+        "optimizer_step": optimizer_step,
+    }
+    return {
+        "schema_version": COMPOSITE_VALIDATION_EVALUATION_SCHEMA,
+        "evaluated_model_state_sha256": model_state_sha256,
+        "evaluated_checkpoint_identity_sha256": _canonical_json_sha256(
+            checkpoint_identity
+        ),
+        "evaluation_runtime_binding_sha256": runtime_sha256,
+        "evaluation_epoch": epoch,
+        "evaluation_optimizer_step": optimizer_step,
+    }
+
+
+def _objective_matched_promotion_metrics_binding(
+    matched: Mapping[str, object],
+) -> dict[str, object]:
+    metrics = matched.get("metrics")
+    components = matched.get("components")
+    if not isinstance(metrics, dict) or not isinstance(components, dict):
+        raise ValueError("objective-matched promotion metrics are malformed")
+    component_metrics: dict[str, dict] = {}
+    for component_id, report in components.items():
+        values = report.get("metrics") if isinstance(report, dict) else None
+        if not isinstance(component_id, str) or not isinstance(values, dict):
+            raise ValueError("objective-matched component promotion metrics are malformed")
+        component_metrics[component_id] = values
+    return {
+        "aggregate_metrics": metrics,
+        "component_metrics": component_metrics,
+    }
+
+
+def _reseal_objective_matched_validation_wrapper(
+    matched: dict[str, object],
+) -> dict[str, object]:
+    """Rebind mutable aggregate/component metrics after objective composition."""
+
+    provenance = matched.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("objective-matched validation provenance is missing")
+    provenance = dict(provenance)
+    provenance["promotion_metrics_sha256"] = _canonical_json_sha256(
+        _objective_matched_promotion_metrics_binding(matched)
+    )
+    matched["provenance"] = provenance
+    matched["provenance_sha256"] = _canonical_json_sha256(provenance)
+    return matched
+
+
 def _validated_objective_matched_validation_wrapper(
     epoch_metrics: dict,
     *,
@@ -17831,14 +17924,50 @@ def _validated_objective_matched_validation_wrapper(
         or not _is_sha256(provenance.get("descriptor_fingerprint"))
         or not _is_sha256(provenance.get("payload_inventory_sha256"))
         or not _is_sha256(provenance.get("validation_game_seed_set_sha256"))
+        or not _is_sha256(provenance.get("promotion_metrics_sha256"))
         or provenance.get("component_coverage_sha256")
         != _canonical_json_sha256(coverage)
+        or provenance.get("promotion_metrics_sha256")
+        != _canonical_json_sha256(
+            _objective_matched_promotion_metrics_binding(matched)
+        )
         or provenance_sha256 != _canonical_json_sha256(provenance)
     ):
         raise ValueError("objective-matched validation provenance is malformed")
     source_authority = provenance.get("source_authority_semantic_sha256")
     if source_authority is not None and not _is_sha256(source_authority):
         raise ValueError("objective-matched source authority is malformed")
+    if (
+        provenance.get("evaluation_schema_version")
+        != COMPOSITE_VALIDATION_EVALUATION_SCHEMA
+        or not _is_sha256(provenance.get("evaluated_model_state_sha256"))
+        or not _is_sha256(
+            provenance.get("evaluated_checkpoint_identity_sha256")
+        )
+        or not _is_sha256(provenance.get("evaluation_runtime_binding_sha256"))
+        or isinstance(provenance.get("evaluation_epoch"), bool)
+        or not isinstance(provenance.get("evaluation_epoch"), int)
+        or int(provenance["evaluation_epoch"]) < 0
+        or isinstance(provenance.get("evaluation_optimizer_step"), bool)
+        or not isinstance(provenance.get("evaluation_optimizer_step"), int)
+        or int(provenance["evaluation_optimizer_step"]) < 0
+    ):
+        raise ValueError("objective-matched evaluation identity is malformed")
+    expected_checkpoint_identity = _canonical_json_sha256(
+        {
+            "model_state_sha256": provenance["evaluated_model_state_sha256"],
+            "runtime_binding_sha256": provenance[
+                "evaluation_runtime_binding_sha256"
+            ],
+            "epoch": provenance["evaluation_epoch"],
+            "optimizer_step": provenance["evaluation_optimizer_step"],
+        }
+    )
+    if (
+        provenance["evaluated_checkpoint_identity_sha256"]
+        != expected_checkpoint_identity
+    ):
+        raise ValueError("objective-matched checkpoint identity is malformed")
     return matched
 
 
@@ -18437,6 +18566,8 @@ def evaluate_composite_validation_measure(
     data,
     validation_indices: np.ndarray,
     evaluate_indices,
+    *,
+    evaluation_identity: Mapping[str, object],
 ) -> dict[str, object]:
     """Evaluate a composite under its authenticated training distribution.
 
@@ -18557,6 +18688,23 @@ def evaluate_composite_validation_measure(
         }
         for component_id in component_reports
     }
+    required_evaluation_fields = {
+        "schema_version",
+        "evaluated_model_state_sha256",
+        "evaluated_checkpoint_identity_sha256",
+        "evaluation_runtime_binding_sha256",
+        "evaluation_epoch",
+        "evaluation_optimizer_step",
+    }
+    if (
+        not isinstance(evaluation_identity, Mapping)
+        or set(evaluation_identity) != required_evaluation_fields
+        or evaluation_identity.get("schema_version")
+        != COMPOSITE_VALIDATION_EVALUATION_SCHEMA
+    ):
+        raise SystemExit(
+            "objective-matched validation requires exact evaluation identity"
+        )
     provenance = {
         "schema_version": COMPOSITE_VALIDATION_PROVENANCE_SCHEMA,
         "measure": COMPOSITE_VALIDATION_MEASURE,
@@ -18569,8 +18717,14 @@ def evaluate_composite_validation_measure(
             np.unique(seeds)
         ),
         "component_coverage_sha256": _canonical_json_sha256(coverage),
+        "evaluation_schema_version": evaluation_identity["schema_version"],
+        **{
+            key: evaluation_identity[key]
+            for key in required_evaluation_fields
+            if key != "schema_version"
+        },
     }
-    return {
+    result: dict[str, object] = {
         "schema_version": COMPOSITE_VALIDATION_MEASURE_SCHEMA,
         "measure": COMPOSITE_VALIDATION_MEASURE,
         "objective_matched": True,
@@ -18590,13 +18744,13 @@ def evaluate_composite_validation_measure(
         "metrics": aggregate,
         "components": component_reports,
         "provenance": provenance,
-        "provenance_sha256": _canonical_json_sha256(provenance),
         **(
             {"objective_measure_sufficient_statistics": aggregate_sufficient}
             if aggregate_sufficient is not None
             else {}
         ),
     }
+    return _reseal_objective_matched_validation_wrapper(result)
 
 
 def evaluate_bc_batches(
@@ -30362,12 +30516,13 @@ def _a1_load_aux_geometry_manifest(
     return manifest, positions
 
 
-def _a1_model_tensor_state_sha256(model) -> str:
-    """Digest exact tensor bytes, names, shapes, and dtypes for no-mutation proof."""
+def _tensor_state_mapping_sha256(state: Mapping[str, object]) -> str:
+    """Digest exact tensor bytes, names, shapes, and dtypes."""
 
-    unwrapped = getattr(model, "module", model)
     digest = hashlib.sha256()
-    for name, tensor in sorted(unwrapped.state_dict().items()):
+    for name, tensor in sorted(state.items()):
+        if not hasattr(tensor, "detach"):
+            raise ValueError(f"checkpoint model state contains a non-tensor: {name}")
         value = tensor.detach().cpu().contiguous()
         metadata = json.dumps(
             {
@@ -30383,6 +30538,26 @@ def _a1_model_tensor_state_sha256(model) -> str:
         digest.update(value.numpy().tobytes())
         digest.update(b"\0")
     return "sha256:" + digest.hexdigest()
+
+
+def _a1_model_tensor_state_sha256(model) -> str:
+    """Digest exact in-memory model state for validation/no-mutation proof."""
+
+    unwrapped = getattr(model, "module", model)
+    return _tensor_state_mapping_sha256(unwrapped.state_dict())
+
+
+def _checkpoint_model_tensor_state_sha256(path: str | Path) -> str:
+    """Recover the exact model-state identity from a durable entity checkpoint."""
+
+    import torch
+
+    resolved = Path(path).expanduser().resolve(strict=True)
+    payload = torch.load(resolved, map_location="cpu", weights_only=False)
+    state = payload.get("model") if isinstance(payload, dict) else None
+    if not isinstance(state, Mapping) or not state:
+        raise ValueError("checkpoint does not contain a model tensor mapping")
+    return _tensor_state_mapping_sha256(state)
 
 
 def _epoch_order(

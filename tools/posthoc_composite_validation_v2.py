@@ -342,15 +342,25 @@ def run_rescore(
             scalar_value_loss_scale=scalar_scale,
         )
 
+    runtime_binding = train_bc._assert_checkout_runtime_binding()
     exact = train_bc.evaluate_composite_validation_measure(
-        data, validation_indices, evaluate
+        data,
+        validation_indices,
+        evaluate,
+        evaluation_identity=train_bc.objective_matched_validation_evaluation_identity(
+            model_state_sha256=train_bc._a1_model_tensor_state_sha256(
+                getattr(policy, "model", policy)
+            ),
+            runtime_binding=runtime_binding,
+            epoch=int(report.get("epochs", 0)),
+            optimizer_step=int(report.get("steps_completed", 0)),
+        ),
     )
     if exact.get("schema_version") != "composite-validation-measure-v2":
         raise RuntimeError("trainer did not emit exact composite validation v2")
     after = {name: _sha256(path) for name, path in paths.items()}
     if after != before:
         raise RuntimeError("posthoc validation input bytes changed during evaluation")
-    runtime_binding = train_bc._assert_checkout_runtime_binding()
     return {
         "schema_version": SCHEMA,
         "read_only": True,

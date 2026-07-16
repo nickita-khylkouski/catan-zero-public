@@ -214,6 +214,11 @@ def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch
         lambda corpus, weights: value_scope_calls.append(corpus) or weights,
     )
     monkeypatch.setattr(posthoc, "_load_policy", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(
+        posthoc.train_bc,
+        "_a1_model_tensor_state_sha256",
+        lambda model: "sha256:" + "a" * 64,
+    )
 
     evaluate_calls = []
 

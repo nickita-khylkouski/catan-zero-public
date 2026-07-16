@@ -28,7 +28,7 @@ def _matched_validation(
         }
         for index, (component_id, values) in enumerate(component_metrics.items())
     }
-    return {
+    matched = {
         "schema_version": "composite-validation-measure-v2",
         "measure": train_bc.COMPOSITE_VALIDATION_MEASURE,
         "objective_matched": True,
@@ -40,6 +40,38 @@ def _matched_validation(
         "metrics": metrics,
         "components": components,
     }
+    coverage = {
+        component_id: {
+            key: report[key]
+            for key in (
+                "component_index",
+                "authenticated_sampling_ratio",
+                "rows",
+                "games",
+                "min_rows_per_game",
+                "max_rows_per_game",
+            )
+        }
+        for component_id, report in components.items()
+    }
+    identity = train_bc.objective_matched_validation_evaluation_identity(
+        model_state_sha256="sha256:" + "1" * 64,
+        runtime_binding={"test": "batch-probe"},
+        epoch=1,
+        optimizer_step=1,
+    )
+    matched["provenance"] = {
+        "schema_version": train_bc.COMPOSITE_VALIDATION_PROVENANCE_SCHEMA,
+        "measure": train_bc.COMPOSITE_VALIDATION_MEASURE,
+        "descriptor_fingerprint": "sha256:" + "2" * 64,
+        "payload_inventory_sha256": "sha256:" + "3" * 64,
+        "source_authority_semantic_sha256": None,
+        "validation_game_seed_set_sha256": "sha256:" + "4" * 64,
+        "component_coverage_sha256": train_bc._canonical_json_sha256(coverage),
+        "evaluation_schema_version": identity["schema_version"],
+        **{key: value for key, value in identity.items() if key != "schema_version"},
+    }
+    return train_bc._reseal_objective_matched_validation_wrapper(matched)
 
 
 def _receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:

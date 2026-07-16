@@ -5,11 +5,13 @@ import pytest
 
 from tools.train_bc import (
     _combine_policy_aux_validation_metrics,
+    _canonical_json_sha256,
     _IndexedValidationWeights,
     _objective_measure_validation_aggregate,
     _policy_aux_validation_objective_weights,
     evaluate_composite_validation_measure,
     objective_matched_validation_component_metrics,
+    objective_matched_validation_evaluation_identity,
     objective_matched_validation_metrics,
 )
 
@@ -104,6 +106,15 @@ class _Composite:
         )
 
 
+def _evaluation_identity() -> dict[str, object]:
+    return objective_matched_validation_evaluation_identity(
+        model_state_sha256="sha256:" + "1" * 64,
+        runtime_binding={"schema_version": "test-runtime-v1", "tree": "sha256:" + "2" * 64},
+        epoch=1,
+        optimizer_step=32,
+    )
+
+
 def test_objective_matched_validation_is_component_then_game_then_row() -> None:
     data = _Composite()
     per_row_loss = np.asarray([1.0, 3.0, 3.0, 3.0, 10.0, 10.0])
@@ -120,7 +131,10 @@ def test_objective_matched_validation_is_component_then_game_then_row() -> None:
         }
 
     report = evaluate_composite_validation_measure(
-        data, np.arange(6, dtype=np.int64), evaluate
+        data,
+        np.arange(6, dtype=np.int64),
+        evaluate,
+        evaluation_identity=_evaluation_identity(),
     )
 
     # n128 game-uniform=(1+3)/2=2, replay=10; authenticated aggregate
@@ -135,7 +149,7 @@ def test_objective_matched_validation_is_component_then_game_then_row() -> None:
     assert report["component_sampling_ratios"] == {"n128": 0.75, "replay": 0.25}
     assert report["schema_version"] == "composite-validation-measure-v2"
     assert report["provenance"]["schema_version"] == (
-        "composite-validation-provenance-v1"
+        "composite-validation-provenance-v2"
     )
     assert report["provenance"]["descriptor_fingerprint"] == "sha256:" + "d" * 64
     assert report["provenance"]["payload_inventory_sha256"] == "sha256:" + "e" * 64
@@ -146,6 +160,12 @@ def test_objective_matched_validation_is_component_then_game_then_row() -> None:
         "sha256:"
     )
     assert report["provenance"]["component_coverage_sha256"].startswith("sha256:")
+    assert report["provenance"]["promotion_metrics_sha256"].startswith("sha256:")
+    assert report["provenance"]["evaluated_model_state_sha256"] == (
+        "sha256:" + "1" * 64
+    )
+    assert report["provenance"]["evaluation_epoch"] == 1
+    assert report["provenance"]["evaluation_optimizer_step"] == 32
     assert report["provenance_sha256"].startswith("sha256:")
     assert calls == [(0,), (1, 2, 3), (4, 5)]
 
@@ -158,6 +178,7 @@ def test_objective_matched_validation_rejects_missing_component_holdout() -> Non
             data,
             np.arange(4, dtype=np.int64),
             lambda indices: {"loss": float(len(indices))},
+            evaluation_identity=_evaluation_identity(),
         )
     except SystemExit as error:
         assert "replay" in str(error)
@@ -176,6 +197,7 @@ def _matched_epoch() -> dict:
             "policy_loss": float(len(indices)),
             "samples": int(len(indices)),
         },
+        evaluation_identity=_evaluation_identity(),
     )
     return {
         "validation": {"loss": 99.0},
@@ -183,10 +205,35 @@ def _matched_epoch() -> dict:
     }
 
 
-def test_downstream_metric_selector_prefers_matched_and_falls_back_historically() -> None:
+def test_downstream_metric_selector_rejects_tampered_matched_metrics() -> None:
     epoch = _matched_epoch()
     epoch["validation_objective_matched"]["metrics"]["loss"] = 4.0
-    assert objective_matched_validation_metrics(epoch)["loss"] == 4.0
+
+    with pytest.raises(ValueError, match="provenance"):
+        objective_matched_validation_metrics(epoch, require_provenance=True)
+
+
+def test_downstream_metric_selector_rejects_tampered_component_metrics() -> None:
+    epoch = _matched_epoch()
+    epoch["validation_objective_matched"]["components"]["replay"]["metrics"][
+        "loss"
+    ] = 4.0
+
+    with pytest.raises(ValueError, match="provenance"):
+        objective_matched_validation_metrics(epoch, require_provenance=True)
+
+
+def test_downstream_metric_selector_rejects_replayed_step_identity() -> None:
+    epoch = _matched_epoch()
+    matched = epoch["validation_objective_matched"]
+    matched["provenance"]["evaluation_optimizer_step"] = 31
+    matched["provenance_sha256"] = _canonical_json_sha256(matched["provenance"])
+
+    with pytest.raises(ValueError, match="checkpoint identity"):
+        objective_matched_validation_metrics(epoch, require_provenance=True)
+
+
+def test_downstream_metric_selector_falls_back_only_for_explicit_legacy_use() -> None:
     assert objective_matched_validation_metrics({"validation": {"loss": 2.0}}) == {
         "loss": 2.0
     }
@@ -258,7 +305,10 @@ def test_objective_measure_aggregates_weight_density_before_dividing() -> None:
         }
 
     report = evaluate_composite_validation_measure(
-        data, np.arange(6, dtype=np.int64), evaluate
+        data,
+        np.arange(6, dtype=np.int64),
+        evaluate,
+        evaluation_identity=_evaluation_identity(),
     )
 
     assert report["components"]["n128"]["metrics"]["policy_loss"] == 3.0
@@ -349,7 +399,10 @@ def test_objective_matched_validation_excludes_value_only_replay_policy_ce() -> 
         }
 
     report = evaluate_composite_validation_measure(
-        data, np.arange(6, dtype=np.int64), evaluate
+        data,
+        np.arange(6, dtype=np.int64),
+        evaluate,
+        evaluation_identity=_evaluation_identity(),
     )
     assert report["policy_distillation_component_ids"] == ["n128"]
     assert report["components"]["n128"]["policy_distillation_enabled"] is True
@@ -378,7 +431,10 @@ def test_teacher_gap_closure_uses_aggregate_kl_mass_not_mean_of_game_ratios() ->
         }
 
     report = evaluate_composite_validation_measure(
-        data, np.arange(6, dtype=np.int64), evaluate
+        data,
+        np.arange(6, dtype=np.int64),
+        evaluate,
+        evaluation_identity=_evaluation_identity(),
     )
 
     assert report["components"]["n128"]["metrics"][
