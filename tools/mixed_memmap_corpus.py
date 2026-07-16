@@ -22,6 +22,7 @@ from catan_zero.rl.aux_subgoal_targets import (
 from catan_zero.rl.entity_feature_adapter import (
     LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
 )
+from catan_zero.rl.restart_provenance import RESTART_PROVENANCE_KEYS
 
 
 # These columns were added after the original gen3 corpus was converted. Their
@@ -64,6 +65,7 @@ SYNTHESIZABLE_COLUMNS = frozenset(
         # contract.  Version 0 means unversioned/ineligible and is synthesized
         # lazily so those rows stay available for policy/value objectives.
         AUX_SUBGOAL_TARGET_VERSION_KEY,
+        *RESTART_PROVENANCE_KEYS,
     }
 )
 
@@ -364,6 +366,7 @@ def _synthesized_column(corpus: Any, key: str):
         "is_pool_game",
         "opponent_provenance_present",
         "training_source_category_verified",
+        "restart_provenance_present",
     }:
         return _ConstantColumn(corpus.row_count, False, np.bool_)
     if key == "opponent_version":
@@ -373,8 +376,17 @@ def _synthesized_column(corpus: Any, key: str):
         "opponent_checkpoint_md5",
         "opponent_type",
         "training_source_category",
+        "start_bucket",
     }:
         return _ConstantColumn(corpus.row_count, "", "<U1")
+    if key == "start_mode":
+        return _ConstantColumn(corpus.row_count, "legacy_unknown", "<U14")
+    if key in {
+        "archived_game_seed",
+        "archived_decision_index",
+        "restart_select_seed",
+    }:
+        return _ConstantColumn(corpus.row_count, -1, np.int64)
     if key == AUX_SUBGOAL_TARGET_VERSION_KEY:
         return _ConstantColumn(corpus.row_count, 0, np.uint8)
     if key in {"aux_next_settlement", "aux_robber_target"}:

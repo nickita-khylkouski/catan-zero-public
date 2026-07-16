@@ -102,6 +102,12 @@ from catan_zero.rl.target_reliability import (
     TARGET_RELIABILITY_VERSION,
     target_reliability_confidence,
 )
+from catan_zero.rl.restart_provenance import (
+    RESTART_BOOL_KEYS,
+    RESTART_INT64_KEYS,
+    RESTART_PROVENANCE_KEYS,
+    RESTART_STRING_KEYS,
+)
 from catan_zero.rl.memmap_corpus import (
     MEMMAP_LAZY_COLUMNS,  # noqa: F401 - compatibility re-export
     ImplicitConstantColumn as _ImplicitConstantColumn,  # noqa: F401
@@ -25303,6 +25309,7 @@ def load_teacher_data(
         "has_final_actual_vps",
         "policy_weight_multiplier",
         "value_weight_multiplier",
+        *RESTART_PROVENANCE_KEYS,
         *OPPONENT_PROVENANCE_KEYS,
         *TRAINING_SOURCE_PROVENANCE_KEYS,
         *AUX_TARGET_KEYS,
@@ -26670,6 +26677,86 @@ def _normalize_teacher_shard(
         result[AUX_SUBGOAL_TARGET_VERSION_KEY] = version.astype(
             np.uint8, copy=False
         )
+    restart_present = set(RESTART_PROVENANCE_KEYS) & set(shard)
+    if restart_present:
+        missing = set(RESTART_PROVENANCE_KEYS) - restart_present
+        if missing:
+            raise SystemExit(
+                f"{path} has incomplete restart provenance; "
+                f"missing={sorted(missing)}"
+            )
+        for key in RESTART_STRING_KEYS:
+            value = np.asarray(shard[key])
+            if value.shape != (n,):
+                raise SystemExit(
+                    f"{path} field {key} has shape {value.shape}, expected ({n},)"
+                )
+            result[key] = value.astype(str)
+        for key in RESTART_BOOL_KEYS:
+            value = np.asarray(shard[key])
+            if value.shape != (n,):
+                raise SystemExit(
+                    f"{path} field {key} has shape {value.shape}, expected ({n},)"
+                )
+            result[key] = value.astype(np.bool_, copy=False)
+        for key in RESTART_INT64_KEYS:
+            value = np.asarray(shard[key])
+            if value.shape != (n,) or value.dtype.kind not in {"i", "u"}:
+                raise SystemExit(
+                    f"{path} field {key} must be an integral ({n},) column"
+                )
+            result[key] = value.astype(np.int64, copy=False)
+        modes = np.asarray(result["start_mode"]).astype(str)
+        buckets = np.asarray(result["start_bucket"]).astype(str)
+        archived = modes == "archived_public_state"
+        normal = modes == "normal"
+        if not bool(np.all(result["restart_provenance_present"])):
+            raise SystemExit(f"{path} restart provenance presence bit is false")
+        if bool(np.any(~(archived | normal))):
+            raise SystemExit(f"{path} has unknown restart start_mode")
+        if bool(
+            np.any(
+                np.asarray(result["restart_select_seed"], dtype=np.int64)
+                != np.asarray(result["game_seed"], dtype=np.int64)
+            )
+        ):
+            raise SystemExit(
+                f"{path} restart trajectory game_seed differs from "
+                "restart_select_seed"
+            )
+        archived_seeds = np.asarray(result["archived_game_seed"], dtype=np.int64)
+        archived_decisions = np.asarray(
+            result["archived_decision_index"], dtype=np.int64
+        )
+        if bool(
+            np.any(
+                archived
+                & (
+                    (archived_seeds < 0)
+                    | (archived_decisions < 0)
+                    | (buckets == "")
+                    | (buckets == "normal")
+                )
+            )
+        ):
+            raise SystemExit(f"{path} has invalid archived restart provenance")
+        if bool(
+            np.any(
+                normal
+                & (
+                    (archived_seeds != -1)
+                    | (archived_decisions != -1)
+                    | (buckets != "normal")
+                )
+            )
+        ):
+            raise SystemExit(f"{path} has invalid normal-start provenance")
+    else:
+        result["restart_provenance_present"] = np.zeros(n, dtype=np.bool_)
+        result["start_mode"] = np.full(n, "legacy_unknown")
+        result["start_bucket"] = np.full(n, "")
+        for key in RESTART_INT64_KEYS:
+            result[key] = np.full(n, -1, dtype=np.int64)
     for key, dtype in ENTITY_FIELD_DTYPES.items():
         if key not in shard:
             continue

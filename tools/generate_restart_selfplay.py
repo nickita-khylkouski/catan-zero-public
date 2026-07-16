@@ -27,6 +27,10 @@ Reproducibility: the archived prefix is replayed with the archived game's own
 chance stream (`reconstruct_state(..., return_rng=True)`); the continuation
 keeps drawing from that same stream, so a branched game is reproducible from
 (archived_game_seed, archived_decision_index, restart_select_seed).
+`game_seed` identifies the new branched trajectory and is therefore set to the
+unique `restart_select_seed`; the source reconstruction seed remains in
+`archived_game_seed`. Reusing the source seed as the trajectory identity would
+merge independent branches that can have different terminal winners.
 
 SKELETON SCOPE: single-process, correctness-first. The per-worker
 multiprocessing fan-out (mirroring `generate_raw_selfplay_data.py`) and the
@@ -64,6 +68,7 @@ from catan_zero.rl.raw_selfplay import (
     _select_action,
     play_one_raw_selfplay_game,
 )
+from catan_zero.rl.restart_provenance import RESTART_PROVENANCE_KEYS
 from catan_zero.search.rust_mcts import RustEvaluator
 
 from reconstruct_state import (
@@ -73,7 +78,6 @@ from reconstruct_state import (
 from rgsc_sampler import (
     DEFAULT_RGSC_TEMPERATURE,
     rgsc_sample_indices,
-    uniform_sample_indices,
 )
 
 TEACHER_NAME = "restart_selfplay"
@@ -82,16 +86,10 @@ TEACHER_NAME = "restart_selfplay"
 START_NORMAL = "normal"
 START_ARCHIVED = "archived_public_state"
 
-# Restart columns added on top of the shared schema. train_bc's loader ignores
-# unknown keys, so these are forward-compatible (like gumbel_self_play's
-# EXTRA_KEYS). Kept out of BASE/ENTITY so byte-compatibility is preserved.
-RESTART_KEYS = (
-    "start_mode",
-    "start_bucket",
-    "archived_game_seed",
-    "archived_decision_index",
-    "restart_select_seed",
-)
+# Restart columns added on top of the shared schema. They remain outside
+# BASE/ENTITY so old shard writers stay byte-compatible, but the NPZ learner
+# and memmap converter explicitly preserve them.
+RESTART_KEYS = RESTART_PROVENANCE_KEYS
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +162,8 @@ class RestartShardWriter(GumbelShardWriter):
 
 
 def _default_restart(key: str) -> Any:
+    if key == "restart_provenance_present":
+        return True
     if key in ("archived_game_seed", "archived_decision_index", "restart_select_seed"):
         return np.int64(-1)
     return ""
@@ -238,7 +238,11 @@ def play_restart_game_from_state(
             priors=priors,
             action_size=action_size,
             colors=colors,
-            game_seed=archived_game_seed,
+            # A restart is a new stochastic trajectory. Multiple selected
+            # roots may come from one archived game and independent branches
+            # can end with different winners, so the source reconstruction
+            # seed cannot also be their learner game identity.
+            game_seed=restart_select_seed,
             decision_index=cont_index,
             obs_width=config.obs_width,
             meaningful_public_history=bool(config.meaningful_public_history),
@@ -253,6 +257,7 @@ def play_restart_game_from_state(
         )
         # Tag provenance + start mode. teacher_name distinguishes this corpus.
         row["teacher_name"] = TEACHER_NAME
+        row["restart_provenance_present"] = np.bool_(True)
         row["start_mode"] = start_mode
         row["start_bucket"] = start_bucket
         row["archived_game_seed"] = np.int64(archived_game_seed)
@@ -299,6 +304,32 @@ def plan_start_mix(
     return counts
 
 
+def plan_trajectory_seed_ranges(
+    base_seed: int,
+    counts: dict[str, int],
+) -> dict[str, int]:
+    """Allocate disjoint int64 game identities for normal and restart games."""
+
+    required = {"normal", "opening", "robber_dev", "random_archived"}
+    if set(counts) != required or any(
+        isinstance(counts[key], bool) or int(counts[key]) < 0 for key in required
+    ):
+        raise ValueError("trajectory seed planning requires non-negative bucket counts")
+    start = int(base_seed)
+    normal_count = int(counts["normal"])
+    archived_count = sum(int(counts[key]) for key in required - {"normal"})
+    stop = start + normal_count + archived_count
+    int64 = np.iinfo(np.int64)
+    if start < 0 or stop - 1 > int(int64.max):
+        raise ValueError("trajectory seed range does not fit non-negative int64")
+    return {
+        "normal_start": start,
+        "normal_stop_exclusive": start + normal_count,
+        "archived_start": start + normal_count,
+        "archived_stop_exclusive": stop,
+    }
+
+
 def _bucket_of_phase(phase: str) -> str:
     up = str(phase).upper()
     if "BUILD_INITIAL_SETTLEMENT" in up or "BUILD_INITIAL_ROAD" in up:
@@ -315,8 +346,8 @@ def _stable_unit_hash(*parts: int) -> float:
     `hash()` of `str`/`bytes` -- is NOT affected by `PYTHONHASHSEED`
     randomisation (CPython hashes small ints to themselves), so this is
     stable across processes and machines. Used to derive a reproducible
-    train/holdout partition from `(game_seed, decision_index)` alone, with no
-    external state to keep in sync.
+    train/holdout partition from source-game identity, with no external state
+    to keep in sync.
     """
     return (hash(tuple(int(p) for p in parts)) & 0xFFFFFFFF) / 0xFFFFFFFF
 
@@ -332,19 +363,23 @@ def split_holdout_indices(
 
     The held-out fraction is never selected for restart generation (CAT-43
     step 2): it exists purely as a frozen high-regret evaluation suite. The
-    split is a deterministic per-row hash of `(game_seed, decision_index,
-    holdout_seed)` -- NOT a random shuffle -- so re-running extraction or
-    generation with the same seed always reserves the exact same states,
-    without needing to persist row indices anywhere.
+    split is a deterministic per-source-game hash of `(game_seed,
+    holdout_seed)` -- NOT a random shuffle -- so every root from one source
+    game stays on the same side and re-running with the same seed reserves the
+    exact same source games without external state.
     """
     if not (0.0 <= holdout_fraction < 1.0):
         raise ValueError(f"holdout_fraction must be in [0, 1), got {holdout_fraction!r}")
-    n = int(np.asarray(game_seeds).shape[0])
+    game_seeds = np.asarray(game_seeds)
+    decision_indices = np.asarray(decision_indices)
+    if game_seeds.ndim != 1 or decision_indices.shape != game_seeds.shape:
+        raise ValueError("holdout game_seed/decision_index columns are misaligned")
+    n = int(game_seeds.shape[0])
     if holdout_fraction <= 0.0 or n == 0:
         return np.arange(n, dtype=np.int64), np.empty(0, dtype=np.int64)
     is_holdout = np.array(
         [
-            _stable_unit_hash(int(game_seeds[i]), int(decision_indices[i]), int(holdout_seed))
+            _stable_unit_hash(int(game_seeds[i]), int(holdout_seed))
             < holdout_fraction
             for i in range(n)
         ]
@@ -402,11 +437,10 @@ def select_archived_states(
 
     `sampling` selects the selection rule within each bucket's candidate
     pool:
-      * "uniform" (default, regression-safe): opening/robber_dev take the
-        highest-scoring rows in that phase bucket (manifest is already
-        score-sorted desc); random_archived samples uniformly across ALL
-        candidate rows (smoothing). This is the pre-CAT-43 behaviour,
-        unchanged when `usable_idx` covers every row (holdout_fraction=0).
+      * "uniform" (default): opening/robber_dev take the highest-scoring row
+        from distinct source games in that phase bucket; random_archived scans
+        a uniform random permutation of remaining candidate rows and keeps the
+        first row from each still-unused source game.
       * "rgsc": every bucket samples from its candidate pool via the RGSC
         ranking-based regret-weighted rule (`rgsc_sampler.rgsc_sample_indices`)
         instead of a deterministic top-slice / plain uniform choice.
@@ -435,19 +469,60 @@ def select_archived_states(
             "regret_score": float(data["regret_score"][i]),
         }
 
-    def pick_from(candidates: np.ndarray, want: int) -> list[int]:
+    used_game_seeds: set[int] = set()
+
+    def unique_game_candidates(candidates: np.ndarray) -> np.ndarray:
+        """Keep the highest-regret row from each unused source game."""
+
+        selected: list[int] = []
+        local: set[int] = set()
+        for raw_index in candidates:
+            index = int(raw_index)
+            game_seed = int(data["game_seed"][index])
+            if game_seed in used_game_seeds or game_seed in local:
+                continue
+            local.add(game_seed)
+            selected.append(index)
+        return np.asarray(selected, dtype=np.int64)
+
+    def pick_from(
+        candidates: np.ndarray,
+        want: int,
+        *,
+        randomize_uniform: bool = False,
+    ) -> list[int]:
         """`want` global indices out of `candidates` (a global-index array),
         per the active `sampling` mode. `candidates` is assumed already in
         manifest (score-sorted desc) order for "uniform" top-slice semantics.
         """
         if want <= 0 or candidates.size == 0:
             return []
-        if sampling == "uniform":
-            return [int(i) for i in candidates[:want]]
-        local = rgsc_sample_indices(
-            regret_scores[candidates], want, temperature=rgsc_temperature, rng=rng
-        )
-        return [int(candidates[j]) for j in local]
+        if sampling == "uniform" and randomize_uniform:
+            picked = []
+            local_game_seeds: set[int] = set()
+            for raw_index in rng.permutation(candidates):
+                index = int(raw_index)
+                game_seed = int(data["game_seed"][index])
+                if game_seed in used_game_seeds or game_seed in local_game_seeds:
+                    continue
+                local_game_seeds.add(game_seed)
+                picked.append(index)
+                if len(picked) >= want:
+                    break
+        else:
+            candidates = unique_game_candidates(candidates)
+            if sampling == "uniform":
+                picked = [int(index) for index in candidates[:want]]
+            else:
+                local_indices = rgsc_sample_indices(
+                    regret_scores[candidates],
+                    want,
+                    temperature=rgsc_temperature,
+                    rng=rng,
+                )
+                picked = [int(candidates[index]) for index in local_indices]
+        used_game_seeds.update(int(data["game_seed"][index]) for index in picked)
+        return picked
 
     out: dict[str, list[dict[str, Any]]] = {}
     # Manifest is already score-sorted desc, so first occurrences are top scored.
@@ -458,15 +533,36 @@ def select_archived_states(
         out[bucket] = [record(i) for i in idxs]
     want_rand = counts.get("random_archived", 0)
     if want_rand > 0 and pool.size > 0:
-        if sampling == "uniform":
-            local = uniform_sample_indices(pool.size, want_rand, rng=rng)
-            picked = [int(pool[j]) for j in local]
-        else:
-            picked = pick_from(pool, want_rand)
+        picked = pick_from(
+            pool,
+            want_rand,
+            randomize_uniform=sampling == "uniform",
+        )
         out["random_archived"] = [record(i) for i in picked]
     else:
         out["random_archived"] = []
     return out
+
+
+def validate_archived_selection_counts(
+    selected: dict[str, list[dict[str, Any]]],
+    planned_counts: dict[str, int],
+) -> None:
+    """Fail before generation when source-game dedup cannot fill the recipe."""
+
+    shortfalls = {
+        bucket: {
+            "planned": int(planned_counts.get(bucket, 0)),
+            "selected": len(selected.get(bucket, [])),
+        }
+        for bucket in ("opening", "robber_dev", "random_archived")
+        if len(selected.get(bucket, [])) != int(planned_counts.get(bucket, 0))
+    }
+    if shortfalls:
+        raise SystemExit(
+            "insufficient distinct archived source games for restart mix: "
+            f"{shortfalls}"
+        )
 
 
 def main() -> None:
@@ -589,6 +685,7 @@ def main() -> None:
         robber_dev=args.robber_dev_fraction,
         random_archived=args.random_archived_fraction,
     )
+    trajectory_seed_ranges = plan_trajectory_seed_ranges(args.base_seed, counts)
     rng = np.random.default_rng(args.base_seed)
     holdout_seed = args.holdout_seed if args.holdout_seed is not None else args.base_seed
     usable_idx: np.ndarray | None = None
@@ -618,13 +715,14 @@ def main() -> None:
         rgsc_temperature=float(args.rgsc_temperature),
         usable_idx=usable_idx,
     )
+    validate_archived_selection_counts(archived, counts)
 
     writer = RestartShardWriter(output, shard_size=int(args.shard_size))
     started = time.perf_counter()
     stats = {"games": 0, "rows": 0, "by_bucket": {}, "failures": []}
 
     # Normal starts: fresh raw-policy games tagged start_mode="normal".
-    game_seed = int(args.base_seed)
+    game_seed = int(trajectory_seed_ranges["normal_start"])
     for _ in range(counts["normal"]):
         record = play_one_raw_selfplay_game(
             evaluator,
@@ -656,6 +754,7 @@ def main() -> None:
         )
         for dec in record.decisions:
             dec.row["teacher_name"] = TEACHER_NAME
+            dec.row["restart_provenance_present"] = np.bool_(True)
             dec.row["start_mode"] = START_NORMAL
             dec.row["start_bucket"] = "normal"
             dec.row["archived_game_seed"] = np.int64(-1)
@@ -668,7 +767,9 @@ def main() -> None:
         game_seed += 1
 
     # Archived-state restarts.
-    restart_seed = int(args.base_seed) + 500_000
+    if game_seed != int(trajectory_seed_ranges["normal_stop_exclusive"]):
+        raise RuntimeError("normal trajectory seed allocation drift")
+    restart_seed = int(trajectory_seed_ranges["archived_start"])
     for bucket in ("opening", "robber_dev", "random_archived"):
         for spec in archived.get(bucket, []):
             try:
@@ -721,10 +822,16 @@ def main() -> None:
         "n_failures": len(stats["failures"]),
         "elapsed_sec": time.perf_counter() - started,
         "config": dataclasses.asdict(config),
+        "trajectory_seed_ranges": trajectory_seed_ranges,
         "shards": [str(p) for p in writer.paths],
         "start_mode_note": (
             "archived rows are legitimate reachable PUBLIC states (true-history "
             "replay), flagged for separate metrics per DAGS arXiv 2605.14379"
+        ),
+        "trajectory_game_seed_semantics": (
+            "normal rows use their fresh game seed; archived rows use the unique "
+            "restart_select_seed, with the reconstruction source retained in "
+            "archived_game_seed"
         ),
         "restart_sampling": args.restart_sampling,
         "rgsc_temperature": float(args.rgsc_temperature),

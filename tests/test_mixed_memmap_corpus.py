@@ -346,6 +346,55 @@ def test_old_component_gets_unknown_opponent_provenance_not_fabricated_identity(
     }
 
 
+def test_legacy_component_gets_explicit_absent_restart_provenance():
+    module = _module()
+    restart = _Corpus(0, 2)
+    restart._eager.update(
+        {
+            "restart_provenance_present": np.asarray([True, True]),
+            "start_mode": np.asarray(["archived_public_state"] * 2),
+            "start_bucket": np.asarray(["opening"] * 2),
+            "archived_game_seed": np.asarray([123, 123], dtype=np.int64),
+            "archived_decision_index": np.asarray([4, 4], dtype=np.int64),
+            "restart_select_seed": np.asarray([700_001, 700_001], dtype=np.int64),
+        }
+    )
+    for name, value in tuple(restart._eager.items()):
+        if name not in module.SYNTHESIZABLE_COLUMNS:
+            continue
+        array = np.asarray(value)
+        restart._columns[name] = (
+            {"kind": "string", "dtype": "int32"}
+            if array.dtype.kind in {"U", "S", "O"}
+            else {"kind": "fixed", "dtype": array.dtype.str, "inner_shape": []}
+        )
+    legacy = _Corpus(2, 2)
+
+    mixed = module.ConcatMemmapCorpus([restart, legacy])
+
+    assert mixed["restart_provenance_present"][:].tolist() == [
+        True,
+        True,
+        False,
+        False,
+    ]
+    assert mixed["start_mode"][:].tolist() == [
+        "archived_public_state",
+        "archived_public_state",
+        "legacy_unknown",
+        "legacy_unknown",
+    ]
+    assert mixed["archived_game_seed"][:].tolist() == [123, 123, -1, -1]
+    assert set(mixed.synthesized_columns_by_component[1]) >= {
+        "restart_provenance_present",
+        "start_mode",
+        "start_bucket",
+        "archived_game_seed",
+        "archived_decision_index",
+        "restart_select_seed",
+    }
+
+
 @pytest.mark.parametrize("missing", ["afterstate_target", "afterstate_target_mask"])
 def test_afterstate_target_and_mask_must_be_an_atomic_pair(missing: str) -> None:
     module = _module()

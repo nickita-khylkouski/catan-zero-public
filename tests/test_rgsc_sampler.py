@@ -59,7 +59,9 @@ def test_rgsc_temperature_controls_concentration():
     # Lower temperature concentrates more mass on the top-scoring state.
     assert sharp[-1] > soft[-1]
     # Lower temperature is a lower-entropy distribution.
-    entropy = lambda p: -np.sum(p * np.log(np.clip(p, 1e-300, None)))
+    def entropy(p):
+        return -np.sum(p * np.log(np.clip(p, 1e-300, None)))
+
     assert entropy(sharp) < entropy(soft)
 
 
@@ -181,6 +183,22 @@ def test_split_holdout_indices_rejects_bad_fraction():
         gr.split_holdout_indices(game_seeds, decision_indices, holdout_fraction=1.0, holdout_seed=1)
 
 
+def test_split_holdout_keeps_every_root_from_one_source_game_together():
+    game_seeds = np.asarray([123] * 50 + [456] * 50, dtype=np.int64)
+    decision_indices = np.arange(100, dtype=np.int32)
+
+    usable, holdout = gr.split_holdout_indices(
+        game_seeds,
+        decision_indices,
+        holdout_fraction=0.5,
+        holdout_seed=17,
+    )
+
+    for seed in (123, 456):
+        rows = set(np.flatnonzero(game_seeds == seed).tolist())
+        assert rows <= set(usable.tolist()) or rows <= set(holdout.tolist())
+
+
 # --------------------------------------------------------------------------- #
 # select_archived_states: uniform-mode regression + rgsc-mode + holdout wiring
 # --------------------------------------------------------------------------- #
@@ -229,6 +247,7 @@ def test_select_archived_states_uniform_mode_matches_legacy_topslice(tmp_path):
     assert got_opening_scores == pytest.approx(expected_opening_scores)
     assert len(picked["robber_dev"]) == 4
     assert len(picked["random_archived"]) == 6
+    gr.validate_archived_selection_counts(picked, counts)
 
 
 def test_select_archived_states_rgsc_mode_prefers_higher_regret(tmp_path):
@@ -265,6 +284,70 @@ def test_select_archived_states_excludes_holdout_rows(tmp_path):
         for bucket_rows in picked.values():
             for row in bucket_rows:
                 assert row["game_seed"] not in holdout_seeds
+
+
+def test_select_archived_states_uses_at_most_one_root_per_source_game(
+    tmp_path,
+) -> None:
+    manifest = tmp_path / "manifest.npz"
+    _write_synthetic_manifest(manifest, n=12)
+    with np.load(manifest, allow_pickle=True) as source:
+        payload = {key: np.asarray(source[key]) for key in source.files}
+    payload["game_seed"] = np.asarray(
+        [100, 100, 100, 200, 200, 200, 300, 300, 300, 400, 400, 400],
+        dtype=np.int64,
+    )
+    np.savez(manifest, **payload)
+
+    picked = gr.select_archived_states(
+        manifest,
+        {"opening": 3, "robber_dev": 3, "random_archived": 3},
+        rng=np.random.default_rng(0),
+    )
+    selected_seeds = [
+        int(row["game_seed"])
+        for bucket_rows in picked.values()
+        for row in bucket_rows
+    ]
+
+    assert len(selected_seeds) == len(set(selected_seeds))
+    with pytest.raises(SystemExit, match="insufficient distinct archived source games"):
+        gr.validate_archived_selection_counts(
+            picked,
+            {"opening": 3, "robber_dev": 3, "random_archived": 3},
+        )
+
+
+def test_uniform_random_bucket_does_not_force_per_game_regret_maximum(
+    tmp_path,
+) -> None:
+    manifest = tmp_path / "manifest.npz"
+    _write_synthetic_manifest(manifest, n=30)
+    with np.load(manifest, allow_pickle=True) as source:
+        payload = {key: np.asarray(source[key]) for key in source.files}
+    payload["game_seed"] = np.repeat(
+        np.arange(100, 110, dtype=np.int64),
+        3,
+    )
+    np.savez(manifest, **payload)
+
+    picked = gr.select_archived_states(
+        manifest,
+        {"opening": 0, "robber_dev": 0, "random_archived": 10},
+        rng=np.random.default_rng(4),
+    )["random_archived"]
+    selected_rows = {
+        (int(row["game_seed"]), int(row["decision_index"])) for row in picked
+    }
+    with np.load(manifest, allow_pickle=True) as source:
+        seeds = np.asarray(source["game_seed"], dtype=np.int64)
+        decisions = np.asarray(source["decision_index"], dtype=np.int64)
+    per_game_first = {
+        (int(seed), int(decisions[int(np.flatnonzero(seeds == seed)[0])]))
+        for seed in np.unique(seeds)
+    }
+
+    assert selected_rows != per_game_first
 
 
 def test_write_holdout_manifest_roundtrip(tmp_path):

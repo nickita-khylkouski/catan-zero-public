@@ -50,6 +50,7 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_TARGET_KEYS,
 )
 from catan_zero.rl.target_reliability import TARGET_RELIABILITY_COLUMNS
+from catan_zero.rl.restart_provenance import RESTART_PROVENANCE_KEYS
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
@@ -1215,6 +1216,7 @@ LOADER_KEYS: tuple[str, ...] = (
     "has_final_actual_vps",
     "policy_weight_multiplier",
     "value_weight_multiplier",
+    *RESTART_PROVENANCE_KEYS,
     *OPPONENT_PROVENANCE_KEYS,
     *TRAINING_SOURCE_PROVENANCE_KEYS,
     "is_forced",

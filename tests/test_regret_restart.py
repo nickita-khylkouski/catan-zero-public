@@ -170,6 +170,106 @@ def test_plan_start_mix_rounding_goes_to_normal():
     assert sum(counts.values()) == 7
 
 
+def test_trajectory_seed_ranges_never_overlap_for_large_run() -> None:
+    import generate_restart_selfplay as gr
+
+    counts = gr.plan_start_mix(1_000_000)
+    ranges = gr.plan_trajectory_seed_ranges(900_000, counts)
+
+    assert ranges["normal_stop_exclusive"] == ranges["archived_start"]
+    assert ranges == {
+        "normal_start": 900_000,
+        "normal_stop_exclusive": 1_500_000,
+        "archived_start": 1_500_000,
+        "archived_stop_exclusive": 1_900_000,
+    }
+
+
+def test_trajectory_seed_ranges_reject_int64_overflow() -> None:
+    import generate_restart_selfplay as gr
+
+    counts = gr.plan_start_mix(10)
+    with pytest.raises(ValueError, match="does not fit"):
+        gr.plan_trajectory_seed_ranges(np.iinfo(np.int64).max - 5, counts)
+
+
+def test_restart_branch_uses_unique_trajectory_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import generate_restart_selfplay as gr
+
+    class _Game:
+        def winning_color(self):
+            return None
+
+        def playable_action_indices(self, _colors, _map_kind):
+            return (7,)
+
+        def current_color(self):
+            return "RED"
+
+    captured_game_seeds: list[int] = []
+
+    monkeypatch.setattr(
+        gr,
+        "_select_action",
+        lambda *_args, **_kwargs: (7, {7: 1.0}),
+    )
+
+    def _build_row(
+        _game,
+        *,
+        game_seed,
+        decision_index,
+        **_kwargs,
+    ):
+        captured_game_seeds.append(int(game_seed))
+        return (
+            {
+                "decision_index": np.int32(decision_index),
+                "policy_weight_multiplier": np.float32(0.0),
+                "value_weight_multiplier": np.float32(1.0),
+            },
+            {},
+        )
+
+    monkeypatch.setattr(gr, "_build_raw_decision_row", _build_row)
+    monkeypatch.setattr(
+        gr,
+        "_apply_selected_action",
+        lambda game, *_args, **_kwargs: game,
+    )
+    monkeypatch.setattr(
+        gr,
+        "_game_outcome_fields",
+        lambda *_args, **_kwargs: {
+            "winner": "RED",
+            "terminated": True,
+            "truncated": False,
+        },
+    )
+
+    pairs = gr.play_restart_game_from_state(
+        object(),
+        _Game(),
+        config=gr.RestartSelfPlayConfig(max_continuation_decisions=1),
+        start_mode=gr.START_ARCHIVED,
+        start_bucket="opening",
+        archived_game_seed=123,
+        archived_decision_index=4,
+        restart_select_seed=900_001,
+        action_size=8,
+        chance_rng=object(),
+    )
+
+    assert captured_game_seeds == [900_001]
+    assert len(pairs) == 1
+    row, _features = pairs[0]
+    assert bool(row["restart_provenance_present"]) is True
+    assert int(row["archived_game_seed"]) == 123
+    assert int(row["restart_select_seed"]) == 900_001
+
+
 # --------------------------------------------------------------------------- #
 # Restart play-from-state + writer round-trip
 # --------------------------------------------------------------------------- #
@@ -211,6 +311,7 @@ def test_restart_play_from_state_and_writer(tmp_path):
         assert float(row["policy_weight_multiplier"]) == 0.0
         assert float(row["value_weight_multiplier"]) == 1.0
         assert int(row["archived_game_seed"]) == gseed
+        assert int(row["game_seed"]) == 123
         # legal_action_ids valid entries are within action space.
         lids = np.asarray(row["legal_action_ids"])
         assert (lids[lids >= 0] < action_size).all()

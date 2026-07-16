@@ -139,6 +139,123 @@ def test_opponent_provenance_survives_mixed_npz_and_memmap_paths(tmp_path):
     assert teacher_provenance_quality(memmap, chunk_rows=1)["opponent_provenance_fraction"] == 0.5
 
 
+def test_restart_provenance_survives_npz_and_memmap_paths(tmp_path):
+    shard = tmp_path / "restart.npz"
+    _minimal_teacher_shard(shard, seed=700_001, opponent=False)
+    with np.load(shard, allow_pickle=True) as source:
+        payload = {key: np.asarray(source[key]) for key in source.files}
+    payload.update(
+        {
+            "restart_provenance_present": np.ones(2, dtype=np.bool_),
+            "start_mode": np.asarray(["archived_public_state"] * 2),
+            "start_bucket": np.asarray(["opening"] * 2),
+            "archived_game_seed": np.asarray([123, 123], dtype=np.int64),
+            "archived_decision_index": np.asarray([4, 4], dtype=np.int64),
+            "restart_select_seed": np.asarray([700_001, 700_001], dtype=np.int64),
+        }
+    )
+    np.savez(shard, **payload)
+    teacher = _make_teacher_dir(tmp_path, [str(shard)])
+    corpus_dir = tmp_path / "restart.memmap"
+    build_memmap_corpus(teacher, corpus_dir, progress_every=0)
+
+    in_memory = load_teacher_data(teacher)
+    memmap = MemmapCorpus(corpus_dir)
+    expected = {
+        "restart_provenance_present": [True, True],
+        "start_mode": ["archived_public_state", "archived_public_state"],
+        "start_bucket": ["opening", "opening"],
+        "archived_game_seed": [123, 123],
+        "archived_decision_index": [4, 4],
+        "restart_select_seed": [700_001, 700_001],
+    }
+    for field, values in expected.items():
+        assert field in in_memory
+        assert field in memmap
+        np.testing.assert_array_equal(
+            np.asarray(in_memory[field]).astype(str)
+            if np.asarray(in_memory[field]).dtype.kind in {"O", "U", "S"}
+            else np.asarray(in_memory[field]),
+            np.asarray(values).astype(str)
+            if np.asarray(in_memory[field]).dtype.kind in {"O", "U", "S"}
+            else np.asarray(values),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(memmap[field]).astype(str),
+            np.asarray(values).astype(str),
+        )
+
+
+def test_mixed_npz_restart_provenance_is_row_aligned(tmp_path):
+    legacy = tmp_path / "legacy.npz"
+    restart = tmp_path / "restart.npz"
+    _minimal_teacher_shard(legacy, seed=10, opponent=False)
+    _minimal_teacher_shard(restart, seed=700_001, opponent=False)
+    with np.load(restart, allow_pickle=True) as source:
+        payload = {key: np.asarray(source[key]) for key in source.files}
+    payload.update(
+        {
+            "restart_provenance_present": np.ones(2, dtype=np.bool_),
+            "start_mode": np.asarray(["archived_public_state"] * 2),
+            "start_bucket": np.asarray(["opening"] * 2),
+            "archived_game_seed": np.asarray([123, 123], dtype=np.int64),
+            "archived_decision_index": np.asarray([4, 4], dtype=np.int64),
+            "restart_select_seed": np.asarray([700_001, 700_001], dtype=np.int64),
+        }
+    )
+    np.savez(restart, **payload)
+    teacher = _make_teacher_dir(tmp_path, [str(legacy), str(restart)])
+
+    loaded = load_teacher_data(teacher)
+
+    assert len(loaded["action_taken"]) == len(loaded["start_mode"]) == 4
+    assert loaded["restart_provenance_present"].tolist() == [
+        False,
+        False,
+        True,
+        True,
+    ]
+    assert loaded["start_mode"].tolist() == [
+        "legacy_unknown",
+        "legacy_unknown",
+        "archived_public_state",
+        "archived_public_state",
+    ]
+    assert loaded["archived_game_seed"].tolist() == [-1, -1, 123, 123]
+
+
+@pytest.mark.parametrize("malformation", ["partial", "source_seed_as_game_seed"])
+def test_restart_provenance_loader_rejects_malformed_identity(
+    tmp_path,
+    malformation,
+):
+    shard = tmp_path / "restart-malformed.npz"
+    _minimal_teacher_shard(shard, seed=700_001, opponent=False)
+    with np.load(shard, allow_pickle=True) as source:
+        payload = {key: np.asarray(source[key]) for key in source.files}
+    payload.update(
+        {
+            "restart_provenance_present": np.ones(2, dtype=np.bool_),
+            "start_mode": np.asarray(["archived_public_state"] * 2),
+            "start_bucket": np.asarray(["opening"] * 2),
+            "archived_game_seed": np.asarray([123, 123], dtype=np.int64),
+            "archived_decision_index": np.asarray([4, 4], dtype=np.int64),
+            "restart_select_seed": np.asarray([700_001, 700_001], dtype=np.int64),
+        }
+    )
+    if malformation == "partial":
+        del payload["archived_decision_index"]
+        message = "incomplete restart provenance"
+    else:
+        payload["game_seed"][:] = 123
+        message = "game_seed differs from restart_select_seed"
+    np.savez(shard, **payload)
+    teacher = _make_teacher_dir(tmp_path, [str(shard)])
+
+    with pytest.raises(SystemExit, match=message):
+        load_teacher_data(teacher)
+
+
 def test_authenticated_selected_game_categories_are_stamped_without_guessing():
     normalized = {
         "game_seed": np.asarray([11, 11, 22, 33], dtype=np.int64),

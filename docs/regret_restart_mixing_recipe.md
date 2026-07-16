@@ -43,7 +43,7 @@ otherwise, for clean terminal rows only (`winner != ""` and not truncated).
 | normal starts | **60%** | `normal` | on-distribution anchor; prevents forgetting the opening and biasing toward mid-game states (DAGS caution). |
 | high-regret openings | **20%** | `archived_public_state` | placement blowouts were 74.6% of search losses — the highest-leverage states to resample. |
 | robber / dev (chance-heavy) states | **10%** | `archived_public_state` | high-variance chance nodes where the value head is least calibrated. |
-| random archived | **10%** | `archived_public_state` | smoothing — samples archived states uniformly regardless of regret score, so training does not overfit the regret metric's own blind spots. |
+| random archived | **10%** | `archived_public_state` | smoothing — scans a uniform random permutation of the remaining archived rows while admitting at most one root per source game, so training does not collapse onto the regret maxima or duplicate a source prefix. |
 
 Weights are CLI flags (`--normal-fraction`, `--opening-fraction`,
 `--robber-dev-fraction`, `--random-archived-fraction`); `plan_start_mix`
@@ -64,11 +64,16 @@ for branch diversity, then plays argmax — the same absolute-count schedule as
   continuation keeps drawing from the same chance stream, so a branched game is
   reproducible from `(archived_game_seed, archived_decision_index,
   restart_select_seed)`.
+- The branch is a new stochastic trajectory, so its learner `game_seed` is the
+  unique `restart_select_seed`; `archived_game_seed` remains the reconstruction
+  source. Normal and restart trajectory seeds occupy adjacent, disjoint int64
+  ranges recorded in the output summary.
 - Every restart row still carries `start_mode` (+ `start_bucket`,
-  `archived_game_seed`, `archived_decision_index`, `restart_select_seed`) so
-  downstream training keeps **separate metrics** for intermediate-start vs
-  normal-start data and can down-weight or ablate the restart rows per the DAGS
-  caution.
+  `archived_game_seed`, `archived_decision_index`, `restart_select_seed`, and
+  an explicit presence bit). NPZ, memmap, and mixed-component loaders preserve
+  these fields; legacy rows receive presence=false sentinels so downstream
+  training can keep separate metrics or down-weight/ablate restart rows per the
+  DAGS caution.
 
 ## Public-observation / hidden-info dependency (task #71)
 
@@ -107,13 +112,17 @@ PLAY_TURN.
 ## Archive sampling: uniform vs RGSC (task CAT-43)
 
 `tools/generate_restart_selfplay.py --restart-sampling {uniform,rgsc}` (default
-`uniform`, regression-safe) controls how each start-mode bucket selects rows
+`uniform`) controls how each start-mode bucket selects rows
 from the regret manifest:
 
-- **`uniform`** (pre-CAT-43 behaviour): opening/robber_dev take the
-  highest-scoring rows in that phase (the manifest is already score-sorted
-  desc, so this is a deterministic top-slice); `random_archived` samples
-  uniformly across the whole manifest (smoothing, no regret bias).
+- **`uniform`**: opening/robber_dev take the highest-scoring row from each
+  still-unused source game in that phase (the manifest is score-sorted);
+  `random_archived` scans a uniform random permutation of the remaining rows
+  and keeps the first row encountered from each still-unused source game.
+  This retains a non-max-regret smoothing lane without allowing exact roots or
+  shared source-game prefixes to cross training/evaluation groups. If distinct
+  source games cannot fill every planned bucket, generation fails before
+  writing data instead of silently changing the 60/20/10/10 mix.
 - **`rgsc`**: every bucket instead samples via the ranking-based
   regret-weighted rule from *Regret-Guided Search Control* (Tsai et al.,
   ICLR 2026, [github.com/rlglab/rgsc](https://github.com/rlglab/rgsc)) --
@@ -135,12 +144,12 @@ from the regret manifest:
 ## Held-out high-regret suite (task CAT-43)
 
 `--holdout-fraction` (default 0.0) reserves a deterministic fraction of the
-manifest's states as a frozen evaluation suite that generation never draws
+manifest's source games as a frozen evaluation suite that generation never draws
 from -- the "held-out high-regret suite never trained on" from the roadmap
-(§9 error atlas). The split is a stable hash of `(game_seed, decision_index,
---holdout-seed)` -- not a random shuffle -- so re-running generation with the
-same seed always reserves the exact same states without persisting row
-indices anywhere. Held-out rows are written to
+(§9 error atlas). The split is a stable hash of `(game_seed, --holdout-seed)`
+-- not a random shuffle -- so every decision root from one source game stays on
+the same side. Re-running with the same seed reserves the exact same source
+games without persisting row indices anywhere. Held-out rows are written to
 `<out-dir>/holdout_manifest.npz` and excluded from all three archived buckets
 regardless of `--restart-sampling` mode.
 
