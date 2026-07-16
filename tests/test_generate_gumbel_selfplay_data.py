@@ -24,6 +24,7 @@ from catan_zero.rl.aux_subgoal_targets import (  # noqa: E402
 from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
+    RUST_ENTITY_ADAPTER_V2,
 )
 from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
 
@@ -222,6 +223,85 @@ def test_search_evidence_is_explicitly_opt_in() -> None:
     assert summary["search_evidence_schema"] == cli.SEARCH_EVIDENCE_SCHEMA
     assert summary[AUX_SUBGOAL_TARGET_VERSION_KEY] == AUX_SUBGOAL_TARGET_VERSION
     assert summary["aux_subgoal_target_semantic"] == AUX_SUBGOAL_TARGET_SEMANTIC
+
+
+def test_learner_row_adapter_flag_is_typed_and_defaults_to_tied_contract() -> None:
+    parser = cli.build_parser()
+    default = parser.parse_args(["--out-dir", "/tmp/adapter-default"])
+    explicit = parser.parse_args(
+        [
+            "--out-dir",
+            "/tmp/adapter-explicit",
+            "--learner-entity-feature-adapter-version",
+            RUST_ENTITY_ADAPTER_V2,
+        ]
+    )
+
+    assert default.learner_entity_feature_adapter_version is None
+    assert explicit.learner_entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V2
+    assert (
+        GenerateConfig.from_namespace(explicit).learner_entity_feature_adapter_version
+        == RUST_ENTITY_ADAPTER_V2
+    )
+
+
+def test_merge_worker_summaries_authenticates_teacher_and_learner_adapters(
+    tmp_path: Path,
+) -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "--out-dir",
+            str(tmp_path),
+            "--learner-entity-feature-adapter-version",
+            CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        ]
+    )
+    worker = {
+        "worker_index": 0,
+        "rows": 1,
+        "teacher_entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V2,
+        "learner_entity_feature_adapter_version": (
+            CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        ),
+        "adapter_version": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    }
+
+    summary = cli._merge_worker_summaries(
+        [worker], out_dir=tmp_path, elapsed_sec=1.0, args=args
+    )
+
+    assert summary["teacher_entity_feature_adapter_version"] == (
+        RUST_ENTITY_ADAPTER_V2
+    )
+    assert summary["learner_entity_feature_adapter_version"] == (
+        CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    assert summary["adapter_version"] == CURRENT_RUST_ENTITY_ADAPTER_VERSION
+
+
+def test_merge_worker_summaries_rejects_mixed_learner_adapters(
+    tmp_path: Path,
+) -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(["--out-dir", str(tmp_path)])
+    workers = [
+        {
+            "worker_index": index,
+            "rows": 1,
+            "teacher_entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V2,
+            "learner_entity_feature_adapter_version": adapter,
+            "adapter_version": adapter,
+        }
+        for index, adapter in enumerate(
+            (RUST_ENTITY_ADAPTER_V2, CURRENT_RUST_ENTITY_ADAPTER_VERSION)
+        )
+    ]
+
+    with pytest.raises(RuntimeError, match="mixed learner entity feature adapters"):
+        cli._merge_worker_summaries(
+            workers, out_dir=tmp_path, elapsed_sec=1.0, args=args
+        )
 
 
 # ---------------------------------------------------------------------------

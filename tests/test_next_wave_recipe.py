@@ -33,14 +33,14 @@ from tools.build_memmap_corpus import (  # noqa: E402
 
 CONFIG = (
     REPO
-    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v2.schema13.json"
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema14.json"
 )
 GUARD = (
     REPO
-    / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v2.json"
+    / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
 )
 LEARNER = REPO / "configs/experiments/next_wave/one_dose_public_card_overrides.json"
-OPERATION = REPO / "configs/operations/a1-next-wave-coherent-public-v2"
+OPERATION = REPO / "configs/operations/a1-next-wave-coherent-public-v3"
 RUNBOOK = OPERATION / "README.md"
 SCIENCE_CONTRACT = OPERATION / "science.contract.json"
 LEGACY_CONFIG = (
@@ -82,10 +82,10 @@ def test_meaningful_history_uses_legacy_compatible_memmap_width() -> None:
     assert np.all(normalized["event_target_ids"][:, 32:] == -1)
 
 
-def test_next_wave_typed_generation_config_is_exact_schema_13_recipe() -> None:
+def test_next_wave_typed_generation_config_is_exact_schema_14_recipe() -> None:
     payload = json.loads(CONFIG.read_text())
     assert payload["pipeline"] == GenerateConfig.PIPELINE
-    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 13
+    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 14
 
     cfg = GenerateConfig(**payload["fields"])
     assert cfg.canonical_payload() == payload
@@ -105,6 +105,9 @@ def test_next_wave_typed_generation_config_is_exact_schema_13_recipe() -> None:
     assert cfg.meaningful_public_history is True
     assert cfg.event_history_limit == 32
     assert cfg.record_automatic_transitions is True
+    assert cfg.learner_entity_feature_adapter_version == (
+        "rust_entity_adapter_v3_structured_action_resources"
+    )
     assert cfg.temperature_clock == "nonforced_choice"
     assert (cfg.temperature_decisions, cfg.late_temperature_decisions) == (40, 100)
     assert cfg.late_temperature == 0.1
@@ -156,6 +159,9 @@ def test_next_wave_guard_pins_the_same_science_values() -> None:
         "--late-temperature": "late_temperature",
         "--late-temperature-decisions": "late_temperature_decisions",
         "--meaningful-public-history": "meaningful_public_history",
+        "--learner-entity-feature-adapter-version": (
+            "learner_entity_feature_adapter_version"
+        ),
         "--max-decisions": "max_decisions",
         "--max-depth": "max_depth",
         "--n-fast": "n_fast",
@@ -259,7 +265,7 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
         "sha256:4a388fb8ccb3e2e1d77919faa55df4a999dcd336d32c6e171bb80b4846bc00e8"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:be29b26c1a3a86a5af1a1703dcf54f0c2e8de297a0910bcf9dbde267a9cf092d"
+        "sha256:9e78391ad49ff7586e5d8ff6b03a2679c8c680c221316de1c2fcdbe0b2795e8d"
     )
 
 

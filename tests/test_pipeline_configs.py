@@ -595,6 +595,17 @@ def test_generate_hash_binds_gpu_pipeline_sharing_topology() -> None:
     ).config_hash()
 
 
+def test_generate_hash_binds_learner_row_adapter_independently_of_teacher() -> None:
+    tied = GenerateConfig(learner_entity_feature_adapter_version=None)
+    advanced = GenerateConfig(
+        learner_entity_feature_adapter_version=(
+            "rust_entity_adapter_v3_structured_action_resources"
+        )
+    )
+
+    assert tied.config_hash() != advanced.config_hash()
+
+
 # --------------------------------------------------------------------------- #
 # Ticket smoke test: a CLI-vs-dataclass mismatch is reflected in the hash.
 # --------------------------------------------------------------------------- #

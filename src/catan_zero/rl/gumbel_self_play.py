@@ -74,6 +74,7 @@ from catan_zero.rl.aux_subgoal_targets import (
 )
 from catan_zero.rl.flywheel import ChampionRef, OpponentPolicy, choose_opponent
 from catan_zero.rl.flywheel.opponent_mix import OpponentMixConfig, choose_mix_opponent
+from catan_zero.rl.entity_feature_adapter import require_known_entity_feature_adapter
 from catan_zero.rl.target_reliability import (
     TARGET_RELIABILITY_COLUMNS,
     TARGET_RELIABILITY_SCHEMA,
@@ -329,6 +330,12 @@ class GumbelSelfPlayConfig:
     # Defaults preserve legacy shard shape/contents.
     meaningful_public_history: bool = False
     event_history_limit: int = 64
+    # The search evaluator remains checkpoint-bound to its own feature adapter.
+    # Fresh learner rows may explicitly use a newer, versioned adapter because
+    # search targets are action-ID distributions, while the stored entity/action
+    # tensors are the student's input surface. None preserves the historical
+    # tied contract exactly.
+    learner_entity_feature_adapter_version: str | None = None
     # One-action UI/chance prompts are strategically real trajectory states.
     # Record them as value-only rows by default: _build_decision_row gives
     # them zero policy authority and full terminal-outcome value authority.
@@ -534,6 +541,24 @@ def entity_adapter_for_evaluator(evaluator: RustEvaluator) -> str:
         None,
     )
     return str(version or RUST_ENTITY_ADAPTER_VERSION)
+
+
+def learner_entity_adapter_for_generation(
+    config: GumbelSelfPlayConfig,
+    evaluator: RustEvaluator,
+) -> str:
+    """Resolve the stored learner-row adapter independently of teacher inference.
+
+    The default remains tied to the evaluator for byte-compatible legacy
+    generation. An explicit value is fail-closed against the append-only
+    adapter registry and changes only stored learner features; it never changes
+    the checkpoint-bound features used to compute priors or leaf values.
+    """
+
+    requested = config.learner_entity_feature_adapter_version
+    if requested is None:
+        requested = entity_adapter_for_evaluator(evaluator)
+    return require_known_entity_feature_adapter(requested)
 
 
 def _temperature_for_decision(
@@ -1202,6 +1227,9 @@ def play_one_game(
             game, "apply_public_belief_development_draws"
         ),
     )
+    learner_entity_feature_adapter_version = learner_entity_adapter_for_generation(
+        config, evaluator
+    )
     chance_rng = random.Random(int(game_seed) ^ 0xA17E)
     reliability_fraction = float(config.target_reliability_audit_fraction)
     if (
@@ -1427,7 +1455,9 @@ def play_one_game(
                 meaningful_public_history=bool(config.meaningful_public_history),
                 event_history_limit=int(config.event_history_limit),
                 decision_class=decision_class,
-                entity_feature_adapter_version=entity_adapter_for_evaluator(evaluator),
+                entity_feature_adapter_version=(
+                    learner_entity_feature_adapter_version
+                ),
             )
             if reliability_fields is not None:
                 row.update(reliability_fields)
@@ -2576,7 +2606,10 @@ def run_worker_games(
     )
     out_dir = Path(out_dir)
     action_size = action_size_for_evaluator(evaluator, config.colors)
-    entity_feature_adapter_version = entity_adapter_for_evaluator(evaluator)
+    teacher_entity_feature_adapter_version = entity_adapter_for_evaluator(evaluator)
+    learner_entity_feature_adapter_version = learner_entity_adapter_for_generation(
+        config, evaluator
+    )
     engine_supports_determinization = False
     engine_supports_public_belief_development_draws = False
     if bool(getattr(search_config, "information_set_search", False)) or bool(
@@ -3115,7 +3148,16 @@ def run_worker_games(
         "worker_seed": int(worker_seed),
         "base_seed": int(base_seed),
         "game_index_start": int(game_index_start),
-        "adapter_version": entity_feature_adapter_version,
+        # `adapter_version` remains the exact row-column identity consumed by
+        # existing corpus/admission tooling. The two explicit names prevent a
+        # legacy teacher and a current learner surface from being conflated.
+        "adapter_version": learner_entity_feature_adapter_version,
+        "learner_entity_feature_adapter_version": (
+            learner_entity_feature_adapter_version
+        ),
+        "teacher_entity_feature_adapter_version": (
+            teacher_entity_feature_adapter_version
+        ),
         # Full provenance of what this worker ACTUALLY constructed (not what
         # the CLI was asked for): catches argparse-default-vs-dataclass-default
         # divergence after the fact -- the exact class of gap behind the

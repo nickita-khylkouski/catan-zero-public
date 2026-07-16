@@ -147,6 +147,8 @@
     "record_automatic_transitions": true,
     "meaningful_public_history": true,
     "event_history_limit": 32,
+    "teacher_entity_feature_adapter_version": "rust_entity_adapter_v2_land_topology_ports_maritime",
+    "learner_entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
     "workers_per_gpu": 16,
     "shard_size": 512,
     "format": "npz",
@@ -204,10 +206,10 @@
     "output_root": "__UNRESOLVED__"
   },
   "provenance": {
-    "guard_config": "../guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v2.json",
+    "guard_config": "../guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json",
     "generator_code_files": [
       "../../tools/a1_current_science_contract.py",
-      "../operations/a1-next-wave-coherent-public-v2/science.contract.json",
+      "../operations/a1-next-wave-coherent-public-v3/science.contract.json",
       "../../tools/generate_gumbel_selfplay_data.py",
       "../../tools/fleet/systemd/nvidia-mps.service",
       "../../tools/opponent_mix_registry.py",
@@ -233,7 +235,7 @@
     ],
     "learner_code_files": [
       "../../tools/a1_current_science_contract.py",
-      "../operations/a1-next-wave-coherent-public-v2/science.contract.json",
+      "../operations/a1-next-wave-coherent-public-v3/science.contract.json",
       "../guards/train_bc.json",
       "../../tools/factory_common.py",
       "../../tools/launcher_guards.py",

@@ -17,6 +17,10 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_VERSION_KEY,
     AUX_TARGET_KEYS,
 )
+from catan_zero.rl.entity_feature_adapter import (
+    RUST_ENTITY_ADAPTER_V2,
+    RUST_ENTITY_ADAPTER_V3,
+)
 from catan_zero.rl.flywheel.opponent_mix import (
     MixCategory,
     MixCheckpointRef,
@@ -35,6 +39,7 @@ from catan_zero.rl.gumbel_self_play import (
     _search_execution_contract,
     _target_information_regime_for_search,
     action_size_for_evaluator,
+    learner_entity_adapter_for_generation,
     play_one_game,
     run_worker_games,
 )
@@ -145,6 +150,26 @@ def test_action_size_for_evaluator_falls_back_to_action_catalog_for_heuristic():
     _rust()
     size = action_size_for_evaluator(HeuristicRustEvaluator(), COLORS)
     assert size == ActionCatalog(COLORS).size
+
+
+def test_learner_row_adapter_can_explicitly_advance_beyond_teacher_adapter():
+    evaluator = SimpleNamespace(
+        config=SimpleNamespace(entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V2)
+    )
+
+    assert (
+        learner_entity_adapter_for_generation(GumbelSelfPlayConfig(), evaluator)
+        == RUST_ENTITY_ADAPTER_V2
+    )
+    assert (
+        learner_entity_adapter_for_generation(
+            GumbelSelfPlayConfig(
+                learner_entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V3
+            ),
+            evaluator,
+        )
+        == RUST_ENTITY_ADAPTER_V3
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +433,12 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
             assert force_full is None
             return SimpleNamespace(selected_action=100, simulations_used=4)
 
-    def fake_build(game, **_kwargs):
+    recorded_adapter_versions: list[str] = []
+
+    def fake_build(game, **kwargs):
+        recorded_adapter_versions.append(
+            str(kwargs["entity_feature_adapter_version"])
+        )
         return {
             "player": str(game.current_color()),
             "policy_weight_multiplier": np.float32(0.0),
@@ -430,14 +460,22 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
 
     record = play_one_game(
         FakeMCTS(),
-        object(),
-        config=GumbelSelfPlayConfig(max_decisions=3),
+        SimpleNamespace(
+            config=SimpleNamespace(
+                entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V2
+            )
+        ),
+        config=GumbelSelfPlayConfig(
+            max_decisions=3,
+            learner_entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V3,
+        ),
         game_seed=123,
         game_index=0,
         action_size=1,
     )
 
     assert record.terminal is True
+    assert recorded_adapter_versions == [RUST_ENTITY_ADAPTER_V3] * 3
     assert record.forced_decisions == 3
     assert len(record.decisions) == 3
     for decision in record.decisions:

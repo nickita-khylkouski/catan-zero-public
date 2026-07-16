@@ -33,7 +33,7 @@ GLOBAL_BATCH_SIZE = 4096
 SHORT_STEPS = 128
 LONG_STEPS = 256
 SCIENCE_CONTRACT_RELATIVE = Path(
-    "configs/operations/a1-next-wave-coherent-public-v2/science.contract.json"
+    "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json"
 )
 EXISTING_CORPUS_SCIENCE_FIELDS = {
     "forced_row_value_action_type_weights": "END_TURN=1.0,ROLL=1.0",

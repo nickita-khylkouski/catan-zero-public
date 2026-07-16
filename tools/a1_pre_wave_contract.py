@@ -55,6 +55,7 @@ from catan_zero.rl.action_mask import ActionCatalog  # noqa: E402
 from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ENTITY_FEATURE_ADAPTER_SPECS,
+    RUST_ENTITY_ADAPTER_V2,
     require_known_entity_feature_adapter,
 )
 from catan_zero.rl.decision_taxonomy import (  # noqa: E402
@@ -646,6 +647,8 @@ _OPTIONAL_GENERATION_KEYS = {
     "record_automatic_transitions",
     "meaningful_public_history",
     "event_history_limit",
+    "learner_entity_feature_adapter_version",
+    "teacher_entity_feature_adapter_version",
 }
 
 
@@ -2116,6 +2119,9 @@ def _validate_guard_payload(
         "record_automatic_transitions": "--record-automatic-transitions",
         "meaningful_public_history": "--meaningful-public-history",
         "event_history_limit": "--event-history-limit",
+        "learner_entity_feature_adapter_version": (
+            "--learner-entity-feature-adapter-version"
+        ),
     }
     for key, flag in optional_generation_flags.items():
         if key in generation:
@@ -2553,6 +2559,32 @@ def _validate_generation(generation: dict[str, Any]) -> None:
         if int(generation["event_history_limit"]) != MEANINGFUL_PUBLIC_HISTORY_LIMIT:
             raise ContractError(
                 "meaningful-history waves require the reviewed 32-event bound"
+            )
+    adapter_keys = {
+        "learner_entity_feature_adapter_version",
+        "teacher_entity_feature_adapter_version",
+    }
+    present_adapter_keys = adapter_keys.intersection(generation)
+    if present_adapter_keys and present_adapter_keys != adapter_keys:
+        raise ContractError(
+            "generation teacher/learner adapter identities are atomic; missing="
+            f"{sorted(adapter_keys - present_adapter_keys)}"
+        )
+    if present_adapter_keys:
+        learner_adapter = require_known_entity_feature_adapter(
+            generation["learner_entity_feature_adapter_version"]
+        )
+        teacher_adapter = require_known_entity_feature_adapter(
+            generation["teacher_entity_feature_adapter_version"]
+        )
+        if learner_adapter != CURRENT_RUST_ENTITY_ADAPTER_VERSION:
+            raise ContractError(
+                "current generation learner rows must use the current entity adapter"
+            )
+        if teacher_adapter != RUST_ENTITY_ADAPTER_V2:
+            raise ContractError(
+                "the pinned pre-metadata producer must remain explicitly bound "
+                "to the historical v2 teacher adapter"
             )
     for key in (
         "vps_to_win",
@@ -7178,7 +7210,7 @@ def build_lock(
     if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
         for suffix in (
             "tools/a1_current_science_contract.py",
-            "configs/operations/a1-next-wave-coherent-public-v2/science.contract.json",
+            "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json",
         ):
             if not any(path.endswith(suffix) for path in code_paths):
                 missing_code.add(suffix)
@@ -7206,7 +7238,7 @@ def build_lock(
     if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
         for suffix in (
             "tools/a1_current_science_contract.py",
-            "configs/operations/a1-next-wave-coherent-public-v2/science.contract.json",
+            "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json",
         ):
             if not any(path.endswith(suffix) for path in learner_code_paths):
                 missing_learner_code.add(suffix)
@@ -8140,6 +8172,13 @@ def _generator_argv(
         )
     if "event_history_limit" in generation:
         argv.extend(("--event-history-limit", str(generation["event_history_limit"])))
+    if "learner_entity_feature_adapter_version" in generation:
+        argv.extend(
+            (
+                "--learner-entity-feature-adapter-version",
+                str(generation["learner_entity_feature_adapter_version"]),
+            )
+        )
     if lock.get("schema_version") == GENERATION_ARM_LOCK_SCHEMA:
         argv.extend(
             (
@@ -9105,6 +9144,9 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "meaningful_public_history": generation.get(
             "meaningful_public_history", False
         ),
+        "learner_entity_feature_adapter_version": generation.get(
+            "learner_entity_feature_adapter_version"
+        ),
         "event_history_limit": generation.get("event_history_limit", 64),
         "temperature_move_fraction": float(generation["temperature_decisions"])
         / float(generation["max_decisions"]),
@@ -9175,6 +9217,9 @@ def _expected_selfplay_config(lock: dict[str, Any]) -> dict[str, Any]:
             ),
             meaningful_public_history=bool(
                 generation.get("meaningful_public_history", False)
+            ),
+            learner_entity_feature_adapter_version=generation.get(
+                "learner_entity_feature_adapter_version"
             ),
             event_history_limit=int(generation.get("event_history_limit", 64)),
             temperature_high=float(generation["temperature_high"]),
@@ -10426,6 +10471,28 @@ def audit_outputs(
                     f"{job['job_id']}: worker adapter_version="
                     f"{worker_manifest.get('adapter_version')!r}, expected "
                     f"{expected_adapter_version!r}"
+                )
+            if (
+                worker_manifest.get("learner_entity_feature_adapter_version")
+                != expected_adapter_version
+            ):
+                errors.append(
+                    f"{job['job_id']}: worker learner adapter="
+                    f"{worker_manifest.get('learner_entity_feature_adapter_version')!r}, "
+                    f"expected {expected_adapter_version!r}"
+                )
+            expected_teacher_adapter = lock["generation"].get(
+                "teacher_entity_feature_adapter_version"
+            )
+            if (
+                expected_teacher_adapter is not None
+                and worker_manifest.get("teacher_entity_feature_adapter_version")
+                != expected_teacher_adapter
+            ):
+                errors.append(
+                    f"{job['job_id']}: worker teacher adapter="
+                    f"{worker_manifest.get('teacher_entity_feature_adapter_version')!r}, "
+                    f"expected {expected_teacher_adapter!r}"
                 )
             shard_records.append(
                 {

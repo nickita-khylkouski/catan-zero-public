@@ -50,7 +50,10 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_VERSION,
     AUX_SUBGOAL_TARGET_VERSION_KEY,
 )
-from catan_zero.rl.entity_feature_adapter import policy_entity_feature_adapter_version
+from catan_zero.rl.entity_feature_adapter import (
+    IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
+    policy_entity_feature_adapter_version,
+)
 from catan_zero.rl.gumbel_self_play import (
     COLORS,
     GumbelSelfPlayConfig,
@@ -774,6 +777,14 @@ def build_parser() -> argparse.ArgumentParser:
         "public 2p-no-trade actions (build/buy/play/bank-trade/robber/discard), "
         "excluding ROLL/END_TURN/UI plumbing. Default off preserves legacy "
         "empty/native history behavior.",
+    )
+    parser.add_argument(
+        "--learner-entity-feature-adapter-version",
+        choices=sorted(IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS),
+        default=None,
+        help="Versioned feature adapter for STORED learner rows. The teacher "
+        "evaluator remains bound to its checkpoint adapter. Default None keeps "
+        "the historical tied evaluator/row contract.",
     )
     parser.add_argument(
         "--event-history-limit",
@@ -1526,6 +1537,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "meaningful_public_history": bool(
                     args.meaningful_public_history
                 ),
+                "learner_entity_feature_adapter_version": (
+                    args.learner_entity_feature_adapter_version
+                ),
                 "event_history_limit": int(args.event_history_limit),
                 "record_automatic_transitions": bool(
                     args.record_automatic_transitions
@@ -1980,6 +1994,7 @@ def _run_worker(
 ) -> dict[str, Any]:
     coherent_row_fields = (
         "meaningful_public_history",
+        "learner_entity_feature_adapter_version",
         "event_history_limit",
         "record_automatic_transitions",
     )
@@ -2152,6 +2167,9 @@ def _run_worker(
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
         meaningful_public_history=bool(
             worker_args.get("meaningful_public_history", False)
+        ),
+        learner_entity_feature_adapter_version=worker_args.get(
+            "learner_entity_feature_adapter_version"
         ),
         event_history_limit=(
             min(int(worker_args.get("event_history_limit", 64)), 32)
@@ -2328,6 +2346,8 @@ def _merge_worker_summaries(
     exploiter_engine_stats: dict[str, dict[str, int]] = {}
     exploiter_divergence_topics: dict[str, int] = {}
     target_information_regimes: set[str] = set()
+    teacher_entity_feature_adapters: set[str] = set()
+    learner_entity_feature_adapters: set[str] = set()
     for result in sorted(results, key=lambda item: int(item.get("worker_index", 0))):
         # Defensive: only list shards that actually exist on disk, even
         # though `run_worker_games` only ever reports paths it just
@@ -2350,6 +2370,17 @@ def _merge_worker_summaries(
                     )
                 )
             )
+            teacher_adapter = result.get(
+                "teacher_entity_feature_adapter_version"
+            )
+            learner_adapter = result.get(
+                "learner_entity_feature_adapter_version",
+                result.get("adapter_version"),
+            )
+            if teacher_adapter is not None:
+                teacher_entity_feature_adapters.add(str(teacher_adapter))
+            if learner_adapter is not None:
+                learner_entity_feature_adapters.add(str(learner_adapter))
         for color, count in dict(result.get("wins_by_color", {})).items():
             wins_by_color[color] = wins_by_color.get(color, 0) + int(count)
         for error in result.get("errors", ()):
@@ -2410,6 +2441,37 @@ def _merge_worker_summaries(
     target_information_regime = next(
         iter(target_information_regimes), TARGET_INFORMATION_REGIME_AUTHORITATIVE
     )
+    if len(teacher_entity_feature_adapters) > 1:
+        raise RuntimeError(
+            "workers emitted mixed teacher entity feature adapters; refusing to "
+            f"merge incompatible target producers: "
+            f"{sorted(teacher_entity_feature_adapters)}"
+        )
+    if len(learner_entity_feature_adapters) > 1:
+        raise RuntimeError(
+            "workers emitted mixed learner entity feature adapters; refusing to "
+            f"merge incompatible row tensors: "
+            f"{sorted(learner_entity_feature_adapters)}"
+        )
+    requested_learner_adapter = getattr(
+        args, "learner_entity_feature_adapter_version", None
+    )
+    if (
+        requested_learner_adapter is not None
+        and rows > 0
+        and learner_entity_feature_adapters != {str(requested_learner_adapter)}
+    ):
+        raise RuntimeError(
+            "worker learner adapter attestation does not match the requested "
+            f"generation contract: observed={sorted(learner_entity_feature_adapters)} "
+            f"requested={requested_learner_adapter!r}"
+        )
+    teacher_entity_feature_adapter_version = next(
+        iter(teacher_entity_feature_adapters), None
+    )
+    learner_entity_feature_adapter_version = next(
+        iter(learner_entity_feature_adapters), requested_learner_adapter
+    )
 
     return {
         "out_dir": str(out_dir),
@@ -2426,6 +2488,13 @@ def _merge_worker_summaries(
         "forced_decisions_total": int(forced_decisions_total),
         "simulations_used_total": int(simulations_used_total),
         "target_information_regime": target_information_regime,
+        "adapter_version": learner_entity_feature_adapter_version,
+        "learner_entity_feature_adapter_version": (
+            learner_entity_feature_adapter_version
+        ),
+        "teacher_entity_feature_adapter_version": (
+            teacher_entity_feature_adapter_version
+        ),
         "target_reliability_contract": target_reliability_contract(
             audit_fraction=float(
                 getattr(args, "target_reliability_audit_fraction", 0.0)

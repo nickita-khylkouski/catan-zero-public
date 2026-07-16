@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 13
+CONFIG_SCHEMA_VERSION = 14
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -426,6 +426,10 @@ class GenerateConfig(PipelineConfig):
     # Every new Gumbel shard carries this additive public-only tensor, even
     # when the producer checkpoint predates/does not consume the adapter.
     public_card_count_feature_schema: str = "public_card_state_v2"
+    # Stored learner features can intentionally advance beyond the
+    # checkpoint-bound teacher adapter. None preserves the historical tied
+    # evaluator/row contract.
+    learner_entity_feature_adapter_version: str | None = None
     meaningful_public_history: bool = False
     event_history_limit: int = 64
     record_automatic_transitions: bool = True

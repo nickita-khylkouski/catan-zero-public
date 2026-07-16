@@ -3612,6 +3612,23 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
                     "selfplay_config": contract._expected_selfplay_config(lock),
                     "target_information_regime": "public_conservation_pimc_v1",
                     "adapter_version": contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+                        "learner_entity_feature_adapter_version": (
+                            contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION
+                        ),
+                        **(
+                            {}
+                            if lock["generation"].get(
+                                "teacher_entity_feature_adapter_version"
+                            )
+                            is None
+                            else {
+                                "teacher_entity_feature_adapter_version": (
+                                    lock["generation"][
+                                        "teacher_entity_feature_adapter_version"
+                                    ]
+                                )
+                            }
+                        ),
                     "public_award_feature_provenance": (
                         contract._expected_public_award_feature_provenance(  # noqa: SLF001
                             rust_featurize=bool(
