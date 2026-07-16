@@ -26205,8 +26205,19 @@ def _build_optimizer_param_groups(
         if float(public_card_lr_mult) != 1.0
         else []
     )
+    public_card_param_ids = {id(p) for p in public_card_params}
     trunk_params = (
-        _params_under(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"])
+        [
+            parameter
+            for parameter in _params_under(
+                ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
+            )
+            # The public-card adapter is part of the complete trunk freeze
+            # surface, but its dedicated LR control is explicitly independent
+            # from the mature trunk. When both controls are active, the
+            # narrower public-card group owns these parameters.
+            if id(parameter) not in public_card_param_ids
+        ]
         if float(trunk_lr_mult) != 1.0
         else []
     )
@@ -26232,7 +26243,6 @@ def _build_optimizer_param_groups(
         )
     value_param_ids = {id(p) for p in value_params}
     action_param_ids = {id(p) for p in action_params}
-    public_card_param_ids = {id(p) for p in public_card_params}
     trunk_param_ids = {id(p) for p in trunk_params}
     pairwise_overlaps = {
         "value/action": value_param_ids & action_param_ids,

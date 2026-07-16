@@ -21,6 +21,7 @@ def _make_entity_policy(
     action_local: bool = False,
     edge_policy_head: bool = False,
     value_attention_pool: bool = False,
+    public_card_count_features: bool = False,
 ):
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.self_play import make_env_config
@@ -32,7 +33,13 @@ def _make_entity_policy(
         attention_heads=2,
         seed=0,
     )
-    if categorical_bins or action_local or edge_policy_head or value_attention_pool:
+    if (
+        categorical_bins
+        or action_local
+        or edge_policy_head
+        or value_attention_pool
+        or public_card_count_features
+    ):
         config = replace(
             policy.config,
             value_categorical_bins=int(categorical_bins),
@@ -40,6 +47,7 @@ def _make_entity_policy(
             action_cross_attention_layers=2 if action_local else 0,
             edge_policy_head=bool(edge_policy_head),
             value_attention_pool=bool(value_attention_pool),
+            public_card_count_features=bool(public_card_count_features),
         )
         policy = EntityGraphPolicy(
             config,
@@ -251,6 +259,46 @@ def test_trunk_lr_multiplier_changes_only_canonical_entity_graph_trunk() -> None
 
     assigned = [id(p) for group in groups for p in group["params"]]
     expected = [id(p) for p in policy.model.parameters() if p.requires_grad]
+    assert len(assigned) == len(set(assigned))
+    assert set(assigned) == set(expected)
+
+
+def test_public_card_lr_multiplier_overrides_trunk_group_for_shared_freeze_surface() -> (
+    None
+):
+    policy = _make_entity_policy(public_card_count_features=True)
+    groups = _build_optimizer_param_groups(
+        policy.model,
+        base_lr=2e-4,
+        value_lr_mult=1.0,
+        public_card_lr_mult=4.0,
+        trunk_lr_mult=0.25,
+        architecture="entity_graph",
+    )
+
+    by_name = {group["_group_name"]: group for group in groups}
+    assert set(by_name) == {"base", "public_card", "trunk"}
+    assert by_name["public_card"]["lr"] == pytest.approx(2e-4 * 4.0)
+    assert by_name["trunk"]["lr"] == pytest.approx(2e-4 * 0.25)
+
+    public_card_ids = {
+        id(parameter)
+        for parameter in policy.model.public_card_count_residual.parameters()
+        if parameter.requires_grad
+    }
+    assert {
+        id(parameter) for parameter in by_name["public_card"]["params"]
+    } == public_card_ids
+    assert public_card_ids.isdisjoint(
+        {id(parameter) for parameter in by_name["trunk"]["params"]}
+    )
+
+    assigned = [id(parameter) for group in groups for parameter in group["params"]]
+    expected = [
+        id(parameter)
+        for parameter in policy.model.parameters()
+        if parameter.requires_grad
+    ]
     assert len(assigned) == len(set(assigned))
     assert set(assigned) == set(expected)
 
