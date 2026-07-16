@@ -10,6 +10,7 @@ limited to run identity and placement.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -27,6 +28,9 @@ from generate_gumbel_selfplay_data import main as _legacy_executor_main
 
 
 CANONICAL_OPTION_COUNT = 9
+CANONICAL_CONFIG_SHA256 = (
+    "d34a3b1590b7b6580b38652727938f18f5e9fbd4921191b59c7016a07e96a064"
+)
 
 # These are not tuning knobs on the production path anymore.  Historical
 # configs remain replayable through generate_gumbel_selfplay_data.py, while the
@@ -127,6 +131,17 @@ def _validate_config(path: Path) -> None:
         raise ValueError(f"cannot load generation config {path}: {error}") from error
     if not isinstance(payload, dict):
         raise ValueError("generation config must contain a JSON object")
+    payload_sha256 = hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+    ).hexdigest()
+    if payload_sha256 != CANONICAL_CONFIG_SHA256:
+        raise ValueError(
+            "generation config is not the exact commissioned canonical payload: "
+            f"expected_sha256={CANONICAL_CONFIG_SHA256} "
+            f"actual_sha256={payload_sha256}"
+        )
     if payload.get("pipeline") != GenerateConfig.PIPELINE:
         raise ValueError(
             f"generation config pipeline must be {GenerateConfig.PIPELINE!r}"

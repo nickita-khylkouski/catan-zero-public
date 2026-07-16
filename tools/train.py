@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -31,6 +32,9 @@ from catan_zero.rl.pipeline_configs import (  # noqa: E402
 
 
 CANONICAL_TRAIN_LAUNCH_SCHEMA = 1
+CANONICAL_CONFIG_SHA256 = (
+    "767dacec14134114dea0c9ff105bb42b76509a2593c4dfbea8cd008f7ac5923f"
+)
 _ENGINE_SETTING_KEYS = frozenset(
     {
         "base_sampler",
@@ -94,6 +98,17 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
         raise SystemExit(f"invalid canonical train config {source}: {error}") from error
     if not isinstance(payload, dict):
         raise SystemExit("canonical train config must be a JSON object")
+    payload_sha256 = hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+    ).hexdigest()
+    if payload_sha256 != CANONICAL_CONFIG_SHA256:
+        raise SystemExit(
+            "canonical train config is not the exact commissioned payload: "
+            f"expected_sha256={CANONICAL_CONFIG_SHA256} "
+            f"actual_sha256={payload_sha256}"
+        )
     if payload.get("launcher_schema") != CANONICAL_TRAIN_LAUNCH_SCHEMA:
         raise SystemExit(
             "canonical train config launcher_schema must be "

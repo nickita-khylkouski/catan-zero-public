@@ -9,6 +9,7 @@ large historical H2H CLI remains available solely for sealed replay and R&D.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -25,6 +26,9 @@ from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION, EvalConfig
 
 
 CANONICAL_OPTION_COUNT = 9
+CANONICAL_CONFIG_SHA256 = (
+    "ccfb45ab4b5b3842f0601f5145d2c3f9f7c28ba935361107d2094a6e2222df9a"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +52,17 @@ def _validate_config(path: Path) -> None:
         raise ValueError(f"cannot load evaluation config {path}: {error}") from error
     if not isinstance(payload, dict):
         raise ValueError("evaluation config must contain a JSON object")
+    payload_sha256 = hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+    ).hexdigest()
+    if payload_sha256 != CANONICAL_CONFIG_SHA256:
+        raise ValueError(
+            "evaluation config is not the exact commissioned canonical payload: "
+            f"expected_sha256={CANONICAL_CONFIG_SHA256} "
+            f"actual_sha256={payload_sha256}"
+        )
     if payload.get("pipeline") != EvalConfig.PIPELINE:
         raise ValueError(f"evaluation config pipeline must be {EvalConfig.PIPELINE!r}")
     if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:
