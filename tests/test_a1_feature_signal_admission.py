@@ -10,6 +10,7 @@ from tools import a1_feature_signal_admission as admission
 
 REQUIRED_MODULES = [
     "event_encoder",
+    "final_vp_head",
     "legal_action_value_residual_proj",
     "legal_action_value_static_proj",
     "meaningful_history_ordered_gate",
@@ -19,6 +20,9 @@ REQUIRED_MODULES = [
     "public_card_count_residual",
     "public_rule_state_residual",
     "static_action_residual_proj",
+    "value_blocks",
+    "value_head",
+    "value_state_norm",
 ]
 
 
@@ -112,6 +116,81 @@ def test_current_v4_objective_gradient_admission_accepts_global_geometry() -> No
     assert [
         row["optimizer_step"] for row in evidence["observations"]
     ] == [1, 16, 32]
+
+
+def test_zero_shared_value_gradient_admission_requires_exact_stop_gradient() -> None:
+    payload = _objective_payload()
+    for observation in payload["observations"]:
+        observation.update(
+            {
+                "scalar_value_trunk_grad_scale": 0.0,
+                "value_trunk_grad_norm": 0.0,
+                "value_to_policy_grad_norm_ratio": 0.0,
+                "trunk_gradient_cosine": None,
+                "opposing_coordinate_fraction": None,
+                "combined_trunk_grad_norm": observation[
+                    "policy_trunk_grad_norm"
+                ],
+            }
+        )
+
+    evidence = admission.verify_objective_interference(
+        payload,
+        cadence_batches=16,
+        minimum_observations=2,
+        expected_world_size=8,
+        expected_value_trunk_grad_scale=0.0,
+        where="split value-tower scratch report",
+    )
+
+    assert evidence["authenticated"] is True
+    assert all(
+        row["value_trunk_grad_norm"] == 0.0
+        and row["value_to_policy_grad_norm_ratio"] == 0.0
+        and row["trunk_gradient_cosine"] is None
+        and row["opposing_coordinate_fraction"] is None
+        for row in evidence["observations"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("value_trunk_grad_norm", 0.01),
+        ("value_to_policy_grad_norm_ratio", 0.01),
+        ("trunk_gradient_cosine", 0.0),
+        ("opposing_coordinate_fraction", 0.0),
+        ("combined_trunk_grad_norm", 0.6),
+    ],
+)
+def test_zero_shared_value_gradient_admission_rejects_boundary_leakage(
+    field: str, bad_value: object
+) -> None:
+    payload = _objective_payload()
+    for observation in payload["observations"]:
+        observation.update(
+            {
+                "scalar_value_trunk_grad_scale": 0.0,
+                "value_trunk_grad_norm": 0.0,
+                "value_to_policy_grad_norm_ratio": 0.0,
+                "trunk_gradient_cosine": None,
+                "opposing_coordinate_fraction": None,
+                "combined_trunk_grad_norm": observation[
+                    "policy_trunk_grad_norm"
+                ],
+            }
+        )
+    payload["observations"][0][field] = bad_value
+
+    with pytest.raises(admission.FeatureSignalError, match="objective-gradient"):
+        admission.verify_objective_interference(
+            payload,
+            cadence_batches=16,
+            minimum_observations=2,
+            expected_world_size=8,
+            expected_value_trunk_grad_scale=0.0,
+            where="split value-tower scratch report",
+        )
 
 
 @pytest.mark.parametrize(

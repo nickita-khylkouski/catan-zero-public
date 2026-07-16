@@ -172,16 +172,19 @@ def verify_objective_interference(
         if distributed
         else "single_process_exact_gradient"
     )
+    exact_value_stop_gradient = float(expected_value_trunk_grad_scale) == 0.0
     positive_fields = (
         "policy_trunk_grad_norm",
-        "value_trunk_grad_norm",
-        "value_to_policy_grad_norm_ratio",
         "combined_trunk_grad_norm",
     )
-    bounded_fields = {
-        "trunk_gradient_cosine": (-1.0, 1.0),
-        "opposing_coordinate_fraction": (0.0, 1.0),
-    }
+    positive_value_fields = (
+        "value_trunk_grad_norm",
+        "value_to_policy_grad_norm_ratio",
+    )
+    bounded_fields = (
+        "trunk_gradient_cosine",
+        "opposing_coordinate_fraction",
+    )
     failures: dict[int, object] = {}
     selected: list[dict[str, object]] = []
     steps: list[int] = []
@@ -211,18 +214,54 @@ def verify_objective_interference(
             or float(scale) != float(expected_value_trunk_grad_scale)
         ):
             failed_fields.append("scalar_value_trunk_grad_scale")
-        for field in positive_fields:
+        required_positive_fields = (
+            positive_fields
+            if exact_value_stop_gradient
+            else (*positive_fields, *positive_value_fields)
+        )
+        for field in required_positive_fields:
             if _positive_float(observation.get(field)) is None:
                 failed_fields.append(field)
-        for field, (lower, upper) in bounded_fields.items():
-            value = observation.get(field)
+        if exact_value_stop_gradient:
+            for field in positive_value_fields:
+                value = observation.get(field)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or float(value) != 0.0
+                ):
+                    failed_fields.append(field)
+            for field in bounded_fields:
+                if observation.get(field) is not None:
+                    failed_fields.append(field)
+            policy_norm = observation.get("policy_trunk_grad_norm")
+            combined_norm = observation.get("combined_trunk_grad_norm")
             if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or not lower <= float(value) <= upper
+                _positive_float(policy_norm) is not None
+                and _positive_float(combined_norm) is not None
+                and not math.isclose(
+                    float(combined_norm),
+                    float(policy_norm),
+                    rel_tol=1.0e-12,
+                    abs_tol=1.0e-12,
+                )
             ):
-                failed_fields.append(field)
+                failed_fields.append("combined_trunk_grad_norm")
+        else:
+            for field in bounded_fields:
+                value = observation.get(field)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or not -1.0 <= float(value) <= 1.0
+                    or (
+                        field == "opposing_coordinate_fraction"
+                        and float(value) < 0.0
+                    )
+                ):
+                    failed_fields.append(field)
         if failed_fields:
             failures[index] = failed_fields
         else:
@@ -230,8 +269,16 @@ def verify_objective_interference(
                 {
                     "optimizer_step": int(step),
                     **{
-                        field: float(observation[field])
-                        for field in (*positive_fields, *bounded_fields)
+                        field: (
+                            None
+                            if observation[field] is None
+                            else float(observation[field])
+                        )
+                        for field in (
+                            *positive_fields,
+                            *positive_value_fields,
+                            *bounded_fields,
+                        )
                     },
                 }
             )

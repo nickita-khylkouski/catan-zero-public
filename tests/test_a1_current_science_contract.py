@@ -64,15 +64,19 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         recipe["require_feature_learning_signal_modules"].split(",")
     ) == {
         "event_encoder",
+        "final_vp_head",
         "legal_action_value_residual_proj",
-            "legal_action_value_static_proj",
-            "meaningful_history_residual_gate",
-            "meaningful_history_ordered_gate",
-            "meaningful_history_sequence",
-            "meaningful_history_target_proj",
-            "public_card_count_residual",
+        "legal_action_value_static_proj",
+        "meaningful_history_residual_gate",
+        "meaningful_history_ordered_gate",
+        "meaningful_history_sequence",
+        "meaningful_history_target_proj",
+        "public_card_count_residual",
         "public_rule_state_residual",
         "static_action_residual_proj",
+        "value_blocks",
+        "value_head",
+        "value_state_norm",
     }
 
 

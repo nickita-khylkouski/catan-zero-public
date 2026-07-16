@@ -96,7 +96,8 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
         "meaningful_history_ordered_gate,meaningful_history_sequence,"
         "meaningful_history_target_proj,"
         "public_card_count_residual,public_rule_state_residual,"
-        "static_action_residual_proj"
+        "static_action_residual_proj,value_blocks,value_head,"
+        "value_state_norm,final_vp_head"
     ),
     "minimum_feature_learning_signal_observations": 2,
     "final_vp_loss_weight": 0.05,
