@@ -9238,6 +9238,33 @@ pub mod python_bindings {
         )
     }
 
+    /// Return the newest `limit` matching indices in their original order.
+    ///
+    /// Entity features retain only a bounded suffix of public history. Walk
+    /// backward so a long game's discarded prefix is never scanned or
+    /// allocated at every MCTS leaf, then restore chronological order for the
+    /// token encoder.
+    fn recent_matching_indices<T>(
+        items: &[T],
+        limit: usize,
+        mut retain: impl FnMut(usize, &T) -> bool,
+    ) -> Vec<usize> {
+        let mut indices = Vec::with_capacity(limit.min(items.len()));
+        if limit == 0 {
+            return indices;
+        }
+        for (index, item) in items.iter().enumerate().rev() {
+            if retain(index, item) {
+                indices.push(index);
+                if indices.len() == limit {
+                    break;
+                }
+            }
+        }
+        indices.reverse();
+        indices
+    }
+
     /// Per-game entity-feature arrays, unpadded (`legal_action_*` widths vary
     /// with `n_legal`; everything else is fixed-size). Pure Rust, no PyO3
     /// types -- safe to build in parallel (rayon) or sequentially alike.
@@ -9663,30 +9690,28 @@ pub mod python_bindings {
         let mut event_target_ids = vec![-1i64; event_history_limit * 4];
         let mut event_mask = vec![false; event_history_limit];
         if meaningful_public_history && event_history_limit > 0 {
-            let meaningful = state
-                .action_records
-                .iter()
-                .enumerate()
-                .filter(|(index, record)| {
+            let retained_indices = recent_matching_indices(
+                &state.action_records,
+                event_history_limit,
+                |index, record| {
                     entity_is_meaningful_public_action(record.action.action_type)
                         // Only a known-public width of one suppresses an event.
                         // Missing/zero metadata is private or legacy and must
                         // remain in history rather than leak a hidden-hand bit.
                         && state
                             .action_public_legal_counts
-                            .get(*index)
+                            .get(index)
                             .copied()
                             .unwrap_or(0)
                             != 1
-                })
-                .map(|(record_index, record)| (record_index, record))
-                .collect::<Vec<_>>();
+                },
+            );
             // `event_history_limit` is already schema-bounded above: v1 caps
             // at 32 while adapter-v5/v2 may retain the full 64-row surface.
-            let retained = meaningful.len().min(event_history_limit);
-            let source_start = meaningful.len().saturating_sub(retained);
+            let retained = retained_indices.len();
             let row_start = event_history_limit - retained;
-            for (index, (record_index, record)) in meaningful[source_start..].iter().enumerate() {
+            for (index, &record_index) in retained_indices.iter().enumerate() {
+                let record = &state.action_records[record_index];
                 let row = row_start + index;
                 let base = row * ENTITY_EVENT_FEATURE_SIZE;
                 event_mask[row] = true;
@@ -9700,7 +9725,7 @@ pub mod python_bindings {
                 }
                 if encode_meaningful_history_v2
                     && let Some(Some((turn_number, turn_index))) =
-                        state.action_public_turn_keys.get(*record_index)
+                        state.action_public_turn_keys.get(record_index)
                 {
                     event_tokens[base + 15] = entity_scale(*turn_number as i64, 512.0);
                     event_tokens[base + 16] = entity_scale(*turn_index as i64, 4.0);
@@ -10731,6 +10756,32 @@ pub mod python_bindings {
             );
             let actor_index = entity_player_index(color_name(actor)).unwrap();
             assert_eq!(v4.global_tokens[16 + actor_index], 1.0);
+        }
+
+        #[test]
+        fn recent_matching_indices_is_bounded_and_chronological() {
+            let items = (0usize..10_000).collect::<Vec<_>>();
+            let mut inspected = 0usize;
+            let retained = recent_matching_indices(&items, 64, |_, item| {
+                inspected += 1;
+                item % 2 == 0
+            });
+
+            assert_eq!(inspected, 128);
+            assert_eq!(retained.len(), 64);
+            assert_eq!(retained.first().copied(), Some(9_872));
+            assert_eq!(retained.last().copied(), Some(9_998));
+            assert!(retained.windows(2).all(|pair| pair[0] < pair[1]));
+
+            let mut zero_limit_inspected = 0usize;
+            assert!(
+                recent_matching_indices(&items, 0, |_, _| {
+                    zero_limit_inspected += 1;
+                    true
+                })
+                .is_empty()
+            );
+            assert_eq!(zero_limit_inspected, 0);
         }
 
         #[test]
