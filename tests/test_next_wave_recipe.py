@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import argparse
 
 import numpy as np
 import pytest
@@ -22,6 +23,7 @@ if str(TOOLS) not in sys.path:
 
 from tools import generate_gumbel_selfplay_data as generator  # noqa: E402
 from tools import a1_pre_wave_contract as contract  # noqa: E402
+from tools import train_bc  # noqa: E402
 from tools import prelaunch_guard  # noqa: E402
 from tools.build_memmap_corpus import (  # noqa: E402
     EVENT_STORAGE_WIDTH,
@@ -218,11 +220,29 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
     ]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:f9d75162a6fabd171c43abad51446972bc3af1552cbde9f9d68a7515eda040d3"
+        "sha256:b48ffdb23635086fb2cfe1b5160c99a25dbdb8489008c89ac8ca4ba3ee990b2f"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:671baad1d6314e0c9b36cda25d0b74a24af7c5f8c09a37e5b5cc5afaeb9223bc"
+        "sha256:0eb2fdf6d633bb4841ab2c74c33f337ce1ce35805e7e950df4d0778150fa4301"
     )
+
+
+def test_canonical_short_dose_reconstructs_byte_exactly_in_trainer() -> None:
+    recipe = contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE
+    args = argparse.Namespace(
+        **{
+            key: value
+            for key, value in recipe.items()
+            if key not in {"world_size", "global_batch_size"}
+        }
+    )
+
+    effective = train_bc._effective_a1_learner_training_recipe(  # noqa: SLF001
+        args,
+        {"world_size": 1, "rank": 0, "local_rank": 0, "enabled": False},
+    )
+
+    assert effective == recipe
 
 
 def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:
