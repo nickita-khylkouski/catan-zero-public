@@ -63,6 +63,7 @@ def _checkpoints(tmp_path: Path) -> tuple[Path, Path]:
                 "initialization_seed": 1,
                 "trained_value_readouts_added": [],
                 "forward_max_diff": 0.0,
+                "forward_tolerance": 0.0,
                 "forward_identical_at_init": True,
             },
         },
@@ -125,6 +126,7 @@ def _value_tower_split_checkpoints(
                 "initialization_seed": 1,
                 "trained_value_readouts_added": [],
                 "forward_max_diff": 0.0,
+                "forward_tolerance": float(torch.finfo(torch.float32).eps),
                 "forward_identical_at_init": True,
             },
         },
@@ -641,11 +643,47 @@ def test_value_tower_split_receipt_binds_exact_six_layer_source(tmp_path: Path) 
     )
 
     assert evidence["flags"] == {"value_tower_split_layers": 1}
+    assert evidence["forward_tolerance"] == float(torch.finfo(torch.float32).eps)
     assert set(evidence["new_parameters"]) == set(
         upgrade.ALLOWLIST[upgrade.MODULE_VALUE_TOWER_SPLIT_1][
             "new_parameter_initialization"
         ]
     )
+
+
+def test_value_tower_split_receipt_accepts_one_fp32_epsilon(tmp_path: Path) -> None:
+    source, initializer = _value_tower_split_checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"]["forward_max_diff"] = float(
+        torch.finfo(torch.float32).eps
+    )
+    torch.save(raw, initializer)
+
+    evidence = upgrade.inspect_upgrade(
+        source,
+        initializer,
+        module=upgrade.MODULE_VALUE_TOWER_SPLIT_1,
+    )
+
+    assert evidence["forward_max_diff"] == float(torch.finfo(torch.float32).eps)
+
+
+def test_value_tower_split_receipt_rejects_more_than_one_fp32_epsilon(
+    tmp_path: Path,
+) -> None:
+    source, initializer = _value_tower_split_checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"]["forward_max_diff"] = 2.0 * float(
+        torch.finfo(torch.float32).eps
+    )
+    torch.save(raw, initializer)
+
+    with pytest.raises(upgrade.UpgradeError, match="typed forward tolerance"):
+        upgrade.inspect_upgrade(
+            source,
+            initializer,
+            module=upgrade.MODULE_VALUE_TOWER_SPLIT_1,
+        )
 
 
 def test_current_v5_split1_is_one_direct_reviewed_upgrade_edge() -> None:

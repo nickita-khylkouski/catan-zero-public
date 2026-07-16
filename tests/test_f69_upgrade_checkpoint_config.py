@@ -15,6 +15,7 @@ import sys
 from dataclasses import fields
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
@@ -152,6 +153,14 @@ def test_value_tower_split_upgrade_is_explicit_and_default_off():
     assert overrides == {"value_tower_split_layers": 2}
     upgraded = upgrade_tool._build_upgraded_config(base, overrides)
     assert upgraded.value_tower_split_layers == 2
+
+
+def test_forward_tolerance_is_module_owned_and_split_only():
+    assert upgrade_tool._forward_tolerance({}) == 0.0  # noqa: SLF001
+    assert (  # noqa: SLF001
+        upgrade_tool._forward_tolerance({"value_tower_split_layers": 1})
+        == float(np.finfo(np.float32).eps)
+    )
 
 
 def test_canonical_v3_flag_bundle_enables_all_structured_input_repairs():

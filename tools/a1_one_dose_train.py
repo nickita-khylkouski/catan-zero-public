@@ -754,6 +754,7 @@ def _portable_upgrade_identity(upgrade: dict[str, Any]) -> dict[str, Any]:
             "flags": copy.deepcopy(upgrade["flags"]),
             "initialization_seed": upgrade["initialization_seed"],
             "forward_max_diff": upgrade["forward_max_diff"],
+            "forward_tolerance": upgrade["forward_tolerance"],
             "forward_identical_at_init": upgrade["forward_identical_at_init"],
             "shared_parameters_bit_identical": upgrade[
                 "shared_parameters_bit_identical"

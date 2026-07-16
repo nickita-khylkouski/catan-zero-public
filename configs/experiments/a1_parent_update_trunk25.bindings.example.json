@@ -1,0 +1,23 @@
+{
+  "arm": "a1-parent-update-35m-b200-trunk25-rnd",
+  "architecture_upgrade_receipt": {
+    "path": "/absolute/checkpoints/f7-to-current-v5-split1.receipt.json",
+    "sha256": "sha256:REPLACE_WITH_64_LOWERCASE_HEX"
+  },
+  "checkpoint": "/absolute/run/arm-b-trunk25/candidate.pt",
+  "data": {
+    "path": "/absolute/data/memmap_composite.json",
+    "sha256": "sha256:REPLACE_WITH_64_LOWERCASE_HEX"
+  },
+  "host_lock_file": "/tmp/catan_zero_train_bc_trunk25.lock",
+  "init_checkpoint": {
+    "path": "/absolute/checkpoints/f7-current-v5-split1.pt",
+    "sha256": "sha256:REPLACE_WITH_64_LOWERCASE_HEX"
+  },
+  "parent_checkpoint": {
+    "path": "/absolute/checkpoints/f7.pt",
+    "sha256": "sha256:REPLACE_WITH_64_LOWERCASE_HEX"
+  },
+  "report": "/absolute/run/arm-b-trunk25/train.report.json",
+  "schema_version": "catan-zero-rnd-parent-update-bindings-v1"
+}

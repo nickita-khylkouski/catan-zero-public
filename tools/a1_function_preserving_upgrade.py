@@ -19,6 +19,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -101,6 +102,22 @@ MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1 = (
     "meaningful_history_target_gather+actor_public_rule_state.v5+"
     "value_tower_split1"
 )
+
+
+def _module_forward_tolerance(module: str) -> float:
+    """Bind the only reviewed non-zero forward tolerance to typed modules."""
+
+    if module in {
+        MODULE_VALUE_TOWER_SPLIT_1,
+        MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+    }:
+        # The cloned tower preserves the function algebraically, but evaluating
+        # it outside the shared policy suffix may reorder FP32 operations by one
+        # ULP.  No caller may widen this module-owned bound.
+        import torch
+
+        return float(torch.finfo(torch.float32).eps)
+    return 0.0
 MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY = (
     "entity_graph.meaningful_public_history.ordered_attention.v2"
 )
@@ -880,6 +897,36 @@ def inspect_upgrade(
         if isinstance(provenance, Mapping)
         else None
     )
+    expected_forward_tolerance = _module_forward_tolerance(module)
+    forward_max_diff = (
+        provenance.get("forward_max_diff")
+        if isinstance(provenance, Mapping)
+        else None
+    )
+    declared_forward_tolerance = (
+        provenance.get("forward_tolerance", 0.0)
+        if isinstance(provenance, Mapping)
+        else None
+    )
+    tolerance_was_declared = bool(
+        isinstance(provenance, Mapping) and "forward_tolerance" in provenance
+    )
+    valid_forward_evidence = bool(
+        not isinstance(forward_max_diff, bool)
+        and isinstance(forward_max_diff, (int, float))
+        and math.isfinite(float(forward_max_diff))
+        and 0.0 <= float(forward_max_diff) <= expected_forward_tolerance
+        and not isinstance(declared_forward_tolerance, bool)
+        and isinstance(declared_forward_tolerance, (int, float))
+        and math.isfinite(float(declared_forward_tolerance))
+        and (
+            float(declared_forward_tolerance) == expected_forward_tolerance
+            or (
+                not tolerance_was_declared
+                and float(forward_max_diff) == 0.0
+            )
+        )
+    )
     if (
         not isinstance(provenance, Mapping)
         or provenance.get("schema_version") != "entity-graph-upgrade-v1"
@@ -889,11 +936,13 @@ def inspect_upgrade(
         or isinstance(seed, bool)
         or not isinstance(seed, int)
         or seed < 0
-        or provenance.get("forward_max_diff") != 0.0
+        or not valid_forward_evidence
         or provenance.get("forward_identical_at_init") is not True
         or provenance.get("trained_value_readouts_added") != []
     ):
-        raise UpgradeError("checkpoint upgrade provenance is not exact and zero-diff")
+        raise UpgradeError(
+            "checkpoint upgrade provenance exceeds its typed forward tolerance"
+        )
 
     before_model, after_model = before.get("model"), after.get("model")
     if not isinstance(before_model, Mapping) or not isinstance(after_model, Mapping):
@@ -1024,7 +1073,8 @@ def inspect_upgrade(
         "upgraded_initializer": upgraded_ref,
         "flags": dict(spec["flags"]),
         "initialization_seed": seed,
-        "forward_max_diff": 0.0,
+        "forward_max_diff": float(forward_max_diff),
+        "forward_tolerance": expected_forward_tolerance,
         "forward_identical_at_init": True,
         "shared_parameters_bit_identical": True,
         "shared_parameter_count": len(before_model),
