@@ -89,20 +89,16 @@ def test_status_exposes_only_commissioned_production_state() -> None:
     assert status["pipelines"]["generate"]["authorized"] is True
     assert status["pipelines"]["evaluate"]["authorized"] is True
     train = status["pipelines"]["train"]
-    assert train["authorized"] is True
+    assert train["authorized"] is False
     assert train["reason"] == "recipe_specific_authorization"
     assert train["recipes"]["a1-current-35m-b200"]["authorized"] is False
-    assert train["recipes"]["a1-parent-update-35m-b200"] == {
-        "pipeline": "train",
-        "recipe": "a1-parent-update-35m-b200",
-        "status": "ready",
-        "authorized": True,
-        "reason": "commissioned_parent_update_recipe",
-        "authority": str(
-            (ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json").resolve()
-        ),
-        "authority_sha256": "ada85baa252882011c93614cd5fabea5211442e4769a1255d37f92862682a137",
-    }
+    parent = train["recipes"]["a1-parent-update-35m-b200"]
+    assert parent["authorized"] is False
+    assert parent["status"] == "blocked"
+    assert parent["reason"] == "parent_update_training_signal_contract_unresolved"
+    assert parent["unresolved_requirements"][0].startswith(
+        "remove spatial_state_topology_aliasing"
+    )
     assert status["pipelines"]["ppo"]["authorized"] is False
 
 
@@ -165,14 +161,17 @@ def test_other_pipelines_resolve_through_compact_launchers(
         assert "--lock" in plan["command"]
 
 
-def test_commissioned_parent_update_uses_exact_recipe_and_parent(
+def test_cataloged_parent_update_uses_exact_recipe_and_parent_but_is_blocked(
     tmp_path: Path,
 ) -> None:
     plan = cli.build_plan(
         _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
     )
 
-    assert plan["readiness"]["authorized"] is True
+    assert plan["readiness"]["authorized"] is False
+    assert plan["readiness"]["reason"] == (
+        "parent_update_training_signal_contract_unresolved"
+    )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
         "ada85baa252882011c93614cd5fabea5211442e4769a1255d37f92862682a137"
@@ -183,6 +182,25 @@ def test_commissioned_parent_update_uses_exact_recipe_and_parent(
     assert "--architecture-upgrade-receipt" in plan["command"]
     assert "--nproc-per-node=8" in plan["command"]
     assert plan["prepare_command"] is None
+
+
+def test_training_science_admission_cannot_authorize_recipe_digest_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = ROOT / contracts.TRAINING_SCIENCE_ADMISSION
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    payload["recipes"]["a1-parent-update-35m-b200"]["recipe_canonical_sha256"] = (
+        "0" * 64
+    )
+    drifted = tmp_path / "training-science-admission.json"
+    drifted.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(contracts, "TRAINING_SCIENCE_ADMISSION", drifted)
+
+    with pytest.raises(
+        contracts.ProductionContractError,
+        match="does not bind the exact recipe",
+    ):
+        contracts.pipeline_readiness(ROOT, "train", "a1-parent-update-35m-b200")
 
 
 def test_parent_update_requires_receipt_only_for_changed_initializer(
@@ -377,7 +395,8 @@ def test_doctor_refuses_blocked_training_even_with_exact_runtime(
 
     assert result["ok"] is False
     assert (
-        "pipeline is blocked: scratch_optimizer_schedule_unresolved" in result["errors"]
+        "pipeline is blocked: scratch_training_signal_contract_unresolved"
+        in result["errors"]
     )
     assert any("authenticated plan receipt" in error for error in result["errors"])
 

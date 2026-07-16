@@ -53,6 +53,8 @@ TRAIN_ACCELERATOR_MODELS = {
     "a1-current-35m-b200": "NVIDIA B200",
     "a1-parent-update-35m-b200": "NVIDIA B200",
 }
+TRAINING_SCIENCE_ADMISSION = Path("configs/production/training_science_admission.json")
+TRAINING_SCIENCE_ADMISSION_SCHEMA = "catan-zero-training-science-admission-v1"
 
 
 class ProductionContractError(RuntimeError):
@@ -165,40 +167,66 @@ def pipeline_readiness(
 
     identity = validate_pipeline_contract(repo, pipeline, recipe)
     if pipeline == "train":
-        if identity["recipe"] == "a1-parent-update-35m-b200":
-            return {
-                "pipeline": pipeline,
-                "recipe": identity["recipe"],
-                "status": "ready",
-                "authorized": True,
-                "reason": "commissioned_parent_update_recipe",
-                "authority": identity["config"],
-                "authority_sha256": identity["config_sha256"],
-            }
-        science_path = (
-            repo / "configs/operations/a1-next-wave-coherent-public-v3/"
-            "science.contract.json"
-        ).resolve()
-        science = _read_json_object(science_path, label="current science contract")
-        execution = science.get("learner", {}).get("execution_topology", {})
-        ready = bool(
-            isinstance(execution, dict)
-            and execution.get("go_authorized") is True
-            and execution.get("optimization_schedule_status")
-            == "commissioned_scratch_update_horizon_v1"
-        )
+        science_path = (repo / TRAINING_SCIENCE_ADMISSION).resolve()
+        science = _read_json_object(science_path, label="training science admission")
+        if (
+            set(science) != {"schema_version", "recipes"}
+            or science.get("schema_version") != TRAINING_SCIENCE_ADMISSION_SCHEMA
+        ):
+            raise ProductionContractError("training science admission schema drift")
+        recipes = science.get("recipes")
+        if not isinstance(recipes, dict) or set(recipes) != set(
+            TRAIN_ACCELERATOR_MODELS
+        ):
+            raise ProductionContractError("training science admission recipe drift")
+        admission = recipes.get(identity["recipe"])
+        expected_fields = {
+            "recipe_canonical_sha256",
+            "authorized",
+            "reason",
+            "unresolved_requirements",
+            "observations",
+            "commissioning_evidence",
+        }
+        if not isinstance(admission, dict) or set(admission) != expected_fields:
+            raise ProductionContractError("training science admission fields drift")
+        if admission.get("recipe_canonical_sha256") != identity["config_sha256"]:
+            raise ProductionContractError(
+                "training science admission does not bind the exact recipe"
+            )
+        authorized = admission.get("authorized")
+        reason = admission.get("reason")
+        unresolved = admission.get("unresolved_requirements")
+        observations = admission.get("observations")
+        evidence = admission.get("commissioning_evidence")
+        if (
+            not isinstance(authorized, bool)
+            or not isinstance(reason, str)
+            or not reason
+            or not isinstance(unresolved, list)
+            or any(not isinstance(item, str) or not item for item in unresolved)
+            or not isinstance(observations, dict)
+            or not isinstance(evidence, list)
+        ):
+            raise ProductionContractError("training science admission value drift")
+        if authorized and (unresolved or not evidence):
+            raise ProductionContractError(
+                "authorized training requires resolved blockers and commissioning evidence"
+            )
+        if not authorized and not unresolved:
+            raise ProductionContractError(
+                "blocked training science admission must name unresolved requirements"
+            )
         return {
             "pipeline": pipeline,
             "recipe": identity["recipe"],
-            "status": "ready" if ready else "blocked",
-            "authorized": ready,
-            "reason": (
-                "commissioned_scratch_schedule"
-                if ready
-                else "scratch_optimizer_schedule_unresolved"
-            ),
+            "status": "ready" if authorized else "blocked",
+            "authorized": authorized,
+            "reason": reason,
             "authority": str(science_path),
             "authority_sha256": canonical_json_sha256(science),
+            "unresolved_requirements": unresolved,
+            "observations": observations,
         }
     if pipeline == "ppo":
         return {

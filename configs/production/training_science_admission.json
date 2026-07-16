@@ -1,0 +1,39 @@
+{
+  "schema_version": "catan-zero-training-science-admission-v1",
+  "recipes": {
+    "a1-current-35m-b200": {
+      "recipe_canonical_sha256": "eea4fbfec0b77bf2fce7950977425bde883f7cb7f430035a3b0b061af009a8ae",
+      "authorized": false,
+      "reason": "scratch_training_signal_contract_unresolved",
+      "unresolved_requirements": [
+        "commission scratch optimizer horizon and schedule",
+        "remove spatial_state_topology_aliasing from the value information surface",
+        "commission minimum realized initial-settlement and initial-road policy-loss mass",
+        "materialize and authenticate a full adapter-v5 training composite"
+      ],
+      "observations": {
+        "architecture_information_surface": "spatial_state_topology_aliasing",
+        "retained_composite_adapter_status": "adapter_v2_only",
+        "opening_policy_loss_mass_fraction": 0.027885
+      },
+      "commissioning_evidence": []
+    },
+    "a1-parent-update-35m-b200": {
+      "recipe_canonical_sha256": "ada85baa252882011c93614cd5fabea5211442e4769a1255d37f92862682a137",
+      "authorized": false,
+      "reason": "parent_update_training_signal_contract_unresolved",
+      "unresolved_requirements": [
+        "remove spatial_state_topology_aliasing from the value information surface",
+        "commission minimum realized initial-settlement and initial-road policy-loss mass",
+        "materialize and authenticate a full adapter-v5 training composite",
+        "seal an opening-specific value and policy no-regression gate"
+      ],
+      "observations": {
+        "architecture_information_surface": "spatial_state_topology_aliasing",
+        "retained_composite_adapter_status": "adapter_v2_only",
+        "opening_policy_loss_mass_fraction": 0.027885
+      },
+      "commissioning_evidence": []
+    }
+  }
+}

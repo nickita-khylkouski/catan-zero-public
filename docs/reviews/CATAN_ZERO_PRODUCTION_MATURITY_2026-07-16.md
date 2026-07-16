@@ -242,8 +242,10 @@ gate must be required before an authority-changing commit is accepted.
   a real wave still requires an authenticated checkpoint and exact job inputs.
 - **Evaluation on the supplied H100:** software/runtime path is commissioned;
   strength claims still require the sealed paired gate.
-- **Parent-update training:** scientifically commissioned only for its exact
-  eight-B200 recipe; the supplied H100 must refuse it.
+- **Parent-update training:** its exact eight-B200 execution recipe remains
+  reproducible, but scientific admission is blocked because the value surface
+  is topology-blind, opening policy supervision is under-allocated, no full
+  adapter-v5 composite exists, and no sealed opening-slice gate exists.
 - **Scratch training:** blocked because the optimizer schedule is unresolved.
 - **PPO:** blocked because the retained exact-initializer canary was harmful and
   no canonical PPO recipe exists.
