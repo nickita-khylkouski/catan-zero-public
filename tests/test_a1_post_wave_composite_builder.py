@@ -924,6 +924,12 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
     assert descriptor["learner_recipe_overrides"]["policy_kl_anchor_direction"] == (
         "forward"
     )
+    assert descriptor["learner_recipe_overrides"]["soft_target_weight"] == pytest.approx(
+        1.0
+    )
+    assert descriptor["learner_recipe_overrides"][
+        "policy_target_blend_semantics"
+    ] == "policy_target_fallback_v2"
     assert descriptor["entity_feature_adapter_component_versions"] == {
         component_id: CURRENT_RUST_ENTITY_ADAPTER_VERSION
         for component_id in (

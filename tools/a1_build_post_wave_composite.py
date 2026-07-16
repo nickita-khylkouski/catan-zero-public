@@ -184,7 +184,8 @@ LEARNER_RECIPE_OVERRIDES: dict[str, object] = {
     "q_loss_weight": 0.0,
     "soft_target_source": "policy",
     "soft_target_temperature": 0.7,
-    "soft_target_weight": 0.9,
+    "soft_target_weight": 1.0,
+    "policy_target_blend_semantics": "policy_target_fallback_v2",
     "truncated_vp_margin_value_weight": 0.25,
     "value_target_lambda": 1.0,
 }

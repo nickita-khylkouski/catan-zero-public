@@ -5064,7 +5064,9 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             and overrides.get("per_game_value_weight") is False
             and overrides.get("loser_sample_weight") == 1.0
             and overrides.get("soft_target_temperature") == 0.7
-            and overrides.get("soft_target_weight") == 0.9
+            and overrides.get("soft_target_weight") == 1.0
+            and overrides.get("policy_target_blend_semantics")
+            == POLICY_TARGET_BLEND_FALLBACK_V2
             and overrides.get("soft_target_source") == "policy"
             and overrides.get("truncated_vp_margin_value_weight") == 0.25
             and overrides.get("value_target_lambda") == 1.0
