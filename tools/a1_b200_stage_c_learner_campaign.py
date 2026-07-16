@@ -102,7 +102,9 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
         if destination.is_symlink() or not destination.is_file():
             raise CampaignError(f"immutable output is not a file: {destination}")
         if destination.read_text(encoding="utf-8") != rendered:
-            raise CampaignError(f"immutable output already exists with drift: {destination}")
+            raise CampaignError(
+                f"immutable output already exists with drift: {destination}"
+            )
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(rendered, encoding="utf-8")
@@ -214,7 +216,9 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         raise CampaignError(f"learner Python refused: {error}") from error
     canary = args.ddp_canary_receipt.expanduser().resolve(strict=True)
     upgrade_path = args.architecture_upgrade_receipt.expanduser().resolve(strict=True)
-    if any(path.is_symlink() or not path.is_file() for path in (lock, canary, upgrade_path)):
+    if any(
+        path.is_symlink() or not path.is_file() for path in (lock, canary, upgrade_path)
+    ):
         raise CampaignError("lock/canary/upgrade inputs must be regular files")
     try:
         verified = one_dose.verify_training_inputs(
@@ -230,12 +234,9 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
     if (
         verified.get("data_kind") != "coherent_direct_memmap_v1"
         or verified.get("recipe", {}).get("soft_target_source") != "policy"
-        or float(verified.get("recipe", {}).get("policy_loss_weight", -1.0))
-        != 1.0
-        or float(verified.get("recipe", {}).get("value_loss_weight", -1.0))
-        != 0.25
-        or float(verified.get("recipe", {}).get("policy_kl_anchor_weight", -1.0))
-        != 0.0
+        or float(verified.get("recipe", {}).get("policy_loss_weight", -1.0)) != 1.0
+        or float(verified.get("recipe", {}).get("value_loss_weight", -1.0)) != 0.25
+        or float(verified.get("recipe", {}).get("policy_kl_anchor_weight", -1.0)) != 0.0
         or verified.get("recipe", {}).get("policy_kl_target") is not None
         or upgrade.get("source", {}).get("sha256") != stage_a.EXPECTED_F7_PARENT_SHA256
         or upgrade.get("module")
@@ -260,9 +261,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         overlay_evidence["receipt"]["projection"]["selected_rows"]
     )
     selected_training_roots = int(
-        overlay_evidence["receipt"]["projection"][
-            "selected_training_policy_rows"
-        ]
+        overlay_evidence["receipt"]["projection"]["selected_training_policy_rows"]
     )
     if selected_roots_total <= 0 or selected_training_roots <= 0:
         raise CampaignError("Stage-C overlay has no policy roots")
@@ -413,16 +412,30 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
     command = _one_dose_command(plan)
     if not go:
         return {"mode": "dry-run", "command": command}
-    result = subprocess.run([*command, "--go"], check=False)
-    if result.returncode != 0:
-        raise CampaignError(f"Stage-C aligned learner exited {result.returncode}")
     receipt_path = Path(str(plan["expected_artifacts"]["one_dose_receipt"]))
+    adopted_completed_receipt = receipt_path.exists() or receipt_path.is_symlink()
     try:
-        receipt = one_dose._load_authenticated_completed_aux_receipt(  # noqa: SLF001
-            receipt_path
-        )
+        if adopted_completed_receipt:
+            # The trainer may have completed and durably receipted its exact
+            # dose before this outer campaign process was interrupted or hit a
+            # post-training wrapper bug. Authenticate first and never launch a
+            # second optimizer trajectory into that terminal namespace.
+            receipt = one_dose._load_authenticated_completed_ablation_receipt(  # noqa: SLF001
+                receipt_path
+            )
+        else:
+            result = subprocess.run([*command, "--go"], check=False)
+            if result.returncode != 0:
+                raise CampaignError(
+                    f"Stage-C aligned learner exited {result.returncode}"
+                )
+            receipt = one_dose._load_authenticated_completed_ablation_receipt(  # noqa: SLF001
+                receipt_path
+            )
     except one_dose.ExecutorError as error:
-        raise CampaignError(f"completed Stage-C learner receipt refused: {error}") from error
+        raise CampaignError(
+            f"completed Stage-C learner receipt refused: {error}"
+        ) from error
     report_path = Path(str(plan["expected_artifacts"]["report"])).resolve(strict=True)
     report = _load_json(report_path, where="completed Stage-C learner report")[1]
     freeze = report.get("training_information_surface", {}).get(
@@ -431,8 +444,7 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
     if (
         float(report.get("value_trunk_grad_scale", -1.0)) != 0.1
         or not isinstance(freeze, dict)
-        or freeze.get("frozen_groups")
-        != sorted(FROZEN_ADAPTER_GROUPS.split(","))
+        or freeze.get("frozen_groups") != sorted(FROZEN_ADAPTER_GROUPS.split(","))
         or set(freeze.get("frozen_submodules", ()))
         != {"meaningful_history_residual_gate", "public_card_count_residual"}
         or freeze.get("all_require_grad_false") is not True
@@ -484,18 +496,17 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
             "unique_auxiliary_source_rows": unique_rows,
             "unique_root_coverage_fraction": unique_rows / selected_roots,
             "auxiliary_reuse_factor": aux_draws / unique_rows,
-            "base_policy_active_draws": int(
-                report.get("policy_base_active_rows", 0)
-            ),
+            "base_policy_active_draws": int(report.get("policy_base_active_rows", 0)),
         },
         "optimizer_batch_kl_used_as_trust_authority": False,
         "posthoc_frozen_holdout_selection_required": True,
+        "existing_completed_dose_adopted": adopted_completed_receipt,
     }
     execution["execution_sha256"] = _value_sha256(execution)
     execution_path = Path(str(plan["expected_artifacts"]["execution_receipt"]))
     _write_json(execution_path, execution)
     return {
-        "mode": "go",
+        "mode": "finalize-existing" if adopted_completed_receipt else "go",
         "receipt": str(receipt_path),
         "receipt_sha256": receipt["receipt_sha256"],
         "checkpoint": receipt["outputs"]["checkpoint"],
@@ -508,7 +519,11 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
 
 def _checkpoint_path(plan: Mapping[str, Any], step: int) -> Path:
     root = Path(str(plan["output_root"])) / "learner"
-    return root / "candidate.pt" if step == MAX_STEPS else root / f"candidate_step{step:04d}.pt"
+    return (
+        root / "candidate.pt"
+        if step == MAX_STEPS
+        else root / f"candidate_step{step:04d}.pt"
+    )
 
 
 def _trunk_relative_l2(report: Mapping[str, Any]) -> float:
@@ -531,10 +546,70 @@ def _trunk_relative_l2(report: Mapping[str, Any]) -> float:
     return math.sqrt(delta / baseline)
 
 
-def _fingerprint(plan_path: Path, plan: Mapping[str, Any], *, go: bool, device: str) -> dict[str, Any]:
+def _fingerprint(
+    plan_path: Path, plan: Mapping[str, Any], *, go: bool, device: str
+) -> dict[str, Any]:
     _verify_inputs(plan)
     output_root = Path(str(plan["output_root"])) / "fingerprints"
     report = Path(str(plan["expected_artifacts"]["report"])).resolve(strict=True)
+    report_payload = _load_json(report, where="completed Stage-C learner report")[1]
+    emitted_holdout = report_payload.get("validation_game_seed_manifest")
+    if not isinstance(emitted_holdout, str) or not emitted_holdout:
+        raise CampaignError(
+            "completed Stage-C learner report has no emitted validation holdout"
+        )
+    validation_manifest = Path(emitted_holdout).expanduser()
+    if not validation_manifest.is_absolute():
+        validation_manifest = report.parent / validation_manifest
+    if validation_manifest.is_symlink() or not validation_manifest.is_file():
+        raise CampaignError("emitted validation holdout must be a regular file")
+    validation_manifest = validation_manifest.resolve(strict=True)
+    validation_payload = _load_json(
+        validation_manifest, where="emitted Stage-C validation holdout"
+    )[1]
+    expected_input_manifest = Path(str(plan["inputs"]["validation_manifest"])).resolve(
+        strict=True
+    )
+    if (
+        validation_payload.get("schema_version") != "train-validation-game-seeds-v1"
+        or validation_payload.get("a1_contract_sha256")
+        != report_payload.get("a1_contract_sha256")
+        or validation_payload.get("data") != report_payload.get("data")
+        or validation_payload.get("data_fingerprint")
+        != report_payload.get("data_fingerprint")
+        or validation_payload.get("validation_game_seed_count")
+        != report_payload.get("validation_game_seed_count")
+        or validation_payload.get("validation_game_seed_set_sha256")
+        != report_payload.get("validation_game_seed_set_sha256")
+        or validation_payload.get("training_excluded_game_seed_count")
+        != report_payload.get("training_excluded_game_seed_count")
+        or validation_payload.get("training_excluded_game_seed_set_sha256")
+        != report_payload.get("training_excluded_game_seed_set_sha256")
+        or validation_payload.get("input_validation_game_seed_manifest")
+        != str(expected_input_manifest)
+        or validation_payload.get("input_validation_game_seed_manifest_sha256")
+        != report_payload.get("input_validation_game_seed_manifest_sha256")
+        or validation_payload.get("input_validation_game_seed_manifest_sha256")
+        != _file_sha256(expected_input_manifest)
+    ):
+        raise CampaignError(
+            "emitted validation holdout differs from the completed learner report"
+        )
+    validation_binding = {
+        "path": str(validation_manifest),
+        "file_sha256": _file_sha256(validation_manifest),
+        "validation_game_seed_count": validation_payload["validation_game_seed_count"],
+        "validation_game_seed_set_sha256": validation_payload[
+            "validation_game_seed_set_sha256"
+        ],
+        "training_excluded_game_seed_set_sha256": validation_payload[
+            "training_excluded_game_seed_set_sha256"
+        ],
+        "input_validation_game_seed_manifest": str(expected_input_manifest),
+        "input_validation_game_seed_manifest_sha256": _file_sha256(
+            expected_input_manifest
+        ),
+    }
     authority = _load_json(
         Path(str(plan["inputs"]["independent_parent_authority"])),
         where="independent parent authority",
@@ -560,7 +635,7 @@ def _fingerprint(plan_path: Path, plan: Mapping[str, Any], *, go: bool, device: 
             "--data",
             str(plan["inputs"]["data"]),
             "--validation-manifest",
-            str(plan["inputs"]["validation_manifest"]),
+            str(validation_manifest),
             "--device",
             device,
             "--output",
@@ -576,14 +651,18 @@ def _fingerprint(plan_path: Path, plan: Mapping[str, Any], *, go: bool, device: 
             "--output",
             str(drift_path),
         ]
-        commands.append({"step": step, "functional": functional_command, "drift": drift_command})
+        commands.append(
+            {"step": step, "functional": functional_command, "drift": drift_command}
+        )
         if not go:
             continue
         output_root.mkdir(parents=True, exist_ok=True)
         for command in (functional_command, drift_command):
             result = subprocess.run(command, check=False)
             if result.returncode != 0:
-                raise CampaignError(f"checkpoint {step} fingerprint exited {result.returncode}")
+                raise CampaignError(
+                    f"checkpoint {step} fingerprint exited {result.returncode}"
+                )
         functional = _load_json(functional_path, where=f"step {step} functional")[1]
         drift = _load_json(drift_path, where=f"step {step} drift")[1]
         fingerprint = functional.get("functional_dose_fingerprint")
@@ -605,14 +684,28 @@ def _fingerprint(plan_path: Path, plan: Mapping[str, Any], *, go: bool, device: 
                     and trunk <= MAX_TRUNK_RELATIVE_L2
                     and closure > 0.0
                 ),
-                "functional": {"path": str(functional_path), "file_sha256": _file_sha256(functional_path)},
-                "drift": {"path": str(drift_path), "file_sha256": _file_sha256(drift_path)},
+                "functional": {
+                    "path": str(functional_path),
+                    "file_sha256": _file_sha256(functional_path),
+                },
+                "drift": {
+                    "path": str(drift_path),
+                    "file_sha256": _file_sha256(drift_path),
+                },
             }
         )
     if not go:
-        return {"mode": "dry-run", "commands": commands}
+        return {
+            "mode": "dry-run",
+            "validation_holdout": validation_binding,
+            "commands": commands,
+        }
     eligible = [row for row in records if row["eligible"]]
-    winner = max(eligible, key=lambda row: (row["teacher_gap_closure"], -row["step"])) if eligible else None
+    winner = (
+        max(eligible, key=lambda row: (row["teacher_gap_closure"], -row["step"]))
+        if eligible
+        else None
+    )
     payload: dict[str, Any] = {
         "schema_version": FINGERPRINT_SCHEMA,
         "campaign": {
@@ -621,6 +714,7 @@ def _fingerprint(plan_path: Path, plan: Mapping[str, Any], *, go: bool, device: 
             "campaign_sha256": plan["campaign_sha256"],
         },
         "metric_scope": "frozen_whole_game_validation_policy_active_multi_action_rows",
+        "validation_holdout": validation_binding,
         "optimizer_batch_kl_used_as_trust_authority": False,
         "checkpoints": records,
         "winner": winner,

@@ -150,9 +150,7 @@ TRAINING_TOPOLOGIES: dict[str, dict[str, Any]] = {
         "global_batch_size": 4096,
     },
 }
-EVENT_HISTORY_ACK_FLAG = (
-    "--acknowledge-empty-event-history-payload-inventory-sha256"
-)
+EVENT_HISTORY_ACK_FLAG = "--acknowledge-empty-event-history-payload-inventory-sha256"
 EVENT_HISTORY_CROP_FLAG = "--crop-authenticated-empty-event-history"
 TRUSTED_A1_LOCK_FILE_SHA256 = (
     "sha256:8301c7547e1745812c69ca04934424755c7116eb5e221688abc58c1bcb7a3122"
@@ -183,9 +181,7 @@ V5_PRODUCTION_A1_VERIFIER_PATH = Path(
 V5_PRODUCTION_A1_VERIFIER_SHA256 = (
     "sha256:ab5d4ef8d4a3f82ecacb6c94ff613e24041ec9d1d4e2722ae6c65a19220f101c"
 )
-V5_PRODUCTION_CONTRACT_ID = (
-    "a1-v5-recovery-n128-p4-64000games-64gpu-20260714-r2"
-)
+V5_PRODUCTION_CONTRACT_ID = "a1-v5-recovery-n128-p4-64000games-64gpu-20260714-r2"
 V5_PRODUCTION_CONTRACT_SHA256 = (
     "sha256:2becf946235fb55dff606b90906acee6c6933eba21d507d49a258690a371891a"
 )
@@ -279,9 +275,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
 )
 
 LEGACY_AUX_REGULARIZATION_MODULE = architecture_upgrade.MODULE_AUX_SUBGOAL_HEADS
-AUX_REGULARIZATION_MODULE = (
-    architecture_upgrade.MODULE_AUX_SUBGOAL_POINTER_HEADS
-)
+AUX_REGULARIZATION_MODULE = architecture_upgrade.MODULE_AUX_SUBGOAL_POINTER_HEADS
 AUX_CONTROL_ARM = "AUX0"
 AUX_TREATMENT_ARM = "AUXT"
 AUX_SELECTED_SAMPLE_DOSE = 524_288
@@ -516,8 +510,7 @@ def _current_ablation_code_binding(lock: dict[str, Any]) -> dict[str, Any]:
             # in the transitive runtime inventory. The bytes/path must agree;
             # otherwise the sealed inventories are internally contradictory.
             if prior is not None and (
-                prior["path"] != record["path"]
-                or prior["sha256"] != record["sha256"]
+                prior["path"] != record["path"] or prior["sha256"] != record["sha256"]
             ):
                 raise ExecutorError(
                     f"conflicting A1 code provenance for {relative_key}"
@@ -552,6 +545,129 @@ def _current_ablation_code_binding(lock: dict[str, Any]) -> dict[str, Any]:
     }
     binding["code_tree_sha256"] = _value_sha256(binding)
     return binding
+
+
+def _verify_completed_ablation_code_binding(
+    binding: Mapping[str, Any], *, lock: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Authenticate the immutable checkout used by a completed ablation.
+
+    Completion replay cannot substitute the verifier's newer checkout for the
+    code bytes that actually rendered and ran the learner.  This verifier
+    rebuilds the required relative-path inventory from the sealed lock, then
+    proves every recorded byte beneath the receipt-bound historical checkout.
+    It is deliberately not exposed by the launch CLI.
+    """
+
+    if not isinstance(binding, dict) or set(binding) != {
+        "schema_version",
+        "repository_root",
+        "records",
+        "code_tree_sha256",
+    }:
+        raise ExecutorError("completed ablation code binding shape drift")
+    unsigned = dict(binding)
+    stated = unsigned.pop("code_tree_sha256", None)
+    if binding.get(
+        "schema_version"
+    ) != "a1-learner-ablation-code-binding-v1" or stated != _value_sha256(unsigned):
+        raise ExecutorError("completed ablation code binding digest drift")
+    root_ref = binding.get("repository_root")
+    if not isinstance(root_ref, str) or not Path(root_ref).is_absolute():
+        raise ExecutorError("completed ablation repository root is not absolute")
+    root_lexical = Path(root_ref).expanduser()
+    if root_lexical.is_symlink() or not root_lexical.is_dir():
+        raise ExecutorError("completed ablation repository root is unavailable")
+    try:
+        root = root_lexical.resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(
+            f"cannot resolve completed ablation repository root: {error}"
+        ) from error
+    if str(root) != root_ref:
+        raise ExecutorError("completed ablation repository root is not canonical")
+
+    provenance = lock.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ExecutorError("sealed A1 contract has no code provenance")
+    expected_kinds: dict[str, str] = {}
+    for section, kind in (
+        ("learner_code", "learner_code"),
+        ("runtime_code_tree", "runtime_code"),
+    ):
+        source = provenance.get(section)
+        if not isinstance(source, list) or not source:
+            raise ExecutorError(f"sealed A1 contract has no {section} inventory")
+        for old in source:
+            if not isinstance(old, dict) or not isinstance(old.get("path"), str):
+                raise ExecutorError(f"sealed A1 {section} record is malformed")
+            relative = _repo_relative_code_path(old["path"]).as_posix()
+            if relative not in expected_kinds or kind == "learner_code":
+                expected_kinds[relative] = kind
+    for relative in (
+        "src/catan_zero/rl/entity_token_policy.py",
+        "tools/a1_ddp_epoch_canary.py",
+        "tools/a1_function_preserving_upgrade.py",
+        "tools/a1_one_dose_train.py",
+        "tools/train_bc.py",
+    ):
+        expected_kinds[relative] = "learner_code"
+
+    raw_records = binding.get("records")
+    if not isinstance(raw_records, list) or not raw_records:
+        raise ExecutorError("completed ablation code binding has no records")
+    observed: dict[str, dict[str, str]] = {}
+    for raw in raw_records:
+        if not isinstance(raw, dict) or set(raw) != {
+            "kind",
+            "relative_path",
+            "path",
+            "sha256",
+        }:
+            raise ExecutorError("completed ablation code record shape drift")
+        kind = raw.get("kind")
+        relative_ref = raw.get("relative_path")
+        path_ref = raw.get("path")
+        digest = raw.get("sha256")
+        if (
+            kind not in {"learner_code", "runtime_code"}
+            or not isinstance(relative_ref, str)
+            or not relative_ref
+            or Path(relative_ref).is_absolute()
+            or ".." in Path(relative_ref).parts
+            or not isinstance(path_ref, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", str(digest)) is None
+            or relative_ref in observed
+        ):
+            raise ExecutorError("completed ablation code record is invalid")
+        expected_path = root / relative_ref
+        lexical_path = Path(path_ref).expanduser()
+        if lexical_path.is_symlink() or not lexical_path.is_file():
+            raise ExecutorError(
+                f"completed ablation code file is unavailable: {relative_ref}"
+            )
+        try:
+            actual_path = lexical_path.resolve(strict=True)
+        except OSError as error:
+            raise ExecutorError(
+                f"cannot resolve completed ablation code file {relative_ref}: {error}"
+            ) from error
+        if (
+            actual_path != expected_path
+            or path_ref != str(expected_path)
+            or _file_sha256(actual_path) != digest
+        ):
+            raise ExecutorError(
+                f"completed ablation code bytes/path drift: {relative_ref}"
+            )
+        observed[relative_ref] = dict(raw)
+    if {
+        relative: record["kind"] for relative, record in observed.items()
+    } != expected_kinds:
+        raise ExecutorError(
+            "completed ablation code inventory differs from sealed lock"
+        )
+    return copy.deepcopy(binding)
 
 
 def _portable_ablation_code_identity(
@@ -607,15 +723,11 @@ def _portable_upgrade_identity(upgrade: dict[str, Any]) -> dict[str, Any]:
             "schema_version": "a1-portable-function-upgrade-identity-v1",
             "module": str(upgrade["module"]),
             "source_checkpoint_sha256": str(upgrade["source"]["sha256"]),
-            "initializer_sha256": str(
-                upgrade["upgraded_initializer"]["sha256"]
-            ),
+            "initializer_sha256": str(upgrade["upgraded_initializer"]["sha256"]),
             "flags": copy.deepcopy(upgrade["flags"]),
             "initialization_seed": upgrade["initialization_seed"],
             "forward_max_diff": upgrade["forward_max_diff"],
-            "forward_identical_at_init": upgrade[
-                "forward_identical_at_init"
-            ],
+            "forward_identical_at_init": upgrade["forward_identical_at_init"],
             "shared_parameters_bit_identical": upgrade[
                 "shared_parameters_bit_identical"
             ],
@@ -635,7 +747,9 @@ def _portable_upgrade_identity(upgrade: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     except (KeyError, TypeError) as error:
-        raise ExecutorError("function-preserving upgrade identity is incomplete") from error
+        raise ExecutorError(
+            "function-preserving upgrade identity is incomplete"
+        ) from error
     digest_values = [
         identity["source_checkpoint_sha256"],
         identity["initializer_sha256"],
@@ -727,18 +841,24 @@ def _selected_gpus(verified: dict[str, Any], *, fallback_gpu: int) -> tuple[int,
     if (
         not isinstance(raw, list)
         or not raw
-        or any(isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0 for gpu in raw)
+        or any(
+            isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0 for gpu in raw
+        )
         or len(set(raw)) != len(raw)
     ):
         raise ExecutorError("training topology has invalid physical GPU ownership")
     gpus = tuple(raw)
     world_size = int(verified.get("recipe", {}).get("world_size", len(gpus)))
     if len(gpus) != world_size:
-        raise ExecutorError("training topology GPU count differs from learner world size")
+        raise ExecutorError(
+            "training topology GPU count differs from learner world size"
+        )
     return gpus
 
 
-def _child_environment(gpu: int | Sequence[int]) -> dict[str, str]:
+def _child_environment(
+    gpu: int | Sequence[int], *, repository_root: Path | None = None
+) -> dict[str, str]:
     """Return the complete, secret-free environment for the learner child.
 
     Do not start from ``os.environ``: an operator shell may contain distributed,
@@ -747,7 +867,9 @@ def _child_environment(gpu: int | Sequence[int]) -> dict[str, str]:
     not the ambient HOME variable, and every other entry is an explicit value.
     """
 
-    raw_gpus = [gpu] if isinstance(gpu, int) and not isinstance(gpu, bool) else list(gpu)
+    raw_gpus = (
+        [gpu] if isinstance(gpu, int) and not isinstance(gpu, bool) else list(gpu)
+    )
     if (
         not raw_gpus
         or any(
@@ -756,11 +878,20 @@ def _child_environment(gpu: int | Sequence[int]) -> dict[str, str]:
         )
         or len(set(raw_gpus)) != len(raw_gpus)
     ):
-        raise ExecutorError("child environment GPUs must be unique non-negative integers")
+        raise ExecutorError(
+            "child environment GPUs must be unique non-negative integers"
+        )
     try:
         account_home = pwd.getpwuid(os.getuid()).pw_dir
     except (KeyError, OSError) as error:
         raise ExecutorError("cannot resolve the learner account home") from error
+    repo_root = (
+        _REPO_ROOT.resolve(strict=True)
+        if repository_root is None
+        else repository_root.expanduser().resolve(strict=True)
+    )
+    if repo_root.is_symlink() or not repo_root.is_dir():
+        raise ExecutorError("learner repository root must be a regular directory")
     environment = {
         "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
         "CUDA_VISIBLE_DEVICES": ",".join(map(str, raw_gpus)),
@@ -771,7 +902,7 @@ def _child_environment(gpu: int | Sequence[int]) -> dict[str, str]:
         "PYTHONHASHSEED": "0",
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONNOUSERSITE": "1",
-        "PYTHONPATH": f"{_REPO_ROOT / 'src'}:{_REPO_ROOT}",
+        "PYTHONPATH": f"{repo_root / 'src'}:{repo_root}",
         "TMPDIR": "/tmp",
         "TZ": "UTC",
     }
@@ -831,9 +962,7 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
         "effective_learner_recipe_sha256": _value_sha256(recipe),
         "training_topology": topology,
         "ddp_canary": verified.get("ddp_canary"),
-        "aux_subgoal_preclaim_contract": verified.get(
-            "aux_subgoal_preclaim_contract"
-        ),
+        "aux_subgoal_preclaim_contract": verified.get("aux_subgoal_preclaim_contract"),
         "aux_pair_executor_authority_sha256": (
             verified.get("aux_pair_executor_authority", {}).get("authority_sha256")
             if isinstance(verified.get("aux_pair_executor_authority"), dict)
@@ -848,16 +977,12 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
             verified.get("final_replication_executor_authority", {}).get(
                 "authority_sha256"
             )
-            if isinstance(
-                verified.get("final_replication_executor_authority"), dict
-            )
+            if isinstance(verified.get("final_replication_executor_authority"), dict)
             else None
         ),
         "central_published_executor_authority": (
             copy.deepcopy(verified["central_published_executor_authority"])
-            if isinstance(
-                verified.get("central_published_executor_authority"), dict
-            )
+            if isinstance(verified.get("central_published_executor_authority"), dict)
             else None
         ),
         "diagnostic_comparison_source": (
@@ -896,9 +1021,7 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
                 "composite_build_receipt": verified["composite_build_receipt"],
                 "source_authority": verified.get("source_authority_ref"),
                 "category_semantics": verified.get("category_semantics"),
-                "category_semantics_sha256": verified.get(
-                    "category_semantics_sha256"
-                ),
+                "category_semantics_sha256": verified.get("category_semantics_sha256"),
             }
         )
         if "p1_training_descriptor_authority" in verified:
@@ -920,9 +1043,7 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
         payload.update(
             {
                 "validation_manifest": str(verified["validation_path"]),
-                "validation_manifest_file_sha256": verified[
-                    "validation_file_sha256"
-                ],
+                "validation_manifest_file_sha256": verified["validation_file_sha256"],
                 "selected_game_seed_set_sha256": verified[
                     "selected_game_seed_set_sha256"
                 ],
@@ -936,9 +1057,7 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
         )
     lock_verifier_authority = verified.get("lock_verifier_authority")
     if lock_verifier_authority is not None:
-        payload["lock_verifier_authority"] = copy.deepcopy(
-            lock_verifier_authority
-        )
+        payload["lock_verifier_authority"] = copy.deepcopy(lock_verifier_authority)
     payload["binding_sha256"] = _value_sha256(payload)
     return payload
 
@@ -1352,9 +1471,7 @@ def _verify_lock_with_sealed_runtime(
         raw.get("contract_id") != expected_contract_id
         or raw.get("contract_sha256") != expected_contract_sha
         or _producer(raw).get("sha256") != expected_producer_sha
-        or raw.get("promotion_handoff", {})
-        .get("producer_checkpoint", {})
-        .get("sha256")
+        or raw.get("promotion_handoff", {}).get("producer_checkpoint", {}).get("sha256")
         != expected_producer_sha
     ):
         raise ExecutorError(
@@ -1630,15 +1747,16 @@ def _verify_coherent_direct_training_inputs(
         admission_path = admission_path.expanduser().resolve(strict=True)
         payload = json.loads(admission_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ExecutorError(f"cannot read coherent corpus admission: {error}") from error
+        raise ExecutorError(
+            f"cannot read coherent corpus admission: {error}"
+        ) from error
     if not isinstance(payload, dict):
         raise ExecutorError("coherent corpus admission must be a JSON object")
     unsigned = dict(payload)
     stated = unsigned.pop("admission_sha256", None)
     if (
         payload.get("schema_version") != "a1-coherent-n128-corpus-admission-v1"
-        or payload.get("status")
-        != "admitted_for_diagnostic_policy_distillation"
+        or payload.get("status") != "admitted_for_diagnostic_policy_distillation"
         or payload.get("diagnostic_only") is not True
         or payload.get("promotion_eligible") is not False
         or stated != _value_sha256(unsigned)
@@ -1660,10 +1778,8 @@ def _verify_coherent_direct_training_inputs(
         or corpus.get("producer_checkpoint_sha256") != producer.get("sha256")
         or corpus.get("selected_games") != 8_192
         or not isinstance(corpus.get("selected_game_seed_set_sha256"), str)
-        or corpus.get("target_information_regime")
-        != "public_belief_single_tree_v1"
-        or corpus.get("search_evidence_schema")
-        != "gumbel_root_search_evidence_v1"
+        or corpus.get("target_information_regime") != "public_belief_single_tree_v1"
+        or corpus.get("search_evidence_schema") != "gumbel_root_search_evidence_v1"
         or corpus.get("incompatible_policy_active_rows") != 0
         or policy.get("coherent_public_n128_only") is not True
         or policy.get("legacy_pimc_rows_allowed") is not False
@@ -1693,18 +1809,22 @@ def _verify_coherent_direct_training_inputs(
         )
         data = train_bc.load_teacher_data_memmap(data_path)
     except (OSError, SystemExit, ValueError) as error:
-        raise ExecutorError(f"coherent corpus bytes/holdout refused: {error}") from error
+        raise ExecutorError(
+            f"coherent corpus bytes/holdout refused: {error}"
+        ) from error
     if (
         validation["a1_contract_sha256"] != contract.get("contract_sha256")
-        or validation["file_sha256"]
-        != corpus["validation_manifest"]["file_sha256"]
+        or validation["file_sha256"] != corpus["validation_manifest"]["file_sha256"]
     ):
         raise ExecutorError("coherent holdout binds a different target contract")
     observed = np.asarray(data["game_seed"], dtype=np.int64).reshape(-1)
     if observed.size == 0:
         raise ExecutorError("coherent corpus has no game rows")
     run_starts = np.concatenate(
-        (np.asarray([0], dtype=np.int64), np.flatnonzero(observed[1:] != observed[:-1]) + 1)
+        (
+            np.asarray([0], dtype=np.int64),
+            np.flatnonzero(observed[1:] != observed[:-1]) + 1,
+        )
     )
     run_values = observed[run_starts]
     selected = np.sort(np.unique(observed))
@@ -1714,7 +1834,9 @@ def _verify_coherent_direct_training_inputs(
         or train_bc._game_seed_set_sha256(selected)  # noqa: SLF001
         != corpus["selected_game_seed_set_sha256"]
     ):
-        raise ExecutorError("coherent corpus differs from its explicit selected seed set")
+        raise ExecutorError(
+            "coherent corpus differs from its explicit selected seed set"
+        )
     validation_seeds = np.asarray(validation["game_seeds"], dtype=np.int64)
     if not np.isin(validation_seeds, selected).all():
         raise ExecutorError("coherent holdout includes a seed outside the corpus")
@@ -1739,9 +1861,7 @@ def _verify_coherent_direct_training_inputs(
     validation_binding = {
         "path": str(validation_path),
         "file_sha256": validation["file_sha256"],
-        "game_count": int(
-            np.asarray(validation["game_seeds"], dtype=np.int64).size
-        ),
+        "game_count": int(np.asarray(validation["game_seeds"], dtype=np.int64).size),
         "game_seed_set_sha256": validation["validation_game_seed_set_sha256"],
         "row_count": validation_row_count,
     }
@@ -1844,7 +1964,9 @@ def verify_training_inputs(
     except OSError as error:
         raise ExecutorError(f"cannot resolve A1 training input: {error}") from error
     if not (data_path.is_dir() or data_path.is_file()):
-        raise ExecutorError(f"A1 data path is not a corpus directory/descriptor: {data_path}")
+        raise ExecutorError(
+            f"A1 data path is not a corpus directory/descriptor: {data_path}"
+        )
 
     try:
         lock, lock_verifier_authority = _verify_training_lock(
@@ -1894,7 +2016,9 @@ def verify_training_inputs(
                 "--composite-build-receipt is valid only for a production composite"
             )
         if validation_path is None:
-            raise ExecutorError("ordinary A1 memmap input requires a validation manifest")
+            raise ExecutorError(
+                "ordinary A1 memmap input requires a validation manifest"
+            )
         validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
             validation_path,
             validation_fraction=0.05,
@@ -2001,7 +2125,9 @@ def _validate_production_composite_build_receipt(
         "verified_descriptor_fingerprint",
         "receipt_sha256",
     }
-    receipt_schema = payload.get("schema_version") if isinstance(payload, dict) else None
+    receipt_schema = (
+        payload.get("schema_version") if isinstance(payload, dict) else None
+    )
     if receipt_schema == "a1-post-wave-composite-build-v2":
         expected.add("fresh_target_activation")
     if (
@@ -2064,9 +2190,7 @@ def _validate_production_composite_build_receipt(
         raise ExecutorError("composite build receipt input/sampling binding drift")
     if receipt_schema == "a1-post-wave-composite-build-v2":
         activation = payload.get("fresh_target_activation")
-        authority_activation = meta["source_authority"].get(
-            "fresh_target_activation"
-        )
+        authority_activation = meta["source_authority"].get("fresh_target_activation")
         audit_ref = payload.get("post_wave_audit")
         if (
             not isinstance(activation, dict)
@@ -2130,9 +2254,7 @@ def _verify_production_composite_inputs(
         "historical_replay": 0.20,
     }
     raw_components = meta.get("components")
-    if not isinstance(raw_components, list) or len(raw_components) != len(
-        expected_ids
-    ):
+    if not isinstance(raw_components, list) or len(raw_components) != len(expected_ids):
         raise ExecutorError(
             "production composite lacks authenticated component metadata for "
             "event-history admission"
@@ -2254,15 +2376,9 @@ def _verify_production_composite_inputs(
         or meta.get("policy_kl_anchor_component_ids") != []
         or meta.get("policy_distillation_component_ids") != expected_ids
         or meta.get("value_training_component_ids") != expected_ids
-        or not isinstance(
-            meta.get("entity_feature_adapter_component_versions"), dict
-        )
-        or set(meta["entity_feature_adapter_component_versions"])
-        != set(expected_ids)
-        or len(
-            set(meta["entity_feature_adapter_component_versions"].values())
-        )
-        != 1
+        or not isinstance(meta.get("entity_feature_adapter_component_versions"), dict)
+        or set(meta["entity_feature_adapter_component_versions"]) != set(expected_ids)
+        or len(set(meta["entity_feature_adapter_component_versions"].values())) != 1
         or not math.isclose(
             float(contract.get("realized_replay_ratio", -1.0)),
             0.20,
@@ -2272,7 +2388,9 @@ def _verify_production_composite_inputs(
     ):
         raise ExecutorError("production composite is not exact 64/12/4/20 replay")
     if contract.get("initializer_checkpoint_sha256") != producer.get("sha256"):
-        raise ExecutorError("production composite initializer differs from sealed producer")
+        raise ExecutorError(
+            "production composite initializer differs from sealed producer"
+        )
     # The generation lock predates the post-wave composite, so it binds the
     # base learner recipe with K=0.  The byte-authenticated descriptor preserves
     # that known TEMP control while binding the exact component scopes. Preserve
@@ -2326,7 +2444,9 @@ def _verify_production_composite_inputs(
     ):
         start, stop = offsets[index], offsets[index + 1]
         seeds = np.asarray(component["game_seed"], dtype=np.int64)
-        local_train = train_indices[(train_indices >= start) & (train_indices < stop)] - start
+        local_train = (
+            train_indices[(train_indices >= start) & (train_indices < stop)] - start
+        )
         local_validation = (
             validation_indices[
                 (validation_indices >= start) & (validation_indices < stop)
@@ -2346,10 +2466,9 @@ def _verify_production_composite_inputs(
         globally_seen_game_seeds.update(component_game_seeds)
         train_games = np.unique(seeds[local_train])
         validation_games = np.unique(seeds[local_validation])
-        if (
-            set(map(int, train_games)).intersection(map(int, validation_games))
-            or len(train_games) + len(validation_games) != len(all_games)
-        ):
+        if set(map(int, train_games)).intersection(map(int, validation_games)) or len(
+            train_games
+        ) + len(validation_games) != len(all_games):
             raise ExecutorError(
                 f"component {component_id} validation is not a whole-game partition"
             )
@@ -2423,9 +2542,7 @@ def _verify_production_composite_inputs(
         "corpus_meta_file_sha256": descriptor_sha,
         "descriptor_fingerprint": meta["descriptor_fingerprint"],
         "learner_recipe_overrides": meta["learner_recipe_overrides"],
-        "learner_recipe_overrides_sha256": meta[
-            "learner_recipe_overrides_sha256"
-        ],
+        "learner_recipe_overrides_sha256": meta["learner_recipe_overrides_sha256"],
         "entity_feature_adapter_component_versions": dict(
             meta["entity_feature_adapter_component_versions"]
         ),
@@ -2484,15 +2601,11 @@ def bind_training_topology(
     spec = TRAINING_TOPOLOGIES.get(topology)
     if spec is None:
         raise ExecutorError(f"unsupported training topology {topology!r}")
-    matched_aux = verified.get("learner_ablation", {}).get(
-        "matched_aux_regularization"
-    )
+    matched_aux = verified.get("learner_ablation", {}).get("matched_aux_regularization")
     central_p1 = verified.get("learner_ablation", {}).get("central_p1")
     central_learner = verified.get("central_learner_binding")
     if (
-        matched_aux is not None
-        or central_p1 is not None
-        or central_learner is not None
+        matched_aux is not None or central_p1 is not None or central_learner is not None
     ) and topology != B200_8GPU_DDP_TOPOLOGY:
         raise ExecutorError(
             "central P1/AUX arms require the exact b200-8gpu-ddp topology"
@@ -2559,9 +2672,7 @@ def bind_training_topology(
             }
         )
         learner_ablation["bound_recipe"] = topology_bound_recipe
-        learner_ablation["bound_recipe_sha256"] = _value_sha256(
-            topology_bound_recipe
-        )
+        learner_ablation["bound_recipe_sha256"] = _value_sha256(topology_bound_recipe)
         learner_ablation["effective_recipe"] = dict(effective)
         learner_ablation["effective_recipe_sha256"] = _value_sha256(effective)
         matched_aux = learner_ablation.get("matched_aux_regularization")
@@ -2587,9 +2698,9 @@ def bind_training_topology(
                         "receipt_digest": result["function_preserving_upgrade"][
                             "receipt_sha256"
                         ],
-                        "initializer_sha256": result[
-                            "function_preserving_upgrade"
-                        ]["upgraded_initializer"]["sha256"],
+                        "initializer_sha256": result["function_preserving_upgrade"][
+                            "upgraded_initializer"
+                        ]["sha256"],
                     }
                 ),
                 "ablation": learner_ablation,
@@ -2606,7 +2717,10 @@ def bind_training_topology(
 
 
 def _verify_ddp_canary_receipt(
-    receipt_path: Path, *, reference_time_ns: int
+    receipt_path: Path,
+    *,
+    reference_time_ns: int,
+    completed_repository_root: Path | None = None,
 ) -> dict[str, Any]:
     """Verify one host-local canary at an explicit trusted point in time.
 
@@ -2698,17 +2812,31 @@ def _verify_ddp_canary_receipt(
         or [record.get("physical_index") for record in payload["gpu_identities"]]
         != list(range(8))
         or len({record.get("uuid") for record in payload["gpu_identities"]}) != 8
-        or len({record.get("pci_bus_id") for record in payload["gpu_identities"]})
-        != 8
+        or len({record.get("pci_bus_id") for record in payload["gpu_identities"]}) != 8
         or [record.get("name") for record in payload["gpu_identities"]]
         != payload["gpu_names"]
     ):
         raise ExecutorError("8-GPU canary did not prove the exact B200 DDP topology")
-    expected_files = {
-        "tool": Path(ddp_canary.__file__).resolve(),
-        "train_bc": Path(train_bc.__file__).resolve(),
-    }
+    expected_root = (
+        None
+        if completed_repository_root is None
+        else completed_repository_root.expanduser().resolve(strict=True)
+    )
+    expected_files = (
+        {
+            "tool": Path(ddp_canary.__file__).resolve(),
+            "train_bc": Path(train_bc.__file__).resolve(),
+        }
+        if expected_root is None
+        else {
+            "tool": expected_root / "tools" / "a1_ddp_epoch_canary.py",
+            "train_bc": expected_root / "tools" / "train_bc.py",
+        }
+    )
     for field, expected_path in expected_files.items():
+        if expected_path.is_symlink() or not expected_path.is_file():
+            raise ExecutorError(f"8-GPU canary {field} historical code is unavailable")
+        expected_path = expected_path.resolve(strict=True)
         record = payload.get(field)
         if (
             not isinstance(record, dict)
@@ -2718,9 +2846,7 @@ def _verify_ddp_canary_receipt(
             raise ExecutorError(f"8-GPU canary {field} implementation drift")
     runtime_identity = payload.get("runtime_identity")
     python_identity = (
-        runtime_identity.get("python")
-        if isinstance(runtime_identity, dict)
-        else None
+        runtime_identity.get("python") if isinstance(runtime_identity, dict) else None
     )
     if (
         not isinstance(runtime_identity, dict)
@@ -2760,9 +2886,7 @@ def _verify_ddp_canary_receipt(
             contract["effective_torch_seed"]
             for contract in payload["training_rng_contracts"]
         ],
-        "dropout_probe_sha256_by_rank": payload[
-            "dropout_probe_sha256_by_rank"
-        ],
+        "dropout_probe_sha256_by_rank": payload["dropout_probe_sha256_by_rank"],
         "global_draw_sha256": payload["global_draw_sha256"],
         "rank_slice_sha256": payload["rank_slice_sha256"],
         "distributed_backend": payload["distributed_backend"],
@@ -2809,9 +2933,7 @@ def _bind_verified_ddp_canary(
         # parallel on different 8xB200 hosts.
         canary_semantics = canary["semantic_identity"]
         shared["ddp_canary_semantics"] = canary_semantics
-        shared["ddp_canary_semantics_sha256"] = _value_sha256(
-            canary_semantics
-        )
+        shared["ddp_canary_semantics_sha256"] = _value_sha256(canary_semantics)
         matched_aux["shared_identity"] = shared
         matched_aux["shared_identity_sha256"] = _value_sha256(shared)
         learner_ablation["matched_aux_regularization"] = matched_aux
@@ -2825,9 +2947,7 @@ def _bind_verified_ddp_canary(
                     "module": upgrade["module"],
                     "receipt_sha256": upgrade["receipt"]["sha256"],
                     "receipt_digest": upgrade["receipt_sha256"],
-                    "initializer_sha256": upgrade["upgraded_initializer"][
-                        "sha256"
-                    ],
+                    "initializer_sha256": upgrade["upgraded_initializer"]["sha256"],
                 },
                 "ablation": learner_ablation,
                 "training_topology": result["training_topology"],
@@ -2850,9 +2970,7 @@ def bind_ddp_canary(
         return verified
     if receipt_path is None:
         raise ExecutorError("8-GPU production topology requires --ddp-canary-receipt")
-    canary = _verify_ddp_canary_receipt(
-        receipt_path, reference_time_ns=time.time_ns()
-    )
+    canary = _verify_ddp_canary_receipt(receipt_path, reference_time_ns=time.time_ns())
     return _bind_verified_ddp_canary(verified, canary)
 
 
@@ -2867,9 +2985,7 @@ def bind_aux_subgoal_preclaim_contract(
     defects, not optimizer attempts, and therefore must fail before that claim.
     """
 
-    matched = verified.get("learner_ablation", {}).get(
-        "matched_aux_regularization"
-    )
+    matched = verified.get("learner_ablation", {}).get("matched_aux_regularization")
     if not isinstance(matched, dict):
         return verified
     weight = float(matched.get("aux_subgoal_loss_weight", -1.0))
@@ -2895,9 +3011,7 @@ def bind_aux_subgoal_preclaim_contract(
             )
             if not isinstance(meta, dict):
                 raise SystemExit("production composite metadata is unavailable")
-            data = train_bc.load_teacher_data_memmap(
-                data_path, composite_meta=meta
-            )
+            data = train_bc.load_teacher_data_memmap(data_path, composite_meta=meta)
             split = train_bc.split_train_validation_indices(
                 data,
                 validation_fraction=0.05,
@@ -2906,14 +3020,12 @@ def bind_aux_subgoal_preclaim_contract(
             )
         else:
             data = train_bc.load_teacher_data_memmap(data_path)
-            validation = (
-                train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
-                    verified["validation_path"],
-                    validation_fraction=0.05,
-                    validation_seed=17,
-                    validation_max_samples=0,
-                    validation_game_seed_ranges=[],
-                )
+            validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
+                verified["validation_path"],
+                validation_fraction=0.05,
+                validation_seed=17,
+                validation_max_samples=0,
+                validation_game_seed_ranges=[],
             )
             split = train_bc.split_train_validation_indices(
                 data,
@@ -2971,9 +3083,7 @@ def _expected_final_aux_claim_identity(verified: dict[str, Any]) -> str:
     if (
         not isinstance(upgrade, dict)
         or not isinstance(learner_ablation, dict)
-        or not isinstance(
-            learner_ablation.get("matched_aux_regularization"), dict
-        )
+        or not isinstance(learner_ablation.get("matched_aux_regularization"), dict)
         or not isinstance(preclaim, dict)
     ):
         raise ExecutorError("matched AUX final identity inputs are incomplete")
@@ -3000,53 +3110,32 @@ def _expected_final_aux_claim_identity(verified: dict[str, Any]) -> str:
         "aux_subgoal_treatment_admission_sha256",
     )
     if any(
-        re.fullmatch(r"sha256:[0-9a-f]{64}", str(shared.get(field, "")))
-        is None
+        re.fullmatch(r"sha256:[0-9a-f]{64}", str(shared.get(field, ""))) is None
         for field in required_shared_digests
     ):
         raise ExecutorError("matched AUX portable identity digest is incomplete")
     portable_science = {
         "pair_id": shared["pair_id"],
-        "portable_science_identity_sha256": shared[
-            "portable_science_identity_sha256"
-        ],
-        "p1_selection_authority_sha256": shared[
-            "p1_selection_authority_sha256"
-        ],
-        "effective_recipe_sha256": learner_ablation[
-            "effective_recipe_sha256"
-        ],
-        "effective_p1_recipe_sha256": shared[
-            "effective_p1_recipe_sha256"
-        ],
+        "portable_science_identity_sha256": shared["portable_science_identity_sha256"],
+        "p1_selection_authority_sha256": shared["p1_selection_authority_sha256"],
+        "effective_recipe_sha256": learner_ablation["effective_recipe_sha256"],
+        "effective_p1_recipe_sha256": shared["effective_p1_recipe_sha256"],
         "composite_authority_sha256": shared["composite_authority_sha256"],
-        "exact_current_parent_sha256": shared[
-            "exact_current_parent_sha256"
-        ],
-        "portable_code_identity_sha256": shared[
-            "portable_code_identity_sha256"
-        ],
-        "portable_upgrade_identity_sha256": shared[
-            "portable_upgrade_identity_sha256"
-        ],
-        "pointer_upgrade_identity_sha256": shared[
-            "pointer_upgrade_identity_sha256"
-        ],
+        "exact_current_parent_sha256": shared["exact_current_parent_sha256"],
+        "portable_code_identity_sha256": shared["portable_code_identity_sha256"],
+        "portable_upgrade_identity_sha256": shared["portable_upgrade_identity_sha256"],
+        "pointer_upgrade_identity_sha256": shared["pointer_upgrade_identity_sha256"],
         "warmup_terminal_sha256": shared["warmup_terminal_sha256"],
         "gradient_geometry_terminal_sha256": shared[
             "gradient_geometry_terminal_sha256"
         ],
         "selector_rule_sha256": shared["selector_rule_sha256"],
-        "selected_aux_coefficient_decimal": shared[
-            "selected_aux_coefficient_decimal"
-        ],
+        "selected_aux_coefficient_decimal": shared["selected_aux_coefficient_decimal"],
         "initializer_sha256": shared["initializer_sha256"],
         "pair_contract_state_sha256": shared["pair_contract_state_sha256"],
         "aux_pair_authority_sha256": matched["aux_pair_authority_sha256"],
         "training_topology": topology,
-        "ddp_canary_semantics_sha256": shared[
-            "ddp_canary_semantics_sha256"
-        ],
+        "ddp_canary_semantics_sha256": shared["ddp_canary_semantics_sha256"],
         "aux_subgoal_treatment_admission_sha256": shared[
             "aux_subgoal_treatment_admission_sha256"
         ],
@@ -3070,6 +3159,7 @@ def bind_learner_ablation(
     reviewed_code_tree_sha256: str,
     diagnostic_dose_curve: bool = False,
     diagnostic_checkpoint_steps: str = "",
+    _authenticated_completed_code_binding: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Derive a diagnostic learner recipe without weakening the sealed inputs."""
 
@@ -3077,6 +3167,7 @@ def bind_learner_ablation(
         raise ExecutorError(
             "--ablation-id must be a nonempty 1-80 character safe identifier"
         )
+
     def _reject_json_constant(value: str) -> None:
         raise ValueError(f"non-finite JSON constant {value}")
 
@@ -3107,8 +3198,7 @@ def bind_learner_ablation(
             "auxiliary arms are retired; use the pointer commissioning contract"
         )
     aux_upgrade = bool(
-        isinstance(upgrade, dict)
-        and upgrade.get("module") == AUX_REGULARIZATION_MODULE
+        isinstance(upgrade, dict) and upgrade.get("module") == AUX_REGULARIZATION_MODULE
     )
     if aux_upgrade:
         raise ExecutorError(
@@ -3187,10 +3277,8 @@ def bind_learner_ablation(
                 raise ExecutorError(
                     "A1 learner ablation forced action-type map must be nonempty"
                 )
-            effective[key] = (
-                train_bc._canonical_forced_row_value_action_type_weights(
-                    parsed_type_weights
-                )
+            effective[key] = train_bc._canonical_forced_row_value_action_type_weights(
+                parsed_type_weights
             )
             continue
         if key == "per_game_value_weight_mode":
@@ -3269,18 +3357,14 @@ def bind_learner_ablation(
                 raise ExecutorError(f"A1 learner ablation {key} must be finite")
             minimum, maximum, minimum_inclusive = numeric_domains[key]
             if minimum is not None and (
-                numeric < minimum
-                if minimum_inclusive
-                else numeric <= minimum
+                numeric < minimum if minimum_inclusive else numeric <= minimum
             ):
                 relation = ">=" if minimum_inclusive else ">"
                 raise ExecutorError(
                     f"A1 learner ablation {key} must be {relation} {minimum}"
                 )
             if maximum is not None and numeric > maximum:
-                raise ExecutorError(
-                    f"A1 learner ablation {key} must be <= {maximum}"
-                )
+                raise ExecutorError(f"A1 learner ablation {key} must be <= {maximum}")
         if key in enum_domains and value not in enum_domains[key]:
             raise ExecutorError(
                 f"A1 learner ablation {key} must be one of {sorted(enum_domains[key])}"
@@ -3309,9 +3393,7 @@ def bind_learner_ablation(
     requested_adaptive_fields = adaptive_fields & set(overrides)
     if requested_adaptive_fields:
         if "policy_kl_target" not in requested_adaptive_fields:
-            raise ExecutorError(
-                "adaptive policy-KL options require policy_kl_target"
-            )
+            raise ExecutorError("adaptive policy-KL options require policy_kl_target")
         missing = adaptive_fields - requested_adaptive_fields
         if missing:
             raise ExecutorError(
@@ -3325,9 +3407,7 @@ def bind_learner_ablation(
         if float(effective["policy_kl_anchor_weight"]) > float(
             effective["policy_kl_max_weight"]
         ):
-            raise ExecutorError(
-                "adaptive policy-KL initial weight exceeds its maximum"
-            )
+            raise ExecutorError("adaptive policy-KL initial weight exceeds its maximum")
     active_objective_mass = sum(
         float(effective[key])
         for key in (
@@ -3338,7 +3418,9 @@ def bind_learner_ablation(
         )
     )
     if active_objective_mass <= 0.0:
-        raise ExecutorError("A1 learner ablation disables every active training objective")
+        raise ExecutorError(
+            "A1 learner ablation disables every active training objective"
+        )
     try:
         checkpoint_steps = train_bc._parse_checkpoint_steps(  # noqa: SLF001
             diagnostic_checkpoint_steps,
@@ -3400,7 +3482,13 @@ def bind_learner_ablation(
             }
     if not drift and aux_arm != "AUX0":
         raise ExecutorError("A1 learner ablation is a no-op")
-    code_binding = _current_ablation_code_binding(verified["lock"])
+    code_binding = (
+        _current_ablation_code_binding(verified["lock"])
+        if _authenticated_completed_code_binding is None
+        else _verify_completed_ablation_code_binding(
+            _authenticated_completed_code_binding, lock=verified["lock"]
+        )
+    )
     portable_code_identity = _portable_ablation_code_identity(code_binding)
     reviewed_lock_sha = verified.get("reviewed_lock_file_sha256")
     if reviewed_lock_sha != verified.get("lock_file_sha256"):
@@ -3438,9 +3526,7 @@ def bind_learner_ablation(
             "upgrade_receipt_digest": upgrade["receipt_sha256"],
             "initializer_sha256": initializer["sha256"],
             "portable_code_identity": portable_code_identity,
-            "portable_code_identity_sha256": portable_code_identity[
-                "code_sha256"
-            ],
+            "portable_code_identity_sha256": portable_code_identity["code_sha256"],
             "portable_upgrade_identity": portable_upgrade_identity,
             "portable_upgrade_identity_sha256": portable_upgrade_identity[
                 "identity_sha256"
@@ -3449,9 +3535,7 @@ def bind_learner_ablation(
         matched_aux_regularization = {
             "schema_version": "a1-matched-aux-regularization-arm-v1",
             "arm_id": aux_arm,
-            "aux_subgoal_loss_weight": float(
-                effective["aux_subgoal_loss_weight"]
-            ),
+            "aux_subgoal_loss_weight": float(effective["aux_subgoal_loss_weight"]),
             "upgrade_module": upgrade["module"],
             "upgrade_receipt": receipt["path"],
             "upgrade_receipt_file_sha256": receipt["sha256"],
@@ -3479,9 +3563,7 @@ def bind_learner_ablation(
         "reporting_contract": {
             "diagnostic_dose_curve": bool(diagnostic_dose_curve),
             "checkpoint_steps": list(checkpoint_steps),
-            "train_diagnostics_every_batches": (
-                16 if diagnostic_dose_curve else 0
-            ),
+            "train_diagnostics_every_batches": (16 if diagnostic_dose_curve else 0),
             # Two observations (steps 64 and 128) are enough to compare the
             # four exposure arms without turning objective attribution into a
             # material fraction of the dose. Each observation reuses the real
@@ -3513,14 +3595,10 @@ def bind_learner_ablation(
                     "module": upgrade["module"],
                     "receipt_sha256": upgrade["receipt"]["sha256"],
                     "receipt_digest": upgrade["receipt_sha256"],
-                    "initializer_sha256": upgrade["upgraded_initializer"][
-                        "sha256"
-                    ],
+                    "initializer_sha256": upgrade["upgraded_initializer"]["sha256"],
                 }
             ),
-            "diagnostic_comparison_source": result.get(
-                "diagnostic_comparison_source"
-            ),
+            "diagnostic_comparison_source": result.get("diagnostic_comparison_source"),
             "learner_lineage_parent": result.get("learner_lineage_parent"),
             "ablation": result["learner_ablation"],
         }
@@ -3538,9 +3616,7 @@ ALL_POST_WAVE_COMPONENT_IDS = (
     *FRESH_POLICY_DISTILLATION_COMPONENT_IDS,
     "historical_replay",
 )
-DIAGNOSTIC_TRAINING_DESCRIPTOR_SCHEMA = (
-    "a1-diagnostic-training-descriptor-authority-v1"
-)
+DIAGNOSTIC_TRAINING_DESCRIPTOR_SCHEMA = "a1-diagnostic-training-descriptor-authority-v1"
 
 
 def bind_diagnostic_training_descriptor(
@@ -3582,7 +3658,9 @@ def bind_diagnostic_training_descriptor(
     try:
         base = json.loads(base_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ExecutorError(f"cannot read base production descriptor: {error}") from error
+        raise ExecutorError(
+            f"cannot read base production descriptor: {error}"
+        ) from error
     if (
         not isinstance(base, dict)
         or base_file_sha256 != verified["corpus_meta_file_sha256"]
@@ -3596,7 +3674,9 @@ def bind_diagnostic_training_descriptor(
 
     base_overrides = base.get("learner_recipe_overrides")
     if not isinstance(base_overrides, dict) or not base_overrides:
-        raise ExecutorError("base production descriptor has no learner override authority")
+        raise ExecutorError(
+            "base production descriptor has no learner override authority"
+        )
     effective_recipe = verified["recipe"]
     derived_overrides: dict[str, Any] = {}
     for key in base_overrides:
@@ -3647,9 +3727,7 @@ def bind_diagnostic_training_descriptor(
             "lr_schedule",
         ):
             derived_overrides[key] = effective_recipe[key]
-        policy_aux_batch = int(
-            effective_recipe.get("policy_aux_active_batch_size", 0)
-        )
+        policy_aux_batch = int(effective_recipe.get("policy_aux_active_batch_size", 0))
         if policy_aux_batch > 0:
             derived_overrides["policy_aux_active_batch_size"] = policy_aux_batch
 
@@ -3686,14 +3764,9 @@ def bind_diagnostic_training_descriptor(
     ):
         semantic_delta["policy_distillation_component_ids"] = {
             "base": copy.deepcopy(base["policy_distillation_component_ids"]),
-            "effective": copy.deepcopy(
-                derived["policy_distillation_component_ids"]
-            ),
+            "effective": copy.deepcopy(derived["policy_distillation_component_ids"]),
         }
-    if (
-        derived["value_training_component_ids"]
-        != base["value_training_component_ids"]
-    ):
+    if derived["value_training_component_ids"] != base["value_training_component_ids"]:
         semantic_delta["value_training_component_ids"] = {
             "base": copy.deepcopy(base["value_training_component_ids"]),
             "effective": copy.deepcopy(derived["value_training_component_ids"]),
@@ -3719,9 +3792,7 @@ def bind_diagnostic_training_descriptor(
         "diagnostic_only": True,
         "promotion_eligible": False,
     }
-    derived["diagnostic_derivation_authority"] = (
-        diagnostic_derivation_authority
-    )
+    derived["diagnostic_derivation_authority"] = diagnostic_derivation_authority
 
     lexical = descriptor_path.expanduser().absolute()
     if (
@@ -3733,7 +3804,9 @@ def bind_diagnostic_training_descriptor(
             "diagnostic training descriptor path must be distinct, lexical, "
             "absolute, and non-symlink"
         )
-    derived_bytes = json.dumps(derived, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    derived_bytes = (
+        json.dumps(derived, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    )
     derived_file_sha256 = "sha256:" + hashlib.sha256(derived_bytes).hexdigest()
     derived_fingerprint = _value_sha256(derived)
     authority = {
@@ -3774,9 +3847,7 @@ def bind_diagnostic_training_descriptor(
             "validation_path": lexical,
             "validation_file_sha256": derived_file_sha256,
             "learner_recipe_overrides": copy.deepcopy(derived_overrides),
-            "learner_recipe_overrides_sha256": _value_sha256(
-                derived_overrides
-            ),
+            "learner_recipe_overrides_sha256": _value_sha256(derived_overrides),
             "diagnostic_training_descriptor_authority": authority,
             "_diagnostic_training_descriptor_bytes": derived_bytes,
         }
@@ -3788,9 +3859,7 @@ def bind_diagnostic_training_descriptor(
         {
             "schema_version": "a1-learner-ablation-claim-identity-v3",
             "contract_sha256": verified["contract_sha256"],
-            "function_preserving_upgrade": verified.get(
-                "function_preserving_upgrade"
-            ),
+            "function_preserving_upgrade": verified.get("function_preserving_upgrade"),
             "ablation": bound_ablation,
         }
     )
@@ -3805,15 +3874,16 @@ def _materialize_diagnostic_training_descriptor(verified: Mapping[str, Any]) -> 
     if authority is None and raw_bytes is None:
         return
     if not isinstance(authority, dict) or not isinstance(raw_bytes, bytes):
-        raise ExecutorError("diagnostic training descriptor materialization is incomplete")
+        raise ExecutorError(
+            "diagnostic training descriptor materialization is incomplete"
+        )
     target = Path(authority["derived_descriptor"]["path"])
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         if (
             target.is_symlink()
             or not target.is_file()
-            or _file_sha256(target)
-            != authority["derived_descriptor"]["file_sha256"]
+            or _file_sha256(target) != authority["derived_descriptor"]["file_sha256"]
             or stat.S_IMODE(target.stat().st_mode) != 0o444
         ):
             raise ExecutorError("existing diagnostic training descriptor differs")
@@ -3894,11 +3964,8 @@ def _central_learner_binding(
         or published.get("schema_version")
         != aux_coordinator.PUBLISHED_EXECUTOR_AUTHORITY_SCHEMA
         or published_authority.get("schema_version") != central_authority_schema
-        or published_authority.get("authority_sha256")
-        != central_authority_sha256
-        or not re.fullmatch(
-            r"sha256:[0-9a-f]{64}", str(published.get("file_sha256"))
-        )
+        or published_authority.get("authority_sha256") != central_authority_sha256
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(published.get("file_sha256")))
         or not re.fullmatch(
             r"sha256:[0-9a-f]{64}",
             str(published_authority.get("state_sha256")),
@@ -3913,9 +3980,7 @@ def _central_learner_binding(
         "descriptor_sha256": sample_receipt["descriptor_sha256"],
         "payload_inventory_sha256": sample_receipt["payload_inventory_sha256"],
         "category_semantics": copy.deepcopy(sample_receipt["category_semantics"]),
-        "category_semantics_sha256": sample_receipt[
-            "category_semantics_sha256"
-        ],
+        "category_semantics_sha256": sample_receipt["category_semantics_sha256"],
         "source_authority": copy.deepcopy(sample_receipt["source_authority"]),
         "sampler_identity_sha256": sample_receipt["sampler_identity_sha256"],
         "sample_order_sha256": sample_receipt["sample_order_sha256"],
@@ -3928,12 +3993,8 @@ def _central_learner_binding(
         "prior_row_set_sha256": sample_receipt["prior_row_set_sha256"],
         "kl_eligible_rows": sample_receipt["kl_eligible_rows"],
         "kl_eligible_mass_decimal": sample_receipt["kl_eligible_mass_decimal"],
-        "kl_ordered_evidence_sha256": sample_receipt[
-            "kl_ordered_evidence_sha256"
-        ],
-        "kl_eligible_evidence_sha256": sample_receipt[
-            "kl_eligible_evidence_sha256"
-        ],
+        "kl_ordered_evidence_sha256": sample_receipt["kl_ordered_evidence_sha256"],
+        "kl_eligible_evidence_sha256": sample_receipt["kl_eligible_evidence_sha256"],
     }
     return {
         "schema_version": CENTRAL_LEARNER_BINDING_SCHEMA,
@@ -3951,9 +4012,7 @@ def _central_learner_binding(
         "eligible_for_full_gate": stage == "FINAL",
         "full_gate_required": stage == "FINAL",
         "immutable_contract_recipe": copy.deepcopy(immutable_contract_recipe),
-        "immutable_contract_recipe_sha256": _value_sha256(
-            immutable_contract_recipe
-        ),
+        "immutable_contract_recipe_sha256": _value_sha256(immutable_contract_recipe),
         "effective_recipe": copy.deepcopy(effective_recipe),
         "effective_recipe_sha256": _value_sha256(effective_recipe),
         "initializer_sha256": initializer_sha256,
@@ -3974,9 +4033,7 @@ def _published_executor_authority(
         root_path / experiment_id.removeprefix("sha256:") / filename
     ).resolve(strict=True)
     try:
-        published = aux_coordinator.verify_published_executor_authority(
-            authority_path
-        )
+        published = aux_coordinator.verify_published_executor_authority(authority_path)
     except aux_coordinator.CoordinatorError as error:
         raise ExecutorError(
             f"published executor authority replay refused: {error}"
@@ -3999,23 +4056,25 @@ def _bind_p1_training_descriptor(
     arm_id = str(authority.get("arm_id"))
     descriptor_authority = authority.get("training_descriptor_authority")
     try:
-        descriptor_authority = (
-            aux_coordinator._verify_p1_training_descriptor_authority(  # noqa: SLF001
-                descriptor_authority,
-                arm_id=arm_id,
-                composite=authority["composite"],
-                eligibility=authority["kl_eligibility_authority"],
-            )
+        descriptor_authority = aux_coordinator._verify_p1_training_descriptor_authority(  # noqa: SLF001
+            descriptor_authority,
+            arm_id=arm_id,
+            composite=authority["composite"],
+            eligibility=authority["kl_eligibility_authority"],
         )
     except (KeyError, TypeError, aux_coordinator.CoordinatorError) as error:
-        raise ExecutorError(f"P1 training descriptor authority refused: {error}") from error
+        raise ExecutorError(
+            f"P1 training descriptor authority refused: {error}"
+        ) from error
 
     if descriptor_authority["kind"] == "base":
         descriptor_path = Path(verified["data_path"]).expanduser().resolve(strict=True)
     else:
-        published_path = Path(
-            str(published_executor_authority.get("path", ""))
-        ).expanduser().resolve(strict=True)
+        published_path = (
+            Path(str(published_executor_authority.get("path", "")))
+            .expanduser()
+            .resolve(strict=True)
+        )
         descriptor_path = (
             published_path.parent / str(descriptor_authority["filename"])
         ).resolve(strict=True)
@@ -4028,7 +4087,9 @@ def _bind_p1_training_descriptor(
                 authority=descriptor_authority,
             )
         except (OSError, aux_coordinator.CoordinatorError) as error:
-            raise ExecutorError(f"P1 derived training descriptor refused: {error}") from error
+            raise ExecutorError(
+                f"P1 derived training descriptor refused: {error}"
+            ) from error
     try:
         descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -4037,21 +4098,21 @@ def _bind_p1_training_descriptor(
         not isinstance(descriptor, dict)
         or _file_sha256(descriptor_path)
         != descriptor_authority["descriptor_file_sha256"]
-        or _value_sha256(descriptor)
-        != descriptor_authority["descriptor_fingerprint"]
+        or _value_sha256(descriptor) != descriptor_authority["descriptor_fingerprint"]
         or descriptor.get("policy_kl_anchor_component_ids")
         != descriptor_authority["policy_kl_anchor_component_ids"]
     ):
-        raise ExecutorError("P1 trainer-visible descriptor differs from central authority")
-    if descriptor_authority["base_descriptor_sha256"] != verified[
-        "corpus_meta_file_sha256"
-    ]:
+        raise ExecutorError(
+            "P1 trainer-visible descriptor differs from central authority"
+        )
+    if (
+        descriptor_authority["base_descriptor_sha256"]
+        != verified["corpus_meta_file_sha256"]
+    ):
         raise ExecutorError("P1 derived descriptor does not descend from verified data")
 
     result = dict(verified)
-    result["p1_training_descriptor_authority"] = copy.deepcopy(
-        descriptor_authority
-    )
+    result["p1_training_descriptor_authority"] = copy.deepcopy(descriptor_authority)
     if descriptor_authority["kind"] != "base":
         result.update(
             {
@@ -4086,7 +4147,9 @@ def bind_p1_arm(
     if verified.get("learner_ablation") is not None:
         raise ExecutorError("central P1 authority cannot wrap another ablation")
     if verified.get("function_preserving_upgrade") is not None:
-        raise ExecutorError("P1 arms must reload the exact current parent independently")
+        raise ExecutorError(
+            "P1 arms must reload the exact current parent independently"
+        )
     expected_keys = {
         "schema_version",
         "sweep_id",
@@ -4118,9 +4181,10 @@ def bind_p1_arm(
     unsigned = dict(authority)
     unsigned.pop("state_sha256", None)
     stated_authority_sha = unsigned.pop("authority_sha256", None)
-    if (
-        authority.get("schema_version") != "a1-p1-arm-executor-authority-v1"
-        or stated_authority_sha != _value_sha256(unsigned)
+    if authority.get(
+        "schema_version"
+    ) != "a1-p1-arm-executor-authority-v1" or stated_authority_sha != _value_sha256(
+        unsigned
     ):
         raise ExecutorError("central P1 executor authority digest/schema drift")
     arm_id = authority.get("arm_id")
@@ -4135,8 +4199,7 @@ def bind_p1_arm(
         or claim.get("sweep_id") != authority.get("sweep_id")
         or claim.get("arm") != arm
         or claim.get("allocation") != authority.get("allocation")
-        or claim.get("prior_authority_sha256")
-        != authority.get("sweep_state_sha256")
+        or claim.get("prior_authority_sha256") != authority.get("sweep_state_sha256")
     ):
         raise ExecutorError("central P1 arm/claim/allocation chain drift")
     try:
@@ -4159,8 +4222,7 @@ def bind_p1_arm(
         ) from error
     if (
         authority["recovery_component_semantics"] != exact_recovery_semantics
-        or verified.get("producer", {}).get("sha256")
-        != parent["checkpoint_sha256"]
+        or verified.get("producer", {}).get("sha256") != parent["checkpoint_sha256"]
         or verified.get("data_kind") != "production_composite_v2"
     ):
         raise ExecutorError(
@@ -4177,9 +4239,7 @@ def bind_p1_arm(
         "validation_split_receipt_sha256": verified.get(
             "validation_split_receipt_sha256"
         ),
-        "training_game_seed_set_sha256": verified.get(
-            "training_game_seed_set_sha256"
-        ),
+        "training_game_seed_set_sha256": verified.get("training_game_seed_set_sha256"),
         "validation_game_seed_set_sha256": verified.get(
             "validation_game_seed_set_sha256"
         ),
@@ -4196,15 +4256,13 @@ def bind_p1_arm(
     code_binding = _current_ablation_code_binding(verified["lock"])
     if (
         reviewed_code_tree_sha256 != code_binding["code_tree_sha256"]
-        or authority["portable_code_identity_sha256"]
-        != reviewed_code_tree_sha256
+        or authority["portable_code_identity_sha256"] != reviewed_code_tree_sha256
     ):
         raise ExecutorError("central P1 code tree differs from reviewed digest")
     recipe = arm.get("effective_recipe")
-    if (
-        not isinstance(recipe, dict)
-        or arm.get("effective_recipe_sha256") != _value_sha256(recipe)
-    ):
+    if not isinstance(recipe, dict) or arm.get(
+        "effective_recipe_sha256"
+    ) != _value_sha256(recipe):
         raise ExecutorError("central P1 effective recipe digest drift")
     # The authenticated corpus was originally issued under the historical v2
     # lock.  The central coordinator deliberately selects the reviewed v3
@@ -4251,9 +4309,7 @@ def bind_p1_arm(
             "sweep_id": authority["sweep_id"],
             "arm_id": arm_id,
             "authority_sha256": stated_authority_sha,
-            "policy_kl_anchor_weight_decimal": arm[
-                "policy_kl_anchor_weight_decimal"
-            ],
+            "policy_kl_anchor_weight_decimal": arm["policy_kl_anchor_weight_decimal"],
             "exact_current_parent_sha256": parent["checkpoint_sha256"],
             "sampler_seed": recipe["sampler_seed"],
             "sampler_identity_sha256": authority["kl_eligibility_authority"][
@@ -4336,8 +4392,7 @@ def bind_aux_pair_arm(
     unsigned_authority.pop("state_sha256", None)
     stated_authority_sha = unsigned_authority.pop("authority_sha256", None)
     if (
-        authority.get("schema_version")
-        != aux_coordinator.EXECUTOR_AUTHORITY_SCHEMA
+        authority.get("schema_version") != aux_coordinator.EXECUTOR_AUTHORITY_SCHEMA
         or stated_authority_sha != aux_coordinator._digest(unsigned_authority)  # noqa: SLF001
     ):
         raise ExecutorError("central AUX executor authority digest/schema drift")
@@ -4356,19 +4411,15 @@ def bind_aux_pair_arm(
             pair["portable_science_identity"]["current_parent_authority"],
             recovery_authority=recovery,
         )
-        transition_authority = (
-            aux_coordinator.verify_public_award_transition_authority(
-                pair["portable_science_identity"][
-                    "public_award_transition_authority"
-                ],
-                expected_parent=parent_authority,
-            )
+        transition_authority = aux_coordinator.verify_public_award_transition_authority(
+            pair["portable_science_identity"]["public_award_transition_authority"],
+            expected_parent=parent_authority,
         )
         pointer_authority = aux_coordinator.verify_pointer_upgrade_authority(
             pair["portable_science_identity"]["pointer_upgrade_authority"],
-            expected_parent_sha256=transition_authority[
-                "transitioned_checkpoint"
-            ]["sha256"],
+            expected_parent_sha256=transition_authority["transitioned_checkpoint"][
+                "sha256"
+            ],
         )
         selector_rule = aux_coordinator.verify_selector_rule(
             pair["portable_science_identity"]["selector_rule"]
@@ -4435,9 +4486,7 @@ def bind_aux_pair_arm(
         raise ExecutorError(
             f"central AUX joint selected recipe/dose drift: {joint_drift}"
         )
-    base_recipe = aux_coordinator.canonical_p1_final_lock_authority()[
-        "base_recipe"
-    ]
+    base_recipe = aux_coordinator.canonical_p1_final_lock_authority()["base_recipe"]
     base_recipe = copy.deepcopy(base_recipe)
     base_recipe["policy_kl_anchor_weight"] = selected_recipe.get(
         "policy_kl_anchor_weight"
@@ -4468,9 +4517,7 @@ def bind_aux_pair_arm(
         "validation_split_receipt_sha256": verified.get(
             "validation_split_receipt_sha256"
         ),
-        "training_game_seed_set_sha256": verified.get(
-            "training_game_seed_set_sha256"
-        ),
+        "training_game_seed_set_sha256": verified.get("training_game_seed_set_sha256"),
         "validation_game_seed_set_sha256": verified.get(
             "validation_game_seed_set_sha256"
         ),
@@ -4528,12 +4575,8 @@ def bind_aux_pair_arm(
     shared_identity = {
         "schema_version": "a1-aux-pointer-shared-identity-v1",
         "pair_id": pair["pair_id"],
-        "portable_science_identity_sha256": pair[
-            "portable_science_identity_sha256"
-        ],
-        "p1_selection_authority_sha256": pair[
-            "p1_selection_authority_sha256"
-        ],
+        "portable_science_identity_sha256": pair["portable_science_identity_sha256"],
+        "p1_selection_authority_sha256": pair["p1_selection_authority_sha256"],
         "effective_p1_recipe_sha256": joint["effective_recipe_sha256"],
         "composite_authority_sha256": _value_sha256(composite),
         "exact_current_parent_sha256": pair["exact_current_parent_sha256"],
@@ -4546,13 +4589,9 @@ def bind_aux_pair_arm(
         "portable_upgrade_identity_sha256": portable_upgrade_identity[
             "identity_sha256"
         ],
-        "pointer_upgrade_identity_sha256": pair[
-            "pointer_upgrade_identity_sha256"
-        ],
+        "pointer_upgrade_identity_sha256": pair["pointer_upgrade_identity_sha256"],
         "warmup_terminal_sha256": pair["warmup_terminal_sha256"],
-        "gradient_geometry_terminal_sha256": pair[
-            "gradient_geometry_terminal_sha256"
-        ],
+        "gradient_geometry_terminal_sha256": pair["gradient_geometry_terminal_sha256"],
         "selector_rule": selector_rule,
         "selector_rule_sha256": pair["selector_rule_sha256"],
         "selected_aux_coefficient_decimal": selected_decimal,
@@ -4692,13 +4731,9 @@ def bind_final_replication(
             final["initializer_authority"]["exact_current_parent_authority"],
             recovery_authority=p1["recovery_authority"],
         )
-        transition_authority = (
-            aux_coordinator.verify_public_award_transition_authority(
-                final["initializer_authority"][
-                    "public_award_transition_authority"
-                ],
-                expected_parent=parent,
-            )
+        transition_authority = aux_coordinator.verify_public_award_transition_authority(
+            final["initializer_authority"]["public_award_transition_authority"],
+            expected_parent=parent,
         )
         loaded_experiment = aux_coordinator._verify_sealed(  # noqa: SLF001
             experiment, "FINAL experiment authority"
@@ -4728,8 +4763,7 @@ def bind_final_replication(
     if (
         reviewed_code_tree_sha256 != code_binding["code_tree_sha256"]
         or expected_code_sha != reviewed_code_tree_sha256
-        or verified.get("reviewed_lock_file_sha256")
-        != verified.get("lock_file_sha256")
+        or verified.get("reviewed_lock_file_sha256") != verified.get("lock_file_sha256")
     ):
         raise ExecutorError("FINAL code/lock differs from reviewed experiment bytes")
     if (
@@ -4755,9 +4789,7 @@ def bind_final_replication(
         "validation_split_receipt_sha256": verified.get(
             "validation_split_receipt_sha256"
         ),
-        "training_game_seed_set_sha256": verified.get(
-            "training_game_seed_set_sha256"
-        ),
+        "training_game_seed_set_sha256": verified.get("training_game_seed_set_sha256"),
         "validation_game_seed_set_sha256": verified.get(
             "validation_game_seed_set_sha256"
         ),
@@ -4811,16 +4843,13 @@ def bind_final_replication(
     full_recipe = final.get("effective_recipe")
     if (
         not isinstance(full_recipe, dict)
-        or final.get("effective_recipe_sha256")
-        != aux_coordinator._digest(full_recipe)  # noqa: SLF001
+        or final.get("effective_recipe_sha256") != aux_coordinator._digest(full_recipe)  # noqa: SLF001
     ):
         raise ExecutorError("FINAL effective recipe digest drift")
     selected_p1 = p1["effective_recipe"]
     base = aux_coordinator.canonical_p1_final_lock_authority()["base_recipe"]
     base = copy.deepcopy(base)
-    base["policy_kl_anchor_weight"] = selected_p1.get(
-        "policy_kl_anchor_weight"
-    )
+    base["policy_kl_anchor_weight"] = selected_p1.get("policy_kl_anchor_weight")
     expected_p1 = copy.deepcopy(base)
     expected_p1.update(
         {
@@ -4874,7 +4903,9 @@ def bind_final_replication(
             is not True
             or final_warmed_initializer is None
         ):
-            raise ExecutorError("FINAL AUXT pointer upgrade/warmup replay is incomplete")
+            raise ExecutorError(
+                "FINAL AUXT pointer upgrade/warmup replay is incomplete"
+            )
         warmed = final_warmed_initializer.expanduser()
         if warmed.is_symlink() or not warmed.is_file():
             raise ExecutorError("FINAL warmed initializer must be a regular file")
@@ -4939,13 +4970,9 @@ def bind_final_replication(
         "sampler_identity_sha256": sampling["sampler_identity_sha256"],
         "sample_order_sha256": sampling["sample_order_sha256"],
         "row_set_sha256": sampling["row_set_sha256"],
-        "component_routing_state_sha256": final[
-            "component_routing_state_sha256"
-        ],
+        "component_routing_state_sha256": final["component_routing_state_sha256"],
         "selected_aux_decision": selected_aux,
-        "selected_aux_coefficient_decimal": final[
-            "selected_aux_coefficient_decimal"
-        ],
+        "selected_aux_coefficient_decimal": final["selected_aux_coefficient_decimal"],
         "diagnostic_checkpoint_loaded": False,
         "promotion_eligible": False,
         "eligible_for_full_gate": True,
@@ -4967,9 +4994,7 @@ def bind_final_replication(
     result["central_published_executor_authority"] = copy.deepcopy(
         published_executor_authority
     )
-    result["claim_identity_sha256"] = _value_sha256(
-        result["final_replication_binding"]
-    )
+    result["claim_identity_sha256"] = _value_sha256(result["final_replication_binding"])
     return result
 
 
@@ -4995,19 +5020,39 @@ def _build_direct_train_command(
         trainer_authority = _require_current_production_trainer_authority(verified)
         assert trainer_authority is not None
         trainer_path = Path(trainer_authority["path"])
+    elif isinstance(verified.get("learner_ablation"), dict):
+        code_binding = verified["learner_ablation"].get("code_binding")
+        records = (
+            code_binding.get("records") if isinstance(code_binding, dict) else None
+        )
+        candidates = [
+            Path(str(record["path"]))
+            for record in records or ()
+            if isinstance(record, dict)
+            and record.get("relative_path") == "tools/train_bc.py"
+        ]
+        if len(candidates) != 1:
+            raise ExecutorError(
+                "learner ablation must bind exactly one train_bc entrypoint"
+            )
+        trainer_path = candidates[0].expanduser().resolve(strict=True)
     elif (
         verified.get("learner_ablation") is None
         and verified.get("central_learner_binding") is None
     ):
         candidates = [
             Path(str(record.get("path")))
-            for record in (verified.get("lock", {}).get("provenance", {}).get("learner_code", []))
+            for record in (
+                verified.get("lock", {}).get("provenance", {}).get("learner_code", [])
+            )
             if isinstance(record, dict)
             and str(record.get("path", "")).endswith("/tools/train_bc.py")
         ]
         if candidates:
             if len(candidates) != 1:
-                raise ExecutorError("sealed A1 contract binds multiple train_bc entrypoints")
+                raise ExecutorError(
+                    "sealed A1 contract binds multiple train_bc entrypoints"
+                )
             trainer_path = candidates[0].expanduser().resolve(strict=True)
     command = [str(python), str(trainer_path)]
     command.extend(["--arch", "entity_graph"])
@@ -5038,9 +5083,7 @@ def _build_direct_train_command(
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
     }:
-        command.extend(
-            ["--meaningful-public-history", "--event-history-limit", "32"]
-        )
+        command.extend(["--meaningful-public-history", "--event-history-limit", "32"])
     command.extend(
         [
             "--data",
@@ -5190,17 +5233,13 @@ def _build_direct_train_command(
     if "sampler_seed" in recipe:
         command.extend(["--sampler-seed", str(recipe["sampler_seed"])])
     max_steps = int(recipe.get("max_steps", 0))
-    reporting = (verified.get("learner_ablation") or {}).get(
-        "reporting_contract", {}
-    )
+    reporting = (verified.get("learner_ablation") or {}).get("reporting_contract", {})
     explicit_checkpoints = list(reporting.get("checkpoint_steps", ()))
     if explicit_checkpoints:
         # An explicit generic diagnostic schedule is topology/data-kind
         # independent.  The terminal max-step checkpoint remains the ordinary
         # output; only strictly earlier steps belong on --checkpoint-steps.
-        command.extend(
-            ["--checkpoint-steps", ",".join(map(str, explicit_checkpoints))]
-        )
+        command.extend(["--checkpoint-steps", ",".join(map(str, explicit_checkpoints))])
     elif (
         verified.get("data_kind") == "production_composite_v2"
         and verified.get("central_learner_binding") is None
@@ -5225,9 +5264,7 @@ def _build_direct_train_command(
             while step < max_steps:
                 checkpoints.append(step)
                 step *= 2
-            command.extend(
-                ["--checkpoint-steps", ",".join(map(str, checkpoints))]
-            )
+            command.extend(["--checkpoint-steps", ",".join(map(str, checkpoints))])
         elif verified.get("learner_ablation") is not None and max_steps > 128:
             # Historical diagnostic behavior, retained for non-campaign
             # ablations that did not request the explicit 64-step frontier.
@@ -5236,9 +5273,7 @@ def _build_direct_train_command(
             while step < max_steps:
                 checkpoints.append(step)
                 step *= 2
-            command.extend(
-                ["--checkpoint-steps", ",".join(map(str, checkpoints))]
-            )
+            command.extend(["--checkpoint-steps", ",".join(map(str, checkpoints))])
     if verified.get("data_kind") == "production_composite_v2":
         # The production 64/12/4/20 descriptor has three corrected components
         # plus homogeneous legacy replay. train_bc authenticates and routes
@@ -5261,9 +5296,7 @@ def _build_direct_train_command(
         trainable_history = event_history_contract.get(
             "training_event_history_trainable"
         )
-        usable_history = event_history_contract.get(
-            "event_history_end_to_end_usable"
-        )
+        usable_history = event_history_contract.get("event_history_end_to_end_usable")
         if (
             not isinstance(acknowledgements, list)
             or any(not isinstance(value, str) for value in acknowledgements)
@@ -5425,8 +5458,8 @@ def _build_direct_train_command(
                 # claim/output set.  The generic host-wide BC lock would
                 # otherwise serialize or reject independent diagnostic arms.
                 # Never add this to the historical/default one-dose command.
-                    "--per-game-value-weight-mode",
-                    str(recipe.get("per_game_value_weight_mode", "equal")),
+                "--per-game-value-weight-mode",
+                str(recipe.get("per_game_value_weight_mode", "equal")),
                 "--a1-learner-ablation-id",
                 str(learner_ablation["ablation_id"]),
                 "--a1-effective-learner-recipe-json",
@@ -5465,8 +5498,7 @@ def _topologize_train_command(
         or Path(command[1]).name != "train_bc.py"
         or "torch.distributed.run" in command
         or any(
-            token.startswith("--nproc_per_node")
-            or token.startswith("--nproc-per-node")
+            token.startswith("--nproc_per_node") or token.startswith("--nproc-per-node")
             for token in command
         )
     ):
@@ -5501,16 +5533,16 @@ def build_train_command(
 ) -> list[str]:
     """Render every effective learner field and its authorized topology."""
 
-    matched = verified.get("learner_ablation", {}).get(
-        "matched_aux_regularization"
-    )
+    matched = verified.get("learner_ablation", {}).get("matched_aux_regularization")
     if isinstance(matched, dict):
         topology = verified.get("training_topology")
         canary = verified.get("ddp_canary")
         preclaim = verified.get("aux_subgoal_preclaim_contract")
-        runtime_identity = matched.get("shared_identity", {}).get(
-            "ddp_canary_semantics", {}
-        ).get("runtime_identity")
+        runtime_identity = (
+            matched.get("shared_identity", {})
+            .get("ddp_canary_semantics", {})
+            .get("runtime_identity")
+        )
         python_identity = (
             runtime_identity.get("python")
             if isinstance(runtime_identity, dict)
@@ -5521,7 +5553,9 @@ def build_train_command(
                 Path(python).expanduser().resolve(strict=True)
             )
         except OSError as error:
-            raise ExecutorError(f"cannot authenticate matched AUX Python: {error}") from error
+            raise ExecutorError(
+                f"cannot authenticate matched AUX Python: {error}"
+            ) from error
         if (
             not isinstance(preclaim, dict)
             or not isinstance(canary, dict)
@@ -5533,13 +5567,10 @@ def build_train_command(
                 "aux_subgoal_treatment_admission_sha256"
             )
             != preclaim.get("treatment_grade_admission_sha256")
-            or matched.get("shared_identity", {}).get(
-                "ddp_canary_semantics_sha256"
-            )
+            or matched.get("shared_identity", {}).get("ddp_canary_semantics_sha256")
             != canary.get("semantic_identity_sha256")
             or not isinstance(python_identity, dict)
-            or python_identity.get("executable_sha256")
-            != learner_python_sha256
+            or python_identity.get("executable_sha256") != learner_python_sha256
         ):
             raise ExecutorError(
                 "matched AUX command requires final treatment admission, "
@@ -5668,20 +5699,16 @@ def bind_function_preserving_upgrade(
     source_transition_evidence = None
     diagnostic_comparison_source = None
     independent_parent_authority = None
-    source_matches_producer = (
-        upgrade["source"]["sha256"] == verified["producer"]["sha256"]
-        and Path(upgrade["source"]["path"])
-        == Path(verified["producer"]["path"])
-    )
+    source_matches_producer = upgrade["source"]["sha256"] == verified["producer"][
+        "sha256"
+    ] and Path(upgrade["source"]["path"]) == Path(verified["producer"]["path"])
     if source_matches_producer and independent_parent_authority_path is not None:
         raise ExecutorError(
             "independent learner-parent authority is invalid when initializer "
             "already equals the sealed corpus producer"
         )
     if not source_matches_producer:
-        recent_history = verified.get("category_semantics", {}).get(
-            "recent_history"
-        )
+        recent_history = verified.get("category_semantics", {}).get("recent_history")
         recent_checkpoint = (
             recent_history.get("checkpoint")
             if isinstance(recent_history, dict)
@@ -5729,9 +5756,7 @@ def bind_function_preserving_upgrade(
                 "role": "recent_history",
                 "source": copy.deepcopy(upgrade["source"]),
                 "sealed_producer": copy.deepcopy(verified["producer"]),
-                "category_semantics_sha256": verified.get(
-                    "category_semantics_sha256"
-                ),
+                "category_semantics_sha256": verified.get("category_semantics_sha256"),
                 "diagnostic_only": True,
                 "promotion_eligible": False,
             }
@@ -5741,11 +5766,9 @@ def bind_function_preserving_upgrade(
             )
         elif diagnostic_comparison_source is None:
             try:
-                source_transition_evidence = (
-                    aux_coordinator.scientific_evidence._public_award_transition_evidence(  # noqa: SLF001
-                        Path(verified["producer"]["path"]),
-                        Path(upgrade["source"]["path"]),
-                    )
+                source_transition_evidence = aux_coordinator.scientific_evidence._public_award_transition_evidence(  # noqa: SLF001
+                    Path(verified["producer"]["path"]),
+                    Path(upgrade["source"]["path"]),
                 )
             except (
                 OSError,
@@ -5755,16 +5778,17 @@ def bind_function_preserving_upgrade(
                 raise ExecutorError(
                     f"architecture upgrade transition source refused: {error}"
                 ) from error
-        if diagnostic_comparison_source is None and source_transition_evidence is not None:
+        if (
+            diagnostic_comparison_source is None
+            and source_transition_evidence is not None
+        ):
             if (
                 source_transition_evidence["source_checkpoint_sha256"]
                 != verified["producer"]["sha256"]
                 or source_transition_evidence["transitioned_checkpoint_sha256"]
                 != upgrade["source"]["sha256"]
                 or source_transition_evidence["optimizer_steps"] != 0
-                or source_transition_evidence[
-                    "legacy_zero_input_function_preserving"
-                ]
+                or source_transition_evidence["legacy_zero_input_function_preserving"]
                 is not True
             ):
                 raise ExecutorError(
@@ -5784,9 +5808,7 @@ def bind_function_preserving_upgrade(
     result["function_preserving_upgrade"] = upgrade
     result["function_preserving_upgrade_lineage"] = lineage_binding
     if source_transition_evidence is not None:
-        result["public_award_transition_source_evidence"] = (
-            source_transition_evidence
-        )
+        result["public_award_transition_source_evidence"] = source_transition_evidence
     if diagnostic_comparison_source is not None:
         result["diagnostic_comparison_source"] = diagnostic_comparison_source
         # A production composite's data producer and the checkpoint used as an
@@ -5816,9 +5838,7 @@ def bind_function_preserving_upgrade(
                 "role": "diagnostic_recent_history",
                 "checkpoint": copy.deepcopy(upgrade["source"]),
                 "corpus_producer": copy.deepcopy(verified["producer"]),
-                "category_semantics_sha256": verified.get(
-                    "category_semantics_sha256"
-                ),
+                "category_semantics_sha256": verified.get("category_semantics_sha256"),
                 "function_preserving_upgrade_receipt_sha256": receipt["sha256"],
                 "diagnostic_only": True,
                 "promotion_eligible": False,
@@ -5836,9 +5856,7 @@ def bind_function_preserving_upgrade(
         coherent_binding["learner_initializer"] = {
             "role": "diagnostic_independent_parent",
             "parent_checkpoint_sha256": upgrade["source"]["sha256"],
-            "initializer_checkpoint_sha256": upgrade["upgraded_initializer"][
-                "sha256"
-            ],
+            "initializer_checkpoint_sha256": upgrade["upgraded_initializer"]["sha256"],
             "upgrade_module": upgrade["module"],
             "upgrade_receipt_file_sha256": receipt["sha256"],
             "upgrade_receipt_sha256": upgrade["receipt_sha256"],
@@ -5934,8 +5952,7 @@ def _warmup_initializer_transition_record(
 ) -> dict[str, Any]:
     result = terminal["result"]
     if (
-        terminal.get("schema_version")
-        != "a1-aux-pointer-warmup-terminal-v1"
+        terminal.get("schema_version") != "a1-aux-pointer-warmup-terminal-v1"
         or result.get("status") != "complete"
         or result.get("optimizer_sidecar_discarded_for_joint") is not True
         or result.get("inherited_parameters_bit_identical") is not True
@@ -5962,10 +5979,8 @@ def _load_warmup_transition_record(
     authority_path = Path(str(published_executor_authority["path"]))
     terminal_path = authority_path.parent / "20-warmup-terminal.json"
     try:
-        terminal, file_sha256, _identity = (
-            aux_coordinator._stable_read_immutable_json(  # noqa: SLF001
-                terminal_path, where="typed initializer warmup terminal"
-            )
+        terminal, file_sha256, _identity = aux_coordinator._stable_read_immutable_json(  # noqa: SLF001
+            terminal_path, where="typed initializer warmup terminal"
         )
     except (OSError, aux_coordinator.CoordinatorError) as error:
         raise ExecutorError(f"cannot replay typed warmup lineage: {error}") from error
@@ -6152,7 +6167,9 @@ def _physical_gpu_lock(gpu: int, *, lock_root: Path = Path("/tmp")):
                 raise ExecutorError(
                     f"physical B200 GPU {gpu} is already reserved by another A1 executor"
                 ) from error
-            raise ExecutorError(f"cannot lock physical B200 GPU {gpu}: {error}") from error
+            raise ExecutorError(
+                f"cannot lock physical B200 GPU {gpu}: {error}"
+            ) from error
         yield path
     finally:
         try:
@@ -6387,7 +6404,9 @@ def _load_failed_retry_receipt(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ExecutorError(f"parent retry failure receipt is unreadable: {path}") from error
+        raise ExecutorError(
+            f"parent retry failure receipt is unreadable: {path}"
+        ) from error
     if not isinstance(payload, dict):
         raise ExecutorError("parent retry failure receipt is not an object")
     stated = payload.get("receipt_sha256")
@@ -6400,7 +6419,9 @@ def _load_failed_retry_receipt(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _load_retry_contract_reference(reference: Any, *, where: str) -> tuple[dict[str, Any], Path]:
+def _load_retry_contract_reference(
+    reference: Any, *, where: str
+) -> tuple[dict[str, Any], Path]:
     """Replay a v1 retry contract from an exact path/file/semantic reference."""
 
     if not isinstance(reference, dict) or set(reference) != {
@@ -6487,8 +6508,7 @@ def _validated_recorded_production_trainer_authority(
             or set(record) != {"relative_path", "path", "sha256"}
             or not isinstance(record.get("relative_path"), str)
             or not isinstance(record.get("path"), str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", str(record.get("sha256")))
-            is None
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", str(record.get("sha256"))) is None
             or record["relative_path"] in records
         ):
             raise ExecutorError(f"{where} trainer code-surface record drift")
@@ -6508,7 +6528,9 @@ def _production_retry_output_paths(args: argparse.Namespace) -> tuple[Path, ...]
             str(args.checkpoint_steps), max_steps=int(args.max_steps)
         )
     except SystemExit as error:
-        raise ExecutorError("parent retry checkpoint-step contract is invalid") from error
+        raise ExecutorError(
+            "parent retry checkpoint-step contract is invalid"
+        ) from error
     paths = [
         checkpoint,
         Path(str(checkpoint) + ".optimizer.pt"),
@@ -6532,10 +6554,8 @@ def _production_retry_ddp_canary_semantics(
     semantic_identity = canary.get("semantic_identity")
     if (
         not isinstance(semantic_identity, dict)
-        or canary.get("semantic_identity_sha256")
-        != _value_sha256(semantic_identity)
-        or semantic_identity.get("train_bc_sha256")
-        != expected_trainer_sha256
+        or canary.get("semantic_identity_sha256") != _value_sha256(semantic_identity)
+        or semantic_identity.get("train_bc_sha256") != expected_trainer_sha256
     ):
         raise ExecutorError(f"{where} DDP canary authority drift")
     portable = copy.deepcopy(semantic_identity)
@@ -6610,16 +6630,14 @@ def _authorize_production_preflight_serialization_retry(
     if parent_binding["command_sha256"] != parent["command_sha256"]:
         raise ExecutorError("retry parent execution binding disagrees with its command")
     parent_input_binding = parent.get("input_binding")
-    if (
-        not isinstance(parent_input_binding, dict)
-        or parent_input_binding.get("binding_sha256")
-        != _value_sha256(
-            {
-                key: value
-                for key, value in parent_input_binding.items()
-                if key != "binding_sha256"
-            }
-        )
+    if not isinstance(parent_input_binding, dict) or parent_input_binding.get(
+        "binding_sha256"
+    ) != _value_sha256(
+        {
+            key: value
+            for key, value in parent_input_binding.items()
+            if key != "binding_sha256"
+        }
     ):
         raise ExecutorError("retry parent input binding is invalid")
 
@@ -6659,7 +6677,9 @@ def _authorize_production_preflight_serialization_retry(
         where="buggy production preflight parent",
     )
     if parent_input_binding.get("trainer_authority") != parent_authority:
-        raise ExecutorError("parent input binding disagrees with buggy trainer authority")
+        raise ExecutorError(
+            "parent input binding disagrees with buggy trainer authority"
+        )
 
     parent_records = {
         record["relative_path"]: record["sha256"]
@@ -6802,20 +6822,12 @@ def _authorize_production_preflight_serialization_retry(
         "producer_checkpoint_sha256": verified["producer"]["sha256"],
         "effective_learner_recipe_sha256": _value_sha256(verified["recipe"]),
         "learner_value_objective_sha256": _value_sha256(verified["objective"]),
-        "selected_game_seed_set_sha256": verified[
-            "selected_game_seed_set_sha256"
-        ],
-        "training_game_seed_set_sha256": verified[
-            "training_game_seed_set_sha256"
-        ],
-        "validation_game_seed_set_sha256": verified[
-            "validation_game_seed_set_sha256"
-        ],
+        "selected_game_seed_set_sha256": verified["selected_game_seed_set_sha256"],
+        "training_game_seed_set_sha256": verified["training_game_seed_set_sha256"],
+        "validation_game_seed_set_sha256": verified["validation_game_seed_set_sha256"],
         "parent_input_semantics_sha256": _value_sha256(parent_semantics),
         "retry_input_semantics_sha256": _value_sha256(current_semantics),
-        "parent_ddp_canary": copy.deepcopy(
-            parent_input_binding["ddp_canary"]
-        ),
+        "parent_ddp_canary": copy.deepcopy(parent_input_binding["ddp_canary"]),
         "ddp_canary_semantics_without_trainer_sha256": _value_sha256(
             current_canary_semantics
         ),
@@ -6829,9 +6841,7 @@ def _authorize_production_preflight_serialization_retry(
             "trainer_authority": parent_authority,
             "pre_optimizer_proof": {
                 "kind": PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND,
-                "buggy_train_bc_sha256": (
-                    BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256
-                ),
+                "buggy_train_bc_sha256": (BUGGY_PRODUCTION_PREFLIGHT_TRAINER_SHA256),
                 "failure_phase": "ddp_preflight_json_publish_before_model_optimizer",
                 "optimizer_steps": 0,
                 "outputs": None,
@@ -6847,9 +6857,7 @@ def _authorize_production_preflight_serialization_retry(
             "allowed_argv_drift": sorted(allowed_argv_drift),
             "checkpoint": str(checkpoint),
             "optimizer_sidecar": str(Path(str(checkpoint) + ".optimizer.pt")),
-            "progress_sidecar": str(
-                Path(str(checkpoint) + ".training-progress.json")
-            ),
+            "progress_sidecar": str(Path(str(checkpoint) + ".training-progress.json")),
             "report": str(report),
             "receipt": str(receipt),
         },
@@ -6863,9 +6871,7 @@ def _authorize_production_preflight_serialization_retry(
     if publish:
         if retry_contract_path.exists():
             try:
-                existing = json.loads(
-                    retry_contract_path.read_text(encoding="utf-8")
-                )
+                existing = json.loads(retry_contract_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError) as error:
                 raise ExecutorError("existing retry contract is unreadable") from error
             if existing != retry_contract:
@@ -6922,7 +6928,9 @@ def _authorize_production_preflight_transport_retry(
         parent_claim = parent_claim.resolve(strict=True)
         parent_hint = json.loads(parent_claim.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ExecutorError(f"cannot load parent failed retry claim: {error}") from error
+        raise ExecutorError(
+            f"cannot load parent failed retry claim: {error}"
+        ) from error
     if not isinstance(parent_hint, dict):
         raise ExecutorError("parent failed retry claim is not an object")
     parent_identity = parent_hint.get("claim_identity_sha256")
@@ -6963,16 +6971,14 @@ def _authorize_production_preflight_transport_retry(
     if parent_binding["command_sha256"] != parent["command_sha256"]:
         raise ExecutorError("transport retry parent execution binding drift")
     parent_input_binding = parent.get("input_binding")
-    if (
-        not isinstance(parent_input_binding, dict)
-        or parent_input_binding.get("binding_sha256")
-        != _value_sha256(
-            {
-                key: value
-                for key, value in parent_input_binding.items()
-                if key != "binding_sha256"
-            }
-        )
+    if not isinstance(parent_input_binding, dict) or parent_input_binding.get(
+        "binding_sha256"
+    ) != _value_sha256(
+        {
+            key: value
+            for key, value in parent_input_binding.items()
+            if key != "binding_sha256"
+        }
     ):
         raise ExecutorError("transport retry parent input binding is invalid")
 
@@ -7018,12 +7024,9 @@ def _authorize_production_preflight_transport_retry(
         or set(first_identity)
         != {"schema_version", "repair_kind", "parent_contract_sha256", "parent"}
         or first_identity.get("schema_version") != RETRY_IDENTITY_SCHEMA
-        or first_identity.get("repair_kind")
-        != PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND
-        or first_identity.get("parent_contract_sha256")
-        != verified["contract_sha256"]
-        or first_contract.get("retry_identity_sha256")
-        != _value_sha256(first_identity)
+        or first_identity.get("repair_kind") != PRODUCTION_PREFLIGHT_RETRY_REPAIR_KIND
+        or first_identity.get("parent_contract_sha256") != verified["contract_sha256"]
+        or first_contract.get("retry_identity_sha256") != _value_sha256(first_identity)
         or first_contract.get("retry_identity_sha256") != parent_identity
     ):
         raise ExecutorError("parent is not the exact first production preflight retry")
@@ -7056,7 +7059,9 @@ def _authorize_production_preflight_transport_retry(
         original_claim_path = original_claim_path.resolve(strict=True)
         original_receipt_path = original_receipt_path.resolve(strict=True)
     except OSError as error:
-        raise ExecutorError(f"cannot replay first retry causal parent: {error}") from error
+        raise ExecutorError(
+            f"cannot replay first retry causal parent: {error}"
+        ) from error
     if original_claim_path != _claim_path(verified).resolve(strict=False):
         raise ExecutorError("first retry does not descend from the sealed dose claim")
     original_claim = _load_claim_state(
@@ -7654,14 +7659,18 @@ def _central_live_allocation(verified: dict[str, Any]) -> dict[str, Any] | None:
     stage = central.get("stage")
     if stage == "P1":
         authority = verified.get("p1_arm_executor_authority")
-        allocation = authority.get("allocation") if isinstance(authority, dict) else None
+        allocation = (
+            authority.get("allocation") if isinstance(authority, dict) else None
+        )
     elif stage in {AUX_CONTROL_ARM, AUX_TREATMENT_ARM}:
         authority = verified.get("aux_pair_executor_authority")
         claim = authority.get("arm_claim") if isinstance(authority, dict) else None
         allocation = claim.get("allocation") if isinstance(claim, dict) else None
     elif stage == "FINAL":
         authority = verified.get("final_replication_executor_authority")
-        allocation = authority.get("allocation") if isinstance(authority, dict) else None
+        allocation = (
+            authority.get("allocation") if isinstance(authority, dict) else None
+        )
     else:
         raise ExecutorError(f"unsupported central learner stage {stage!r}")
     if not isinstance(allocation, dict):
@@ -7697,7 +7706,9 @@ def _verify_central_live_allocation(
         aux_coordinator.CoordinatorError,
         scientific_evidence.EvidenceError,
     ) as error:
-        raise ExecutorError(f"live central B200 allocation replay failed: {error}") from error
+        raise ExecutorError(
+            f"live central B200 allocation replay failed: {error}"
+        ) from error
     return report
 
 
@@ -7722,14 +7733,11 @@ def _exact_objective_exposure(report_payload: dict[str, Any]) -> dict[str, Any]:
             )
         values[field] = value
     if (
-        values["policy_aux_training_row_draws"]
-        != values["policy_aux_active_rows"]
+        values["policy_aux_training_row_draws"] != values["policy_aux_active_rows"]
         or values["policy_total_active_rows"]
-        != values["policy_base_active_rows"]
-        + values["policy_aux_active_rows"]
+        != values["policy_base_active_rows"] + values["policy_aux_active_rows"]
         or report_payload.get("total_training_row_draws")
-        != values["base_training_row_draws"]
-        + values["policy_aux_training_row_draws"]
+        != values["base_training_row_draws"] + values["policy_aux_training_row_draws"]
     ):
         raise ExecutorError("A1 training report objective-dose arithmetic drift")
     if values["value_active_rows"] > values["base_training_row_draws"]:
@@ -7744,9 +7752,7 @@ def _exact_objective_exposure(report_payload: dict[str, Any]) -> dict[str, Any]:
         "policy_aux_active_sampled_rows": values["policy_aux_active_rows"],
         "policy_active_sampled_rows": values["policy_total_active_rows"],
         "value_active_sampled_rows": values["value_active_rows"],
-        "anchor_eligible_sampled_rows": values[
-            "policy_kl_anchor_eligible_rows"
-        ],
+        "anchor_eligible_sampled_rows": values["policy_kl_anchor_eligible_rows"],
     }
 
 
@@ -7768,8 +7774,7 @@ def _expected_optimizer_steps(
 ) -> int:
     effective = verified["recipe"] if recipe is None else recipe
     steps = math.ceil(
-        int(verified["training_row_count"])
-        / _effective_global_batch_size(effective)
+        int(verified["training_row_count"]) / _effective_global_batch_size(effective)
     )
     if int(effective["max_steps"]) > 0:
         steps = min(steps, int(effective["max_steps"]))
@@ -7798,7 +7803,10 @@ def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
         return str(producer["sha256"])
     upgrade = verified.get("function_preserving_upgrade_lineage")
     checkpoint = parent.get("checkpoint") if isinstance(parent, Mapping) else None
-    if isinstance(parent, Mapping) and parent.get("role") == "diagnostic_independent_parent":
+    if (
+        isinstance(parent, Mapping)
+        and parent.get("role") == "diagnostic_independent_parent"
+    ):
         authority = verified.get("independent_parent_authority")
         expected_independent = {
             "schema_version": LEARNER_LINEAGE_PARENT_SCHEMA,
@@ -7813,9 +7821,7 @@ def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
                 else None
             ),
             "function_preserving_upgrade_receipt_sha256": (
-                upgrade.get("receipt_sha256")
-                if isinstance(upgrade, Mapping)
-                else None
+                upgrade.get("receipt_sha256") if isinstance(upgrade, Mapping) else None
             ),
             "diagnostic_only": True,
             "promotion_eligible": False,
@@ -7826,13 +7832,11 @@ def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
             or diagnostic.get("diagnostic_only") is not True
             or diagnostic.get("promotion_eligible") is not False
             or not isinstance(authority, Mapping)
-            or authority.get("schema_version")
-            != INDEPENDENT_PARENT_AUTHORITY_SCHEMA
+            or authority.get("schema_version") != INDEPENDENT_PARENT_AUTHORITY_SCHEMA
             or not isinstance(upgrade, Mapping)
             or not isinstance(checkpoint, Mapping)
             or dict(parent) != expected_independent
-            or checkpoint.get("sha256")
-            != upgrade.get("source_checkpoint_sha256")
+            or checkpoint.get("sha256") != upgrade.get("source_checkpoint_sha256")
         ):
             raise ExecutorError(
                 "diagnostic learner lineage parent lost independent-parent authority"
@@ -7861,8 +7865,7 @@ def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
         or not isinstance(upgrade, Mapping)
         or not isinstance(checkpoint, Mapping)
         or dict(parent) != expected
-        or checkpoint.get("sha256")
-        != upgrade.get("source_checkpoint_sha256")
+        or checkpoint.get("sha256") != upgrade.get("source_checkpoint_sha256")
     ):
         raise ExecutorError(
             "diagnostic learner lineage parent lost exact recent-history authority"
@@ -7912,9 +7915,7 @@ def _direct_lineage_dose(
         "base_training_row_draws",
         "total_training_row_draws",
     }
-    if present_objective_counter_fields.intersection(
-        exact_objective_specific_fields
-    ):
+    if present_objective_counter_fields.intersection(exact_objective_specific_fields):
         if present_objective_counter_fields != objective_counter_fields:
             missing = sorted(
                 objective_counter_fields - present_objective_counter_fields
@@ -7954,9 +7955,7 @@ def _direct_lineage_dose(
             )
             if verified.get("initializer_transition_chain") is None
             else None,
-            initializer_transition_chain=verified.get(
-                "initializer_transition_chain"
-            ),
+            initializer_transition_chain=verified.get("initializer_transition_chain"),
             current_sampled_rows=sampled_rows,
             current_optimizer_steps=steps,
             objective_exposure=objective_exposure,
@@ -7993,18 +7992,14 @@ def _bind_training_report(
         or "a1_lineage_dose" in payload
         or REPORT_LEARNER_LINEAGE_PARENT_FIELD in payload
     ):
-        raise ExecutorError(
-            "A1 training child pre-populated executor-owned provenance"
-        )
+        raise ExecutorError("A1 training child pre-populated executor-owned provenance")
     _validate_execution_binding(execution_binding)
     payload[REPORT_EXECUTION_BINDING_FIELD] = execution_binding
     payload[REPORT_INPUT_BINDING_FIELD] = _input_binding(verified)
     payload[REPORT_LEARNER_LINEAGE_PARENT_FIELD] = copy.deepcopy(
         verified.get("learner_lineage_parent")
     )
-    payload["a1_lineage_dose"] = _direct_lineage_dose(
-        verified, report_payload=payload
-    )
+    payload["a1_lineage_dose"] = _direct_lineage_dose(verified, report_payload=payload)
     learner_ablation = verified.get("learner_ablation")
     central_binding = verified.get("central_learner_binding")
     if isinstance(central_binding, dict):
@@ -8025,8 +8020,7 @@ def _bind_training_report(
             payload.get("a1_central_learner_binding") != central_binding
             or payload.get("a1_central_published_executor_authority") != published
             or not isinstance(realized, dict)
-            or realized.get("schema_version")
-            != "a1-realized-central-sample-order-v1"
+            or realized.get("schema_version") != "a1-realized-central-sample-order-v1"
             or realized.get("physical_row_identity") is not True
             or realized.get("validation_rows_excluded") is not True
             or any(
@@ -8037,8 +8031,7 @@ def _bind_training_report(
             != central_binding["effective_recipe"]
             or payload.get("a1_effective_learner_training_recipe_sha256")
             != central_binding["effective_recipe_sha256"]
-            or payload.get("diagnostic_only")
-            is not central_binding["diagnostic_only"]
+            or payload.get("diagnostic_only") is not central_binding["diagnostic_only"]
             or payload.get("promotion_eligible")
             is not central_binding["promotion_eligible"]
             or payload.get("eligible_for_full_gate")
@@ -8049,18 +8042,15 @@ def _bind_training_report(
                 "realized physical sample order"
             )
         matched_aux = (learner_ablation or {}).get("matched_aux_regularization")
-        if matched_aux is not None and payload.get(
-            "a1_aux_regularization_binding"
-        ) != matched_aux:
+        if (
+            matched_aux is not None
+            and payload.get("a1_aux_regularization_binding") != matched_aux
+        ):
             raise ExecutorError("central AUX child did not echo pointer-arm authority")
         if central_binding.get("stage") == "P1":
-            descriptor_authority = verified.get(
-                "p1_training_descriptor_authority"
-            )
+            descriptor_authority = verified.get("p1_training_descriptor_authority")
             expected_anchor_rows = (
-                descriptor_authority.get(
-                    "expected_policy_kl_anchor_eligible_rows"
-                )
+                descriptor_authority.get("expected_policy_kl_anchor_eligible_rows")
                 if isinstance(descriptor_authority, dict)
                 else None
             )
@@ -8070,9 +8060,7 @@ def _bind_training_report(
                     f"expected={expected_anchor_rows!r} "
                     f"actual={payload.get('policy_kl_anchor_eligible_rows')!r}"
                 )
-        payload["a1_realized_central_sample_evidence_sha256"] = _value_sha256(
-            realized
-        )
+        payload["a1_realized_central_sample_evidence_sha256"] = _value_sha256(realized)
     elif (
         learner_ablation is not None
         and verified.get("data_kind") == "production_composite_v2"
@@ -8106,16 +8094,14 @@ def _bind_training_report(
         )
         payload["a1_learner_ablation"] = learner_ablation
         payload["value_training"]["learner_ablation"] = learner_ablation
-        descriptor_authority = verified.get(
-            "diagnostic_training_descriptor_authority"
-        )
+        descriptor_authority = verified.get("diagnostic_training_descriptor_authority")
         if descriptor_authority is not None:
             payload["a1_diagnostic_training_descriptor_authority"] = (
                 descriptor_authority
             )
-            payload["value_training"][
-                "diagnostic_training_descriptor_authority"
-            ] = descriptor_authority
+            payload["value_training"]["diagnostic_training_descriptor_authority"] = (
+                descriptor_authority
+            )
         payload["diagnostic_only"] = True
         payload["promotion_eligible"] = False
     tmp = report.with_name(f".{report.name}.tmp.{os.getpid()}.{time.time_ns()}")
@@ -8160,14 +8146,12 @@ def _verify_matched_aux_torch_artifacts(
     try:
         import torch
 
-        checkpoint_blob = torch.load(
-            checkpoint, map_location="cpu", weights_only=False
-        )
-        optimizer_blob = torch.load(
-            optimizer, map_location="cpu", weights_only=False
-        )
+        checkpoint_blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        optimizer_blob = torch.load(optimizer, map_location="cpu", weights_only=False)
     except Exception as error:
-        raise ExecutorError(f"cannot load matched AUX torch outputs: {error}") from error
+        raise ExecutorError(
+            f"cannot load matched AUX torch outputs: {error}"
+        ) from error
     if not isinstance(checkpoint_blob, dict):
         raise ExecutorError("matched AUX checkpoint root is not a mapping")
     model_state = checkpoint_blob.get("model")
@@ -8177,11 +8161,12 @@ def _verify_matched_aux_torch_artifacts(
     try:
         config_fields = architecture_upgrade._config(config)  # noqa: SLF001
     except architecture_upgrade.UpgradeError as error:
-        raise ExecutorError(f"matched AUX checkpoint config is invalid: {error}") from error
+        raise ExecutorError(
+            f"matched AUX checkpoint config is invalid: {error}"
+        ) from error
     if (
         checkpoint_blob.get("policy_type") != "entity_graph"
-        or
-        config_fields.get("aux_subgoal_heads") is not True
+        or config_fields.get("aux_subgoal_heads") is not True
         or config_fields.get("aux_settlement_pointer_head") is not True
         or any(name.startswith("aux_next_settlement_head.") for name in model_state)
         or not all(
@@ -8228,7 +8213,12 @@ def _verify_matched_aux_torch_artifacts(
     optimizer_state = optimizer_blob["optimizer"]
     state = optimizer_state.get("state")
     groups = optimizer_state.get("param_groups")
-    if not isinstance(state, dict) or not state or not isinstance(groups, list) or not groups:
+    if (
+        not isinstance(state, dict)
+        or not state
+        or not isinstance(groups, list)
+        or not groups
+    ):
         raise ExecutorError("matched AUX optimizer state is structurally empty")
     # Rebuild the exact arm-specific trainable surface.  AUX0 excludes all five
     # optional readouts from Adam; AUXT includes them.  Reconstructing the
@@ -8253,12 +8243,8 @@ def _verify_matched_aux_torch_artifacts(
             reconstructed.model,
             base_lr=float(recipe["lr"]),
             value_lr_mult=float(recipe["value_lr_mult"]),
-            action_module_lr_mult=float(
-                recipe.get("action_module_lr_mult", 1.0)
-            ),
-            public_card_lr_mult=float(
-                recipe.get("public_card_lr_mult", 1.0)
-            ),
+            action_module_lr_mult=float(recipe.get("action_module_lr_mult", 1.0)),
+            public_card_lr_mult=float(recipe.get("public_card_lr_mult", 1.0)),
             trunk_lr_mult=float(recipe.get("trunk_lr_mult", 1.0)),
             architecture="entity_graph",
         )
@@ -8273,9 +8259,11 @@ def _verify_matched_aux_torch_artifacts(
         if float(recipe["aux_subgoal_loss_weight"]) > 0.0
         else set()
     )
-    if set(freeze.get("active_optional_submodules", [])) & set(
-        AUX_SUBGOAL_HEAD_MODULES
-    ) != expected_active:
+    if (
+        set(freeze.get("active_optional_submodules", []))
+        & set(AUX_SUBGOAL_HEAD_MODULES)
+        != expected_active
+    ):
         raise ExecutorError("matched AUX reconstructed optional-head surface drift")
     if len(groups) != len(expected_groups):
         raise ExecutorError("matched AUX Adam parameter-group count drift")
@@ -8299,7 +8287,9 @@ def _verify_matched_aux_torch_artifacts(
             not isinstance(actual_params, list)
             or not isinstance(expected_params_ids, list)
             or len(actual_params) != len(expected_params_ids)
-            or any(actual.get(field) != expected.get(field) for field in exact_group_fields)
+            or any(
+                actual.get(field) != expected.get(field) for field in exact_group_fields
+            )
         ):
             raise ExecutorError("matched AUX Adam parameter group/hyperparameter drift")
         actual_param_ids.update(int(value) for value in actual_params)
@@ -8364,9 +8354,7 @@ def _verify_matched_aux_torch_artifacts(
         ) from error
 
 
-def _strict_load_production_entity_checkpoint(
-    checkpoint: Path, *, where: str
-) -> None:
+def _strict_load_production_entity_checkpoint(checkpoint: Path, *, where: str) -> None:
     """Reconstruct an ordinary production checkpoint with an exact state load.
 
     ``torch.load`` proves only that pickle deserialization succeeds.  The
@@ -8389,9 +8377,7 @@ def _strict_load_production_entity_checkpoint(
         raise ExecutorError(
             f"{where} cannot strict-load as the declared entity model: {error}"
         ) from error
-    parameter_count = sum(
-        parameter.numel() for parameter in policy.model.parameters()
-    )
+    parameter_count = sum(parameter.numel() for parameter in policy.model.parameters())
     if not 30_000_000 <= parameter_count <= 40_000_000:
         raise ExecutorError(
             f"{where} strict-loaded an unexpected parameter count: {parameter_count}"
@@ -8511,9 +8497,7 @@ def _verify_production_validation_seed_manifest(
             "production validation-seed manifest contains a non-int64 seed"
         ) from error
     expected_count = int(
-        verified["validation_split_receipt"]["aggregate"][
-            "validation_game_count"
-        ]
+        verified["validation_split_receipt"]["aggregate"]["validation_game_count"]
     )
     expected_digest = str(verified["trainer_validation_game_seed_set_sha256"])
     actual_digest = train_bc._game_seed_set_sha256(seed_array)  # noqa: SLF001
@@ -8524,13 +8508,10 @@ def _verify_production_validation_seed_manifest(
         or payload.get("training_excluded_game_seed_count") != expected_count
         or actual_digest != expected_digest
         or payload.get("validation_game_seed_set_sha256") != expected_digest
-        or payload.get("training_excluded_game_seed_set_sha256")
-        != expected_digest
-        or report_payload.get("validation_game_seed_manifest")
-        != str(manifest_path)
+        or payload.get("training_excluded_game_seed_set_sha256") != expected_digest
+        or report_payload.get("validation_game_seed_manifest") != str(manifest_path)
         or report_payload.get("validation_game_seed_count") != expected_count
-        or report_payload.get("validation_game_seed_set_sha256")
-        != expected_digest
+        or report_payload.get("validation_game_seed_set_sha256") != expected_digest
     ):
         raise ExecutorError(
             "production validation-seed manifest differs from the authenticated split"
@@ -8682,16 +8663,16 @@ def _verify_production_checkout_runtime_binding(
             or not isinstance(record.get("sha256"), str)
         ):
             raise ExecutorError("production trainer authority code-surface drifted")
-        authority_by_relative_path[str(record["relative_path"])] = str(
-            record["sha256"]
-        )
+        authority_by_relative_path[str(record["relative_path"])] = str(record["sha256"])
     required = {
         "catan_zero",
         "catan_zero.rl.optim_state",
         "catan_zero.rl.entity_token_policy",
     }
     if not isinstance(modules, dict) or not required.issubset(modules):
-        raise ExecutorError("production checkout runtime lacks required learner modules")
+        raise ExecutorError(
+            "production checkout runtime lacks required learner modules"
+        )
     for module_name, record in modules.items():
         if (
             not isinstance(module_name, str)
@@ -8753,9 +8734,7 @@ def _verify_training_outputs(
         if isinstance(learner_ablation, dict)
         else None
     )
-    is_production_composite = (
-        verified.get("data_kind") == "production_composite_v2"
-    )
+    is_production_composite = verified.get("data_kind") == "production_composite_v2"
     checkout_runtime_binding = (
         _verify_production_checkout_runtime_binding(
             report_payload.get("checkout_runtime_binding"),
@@ -8788,11 +8767,9 @@ def _verify_training_outputs(
             "matched AUX output verifier requires exact FP32 8x512/128-step dose"
         )
     resume_identity = report_payload.get("training_resume_recipe_identity")
-    if (
-        not isinstance(resume_identity, dict)
-        or report_payload.get("training_resume_recipe_identity_sha256")
-        != _value_sha256(resume_identity)
-    ):
+    if not isinstance(resume_identity, dict) or report_payload.get(
+        "training_resume_recipe_identity_sha256"
+    ) != _value_sha256(resume_identity):
         raise ExecutorError(
             "A1 training report lacks an authenticated resume-recipe identity"
         )
@@ -8859,9 +8836,7 @@ def _verify_training_outputs(
         "lr": float(recipe["lr"]),
         "weight_decay": float(recipe["weight_decay"]),
         "seed": int(recipe["seed"]),
-        "training_rng_rank_offset": bool(
-            recipe.get("training_rng_rank_offset", False)
-        ),
+        "training_rng_rank_offset": bool(recipe.get("training_rng_rank_offset", False)),
         "mask_hidden_info": True,
         "symmetry_augment": False,
         "data": str(verified["data_path"]),
@@ -8886,9 +8861,7 @@ def _verify_training_outputs(
         "a1_lineage_dose": lineage_dose,
         "forced_action_weight": float(recipe["forced_action_weight"]),
         "forced_row_value_weight": float(recipe["forced_row_value_weight"]),
-        "per_game_policy_weight": bool(
-            recipe.get("per_game_policy_weight", False)
-        ),
+        "per_game_policy_weight": bool(recipe.get("per_game_policy_weight", False)),
         "per_game_policy_weight_mode": str(
             recipe.get("per_game_policy_weight_mode", "equal")
         ),
@@ -8908,9 +8881,7 @@ def _verify_training_outputs(
         if recipe.get("policy_kl_target") is not None:
             expected.update(
                 {
-                    "policy_kl_anchor_weight": float(
-                        recipe["policy_kl_anchor_weight"]
-                    ),
+                    "policy_kl_anchor_weight": float(recipe["policy_kl_anchor_weight"]),
                     "policy_kl_anchor_direction": str(
                         recipe["policy_kl_anchor_direction"]
                     ),
@@ -8958,9 +8929,7 @@ def _verify_training_outputs(
         expected.update(
             {
                 "a1_contract_sha256": verified["contract_sha256"],
-                "input_validation_game_seed_manifest": str(
-                    verified["validation_path"]
-                ),
+                "input_validation_game_seed_manifest": str(verified["validation_path"]),
                 "input_validation_game_seed_manifest_sha256": verified[
                     "validation_file_sha256"
                 ],
@@ -8987,9 +8956,7 @@ def _verify_training_outputs(
     if drift:
         raise ExecutorError(f"A1 training report invariant drift: {drift}")
     checkpoint_step_values = (
-        []
-        if command is None
-        else _literal_option_values(command, "--checkpoint-steps")
+        [] if command is None else _literal_option_values(command, "--checkpoint-steps")
     )
     if len(checkpoint_step_values) > 1:
         raise ExecutorError("A1 training command repeats --checkpoint-steps")
@@ -9041,14 +9008,14 @@ def _verify_training_outputs(
         try:
             import torch
 
-            snapshot = torch.load(
-                expected_path, map_location="cpu", weights_only=False
-            )
+            snapshot = torch.load(expected_path, map_location="cpu", weights_only=False)
         except Exception as error:
             raise ExecutorError(
                 f"cannot load A1 intermediate checkpoint step {step}: {error}"
             ) from error
-        snapshot_value = snapshot.get("value_training") if isinstance(snapshot, dict) else None
+        snapshot_value = (
+            snapshot.get("value_training") if isinstance(snapshot, dict) else None
+        )
         if (
             not isinstance(snapshot, dict)
             or snapshot.get("policy_type") != "entity_graph"
@@ -9076,8 +9043,7 @@ def _verify_training_outputs(
                 where=f"production intermediate checkpoint step {step}",
             )
             if (
-                snapshot.get("public_award_feature_contract")
-                != "authoritative_v1"
+                snapshot.get("public_award_feature_contract") != "authoritative_v1"
                 or snapshot_value.get("checkout_runtime_binding")
                 != checkout_runtime_binding
             ):
@@ -9099,12 +9065,8 @@ def _verify_training_outputs(
             "policy_aux_training_row_draws": int(
                 exposure["policy_aux_active_sampled_rows"]
             ),
-            "policy_base_active_rows": int(
-                exposure["policy_base_active_sampled_rows"]
-            ),
-            "policy_aux_active_rows": int(
-                exposure["policy_aux_active_sampled_rows"]
-            ),
+            "policy_base_active_rows": int(exposure["policy_base_active_sampled_rows"]),
+            "policy_aux_active_rows": int(exposure["policy_aux_active_sampled_rows"]),
             "policy_total_active_rows": int(exposure["policy_active_sampled_rows"]),
         }
         draw_drift = {
@@ -9177,9 +9139,7 @@ def _verify_training_outputs(
             ],
             "flywheel_replay_contract": verified["production_mix_contract"],
             "category_semantics": verified.get("category_semantics"),
-            "category_semantics_sha256": verified.get(
-                "category_semantics_sha256"
-            ),
+            "category_semantics_sha256": verified.get("category_semantics_sha256"),
         }
         expected_diagnostic = (
             central_binding["diagnostic_only"]
@@ -9194,13 +9154,10 @@ def _verify_training_outputs(
         if (
             not isinstance(composite, dict)
             or any(
-                composite.get(key) != value
-                for key, value in expected_composite.items()
+                composite.get(key) != value for key, value in expected_composite.items()
             )
-            or report_payload.get("diagnostic_only")
-            != expected_diagnostic
-            or report_payload.get("promotion_eligible")
-            != expected_promotion
+            or report_payload.get("diagnostic_only") != expected_diagnostic
+            or report_payload.get("promotion_eligible") != expected_promotion
             or (
                 isinstance(central_binding, dict)
                 and report_payload.get("eligible_for_full_gate")
@@ -9210,9 +9167,7 @@ def _verify_training_outputs(
             raise ExecutorError(
                 "training report does not bind the exact promotion replay composite"
             )
-        descriptor_authority = verified.get(
-            "diagnostic_training_descriptor_authority"
-        )
+        descriptor_authority = verified.get("diagnostic_training_descriptor_authority")
         if descriptor_authority is not None:
             expected_policy_components = set(
                 descriptor_authority["policy_distillation_component_ids"]
@@ -9229,17 +9184,11 @@ def _verify_training_outputs(
             component_dose = report_payload.get("policy_component_active_dose")
             value_scope = report_payload.get("value_training_scope")
             value_components = (
-                value_scope.get("components")
-                if isinstance(value_scope, dict)
-                else None
+                value_scope.get("components") if isinstance(value_scope, dict) else None
             )
-            value_component_dose = report_payload.get(
-                "value_component_active_dose"
-            )
+            value_component_dose = report_payload.get("value_component_active_dose")
             if (
-                report_payload.get(
-                    "a1_diagnostic_training_descriptor_authority"
-                )
+                report_payload.get("a1_diagnostic_training_descriptor_authority")
                 != descriptor_authority
                 or report_payload.get("value_training", {}).get(
                     "diagnostic_training_descriptor_authority"
@@ -9351,14 +9300,11 @@ def _verify_training_outputs(
         if isinstance(central_binding, dict):
             realized = report_payload.get("a1_realized_central_sample_order")
             if (
-                report_payload.get("a1_central_learner_binding")
-                != central_binding
+                report_payload.get("a1_central_learner_binding") != central_binding
                 or report_payload.get("a1_central_published_executor_authority")
                 != verified.get("central_published_executor_authority")
                 or not isinstance(realized, dict)
-                or report_payload.get(
-                    "a1_realized_central_sample_evidence_sha256"
-                )
+                or report_payload.get("a1_realized_central_sample_evidence_sha256")
                 != _value_sha256(realized)
             ):
                 raise ExecutorError(
@@ -9384,9 +9330,7 @@ def _verify_training_outputs(
         raise ExecutorError(
             "A1 training report does not bind the authenticated input/split/topology"
         )
-    production_information_surface = report_payload.get(
-        "training_information_surface"
-    )
+    production_information_surface = report_payload.get("training_information_surface")
     if is_production_composite:
         award_training = report_payload.get("public_award_feature_training")
         if report_payload.get("public_award_feature_contract") != "authoritative_v1":
@@ -9499,9 +9443,7 @@ def _verify_training_outputs(
             if not AUX_SUBGOAL_HEAD_MODULES.issubset(active) or (
                 AUX_SUBGOAL_HEAD_MODULES & frozen
             ):
-                raise ExecutorError(
-                    "AUXT did not activate every shared auxiliary head"
-                )
+                raise ExecutorError("AUXT did not activate every shared auxiliary head")
         else:  # The binding validator should make this unreachable.
             raise ExecutorError("unsupported matched auxiliary loss weight")
         parts = metrics[0].get("aux_subgoal_loss_parts")
@@ -9545,9 +9487,7 @@ def _verify_training_outputs(
         matched_components = (
             matched.get("components") if isinstance(matched, dict) else None
         )
-        matched_metrics = (
-            matched.get("metrics") if isinstance(matched, dict) else None
-        )
+        matched_metrics = matched.get("metrics") if isinstance(matched, dict) else None
         if (
             not isinstance(matched, dict)
             or matched.get("schema_version") != "composite-validation-measure-v2"
@@ -9638,7 +9578,9 @@ def _verify_training_outputs(
             or report_payload.get("promotion_eligible") is not False
             or value_training.get("learner_ablation") != learner_ablation
         ):
-            raise ExecutorError("A1 learner ablation provenance/diagnostic marker drift")
+            raise ExecutorError(
+                "A1 learner ablation provenance/diagnostic marker drift"
+            )
     if "scalar" not in value_training.get("trained_value_readouts", []):
         raise ExecutorError(
             "A1 candidate does not attest a trained scalar value readout"
@@ -9664,9 +9606,7 @@ def _verify_training_outputs(
         "optimizer_sidecar_sha256": _file_sha256(optimizer),
         "training_progress": str(progress),
         "training_progress_sha256": _file_sha256(progress),
-        "training_progress_payload_sha256": progress_payload.get(
-            "progress_sha256"
-        ),
+        "training_progress_payload_sha256": progress_payload.get("progress_sha256"),
         "report": str(report),
         "report_sha256": _file_sha256(report),
         **(
@@ -9733,6 +9673,379 @@ def _verify_training_outputs(
     }
 
 
+def _generic_completed_ablation_overrides(
+    learner_ablation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recover the effective generic override from terminal receipt semantics."""
+
+    if (
+        not isinstance(learner_ablation, dict)
+        or learner_ablation.get("schema_version") != "a1-learner-ablation-v1"
+        or isinstance(learner_ablation.get("matched_aux_regularization"), dict)
+    ):
+        raise ExecutorError("completed generic ablation identity is invalid")
+    bound = learner_ablation.get("bound_recipe")
+    effective = learner_ablation.get("effective_recipe")
+    drift = learner_ablation.get("recipe_drift")
+    if (
+        not isinstance(bound, dict)
+        or not isinstance(effective, dict)
+        or not isinstance(drift, dict)
+        or learner_ablation.get("bound_recipe_sha256") != _value_sha256(bound)
+        or learner_ablation.get("effective_recipe_sha256") != _value_sha256(effective)
+        or learner_ablation.get("recipe_drift_sha256") != _value_sha256(drift)
+    ):
+        raise ExecutorError("completed generic ablation recipe digest drift")
+    overrides = {
+        key: copy.deepcopy(effective[key])
+        for key in sorted(A1_LEARNER_ABLATION_FIELDS)
+        if key in effective and (key not in bound or effective[key] != bound[key])
+    }
+    if not overrides:
+        raise ExecutorError("completed generic ablation has no effective treatment")
+    return overrides
+
+
+def _replay_completed_ablation_receipt_authority(
+    payload: dict[str, Any], *, claim_path: Path, authenticated_started_unix_ns: int
+) -> dict[str, Any]:
+    """Replay a completed non-matched ablation from its immutable authorities."""
+
+    input_binding = payload.get("input_binding")
+    learner_ablation = payload.get("learner_ablation")
+    if not isinstance(input_binding, dict) or not isinstance(learner_ablation, dict):
+        raise ExecutorError("completed ablation lacks input/ablation authority")
+    if isinstance(learner_ablation.get("matched_aux_regularization"), dict):
+        raise ExecutorError(
+            "matched AUX receipts require the matched-AUX receipt verifier"
+        )
+    lock_ref = payload.get("lock")
+    corpus_ref = payload.get("corpus")
+    reviewed_lock_sha256 = learner_ablation.get("reviewed_lock_file_sha256")
+    if (
+        not isinstance(lock_ref, str)
+        or not isinstance(corpus_ref, str)
+        or not isinstance(reviewed_lock_sha256, str)
+        or reviewed_lock_sha256 != payload.get("lock_file_sha256")
+    ):
+        raise ExecutorError("completed ablation has no reviewed lock/data authority")
+    lock_lexical = Path(lock_ref).expanduser()
+    if lock_lexical.is_symlink() or not lock_lexical.is_file():
+        raise ExecutorError("completed ablation reviewed lock must be a regular file")
+    try:
+        lock_path = lock_lexical.resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(
+            f"cannot resolve completed ablation reviewed lock: {error}"
+        ) from error
+    if _file_sha256(lock_path) != reviewed_lock_sha256:
+        raise ExecutorError("completed ablation reviewed lock bytes drift")
+
+    data_kind = input_binding.get("data_kind")
+    validation_ref = payload.get("validation_manifest")
+    if not isinstance(validation_ref, str):
+        raise ExecutorError("completed ablation has no validation manifest")
+    validation_path = Path(validation_ref)
+    coherent_admission = None
+    composite_build_receipt = None
+    if data_kind == "coherent_direct_memmap_v1":
+        admission = input_binding.get("coherent_corpus_admission")
+        admission_ref = admission.get("path") if isinstance(admission, dict) else None
+        if not isinstance(admission_ref, str):
+            raise ExecutorError("completed ablation has no coherent admission")
+        coherent_admission = Path(admission_ref)
+    elif data_kind == "production_composite_v2":
+        raise ExecutorError(
+            "production-composite ablations require their descriptor-specific verifier"
+        )
+    replayed = verify_training_inputs(
+        lock_path=lock_path,
+        data_path=Path(corpus_ref),
+        validation_path=validation_path,
+        composite_build_receipt=composite_build_receipt,
+        reviewed_lock_file_sha256=reviewed_lock_sha256,
+        coherent_corpus_admission=coherent_admission,
+    )
+
+    upgrade = payload.get("function_preserving_upgrade")
+    upgrade_receipt = upgrade.get("receipt") if isinstance(upgrade, dict) else None
+    upgrade_receipt_path = (
+        upgrade_receipt.get("path") if isinstance(upgrade_receipt, dict) else None
+    )
+    if not isinstance(upgrade_receipt_path, str):
+        raise ExecutorError("completed ablation lacks upgrade receipt authority")
+    diagnostic_source = input_binding.get("diagnostic_comparison_source")
+    independent_authority = (
+        diagnostic_source.get("authority")
+        if isinstance(diagnostic_source, dict)
+        else None
+    )
+    independent_authority_path = (
+        independent_authority.get("path")
+        if isinstance(independent_authority, dict)
+        else None
+    )
+    if not isinstance(independent_authority_path, str):
+        raise ExecutorError("completed ablation lacks independent-parent authority")
+    reconstructed = bind_function_preserving_upgrade(
+        replayed,
+        Path(upgrade_receipt_path),
+        independent_parent_authority_path=Path(independent_authority_path),
+    )
+    code_binding = learner_ablation.get("code_binding")
+    reporting = learner_ablation.get("reporting_contract")
+    if not isinstance(code_binding, dict) or not isinstance(reporting, dict):
+        raise ExecutorError("completed ablation lacks code/reporting authority")
+    overrides = _generic_completed_ablation_overrides(learner_ablation)
+    checkpoint_steps = reporting.get("checkpoint_steps")
+    if not isinstance(checkpoint_steps, list) or any(
+        isinstance(step, bool) or not isinstance(step, int) for step in checkpoint_steps
+    ):
+        raise ExecutorError("completed ablation checkpoint schedule is invalid")
+    reconstructed = bind_learner_ablation(
+        reconstructed,
+        ablation_id=str(learner_ablation.get("ablation_id", "")),
+        overrides_json=_canonical_bytes(overrides).decode("ascii"),
+        reviewed_code_tree_sha256=str(learner_ablation.get("code_tree_sha256", "")),
+        diagnostic_dose_curve=reporting.get("diagnostic_dose_curve") is True,
+        diagnostic_checkpoint_steps=",".join(map(str, checkpoint_steps)),
+        _authenticated_completed_code_binding=code_binding,
+    )
+
+    topology = payload.get("training_topology")
+    gpu = payload.get("gpu")
+    if (
+        not isinstance(topology, dict)
+        or not isinstance(topology.get("name"), str)
+        or isinstance(gpu, bool)
+        or not isinstance(gpu, int)
+    ):
+        raise ExecutorError("completed ablation topology authority is invalid")
+    reconstructed = bind_training_topology(
+        reconstructed, topology=str(topology["name"]), gpu=gpu
+    )
+    canary_ref = payload.get("ddp_canary")
+    canary_path = canary_ref.get("path") if isinstance(canary_ref, dict) else None
+    historical_root = Path(str(code_binding["repository_root"]))
+    if not isinstance(canary_path, str):
+        raise ExecutorError("completed ablation lacks canary/start authority")
+    canary = _verify_ddp_canary_receipt(
+        Path(canary_path),
+        reference_time_ns=authenticated_started_unix_ns,
+        completed_repository_root=historical_root,
+    )
+    reconstructed = _bind_verified_ddp_canary(reconstructed, canary)
+
+    if (
+        reconstructed.get("function_preserving_upgrade") != upgrade
+        or reconstructed.get("learner_ablation") != learner_ablation
+        or reconstructed.get("training_topology") != topology
+        or reconstructed.get("ddp_canary") != canary_ref
+        or _input_binding(reconstructed) != input_binding
+        or reconstructed.get("claim_identity_sha256")
+        != payload.get("claim_identity_sha256")
+    ):
+        raise ExecutorError("completed ablation canonical derived-state drift")
+    if (
+        payload.get("contract_sha256") != reconstructed["contract_sha256"]
+        or payload.get("lock") != str(reconstructed["lock_path"])
+        or payload.get("lock_file_sha256") != reconstructed["lock_file_sha256"]
+        or payload.get("corpus") != str(reconstructed["data_path"])
+        or payload.get("corpus_meta_file_sha256")
+        != reconstructed["corpus_meta_file_sha256"]
+        or payload.get("payload_inventory_sha256")
+        != reconstructed["payload_inventory_sha256"]
+        or payload.get("producer_checkpoint_sha256")
+        != reconstructed["producer"]["sha256"]
+        or payload.get("validation_manifest") != str(reconstructed["validation_path"])
+        or payload.get("validation_manifest_file_sha256")
+        != reconstructed["validation_file_sha256"]
+        or payload.get("learner_lineage_parent")
+        != reconstructed.get("learner_lineage_parent")
+    ):
+        raise ExecutorError("completed ablation drifted from replayed lock/input")
+    expected_claim_path = _claim_path(reconstructed).resolve(strict=False)
+    if claim_path != expected_claim_path:
+        raise ExecutorError(
+            "completed ablation claim is not the canonical derived path"
+        )
+
+    outputs = payload.get("outputs")
+    command = payload.get("command")
+    if not isinstance(outputs, dict) or not isinstance(command, list) or not command:
+        raise ExecutorError("completed ablation lacks command/output authority")
+    checkpoint = Path(str(outputs.get("checkpoint", "")))
+    report = Path(str(outputs.get("report", "")))
+    canonical_command = build_train_command(
+        reconstructed,
+        python=Path(str(command[0])),
+        checkpoint=checkpoint,
+        report=report,
+    )
+    environment = _child_environment(
+        _selected_gpus(reconstructed, fallback_gpu=gpu),
+        repository_root=historical_root,
+    )
+    execution_binding = _execution_binding(
+        command=canonical_command, environment=environment
+    )
+    if (
+        command != canonical_command
+        or payload.get("command_sha256") != _value_sha256(canonical_command)
+        or payload.get("execution_binding") != execution_binding
+        or payload.get("training_transaction_sha256")
+        != _training_transaction_sha256(
+            command=canonical_command, input_binding=input_binding
+        )
+    ):
+        raise ExecutorError("completed ablation command/environment replay drift")
+    reverified_outputs = _verify_training_outputs(
+        checkpoint=checkpoint,
+        report=report,
+        verified=reconstructed,
+        execution_binding=execution_binding,
+        command=canonical_command,
+    )
+    if reverified_outputs != outputs:
+        raise ExecutorError("completed ablation canonical output verification drift")
+    return reconstructed
+
+
+def _load_authenticated_completed_ablation_receipt(path: Path) -> dict[str, Any]:
+    """Authenticate one completed generic ablation without AUX pair authority."""
+
+    lexical = path.expanduser()
+    if lexical.is_symlink() or not lexical.is_file():
+        raise ExecutorError("completed ablation receipt must be a regular file")
+    try:
+        receipt_path = lexical.resolve(strict=True)
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ExecutorError(
+            f"cannot load completed ablation receipt: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise ExecutorError("completed ablation receipt is not an object")
+    unsigned = dict(payload)
+    stated = unsigned.pop("receipt_sha256", None)
+    if (
+        stated != _value_sha256(unsigned)
+        or payload.get("schema_version") != ABLATION_RECEIPT_SCHEMA
+        or payload.get("status") != "complete"
+        or payload.get("diagnostic_only") is not True
+        or payload.get("promotion_eligible") is not False
+    ):
+        raise ExecutorError("completed ablation receipt schema/status/digest drift")
+    learner_ablation = payload.get("learner_ablation")
+    if not isinstance(learner_ablation, dict) or isinstance(
+        learner_ablation.get("matched_aux_regularization"), dict
+    ):
+        raise ExecutorError("completed receipt is not a generic learner ablation")
+
+    claim_ref = payload.get("claim")
+    if not isinstance(claim_ref, str) or not claim_ref:
+        raise ExecutorError("completed ablation receipt has no terminal claim")
+    claim_lexical = Path(claim_ref).expanduser()
+    if claim_lexical.is_symlink() or not claim_lexical.is_file():
+        raise ExecutorError("completed ablation terminal claim must be a regular file")
+    try:
+        claim_path = claim_lexical.resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(
+            f"cannot resolve completed ablation terminal claim: {error}"
+        ) from error
+    claim_stat = claim_path.stat()
+    if (
+        stat.S_IMODE(claim_stat.st_mode) != 0o444
+        or claim_stat.st_uid != receipt_path.stat().st_uid
+    ):
+        raise ExecutorError("completed ablation terminal claim mode/owner drift")
+    contract_sha256 = payload.get("contract_sha256")
+    claim_identity_sha256 = payload.get("claim_identity_sha256")
+    if not isinstance(contract_sha256, str) or not isinstance(
+        claim_identity_sha256, str
+    ):
+        raise ExecutorError("completed ablation receipt has no claim identity")
+    claim = _load_claim_state(
+        claim_path,
+        contract_sha256=contract_sha256,
+        claim_identity_sha256=claim_identity_sha256,
+    )
+    target_ref = claim.get("receipt_target")
+    if not isinstance(target_ref, str) or not target_ref:
+        raise ExecutorError("completed ablation terminal claim has no receipt target")
+    target_lexical = Path(target_ref).expanduser()
+    if target_lexical.is_symlink():
+        raise ExecutorError("completed ablation terminal receipt target is a symlink")
+    try:
+        target_path = target_lexical.resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(
+            f"cannot resolve completed ablation terminal receipt target: {error}"
+        ) from error
+    if (
+        claim.get("schema_version") != ABLATION_CLAIM_SCHEMA
+        or claim.get("status") != "complete"
+        or payload.get("claim_state_sha256") != claim.get("state_sha256")
+        or target_path != receipt_path
+    ):
+        raise ExecutorError("completed ablation terminal claim identity/status drift")
+    claim_projection = dict(claim)
+    claim_projection.pop("state_sha256", None)
+    claim_projection.pop("receipt_target", None)
+    claim_projection["schema_version"] = ABLATION_RECEIPT_SCHEMA
+    receipt_projection = dict(payload)
+    receipt_projection.pop("receipt_sha256", None)
+    receipt_projection.pop("claim", None)
+    receipt_projection.pop("claim_state_sha256", None)
+    if claim_projection != receipt_projection:
+        raise ExecutorError("completed ablation receipt differs from terminal claim")
+    authenticated_started_unix_ns = claim.get("started_unix_ns")
+    if isinstance(authenticated_started_unix_ns, bool) or not isinstance(
+        authenticated_started_unix_ns, int
+    ):
+        raise ExecutorError("completed ablation claim lacks a valid start time")
+    _replay_completed_ablation_receipt_authority(
+        payload,
+        claim_path=claim_path,
+        authenticated_started_unix_ns=authenticated_started_unix_ns,
+    )
+
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, dict):
+        raise ExecutorError("completed ablation receipt has no output artifacts")
+    artifact_fields = (
+        ("checkpoint", "checkpoint_sha256"),
+        ("optimizer_sidecar", "optimizer_sidecar_sha256"),
+        ("training_progress", "training_progress_sha256"),
+        ("report", "report_sha256"),
+    )
+    resolved_artifacts: list[Path] = []
+    for path_field, digest_field in artifact_fields:
+        artifact_ref = outputs.get(path_field)
+        expected_digest = outputs.get(digest_field)
+        if not isinstance(artifact_ref, str) or not isinstance(expected_digest, str):
+            raise ExecutorError(f"completed ablation output lacks {path_field} binding")
+        artifact_lexical = Path(artifact_ref).expanduser()
+        if artifact_lexical.is_symlink() or not artifact_lexical.is_file():
+            raise ExecutorError(
+                f"completed ablation {path_field} must be a regular file"
+            )
+        try:
+            artifact_path = artifact_lexical.resolve(strict=True)
+            actual_digest = _file_sha256(artifact_path)
+        except OSError as error:
+            raise ExecutorError(
+                f"cannot authenticate completed ablation {path_field}: {error}"
+            ) from error
+        if actual_digest != expected_digest:
+            raise ExecutorError(f"completed ablation {path_field} byte drift")
+        resolved_artifacts.append(artifact_path)
+    if len(set(resolved_artifacts)) != len(resolved_artifacts):
+        raise ExecutorError("completed ablation output artifact paths are not distinct")
+    return payload
+
+
 def _replay_completed_aux_receipt_authority(
     payload: dict[str, Any], *, claim_path: Path, authenticated_started_unix_ns: int
 ) -> dict[str, Any]:
@@ -9763,7 +10076,9 @@ def _replay_completed_aux_receipt_authority(
     try:
         lock_path = lock_lexical.resolve(strict=True)
     except OSError as error:
-        raise ExecutorError(f"cannot resolve matched aux reviewed lock: {error}") from error
+        raise ExecutorError(
+            f"cannot resolve matched aux reviewed lock: {error}"
+        ) from error
     if _file_sha256(lock_path) != reviewed_lock_sha256:
         raise ExecutorError("matched aux reviewed lock bytes drift")
 
@@ -9771,7 +10086,9 @@ def _replay_completed_aux_receipt_authority(
     if data_kind == "production_composite_v2":
         validation_path = None
         build_ref = input_binding.get("composite_build_receipt")
-        build_path_value = build_ref.get("path") if isinstance(build_ref, dict) else None
+        build_path_value = (
+            build_ref.get("path") if isinstance(build_ref, dict) else None
+        )
         if not isinstance(build_path_value, str):
             raise ExecutorError("matched aux composite has no build receipt")
         composite_build_receipt = Path(build_path_value)
@@ -9791,9 +10108,7 @@ def _replay_completed_aux_receipt_authority(
     arm = matched.get("arm_id")
     weight = matched.get("aux_subgoal_loss_weight")
     pair_authority = payload.get("aux_pair_executor_authority")
-    published_authority = input_binding.get(
-        "central_published_executor_authority"
-    )
+    published_authority = input_binding.get("central_published_executor_authority")
     if not isinstance(pair_authority, dict) or not isinstance(
         published_authority, dict
     ):
@@ -9819,9 +10134,7 @@ def _replay_completed_aux_receipt_authority(
             authority=pair_authority,
             published_executor_authority=published_authority,
             warmed_initializer=Path(str(matched["initializer"])),
-            reviewed_code_tree_sha256=str(
-                learner_ablation["code_tree_sha256"]
-            ),
+            reviewed_code_tree_sha256=str(learner_ablation["code_tree_sha256"]),
         )
         reconstructed = bind_training_topology(
             reconstructed, topology=B200_8GPU_DDP_TOPOLOGY, gpu=0
@@ -9845,8 +10158,7 @@ def _replay_completed_aux_receipt_authority(
         != payload.get("function_preserving_upgrade")
         or reconstructed.get("aux_pair_executor_authority") != pair_authority
         or reconstructed.get("learner_ablation") != learner_ablation
-        or reconstructed.get("training_topology")
-        != payload.get("training_topology")
+        or reconstructed.get("training_topology") != payload.get("training_topology")
         or reconstructed.get("ddp_canary") != payload.get("ddp_canary")
         or reconstructed.get("aux_subgoal_preclaim_contract")
         != input_binding.get("aux_subgoal_preclaim_contract")
@@ -9883,9 +10195,7 @@ def _replay_completed_aux_receipt_authority(
         checkpoint=checkpoint,
         report=report,
     )
-    environment = _child_environment(
-        _selected_gpus(reconstructed, fallback_gpu=0)
-    )
+    environment = _child_environment(_selected_gpus(reconstructed, fallback_gpu=0))
     execution_binding = _execution_binding(
         command=canonical_command, environment=environment
     )
@@ -9940,7 +10250,9 @@ def _load_authenticated_completed_aux_receipt(path: Path) -> dict[str, Any]:
     try:
         claim_path = claim_lexical.resolve(strict=True)
     except OSError as error:
-        raise ExecutorError(f"cannot resolve matched aux terminal claim: {error}") from error
+        raise ExecutorError(
+            f"cannot resolve matched aux terminal claim: {error}"
+        ) from error
     claim_stat = claim_path.stat()
     if (
         stat.S_IMODE(claim_stat.st_mode) != 0o444
@@ -10015,15 +10327,11 @@ def _load_authenticated_completed_aux_receipt(path: Path) -> dict[str, Any]:
     for path_field, digest_field in artifact_fields:
         artifact_ref = outputs.get(path_field)
         expected_digest = outputs.get(digest_field)
-        if not isinstance(artifact_ref, str) or not isinstance(
-            expected_digest, str
-        ):
+        if not isinstance(artifact_ref, str) or not isinstance(expected_digest, str):
             raise ExecutorError(f"matched aux output lacks {path_field} binding")
         artifact_lexical = Path(artifact_ref).expanduser()
         if artifact_lexical.is_symlink() or not artifact_lexical.is_file():
-            raise ExecutorError(
-                f"matched aux {path_field} must be a regular file"
-            )
+            raise ExecutorError(f"matched aux {path_field} must be a regular file")
         try:
             artifact_path = artifact_lexical.resolve(strict=True)
             actual_digest = _file_sha256(artifact_path)
@@ -10081,8 +10389,7 @@ def verify_matched_aux_receipt_pair(
         or not isinstance(control_pair, dict)
         or control_pair != treatment_pair
         or control_authority.get("arm", {}).get("arm_id") != AUX_CONTROL_ARM
-        or treatment_authority.get("arm", {}).get("arm_id")
-        != AUX_TREATMENT_ARM
+        or treatment_authority.get("arm", {}).get("arm_id") != AUX_TREATMENT_ARM
         or control_match["shared_identity"] != treatment_match["shared_identity"]
         or control_match["shared_identity_sha256"]
         != treatment_match["shared_identity_sha256"]
@@ -10113,12 +10420,8 @@ def verify_matched_aux_receipt_pair(
     treatment_input.pop("effective_learner_recipe_sha256", None)
     control_canary = control_input.pop("ddp_canary", None)
     treatment_canary = treatment_input.pop("ddp_canary", None)
-    control_aux_preflight = control_input.pop(
-        "aux_subgoal_preclaim_contract", None
-    )
-    treatment_aux_preflight = treatment_input.pop(
-        "aux_subgoal_preclaim_contract", None
-    )
+    control_aux_preflight = control_input.pop("aux_subgoal_preclaim_contract", None)
+    treatment_aux_preflight = treatment_input.pop("aux_subgoal_preclaim_contract", None)
     control_semantics = (
         control_canary.get("semantic_identity")
         if isinstance(control_canary, dict)
@@ -10129,9 +10432,7 @@ def verify_matched_aux_receipt_pair(
         if isinstance(treatment_canary, dict)
         else None
     )
-    shared_semantics = control_match["shared_identity"].get(
-        "ddp_canary_semantics"
-    )
+    shared_semantics = control_match["shared_identity"].get("ddp_canary_semantics")
     control_admission = (
         control_aux_preflight.get("treatment_grade_admission")
         if isinstance(control_aux_preflight, dict)
@@ -10150,8 +10451,7 @@ def verify_matched_aux_receipt_pair(
         or control_input.get("training_topology", {}).get("name")
         != B200_8GPU_DDP_TOPOLOGY
         or control_input.get("training_topology", {}).get("world_size") != 8
-        or control_input.get("training_topology", {}).get("global_batch_size")
-        != 4096
+        or control_input.get("training_topology", {}).get("global_batch_size") != 4096
         or not isinstance(control_canary, dict)
         or not isinstance(treatment_canary, dict)
         or control_semantics != treatment_semantics
@@ -10160,9 +10460,7 @@ def verify_matched_aux_receipt_pair(
         != _value_sha256(control_semantics)
         or treatment_canary.get("semantic_identity_sha256")
         != _value_sha256(treatment_semantics)
-        or control_match["shared_identity"].get(
-            "ddp_canary_semantics_sha256"
-        )
+        or control_match["shared_identity"].get("ddp_canary_semantics_sha256")
         != _value_sha256(shared_semantics)
         or not isinstance(control_aux_preflight, dict)
         or control_aux_preflight.get("arm_loss_weight") != 0.0
@@ -10281,7 +10579,9 @@ def _canonical_one_dose_output_namespace(
         try:
             parent = lexical.parent.resolve(strict=False)
         except OSError as error:
-            raise ExecutorError(f"{where} output parent is unavailable: {error}") from error
+            raise ExecutorError(
+                f"{where} output parent is unavailable: {error}"
+            ) from error
         if lexical.parent != parent:
             raise ExecutorError(f"{where} output parent may not be a symlink")
         return parent / lexical.name
@@ -10292,8 +10592,15 @@ def _canonical_one_dose_output_namespace(
     claim_path = canonical(one_dose_claim, "one-dose claim")
     namespace = {
         "checkpoint": str(checkpoint_path),
-        "optimizer_sidecar": str(canonical(Path(str(checkpoint_path) + ".optimizer.pt"), "optimizer sidecar")),
-        "training_progress": str(canonical(Path(str(checkpoint_path) + ".training-progress.json"), "training progress")),
+        "optimizer_sidecar": str(
+            canonical(Path(str(checkpoint_path) + ".optimizer.pt"), "optimizer sidecar")
+        ),
+        "training_progress": str(
+            canonical(
+                Path(str(checkpoint_path) + ".training-progress.json"),
+                "training progress",
+            )
+        ),
         "report": str(report_path),
         "receipt": str(receipt_path),
         "one_dose_claim": str(claim_path),
@@ -10316,9 +10623,7 @@ def _require_final_matched_aux_command_binding(
 ) -> None:
     """Refuse stale direct-library commands before the one-dose claim."""
 
-    matched = verified.get("learner_ablation", {}).get(
-        "matched_aux_regularization"
-    )
+    matched = verified.get("learner_ablation", {}).get("matched_aux_regularization")
     if not isinstance(matched, dict):
         return
     flag = "--a1-aux-regularization-binding-json"
@@ -10431,9 +10736,7 @@ def _recover_terminal_complete_receipt(
         "validation_manifest": str(verified["validation_path"]),
         "validation_manifest_file_sha256": verified["validation_file_sha256"],
         "producer_checkpoint_sha256": verified["producer"]["sha256"],
-        "learner_lineage_parent": copy.deepcopy(
-            verified.get("learner_lineage_parent")
-        ),
+        "learner_lineage_parent": copy.deepcopy(verified.get("learner_lineage_parent")),
         "learner_training_recipe_sha256": _value_sha256(
             verified.get("bound_recipe", verified["recipe"])
         ),
@@ -10465,9 +10768,7 @@ def _recover_terminal_complete_receipt(
         if claim.get(key) != value
     }
     if drift:
-        raise ExecutorError(
-            f"terminal completion recovery binding drift: {drift}"
-        )
+        raise ExecutorError(f"terminal completion recovery binding drift: {drift}")
     if (
         isinstance(claim.get("started_unix_ns"), bool)
         or not isinstance(claim.get("started_unix_ns"), int)
@@ -10479,7 +10780,9 @@ def _recover_terminal_complete_receipt(
         or len(claim["gpu_names"]) != len(selected_gpus)
         or not isinstance(outputs, dict)
     ):
-        raise ExecutorError("terminal completion recovery runtime/output evidence drift")
+        raise ExecutorError(
+            "terminal completion recovery runtime/output evidence drift"
+        )
     if (
         outputs.get("checkpoint") != output_namespace["checkpoint"]
         or outputs.get("optimizer_sidecar") != output_namespace["optimizer_sidecar"]
@@ -10541,9 +10844,7 @@ def _execute_locked(
 
     _require_current_production_trainer_authority(verified, command=command)
 
-    matched_aux = verified.get("learner_ablation", {}).get(
-        "matched_aux_regularization"
-    )
+    matched_aux = verified.get("learner_ablation", {}).get("matched_aux_regularization")
     if isinstance(matched_aux, dict) and not isinstance(
         verified.get("aux_subgoal_preclaim_contract"), dict
     ):
@@ -10678,9 +10979,7 @@ def _execute_locked(
             }
         )
     if is_central:
-        claim_payload["central_execution_commitment"] = (
-            central_execution_commitment
-        )
+        claim_payload["central_execution_commitment"] = central_execution_commitment
     claim = _claim_attempt(verified, claim_payload)
     status = "failed"
     returncode: int | None = None
@@ -10756,9 +11055,7 @@ def _execute_locked(
         "validation_manifest": str(verified["validation_path"]),
         "validation_manifest_file_sha256": verified["validation_file_sha256"],
         "producer_checkpoint_sha256": verified["producer"]["sha256"],
-        "learner_lineage_parent": copy.deepcopy(
-            verified.get("learner_lineage_parent")
-        ),
+        "learner_lineage_parent": copy.deepcopy(verified.get("learner_lineage_parent")),
         "learner_training_recipe_sha256": _value_sha256(
             verified.get("bound_recipe", verified["recipe"])
         ),
@@ -11035,9 +11332,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--frozen-verifier-sha256",
         default="",
-        help=(
-            "explicit SHA-256 of <frozen-repo>/tools/a1_pre_wave_contract.py"
-        ),
+        help=("explicit SHA-256 of <frozen-repo>/tools/a1_pre_wave_contract.py"),
     )
     parser.add_argument(
         "--aux-coordinator-root",
@@ -11074,7 +11369,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="central append-only P1 sweep root",
     )
-    parser.add_argument("--p1-sweep-id", default="", help="centrally issued P1 sweep id")
+    parser.add_argument(
+        "--p1-sweep-id", default="", help="centrally issued P1 sweep id"
+    )
     parser.add_argument(
         "--p1-arm",
         choices=tuple(sorted(P1_CENTRAL_ARMS)),
@@ -11206,7 +11503,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         generic_ablation_requested = bool(
             args.ablation_id or args.recipe_overrides_json
         )
-        if args.coherent_corpus_admission is not None and not generic_ablation_requested:
+        if (
+            args.coherent_corpus_admission is not None
+            and not generic_ablation_requested
+        ):
             raise ExecutorError(
                 "--coherent-corpus-admission requires an explicit diagnostic ablation"
             )
@@ -11271,15 +11571,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             verified = bind_function_preserving_upgrade(
                 verified,
                 args.architecture_upgrade_receipt,
-                allow_public_award_transition_source=(
-                    aux_requested or final_requested
-                ),
-                allow_diagnostic_recent_history_source=bool(
-                    args.diagnostic_dose_curve
-                ),
-                independent_parent_authority_path=(
-                    args.independent_parent_authority
-                ),
+                allow_public_award_transition_source=(aux_requested or final_requested),
+                allow_diagnostic_recent_history_source=bool(args.diagnostic_dose_curve),
+                independent_parent_authority_path=(args.independent_parent_authority),
             )
         if generic_ablation_requested:
             verified = bind_learner_ablation(
@@ -11298,9 +11592,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 descriptor_path=checkpoint_for_descriptor.with_name(
                     f"{checkpoint_for_descriptor.name}.training-descriptor.json"
                 ),
-                fresh_policy_distillation_only=(
-                    args.fresh_policy_distillation_only
-                ),
+                fresh_policy_distillation_only=(args.fresh_policy_distillation_only),
                 fresh_value_training_only=args.fresh_value_training_only,
             )
         if p1_requested:
@@ -11363,7 +11655,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     observed_allocation=observed_allocation,
                 )
             except aux_coordinator.CoordinatorError as error:
-                raise ExecutorError(f"central AUX authority refused: {error}") from error
+                raise ExecutorError(
+                    f"central AUX authority refused: {error}"
+                ) from error
             published_aux_authority = _published_executor_authority(
                 root=args.aux_coordinator_root,
                 experiment_id=args.aux_experiment_id,
@@ -11403,7 +11697,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.final_coordinator_root, args.final_experiment_id
                 )
             except aux_coordinator.CoordinatorError as error:
-                raise ExecutorError(f"central FINAL authority refused: {error}") from error
+                raise ExecutorError(
+                    f"central FINAL authority refused: {error}"
+                ) from error
             published_final_authority = _published_executor_authority(
                 root=args.final_coordinator_root,
                 experiment_id=args.final_experiment_id,
@@ -11436,8 +11732,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ExecutorError(
                 "--retry-parent-claim and --retry-contract must be supplied together"
             )
-        if verified.get("learner_ablation") is not None and args.retry_parent_claim is not None:
-            raise ExecutorError("learner ablations cannot use the historical retry path")
+        if (
+            verified.get("learner_ablation") is not None
+            and args.retry_parent_claim is not None
+        ):
+            raise ExecutorError(
+                "learner ablations cannot use the historical retry path"
+            )
         if (
             isinstance(verified.get("central_learner_binding"), dict)
             and args.retry_parent_claim is not None
@@ -11519,16 +11820,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "input_binding": input_binding,
             "training_transaction_sha256": transaction_sha256,
             "trainer_authority": verified.get("trainer_authority"),
-            "lock_verifier_authority": verified.get(
-                "lock_verifier_authority"
-            ),
+            "lock_verifier_authority": verified.get("lock_verifier_authority"),
             "execution_binding": execution_binding,
             "checkpoint": str(checkpoint),
             "report": str(report),
             "receipt": str(receipt),
-            "function_preserving_upgrade": verified.get(
-                "function_preserving_upgrade"
-            ),
+            "function_preserving_upgrade": verified.get("function_preserving_upgrade"),
             "diagnostic_comparison_source": verified.get(
                 "diagnostic_comparison_source"
             ),
