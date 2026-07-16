@@ -35,6 +35,9 @@ IMPORTANT_PHASES = frozenset(
 )
 PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
 TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
+SHA256_PREFIX = "sha256:"
+SOURCE_MANIFEST_BINDING_SCHEMA = "teacher-source-manifest-binding-v1"
+TOOL_PROVENANCE_SCHEMA = "teacher-tool-provenance-v1"
 
 
 def _action_ids_for_type(action_type: str) -> frozenset[int]:
@@ -1266,11 +1269,7 @@ def _input_manifests(data_dirs: list[str]) -> list[dict[str, Any]]:
             if not candidate.exists():
                 continue
             found_direct = True
-            try:
-                loaded = json.loads(candidate.read_text(encoding="utf-8"))
-            except Exception as error:
-                payload[candidate.name] = {"error": str(error)}
-                continue
+            loaded, binding = _load_bound_manifest(candidate)
             compact = {
                 key: loaded.get(key)
                 for key in (
@@ -1298,12 +1297,42 @@ def _input_manifests(data_dirs: list[str]) -> list[dict[str, Any]]:
             }
             compact.update(_manifest_metadata_summary(loaded))
             payload[candidate.name] = compact
+            payload["source_manifest"] = binding
+            break
         if not found_direct:
             modal_summary = _modal_parts_summary(path)
             if modal_summary:
                 payload["modal_parts_summary"] = modal_summary
+            else:
+                raise SystemExit(
+                    f"input teacher-data root lacks a readable source manifest: {path}"
+                )
         manifests.append(payload)
     return manifests
+
+
+def _sha256_bytes(payload: bytes) -> str:
+    return SHA256_PREFIX + hashlib.sha256(payload).hexdigest()
+
+
+def _load_bound_manifest(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        before = resolved.read_bytes()
+        loaded = json.loads(before.decode("utf-8"))
+        after = resolved.read_bytes()
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot authenticate source manifest {path}: {error}") from error
+    if not isinstance(loaded, dict):
+        raise SystemExit(f"source manifest must contain a JSON object: {resolved}")
+    before_sha256 = _sha256_bytes(before)
+    if _sha256_bytes(after) != before_sha256:
+        raise SystemExit(f"source manifest changed while being authenticated: {resolved}")
+    return loaded, {
+        "schema_version": SOURCE_MANIFEST_BINDING_SCHEMA,
+        "path": str(resolved),
+        "file_sha256": before_sha256,
+    }
 
 
 def _manifest_metadata_summary(value: Any) -> dict[str, Any]:
@@ -1407,11 +1436,10 @@ def _modal_parts_summary(path: Path) -> dict[str, Any]:
     invalid = 0
     mixed_seats: set[bool] = set()
     mixed_modes: set[str] = set()
+    part_manifests: list[dict[str, str]] = []
     for manifest in manifests:
-        try:
-            loaded = json.loads(manifest.read_text(encoding="utf-8"))
-        except Exception:
-            continue
+        loaded, binding = _load_bound_manifest(manifest)
+        part_manifests.append(binding)
         tool_provenance = loaded.get("tool_provenance")
         if isinstance(tool_provenance, dict):
             file_sha256 = tool_provenance.get("file_sha256")
@@ -1451,6 +1479,7 @@ def _modal_parts_summary(path: Path) -> dict[str, Any]:
         "mixed_seats_values": sorted(mixed_seats),
         "mixed_seat_modes": sorted(mixed_modes),
         "part_tool_provenance": part_tool_provenance,
+        "part_manifests": part_manifests,
     }
     if len(tracks) == 1:
         summary["track"] = next(iter(tracks))
@@ -1479,14 +1508,9 @@ def _tool_provenance() -> dict[str, Any]:
         "src/catan_zero/rl/xdim_lite_policy.py",
         "src/catan_zero/rl/policy_pool.py",
     ]
-    hashes = {}
-    for name in files:
-        path = repo_root / name
-        try:
-            hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            continue
+    hashes = _hash_required_files(repo_root, files)
     return {
+        "schema_version": TOOL_PROVENANCE_SCHEMA,
         "file_sha256": hashes,
         "feature_semantics_files": [
             "catan_rules_v1.json",
@@ -1499,6 +1523,19 @@ def _tool_provenance() -> dict[str, Any]:
             "src/catan_zero/rl/policy_pool.py",
         ],
     }
+
+
+def _hash_required_files(repo_root: Path, files: list[str]) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for name in files:
+        path = repo_root / name
+        try:
+            hashes[name] = _sha256_bytes(path.read_bytes())
+        except OSError as error:
+            raise RuntimeError(
+                f"required provenance file is unreadable or missing: {path}"
+            ) from error
+    return hashes
 
 
 def _has_soft_policy(row: dict[str, Any]) -> bool:

@@ -1,11 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 from train_bc import load_teacher_data, teacher_data_quality
+
+
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+SOURCE_MANIFEST_BINDING_SCHEMA = "teacher-source-manifest-binding-v1"
+TOOL_PROVENANCE_SCHEMA = "teacher-tool-provenance-v1"
+REQUIRED_SOURCE_FEATURE_FILES = frozenset(
+    {
+        "src/catan_zero/rl/self_play.py",
+        "src/catan_zero/rl/action_features.py",
+        "src/catan_zero/rl/xdim_lite_policy.py",
+    }
+)
 
 
 def main() -> None:
@@ -824,11 +838,17 @@ def _input_metadata(data_path: Path) -> dict[str, Any]:
     graph_history_features: set[bool] = set()
     provenance_hashes: dict[str, set[str]] = {}
     source_provenance_hashes: dict[str, set[str]] = {}
+    source_provenance_errors: list[str] = []
     for manifest in manifests:
         payload = manifest.get("payload")
         if payload is None:
             continue
-        _collect_source_provenance_values(payload, source_provenance_hashes)
+        _collect_source_provenance_values(
+            payload,
+            source_provenance_hashes,
+            source_provenance_errors,
+            manifest_path=Path(str(manifest["path"])),
+        )
         _collect_manifest_values(
             payload,
             tracks=tracks,
@@ -853,6 +873,7 @@ def _input_metadata(data_path: Path) -> dict[str, Any]:
             path: sorted(values)
             for path, values in sorted(source_provenance_hashes.items())
         },
+        "source_provenance_errors": source_provenance_errors,
         "manifest_paths": [str(item.get("path", "")) for item in manifests],
         "manifest_errors": [
             {"path": str(item.get("path", "")), "error": str(item.get("error", ""))}
@@ -922,28 +943,202 @@ def _collect_manifest_values(
 def _collect_source_provenance_values(
     payload: Any,
     source_provenance_hashes: dict[str, set[str]],
+    errors: list[str],
+    *,
+    manifest_path: Path,
 ) -> None:
     if not isinstance(payload, dict):
+        errors.append(f"teacher manifest is not a JSON object: {manifest_path}")
         return
-    if "input_manifests" in payload:
-        _collect_file_sha256_values(payload.get("input_manifests"), source_provenance_hashes)
-    if "modal_parts_summary" in payload:
-        _collect_file_sha256_values(payload.get("modal_parts_summary"), source_provenance_hashes)
-    _collect_file_sha256_values(payload, source_provenance_hashes)
+    seen: set[Path] = set()
+    _collect_authenticated_manifest_chain(
+        payload,
+        source_provenance_hashes,
+        errors,
+        manifest_path=manifest_path,
+        seen=seen,
+    )
 
 
-def _collect_file_sha256_values(value: Any, hashes: dict[str, set[str]]) -> None:
-    if isinstance(value, dict):
-        file_sha256 = value.get("file_sha256")
-        if isinstance(file_sha256, dict):
-            for path, digest in file_sha256.items():
-                if isinstance(path, str) and isinstance(digest, str) and digest:
-                    hashes.setdefault(path, set()).add(digest)
-        for child in value.values():
-            _collect_file_sha256_values(child, hashes)
-    elif isinstance(value, list):
-        for child in value:
-            _collect_file_sha256_values(child, hashes)
+def _collect_authenticated_manifest_chain(
+    payload: dict[str, Any],
+    hashes: dict[str, set[str]],
+    errors: list[str],
+    *,
+    manifest_path: Path,
+    seen: set[Path],
+) -> None:
+    named_files = _collect_named_tool_provenance(
+        payload.get("tool_provenance"),
+        hashes,
+        errors,
+        manifest_path=manifest_path,
+    )
+    follow_source_provenance = not REQUIRED_SOURCE_FEATURE_FILES.issubset(named_files)
+    inputs = payload.get("input_manifests")
+    if inputs is None:
+        return
+    if not isinstance(inputs, list):
+        errors.append(f"input_manifests must be a list: {manifest_path}")
+        return
+    for index, item in enumerate(inputs):
+        if not isinstance(item, dict):
+            errors.append(f"input_manifests[{index}] must be an object: {manifest_path}")
+            continue
+        binding = item.get("source_manifest")
+        modal = item.get("modal_parts_summary")
+        if binding is not None:
+            _collect_bound_source_manifest(
+                binding,
+                hashes,
+                errors,
+                owner=f"{manifest_path}:input_manifests[{index}]",
+                seen=seen,
+                follow_chain=follow_source_provenance,
+            )
+        elif not isinstance(modal, dict):
+            errors.append(
+                "input lineage lacks source_manifest binding: "
+                f"{manifest_path}:input_manifests[{index}]"
+            )
+        if isinstance(modal, dict):
+            part_manifests = modal.get("part_manifests")
+            if not isinstance(part_manifests, list) or not part_manifests:
+                errors.append(
+                    "modal source lineage requires non-empty part_manifests: "
+                    f"{manifest_path}:input_manifests[{index}]"
+                )
+                continue
+            for part_index, part_binding in enumerate(part_manifests):
+                _collect_bound_source_manifest(
+                    part_binding,
+                    hashes,
+                    errors,
+                    owner=(
+                        f"{manifest_path}:input_manifests[{index}]"
+                        f".part_manifests[{part_index}]"
+                    ),
+                    seen=seen,
+                    follow_chain=follow_source_provenance,
+                )
+
+
+def _collect_bound_source_manifest(
+    binding: Any,
+    hashes: dict[str, set[str]],
+    errors: list[str],
+    *,
+    owner: str,
+    seen: set[Path],
+    follow_chain: bool,
+) -> None:
+    expected_fields = {"schema_version", "path", "file_sha256"}
+    if not isinstance(binding, dict) or set(binding) != expected_fields:
+        errors.append(
+            f"source manifest binding has wrong fields at {owner}; "
+            f"expected {sorted(expected_fields)}"
+        )
+        return
+    if binding.get("schema_version") != SOURCE_MANIFEST_BINDING_SCHEMA:
+        errors.append(f"source manifest binding has wrong schema at {owner}")
+        return
+    raw_path = binding.get("path")
+    expected_sha256 = binding.get("file_sha256")
+    if not isinstance(raw_path, str) or not raw_path:
+        errors.append(f"source manifest binding path is invalid at {owner}")
+        return
+    if not _is_sha256(expected_sha256):
+        errors.append(f"source manifest binding digest is invalid at {owner}")
+        return
+    try:
+        path = Path(raw_path).expanduser().resolve(strict=True)
+        payload_bytes = path.read_bytes()
+    except OSError as error:
+        errors.append(f"source manifest is unreadable at {owner}: {error}")
+        return
+    if str(path) != raw_path:
+        errors.append(f"source manifest binding path is not canonical at {owner}")
+        return
+    actual_sha256 = "sha256:" + hashlib.sha256(payload_bytes).hexdigest()
+    if actual_sha256 != expected_sha256:
+        errors.append(
+            f"source manifest byte hash mismatch at {owner}: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+        return
+    if path in seen:
+        return
+    seen.add(path)
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        errors.append(f"source manifest JSON is invalid at {owner}: {error}")
+        return
+    if not isinstance(payload, dict):
+        errors.append(f"source manifest must contain a JSON object at {owner}")
+        return
+    if follow_chain:
+        _collect_authenticated_manifest_chain(
+            payload,
+            hashes,
+            errors,
+            manifest_path=path,
+            seen=seen,
+        )
+
+
+def _collect_named_tool_provenance(
+    provenance: Any,
+    hashes: dict[str, set[str]],
+    errors: list[str],
+    *,
+    manifest_path: Path,
+) -> set[str]:
+    required_fields = {"schema_version", "file_sha256", "feature_semantics_files"}
+    if not isinstance(provenance, dict):
+        errors.append(f"manifest lacks named tool_provenance object: {manifest_path}")
+        return set()
+    if not required_fields.issubset(provenance):
+        errors.append(
+            f"tool_provenance lacks required fields {sorted(required_fields)}: "
+            f"{manifest_path}"
+        )
+        return set()
+    if provenance.get("schema_version") != TOOL_PROVENANCE_SCHEMA:
+        errors.append(f"tool_provenance has wrong schema: {manifest_path}")
+        return set()
+    file_sha256 = provenance.get("file_sha256")
+    feature_files = provenance.get("feature_semantics_files")
+    if not isinstance(file_sha256, dict) or not isinstance(feature_files, list):
+        errors.append(f"tool_provenance fields have invalid types: {manifest_path}")
+        return set()
+    if not feature_files or any(
+        not isinstance(path, str) or not path for path in feature_files
+    ):
+        errors.append(f"tool_provenance feature_semantics_files is invalid: {manifest_path}")
+        return set()
+    if any(path not in file_sha256 for path in feature_files):
+        errors.append(
+            f"tool_provenance omits a named feature-semantics digest: {manifest_path}"
+        )
+        return set()
+    invalid = [
+        path
+        for path, digest in file_sha256.items()
+        if not isinstance(path, str) or not path or not _is_sha256(digest)
+    ]
+    if invalid:
+        errors.append(
+            f"tool_provenance contains invalid sha256 entries {invalid}: {manifest_path}"
+        )
+        return set()
+    for path, digest in file_sha256.items():
+        hashes.setdefault(path, set()).add(str(digest))
+    return set(file_sha256)
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and SHA256_RE.fullmatch(value) is not None
 
 
 def _check_manifest_metadata(failures: list[str], args: argparse.Namespace, metadata: dict[str, Any]) -> None:
@@ -981,6 +1176,11 @@ def _check_manifest_metadata(failures: list[str], args: argparse.Namespace, meta
         )
 
     if getattr(args, "production_35m_teacher", False):
+        if metadata.get("source_provenance_errors"):
+            failures.append(
+                "production 35M teacher gate source provenance authentication "
+                f"failed: {metadata['source_provenance_errors']}"
+            )
         observed_mixed = set(bool(value) for value in metadata.get("mixed_seats", ()))
         if observed_mixed != {True}:
             failures.append(
@@ -1003,13 +1203,8 @@ def _check_manifest_metadata(failures: list[str], args: argparse.Namespace, meta
 
 
 def _check_feature_provenance(failures: list[str], metadata: dict[str, Any]) -> None:
-    required = {
-        "src/catan_zero/rl/self_play.py",
-        "src/catan_zero/rl/action_features.py",
-        "src/catan_zero/rl/xdim_lite_policy.py",
-    }
     observed = dict(metadata.get("source_provenance_hashes", {}))
-    for path in sorted(required):
+    for path in sorted(REQUIRED_SOURCE_FEATURE_FILES):
         hashes = observed.get(path, [])
         if not hashes:
             failures.append(
@@ -1020,6 +1215,11 @@ def _check_feature_provenance(failures: list[str], metadata: dict[str, Any]) -> 
             failures.append(
                 "production 35M teacher gate requires one source feature provenance hash "
                 f"for {path}, got {hashes}"
+            )
+        elif not _is_sha256(hashes[0]):
+            failures.append(
+                "production 35M teacher gate requires canonical sha256 provenance "
+                f"for {path}, got {hashes[0]!r}"
             )
 
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-import hashlib
 import io
 import json
 import os
@@ -33,7 +32,11 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from factory_common import parse_track, write_json  # noqa: E402
-from curate_teacher_data import _input_manifests  # noqa: E402
+from curate_teacher_data import (  # noqa: E402
+    TOOL_PROVENANCE_SCHEMA,
+    _hash_required_files,
+    _input_manifests,
+)
 
 # Additive-only (CAT-59): included in shards only when --emit-deduction-features
 # is passed. `(4, DEDUCTION_FEATURE_SIZE)` per row, same per-player-slot
@@ -293,14 +296,9 @@ def _tool_provenance() -> dict[str, Any]:
         "src/catan_zero/rl/multiagent_env.py",
         "src/catan_zero/rl/action_features.py",
     ]
-    hashes: dict[str, str] = {}
-    for name in files:
-        path = repo_root / name
-        try:
-            hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
-            continue
+    hashes = _hash_required_files(repo_root, files)
     return {
+        "schema_version": TOOL_PROVENANCE_SCHEMA,
         "file_sha256": hashes,
         "feature_semantics_files": files,
     }

@@ -345,28 +345,31 @@ def test_q_score_loss_parts_use_sample_weight_denominator():
 
 
 def test_production_metadata_reads_current_manifest_source_provenance(tmp_path):
+    hashes = {
+        "src/catan_zero/rl/self_play.py": "sha256:" + "1" * 64,
+        "src/catan_zero/rl/action_features.py": "sha256:" + "2" * 64,
+        "src/catan_zero/rl/xdim_lite_policy.py": "sha256:" + "3" * 64,
+    }
     manifest = {
         "track": "2p_no_trade",
         "vps_to_win": 10,
         "mixed_seats": True,
         "mixed_seat_mode": "random",
         "graph_history_features": True,
-        "input_manifests": [{"manifest.json": {"samples": 1}}],
         "tool_provenance": {
-            "file_sha256": {
-                "src/catan_zero/rl/self_play.py": "self",
-                "src/catan_zero/rl/action_features.py": "actions",
-                "src/catan_zero/rl/xdim_lite_policy.py": "xdim",
-            }
+            "schema_version": "teacher-tool-provenance-v1",
+            "file_sha256": hashes,
+            "feature_semantics_files": sorted(hashes),
         },
     }
     (tmp_path / "manifest.json").write_text(__import__("json").dumps(manifest), encoding="utf-8")
 
     metadata = _input_metadata(tmp_path)
 
-    assert metadata["source_provenance_hashes"]["src/catan_zero/rl/self_play.py"] == ["self"]
-    assert metadata["source_provenance_hashes"]["src/catan_zero/rl/action_features.py"] == ["actions"]
-    assert metadata["source_provenance_hashes"]["src/catan_zero/rl/xdim_lite_policy.py"] == ["xdim"]
+    assert metadata["source_provenance_hashes"] == {
+        path: [digest] for path, digest in sorted(hashes.items())
+    }
+    assert metadata["source_provenance_errors"] == []
     assert metadata["graph_history_features"] == [True]
 
 
