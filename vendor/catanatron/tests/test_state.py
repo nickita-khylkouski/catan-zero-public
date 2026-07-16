@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from catanatron.state import State
@@ -7,6 +9,7 @@ from catanatron.state_functions import (
     player_clean_turn,
     player_freqdeck_add,
     player_deck_replenish,
+    player_key,
     player_num_dev_cards,
     player_num_resource_cards,
 )
@@ -14,6 +17,7 @@ from catanatron.models.enums import (
     RESOURCES,
     ActionPrompt,
     BRICK,
+    KNIGHT,
     MONOPOLY,
     ORE,
     ActionRecord,
@@ -90,6 +94,46 @@ def test_trade_execution():
 
 
 # ===== Development Cards
+def _development_card_age_state():
+    return SimpleNamespace(
+        color_to_index={Color.RED: 0},
+        player_state={
+            "P0_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN": False,
+            "P0_HAS_ROLLED": True,
+            "P0_KNIGHT_IN_HAND": 0,
+            "P0_KNIGHT_OWNED_AT_START": 0,
+            "P0_MONOPOLY_IN_HAND": 0,
+            "P0_MONOPOLY_OWNED_AT_START": 0,
+            "P0_YEAR_OF_PLENTY_IN_HAND": 0,
+            "P0_YEAR_OF_PLENTY_OWNED_AT_START": 0,
+            "P0_ROAD_BUILDING_IN_HAND": 0,
+            "P0_ROAD_BUILDING_OWNED_AT_START": 0,
+        },
+    )
+
+
+def test_turn_boundary_tracks_multiple_old_development_cards():
+    state = _development_card_age_state()
+
+    player_deck_replenish(state, Color.RED, KNIGHT, 2)
+    player_clean_turn(state, Color.RED)
+
+    key = player_key(state, Color.RED)
+    assert state.player_state[f"{key}_KNIGHT_OWNED_AT_START"] == 2
+
+
+def test_new_same_type_development_card_does_not_age_during_turn():
+    state = _development_card_age_state()
+
+    player_deck_replenish(state, Color.RED, KNIGHT, 1)
+    player_clean_turn(state, Color.RED)
+    player_deck_replenish(state, Color.RED, KNIGHT, 1)
+
+    key = player_key(state, Color.RED)
+    assert state.player_state[f"{key}_KNIGHT_IN_HAND"] == 2
+    assert state.player_state[f"{key}_KNIGHT_OWNED_AT_START"] == 1
+
+
 def test_cant_buy_more_than_max_card():
     players = [SimplePlayer(Color.RED), SimplePlayer(Color.BLUE)]
     state = State(players)

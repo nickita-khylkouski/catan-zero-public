@@ -51,7 +51,7 @@ def _python_player_payload_fixture() -> SimpleNamespace:
         for card in cards:
             player_state[f"{color}_{card}_IN_HAND"] = 0
             if card != "VICTORY_POINT":
-                player_state[f"{color}_{card}_OWNED_AT_START"] = False
+                player_state[f"{color}_{card}_OWNED_AT_START"] = 0
                 player_state[f"{color}_PLAYED_{card}"] = 0
 
     fake = SimpleNamespace(
@@ -98,9 +98,9 @@ def test_python_observation_payload_matches_public_rule_state_feature_contract()
     state = fake.game.state.player_state
     state["BLUE_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN"] = True
     state["BLUE_KNIGHT_IN_HAND"] = 2
-    state["BLUE_KNIGHT_OWNED_AT_START"] = True
+    state["BLUE_KNIGHT_OWNED_AT_START"] = 2
     state["BLUE_MONOPOLY_IN_HAND"] = 1
-    state["BLUE_MONOPOLY_OWNED_AT_START"] = False
+    state["BLUE_MONOPOLY_OWNED_AT_START"] = 0
 
     players = ColonistMultiAgentEnv._player_payloads(fake, "BLUE")
     assert players["BLUE"]["has_played_development_card_in_turn"] is True

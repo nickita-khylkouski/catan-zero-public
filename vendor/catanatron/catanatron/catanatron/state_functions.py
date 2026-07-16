@@ -342,16 +342,17 @@ def player_clean_turn(state: State, color):
     key = player_key(state, color)
     state.player_state[f"{key}_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN"] = False
     state.player_state[f"{key}_HAS_ROLLED"] = False
-    # Dev cards owned this turn will be playable next turn
-    state.player_state[f"{key}_KNIGHT_OWNED_AT_START"] = (
-        state.player_state[f"{key}_KNIGHT_IN_HAND"] > 0
-    )
-    state.player_state[f"{key}_MONOPOLY_OWNED_AT_START"] = (
-        state.player_state[f"{key}_MONOPOLY_IN_HAND"] > 0
-    )
-    state.player_state[f"{key}_YEAR_OF_PLENTY_OWNED_AT_START"] = (
-        state.player_state[f"{key}_YEAR_OF_PLENTY_IN_HAND"] > 0
-    )
-    state.player_state[f"{key}_ROAD_BUILDING_OWNED_AT_START"] = (
-        state.player_state[f"{key}_ROAD_BUILDING_IN_HAND"] > 0
-    )
+    # Snapshot exact playable counts. Cards bought after this boundary increase
+    # IN_HAND without changing OWNED_AT_START, matching the native engine.
+    state.player_state[f"{key}_KNIGHT_OWNED_AT_START"] = state.player_state[
+        f"{key}_KNIGHT_IN_HAND"
+    ]
+    state.player_state[f"{key}_MONOPOLY_OWNED_AT_START"] = state.player_state[
+        f"{key}_MONOPOLY_IN_HAND"
+    ]
+    state.player_state[f"{key}_YEAR_OF_PLENTY_OWNED_AT_START"] = state.player_state[
+        f"{key}_YEAR_OF_PLENTY_IN_HAND"
+    ]
+    state.player_state[f"{key}_ROAD_BUILDING_OWNED_AT_START"] = state.player_state[
+        f"{key}_ROAD_BUILDING_IN_HAND"
+    ]

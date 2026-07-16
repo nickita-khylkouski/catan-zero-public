@@ -951,18 +951,13 @@ class ColonistMultiAgentEnv:
                 player_payload["has_played_development_card_in_turn"] = (
                     state.player_state[f"{key}_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN"]
                 )
-                # Catanatron stores one OWNED_AT_START boolean per card type,
-                # whereas the native engine stores the corresponding count.
-                # When the flag is true all currently held cards of that type
-                # are old enough to play; otherwise none are.  Exclude hidden
-                # VP cards, which have no play action and are intentionally not
-                # part of the four-slot public-rule feature contract.
+                # The vendored and native engines both retain the exact number
+                # held at the turn boundary. Cards bought later increase the
+                # hand without aging into this count. Exclude hidden VP cards,
+                # which have no play action and are intentionally not part of
+                # the four-slot public-rule feature contract.
                 player_payload["playable_development_cards"] = {
-                    card: (
-                        state.player_state[f"{key}_{card}_IN_HAND"]
-                        if state.player_state[f"{key}_{card}_OWNED_AT_START"]
-                        else 0
-                    )
+                    card: int(state.player_state[f"{key}_{card}_OWNED_AT_START"])
                     for card in self.DEVELOPMENT_CARDS
                     if card != self.VICTORY_POINT
                 }

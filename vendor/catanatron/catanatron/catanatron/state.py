@@ -31,10 +31,10 @@ PLAYER_INITIAL_STATE = {
     # de-normalized features (for performance since we think they are good features)
     "ACTUAL_VICTORY_POINTS": 0,
     "LONGEST_ROAD_LENGTH": 0,
-    "KNIGHT_OWNED_AT_START": False,
-    "MONOPOLY_OWNED_AT_START": False,
-    "YEAR_OF_PLENTY_OWNED_AT_START": False,
-    "ROAD_BUILDING_OWNED_AT_START": False,
+    "KNIGHT_OWNED_AT_START": 0,
+    "MONOPOLY_OWNED_AT_START": 0,
+    "YEAR_OF_PLENTY_OWNED_AT_START": 0,
+    "ROAD_BUILDING_OWNED_AT_START": 0,
 }
 for resource in RESOURCES:
     PLAYER_INITIAL_STATE[f"{resource}_IN_HAND"] = 0
