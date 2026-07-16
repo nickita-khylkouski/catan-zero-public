@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import operator
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -23,6 +23,20 @@ from catan_zero.rl.entity_feature_adapter import (
     LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
 )
 from catan_zero.rl.restart_provenance import RESTART_PROVENANCE_KEYS
+
+
+SEARCH_EVIDENCE_BASE_COLUMNS = frozenset(
+    {
+        "search_evidence_version",
+        "search_evidence_mask",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+    }
+)
+SEARCH_EVIDENCE_PRIOR_COLUMN = "search_prior_policy_flat"
+SEARCH_EVIDENCE_SCHEMA_V1 = "gumbel_root_search_evidence_v1"
+SEARCH_EVIDENCE_SCHEMA_V2 = "gumbel_root_search_evidence_v2_fp32_prior"
 
 
 # These columns were added after the original gen3 corpus was converted. Their
@@ -66,6 +80,11 @@ SYNTHESIZABLE_COLUMNS = frozenset(
         # lazily so those rows stay available for policy/value objectives.
         AUX_SUBGOAL_TARGET_VERSION_KEY,
         *RESTART_PROVENANCE_KEYS,
+        # Search evidence is optional historical audit data. Legacy rows have
+        # no honest reconstruction, so expose an explicitly unavailable bundle
+        # rather than rejecting a fresh+historical composite.
+        *SEARCH_EVIDENCE_BASE_COLUMNS,
+        SEARCH_EVIDENCE_PRIOR_COLUMN,
     }
 )
 
@@ -393,6 +412,28 @@ def _synthesized_column(corpus: Any, key: str):
         return _ConstantColumn(corpus.row_count, -1, np.int16)
     if key in set(AUX_TARGET_KEYS):
         return _ConstantColumn(corpus.row_count, np.nan, np.float32)
+    if key == "search_evidence_version":
+        return _ConstantColumn(corpus.row_count, 0, np.uint8)
+    if key == "search_evidence_mask":
+        return _ConstantColumn(corpus.row_count, False, np.bool_)
+    if key == "search_evidence_offsets":
+        return _ConstantColumn(
+            corpus.row_count, 0, np.int64, inner_shape=(2,)
+        )
+    if key == "search_visit_counts_flat":
+        return _ConstantColumn(
+            corpus.row_count,
+            0,
+            np.uint16,
+            inner_shape=(int(corpus.legal_width),),
+        )
+    if key in {"search_completed_q_flat", SEARCH_EVIDENCE_PRIOR_COLUMN}:
+        return _ConstantColumn(
+            corpus.row_count,
+            np.nan,
+            np.float32,
+            inner_shape=(int(corpus.legal_width),),
+        )
     raise KeyError(key)
 
 
@@ -436,12 +477,64 @@ class ConcatMemmapCorpus:
         first = self.corpora[0]
         component_key_sets = [set(corpus.keys()) for corpus in self.corpora]
         afterstate_pair = {"afterstate_target", "afterstate_target_mask"}
-        for index, keys in enumerate(component_key_sets):
+        for index, (corpus, keys) in enumerate(
+            zip(self.corpora, component_key_sets, strict=True)
+        ):
             present_afterstate = keys & afterstate_pair
             if present_afterstate and present_afterstate != afterstate_pair:
                 raise SystemExit(
                     "memmap component has an incomplete afterstate target/mask pair: "
                     f"component={index} present={sorted(present_afterstate)}"
+                )
+            present_search_evidence = keys & SEARCH_EVIDENCE_BASE_COLUMNS
+            if (
+                present_search_evidence
+                and present_search_evidence != SEARCH_EVIDENCE_BASE_COLUMNS
+            ):
+                raise SystemExit(
+                    "memmap component has an incomplete search evidence bundle: "
+                    f"component={index} present={sorted(present_search_evidence)} "
+                    f"required={sorted(SEARCH_EVIDENCE_BASE_COLUMNS)}"
+                )
+            if (
+                SEARCH_EVIDENCE_PRIOR_COLUMN in keys
+                and not present_search_evidence
+            ):
+                raise SystemExit(
+                    "memmap component has search prior evidence without the base "
+                    f"bundle: component={index}"
+                )
+            evidence_meta = getattr(corpus, "meta", {}).get("search_evidence")
+            if not present_search_evidence:
+                if evidence_meta is not None:
+                    raise SystemExit(
+                        "memmap component declares search evidence metadata without "
+                        f"the base columns: component={index}"
+                    )
+                continue
+            if not isinstance(evidence_meta, Mapping):
+                raise SystemExit(
+                    "memmap component search evidence columns lack authenticated "
+                    f"metadata: component={index}"
+                )
+            evidence_schema = evidence_meta.get("schema")
+            has_prior = SEARCH_EVIDENCE_PRIOR_COLUMN in keys
+            if evidence_schema == SEARCH_EVIDENCE_SCHEMA_V1:
+                if has_prior:
+                    raise SystemExit(
+                        "memmap v1 search evidence must not contain an exact prior: "
+                        f"component={index}"
+                    )
+            elif evidence_schema == SEARCH_EVIDENCE_SCHEMA_V2:
+                if not has_prior:
+                    raise SystemExit(
+                        "memmap v2 search evidence is missing its exact prior: "
+                        f"component={index}"
+                    )
+            else:
+                raise SystemExit(
+                    "memmap component has unsupported search evidence metadata: "
+                    f"component={index} schema={evidence_schema!r}"
                 )
         union_keys = set.union(*component_key_sets)
         if adapter_versions is not None:

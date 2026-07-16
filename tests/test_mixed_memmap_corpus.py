@@ -432,6 +432,148 @@ def test_afterstate_target_and_mask_must_be_an_atomic_pair(missing: str) -> None
         module.ConcatMemmapCorpus([complete, broken])
 
 
+def _add_search_evidence(module, corpus: _Corpus, *, include_prior: bool = True) -> None:
+    width = int(corpus.legal_width)
+    rows = int(corpus.row_count)
+    corpus._eager.update(
+        {
+            "search_evidence_version": np.full(
+                rows, 2 if include_prior else 1, dtype=np.uint8
+            ),
+            "search_evidence_mask": np.full(rows, True, dtype=np.bool_),
+            "search_evidence_offsets": np.stack(
+                (
+                    np.arange(rows, dtype=np.int64),
+                    np.arange(1, rows + 1, dtype=np.int64),
+                ),
+                axis=1,
+            ),
+            "search_visit_counts_flat": np.ones((rows, width), dtype=np.uint16),
+            "search_completed_q_flat": np.zeros((rows, width), dtype=np.float32),
+        }
+    )
+    corpus._columns.update(
+        {
+            "search_evidence_version": {
+                "kind": "fixed",
+                "dtype": np.dtype(np.uint8).str,
+                "inner_shape": [],
+            },
+            "search_evidence_mask": {
+                "kind": "fixed",
+                "dtype": np.dtype(np.bool_).str,
+                "inner_shape": [],
+            },
+            "search_evidence_offsets": {
+                "kind": "row_offsets",
+                "dtype": np.dtype(np.int64).str,
+            },
+            "search_visit_counts_flat": {
+                "kind": "independent_ragged1d",
+                "dtype": np.dtype(np.uint16).str,
+                "fill": 0,
+                "offsets": "search_evidence_offsets",
+            },
+            "search_completed_q_flat": {
+                "kind": "independent_ragged1d",
+                "dtype": np.dtype(np.float32).str,
+                "fill": float("nan"),
+                "offsets": "search_evidence_offsets",
+            },
+        }
+    )
+    if include_prior:
+        corpus._eager[module.SEARCH_EVIDENCE_PRIOR_COLUMN] = np.full(
+            (rows, width), 1.0 / width, dtype=np.float32
+        )
+        corpus._columns[module.SEARCH_EVIDENCE_PRIOR_COLUMN] = {
+            "kind": "independent_ragged1d",
+            "dtype": np.dtype(np.float32).str,
+            "fill": float("nan"),
+            "offsets": "search_evidence_offsets",
+        }
+    corpus.meta["search_evidence"] = {
+        "schema": (
+            module.SEARCH_EVIDENCE_SCHEMA_V2
+            if include_prior
+            else module.SEARCH_EVIDENCE_SCHEMA_V1
+        )
+    }
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "search_evidence_version",
+        "search_evidence_mask",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+    ],
+)
+def test_search_evidence_base_bundle_must_be_atomic(missing: str) -> None:
+    module = _module()
+    complete = _Corpus(0, 2)
+    _add_search_evidence(module, complete)
+    broken = _Corpus(2, 2)
+    _add_search_evidence(module, broken)
+    broken._eager.pop(missing)
+    broken._columns.pop(missing)
+
+    with pytest.raises(SystemExit, match="incomplete search evidence bundle"):
+        module.ConcatMemmapCorpus([complete, broken])
+
+
+def test_search_prior_requires_base_evidence_bundle() -> None:
+    module = _module()
+    complete = _Corpus(0, 2)
+    _add_search_evidence(module, complete)
+    prior_only = _Corpus(2, 2)
+    prior_only._eager[module.SEARCH_EVIDENCE_PRIOR_COLUMN] = np.ones(
+        (2, 3), dtype=np.float32
+    )
+    prior_only._columns[module.SEARCH_EVIDENCE_PRIOR_COLUMN] = dict(
+        complete._columns[module.SEARCH_EVIDENCE_PRIOR_COLUMN]
+    )
+
+    with pytest.raises(SystemExit, match="search prior evidence without the base"):
+        module.ConcatMemmapCorpus([complete, prior_only])
+
+
+def test_v1_search_evidence_synthesizes_only_missing_prior() -> None:
+    module = _module()
+    v2 = _Corpus(0, 2)
+    _add_search_evidence(module, v2)
+    v1 = _Corpus(2, 2)
+    _add_search_evidence(module, v1, include_prior=False)
+
+    mixed = module.ConcatMemmapCorpus([v2, v1])
+
+    np.testing.assert_allclose(
+        mixed[module.SEARCH_EVIDENCE_PRIOR_COLUMN][:2],
+        np.full((2, 3), 1.0 / 3, dtype=np.float32),
+    )
+    assert bool(
+        np.all(np.isnan(mixed[module.SEARCH_EVIDENCE_PRIOR_COLUMN][2:]))
+    )
+    assert mixed.synthesized_columns_by_component == {
+        1: (module.SEARCH_EVIDENCE_PRIOR_COLUMN,)
+    }
+
+
+def test_v2_search_evidence_without_exact_prior_fails_closed() -> None:
+    module = _module()
+    complete = _Corpus(0, 2)
+    _add_search_evidence(module, complete)
+    malformed_v2 = _Corpus(2, 2)
+    _add_search_evidence(module, malformed_v2)
+    malformed_v2._eager.pop(module.SEARCH_EVIDENCE_PRIOR_COLUMN)
+    malformed_v2._columns.pop(module.SEARCH_EVIDENCE_PRIOR_COLUMN)
+
+    with pytest.raises(SystemExit, match="v2 search evidence is missing its exact prior"):
+        module.ConcatMemmapCorpus([complete, malformed_v2])
+
+
 def test_unknown_missing_column_still_fails_closed():
     module = _module()
     left = _Corpus(0, 2)

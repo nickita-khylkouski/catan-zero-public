@@ -47,6 +47,41 @@ def test_complete_effective_search_config_binds_resolved_defaults() -> None:
     }
 
 
+def test_paired_root_output_contract_binds_preservation_semantics() -> None:
+    preserved = alignment._paired_root_value_output_contract(  # noqa: SLF001
+        {"preserve_root_prior_value": True},
+        {},
+    )
+
+    assert preserved["schema_version"] == alignment.PAIRED_ROOT_VALUE_OUTPUT_SCHEMA
+    assert preserved["root_value_semantics"] == "post_search_root_value"
+    assert (
+        preserved["root_prior_value_semantics"]
+        == "pre_search_root_evaluator_value"
+    )
+    assert preserved["preserve_root_prior_value"] is True
+    assert preserved["atomic_pair_required"] is True
+    assert preserved["authority"] == {
+        "schema_version": alignment.current_science.SCHEMA_VERSION,
+        "contract_id": "a1-next-wave-coherent-public-v3",
+        "path": str(alignment.current_science.CONTRACT_PATH.resolve(strict=True)),
+        "file_sha256": alignment._file_sha256(  # noqa: SLF001
+            alignment.current_science.CONTRACT_PATH.resolve(strict=True)
+        ),
+    }
+    with pytest.raises(alignment.AlignmentError, match="disagrees"):
+        alignment._paired_root_value_output_contract(  # noqa: SLF001
+            {"preserve_root_prior_value": False},
+            {},
+        )
+    for malformed in (0, "false", None):
+        with pytest.raises(alignment.AlignmentError, match="must be boolean"):
+            alignment._paired_root_value_output_contract(  # noqa: SLF001
+                {"preserve_root_prior_value": malformed},
+                {},
+            )
+
+
 def test_stage_c_execution_identity_is_forced_full_and_seed_schema_bound() -> None:
     execution = alignment.STAGE_C_TARGET_EXECUTION
 

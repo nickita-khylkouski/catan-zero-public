@@ -48,6 +48,7 @@ if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from tools import a1_target_eligibility_inventory as target_inventory  # noqa: E402
+from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import train_bc  # noqa: E402
 from catan_zero.rl.target_reliability import (  # noqa: E402
     TARGET_RELIABILITY_COLUMNS,
@@ -71,6 +72,8 @@ SUBSET_SCHEMA = "a1-stage-c-reanalysis-subset-v2"
 COHERENT_REGIME = "public_belief_single_tree_v1"
 OPERATOR_IDENTITY_SCHEMA_V1 = "a1-operator-bound-policy-target-identity-v1"
 OPERATOR_IDENTITY_SCHEMA_V2 = "a1-operator-bound-policy-target-identity-v2"
+OPERATOR_IDENTITY_SCHEMA_V3 = "a1-operator-bound-policy-target-identity-v3"
+PAIRED_ROOT_VALUE_OUTPUT_SCHEMA = "a1-paired-root-value-output-contract-v1"
 STAGE_C_ROW_SEED_SCHEMA = "a1-stage-c-coherent-reanalysis-root-seed-v1"
 STAGE_C_TARGET_EXECUTION = {
     "schema_version": "a1-stage-c-target-execution-v1",
@@ -369,6 +372,52 @@ def _complete_effective_evaluator_config(
     return _json_normalized(resolved)
 
 
+def _paired_root_value_output_contract(
+    fields: Mapping[str, Any],
+    operator: Mapping[str, Any],
+) -> dict[str, Any]:
+    science = current_science.load()
+    generation = science.get("generation")
+    if not isinstance(generation, Mapping):
+        raise AlignmentError("current science lacks a generation contract")
+    preservation = generation.get("preserve_root_prior_value")
+    if not isinstance(preservation, bool):
+        raise AlignmentError(
+            "current science does not explicitly bind preserve_root_prior_value"
+        )
+    target_bindings: list[bool] = []
+    for label, source in (
+        ("typed generation config", fields),
+        ("sealed operator", operator),
+    ):
+        if "preserve_root_prior_value" not in source:
+            continue
+        value = source["preserve_root_prior_value"]
+        if type(value) is not bool:
+            raise AlignmentError(
+                f"{label} preserve_root_prior_value must be boolean"
+            )
+        target_bindings.append(value)
+    if target_bindings and any(value is not preservation for value in target_bindings):
+        raise AlignmentError(
+            "target authority disagrees with current paired-root output contract"
+        )
+    science_path = current_science.CONTRACT_PATH.resolve(strict=True)
+    return {
+        "schema_version": PAIRED_ROOT_VALUE_OUTPUT_SCHEMA,
+        "root_value_semantics": "post_search_root_value",
+        "root_prior_value_semantics": "pre_search_root_evaluator_value",
+        "preserve_root_prior_value": preservation,
+        "atomic_pair_required": True,
+        "authority": {
+            "schema_version": science["schema_version"],
+            "contract_id": science["contract_id"],
+            "path": str(science_path),
+            "file_sha256": _file_sha256(science_path),
+        },
+    }
+
+
 def _operator_identity(
     contract_path: Path,
     checkpoint: Path,
@@ -447,6 +496,7 @@ def _operator_identity(
     if identity_schema not in {
         OPERATOR_IDENTITY_SCHEMA_V1,
         OPERATOR_IDENTITY_SCHEMA_V2,
+        OPERATOR_IDENTITY_SCHEMA_V3,
     }:
         raise AlignmentError(
             f"unsupported policy-target identity schema {identity_schema!r}"
@@ -490,7 +540,10 @@ def _operator_identity(
             "operator_semantic_sha256": _value_sha256(operator),
         },
     }
-    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V2:
+    if identity_schema in {
+        OPERATOR_IDENTITY_SCHEMA_V2,
+        OPERATOR_IDENTITY_SCHEMA_V3,
+    }:
         execution = (
             dict(target_execution)
             if target_execution is not None
@@ -521,6 +574,19 @@ def _operator_identity(
                 "operator input"
             ),
         }
+    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V3:
+        value["root_value_output_contract"] = _paired_root_value_output_contract(
+            fields,
+            operator,
+        )
+        if (
+            require_current_target
+            and value["root_value_output_contract"]["preserve_root_prior_value"]
+            is not True
+        ):
+            raise AlignmentError(
+                "current paired-root target must preserve root_prior_value"
+            )
     # The scientific identity deliberately excludes contract path, seed lanes,
     # and fleet placement. Those authenticate provenance but do not change a
     # root target. It includes the producer network and every search semantic.
@@ -534,7 +600,10 @@ def _operator_identity(
         "symmetry",
         "target_semantics",
     ]
-    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V2:
+    if identity_schema in {
+        OPERATOR_IDENTITY_SCHEMA_V2,
+        OPERATOR_IDENTITY_SCHEMA_V3,
+    }:
         scientific_keys.extend(
             (
                 "effective_gumbel_config",
@@ -543,10 +612,18 @@ def _operator_identity(
                 "identity_exclusions",
             )
         )
+    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V3:
+        scientific_keys.append("root_value_output_contract")
     scientific = {key: value[key] for key in scientific_keys}
     scientific["producer_checkpoint"] = {
         "sha256": value["producer_checkpoint"]["sha256"]
     }
+    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V3:
+        scientific_output = dict(scientific["root_value_output_contract"])
+        scientific_authority = dict(scientific_output["authority"])
+        scientific_authority.pop("path")
+        scientific_output["authority"] = scientific_authority
+        scientific["root_value_output_contract"] = scientific_output
     value["identity_sha256"] = _value_sha256(scientific)
     return value
 
@@ -1236,6 +1313,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         args.target_operator_contract,
         args.target_checkpoint,
         require_current_target=True,
+        identity_schema=OPERATOR_IDENTITY_SCHEMA_V3,
         target_execution=STAGE_C_TARGET_EXECUTION,
     )
     if (
@@ -1605,7 +1683,11 @@ def _verify_plan(path: Path) -> dict[str, Any]:
             identity_schema=str(schema),
             target_execution=(
                 identity.get("target_execution")
-                if schema == OPERATOR_IDENTITY_SCHEMA_V2
+                if schema
+                in {
+                    OPERATOR_IDENTITY_SCHEMA_V2,
+                    OPERATOR_IDENTITY_SCHEMA_V3,
+                }
                 and identity_key == "target_policy_target_identity"
                 else None
             ),
