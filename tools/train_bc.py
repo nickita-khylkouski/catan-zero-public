@@ -17331,6 +17331,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
     )
     training_draw_accounting = _training_draw_accounting(metrics)
+    value_independent_evidence = _value_independent_evidence_report(
+        data,
+        train_indices,
+        value_sample_weights,
+    )
     coverage_completed = bool(
         base_sampler == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1
         and start_epoch == 0
@@ -17516,6 +17521,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             * int(ddp["world_size"])
         ),
         **training_draw_accounting,
+        "value_independent_evidence": value_independent_evidence,
         "amp": args.amp,
         "optimizer": args.optimizer,
         "lr": float(args.lr),
@@ -36648,6 +36654,119 @@ def _training_draw_accounting(metrics: list[dict]) -> dict[str, int | str | None
         "value_active_training_row_draws": int(value_active),
         "total_training_row_draws": int(base + policy_aux),
         "unique_training_rows_drawn": None,
+    }
+
+
+def _value_independent_evidence_report(
+    data: object,
+    train_indices: np.ndarray,
+    value_sample_weights: np.ndarray,
+) -> dict[str, object]:
+    """Separate value-row exposure from independent terminal outcomes.
+
+    Every state in one completed game inherits the same terminal result. Row
+    counts therefore exaggerate the amount of independent value supervision by
+    roughly the number of recorded decisions per game. Report both the raw
+    state labels and their game-level effective sample size.
+    """
+
+    rows = np.asarray(train_indices, dtype=np.int64)
+    weights = np.asarray(value_sample_weights, dtype=np.float64)
+    if rows.ndim != 1 or weights.ndim != 1 or np.any(rows < 0):
+        raise ValueError("value evidence accounting inputs are malformed")
+    if len(rows) == 0:
+        return {
+            "schema_version": "value-independent-evidence-v1",
+            "status": "empty_training_partition",
+        }
+    if "game_seed" not in data or "winner" not in data:
+        return {
+            "schema_version": "value-independent-evidence-v1",
+            "status": "unavailable_missing_game_seed_or_winner",
+            "training_rows": int(len(rows)),
+        }
+    if np.any(rows >= len(weights)):
+        raise ValueError("value evidence rows exceed the weight array")
+
+    game_seeds = np.asarray(data["game_seed"][rows], dtype=np.int64).reshape(-1)
+    winners = np.asarray(data["winner"][rows]).astype(str, copy=False).reshape(-1)
+    truncated = _batch_array_or_fill(
+        data, "truncated", rows, False, dtype=np.bool_
+    )
+    row_weights = weights[rows]
+    if (
+        game_seeds.shape != rows.shape
+        or winners.shape != rows.shape
+        or truncated.shape != rows.shape
+        or row_weights.shape != rows.shape
+        or not np.isfinite(row_weights).all()
+        or np.any(row_weights < 0.0)
+    ):
+        raise ValueError("value evidence columns are not row-aligned")
+
+    clean = (row_weights > 0.0) & (winners != "") & ~truncated
+    if not np.any(clean):
+        return {
+            "schema_version": "value-independent-evidence-v1",
+            "status": "no_clean_terminal_value_rows",
+            "training_rows": int(len(rows)),
+            "positive_value_weight_rows": int(np.count_nonzero(row_weights > 0.0)),
+        }
+
+    clean_seeds = game_seeds[clean]
+    clean_winners = winners[clean]
+    clean_weights = row_weights[clean]
+    unique_seeds, first, inverse = np.unique(
+        clean_seeds, return_index=True, return_inverse=True
+    )
+    game_rows = np.bincount(inverse, minlength=len(unique_seeds)).astype(np.int64)
+    game_mass = np.bincount(
+        inverse, weights=clean_weights, minlength=len(unique_seeds)
+    ).astype(np.float64)
+    winner_mismatch = clean_winners != clean_winners[first[inverse]]
+    contradictory_games = int(
+        np.count_nonzero(
+            np.bincount(
+                inverse,
+                weights=winner_mismatch.astype(np.int64),
+                minlength=len(unique_seeds),
+            )
+            > 0
+        )
+    )
+    mass_sum = float(game_mass.sum())
+    mass_square_sum = float(np.square(game_mass).sum())
+    game_ess = (
+        mass_sum * mass_sum / mass_square_sum
+        if mass_square_sum > 0.0
+        else 0.0
+    )
+    clean_rows = int(np.count_nonzero(clean))
+    games = int(len(unique_seeds))
+    return {
+        "schema_version": "value-independent-evidence-v1",
+        "status": "ok" if contradictory_games == 0 else "contradictory_game_outcomes",
+        "training_rows": int(len(rows)),
+        "positive_value_weight_rows": int(np.count_nonzero(row_weights > 0.0)),
+        "clean_terminal_value_rows": clean_rows,
+        "independent_terminal_games": games,
+        "row_labels_per_independent_outcome": clean_rows / max(games, 1),
+        "repeated_label_fraction": 1.0 - games / max(clean_rows, 1),
+        "game_weight_effective_sample_size": float(game_ess),
+        "game_weight_ess_fraction": float(game_ess / max(games, 1)),
+        "rows_per_game": {
+            "mean": float(np.mean(game_rows)),
+            "p50": float(np.percentile(game_rows, 50)),
+            "p90": float(np.percentile(game_rows, 90)),
+            "max": int(np.max(game_rows)),
+        },
+        "value_weight_mass_per_game": {
+            "mean": float(np.mean(game_mass)),
+            "p50": float(np.percentile(game_mass, 50)),
+            "p90": float(np.percentile(game_mass, 90)),
+            "max": float(np.max(game_mass)),
+        },
+        "contradictory_terminal_outcome_games": contradictory_games,
     }
 
 

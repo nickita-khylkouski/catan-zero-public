@@ -7,6 +7,7 @@ from tools.train_bc import (
     _MemmapCategoricalColumn,
     _apply_authenticated_value_training_scope,
     _value_component_active_dose_for_batch,
+    _value_independent_evidence_report,
     _value_training_scope_report,
     apply_value_player_outcome_balance,
     build_value_sample_weights,
@@ -25,6 +26,43 @@ def _legal_action_ids(counts: list[int], width: int = 4) -> np.ndarray:
         row = list(range(count)) + [-1] * (width - count)
         rows.append(row)
     return np.asarray(rows, dtype=np.int32)
+
+
+def test_value_evidence_reports_independent_games_not_repeated_rows() -> None:
+    data = {
+        "game_seed": np.asarray([10, 10, 20], dtype=np.int64),
+        "winner": np.asarray(["RED", "RED", "BLUE"]),
+        "truncated": np.asarray([False, False, False]),
+    }
+    report = _value_independent_evidence_report(
+        data,
+        np.arange(3, dtype=np.int64),
+        np.asarray([0.5, 0.5, 1.0], dtype=np.float32),
+    )
+
+    assert report["status"] == "ok"
+    assert report["clean_terminal_value_rows"] == 3
+    assert report["independent_terminal_games"] == 2
+    assert report["row_labels_per_independent_outcome"] == pytest.approx(1.5)
+    assert report["game_weight_effective_sample_size"] == pytest.approx(2.0)
+    assert report["game_weight_ess_fraction"] == pytest.approx(1.0)
+    assert report["contradictory_terminal_outcome_games"] == 0
+
+
+def test_value_evidence_surfaces_contradictory_outcomes_within_game() -> None:
+    data = {
+        "game_seed": np.asarray([7, 7], dtype=np.int64),
+        "winner": np.asarray(["RED", "BLUE"]),
+        "truncated": np.asarray([False, False]),
+    }
+    report = _value_independent_evidence_report(
+        data,
+        np.arange(2, dtype=np.int64),
+        np.ones(2, dtype=np.float32),
+    )
+
+    assert report["status"] == "contradictory_game_outcomes"
+    assert report["contradictory_terminal_outcome_games"] == 1
 
 
 def test_per_game_value_weight_equalizes_total_mass_across_game_lengths() -> None:
