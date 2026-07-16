@@ -105,20 +105,45 @@ def test_explicit_ranges_supports_multiple_disjoint_process_blocks():
     assert validation_seeds == {5000001 + 19, 6400001 + 19}
 
 
-def test_explicit_ranges_still_respects_validation_max_samples_cap():
+def test_explicit_ranges_refuse_row_level_validation_cap():
+    game_seeds = np.repeat(np.arange(100, dtype=np.int64), 10)
+    data = _make_data(game_seeds)
+    with pytest.raises(
+        SystemExit,
+        match="row cap would split held-out games",
+    ):
+        split_train_validation_indices(
+            data,
+            validation_fraction=0.05,
+            validation_seed=17,
+            validation_max_samples=50,
+            validation_game_seed_ranges=[(0, 99)],
+        )
+
+
+def test_random_game_split_caps_by_complete_games() -> None:
     game_seeds = np.repeat(np.arange(100, dtype=np.int64), 10)
     data = _make_data(game_seeds)
     split = split_train_validation_indices(
-        data, validation_fraction=0.05, validation_seed=17,
-        validation_max_samples=50,
-        validation_game_seed_ranges=[(0, 99)],  # all 1000 rows held out
+        data,
+        validation_fraction=0.5,
+        validation_seed=17,
+        validation_max_samples=55,
     )
-    assert len(split["validation"]) == 50
+
+    validation_seeds, counts = np.unique(
+        game_seeds[split["validation"]], return_counts=True
+    )
+    assert len(validation_seeds) == 6
+    assert counts.tolist() == [10] * 6
+    assert len(split["validation"]) == 60
+    assert not set(validation_seeds).intersection(
+        game_seeds[split["train"]].tolist()
+    )
 
 
 def test_no_explicit_ranges_falls_back_to_existing_random_behavior():
     """Regression: passing None/empty must not change any existing behavior."""
-    rng = np.random.default_rng(0)
     game_seeds = np.repeat(np.arange(50, dtype=np.int64), 4)
     data = _make_data(game_seeds)
 

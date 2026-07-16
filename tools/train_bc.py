@@ -32727,15 +32727,17 @@ def split_train_validation_indices(
         # game_seed permutation below entirely -- these EXACT games are what a
         # holdout.json documents for coordination with the separate calibration
         # probe (docs/catan_postrepair_revalidation_protocol_20260704.md Step 1).
+        if int(validation_max_samples) != 0:
+            raise SystemExit(
+                "explicit validation game-seed ranges require "
+                "validation_max_samples=0; a row cap would split held-out games"
+            )
         seeds = np.asarray(data.get("game_seed", np.arange(n, dtype=np.int64)), dtype=np.int64)
         validation_mask = np.zeros(n, dtype=bool)
         for start, end in validation_game_seed_ranges:
             validation_mask |= (seeds >= start) & (seeds <= end)
         validation = all_indices[validation_mask]
         train = all_indices[~validation_mask]
-        if validation_max_samples > 0 and len(validation) > validation_max_samples:
-            rng = np.random.default_rng(validation_seed + 1)
-            validation = np.sort(rng.choice(validation, size=validation_max_samples, replace=False))
         return {
             "train": train.astype(np.int64, copy=False),
             "validation": validation.astype(np.int64, copy=False),
@@ -32804,7 +32806,8 @@ def split_train_validation_indices(
             )
         return {"train": train, "validation": validation}
     unique_seeds = np.unique(seeds)
-    if unique_seeds.size <= 1:
+    row_level_fallback = unique_seeds.size <= 1
+    if row_level_fallback:
         if n >= 1000:
             raise SystemExit(
                 "validation_fraction requires non-degenerate game_seed values for "
@@ -32829,6 +32832,8 @@ def split_train_validation_indices(
         unique_seeds, unique_seed_counts = np.unique(seeds, return_counts=True)
         shuffled_seeds = rng.permutation(unique_seeds)
         target_rows = max(1, int(round(n * fraction)))
+        if validation_max_samples > 0:
+            target_rows = min(target_rows, int(validation_max_samples))
         selected: list[int] = []
         selected_rows = 0
         shuffled_counts = unique_seed_counts[
@@ -32844,7 +32849,11 @@ def split_train_validation_indices(
         validation_mask = np.isin(seeds, np.asarray(selected, dtype=np.int64))
         validation = all_indices[validation_mask]
         train = all_indices[~validation_mask]
-    if validation_max_samples > 0 and len(validation) > validation_max_samples:
+    if (
+        row_level_fallback
+        and validation_max_samples > 0
+        and len(validation) > validation_max_samples
+    ):
         rng = np.random.default_rng(validation_seed + 1)
         validation = np.sort(rng.choice(validation, size=validation_max_samples, replace=False))
     if len(train) == 0:
