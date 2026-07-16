@@ -440,6 +440,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--required-target-information-regime",
+        choices=(
+            TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+            TARGET_INFORMATION_REGIME_PUBLIC,
+        ),
+        default=TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+        help=(
+            "Exact search-operator information regime allowed to provide policy, "
+            "Q, search-root-value, KL-anchor, or surprise targets during public-"
+            "observation training. Defaults to the current coherent public-belief "
+            "single-tree operator. Legacy public PIMC targets require an explicit "
+            "override; recognized public regimes are not interchangeable teachers."
+        ),
+    )
+    parser.add_argument(
         "--public-card-count-features",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -9734,6 +9749,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
             policy_kl_target=args.policy_kl_target,
             policy_surprise_weight=float(args.policy_surprise_weight),
+            required_target_information_regime=str(
+                args.required_target_information_regime
+            ),
             per_game_policy_surprise_weighting=bool(
                 args.per_game_policy_surprise_weighting
             ),
@@ -18318,6 +18336,9 @@ def _validate_target_information_admission(
     value_target_lambda: float,
     policy_kl_anchor_weight: float,
     policy_surprise_weight: float,
+    required_target_information_regime: str = (
+        TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+    ),
     policy_kl_target: float | None = None,
     per_game_policy_surprise_weighting: bool = False,
 ) -> dict[str, object]:
@@ -18389,21 +18410,33 @@ def _validate_target_information_admission(
     ):
         objectives.append("per_game_capped_policy_surprise_sampling")
 
+    required_regime = str(required_target_information_regime)
+    if required_regime not in TARGET_INFORMATION_REGIMES_PUBLIC:
+        raise SystemExit(
+            "required_target_information_regime must name one exact supported "
+            f"public search operator, got {required_regime!r}"
+        )
+    mismatched_target_rows = n - int(counts.get(required_regime, 0))
     report: dict[str, object] = {
         "mask_hidden_info": bool(mask_hidden_info),
         "target_information_regime_counts": counts,
+        "required_target_information_regime": required_regime,
+        "mismatched_target_information_rows": mismatched_target_rows,
         "unsafe_or_unknown_rows": unsafe_count,
         "search_target_objectives": objectives,
     }
-    if bool(mask_hidden_info) and objectives and unsafe_count:
+    if bool(mask_hidden_info) and objectives and mismatched_target_rows:
         raise SystemExit(
-            "public-observation training refused unsafe/unknown search targets: "
-            f"objectives={objectives}, unsafe_or_unknown_rows={unsafe_count}/{n}, "
-            f"target_information_regimes={counts}. Only one of "
-            f"{sorted(TARGET_INFORMATION_REGIMES_PUBLIC)!r} may supply soft policy, Q, or "
-            "search-root value targets to --mask-hidden-info training. Re-generate "
-            "with an attested public-search operator, or disable every listed search-target "
-            "objective and train only on hard actions/realised outcomes."
+            "public-observation training refused mismatched search targets: "
+            f"objectives={objectives}, required_target_information_regime="
+            f"{required_regime!r}, mismatched_rows={mismatched_target_rows}/{n}, "
+            f"unsafe_or_unknown_rows={unsafe_count}/{n}, "
+            f"target_information_regimes={counts}. Public PIMC and coherent-public "
+            "single-tree targets are different policy-improvement operators and may "
+            "not be silently combined or substituted. Reanalyse with the required "
+            "operator, explicitly select the legacy regime for a sealed ablation, or "
+            "disable every listed search-target objective and train only on hard "
+            "actions/realised outcomes."
         )
     return report
 

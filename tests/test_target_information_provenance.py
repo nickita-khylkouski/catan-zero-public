@@ -46,7 +46,10 @@ def _admit(data: dict, **overrides):
 
 
 def test_public_information_set_targets_are_admitted():
-    report = _admit(_data([TARGET_INFORMATION_REGIME_PUBLIC] * 3))
+    report = _admit(
+        _data([TARGET_INFORMATION_REGIME_PUBLIC] * 3),
+        required_target_information_regime=TARGET_INFORMATION_REGIME_PUBLIC,
+    )
     assert report["unsafe_or_unknown_rows"] == 0
     assert report["search_target_objectives"] == ["soft_policy"]
 
@@ -54,7 +57,27 @@ def test_public_information_set_targets_are_admitted():
 def test_coherent_public_belief_targets_are_admitted():
     report = _admit(_data([TARGET_INFORMATION_REGIME_PUBLIC_COHERENT] * 3))
     assert report["unsafe_or_unknown_rows"] == 0
+    assert report["required_target_information_regime"] == (
+        TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+    )
     assert report["search_target_objectives"] == ["soft_policy"]
+
+
+def test_public_pimc_is_not_silently_substituted_for_coherent_teacher():
+    with pytest.raises(SystemExit, match="different policy-improvement operators"):
+        _admit(_data([TARGET_INFORMATION_REGIME_PUBLIC] * 3))
+
+
+def test_public_teacher_regimes_cannot_be_mixed():
+    with pytest.raises(SystemExit, match="mismatched search targets"):
+        _admit(
+            _data(
+                [
+                    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+                    TARGET_INFORMATION_REGIME_PUBLIC,
+                ]
+            )
+        )
 
 
 @pytest.mark.parametrize(
