@@ -86,6 +86,92 @@ def test_policy_objective_fraction_preserves_fractional_boundary() -> None:
         train_bc._policy_objective_fraction(1.01, 1.0)  # noqa: SLF001
 
 
+@pytest.mark.parametrize(
+    ("presence", "group_size", "expected_weight", "expected_fraction"),
+    [
+        ([True, False, False, False], 4, 0.25, 0.25),
+        ([True, True, True, True], 4, 1.0, 1.0),
+        ([True, False], 2, 0.5, 0.5),
+        ([False, False, False, False], 4, 0.0, 0.0),
+    ],
+)
+def test_policy_group_dose_follows_realized_active_microbatches(
+    presence,
+    group_size,
+    expected_weight,
+    expected_fraction,
+) -> None:
+    weight = 0.0
+    fraction = 0.0
+    for active in presence:
+        micro_weight, micro_fraction = (
+            train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
+                policy_loss_weight=1.0,
+                policy_objective_fraction=1.0,
+                globally_policy_active=active,
+                accumulation_group_size=group_size,
+            )
+        )
+        weight += micro_weight
+        fraction += micro_fraction
+
+    assert weight == pytest.approx(expected_weight)
+    assert fraction == pytest.approx(expected_fraction)
+
+
+def test_global_policy_presence_uses_active_rows_not_fixed_denominator(
+    monkeypatch,
+) -> None:
+    pytest.importorskip("torch")
+    import torch.distributed as dist
+
+    def remote_rank_has_policy(tensor, op):
+        assert op == dist.ReduceOp.MAX
+        tensor.fill_(1)
+
+    monkeypatch.setattr(dist, "all_reduce", remote_rank_has_policy)
+    assert train_bc._global_policy_objective_presence(  # noqa: SLF001
+        local_base_active_rows=0,
+        local_aux_active_rows=0,
+        ddp={"enabled": True, "world_size": 2, "rank": 0, "local_rank": 0},
+    )
+    # A positive coverage/fixed denominator is deliberately absent from this
+    # API: zero realized rows must never spend policy dose.
+    assert not train_bc._global_policy_objective_presence(  # noqa: SLF001
+        local_base_active_rows=0,
+        local_aux_active_rows=0,
+        ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+    )
+
+
+def test_value_only_group_does_not_trigger_post_policy_freeze() -> None:
+    consumed = 0.0
+    weight, _fraction = train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
+        policy_loss_weight=1.0,
+        policy_objective_fraction=1.0,
+        globally_policy_active=False,
+        accumulation_group_size=1,
+    )
+    consumed += 0.01 * weight
+    still_open = train_bc._policy_weight_for_lr_area(  # noqa: SLF001
+        1.0,
+        scheduled_base_lr=0.01,
+        consumed_lr_area=consumed,
+        target_lr_area=0.01,
+    )
+    routing = train_bc._post_policy_dose_value_trunk_routing(  # noqa: SLF001
+        base_scale=0.25,
+        post_scale=0.0,
+        target_lr_area=0.01,
+        realized_policy_loss_weight=still_open,
+    )
+
+    assert consumed == 0.0
+    assert still_open == pytest.approx(1.0)
+    assert routing["phase"] == "pre_or_boundary_policy_dose"
+    assert routing["shared_policy_representation_frozen"] is False
+
+
 def test_policy_dose_requires_matching_global_batch_topology() -> None:
     assert train_bc._validate_policy_dose_topology(  # noqa: SLF001
         target_lr_area=0.01,

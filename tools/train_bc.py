@@ -2709,6 +2709,72 @@ def _policy_objective_fraction(
     return min(1.0, fraction)
 
 
+def _global_policy_objective_presence(
+    *,
+    local_base_active_rows: int,
+    local_aux_active_rows: int,
+    ddp: Mapping[str, int | bool],
+) -> bool:
+    """Return whether any rank supplied real policy rows to this microbatch.
+
+    Policy-loss denominators are not an admissible signal here: coverage-mode
+    normalizers can stay positive on a rank whose microbatch contains no policy
+    rows. Dose ownership follows realized rows, reduced across the complete DDP
+    worker set.
+    """
+
+    base_rows = int(local_base_active_rows)
+    aux_rows = int(local_aux_active_rows)
+    if base_rows < 0 or aux_rows < 0:
+        raise ValueError("policy active-row counts must be non-negative")
+    present = base_rows + aux_rows > 0
+    if not bool(ddp.get("enabled", False)):
+        return present
+
+    import torch
+    import torch.distributed as dist
+
+    device = (
+        f"cuda:{int(ddp.get('local_rank', 0))}"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+    global_presence = torch.tensor(
+        int(present),
+        dtype=torch.int32,
+        device=device,
+    )
+    dist.all_reduce(global_presence, op=dist.ReduceOp.MAX)
+    return bool(global_presence.item())
+
+
+def _realized_policy_microbatch_dose(
+    *,
+    policy_loss_weight: float,
+    policy_objective_fraction: float,
+    globally_policy_active: bool,
+    accumulation_group_size: int,
+) -> tuple[float, float]:
+    """Return this microbatch's contribution to one optimizer-group dose.
+
+    The learner divides every microbatch objective by the actual accumulation
+    group size, including a short trailing group. Policy LR-area and equivalent
+    optimizer updates must use the same divisor or value-only/empty
+    microbatches silently spend a dose they never applied.
+    """
+
+    weight = _validate_policy_loss_weight(policy_loss_weight)
+    fraction = float(policy_objective_fraction)
+    group_size = int(accumulation_group_size)
+    if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+        raise ValueError("policy objective fraction must be finite and in [0, 1]")
+    if group_size < 1:
+        raise ValueError("policy accumulation group size must be positive")
+    if not bool(globally_policy_active):
+        return 0.0, 0.0
+    return weight / group_size, fraction / group_size
+
+
 def _validate_policy_dose_topology(
     *,
     target_lr_area: float,
@@ -11260,6 +11326,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.policy_loss_weight
     )
     if float(args.policy_dose_lr_area) > 0.0:
+        if float(args.policy_loss_weight) == 0.0:
+            raise SystemExit(
+                "positive --policy-dose-lr-area requires "
+                "--policy-loss-weight > 0"
+            )
         policy_group_multipliers = {
             "--trunk-lr-mult": float(args.trunk_lr_mult),
             "--action-module-lr-mult": float(args.action_module_lr_mult),
@@ -11593,39 +11664,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             "xdim_graph (the _train_xdim_batch trainer); other archs must use "
             "--grad-accum-steps 1"
         )
-    if args.grow_from_checkpoint and args.init_checkpoint:
-        raise SystemExit(
-            "--grow-from-checkpoint and --init-checkpoint are mutually exclusive: "
-            "--init-checkpoint resumes at the checkpoint's exact architecture, "
-            "--grow-from-checkpoint warm-starts a fresh (bigger) architecture"
-        )
-    if args.grow_from_checkpoint and args.arch != "entity_graph":
-        raise SystemExit("--grow-from-checkpoint currently supports --arch entity_graph only")
-    args.value_categorical_bins = _resolve_effective_value_categorical_bins(args)
-    args.public_card_count_features = (
-        _resolve_effective_public_card_count_features(args)
-    )
-    args.public_card_count_residual_bias = (
-        _resolve_effective_public_card_count_residual_bias(args)
-    )
-    args.public_rule_state_features = (
-        _resolve_effective_public_rule_state_features(args)
-    )
-    args.action_target_gather = _resolve_effective_action_target_gather(args)
-    (
-        args.static_action_residual,
-        args.legal_action_value_residual,
-        args.legal_action_value_set_statistics,
-    ) = _resolve_effective_structured_action_residuals(args)
-    args.value_tower_split_layers = (
-        _resolve_effective_value_tower_split_layers(args)
-    )
-    (
-        args.meaningful_public_history,
-        args.event_history_limit,
-        args.meaningful_public_history_pooling,
-        args.meaningful_public_history_target_gather,
-    ) = _resolve_effective_meaningful_public_history(args)
     args.policy_target_reanalysis = None
     if str(args.data_format) != "memmap":
         reanalysis_manifest = Path(args.data) / "manifest.json"
@@ -14649,6 +14687,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         micro_in_group = 0
         accumulation_group_size = accum
         policy_group_objective_fraction = 0.0
+        policy_group_lr_area_weight = 0.0
         # The policy-KL anchor and value-uncertainty auxiliary loss are entity_graph
         # (_train_xdim_batch) features -- the legacy dense _train_candidate_batch path
         # does not accept them, so only forward them when the xdim trainer is active.
@@ -14776,6 +14815,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             accum_do_zero_grad = micro_in_group == 1
             if accum_do_zero_grad:
                 policy_group_objective_fraction = 0.0
+                policy_group_lr_area_weight = 0.0
                 # The final accumulation group can contain fewer than ``accum``
                 # micro-batches.  Dividing those losses by the configured size
                 # would shrink the final optimizer update by k/accum and break
@@ -15051,6 +15091,29 @@ def main(argv: Sequence[str] | None = None) -> None:
             optimizer_step_applied = bool(
                 batch_metrics.get("optimizer_step_applied", accum_do_step)
             )
+            globally_policy_active = _global_policy_objective_presence(
+                local_base_active_rows=int(
+                    batch_metrics.get(
+                        "policy_base_active_count",
+                        batch_metrics.get("active_count", 0),
+                    )
+                ),
+                local_aux_active_rows=int(
+                    batch_metrics.get("policy_aux_active_count", 0)
+                ),
+                ddp=ddp,
+            )
+            (
+                microbatch_lr_area_weight,
+                microbatch_objective_fraction,
+            ) = _realized_policy_microbatch_dose(
+                policy_loss_weight=batch_policy_loss_weight,
+                policy_objective_fraction=batch_policy_objective_fraction,
+                globally_policy_active=globally_policy_active,
+                accumulation_group_size=accumulation_group_size,
+            )
+            policy_group_lr_area_weight += microbatch_lr_area_weight
+            policy_group_objective_fraction += microbatch_objective_fraction
             if batch_post_policy_routing["phase"] == "post_policy_dose":
                 epoch_post_policy_dose_value_routing_batches += 1
                 if optimizer_step_applied:
@@ -15066,8 +15129,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             if optimizer_step_applied:
                 optimizer_lr_applied_updates += 1
                 optimizer_schedule_multiplier_sum += float(applied_lr_multiplier)
-                policy_objective_lr_area += (
-                    float(batch_policy_loss_weight) * scheduled_base_lr
+                next_policy_objective_lr_area = policy_objective_lr_area + (
+                    policy_group_lr_area_weight * scheduled_base_lr
+                )
+                policy_objective_lr_area = (
+                    min(
+                        next_policy_objective_lr_area,
+                        float(args.policy_dose_lr_area),
+                    )
+                    if float(args.policy_dose_lr_area) > 0.0
+                    else next_policy_objective_lr_area
                 )
                 if (
                     policy_dose_cutoff_optimizer_step is None
@@ -15233,10 +15304,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                     batch_policy_effective_weight
                     * batch_policy_objective_fraction
                 )
-            policy_group_objective_fraction = max(
-                policy_group_objective_fraction,
-                batch_policy_objective_fraction,
-            )
             if (
                 optimizer_step_applied
                 and policy_group_objective_fraction > 0.0
