@@ -2437,8 +2437,14 @@ def _value_trunk_gradient_routing(
         if final_vp_weight is None
         else final_vp_weight
     )
+    scalar_value_objective = str(
+        getattr(args, "scalar_value_objective", "mse")
+    )
+    scalar_primary_loss_kind = _scalar_value_primary_loss_kind(
+        scalar_value_objective
+    )
     active_value_objectives = {
-        "scalar_mse": float(scalar_weight),
+        scalar_primary_loss_kind: float(scalar_weight),
         "categorical_ce": float(categorical_weight),
         "final_vp": resolved_final_vp_weight,
     }
@@ -2473,6 +2479,8 @@ def _value_trunk_gradient_routing(
         "shared_state_upstream_gradient_scale": scale,
         "scope": "value_family_readouts_all_shared_inputs",
         "legacy_scope_alias": "scalar_value_head_state_input_only",
+        "scalar_value_objective": scalar_value_objective,
+        "scalar_value_primary_loss_kind": scalar_primary_loss_kind,
         "active_value_objectives": active_value_objectives,
         "shared_input_paths": shared_input_paths,
         "value_attention_pool_enabled": value_attention_pool,

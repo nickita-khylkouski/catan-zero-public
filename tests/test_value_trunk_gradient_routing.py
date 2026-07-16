@@ -169,6 +169,7 @@ def _args(**overrides):
     values = {
         "arch": "entity_graph",
         "value_head_type": "mse",
+        "scalar_value_objective": "mse",
         "value_trunk_grad_scale": 1.0,
         "value_target_lambda": 1.0,
     }
@@ -266,6 +267,26 @@ def test_categorical_value_objective_can_use_trunk_gradient_protection() -> None
         "categorical_ce": 0.25,
         "final_vp": 0.0,
     }
+
+
+def test_binary_win_routing_reports_the_actual_scalar_objective() -> None:
+    routing = train_bc._value_trunk_gradient_routing(
+        _args(
+            scalar_value_objective="binary_win_bce",
+            value_trunk_grad_scale=0.25,
+        ),
+        scalar_weight=0.25,
+    )
+
+    assert routing["scalar_value_objective"] == "binary_win_bce"
+    assert routing["scalar_value_primary_loss_kind"] == "binary_win_bce"
+    assert routing["active_value_objectives"] == {
+        "binary_win_bce": 0.25,
+        "categorical_ce": 0.0,
+        "final_vp": 0.0,
+    }
+    assert "scalar_mse" not in routing["active_value_objectives"]
+
 
 def test_train_config_hash_binds_value_trunk_gradient_scale() -> None:
     from catan_zero.rl.pipeline_configs import TrainConfig
