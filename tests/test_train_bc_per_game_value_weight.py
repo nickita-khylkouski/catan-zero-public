@@ -6,6 +6,7 @@ import pytest
 from tools.train_bc import (
     _MemmapCategoricalColumn,
     _apply_authenticated_value_training_scope,
+    _forced_value_nominal_population_measure,
     _value_component_active_dose_for_batch,
     _value_independent_evidence_report,
     _value_training_scope_report,
@@ -220,6 +221,118 @@ def test_forced_row_action_type_weights_compose_after_global_multiplier() -> Non
     assert report["effective_forced_value_mass"] == pytest.approx(
         sum(float(weights[index]) for index in (0, 1, 2))
     )
+
+
+def test_forced_action_mass_report_uses_only_training_objective_measure() -> None:
+    catalog = ActionCatalog(("RED", "BLUE"))
+    roll = _catalog_action_id(catalog, "ROLL")
+    end_turn = _catalog_action_id(catalog, "END_TURN")
+    build_road = _catalog_action_id(catalog, "BUILD_ROAD")
+    data = {
+        "action_taken": np.asarray(
+            [roll, end_turn, build_road, roll], dtype=np.int16
+        ),
+        "legal_action_ids": np.asarray(
+            [
+                [roll, -1],
+                [end_turn, -1],
+                [build_road, roll],
+                [roll, -1],
+            ],
+            dtype=np.int32,
+        ),
+    }
+    # Rows 0 and 2 are the training split. Row 1 is a forced validation row
+    # with enormous mass; row 3 is another excluded forced row. The supplied
+    # vector is already the sampler-adjusted optimizer objective measure.
+    objective_measure = np.asarray([0.25, 1000.0, 0.75, 1000.0], dtype=np.float64)
+
+    report = forced_action_type_value_mass_quality(
+        data,
+        objective_measure,
+        row_indices=np.asarray([0, 2], dtype=np.int64),
+        objective_measure="coverage_importance_training_value_loss_v1",
+        action_catalog=catalog,
+        configured_weights={"ROLL": 1.0},
+    )
+
+    assert report["schema_version"] == "forced-action-type-value-mass-v2"
+    assert report["scope"] == "training_rows"
+    assert report["scope_rows"] == 2
+    assert report["objective_measure"] == (
+        "coverage_importance_training_value_loss_v1"
+    )
+    assert report["forced_rows"] == 1
+    assert report["forced_row_fraction"] == pytest.approx(0.5)
+    assert report["effective_forced_value_mass"] == pytest.approx(0.25)
+    assert report["effective_total_value_mass"] == pytest.approx(1.0)
+    assert report["effective_forced_value_mass_fraction"] == pytest.approx(0.25)
+    assert report["by_action_type"]["ROLL"]["rows"] == 1
+    assert "END_TURN" not in report["by_action_type"]
+
+
+def test_forced_value_nominal_measure_composes_sampler_and_label_confidence() -> None:
+    weights = np.asarray([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
+    train_indices = np.asarray([1, 3], dtype=np.int64)
+    confidence = np.asarray([0.5, 0.25], dtype=np.float32)
+
+    weighted, weighted_name = _forced_value_nominal_population_measure(
+        weights,
+        train_indices,
+        base_sampler="weighted_replacement_v1",
+        component_game_sampling=np.asarray([0.25, 0.75], dtype=np.float64),
+        objective_confidence=confidence,
+    )
+    coverage_weights = weights.copy()
+    coverage_weights[train_indices] *= np.asarray([0.5, 1.5], dtype=np.float32)
+    coverage, coverage_name = _forced_value_nominal_population_measure(
+        coverage_weights,
+        train_indices,
+        base_sampler="coverage_importance_v1",
+        component_game_sampling=np.asarray([0.25, 0.75], dtype=np.float64),
+        objective_confidence=confidence,
+    )
+
+    assert weighted.tolist() == pytest.approx([2.5, 7.5])
+    assert weighted_name == (
+        "authenticated_weighted_replacement_scalar_outcome_value_loss_v1"
+    )
+    assert coverage.tolist() == pytest.approx([5.0, 15.0])
+    assert coverage.tolist() == pytest.approx((2.0 * weighted).tolist())
+    assert coverage[0] / coverage.sum() == pytest.approx(
+        weighted[0] / weighted.sum()
+    )
+    assert coverage_name == "coverage_importance_scalar_outcome_value_loss_v1"
+    assert weights.tolist() == [10.0, 20.0, 30.0, 40.0]
+
+
+@pytest.mark.parametrize(
+    ("row_indices", "match"),
+    [
+        (np.asarray([0, 0], dtype=np.int64), "must be unique"),
+        (np.asarray([-1], dtype=np.int64), "out of range"),
+        (np.asarray([[0]], dtype=np.int64), "one-dimensional"),
+    ],
+)
+def test_forced_action_mass_report_rejects_invalid_scope(
+    row_indices: np.ndarray, match: str
+) -> None:
+    catalog = ActionCatalog(("RED", "BLUE"))
+    roll = _catalog_action_id(catalog, "ROLL")
+    data = {
+        "action_taken": np.asarray([roll], dtype=np.int16),
+        "legal_action_ids": np.asarray([[roll]], dtype=np.int32),
+    }
+
+    with pytest.raises(ValueError, match=match):
+        forced_action_type_value_mass_quality(
+            data,
+            np.ones(1, dtype=np.float32),
+            row_indices=row_indices,
+            objective_measure="test_measure",
+            action_catalog=catalog,
+            configured_weights={"ROLL": 1.0},
+        )
 
 
 def test_empty_forced_row_action_type_map_is_exact_historical_default() -> None:

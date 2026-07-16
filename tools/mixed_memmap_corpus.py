@@ -211,6 +211,36 @@ class _ConcatColumn:
             array = array.copy()
         return array
 
+    def row_counts(self, index: Any = None) -> np.ndarray:
+        """Route compact ragged-row counts without decoding padded payloads."""
+
+        if not all(
+            callable(getattr(column, "row_counts", None))
+            for column in self._columns
+        ):
+            raise TypeError("concatenated column has no ragged row-count view")
+        if index is None:
+            return np.concatenate(
+                [
+                    np.asarray(column.row_counts(), dtype=np.int64)
+                    for column in self._columns
+                ]
+            )
+        indices, scalar = _normalize_global_index(index, self._n)
+        flat = np.asarray(indices, dtype=np.int64).reshape(-1)
+        output = np.empty(flat.size, dtype=np.int64)
+        for part, column in enumerate(self._columns):
+            selected = (flat >= self._offsets[part]) & (
+                flat < self._offsets[part + 1]
+            )
+            if not bool(np.any(selected)):
+                continue
+            local = flat[selected] - self._offsets[part]
+            output[selected] = np.asarray(
+                column.row_counts(local), dtype=np.int64
+            )
+        return output[0] if scalar else output.reshape(indices.shape)
+
     def grouped_weights(
         self, weights: np.ndarray, *, limit: int
     ) -> dict[str, dict[str, float | int]]:

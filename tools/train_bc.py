@@ -15105,10 +15105,46 @@ def main(
             value_player_outcome_balance_report
         )
         if forced_row_value_action_type_weight_map:
+            if (
+                float(resolved_scalar_value_weight) > 0.0
+                and "winner" in data
+                and "player" in data
+            ):
+                forced_value_outcome_confidence = (
+                    _scalar_value_outcome_confidence_for_rows(
+                        data,
+                        train_indices,
+                        int(args.vps_to_win),
+                        truncated_vp_margin_value_weight=float(
+                            args.truncated_vp_margin_value_weight
+                        ),
+                        public_information_only=bool(args.mask_hidden_info),
+                    )
+                )
+                forced_value_objective_active = True
+            else:
+                forced_value_outcome_confidence = np.zeros(
+                    len(train_indices), dtype=np.float32
+                )
+                forced_value_objective_active = False
+            (
+                forced_value_objective_measure,
+                forced_value_objective_measure_name,
+            ) = _forced_value_nominal_population_measure(
+                training_value_sample_weights,
+                train_indices,
+                base_sampler=base_sampler,
+                component_game_sampling=component_game_sampling,
+                objective_confidence=forced_value_outcome_confidence,
+            )
             value_sample_weight_report["by_forced_action_type"] = (
                 forced_action_type_value_mass_quality(
                     data,
-                    value_sample_weights,
+                    forced_value_objective_measure,
+                    row_indices=train_indices,
+                    weights_aligned_to_rows=True,
+                    objective_measure=forced_value_objective_measure_name,
+                    objective_active=forced_value_objective_active,
                     action_catalog=forced_row_value_action_catalog,
                     configured_weights=forced_row_value_action_type_weight_map,
                 )
@@ -29858,6 +29894,101 @@ def _policy_value_categorical_bins(policy: object) -> int:
     return bins
 
 
+def _scalar_value_outcome_targets_np(
+    data: dict,
+    batch: np.ndarray,
+    vps_to_win: int,
+    *,
+    truncated_vp_margin_value_weight: float = 0.0,
+    public_information_only: bool | None = None,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Build the exact scalar-outcome target mask and confidence on CPU."""
+
+    winners = np.asarray(data["winner"][batch]).astype(str)
+    players = np.asarray(data["player"][batch]).astype(str)
+    truncated = _batch_array_or_fill(
+        data,
+        "truncated",
+        batch,
+        False,
+        dtype=np.bool_,
+    )
+    has_outcome = (winners != "") & ~truncated
+    outcome = np.zeros(len(batch), dtype=np.float32)
+    outcome[has_outcome & (winners == players)] = 1.0
+    outcome[has_outcome & (winners != players)] = -1.0
+    value_outcome = outcome.copy()
+    value_has_outcome = has_outcome.copy()
+    confidence = np.where(has_outcome, 1.0, 0.0).astype(np.float32)
+    if float(truncated_vp_margin_value_weight) > 0.0 and truncated.any():
+        if public_information_only is None:
+            public_information_only = _MASK_HIDDEN_INFO_PLAYER_TOKENS
+        soft_mask, soft_outcome = _truncated_vp_margin_outcome(
+            data,
+            batch,
+            truncated,
+            vps_to_win,
+            public_information_only=bool(public_information_only),
+        )
+        fill = soft_mask & ~has_outcome
+        value_outcome[fill] = soft_outcome[fill]
+        value_has_outcome |= fill
+        confidence[fill] = float(truncated_vp_margin_value_weight)
+    return (
+        outcome,
+        has_outcome,
+        value_outcome,
+        value_has_outcome,
+        confidence,
+        truncated,
+    )
+
+
+def _scalar_value_outcome_confidence_for_rows(
+    data: dict,
+    rows: np.ndarray,
+    vps_to_win: int,
+    *,
+    truncated_vp_margin_value_weight: float = 0.0,
+    public_information_only: bool | None = None,
+    chunk_rows: int = 1 << 20,
+) -> np.ndarray:
+    """Return exact scalar-value eligibility/confidence with bounded decoding."""
+
+    indices = np.asarray(rows, dtype=np.int64)
+    if indices.ndim != 1:
+        raise ValueError("scalar value confidence rows must be one-dimensional")
+    chunk_size = int(chunk_rows)
+    if chunk_size <= 0:
+        raise ValueError("scalar value confidence chunk size must be positive")
+    confidence = np.empty(indices.shape[0], dtype=np.float32)
+    for start in range(0, indices.shape[0], chunk_size):
+        stop = min(start + chunk_size, indices.shape[0])
+        (
+            _outcome,
+            _has_outcome,
+            _value_outcome,
+            _value_has_outcome,
+            chunk_confidence,
+            _truncated,
+        ) = _scalar_value_outcome_targets_np(
+            data,
+            indices[start:stop],
+            vps_to_win,
+            truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+            public_information_only=public_information_only,
+        )
+        confidence[start:stop] = chunk_confidence
+    return confidence
+
+
 def _value_targets(
     data: dict,
     batch: np.ndarray,
@@ -29871,41 +30002,23 @@ def _value_targets(
 
     if "winner" not in data or "player" not in data:
         return None, None, None, None, None, None, None
-    winners = np.asarray(data["winner"][batch]).astype(str)
-    players = np.asarray(data["player"][batch]).astype(str)
-    truncated = _batch_array_or_fill(
+    # The policy advantage view (outcome/has_outcome_np) intentionally remains
+    # separate from the scalar value-loss view, which may admit confidence-
+    # weighted truncated VP-margin targets.
+    (
+        outcome,
+        has_outcome_np,
+        value_outcome,
+        value_has_outcome_np,
+        outcome_confidence,
+        truncated,
+    ) = _scalar_value_outcome_targets_np(
         data,
-        "truncated",
         batch,
-        False,
-        dtype=np.bool_,
+        vps_to_win,
+        truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+        public_information_only=public_information_only,
     )
-    has_outcome_np = (winners != "") & ~truncated
-    outcome = np.zeros(len(batch), dtype=np.float32)
-    outcome[has_outcome_np & (winners == players)] = 1.0
-    outcome[has_outcome_np & (winners != players)] = -1.0
-    # FIX F3: value_outcome/value_has_outcome_np/outcome_confidence are a SEPARATE,
-    # value-loss-only view -- outcome/has_outcome_np above stay exactly as they were
-    # (some callers, e.g. _train_xdim_batch, also feed them into
-    # _advantage_reweighted_policy_weights for POLICY advantage weighting, which this
-    # fix must not touch; team-lead scoped F3 to the value head only).
-    value_outcome = outcome.copy()
-    value_has_outcome_np = has_outcome_np.copy()
-    outcome_confidence = np.where(has_outcome_np, 1.0, 0.0).astype(np.float32)
-    if float(truncated_vp_margin_value_weight) > 0.0 and truncated.any():
-        if public_information_only is None:
-            public_information_only = _MASK_HIDDEN_INFO_PLAYER_TOKENS
-        soft_mask, soft_outcome = _truncated_vp_margin_outcome(
-            data,
-            batch,
-            truncated,
-            vps_to_win,
-            public_information_only=bool(public_information_only),
-        )
-        fill = soft_mask & ~has_outcome_np
-        value_outcome[fill] = soft_outcome[fill]
-        value_has_outcome_np = value_has_outcome_np | fill
-        outcome_confidence[fill] = float(truncated_vp_margin_value_weight)
     vp_target = np.zeros(len(batch), dtype=np.float32)
     has_vp_np = np.zeros(len(batch), dtype=bool)
     if "seat" in data and "final_actual_vps" in data:
@@ -33396,12 +33509,17 @@ def value_player_outcome_balance_quality(
     }
 
 
-def _legal_action_counts(legal_column: object) -> np.ndarray:
-    counts = (
-        legal_column.row_counts()
-        if isinstance(legal_column, _MemmapRaggedColumn)
-        else np.sum(np.asarray(legal_column) >= 0, axis=1)
-    )
+def _legal_action_counts(
+    legal_column: object,
+    row_indices: np.ndarray | None = None,
+) -> np.ndarray:
+    compact_row_counts = getattr(legal_column, "row_counts", None)
+    if callable(compact_row_counts):
+        counts = compact_row_counts(row_indices)
+    elif row_indices is None:
+        counts = np.sum(np.asarray(legal_column) >= 0, axis=1)
+    else:
+        counts = np.sum(np.asarray(legal_column[row_indices]) >= 0, axis=1)
     return np.asarray(counts, dtype=np.int64)
 
 
@@ -33458,8 +33576,22 @@ def _validated_forced_action_ids(
     forced_mask: np.ndarray,
     *,
     action_catalog_size: int,
+    row_indices: np.ndarray | None = None,
 ) -> np.ndarray:
-    actions = np.asarray(data["action_taken"])[forced_mask]
+    forced = np.asarray(forced_mask, dtype=np.bool_)
+    if forced.ndim != 1:
+        raise ValueError("forced-row mask must be one-dimensional")
+    if row_indices is None:
+        if forced.shape[0] != len(data["action_taken"]):
+            raise ValueError("forced-row mask length does not match corpus rows")
+        actions = np.asarray(data["action_taken"])[forced]
+        forced_rows = np.flatnonzero(forced)
+    else:
+        source_rows = np.asarray(row_indices, dtype=np.int64)
+        if source_rows.ndim != 1 or forced.shape[0] != source_rows.shape[0]:
+            raise ValueError("forced-row scope does not match its row indices")
+        actions = np.asarray(data["action_taken"][source_rows])[forced]
+        forced_rows = source_rows[np.flatnonzero(forced)]
     action_ids = np.asarray(actions, dtype=np.int64)
     if (
         action_ids.shape != actions.shape
@@ -33473,7 +33605,6 @@ def _validated_forced_action_ids(
     legal_column = data.get("legal_action_ids")
     if legal_column is None:
         raise SystemExit("forced-row action validation requires legal_action_ids")
-    forced_rows = np.flatnonzero(np.asarray(forced_mask, dtype=np.bool_))
     forced_legal = np.asarray(legal_column[forced_rows])
     if forced_legal.ndim != 2 or forced_legal.shape[0] != action_ids.shape[0]:
         raise SystemExit("forced-row legal action payload is malformed")
@@ -33489,14 +33620,93 @@ def _validated_forced_action_ids(
     return action_ids
 
 
+def _forced_value_nominal_population_measure(
+    training_value_sample_weights: np.ndarray,
+    train_indices: np.ndarray,
+    *,
+    base_sampler: str,
+    component_game_sampling: np.ndarray | None,
+    objective_confidence: np.ndarray | None = None,
+) -> tuple[np.ndarray, str]:
+    """Materialize the intended scalar-value population objective measure."""
+
+    indices = np.asarray(train_indices, dtype=np.int64)
+    if indices.ndim != 1:
+        raise ValueError("training value objective indices must be one-dimensional")
+    source_weights = np.asarray(training_value_sample_weights)
+    if (
+        source_weights.ndim != 1
+        or np.any(indices < 0)
+        or np.any(indices >= source_weights.shape[0])
+    ):
+        raise ValueError("training value objective rows are not weight-aligned")
+    weights = np.asarray(source_weights[indices], dtype=np.float64)
+    if objective_confidence is not None:
+        confidence = np.asarray(objective_confidence, dtype=np.float64)
+        if (
+            confidence.ndim != 1
+            or confidence.shape != indices.shape
+            or not np.isfinite(confidence).all()
+            or np.any(confidence < 0.0)
+        ):
+            raise ValueError(
+                "scalar value objective confidence must be non-negative, "
+                "finite, and aligned to training rows"
+            )
+        weights *= confidence
+    if base_sampler == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1:
+        # Coverage has already transferred authenticated p_i onto its uniform
+        # traversal as N*p_i inside training_value_sample_weights. A fixed
+        # normalizer is a scalar and therefore cannot change mass fractions.
+        return weights, "coverage_importance_scalar_outcome_value_loss_v1"
+    if base_sampler != BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1:
+        raise ValueError(f"unsupported base sampler {base_sampler!r}")
+    if component_game_sampling is None:
+        # Ordinary corpora use the uniform epoch path. The omitted 1/N factor
+        # is common to every row and cancels from all reported fractions.
+        return weights, "uniform_training_row_scalar_outcome_value_loss_v1"
+    probabilities = np.asarray(component_game_sampling, dtype=np.float64)
+    if (
+        probabilities.ndim != 1
+        or probabilities.shape != indices.shape
+        or not np.isfinite(probabilities).all()
+        or np.any(probabilities < 0.0)
+        or not math.isclose(
+            float(probabilities.sum()), 1.0, rel_tol=0.0, abs_tol=1.0e-9
+        )
+    ):
+        raise ValueError(
+            "authenticated weighted-replacement probabilities must be "
+            "non-negative, normalized, and aligned to training rows"
+        )
+    # Weighted replacement visits row i with probability p_i. Its population
+    # value objective therefore has mass p_i * loss_weight_i.
+    weights *= probabilities
+    return (
+        weights,
+        "authenticated_weighted_replacement_scalar_outcome_value_loss_v1",
+    )
+
+
 def forced_action_type_value_mass_quality(
     data: dict,
     weights: np.ndarray,
     *,
+    row_indices: np.ndarray | None = None,
+    weights_aligned_to_rows: bool = False,
+    objective_measure: str = "supplied_value_loss_weights",
+    objective_active: bool = True,
     action_catalog: object,
     configured_weights: Mapping[str, float],
 ) -> dict[str, object]:
-    """Report final effective value-loss mass for each forced action type."""
+    """Report forced-action mass under an explicit value objective measure.
+
+    ``weights`` is full-corpus aligned. ``row_indices`` selects the unique
+    population whose optimizer objective is being audited; callers using a
+    non-uniform sampler must supply weights that already include its draw
+    measure. This keeps validation rows and pre-sampler weights from silently
+    contaminating the production training-signal report.
+    """
 
     multipliers, action_types = _action_catalog_type_projection(
         action_catalog, configured_weights
@@ -33505,15 +33715,67 @@ def forced_action_type_value_mass_quality(
         raise SystemExit(
             "forced action-type value mass reporting requires legal_action_ids"
         )
+    row_count = len(data["action_taken"])
+    if not isinstance(objective_measure, str) or not objective_measure.strip():
+        raise ValueError("forced action-type objective measure must be non-empty")
+    if row_indices is None:
+        scope_rows = None
+        scope_row_count = row_count
+        scope_name = "all_rows"
+    else:
+        scope_rows = np.asarray(row_indices)
+        if scope_rows.ndim != 1:
+            raise ValueError("forced action-type value scope must be one-dimensional")
+        if not np.issubdtype(scope_rows.dtype, np.integer):
+            raise ValueError("forced action-type value scope must contain row indices")
+        scope_rows = scope_rows.astype(np.int64, copy=False)
+        if np.any(scope_rows < 0) or np.any(scope_rows >= row_count):
+            raise ValueError("forced action-type value scope row is out of range")
+        if scope_rows.size > 1 and np.any(scope_rows[1:] <= scope_rows[:-1]):
+            raise ValueError(
+                "forced action-type value scope rows must be unique and "
+                "strictly increasing"
+            )
+        scope_row_count = int(scope_rows.size)
+        scope_name = "training_rows"
     final_weights = np.asarray(weights, dtype=np.float64)
-    forced = _legal_action_counts(data["legal_action_ids"]) == 1
+    expected_weight_rows = (
+        scope_row_count if bool(weights_aligned_to_rows) else row_count
+    )
+    if (
+        final_weights.ndim != 1
+        or final_weights.shape[0] != expected_weight_rows
+        or not np.isfinite(final_weights).all()
+        or np.any(final_weights < 0.0)
+        or (bool(weights_aligned_to_rows) and scope_rows is None)
+    ):
+        alignment = (
+            "selected scope rows"
+            if bool(weights_aligned_to_rows)
+            else "corpus rows"
+        )
+        raise ValueError(
+            "forced action-type value objective weights must be finite, "
+            f"non-negative, and aligned to {alignment}"
+        )
+    scoped_weights = (
+        final_weights
+        if bool(weights_aligned_to_rows) or scope_rows is None
+        else final_weights[scope_rows]
+    )
+    forced = _legal_action_counts(
+        data["legal_action_ids"], scope_rows
+    ) == 1
     action_ids = _validated_forced_action_ids(
-        data, forced, action_catalog_size=len(multipliers)
+        data,
+        forced,
+        action_catalog_size=len(multipliers),
+        row_indices=scope_rows,
     )
     counts_by_id = np.bincount(action_ids, minlength=len(multipliers))
     mass_by_id = np.bincount(
         action_ids,
-        weights=final_weights[forced],
+        weights=scoped_weights[forced],
         minlength=len(multipliers),
     )
     rows_by_type: dict[str, int] = {}
@@ -33525,8 +33787,8 @@ def forced_action_type_value_mass_quality(
         mass_by_type[action_type] = mass_by_type.get(action_type, 0.0) + float(
             mass_by_id[action_id]
         )
-    forced_mass = float(np.sum(final_weights[forced]))
-    total_mass = float(np.sum(final_weights))
+    forced_mass = float(np.sum(scoped_weights[forced]))
+    total_mass = float(np.sum(scoped_weights))
     by_action_type = {
         action_type: {
             "rows": rows_by_type[action_type],
@@ -33545,7 +33807,26 @@ def forced_action_type_value_mass_quality(
         if rows_by_type[action_type] > 0
     }
     return {
+        "schema_version": "forced-action-type-value-mass-v2",
         "enabled": True,
+        "scope": scope_name,
+        "scope_rows": scope_row_count,
+        "weights_alignment": (
+            "scope_rows" if bool(weights_aligned_to_rows) else "corpus_rows"
+        ),
+        "objective_measure": str(objective_measure),
+        "objective": "scalar_outcome_value_loss",
+        "objective_active": bool(objective_active),
+        "measure_semantics": "nominal_population_objective_v1",
+        "mass_scale_semantics": (
+            "raw_mass_units_are_objective_measure_specific;fractions_only_are_"
+            "cross_sampler_comparable"
+        ),
+        "realized_optimizer_coefficient_semantics": (
+            "coverage_fixed_denominator_is_unbiased;uniform_and_weighted_"
+            "replacement_self_normalized_microbatches_are_not_exactly_"
+            "represented"
+        ),
         "configured_weights": {
             key: float(configured_weights[key]) for key in sorted(configured_weights)
         },

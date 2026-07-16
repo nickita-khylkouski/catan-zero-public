@@ -5,7 +5,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from catan_zero.rl.action_mask import ActionCatalog
 from tools import train_bc
+from tools.mixed_memmap_corpus import _ConcatColumn
 
 
 def test_categorical_memmap_decodes_only_requested_rows(tmp_path: Path) -> None:
@@ -131,3 +133,117 @@ def test_forced_value_weights_use_ragged_offsets_without_padding_reconstruction(
         forced_row_value_weight=0.1,
     )
     assert weights.tolist() == pytest.approx([2.0 / 11.0, 20.0 / 11.0])
+
+
+def test_forced_mass_report_reads_only_selected_forced_ragged_rows(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    catalog = ActionCatalog(("RED", "BLUE"))
+    roll = next(
+        index
+        for index in range(catalog.size)
+        if catalog.describe(index)["action_type"] == "ROLL"
+    )
+    build_road = next(
+        index
+        for index in range(catalog.size)
+        if catalog.describe(index)["action_type"] == "BUILD_ROAD"
+    )
+    flat_path = tmp_path / "legal-report.dat"
+    np.asarray([roll, build_road, roll, roll], dtype=np.int16).tofile(flat_path)
+    flat = np.memmap(flat_path, dtype=np.int16, mode="r", shape=(4,))
+    column = train_bc._MemmapRaggedColumn(  # noqa: SLF001
+        flat,
+        np.asarray([0, 1, 2, 4], dtype=np.int64),
+        2,
+        -1,
+        np.int16,
+        None,
+    )
+    reconstructed: list[np.ndarray | None] = []
+    original = column._reconstruct  # noqa: SLF001
+
+    def observe(indices):
+        reconstructed.append(indices)
+        return original(indices)
+
+    monkeypatch.setattr(column, "_reconstruct", observe)
+    report = train_bc.forced_action_type_value_mass_quality(
+        {
+            "action_taken": np.asarray([roll, build_road, roll], dtype=np.int16),
+            "legal_action_ids": column,
+        },
+        np.ones(3, dtype=np.float32),
+        row_indices=np.asarray([0, 2], dtype=np.int64),
+        objective_measure="test_nominal_measure",
+        action_catalog=catalog,
+        configured_weights={"ROLL": 1.0},
+    )
+
+    assert report["forced_rows"] == 1
+    assert len(reconstructed) == 1
+    assert reconstructed[0].tolist() == [0]
+
+
+def test_forced_mass_report_routes_compact_counts_through_composite(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    catalog = ActionCatalog(("RED", "BLUE"))
+    roll = next(
+        index
+        for index in range(catalog.size)
+        if catalog.describe(index)["action_type"] == "ROLL"
+    )
+    build_road = next(
+        index
+        for index in range(catalog.size)
+        if catalog.describe(index)["action_type"] == "BUILD_ROAD"
+    )
+    columns = []
+    observations: list[list[np.ndarray | None]] = []
+    for part, (legal, offsets) in enumerate(
+        (
+            ([roll, build_road, roll], [0, 1, 3]),
+            ([build_road, roll, roll], [0, 2, 3]),
+        )
+    ):
+        path = tmp_path / f"legal-composite-{part}.dat"
+        np.asarray(legal, dtype=np.int16).tofile(path)
+        flat = np.memmap(path, dtype=np.int16, mode="r", shape=(3,))
+        column = train_bc._MemmapRaggedColumn(  # noqa: SLF001
+            flat,
+            np.asarray(offsets, dtype=np.int64),
+            2,
+            -1,
+            np.int16,
+            None,
+        )
+        observed: list[np.ndarray | None] = []
+        original = column._reconstruct  # noqa: SLF001
+
+        def observe(indices, *, _observed=observed, _original=original):
+            _observed.append(indices)
+            return _original(indices)
+
+        monkeypatch.setattr(column, "_reconstruct", observe)
+        columns.append(column)
+        observations.append(observed)
+    composite = _ConcatColumn(columns, (2, 2))
+
+    report = train_bc.forced_action_type_value_mass_quality(
+        {
+            "action_taken": np.asarray(
+                [roll, build_road, build_road, roll], dtype=np.int16
+            ),
+            "legal_action_ids": composite,
+        },
+        np.ones(2, dtype=np.float32),
+        row_indices=np.asarray([0, 3], dtype=np.int64),
+        weights_aligned_to_rows=True,
+        objective_measure="test_composite_nominal_measure",
+        action_catalog=catalog,
+        configured_weights={"ROLL": 1.0},
+    )
+
+    assert report["forced_rows"] == 2
+    assert [entry[0].tolist() for entry in observations] == [[0], [1]]

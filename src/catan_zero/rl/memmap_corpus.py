@@ -256,8 +256,14 @@ class MemmapRaggedColumn:
     def __len__(self) -> int:
         return self._n
 
-    def row_counts(self) -> np.ndarray:
-        return (self._offsets[1:] - self._offsets[:-1]).astype(
+    def row_counts(self, indices: np.ndarray | None = None) -> np.ndarray:
+        if indices is None:
+            return (self._offsets[1:] - self._offsets[:-1]).astype(
+                np.int64, copy=False
+            )
+        rows = normalize_index(indices, self._n)
+        assert rows is not None
+        return (self._offsets[rows + 1] - self._offsets[rows]).astype(
             np.int64, copy=False
         )
 
