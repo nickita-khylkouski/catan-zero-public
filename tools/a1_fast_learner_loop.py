@@ -144,6 +144,15 @@ def _set_option(command: list[str], flag: str, value: str) -> None:
     command[index + 1] = value
 
 
+def _set_or_append_option(command: list[str], flag: str, value: str) -> None:
+    """Set one existing scalar option, or materialize an explicit default."""
+
+    if any(item == flag or item.startswith(flag + "=") for item in command):
+        _set_option(command, flag, value)
+    else:
+        command.extend((flag, value))
+
+
 def _set_boolean_option(command: list[str], flag: str, *, enabled: bool) -> None:
     """Normalize one BooleanOptionalAction without contradictory flags."""
 
@@ -332,10 +341,17 @@ def derive_run(
         "pure_search_deployed_tanh_double_dose",
         "current_policy_deployed_tanh",
     }:
-        if "--scalar-value-loss-transform" in command:
-            _set_option(command, "--scalar-value-loss-transform", "deployed_tanh")
-        else:
-            command.extend(("--scalar-value-loss-transform", "deployed_tanh"))
+        # train_bc's authenticated operator is named "readout"; the historical
+        # treatment runner emitted a never-implemented "transform" flag.
+        _set_or_append_option(
+            command, "--scalar-value-loss-readout", "deployed_tanh"
+        )
+        if not any(
+            item == "--scalar-value-loss-scale"
+            or item.startswith("--scalar-value-loss-scale=")
+            for item in command
+        ):
+            command.extend(("--scalar-value-loss-scale", "1.0"))
     if arm == "pure_search_deployed_tanh_double_dose":
         # One clean point on the dose-response curve: reload the same f7
         # initializer and double samples without candidate chaining.

@@ -254,6 +254,31 @@ def _root_blend_args(report: Mapping[str, Any]) -> tuple[tuple[str, ...], bool]:
     return tuple(phases), mode == "global_compat"
 
 
+def _scalar_value_loss_args(report: Mapping[str, Any]) -> tuple[str, float]:
+    """Return the report-authenticated scalar learner readout."""
+
+    contract = report.get("scalar_value_loss_contract")
+    if contract is None:
+        return "raw", 1.0
+    if not isinstance(contract, Mapping):
+        raise SystemExit("scalar_value_loss_contract must be a JSON object")
+    if contract.get("schema_version") != "scalar-value-loss-readout-v1":
+        raise SystemExit("unsupported scalar_value_loss_contract schema")
+    readout = str(contract.get("readout", ""))
+    if readout not in {"raw", "deployed_tanh"}:
+        raise SystemExit("unsupported scalar value loss readout")
+    try:
+        scale = float(contract["scale"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit("scalar value loss scale must be numeric") from error
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise SystemExit("scalar value loss scale must be finite and > 0")
+    expected_formula = "raw" if readout == "raw" else "tanh(raw * scale)"
+    if contract.get("formula") != expected_formula:
+        raise SystemExit("scalar value loss formula differs from its typed contract")
+    return readout, scale
+
+
 def _forced_row_value_recipe(
     train_bc, report: Mapping[str, Any]
 ) -> tuple[dict[str, float], object | None]:
@@ -519,6 +544,7 @@ def _prepare_probe(
     award_contract = str(_required(report, "public_award_feature_contract"))
     train_bc._PUBLIC_AWARD_FEATURE_CONTRACT = award_contract
     blend_phases, blend_global = _root_blend_args(report)
+    scalar_readout, scalar_scale = _scalar_value_loss_args(report)
     scope_identity = _scope_identity(data, report)
     objective_reconstruction = {
         "schema_version": "posthoc-objective-reconstruction-v1",
@@ -539,6 +565,10 @@ def _prepare_probe(
         "value_root_blend_phases": list(blend_phases),
         "value_root_blend_global_compat": blend_global,
         "value_target_lambda": float(_required(report, "value_target_lambda")),
+        "scalar_value_loss_contract": {
+            "readout": scalar_readout,
+            "scale": scalar_scale,
+        },
     }
     holdout_semantics = {
         "schema_version": "posthoc-shared-holdout-identity/v1",
@@ -570,6 +600,8 @@ def _prepare_probe(
         "batch_size": eval_batch_size,
         "award_contract": award_contract,
         "objective_reconstruction": objective_reconstruction,
+        "scalar_value_loss_readout": scalar_readout,
+        "scalar_value_loss_scale": scalar_scale,
         "shared_holdout": {
             **holdout_semantics,
             "identity_sha256": _canonical_sha256(holdout_semantics),
@@ -734,6 +766,8 @@ def _evaluate_policy_metrics(
         value_target_lambda=float(_required(report, "value_target_lambda")),
         value_root_blend_phases=blend_phases,
         value_root_blend_global_compat=blend_global,
+        scalar_value_loss_readout=str(prepared["scalar_value_loss_readout"]),
+        scalar_value_loss_scale=float(prepared["scalar_value_loss_scale"]),
     )
 
 

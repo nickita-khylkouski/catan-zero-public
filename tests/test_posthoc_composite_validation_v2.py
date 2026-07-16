@@ -100,6 +100,12 @@ def _report(seed_sha: str) -> dict:
         "value_hlgauss_sigma_ratio": 0.75,
         "value_target_lambda": 1.0,
         "value_root_blend_regime": {"mode": "disabled", "phases": []},
+        "scalar_value_loss_contract": {
+            "schema_version": "scalar-value-loss-readout-v1",
+            "readout": "deployed_tanh",
+            "scale": 1.5,
+            "formula": "tanh(raw * scale)",
+        },
         "checkout_runtime_binding": {"training": "old"},
     }
 
@@ -248,6 +254,15 @@ def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch
     assert all(
         call["belief_resource_loss_weight"] == 0.4 for call in evaluate_calls
     )
+    assert all(
+        call["scalar_value_loss_readout"] == "deployed_tanh"
+        and call["scalar_value_loss_scale"] == 1.5
+        for call in evaluate_calls
+    )
+    assert result["scalar_value_loss_contract"] == {
+        "readout": "deployed_tanh",
+        "scale": 1.5,
+    }
     assert result["checkpoint_mutated"] is False
     assert result["evaluation_repo_commit"] == "abc123"
     assert result["evaluation_tool_sha256"].startswith("sha256:")
@@ -256,3 +271,18 @@ def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch
         path: posthoc._sha256(path)
         for path in (report_path, checkpoint, descriptor, manifest)
     }
+
+
+def test_scalar_value_loss_args_preserve_legacy_raw_and_reject_drift() -> None:
+    assert posthoc._scalar_value_loss_args({}) == ("raw", 1.0)
+    with pytest.raises(SystemExit, match="formula differs"):
+        posthoc._scalar_value_loss_args(
+            {
+                "scalar_value_loss_contract": {
+                    "schema_version": "scalar-value-loss-readout-v1",
+                    "readout": "deployed_tanh",
+                    "scale": 1.0,
+                    "formula": "raw",
+                }
+            }
+        )

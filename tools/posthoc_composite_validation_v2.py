@@ -144,6 +144,31 @@ def _root_blend_args(report: dict[str, Any]) -> tuple[tuple[str, ...], bool]:
     return tuple(phases), mode == "global_compat"
 
 
+def _scalar_value_loss_args(report: dict[str, Any]) -> tuple[str, float]:
+    """Reconstruct the exact scalar readout optimized by the learner."""
+
+    contract = report.get("scalar_value_loss_contract")
+    if contract is None:
+        return "raw", 1.0
+    if not isinstance(contract, dict):
+        raise SystemExit("scalar_value_loss_contract must be a JSON object")
+    if contract.get("schema_version") != "scalar-value-loss-readout-v1":
+        raise SystemExit("unsupported scalar_value_loss_contract schema")
+    readout = str(contract.get("readout", ""))
+    if readout not in {"raw", "deployed_tanh"}:
+        raise SystemExit("unsupported scalar value loss readout")
+    try:
+        scale = float(contract["scale"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit("scalar value loss scale must be numeric") from error
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise SystemExit("scalar value loss scale must be finite and > 0")
+    expected_formula = "raw" if readout == "raw" else "tanh(raw * scale)"
+    if contract.get("formula") != expected_formula:
+        raise SystemExit("scalar value loss formula differs from its typed contract")
+    return readout, scale
+
+
 def _forced_row_value_recipe(
     report: dict[str, Any],
 ) -> tuple[dict[str, float], object | None]:
@@ -264,6 +289,7 @@ def run_rescore(
         )
     )
     blend_phases, blend_global = _root_blend_args(report)
+    scalar_readout, scalar_scale = _scalar_value_loss_args(report)
     ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
 
     def evaluate(indices: np.ndarray) -> dict:
@@ -312,6 +338,8 @@ def run_rescore(
             value_target_lambda=float(_required(report, "value_target_lambda")),
             value_root_blend_phases=blend_phases,
             value_root_blend_global_compat=blend_global,
+            scalar_value_loss_readout=scalar_readout,
+            scalar_value_loss_scale=scalar_scale,
         )
 
     exact = train_bc.evaluate_composite_validation_measure(
@@ -350,6 +378,10 @@ def run_rescore(
         "arch": report["arch"],
         "device": device,
         "batch_size": eval_batch_size,
+        "scalar_value_loss_contract": {
+            "readout": scalar_readout,
+            "scale": scalar_scale,
+        },
         "exact_validation": exact,
     }
 

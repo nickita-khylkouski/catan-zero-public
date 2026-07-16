@@ -83,6 +83,12 @@ def _report() -> dict:
             "mode": "phase_gated",
             "phases": ["PLAY_TURN"],
         },
+        "scalar_value_loss_contract": {
+            "schema_version": "scalar-value-loss-readout-v1",
+            "readout": "deployed_tanh",
+            "scale": 1.25,
+            "formula": "tanh(raw * scale)",
+        },
         "policy_distillation_scope": None,
         "value_training_scope": None,
     }
@@ -243,11 +249,17 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert kwargs["moe_balance_loss_weight"] == 0.01
     assert kwargs["value_root_blend_phases"] == ("PLAY_TURN",)
     assert kwargs["value_root_blend_global_compat"] is False
+    assert kwargs["scalar_value_loss_readout"] == "deployed_tanh"
+    assert kwargs["scalar_value_loss_scale"] == pytest.approx(1.25)
     objective = result["shared_holdout"]["objective_reconstruction"]
     assert objective["target_reliability_confidence_weighting"] is True
     assert objective["forced_row_value_action_type_weights"] == {"END_TURN": 0.2}
     assert objective["policy_kl_anchor_direction"] == "reverse"
     assert objective["value_target_lambda"] == pytest.approx(1.0)
+    assert objective["scalar_value_loss_contract"] == {
+        "readout": "deployed_tanh",
+        "scale": 1.25,
+    }
     assert result["teacher_gap"] == {
         "active_policy_teacher_gap_rows": 2,
         "active_policy_kl_target_model_mean": 0.2,
