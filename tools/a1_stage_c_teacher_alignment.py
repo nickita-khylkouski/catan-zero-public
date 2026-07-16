@@ -365,7 +365,7 @@ def _operator_identity(
     contract_unsigned = dict(contract)
     contract_digest = contract_unsigned.pop("contract_sha256", None)
     if (
-        contract.get("schema_version") != target_inventory.RD_CONTRACT_SCHEMA
+        contract.get("schema_version") not in target_inventory.RD_CONTRACT_SCHEMAS
         or contract_digest != _value_sha256(contract_unsigned)
         or config.get("schema_version") != 13
         or config.get("pipeline") != "generate"

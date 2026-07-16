@@ -497,9 +497,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help=(
             "Whether single-legal-action engine transitions become value-only "
-            "training rows. The coherent 2p no-trade recipe disables this: the "
-            "sole transition is applied directly with no neural/MCTS work and "
-            "no row. Default true preserves historical corpora."
+            "training rows. They always carry zero policy authority; with "
+            "--forced-root-target-mode trajectory_only they also require no "
+            "neural/MCTS work. Disable only to replay a historical recipe that "
+            "explicitly omitted these rows."
         ),
     )
     parser.add_argument("--c-visit", type=float, default=50.0)

@@ -79,6 +79,8 @@
       "soft_target_temperature": 0.7,
       "soft_target_min_legal_coverage": 0.5,
       "value_loss_weight": 0.25,
+      "scalar_value_loss_readout": "deployed_tanh",
+      "scalar_value_loss_scale": 1.0,
       "value_target_lambda": 1.0,
       "value_categorical_loss_weight": 0.0,
       "hlgauss_scalar_aux_loss_weight": 0.0,
@@ -99,7 +101,7 @@
       "symmetry_augment": false,
       "forced_action_weight": 0.0,
       "forced_row_value_weight": 1.0,
-      "forced_row_value_action_type_weights": "END_TURN=1,ROLL=1",
+      "forced_row_value_action_type_weights": "END_TURN=1.0,ROLL=1.0",
       "per_game_policy_weight": true,
       "per_game_policy_weight_mode": "equal",
       "per_game_policy_surprise_weighting": true,
@@ -142,7 +144,7 @@
     "temperature_low": 0.0,
     "late_temperature_decisions": 100,
     "late_temperature": 0.1,
-    "record_automatic_transitions": false,
+    "record_automatic_transitions": true,
     "meaningful_public_history": true,
     "event_history_limit": 32,
     "workers_per_gpu": 16,
@@ -202,10 +204,10 @@
     "output_root": "__UNRESOLVED__"
   },
   "provenance": {
-    "guard_config": "../guards/a1_generation_coherent_public_n128_adaptive256_v1.json",
+    "guard_config": "../guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v2.json",
     "generator_code_files": [
       "../../tools/a1_current_science_contract.py",
-      "../operations/a1-next-wave-coherent-public-v1/science.contract.json",
+      "../operations/a1-next-wave-coherent-public-v2/science.contract.json",
       "../../tools/generate_gumbel_selfplay_data.py",
       "../../tools/fleet/systemd/nvidia-mps.service",
       "../../tools/opponent_mix_registry.py",
@@ -231,7 +233,7 @@
     ],
     "learner_code_files": [
       "../../tools/a1_current_science_contract.py",
-      "../operations/a1-next-wave-coherent-public-v1/science.contract.json",
+      "../operations/a1-next-wave-coherent-public-v2/science.contract.json",
       "../guards/train_bc.json",
       "../../tools/factory_common.py",
       "../../tools/launcher_guards.py",

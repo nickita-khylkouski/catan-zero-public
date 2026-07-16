@@ -20,7 +20,11 @@ def _write_corpus(
     tmp_path: Path,
     decisions: list[int],
     *,
+    game_seeds: list[int] | None = None,
+    phases: list[str] | None = None,
+    actions: list[int] | None = None,
     policy_weights: list[float] | None = None,
+    value_weights: list[float] | None = None,
     used_full_search: list[bool] | None = None,
     is_forced: list[bool] | None = None,
     simulations_used: list[int] | None = None,
@@ -28,28 +32,31 @@ def _write_corpus(
     root = tmp_path / "corpus"
     root.mkdir()
     rows = len(decisions)
+    game_seeds = [7] * rows if game_seeds is None else game_seeds
+    phases = ["play_turn"] * rows if phases is None else phases
+    actions = list(range(rows)) if actions is None else actions
+    policy_weights = [1.0] * rows if policy_weights is None else policy_weights
+    value_weights = [1.0] * rows if value_weights is None else value_weights
+    used_full_search = (
+        [True] * rows if used_full_search is None else used_full_search
+    )
+    is_forced = [False] * rows if is_forced is None else is_forced
     columns: dict[str, dict[str, object]] = {}
 
     fixed = {
-        "game_seed": np.asarray([7] * rows, dtype=np.int64),
+        "game_seed": np.asarray(game_seeds, dtype=np.int64),
         "decision_index": np.asarray(decisions, dtype=np.int32),
-        "action_taken": np.arange(rows, dtype=np.int16),
+        "action_taken": np.asarray(actions, dtype=np.int16),
         "phase": None,
         "player": None,
         "terminated": np.asarray([True] * rows, dtype=np.bool_),
         "truncated": np.asarray([False] * rows, dtype=np.bool_),
         "policy_weight_multiplier": np.asarray(
-            policy_weights if policy_weights is not None else [1.0] * rows,
-            dtype=np.float32,
+            policy_weights, dtype=np.float32
         ),
-        "used_full_search": np.asarray(
-            used_full_search if used_full_search is not None else [True] * rows,
-            dtype=np.bool_,
-        ),
-        "is_forced": np.asarray(
-            is_forced if is_forced is not None else [False] * rows,
-            dtype=np.bool_,
-        ),
+        "value_weight_multiplier": np.asarray(value_weights, dtype=np.float32),
+        "used_full_search": np.asarray(used_full_search, dtype=np.bool_),
+        "is_forced": np.asarray(is_forced, dtype=np.bool_),
     }
     if simulations_used is not None:
         fixed["simulations_used"] = np.asarray(simulations_used, dtype=np.int32)
@@ -65,12 +72,14 @@ def _write_corpus(
             "inner_shape": list(value.shape[1:]),
         }
     for name, values in {
-        "phase": ["play_turn"] * rows,
+        "phase": phases,
         "player": ["RED"] * rows,
         "target_information_regime": [inventory.PIMC_REGIME] * rows,
     }.items():
-        np.zeros(rows, dtype=np.int32).tofile(root / f"{name}.codes.dat")
-        columns[name] = {"kind": "string", "categories": [values[0]]}
+        categories = list(dict.fromkeys(values))
+        codes = np.asarray([categories.index(value) for value in values], dtype=np.int32)
+        codes.tofile(root / f"{name}.codes.dat")
+        columns[name] = {"kind": "string", "categories": categories}
 
     meta = {
         "schema": "memmap_corpus_v1",
@@ -180,16 +189,62 @@ def test_inventory_preserves_legacy_zero_fast_policy_compatibility(
     assert result["policy_targets_eligible_for_requested_learner"] is True
 
 
+def test_inventory_attests_forced_rows_as_value_only_with_phase_action_coverage(
+    tmp_path: Path,
+) -> None:
+    root = _write_corpus(
+        tmp_path,
+        [0, 1, 0, 1],
+        game_seeds=[7, 7, 8, 8],
+        is_forced=[False, True, False, True],
+        phases=["PLAY_TURN", "ROLL", "PLAY_TURN", "END_TURN"],
+        actions=[9, 331, 10, 186],
+        policy_weights=[1.0, 0.0, 1.0, 0.0],
+    )
+    result = inventory.inspect_memmap(
+        label="coherent", corpus_dir=root, required_regime=inventory.PIMC_REGIME
+    )
+    forced = result["forced_value_rows"]
+
+    assert forced["contract_passed"] is True
+    assert forced["forced_rows"] == 2
+    assert forced["games_with_forced_rows"] == 2
+    assert forced["forced_game_coverage"] == 1.0
+    assert forced["forced_policy_active_rows"] == 0
+    assert forced["forced_value_inactive_rows"] == 0
+    assert forced["forced_phase_counts"] == {"ROLL": 1, "END_TURN": 1}
+    assert forced["forced_action_taken_counts"] == {"186": 1, "331": 1}
+    assert forced["forced_action_type_counts"] == {"END_TURN": 1, "ROLL": 1}
+
+
+def test_inventory_rejects_silent_zero_forced_rows(tmp_path: Path) -> None:
+    root = _write_corpus(tmp_path, [0, 1, 2])
+    result = inventory.inspect_memmap(
+        label="coherent", corpus_dir=root, required_regime=inventory.PIMC_REGIME
+    )
+
+    assert result["forced_value_rows"]["forced_rows"] == 0
+    assert result["forced_value_rows"]["contract_passed"] is False
+
+
 def test_sealed_rd_contract_and_nullable_override_guard() -> None:
     repo = Path(__file__).resolve().parents[1]
-    contract = (
-        repo
-        / "configs/operations/a1-target-identity-coherent-n128-rd-v1/contract.json"
-    )
-    result = inventory.inspect_rd_contract(contract)
-    assert result["contract_eligible_to_launch"] is True
-    assert result["target_information_regime"] == inventory.COHERENT_REGIME
-    assert result["total_games"] == 8192
+    contracts = {
+        inventory.RD_CONTRACT_SCHEMA: (
+            repo
+            / "configs/operations/a1-target-identity-coherent-n128-rd-v1/contract.json"
+        ),
+        inventory.RD_CONTRACT_SCHEMA_V2: (
+            repo
+            / "configs/operations/a1-target-identity-coherent-n128-rd-v2/contract.json"
+        ),
+    }
+    for schema, contract in contracts.items():
+        result = inventory.inspect_rd_contract(contract)
+        assert result["schema_version"] == schema
+        assert result["contract_eligible_to_launch"] is True
+        assert result["target_information_regime"] == inventory.COHERENT_REGIME
+        assert result["total_games"] == 8192
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--required")

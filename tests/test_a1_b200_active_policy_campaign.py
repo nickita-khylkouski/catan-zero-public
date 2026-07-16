@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from argparse import Namespace
 import json
 from pathlib import Path
 
@@ -137,6 +138,232 @@ def test_active_policy_arms_change_only_auxiliary_exposure() -> None:
     assert common["max_steps"] == 128
     assert common["lr"] == 6e-5
     assert common["lr_warmup_steps"] == 16
+
+
+def test_corpus_admission_requires_complete_forced_value_row_coverage() -> None:
+    report = {
+        "present": True,
+        "missing_columns": [],
+        "rows": 1_000_000,
+        "forced_rows": 400_000,
+        "forced_fraction": 0.4,
+        "game_count": campaign.EXPECTED_GAMES,
+        "games_with_forced_rows": campaign.EXPECTED_GAMES,
+        "forced_game_coverage": 1.0,
+        "forced_policy_active_rows": 0,
+        "forced_value_inactive_rows": 0,
+        "phase_counts": {"PLAY_TURN": 600_000, "ROLL": 300_000, "END_TURN": 100_000},
+        "forced_phase_counts": {"ROLL": 300_000, "END_TURN": 100_000},
+        "action_taken_counts": {"0": 300_000, "42": 100_000, "9": 600_000},
+        "forced_action_taken_counts": {"0": 300_000, "42": 100_000},
+        "action_type_counts": {
+            "BUILD_CITY": 600_000,
+            "ROLL": 300_000,
+            "END_TURN": 100_000,
+        },
+        "forced_action_type_counts": {"ROLL": 300_000, "END_TURN": 100_000},
+        "contract_passed": True,
+    }
+
+    assert campaign._require_forced_value_rows({"forced_value_rows": report}) == report
+
+
+def test_corpus_admission_refuses_zero_forced_rows() -> None:
+    report = {
+        "present": True,
+        "missing_columns": [],
+        "rows": 600_000,
+        "forced_rows": 0,
+        "forced_fraction": 0.0,
+        "game_count": campaign.EXPECTED_GAMES,
+        "games_with_forced_rows": 0,
+        "forced_game_coverage": 0.0,
+        "forced_policy_active_rows": 0,
+        "forced_value_inactive_rows": 0,
+        "phase_counts": {"PLAY_TURN": 600_000},
+        "forced_phase_counts": {},
+        "action_taken_counts": {"9": 600_000},
+        "forced_action_taken_counts": {},
+        "action_type_counts": {"BUILD_CITY": 600_000},
+        "forced_action_type_counts": {},
+        "contract_passed": False,
+    }
+
+    with pytest.raises(campaign.CampaignError, match="sole-action value signal"):
+        campaign._require_forced_value_rows({"forced_value_rows": report})
+
+
+def test_forced_value_contract_is_new_v2_only() -> None:
+    legacy = {
+        "schema_version": "a1-coherent-target-rd-contract-v1",
+        "operator": {"record_automatic_transitions": False},
+    }
+    current = {
+        "schema_version": campaign.FORCED_VALUE_TARGET_CONTRACT_SCHEMA,
+        "operator": {"record_automatic_transitions": True},
+    }
+    assert campaign._requires_forced_value_rows(
+        contract=legacy, repaired_distillation=False
+    ) is False
+    assert campaign._requires_forced_value_rows(
+        contract=current, repaired_distillation=True
+    ) is False
+    assert campaign._requires_forced_value_rows(
+        contract=current, repaired_distillation=False
+    ) is True
+
+
+def test_target_contract_verifier_accepts_authenticated_v1_and_v2() -> None:
+    repo = Path(campaign.__file__).resolve().parents[1]
+    expected = {
+        "a1-target-identity-coherent-n128-rd-v1": (
+            campaign.EXPECTED_TARGET_CONTRACT_SHA256,
+            False,
+        ),
+        "a1-target-identity-coherent-n128-rd-v2": (
+            campaign.EXPECTED_TARGET_CONTRACT_V2_SHA256,
+            True,
+        ),
+    }
+    for operation, (digest, automatic) in expected.items():
+        path = repo / "configs/operations" / operation / "contract.json"
+        resolved, contract = campaign._verify_target_contract(path)
+        assert resolved == path.resolve()
+        assert contract["contract_sha256"] == digest
+        assert contract["operator"]["record_automatic_transitions"] is automatic
+
+
+def test_v2_admission_rejects_zero_forced_rows_after_real_contract_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = Path(campaign.__file__).resolve().parents[1]
+    contract_path = (
+        repo
+        / "configs/operations/a1-target-identity-coherent-n128-rd-v2/contract.json"
+    )
+    corpus_meta = tmp_path / "corpus_meta.json"
+    corpus_meta.write_text("{}\n")
+    validation = tmp_path / "validation.json"
+    validation.write_text("{}\n")
+    completion = {
+        "schema_version": campaign.COMPLETION_RECEIPT_SCHEMA,
+    }
+    zero_forced = {
+        "present": True,
+        "missing_columns": [],
+        "rows": 600_000,
+        "forced_rows": 0,
+        "forced_fraction": 0.0,
+        "game_count": campaign.EXPECTED_GAMES,
+        "games_with_forced_rows": 0,
+        "forced_game_coverage": 0.0,
+        "forced_policy_active_rows": 0,
+        "forced_value_inactive_rows": 0,
+        "phase_counts": {"PLAY_TURN": 600_000},
+        "forced_phase_counts": {},
+        "action_taken_counts": {"9": 600_000},
+        "forced_action_taken_counts": {},
+        "action_type_counts": {"BUILD_CITY": 600_000},
+        "forced_action_type_counts": {},
+        "contract_passed": False,
+    }
+    inventory_payload = {
+        "direct_corpora": [{"forced_value_rows": zero_forced}],
+        "aggregate": {},
+        "rd_contract": {
+            "contract_sha256": campaign.EXPECTED_TARGET_CONTRACT_V2_SHA256
+        },
+    }
+    monkeypatch.setattr(
+        campaign,
+        "_verify_completion_receipt",
+        lambda *_args, **_kwargs: (tmp_path / "completion.json", completion),
+    )
+    monkeypatch.setattr(
+        campaign,
+        "_load_signed",
+        lambda *_args, **_kwargs: (tmp_path / "inventory.json", inventory_payload),
+    )
+
+    with pytest.raises(campaign.CampaignError, match="sole-action value signal"):
+        campaign._admit_corpus(
+            Namespace(
+                contract=contract_path,
+                completion_receipt=tmp_path / "completion.json",
+                inventory=tmp_path / "inventory.json",
+                corpus_meta=corpus_meta,
+                validation_manifest=validation,
+            )
+        )
+
+
+def test_legacy_admission_without_forced_rows_remains_loadable(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "corpus"
+    data.mkdir()
+    meta = data / "corpus_meta.json"
+    meta.write_text("{}\n")
+    contract_path = tmp_path / "contract.json"
+    completion_path = tmp_path / "completion.json"
+    inventory_path = tmp_path / "inventory.json"
+    validation_path = tmp_path / "validation.json"
+    for path in (contract_path, completion_path, inventory_path, validation_path):
+        path.write_text("{}\n")
+    corpus = {
+        "data_path": str(data),
+        "corpus_meta_path": str(meta),
+        "corpus_meta_file_sha256": campaign._file_sha256(meta),
+        "payload_inventory_sha256": "sha256:" + "1" * 64,
+        "validation_manifest": {
+            "path": str(validation_path),
+            "file_sha256": campaign._file_sha256(validation_path),
+        },
+        "producer_checkpoint_sha256": campaign.EXPECTED_CORPUS_PRODUCER_SHA256,
+        "target_information_regime": campaign.TARGET_INFORMATION_REGIME,
+        "search_evidence_schema": campaign.SEARCH_EVIDENCE_SCHEMA,
+        "selected_games": campaign.EXPECTED_GAMES,
+        "selected_game_seed_set_sha256": "sha256:" + "2" * 64,
+        "selection_mode": "explicit_truncation_repair_seed_set",
+        "complete_two_seat_trace_games": campaign.EXPECTED_GAMES,
+        "stored_policy_target_distillation_eligible": True,
+        "state_reanalysis_eligible": False,
+        "search_evidence_storage": "receipt_bound_source_npz_only",
+        "incompatible_policy_active_rows": 0,
+    }
+    admission = {
+        "schema_version": campaign.ADMISSION_SCHEMA,
+        "status": "admitted_for_diagnostic_policy_distillation",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "contract": {
+            "path": str(contract_path),
+            "file_sha256": campaign._file_sha256(contract_path),
+            "contract_sha256": campaign.EXPECTED_TARGET_CONTRACT_SHA256,
+        },
+        "completion_receipt": {
+            "path": str(completion_path),
+            "file_sha256": campaign._file_sha256(completion_path),
+        },
+        "target_eligibility_inventory": {
+            "path": str(inventory_path),
+            "file_sha256": campaign._file_sha256(inventory_path),
+        },
+        "corpus": corpus,
+        "policy_distillation_contract": {
+            "coherent_public_n128_only": True,
+            "legacy_pimc_rows_allowed": False,
+        },
+    }
+    admission_path = tmp_path / "admission.json"
+    _write_signed(admission_path, admission, "admission_sha256")
+
+    resolved, loaded = campaign._load_admission(admission_path)
+
+    assert resolved == admission_path.resolve()
+    assert loaded["corpus"] == corpus
+    assert "value_distillation_contract" not in loaded
+    assert "forced_value_rows" not in loaded["corpus"]
 
 
 def test_independent_parent_authority_keeps_producer_and_f7_distinct(

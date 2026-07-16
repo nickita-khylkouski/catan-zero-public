@@ -25,6 +25,7 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from catan_zero.rl.action_mask import ActionCatalog
 from catan_zero.rl.gumbel_self_play import (
     FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS,
     FAST_SEARCH_POLICY_WEIGHT_MAX,
@@ -33,6 +34,8 @@ from catan_zero.rl.gumbel_self_play import (
 
 SCHEMA = "a1-target-eligibility-inventory-v1"
 RD_CONTRACT_SCHEMA = "a1-coherent-target-rd-contract-v1"
+RD_CONTRACT_SCHEMA_V2 = "a1-coherent-target-rd-contract-v2"
+RD_CONTRACT_SCHEMAS = frozenset({RD_CONTRACT_SCHEMA, RD_CONTRACT_SCHEMA_V2})
 PIMC_REGIME = "public_conservation_pimc_v1"
 COHERENT_REGIME = "public_belief_single_tree_v1"
 
@@ -75,6 +78,16 @@ SERIALIZED_STATE_COLUMNS = frozenset(
 )
 POLICY_COLUMNS = frozenset(
     {"policy_weight_multiplier", "target_information_regime"}
+)
+FORCED_VALUE_COLUMNS = frozenset(
+    {
+        "game_seed",
+        "phase",
+        "action_taken",
+        "is_forced",
+        "policy_weight_multiplier",
+        "value_weight_multiplier",
+    }
 )
 SEARCH_EVIDENCE_COLUMNS = frozenset(
     {
@@ -225,6 +238,140 @@ def _regime_counts(
         {category: int(total[index]) for index, category in enumerate(categories)},
         {category: int(active[index]) for index, category in enumerate(categories)},
     )
+
+
+def _forced_value_inventory(
+    root: Path, meta: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Measure whether sole-action states have real value-only authority.
+
+    Percentages are reported for diagnosis, but the admission contract uses
+    structural invariants: at least one row, coverage in every complete game,
+    exactly zero forced-row policy authority, and exactly one forced-row value
+    multiplier. Phase and selected-action counts make omissions visible
+    without pinning a brittle historical forced-row percentage.
+    """
+
+    columns = set(meta.get("columns", {}))
+    missing = sorted(FORCED_VALUE_COLUMNS - columns)
+    if missing:
+        return {
+            "present": False,
+            "missing_columns": missing,
+            "rows": int(meta.get("row_count", 0)),
+            "forced_rows": None,
+            "forced_fraction": None,
+            "game_count": None,
+            "games_with_forced_rows": None,
+            "forced_game_coverage": None,
+            "forced_policy_active_rows": None,
+            "forced_value_inactive_rows": None,
+            "phase_counts": {},
+            "forced_phase_counts": {},
+            "action_taken_counts": {},
+            "forced_action_taken_counts": {},
+            "action_type_counts": {},
+            "forced_action_type_counts": {},
+            "contract_passed": False,
+        }
+
+    forced = np.asarray(_column(root, meta, "is_forced").reshape(-1))
+    if forced.dtype.kind != "b":
+        raise InventoryError(f"{root}: is_forced is not boolean")
+    seeds = np.asarray(_column(root, meta, "game_seed").reshape(-1))
+    actions = np.asarray(_column(root, meta, "action_taken").reshape(-1))
+    policy = np.asarray(
+        _column(root, meta, "policy_weight_multiplier").reshape(-1),
+        dtype=np.float64,
+    )
+    value = np.asarray(
+        _column(root, meta, "value_weight_multiplier").reshape(-1),
+        dtype=np.float64,
+    )
+    rows = int(meta["row_count"])
+    if any(array.shape != (rows,) for array in (forced, seeds, actions, policy, value)):
+        raise InventoryError(f"{root}: forced-value columns are not row-aligned")
+
+    phase_codes, phase_categories = _categorical_codes(root, meta, "phase")
+    phase_total = np.bincount(
+        np.asarray(phase_codes), minlength=len(phase_categories)
+    )
+    phase_forced = np.bincount(
+        np.asarray(phase_codes)[forced], minlength=len(phase_categories)
+    )
+
+    def _integer_counts(raw: np.ndarray) -> dict[str, int]:
+        unique, counts = np.unique(raw, return_counts=True)
+        return {
+            str(int(key)): int(count)
+            for key, count in zip(unique.tolist(), counts.tolist())
+        }
+
+    catalog = ActionCatalog(("RED", "BLUE"))
+
+    def _action_type_counts(raw: np.ndarray) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        unique, occurrences = np.unique(raw, return_counts=True)
+        for action_id, occurrence_count in zip(
+            unique.tolist(), occurrences.tolist()
+        ):
+            index = int(action_id)
+            if not 0 <= index < catalog.size:
+                raise InventoryError(
+                    f"{root}: action_taken id {index} is outside the 2p action catalog"
+                )
+            action_type = catalog.descriptor(index).action_type
+            counts[action_type] = (
+                counts.get(action_type, 0) + int(occurrence_count)
+            )
+        return dict(sorted(counts.items()))
+
+    forced_rows = int(np.count_nonzero(forced))
+    game_count = int(np.unique(seeds).size)
+    forced_game_count = int(np.unique(seeds[forced]).size) if forced_rows else 0
+    forced_policy_active = int(
+        np.count_nonzero(forced & (~np.isfinite(policy) | (policy != 0.0)))
+    )
+    forced_value_inactive = int(
+        np.count_nonzero(forced & (~np.isfinite(value) | (value != 1.0)))
+    )
+    contract_passed = bool(
+        rows > 0
+        and forced_rows > 0
+        and game_count > 0
+        and forced_game_count == game_count
+        and forced_policy_active == 0
+        and forced_value_inactive == 0
+    )
+    return {
+        "present": True,
+        "missing_columns": [],
+        "rows": rows,
+        "forced_rows": forced_rows,
+        "forced_fraction": float(forced_rows / rows) if rows else None,
+        "game_count": game_count,
+        "games_with_forced_rows": forced_game_count,
+        "forced_game_coverage": (
+            float(forced_game_count / game_count) if game_count else None
+        ),
+        "forced_policy_active_rows": forced_policy_active,
+        "forced_value_inactive_rows": forced_value_inactive,
+        "phase_counts": {
+            category: int(phase_total[index])
+            for index, category in enumerate(phase_categories)
+            if int(phase_total[index]) > 0
+        },
+        "forced_phase_counts": {
+            category: int(phase_forced[index])
+            for index, category in enumerate(phase_categories)
+            if int(phase_forced[index]) > 0
+        },
+        "action_taken_counts": _integer_counts(actions),
+        "forced_action_taken_counts": _integer_counts(actions[forced]),
+        "action_type_counts": _action_type_counts(actions),
+        "forced_action_type_counts": _action_type_counts(actions[forced]),
+        "contract_passed": contract_passed,
+    }
 
 
 def _search_evidence_inventory(
@@ -555,6 +702,7 @@ def inspect_memmap(
     )
     replay = _trajectory_inventory(root, meta)
     search_evidence = _search_evidence_inventory(root, meta, policy)
+    forced_value = _forced_value_inventory(root, meta)
     return {
         "label": label,
         "corpus_dir": str(root),
@@ -593,6 +741,7 @@ def inspect_memmap(
         ),
         "search_evidence": search_evidence,
         "exact_root_reanalysis": replay,
+        "forced_value_rows": forced_value,
     }
 
 
@@ -880,8 +1029,11 @@ def inspect_rd_contract(contract_path: Path) -> dict[str, Any]:
 
     path = contract_path.expanduser().resolve(strict=True)
     value = _load_json(path)
-    if value.get("schema_version") != RD_CONTRACT_SCHEMA:
-        raise InventoryError(f"{path}: expected {RD_CONTRACT_SCHEMA}")
+    contract_schema = value.get("schema_version")
+    if contract_schema not in RD_CONTRACT_SCHEMAS:
+        raise InventoryError(
+            f"{path}: expected one of {sorted(RD_CONTRACT_SCHEMAS)}"
+        )
     declared = value.get("contract_sha256")
     actual = _self_digest(value, "contract_sha256")
     if declared != actual:
@@ -913,6 +1065,7 @@ def inspect_rd_contract(contract_path: Path) -> dict[str, Any]:
     fields = config.get("fields")
     if not isinstance(fields, Mapping):
         raise InventoryError(f"{path}: typed config has no fields")
+    records_automatic_transitions = contract_schema == RD_CONTRACT_SCHEMA_V2
     required_fields = {
         "public_observation": True,
         "coherent_public_belief_search": True,
@@ -928,7 +1081,7 @@ def inspect_rd_contract(contract_path: Path) -> dict[str, Any]:
         "opponent_pool_manifest": None,
         "native_mcts_hot_loop": True,
         "rust_featurize": True,
-        "record_automatic_transitions": False,
+        "record_automatic_transitions": records_automatic_transitions,
         "meaningful_public_history": True,
         "seed_claim": True,
         "checkpoint": None,
@@ -966,10 +1119,32 @@ def inspect_rd_contract(contract_path: Path) -> dict[str, Any]:
     if expected.get("--coherent-public-belief-search") is not True:
         raise InventoryError(f"{path}: coherent public search is not guard-required")
     if (
+        expected.get("--record-automatic-transitions")
+        is not records_automatic_transitions
+    ):
+        raise InventoryError(
+            f"{path}: automatic-transition guard disagrees with contract version"
+        )
+    if (
         value.get("acceptance", {}).get("require_search_evidence_schema")
         != "gumbel_root_search_evidence_v1"
     ):
         raise InventoryError(f"{path}: search-evidence acceptance schema drift")
+    if contract_schema == RD_CONTRACT_SCHEMA_V2 and (
+        value.get("acceptance", {}).get(
+            "require_forced_value_rows_in_every_game"
+        )
+        is not True
+        or value.get("acceptance", {}).get(
+            "forced_row_policy_weight_multiplier"
+        )
+        != 0.0
+        or value.get("acceptance", {}).get(
+            "forced_row_value_weight_multiplier"
+        )
+        != 1.0
+    ):
+        raise InventoryError(f"{path}: forced-value acceptance contract drift")
 
     execution = value.get("execution")
     if not isinstance(execution, Mapping):
@@ -1013,6 +1188,7 @@ def inspect_rd_contract(contract_path: Path) -> dict[str, Any]:
     return {
         "path": str(path),
         "sha256": _file_sha256(path),
+        "schema_version": contract_schema,
         "contract_sha256": actual,
         "contract_id": value.get("contract_id"),
         "status": value.get("status"),

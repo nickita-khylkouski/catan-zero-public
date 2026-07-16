@@ -331,9 +331,11 @@ class GumbelSelfPlayConfig:
     # Defaults preserve legacy shard shape/contents.
     meaningful_public_history: bool = False
     event_history_limit: int = 64
-    # Legacy corpora recorded one-action UI/chance prompts as value-only rows.
-    # The coherent next wave omits them entirely; keep the default only for
-    # replay/backward-compatible callers.
+    # One-action UI/chance prompts are strategically real trajectory states.
+    # Record them as value-only rows by default: _build_decision_row gives
+    # them zero policy authority and full terminal-outcome value authority.
+    # False remains an explicit backward-compatible opt-out for replaying
+    # historical generation recipes that omitted these transitions.
     record_automatic_transitions: bool = True
     # Deterministic fraction of eligible policy-active coherent n128 roots that
     # receive a second, independently seeded search.  The duplicate produces
@@ -1301,9 +1303,10 @@ def play_one_game(
             break
 
         if len(legal_rust) == 1 and not bool(config.record_automatic_transitions):
-            # Do not turn UI/chance plumbing into half of the learner corpus.
-            # We still route the sole transition through the deterministic
-            # chance sampler so game_seed replay semantics remain identical.
+            # Explicit legacy compatibility path. We still route the sole
+            # transition through the deterministic chance sampler so
+            # game_seed replay semantics remain identical, but no learner row
+            # is emitted. Current coherent recipes must keep this opt-out off.
             action_ids = [
                 int(action)
                 for action in game.playable_action_indices(list(config.colors), None)

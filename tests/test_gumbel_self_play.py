@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import random
 import sys
@@ -399,7 +400,9 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
 
     class FakeMCTS:
         def __init__(self):
-            self.config = GumbelChanceMCTSConfig()
+            self.config = GumbelChanceMCTSConfig(
+                forced_root_target_mode="trajectory_only"
+            )
             self.evaluator = None
 
         def search(self, _game, *, force_full):
@@ -407,7 +410,13 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
             return SimpleNamespace(selected_action=100, simulations_used=4)
 
     def fake_build(game, **_kwargs):
-        return {"player": str(game.current_color())}, {}
+        return {
+            "player": str(game.current_color()),
+            "policy_weight_multiplier": np.float32(0.0),
+            "value_weight_multiplier": np.float32(1.0),
+            "root_value": np.float32(np.nan),
+            "root_value_mask": np.bool_(False),
+        }, {}
 
     def fake_apply(game, _action_index, **kwargs):
         assert kwargs["action_json"] == actions[game.step]
@@ -430,7 +439,16 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
     )
 
     assert record.terminal is True
+    assert record.forced_decisions == 3
     assert len(record.decisions) == 3
+    for decision in record.decisions:
+        assert decision.row["winner"] == "RED"
+        assert decision.row["terminated"] is True
+        assert decision.row["truncated"] is False
+        assert float(decision.row["policy_weight_multiplier"]) == 0.0
+        assert float(decision.row["value_weight_multiplier"]) == 1.0
+        assert not bool(decision.row["root_value_mask"])
+        assert np.isnan(decision.row["root_value"])
     red0 = record.decisions[0].row
     assert red0["aux_longest_road"] == np.float32(1.0)
     assert red0["aux_largest_army"] == np.float32(0.0)
@@ -638,6 +656,64 @@ def test_forced_decisions_are_recorded_with_zero_policy_weight_and_real_value_we
         assert float(row["value_weight_multiplier"]) == pytest.approx(1.0)
         assert not bool(row["root_value_mask"])
         assert np.isnan(row["root_value"])
+
+
+def test_trajectory_only_forced_rows_emit_without_search_or_policy_authority():
+    _rust()
+    self_play_config, _ = _fast_config(max_decisions=14)
+    search_config = GumbelChanceMCTSConfig(
+        seed=0,
+        n_full=4,
+        n_fast=2,
+        p_full=1.0,
+        max_depth=40,
+        forced_root_target_mode="trajectory_only",
+    )
+    evaluator = HeuristicRustEvaluator(score_actions=False)
+    record = play_one_game(
+        GumbelChanceMCTS(search_config, evaluator),
+        evaluator,
+        config=self_play_config,
+        game_seed=7,
+        game_index=0,
+        action_size=ActionCatalog(COLORS).size,
+    )
+
+    forced_rows = [
+        decision.row for decision in record.decisions if decision.row["is_forced"]
+    ]
+    assert forced_rows
+    for row in forced_rows:
+        assert row["used_full_search"] is False
+        assert int(row["simulations_used"]) == 0
+        assert float(row["policy_weight_multiplier"]) == 0.0
+        assert float(row["value_weight_multiplier"]) == 1.0
+        assert not bool(row["root_value_mask"])
+        assert np.isnan(row["root_value"])
+        assert not np.any(row["afterstate_target_mask"])
+        assert "_search_visit_counts" not in row
+        assert "_search_completed_q" not in row
+
+
+def test_explicit_legacy_opt_out_still_omits_forced_transition_rows():
+    _rust()
+    self_play_config, search_config = _fast_config(max_decisions=14)
+    self_play_config = dataclasses.replace(
+        self_play_config, record_automatic_transitions=False
+    )
+    evaluator = HeuristicRustEvaluator(score_actions=False)
+    record = play_one_game(
+        GumbelChanceMCTS(search_config, evaluator),
+        evaluator,
+        config=self_play_config,
+        game_seed=7,
+        game_index=0,
+        action_size=ActionCatalog(COLORS).size,
+    )
+
+    assert record.total_decisions > len(record.decisions)
+    assert record.forced_decisions == 0
+    assert not any(decision.row["is_forced"] for decision in record.decisions)
 
 
 def test_forced_roll_rows_carry_real_afterstate_targets():

@@ -693,6 +693,7 @@ def test_merge_worker_summaries_excludes_manifest_path_for_a_crashed_worker(tmp_
 
     assert summary["games_completed"] == 4
     assert summary["games_failed"] == 3
+    assert summary["forced_decisions_total"] == 4
     assert summary["shards"] == [str(present_shard)]
     assert len(summary["errors"]) == 1
     assert "synthetic fatal worker crash" in summary["errors"][0]["error"]

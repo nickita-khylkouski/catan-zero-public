@@ -60,12 +60,19 @@ DOSE_TELEMETRY_SCHEMA = "a1-active-policy-dose-telemetry-v2"
 SELECTION_SCHEMA = "a1-b200-active-policy-selection-v2"
 INVENTORY_SCHEMA = "a1-target-eligibility-inventory-v1"
 COMPLETION_RECEIPT_SCHEMA = "a1-coherent-target-rd-completion-receipt-v1"
+FORCED_VALUE_TARGET_CONTRACT_SCHEMA = "a1-coherent-target-rd-contract-v2"
 
 TARGET_CONTRACT_RELATIVE = Path(
     "configs/operations/a1-target-identity-coherent-n128-rd-v1/contract.json"
 )
 EXPECTED_TARGET_CONTRACT_SHA256 = (
     "sha256:a37d3a707d4cdb05dd2174f4a8b1125d535876971e8efee6db12061c0713dd4f"
+)
+EXPECTED_TARGET_CONTRACT_V2_SHA256 = (
+    "sha256:31989e86274040cf132aca31f28b3487242086e9834240c883e2432ed851b5c5"
+)
+SUPPORTED_TARGET_CONTRACT_SHA256S = frozenset(
+    {EXPECTED_TARGET_CONTRACT_SHA256, EXPECTED_TARGET_CONTRACT_V2_SHA256}
 )
 EXPECTED_CORPUS_PRODUCER_SHA256 = (
     "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c"
@@ -202,15 +209,41 @@ def _verify_target_contract(path: Path) -> tuple[Path, dict[str, Any]]:
     resolved, contract = _load_json(path, where="coherent target contract")
     unsigned = dict(contract)
     stated = unsigned.pop("contract_sha256", None)
+    schema = contract.get("schema_version")
+    expected_digest = {
+        "a1-coherent-target-rd-contract-v1": EXPECTED_TARGET_CONTRACT_SHA256,
+        FORCED_VALUE_TARGET_CONTRACT_SCHEMA: EXPECTED_TARGET_CONTRACT_V2_SHA256,
+    }.get(schema)
     if (
-        contract.get("schema_version") != "a1-coherent-target-rd-contract-v1"
+        expected_digest is None
         or stated != _value_sha256(unsigned)
-        or stated != EXPECTED_TARGET_CONTRACT_SHA256
+        or stated != expected_digest
         or contract.get("target_information_regime") != TARGET_INFORMATION_REGIME
         or contract.get("producer_checkpoint", {}).get("sha256")
         != EXPECTED_CORPUS_PRODUCER_SHA256
         or contract.get("execution", {}).get("total_games") != EXPECTED_GAMES
         or contract.get("acceptance", {}).get("games_completed") != EXPECTED_GAMES
+        or (
+            schema == FORCED_VALUE_TARGET_CONTRACT_SCHEMA
+            and (
+                contract.get("operator", {}).get(
+                    "record_automatic_transitions"
+                )
+                is not True
+                or contract.get("acceptance", {}).get(
+                    "require_forced_value_rows_in_every_game"
+                )
+                is not True
+                or contract.get("acceptance", {}).get(
+                    "forced_row_policy_weight_multiplier"
+                )
+                != 0.0
+                or contract.get("acceptance", {}).get(
+                    "forced_row_value_weight_multiplier"
+                )
+                != 1.0
+            )
+        )
     ):
         raise CampaignError("coherent target contract identity/acceptance drift")
     return resolved, contract
@@ -336,6 +369,66 @@ def _verify_completion_receipt(
     return resolved, replayed
 
 
+def _require_forced_value_rows(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Fail closed unless every coherent game retained value-only forced rows."""
+
+    report = item.get("forced_value_rows")
+    if not isinstance(report, Mapping):
+        raise CampaignError(
+            "coherent inventory has no forced-value row audit; regenerate the "
+            "inventory before corpus admission"
+        )
+    forced_rows = report.get("forced_rows")
+    rows = report.get("rows")
+    game_count = report.get("game_count")
+    forced_games = report.get("games_with_forced_rows")
+    forced_phases = report.get("forced_phase_counts")
+    forced_actions = report.get("forced_action_taken_counts")
+    forced_action_types = report.get("forced_action_type_counts")
+    if (
+        report.get("present") is not True
+        or report.get("missing_columns") != []
+        or report.get("contract_passed") is not True
+        or not isinstance(rows, int)
+        or not isinstance(forced_rows, int)
+        or not 0 < forced_rows < rows
+        or game_count != EXPECTED_GAMES
+        or forced_games != EXPECTED_GAMES
+        or report.get("forced_game_coverage") != 1.0
+        or report.get("forced_policy_active_rows") != 0
+        or report.get("forced_value_inactive_rows") != 0
+        or not isinstance(forced_phases, Mapping)
+        or not forced_phases
+        or sum(int(value) for value in forced_phases.values()) != forced_rows
+        or not isinstance(forced_actions, Mapping)
+        or not forced_actions
+        or sum(int(value) for value in forced_actions.values()) != forced_rows
+        or not isinstance(forced_action_types, Mapping)
+        or int(forced_action_types.get("ROLL", 0)) <= 0
+        or sum(int(value) for value in forced_action_types.values()) != forced_rows
+    ):
+        raise CampaignError(
+            "coherent corpus lost sole-action value signal: every complete game "
+            "must retain forced rows with policy_weight=0, value_weight=1, and "
+            "audited phase/action coverage"
+        )
+    return copy.deepcopy(dict(report))
+
+
+def _requires_forced_value_rows(
+    *,
+    contract: Mapping[str, Any],
+    repaired_distillation: bool,
+) -> bool:
+    """Apply the new value-row contract without rewriting historical v1 data."""
+
+    return (
+        not repaired_distillation
+        and contract.get("schema_version") == FORCED_VALUE_TARGET_CONTRACT_SCHEMA
+        and contract.get("operator", {}).get("record_automatic_transitions") is True
+    )
+
+
 def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
     contract_path, contract = _verify_target_contract(args.contract)
     completion_path, completion = _verify_completion_receipt(
@@ -374,13 +467,19 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
     repaired_distillation = (
         completion.get("schema_version") == corpus_repair.RECEIPT_SCHEMA
     )
+    require_forced_value_rows = _requires_forced_value_rows(
+        contract=contract,
+        repaired_distillation=repaired_distillation,
+    )
+    forced_value_rows = (
+        _require_forced_value_rows(item)
+        if require_forced_value_rows and isinstance(item, Mapping)
+        else None
+    )
     if repaired_distillation:
-        # This producer intentionally omits automatic UI transitions while
-        # retaining every meaningful decision for both seats. Consequently,
-        # engine decision_index has gaps and the legacy replay audit also asks
-        # for opponent tags that are redundant for receipt-bound single-model
-        # self-play. This corpus is valid for its stored coherent n128 targets,
-        # but we must not mislabel it as state-reanalysis-ready.
+        # Historical v1 repair receipts omitted automatic transitions. They
+        # remain replayable for diagnostic policy distillation, while the new
+        # v2 contract is reserved for newly generated complete-game corpora.
         trace_ok = (
             isinstance(trace, dict)
             and trace.get("game_count") == EXPECTED_GAMES
@@ -420,7 +519,7 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
         inventory.get("required_target_information_regime")
         != TARGET_INFORMATION_REGIME
         or not isinstance(rd_contract, dict)
-        or rd_contract.get("contract_sha256") != EXPECTED_TARGET_CONTRACT_SHA256
+        or rd_contract.get("contract_sha256") != contract["contract_sha256"]
         or not isinstance(meta_ref, dict)
         or Path(str(meta_ref.get("path", ""))).resolve(strict=True) != corpus_meta
         or meta_ref.get("sha256") != _file_sha256(corpus_meta)
@@ -560,6 +659,14 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
             ),
         },
     }
+    if require_forced_value_rows:
+        payload["corpus"]["forced_value_rows"] = forced_value_rows
+        payload["value_distillation_contract"] = {
+            "forced_rows_retained": True,
+            "forced_policy_authority": 0.0,
+            "forced_value_authority": 1.0,
+            "complete_game_forced_row_coverage": 1.0,
+        }
     payload["admission_sha256"] = _value_sha256(payload)
     return payload
 
@@ -573,12 +680,17 @@ def _load_admission(path: Path) -> tuple[Path, dict[str, Any]]:
     )
     corpus = admission.get("corpus")
     policy = admission.get("policy_distillation_contract")
+    value = admission.get("value_distillation_contract")
+    forced_value_rows = (
+        corpus.get("forced_value_rows") if isinstance(corpus, dict) else None
+    )
+    strict_value_contract = value is not None or forced_value_rows is not None
     if (
         admission.get("status") != "admitted_for_diagnostic_policy_distillation"
         or admission.get("diagnostic_only") is not True
         or admission.get("promotion_eligible") is not False
         or admission.get("contract", {}).get("contract_sha256")
-        != EXPECTED_TARGET_CONTRACT_SHA256
+        not in SUPPORTED_TARGET_CONTRACT_SHA256S
         or not isinstance(corpus, dict)
         or corpus.get("producer_checkpoint_sha256")
         != EXPECTED_CORPUS_PRODUCER_SHA256
@@ -604,6 +716,21 @@ def _load_admission(path: Path) -> tuple[Path, dict[str, Any]]:
         or policy.get("legacy_pimc_rows_allowed") is not False
     ):
         raise CampaignError("coherent corpus admission semantics drifted")
+    if strict_value_contract and (
+        not isinstance(forced_value_rows, dict)
+        or forced_value_rows.get("contract_passed") is not True
+        or forced_value_rows.get("games_with_forced_rows") != EXPECTED_GAMES
+        or forced_value_rows.get("forced_policy_active_rows") != 0
+        or forced_value_rows.get("forced_value_inactive_rows") != 0
+        or value
+        != {
+            "forced_rows_retained": True,
+            "forced_policy_authority": 0.0,
+            "forced_value_authority": 1.0,
+            "complete_game_forced_row_coverage": 1.0,
+        }
+    ):
+        raise CampaignError("coherent corpus admission value semantics drifted")
     for record, where in (
         (admission["contract"], "target contract"),
         (admission["completion_receipt"], "completion receipt"),
@@ -782,7 +909,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         or verified.get("coherent_direct_corpus_binding", {}).get(
             "target_contract_sha256"
         )
-        != EXPECTED_TARGET_CONTRACT_SHA256
+        != admission["contract"]["contract_sha256"]
         or verified.get("producer", {}).get("sha256")
         != EXPECTED_CORPUS_PRODUCER_SHA256
         or verified.get("payload_inventory_sha256")

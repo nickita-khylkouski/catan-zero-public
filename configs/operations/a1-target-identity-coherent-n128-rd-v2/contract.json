@@ -1,0 +1,154 @@
+{
+  "schema_version": "a1-coherent-target-rd-contract-v2",
+  "contract_id": "a1-target-identity-coherent-n128-8192games-forced-value-20260716-r2",
+  "status": "ready_nonpromotable_rd",
+  "purpose": "Generate coherent public-belief single-tree n128 targets with complete two-seat traces and value-only forced-transition rows in every game.",
+  "target_information_regime": "public_belief_single_tree_v1",
+  "producer_checkpoint": {
+    "path": "/home/ubuntu/catan-zero-production/runs/learner/a1-production-l1-one-dose-20260712-r3/candidate.pt",
+    "sha256": "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c"
+  },
+  "source_population": {
+    "mode": "producer_mirror_self_play",
+    "opponent_mix": null,
+    "opponent_pool": null,
+    "reason": "Every game must retain a complete two-seat action trace and value-only sole-action states; archived-opponent own-side filtering cannot provide that contract."
+  },
+  "operator": {
+    "n_full": 128,
+    "n_fast": 16,
+    "p_full": 0.25,
+    "adaptive_wide_budget": null,
+    "coherent_public_belief_search": true,
+    "information_set_search": false,
+    "determinization_particles": 1,
+    "c_visit": 50.0,
+    "c_scale": 0.1,
+    "sigma_eval": 0.79,
+    "symmetry_averaged_eval": true,
+    "symmetry_averaged_eval_threshold": 20,
+    "forced_root_target_mode": "trajectory_only",
+    "record_automatic_transitions": true,
+    "meaningful_public_history": true,
+    "event_history_limit": 32,
+    "preserve_search_evidence": true,
+    "native_mcts_hot_loop": true,
+    "rust_featurize": true
+  },
+  "execution": {
+    "host": "149.118.65.110",
+    "gpu_model": "B200",
+    "gpu_count": 8,
+    "workers_per_gpu": 16,
+    "mps_service": "nvidia-mps.service",
+    "mps_environment": {
+      "CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps_pipe_host",
+      "CUDA_MPS_LOG_DIRECTORY": "/tmp/mps_log_host"
+    },
+    "games_per_gpu": 1024,
+    "total_games": 8192,
+    "seed_ledger": "/home/ubuntu/catan-zero-production/SEED_LEDGER.md",
+    "seed_start": 570000008192,
+    "seed_end": 570000016384,
+    "output_root": "/home/ubuntu/experimental_nonpromotable/coherent-target-rd-n128-forced-value-8192-20260716-r2",
+    "lanes": [
+      {
+        "lane_id": "b200_gpu0",
+        "host": "149.118.65.110",
+        "gpu": 0,
+        "base_seed": 570000008192,
+        "games": 1024,
+        "claim_label": "a1-target-identity-coherent-n128-forced-value-r2:b200_gpu0"
+      },
+      {
+        "lane_id": "b200_gpu1",
+        "host": "149.118.65.110",
+        "gpu": 1,
+        "base_seed": 570000009216,
+        "games": 1024,
+        "claim_label": "a1-target-identity-coherent-n128-forced-value-r2:b200_gpu1"
+      },
+      {
+        "lane_id": "b200_gpu2",
+        "host": "149.118.65.110",
+        "gpu": 2,
+        "base_seed": 570000010240,
+        "games": 1024,
+        "claim_label": "a1-target-identity-coherent-n128-forced-value-r2:b200_gpu2"
+      },
+      {
+        "lane_id": "b200_gpu3",
+        "host": "149.118.65.110",
+        "gpu": 3,
+        "base_seed": 570000011264,
+        "games": 1024,
+        "claim_label": "a1-target-identity-coherent-n128-forced-value-r2:b200_gpu3"
+      },
+      {
+        "lane_id": "b200_gpu4",
+        "host": "149.118.65.110",
+        "gpu": 4,
+        "base_seed": 570000012288,
+        "games": 1024,
+        "claim_label": "a1-target-identity-coherent-n128-forced-value-r2:b200_gpu4"
+      },
+      {
+        "lane_id": "b200_gpu5",
+        "host": "149.118.65.110",
+        "gpu": 5,
+        "base_seed": 570000013312,
+        "games": 1024,
+        "claim_label": "a1-target-identity-coherent-n128-forced-value-r2:b200_gpu5"
+      },
+      {
+        "lane_id": "b200_gpu6",
+        "host": "149.118.65.110",
+        "gpu": 6,
+        "base_seed": 570000014336,
+        "games": 1024,
+        "claim_label": "a1-target-identity-coherent-n128-forced-value-r2:b200_gpu6"
+      },
+      {
+        "lane_id": "b200_gpu7",
+        "host": "149.118.65.110",
+        "gpu": 7,
+        "base_seed": 570000015360,
+        "games": 1024,
+        "claim_label": "a1-target-identity-coherent-n128-forced-value-r2:b200_gpu7"
+      }
+    ]
+  },
+  "artifacts": {
+    "typed_generation_config": {
+      "path": "configs/experiments/target_identity/coherent_public_n128_rd_forced_value_v2.schema13.json",
+      "sha256": "sha256:8b69cda7ce04e3905ab443499fb3c993dd7946b4c87d847e3073a38a9dc3a0dd"
+    },
+    "generation_guard": {
+      "path": "configs/guards/a1_generation_coherent_public_n128_rd_forced_value_v2.json",
+      "sha256": "sha256:2ac3035e9cf1dd9fa4d332813714f880b80cd6aa82b03c8d656ffeddfee499b6"
+    }
+  },
+  "acceptance": {
+    "games_completed": 8192,
+    "games_failed": 0,
+    "games_truncated": 0,
+    "require_unique_game_seeds": true,
+    "require_complete_contiguous_two_seat_action_trace": true,
+    "require_target_information_regime": "public_belief_single_tree_v1",
+    "require_policy_active_rows": true,
+    "require_search_evidence_schema": "gumbel_root_search_evidence_v1",
+    "require_public_observation": true,
+    "require_meaningful_public_history": true,
+    "require_public_card_count_schema": "public_card_state_v2",
+    "require_forced_value_rows_in_every_game": true,
+    "forced_row_policy_weight_multiplier": 0.0,
+    "forced_row_value_weight_multiplier": 1.0
+  },
+  "eligibility": {
+    "production_promotion_eligible": false,
+    "learner_policy_distillation_eligible_after_acceptance": true,
+    "may_mix_with_legacy_pimc_policy_targets": false,
+    "value_only_legacy_rows_may_be_separate": false
+  },
+  "contract_sha256": "sha256:31989e86274040cf132aca31f28b3487242086e9834240c883e2432ed851b5c5"
+}

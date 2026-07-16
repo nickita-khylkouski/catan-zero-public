@@ -51,6 +51,7 @@ if str(TOOLS) not in sys.path:
 
 from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig  # noqa: E402
 from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluatorConfig  # noqa: E402
+from catan_zero.rl.action_mask import ActionCatalog  # noqa: E402
 from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ENTITY_FEATURE_ADAPTER_SPECS,
@@ -2544,9 +2545,10 @@ def _validate_generation(generation: dict[str, Any]) -> None:
             raise ContractError(
                 "current explicit event-history contract requires meaningful_public_history=true"
             )
-        if generation["record_automatic_transitions"] is not False:
+        if generation["record_automatic_transitions"] is not True:
             raise ContractError(
-                "meaningful-history waves must not emit automatic-transition learner rows"
+                "current meaningful-history waves must retain automatic "
+                "transitions as value-only learner rows"
             )
         if int(generation["event_history_limit"]) != MEANINGFUL_PUBLIC_HISTORY_LIMIT:
             raise ContractError(
@@ -7176,7 +7178,7 @@ def build_lock(
     if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
         for suffix in (
             "tools/a1_current_science_contract.py",
-            "configs/operations/a1-next-wave-coherent-public-v1/science.contract.json",
+            "configs/operations/a1-next-wave-coherent-public-v2/science.contract.json",
         ):
             if not any(path.endswith(suffix) for path in code_paths):
                 missing_code.add(suffix)
@@ -7204,7 +7206,7 @@ def build_lock(
     if target_information_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT:
         for suffix in (
             "tools/a1_current_science_contract.py",
-            "configs/operations/a1-next-wave-coherent-public-v1/science.contract.json",
+            "configs/operations/a1-next-wave-coherent-public-v2/science.contract.json",
         ):
             if not any(path.endswith(suffix) for path in learner_code_paths):
                 missing_learner_code.add(suffix)
@@ -10180,10 +10182,14 @@ def audit_outputs(
     invalid_actions = 0
     rows = 0
     forced = 0
+    forced_seeds: set[int] = set()
     full_active = 0
     target_entropy_sum = 0.0
     target_entropy_count = 0
     phases: Counter[str] = Counter()
+    forced_phases: Counter[str] = Counter()
+    forced_actions: Counter[str] = Counter()
+    forced_action_types: Counter[str] = Counter()
     decision_bins: Counter[str] = Counter()
     legal_widths: Counter[str] = Counter()
     errors: list[str] = []
@@ -10215,6 +10221,7 @@ def audit_outputs(
     checkpoint_by_id = {record["id"]: record for record in lock["checkpoints"]}
     category_specs = {item["name"]: item for item in lock["source_categories"]}
     selfplay_colors = tuple(_expected_selfplay_config(lock)["colors"])
+    action_catalog = ActionCatalog(selfplay_colors)
     rust_featurize = bool(lock["science"]["evaluator"]["rust_featurize"])
     expected_public_award_provenance = _expected_public_award_feature_provenance(
         rust_featurize=rust_featurize
@@ -10792,8 +10799,24 @@ def audit_outputs(
                             "chunk_sha256": activation_chunk["chunk_sha256"],
                         }
                     forced += int(is_forced.sum())
+                    forced_seeds.update(
+                        map(int, selected_seeds[is_forced].tolist())
+                    )
                     full_active += int(np.sum(used_full & ~is_forced))
                     phases.update(phase.tolist())
+                    forced_phases.update(phase[is_forced].tolist())
+                    forced_ids, forced_id_counts = np.unique(
+                        actions[is_forced], return_counts=True
+                    )
+                    for value, count in zip(
+                        forced_ids.tolist(), forced_id_counts.tolist()
+                    ):
+                        action_id = int(value)
+                        count = int(count)
+                        forced_actions[str(action_id)] += count
+                        forced_action_types[
+                            action_catalog.descriptor(action_id).action_type
+                        ] += count
                     for value in decision:
                         key = (
                             f"{(int(value) // 25) * 25:03d}-"
@@ -10868,6 +10891,26 @@ def audit_outputs(
         all_seeds.update(seeds)
     if invalid_actions:
         errors.append(f"invalid_teacher_actions={invalid_actions}, expected 0")
+    retain_forced_value_rows = bool(
+        lock["generation"].get("record_automatic_transitions", True)
+    )
+    missing_forced_seeds = all_seeds - forced_seeds
+    if retain_forced_value_rows and (
+        forced <= 0
+        or missing_forced_seeds
+        or not forced_phases
+        or sum(forced_phases.values()) != forced
+        or not forced_actions
+        or sum(forced_actions.values()) != forced
+        or int(forced_action_types.get("ROLL", 0)) <= 0
+        or sum(forced_action_types.values()) != forced
+    ):
+        errors.append(
+            "forced-value coverage contract failed: retained sole-action rows "
+            "must appear in every selected complete game with phase/action "
+            f"coverage (forced_rows={forced}, "
+            f"games_without_forced_rows={len(missing_forced_seeds)})"
+        )
     if any(
         _ranges_overlap((seed, seed + 1), VAL_ONLY_SEED_RANGE) for seed in all_seeds
     ):
@@ -11118,6 +11161,19 @@ def audit_outputs(
                 ),
             },
             "forced_fraction": forced / rows if rows else None,
+            "forced_value_coverage": {
+                "required": retain_forced_value_rows,
+                "forced_rows": forced,
+                "selected_games": len(all_seeds),
+                "games_with_forced_rows": len(forced_seeds),
+                "games_without_forced_rows": len(missing_forced_seeds),
+                "game_coverage": (
+                    len(forced_seeds) / len(all_seeds) if all_seeds else None
+                ),
+                "phase_counts": dict(forced_phases),
+                "action_taken_counts": dict(forced_actions),
+                "action_type_counts": dict(forced_action_types),
+            },
             "phase_mix": dict(phases),
             "decision_index_mix": dict(decision_bins),
             "legal_width": dict(legal_widths),

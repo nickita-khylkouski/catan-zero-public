@@ -917,7 +917,7 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert payload["science"]["search"]["n_full_wide_threshold"] is None
     assert payload["science"]["search"]["wide_roots_always_full"] is False
     assert payload["generation"]["meaningful_public_history"] is True
-    assert payload["generation"]["record_automatic_transitions"] is False
+    assert payload["generation"]["record_automatic_transitions"] is True
     assert payload["fleet"]["output_root"] == "__UNRESOLVED__"
     assert "$.science.search.n_full_wide" not in unresolved
     assert "$.science.evaluator.value_readout" in unresolved
@@ -3510,46 +3510,59 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
             json.dumps(contract._job_attestation(lock, job)), encoding="utf-8"
         )
         n = int(job["attempts"])
+        row_count = 2 * n
+        game_seeds = np.repeat(
+            np.arange(job["base_seed"], job["seed_end"], dtype=np.int64), 2
+        )
+        forced_mask = np.arange(row_count) % 2 == 0
+        action_ids = np.where(forced_mask, 331, 0).astype(np.int16)
         shard = out_dir / "shard_00000.npz"
         arrays = {
-            "game_seed": np.arange(job["base_seed"], job["seed_end"], dtype=np.int64),
-            "action_taken": np.zeros(n, dtype=np.int16),
-            "legal_action_ids": np.zeros((n, 1), dtype=np.int16),
-            "legal_action_mask": np.ones((n, 1), dtype=bool),
-            "terminated": np.ones(n, dtype=bool),
-            "truncated": np.zeros(n, dtype=bool),
-            "is_forced": np.zeros(n, dtype=bool),
-            "used_full_search": np.ones(n, dtype=bool),
-            "policy_weight_multiplier": np.ones(n, dtype=np.float32),
-            "value_weight_multiplier": np.ones(n, dtype=np.float32),
-            "phase": np.full(n, "MAIN", dtype="U8"),
-            "decision_index": np.zeros(n, dtype=np.int32),
-            "target_policy": np.ones((n, 1), dtype=np.float32),
-            "target_policy_mask": np.ones((n, 1), dtype=bool),
+            "game_seed": game_seeds,
+            "action_taken": action_ids,
+            "legal_action_ids": action_ids[:, np.newaxis],
+            "legal_action_mask": np.ones((row_count, 1), dtype=bool),
+            "terminated": np.ones(row_count, dtype=bool),
+            "truncated": np.zeros(row_count, dtype=bool),
+            "is_forced": forced_mask,
+            "used_full_search": np.ones(row_count, dtype=bool),
+            "policy_weight_multiplier": (~forced_mask).astype(np.float32),
+            "value_weight_multiplier": np.ones(row_count, dtype=np.float32),
+            "phase": np.where(forced_mask, "ROLL", "MAIN"),
+            "decision_index": np.tile(
+                np.asarray([0, 1], dtype=np.int32), n
+            ),
+            "target_policy": np.ones((row_count, 1), dtype=np.float32),
+            "target_policy_mask": np.ones((row_count, 1), dtype=bool),
             "target_information_regime": np.full(
-                n, "public_conservation_pimc_v1", dtype="U32"
+                row_count, "public_conservation_pimc_v1", dtype="U32"
             ),
             "adapter_version": np.full(
-                n, contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
+                row_count, contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
             ),
-            "event_tokens": np.zeros((n, 2, 1), dtype=np.float16),
-            "event_mask": np.zeros((n, 2), dtype=bool),
-            "event_target_ids": np.full((n, 2, 4), -1, dtype=np.int16),
+            "event_tokens": np.zeros((row_count, 2, 1), dtype=np.float16),
+            "event_mask": np.zeros((row_count, 2), dtype=bool),
+            "event_target_ids": np.full((row_count, 2, 4), -1, dtype=np.int16),
         }
         # The bounded reserve is real: the highest-seed attempt truncates and
         # must be excluded before selected metrics/holdout construction.
-        arrays["terminated"][-1] = False
-        arrays["truncated"][-1] = True
+        arrays["terminated"][-2:] = False
+        arrays["truncated"][-2:] = True
         if job["category"] != "current_producer":
             spec = category_by_name[job["category"]]
             opponent = checkpoint_by_id[spec["checkpoint_ids"][0]]
-            arrays["opponent_tag"] = np.full(n, job["category"], dtype="U32")
-            arrays["opponent_checkpoint_md5"] = np.full(n, opponent["md5"], dtype="U32")
-            arrays["is_pool_game"] = np.ones(n, dtype=bool)
-            arrays["opponent_version"] = np.full(
-                n, int(opponent.get("version", -1)), dtype=np.int32
+            arrays["opponent_tag"] = np.full(
+                row_count, job["category"], dtype="U32"
             )
-            players = np.asarray(
+            arrays["opponent_checkpoint_md5"] = np.full(
+                row_count, opponent["md5"], dtype="U32"
+            )
+            arrays["is_pool_game"] = np.ones(row_count, dtype=bool)
+            arrays["opponent_version"] = np.full(
+                row_count, int(opponent.get("version", -1)), dtype=np.int32
+            )
+            players = np.repeat(
+                np.asarray(
                 [
                     "RED"
                     if contract._pool_champion_plays_first_seat(index)  # noqa: SLF001
@@ -3557,6 +3570,8 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
                     for index in range(n)
                 ],
                 dtype="U8",
+                ),
+                2,
             )
             arrays["player"] = players
             arrays["seat"] = np.asarray(
@@ -3710,11 +3725,10 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
     ]
     assert lock["generation"]["native_mcts_hot_loop"] is True
     assert report["games"] == contract.EXPECTED_GAMES
+    expected_rows = 2 * sum(contract.EXPECTED_ATTEMPTS.values())
     assert report["target_information_regime"] == {
         "required": "public_conservation_pimc_v1",
-        "counts": {
-            "public_conservation_pimc_v1": sum(contract.EXPECTED_ATTEMPTS.values())
-        },
+        "counts": {"public_conservation_pimc_v1": expected_rows},
     }
     feature_semantics = report["feature_semantics"]
     assert feature_semantics["public_award_feature_provenance"]["expected"] == (
@@ -3723,16 +3737,16 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
         )
     )
     assert feature_semantics["entity_feature_adapter"]["row_counts"] == {
-        contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION: sum(
-            contract.EXPECTED_ATTEMPTS.values()
-        )
+        contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION: expected_rows
     }
     assert feature_semantics["event_history"]["authenticated_empty"] is True
-    assert feature_semantics["event_history"]["row_count"] == sum(
-        contract.EXPECTED_ATTEMPTS.values()
-    )
+    assert feature_semantics["event_history"]["row_count"] == expected_rows
     assert feature_semantics["event_history"]["history_width_row_counts"] == {
-        "2": sum(contract.EXPECTED_ATTEMPTS.values())
+        "2": expected_rows
+    }
+    assert report["reports"]["forced_value_coverage"]["game_coverage"] == 1.0
+    assert report["reports"]["forced_value_coverage"]["action_type_counts"] == {
+        "ROLL": sum(contract.EXPECTED_GAMES.values())
     }
     # The issued v2 fixture remains readable without retroactively requiring
     # the v3 target-activation receipt.
@@ -3774,9 +3788,9 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
     with pytest.raises(contract.ContractError, match="post-wave audit failed"):
         contract.audit_outputs(lock_path, tmp_path / "audit.unsafe.json")
     assert report["total_unique_games"] == 12_000
-    assert report["rows"] == 12_000
+    assert report["rows"] == 24_000
     assert report["invalid_teacher_actions"] == 0
-    assert report["reports"]["full_search_policy_mass"] == 1.0
+    assert report["reports"]["full_search_policy_mass"] == 0.5
     assert (
         report["reports"]["truncation"][
             "reserve_truncated_or_incomplete_attempts"

@@ -33,13 +33,24 @@ from tools.build_memmap_corpus import (  # noqa: E402
 
 CONFIG = (
     REPO
-    / "configs/experiments/next_wave/coherent_public_n128_adaptive256.schema13.json"
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v2.schema13.json"
 )
-GUARD = REPO / "configs/guards/a1_generation_coherent_public_n128_adaptive256_v1.json"
+GUARD = (
+    REPO
+    / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v2.json"
+)
 LEARNER = REPO / "configs/experiments/next_wave/one_dose_public_card_overrides.json"
-OPERATION = REPO / "configs/operations/a1-next-wave-coherent-public-v1"
+OPERATION = REPO / "configs/operations/a1-next-wave-coherent-public-v2"
 RUNBOOK = OPERATION / "README.md"
 SCIENCE_CONTRACT = OPERATION / "science.contract.json"
+LEGACY_CONFIG = (
+    REPO
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256.schema13.json"
+)
+LEGACY_GUARD = (
+    REPO / "configs/guards/a1_generation_coherent_public_n128_adaptive256_v1.json"
+)
+LEGACY_OPERATION = REPO / "configs/operations/a1-next-wave-coherent-public-v1"
 
 
 def _canonical_sha256(value: object) -> str:
@@ -93,7 +104,7 @@ def test_next_wave_typed_generation_config_is_exact_schema_13_recipe() -> None:
     assert cfg.shard_size == 512
     assert cfg.meaningful_public_history is True
     assert cfg.event_history_limit == 32
-    assert cfg.record_automatic_transitions is False
+    assert cfg.record_automatic_transitions is True
     assert cfg.temperature_clock == "nonforced_choice"
     assert (cfg.temperature_decisions, cfg.late_temperature_decisions) == (40, 100)
     assert cfg.late_temperature == 0.1
@@ -101,6 +112,30 @@ def test_next_wave_typed_generation_config_is_exact_schema_13_recipe() -> None:
     # accidentally launch a real wave by itself.
     assert cfg.checkpoint is None
     assert cfg.games == 0
+
+
+def test_issued_v1_generation_artifacts_remain_byte_identical() -> None:
+    expected = {
+        LEGACY_CONFIG: "0023bfc5fb3fb1b10d39259bd73e1b0818c6a98faa6c3208d9919fe34d5e8fd5",
+        LEGACY_GUARD: "d816efe9e2878e7d185f067d40c85fa7bfe5c8d817c62fdc6739bb4d0c284cc6",
+        LEGACY_OPERATION / "science.contract.json": (
+            "0eb2fdf6d633bb4841ab2c74c33f337ce1ce35805e7e950df4d0778150fa4301"
+        ),
+        LEGACY_OPERATION / "README.md": (
+            "c40b3b226753baef9b7a48b44bd8c2734420512f4656661a39bd9cc64ad2da62"
+        ),
+    }
+    for path, digest in expected.items():
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    legacy_config = json.loads(LEGACY_CONFIG.read_text())["fields"]
+    legacy_guard = json.loads(LEGACY_GUARD.read_text())["guards"][0]["args"]
+    assert legacy_config["record_automatic_transitions"] is False
+    assert (
+        legacy_guard["expected_values"]["--record-automatic-transitions"] is False
+    )
+    assert "--no-record-automatic-transitions" in (
+        LEGACY_OPERATION / "README.md"
+    ).read_text()
 
 
 def test_next_wave_guard_pins_the_same_science_values() -> None:
@@ -223,7 +258,7 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
         "sha256:b48ffdb23635086fb2cfe1b5160c99a25dbdb8489008c89ac8ca4ba3ee990b2f"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:0eb2fdf6d633bb4841ab2c74c33f337ce1ce35805e7e950df4d0778150fa4301"
+        "sha256:78774dee44e34e2704cb22f39c09d65d824d4dfd77f18eb1f7e963e804df46c1"
     )
 
 
@@ -248,28 +283,15 @@ def test_canonical_short_dose_reconstructs_byte_exactly_in_trainer() -> None:
 def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:
     text = RUNBOOK.read_text()
     assert "tools/generate_gumbel_selfplay_data.py" in text
-    assert "tools/a1_iteration_orchestrator.py" in text
-    assert "tools/gumbel_search_cross_net_h2h.py" in text
     assert "--forced-root-target-mode trajectory_only" in text
     assert "--coherent-public-belief-search" in text
-    assert "--no-record-automatic-transitions" in text
+    assert "--record-automatic-transitions" in text
     assert "--meaningful-public-history" in text
     assert "--event-history-limit 32" in text
-    assert (
-        "--flags structured_action_value,card_count_v2,meaningful_history"
-        in text
-    )
-    assert (
-        "entity_graph.static_action_residual+legal_action_value_residual+"
-        "public_card_count_features+meaningful_public_history.v3"
-        in text
-    )
-    assert "tools/a1_iteration_orchestrator.py initialize-next" in text
-    assert "tools/fleet/a1_h100_eval_fleet.py" in text
-    assert "action-target gather experiment was neutral" in text
-    assert "LR `6e-5` and 16 warmup steps" in text
-    assert "Value rows are normalized to equal" in text
-    assert "total mass per game" in text
+    assert "complete forced-transition retention" in text
+    assert "policy_weight_multiplier=0" in text
+    assert "value_weight_multiplier=1" in text
+    assert "equal per-game value mass" in text
 
 
 def _contract_fields(*, coherent: bool) -> tuple[dict, dict, dict]:
@@ -296,7 +318,7 @@ def _contract_fields(*, coherent: bool) -> tuple[dict, dict, dict]:
         generation["temperature_clock"] = "nonforced_choice"
         generation.update(
             {
-                "record_automatic_transitions": False,
+                "record_automatic_transitions": True,
                 "meaningful_public_history": True,
                 "event_history_limit": 32,
             }
@@ -390,14 +412,14 @@ def test_pre_wave_contract_binds_coherent_regime_and_runtime_fields(
     assert "--coherent-public-belief-search" in argv
     assert argv[argv.index("--forced-root-target-mode") + 1] == "trajectory_only"
     assert argv[argv.index("--temperature-clock") + 1] == "nonforced_choice"
-    assert "--no-record-automatic-transitions" in argv
+    assert "--record-automatic-transitions" in argv
     assert "--meaningful-public-history" in argv
     assert argv[argv.index("--event-history-limit") + 1] == "32"
     cli = contract._expected_cli_fields(lock, job)  # noqa: SLF001
     assert cli["coherent_public_belief_search"] is True
     assert cli["forced_root_target_mode"] == "trajectory_only"
     assert cli["temperature_clock"] == "nonforced_choice"
-    assert cli["record_automatic_transitions"] is False
+    assert cli["record_automatic_transitions"] is True
     assert cli["meaningful_public_history"] is True
     assert cli["event_history_limit"] == 32
 

@@ -20,16 +20,16 @@ from typing import Any, Mapping
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = (
     REPO_ROOT
-    / "configs/operations/a1-next-wave-coherent-public-v1/science.contract.json"
+    / "configs/operations/a1-next-wave-coherent-public-v2/science.contract.json"
 )
 TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract.template.json"
 GENERATOR_CONFIG_PATH = (
     REPO_ROOT
-    / "configs/experiments/next_wave/coherent_public_n128_adaptive256.schema13.json"
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v2.schema13.json"
 )
 GENERATOR_GUARD_PATH = (
     REPO_ROOT
-    / "configs/guards/a1_generation_coherent_public_n128_adaptive256_v1.json"
+    / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v2.json"
 )
 SCHEMA_VERSION = "a1-current-science-contract-v1"
 TEACHER_REPORT_SCHEMA = "teacher-operator-causal-report-v1"
