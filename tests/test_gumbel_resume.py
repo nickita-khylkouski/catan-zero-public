@@ -91,6 +91,7 @@ def _fake_decision(game_seed: int, decision_index: int) -> gsp.DecisionRecord:
         "edge_tokens": np.zeros((4, 2), dtype=np.float16),
         "edge_vertex_ids": np.zeros((4, 2), dtype=np.int16),
         "player_tokens": np.zeros((2, 2), dtype=np.float16),
+        "deduction_features": np.zeros((4, 11), dtype=np.float32),
         "global_tokens": np.zeros((1, 2), dtype=np.float16),
         "legal_action_tokens": np.zeros((2, 2), dtype=np.float16),
         "legal_action_target_ids": np.zeros((2, 4), dtype=np.int16),
