@@ -73,6 +73,11 @@ INDEPENDENT_PARENT_AUTHORITY_SCHEMA = (
 )
 TRAINING_TRANSACTION_SCHEMA = "a1-one-dose-training-transaction-v1"
 PRODUCTION_TRAINER_AUTHORITY_SCHEMA = "a1-production-trainer-authority-v1"
+SEARCH_EVIDENCE_V1_SCHEMA = "gumbel_root_search_evidence_v1"
+SEARCH_EVIDENCE_V2_SCHEMA = "gumbel_root_search_evidence_v2_fp32_prior"
+SUPPORTED_SEARCH_EVIDENCE_SCHEMAS = frozenset(
+    {SEARCH_EVIDENCE_V1_SCHEMA, SEARCH_EVIDENCE_V2_SCHEMA}
+)
 PRODUCTION_TRAINER_CODE_SURFACE = tuple(
     sorted(
         train_bc.A1_REQUIRED_LEARNER_CODE_SUFFIXES
@@ -1791,6 +1796,49 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     return recipe, objective
 
 
+def _verify_coherent_search_evidence_memmap(
+    *, corpus: Mapping[str, Any], meta: Mapping[str, Any]
+) -> None:
+    """Bind v2 admissions to their reconstruction-grade memmap payload.
+
+    Archived v1 repair receipts may intentionally keep evidence only in their
+    receipt-bound NPZs. New v2 admissions are useful only when the learner-side
+    corpus retains the fp32-prior column, so they fail closed on any storage or
+    metadata downgrade.
+    """
+
+    schema = corpus.get("search_evidence_schema")
+    if schema not in SUPPORTED_SEARCH_EVIDENCE_SCHEMAS:
+        raise ExecutorError("unsupported coherent search-evidence schema")
+    storage = corpus.get("search_evidence_storage")
+    if schema == SEARCH_EVIDENCE_V2_SCHEMA and storage != "training_memmap":
+        raise ExecutorError(
+            "v2 fp32-prior evidence must be stored in training memmap"
+        )
+    if storage != "training_memmap":
+        return
+    evidence_meta = meta.get("search_evidence")
+    columns = meta.get("columns")
+    required_columns = {
+        "search_evidence_version",
+        "search_evidence_mask",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+    }
+    if schema == SEARCH_EVIDENCE_V2_SCHEMA:
+        required_columns.add("search_prior_policy_flat")
+    if (
+        not isinstance(evidence_meta, Mapping)
+        or evidence_meta.get("schema") != schema
+        or not isinstance(columns, Mapping)
+        or not required_columns <= set(columns)
+    ):
+        raise ExecutorError(
+            "coherent memmap search-evidence schema differs from admission"
+        )
+
+
 def _verify_coherent_direct_training_inputs(
     *,
     admission_path: Path,
@@ -1848,6 +1896,7 @@ def _verify_coherent_direct_training_inputs(
     contract = payload.get("contract")
     if not all(isinstance(value, dict) for value in (corpus, policy, contract)):
         raise ExecutorError("coherent corpus admission sections are malformed")
+    search_evidence_schema = corpus.get("search_evidence_schema")
     producer = _producer(lock)
     if (
         Path(str(corpus.get("data_path", ""))).expanduser().resolve(strict=True)
@@ -1860,7 +1909,11 @@ def _verify_coherent_direct_training_inputs(
         or corpus.get("selected_games") != 8_192
         or not isinstance(corpus.get("selected_game_seed_set_sha256"), str)
         or corpus.get("target_information_regime") != "public_belief_single_tree_v1"
-        or corpus.get("search_evidence_schema") != "gumbel_root_search_evidence_v1"
+        or search_evidence_schema not in SUPPORTED_SEARCH_EVIDENCE_SCHEMAS
+        or (
+            search_evidence_schema == SEARCH_EVIDENCE_V2_SCHEMA
+            and corpus.get("search_evidence_storage") != "training_memmap"
+        )
         or corpus.get("incompatible_policy_active_rows") != 0
         or policy.get("coherent_public_n128_only") is not True
         or policy.get("legacy_pimc_rows_allowed") is not False
@@ -1879,6 +1932,7 @@ def _verify_coherent_direct_training_inputs(
         != corpus.get("payload_inventory_sha256")
     ):
         raise ExecutorError("coherent corpus metadata differs from admission")
+    _verify_coherent_search_evidence_memmap(corpus=corpus, meta=meta)
     try:
         train_bc._validate_memmap_payload_inventory(data_path, meta)  # noqa: SLF001
         validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001

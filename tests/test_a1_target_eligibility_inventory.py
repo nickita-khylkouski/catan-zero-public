@@ -261,6 +261,23 @@ def test_sealed_rd_contract_and_nullable_override_guard() -> None:
     assert guarded.details["forbidden_flags"] == ["--nullable"]
 
 
+def test_rd_contract_accepts_archived_v1_and_fp32_prior_v2_schemas() -> None:
+    where = Path("contract.json")
+    for schema in (
+        inventory.SEARCH_EVIDENCE_V1_SCHEMA,
+        inventory.SEARCH_EVIDENCE_V2_SCHEMA,
+    ):
+        assert inventory._required_search_evidence_schema(  # noqa: SLF001
+            {"acceptance": {"require_search_evidence_schema": schema}},
+            where=where,
+        ) == schema
+    with pytest.raises(inventory.InventoryError, match="acceptance schema drift"):
+        inventory._required_search_evidence_schema(  # noqa: SLF001
+            {"acceptance": {"require_search_evidence_schema": "unknown"}},
+            where=where,
+        )
+
+
 def test_policy_operator_inventory_rejects_mixed_search_teachers() -> None:
     groups = [
         {

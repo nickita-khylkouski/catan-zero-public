@@ -74,10 +74,15 @@ def test_progress_snapshot_aggregates_workers_and_marks_missing_stale(
     }
 
 
-def _coherent_shard(path: Path, *, corrupt_visit_sum: bool = False) -> None:
+def _coherent_shard(
+    path: Path,
+    *,
+    corrupt_visit_sum: bool = False,
+    evidence_version: int = 1,
+    zero_prior_mass: bool = False,
+) -> None:
     visits = np.asarray([5, 3, 6 if corrupt_visit_sum else 7], dtype=np.uint16)
-    np.savez_compressed(
-        path,
+    payload = dict(
         game_seed=np.asarray([901, 901, 901], dtype=np.uint64),
         decision_index=np.asarray([0, 1, 2], dtype=np.int32),
         seat=np.asarray([0, 1, 0], dtype=np.int8),
@@ -93,11 +98,17 @@ def _coherent_shard(path: Path, *, corrupt_visit_sum: bool = False) -> None:
             [[True, True, False], [True, False, False], [False, True, False]]
         ),
         simulations_used=np.asarray([8, 0, 7], dtype=np.uint16),
-        search_evidence_version=np.asarray(1, dtype=np.uint8),
+        search_evidence_version=np.asarray(evidence_version, dtype=np.uint8),
         search_evidence_offsets=np.asarray([0, 2, 3], dtype=np.uint32),
         search_visit_counts_flat=visits,
         search_completed_q_flat=np.asarray([0.1, -0.2, 0.3], dtype=np.float32),
     )
+    if evidence_version == 2:
+        payload["search_prior_policy_flat"] = np.asarray(
+            [0.0, 0.0, 0.0] if zero_prior_mass else [0.7, 0.3, 1.0],
+            dtype=np.float32,
+        )
+    np.savez_compressed(path, **payload)
 
 
 @pytest.mark.parametrize(
@@ -178,6 +189,39 @@ def test_shard_closure_authenticates_search_evidence_and_full_trajectory(
     assert result == {"rows": 3, "policy_active_rows": 2}
     assert trace["seen"] == {901}
     assert trace["current_complete"] is True
+
+
+def test_shard_closure_accepts_v2_fp32_prior_and_rejects_zero_mass(
+    tmp_path: Path,
+) -> None:
+    shard = tmp_path / "shard.npz"
+    trace = {
+        "seen": set(),
+        "current_seed": None,
+        "last_decision": None,
+        "current_complete": False,
+        "current_seats": set(),
+    }
+    _coherent_shard(shard, evidence_version=2)
+    assert executor._verify_shard_arrays(
+        shard,
+        contract={"target_information_regime": "coherent"},
+        trace=trace,
+    ) == {"rows": 3, "policy_active_rows": 2}
+
+    _coherent_shard(shard, evidence_version=2, zero_prior_mass=True)
+    with pytest.raises(executor.ExecutorError, match="zero-mass fp32 prior"):
+        executor._verify_shard_arrays(
+            shard,
+            contract={"target_information_regime": "coherent"},
+            trace={
+                "seen": set(),
+                "current_seed": None,
+                "last_decision": None,
+                "current_complete": False,
+                "current_seats": set(),
+            },
+        )
 
 
 def test_shard_closure_rejects_search_visit_sum_drift(tmp_path: Path) -> None:

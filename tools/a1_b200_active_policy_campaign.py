@@ -69,7 +69,7 @@ EXPECTED_TARGET_CONTRACT_SHA256 = (
     "sha256:a37d3a707d4cdb05dd2174f4a8b1125d535876971e8efee6db12061c0713dd4f"
 )
 EXPECTED_TARGET_CONTRACT_V2_SHA256 = (
-    "sha256:31989e86274040cf132aca31f28b3487242086e9834240c883e2432ed851b5c5"
+    "sha256:89052c1f67c576c628fa9b89f740c9aecb65a06db134ef847b97411c8b84c2e2"
 )
 SUPPORTED_TARGET_CONTRACT_SHA256S = frozenset(
     {EXPECTED_TARGET_CONTRACT_SHA256, EXPECTED_TARGET_CONTRACT_V2_SHA256}
@@ -81,7 +81,11 @@ EXPECTED_F7_PARENT_SHA256 = (
     "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4"
 )
 TARGET_INFORMATION_REGIME = "public_belief_single_tree_v1"
-SEARCH_EVIDENCE_SCHEMA = "gumbel_root_search_evidence_v1"
+ARCHIVED_SEARCH_EVIDENCE_SCHEMA = "gumbel_root_search_evidence_v1"
+SEARCH_EVIDENCE_SCHEMA = "gumbel_root_search_evidence_v2_fp32_prior"
+SUPPORTED_SEARCH_EVIDENCE_SCHEMAS = frozenset(
+    {ARCHIVED_SEARCH_EVIDENCE_SCHEMA, SEARCH_EVIDENCE_SCHEMA}
+)
 EXPECTED_GAMES = 8_192
 WORLD_SIZE = 8
 LOCAL_BATCH_SIZE = 512
@@ -108,12 +112,17 @@ ARMS = {
     }
     for arm, multiplier in ARM_MULTIPLIERS.items()
 }
-EXPECTED_SEARCH_EVIDENCE_COLUMNS = {
-    "search_evidence_version",
-    "search_evidence_offsets",
-    "search_visit_counts_flat",
-    "search_completed_q_flat",
-}
+BASE_SEARCH_EVIDENCE_COLUMNS = frozenset(
+    {
+        "search_evidence_version",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+    }
+)
+EXPECTED_SEARCH_EVIDENCE_COLUMNS = frozenset(
+    {*BASE_SEARCH_EVIDENCE_COLUMNS, "search_prior_policy_flat"}
+)
 R2_UPDATE_FRONTIER_REFERENCE = {
     "source": "a1-r2-early-62-of-64-aggregate",
     "reference_arm": "B",
@@ -128,6 +137,31 @@ R2_UPDATE_FRONTIER_REFERENCE = {
 
 class CampaignError(RuntimeError):
     """An immutable campaign input or result is semantically invalid."""
+
+
+def _search_evidence_columns(schema: object) -> frozenset[str]:
+    """Return the exact evidence surface for one explicit schema generation."""
+
+    if schema == SEARCH_EVIDENCE_SCHEMA:
+        return EXPECTED_SEARCH_EVIDENCE_COLUMNS
+    if schema == ARCHIVED_SEARCH_EVIDENCE_SCHEMA:
+        return BASE_SEARCH_EVIDENCE_COLUMNS
+    raise CampaignError(f"unsupported search-evidence schema {schema!r}")
+
+
+def _admission_search_evidence_schema(
+    *, repaired_distillation: bool, completion_schema: object
+) -> str:
+    """Bind new admissions to fp32 priors without invalidating archives."""
+
+    if repaired_distillation:
+        return ARCHIVED_SEARCH_EVIDENCE_SCHEMA
+    if completion_schema != SEARCH_EVIDENCE_SCHEMA:
+        raise CampaignError(
+            "new coherent corpus admission requires fp32-prior search evidence "
+            f"schema {SEARCH_EVIDENCE_SCHEMA!r}; got {completion_schema!r}"
+        )
+    return SEARCH_EVIDENCE_SCHEMA
 
 
 def _file_sha256(path: Path) -> str:
@@ -347,7 +381,8 @@ def _verify_completion_receipt(
         != EXPECTED_CORPUS_PRODUCER_SHA256
         or replayed.get("target_information_regime")
         != TARGET_INFORMATION_REGIME
-        or replayed.get("search_evidence_schema") != SEARCH_EVIDENCE_SCHEMA
+        or replayed.get("search_evidence_schema")
+        not in SUPPORTED_SEARCH_EVIDENCE_SCHEMAS
         or not isinstance(operator, dict)
         or operator.get("semantic_sha256") != _value_sha256(contract["operator"])
         or not isinstance(seeds, dict)
@@ -467,6 +502,13 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
     repaired_distillation = (
         completion.get("schema_version") == corpus_repair.RECEIPT_SCHEMA
     )
+    completion_evidence_schema = _admission_search_evidence_schema(
+        repaired_distillation=repaired_distillation,
+        completion_schema=completion.get("search_evidence_schema"),
+    )
+    expected_evidence_columns = _search_evidence_columns(
+        completion_evidence_schema
+    )
     require_forced_value_rows = _requires_forced_value_rows(
         contract=contract,
         repaired_distillation=repaired_distillation,
@@ -512,8 +554,13 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
             and trace.get("complete_action_trace_fraction") == 1.0
             and trace.get("full_corpus_replayable") is True
         )
-        search_evidence_ok = EXPECTED_SEARCH_EVIDENCE_COLUMNS.issubset(
-            set(item.get("search_evidence_columns", ()))
+        item_evidence = item.get("search_evidence")
+        search_evidence_ok = (
+            isinstance(item_evidence, Mapping)
+            and item_evidence.get("schema") == completion_evidence_schema
+            and expected_evidence_columns.issubset(
+                set(item.get("search_evidence_columns", ()))
+            )
         )
     if (
         inventory.get("required_target_information_regime")
@@ -621,7 +668,7 @@ def _admit_corpus(args: argparse.Namespace) -> dict[str, Any]:
             },
             "producer_checkpoint_sha256": EXPECTED_CORPUS_PRODUCER_SHA256,
             "target_information_regime": TARGET_INFORMATION_REGIME,
-            "search_evidence_schema": SEARCH_EVIDENCE_SCHEMA,
+            "search_evidence_schema": completion_evidence_schema,
             "selected_games": EXPECTED_GAMES,
             "selected_game_seed_set_sha256": selected_seed_set_sha256,
             "selection_mode": selection_mode,
@@ -695,7 +742,8 @@ def _load_admission(path: Path) -> tuple[Path, dict[str, Any]]:
         or corpus.get("producer_checkpoint_sha256")
         != EXPECTED_CORPUS_PRODUCER_SHA256
         or corpus.get("target_information_regime") != TARGET_INFORMATION_REGIME
-        or corpus.get("search_evidence_schema") != SEARCH_EVIDENCE_SCHEMA
+        or corpus.get("search_evidence_schema")
+        not in SUPPORTED_SEARCH_EVIDENCE_SCHEMAS
         or corpus.get("selected_games") != EXPECTED_GAMES
         or not isinstance(corpus.get("selected_game_seed_set_sha256"), str)
         or corpus.get("selection_mode")
@@ -709,6 +757,10 @@ def _load_admission(path: Path) -> tuple[Path, dict[str, Any]]:
                 or corpus.get("search_evidence_storage")
                 != "receipt_bound_source_npz_only"
             )
+        )
+        or (
+            corpus.get("search_evidence_schema") == SEARCH_EVIDENCE_SCHEMA
+            and corpus.get("search_evidence_storage") != "training_memmap"
         )
         or corpus.get("incompatible_policy_active_rows") != 0
         or not isinstance(policy, dict)

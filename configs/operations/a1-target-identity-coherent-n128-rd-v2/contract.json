@@ -136,7 +136,7 @@
     "require_complete_contiguous_two_seat_action_trace": true,
     "require_target_information_regime": "public_belief_single_tree_v1",
     "require_policy_active_rows": true,
-    "require_search_evidence_schema": "gumbel_root_search_evidence_v1",
+    "require_search_evidence_schema": "gumbel_root_search_evidence_v2_fp32_prior",
     "require_public_observation": true,
     "require_meaningful_public_history": true,
     "require_public_card_count_schema": "public_card_state_v2",
@@ -150,5 +150,5 @@
     "may_mix_with_legacy_pimc_policy_targets": false,
     "value_only_legacy_rows_may_be_separate": false
   },
-  "contract_sha256": "sha256:31989e86274040cf132aca31f28b3487242086e9834240c883e2432ed851b5c5"
+  "contract_sha256": "sha256:89052c1f67c576c628fa9b89f740c9aecb65a06db134ef847b97411c8b84c2e2"
 }

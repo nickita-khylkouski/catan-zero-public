@@ -91,7 +91,7 @@ FORCED_VALUE_COLUMNS = frozenset(
         "value_weight_multiplier",
     }
 )
-SEARCH_EVIDENCE_COLUMNS = frozenset(
+SEARCH_EVIDENCE_BASE_COLUMNS = frozenset(
     {
         "search_evidence_version",
         "search_evidence_mask",
@@ -100,6 +100,16 @@ SEARCH_EVIDENCE_COLUMNS = frozenset(
         "search_completed_q_flat",
     }
 )
+SEARCH_EVIDENCE_V2_COLUMNS = frozenset(
+    {*SEARCH_EVIDENCE_BASE_COLUMNS, "search_prior_policy_flat"}
+)
+SEARCH_EVIDENCE_V1_SCHEMA = "gumbel_root_search_evidence_v1"
+SEARCH_EVIDENCE_V2_SCHEMA = "gumbel_root_search_evidence_v2_fp32_prior"
+SUPPORTED_SEARCH_EVIDENCE_SCHEMAS = frozenset(
+    {SEARCH_EVIDENCE_V1_SCHEMA, SEARCH_EVIDENCE_V2_SCHEMA}
+)
+
+
 # Historical manifests were fingerprinted with this deliberately incomplete
 # flat projection.  Keep it append-only so archived composites remain
 # inspectable under the exact identity rule that originally admitted them.
@@ -169,6 +179,13 @@ PRODUCER_CODE_IDENTITY_FIELDS = (
 
 class InventoryError(RuntimeError):
     """The input is malformed or cannot support an exact inventory."""
+
+
+def _required_search_evidence_schema(value: Mapping[str, Any], *, where: Path) -> str:
+    schema = value.get("acceptance", {}).get("require_search_evidence_schema")
+    if schema not in SUPPORTED_SEARCH_EVIDENCE_SCHEMAS:
+        raise InventoryError(f"{where}: search-evidence acceptance schema drift")
+    return str(schema)
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -417,7 +434,7 @@ def _search_evidence_inventory(
     columns = meta.get("columns")
     if not isinstance(columns, dict):
         raise InventoryError(f"{root}: missing memmap columns")
-    present = SEARCH_EVIDENCE_COLUMNS & set(columns)
+    present = SEARCH_EVIDENCE_V2_COLUMNS & set(columns)
     if not present:
         return {
             "present": False,
@@ -427,10 +444,19 @@ def _search_evidence_inventory(
             "active_rows": 0,
             "flat_entries": 0,
         }
-    if present != SEARCH_EVIDENCE_COLUMNS:
+    declared = meta.get("search_evidence")
+    declared_schema = (
+        declared.get("schema") if isinstance(declared, dict) else None
+    )
+    expected_columns = (
+        SEARCH_EVIDENCE_V2_COLUMNS
+        if declared_schema == SEARCH_EVIDENCE_V2_SCHEMA
+        else SEARCH_EVIDENCE_BASE_COLUMNS
+    )
+    if present != expected_columns:
         raise InventoryError(
             f"{root}: incomplete row-addressable search evidence; "
-            f"missing={sorted(SEARCH_EVIDENCE_COLUMNS - present)}"
+            f"missing={sorted(expected_columns - present)}"
         )
     expected_schemas = {
         "search_evidence_version": ("fixed", np.dtype(np.uint8), []),
@@ -447,6 +473,12 @@ def _search_evidence_inventory(
             None,
         ),
     }
+    if declared_schema == SEARCH_EVIDENCE_V2_SCHEMA:
+        expected_schemas["search_prior_policy_flat"] = (
+            "independent_ragged1d",
+            np.dtype(np.float32),
+            None,
+        )
     for name, (kind, dtype, inner) in expected_schemas.items():
         schema = columns[name]
         if (
@@ -478,7 +510,16 @@ def _search_evidence_inventory(
         not np.array_equal(mask, expected_active)
         or bool(np.any(lengths[~mask] != 0))
         or bool(np.any(lengths[mask] <= 0))
-        or bool(np.any(version[mask] != 1))
+        or bool(
+            np.any(
+                version[mask]
+                != (
+                    2
+                    if declared_schema == SEARCH_EVIDENCE_V2_SCHEMA
+                    else 1
+                )
+            )
+        )
         or bool(np.any(version[~mask] != 0))
     ):
         raise InventoryError(f"{root}: search evidence is not policy-row aligned")
@@ -493,6 +534,10 @@ def _search_evidence_inventory(
         "search_visit_counts_flat.dat": flat_entries * np.dtype(np.uint16).itemsize,
         "search_completed_q_flat.dat": flat_entries * np.dtype(np.float32).itemsize,
     }
+    if declared_schema == SEARCH_EVIDENCE_V2_SCHEMA:
+        expected_sizes["search_prior_policy_flat.dat"] = (
+            flat_entries * np.dtype(np.float32).itemsize
+        )
     for filename, expected_size in expected_sizes.items():
         if (root / filename).stat().st_size != expected_size:
             raise InventoryError(f"{root}: {filename} byte length drift")
@@ -505,10 +550,29 @@ def _search_evidence_inventory(
         )
         if bool(np.any(~np.isfinite(completed_q))):
             raise InventoryError(f"{root}: non-finite completed-Q evidence")
-    declared = meta.get("search_evidence")
+        if declared_schema == SEARCH_EVIDENCE_V2_SCHEMA:
+            prior = np.memmap(
+                root / "search_prior_policy_flat.dat",
+                mode="r",
+                dtype=np.float32,
+                shape=(flat_entries,),
+            )
+            if bool(np.any(~np.isfinite(prior))) or bool(np.any(prior < 0.0)):
+                raise InventoryError(f"{root}: invalid fp32 prior-policy evidence")
+            prior_mass = np.add.reduceat(
+                prior.astype(np.float64, copy=False),
+                np.asarray(offsets[:-1][mask]),
+            )
+            if bool(np.any(~np.isfinite(prior_mass))) or bool(
+                np.any(prior_mass <= 0.0)
+            ):
+                raise InventoryError(
+                    f"{root}: fp32 prior-policy has zero active-row mass"
+                )
     if (
         not isinstance(declared, dict)
-        or declared.get("schema") != "gumbel_root_search_evidence_v1"
+        or declared_schema
+        not in SUPPORTED_SEARCH_EVIDENCE_SCHEMAS
         or declared.get("row_addressing") != "all_rows_empty_inactive_v1"
         or declared.get("active_row_count") != int(np.count_nonzero(mask))
         or declared.get("flat_entry_count") != flat_entries
@@ -1391,11 +1455,7 @@ def inspect_rd_contract(contract_path: Path) -> dict[str, Any]:
         raise InventoryError(
             f"{path}: automatic-transition guard disagrees with contract version"
         )
-    if (
-        value.get("acceptance", {}).get("require_search_evidence_schema")
-        != "gumbel_root_search_evidence_v1"
-    ):
-        raise InventoryError(f"{path}: search-evidence acceptance schema drift")
+    _required_search_evidence_schema(value, where=path)
     if contract_schema == RD_CONTRACT_SCHEMA_V2 and (
         value.get("acceptance", {}).get(
             "require_forced_value_rows_in_every_game"

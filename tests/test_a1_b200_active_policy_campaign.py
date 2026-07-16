@@ -140,6 +140,46 @@ def test_active_policy_arms_change_only_auxiliary_exposure() -> None:
     assert common["lr_warmup_steps"] == 16
 
 
+def test_search_evidence_schema_requires_fp32_prior_but_keeps_v1_explicit() -> None:
+    assert campaign._search_evidence_columns(campaign.SEARCH_EVIDENCE_SCHEMA) == {
+        "search_evidence_version",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+        "search_prior_policy_flat",
+    }
+    assert campaign._search_evidence_columns(
+        campaign.ARCHIVED_SEARCH_EVIDENCE_SCHEMA
+    ) == {
+        "search_evidence_version",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+    }
+    with pytest.raises(campaign.CampaignError, match="unsupported search-evidence"):
+        campaign._search_evidence_columns("gumbel_root_search_evidence_v3_unknown")
+
+    assert (
+        campaign._admission_search_evidence_schema(
+            repaired_distillation=False,
+            completion_schema=campaign.SEARCH_EVIDENCE_SCHEMA,
+        )
+        == campaign.SEARCH_EVIDENCE_SCHEMA
+    )
+    assert (
+        campaign._admission_search_evidence_schema(
+            repaired_distillation=True,
+            completion_schema=None,
+        )
+        == campaign.ARCHIVED_SEARCH_EVIDENCE_SCHEMA
+    )
+    with pytest.raises(campaign.CampaignError, match="requires fp32-prior"):
+        campaign._admission_search_evidence_schema(
+            repaired_distillation=False,
+            completion_schema=campaign.ARCHIVED_SEARCH_EVIDENCE_SCHEMA,
+        )
+
+
 def test_corpus_admission_requires_complete_forced_value_row_coverage() -> None:
     report = {
         "present": True,
@@ -247,6 +287,7 @@ def test_v2_admission_rejects_zero_forced_rows_after_real_contract_verification(
     validation.write_text("{}\n")
     completion = {
         "schema_version": campaign.COMPLETION_RECEIPT_SCHEMA,
+        "search_evidence_schema": campaign.SEARCH_EVIDENCE_SCHEMA,
     }
     zero_forced = {
         "present": True,
@@ -321,7 +362,7 @@ def test_legacy_admission_without_forced_rows_remains_loadable(
         },
         "producer_checkpoint_sha256": campaign.EXPECTED_CORPUS_PRODUCER_SHA256,
         "target_information_regime": campaign.TARGET_INFORMATION_REGIME,
-        "search_evidence_schema": campaign.SEARCH_EVIDENCE_SCHEMA,
+        "search_evidence_schema": campaign.ARCHIVED_SEARCH_EVIDENCE_SCHEMA,
         "selected_games": campaign.EXPECTED_GAMES,
         "selected_game_seed_set_sha256": "sha256:" + "2" * 64,
         "selection_mode": "explicit_truncation_repair_seed_set",

@@ -50,10 +50,6 @@ from catan_zero.rl.target_reliability import (  # noqa: E402
     target_reliability_root_selected,
     unaudited_target_reliability_fields,
 )
-from catan_zero.rl.gumbel_self_play import (  # noqa: E402
-    SEARCH_EVIDENCE_SCHEMA,
-    SEARCH_EVIDENCE_VERSION,
-)
 from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
     GumbelChanceMCTSConfig,
     _root_candidate_count,
@@ -82,6 +78,12 @@ PATCH_SCHEMA = "a1-stage-c-coherent-reanalysis-target-patch-v2"
 REBOUND_MERGE_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-rebound-merge-receipt-v2"
 MERGE_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-merge-receipt-v1"
 ROW_SEED_SCHEMA = alignment.STAGE_C_ROW_SEED_SCHEMA
+# Stage-C patches predate the compact generation sidecar and describe a
+# different payload without per-action visit counts. Keep their receipt
+# identity locally owned so sidecar schema upgrades cannot relabel new patches
+# or invalidate archived receipts.
+STAGE_C_PATCH_SEARCH_EVIDENCE_SCHEMA = "gumbel_root_search_evidence_v1"
+STAGE_C_PATCH_SEARCH_EVIDENCE_VERSION = 1
 STATUS = {
     "unclassified": 0,
     "reconstructable_public_roundtrip": 1,
@@ -1655,8 +1657,8 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
             "target_execution": target["target_execution"],
             "target_execution_sha256": _value_sha256(target["target_execution"]),
             "row_search_evidence": {
-                "schema": SEARCH_EVIDENCE_SCHEMA,
-                "version": SEARCH_EVIDENCE_VERSION,
+                "schema": STAGE_C_PATCH_SEARCH_EVIDENCE_SCHEMA,
+                "version": STAGE_C_PATCH_SEARCH_EVIDENCE_VERSION,
                 "simulations": "simulations_used",
                 "full_search": "used_full_search",
                 "completed_q": "completed_q_values_flat",
@@ -1916,7 +1918,8 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
         search.get("target_execution") != alignment.STAGE_C_TARGET_EXECUTION
         or search.get("target_execution_sha256")
         != _value_sha256(alignment.STAGE_C_TARGET_EXECUTION)
-        or search.get("row_search_evidence", {}).get("schema") != SEARCH_EVIDENCE_SCHEMA
+        or search.get("row_search_evidence", {}).get("schema")
+        != STAGE_C_PATCH_SEARCH_EVIDENCE_SCHEMA
     ):
         raise ExecutorError("Stage-C v2 execution target evidence drifted")
     artifact = receipt["artifact"]
@@ -2140,8 +2143,8 @@ def _rebound_search_receipt(
             "target_execution": target["target_execution"],
             "target_execution_sha256": _value_sha256(target["target_execution"]),
             "row_search_evidence": {
-                "schema": SEARCH_EVIDENCE_SCHEMA,
-                "version": SEARCH_EVIDENCE_VERSION,
+                "schema": STAGE_C_PATCH_SEARCH_EVIDENCE_SCHEMA,
+                "version": STAGE_C_PATCH_SEARCH_EVIDENCE_VERSION,
                 "simulations": "simulations_used",
                 "full_search": "used_full_search",
                 "completed_q": "completed_q_values_flat",

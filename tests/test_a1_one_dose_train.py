@@ -45,6 +45,58 @@ def _objective() -> dict[str, object]:
     }
 
 
+def _search_evidence_meta(schema: str) -> dict[str, object]:
+    columns = {
+        name: {}
+        for name in (
+            "search_evidence_version",
+            "search_evidence_mask",
+            "search_evidence_offsets",
+            "search_visit_counts_flat",
+            "search_completed_q_flat",
+        )
+    }
+    if schema == executor.SEARCH_EVIDENCE_V2_SCHEMA:
+        columns["search_prior_policy_flat"] = {}
+    return {"search_evidence": {"schema": schema}, "columns": columns}
+
+
+def test_coherent_direct_search_evidence_accepts_archived_v1_and_bound_v2() -> None:
+    executor._verify_coherent_search_evidence_memmap(  # noqa: SLF001
+        corpus={
+            "search_evidence_schema": executor.SEARCH_EVIDENCE_V1_SCHEMA,
+            "search_evidence_storage": "receipt_bound_source_npz_only",
+        },
+        meta={},
+    )
+    executor._verify_coherent_search_evidence_memmap(  # noqa: SLF001
+        corpus={
+            "search_evidence_schema": executor.SEARCH_EVIDENCE_V2_SCHEMA,
+            "search_evidence_storage": "training_memmap",
+        },
+        meta=_search_evidence_meta(executor.SEARCH_EVIDENCE_V2_SCHEMA),
+    )
+
+    missing_prior = _search_evidence_meta(executor.SEARCH_EVIDENCE_V2_SCHEMA)
+    del missing_prior["columns"]["search_prior_policy_flat"]  # type: ignore[index]
+    with pytest.raises(executor.ExecutorError, match="differs from admission"):
+        executor._verify_coherent_search_evidence_memmap(  # noqa: SLF001
+            corpus={
+                "search_evidence_schema": executor.SEARCH_EVIDENCE_V2_SCHEMA,
+                "search_evidence_storage": "training_memmap",
+            },
+            meta=missing_prior,
+        )
+    with pytest.raises(executor.ExecutorError, match="must be stored"):
+        executor._verify_coherent_search_evidence_memmap(  # noqa: SLF001
+            corpus={
+                "search_evidence_schema": executor.SEARCH_EVIDENCE_V2_SCHEMA,
+                "search_evidence_storage": "receipt_bound_source_npz_only",
+            },
+            meta={},
+        )
+
+
 def _lock(
     *,
     n_full: int = 128,

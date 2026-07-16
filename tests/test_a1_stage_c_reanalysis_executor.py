@@ -12,6 +12,25 @@ from tools import a1_stage_c_reanalysis_executor as executor
 from tools import reconstruct_state
 
 
+def test_stage_c_patch_evidence_schema_is_independent_of_generation_sidecars() -> None:
+    assert (
+        executor.STAGE_C_PATCH_SEARCH_EVIDENCE_SCHEMA
+        == "gumbel_root_search_evidence_v1"
+    )
+    assert executor.STAGE_C_PATCH_SEARCH_EVIDENCE_VERSION == 1
+
+    search = executor._rebound_search_receipt(  # noqa: SLF001
+        {},
+        {"target_execution": {"operator": "fixture"}},
+    )
+    evidence = search["row_search_evidence"]
+    assert evidence["schema"] == executor.STAGE_C_PATCH_SEARCH_EVIDENCE_SCHEMA
+    assert evidence["version"] == executor.STAGE_C_PATCH_SEARCH_EVIDENCE_VERSION
+    assert evidence["visit_counts"] == (
+        "not_present_in_v1_patch_not_required_by_overlay"
+    )
+
+
 def test_sequence_rows_preserves_sparse_absolute_decision_clock() -> None:
     data = {
         "game_seed": np.asarray([7, 7, 7, 9, 9], dtype=np.int64),

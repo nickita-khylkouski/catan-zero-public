@@ -145,8 +145,8 @@ PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
 ACTION_MASK_VERSION = "colonist-multiagent-v1"
 TEACHER_NAME = "gumbel_self_play"
 TARGET_SCORE_SOURCE = "gumbel_mcts_visit_q"
-SEARCH_EVIDENCE_SCHEMA = "gumbel_root_search_evidence_v1"
-SEARCH_EVIDENCE_VERSION = 1
+SEARCH_EVIDENCE_SCHEMA = "gumbel_root_search_evidence_v2_fp32_prior"
+SEARCH_EVIDENCE_VERSION = 2
 # Retained as historical evidence semantics for contract/inventory tools that
 # must decode older shards. Current production generation keeps n_fast rows
 # policy-inactive; these constants do not re-enable fast-search supervision.
@@ -1043,6 +1043,17 @@ def _build_decision_row(
             ],
             dtype=np.float32,
         )
+        # ``prior_policy`` remains float16 for the historical learner schema,
+        # but reconstruction-grade posthoc replay of the improved policy needs
+        # the float32 prior used by search. Near ties can change after a float16
+        # round trip, so keep the higher-precision prior only in the opt-in
+        # compact evidence sidecar alongside completed-Q and visits. This is a
+        # reconstruction-grade fp32 value, not a byte-lossless copy of Python's
+        # intermediate float operator.
+        row["_search_prior_policy"] = np.asarray(
+            [float(result.priors.get(int(action), np.nan)) for action in legal_rust],
+            dtype=np.float32,
+        )
     # Opponent-pool provenance (H2): only stamped when the caller is running
     # with a pool assignment at all (`is_pool_game`/`opponent_version` passed
     # as non-None) -- omitted entirely otherwise so pool-disabled runs keep
@@ -1173,8 +1184,9 @@ def _search_execution_contract(
 def _search_evidence_recalibration_scope(search_config: Any) -> str:
     """Attest when one completed-Q vector can reproduce the target operator.
 
-    A single-world target is reconstructible at the existing stored-prior
-    precision from completed-Q, visits, phase, and manifest config. Public-belief
+    A single-world v2 target is reconstructible within the declared fp32
+    tolerance from completed-Q, visits, the reconstruction-grade fp32 prior
+    sidecar, phase, and manifest config. Public-belief
     ``aggregate_q_then_improve`` has the same property because its emitted
     completed-Q is the particle mean and the manifest records particle count.
     Historical ``mean_improved_policy`` does not: mean(softmax(...)) cannot be
@@ -1653,7 +1665,11 @@ class GumbelShardWriter:
             self.preserve_search_evidence
             and float(row.get("policy_weight_multiplier", 0.0)) > 0.0
         ):
-            for key in ("_search_visit_counts", "_search_completed_q"):
+            for key in (
+                "_search_visit_counts",
+                "_search_completed_q",
+                "_search_prior_policy",
+            ):
                 if key not in row:
                     raise ValueError(
                         f"preserve_search_evidence requires row field {key!r}"
@@ -1715,14 +1731,15 @@ def _compact_search_evidence(rows: list[dict[str, Any]]) -> dict[str, np.ndarray
 
     Active rows are already identified by the shard's mandatory
     ``policy_weight_multiplier`` column, so only their uint32 offsets plus
-    fp32 completed-Q and uint16 visits are stored. Valid fast searches are
-    active at bounded confidence; forced and no-search rows remain value-only
-    and consume no evidence payload.
+    fp32 completed-Q, fp32 original priors, and uint16 visits are stored.
+    Forced, fast, and no-search rows remain value-only and consume no evidence
+    payload under the current production policy-weight contract.
     """
 
     offsets = [0]
     visit_chunks: list[np.ndarray] = []
     completed_q_chunks: list[np.ndarray] = []
+    prior_chunks: list[np.ndarray] = []
     for row in rows:
         policy_weight = float(row.get("policy_weight_multiplier", 0.0))
         if not math.isfinite(policy_weight) or policy_weight < 0.0:
@@ -1734,7 +1751,12 @@ def _compact_search_evidence(rows: list[dict[str, Any]]) -> dict[str, np.ndarray
         legal_count = int(np.asarray(row["legal_action_ids"]).shape[0])
         visits = np.asarray(row.get("_search_visit_counts"), dtype=np.int64)
         completed_q = np.asarray(row.get("_search_completed_q"), dtype=np.float32)
-        if visits.shape != (legal_count,) or completed_q.shape != (legal_count,):
+        prior = np.asarray(row.get("_search_prior_policy"), dtype=np.float32)
+        if (
+            visits.shape != (legal_count,)
+            or completed_q.shape != (legal_count,)
+            or prior.shape != (legal_count,)
+        ):
             raise ValueError(
                 "search evidence must align exactly with the row's legal-action axis"
             )
@@ -1742,6 +1764,15 @@ def _compact_search_evidence(rows: list[dict[str, Any]]) -> dict[str, np.ndarray
             raise ValueError("search visit counts exceed uint16 evidence schema")
         if not bool(np.all(np.isfinite(completed_q))):
             raise ValueError("policy-active search evidence has non-finite completed-Q")
+        if (
+            not bool(np.all(np.isfinite(prior)))
+            or bool(np.any(prior < 0.0))
+            or not math.isfinite(float(prior.sum(dtype=np.float64)))
+            or float(prior.sum(dtype=np.float64)) <= 0.0
+        ):
+            raise ValueError(
+                "policy-active search evidence has invalid fp32 prior-policy"
+            )
         expected_simulations = int(row.get("simulations_used", int(visits.sum())))
         if int(visits.sum()) != expected_simulations:
             raise ValueError(
@@ -1750,6 +1781,7 @@ def _compact_search_evidence(rows: list[dict[str, Any]]) -> dict[str, np.ndarray
             )
         visit_chunks.append(visits.astype(np.uint16, copy=False))
         completed_q_chunks.append(completed_q)
+        prior_chunks.append(prior)
         offsets.append(offsets[-1] + legal_count)
 
     if (
@@ -1767,11 +1799,17 @@ def _compact_search_evidence(rows: list[dict[str, Any]]) -> dict[str, np.ndarray
         if completed_q_chunks
         else np.asarray([], dtype=np.float32)
     )
+    prior_flat = (
+        np.concatenate(prior_chunks)
+        if prior_chunks
+        else np.asarray([], dtype=np.float32)
+    )
     return {
         "search_evidence_version": np.asarray(SEARCH_EVIDENCE_VERSION, dtype=np.uint8),
         "search_evidence_offsets": np.asarray(offsets, dtype=np.uint32),
         "search_visit_counts_flat": visits_flat,
         "search_completed_q_flat": completed_q_flat,
+        "search_prior_policy_flat": prior_flat,
     }
 
 
@@ -1780,24 +1818,37 @@ def search_evidence_for_row(
 ) -> dict[str, np.ndarray] | None:
     """Decode one optional compact evidence row, or return None when absent."""
 
-    evidence_keys = {
+    base_evidence_keys = {
         "search_evidence_version",
         "search_evidence_offsets",
         "search_visit_counts_flat",
         "search_completed_q_flat",
     }
-    present = evidence_keys.intersection(shard.keys())
+    all_evidence_keys = base_evidence_keys | {"search_prior_policy_flat"}
+    present = all_evidence_keys.intersection(shard.keys())
     if not present:
         return None
-    required = evidence_keys | {"legal_action_ids", "policy_weight_multiplier"}
+    if not base_evidence_keys <= set(shard):
+        raise ValueError(
+            "incomplete search evidence payload; "
+            f"missing={sorted(base_evidence_keys - set(shard))}"
+        )
+    version = int(np.asarray(shard["search_evidence_version"]).item())
+    if version not in {1, SEARCH_EVIDENCE_VERSION}:
+        raise ValueError(f"unsupported search evidence version {version!r}")
+    if version == 1 and "search_prior_policy_flat" in shard:
+            raise ValueError("version-1 search evidence has an unversioned fp32 prior")
+    version_keys = (
+        base_evidence_keys | {"search_prior_policy_flat"}
+        if version == SEARCH_EVIDENCE_VERSION
+        else base_evidence_keys
+    )
+    required = version_keys | {"legal_action_ids", "policy_weight_multiplier"}
     present = required.intersection(shard.keys())
     if present != required:
         raise ValueError(
             f"incomplete search evidence payload; missing={sorted(required - present)}"
         )
-    version = int(np.asarray(shard["search_evidence_version"]).item())
-    if version != SEARCH_EVIDENCE_VERSION:
-        raise ValueError(f"unsupported search evidence version {version!r}")
     offsets = np.asarray(shard["search_evidence_offsets"], dtype=np.uint32)
     policy_weights = np.asarray(shard["policy_weight_multiplier"], dtype=np.float32)
     if policy_weights.ndim != 1:
@@ -1825,11 +1876,24 @@ def search_evidence_for_row(
     legal = np.asarray(legal[legal >= 0], dtype=np.int16)
     if stop - start != legal.size:
         raise ValueError("search evidence width differs from legal-action count")
-    return {
+    result = {
         "legal_action_ids": legal.copy(),
         "visit_counts": visits[start:stop].copy(),
         "completed_q": completed_q[start:stop].copy(),
     }
+    if version == SEARCH_EVIDENCE_VERSION:
+        prior = np.asarray(shard["search_prior_policy_flat"], dtype=np.float32)
+        row_prior = prior[start:stop]
+        if (
+            prior.shape != completed_q.shape
+            or not bool(np.all(np.isfinite(prior)))
+            or bool(np.any(prior < 0.0))
+            or not math.isfinite(float(row_prior.sum(dtype=np.float64)))
+            or float(row_prior.sum(dtype=np.float64)) <= 0.0
+        ):
+            raise ValueError("malformed fp32 prior-policy evidence")
+        result["prior_policy"] = row_prior.copy()
+    return result
 
 
 def _rows_to_arrays(

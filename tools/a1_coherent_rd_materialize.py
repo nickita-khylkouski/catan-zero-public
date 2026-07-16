@@ -268,8 +268,13 @@ def _verify_shard(
             completed_q = np.asarray(
                 shard["search_completed_q_flat"], dtype=np.float32
             )
+            version_raw = np.asarray(shard["search_evidence_version"])
+            prior_present = "search_prior_policy_flat" in shard.files
             if (
-                int(np.asarray(shard["search_evidence_version"]).item()) != 1
+                version_raw.shape != ()
+                or version_raw.dtype != np.dtype(np.uint8)
+                or int(version_raw.item()) not in {1, 2}
+                or prior_present != (int(version_raw.item()) == 2)
                 or offsets.shape != (int(active.sum()) + 1,)
                 or int(offsets[0]) != 0
                 or np.any(offsets[1:] < offsets[:-1])
@@ -278,6 +283,25 @@ def _verify_shard(
                 or np.any(~np.isfinite(completed_q))
             ):
                 raise MaterializationError(f"malformed search evidence: {path}")
+            if int(version_raw.item()) == 2:
+                prior = np.asarray(shard["search_prior_policy_flat"])
+                if (
+                    prior.dtype != np.dtype(np.float32)
+                    or prior.shape != completed_q.shape
+                    or np.any(~np.isfinite(prior))
+                    or np.any(prior < 0.0)
+                ):
+                    raise MaterializationError(
+                        f"invalid fp32 prior-policy evidence: {path}"
+                    )
+                if active.any():
+                    prior_mass = np.add.reduceat(
+                        prior.astype(np.float64, copy=False), offsets[:-1]
+                    )
+                    if np.any(~np.isfinite(prior_mass)) or np.any(prior_mass <= 0.0):
+                        raise MaterializationError(
+                            f"zero-mass fp32 prior-policy evidence: {path}"
+                        )
             widths = np.asarray(shard["legal_action_mask"], dtype=np.bool_).sum(axis=1)[
                 active
             ]

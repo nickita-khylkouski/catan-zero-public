@@ -1729,8 +1729,18 @@ def _verify_shard_arrays(
             offsets = np.asarray(shard["search_evidence_offsets"], dtype=np.uint32)
             visits = np.asarray(shard["search_visit_counts_flat"], dtype=np.uint16)
             completed_q = np.asarray(shard["search_completed_q_flat"], dtype=np.float32)
-            version = int(np.asarray(shard["search_evidence_version"]).item())
-            if version != 1 or offsets.shape != (int(active.sum()) + 1,):
+            version_raw = np.asarray(shard["search_evidence_version"])
+            if version_raw.shape != () or version_raw.dtype != np.dtype(np.uint8):
+                raise ExecutorError(
+                    f"malformed search evidence version scalar in {path}"
+                )
+            version = int(version_raw.item())
+            prior_present = "search_prior_policy_flat" in shard.files
+            if (
+                version not in {1, 2}
+                or prior_present != (version == 2)
+                or offsets.shape != (int(active.sum()) + 1,)
+            ):
                 raise ExecutorError(
                     f"malformed search evidence offsets/version in {path}"
                 )
@@ -1740,6 +1750,25 @@ def _verify_shard_arrays(
                 raise ExecutorError(f"search evidence flat payload mismatch in {path}")
             if not bool(np.all(np.isfinite(completed_q))):
                 raise ExecutorError(f"non-finite completed-Q evidence in {path}")
+            if version == 2:
+                prior = np.asarray(shard["search_prior_policy_flat"])
+                if (
+                    prior.dtype != np.dtype(np.float32)
+                    or prior.shape != completed_q.shape
+                    or not bool(np.all(np.isfinite(prior)))
+                    or bool(np.any(prior < 0.0))
+                ):
+                    raise ExecutorError(f"invalid fp32 prior-policy evidence in {path}")
+                if active.any():
+                    prior_mass = np.add.reduceat(
+                        prior.astype(np.float64, copy=False), offsets[:-1]
+                    )
+                    if bool(np.any(~np.isfinite(prior_mass))) or bool(
+                        np.any(prior_mass <= 0.0)
+                    ):
+                        raise ExecutorError(
+                            f"zero-mass fp32 prior-policy evidence in {path}"
+                        )
             widths = np.asarray(shard["legal_action_mask"], dtype=np.bool_).sum(axis=1)[
                 active
             ]

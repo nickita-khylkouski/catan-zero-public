@@ -24837,6 +24837,7 @@ MEMMAP_LAZY_COLUMNS = frozenset(
         "search_evidence_offsets",
         "search_visit_counts_flat",
         "search_completed_q_flat",
+        "search_prior_policy_flat",
     }
 )
 
