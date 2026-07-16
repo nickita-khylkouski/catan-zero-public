@@ -25,7 +25,7 @@ CONTRACT_PATH = (
 TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract.template.json"
 GENERATOR_CONFIG_PATH = (
     REPO_ROOT
-    / "configs/generation/coherent_public_n128.schema17.json"
+    / "configs/generation/coherent_public_n128.schema18.json"
 )
 GENERATOR_GUARD_PATH = (
     REPO_ROOT

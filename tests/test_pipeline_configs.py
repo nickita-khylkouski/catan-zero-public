@@ -93,6 +93,31 @@ def test_per_game_policy_surprise_changes_typed_train_hash() -> None:
     assert config_from_payload(exact_surprise.canonical_payload()) == exact_surprise
 
 
+def test_value_outcome_balance_changes_typed_train_hash() -> None:
+    baseline = TrainConfig()
+    balanced = TrainConfig(
+        value_player_outcome_balance_mode="sampler_balanced_v1"
+    )
+
+    assert baseline.value_player_outcome_balance_mode == "none"
+    assert balanced.config_hash() != baseline.config_hash()
+    assert config_from_payload(balanced.canonical_payload()) == balanced
+
+
+def test_current_canonical_train_recipe_does_not_inherit_policy_phase_weights() -> None:
+    from tools.train import _load_recipe
+
+    recipe = (
+        Path(__file__).resolve().parents[1]
+        / "configs/training/a1_current_35m_b200.schema1.json"
+    )
+    config, _engine = _load_recipe(recipe)
+
+    assert config.phase_weights == "PLAY_TURN=4.0"
+    assert config.value_phase_weights == "none"
+    assert config.value_player_outcome_balance_mode == "none"
+
+
 def test_config_from_payload_rejects_unknown_pipeline() -> None:
     with pytest.raises(ValueError, match="unknown pipeline"):
         config_from_payload({"pipeline": "nonsense", "fields": {}})

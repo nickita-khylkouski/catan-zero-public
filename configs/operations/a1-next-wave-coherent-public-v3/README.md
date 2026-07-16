@@ -13,7 +13,14 @@ post-search learner tensors advance, restoring Year of Plenty and Monopoly
 resource identity plus the current actor's development-card playability, Road
 Building continuation, remaining free roads, and discard remainder. Historical
 v1/v2 artifacts remain immutable and diagnostically replayable.
-The current typed generator artifact is schema 17, which binds
+The typed generator resolves the internal historical engine settings
+`--forced-root-target-mode trajectory_only`,
+`--coherent-public-belief-search`, `--record-automatic-transitions`,
+`--meaningful-public-history`, `--event-history-limit 64`, and
+`--preserve-search-evidence`; callers do not override them. The learner
+separately binds `--value-phase-weights none` so the policy's phase sampler
+cannot silently redefine the value-state distribution.
+The current typed generator artifact is schema 18, which binds
 `boundary_value_particles` into generation and evaluation identity. The
 schema-16 artifact remains byte-identical historical evidence and must not be
 used as the current launch config.
@@ -61,7 +68,7 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
 
 ```bash
 "$PY" tools/generate.py \
-  --config configs/generation/coherent_public_n128.schema17.json \
+  --config configs/generation/coherent_public_n128.schema18.json \
   --guard configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json \
   --checkpoint "$CHECKPOINT" --out-dir "$OUT" \
   --base-seed "$BASE_SEED" --games "$GAMES" --workers "$WORKERS" \
@@ -70,7 +77,7 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
 
 `tools/generate_gumbel_selfplay_data.py` remains the internal historical replay
 executor. New launches must not address its experiment-by-flag interface
-directly; the schema-17 config above is the complete science contract.
+directly; the schema-18 config above is the complete science contract.
 
 Post-wave admission must prove every worker used teacher v2 and emitted learner
 rows v5, with the legacy `adapter_version` row column equal to the learner

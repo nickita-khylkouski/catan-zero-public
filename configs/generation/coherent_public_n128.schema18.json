@@ -99,5 +99,5 @@
     "workers": 1
   },
   "pipeline": "generate",
-  "schema_version": 17
+  "schema_version": 18
 }

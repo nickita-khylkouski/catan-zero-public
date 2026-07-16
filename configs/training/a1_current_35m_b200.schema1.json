@@ -155,7 +155,8 @@
       "value_hlgauss_sigma_ratio": 0.75,
       "value_loss_weight": 0.25,
       "value_lr_mult": 1.0,
-      "value_phase_weights": "",
+      "value_phase_weights": "none",
+      "value_player_outcome_balance_mode": "none",
       "value_root_blend_global_compat": false,
       "value_root_blend_phases": "",
       "value_target_lambda": 1.0,
@@ -168,6 +169,6 @@
       "winner_sample_weight": 1.0
     },
     "pipeline": "train",
-    "schema_version": 17
+    "schema_version": 18
   }
 }

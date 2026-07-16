@@ -93,9 +93,10 @@ _T = TypeVar("_T", bound="PipelineConfig")
 # Schema 16 was already issued before ``boundary_value_particles`` became part
 # of both generation and evaluation identity.  Reusing 16 would allow an
 # evaluator payload without that field and one with it to claim the same
-# schema.  Schema 17 is the first pipeline schema that binds the boundary
-# particle count across every search-bearing pipeline.
-CONFIG_SCHEMA_VERSION = 17
+# schema. Schema 17 first bound the boundary-particle count across every
+# search-bearing pipeline. Schema 18 additionally binds the value-label
+# outcome-balancing control used by the canonical learner.
+CONFIG_SCHEMA_VERSION = 18
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -383,6 +384,10 @@ class TrainConfig(PipelineConfig):
     teacher_weights: str = ""
     phase_weights: str = ""
     value_phase_weights: str = ""
+    # Training-only value-label coverage control.  This must be part of the
+    # typed identity because equal per-game mass does not by itself equalize
+    # winner/loser actor mass inside a game.
+    value_player_outcome_balance_mode: str = "none"
     winner_sample_weight: float = 1.0
     # Search targets remain supervised signal even when later stochastic play
     # loses the game. Outcome-conditioned downweighting is diagnostic-only.
