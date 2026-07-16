@@ -13542,6 +13542,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         symmetry_rng=symmetry_rng,
         ddp=ddp,
     )
+    _validate_resumed_max_step_boundary(
+        resumed=resume_progress is not None,
+        global_step=global_step,
+        max_steps=int(args.max_steps),
+    )
     policy_kl_controller = _adaptive_policy_kl_controller(
         args, resume_progress=resume_progress
     )
@@ -31555,6 +31560,38 @@ def _validate_exact_optimizer_step_dose(
             "exact optimizer-step dose was not reached: "
             f"requested={int(max_steps)} applied={int(applied_steps)} "
             f"effective_epoch_limit={int(epoch_limit)}"
+        )
+
+
+def _validate_resumed_max_step_boundary(
+    *, resumed: bool, global_step: int, max_steps: int
+) -> None:
+    """Refuse a capped resume that has no legal optimizer step remaining.
+
+    This check belongs immediately after progress restoration and before any
+    epoch order is constructed. The weighted sampler otherwise turns an
+    already-complete dose into an empty draw and reaches checkpoint saving,
+    while the uniform sampler ignores the weighted-only draw cap and can apply
+    an extra optimizer update. One sampler-independent boundary keeps both
+    paths exact and prevents a completed checkpoint from being rewritten.
+    """
+
+    if not resumed or int(max_steps) <= 0:
+        return
+    restored_step = int(global_step)
+    requested_cap = int(max_steps)
+    if restored_step > requested_cap:
+        raise SystemExit(
+            "resumed optimizer_step exceeds --max-steps: "
+            f"restored={restored_step} max_steps={requested_cap}; "
+            "refusing to sample, update, or save"
+        )
+    if restored_step == requested_cap:
+        raise SystemExit(
+            "resumed optimizer_step already equals --max-steps: "
+            f"restored={restored_step} max_steps={requested_cap}; "
+            "the requested dose is complete, so no optimizer update or "
+            "checkpoint save will be performed"
         )
 
 

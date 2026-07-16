@@ -10,6 +10,7 @@ from tools.train_bc import (
     _effective_training_epoch_limit,
     _gradient_sync_context,
     _validate_exact_optimizer_step_dose,
+    _validate_resumed_max_step_boundary,
 )
 
 
@@ -116,6 +117,66 @@ def test_exact_step_dose_fails_closed_when_no_batch_applies_an_update() -> None:
             applied_steps=0,
             epoch_limit=128,
         )
+
+
+def test_resume_at_step_cap_refuses_as_an_exact_no_op() -> None:
+    with pytest.raises(
+        SystemExit,
+        match=(
+            "already equals --max-steps.*"
+            "no optimizer update or checkpoint save will be performed"
+        ),
+    ):
+        _validate_resumed_max_step_boundary(
+            resumed=True,
+            global_step=32,
+            max_steps=32,
+        )
+
+
+def test_resume_beyond_step_cap_is_invalid() -> None:
+    with pytest.raises(
+        SystemExit,
+        match="exceeds --max-steps.*refusing to sample, update, or save",
+    ):
+        _validate_resumed_max_step_boundary(
+            resumed=True,
+            global_step=33,
+            max_steps=32,
+        )
+
+
+@pytest.mark.parametrize(
+    ("resumed", "global_step", "max_steps"),
+    [
+        (True, 31, 32),
+        (True, 128, 0),
+        (False, 32, 32),
+    ],
+)
+def test_resume_step_cap_guard_allows_only_legal_or_uncapped_states(
+    resumed: bool, global_step: int, max_steps: int
+) -> None:
+    _validate_resumed_max_step_boundary(
+        resumed=resumed,
+        global_step=global_step,
+        max_steps=max_steps,
+    )
+
+
+def test_resume_step_cap_guard_precedes_uniform_and_weighted_sampler_paths() -> None:
+    import inspect
+
+    from tools import train_bc
+
+    source = inspect.getsource(train_bc.main)
+    restore = source.index("_restore_training_progress_state(")
+    guard = source.index("_validate_resumed_max_step_boundary(")
+    epoch_loop = source.index("for epoch in range(")
+    order = source.index("order = _epoch_order(")
+    terminal_save = source.index("_save_policy(", guard)
+
+    assert restore < guard < epoch_loop < order < terminal_save
 
 
 def test_nonstepping_microbatch_cannot_claim_an_optimizer_update() -> None:
