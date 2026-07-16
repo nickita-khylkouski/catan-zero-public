@@ -55,10 +55,32 @@ The learner was restarted on GPU 0 with the same manifest and initializer. It:
 This verifies the bounded local path from one bound manifest through actor
 shard identity, learner filtering, per-update recovery, and exact resume.
 
+## Merged-checkout rerun
+
+The same bounded diagnostic was repeated after the production and Modal
+manifest work landed, using checkout `1933f3f` on the designated H100 host.
+The retained bound manifest and initializer hashes matched the values above.
+
+- 71 focused production, manifest, learner, actor, and rule-parity tests passed
+  on the H100 checkout.
+- GPU 1 generated two games, 66 samples, and one manifest-stamped shard in
+  5.31 seconds.
+- GPU 0 accepted that shard, applied exactly one finite V-trace update, wrote
+  the model and optimizer recovery checkpoint, and exited at `max_steps=1`.
+- The update reported 66 V-trace steps, zero bad trajectories, and
+  `vtrace_skipped=0`.
+- A restart restored step 1 and its optimizer state, republished the recovered
+  weights, and exited without applying a second update.
+
+The rerun root was `/tmp/ppo-v2-h100-rerun-1933f3f/run`. It was isolated from
+production pointers and did not run evaluation or promotion.
+
 ## Remaining boundary
 
 PPO remains uncommissioned. The retained exact-initializer efficacy canary was
-negative, the checked v2 manifest is still a template, and the Modal wrappers
-do not yet consume/stamp the v2 manifest. New production PPO jobs must remain
-blocked until those wrappers are wired and a reviewed recipe has positive
-bounded evidence.
+negative and the checked v2 manifest is still a template. The local and Modal
+entrypoints now consume the bound manifest, stamp every shard, and derive
+learner science from it; the Modal path has 50 code-level tests but has not been
+run against live Modal volume semantics. New production PPO jobs must remain
+blocked until that external boundary is exercised and a reviewed recipe has
+positive bounded efficacy evidence.
