@@ -130,6 +130,15 @@ def main() -> None:
             "omniscient replay."
         ),
     )
+    parser.add_argument(
+        "--acknowledge-authoritative-hard-action-targets",
+        action="store_true",
+        help=(
+            "Authorize masked historical/diagnostic replay of classical hard "
+            "labels selected with authoritative hidden state. Requires a "
+            "non-production quality-gate scope and is forwarded to train_bc."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument(
         "--optimizer",
@@ -323,6 +332,14 @@ def main() -> None:
             "train_bc implements exact union-weighted gradient accumulation; "
             "use --quality-gate none only for an explicit diagnostic replay"
         )
+    if (
+        args.quality_gate == "production"
+        and args.acknowledge_authoritative_hard_action_targets
+    ):
+        raise SystemExit(
+            "--acknowledge-authoritative-hard-action-targets is diagnostic-only "
+            "and cannot override the production hard-label admission contract"
+        )
     if int(args.bc_max_steps) < 0:
         raise SystemExit("--bc-max-steps must be >= 0")
     if args.quality_gate == "production" and int(args.bc_max_steps) <= 0:
@@ -362,6 +379,22 @@ def main() -> None:
             "--allow-ppo is disabled for the 35M teacher-only phase. "
             "Promote a BC checkpoint by scoreboard first, then use the separate "
             "PPO runbook after explicit approval."
+        )
+
+    production_hard_action_blocked = bool(
+        args.quality_gate == "production"
+        and args.arch == "entity_graph"
+        and args.mask_hidden_info
+    )
+    if production_hard_action_blocked and not args.dry_run:
+        raise SystemExit(
+            "production factory launch refused before data generation: this "
+            "factory's classical teachers select action_taken from authoritative "
+            "hidden game state, while --mask-hidden-info trains a public-only "
+            "student. Use a sealed coherent public-information generation path for "
+            "production. For historical diagnostics only, select a non-production "
+            "quality gate and pass "
+            "--acknowledge-authoritative-hard-action-targets."
         )
 
     run_dir = Path(args.run_dir)
@@ -609,6 +642,11 @@ def main() -> None:
             if args.arch == "entity_graph" and args.mask_hidden_info
             else []
         )
+        + (
+            ["--acknowledge-authoritative-hard-action-targets"]
+            if args.acknowledge_authoritative_hard_action_targets
+            else []
+        )
         + (["--init-checkpoint", args.init_checkpoint] if args.init_checkpoint else [])
         + (["--save-each-epoch"] if args.save_each_epoch else [])
         + (
@@ -718,6 +756,15 @@ def main() -> None:
         "run_dir": str(run_dir),
         "commands": commands,
         "allow_ppo": bool(args.allow_ppo),
+        "production_hard_action_admission": {
+            "blocked": production_hard_action_blocked,
+            "producer": "classical_policy_on_authoritative_game_v1",
+            "student_information_scope": (
+                "public_information_set"
+                if args.arch == "entity_graph" and args.mask_hidden_info
+                else "authoritative_full_state"
+            ),
+        },
         "bc_training_data": {
             "curated": str(data_dir),
             "entity_converted": (
@@ -727,6 +774,9 @@ def main() -> None:
             "graph_history_features": bool(args.graph_history_features),
             "mask_hidden_info": bool(
                 args.arch == "entity_graph" and args.mask_hidden_info
+            ),
+            "acknowledge_authoritative_hard_action_targets": bool(
+                args.acknowledge_authoritative_hard_action_targets
             ),
             "soft_target_weight": float(args.soft_target_weight),
             "target_reliability_confidence_weighting": bool(

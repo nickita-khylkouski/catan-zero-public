@@ -9,6 +9,7 @@ import pytest
 from tools import convert_teacher_to_entity_tokens as converter
 from tools import curate_teacher_data as curator
 from tools import report_teacher_data_quality as quality
+from tools.factory_common import classical_teacher_hard_action_target_information
 
 
 def _source_manifest(path: Path) -> Path:
@@ -22,6 +23,9 @@ def _source_manifest(path: Path) -> Path:
                 "mixed_seats": True,
                 "mixed_seat_mode": "random",
                 "graph_history_features": True,
+                "hard_action_target_information": (
+                    classical_teacher_hard_action_target_information()
+                ),
                 "tool_provenance": curator._tool_provenance(),
             }
         ),
@@ -40,6 +44,11 @@ def _converted_manifest(tmp_path: Path) -> tuple[Path, Path]:
             {
                 "inputs": [str(source)],
                 "input_manifests": converter._input_manifests([str(source)]),
+                "hard_action_target_information": (
+                    converter.propagated_hard_action_target_information(
+                        converter._input_manifests([str(source)])
+                    )
+                ),
                 "track": "2p_no_trade",
                 "vps_to_win": 10,
                 "graph_history_features": True,
@@ -49,7 +58,6 @@ def _converted_manifest(tmp_path: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     return converted, source_manifest
-
 
 def _production_failures(data: Path) -> tuple[dict[str, object], list[str]]:
     metadata = quality._input_metadata(data)
@@ -72,6 +80,9 @@ def test_entity_conversion_preserves_authenticated_production_gate_lineage(
     converted, source_manifest = _converted_manifest(tmp_path)
     converted_payload = json.loads((converted / "manifest.json").read_text())
     binding = converted_payload["input_manifests"][0]["source_manifest"]
+    assert converted_payload["hard_action_target_information"] == (
+        classical_teacher_hard_action_target_information()
+    )
 
     assert binding == {
         "schema_version": curator.SOURCE_MANIFEST_BINDING_SCHEMA,

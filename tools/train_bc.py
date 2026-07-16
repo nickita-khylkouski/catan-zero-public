@@ -190,7 +190,13 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from factory_common import parse_track, write_json  # noqa: E402
+from factory_common import (  # noqa: E402
+    HARD_ACTION_SCOPE_PUBLIC,
+    HARD_ACTION_TARGET_INFORMATION_SCHEMA,
+    parse_track,
+    propagated_hard_action_target_information,
+    write_json,
+)
 from policy_target_reanalysis_contract import (  # noqa: E402
     SCHEMA as _POLICY_TARGET_REANALYSIS_SCHEMA,
     validate_policy_target_reanalysis_manifest as _validate_policy_target_reanalysis_manifest,
@@ -451,6 +457,16 @@ def build_parser() -> argparse.ArgumentParser:
             "public counts/VP and the actor's own hand. Makes the banked (omniscient) "
             "corpus trainable on public-only inputs WITHOUT regeneration; pair with "
             "EntityGraphRustEvaluatorConfig.public_observation=True at inference."
+        ),
+    )
+    parser.add_argument(
+        "--acknowledge-authoritative-hard-action-targets",
+        action="store_true",
+        help=(
+            "Permit masked diagnostic/historical replay whose action_taken labels "
+            "were selected with authoritative hidden state, or whose information "
+            "scope predates the hard-action provenance contract. This cannot "
+            "override --require-production-35m-teacher."
         ),
     )
     parser.add_argument(
@@ -10405,6 +10421,31 @@ def main(argv: Sequence[str] | None = None) -> None:
             "admission because rank 0 sees only its local NPZ subset; use the "
             "shared memmap/non-sharded corpus path"
         )
+    hard_action_target_admission = _rank0_authoritative_call(
+        ddp,
+        "hard-action target admission",
+        lambda: _validate_hard_action_target_admission(
+            data,
+            args.data,
+            mask_hidden_info=bool(args.mask_hidden_info),
+            policy_loss_weight=float(args.policy_loss_weight),
+            train_value_only=bool(args.train_value_only),
+            production=bool(args.require_production_35m_teacher),
+            acknowledged_authoritative_targets=bool(
+                args.acknowledge_authoritative_hard_action_targets
+            ),
+        ),
+    )
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "hard_action_target_admission",
+                **hard_action_target_admission,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
     outcome_label_admission = _rank0_authoritative_call(
         ddp,
         "value outcome label admission",
@@ -14894,6 +14935,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "fused_optimizer": bool(args.fused_optimizer),
         "hidden_size": int(args.hidden_size),
         "mask_hidden_info": bool(args.mask_hidden_info),
+        "hard_action_target_admission": hard_action_target_admission,
+        "acknowledge_authoritative_hard_action_targets": bool(
+            args.acknowledge_authoritative_hard_action_targets
+        ),
         "public_award_feature_contract": str(
             policy.public_award_feature_contract
         )
@@ -21157,6 +21202,129 @@ def load_teacher_data(
             if key in shard:
                 arrays.setdefault(key, []).append(shard[key])
     return {key: _concat_padded(key, values) for key, values in arrays.items()}
+
+
+def _validate_hard_action_target_admission(
+    data,
+    data_path: str | Path,
+    *,
+    mask_hidden_info: bool,
+    policy_loss_weight: float,
+    train_value_only: bool,
+    production: bool,
+    acknowledged_authoritative_targets: bool,
+) -> dict[str, object]:
+    """Keep played-action provenance separate from search-target provenance.
+
+    A public-masked student can only treat ``action_taken`` as a production label
+    when the producing manifest authenticates a public information-set teacher.
+    Older and authoritative corpora remain available for explicitly acknowledged
+    diagnostics, but acknowledgment is never a production override.
+    """
+
+    rows = int(len(data["action_taken"]))
+    potential_hard_action_rows = rows
+    if "policy_weight_multiplier" in data:
+        multiplier = np.asarray(data["policy_weight_multiplier"])
+        if multiplier.shape != (rows,):
+            raise SystemExit(
+                "policy_weight_multiplier shape drift during hard-action admission"
+            )
+        potential_hard_action_rows = int(np.count_nonzero(multiplier > 0.0))
+    hard_action_active = (
+        bool(mask_hidden_info)
+        and float(policy_loss_weight) > 0.0
+        and not bool(train_value_only)
+        and potential_hard_action_rows > 0
+    )
+
+    root = Path(data_path)
+    manifest_path = root / (
+        "corpus_meta.json" if (root / "corpus_meta.json").is_file() else "manifest.json"
+    )
+    manifest: dict[str, object] = {}
+    if manifest_path.is_file():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"cannot read hard-action provenance manifest {manifest_path}: {error}"
+            ) from error
+        if not isinstance(loaded, dict):
+            raise SystemExit(
+                f"hard-action provenance manifest must be a JSON object: {manifest_path}"
+            )
+        manifest = loaded
+
+    direct = manifest.get("hard_action_target_information")
+    resolved = propagated_hard_action_target_information(manifest)
+    direct_contract_present = isinstance(direct, dict)
+    if direct_contract_present and direct != resolved:
+        raise SystemExit(
+            "hard-action target provenance conflicts with nested source lineage: "
+            f"manifest={manifest_path}"
+        )
+    expected_fields = {
+        "schema_version",
+        "target_column",
+        "information_scope",
+        "public_information_authenticated",
+        "producer",
+    }
+    shape_valid = (
+        set(resolved) == expected_fields
+        and resolved.get("schema_version") == HARD_ACTION_TARGET_INFORMATION_SCHEMA
+        and resolved.get("target_column") == "action_taken"
+        and isinstance(resolved.get("information_scope"), str)
+        and isinstance(resolved.get("public_information_authenticated"), bool)
+        and isinstance(resolved.get("producer"), str)
+        and bool(resolved.get("producer"))
+    )
+    public_authenticated = bool(
+        shape_valid
+        and direct_contract_present
+        and resolved.get("information_scope") == HARD_ACTION_SCOPE_PUBLIC
+        and resolved.get("public_information_authenticated") is True
+    )
+    report: dict[str, object] = {
+        "mask_hidden_info": bool(mask_hidden_info),
+        # Conservative by construction: even soft_target_weight=1 uses
+        # action_taken as fallback on rows without an admitted soft target.
+        # The hard-label provenance contract must therefore cover every
+        # policy-weight-positive row unless policy training is wholly disabled.
+        "potential_hard_action_policy_active_rows": potential_hard_action_rows,
+        "hard_action_objective_active": hard_action_active,
+        "train_value_only": bool(train_value_only),
+        "manifest": str(manifest_path),
+        "direct_contract_present": direct_contract_present,
+        "contract": resolved,
+        "public_information_authenticated": public_authenticated,
+        "diagnostic_acknowledgement": bool(acknowledged_authoritative_targets),
+        "production": bool(production),
+    }
+    if not hard_action_active:
+        return report
+    if public_authenticated:
+        return report
+    if bool(production):
+        raise SystemExit(
+            "masked production training refused hard action targets that are not "
+            "public-information authenticated: action_taken was selected under "
+            f"scope={resolved.get('information_scope')!r}, producer="
+            f"{resolved.get('producer')!r}, manifest={manifest_path}. Observation "
+            "masking does not sanitize an authoritative teacher label. Generate "
+            "labels with an authenticated public information-set teacher; the "
+            "diagnostic acknowledgment flag cannot override production admission."
+        )
+    if not bool(acknowledged_authoritative_targets):
+        raise SystemExit(
+            "masked training refused unauthenticated hard action targets: "
+            f"scope={resolved.get('information_scope')!r}, producer="
+            f"{resolved.get('producer')!r}, manifest={manifest_path}. For a sealed "
+            "historical/diagnostic replay only, pass "
+            "--acknowledge-authoritative-hard-action-targets."
+        )
+    return report
 
 
 def _validate_target_information_admission(

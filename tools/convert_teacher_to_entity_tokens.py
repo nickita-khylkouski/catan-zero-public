@@ -31,7 +31,11 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from factory_common import parse_track, write_json  # noqa: E402
+from factory_common import (  # noqa: E402
+    parse_track,
+    propagated_hard_action_target_information,
+    write_json,
+)
 from curate_teacher_data import (  # noqa: E402
     TOOL_PROVENANCE_SCHEMA,
     _hash_required_files,
@@ -160,9 +164,13 @@ def main() -> None:
         vps_to_win=int(args.vps_to_win),
         use_graph_history_features=bool(args.graph_history_features),
     )
+    input_manifests = _input_manifests(args.data)
     summary: dict[str, Any] = {
         "inputs": args.data,
-        "input_manifests": _input_manifests(args.data),
+        "input_manifests": input_manifests,
+        "hard_action_target_information": propagated_hard_action_target_information(
+            input_manifests
+        ),
         "out": str(output),
         "track": args.track,
         "vps_to_win": int(args.vps_to_win),

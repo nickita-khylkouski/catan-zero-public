@@ -13,7 +13,7 @@ import numpy as np
 
 from catan_zero.rl.action_mask import ActionCatalog
 
-from factory_common import write_json
+from factory_common import propagated_hard_action_target_information, write_json
 
 
 # ``phase`` is the engine's public ``current_prompt`` in current teacher shards.
@@ -228,6 +228,7 @@ def main() -> None:
     output.mkdir(parents=True, exist_ok=True)
     writer = ShardWriter(output, args.shard_size, args.format)
     teacher_keep = _parse_keep_map(args.teacher_keep)
+    input_manifests = _input_manifests(args.data)
 
     report: dict[str, Any] = {
         "inputs": args.data,
@@ -240,7 +241,10 @@ def main() -> None:
         "production_35m_teacher": bool(args.production_35m_teacher),
         "preserve_value_only_filtered_rows": bool(args.preserve_value_only_filtered_rows),
         "dedupe_keys": str(args.dedupe_keys),
-        "input_manifests": _input_manifests(args.data),
+        "input_manifests": input_manifests,
+        "hard_action_target_information": propagated_hard_action_target_information(
+            input_manifests
+        ),
         "tool_provenance": _tool_provenance(),
         "raw_samples": 0,
         "kept_samples": 0,
@@ -386,6 +390,7 @@ def main() -> None:
             )
 
     shards = writer.close()
+    final_input_manifests = _input_manifests(args.data)
     manifest = {
         "inputs": args.data,
         "shards": [str(path) for path in shards],
@@ -401,7 +406,10 @@ def main() -> None:
         "production_35m_teacher": bool(args.production_35m_teacher),
         "preserve_value_only_filtered_rows": bool(args.preserve_value_only_filtered_rows),
         "dedupe_keys": str(args.dedupe_keys),
-        "input_manifests": _input_manifests(args.data),
+        "input_manifests": final_input_manifests,
+        "hard_action_target_information": propagated_hard_action_target_information(
+            final_input_manifests
+        ),
         "tool_provenance": _tool_provenance(),
         "score_source_counts": dict(report["kept_score_sources"].most_common()),
         "target_information_regime_counts": dict(
@@ -1291,6 +1299,7 @@ def _input_manifests(data_dirs: list[str]) -> list[dict[str, Any]]:
                     "score_source_counts",
                     "truncated_fraction",
                     "invalid_teacher_actions",
+                    "hard_action_target_information",
                     "tool_provenance",
                 )
                 if key in loaded

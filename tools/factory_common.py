@@ -9,6 +9,70 @@ from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig
 from catan_zero.rl.policy_pool import PolicySpec, load_checkpoint_policy, make_policy
 
 
+HARD_ACTION_TARGET_INFORMATION_SCHEMA = "hard-action-target-information-v1"
+HARD_ACTION_SCOPE_AUTHORITATIVE = "authoritative_full_state"
+HARD_ACTION_SCOPE_PUBLIC = "public_information_set"
+HARD_ACTION_SCOPE_UNKNOWN = "unknown"
+
+
+def classical_teacher_hard_action_target_information() -> dict[str, Any]:
+    """Describe the information available to this factory's played-action teachers.
+
+    ``generate_teacher_data`` invokes the classical policies against the live,
+    authoritative ``env.game``.  Masking the saved student observation later does
+    not retroactively make the selected action a public-information label.
+    """
+
+    return {
+        "schema_version": HARD_ACTION_TARGET_INFORMATION_SCHEMA,
+        "target_column": "action_taken",
+        "information_scope": HARD_ACTION_SCOPE_AUTHORITATIVE,
+        "public_information_authenticated": False,
+        "producer": "classical_policy_on_authoritative_game_v1",
+    }
+
+
+def propagated_hard_action_target_information(value: Any) -> dict[str, Any]:
+    """Preserve one exact hard-target contract through curation/conversion.
+
+    Missing or conflicting lineage remains explicitly unknown.  Transformations
+    must never upgrade an old corpus to public-authenticated merely because its
+    observations were converted or masked.
+    """
+
+    contracts: list[dict[str, Any]] = []
+
+    def collect(node: Any) -> None:
+        if isinstance(node, dict):
+            contract = node.get("hard_action_target_information")
+            if isinstance(contract, dict):
+                contracts.append(contract)
+            for child in node.values():
+                collect(child)
+        elif isinstance(node, list):
+            for child in node:
+                collect(child)
+
+    collect(value)
+    canonical = {
+        json.dumps(contract, sort_keys=True, separators=(",", ":")): contract
+        for contract in contracts
+    }
+    if len(canonical) == 1:
+        return dict(next(iter(canonical.values())))
+    return {
+        "schema_version": HARD_ACTION_TARGET_INFORMATION_SCHEMA,
+        "target_column": "action_taken",
+        "information_scope": HARD_ACTION_SCOPE_UNKNOWN,
+        "public_information_authenticated": False,
+        "producer": (
+            "missing_source_contract_v1"
+            if not canonical
+            else "conflicting_source_contracts_v1"
+        ),
+    }
+
+
 def parse_track(
     track: str,
     *,

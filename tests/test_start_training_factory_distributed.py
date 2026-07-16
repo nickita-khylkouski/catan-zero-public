@@ -62,6 +62,11 @@ def test_factory_keeps_default_global_batch_constant_across_world_sizes(
 
     assert result.returncode == 0, result.stderr
     manifest = _manifest(tmp_path)
+    assert manifest["production_hard_action_admission"] == {
+        "blocked": True,
+        "producer": "classical_policy_on_authoritative_game_v1",
+        "student_information_scope": "public_information_set",
+    }
     topology = manifest["bc_training_topology"]
     assert topology == {
         "world_size": world_size,
@@ -149,6 +154,7 @@ def test_factory_converts_entity_tokens_and_masks_hidden_inputs(tmp_path: Path) 
         "effective": str(tmp_path / "teacher_data_entity"),
         "graph_history_features": True,
         "mask_hidden_info": True,
+        "acknowledge_authoritative_hard_action_targets": False,
         "soft_target_weight": 0.0,
         "target_reliability_confidence_weighting": False,
         "target_reliability_confidence_floor": 0.25,
@@ -169,6 +175,70 @@ def test_factory_can_render_explicit_omniscient_soft_target_replay(
     command = _train_command(_manifest(tmp_path))
     assert "--mask-hidden-info" not in command
     assert command[command.index("--soft-target-weight") + 1] == "1.0"
+
+
+def test_factory_forwards_explicit_diagnostic_hard_target_acknowledgement(
+    tmp_path: Path,
+) -> None:
+    result = _dry_run(
+        tmp_path,
+        "--quality-gate",
+        "none",
+        "--acknowledge-authoritative-hard-action-targets",
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = _manifest(tmp_path)
+    assert (
+        manifest["bc_training_data"][
+            "acknowledge_authoritative_hard_action_targets"
+        ]
+        is True
+    )
+    assert "--acknowledge-authoritative-hard-action-targets" in _train_command(
+        manifest
+    )
+
+
+def test_factory_rejects_hard_target_acknowledgement_in_production(
+    tmp_path: Path,
+) -> None:
+    result = _dry_run(
+        tmp_path,
+        "--acknowledge-authoritative-hard-action-targets",
+    )
+
+    assert result.returncode != 0
+    assert "diagnostic-only" in result.stderr
+
+
+def test_factory_rejects_masked_classical_production_before_any_subprocess(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "blocked"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in ("src", env.get("PYTHONPATH", "")) if value
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "tools/start_training_factory.py",
+            "--run-dir",
+            str(run_dir),
+        ],
+        cwd=REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "refused before data generation" in result.stderr
+    assert not run_dir.exists()
 
 
 def test_non_entity_factory_skips_entity_conversion_and_masking(

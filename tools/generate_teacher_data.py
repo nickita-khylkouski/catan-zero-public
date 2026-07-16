@@ -12,7 +12,12 @@ import time
 import numpy as np
 
 from catan_zero.rl import collect_imitation_game
-from factory_common import make_named_policy, parse_track, write_json
+from factory_common import (
+    classical_teacher_hard_action_target_information,
+    make_named_policy,
+    parse_track,
+    write_json,
+)
 
 PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
 DEFAULT_PRODUCTION_TEACHERS = (
@@ -171,6 +176,9 @@ def main() -> None:
         "mixed_seat_mode": args.mixed_seat_mode,
         "teacher_sampling_weights": args.teacher_sampling_weights,
         "graph_history_features": args.graph_history_features,
+        "hard_action_target_information": (
+            classical_teacher_hard_action_target_information()
+        ),
         "tool_provenance": _tool_provenance(),
         "shards": [str(path) for path in shards],
         "elapsed_sec": time.perf_counter() - start,
