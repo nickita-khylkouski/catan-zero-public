@@ -151,6 +151,76 @@ def test_late_value_tower_clone_is_function_preserving_at_activation():
     assert len(split.encode_state(batch)) == 5
 
 
+def test_split1_inference_cls_suffix_matches_loaded_full_block_parameters(
+    monkeypatch,
+):
+    """The inference shortcut must preserve policy and scalar-value outputs."""
+
+    optimized = EntityGraphNet(
+        _config(state_layers=3, value_tower_split_layers=1, dropout=0.0)
+    ).eval()
+    reference = EntityGraphNet(copy.deepcopy(optimized.config))
+    reference.load_state_dict(optimized.state_dict(), strict=True)
+    reference.eval()
+    # Force only the reference through the historical full-token suffix while
+    # retaining identical eval-mode kernels everywhere else in the model.
+    monkeypatch.setattr(reference, "_use_cls_only_value_suffix", lambda: False)
+    batch = _batch(batch_size=3, action_width=5, event_width=16)
+
+    with torch.no_grad():
+        optimized_outputs = optimized(batch, return_q=True)
+        reference_outputs = reference(batch, return_q=True)
+
+    assert torch.equal(optimized_outputs["logits"], reference_outputs["logits"])
+    for key in ("value", "q_values"):
+        torch.testing.assert_close(
+            optimized_outputs[key],
+            reference_outputs[key],
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
+
+@pytest.mark.parametrize(
+    ("split_layers", "value_attention_pool", "training", "expect_cls_only"),
+    (
+        (1, False, False, True),
+        (1, False, True, False),
+        (1, True, False, False),
+        (2, False, False, False),
+    ),
+)
+def test_cls_only_value_suffix_is_guarded_to_safe_split1_inference(
+    monkeypatch,
+    split_layers: int,
+    value_attention_pool: bool,
+    training: bool,
+    expect_cls_only: bool,
+):
+    model = EntityGraphNet(
+        _config(
+            state_layers=3,
+            value_tower_split_layers=split_layers,
+            value_attention_pool=value_attention_pool,
+            dropout=0.0,
+        )
+    )
+    model.train(training)
+    cls_calls = 0
+    original = model.value_blocks[0].forward_cls
+
+    def counted_cls(*args, **kwargs):
+        nonlocal cls_calls
+        cls_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(model.value_blocks[0], "forward_cls", counted_cls)
+    with torch.no_grad():
+        model(_batch(batch_size=2, action_width=4, event_width=8))
+
+    assert (cls_calls == 1) is expect_cls_only
+
+
 def test_late_value_tower_isolates_policy_and_value_suffix_gradients():
     model = EntityGraphNet(
         _config(state_layers=2, value_tower_split_layers=1)

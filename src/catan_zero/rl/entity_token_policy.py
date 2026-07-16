@@ -453,6 +453,32 @@ class EntityGraphNet:
                 tokens = tokens + self.ff(self.norm_ff(tokens))
                 return tokens
 
+            def forward_cls(self, tokens, key_padding_mask=None):
+                """Return only the final CLS row of this Transformer block.
+
+                A last private value block feeds only ``value_state_norm`` on
+                its CLS row. Every CLS attention output depends on all input
+                keys/values, but not on the other query outputs or their
+                token-wise FFNs. Querying with only CLS is therefore the same
+                Transformer function for the consumed row while avoiding work
+                whose result is immediately discarded.
+
+                This helper is inference-only at its call site. Training keeps
+                the full-token block so dropout RNG and gradients are unchanged.
+                """
+
+                attn_in = self.norm_attn(tokens)
+                cls_attn_out, _ = self.attn(
+                    attn_in[:, :1],
+                    attn_in,
+                    attn_in,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+                cls = tokens[:, :1] + cls_attn_out
+                cls = cls + self.ff(self.norm_ff(cls))
+                return cls
+
         class _CrossBlock(nn.Module):
             """Pre-LN cross-attention block: `query` attends over `memory`.
 
@@ -1214,6 +1240,15 @@ class EntityGraphNet:
                     self.state_norm.state_dict(), strict=True
                 )
 
+            def _use_cls_only_value_suffix(self) -> bool:
+                """Whether inference can discard private non-CLS outputs."""
+
+                return bool(
+                    not self.training
+                    and self.value_tower_split_layers == 1
+                    and not self.value_attention_pool
+                )
+
             def encode_state(
                 self,
                 batch: dict[str, Any],
@@ -1562,10 +1597,19 @@ class EntityGraphNet:
                             + value_trunk_grad_scale
                             * (value_tower_input - value_tower_input.detach())
                         )
-                    for block in self.value_blocks:
-                        value_tokens = block(
+                    if self._use_cls_only_value_suffix():
+                        # Keep every K/V row and the exact padding mask, but do
+                        # not form query/FFN outputs no downstream head reads.
+                        value_tokens = self.value_blocks[0].forward_cls(
                             value_tokens, key_padding_mask=padding_mask
                         )
+                    else:
+                        # Training, deeper private towers, and attention-pool
+                        # readouts retain the full historical token semantics.
+                        for block in self.value_blocks:
+                            value_tokens = block(
+                                value_tokens, key_padding_mask=padding_mask
+                            )
                     if value_trunk_grad_scale == 0.0:
                         history_delta = history_delta.detach()
                     elif value_trunk_grad_scale != 1.0:
