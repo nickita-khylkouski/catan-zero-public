@@ -60,6 +60,34 @@ app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 
+def _hard_action_target_information() -> dict[str, Any]:
+    """Return the exact played-action provenance used by the local generator."""
+
+    try:
+        from factory_common import classical_teacher_hard_action_target_information
+    except ModuleNotFoundError:  # Package import in tests and library callers.
+        from tools.factory_common import classical_teacher_hard_action_target_information
+
+    return classical_teacher_hard_action_target_information()
+
+
+def _validated_generated_part_manifest(
+    manifest: dict[str, Any],
+    *,
+    source: Path,
+) -> dict[str, Any]:
+    """Fail closed before reusing or summarizing unauthenticated teacher data."""
+
+    expected = _hard_action_target_information()
+    actual = manifest.get("hard_action_target_information")
+    if actual != expected:
+        raise RuntimeError(
+            f"{source} lacks the exact authoritative hard-action target provenance; "
+            "refusing to reuse or summarize this generated part"
+        )
+    return manifest
+
+
 def _run_worker(payload: dict[str, Any]) -> dict[str, Any]:
     import numpy as np
 
@@ -78,7 +106,10 @@ def _run_worker(payload: dict[str, Any]) -> dict[str, Any]:
         if complete_manifest.exists():
             complete = json.loads(complete_manifest.read_text(encoding="utf-8"))
             if run_id and str(complete.get("run_id", "")) == run_id:
-                return complete
+                return _validated_generated_part_manifest(
+                    complete,
+                    source=complete_manifest,
+                )
         shutil.rmtree(out_dir)
     if out_dir.exists() and not bool(payload.get("resume", False)):
         existing = list(out_dir.iterdir())
@@ -88,7 +119,10 @@ def _run_worker(payload: dict[str, Any]) -> dict[str, Any]:
             if complete_manifest.exists():
                 complete = json.loads(complete_manifest.read_text(encoding="utf-8"))
                 if run_id and str(complete.get("run_id", "")) == run_id:
-                    return complete
+                    return _validated_generated_part_manifest(
+                        complete,
+                        source=complete_manifest,
+                    )
             if partial_manifest.exists():
                 partial = json.loads(partial_manifest.read_text(encoding="utf-8"))
                 if run_id and str(partial.get("run_id", "")) == run_id:
@@ -299,6 +333,7 @@ def _part_report(
         "mixed_seat_mode": str(payload.get("mixed_seat_mode", "")),
         "graph_history_features": bool(payload.get("graph_history_features", False)),
         "teacher_sampling_weights": str(payload.get("teacher_sampling_weights", "")),
+        "hard_action_target_information": _hard_action_target_information(),
         "tool_provenance": _tool_provenance(),
         "shards": [str(path) for path in shards],
         "elapsed_sec": elapsed,
@@ -405,7 +440,7 @@ def summarize_run(run_name: str, run_id: str = "") -> dict[str, Any]:
         part = json.loads(path.read_text(encoding="utf-8"))
         if run_id and str(part.get("run_id", "")) != str(run_id):
             continue
-        parts.append(part)
+        parts.append(_validated_generated_part_manifest(part, source=path))
     complete_part_dirs = set()
     for path in manifests:
         part = json.loads(path.read_text(encoding="utf-8"))
@@ -419,7 +454,7 @@ def summarize_run(run_name: str, run_id: str = "") -> dict[str, Any]:
         part = json.loads(path.read_text(encoding="utf-8"))
         if run_id and str(part.get("run_id", "")) != str(run_id):
             continue
-        partial_parts.append(part)
+        partial_parts.append(_validated_generated_part_manifest(part, source=path))
     total_games = sum(int(part.get("completed_games", 0)) for part in parts)
     total_samples = sum(int(part.get("samples", 0)) for part in parts)
     partial_games = sum(int(part.get("completed_games", 0)) for part in partial_parts)
@@ -484,6 +519,7 @@ def summarize_run(run_name: str, run_id: str = "") -> dict[str, Any]:
     return {
         "run_name": run_name,
         "run_id": run_id,
+        "hard_action_target_information": _hard_action_target_information(),
         "parts_complete": len(parts),
         "parts_partial": len(partial_parts),
         "games": total_games,
