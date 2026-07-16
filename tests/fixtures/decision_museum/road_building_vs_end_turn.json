@@ -1,0 +1,32 @@
+{
+  "schema_version": "decision-museum-regression-shape-v1",
+  "description": "Deterministic synthetic shape matching the observed Road Building hoard versus END_TURN failure. Values are regression semantics, not a private game state.",
+  "private_artifact_dependency": false,
+  "focus_action_types": [
+    "END_TURN",
+    "PLAY_ROAD_BUILDING"
+  ],
+  "raw_policy": {
+    "END_TURN": 0.784,
+    "PLAY_ROAD_BUILDING": 0.059
+  },
+  "search_selected": "END_TURN",
+  "search_q": {
+    "END_TURN": -0.176,
+    "PLAY_ROAD_BUILDING": -0.170
+  },
+  "paired_seeds": [
+    710001,
+    710002,
+    710003,
+    710004,
+    710005,
+    710006,
+    710007,
+    710008
+  ],
+  "paired_counterfactual_outcomes": {
+    "END_TURN": [-1, -1, -1, -1, -1, -1, -1, -1],
+    "PLAY_ROAD_BUILDING": [1, -1, -1, 1, -1, -1, 1, -1]
+  }
+}

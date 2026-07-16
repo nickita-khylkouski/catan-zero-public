@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import pytest
+
 from tools.strategic_root_exam import (
     _role_exam,
+    build_exam,
+    content_sha256,
     describe_action,
     render_markdown,
+    run_paired_counterfactuals,
 )
 
 
@@ -83,6 +91,28 @@ def test_markdown_names_actual_moves() -> None:
                 "phase_raw": "PLAY_TURN",
                 "actor": "RED",
                 "legal_width": 2,
+                "paired_counterfactuals": {
+                    "actions": [
+                        {
+                            "action": {
+                                "action_type": "END_TURN",
+                                "argument": None,
+                            },
+                            "summary": {"mean_outcome": -1.0, "wins": 0, "trials": 8},
+                        },
+                        {
+                            "action": {
+                                "action_type": "PLAY_ROAD_BUILDING",
+                                "argument": None,
+                            },
+                            "summary": {
+                                "mean_outcome": -0.25,
+                                "wins": 3,
+                                "trials": 8,
+                            },
+                        },
+                    ]
+                },
                 "roles": {
                     "base_n128": {
                         "raw_prior_top": [
@@ -114,19 +144,24 @@ def test_markdown_names_actual_moves() -> None:
 
     assert "END_TURN" in markdown
     assert "BUY_DEVELOPMENT_CARD" in markdown
+    assert "PLAY_ROAD_BUILDING" in markdown
+    assert "mean outcome -0.250" in markdown
 
 
 def test_exam_uses_sealed_snapshot_actions_without_runtime_reconstruction() -> None:
-    from tools.strategic_root_exam import build_exam
-
     panel = {
         "panel_content_sha256": "sha256:panel",
+        "provenance": {
+            "checkpoint_sha256": "sha256:checkpoint",
+            "evaluator_config_sha256": "sha256:evaluator",
+        },
         "roots": [
             {
                 "root_index": 0,
                 "root_sha256": "sha256:root",
                 "game_seed": 7,
                 "decision_index": 0,
+                "action_prefix": [],
                 "phase": "opening_placement",
                 "phase_raw": "BUILD_INITIAL_SETTLEMENT",
                 "legal_width": 2,
@@ -151,6 +186,12 @@ def test_exam_uses_sealed_snapshot_actions_without_runtime_reconstruction() -> N
     }
     report = {
         "schema_version": "fixed-root-search-stability-v2",
+        "report_content_sha256": "sha256:report",
+        "checkpoint": {"sha256": "sha256:checkpoint"},
+        "evaluator": {"effective_evaluator_config_sha256": "sha256:evaluator"},
+        "roles": {
+            "base_n128": {"effective_search_config_sha256": "sha256:search-n128"}
+        },
         "root_panel": {"content_sha256": "sha256:panel"},
         "per_root": [
             {
@@ -173,3 +214,178 @@ def test_exam_uses_sealed_snapshot_actions_without_runtime_reconstruction() -> N
     chosen = exam["roots"][0]["roles"]["base_n128"]["selected_actions"][0]
     assert chosen["action_type"] == "BUILD_SETTLEMENT"
     assert chosen["argument"] == 0
+
+
+def test_exam_embeds_standalone_replay_and_model_operator_hashes() -> None:
+    panel = {
+        "panel_content_sha256": "sha256:panel",
+        "provenance": {
+            "checkpoint_sha256": "sha256:checkpoint",
+            "evaluator_config_sha256": "sha256:evaluator",
+        },
+        "roots": [
+            {
+                "root_index": 0,
+                "root_sha256": "sha256:root",
+                "game_seed": 7,
+                "decision_index": 2,
+                "action_prefix": [91, 92],
+                "phase": "play_turn",
+                "phase_raw": "PLAY_TURN",
+                "legal_width": 2,
+                "current_color": "RED",
+                "legal_action_ids": [186, 310],
+                "snapshot": {
+                    "colors": ["RED", "BLUE"],
+                    "player_state": [{}, {}],
+                    "current_playable_actions": [
+                        ["RED", "END_TURN", None],
+                        ["RED", "PLAY_ROAD_BUILDING", None],
+                    ],
+                },
+            }
+        ],
+    }
+    run = {
+        "selected_action": 186,
+        "prior_policy": {"186": 0.784, "310": 0.216},
+        "improved_policy": {"186": 0.8, "310": 0.2},
+        "completed_q_top_margin": 0.006,
+    }
+    report = {
+        "schema_version": "fixed-root-search-stability-v2",
+        "report_content_sha256": "sha256:report",
+        "checkpoint": {"sha256": "sha256:checkpoint"},
+        "evaluator": {"effective_evaluator_config_sha256": "sha256:evaluator"},
+        "roles": {
+            "coherent_n128": {"effective_search_config_sha256": "sha256:search-n128"}
+        },
+        "root_panel": {"content_sha256": "sha256:panel"},
+        "per_root": [
+            {
+                "root_sha256": "sha256:root",
+                "roles": {
+                    "coherent_n128": {
+                        "runs": [run, dict(run)],
+                        "stability": {
+                            "cross_seed_js_mean": 0.0,
+                            "top1_pair_agreement": 1.0,
+                        },
+                    }
+                },
+            }
+        ],
+    }
+
+    counterfactual = run_paired_counterfactuals(
+        object(),
+        action_ids=[186, 310],
+        seeds=[11, 12],
+        hook=lambda _state, action, seed: {
+            "outcome": 1.0 if action == 310 and seed == 11 else -1.0
+        },
+        action_descriptions={
+            186: {
+                "action_id": 186,
+                "action_type": "END_TURN",
+                "argument": None,
+            },
+            310: {
+                "action_id": 310,
+                "action_type": "PLAY_ROAD_BUILDING",
+                "argument": None,
+            },
+        },
+    )
+    exam = build_exam(panel, report, counterfactuals_by_root={0: counterfactual})
+
+    assert exam["provenance"] == {
+        "root_panel_content_sha256": "sha256:panel",
+        "source_report_content_sha256": "sha256:report",
+        "checkpoint_sha256": "sha256:checkpoint",
+        "evaluator_operator_sha256": "sha256:evaluator",
+        "search_operator_sha256_by_role": {"coherent_n128": "sha256:search-n128"},
+    }
+    assert exam["roots"][0]["replay"] == {
+        "root_sha256": "sha256:root",
+        "game_seed": 7,
+        "decision_index": 2,
+        "action_prefix": [91, 92],
+        "snapshot": panel["roots"][0]["snapshot"],
+        "legal_action_ids": [186, 310],
+        "current_color": "RED",
+    }
+    assert exam["roots"][0]["paired_counterfactuals"] == counterfactual
+
+
+def test_exam_rejects_checkpoint_or_operator_provenance_drift() -> None:
+    panel = {
+        "panel_content_sha256": "sha256:panel",
+        "provenance": {
+            "checkpoint_sha256": "sha256:checkpoint-a",
+            "evaluator_config_sha256": "sha256:evaluator",
+        },
+        "roots": [],
+    }
+    report = {
+        "schema_version": "fixed-root-search-stability-v2",
+        "checkpoint": {"sha256": "sha256:checkpoint-b"},
+        "evaluator": {"effective_evaluator_config_sha256": "sha256:evaluator"},
+        "roles": {},
+        "root_panel": {"content_sha256": "sha256:panel"},
+        "per_root": [],
+    }
+
+    with pytest.raises(ValueError, match="checkpoint hashes differ"):
+        build_exam(panel, report)
+
+
+def test_paired_counterfactual_hook_uses_the_same_seeds_for_each_action() -> None:
+    calls: list[tuple[int, int]] = []
+    actions = {
+        186: {"action_id": 186, "action_type": "END_TURN", "argument": None},
+        310: {
+            "action_id": 310,
+            "action_type": "PLAY_ROAD_BUILDING",
+            "argument": None,
+        },
+    }
+
+    def hook(_state: object, action_id: int, seed: int) -> dict:
+        calls.append((action_id, seed))
+        return {"outcome": 1.0 if action_id == 310 and seed == 11 else -1.0}
+
+    evidence = run_paired_counterfactuals(
+        object(),
+        action_ids=[186, 310],
+        seeds=[11, 12],
+        hook=hook,
+        action_descriptions=actions,
+    )
+
+    assert calls == [(186, 11), (186, 12), (310, 11), (310, 12)]
+    assert evidence["protocol"] == "paired-common-seed-v1"
+    assert evidence["seed_manifest_sha256"] == content_sha256([11, 12])
+    assert evidence["actions"][0]["summary"]["wins"] == 0
+    assert evidence["actions"][1]["summary"]["wins"] == 1
+    assert evidence["paired_deltas"][0]["mean_outcome_delta"] == pytest.approx(1.0)
+
+
+def test_checked_in_road_building_failure_shape_needs_no_private_artifact() -> None:
+    fixture = (
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "decision_museum"
+        / "road_building_vs_end_turn.json"
+    )
+    payload = json.loads(fixture.read_text(encoding="utf-8"))
+
+    assert payload["private_artifact_dependency"] is False
+    assert payload["raw_policy"]["END_TURN"] == pytest.approx(0.784)
+    assert payload["search_selected"] == "END_TURN"
+    assert payload["search_q"]["PLAY_ROAD_BUILDING"] > payload["search_q"]["END_TURN"]
+    end = payload["paired_counterfactual_outcomes"]["END_TURN"]
+    road = payload["paired_counterfactual_outcomes"]["PLAY_ROAD_BUILDING"]
+    assert len(end) == len(road) == 8
+    assert sum(outcome > 0 for outcome in end) == 0
+    assert sum(outcome > 0 for outcome in road) == 3
