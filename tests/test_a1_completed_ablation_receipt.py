@@ -450,6 +450,7 @@ def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -
             "teacher_gap_closure": 0.99,
             "fresh_parent_teacher_gap_absolute_closure": -0.02,
             "fresh_parent_teacher_gap_relative_closure": -0.10,
+            "value_quality_gate": {"passed": True},
         },
         {
             "step": 16,
@@ -462,6 +463,7 @@ def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -
             "teacher_gap_closure": -0.50,
             "fresh_parent_teacher_gap_absolute_closure": 0.04,
             "fresh_parent_teacher_gap_relative_closure": 0.25,
+            "value_quality_gate": {"passed": True},
         },
     ]
 
@@ -488,6 +490,7 @@ def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> N
             "trunk_relative_l2": 0.001,
             "fresh_parent_teacher_gap_absolute_closure": 0.5,
             "fresh_parent_teacher_gap_relative_closure": 0.5,
+            "value_quality_gate": {"passed": True},
         },
         {
             "step": 16,
@@ -498,6 +501,7 @@ def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> N
             "trunk_relative_l2": 0.02,
             "fresh_parent_teacher_gap_absolute_closure": 0.01,
             "fresh_parent_teacher_gap_relative_closure": 0.01,
+            "value_quality_gate": {"passed": True},
         },
     ]
 
@@ -511,6 +515,123 @@ def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> N
     assert commissioned["authenticated"] is True
     assert selected is not None
     assert selected["step"] == 16
+
+
+def test_stage_c_rejects_policy_improvement_when_value_regresses() -> None:
+    records = [
+        {
+            "step": 16,
+            "feature_learning_signal_authenticated": True,
+            "parent_kl": 0.002,
+            "trunk_relative_l2": 0.001,
+            "fresh_parent_teacher_gap_absolute_closure": 0.02,
+            "fresh_parent_teacher_gap_relative_closure": 0.03,
+            "value_quality_gate": {"passed": False},
+        },
+        {
+            "step": 24,
+            "feature_learning_signal_authenticated": True,
+            "parent_kl": 0.02,
+            "trunk_relative_l2": 0.002,
+            "fresh_parent_teacher_gap_absolute_closure": 0.05,
+            "fresh_parent_teacher_gap_relative_closure": 0.06,
+            "value_quality_gate": {"passed": False},
+        },
+    ]
+
+    assert campaign._select_fingerprint_winner(records) is None  # noqa: SLF001
+
+
+def test_stage_c_accepts_earlier_mid_epoch_value_safe_checkpoint() -> None:
+    records = [
+        {
+            "step": 16,
+            "feature_learning_signal_authenticated": True,
+            "parent_kl": 0.002,
+            "trunk_relative_l2": 0.001,
+            "fresh_parent_teacher_gap_absolute_closure": 0.02,
+            "fresh_parent_teacher_gap_relative_closure": 0.03,
+            "value_quality_gate": {"passed": True},
+        },
+        {
+            "step": 24,
+            "feature_learning_signal_authenticated": True,
+            "parent_kl": 0.02,
+            "trunk_relative_l2": 0.002,
+            "fresh_parent_teacher_gap_absolute_closure": 0.05,
+            "fresh_parent_teacher_gap_relative_closure": 0.06,
+            "value_quality_gate": {"passed": False},
+        },
+    ]
+
+    selected = campaign._select_fingerprint_winner(records)  # noqa: SLF001
+    assert selected is not None
+    assert selected["step"] == 16
+
+
+def test_stage_c_value_gate_replays_b200_parent_comparison() -> None:
+    def functional(candidate_value: float) -> dict:
+        return {"paired_parent_value_quality": {
+            "schema_version": campaign.PAIRED_PARENT_VALUE_SCHEMA,
+            "selection_authority": True,
+            "surface": (
+                "same_holdout_same_objective_weights_fresh_exact_parent_forward"
+            ),
+            "metric": "primary_value_loss",
+            "metric_kind": "scalar_mse",
+            "value_weight_mass": 100.0,
+            "parent_value": 0.6638134101444333,
+            "candidate_value": candidate_value,
+            "candidate_minus_parent": candidate_value - 0.6638134101444333,
+        }}
+
+    early = campaign._paired_value_quality(  # noqa: SLF001
+        functional(0.6618989103258975),
+        parent_functional=None,
+        policy=campaign.VALUE_GATE_POLICY,
+        max_absolute_regression=0.0,
+    )
+    regressed = campaign._paired_value_quality(  # noqa: SLF001
+        functional(0.6842854594003515),
+        parent_functional=None,
+        policy=campaign.VALUE_GATE_POLICY,
+        max_absolute_regression=0.0,
+    )
+    assert early["passed"] is True
+    assert regressed["passed"] is False
+    selected = campaign._select_fingerprint_winner(  # noqa: SLF001
+        [
+            {
+                "step": 4,
+                "feature_learning_signal_authenticated": False,
+                "parent_kl": 0.0022811808808186323,
+                "trunk_relative_l2": 0.0006498816281192034,
+                "fresh_parent_teacher_gap_absolute_closure": 0.02064811311465664,
+                "fresh_parent_teacher_gap_relative_closure": 0.025638264338820396,
+                "value_quality_gate": early,
+            },
+            {
+                "step": 32,
+                "feature_learning_signal_authenticated": True,
+                "parent_kl": 0.1130148750044209,
+                "trunk_relative_l2": 0.010375720545963748,
+                "fresh_parent_teacher_gap_absolute_closure": 0.1080338176634672,
+                "fresh_parent_teacher_gap_relative_closure": 0.13414298727479415,
+                "value_quality_gate": regressed,
+            },
+        ]
+    )
+    assert selected is None
+
+    diagnostic = campaign._paired_value_quality(  # noqa: SLF001
+        functional(0.6842854594003515),
+        parent_functional=None,
+        policy="diagnostic_record_only_allow_regression",
+        max_absolute_regression=0.0,
+    )
+    assert diagnostic["passed"] is False
+    assert diagnostic["selection_admitted"] is True
+    assert diagnostic["promotion_authority"] is False
 
 
 def test_checkpoint_signal_is_bound_to_exact_intermediate_bytes(

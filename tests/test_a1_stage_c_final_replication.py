@@ -71,6 +71,7 @@ def _fingerprint(
                 "step": step,
                 "eligible": step != 16,
                 "feature_learning_signal_authenticated": step != 16,
+                "value_quality_gate": {"passed": step != 16},
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": final.file_sha256(checkpoint),
             }
@@ -85,6 +86,10 @@ def _fingerprint(
         "completed_dose": {"feature_learning_signal_authenticated": True},
         "stored_generation_prior_used_as_selection_authority": False,
         "optimizer_batch_kl_used_as_trust_authority": False,
+        "value_quality_gate": {
+            "policy": "require_non_regression",
+            "max_absolute_regression": 0.0,
+        },
         "separate_exact_parent_evidence": {"selection_authority": True},
     }
     path = tmp_path / "fingerprint.json"

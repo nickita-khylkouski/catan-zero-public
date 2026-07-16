@@ -163,6 +163,10 @@ class _FakeTrainBC:
             "prior_kl_model_prior_mean": 0.3,
             "prior_kl_target_prior_mean": 0.4,
             "prior_kl_ratio": 0.75,
+            "primary_value_loss": 0.4,
+            "primary_value_loss_kind": "scalar_mse",
+            "scalar_value_mse_diagnostic": 0.4,
+            "loss_denominators": {"value_loss": 2.0},
         }
 
 
@@ -267,6 +271,7 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
         "active_policy_teacher_gap_closure": 0.6,
     }
     assert result["legacy_prior_kl"]["prior_kl_ratio"] == 0.75
+    assert result["value_quality"]["value"] == pytest.approx(0.4)
     assert result["inputs"]["checkpoint"]["sha256"].startswith("sha256:")
     assert result["inputs"]["training_report"]["sha256"].startswith("sha256:")
 
@@ -420,6 +425,9 @@ def test_single_checkpoint_parent_mode_uses_report_bound_parent(tmp_path, monkey
     )
     assert result["parent_target_kl_mean"] == pytest.approx(0.2)
     assert result["paired_parent_teacher_gap"]["absolute_teacher_gap_closure"] == (
+        pytest.approx(0.0)
+    )
+    assert result["paired_parent_value_quality"]["candidate_minus_parent"] == (
         pytest.approx(0.0)
     )
     assert (

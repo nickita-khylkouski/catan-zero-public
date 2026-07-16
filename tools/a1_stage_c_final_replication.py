@@ -48,7 +48,7 @@ TIEBREAK_SCHEMA = "a1-stage-c-v5-dose-tiebreak-common-crn-v1"
 ROOT_MANIFEST_SCHEMA = "a1-stage-c-independent-root-manifest-v1"
 FINAL_CORPUS_ADMISSION_SCHEMA = "a1-stage-c-final-corpus-admission-v1"
 FINAL_AUTHORITY_SCHEMA = "a1-stage-c-final-matched-replication-authority-v2"
-FRESH_FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v3"
+FRESH_FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
 EXPECTED_ARM = "STRATEGIC_BALANCED"
 EXPECTED_ROOTS = 8_192
 EXPECTED_PARTITIONS = 64
@@ -212,6 +212,16 @@ def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
         or payload.get("stored_generation_prior_used_as_selection_authority")
         is not False
         or payload.get("optimizer_batch_kl_used_as_trust_authority") is not False
+        or payload.get("value_quality_gate", {}).get("policy")
+        != "require_non_regression"
+        or payload.get("value_quality_gate", {}).get("max_absolute_regression")
+        != 0.0
+        or any(
+            item.get("eligible") is True
+            and item.get("value_quality_gate", {}).get("passed") is not True
+            for item in payload.get("checkpoints", [])
+            if isinstance(item, dict)
+        )
         or payload.get("separate_exact_parent_evidence", {}).get(
             "selection_authority"
         )

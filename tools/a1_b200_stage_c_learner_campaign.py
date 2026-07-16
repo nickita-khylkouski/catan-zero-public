@@ -45,12 +45,13 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 
 
-SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v5"
+SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v6"
 EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v1"
-FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v3"
+FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
 TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v1"
 SEPARATE_PARENT_GAP_SCHEMA = "posthoc-separate-parent-teacher-gap-v1"
+PAIRED_PARENT_VALUE_SCHEMA = "posthoc-paired-parent-value-quality-v1"
 WORLD_SIZE = 8
 LOCAL_BATCH_SIZE = 512
 GLOBAL_BATCH_SIZE = WORLD_SIZE * LOCAL_BATCH_SIZE
@@ -84,6 +85,11 @@ EFFECTIVE_FEATURE_CONTRACT = {
     "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     "meaningful_public_history_pooling": MASKED_MEAN_V1,
 }
+VALUE_GATE_POLICY = "require_non_regression"
+VALUE_GATE_POLICIES = frozenset(
+    {VALUE_GATE_POLICY, "diagnostic_record_only_allow_regression"}
+)
+MAX_VALUE_MSE_REGRESSION = 0.0
 
 
 class CampaignError(RuntimeError):
@@ -593,6 +599,26 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
                 "posthoc_trust_budgets_then_paired_play"
             ),
             "teacher_gap_closure_ranking_authority": False,
+            "value_quality_gate": {
+                "policy": str(
+                    getattr(args, "value_gate_policy", VALUE_GATE_POLICY)
+                ),
+                "metric": "primary_value_loss",
+                "metric_kind": "scalar_mse",
+                "parent_baseline": "fresh_exact_report_bound_parent_forward",
+                "max_absolute_regression": float(
+                    getattr(
+                        args,
+                        "max_value_mse_regression",
+                        MAX_VALUE_MSE_REGRESSION,
+                    )
+                ),
+                "phase_slices_required": [],
+                "phase_slice_reason": (
+                    "current posthoc evidence has no objective-matched per-phase "
+                    "value sufficient statistics"
+                ),
+            },
             "playing_strength_evaluation_required": True,
         },
         "optimizer_surface_contract": {
@@ -680,6 +706,7 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
     recipe = plan.get("recipe", {})
     optimizer_surface = plan.get("optimizer_surface_contract")
     feature_signal = plan.get("feature_learning_signal_contract")
+    value_gate = plan.get("selection_contract", {}).get("value_quality_gate")
     if (
         plan.get("arm") not in ARMS
         or float(recipe.get("value_trunk_grad_scale", -1.0)) != 0.1
@@ -706,6 +733,17 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
             "required_modules": sorted(FEATURE_SIGNAL_MODULES),
             "required_positive_fields": list(POSITIVE_OPTIMIZER_SIGNAL_FIELDS),
         }
+        or not isinstance(value_gate, dict)
+        or value_gate.get("policy") not in VALUE_GATE_POLICIES
+        or value_gate.get("metric") != "primary_value_loss"
+        or value_gate.get("metric_kind") != "scalar_mse"
+        or value_gate.get("parent_baseline")
+        != "fresh_exact_report_bound_parent_forward"
+        or not math.isfinite(
+            float(value_gate.get("max_absolute_regression", math.nan))
+        )
+        or float(value_gate.get("max_absolute_regression", math.nan)) < 0.0
+        or value_gate.get("phase_slices_required") != []
     ):
         raise CampaignError("Stage-C clean learner semantics drifted")
     if plan.get("command_sha256") != _value_sha256(_one_dose_command(plan)):
@@ -1219,6 +1257,11 @@ def _select_fingerprint_winner(
         and float(row["trunk_relative_l2"]) <= MAX_TRUNK_RELATIVE_L2
         and float(row["fresh_parent_teacher_gap_relative_closure"]) > 0.0
         and float(row["fresh_parent_teacher_gap_absolute_closure"]) > 0.0
+        and row.get("value_quality_gate", {}).get(
+            "selection_admitted",
+            row.get("value_quality_gate", {}).get("passed"),
+        )
+        is True
     ]
     if not eligible:
         return None
@@ -1232,6 +1275,100 @@ def _select_fingerprint_winner(
             ),
         )
     )
+
+
+def _paired_value_quality(
+    functional: Mapping[str, Any],
+    *,
+    parent_functional: Mapping[str, Any] | None,
+    policy: str,
+    max_absolute_regression: float,
+) -> dict[str, Any]:
+    paired = functional.get("paired_parent_value_quality")
+    if not isinstance(paired, dict):
+        if parent_functional is None:
+            raise CampaignError(
+                "functional report has no authoritative fresh-parent value baseline"
+            )
+        if _posthoc_evaluation_surface(functional) != _posthoc_evaluation_surface(
+            parent_functional
+        ):
+            raise CampaignError("parent and candidate value holdout surfaces differ")
+        candidate_metrics = functional.get("metrics")
+        parent_metrics = parent_functional.get("metrics")
+        if not isinstance(candidate_metrics, dict) or not isinstance(parent_metrics, dict):
+            raise CampaignError("functional report has no value-quality metrics")
+        try:
+            candidate = float(candidate_metrics["primary_value_loss"])
+            parent = float(parent_metrics["primary_value_loss"])
+            candidate_kind = str(candidate_metrics["primary_value_loss_kind"])
+            parent_kind = str(parent_metrics["primary_value_loss_kind"])
+            candidate_mass = float(
+                candidate_metrics["loss_denominators"]["value_loss"]
+            )
+            parent_mass = float(parent_metrics["loss_denominators"]["value_loss"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CampaignError("value-quality metrics are malformed") from error
+        paired = {
+            "schema_version": PAIRED_PARENT_VALUE_SCHEMA,
+            "selection_authority": True,
+            "surface": (
+                "same_holdout_same_objective_weights_fresh_exact_parent_forward"
+            ),
+            "metric": "primary_value_loss",
+            "metric_kind": candidate_kind,
+            "value_weight_mass": candidate_mass,
+            "parent_value": parent,
+            "candidate_value": candidate,
+            "candidate_minus_parent": candidate - parent,
+        }
+        if (
+            candidate_kind != parent_kind
+            or not math.isclose(
+                candidate_mass, parent_mass, rel_tol=0.0, abs_tol=1.0e-9
+            )
+        ):
+            raise CampaignError("parent and candidate value objectives differ")
+    try:
+        parent = float(paired["parent_value"])
+        candidate = float(paired["candidate_value"])
+        delta = float(paired["candidate_minus_parent"])
+        mass = float(paired["value_weight_mass"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError("paired parent value evidence is malformed") from error
+    if (
+        paired.get("schema_version") != PAIRED_PARENT_VALUE_SCHEMA
+        or paired.get("selection_authority") is not True
+        or paired.get("surface")
+        != "same_holdout_same_objective_weights_fresh_exact_parent_forward"
+        or paired.get("metric") != "primary_value_loss"
+        or paired.get("metric_kind") != "scalar_mse"
+        or not all(math.isfinite(value) for value in (parent, candidate, delta, mass))
+        or mass <= 0.0
+        or not math.isclose(
+            delta, candidate - parent, rel_tol=1.0e-9, abs_tol=1.0e-12
+        )
+    ):
+        raise CampaignError("paired parent value evidence is inconsistent")
+    if policy not in VALUE_GATE_POLICIES:
+        raise CampaignError("value-quality gate policy is unsupported")
+    passed = bool(delta <= max_absolute_regression)
+    return {
+        "policy": policy,
+        "metric": "primary_value_loss",
+        "metric_kind": "scalar_mse",
+        "parent_value": parent,
+        "candidate_value": candidate,
+        "candidate_minus_parent": delta,
+        "max_absolute_regression": max_absolute_regression,
+        "passed": passed,
+        "selection_admitted": bool(
+            passed or policy == "diagnostic_record_only_allow_regression"
+        ),
+        "promotion_authority": bool(policy == VALUE_GATE_POLICY and passed),
+        "evidence_schema_version": PAIRED_PARENT_VALUE_SCHEMA,
+        "value_weight_mass": mass,
+    }
 
 
 def _fingerprint(
@@ -1396,6 +1533,18 @@ def _fingerprint(
         fresh_gap = _fresh_parent_teacher_gap(
             functional, parent_functional=separate_parent_payload
         )
+        value_gate = _paired_value_quality(
+            functional,
+            parent_functional=separate_parent_payload,
+            policy=str(
+                plan["selection_contract"]["value_quality_gate"]["policy"]
+            ),
+            max_absolute_regression=float(
+                plan["selection_contract"]["value_quality_gate"][
+                    "max_absolute_regression"
+                ]
+            ),
+        )
         legacy_closure = fresh_gap["legacy_stored_prior_closure"]
         trunk = _trunk_relative_l2(drift)
         feature_signal = _checkpoint_feature_learning_signal(
@@ -1407,6 +1556,7 @@ def _fingerprint(
             and trunk <= MAX_TRUNK_RELATIVE_L2
             and fresh_gap["absolute_closure"] > 0.0
             and fresh_gap["relative_closure"] > 0.0
+            and value_gate["selection_admitted"]
         )
         records.append(
             {
@@ -1433,6 +1583,7 @@ def _fingerprint(
                     "authenticated"
                 ],
                 "feature_learning_signal": feature_signal,
+                "value_quality_gate": value_gate,
                 "eligible": eligible,
                 "functional": {
                     "path": str(functional_path),
@@ -1483,13 +1634,16 @@ def _fingerprint(
             "kl_and_trunk_drift_budgets"
         ),
         "teacher_gap_closure_ranking_authority": False,
+        "value_quality_gate": copy.deepcopy(
+            plan["selection_contract"]["value_quality_gate"]
+        ),
         "output": str(_fresh_parent_fingerprint_path(plan)),
         "checkpoints": records,
         "winner": winner,
         "formal_result": (
             "posthoc_in_budget_candidate_requires_playing_evaluation"
             if winner is not None
-            else "no_positive_fresh_parent_closure_checkpoint_within_posthoc_trust_budget"
+            else "no_value_safe_checkpoint_within_posthoc_trust_budget"
         ),
     }
     if separate_parent_path is not None:
@@ -1530,6 +1684,16 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--python", required=True, type=Path)
     plan.add_argument("--output-root", required=True, type=Path)
     plan.add_argument("--write", required=True, type=Path)
+    plan.add_argument(
+        "--value-gate-policy",
+        choices=sorted(VALUE_GATE_POLICIES),
+        default=VALUE_GATE_POLICY,
+    )
+    plan.add_argument(
+        "--max-value-mse-regression",
+        type=float,
+        default=MAX_VALUE_MSE_REGRESSION,
+    )
     run = commands.add_parser("run")
     run.add_argument("--campaign", required=True, type=Path)
     run.add_argument("--go", action="store_true")

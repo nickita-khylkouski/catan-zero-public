@@ -17,6 +17,8 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parents[1]
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
+VALUE_QUALITY_SCHEMA = "posthoc-objective-matched-value-quality-v1"
+PAIRED_PARENT_VALUE_SCHEMA = "posthoc-paired-parent-value-quality-v1"
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
@@ -783,6 +785,82 @@ def _teacher_gap_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _value_quality_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the objective-matched value statistic used for checkpoint safety."""
+
+    denominators = metrics.get("loss_denominators")
+    if not isinstance(denominators, Mapping):
+        raise SystemExit("posthoc metrics have no value-loss denominator")
+    try:
+        primary = float(metrics["primary_value_loss"])
+        scalar_mse = float(metrics["scalar_value_mse_diagnostic"])
+        kind = str(metrics["primary_value_loss_kind"])
+        weighted_mass = float(denominators["value_loss"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit("posthoc value-quality metrics are malformed") from error
+    if (
+        kind != "scalar_mse"
+        or not math.isfinite(primary)
+        or not math.isfinite(scalar_mse)
+        or weighted_mass <= 0.0
+        or not math.isclose(primary, scalar_mse, rel_tol=0.0, abs_tol=1.0e-12)
+    ):
+        raise SystemExit(
+            "posthoc value-quality metric does not match the scalar-MSE objective"
+        )
+    return {
+        "schema_version": VALUE_QUALITY_SCHEMA,
+        "selection_authority": True,
+        "surface": "same_reconstructed_holdout_and_value_weight_measure",
+        "metric": "primary_value_loss",
+        "metric_kind": kind,
+        "value": primary,
+        "scalar_value_mse_diagnostic": scalar_mse,
+        "value_weight_mass": weighted_mass,
+    }
+
+
+def _paired_parent_value_quality(
+    *, candidate: Mapping[str, Any], parent: Mapping[str, Any]
+) -> dict[str, Any]:
+    if (
+        candidate.get("schema_version") != VALUE_QUALITY_SCHEMA
+        or parent.get("schema_version") != VALUE_QUALITY_SCHEMA
+        or candidate.get("selection_authority") is not True
+        or parent.get("selection_authority") is not True
+        or candidate.get("metric") != parent.get("metric")
+        or candidate.get("metric_kind") != parent.get("metric_kind")
+    ):
+        raise SystemExit("candidate and parent value-quality objectives differ")
+    try:
+        candidate_value = float(candidate["value"])
+        parent_value = float(parent["value"])
+        candidate_mass = float(candidate["value_weight_mass"])
+        parent_mass = float(parent["value_weight_mass"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit("paired parent value-quality metrics are malformed") from error
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (candidate_value, parent_value, candidate_mass, parent_mass)
+        )
+        or candidate_mass <= 0.0
+        or not math.isclose(candidate_mass, parent_mass, rel_tol=0.0, abs_tol=1.0e-9)
+    ):
+        raise SystemExit("candidate and parent value-quality measures differ")
+    return {
+        "schema_version": PAIRED_PARENT_VALUE_SCHEMA,
+        "selection_authority": True,
+        "surface": "same_holdout_same_objective_weights_fresh_exact_parent_forward",
+        "metric": candidate["metric"],
+        "metric_kind": candidate["metric_kind"],
+        "value_weight_mass": candidate_mass,
+        "parent_value": parent_value,
+        "candidate_value": candidate_value,
+        "candidate_minus_parent": candidate_value - parent_value,
+    }
+
+
 def _paired_parent_teacher_gap(
     *, candidate: Mapping[str, Any], parent: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -841,6 +919,7 @@ def _evaluate_candidate(
     parent_ref: Mapping[str, Any] | None = None,
     parent_surface: Mapping[str, Any] | None = None,
     parent_teacher_gap: Mapping[str, Any] | None = None,
+    parent_metrics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = checkpoint_path.resolve(strict=True)
     report = prepared["report"]
@@ -853,11 +932,13 @@ def _evaluate_candidate(
         )
     metrics = _evaluate_policy_metrics(prepared, policy, input_surface=input_surface)
     teacher_gap = _teacher_gap_projection(metrics)
+    value_quality = _value_quality_projection(metrics)
     result = {
         "label": label,
         "checkpoint": {"path": str(path), "sha256": _sha256(path)},
         "input_surface": input_surface,
         "teacher_gap": teacher_gap,
+        "value_quality": value_quality,
         "teacher_gap_semantics": {
             "selection_authority": False,
             "semantic_role": "legacy_generation_operator_diagnostic_only",
@@ -884,6 +965,7 @@ def _evaluate_candidate(
             parent_ref is not None
             and parent_surface is not None
             and parent_teacher_gap is not None
+            and parent_metrics is not None
         )
         result["parent_checkpoint_sha256"] = str(parent_ref["sha256"])
         result["parent_teacher_gap"] = dict(parent_teacher_gap)
@@ -892,6 +974,12 @@ def _evaluate_candidate(
         )
         result["paired_parent_teacher_gap"] = _paired_parent_teacher_gap(
             candidate=teacher_gap, parent=parent_teacher_gap
+        )
+        parent_value_quality = _value_quality_projection(parent_metrics)
+        result["parent_value_quality"] = parent_value_quality
+        result["paired_parent_value_quality"] = _paired_parent_value_quality(
+            candidate=value_quality,
+            parent=parent_value_quality,
         )
         result["functional_dose_fingerprint"] = _functional_drift(
             train_bc=train_bc,
@@ -924,7 +1012,7 @@ def run_probe(
         device=device,
         batch_size=batch_size,
     )
-    parent_policy = parent_ref = parent_surface = parent_teacher_gap = None
+    parent_policy = parent_ref = parent_surface = parent_teacher_gap = parent_metrics = None
     if parent_checkpoint_path is not None:
         parent_policy, parent_ref, parent_surface = _load_parent(
             prepared,
@@ -943,6 +1031,7 @@ def run_probe(
         parent_ref=parent_ref,
         parent_surface=parent_surface,
         parent_teacher_gap=parent_teacher_gap,
+        parent_metrics=parent_metrics,
     )
     shared = prepared["shared_holdout"]
     result = {
@@ -960,6 +1049,7 @@ def run_probe(
         "validation_game_seed_set_sha256": shared["validation_game_seed_set_sha256"],
         "shared_holdout": shared,
         "teacher_gap": candidate["teacher_gap"],
+        "value_quality": candidate["value_quality"],
         "teacher_gap_semantics": candidate["teacher_gap_semantics"],
         "legacy_stored_generation_prior_teacher_gap": candidate[
             "legacy_stored_generation_prior_teacher_gap"
@@ -978,6 +1068,10 @@ def run_probe(
         result["parent_teacher_gap"] = candidate["parent_teacher_gap"]
         result["parent_target_kl_mean"] = candidate["parent_target_kl_mean"]
         result["paired_parent_teacher_gap"] = candidate["paired_parent_teacher_gap"]
+        result["parent_value_quality"] = candidate["parent_value_quality"]
+        result["paired_parent_value_quality"] = candidate[
+            "paired_parent_value_quality"
+        ]
     return result
 
 
@@ -1057,6 +1151,7 @@ def run_batch_probe(
             parent_ref=parent_ref,
             parent_surface=parent_surface,
             parent_teacher_gap=parent_teacher_gap,
+            parent_metrics=parent_metrics,
         )
         for label, checkpoint_path in checkpoints
     }
@@ -1071,6 +1166,7 @@ def run_batch_probe(
         {
             "parent_checkpoint": parent_ref,
             "parent_teacher_gap": parent_teacher_gap,
+            "parent_value_quality": _value_quality_projection(parent_metrics),
             "parent_target_kl_mean": float(
                 parent_teacher_gap["active_policy_kl_target_model_mean"]
             ),
