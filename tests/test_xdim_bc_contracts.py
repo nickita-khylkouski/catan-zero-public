@@ -219,7 +219,7 @@ def test_xdim_graph_loads_legacy_checkpoint_without_new_norm_keys(tmp_path):
     assert hasattr(loaded.model, "final_state_norm")
 
 
-def test_one_hot_policy_targets_are_not_treated_as_distillation_rows():
+def test_one_hot_policy_targets_require_authenticated_legal_support():
     target = np.asarray(
         [
             [1.0, 0.0, 0.0],
@@ -227,11 +227,23 @@ def test_one_hot_policy_targets_are_not_treated_as_distillation_rows():
         ],
         dtype=np.float32,
     )
-    support = target > 0.0
+    legal = np.asarray([[10, 20, 30], [10, 20, 30]], dtype=np.int16)
 
-    has_soft = _has_distillation_distribution(target, support)
+    authenticated = _has_distillation_distribution(
+        target,
+        np.ones_like(target, dtype=np.bool_),
+        legal_action_ids=legal,
+        min_legal_coverage=1.0,
+    )
+    sparse = _has_distillation_distribution(
+        target,
+        target > 0.0,
+        legal_action_ids=legal,
+        min_legal_coverage=1.0,
+    )
 
-    assert has_soft.tolist() == [False, True]
+    assert authenticated.tolist() == [True, True]
+    assert sparse.tolist() == [False, False]
 
 
 def test_low_coverage_soft_targets_fall_back_to_hard_labels():
