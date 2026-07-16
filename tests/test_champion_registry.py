@@ -133,6 +133,28 @@ def test_transitions_log_append_only_never_shrinks(tmp_path: Path) -> None:
     assert first.to_pointer["checkpoint_path"] == str(ckpt_a)
 
 
+def test_fixed_transaction_timestamp_makes_registry_staging_deterministic(
+    tmp_path: Path,
+) -> None:
+    incumbent = _write_checkpoint(tmp_path / "incumbent.pt", b"incumbent")
+    candidate = _write_checkpoint(tmp_path / "candidate.pt", b"candidate")
+    outputs = []
+    for name in ("first.json", "second.json"):
+        registry = ChampionRegistry(tmp_path / name)
+        registry.append_pool(incumbent, version=4, _timestamp=1234.5)
+        registry.set_role(
+            "generator_champion",
+            candidate,
+            version=5,
+            _timestamp=1234.5,
+        )
+        registry.record_promotion("generator_champion", _timestamp=1234.5)
+        registry.save()
+        outputs.append((tmp_path / name).read_bytes())
+
+    assert outputs[0] == outputs[1]
+
+
 # =============================================================================
 # Promotion counter + every-3rd confirmation flag
 # =============================================================================

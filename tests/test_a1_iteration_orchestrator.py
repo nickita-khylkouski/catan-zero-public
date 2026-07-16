@@ -898,6 +898,7 @@ def _promotion_plan(state: dict, adjudication: Path) -> dict:
     return {
         "schema_version": iteration.promotion.RECEIPT_SCHEMA,
         "status": "dry_run",
+        "created_at": 1234.5,
         "transaction_id": "tx-dry",
         "contract": {"contract_sha256": state["training"]["contract_sha256"]},
         "adjudication": {
@@ -1059,6 +1060,7 @@ def test_promotion_go_reuses_exact_preflight_cohort_exclusions(
     assert promoted["stage"] == "promoted"
     assert calls[0]["go"] is True
     assert calls[0]["cohort_exclusions"] == cohort_exclusions.resolve()
+    assert calls[0]["registry_mutation_timestamp"] == 1234.5
 
 
 def test_promote_adopts_committed_transaction_after_orchestrator_crash(

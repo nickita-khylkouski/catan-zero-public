@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Registry roles (CAT-9): ``generator_champion``, ``public_champion`` (pinned to gen-3
 for now), ``tournament_bot`` and ``opponent_pool[]``, plus the promotion tripwires as
 executable code instead of manual judgment.
@@ -33,6 +31,8 @@ Pure stdlib; reuses ``tools.sprt_gate``'s elo_to_score/score_to_elo so the Elo<-
 mapping is defined in exactly one place.
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -62,6 +62,13 @@ def _atomic_write_json(path: Path, obj: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, indent=2, sort_keys=True))
     os.replace(tmp, path)
+
+
+def _mutation_timestamp(value: float | None) -> float:
+    timestamp = time.time() if value is None else float(value)
+    if not math.isfinite(timestamp) or timestamp < 0.0:
+        raise ValueError("registry mutation timestamp must be finite and non-negative")
+    return timestamp
 
 
 # =============================================================================
@@ -165,6 +172,7 @@ class ChampionRegistry:
         provenance: dict[str, Any] | None = None,
         reason: str = "",
         kind: str = "set_role",
+        _timestamp: float | None = None,
     ) -> RolePointer:
         """Point ``role`` at ``checkpoint_path``. Rejects the write if the file's
         computed md5 doesn't match a caller-supplied ``expected_md5`` -- the same
@@ -184,12 +192,13 @@ class ChampionRegistry:
                 "checkpoint whose bytes don't match the claimed provenance"
             )
         previous = self._roles.get(role)
+        mutation_timestamp = _mutation_timestamp(_timestamp)
         pointer = RolePointer(
             role=role,
             checkpoint_path=str(path),
             md5=actual_md5,
             version=version,
-            updated_at=time.time(),
+            updated_at=mutation_timestamp,
             provenance=dict(provenance or {}),
         )
         self._roles[role] = pointer
@@ -218,6 +227,7 @@ class ChampionRegistry:
         provenance: dict[str, Any] | None = None,
         status: str = "active",
         reason: str = "",
+        _timestamp: float | None = None,
     ) -> PoolEntry:
         """Append a checkpoint to the opponent pool. Idempotent on an identical
         (path, md5) pair already present (re-running a promotion step doesn't
@@ -234,11 +244,12 @@ class ChampionRegistry:
         for existing in self._pool:
             if existing.checkpoint_path == str(path) and existing.md5 == actual_md5:
                 return existing
+        mutation_timestamp = _mutation_timestamp(_timestamp)
         entry = PoolEntry(
             checkpoint_path=str(path),
             md5=actual_md5,
             version=version,
-            added_at=time.time(),
+            added_at=mutation_timestamp,
             status=status,
             provenance=dict(provenance or {}),
         )
@@ -256,7 +267,12 @@ class ChampionRegistry:
         return entry
 
     # ---------------------------------------------------------------- promotion counter
-    def record_promotion(self, role: str = "generator_champion") -> int:
+    def record_promotion(
+        self,
+        role: str = "generator_champion",
+        *,
+        _timestamp: float | None = None,
+    ) -> int:
         """Increment and return the promotion count for ``role``. Combine with
         ``requires_nth_confirmation`` to route every 3rd promotion through the
         heavier 200-game/n=64 bucketed confirmation (Master Plan Sec 4.1, R8)."""
@@ -264,7 +280,7 @@ class ChampionRegistry:
         self._promotion_counts[role] = count
         self._transitions.append(
             Transition(
-                ts=time.time(),
+                ts=_mutation_timestamp(_timestamp),
                 kind="promotion_recorded",
                 role=role,
                 reason=f"promotion #{count}",

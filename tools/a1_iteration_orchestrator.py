@@ -1816,6 +1816,9 @@ def promote(
                         else None
                     ),
                     go=True,
+                    registry_mutation_timestamp=float(
+                        evaluation["dry_run_plan"]["created_at"]
+                    ),
                 )
             except (promotion.PromotionError, OSError) as error:
                 raise IterationError(f"A1 promotion refused: {error}") from error

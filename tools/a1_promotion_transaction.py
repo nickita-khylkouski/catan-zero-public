@@ -22,6 +22,7 @@ import hashlib
 import importlib
 import importlib.machinery
 import json
+import math
 import os
 import re
 import stat
@@ -8466,6 +8467,7 @@ def _stage_registry(
     adjudication_path: Path,
     receipt_path: Path,
     reason: str,
+    mutation_timestamp: float,
 ) -> tuple[bytes, int]:
     stage = registry_path.parent / f".{registry_path.name}.{uuid.uuid4().hex}.stage"
     _write_new_bytes(stage, registry_path.read_bytes())
@@ -8510,6 +8512,7 @@ def _stage_registry(
             provenance=provenance,
             status="active",
             reason="dethroned A1 generator champion",
+            _timestamp=mutation_timestamp,
         )
         registry.set_role(
             "generator_champion",
@@ -8518,8 +8521,11 @@ def _stage_registry(
             version=candidate["version"],
             provenance=provenance,
             reason=reason,
+            _timestamp=mutation_timestamp,
         )
-        count = registry.record_promotion("generator_champion")
+        count = registry.record_promotion(
+            "generator_champion", _timestamp=mutation_timestamp
+        )
         if count != verified["next_promotion_count"]:
             raise PromotionError("staged registry promotion count drift")
         registry.save()
@@ -8606,6 +8612,7 @@ def prepare_promotion(
     recovery_gate_authority_ref: Mapping[str, str] | None = None,
     verifier_authority: Mapping[str, Any] | None = None,
     verify_lock_fn: Callable[..., dict[str, Any]] = a1_contract.verify_lock,
+    registry_mutation_timestamp: float | None = None,
 ) -> dict[str, Any]:
     registry_path = _canonical_existing_file(
         registry_path, where="authoritative registry"
@@ -8624,6 +8631,15 @@ def prepare_promotion(
         cohort_exclusions, where="promotion cohort-exclusions manifest"
     )
     receipt_path = _canonical_new_file(receipt_path, where="promotion receipt")
+    created_at = (
+        time.time()
+        if registry_mutation_timestamp is None
+        else float(registry_mutation_timestamp)
+    )
+    if not math.isfinite(created_at) or created_at < 0.0:
+        raise PromotionError(
+            "registry mutation timestamp must be finite and non-negative"
+        )
     if registry_path.stat().st_size == 0:
         raise PromotionError(
             "authoritative registry must be an existing non-empty file"
@@ -8691,6 +8707,7 @@ def prepare_promotion(
         adjudication_path=adjudication_path.resolve(),
         receipt_path=receipt_path.resolve(),
         reason=reason,
+        mutation_timestamp=created_at,
     )
     current_after = (verified["candidate"]["path"] + "\n").encode("utf-8")
     legacy_attestation_ref: dict[str, str] | None = None
@@ -8707,7 +8724,7 @@ def prepare_promotion(
         "schema_version": RECEIPT_SCHEMA,
         "transaction_id": transaction_id,
         "status": "dry_run",
-        "created_at": time.time(),
+        "created_at": created_at,
         "registry": {
             "path": str(registry_path.resolve()),
             "before_sha256": _sha256_bytes(registry_before),
@@ -8778,6 +8795,7 @@ def execute_promotion(
     lock_path: Path | None = None,
     go: bool = False,
     verify_lock_fn: Callable[..., dict[str, Any]] | None = None,
+    registry_mutation_timestamp: float | None = None,
 ) -> dict[str, Any]:
     registry_path = _canonical_existing_file(
         registry_path, where="authoritative registry"
@@ -8859,6 +8877,7 @@ def execute_promotion(
             recovery_gate_authority_ref=recovery_gate_ref,
             verifier_authority=verifier_authority,
             verify_lock_fn=verify_lock_fn,
+            registry_mutation_timestamp=registry_mutation_timestamp,
         )
         if not go:
             return _public_receipt(plan)
