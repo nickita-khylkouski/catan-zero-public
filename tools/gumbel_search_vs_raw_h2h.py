@@ -36,9 +36,14 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from catan_zero.rl.config_cli import add_config_flags, resolve_config
+from catan_zero.rl.entity_token_features_rust import require_rust_feature_path
 from catan_zero.rl.gumbel_self_play import _apply_selected_action
 from catan_zero.rl.pipeline_configs import EvalConfig
 from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTS, GumbelChanceMCTSConfig
+from catan_zero.search.native_gumbel_mcts import (
+    create_gumbel_search,
+    native_hot_loop_available,
+)
 from catan_zero.search.neural_rust_mcts import (
     BatchedEntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
@@ -48,6 +53,100 @@ from factory_common import write_json
 from sprt_gate import GATE_CONFIGS, evaluate_pentanomial_sprt, evaluate_sprt, pair_scores_from_h2h_games, resolve_gate_config
 
 COLORS: tuple[str, ...] = ("RED", "BLUE")
+
+
+def _game_search_seed(*, game_seed: int, search_color: str) -> int:
+    """Return a worker/shard-invariant search RNG seed for one game.
+
+    Search-vs-raw used to reuse one advancing RNG across every game assigned to
+    a worker.  The result therefore changed when the same cohort was sharded
+    over a different number of GPUs.  Seat-keying matches the production
+    cross-net evaluator: the random stream is a function of the game identity,
+    not scheduling history.
+    """
+
+    import hashlib
+
+    color = str(search_color).upper()
+    if color not in COLORS:
+        raise ValueError(f"unsupported H2H search color: {search_color!r}")
+    payload = f"gumbel-search-vs-raw-h2h-v1:{int(game_seed)}:{color}".encode(
+        "ascii"
+    )
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def _build_evaluator_config(worker_args: dict[str, Any]) -> EntityGraphRustEvaluatorConfig:
+    return EntityGraphRustEvaluatorConfig(
+        value_scale=float(worker_args["value_scale"]),
+        prior_temperature=float(worker_args["prior_temperature"]),
+        value_squash=str(worker_args.get("value_squash", "tanh")),
+        value_readout=str(worker_args.get("value_readout", "scalar")),
+        public_observation=bool(worker_args.get("public_observation", False)),
+        rust_featurize=bool(worker_args.get("evaluator_rust_featurize", False)),
+    )
+
+
+def _build_search_config(worker_args: dict[str, Any]) -> GumbelChanceMCTSConfig:
+    return GumbelChanceMCTSConfig(
+        colors=COLORS,
+        seed=int(worker_args["worker_seed"]),
+        n_full=int(worker_args["n_full"]),
+        n_fast=int(worker_args["n_full"]),
+        p_full=1.0,
+        max_depth=int(worker_args["max_depth"]),
+        temperature=0.0,
+        correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
+        lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
+        belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
+        information_set_search=bool(worker_args.get("information_set_search", False)),
+        determinization_particles=int(worker_args.get("determinization_particles", 1)),
+        determinization_min_simulations=int(
+            worker_args.get("determinization_min_simulations", 32)
+        ),
+        c_scale=float(worker_args.get("c_scale", 0.1)),
+        c_visit=float(worker_args.get("c_visit", 50.0)),
+        sigma_eval=float(worker_args.get("sigma_eval", 0.79)),
+        sigma_reference_visits=(
+            int(worker_args["sigma_reference_visits"])
+            if worker_args.get("sigma_reference_visits") is not None
+            else None
+        ),
+        rescale_noise_floor_c=float(worker_args.get("rescale_noise_floor_c", 0.0)),
+        gameplay_policy_aggregation=str(
+            worker_args.get("gameplay_policy_aggregation", "mean_improved_policy")
+        ),
+        max_root_candidates=int(worker_args.get("max_root_candidates", 16)),
+        max_root_candidates_wide=int(worker_args.get("max_root_candidates_wide", 54)),
+        wide_candidates_threshold=int(worker_args.get("wide_candidates_threshold", 24)),
+        n_full_wide=(
+            int(worker_args["n_full_wide"])
+            if worker_args.get("n_full_wide") is not None
+            else None
+        ),
+        raw_policy_above_width=(
+            int(worker_args["raw_policy_above_width"])
+            if worker_args.get("raw_policy_above_width") is not None
+            else None
+        ),
+        symmetry_averaged_eval=bool(worker_args.get("symmetry_averaged_eval", False)),
+        symmetry_averaged_eval_threshold=(
+            int(worker_args["symmetry_averaged_eval_threshold"])
+            if worker_args.get("symmetry_averaged_eval_threshold") is not None
+            else None
+        ),
+    )
+
+
+def _create_search(
+    config: GumbelChanceMCTSConfig,
+    evaluator: Any,
+    *,
+    native_mcts_hot_loop: bool,
+) -> GumbelChanceMCTS:
+    if not native_mcts_hot_loop:
+        return GumbelChanceMCTS(config, evaluator)
+    return create_gumbel_search(config, evaluator, native_hot_loop=True)
 
 
 def _select_raw_action(evaluator: Any, game: Any, legal_actions: tuple[int, ...], *, acting_color: str) -> int:
@@ -160,50 +259,13 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     evaluator = BatchedEntityGraphRustEvaluator.from_checkpoint(
         checkpoint,
         device=worker_args["device"],
-        config=EntityGraphRustEvaluatorConfig(
-            value_scale=float(worker_args["value_scale"]),
-            prior_temperature=float(worker_args["prior_temperature"]),
-            value_squash=str(worker_args.get("value_squash", "tanh")),
-            public_observation=bool(worker_args.get("public_observation", False)),
-        ),
+        config=_build_evaluator_config(worker_args),
     )
-    search_config = GumbelChanceMCTSConfig(
-        colors=COLORS,
-        seed=int(worker_args["worker_seed"]),
-        n_full=int(worker_args["n_full"]),
-        n_fast=int(worker_args["n_full"]),  # unused: force_full=True always selects n_full.
-        p_full=1.0,
-        max_depth=int(worker_args["max_depth"]),
-        temperature=0.0,  # deterministic argmax at the root -- "does search help" not "how creative is search".
-        correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
-        lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
-        belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
-        information_set_search=bool(
-            worker_args.get("information_set_search", False)
-        ),
-        determinization_particles=int(
-            worker_args.get("determinization_particles", 1)
-        ),
-        determinization_min_simulations=int(
-            worker_args.get("determinization_min_simulations", 32)
-        ),
-        c_scale=float(worker_args.get("c_scale", 0.1)),
-        c_visit=float(worker_args.get("c_visit", 50.0)),
-        max_root_candidates=int(worker_args.get("max_root_candidates", 16)),
-        max_root_candidates_wide=int(worker_args.get("max_root_candidates_wide", 54)),
-        n_full_wide=(
-            int(worker_args["n_full_wide"])
-            if worker_args.get("n_full_wide") is not None
-            else None
-        ),
-        raw_policy_above_width=(
-            int(worker_args["raw_policy_above_width"])
-            if worker_args.get("raw_policy_above_width") is not None
-            else None
-        ),
-        symmetry_averaged_eval=bool(worker_args.get("symmetry_averaged_eval", False)),
+    mcts = _create_search(
+        _build_search_config(worker_args),
+        evaluator,
+        native_mcts_hot_loop=bool(worker_args.get("native_mcts_hot_loop", False)),
     )
-    mcts = GumbelChanceMCTS(search_config, evaluator)
 
     games: list[dict[str, Any]] = []
     try:
@@ -213,6 +275,13 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                 ("search_red", {"RED": "search", "BLUE": "raw"}),
                 ("search_blue", {"RED": "raw", "BLUE": "search"}),
             ):
+                search_color = next(
+                    color for color, role in role_by_color.items() if role == "search"
+                )
+                search_seed = _game_search_seed(
+                    game_seed=game_seed, search_color=search_color
+                )
+                mcts.rng.seed(search_seed)
                 record = play_one_h2h_game(
                     mcts,
                     evaluator,
@@ -223,6 +292,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                 )
                 record["orientation"] = orientation
                 record["pair_id"] = int(pair["pair_id"])
+                record["search_seed"] = search_seed
                 games.append(record)
     finally:
         evaluator.close()
@@ -256,14 +326,28 @@ def main() -> None:
     )
     parser.add_argument("--value-squash", choices=("tanh", "clip"), default="tanh",
                         help="Evaluator value squash (#60 diagnostic arm).")
+    parser.add_argument(
+        "--value-readout",
+        choices=("scalar", "categorical", "categorical_expected"),
+        default="scalar",
+    )
     parser.add_argument("--c-visit", type=float, default=50.0,
                         help="Sigma c_visit floor; 1.0 = visit-scaled sigma (armV diagnostic).")
     parser.add_argument("--c-scale", type=float, default=0.1,
                         help="Sigma scale multiplier (matches GumbelChanceMCTSConfig default).")
+    parser.add_argument("--sigma-eval", type=float, default=0.79)
+    parser.add_argument("--sigma-reference-visits", type=int, default=None)
+    parser.add_argument("--rescale-noise-floor-c", type=float, default=0.0)
+    parser.add_argument(
+        "--gameplay-policy-aggregation",
+        choices=("mean_improved_policy", "aggregate_q_then_improve"),
+        default="mean_improved_policy",
+    )
     parser.add_argument("--max-root-candidates", type=int, default=16,
                         help="Root Gumbel-Top-k candidate cap on normal roots (SNR arm: 8).")
     parser.add_argument("--max-root-candidates-wide", type=int, default=54,
                         help="Root Gumbel-Top-k cap on wide (placement) roots; 16 = narrow diagnostic arm.")
+    parser.add_argument("--wide-candidates-threshold", type=int, default=24)
     parser.add_argument(
         "--public-observation",
         action=argparse.BooleanOptionalAction,
@@ -304,6 +388,24 @@ def main() -> None:
             "Threads to GumbelChanceMCTSConfig.symmetry_averaged_eval."
         ),
     )
+    parser.add_argument(
+        "--symmetry-averaged-eval-threshold",
+        type=int,
+        default=None,
+        help="Inclusive minimum legal-action count for D6 averaging.",
+    )
+    parser.add_argument(
+        "--native-mcts-hot-loop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the parity-gated Rust tree hot loop; fail closed if unavailable.",
+    )
+    parser.add_argument(
+        "--evaluator-rust-featurize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the bit-exact native entity/action featurizer; fail closed if unavailable.",
+    )
     parser.add_argument("--base-seed", type=int, default=1)
     parser.add_argument(
         "--gate-config",
@@ -336,6 +438,16 @@ def main() -> None:
         parser.error("--determinization-particles must be >= 1")
     if int(args.determinization_min_simulations) < 1:
         parser.error("--determinization-min-simulations must be >= 1")
+    if bool(args.native_mcts_hot_loop) and not native_hot_loop_available():
+        parser.error(
+            "--native-mcts-hot-loop requires a matching catanatron_rs wheel "
+            "exporting gumbel_search; refusing silent Python fallback"
+        )
+    if bool(args.evaluator_rust_featurize):
+        try:
+            require_rust_feature_path()
+        except RuntimeError as error:
+            parser.error(str(error))
     _gate_cfg, _gate_params = resolve_gate_config(args.gate_config, elo0=args.elo0, elo1=args.elo1)
     args.elo0, args.elo1 = _gate_params["elo0"], _gate_params["elo1"]
 
@@ -385,10 +497,20 @@ def main() -> None:
                     args.determinization_min_simulations
                 ),
                 "value_squash": str(args.value_squash),
+                "value_readout": str(args.value_readout),
                 "c_scale": float(args.c_scale),
                 "c_visit": float(args.c_visit),
+                "sigma_eval": float(args.sigma_eval),
+                "sigma_reference_visits": (
+                    int(args.sigma_reference_visits)
+                    if args.sigma_reference_visits is not None
+                    else None
+                ),
+                "rescale_noise_floor_c": float(args.rescale_noise_floor_c),
+                "gameplay_policy_aggregation": str(args.gameplay_policy_aggregation),
                 "max_root_candidates": int(args.max_root_candidates),
                 "max_root_candidates_wide": int(args.max_root_candidates_wide),
+                "wide_candidates_threshold": int(args.wide_candidates_threshold),
                 "n_full_wide": (int(args.n_full_wide) if args.n_full_wide is not None else None),
                 "raw_policy_above_width": (
                     int(args.raw_policy_above_width)
@@ -396,6 +518,13 @@ def main() -> None:
                     else None
                 ),
                 "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+                "symmetry_averaged_eval_threshold": (
+                    int(args.symmetry_averaged_eval_threshold)
+                    if args.symmetry_averaged_eval_threshold is not None
+                    else None
+                ),
+                "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
+                "evaluator_rust_featurize": bool(args.evaluator_rust_featurize),
                 "threads_per_worker": threads_per_worker,
                 "worker_seed": int(args.base_seed) + 0x9E3779B9 * (worker_index + 1),
             }
@@ -487,14 +616,35 @@ def _build_summary(
 
     return {
         "checkpoint": args.checkpoint,
+        "base_seed": int(getattr(args, "base_seed", 1)),
         "gate_config": getattr(args, "gate_config", None),
         "n_full": int(args.n_full),
+        "max_depth": int(getattr(args, "max_depth", 80)),
+        "max_decisions": int(getattr(args, "max_decisions", 300)),
+        "prior_temperature": float(getattr(args, "prior_temperature", 1.0)),
+        "value_scale": float(getattr(args, "value_scale", 1.0)),
         "lazy_interior_chance": bool(args.lazy_interior_chance),
         "value_squash": str(args.value_squash),
+        "value_readout": str(getattr(args, "value_readout", "scalar")),
         "c_scale": float(args.c_scale),
         "c_visit": float(args.c_visit),
+        "sigma_eval": float(getattr(args, "sigma_eval", 0.79)),
+        "sigma_reference_visits": (
+            int(args.sigma_reference_visits)
+            if getattr(args, "sigma_reference_visits", None) is not None
+            else None
+        ),
+        "rescale_noise_floor_c": float(
+            getattr(args, "rescale_noise_floor_c", 0.0)
+        ),
+        "gameplay_policy_aggregation": str(
+            getattr(args, "gameplay_policy_aggregation", "mean_improved_policy")
+        ),
         "max_root_candidates": int(args.max_root_candidates),
         "max_root_candidates_wide": int(args.max_root_candidates_wide),
+        "wide_candidates_threshold": int(
+            getattr(args, "wide_candidates_threshold", 24)
+        ),
         "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
         # Task #79: input-distribution / search-semantics provenance -- these
         # were previously accepted on the CLI and threaded into the worker
@@ -516,6 +666,17 @@ def _build_summary(
             int(args.raw_policy_above_width) if args.raw_policy_above_width is not None else None
         ),
         "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
+        "symmetry_averaged_eval_threshold": (
+            int(args.symmetry_averaged_eval_threshold)
+            if getattr(args, "symmetry_averaged_eval_threshold", None) is not None
+            else None
+        ),
+        "native_mcts_hot_loop": bool(
+            getattr(args, "native_mcts_hot_loop", False)
+        ),
+        "evaluator_rust_featurize": bool(
+            getattr(args, "evaluator_rust_featurize", False)
+        ),
         "pairs_requested": len(pairs),
         "games_played": len(all_games),
         "games_with_winner": len(outcomes),
