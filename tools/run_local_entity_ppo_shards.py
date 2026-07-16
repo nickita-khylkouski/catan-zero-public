@@ -5,27 +5,54 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import multiprocessing as mp
+import sys
 import time
 from typing import Any
 
 import numpy as np
 
 from catan_zero.rl import ppo_distributed as dist
+from catan_zero.rl.config_cli import _explicit_cli_dests
 from catan_zero.rl.ppo_policy_factory import (
     CANONICAL_PPO_ARCHITECTURE,
     load_ppo_policy,
     validate_canonical_ppo_actor_contract,
 )
+from catan_zero.rl.ppo_run_manifest import ManifestError, PPORunManifest, load_manifest
 from catan_zero.rl.torch_ppo import collect_ppo_episode
-from factory_common import make_named_policy, parse_track
+try:
+    from factory_common import make_named_policy, parse_track
+except ModuleNotFoundError as error:  # package import; direct script uses the sibling import
+    if error.name != "factory_common":
+        raise
+    from tools.factory_common import make_named_policy, parse_track
 
 
 SEATS = ("BLUE", "RED", "ORANGE", "WHITE")
 
+_MANIFEST_RUNTIME_DESTS = {
+    "run_manifest",
+    "run_base",
+    "run_name",
+    "checkpoint",
+    "devices",
+    "games",
+    "workers",
+    "publish",
+}
 
-def main() -> None:
+
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate local distributed-PPO trajectory shards for the 35M entity policy."
+    )
+    parser.add_argument(
+        "--run-manifest",
+        default=None,
+        help=(
+            "Bound canonical_entity_ppo_run_v2 manifest. In manifest mode it is "
+            "the sole actor-science authority."
+        ),
     )
     parser.add_argument("--run-base", default="runs/distributed")
     parser.add_argument("--run-name", required=True)
@@ -60,7 +87,69 @@ def main() -> None:
         ),
     )
     parser.add_argument("--publish", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def resolve_config(
+    argv: list[str] | None = None,
+) -> tuple[argparse.Namespace, PPORunManifest | None]:
+    parser = build_arg_parser()
+    effective_argv = list(argv) if argv is not None else None
+    args = parser.parse_args(effective_argv)
+    explicit_dests = _explicit_cli_dests(
+        parser,
+        effective_argv if effective_argv is not None else sys.argv[1:],
+    )
+    manifest = None
+    args.run_manifest_sha256 = None
+    args.opponent_mode = "fixed"
+    args.pfsp_mode = "pfsp"
+    if args.run_manifest:
+        conflicts = sorted(explicit_dests - _MANIFEST_RUNTIME_DESTS)
+        if conflicts:
+            parser.error(
+                "--run-manifest cannot be combined with legacy actor-science "
+                f"flags: {', '.join(conflicts)}"
+            )
+        try:
+            manifest = load_manifest(args.run_manifest)
+        except (OSError, ManifestError) as error:
+            parser.error(f"invalid --run-manifest: {error}")
+        if manifest.status != "bound":
+            parser.error("--run-manifest must have status='bound'; templates cannot run")
+        expected_sha256 = manifest.spec.identity.initializer_sha256
+        try:
+            actual_sha256 = f"sha256:{dist.checkpoint_sha256(args.checkpoint)}"
+        except OSError as error:
+            parser.error(f"cannot hash --checkpoint: {error}")
+        if actual_sha256 != expected_sha256:
+            parser.error(
+                "--checkpoint SHA-256 does not match run manifest identity: "
+                f"expected={expected_sha256} actual={actual_sha256}"
+            )
+        identity = manifest.spec.identity
+        actor = manifest.spec.actor
+        if actor.opponent_mode != "fixed":
+            parser.error(
+                "local v2 actor supports only opponent_mode='fixed'; "
+                "league/PFSP execution requires the Modal actor"
+            )
+        args.architecture = identity.architecture
+        args.track = identity.track
+        args.vps_to_win = identity.vps_to_win
+        args.max_decisions = actor.max_decisions
+        args.games_per_shard = actor.games_per_shard
+        args.gamma = actor.gamma
+        args.gae_lambda = actor.gae_lambda
+        args.action_temperature = actor.action_temperature
+        args.value_shaping_coef = actor.value_shaping_coef
+        args.value_shaping_scale = actor.value_shaping_scale
+        args.value_shaping_opponent_penalty = actor.value_shaping_opponent_penalty
+        args.seed = actor.seed
+        args.opponent_mode = actor.opponent_mode
+        args.opponents = ",".join(actor.opponents)
+        args.pfsp_mode = actor.pfsp_mode
+        args.run_manifest_sha256 = manifest.sha256()
     try:
         validate_canonical_ppo_actor_contract(
             architecture=args.architecture,
@@ -70,25 +159,34 @@ def main() -> None:
         )
     except ValueError as error:
         parser.error(str(error))
+    return args, manifest
 
+
+def _bind_run_root(
+    args: argparse.Namespace,
+    manifest: PPORunManifest | None,
+):
     root = dist.run_root(args.run_base, args.run_name)
-    dist.ensure_run_dirs(root)
-    dist.bind_run_contract(
-        root,
-        init_checkpoint=args.checkpoint,
-        architecture=args.architecture,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        behavior_temperature=args.action_temperature,
-    )
-    if args.publish or dist.read_version(root) is None:
-        policy = load_ppo_policy(args.checkpoint, architecture=args.architecture, device="cpu")
-        published = dist.publish_weights(root, policy.save, step=0)
+    if manifest is not None:
+        dist.bind_run_manifest(root, manifest)
+        dist.ensure_run_dirs(root)
     else:
-        published = dist.read_version(root)
-        if published is None:
-            raise RuntimeError("failed to publish or read policy version")
+        dist.ensure_run_dirs(root)
+        dist.bind_run_contract(
+            root,
+            init_checkpoint=args.checkpoint,
+            architecture=args.architecture,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            behavior_temperature=args.action_temperature,
+        )
+    return root
 
+
+def _build_worker_payloads(
+    args: argparse.Namespace,
+    published: Any,
+) -> tuple[list[dict[str, Any]], list[str], int]:
     devices = [item.strip() for item in args.devices.split(",") if item.strip()]
     if not devices:
         devices = ["cpu"]
@@ -118,6 +216,8 @@ def main() -> None:
                 "games_per_shard": int(args.games_per_shard),
                 "max_decisions": int(args.max_decisions),
                 "opponents": str(args.opponents),
+                "opponent_mode": str(args.opponent_mode),
+                "pfsp_mode": str(args.pfsp_mode),
                 "seed": int(args.seed) + worker * 1_000_003,
                 "gamma": float(args.gamma),
                 "gae_lambda": float(args.gae_lambda),
@@ -125,9 +225,26 @@ def main() -> None:
                 "value_shaping_scale": float(args.value_shaping_scale),
                 "value_shaping_opponent_penalty": float(args.value_shaping_opponent_penalty),
                 "action_temperature": float(args.action_temperature),
+                "run_manifest_sha256": args.run_manifest_sha256,
             }
         )
         offset += worker_games
+    return payloads, devices, games
+
+
+def main(argv: list[str] | None = None) -> None:
+    args, manifest = resolve_config(argv)
+
+    root = _bind_run_root(args, manifest)
+    if args.publish or dist.read_version(root) is None:
+        policy = load_ppo_policy(args.checkpoint, architecture=args.architecture, device="cpu")
+        published = dist.publish_weights(root, policy.save, step=0)
+    else:
+        published = dist.read_version(root)
+        if published is None:
+            raise RuntimeError("failed to publish or read policy version")
+
+    payloads, devices, games = _build_worker_payloads(args, published)
 
     print(
         json.dumps(
@@ -183,6 +300,10 @@ def _worker(payload: dict[str, Any]) -> dict[str, Any]:
         pass
 
     root = dist.run_root(payload["run_base"], payload["run_name"])
+    if str(payload.get("opponent_mode", "fixed")) != "fixed":
+        raise RuntimeError(
+            "local PPO worker supports only fixed opponents; league/PFSP is unavailable"
+        )
     policy = load_ppo_policy(
         payload["checkpoint"],
         architecture=payload["architecture"],
@@ -236,6 +357,7 @@ def _worker(payload: dict[str, Any]) -> dict[str, Any]:
                 shard_index,
                 buffer,
                 policy_version=int(payload["policy_version"]),
+                run_manifest_sha256=payload.get("run_manifest_sha256"),
             )
             shards += 1
             shard_index += 1
@@ -247,6 +369,7 @@ def _worker(payload: dict[str, Any]) -> dict[str, Any]:
             shard_index,
             buffer,
             policy_version=int(payload["policy_version"]),
+            run_manifest_sha256=payload.get("run_manifest_sha256"),
         )
         shards += 1
     return {
