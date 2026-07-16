@@ -13,6 +13,119 @@ def _write(path: Path, values: np.ndarray) -> None:
     values.tofile(path)
 
 
+def _broad_root_inventory(
+    *,
+    omitted_games: set[int] | None = None,
+    short_game: int | None = None,
+    omit_phase: str | None = None,
+    omit_decision_bin: str | None = None,
+) -> dict:
+    training_games = np.arange(100, 120, dtype=np.int64)
+    validation_games = np.arange(200, 204, dtype=np.int64)
+    all_games = np.concatenate((training_games, validation_games))
+    phases = np.asarray(overlay.ROOT_BREADTH_REQUIRED_PHASES)
+    decision_values = {
+        "d000_009": 5,
+        "d010_029": 15,
+        "d030_059": 35,
+        "d060_099": 65,
+        "d100_149": 105,
+        "d150_199": 155,
+        "d200_plus": 205,
+    }
+    decision_cycle = list(decision_values.values()) + [7]
+    selected_games: list[int] = []
+    selected_decisions: list[int] = []
+    selected_phases: list[str] = []
+    for game in all_games.tolist():
+        if omitted_games and game in omitted_games:
+            continue
+        roots = 7 if game == short_game else 8
+        for ordinal in range(roots):
+            phase = str(phases[ordinal % len(phases)])
+            decision = int(decision_cycle[ordinal])
+            if omit_phase is not None and phase == omit_phase:
+                phase = "PLAY_TURN"
+            if (
+                omit_decision_bin is not None
+                and decision == decision_values[omit_decision_bin]
+            ):
+                decision = decision_values["d000_009"]
+            selected_games.append(game)
+            selected_decisions.append(decision)
+            selected_phases.append(phase)
+    return overlay._stage_c_root_breadth_inventory(  # noqa: SLF001
+        corpus_game_seeds=all_games,
+        validation_game_seeds=validation_games,
+        selected_game_seeds=np.asarray(selected_games, dtype=np.int64),
+        selected_decision_indices=np.asarray(selected_decisions, dtype=np.int64),
+        selected_phases=np.asarray(selected_phases),
+    )
+
+
+def _inventory_selected_rows(inventory: dict) -> int:
+    return sum(
+        int(scope["selected_root_count"])
+        for scope in inventory["scopes"].values()
+    )
+
+
+def test_stage_c_root_breadth_inventory_passes_only_broad_realized_roots() -> None:
+    inventory = _broad_root_inventory()
+
+    assert inventory["passed"] is True
+    assert inventory["failures"] == []
+    verified = overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
+        inventory,
+        selected_rows=_inventory_selected_rows(inventory),
+    )
+    assert verified == inventory
+    assert verified["scopes"]["training"]["unique_game_fraction"] == 1.0
+    assert verified["scopes"]["training"]["roots_per_represented_game"]["minimum"] == 8
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "failure"),
+    [
+        ({"omitted_games": {100, 101}}, "training:unique_game_fraction"),
+        ({"short_game": 100}, "training:minimum_roots_per_represented_game"),
+        ({"omit_phase": "DISCARD"}, "training:phase:DISCARD"),
+        ({"omit_decision_bin": "d200_plus"}, "training:decision_bin:d200_plus"),
+    ],
+)
+def test_stage_c_root_breadth_inventory_fails_closed(
+    kwargs: dict, failure: str
+) -> None:
+    inventory = _broad_root_inventory(**kwargs)
+
+    assert inventory["passed"] is False
+    assert failure in inventory["failures"]
+    with pytest.raises(overlay.OverlayError, match="failed or drifted"):
+        overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
+            inventory,
+            selected_rows=_inventory_selected_rows(inventory),
+        )
+
+
+def test_stage_c_root_breadth_verifier_recomputes_semantic_failures() -> None:
+    inventory = _broad_root_inventory(omitted_games={100, 101})
+    inventory["passed"] = True
+    inventory["failures"] = []
+    inventory["inventory_sha256"] = overlay._value_sha256(  # noqa: SLF001
+        {
+            key: value
+            for key, value in inventory.items()
+            if key != "inventory_sha256"
+        }
+    )
+
+    with pytest.raises(overlay.OverlayError, match="failed or drifted"):
+        overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
+            inventory,
+            selected_rows=_inventory_selected_rows(inventory),
+        )
+
+
 def test_policy_projection_disables_old_targets_and_maps_action_ids(tmp_path: Path) -> None:
     base = tmp_path / "base"
     derived = tmp_path / "derived"

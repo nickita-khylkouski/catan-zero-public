@@ -1224,6 +1224,11 @@ def build_final_corpus_admission(
         raise FinalReplicationError(f"fresh final corpus refused: {error}") from error
     admission = overlay_result["admission"]
     receipt = overlay_result["receipt"]
+    selected_rows = int(receipt.get("projection", {}).get("selected_rows", -1))
+    root_breadth = overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
+        receipt.get("root_breadth"),
+        selected_rows=selected_rows,
+    )
     export_path = Path(str(receipt["export"]["path"]))
     export_path_resolved, export, _patch, subset = overlay._load_export(export_path)  # noqa: SLF001
     merge_ref = export["source_merge_receipt"]
@@ -1247,9 +1252,8 @@ def build_final_corpus_admission(
         != merge.get("target_policy_target_identity_sha256")
         or export.get("target_reanalyzer_checkpoint", {}).get("sha256")
         != admission.get("corpus", {}).get("producer_checkpoint_sha256")
-        or int(receipt.get("projection", {}).get("selected_rows", -1))
-        != EXPECTED_ROOTS
-        or len(subset_identities) != EXPECTED_ROOTS
+        or selected_rows != int(roots["root_count"])
+        or len(subset_identities) != selected_rows
         or _set_sha(subset_identities.tolist()) != roots["root_identity_set_sha256"]
         or admission.get("stage_c_policy_overlay", {}).get(
             "historical_policy_targets_active"
@@ -1302,6 +1306,7 @@ def build_final_corpus_admission(
         "policy_distillation_contract": copy.deepcopy(
             admission["policy_distillation_contract"]
         ),
+        "policy_root_breadth": root_breadth,
         "target_policy_target_identity_sha256": merge[
             "target_policy_target_identity_sha256"
         ],
@@ -1349,6 +1354,22 @@ def verify_final_corpus_admission(path: Path) -> dict[str, Any]:
         digest_field="admission_sha256",
         where="Stage-C final corpus admission",
     )
+    root_manifest_count = int(payload.get("policy_root_breadth", {}).get(
+        "scopes", {}
+    ).get("training", {}).get("selected_root_count", -1)) + int(
+        payload.get("policy_root_breadth", {}).get("scopes", {}).get(
+            "validation", {}
+        ).get("selected_root_count", -1)
+    )
+    try:
+        overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
+            payload.get("policy_root_breadth"),
+            selected_rows=root_manifest_count,
+        )
+    except overlay.OverlayError as error:
+        raise FinalReplicationError(
+            f"Stage-C final policy-root breadth refused: {error}"
+        ) from error
     if (
         payload.get("diagnostic_only") is not False
         or payload.get("promotion_eligible") is not False
@@ -1515,6 +1536,7 @@ def build_final_authority(
             "diagnostic_recipe_selected_step": int(selected["step"]),
             "max_optimizer_steps": 32,
             "checkpoint_steps": [8, 12, 16, 32],
+            "policy_root_breadth": copy.deepcopy(corpus["policy_root_breadth"]),
             "topology": {
                 "name": "b200-8gpu-ddp",
                 "world_size": 8,
@@ -1612,6 +1634,25 @@ def verify_final_authority(path: Path) -> dict[str, Any]:
     assert isinstance(treatment_recipe, dict)
     assert isinstance(quarter_recipe, dict)
     assert isinstance(tenth_recipe, dict)
+    training_root_breadth = payload.get("training", {}).get("policy_root_breadth")
+    selected_root_count = sum(
+        int(scope.get("selected_root_count", -1))
+        for scope in (
+            training_root_breadth.get("scopes", {}).values()
+            if isinstance(training_root_breadth, dict)
+            else ()
+        )
+        if isinstance(scope, dict)
+    )
+    try:
+        overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
+            training_root_breadth,
+            selected_rows=selected_root_count,
+        )
+    except overlay.OverlayError as error:
+        raise FinalReplicationError(
+            f"Stage-C final authority policy-root breadth refused: {error}"
+        ) from error
 
     def differing(recipe: Mapping[str, Any]) -> set[str]:
         return {

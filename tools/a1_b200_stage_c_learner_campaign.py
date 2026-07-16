@@ -622,6 +622,10 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
     selected_training_roots = int(
         overlay_evidence["receipt"]["projection"]["selected_training_policy_rows"]
     )
+    root_breadth = overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
+        overlay_evidence["receipt"].get("root_breadth"),
+        selected_rows=selected_roots_total,
+    )
     if selected_roots_total <= 0 or selected_training_roots <= 0:
         raise CampaignError("Stage-C overlay has no policy roots")
     trajectory = []
@@ -661,6 +665,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "base_value_rows_retained": True,
             "surprise_weighting": False,
             "sampling_distribution": copy.deepcopy(sampling),
+            "root_breadth": root_breadth,
         },
         "topology": {
             "name": "b200-8gpu-ddp",
@@ -802,6 +807,14 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
     optimizer_surface = plan.get("optimizer_surface_contract")
     feature_signal = plan.get("feature_learning_signal_contract")
     value_gate = plan.get("selection_contract", {}).get("value_quality_gate")
+    target_contract = plan.get("policy_target_contract", {})
+    try:
+        overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
+            target_contract.get("root_breadth"),
+            selected_rows=int(target_contract.get("selected_unique_roots_total", -1)),
+        )
+    except overlay.OverlayError as error:
+        raise CampaignError(f"Stage-C policy-root breadth refused: {error}") from error
     if (
         plan.get("arm") not in ARMS
         or float(recipe.get("value_trunk_grad_scale", -1.0)) != 0.1
@@ -969,6 +982,9 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
             "unique_root_coverage_fraction": unique_rows / selected_roots,
             "auxiliary_reuse_factor": aux_draws / unique_rows,
             "base_policy_active_draws": int(report.get("policy_base_active_rows", 0)),
+            "root_breadth": copy.deepcopy(
+                plan["policy_target_contract"]["root_breadth"]
+            ),
         },
         "optimizer_batch_kl_used_as_trust_authority": False,
         "posthoc_frozen_holdout_selection_required": True,

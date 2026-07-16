@@ -53,10 +53,43 @@ EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v1"
 MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v1"
 ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v1"
 SAMPLING_SCHEMA = "a1-stage-c-policy-sampling-distribution-v1"
+ROOT_BREADTH_SCHEMA = "a1-stage-c-policy-root-breadth-v1"
 POLICY_TEACHER = "stage_c_coherent_n128_reanalysis"
 SAMPLING_COLUMN = "stage_c_policy_sampling_weight"
 SAMPLING_ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
 DEFAULT_PRODUCTION_WEIGHT_CAP = 4.0
+ROOT_BREADTH_REQUIRED_PHASES = (
+    "BUILD_INITIAL_ROAD",
+    "BUILD_INITIAL_SETTLEMENT",
+    "DISCARD",
+    "MOVE_ROBBER",
+    "PLAY_TURN",
+)
+ROOT_BREADTH_DECISION_BINS = (
+    ("d000_009", 0, 10),
+    ("d010_029", 10, 30),
+    ("d030_059", 30, 60),
+    ("d060_099", 60, 100),
+    ("d100_149", 100, 150),
+    ("d150_199", 150, 200),
+    ("d200_plus", 200, None),
+)
+ROOT_BREADTH_CONTRACT = {
+    "minimum_unique_game_fraction": 0.95,
+    "minimum_roots_per_represented_game": 8,
+    "minimum_phase_fraction": 0.01,
+    "minimum_decision_bin_fraction": 0.01,
+    "required_phases": list(ROOT_BREADTH_REQUIRED_PHASES),
+    "decision_index_bins": [
+        {
+            "name": name,
+            "start_inclusive": start,
+            "stop_exclusive": stop,
+        }
+        for name, start, stop in ROOT_BREADTH_DECISION_BINS
+    ],
+    "required_scopes": ["training", "validation"],
+}
 REWRITTEN_COLUMNS = frozenset(
     {
         "policy_weight_multiplier",
@@ -86,6 +119,262 @@ OPTIONAL_FIXED_PATCH_COLUMNS = {
 
 class OverlayError(RuntimeError):
     """A Stage-C export, base corpus, or derived overlay is invalid."""
+
+
+def _root_breadth_scope(
+    *,
+    population_game_seeds: np.ndarray,
+    selected_game_seeds: np.ndarray,
+    selected_decision_indices: np.ndarray,
+    selected_phases: np.ndarray,
+) -> dict[str, Any]:
+    population = np.unique(np.asarray(population_game_seeds, dtype=np.int64))
+    games = np.asarray(selected_game_seeds, dtype=np.int64)
+    decisions = np.asarray(selected_decision_indices, dtype=np.int64)
+    phases = np.asarray(selected_phases).astype(str, copy=False)
+    if (
+        games.ndim != 1
+        or decisions.shape != games.shape
+        or phases.shape != games.shape
+        or population.size == 0
+    ):
+        raise OverlayError("Stage-C root-breadth inputs are malformed")
+    if np.any(decisions < 0):
+        raise OverlayError("Stage-C selected decision index is negative")
+    selected_unique, roots_per_game = np.unique(games, return_counts=True)
+    if np.setdiff1d(selected_unique, population).size:
+        raise OverlayError("Stage-C selected root references a game outside the corpus")
+
+    phase_counts = {
+        phase: int(np.count_nonzero(phases == phase))
+        for phase in ROOT_BREADTH_REQUIRED_PHASES
+    }
+    unknown_phases = sorted(set(phases.tolist()) - set(ROOT_BREADTH_REQUIRED_PHASES))
+    decision_counts = {}
+    for name, start, stop in ROOT_BREADTH_DECISION_BINS:
+        mask = decisions >= int(start)
+        if stop is not None:
+            mask &= decisions < int(stop)
+        decision_counts[name] = int(np.count_nonzero(mask))
+
+    selected_count = int(games.size)
+    population_count = int(population.size)
+    selected_game_count = int(selected_unique.size)
+    denominator = max(selected_count, 1)
+    return {
+        "population_game_count": population_count,
+        "selected_root_count": selected_count,
+        "selected_game_count": selected_game_count,
+        "unique_game_fraction": selected_game_count / population_count,
+        "missing_game_count": population_count - selected_game_count,
+        "roots_per_represented_game": {
+            "minimum": int(roots_per_game.min()) if roots_per_game.size else 0,
+            "maximum": int(roots_per_game.max()) if roots_per_game.size else 0,
+            "mean": (
+                float(selected_count / selected_game_count)
+                if selected_game_count
+                else 0.0
+            ),
+        },
+        "phase_counts": phase_counts,
+        "phase_fractions": {
+            phase: count / denominator for phase, count in phase_counts.items()
+        },
+        "unknown_phases": unknown_phases,
+        "decision_index_bin_counts": decision_counts,
+        "decision_index_bin_fractions": {
+            name: count / denominator for name, count in decision_counts.items()
+        },
+    }
+
+
+def _stage_c_root_breadth_inventory(
+    *,
+    corpus_game_seeds: np.ndarray,
+    validation_game_seeds: np.ndarray,
+    selected_game_seeds: np.ndarray,
+    selected_decision_indices: np.ndarray,
+    selected_phases: np.ndarray,
+) -> dict[str, Any]:
+    """Bind realized policy-root breadth to the full train/validation populations."""
+
+    corpus_games = np.asarray(corpus_game_seeds, dtype=np.int64)
+    validation_games = np.unique(
+        np.asarray(validation_game_seeds, dtype=np.int64)
+    )
+    selected_games = np.asarray(selected_game_seeds, dtype=np.int64)
+    selected_decisions = np.asarray(selected_decision_indices, dtype=np.int64)
+    selected_phase_values = np.asarray(selected_phases).astype(str, copy=False)
+    if (
+        corpus_games.ndim != 1
+        or selected_games.ndim != 1
+        or selected_decisions.shape != selected_games.shape
+        or selected_phase_values.shape != selected_games.shape
+    ):
+        raise OverlayError("Stage-C root-breadth arrays are not row-aligned")
+    all_games = np.unique(corpus_games)
+    if np.setdiff1d(validation_games, all_games).size:
+        raise OverlayError("Stage-C validation manifest names a game outside the corpus")
+    training_games = np.setdiff1d(all_games, validation_games)
+    selected_validation = np.isin(selected_games, validation_games)
+    scopes = {
+        "training": _root_breadth_scope(
+            population_game_seeds=training_games,
+            selected_game_seeds=selected_games[~selected_validation],
+            selected_decision_indices=selected_decisions[~selected_validation],
+            selected_phases=selected_phase_values[~selected_validation],
+        ),
+        "validation": _root_breadth_scope(
+            population_game_seeds=validation_games,
+            selected_game_seeds=selected_games[selected_validation],
+            selected_decision_indices=selected_decisions[selected_validation],
+            selected_phases=selected_phase_values[selected_validation],
+        ),
+    }
+    failures = _root_breadth_failures(scopes)
+    inventory: dict[str, Any] = {
+        "schema_version": ROOT_BREADTH_SCHEMA,
+        "contract": copy.deepcopy(ROOT_BREADTH_CONTRACT),
+        "scopes": scopes,
+        "passed": not failures,
+        "failures": failures,
+    }
+    inventory["inventory_sha256"] = _value_sha256(inventory)
+    return inventory
+
+
+def _root_breadth_failures(scopes: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    failures: list[str] = []
+    for scope_name, scope in scopes.items():
+        if (
+            float(scope["unique_game_fraction"])
+            < float(ROOT_BREADTH_CONTRACT["minimum_unique_game_fraction"])
+        ):
+            failures.append(f"{scope_name}:unique_game_fraction")
+        if (
+            int(scope["roots_per_represented_game"]["minimum"])
+            < int(ROOT_BREADTH_CONTRACT["minimum_roots_per_represented_game"])
+        ):
+            failures.append(f"{scope_name}:minimum_roots_per_represented_game")
+        if scope["unknown_phases"]:
+            failures.append(f"{scope_name}:unknown_phases")
+        for phase, fraction in scope["phase_fractions"].items():
+            if float(fraction) < float(ROOT_BREADTH_CONTRACT["minimum_phase_fraction"]):
+                failures.append(f"{scope_name}:phase:{phase}")
+        for name, fraction in scope["decision_index_bin_fractions"].items():
+            if float(fraction) < float(
+                ROOT_BREADTH_CONTRACT["minimum_decision_bin_fraction"]
+            ):
+                failures.append(f"{scope_name}:decision_bin:{name}")
+    return failures
+
+
+def _verify_stage_c_root_breadth_inventory(
+    value: object, *, selected_rows: int
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise OverlayError("Stage-C root-breadth inventory is missing")
+    unsigned = dict(value)
+    stated = unsigned.pop("inventory_sha256", None)
+    scopes = value.get("scopes")
+    malformed = (
+        value.get("schema_version") != ROOT_BREADTH_SCHEMA
+        or stated != _value_sha256(unsigned)
+        or value.get("contract") != ROOT_BREADTH_CONTRACT
+        or not isinstance(scopes, dict)
+        or set(scopes) != set(ROOT_BREADTH_CONTRACT["required_scopes"])
+        or isinstance(selected_rows, bool)
+        or int(selected_rows) < 0
+    )
+    if malformed:
+        raise OverlayError("Stage-C root-breadth inventory failed or drifted")
+    assert isinstance(scopes, dict)
+    required_phases = set(ROOT_BREADTH_REQUIRED_PHASES)
+    required_bins = {name for name, _start, _stop in ROOT_BREADTH_DECISION_BINS}
+    for scope in scopes.values():
+        if not isinstance(scope, dict):
+            raise OverlayError("Stage-C root-breadth inventory failed or drifted")
+        population_count = int(scope.get("population_game_count", -1))
+        root_count = int(scope.get("selected_root_count", -1))
+        game_count = int(scope.get("selected_game_count", -1))
+        roots_per_game = scope.get("roots_per_represented_game")
+        phase_counts = scope.get("phase_counts")
+        phase_fractions = scope.get("phase_fractions")
+        decision_counts = scope.get("decision_index_bin_counts")
+        decision_fractions = scope.get("decision_index_bin_fractions")
+        if (
+            population_count <= 0
+            or root_count < 0
+            or game_count < 0
+            or game_count > population_count
+            or int(scope.get("missing_game_count", -1))
+            != population_count - game_count
+            or not math.isclose(
+                float(scope.get("unique_game_fraction", math.nan)),
+                game_count / population_count,
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            )
+            or not isinstance(roots_per_game, dict)
+            or not isinstance(phase_counts, dict)
+            or set(phase_counts) != required_phases
+            or not isinstance(phase_fractions, dict)
+            or set(phase_fractions) != required_phases
+            or not isinstance(decision_counts, dict)
+            or set(decision_counts) != required_bins
+            or not isinstance(decision_fractions, dict)
+            or set(decision_fractions) != required_bins
+            or not isinstance(scope.get("unknown_phases"), list)
+        ):
+            raise OverlayError("Stage-C root-breadth inventory failed or drifted")
+        minimum = int(roots_per_game.get("minimum", -1))
+        maximum = int(roots_per_game.get("maximum", -1))
+        mean = float(roots_per_game.get("mean", math.nan))
+        expected_mean = root_count / game_count if game_count else 0.0
+        denominator = max(root_count, 1)
+        if (
+            minimum < 0
+            or maximum < minimum
+            or (game_count == 0 and (minimum != 0 or maximum != 0))
+            or (game_count > 0 and (minimum == 0 or root_count < game_count * minimum))
+            or not math.isclose(
+                mean, expected_mean, rel_tol=0.0, abs_tol=1.0e-12
+            )
+            or sum(int(count) for count in phase_counts.values())
+            + len(scope["unknown_phases"])
+            != root_count
+            or sum(int(count) for count in decision_counts.values()) != root_count
+            or any(
+                int(count) < 0
+                or not math.isclose(
+                    float(phase_fractions[name]),
+                    int(count) / denominator,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                )
+                for name, count in phase_counts.items()
+            )
+            or any(
+                int(count) < 0
+                or not math.isclose(
+                    float(decision_fractions[name]),
+                    int(count) / denominator,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                )
+                for name, count in decision_counts.items()
+            )
+        ):
+            raise OverlayError("Stage-C root-breadth inventory failed or drifted")
+    if (
+        sum(int(scope["selected_root_count"]) for scope in scopes.values())
+        != int(selected_rows)
+        or value.get("passed") is not True
+        or value.get("failures") != []
+        or _root_breadth_failures(scopes) != []
+    ):
+        raise OverlayError("Stage-C root-breadth inventory failed or drifted")
+    return copy.deepcopy(value)
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -983,6 +1272,43 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             np.asarray(patch["game_seed"], dtype=np.int64),
             np.asarray(validation["game_seeds"], dtype=np.int64),
         )
+        subset_rows = np.asarray(subset["row_index"], dtype=np.int64)
+        subset_phases = np.asarray(subset["phase"]).astype(str, copy=False)
+        if (
+            subset_rows.ndim != 1
+            or subset_phases.shape != subset_rows.shape
+            or np.unique(subset_rows).size != subset_rows.size
+        ):
+            raise OverlayError("Stage-C selected subset phase evidence is malformed")
+        phase_by_row = {
+            int(row): str(phase)
+            for row, phase in zip(
+                subset_rows.tolist(), subset_phases.tolist(), strict=True
+            )
+        }
+        try:
+            selected_phases = np.asarray(
+                [phase_by_row[int(row)] for row in patch["row_index"]]
+            ).astype(str)
+        except KeyError as error:
+            raise OverlayError(
+                "Stage-C materialized patch row is absent from the selected subset"
+            ) from error
+        base_data = train_bc.MemmapCorpus(base_root)
+        root_breadth = _stage_c_root_breadth_inventory(
+            corpus_game_seeds=np.asarray(base_data["game_seed"], dtype=np.int64),
+            validation_game_seeds=np.asarray(
+                validation["game_seeds"], dtype=np.int64
+            ),
+            selected_game_seeds=np.asarray(patch["game_seed"], dtype=np.int64),
+            selected_decision_indices=np.asarray(
+                patch["decision_index"], dtype=np.int64
+            ),
+            selected_phases=selected_phases,
+        )
+        _verify_stage_c_root_breadth_inventory(
+            root_breadth, selected_rows=len(patch["row_index"])
+        )
         selected_sampling_weights, sampling_report = _selected_sampling_weights(
             export=export,
             subset=subset,
@@ -1052,6 +1378,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "base_value_rows_retained": True,
             "rewritten_columns": sorted(rewritten_columns),
             "sampling_distribution": sampling_report,
+            "root_breadth": root_breadth,
         }
         meta_path = temporary / "corpus_meta.json"
         meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1094,6 +1421,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "target_operator_contract": copy.deepcopy(export["target_operator_contract"]),
             "projection": projection,
             "sampling_distribution": sampling_report,
+            "root_breadth": root_breadth,
             "rewritten_columns": sorted(rewritten_columns),
             "preserved_columns": sorted(set(columns) - rewritten_columns),
             "non_target_source_columns_mutated": False,
@@ -1119,6 +1447,9 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "policy_active_rows": int(projection["selected_rows"]),
                 "stage_c_reanalysis_only": True,
+                "root_breadth_inventory_sha256": root_breadth[
+                    "inventory_sha256"
+                ],
                 "target_policy_target_identity_sha256": export[
                     "target_policy_target_identity_sha256"
                 ],
@@ -1145,6 +1476,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "base_value_rows_retained": True,
             "historical_policy_targets_active": False,
             "sampling_distribution": sampling_report,
+            "root_breadth": root_breadth,
         }
         admission["admission_sha256"] = _value_sha256(admission)
         _write_json_immutable(temporary / "overlay.admission.json", admission)
@@ -1200,6 +1532,10 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
     )
     receipt_unsigned = dict(receipt)
     receipt_stated = receipt_unsigned.pop("receipt_sha256", None)
+    selected_rows = int(overlay.get("selected_policy_rows", 0))
+    root_breadth = _verify_stage_c_root_breadth_inventory(
+        overlay.get("root_breadth"), selected_rows=selected_rows
+    )
     if (
         receipt.get("schema_version") != MATERIALIZATION_SCHEMA
         or receipt_stated != _value_sha256(receipt_unsigned)
@@ -1207,16 +1543,24 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         or receipt_stated != receipt_ref.get("receipt_sha256")
         or receipt.get("target_policy_target_identity_sha256")
         != overlay.get("target_policy_target_identity_sha256")
+        or receipt.get("root_breadth") != root_breadth
+        or admission.get("policy_distillation_contract", {}).get(
+            "root_breadth_inventory_sha256"
+        )
+        != root_breadth["inventory_sha256"]
     ):
         raise OverlayError("Stage-C overlay materialization binding drifted")
     corpus_root = Path(str(admission["corpus"]["data_path"])).resolve(strict=True)
     meta_path = corpus_root / "corpus_meta.json"
+    _meta_path, meta = _load_json(meta_path, where="Stage-C overlay corpus metadata")
     if (
         _file_sha256(meta_path)
         != admission["corpus"]["corpus_meta_file_sha256"]
         or corpus_root != receipt_path.parent
         or receipt["overlay_corpus"]["payload_inventory_sha256"]
         != admission["corpus"]["payload_inventory_sha256"]
+        or meta.get("stage_c_policy_overlay", {}).get("root_breadth")
+        != root_breadth
     ):
         raise OverlayError("Stage-C overlay admission differs from corpus bytes")
     return {
