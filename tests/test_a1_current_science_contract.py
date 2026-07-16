@@ -61,6 +61,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
             "legal_action_value_static_proj",
             "meaningful_history_residual_gate",
             "meaningful_history_ordered_gate",
+            "meaningful_history_sequence",
             "meaningful_history_target_proj",
             "public_card_count_residual",
         "public_rule_state_residual",

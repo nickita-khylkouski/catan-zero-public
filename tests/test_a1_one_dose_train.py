@@ -1397,6 +1397,7 @@ def test_production_trainer_authority_binds_current_science_import() -> None:
     assert records[science_path]["path"] == str(
         Path(executor.current_science.__file__).resolve(strict=True)
     )
+    assert "tools/a1_feature_signal_admission.py" in records
 
 
 def test_production_failure_receipt_binds_current_trainer_authority(

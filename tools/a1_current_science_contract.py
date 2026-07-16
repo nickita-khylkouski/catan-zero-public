@@ -89,7 +89,8 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "require_feature_learning_signal_modules": (
         "event_encoder,legal_action_value_residual_proj,"
         "legal_action_value_static_proj,meaningful_history_residual_gate,"
-        "meaningful_history_ordered_gate,meaningful_history_target_proj,"
+        "meaningful_history_ordered_gate,meaningful_history_sequence,"
+        "meaningful_history_target_proj,"
         "public_card_count_residual,public_rule_state_residual,"
         "static_action_residual_proj"
     ),

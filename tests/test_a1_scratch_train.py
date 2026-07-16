@@ -489,3 +489,7 @@ def test_production_composite_dispatch_retains_late_schedule_refusal(
             {"world_size": 8},
             meta,
         )
+
+
+def test_scratch_code_surface_binds_feature_signal_admission() -> None:
+    assert "tools/a1_feature_signal_admission.py" in scratch.CODE_SURFACE

@@ -284,6 +284,7 @@ A1_REQUIRED_LEARNER_CODE_SUFFIXES = {
     "tools/factory_common.py",
     "tools/launcher_guards.py",
     "tools/prelaunch_guard.py",
+    "tools/a1_feature_signal_admission.py",
     "tools/train_bc.py",
     "tools/build_memmap_corpus.py",
     "src/catan_zero/rl/config_cli.py",
@@ -16937,11 +16938,10 @@ def _initialize_scratch_meaningful_history_path(
 
     A zero gate is required when adding history to an incumbent checkpoint:
     it preserves the parent's function exactly. A scratch model has no parent
-    function to preserve, and leaving the gate at zero blocks every gradient
-    into the event encoder on step one and attenuates the path throughout a
-    short learner dose. Start the established masked-mean path at unit scale
-    for scratch models; an ordered-v2 additive gate remains zero so it can be
-    commissioned separately from the mean path.
+    function to preserve, and leaving a gate at zero blocks gradients into the
+    module behind it on step one and attenuates the path throughout a short
+    learner dose. Start both configured history branches at unit scale for a
+    scratch model; warm-started models retain their serialized gates exactly.
     """
 
     model = getattr(policy, "model", policy)
@@ -16970,12 +16970,15 @@ def _initialize_scratch_meaningful_history_path(
     with torch.no_grad():
         gate.fill_(1.0)
     ordered_gate = getattr(model, "meaningful_history_ordered_gate", None)
+    if ordered_gate is not None:
+        with torch.no_grad():
+            ordered_gate.fill_(1.0)
     return {
         "enabled": True,
         "scratch": True,
         "masked_mean_gate_initialization": "ones",
         "ordered_additive_gate_initialization": (
-            "zeros" if ordered_gate is not None else "not_present"
+            "ones" if ordered_gate is not None else "not_present"
         ),
     }
 
@@ -33618,6 +33621,8 @@ def _checkpoint_dose_telemetry(
             "status": (
                 (
                     "observed_nonzero"
+                    if nonzero_signal_modules and not zero_signal_modules
+                    else "observed_partial"
                     if nonzero_signal_modules
                     else "observed_zero"
                 )
@@ -33688,6 +33693,7 @@ def _checkpoint_dose_telemetry(
                     "meaningful_history_residual_gate",
                     "meaningful_history_ordered_gate",
                     "meaningful_history_sequence",
+                    "meaningful_history_target_proj",
                 ),
             ),
         },

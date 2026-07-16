@@ -36,6 +36,7 @@ CODE_SURFACE = (
     "tools/a1_current_science_contract.py",
     "tools/a1_pre_wave_contract.py",
     "tools/a1_build_post_wave_composite.py",
+    "tools/a1_feature_signal_admission.py",
     "tools/train_bc.py",
     "src/catan_zero/rl/entity_feature_adapter.py",
     "src/catan_zero/rl/entity_token_policy.py",

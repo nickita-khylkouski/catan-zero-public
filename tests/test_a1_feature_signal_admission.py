@@ -12,7 +12,10 @@ REQUIRED_MODULES = [
     "event_encoder",
     "legal_action_value_residual_proj",
     "legal_action_value_static_proj",
+    "meaningful_history_ordered_gate",
     "meaningful_history_residual_gate",
+    "meaningful_history_sequence",
+    "meaningful_history_target_proj",
     "public_card_count_residual",
     "public_rule_state_residual",
     "static_action_residual_proj",
@@ -79,11 +82,11 @@ def _objective_payload() -> dict:
     }
 
 
-def test_current_v4_feature_signal_admission_accepts_every_live_module() -> None:
+def test_current_v5_feature_signal_admission_accepts_every_live_module() -> None:
     evidence = admission.verify_observability(
         _observability(),
         contract=_contract(),
-        where="current v4 scratch report",
+        where="current v5 scratch report",
     )
 
     assert evidence["authenticated"] is True

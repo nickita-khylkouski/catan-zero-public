@@ -2470,6 +2470,16 @@ def _verify_one_dose_training_receipt(
     if checkpoint_selection_requested and legacy_snapshot is not None:
         raise PromotionError("legacy promotion snapshots cannot select intermediate doses")
     raw_schema = _load_json(path).get("schema_version")
+    # Import lazily: one_dose imports the recovery gate, which imports this
+    # module. Importing the scratch executor at module load would close that
+    # historical cycle before one_dose has defined its runtime helpers.
+    from tools import a1_scratch_train as scratch_train
+
+    if raw_schema == scratch_train.PLAN_SCHEMA:
+        raise PromotionError(
+            "plan-only scratch receipt is non-executable and cannot authorize "
+            "checkpoint promotion"
+        )
     _require_training_receipt_initialization_authority(contract)
     if checkpoint_selection_requested and raw_schema != one_dose.RECEIPT_SCHEMA:
         raise PromotionError(

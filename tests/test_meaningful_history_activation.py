@@ -194,7 +194,7 @@ def test_combined_zero_initialized_adapters_receive_optimizer_signal() -> None:
     )
 
 
-def test_scratch_training_activates_mean_history_but_warm_start_preserves_zero():
+def test_scratch_training_activates_history_but_warm_start_preserves_zero():
     from tools import train_bc
 
     scratch = EntityGraphNet(_config(history=True)).train()

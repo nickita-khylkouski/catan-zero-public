@@ -563,6 +563,22 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
                     "mean_relative_parameter_delta": 0.03,
                     "parameter_count": 16,
                 },
+                "meaningful_history_sequence": {
+                    "mean_pre_clip_grad_norm": 0.2,
+                    "max_pre_clip_grad_norm": 0.2,
+                    "mean_parameter_delta_norm": 0.015,
+                    "mean_parameter_update_rms": 0.0015,
+                    "mean_relative_parameter_delta": 0.025,
+                    "parameter_count": 24,
+                },
+                "meaningful_history_target_proj": {
+                    "mean_pre_clip_grad_norm": 0.1,
+                    "max_pre_clip_grad_norm": 0.1,
+                    "mean_parameter_delta_norm": 0.005,
+                    "mean_parameter_update_rms": 0.0005,
+                    "mean_relative_parameter_delta": 0.01,
+                    "parameter_count": 12,
+                },
             },
         },
     }
@@ -612,7 +628,11 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
     ] == []
     assert dose["feature_path_gradients"]["meaningful_history"][
         "nonzero_signal_modules"
-    ] == ["event_encoder"]
+    ] == [
+        "event_encoder",
+        "meaningful_history_sequence",
+        "meaningful_history_target_proj",
+    ]
     assert (
         dose["feature_path_gradients"]["public_card"][
             "independent_loss_objective"
@@ -646,6 +666,8 @@ def test_checkpoint_dose_telemetry_distinguishes_zero_signal_modules() -> None:
                 "public_card_count_residual": dict(zero_signal),
                 "event_encoder": dict(zero_signal),
                 "meaningful_history_residual_gate": dict(nonzero_signal),
+                "meaningful_history_sequence": dict(zero_signal),
+                "meaningful_history_target_proj": dict(zero_signal),
             },
         },
     }
@@ -672,11 +694,15 @@ def test_checkpoint_dose_telemetry_distinguishes_zero_signal_modules() -> None:
     ]
 
     history = dose["feature_path_gradients"]["meaningful_history"]
-    assert history["status"] == "observed_nonzero"
+    assert history["status"] == "observed_partial"
     assert history["nonzero_signal_modules"] == [
         "meaningful_history_residual_gate"
     ]
-    assert history["zero_signal_modules"] == ["event_encoder"]
+    assert history["zero_signal_modules"] == [
+        "event_encoder",
+        "meaningful_history_sequence",
+        "meaningful_history_target_proj",
+    ]
 
 
 def test_checkpoint_dose_refuses_policy_aux_coefficient_drift() -> None:

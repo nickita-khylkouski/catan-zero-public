@@ -154,6 +154,33 @@ def test_ordered_pool_is_mask_safe_and_can_distinguish_order() -> None:
     assert torch.isfinite(forward).all()
 
 
+def test_scratch_ordered_history_is_live_on_the_first_backward() -> None:
+    from tools import train_bc
+
+    torch.manual_seed(23)
+    model = EntityGraphNet(_config(ordered=True)).train()
+    report = train_bc._initialize_scratch_meaningful_history_path(
+        model, scratch=True
+    )
+
+    assert report["masked_mean_gate_initialization"] == "ones"
+    assert report["ordered_additive_gate_initialization"] == "ones"
+    assert torch.equal(
+        model.meaningful_history_ordered_gate,
+        torch.ones_like(model.meaningful_history_ordered_gate),
+    )
+
+    output = model(_batch(history=True))
+    loss = output["logits"].square().mean() + output["value"].square().mean()
+    loss.backward()
+    gradients = [
+        parameter.grad
+        for parameter in model.meaningful_history_sequence.parameters()
+    ]
+    assert all(gradient is not None for gradient in gradients)
+    assert sum(float(gradient.abs().sum()) for gradient in gradients) > 0.0
+
+
 def test_ordered_upgrade_has_typed_function_preserving_receipt() -> None:
     from tools import a1_function_preserving_upgrade as upgrade
 

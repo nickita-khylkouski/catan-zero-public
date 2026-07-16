@@ -2177,6 +2177,29 @@ def test_checkpoint_selection_rejects_candidate_chaining_marker(
         )
 
 
+def test_plan_only_scratch_receipt_is_deliberately_non_promotable(
+    tmp_path: Path,
+) -> None:
+    from tools import a1_scratch_train as scratch_train
+
+    plan = tmp_path / "scratch-plan.json"
+    _write_json(plan, {"schema_version": scratch_train.PLAN_SCHEMA})
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="plan-only scratch receipt is non-executable",
+    ):
+        promotion._verify_one_dose_training_receipt(
+            plan,
+            contract_lock=tmp_path / "unused-lock.json",
+            contract={},
+            candidate_path=tmp_path / "unused-candidate.pt",
+            candidate_sha256="sha256:" + "0" * 64,
+            training_report_path=tmp_path / "unused-report.json",
+            training_report_sha256="sha256:" + "1" * 64,
+        )
+
+
 def test_select_dose_builder_seals_same_trajectory_choice(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     _receipt, modern = _modernize_one_dose_receipt(
