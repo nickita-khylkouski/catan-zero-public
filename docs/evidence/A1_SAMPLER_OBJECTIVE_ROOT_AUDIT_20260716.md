@@ -10,9 +10,9 @@ The main conclusion is that several historical “active-policy dose” results
 were not measuring the treatment their names implied. The old learner coupled
 the active-stream batch size, selected-root sparsity, and row-weight scale into
 one hidden objective coefficient. The current learner has repaired the
-base/AUX normalization and DDP denominator, but production still needs a
-unique-root/reuse contract before another active-policy campaign is
-interpretable.
+base/AUX normalization and DDP denominator and now implements the missing
+weighted-cycle reuse contract and single phase authority. Historical results
+remain invalid for selecting the repaired recipe.
 
 ## Finding 1 — Stage-C was a 94% AUX-policy objective, not a sampler comparison
 
@@ -99,30 +99,29 @@ independent sufficient statistics and applying `policy_aux_loss_weight`
 explicitly. This rules out the historical hidden-mixture bug in new runs, but
 also means old arm rankings are not transferable to the repaired optimizer.
 
-## Finding 3 — draw events still are not an information-dose contract
+## Finding 3 — weighted cycles now bind historical coverage/reuse ambiguity
 
-Current AUX sampling remains with replacement:
+The historical AUX sampler drew with replacement, and the authenticated base
+weighted-replacement path remains available for recipes that explicitly bind
+that legacy measure. Draw counts from those runs were not information-dose
+contracts:
 
-```text
-tools/train_bc.py:31547-31569
-```
+The historical behavior remains available as
+`POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1`.
 
-and authenticated weighted base sampling also draws with replacement:
+Authenticated legacy base sampling also draws with replacement:
 
-```text
-tools/train_bc.py:32045-32102
-```
+The corresponding base behavior is reported as
+`weighted_replacement_v1`.
 
-The current report is honest about the limitation:
+Those historical reports were honest about the limitation:
 
-```text
-tools/train_bc.py:32155-32187
-```
+The report identifies draw-event semantics independently from unique coverage.
 
-`training_row_draws` are draw events and `unique_training_rows_drawn` is
-`None`. Only the AUX path keeps a cumulative unique-row set.
+`training_row_draws` were draw events and `unique_training_rows_drawn` could be
+`None`. Only the AUX path retained a cumulative unique-row set.
 
-This is a root scientific problem for a short-dose learner. The same number of
+This was a root scientific problem for a short-dose learner. The same number of
 draws can mean:
 
 - broad one-pass coverage;
@@ -134,20 +133,23 @@ about `63.2%` of rows in expectation. A nonuniform sampler covers less.
 Therefore a weighted composite “epoch” is not a corpus pass, and optimizer-step
 or draw-event equality does not establish dose equality.
 
-### Smallest production fix
+### Implemented repair
 
-Before enabling the AUX stream in a decisive run:
+The AUX path now supports `weighted_without_replacement_cycles_v1`:
 
-1. count unique base rows, unique AUX rows, unique games, and maximum reuse;
-2. report effective sample size from the realized draw histogram, not only the
-   static weight vector;
-3. cap AUX reuse in short-dose studies;
-4. prefer a shuffled without-replacement active-root cycle until it is
-   exhausted, then reshuffle, rather than immediate replacement sampling.
+- every positive-mass source row appears at most once before a cycle is
+  exhausted;
+- Gumbel-top-k/Plackett-Luce ordering preserves weighted priority inside each
+  cycle without permitting an early duplicate;
+- DDP ranks consume a deterministic rank-strided global stream;
+- the cumulative global draw offset is checkpointed and required on resume;
+- reports bind eligible rows, cycle boundaries, effective sample size,
+  cumulative maximum reuse, realized unique source rows/games, and reuse
+  percentiles.
 
-For authenticated component/game mixtures, implement per-component draw quotas
-plus shuffled game/root cycles. This preserves the mixture without allowing a
-few roots to dominate merely because the requested dose is short.
+This resolves the root omission. A decisive AUX recipe must bind the weighted
+cycle mode; the legacy replacement mode remains explicit for reproduction and
+must not be interpreted as equivalent.
 
 ### Current scratch coverage correction
 
@@ -174,25 +176,11 @@ This removes the million-row blind spot without reverting source exposure to
 raw row proportions. The production schedule remains blocked pending current-v5
 data and optimizer commissioning.
 
-## Finding 4 — phase allocation and phase loss weights can multiply each other
+## Finding 4 — AUX allocation is now the sole phase authority
 
-The authenticated AUX phase allocator sets exact **sampling** shares at:
-
-```text
-tools/train_bc.py:31447-31509
-```
-
-The sampled AUX rows then receive `policy_sample_weights` at:
-
-```text
-tools/train_bc.py:17019-17023
-```
-
-and those weights already include `phase_weights`:
-
-```text
-tools/train_bc.py:27398-27401
-```
+Historically, the authenticated AUX phase allocator set exact **sampling**
+shares, while the sampled AUX rows then received `policy_sample_weights` that
+already included ordinary `phase_weights`.
 
 If a future composite configures both an AUX phase allocation and non-unit
 policy phase weights, the final gradient mass is proportional to:
@@ -205,16 +193,14 @@ not the declared sampling share. For example, a 2/3 `PLAY_TURN` AUX allocation
 combined with `PLAY_TURN=4` produces 8/9 of pre-normalized AUX objective mass,
 not 2/3.
 
-No current v3 scratch recipe enables the AUX stream, so this is not the cause
-of the current scratch run. It is a latent production footgun for the planned
-active-policy learner.
-
-### Smallest production fix
-
-Fail closed when authenticated AUX phase allocation and non-unit policy phase
-weights are both present, unless the contract explicitly declares
-`sampling_share_x_loss_weight_v1`. Prefer one authority for final phase
-objective mass.
+No v3 scratch recipe enabled the AUX stream, so this was not the cause of that
+scratch run. The footgun is now repaired: when authenticated AUX phase
+allocation is present, `_policy_aux_loss_weights_without_phase_multiplication`
+removes the ordinary policy phase multiplier from the AUX loss. The base policy
+objective retains its phase repair, while AUX gradient mass is governed only
+by the authenticated sampling allocation. Reports bind this as
+`allocation_only_remove_duplicate_loss_multiplier_v1`, and non-positive phase
+weights fail closed because they cannot be inverted safely.
 
 ## Finding 5 — current DDP normalization and value/AUX isolation are correct
 
@@ -245,19 +231,19 @@ value loss that does not exist.
 ## Production decision
 
 Do not launch another active-policy sweep by varying AUX batch size. The next
-decisive learner should first use the repaired direct-corpus scratch path with
-no AUX stream. If active correction is reintroduced, commission it with:
+decisive learner should first use the repaired direct-corpus path with no AUX
+stream. If active correction is reintroduced, commission the implemented
+controls together:
 
 ```text
 explicit coefficient
-+ without-replacement/capped-reuse root cycle
++ weighted without-replacement root cycle
 + unique-root/game dose ledger
 + fixed phase authority
 + parent KL and trunk drift
 + held-out whole-game validation
 ```
 
-The highest-value immediate code change after the scratch launch blockers is
-the realized unique-root/game accounting and capped-reuse AUX sampler. It
-directly prevents the failure mode that made historical training loss improve
-while broad playing strength regressed.
+These controls are implemented. The remaining scientific task is to commission
+their combined setting against the direct-corpus baseline; it is no longer a
+missing sampler implementation.

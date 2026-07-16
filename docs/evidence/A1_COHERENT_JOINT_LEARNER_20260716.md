@@ -53,6 +53,11 @@ The commissioning work repaired several root-level failures:
 8. The minimum effective policy rows per global batch affected admission but
    was absent from typed training identity. It is now a hashed `TrainConfig`
    field.
+9. DDP symmetry augmentation gave every rank the same 64-draw stream. An
+   eight-rank update therefore replayed each sampled transform eight times
+   instead of consuming one globally partitioned stream. Commit `33bf402`
+   makes ranks consume `rank::world_size` positions from one deterministic
+   global symmetry stream and preserves that stream across resume.
 
 ## Campaigns
 
@@ -109,8 +114,9 @@ D6 averaging at width 20, and zero truncations.
 | split FULL step 48 | 32 | 19-13 | 59.38% |
 | split D128/FREEZE step 128 | 32 | 19-13 | 59.38% |
 | **split FULL step 48 confirmation** | **128** | **82-46** | **64.06%** |
-| split FULL step 48 replication | 128 | 69-59 | 53.91% |
-| **strictly pooled split FULL step 48** | **256** | **151-105** | **58.98%** |
+| split FULL step 48 replication 1 | 128 | 69-59 | 53.91% |
+| split FULL step 48 replication 2 | 128 | 70-58 | 54.69% |
+| **strictly pooled split FULL step 48** | **384** | **221-163** | **57.55%** |
 
 The screens establish a real learning signal and reject the claim that the
 coherent n128 corpus is intrinsically unlearnable. They are not by themselves
@@ -124,15 +130,75 @@ It completed all 64 pairs with zero truncations. Its production
 `continue`; this result commissions the learner recipe but does not itself
 perform a champion promotion.
 
-The second disjoint 64-pair cohort also favored the candidate. The repository's
+Two disjoint replication cohorts also favored the candidate. The repository's
 strict evaluation pool authenticated identical checkpoint bytes, exact f7,
-matching effective search, non-overlapping seed intervals, and all 128 complete
+matching effective search, non-overlapping seed intervals, and all 192 complete
 pairs. The pooled artifact is
-`/tmp/a1-coherent-joint-split1-8arm-20260716/h2h/split1_full48_vs_f7_pooled128pairs.json`
+`/tmp/a1-coherent-joint-split1-8arm-20260716/h2h/split1_full48_vs_f7_pooled192pairs.json`
 with SHA
-`sha256:6fc12764eb3ab45e7c4f88caefd4db58d014ed63788bc294952eaacb766ecd9b`.
-Its production pentanomial verdict is H1 (`LLR=3.3860`); the stricter
-superiority test remains `continue` (`LLR=1.8591`).
+`sha256:67d8c2a3296a0fea78c30f01f21b41226369b838d01b7f650e11c1c28b104a81`.
+Its production pentanomial verdict is H1 (`LLR=4.5494`); the stricter
+superiority pentanomial test remains `continue` (`LLR=2.4533`).
+
+## Canonical eight-rank commissioning correction
+
+The first canonical 8-GPU replay produced candidate
+`sha256:1fcda56cfcc7a194fb14155af1dc4b33db2a797832e2ae69444f1772765d163c`
+and scored 163-93 over 128 paired seeds (63.67%). Its pooled report has SHA
+`sha256:60279fe8527ab5be15e82f60ba8f237358da2ae07da51698c1d975f7643c8e2d`;
+both the production pentanomial test (`LLR=6.1754`) and strict superiority
+test (`LLR=3.5013`) crossed H1.
+
+That run is **not valid commissioning evidence**. It predates `33bf402`, so
+all eight ranks replayed the same symmetry augmentation draws. The gameplay
+result is an authentic measurement of that trained checkpoint, but it cannot
+commission the intended globally partitioned DDP training recipe.
+
+The corrected DDP replay produced candidate
+`sha256:65f3c1e7a7604633e5bc0adab615d2bfdeb4dfdac876e7a87795cbbc60e75deb`.
+Its first disjoint 64-pair cohort finished 69-59 (53.91%) with all tests still
+`continue`; the report SHA is
+`sha256:b9103a008a6fbf19b5a4f867833815313b8dd0cd662a4384e06d2bc461d4fa68`.
+This is positive but inconclusive. It supersedes the pre-fix result for recipe
+commissioning and does not establish a promotion.
+
+## Direct parent-upgrade lineage commissioning
+
+The canonical architecture transition is now one explicit, allowlisted
+f7-to-current-v5-plus-split1 upgrade rather than two implicit initializer
+stages. With seed 1, the direct initializer is tensor-identical to the old
+two-stage initializer for all 175 model tensors. The direct initializer SHA is
+`sha256:9dd934c90f02e6460bc71e491fd5efab1cb19c5ca56c358f05ac98f309e4b5d3`
+and its bound upgrade receipt SHA is
+`sha256:1462e19057d7a9593d534ccb09df1fa1aeb3991ee20b7c43e7ccd78abb9ba456`.
+
+An eight-GPU replay started from those exact bytes, used fresh Adam, and
+completed 48 optimizer steps / 24,576 global row draws. It produced candidate
+`sha256:b896811535f41d75f78e89c97f845e750722be00633b647ac545a529680d1ddc`
+under entity-model source SHA
+`sha256:b4e2618bc36296470f13ce3dee228b34fd7d117c0211380c46393450793ce975`.
+The training report records the parent SHA, initializer SHA, and upgrade
+receipt as one lineage-bound initialization contract.
+
+A partial H2H launched from the older evaluator checkout was discarded before
+interpretation: that runtime carried entity-model source SHA
+`sha256:70be73d688372fa857799e1ca61a3c3e00a8b70a263b17f0dba03d1626f90906`,
+not the candidate's current source. No result from that partial panel is
+promotion or commissioning evidence. A fully current-runtime H2H remains the
+open measurement; this document intentionally does not claim its outcome.
+
+## Runtime performance repairs
+
+Two implementation changes reduce work without changing the learner recipe:
+
+- `c006f24` uses a CLS-query-only final private value block during evaluation
+  when `value_tower_split_layers=1` and value attention pooling is disabled.
+  It keeps every key/value token and the exact padding mask; training, deeper
+  private towers, and attention-pool readouts retain the full-token path.
+- `11dcdc0` scans Rust public history backward only until the bounded retained
+  suffix is filled, then restores chronological order. This avoids rebuilding
+  and scanning an entire long-game history at every MCTS leaf while preserving
+  the existing 32/64-event feature contract.
 
 ## Current interpretation
 
@@ -146,9 +212,11 @@ superiority test remains `continue` (`LLR=1.8591`).
 - Long unrestricted training can improve teacher KL while damaging value
   quality. Selection must combine target closure, value quality, functional
   drift, and matched gameplay.
-- The commissioned parent-update treatment is the split-value FULL arm at
-  exactly 48 updates, with fresh optimizer state and no candidate chaining.
-  The separate fresh-scratch recipe is not modified by this warm-start result.
+- The selected research treatment is the split-value FULL arm at exactly 48
+  updates, with fresh optimizer state and no candidate chaining. The corrected
+  DDP cohort is still inconclusive, so production commissioning remains open
+  pending the current-runtime H2H. The separate fresh-scratch recipe is not
+  modified by this warm-start result.
 
 The selected checkpoint and evidence bundle are durably staged at
 `/home/ubuntu/catan-zero-artifacts/rl-system-repair-20260716/split1-full48`.
