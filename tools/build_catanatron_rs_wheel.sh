@@ -6,11 +6,11 @@ PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 OUT_DIR="${OUT_DIR:-$SOURCE_ROOT/dist}"
 SEALED_CANONICAL_BUILD_ROOT="/tmp/catan-zero-catanatron-rs-wheel-src"
 CANONICAL_BUILD_ROOT="${CATAN_RS_CANONICAL_BUILD_ROOT:-$SEALED_CANONICAL_BUILD_ROOT}"
-WHEEL_NAME="catanatron_rs-0.1.10-cp311-cp311-manylinux_2_34_x86_64.whl"
-RECEIPT_NAME="catanatron_rs-0.1.10-build-receipt.json"
+WHEEL_NAME="catanatron_rs-0.1.11-cp311-cp311-manylinux_2_34_x86_64.whl"
+RECEIPT_NAME="catanatron_rs-0.1.11-build-receipt.json"
 SEALED_SOURCE_DATE_EPOCH="1784160000"
 SEALED_RUSTFLAGS="--remap-path-prefix=/tmp/catan-zero-catanatron-rs-wheel-src=/src/catan-zero-public -C link-arg=-Wl,--build-id=none"
-SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.10-public-card-meaningful-history-wheel-v1"
+SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.11-feature-abi-wheel-v1"
 
 die() {
   echo "build_catanatron_rs_wheel: $*" >&2
@@ -157,7 +157,7 @@ echo "$PYTHON_VERSION"
 echo "$STRIP_VERSION"
 
 mkdir -p "$OUT_DIR"
-rm -f "$OUT_DIR"/catanatron_rs-0.1.10-*.whl
+rm -f "$OUT_DIR"/catanatron_rs-0.1.11-*.whl
 rm -f "$OUT_DIR/$RECEIPT_NAME"
 
 # PyO3's Python-enabled Rust tests link libpython, unlike the final extension
@@ -199,7 +199,7 @@ cargo test \
   public_card_deductions \
   --lib
 # Capability names are not evidence of semantics.  Run the exact source tests
-# for every corrected 0.1.10 behavior before compiling and hashing the wheel.
+# for every advertised corrected behavior before compiling and hashing the wheel.
 LD_LIBRARY_PATH="$PYTHON_TEST_LIBDIR" \
 RUSTFLAGS="$RUSTFLAGS -L native=$PYTHON_TEST_LIBDIR" \
 cargo test \
@@ -323,7 +323,7 @@ from importlib.metadata import version
 
 import catanatron_rs
 
-assert version("catanatron-rs") == "0.1.10"
+assert version("catanatron-rs") == "0.1.11"
 game = catanatron_rs.Game.simple(["RED", "BLUE"], seed=7)
 observer = game.current_color()
 public_cards = json.loads(game.public_card_deductions_json(observer))
