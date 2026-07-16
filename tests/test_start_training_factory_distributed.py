@@ -6,7 +6,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
+
+from tools import train_bc
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -101,6 +104,54 @@ def test_factory_keeps_forced_policy_rows_out_of_fresh_training(tmp_path: Path) 
     assert result.returncode == 0, result.stderr
     command = _train_command(_manifest(tmp_path))
     assert command[command.index("--forced-action-weight") + 1] == "0.0"
+
+
+def test_factory_phase_weights_match_production_prompt_vocabulary(tmp_path: Path) -> None:
+    result = _dry_run(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    configured = train_bc._parse_weight_map(
+        command[command.index("--phase-weights") + 1]
+    )
+    phases = np.asarray(
+        [
+            "MOVE_ROBBER",
+            "BUILD_INITIAL_SETTLEMENT",
+            "BUILD_INITIAL_ROAD",
+            "DISCARD",
+            "PLAY_TURN",
+        ]
+    )
+    data = {
+        "action_taken": np.arange(len(phases), dtype=np.int16),
+        "legal_action_ids": np.tile(
+            np.asarray([[0, 1]], dtype=np.int16), (len(phases), 1)
+        ),
+        "phase": phases,
+    }
+
+    policy_weights = train_bc.build_sample_weights(
+        data,
+        teacher_weights={},
+        phase_weights=configured,
+        forced_action_weight=1.0,
+        winner_sample_weight=1.0,
+        loser_sample_weight=1.0,
+        vp_margin_weight=0.0,
+        vps_to_win=10,
+    )
+    value_weights = train_bc.build_value_sample_weights(
+        data, phase_weights=configured
+    )
+    expected_relative_weights = np.asarray([3.0, 2.0, 2.0, 1.5, 1.0])
+
+    assert policy_weights / policy_weights[-1] == pytest.approx(
+        expected_relative_weights
+    )
+    assert value_weights / value_weights[-1] == pytest.approx(
+        expected_relative_weights
+    )
 
 
 def test_factory_accounts_for_gradient_accumulation_in_global_batch(tmp_path: Path) -> None:

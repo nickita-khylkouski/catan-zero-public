@@ -122,7 +122,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--phase-weights",
-        default="robber=3.0,initial_build=2.0,discard=1.5",
+        default=(
+            "MOVE_ROBBER=3.0,BUILD_INITIAL_SETTLEMENT=2.0,"
+            "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
+        ),
+        help=(
+            "Comma-separated exact current_prompt weights for current production "
+            "teacher shards. Both initial-placement prompts must be named separately."
+        ),
     )
     parser.add_argument("--winner-sample-weight", type=float, default=1.0)
     parser.add_argument("--loser-sample-weight", type=float, default=1.0)
