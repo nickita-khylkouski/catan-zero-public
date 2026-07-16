@@ -31,7 +31,7 @@ from tools import train_bc  # noqa: E402
 
 
 SCHEMA = "a1-coherent-joint-learner-arm-v1"
-CHECKPOINT_STEPS = "8,12,16,24,32,48,64,96,128,160,192"
+CHECKPOINT_STEPS = "8,12,16,24,32,48,64,96,128,160"
 VALIDATION_RANGES = ",".join(
     f"{96_000_000_000 + lane * 10_000}:{96_000_000_007 + lane * 10_000}"
     for lane in range(8)
