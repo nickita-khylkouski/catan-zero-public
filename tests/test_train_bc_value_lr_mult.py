@@ -24,8 +24,13 @@ def _make_entity_policy(
     value_tower_split_layers: int = 0,
     public_card_count_features: bool = False,
     public_card_count_residual_bias: bool = True,
+    public_rule_state_features: bool = False,
 ):
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.entity_feature_adapter import (
+        CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        RUST_ENTITY_ADAPTER_V4,
+    )
     from catan_zero.rl.self_play import make_env_config
 
     policy = EntityGraphPolicy.create(
@@ -42,6 +47,7 @@ def _make_entity_policy(
         or value_attention_pool
         or value_tower_split_layers
         or public_card_count_features
+        or public_rule_state_features
     ):
         config = replace(
             policy.config,
@@ -53,11 +59,17 @@ def _make_entity_policy(
             value_tower_split_layers=int(value_tower_split_layers),
             public_card_count_features=bool(public_card_count_features),
             public_card_count_residual_bias=bool(public_card_count_residual_bias),
+            public_rule_state_features=bool(public_rule_state_features),
         )
         policy = EntityGraphPolicy(
             config,
             policy.static_action_features.detach().cpu().numpy(),
             device="cpu",
+            entity_feature_adapter_version=(
+                RUST_ENTITY_ADAPTER_V4
+                if public_rule_state_features
+                else CURRENT_RUST_ENTITY_ADAPTER_VERSION
+            ),
         )
     return policy
 
@@ -248,7 +260,11 @@ def test_action_module_lr_multiplier_fails_without_action_local_modules() -> Non
 
 
 def test_trunk_lr_multiplier_changes_only_canonical_entity_graph_trunk() -> None:
-    policy = _make_entity_policy(categorical_bins=9, action_local=True)
+    policy = _make_entity_policy(
+        categorical_bins=9,
+        action_local=True,
+        public_rule_state_features=True,
+    )
     groups = _build_optimizer_param_groups(
         policy.model,
         base_lr=2e-4,
@@ -278,6 +294,10 @@ def test_trunk_lr_multiplier_changes_only_canonical_entity_graph_trunk() -> None
         if parameter.requires_grad
     }
     assert {id(p) for p in by_name["trunk"]["params"]} == direct_trunk_ids
+    assert {
+        id(parameter)
+        for parameter in policy.model.public_rule_state_residual.parameters()
+    }.issubset({id(parameter) for parameter in by_name["trunk"]["params"]})
 
     assigned = [id(p) for group in groups for p in group["params"]]
     expected = [id(p) for p in policy.model.parameters() if p.requires_grad]

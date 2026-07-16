@@ -1,0 +1,48 @@
+{
+  "schema": "a1-actor-public-information-audit-v1",
+  "date": "2026-07-16",
+  "scope": "2p_no_trade",
+  "corpus": {
+    "path": "/home/ubuntu/experimental_nonpromotable/coherent-n128-active-policy-20260715-r1/data/coherent-n128-memmap",
+    "row_count": 959142,
+    "adapter_version": "rust_entity_adapter_v2_land_topology_ports_maritime"
+  },
+  "history": {
+    "rows_with_nonempty_history": 950950,
+    "nonempty_fraction": 0.9914590331775691,
+    "mean_events": 26.606626547476807,
+    "median_events": 32.0,
+    "rows_at_32_event_cap": 623595,
+    "fraction_at_32_event_cap": 0.6501592047892805,
+    "play_turn_fraction_at_cap": 0.7008742839915586,
+    "discard_fraction_at_cap": 0.7642926636215227,
+    "valid_events": 25519533,
+    "events_with_turn_key": 0,
+    "events_with_hex_target": 0,
+    "events_with_vertex_target": 0,
+    "events_with_edge_target": 0,
+    "events_with_player_target": 0
+  },
+  "current_rule_state": {
+    "global_slots_8_through_15_nonzero_counts": [0, 0, 0, 0, 0, 0, 0, 0],
+    "missing": [
+      "actor_has_played_development_card_in_turn",
+      "actor_per_type_playable_development_card_count",
+      "road_building_active",
+      "free_roads_remaining",
+      "current_discard_remainder"
+    ]
+  },
+  "public_card_counting": {
+    "actor_knight_counter_saturated_rows": 49501,
+    "actor_knight_counter_saturated_fraction": 0.051609667807269416,
+    "any_player_knight_counter_saturated_rows": 87073,
+    "any_player_knight_counter_saturated_fraction": 0.09078217823846729,
+    "note": "The public-card residual reconstructs exact aggregate Knight plays from deck conservation, but the base player-token counter alone saturates at five."
+  },
+  "conclusion": {
+    "severity": "CRITICAL",
+    "finding": "The learner was expected to reconstruct present-tense rules state from a history window that is capped on 65% of rows and carries neither turn keys nor spatial targets. Rules-distinct states therefore alias in the state/value input.",
+    "implemented_fix": "Versioned adapter-v4 actor public rule-state slots plus a zero-output model residual; the Rust engine now retains exact per-type turn-start development-card counts instead of booleans."
+  }
+}

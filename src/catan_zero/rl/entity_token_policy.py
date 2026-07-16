@@ -20,6 +20,7 @@ from catan_zero.rl.action_features import (
 )
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    RUST_ENTITY_ADAPTER_V4,
     checkpoint_entity_feature_adapter_metadata,
     require_known_entity_feature_adapter,
     resolve_checkpoint_entity_feature_adapter,
@@ -31,6 +32,9 @@ from catan_zero.rl.entity_token_features import (
     HEX_FEATURE_SIZE,
     LEGAL_ACTION_FEATURE_SIZE,
     PLAYER_FEATURE_SIZE,
+    PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
+    PUBLIC_RULE_STATE_FEATURE_SIZE,
+    PUBLIC_RULE_STATE_FEATURE_SLICE,
     VERTEX_FEATURE_SIZE,
     build_entity_token_features,
     mask_player_tokens_public,
@@ -377,6 +381,16 @@ class EntityGraphConfig:
     # full strength. Default 0 preserves every legacy checkpoint and forward.
     # Appended last for positional legacy-pickle compatibility.
     value_tower_split_layers: int = 0
+    # Current actor/rule state that cannot be reconstructed reliably from the
+    # bounded event window: development-card playability, Road Building
+    # continuation, and discard remainder. Adapter-v4 stores it in the
+    # historically zero global slots 8:16. The inherited global encoder sees
+    # those slots zeroed; this separate zero-output residual makes enabling the
+    # feature an exact warm start.
+    public_rule_state_features: bool = False
+    public_rule_state_feature_schema: str = (
+        PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+    )
 
 
 class EntityGraphNet:
@@ -556,6 +570,23 @@ class EntityGraphNet:
                     if self.public_card_count_residual.bias is not None:
                         nn.init.zeros_(self.public_card_count_residual.bias)
                 self.global_encoder = _token_encoder(GLOBAL_FEATURE_SIZE, h, dropout)
+                self.public_rule_state_features_enabled = bool(
+                    getattr(cfg, "public_rule_state_features", False)
+                )
+                if self.public_rule_state_features_enabled:
+                    schema = str(
+                        getattr(cfg, "public_rule_state_feature_schema", "") or ""
+                    )
+                    if schema != PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION:
+                        raise ValueError(
+                            "unsupported public rule-state feature schema: "
+                            f"{schema!r} != "
+                            f"{PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION!r}"
+                        )
+                    self.public_rule_state_residual = nn.Linear(
+                        PUBLIC_RULE_STATE_FEATURE_SIZE, h, bias=False
+                    )
+                    nn.init.zeros_(self.public_rule_state_residual.weight)
                 self.event_encoder = _token_encoder(EVENT_FEATURE_SIZE, h, dropout)
                 self.meaningful_public_history_enabled = bool(
                     getattr(cfg, "meaningful_public_history", False)
@@ -1667,6 +1698,19 @@ class EntityGraphNet:
                     player_piece = player_piece + self.public_card_count_residual(
                         batch[DEDUCTION_FEATURES_KEY].float()
                     )
+                global_tokens = batch["global_tokens"].float()
+                if self.public_rule_state_features_enabled:
+                    rule_state = global_tokens[
+                        :, :, PUBLIC_RULE_STATE_FEATURE_SLICE
+                    ]
+                    global_tokens = global_tokens.clone()
+                    global_tokens[:, :, PUBLIC_RULE_STATE_FEATURE_SLICE] = 0.0
+                    global_piece = self.global_encoder(global_tokens)
+                    global_piece = global_piece + self.public_rule_state_residual(
+                        rule_state
+                    )
+                else:
+                    global_piece = self.global_encoder(global_tokens)
                 pieces = [
                     self.cls_token.expand(batch["hex_tokens"].shape[0], -1, -1)
                     + self.type_embedding[0].view(1, 1, -1),
@@ -1677,8 +1721,7 @@ class EntityGraphNet:
                     self.edge_encoder(batch["edge_tokens"].float())
                     + self.type_embedding[3].view(1, 1, -1),
                     player_piece + self.type_embedding[4].view(1, 1, -1),
-                    self.global_encoder(batch["global_tokens"].float())
-                    + self.type_embedding[5].view(1, 1, -1),
+                    global_piece + self.type_embedding[5].view(1, 1, -1),
                     event_piece,
                 ]
                 tokens = torch.cat(pieces, dim=1)
@@ -1899,6 +1942,14 @@ class EntityGraphPolicy:
         self.entity_feature_adapter_version = require_known_entity_feature_adapter(
             entity_feature_adapter_version
         )
+        if (
+            bool(getattr(config, "public_rule_state_features", False))
+            and self.entity_feature_adapter_version != RUST_ENTITY_ADAPTER_V4
+        ):
+            raise ValueError(
+                "public_rule_state_features requires entity adapter v4; got "
+                f"{self.entity_feature_adapter_version!r}"
+            )
         self.entity_feature_adapter_binding_source = "new_policy_runtime_binding"
         # Durable checkpoint provenance.  Fresh policies have no training
         # attestation; load() fills these from the source checkpoint so a plain
@@ -1985,6 +2036,10 @@ class EntityGraphPolicy:
         event_history_limit: int = 64,
         meaningful_public_history_pooling: str = MASKED_MEAN_V1,
         value_tower_split_layers: int = 0,
+        public_rule_state_features: bool = False,
+        public_rule_state_feature_schema: str = (
+            PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+        ),
         entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
@@ -2040,6 +2095,10 @@ class EntityGraphPolicy:
                     meaningful_public_history_pooling or MASKED_MEAN_V1
                 ),
                 value_tower_split_layers=int(value_tower_split_layers),
+                public_rule_state_features=bool(public_rule_state_features),
+                public_rule_state_feature_schema=str(
+                    public_rule_state_feature_schema
+                ),
             )
             return cls(
                 config,
@@ -2291,6 +2350,7 @@ class EntityGraphPolicy:
             meaningful_public_history=bool(
                 getattr(self.config, "meaningful_public_history", False)
             ),
+            entity_feature_adapter_version=self.entity_feature_adapter_version,
         )
         if self.trained_with_masked_hidden_info:
             entity = dict(entity)
@@ -2699,6 +2759,7 @@ class EntityGraphPolicy:
             "meaningful_history_residual_gate",
             "meaningful_history_ordered_gate",
             "meaningful_history_sequence.",
+            "public_rule_state_residual.",
         )
         if bool(allow_missing_optional_parameters):
             allowed_missing_prefixes += optional_warmstart_prefixes

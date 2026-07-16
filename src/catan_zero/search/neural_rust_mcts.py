@@ -2059,6 +2059,13 @@ def _entity_payload_from_rust_snapshot(
         "players": players,
         "current_player": str(snapshot.get("current_color", "")),
         "current_prompt": str(snapshot.get("current_prompt", "")),
+        "is_road_building": bool(snapshot.get("is_road_building", False)),
+        "free_roads_available": int(
+            snapshot.get("free_roads_available", 0) or 0
+        ),
+        "current_discard_count": int(
+            snapshot.get("current_discard_count", 0) or 0
+        ),
         "structured_legal_actions": structured_legal_actions,
         "legal_actions": list(legal_action_ids),
         "event_log": (
@@ -2100,6 +2107,11 @@ def _players_from_rust_snapshot(
         resources = _resource_counts(state.get("resources"))
         dev_cards = _dev_card_counts(state.get("dev_cards"))
         played = _dev_card_counts(state.get("played_dev_cards"))
+        owned_at_start = _dev_card_counts(state.get("owned_at_start"))
+        playable_development_cards = {
+            card: min(dev_cards.get(card, 0), owned_at_start.get(card, 0))
+            for card in dev_cards
+        }
         players[color] = {
             "public_victory_points": int(state.get("victory_points", 0) or 0),
             "actual_victory_points": int(state.get("actual_victory_points", 0) or 0),
@@ -2108,6 +2120,10 @@ def _players_from_rust_snapshot(
             "resources": resources,
             "development_cards": dev_cards,
             "played_development_cards": played,
+            "has_played_development_card_in_turn": bool(
+                state.get("has_played_development_card_in_turn", False)
+            ),
+            "playable_development_cards": playable_development_cards,
             "roads_left": int(state.get("roads_available", 0) or 0),
             "settlements_left": int(state.get("settlements_available", 0) or 0),
             "cities_left": int(state.get("cities_available", 0) or 0),
@@ -2153,6 +2169,7 @@ def _mask_players_to_public(
         public = dict(player)
         public["resources"] = None
         public["development_cards"] = None
+        public["playable_development_cards"] = None
         public.pop("actual_victory_points", None)
         masked[color] = public
     return masked

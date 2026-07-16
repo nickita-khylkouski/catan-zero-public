@@ -41,6 +41,10 @@ from catan_zero.rl.entity_token_policy import (  # noqa: E402
     EntityGraphConfig,
     EntityGraphPolicy,
 )
+from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V4  # noqa: E402
+from catan_zero.rl.entity_token_features import (  # noqa: E402
+    PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
+)
 from catan_zero.rl.meaningful_history import (  # noqa: E402
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
@@ -82,6 +86,7 @@ NEW_PARAM_PREFIXES = (
     "meaningful_history_sequence.",
     "value_blocks.",
     "value_state_norm.",
+    "public_rule_state_residual.",
 )
 
 
@@ -170,6 +175,15 @@ def _parse_flags(raw: str) -> dict[str, object]:
             )
             overrides["event_history_limit"] = MEANINGFUL_PUBLIC_HISTORY_LIMIT
             overrides["meaningful_public_history_pooling"] = ORDERED_ATTENTION_V2
+        elif entry in (
+            "public_rule_state",
+            "public_rule_state_features",
+            "actor_public_rule_state",
+        ):
+            overrides["public_rule_state_features"] = True
+            overrides["public_rule_state_feature_schema"] = (
+                PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+            )
         elif entry.startswith("catbins"):
             # CAT-39: build the HL-Gauss categorical value head with N win-loss
             # bins (plus the truncation class, which the config enables by
@@ -229,6 +243,7 @@ def _verify_forward_identical(
             getattr(upgraded.config, "meaningful_public_history", False)
         ),
         history_limit=int(getattr(upgraded.config, "event_history_limit", 64)),
+        entity_feature_adapter_version=upgraded.entity_feature_adapter_version,
     )
     context = rust_action_context_batch(
         game,
@@ -367,6 +382,11 @@ def main() -> None:
         static,
         seed=int(args.seed),
         device=args.device,
+        entity_feature_adapter_version=(
+            RUST_ENTITY_ADAPTER_V4
+            if bool(overrides.get("public_rule_state_features", False))
+            else base.entity_feature_adapter_version
+        ),
     )
     missing, unexpected = upgraded.model.load_state_dict(
         base.model.state_dict(), strict=False
@@ -394,7 +414,13 @@ def main() -> None:
     # CAT-80: restore top-level provenance keys the fresh-policy save() drops
     # (mask_hidden_info et al.); only model weights + config flags are mutated.
     preserved_source_keys = _preserve_source_top_level_keys(
-        args.in_checkpoint, args.out_checkpoint
+        args.in_checkpoint,
+        args.out_checkpoint,
+        mutated_keys=(
+            ("model", "config", "entity_feature_adapter")
+            if bool(overrides.get("public_rule_state_features", False))
+            else ("model", "config")
+        ),
     )
     _record_upgrade_provenance(
         args.out_checkpoint,

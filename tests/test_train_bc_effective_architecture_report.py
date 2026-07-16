@@ -5,6 +5,9 @@ from types import SimpleNamespace
 from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
+from catan_zero.rl.entity_token_features import (
+    PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
+)
 from tools.train_bc import (
     _checkpoint_config_mismatches,
     _effective_entity_graph_architecture_report,
@@ -73,6 +76,10 @@ def test_report_binds_effective_meaningful_history_contract() -> None:
         config=SimpleNamespace(
             public_card_count_features=True,
             public_card_count_residual_bias=False,
+            public_rule_state_features=True,
+            public_rule_state_feature_schema=(
+                PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+            ),
             meaningful_public_history=True,
             meaningful_public_history_schema=(MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION),
             event_history_limit=32,
@@ -84,6 +91,11 @@ def test_report_binds_effective_meaningful_history_contract() -> None:
 
     assert report["public_card_count_features"] is True
     assert report["public_card_count_residual_bias"] is False
+    assert report["public_rule_state_features"] is True
+    assert (
+        report["public_rule_state_feature_schema"]
+        == PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+    )
     assert report["meaningful_public_history"] is True
     assert (
         report["meaningful_public_history_schema"]

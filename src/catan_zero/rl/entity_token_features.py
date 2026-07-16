@@ -12,6 +12,7 @@ from catan_zero.deduction_tracker import (
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     RUST_ENTITY_ADAPTER_V3,
+    RUST_ENTITY_ADAPTER_V4,
     require_known_entity_feature_adapter,
 )
 from catan_zero.rl.meaningful_history import (
@@ -73,6 +74,14 @@ PLAYER_FEATURE_SIZE = 31
 GLOBAL_FEATURE_SIZE = 43
 LEGAL_ACTION_FEATURE_SIZE = 50
 EVENT_FEATURE_SIZE = 41
+
+# Adapter-v4 fills the historically zero global-token slots 8:16 with current
+# actor/rule state. The values are routed through a zero-output residual in the
+# model, never through the inherited global encoder, so upgrading an incumbent
+# remains function-preserving while a fresh learner can acquire the signal.
+PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION = "actor_public_rule_state_2p_v1"
+PUBLIC_RULE_STATE_FEATURE_SLICE = slice(8, 16)
+PUBLIC_RULE_STATE_FEATURE_SIZE = 8
 
 # Public-observation boundary (hidden-information leak fix, f72).
 # The player-token slot where `_player_tokens` writes the "this token is the
@@ -322,7 +331,12 @@ def build_entity_token_features(
     if effective_history_limit < 0:
         raise ValueError("history_limit must be >= 0")
     player_tokens = _player_tokens(payload, actor_name)
-    global_tokens = _global_tokens(env, payload, actor_name)
+    global_tokens = _global_tokens(
+        env,
+        payload,
+        actor_name,
+        encode_actor_public_rule_state=adapter_version == RUST_ENTITY_ADAPTER_V4,
+    )
     return {
         "schema": np.asarray(ENTITY_TOKEN_SCHEMA_VERSION),
         "hex_tokens": _hex_tokens(payload, topology),
@@ -345,7 +359,7 @@ def build_entity_token_features(
             payload,
             topology,
             encode_structured_action_resources=(
-                adapter_version == RUST_ENTITY_ADAPTER_V3
+                adapter_version in {RUST_ENTITY_ADAPTER_V3, RUST_ENTITY_ADAPTER_V4}
             ),
         ),
         "legal_action_target_ids": _legal_action_target_ids(payload, topology),
@@ -658,12 +672,41 @@ def _player_tokens(payload: dict[str, Any], actor_name: str) -> np.ndarray:
     return tokens
 
 
-def _global_tokens(env: Any, payload: dict[str, Any], actor_name: str) -> np.ndarray:
+def _global_tokens(
+    env: Any,
+    payload: dict[str, Any],
+    actor_name: str,
+    *,
+    encode_actor_public_rule_state: bool = False,
+) -> np.ndarray:
     del env
     token = np.zeros((1, GLOBAL_FEATURE_SIZE), dtype=np.float16)
     prompt = str(payload.get("current_prompt", ""))
     for idx, known in enumerate(PROMPTS):
         token[0, idx] = 1.0 if known in prompt else 0.0
+    if encode_actor_public_rule_state:
+        players = (
+            payload.get("players")
+            if isinstance(payload.get("players"), dict)
+            else {}
+        )
+        actor = players.get(actor_name)
+        actor = actor if isinstance(actor, dict) else {}
+        token[0, 8] = float(
+            bool(actor.get("has_played_development_card_in_turn"))
+        )
+        token[0, 9] = float(bool(payload.get("is_road_building")))
+        token[0, 10] = _scale(payload.get("free_roads_available"), 2)
+        token[0, 11] = _scale(payload.get("current_discard_count"), 10)
+        playable = (
+            actor.get("playable_development_cards")
+            if isinstance(actor.get("playable_development_cards"), dict)
+            else {}
+        )
+        for offset, card in enumerate(
+            ("KNIGHT", "YEAR_OF_PLENTY", "MONOPOLY", "ROAD_BUILDING")
+        ):
+            token[0, 12 + offset] = _scale(_lookup_count(playable, card), 5)
     current_idx = _player_index(str(payload.get("current_player", "")))
     actor_idx = _player_index(actor_name)
     if current_idx is not None:

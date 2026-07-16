@@ -2580,7 +2580,7 @@ pub struct PlayerState {
     pub resources: FreqDeck,
     pub dev_cards: [u8; 5],
     pub played_dev_cards: [u8; 5],
-    pub owned_at_start: [bool; 5],
+    pub owned_at_start: [u8; 5],
     pub longest_road_length: usize,
 }
 
@@ -2599,7 +2599,7 @@ impl Default for PlayerState {
             resources: [0; 5],
             dev_cards: [0; 5],
             played_dev_cards: [0; 5],
-            owned_at_start: [false; 5],
+            owned_at_start: [0; 5],
             longest_road_length: 0,
         }
     }
@@ -4268,7 +4268,7 @@ pub fn player_can_play_dev(state: &State, color: Color, card: DevCard) -> bool {
     let ps = state.player_state(color);
     !ps.has_played_development_card_in_turn
         && ps.dev_cards[card.idx()] >= 1
-        && ps.owned_at_start[card.idx()]
+        && ps.owned_at_start[card.idx()] >= 1
 }
 
 pub fn player_freqdeck_add(state: &mut State, color: Color, deck: FreqDeck) {
@@ -4376,7 +4376,7 @@ pub fn player_clean_turn(state: &mut State, color: Color) {
     ps.has_rolled = false;
     for card in DevCard::ALL {
         if card != DevCard::VictoryPoint {
-            ps.owned_at_start[card.idx()] = ps.dev_cards[card.idx()] > 0;
+            ps.owned_at_start[card.idx()] = ps.dev_cards[card.idx()];
         }
     }
 }
@@ -5875,7 +5875,7 @@ impl Game {
                 target.victory_points + i16::from(sampled[DevCard::VictoryPoint.idx()]);
             // Every opponent is between turns at a root owned by `observer`;
             // when its next turn begins the engine refreshes this field anyway.
-            target.owned_at_start = sampled.map(|count| count > 0);
+            target.owned_at_start = sampled;
         }
 
         let mut sampled_deck = Vec::with_capacity(self.state.development_listdeck.len());
@@ -6007,7 +6007,7 @@ impl Game {
                     donor_state.dev_cards[replacement.idx()] += 1;
                     donor_state.actual_victory_points = donor_state.victory_points
                         + i16::from(donor_state.dev_cards[DevCard::VictoryPoint.idx()]);
-                    donor_state.owned_at_start = donor_state.dev_cards.map(|count| count > 0);
+                    donor_state.owned_at_start = donor_state.dev_cards;
                 }
                 sampled.state.development_listdeck.push(*requested);
             }
@@ -6816,6 +6816,15 @@ fn player_state_to_json_value(state: &PlayerState) -> Value {
             )
         })
         .collect::<serde_json::Map<_, _>>();
+    let owned_at_start = DevCard::ALL
+        .iter()
+        .map(|card| {
+            (
+                dev_card_name(*card).to_string(),
+                json!(state.owned_at_start[card.idx()]),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
 
     json!({
         "victory_points": state.victory_points,
@@ -6830,6 +6839,7 @@ fn player_state_to_json_value(state: &PlayerState) -> Value {
         "resources": resources,
         "dev_cards": dev_cards,
         "played_dev_cards": played_dev_cards,
+        "owned_at_start": owned_at_start,
         "longest_road_length": state.longest_road_length,
     })
 }
@@ -9052,6 +9062,7 @@ pub mod python_bindings {
     const ENTITY_MEANINGFUL_PUBLIC_HISTORY_LIMIT: usize = 32;
     const ENTITY_ADAPTER_V2: &str = "rust_entity_adapter_v2_land_topology_ports_maritime";
     const ENTITY_ADAPTER_V3: &str = "rust_entity_adapter_v3_structured_action_resources";
+    const ENTITY_ADAPTER_V4: &str = "rust_entity_adapter_v4_actor_public_rule_state";
     const ENTITY_PLAYERS_ORDER: [&str; 4] = ["BLUE", "RED", "ORANGE", "WHITE"];
     const ENTITY_PROMPTS: [&str; 8] = [
         "BUILD_INITIAL_SETTLEMENT",
@@ -9087,9 +9098,9 @@ pub mod python_bindings {
     fn entity_adapter_encodes_action_resources(version: &str) -> PyResult<bool> {
         match version {
             ENTITY_ADAPTER_V2 => Ok(false),
-            ENTITY_ADAPTER_V3 => Ok(true),
+            ENTITY_ADAPTER_V3 | ENTITY_ADAPTER_V4 => Ok(true),
             _ => Err(PyValueError::new_err(format!(
-                "unknown entity feature adapter version {version:?}; expected {ENTITY_ADAPTER_V2:?} or {ENTITY_ADAPTER_V3:?}"
+                "unknown entity feature adapter version {version:?}; expected {ENTITY_ADAPTER_V2:?}, {ENTITY_ADAPTER_V3:?}, or {ENTITY_ADAPTER_V4:?}"
             ))),
         }
     }
@@ -9216,6 +9227,7 @@ pub mod python_bindings {
         meaningful_public_history: bool,
         requested_event_history_limit: usize,
         encode_structured_action_resources: bool,
+        encode_actor_public_rule_state: bool,
     ) -> PyResult<EntityFeatureArrays> {
         let state = &game.state;
         let actions = &game.playable_actions;
@@ -9452,6 +9464,33 @@ pub mod python_bindings {
             } else {
                 0.0
             };
+        }
+        if encode_actor_public_rule_state {
+            let actor_state = state.player_state(perspective_color);
+            global_tokens[8] = if actor_state.has_played_development_card_in_turn {
+                1.0
+            } else {
+                0.0
+            };
+            global_tokens[9] = if state.is_road_building { 1.0 } else { 0.0 };
+            global_tokens[10] = entity_scale(state.free_roads_available as i64, 2.0);
+            global_tokens[11] = entity_scale(
+                state.discard_counts[state.current_player_index] as i64,
+                10.0,
+            );
+            for (offset, card) in [
+                DevCard::Knight,
+                DevCard::YearOfPlenty,
+                DevCard::Monopoly,
+                DevCard::RoadBuilding,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let playable = actor_state.dev_cards[card.idx()]
+                    .min(actor_state.owned_at_start[card.idx()]);
+                global_tokens[12 + offset] = entity_scale(playable as i64, 5.0);
+            }
         }
         if let Some(idx) = entity_player_index(color_name(state.current_color())) {
             global_tokens[16 + idx] = 1.0;
@@ -9829,6 +9868,8 @@ pub mod python_bindings {
         let colors = parse_colors_list(&colors)?;
         let encode_structured_action_resources =
             entity_adapter_encodes_action_resources(entity_feature_adapter_version)?;
+        let encode_actor_public_rule_state =
+            entity_feature_adapter_version == ENTITY_ADAPTER_V4;
         let arrays = build_entity_feature_arrays(
             &game.game,
             &colors,
@@ -9839,6 +9880,7 @@ pub mod python_bindings {
             meaningful_public_history,
             event_history_limit,
             encode_structured_action_resources,
+            encode_actor_public_rule_state,
         )?;
         entity_feature_arrays_to_pydict(py, arrays)
     }
@@ -9925,6 +9967,8 @@ pub mod python_bindings {
         let colors = parse_colors_list(&colors)?;
         let encode_structured_action_resources =
             entity_adapter_encodes_action_resources(entity_feature_adapter_version)?;
+        let encode_actor_public_rule_state =
+            entity_feature_adapter_version == ENTITY_ADAPTER_V4;
         let batch_size = games.len();
 
         // Borrow every game's inner `Game` up front (needs the GIL) so the
@@ -9947,6 +9991,7 @@ pub mod python_bindings {
                         meaningful_public_history,
                         event_history_limit,
                         encode_structured_action_resources,
+                        encode_actor_public_rule_state,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -9965,6 +10010,7 @@ pub mod python_bindings {
                         meaningful_public_history,
                         event_history_limit,
                         encode_structured_action_resources,
+                        encode_actor_public_rule_state,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -10539,6 +10585,7 @@ pub mod python_bindings {
                 false,
                 ENTITY_EVENT_HISTORY_LIMIT,
                 false,
+                false,
             )
             .unwrap();
             let actor_base =
@@ -10551,6 +10598,67 @@ pub mod python_bindings {
             assert_eq!(arrays.player_tokens[opponent_base + 4], 0.0);
             assert_eq!(arrays.player_tokens[opponent_base + 15], 0.0);
             assert_eq!(arrays.player_tokens[opponent_base + 21], 0.0);
+        }
+
+        #[test]
+        fn entity_v4_global_slots_encode_actor_rule_state_contiguously() {
+            let mut py_game =
+                PyGame::simple(Some(vec!["RED".to_string(), "BLUE".to_string()]), Some(34))
+                    .unwrap();
+            let actor = py_game.game.state.current_color();
+            {
+                let actor_state = py_game.game.state.player_state_mut(actor);
+                actor_state.has_played_development_card_in_turn = true;
+                actor_state.dev_cards = [2, 1, 3, 4, 0];
+                actor_state.owned_at_start = [2, 1, 0, 2, 0];
+            }
+            py_game.game.state.is_road_building = true;
+            py_game.game.state.free_roads_available = 1;
+            let current_index = py_game.game.state.current_player_index;
+            py_game.game.state.discard_counts[current_index] = 3;
+
+            let topology = PyEntityTopology {
+                hex_vertex_ids: vec![vec![-1; 6]; 19],
+                hex_edge_ids: vec![vec![-1; 6]; 19],
+                edge_vertex_ids: vec![vec![-1; 2]; 72],
+                port_base_nodes: vec![vec![-1; 2]; 16],
+            };
+            let colors = py_game.game.state.colors.clone();
+            let policy_action_ids = vec![0; py_game.game.playable_actions.len()];
+            let legacy = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &policy_action_ids,
+                400,
+                &topology,
+                true,
+                false,
+                ENTITY_EVENT_HISTORY_LIMIT,
+                true,
+                false,
+            )
+            .unwrap();
+            let v4 = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &policy_action_ids,
+                400,
+                &topology,
+                true,
+                false,
+                ENTITY_EVENT_HISTORY_LIMIT,
+                true,
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(&legacy.global_tokens[8..16], &[0.0; 8]);
+            assert_eq!(
+                &v4.global_tokens[8..16],
+                &[1.0, 1.0, 0.5, 0.3, 0.4, 0.2, 0.0, 0.4]
+            );
+            let actor_index = entity_player_index(color_name(actor)).unwrap();
+            assert_eq!(v4.global_tokens[16 + actor_index], 1.0);
         }
 
         #[test]
@@ -10615,6 +10723,7 @@ pub mod python_bindings {
                 true,
                 ENTITY_EVENT_HISTORY_LIMIT,
                 true,
+                false,
             )
             .unwrap();
             assert_eq!(enabled.event_history_limit, 32);
@@ -10646,6 +10755,7 @@ pub mod python_bindings {
                 true,
                 false,
                 ENTITY_EVENT_HISTORY_LIMIT,
+                false,
                 false,
             )
             .unwrap();
@@ -10733,6 +10843,7 @@ pub mod python_bindings {
                 false,
                 ENTITY_EVENT_HISTORY_LIMIT,
                 false,
+                false,
             )
             .unwrap();
             let v3 = build_entity_feature_arrays(
@@ -10745,6 +10856,7 @@ pub mod python_bindings {
                 false,
                 ENTITY_EVENT_HISTORY_LIMIT,
                 true,
+                false,
             )
             .unwrap();
 
@@ -13338,7 +13450,7 @@ mod tests {
         {
             let ps = game.state.player_state_mut(p0);
             ps.dev_cards[DevCard::RoadBuilding.idx()] = 1;
-            ps.owned_at_start[DevCard::RoadBuilding.idx()] = true;
+            ps.owned_at_start[DevCard::RoadBuilding.idx()] = 1;
         }
         while !game
             .playable_actions
@@ -14553,7 +14665,7 @@ mod public_belief_determinization_tests {
         // removed from the unknown deck before sampling.
         first.state.player_state_mut(observer).resources = [1, 0, 1, 0, 1];
         first.state.player_state_mut(observer).dev_cards[DevCard::Knight.idx()] = 1;
-        first.state.player_state_mut(observer).owned_at_start[DevCard::Knight.idx()] = true;
+        first.state.player_state_mut(observer).owned_at_start[DevCard::Knight.idx()] = 1;
         for index in 0..5 {
             first.state.resource_freqdeck[index] -=
                 first.state.player_state(observer).resources[index];
@@ -14664,7 +14776,7 @@ mod public_belief_determinization_tests {
             );
             assert_eq!(
                 player.owned_at_start,
-                player.dev_cards.map(|count| count > 0),
+                player.dev_cards,
                 "sampled opponent playability metadata must match its hand",
             );
         }
@@ -14794,7 +14906,7 @@ mod public_belief_determinization_tests {
         {
             let opponent_state = game.state.player_state_mut(opponent);
             opponent_state.dev_cards = hidden_cards;
-            opponent_state.owned_at_start = hidden_cards.map(|count| count > 0);
+            opponent_state.owned_at_start = hidden_cards;
             opponent_state.actual_victory_points = opponent_state.victory_points
                 + i16::from(hidden_cards[DevCard::VictoryPoint.idx()]);
         }
@@ -14841,7 +14953,7 @@ mod public_belief_determinization_tests {
         {
             let opponent_state = second.state.player_state_mut(opponent);
             opponent_state.dev_cards = monopoly_hidden;
-            opponent_state.owned_at_start = monopoly_hidden.map(|count| count > 0);
+            opponent_state.owned_at_start = monopoly_hidden;
             opponent_state.actual_victory_points = opponent_state.victory_points;
         }
         let mut second_deck = starting_devcard_bank();

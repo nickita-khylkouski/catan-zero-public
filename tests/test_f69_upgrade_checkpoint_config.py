@@ -113,6 +113,24 @@ def test_public_card_count_upgrade_flag_is_explicit_and_default_off():
     assert upgraded.public_card_count_residual_bias is True
 
 
+def test_public_rule_state_upgrade_binds_v4_schema_and_parameter_allowlist():
+    base = EntityGraphConfig(action_size=607, static_action_feature_size=1)
+    assert base.public_rule_state_features is False
+
+    overrides = upgrade_tool._parse_flags("public_rule_state")
+    assert overrides == {
+        "public_rule_state_features": True,
+        "public_rule_state_feature_schema": "actor_public_rule_state_2p_v1",
+    }
+    upgraded = upgrade_tool._build_upgraded_config(base, overrides)
+    assert upgraded.public_rule_state_features is True
+    assert (
+        upgraded.public_rule_state_feature_schema
+        == "actor_public_rule_state_2p_v1"
+    )
+    assert "public_rule_state_residual." in upgrade_tool.NEW_PARAM_PREFIXES
+
+
 def test_structured_action_value_upgrade_enables_both_zero_diff_paths():
     base = EntityGraphConfig(action_size=607, static_action_feature_size=45)
     assert base.static_action_residual is False

@@ -68,12 +68,14 @@ from catan_zero.rl.entity_token_features import (
     GLOBAL_FEATURE_SIZE,
     HEX_FEATURE_SIZE,
     PLAYER_FEATURE_SIZE,
+    PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
     VERTEX_FEATURE_SIZE,
     public_card_count_features_from_entity_tokens,
 )
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
+    RUST_ENTITY_ADAPTER_V4,
     checkpoint_entity_feature_adapter_metadata,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
@@ -497,6 +499,18 @@ def build_parser() -> argparse.ArgumentParser:
             "public entity columns, and stored deduction_features are recomputed "
             "rather than trusted. Requires --mask-hidden-info. With an init/grow "
             "checkpoint the omitted default inherits its saved architecture flag."
+        ),
+    )
+    parser.add_argument(
+        "--public-rule-state-features",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable the adapter-v4 current actor/rule-state residual "
+            "(development-card playability, Road Building continuation, and "
+            "discard remainder). This is checkpoint-owned: omitted inherits an "
+            "init/grow checkpoint; enabling on an incumbent requires the "
+            "function-preserving public_rule_state upgrade."
         ),
     )
     parser.add_argument(
@@ -2608,6 +2622,23 @@ def _checkpoint_public_card_count_features(checkpoint_path: str) -> bool:
         )
     config = config_attr_view(checkpoint["config"])
     return bool(getattr(config, "public_card_count_features", False))
+
+
+def _checkpoint_public_rule_state_features(checkpoint_path: str) -> bool:
+    """Read the actor/rule-state input contract from a policy checkpoint."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --public-rule-state-features"
+        )
+    config = config_attr_view(checkpoint["config"])
+    return bool(getattr(config, "public_rule_state_features", False))
 
 
 def _checkpoint_structured_action_residuals(
@@ -7881,6 +7912,8 @@ def _effective_a1_learner_training_recipe(
         effective["value_tower_split_layers"] = int(
             args.value_tower_split_layers
         )
+    if bool(getattr(args, "public_rule_state_features", False)):
+        effective["public_rule_state_features"] = True
     # Additive opt-in objective: historical sealed recipes and old Namespace
     # fixtures predate this field and must remain byte-for-byte exact when it is
     # absent/off. A nonzero value is trajectory-changing and therefore enters
@@ -9196,6 +9229,38 @@ def _resolve_effective_public_card_count_features(
     return False if requested is None else requested
 
 
+def _resolve_effective_public_rule_state_features(
+    args: argparse.Namespace,
+) -> bool:
+    """Resolve the adapter-v4 state residual as checkpoint-owned architecture."""
+
+    requested_raw = getattr(args, "public_rule_state_features", None)
+    requested = None if requested_raw is None else bool(requested_raw)
+    if str(args.arch) != "entity_graph":
+        if requested:
+            raise SystemExit(
+                "--public-rule-state-features is supported only for "
+                "--arch entity_graph"
+            )
+        return False
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_public_rule_state_features(init_checkpoint)
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "--public-rule-state-features does not match --init-checkpoint: "
+                f"checkpoint={inherited} cli={requested}. Upgrade the checkpoint "
+                "with --flags public_rule_state or omit the flag."
+            )
+        return inherited
+    if grow_checkpoint:
+        inherited = _checkpoint_public_rule_state_features(grow_checkpoint)
+        return inherited if requested is None else requested
+    return False if requested is None else requested
+
+
 def _resolve_effective_structured_action_residuals(
     args: argparse.Namespace,
 ) -> tuple[bool, bool]:
@@ -10082,6 +10147,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.public_card_count_features = (
         _resolve_effective_public_card_count_features(args)
     )
+    args.public_rule_state_features = (
+        _resolve_effective_public_rule_state_features(args)
+    )
     (
         args.static_action_residual,
         args.legal_action_value_residual,
@@ -10291,6 +10359,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.public_card_count_features = (
         _resolve_effective_public_card_count_features(args)
     )
+    args.public_rule_state_features = (
+        _resolve_effective_public_rule_state_features(args)
+    )
     (
         args.static_action_residual,
         args.legal_action_value_residual,
@@ -10401,6 +10472,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--public-card-count-features requires --mask-hidden-info; the derived "
             "features are public-only, but the base opponent player slots must also "
             "be masked to keep the complete model input non-cheating"
+        )
+    if bool(args.public_rule_state_features) and not bool(args.mask_hidden_info):
+        raise SystemExit(
+            "--public-rule-state-features requires --mask-hidden-info; actor-private "
+            "playability is valid, but the remaining opponent entity columns must "
+            "still obey the public-observation contract"
         )
     _MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(args.mask_hidden_info)
     _PUBLIC_CARD_COUNT_FEATURES_ENABLED = bool(args.public_card_count_features)
@@ -10857,6 +10934,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     meaningful_public_history_pooling=str(
                         args.meaningful_public_history_pooling
                     ),
+                    public_rule_state_features=bool(
+                        args.public_rule_state_features
+                    ),
+                    public_rule_state_feature_schema=(
+                        PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+                    ),
                 )
                 policy.model.config = policy.config
             else:
@@ -10893,6 +10976,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ),
                     public_card_count_features=bool(
                         args.public_card_count_features
+                    ),
+                    public_rule_state_features=bool(
+                        args.public_rule_state_features
+                    ),
+                    public_rule_state_feature_schema=(
+                        PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+                    ),
+                    entity_feature_adapter_version=(
+                        RUST_ENTITY_ADAPTER_V4
+                        if bool(args.public_rule_state_features)
+                        else CURRENT_RUST_ENTITY_ADAPTER_VERSION
                     ),
                     **_structured_action_create_kwargs(args),
                     value_tower_split_layers=int(
@@ -22874,7 +22968,8 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
         else ""
     )
     if (
-        checkpoint_adapter_version == CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        checkpoint_adapter_version
+        in {CURRENT_RUST_ENTITY_ADAPTER_VERSION, RUST_ENTITY_ADAPTER_V4}
         and not nonempty_adapters
         and len(actions) >= 1000
     ):
@@ -28383,6 +28478,18 @@ def _checkpoint_config_mismatches(
                 f"checkpoint={checkpoint_card_counts} cli={requested_card_counts}; "
                 "use a function-preserving card_count checkpoint upgrade"
             )
+        checkpoint_rule_state = bool(
+            getattr(config, "public_rule_state_features", False)
+        )
+        requested_rule_state = bool(
+            getattr(args, "public_rule_state_features", False)
+        )
+        if checkpoint_rule_state != requested_rule_state:
+            mismatches.append(
+                "public_rule_state_features "
+                f"checkpoint={checkpoint_rule_state} cli={requested_rule_state}; "
+                "use the function-preserving public_rule_state checkpoint upgrade"
+            )
         for field in (
             "static_action_residual",
             "legal_action_value_residual",
@@ -28663,6 +28770,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "edge_encoder",
         "player_encoder",
         "public_card_count_residual",
+        "public_rule_state_residual",
         "global_encoder",
         "event_encoder",
         "meaningful_history_residual_gate",
@@ -28785,6 +28893,10 @@ def _effective_entity_graph_architecture_report(
             "value_tower_split_layers": 0,
             "public_card_count_features": False,
             "public_card_count_residual_bias": False,
+            "public_rule_state_features": False,
+            "public_rule_state_feature_schema": (
+                PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+            ),
             "meaningful_public_history": False,
             "meaningful_public_history_schema": (
                 MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
@@ -28827,6 +28939,17 @@ def _effective_entity_graph_architecture_report(
         ),
         "public_card_count_features": bool(
             getattr(config, "public_card_count_features", False)
+        ),
+        "public_rule_state_features": bool(
+            getattr(config, "public_rule_state_features", False)
+        ),
+        "public_rule_state_feature_schema": str(
+            getattr(
+                config,
+                "public_rule_state_feature_schema",
+                PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
+            )
+            or PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
         ),
         "public_card_count_residual_bias": (
             bool(getattr(config, "public_card_count_residual_bias", True))

@@ -1,0 +1,101 @@
+{
+  "schema_version": "a1-optimizer-ownership-training-signal-audit-v1",
+  "generated_at": "2026-07-16",
+  "repository_head": "213c09c53235a85c919faa398a618369fc932f4f",
+  "mode": "read_only_code_and_existing_b200_report_audit",
+  "findings": [
+    {
+      "id": "public_rule_state_residual_optimizer_ownership_escape",
+      "severity": "high",
+      "summary": "A shared policy-affecting zero-init adapter is absent from the canonical trunk ownership group.",
+      "code_evidence": {
+        "creation": "src/catan_zero/rl/entity_token_policy.py:585",
+        "shared_trunk_injection": "src/catan_zero/rl/entity_token_policy.py:1701",
+        "canonical_trunk_group": "tools/train_bc.py:28420",
+        "value_only_freeze_groups": "tools/train_bc.py:28479",
+        "trunk_lr_assignment": "tools/train_bc.py:28978",
+        "base_group_fallback": "tools/train_bc.py:29030",
+        "shared_trunk_telemetry_selection": "tools/train_bc.py:25444"
+      },
+      "direct_measurement": {
+        "hidden_size": 384,
+        "adapter_parameters": 3072,
+        "initialization": "all_zero",
+        "base_lr": 0.00012,
+        "trunk_lr_mult": 0.1,
+        "intended_trunk_lr": 0.000012,
+        "actual_group": "base",
+        "actual_lr": 0.00012,
+        "lr_error_multiplier": 10.0,
+        "requires_grad_after_value_only_freeze": true,
+        "one_step_value_only_gradient_l1": 0.10997,
+        "one_step_max_parameter_update": 0.00012,
+        "one_step_max_policy_logit_change": 0.0000112
+      },
+      "impact": [
+        "A nominal value-only repair can change policy logits.",
+        "Reduced-trunk-LR experiments overtrain this fresh shared adapter.",
+        "Objective-gradient telemetry omits the escaping path."
+      ],
+      "required_repair": [
+        "Add public_rule_state_residual to canonical trunk ownership.",
+        "Cover it in trunk LR assignment and value-only freezing.",
+        "Cover it in shared-trunk gradient telemetry.",
+        "Add LR ownership and value-only policy-invariance tests."
+      ]
+    },
+    {
+      "id": "value_lr_multiplier_does_not_scale_shared_trunk",
+      "severity": "high_semantic",
+      "summary": "value_lr_mult changes value-specific parameters only; it does not reduce value gradients entering the shared representation.",
+      "code_evidence": {
+        "value_module_list": "tools/train_bc.py:28836",
+        "optimizer_assignment": "tools/train_bc.py:28950",
+        "explicit_report_field": "tools/train_bc.py:25798",
+        "causal_shared_gradient_control": "value_trunk_grad_scale"
+      },
+      "b200_sources": {
+        "root": "/home/ubuntu/catan_rl_evidence_bundle_20260715/03_learner_sweeps",
+        "coherent_active_policy": "coherent_active_policy_four_arm/*/train.report.json",
+        "trust_recovery": "trust_recovery_r2/run-8794e56/arms/*/train.report.json"
+      },
+      "parameter_scale_example": {
+        "forward_active_parameters": 33407431,
+        "transformer_block_parameters": 29541120,
+        "value_head_telemetry_group_parameters": 410881
+      },
+      "coherent_active_policy_value_trunk_scale_1": {
+        "value_lr_mult": 0.3,
+        "value_trunk_grad_scale": 1.0,
+        "mean_shared_gradient_cosine_range": [
+          -0.0575,
+          0.0197
+        ],
+        "negative_cosine_fraction_range": [
+          0.412,
+          0.676
+        ],
+        "mean_value_to_policy_gradient_norm_ratio_range": [
+          0.514,
+          0.891
+        ]
+      },
+      "trust_recovery_value_trunk_scale_point25": {
+        "value_lr_mult": 0.3,
+        "value_trunk_grad_scale": 0.25,
+        "mean_value_to_policy_gradient_norm_ratio_range": [
+          0.175,
+          0.192
+        ],
+        "trust_v25_shared_blocks_mean_parameter_delta": 0.084122291,
+        "trust_v25_value_head_mean_parameter_delta": 0.003460306,
+        "trust_v25_negative_cosine_fraction": 0.5
+      },
+      "interpretation": [
+        "Historical value_lr_mult=0.3 runs undertrained value-specific parameters without protecting the shared trunk.",
+        "value_trunk_grad_scale or an architectural tower split is required to control shared representation damage.",
+        "The three controls value_lr_mult, value_trunk_grad_scale, and trunk_lr_mult must not be treated as interchangeable."
+      ]
+    }
+  ]
+}

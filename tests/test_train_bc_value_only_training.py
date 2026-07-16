@@ -89,6 +89,7 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "meaningful_history_gate",
     }
     assert "value_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
+    assert "public_rule_state_residual" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
     assert (
         "value_categorical_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
     )

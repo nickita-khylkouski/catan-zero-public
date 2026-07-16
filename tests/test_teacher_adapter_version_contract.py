@@ -13,7 +13,10 @@ if str(_TOOLS) not in sys.path:
 
 import train_bc  # type: ignore  # noqa: E402
 from build_memmap_corpus import build_memmap_corpus  # type: ignore  # noqa: E402
-from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V2  # noqa: E402
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    RUST_ENTITY_ADAPTER_V2,
+    RUST_ENTITY_ADAPTER_V4,
+)
 from catan_zero.search.neural_rust_mcts import (  # noqa: E402
     RUST_ENTITY_ADAPTER_VERSION,
 )
@@ -95,6 +98,10 @@ class _LegacyEntityPolicy(_EntityPolicy):
     entity_feature_adapter_version = RUST_ENTITY_ADAPTER_V2
 
 
+class _V4EntityPolicy(_EntityPolicy):
+    entity_feature_adapter_version = RUST_ENTITY_ADAPTER_V4
+
+
 @pytest.mark.parametrize(
     ("versions", "message"),
     [
@@ -162,6 +169,28 @@ def test_current_entity_schema_rejects_missing_production_adapter_provenance(
     with pytest.raises(SystemExit, match="missing adapter_version.*current entity adapter"):
         train_bc.validate_teacher_data_schema(
             _EntityPolicy(), data, {"invalid_teacher_actions": 0}, object()
+        )
+
+
+def test_v4_entity_schema_rejects_missing_production_adapter_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        train_bc, "_expected_action_mask_version", lambda _config: "catalog-v1"
+    )
+    monkeypatch.setattr(
+        train_bc, "_expected_static_action_features_sha256", lambda _config: ""
+    )
+    monkeypatch.setattr(
+        train_bc, "_policy_static_action_features_sha256", lambda _policy: ""
+    )
+    seed = _teacher_arrays(None)
+    data = {key: np.repeat(value, 500, axis=0) for key, value in seed.items()}
+    data["action_mask_version"] = np.full(1000, "catalog-v1")
+
+    with pytest.raises(SystemExit, match="missing adapter_version.*entity adapter"):
+        train_bc.validate_teacher_data_schema(
+            _V4EntityPolicy(), data, {"invalid_teacher_actions": 0}, object()
         )
 
 
