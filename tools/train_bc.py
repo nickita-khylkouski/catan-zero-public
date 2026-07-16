@@ -102,6 +102,10 @@ from catan_zero.rl.flywheel.composite_contract import (
 
 
 CHECKOUT_RUNTIME_BINDING_SCHEMA = "train-bc-checkout-runtime-v1"
+_VALUE_PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
+_VALUE_PLAYER_INDEX = {
+    player: index for index, player in enumerate(_VALUE_PLAYER_NAMES)
+}
 
 
 def _path_within(path: Path, root: Path) -> bool:
@@ -10250,6 +10254,27 @@ def main(argv: Sequence[str] | None = None) -> None:
                 float(args.belief_resource_loss_weight) > 0.0
             ),
         )
+    if bool(args.ddp_shard_data) and "winner" in data and "player" in data:
+        raise SystemExit(
+            "--ddp-shard-data cannot prove corpus-wide value outcome label "
+            "admission because rank 0 sees only its local NPZ subset; use the "
+            "shared memmap/non-sharded corpus path"
+        )
+    outcome_label_admission = _rank0_authoritative_call(
+        ddp,
+        "value outcome label admission",
+        lambda: _validate_value_outcome_labels(data),
+    )
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "value_outcome_label_admission",
+                **outcome_label_admission,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
     belief_resource_coverage = None
     if float(args.belief_resource_loss_weight) > 0.0:
         if bool(args.ddp_shard_data):
@@ -10729,6 +10754,34 @@ def main(argv: Sequence[str] | None = None) -> None:
                 json.dumps({"progress": "warm_start_grow", **grow_report}, sort_keys=True),
                 ddp,
             )
+        scratch_history_initialization = (
+            _initialize_scratch_meaningful_history_path(
+                policy,
+                scratch=not bool(args.init_checkpoint or args.grow_from_checkpoint),
+            )
+            if args.arch == "entity_graph"
+            else {
+                "enabled": False,
+                "scratch": not bool(
+                    args.init_checkpoint or args.grow_from_checkpoint
+                ),
+                "masked_mean_gate_initialization": "not_applicable",
+            }
+        )
+        training_information_surface = {
+            **(training_information_surface or {}),
+            "meaningful_history_initialization": scratch_history_initialization,
+        }
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "meaningful_history_initialization",
+                    **scratch_history_initialization,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
         public_award_feature_training = _configure_public_award_feature_training(
             policy, data, args
         )
@@ -14772,6 +14825,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_distillation_scope": policy_distillation_scope_report,
         "policy_target_identity_admission": policy_target_identity_admission,
         "value_training_scope": value_training_scope_report,
+        "value_outcome_label_admission": outcome_label_admission,
         "aux_subgoal_training_contract": aux_subgoal_training_contract,
         "policy_component_active_dose": policy_component_active_dose,
         "training_strata_dose": training_strata_dose,
@@ -15495,6 +15549,58 @@ def _route_mixed_public_award_batch(
     ] = 0
     routed["player_tokens"] = routed_players
     return routed
+
+
+def _initialize_scratch_meaningful_history_path(
+    policy: Any,
+    *,
+    scratch: bool,
+) -> dict[str, object]:
+    """Activate history immediately only for a genuinely new model.
+
+    A zero gate is required when adding history to an incumbent checkpoint:
+    it preserves the parent's function exactly. A scratch model has no parent
+    function to preserve, and leaving the gate at zero blocks every gradient
+    into the event encoder on step one and attenuates the path throughout a
+    short learner dose. Start the established masked-mean path at unit scale
+    for scratch models; an ordered-v2 additive gate remains zero so it can be
+    commissioned separately from the mean path.
+    """
+
+    model = getattr(policy, "model", policy)
+    config = getattr(policy, "config", getattr(model, "config", None))
+    enabled = bool(getattr(config, "meaningful_public_history", False))
+    if not enabled:
+        return {
+            "enabled": False,
+            "scratch": bool(scratch),
+            "masked_mean_gate_initialization": "not_applicable",
+        }
+    gate = getattr(model, "meaningful_history_residual_gate", None)
+    if gate is None:
+        raise RuntimeError(
+            "meaningful public history is enabled but its residual gate is absent"
+        )
+    if not scratch:
+        return {
+            "enabled": True,
+            "scratch": False,
+            "masked_mean_gate_initialization": "checkpoint_preserved",
+            "ordered_additive_gate_initialization": "checkpoint_preserved",
+        }
+    import torch
+
+    with torch.no_grad():
+        gate.fill_(1.0)
+    ordered_gate = getattr(model, "meaningful_history_ordered_gate", None)
+    return {
+        "enabled": True,
+        "scratch": True,
+        "masked_mean_gate_initialization": "ones",
+        "ordered_additive_gate_initialization": (
+            "zeros" if ordered_gate is not None else "not_present"
+        ),
+    }
 
 
 def _meaningful_event_history_batch(
@@ -24444,6 +24550,167 @@ def _value_targets(
         torch.as_tensor(value_has_outcome_np, dtype=torch.bool, device=device),
         torch.as_tensor(outcome_confidence, dtype=torch.float32, device=device),
     )
+
+
+def _validate_value_outcome_labels(
+    data: Mapping[str, object],
+    *,
+    chunk_rows: int = 1 << 20,
+) -> dict[str, object]:
+    """Fail closed before a malformed winner becomes a universal ``-1`` label.
+
+    ``_value_targets`` is intentionally simple: a clean row is positive when
+    ``winner == player`` and negative otherwise. Without corpus admission, any
+    non-empty typo, truncated fixed-width string, or winner from an unseated
+    color silently turns every row in that game into a loss. Validate the
+    actor/seat domain and accumulate per-game seated-player/winner masks in
+    bounded chunks before the first optimizer step.
+    """
+
+    if "winner" not in data or "player" not in data:
+        return {
+            "schema_version": "value-outcome-label-admission-v1",
+            "present": False,
+            "rows": int(len(data.get("action_taken", ()))),
+            "games": 0,
+            "clean_outcome_games": 0,
+        }
+    n = int(len(data["player"]))
+    if len(data["winner"]) != n:
+        raise SystemExit("winner/player columns are not row-aligned")
+    if chunk_rows <= 0:
+        raise ValueError("chunk_rows must be positive")
+    optional_columns = ("game_seed", "seat", "terminated", "truncated")
+    malformed_lengths = {
+        name: len(data[name])
+        for name in optional_columns
+        if name in data and len(data[name]) != n
+    }
+    if malformed_lengths:
+        raise SystemExit(
+            "value outcome columns are not row-aligned: "
+            f"rows={n}, malformed={malformed_lengths}"
+        )
+
+    game_player_masks: dict[int, int] = {}
+    game_winner_masks: dict[int, int] = {}
+    clean_outcome_rows = 0
+    for start in range(0, n, int(chunk_rows)):
+        stop = min(start + int(chunk_rows), n)
+        row_slice = slice(start, stop)
+        players = np.asarray(data["player"][row_slice]).astype(str)
+        winners = np.asarray(data["winner"][row_slice]).astype(str)
+        player_codes = np.asarray(
+            [_VALUE_PLAYER_INDEX.get(value, -1) for value in players],
+            dtype=np.int8,
+        )
+        winner_codes = np.asarray(
+            [
+                -1 if value == "" else _VALUE_PLAYER_INDEX.get(value, -2)
+                for value in winners
+            ],
+            dtype=np.int8,
+        )
+        invalid_players = np.flatnonzero(player_codes < 0)
+        invalid_winners = np.flatnonzero(winner_codes == -2)
+        if invalid_players.size or invalid_winners.size:
+            examples = {
+                "players": sorted(set(players[invalid_players].tolist()))[:8],
+                "winners": sorted(set(winners[invalid_winners].tolist()))[:8],
+            }
+            raise SystemExit(
+                "value outcome labels contain unknown player/winner values: "
+                f"{examples}"
+            )
+        if "seat" in data:
+            seats = np.asarray(data["seat"][row_slice], dtype=np.int64)
+            bad_seats = seats != player_codes.astype(np.int64)
+            if np.any(bad_seats):
+                index = int(np.flatnonzero(bad_seats)[0])
+                raise SystemExit(
+                    "value outcome actor/seat perspective mismatch at row "
+                    f"{start + index}: player={players[index]!r}, "
+                    f"seat={int(seats[index])}, expected={int(player_codes[index])}"
+                )
+        nonempty = winner_codes >= 0
+        clean_outcome_rows += int(np.count_nonzero(nonempty))
+        if "truncated" in data:
+            truncated = np.asarray(data["truncated"][row_slice], dtype=np.bool_)
+            if np.any(nonempty & truncated):
+                raise SystemExit("truncated rows carry a non-empty terminal winner")
+        if "terminated" in data:
+            terminated = np.asarray(data["terminated"][row_slice], dtype=np.bool_)
+            if np.any(nonempty & ~terminated):
+                raise SystemExit("non-terminal rows carry a non-empty winner")
+            if np.any(terminated & ~nonempty):
+                raise SystemExit("terminal rows are missing their winner label")
+
+        if "game_seed" not in data:
+            continue
+        seeds = np.asarray(data["game_seed"][row_slice], dtype=np.int64)
+        unique_seeds, inverse = np.unique(seeds, return_inverse=True)
+        player_masks = np.zeros(len(unique_seeds), dtype=np.uint8)
+        winner_masks = np.zeros(len(unique_seeds), dtype=np.uint8)
+        np.bitwise_or.at(
+            player_masks,
+            inverse,
+            np.left_shift(np.uint8(1), player_codes.astype(np.uint8)),
+        )
+        if np.any(nonempty):
+            np.bitwise_or.at(
+                winner_masks,
+                inverse[nonempty],
+                np.left_shift(
+                    np.uint8(1), winner_codes[nonempty].astype(np.uint8)
+                ),
+            )
+        for seed, player_mask, winner_mask in zip(
+            unique_seeds, player_masks, winner_masks, strict=True
+        ):
+            key = int(seed)
+            game_player_masks[key] = game_player_masks.get(key, 0) | int(
+                player_mask
+            )
+            game_winner_masks[key] = game_winner_masks.get(key, 0) | int(
+                winner_mask
+            )
+
+    malformed_games = []
+    clean_outcome_games = 0
+    for seed, player_mask in game_player_masks.items():
+        winner_mask = game_winner_masks.get(seed, 0)
+        if winner_mask:
+            clean_outcome_games += 1
+        if (
+            winner_mask
+            and (winner_mask & (winner_mask - 1)) != 0
+            or winner_mask & ~player_mask
+        ):
+            malformed_games.append(
+                {
+                    "game_seed": seed,
+                    "seated_player_mask": player_mask,
+                    "winner_mask": winner_mask,
+                }
+            )
+            if len(malformed_games) >= 8:
+                break
+    if malformed_games:
+        raise SystemExit(
+            "value outcome winner is inconsistent or not seated in its game: "
+            f"{malformed_games}"
+        )
+    return {
+        "schema_version": "value-outcome-label-admission-v1",
+        "present": True,
+        "rows": n,
+        "games": len(game_player_masks),
+        "clean_outcome_rows": clean_outcome_rows,
+        "clean_outcome_games": clean_outcome_games,
+        "player_domain": list(_VALUE_PLAYER_NAMES),
+        "actor_seat_perspective_verified": "seat" in data,
+        "winner_seated_per_game_verified": "game_seed" in data,
+    }
 
 
 def _masked_metric_mean(values, mask):

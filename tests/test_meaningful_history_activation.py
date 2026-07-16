@@ -194,6 +194,32 @@ def test_combined_zero_initialized_adapters_receive_optimizer_signal() -> None:
     )
 
 
+def test_scratch_training_activates_mean_history_but_warm_start_preserves_zero():
+    from tools import train_bc
+
+    scratch = EntityGraphNet(_config(history=True)).train()
+    scratch_report = train_bc._initialize_scratch_meaningful_history_path(
+        scratch, scratch=True
+    )
+    assert scratch_report["masked_mean_gate_initialization"] == "ones"
+    assert torch.equal(
+        scratch.meaningful_history_residual_gate,
+        torch.ones_like(scratch.meaningful_history_residual_gate),
+    )
+
+    warm_start = EntityGraphNet(_config(history=True)).train()
+    warm_report = train_bc._initialize_scratch_meaningful_history_path(
+        warm_start, scratch=False
+    )
+    assert (
+        warm_report["masked_mean_gate_initialization"]
+        == "checkpoint_preserved"
+    )
+    assert torch.count_nonzero(
+        warm_start.meaningful_history_residual_gate
+    ).item() == 0
+
+
 def test_zero_gate_preserves_incumbent_dropout_rng_and_event_encoder_gradients():
     torch.manual_seed(29)
     incumbent = EntityGraphNet(_config(history=False, dropout=0.2)).train()
