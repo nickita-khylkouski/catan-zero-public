@@ -896,6 +896,31 @@ def test_epoch_outputs_reject_malformed_objective_matched_validation(
         )
 
 
+def test_epoch_outputs_do_not_fall_back_to_raw_when_natural_composite_is_present(
+    tmp_path: Path,
+) -> None:
+    verified = _bind_corrective_ablation(
+        _verified(tmp_path),
+        overrides={"epochs": 3, "lr": 0.00012, "loser_sample_weight": 1.0},
+    )
+    binding = dual._execution_binding(["train"], verified)  # noqa: SLF001
+    checkpoint, report = _write_outputs(tmp_path, verified, binding)
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    for metric in payload["metrics"]:
+        metric["validation_natural_composite"] = {
+            "schema_version": "composite-validation-measure-v3",
+            "validation_key": "validation_natural_composite",
+            "objective_matched": False,
+            "metrics": {"loss": 0.01},
+        }
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(dual.DualTrainError, match="malformed objective-matched"):
+        dual.verify_outputs(
+            verified=verified, checkpoint=checkpoint, report=report, binding=binding
+        )
+
+
 def test_promotion_receipt_verifier_accepts_dual_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

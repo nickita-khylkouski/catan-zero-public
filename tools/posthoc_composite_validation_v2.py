@@ -361,8 +361,13 @@ def run_rescore(
         ),
         validation_value_player_outcome_balance_mode="none",
     )
-    if natural.get("schema_version") != "composite-validation-measure-v2":
-        raise RuntimeError("trainer did not emit composite validation v2")
+    if (
+        natural.get("schema_version")
+        != train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3
+        or natural.get("validation_key")
+        != train_bc.NATURAL_COMPOSITE_VALIDATION_KEY
+    ):
+        raise RuntimeError("trainer did not emit natural composite validation v3")
     after = {name: _sha256(path) for name, path in paths.items()}
     if after != before:
         raise RuntimeError("posthoc validation input bytes changed during evaluation")

@@ -308,6 +308,21 @@ def test_verify_training_report_requires_objective_matched_component_metrics(
         executor.verify_training_report(path, report)
 
 
+def test_verify_training_report_rejects_ambiguous_natural_validation_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, payload = _manifest(tmp_path, monkeypatch)
+    report = _write_realized_report(payload)
+    value = json.loads(report.read_text(encoding="utf-8"))
+    value["metrics"][0]["validation_natural_composite"] = {
+        "objective_matched": False
+    }
+    report.write_text(json.dumps(value), encoding="utf-8")
+
+    with pytest.raises(executor.ExecutionError, match="objective-matched validation"):
+        executor.verify_training_report(path, report)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

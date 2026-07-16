@@ -147,10 +147,15 @@ def test_objective_matched_validation_is_component_then_game_then_row() -> None:
     assert report["components"]["n128"]["max_rows_per_game"] == 3
     assert report["components"]["replay"]["metrics"]["loss"] == 10.0
     assert report["component_sampling_ratios"] == {"n128": 0.75, "replay": 0.25}
-    assert report["schema_version"] == "composite-validation-measure-v2"
+    assert report["schema_version"] == "composite-validation-measure-v3"
+    assert report["validation_key"] == "validation_objective_matched"
     assert report["provenance"]["schema_version"] == (
-        "composite-validation-provenance-v2"
+        "composite-validation-provenance-v3"
     )
+    assert report["provenance"]["validation_key"] == (
+        "validation_objective_matched"
+    )
+    assert report["provenance"]["objective_match_sha256"].startswith("sha256:")
     assert report["provenance"]["descriptor_fingerprint"] == "sha256:" + "d" * 64
     assert report["provenance"]["payload_inventory_sha256"] == "sha256:" + "e" * 64
     assert report["provenance"]["source_authority_semantic_sha256"] == (
@@ -199,6 +204,8 @@ def test_natural_outcome_validation_is_not_labeled_sampler_balanced() -> None:
 
     assert report["metrics"]["value_loss"] == pytest.approx(4.75)
     assert report["objective_matched"] is False
+    assert report["schema_version"] == "composite-validation-measure-v3"
+    assert report["validation_key"] == "validation_natural_composite"
     assert report["objective_match"] == {
         "component_game_row_sampling_matched": True,
         "training_value_player_outcome_balance_mode": "sampler_balanced_v1",
@@ -215,9 +222,40 @@ def test_natural_outcome_validation_is_not_labeled_sampler_balanced() -> None:
             epoch
         )
     report["objective_matched"] = True
-    with pytest.raises(ValueError, match="contract is inconsistent"):
+    with pytest.raises(ValueError, match="key-role provenance"):
         objective_matched_validation_metrics(
             {"validation_objective_matched": report}
+        )
+
+
+def test_natural_v3_cannot_be_redeclared_as_objective_matched_without_invalidating_provenance() -> None:
+    report = evaluate_composite_validation_measure(
+        _Composite(),
+        np.arange(6, dtype=np.int64),
+        lambda indices: {
+            "samples": int(len(indices)),
+            "loss": float(len(indices)),
+            "value_loss": float(len(indices)),
+            "loss_denominators": {"value_loss": float(len(indices))},
+            "objective_coefficients": {"value_loss": 1.0},
+        },
+        evaluation_identity=_evaluation_identity(),
+        training_value_player_outcome_balance_mode="sampler_balanced_v1",
+        validation_value_player_outcome_balance_mode="none",
+    )
+    report["objective_matched"] = True
+    report["validation_key"] = "validation_objective_matched"
+    report["objective_match"] = {
+        **report["objective_match"],
+        "training_value_player_outcome_balance_mode": "none",
+        "value_player_outcome_balance_matched": True,
+    }
+
+    with pytest.raises(ValueError, match="key-role provenance"):
+        objective_matched_validation_metrics(
+            {"validation_objective_matched": report},
+            require_matched=True,
+            require_provenance=True,
         )
 
 

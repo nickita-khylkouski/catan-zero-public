@@ -10044,7 +10044,12 @@ def _verify_training_outputs(
             )
         if (
             not isinstance(matched, dict)
-            or matched.get("schema_version") != "composite-validation-measure-v2"
+            or matched.get("schema_version")
+            not in {
+                train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA,
+                train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+                train_bc.POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+            }
             or matched.get("objective_matched") is not True
             or matched.get("samples") != int(verified["validation_row_count"])
             or matched.get("games")

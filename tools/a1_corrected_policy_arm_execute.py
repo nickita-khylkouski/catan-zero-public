@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools import a1_corrected_policy_arm as prepare  # noqa: E402
+from tools import train_bc  # noqa: E402
 
 
 RECEIPT_SCHEMA = "a1-corrected-policy-arm-execution-receipt-v1"
@@ -435,10 +436,35 @@ def verify_training_report(manifest_path: Path, report_path: Path) -> dict[str, 
     metrics = report.get("metrics")
     if not isinstance(metrics, list) or len(metrics) != 1 or not isinstance(metrics[0], dict):
         raise ExecutionError("one-dose report must contain exactly one epoch of metrics")
+    if "validation_natural_composite" in metrics[0]:
+        raise ExecutionError("training report lacks objective-matched validation")
     matched = metrics[0].get("validation_objective_matched")
+    try:
+        if isinstance(matched, dict):
+            train_bc._validate_composite_validation_key_role(  # noqa: SLF001
+                matched,
+                expected_key=train_bc.OBJECTIVE_MATCHED_VALIDATION_KEY,
+            )
+            if matched.get("schema_version") in {
+                train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+                train_bc.POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+            }:
+                train_bc.objective_matched_validation_metrics(
+                    metrics[0],
+                    require_matched=True,
+                    require_provenance=True,
+                )
+    except ValueError as error:
+        raise ExecutionError(
+            "training report lacks objective-matched validation"
+        ) from error
     if not (
         isinstance(matched, dict)
-        and matched.get("schema_version") == "composite-validation-measure-v2"
+        and matched.get("schema_version")
+        in {
+            train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA,
+            train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+        }
         and matched.get("objective_matched") is True
         and matched.get("component_sampling_ratios")
         == {

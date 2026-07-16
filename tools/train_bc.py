@@ -15763,9 +15763,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 validation_value_player_outcome_balance_mode="none",
             )
             validation_key = (
-                "validation_objective_matched"
+                OBJECTIVE_MATCHED_VALIDATION_KEY
                 if composite_validation["objective_matched"] is True
-                else "validation_natural_composite"
+                else NATURAL_COMPOSITE_VALIDATION_KEY
             )
             metrics[-1][validation_key] = composite_validation
         if policy_aux_validation_sampling_weights is not None:
@@ -15883,9 +15883,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
                 )
             base_validation_key = (
-                "validation_objective_matched"
-                if "validation_objective_matched" in metrics[-1]
-                else "validation_natural_composite"
+                OBJECTIVE_MATCHED_VALIDATION_KEY
+                if OBJECTIVE_MATCHED_VALIDATION_KEY in metrics[-1]
+                else NATURAL_COMPOSITE_VALIDATION_KEY
             )
             base_wrapper = metrics[-1].get(base_validation_key)
             base_objective_metrics = (
@@ -15910,7 +15910,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             objective_wrapper.update(
                 {
-                    "schema_version": "policy-aux-validation-measure-v1",
+                    "schema_version": POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
                     "measure": (
                         f"{objective_wrapper.get('measure', 'weighted_held_out_base')}"
                         "+conditioned_policy_aux"
@@ -19150,11 +19150,18 @@ _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
 )
 
 COMPOSITE_VALIDATION_MEASURE_SCHEMA = "composite-validation-measure-v2"
+COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3 = "composite-validation-measure-v3"
 COMPOSITE_VALIDATION_MEASURE = (
     "authenticated_component_then_uniform_game_then_uniform_row_"
     "with_objective_weight_density"
 )
 COMPOSITE_VALIDATION_PROVENANCE_SCHEMA = "composite-validation-provenance-v2"
+COMPOSITE_VALIDATION_PROVENANCE_SCHEMA_V3 = (
+    "composite-validation-provenance-v3"
+)
+POLICY_AUX_VALIDATION_MEASURE_SCHEMA = "policy-aux-validation-measure-v2"
+OBJECTIVE_MATCHED_VALIDATION_KEY = "validation_objective_matched"
+NATURAL_COMPOSITE_VALIDATION_KEY = "validation_natural_composite"
 COMPOSITE_VALIDATION_EVALUATION_SCHEMA = (
     "objective-matched-validation-evaluation-identity-v1"
 )
@@ -19365,10 +19372,23 @@ def _objective_matched_promotion_metrics_binding(
         if not isinstance(component_id, str) or not isinstance(values, dict):
             raise ValueError("objective-matched component promotion metrics are malformed")
         component_metrics[component_id] = values
-    return {
+    binding = {
         "aggregate_metrics": metrics,
         "component_metrics": component_metrics,
     }
+    if matched.get("schema_version") in {
+        COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+        POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+    }:
+        binding["validation_contract"] = {
+            "schema_version": matched.get("schema_version"),
+            "measure": matched.get("measure"),
+            "objective_matched": matched.get("objective_matched"),
+            "validation_key": matched.get("validation_key"),
+            "objective_match": matched.get("objective_match"),
+            "policy_aux": matched.get("policy_aux"),
+        }
+    return binding
 
 
 def _reseal_objective_matched_validation_wrapper(
@@ -19388,6 +19408,74 @@ def _reseal_objective_matched_validation_wrapper(
     return matched
 
 
+def _validate_composite_validation_key_role(
+    wrapper: Mapping[str, object], *, expected_key: str
+) -> None:
+    """Authenticate whether a composite wrapper is decision or natural evidence."""
+
+    schema = wrapper.get("schema_version")
+    if schema in {
+        COMPOSITE_VALIDATION_MEASURE_SCHEMA,
+        "policy-aux-validation-measure-v1",
+    }:
+        provenance = wrapper.get("provenance")
+        if (
+            expected_key != OBJECTIVE_MATCHED_VALIDATION_KEY
+            or wrapper.get("objective_matched") is not True
+            or wrapper.get("objective_match") is not None
+            or wrapper.get("validation_key") is not None
+            or (
+                isinstance(provenance, Mapping)
+                and provenance.get("schema_version")
+                != COMPOSITE_VALIDATION_PROVENANCE_SCHEMA
+            )
+        ):
+            raise ValueError("legacy composite validation has an invalid key role")
+        return
+    if schema not in {
+        COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+        POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+    }:
+        raise ValueError("composite validation schema is unsupported")
+    objective_match = wrapper.get("objective_match")
+    expected_fields = {
+        "component_game_row_sampling_matched",
+        "training_value_player_outcome_balance_mode",
+        "validation_value_player_outcome_balance_mode",
+        "value_player_outcome_balance_matched",
+        "validation_outcome_measure",
+    }
+    if not isinstance(objective_match, dict) or set(objective_match) != expected_fields:
+        raise ValueError("composite validation v3 declaration is malformed")
+    outcome_matched = (
+        objective_match["training_value_player_outcome_balance_mode"]
+        == objective_match["validation_value_player_outcome_balance_mode"]
+    )
+    declared_key = (
+        OBJECTIVE_MATCHED_VALIDATION_KEY
+        if outcome_matched
+        else NATURAL_COMPOSITE_VALIDATION_KEY
+    )
+    provenance = wrapper.get("provenance")
+    if (
+        objective_match.get("component_game_row_sampling_matched") is not True
+        or objective_match.get("value_player_outcome_balance_matched")
+        is not outcome_matched
+        or wrapper.get("objective_matched") is not outcome_matched
+        or wrapper.get("validation_key") != declared_key
+        or expected_key != declared_key
+        or not isinstance(provenance, dict)
+        or provenance.get("schema_version")
+        != COMPOSITE_VALIDATION_PROVENANCE_SCHEMA_V3
+        or provenance.get("validation_key") != declared_key
+        or provenance.get("objective_match_sha256")
+        != _canonical_json_sha256(objective_match)
+        or wrapper.get("provenance_sha256")
+        != _canonical_json_sha256(provenance)
+    ):
+        raise ValueError("composite validation v3 key-role provenance is malformed")
+
+
 def _validated_objective_matched_validation_wrapper(
     epoch_metrics: dict,
     *,
@@ -19396,9 +19484,16 @@ def _validated_objective_matched_validation_wrapper(
 ) -> dict | None:
     """Validate the complete authenticated validation wrapper before use."""
 
-    matched = epoch_metrics.get("validation_objective_matched")
+    if (
+        OBJECTIVE_MATCHED_VALIDATION_KEY in epoch_metrics
+        and NATURAL_COMPOSITE_VALIDATION_KEY in epoch_metrics
+    ):
+        raise ValueError(
+            "validation epoch declares both objective-matched and natural composite roles"
+        )
+    matched = epoch_metrics.get(OBJECTIVE_MATCHED_VALIDATION_KEY)
     if not isinstance(matched, dict):
-        natural = epoch_metrics.get("validation_natural_composite")
+        natural = epoch_metrics.get(NATURAL_COMPOSITE_VALIDATION_KEY)
         if isinstance(natural, dict):
             raise ValueError(
                 "natural composite validation does not match the learner objective; "
@@ -19412,11 +19507,23 @@ def _validated_objective_matched_validation_wrapper(
         return None
     schema = matched.get("schema_version")
     measure = matched.get("measure")
+    current_schema = schema in {
+        COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+        POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+    }
     allowed_measure = (
         measure == COMPOSITE_VALIDATION_MEASURE
-        if schema == COMPOSITE_VALIDATION_MEASURE_SCHEMA
+        if schema
+        in {
+            COMPOSITE_VALIDATION_MEASURE_SCHEMA,
+            COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+        }
         else (
-            schema == "policy-aux-validation-measure-v1"
+            schema
+            in {
+                "policy-aux-validation-measure-v1",
+                POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+            }
             and measure == f"{COMPOSITE_VALIDATION_MEASURE}+conditioned_policy_aux"
         )
     )
@@ -19443,7 +19550,14 @@ def _validated_objective_matched_validation_wrapper(
         if require_matched or matched:
             raise ValueError("objective-matched validation wrapper is malformed")
         return None
+    _validate_composite_validation_key_role(
+        matched, expected_key=OBJECTIVE_MATCHED_VALIDATION_KEY
+    )
     objective_match = matched.get("objective_match")
+    if current_schema and objective_match is None:
+        raise ValueError(
+            "objective-matched validation contract lacks its v3 declaration"
+        )
     if objective_match is not None:
         expected_match_fields = {
             "component_game_row_sampling_matched",
@@ -19480,6 +19594,11 @@ def _validated_objective_matched_validation_wrapper(
             or matched.get("objective_matched") is not declared_outcome_match
         ):
             raise ValueError("objective-matched validation contract is inconsistent")
+    validation_key = matched.get("validation_key")
+    if current_schema and validation_key != OBJECTIVE_MATCHED_VALIDATION_KEY:
+        raise ValueError(
+            "objective-matched validation contract has the wrong report-key role"
+        )
     ratio_values = np.asarray(list(ratios.values()), dtype=np.float64)
     if (
         ratio_values.shape != (len(ratios),)
@@ -19550,12 +19669,21 @@ def _validated_objective_matched_validation_wrapper(
         raise ValueError("objective-matched component coverage totals are malformed")
     provenance = matched.get("provenance")
     provenance_sha256 = matched.get("provenance_sha256")
-    if provenance is None and provenance_sha256 is None and not require_provenance:
+    if (
+        provenance is None
+        and provenance_sha256 is None
+        and not require_provenance
+        and not current_schema
+    ):
         return matched
     if (
         not isinstance(provenance, dict)
         or provenance.get("schema_version")
-        != COMPOSITE_VALIDATION_PROVENANCE_SCHEMA
+        != (
+            COMPOSITE_VALIDATION_PROVENANCE_SCHEMA_V3
+            if current_schema
+            else COMPOSITE_VALIDATION_PROVENANCE_SCHEMA
+        )
         or provenance.get("measure") != COMPOSITE_VALIDATION_MEASURE
         or not _is_sha256(provenance.get("descriptor_fingerprint"))
         or not _is_sha256(provenance.get("payload_inventory_sha256"))
@@ -19570,15 +19698,26 @@ def _validated_objective_matched_validation_wrapper(
         or provenance_sha256 != _canonical_json_sha256(provenance)
     ):
         raise ValueError("objective-matched validation provenance is malformed")
-    if objective_match is not None and (
-        provenance.get("training_value_player_outcome_balance_mode")
-        != objective_match["training_value_player_outcome_balance_mode"]
-        or provenance.get("validation_value_player_outcome_balance_mode")
-        != objective_match["validation_value_player_outcome_balance_mode"]
-        or provenance.get("value_player_outcome_balance_matched")
-        is not objective_match["value_player_outcome_balance_matched"]
-    ):
-        raise ValueError("objective-matched validation provenance is inconsistent")
+    if objective_match is not None:
+        if (
+            provenance.get("training_value_player_outcome_balance_mode")
+            != objective_match["training_value_player_outcome_balance_mode"]
+            or provenance.get("validation_value_player_outcome_balance_mode")
+            != objective_match["validation_value_player_outcome_balance_mode"]
+            or provenance.get("value_player_outcome_balance_matched")
+            is not objective_match["value_player_outcome_balance_matched"]
+        ):
+            raise ValueError(
+                "objective-matched validation provenance is inconsistent"
+            )
+        if current_schema and (
+            provenance.get("validation_key") != validation_key
+            or provenance.get("objective_match_sha256")
+            != _canonical_json_sha256(objective_match)
+        ):
+            raise ValueError(
+                "objective-matched validation v3 declaration provenance is malformed"
+            )
     source_authority = provenance.get("source_authority_semantic_sha256")
     if source_authority is not None and not _is_sha256(source_authority):
         raise ValueError("objective-matched source authority is malformed")
@@ -20374,8 +20513,28 @@ def evaluate_composite_validation_measure(
         raise SystemExit(
             "objective-matched validation requires exact evaluation identity"
         )
+    objective_match = {
+        "component_game_row_sampling_matched": True,
+        "training_value_player_outcome_balance_mode": (
+            training_outcome_balance_mode
+        ),
+        "validation_value_player_outcome_balance_mode": (
+            validation_outcome_balance_mode
+        ),
+        "value_player_outcome_balance_matched": outcome_balance_matched,
+        "validation_outcome_measure": (
+            "natural_holdout_v1"
+            if validation_outcome_balance_mode == "none"
+            else validation_outcome_balance_mode
+        ),
+    }
+    validation_key = (
+        OBJECTIVE_MATCHED_VALIDATION_KEY
+        if outcome_balance_matched
+        else NATURAL_COMPOSITE_VALIDATION_KEY
+    )
     provenance = {
-        "schema_version": COMPOSITE_VALIDATION_PROVENANCE_SCHEMA,
+        "schema_version": COMPOSITE_VALIDATION_PROVENANCE_SCHEMA_V3,
         "measure": COMPOSITE_VALIDATION_MEASURE,
         "descriptor_fingerprint": metadata["descriptor_fingerprint"],
         "payload_inventory_sha256": metadata["payload_inventory_sha256"],
@@ -20393,6 +20552,8 @@ def evaluate_composite_validation_measure(
             validation_outcome_balance_mode
         ),
         "value_player_outcome_balance_matched": outcome_balance_matched,
+        "validation_key": validation_key,
+        "objective_match_sha256": _canonical_json_sha256(objective_match),
         "evaluation_schema_version": evaluation_identity["schema_version"],
         **{
             key: evaluation_identity[key]
@@ -20401,24 +20562,11 @@ def evaluate_composite_validation_measure(
         },
     }
     result: dict[str, object] = {
-        "schema_version": COMPOSITE_VALIDATION_MEASURE_SCHEMA,
+        "schema_version": COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
         "measure": COMPOSITE_VALIDATION_MEASURE,
         "objective_matched": outcome_balance_matched,
-        "objective_match": {
-            "component_game_row_sampling_matched": True,
-            "training_value_player_outcome_balance_mode": (
-                training_outcome_balance_mode
-            ),
-            "validation_value_player_outcome_balance_mode": (
-                validation_outcome_balance_mode
-            ),
-            "value_player_outcome_balance_matched": outcome_balance_matched,
-            "validation_outcome_measure": (
-                "natural_holdout_v1"
-                if validation_outcome_balance_mode == "none"
-                else validation_outcome_balance_mode
-            ),
-        },
+        "validation_key": validation_key,
+        "objective_match": objective_match,
         "samples": int(indices.size),
         "games": int(
             sum(int(report["games"]) for report in component_reports.values())

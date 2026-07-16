@@ -10,6 +10,9 @@ New reports therefore emit this aggregate as `validation_natural_composite`
 with `objective_matched=false`. Objective-matched consumers fail closed instead
 of treating it as promotion evidence. Historical numbers below are retained as
 evidence about row-mix correction, not as proof of full objective matching.
+The corrected wrapper/provenance v3 contract digest-binds the full
+`objective_match` declaration and its exact report key; v2 remains a
+declaration-free historical compatibility path only.
 
 ## Verdict
 

@@ -142,6 +142,40 @@ def test_science_trace_fails_closed_on_malformed_matched_validation() -> None:
         probe._report_trace(report, "primary_value_loss")
 
 
+def test_science_trace_rejects_shallowly_self_consistent_v3_validation() -> None:
+    objective_match = {
+        "component_game_row_sampling_matched": True,
+        "training_value_player_outcome_balance_mode": "none",
+        "validation_value_player_outcome_balance_mode": "none",
+        "value_player_outcome_balance_matched": True,
+        "validation_outcome_measure": "natural_holdout_v1",
+    }
+    provenance = {
+        "schema_version": "composite-validation-provenance-v3",
+        "validation_key": "validation_objective_matched",
+        "objective_match_sha256": probe._digest_json(objective_match),
+    }
+    report = {
+        "metrics": [
+            {
+                "validation_objective_matched": {
+                    "schema_version": "composite-validation-measure-v3",
+                    "objective_matched": True,
+                    "validation_key": "validation_objective_matched",
+                    "objective_match": objective_match,
+                    "metrics": {"primary_value_loss": 0.01},
+                    "provenance": provenance,
+                    "provenance_sha256": probe._digest_json(provenance),
+                }
+            }
+        ]
+        * 3
+    }
+
+    with pytest.raises(probe.ContractError, match="malformed objective-matched"):
+        probe._report_trace(report, "primary_value_loss")
+
+
 def test_science_trace_rejects_partially_matched_epochs() -> None:
     report = {
         "metrics": [
@@ -166,6 +200,33 @@ def test_science_trace_rejects_partially_matched_epochs() -> None:
     }
 
     with pytest.raises(probe.ContractError, match="mixes objective-matched and raw"):
+        probe._report_trace(report, "primary_value_loss")
+
+
+def test_science_trace_rejects_natural_composite_even_when_raw_trace_would_win() -> None:
+    report = {
+        "metrics": [
+            {
+                "validation": {"primary_value_loss": raw},
+                "validation_natural_composite": {
+                    "schema_version": "composite-validation-measure-v3",
+                    "validation_key": "validation_natural_composite",
+                    "objective_matched": False,
+                    "metrics": {"primary_value_loss": natural},
+                },
+            }
+            for raw, natural in zip(
+                (0.60, 0.50, 0.40),
+                (0.40, 0.50, 0.60),
+                strict=True,
+            )
+        ]
+    }
+
+    with pytest.raises(
+        probe.ContractError,
+        match="cannot be compared.*historical raw validation trace",
+    ):
         probe._report_trace(report, "primary_value_loss")
 
 

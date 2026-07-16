@@ -282,7 +282,8 @@ def test_run_rescore_is_read_only_and_emits_natural_v2(
     assert result["evaluation_tool_sha256"].startswith("sha256:")
     assert result["schema_version"] == "posthoc-composite-validation-v2/v2"
     natural = result["natural_validation"]
-    assert natural["schema_version"] == "composite-validation-measure-v2"
+    assert natural["schema_version"] == "composite-validation-measure-v3"
+    assert natural["validation_key"] == "validation_natural_composite"
     assert natural["objective_matched"] is False
     assert natural["objective_match"] == {
         "component_game_row_sampling_matched": True,

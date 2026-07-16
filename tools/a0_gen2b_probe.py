@@ -48,6 +48,8 @@ import numpy as np
 
 _REPO_FROM_TOOL = Path(__file__).resolve().parents[1]
 _LOCAL_SRC = _REPO_FROM_TOOL / "src"
+if str(_REPO_FROM_TOOL) not in sys.path:
+    sys.path.insert(0, str(_REPO_FROM_TOOL))
 if str(_LOCAL_SRC) not in sys.path:
     # Checkpoint configs are pickled under catan_zero.*. Prefer the exact local
     # source tree being hashed/locked over any older installed wheel.
@@ -1100,18 +1102,52 @@ def _decision_validation_metrics(metric: Mapping[str, Any]) -> Mapping[str, Any]
     field when the exact population is present.
     """
 
-    if "validation_objective_matched" in metric:
+    has_matched = "validation_objective_matched" in metric
+    has_natural = "validation_natural_composite" in metric
+    if has_matched and has_natural:
+        raise ContractError(
+            "completed report declares both objective-matched and natural "
+            "composite validation"
+        )
+    if has_natural:
+        raise ContractError(
+            "completed report contains natural composite validation, which "
+            "cannot be compared to this probe's historical raw validation trace"
+        )
+    if has_matched:
         matched = metric.get("validation_objective_matched")
         metrics = matched.get("metrics") if isinstance(matched, Mapping) else None
+        schema = matched.get("schema_version") if isinstance(matched, Mapping) else None
         if (
             not isinstance(matched, Mapping)
-            or matched.get("schema_version") != "composite-validation-measure-v2"
+            or schema
+            not in {
+                "composite-validation-measure-v2",
+                "composite-validation-measure-v3",
+                "policy-aux-validation-measure-v2",
+            }
             or matched.get("objective_matched") is not True
             or not isinstance(metrics, Mapping)
         ):
             raise ContractError(
                 "completed report has malformed objective-matched validation"
             )
+        if schema in {
+            "composite-validation-measure-v3",
+            "policy-aux-validation-measure-v2",
+        }:
+            from tools import train_bc
+
+            try:
+                return train_bc.objective_matched_validation_metrics(
+                    dict(metric),
+                    require_matched=True,
+                    require_provenance=True,
+                )
+            except ValueError as error:
+                raise ContractError(
+                    "completed report has malformed objective-matched validation"
+                ) from error
         return metrics
     validation = metric.get("validation")
     if not isinstance(validation, Mapping):
@@ -1128,6 +1164,16 @@ def _report_trace(report: Mapping[str, Any], field: str) -> list[float]:
         and "validation_objective_matched" in metric
         for metric in metrics
     )
+    natural_validation_present = any(
+        isinstance(metric, Mapping)
+        and "validation_natural_composite" in metric
+        for metric in metrics
+    )
+    if natural_validation_present:
+        raise ContractError(
+            "completed report contains natural composite validation, which "
+            "cannot be compared to this probe's historical raw validation trace"
+        )
     result: list[float] = []
     for metric in metrics:
         if not isinstance(metric, Mapping):

@@ -838,15 +838,16 @@ def verify_outputs(
         )
         for index, row in enumerate(epoch_metrics, start=1)
     )
-    matched_validation_present = any(
+    composite_validation_present = any(
         "validation_objective_matched" in row
+        or "validation_natural_composite" in row
         for row in epoch_metrics
         if isinstance(row, dict)
     )
     try:
         validation_metrics = []
         for row in epoch_metrics:
-            if not matched_validation_present:
+            if not composite_validation_present:
                 validation_metrics.append(
                     train_bc.objective_matched_validation_metrics(row)
                 )
@@ -855,7 +856,11 @@ def verify_outputs(
             if (
                 not isinstance(matched, dict)
                 or matched.get("schema_version")
-                != "composite-validation-measure-v2"
+                not in {
+                    train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA,
+                    train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+                    train_bc.POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+                }
             ):
                 raise ValueError("matched validation schema is absent or unsupported")
             validation_metrics.append(
@@ -931,7 +936,7 @@ def verify_outputs(
                 "validation": validation_metrics[epoch - 1],
                 "validation_measure": (
                     "objective_matched"
-                    if matched_validation_present
+                    if composite_validation_present
                     else "raw_row_concat"
                 ),
             }

@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools import a1_production_l1_rerun as base  # noqa: E402
+from tools import train_bc  # noqa: E402
 
 
 MANIFEST_SCHEMA = "a1-production-temperature-replication-v2"
@@ -220,14 +221,42 @@ def _authenticated_objective_validation(report: dict[str, Any]) -> bool:
     """Whether the report contains the validation measure matching training."""
 
     metrics = report.get("metrics")
-    validation = (
-        metrics[-1].get("validation_objective_matched")
+    epoch = (
+        metrics[-1]
         if isinstance(metrics, list) and metrics and isinstance(metrics[-1], dict)
         else None
     )
+    validation = (
+        epoch.get("validation_objective_matched")
+        if isinstance(epoch, dict)
+        else None
+    )
+    if isinstance(epoch, dict) and "validation_natural_composite" in epoch:
+        return False
+    try:
+        if isinstance(validation, dict):
+            train_bc._validate_composite_validation_key_role(  # noqa: SLF001
+                validation,
+                expected_key=train_bc.OBJECTIVE_MATCHED_VALIDATION_KEY,
+            )
+            if validation.get("schema_version") in {
+                train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+                train_bc.POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+            }:
+                train_bc.objective_matched_validation_metrics(
+                    epoch,
+                    require_matched=True,
+                    require_provenance=True,
+                )
+    except ValueError:
+        return False
     return bool(
         isinstance(validation, dict)
-        and validation.get("schema_version") == "composite-validation-measure-v2"
+        and validation.get("schema_version")
+        in {
+            train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA,
+            train_bc.COMPOSITE_VALIDATION_MEASURE_SCHEMA_V3,
+        }
         and validation.get("objective_matched") is True
         and validation.get("measure")
         == "authenticated_component_then_uniform_game_then_uniform_row_with_objective_weight_density"

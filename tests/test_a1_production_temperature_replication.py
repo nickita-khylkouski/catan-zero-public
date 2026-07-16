@@ -377,6 +377,37 @@ def test_objective_validation_binding_rejects_raw_compatibility_measure() -> Non
     }
     assert temp._authenticated_objective_validation(report) is False
 
+    objective.update(
+        {
+            "schema_version": "composite-validation-measure-v3",
+            "validation_key": "validation_objective_matched",
+            "objective_match": {
+                "component_game_row_sampling_matched": True,
+                "training_value_player_outcome_balance_mode": (
+                    "sampler_balanced_v1"
+                ),
+                "validation_value_player_outcome_balance_mode": "none",
+                "value_player_outcome_balance_matched": False,
+                "validation_outcome_measure": "natural_holdout_v1",
+            },
+            "provenance": {
+                "schema_version": "composite-validation-provenance-v3",
+                "validation_key": "validation_natural_composite",
+            },
+        }
+    )
+    objective["provenance_sha256"] = temp.train_bc._canonical_json_sha256(  # noqa: SLF001
+        objective["provenance"]
+    )
+    report["metrics"][-1] = {"validation_objective_matched": objective}
+    assert temp._authenticated_objective_validation(report) is False
+    objective["schema_version"] = "composite-validation-measure-v2"
+    assert temp._authenticated_objective_validation(report) is False
+    report["metrics"][-1]["validation_natural_composite"] = {
+        "objective_matched": False
+    }
+    assert temp._authenticated_objective_validation(report) is False
+
 
 def test_selection_requires_exact_h1_evidence_and_diagnostic_lineage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
