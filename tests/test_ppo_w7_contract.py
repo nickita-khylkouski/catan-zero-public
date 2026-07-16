@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+import pytest
+
+from catan_zero.rl.ppo_policy_factory import (
+    CANONICAL_PPO_ARCHITECTURE,
+    load_exact_parent_and_frozen_anchor,
+    load_ppo_policy,
+)
+from catan_zero.rl.torch_ppo import make_ppo_optimizer
+from tools.ppo_distributed_learner import (
+    LearnerConfig,
+    _validate_w7_config,
+    resolve_config,
+)
+
+
+def _config(**overrides) -> LearnerConfig:
+    values = {
+        "run_base": "runs/distributed",
+        "run_name": "w7-test",
+        "init_checkpoint": "parent.pt",
+    }
+    values.update(overrides)
+    return LearnerConfig(**values)
+
+
+def test_canonical_loader_rejects_legacy_architecture_before_loading() -> None:
+    with pytest.raises(ValueError, match="canonical PPO requires architecture='entity_graph'"):
+        load_ppo_policy("unused.pt", architecture="xdim_graph")
+
+
+def test_exact_parent_factory_returns_equal_independent_frozen_anchor(monkeypatch) -> None:
+    import torch
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    class FakePolicy:
+        def __init__(self) -> None:
+            torch.manual_seed(7)
+            self.model = torch.nn.Sequential(
+                torch.nn.Linear(3, 4),
+                torch.nn.Dropout(0.5),
+                torch.nn.Linear(4, 1),
+            )
+
+    monkeypatch.setattr(
+        EntityGraphPolicy,
+        "load",
+        lambda checkpoint, device=None: FakePolicy(),
+    )
+
+    parent, anchor = load_exact_parent_and_frozen_anchor("parent.pt")
+
+    assert parent is not anchor
+    assert parent.model is not anchor.model
+    for name, tensor in parent.model.state_dict().items():
+        torch.testing.assert_close(tensor, anchor.model.state_dict()[name], rtol=0, atol=0)
+    assert parent.model.training
+    assert not anchor.model.training
+    assert all(parameter.requires_grad for parameter in parent.model.parameters())
+    assert all(not parameter.requires_grad for parameter in anchor.model.parameters())
+
+
+def test_w7_defaults_are_canonical() -> None:
+    config, _ = resolve_config(["--init-checkpoint", "parent.pt"])
+
+    assert config.architecture == CANONICAL_PPO_ARCHITECTURE
+    assert config.gamma == 1.0
+    assert config.clip_ratio == 0.1
+    assert 0.005 <= config.target_kl <= 0.01
+    assert 2 <= config.ppo_epochs <= 4
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"architecture": "xdim_graph"}, "architecture='entity_graph'"),
+        ({"gamma": 0.997}, "gamma=1.0"),
+        ({"clip_ratio": 0.15}, "clip_ratio=0.1"),
+        ({"target_kl": 0.0}, "target_kl"),
+        ({"ppo_epochs": 1}, "2-4 update epochs"),
+        ({"trunk_lr_mult": 0.25}, "trunk_lr_mult"),
+        ({"use_vtrace": False, "max_staleness": 1}, "max_staleness=0"),
+    ],
+)
+def test_w7_contract_rejects_unsafe_configuration(overrides, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        _validate_w7_config(_config(**overrides))
+
+
+def test_no_vtrace_accepts_only_version_exact_rollouts() -> None:
+    config = _config(use_vtrace=False, max_staleness=0)
+
+    _validate_w7_config(config)
+
+
+def test_entity_optimizer_protects_shared_trunk_with_lower_lr() -> None:
+    import torch
+
+    class FakeEntityPolicy:
+        architecture = "entity_graph"
+
+        def __init__(self) -> None:
+            self.model = torch.nn.Module()
+            self.model.shared_encoder = torch.nn.Linear(3, 3)
+            self.model.blocks = torch.nn.Sequential(torch.nn.Linear(3, 3))
+            self.model.action_encoder = torch.nn.Linear(3, 3)
+            self.model.value_head = torch.nn.Linear(3, 1)
+
+    policy = FakeEntityPolicy()
+    optimizer = make_ppo_optimizer(
+        policy,
+        learning_rate=2.0e-4,
+        trunk_lr_mult=0.1,
+    )
+
+    groups = {group["name"]: group for group in optimizer.param_groups}
+    assert groups["protected_trunk"]["lr"] == pytest.approx(2.0e-5)
+    assert groups["policy_value_heads"]["lr"] == pytest.approx(2.0e-4)
+    trunk_ids = {id(parameter) for parameter in groups["protected_trunk"]["params"]}
+    head_ids = {id(parameter) for parameter in groups["policy_value_heads"]["params"]}
+    assert trunk_ids.isdisjoint(head_ids)
+    assert trunk_ids | head_ids == {
+        id(parameter) for parameter in policy.model.parameters()
+    }

@@ -12,7 +12,10 @@ from typing import Any
 import numpy as np
 
 from catan_zero.rl import ppo_distributed as dist
-from catan_zero.rl.ppo_policy_factory import load_ppo_policy
+from catan_zero.rl.ppo_policy_factory import (
+    CANONICAL_PPO_ARCHITECTURE,
+    load_ppo_policy,
+)
 from catan_zero.rl.torch_ppo import collect_ppo_episode
 from factory_common import make_named_policy, parse_track
 
@@ -27,7 +30,11 @@ def main() -> None:
     parser.add_argument("--run-base", default="runs/distributed")
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--architecture", default="entity_graph")
+    parser.add_argument(
+        "--architecture",
+        choices=(CANONICAL_PPO_ARCHITECTURE,),
+        default=CANONICAL_PPO_ARCHITECTURE,
+    )
     parser.add_argument("--track", default="2p_no_trade")
     parser.add_argument("--vps-to-win", type=int, default=10)
     parser.add_argument("--games", type=int, default=32)
@@ -37,7 +44,7 @@ def main() -> None:
     parser.add_argument("--opponents", default="catanatron_ab3,catanatron_value,heuristic,random")
     parser.add_argument("--devices", default="cuda:0,cuda:1")
     parser.add_argument("--seed", type=int, default=70630001)
-    parser.add_argument("--gamma", type=float, default=0.997)
+    parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--value-shaping-coef", type=float, default=0.0)
     parser.add_argument("--value-shaping-scale", type=float, default=100.0)
@@ -54,6 +61,10 @@ def main() -> None:
     )
     parser.add_argument("--publish", action="store_true")
     args = parser.parse_args()
+    if float(args.gamma) != 1.0:
+        parser.error(f"canonical PPO requires terminal gamma=1.0, got {args.gamma}")
+    if not 0.95 <= float(args.gae_lambda) <= 0.98:
+        parser.error("canonical PPO requires gae-lambda in [0.95, 0.98]")
 
     root = dist.run_root(args.run_base, args.run_name)
     dist.ensure_run_dirs(root)

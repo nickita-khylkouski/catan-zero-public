@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 
 import numpy as np
+import pytest
 
 from catan_zero.rl._catanatron import import_catanatron_module
 
@@ -61,6 +62,7 @@ def _make_entity_policy():
         hidden_size=16,
         state_layers=1,
         attention_heads=2,
+        dropout=0.0,
         seed=0,
     )
 
@@ -145,3 +147,44 @@ def test_entity_ppo_update_all_forced_batch_does_not_crash() -> None:
     assert metrics["policy_active_fraction"] == 0.0
     assert metrics["policy_loss"] == 0.0
     assert np.isfinite(metrics["value_loss"])
+
+
+def test_forced_rows_do_not_dilute_entity_ppo_kl() -> None:
+    """KL early-stop telemetry must measure only rows where policy can change."""
+    import torch
+    from catan_zero.rl.torch_ppo import (
+        _entity_action_column,
+        _entity_graph_outputs,
+        ppo_update,
+    )
+
+    samples = _collect_real_samples(2)
+    trajectory = _make_trajectory(samples, force_indices={1})
+    policy = _make_entity_policy()
+    with torch.no_grad():
+        outputs = _entity_graph_outputs(policy, trajectory.samples)
+        columns = torch.as_tensor(
+            [_entity_action_column(sample) for sample in trajectory.samples],
+            dtype=torch.long,
+            device=policy.device,
+        )
+        current_log_probs = torch.distributions.Categorical(
+            logits=outputs["logits"]
+        ).log_prob(columns)
+    trajectory.old_log_probs = [
+        float(current_log_probs[0].item() + 1.0),
+        0.0,
+    ]
+
+    metrics = ppo_update(
+        policy,
+        [trajectory],
+        learning_rate=0.0,
+        clip_ratio=0.1,
+        value_coef=0.0,
+        entropy_coef=0.0,
+        epochs=1,
+        minibatch_size=64,
+    )
+
+    assert metrics["approx_kl"] == pytest.approx(1.0, abs=1e-6)

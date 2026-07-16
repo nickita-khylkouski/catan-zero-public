@@ -33,6 +33,14 @@ def main() -> None:
         vps_to_win=int(config.get("vps_to_win", 10)),
     )
     arch = str(config.get("arch", "candidate"))
+    if arch == "entity_graph":
+        raise SystemExit(
+            "tools/train_selfplay_gpu.py is a legacy flat/xdim launcher and cannot "
+            "construct entity_graph; use tools/run_local_entity_ppo_shards.py plus "
+            "tools/ppo_distributed_learner.py"
+        )
+    if arch not in {"candidate", "graph_history_candidate", "xdim_lite"}:
+        raise SystemExit(f"unsupported legacy PPO architecture: {arch!r}")
     init_checkpoint = config.get("init_checkpoint")
     if arch == "xdim_lite":
         if init_checkpoint:

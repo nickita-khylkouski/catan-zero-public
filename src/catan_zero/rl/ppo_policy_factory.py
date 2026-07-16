@@ -11,30 +11,44 @@ from __future__ import annotations
 from typing import Any
 
 
-def load_ppo_policy(checkpoint: str, *, architecture: str = "xdim_graph", device: str | None = None) -> Any:
+CANONICAL_PPO_ARCHITECTURE = "entity_graph"
+
+
+def require_canonical_ppo_architecture(architecture: str) -> str:
+    """Fail closed unless the W7 entity-graph architecture is selected explicitly."""
+    resolved = str(architecture).strip()
+    if resolved != CANONICAL_PPO_ARCHITECTURE:
+        raise ValueError(
+            "canonical PPO requires architecture='entity_graph'; "
+            f"legacy architecture {architecture!r} is not accepted"
+        )
+    return resolved
+
+
+def load_ppo_policy(
+    checkpoint: str,
+    *,
+    architecture: str = CANONICAL_PPO_ARCHITECTURE,
+    device: str | None = None,
+) -> Any:
     """Load the trainable PPO policy from a checkpoint.
 
-    ``xdim_graph`` (the 35M model) is the default and the path we use for the real runs. The flat
-    architectures fall back to ``create_ppo_policy`` + a state-dict load for smoke tests.
+    W7 has one production/R&D lane.  Legacy flat/xdim checkpoints must use their
+    historical launchers; accepting them here makes a typo or omitted flag silently
+    construct a different policy family.
     """
-    if architecture in ("entity_graph", "entity"):
-        from catan_zero.rl.entity_token_policy import EntityGraphPolicy
-        return EntityGraphPolicy.load(checkpoint, device=device)
-    if architecture in ("xdim_graph", "graph"):
-        from catan_zero.rl.xdim_lite_policy import XDimGraphPolicy
-        return XDimGraphPolicy.load(checkpoint, device=device)
-    if architecture in ("xdim_lite", "lite"):
-        from catan_zero.rl.xdim_lite_policy import XDimLitePolicy
-        return XDimLitePolicy.load(checkpoint, device=device)
-    # flat / candidate fallback (smoke tests only)
-    from catan_zero.rl.torch_ppo import create_ppo_policy
-    policy = create_ppo_policy(architecture=architecture, device=device)
-    import torch
-    policy.model.load_state_dict(torch.load(checkpoint, map_location=device or "cpu"))
-    return policy
+    require_canonical_ppo_architecture(architecture)
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    return EntityGraphPolicy.load(checkpoint, device=device)
 
 
-def load_frozen_bc_anchor(checkpoint: str, *, architecture: str = "xdim_graph", device: str | None = None) -> Any:
+def load_frozen_bc_anchor(
+    checkpoint: str,
+    *,
+    architecture: str = CANONICAL_PPO_ARCHITECTURE,
+    device: str | None = None,
+) -> Any:
     """Load a SEPARATE, frozen copy of the BC checkpoint to use as the KL anchor (the "magnet").
 
     Passed to ``ppo_update`` as ``ema_policy`` with ``ema_policy_kl_coef=β``; never updated, so the
@@ -43,6 +57,34 @@ def load_frozen_bc_anchor(checkpoint: str, *, architecture: str = "xdim_graph", 
     anchor = load_ppo_policy(checkpoint, architecture=architecture, device=device)
     freeze_in_place(anchor)
     return anchor
+
+
+def load_exact_parent_and_frozen_anchor(
+    checkpoint: str,
+    *,
+    architecture: str = CANONICAL_PPO_ARCHITECTURE,
+    device: str | None = None,
+) -> tuple[Any, Any]:
+    """Load an exact trainable parent plus an independent frozen KL anchor.
+
+    The equality check makes cold-start checkpoint binding executable instead of
+    relying on two loader calls being configured the same way.
+    """
+    import torch
+
+    parent = load_ppo_policy(checkpoint, architecture=architecture, device=device)
+    anchor = load_frozen_bc_anchor(checkpoint, architecture=architecture, device=device)
+    if parent is anchor or parent.model is anchor.model:
+        raise RuntimeError("PPO parent and KL anchor must be independent objects")
+    parent_state = parent.model.state_dict()
+    anchor_state = anchor.model.state_dict()
+    if parent_state.keys() != anchor_state.keys() or any(
+        not torch.equal(parent_state[name], anchor_state[name]) for name in parent_state
+    ):
+        raise RuntimeError("PPO parent and frozen anchor did not load identical checkpoint state")
+    if any(parameter.requires_grad for parameter in anchor.model.parameters()):
+        raise RuntimeError("PPO KL anchor is not fully frozen")
+    return parent, anchor
 
 
 def freeze_in_place(policy: Any) -> Any:

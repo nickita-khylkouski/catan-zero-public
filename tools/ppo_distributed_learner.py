@@ -49,7 +49,13 @@ if str(_TOOLS_DIR) not in sys.path:
 
 from catan_zero.rl import ppo_distributed as dist
 from catan_zero.rl.league import League
-from catan_zero.rl.ppo_policy_factory import load_frozen_bc_anchor, load_ppo_policy
+from catan_zero.rl.ppo_policy_factory import (
+    CANONICAL_PPO_ARCHITECTURE,
+    load_exact_parent_and_frozen_anchor,
+    load_frozen_bc_anchor,
+    load_ppo_policy,
+    require_canonical_ppo_architecture,
+)
 from catan_zero.rl.torch_ppo import make_ppo_optimizer, ppo_update
 from catan_zero.rl.vtrace import vtrace_from_log_probs
 
@@ -67,7 +73,7 @@ class LearnerConfig:
     run_base: str
     run_name: str
     init_checkpoint: str
-    architecture: str = "xdim_graph"
+    architecture: str = CANONICAL_PPO_ARCHITECTURE
     device: str = "auto"
 
     # pull / staleness
@@ -83,13 +89,14 @@ class LearnerConfig:
 
     # optimization
     lr: float = 2.0e-4
-    clip_ratio: float = 0.15
+    trunk_lr_mult: float = 0.1
+    clip_ratio: float = 0.1
     value_coef: float = 0.5
     value_clip_range: float = 0.0
     entropy_coef: float = 0.01
     ppo_epochs: int = 2
     minibatch_size: int = 65536
-    target_kl: float = 0.0
+    target_kl: float = 0.0075
     top_advantage_fraction: float = 1.0
     min_advantage_samples: int = 1
     behavior_temperature: float = 1.0
@@ -105,7 +112,7 @@ class LearnerConfig:
     use_vtrace: bool = True
     vtrace_clip_rho: float = 1.0
     vtrace_clip_pg_rho: float = 1.0
-    gamma: float = 0.997
+    gamma: float = 1.0
     vtrace_use_current_values: bool = True  # recompute critic values vs reuse traj.old_values
     # FIX H4: chunk the V-trace recompute forward into sub-batches of this many rows to bound
     # peak memory (one forward over 25k-150k rows x [action_size x ctx] would OOM the GPU).
@@ -147,8 +154,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Run name; the shared dir is {run-base}/{run-name}.")
     g.add_argument("--init-checkpoint", default=None,
                    help="BC warm-start checkpoint; also the frozen KL-to-BC anchor.")
-    g.add_argument("--architecture", default="xdim_graph",
-                   help="Policy architecture passed to load_ppo_policy / load_frozen_bc_anchor.")
+    g.add_argument(
+        "--architecture",
+        choices=(CANONICAL_PPO_ARCHITECTURE,),
+        default=CANONICAL_PPO_ARCHITECTURE,
+        help="Canonical W7 policy architecture (legacy architectures fail closed).",
+    )
     g.add_argument("--device", default="auto", help="auto|cpu|cuda|cuda:N for the learner.")
 
     g = p.add_argument_group("pull / staleness")
@@ -169,7 +180,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("optimization")
     g.add_argument("--lr", type=float, default=2.0e-4)
-    g.add_argument("--clip-ratio", type=float, default=0.15)
+    g.add_argument(
+        "--trunk-lr-mult",
+        type=float,
+        default=0.1,
+        help="Shared entity-state trunk LR multiplier; policy/value heads keep --lr.",
+    )
+    g.add_argument("--clip-ratio", type=float, default=0.1)
     g.add_argument("--value-coef", type=float, default=0.5)
     g.add_argument(
         "--value-clip-range",
@@ -184,8 +201,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--entropy-coef", type=float, default=0.01)
     g.add_argument("--ppo-epochs", type=int, default=2)
     g.add_argument("--minibatch-size", type=int, default=65536)
-    g.add_argument("--target-kl", type=float, default=0.0,
-                   help="Early-stop PPO epochs once approx_kl exceeds this (0 disables).")
+    g.add_argument("--target-kl", type=float, default=0.0075,
+                   help="Early-stop PPO epochs once approx_kl exceeds this.")
     g.add_argument(
         "--behavior-temperature",
         type=float,
@@ -245,7 +262,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--vtrace-clip-pg-rho", type=float, default=1.0)
     g.add_argument("--vtrace-forward-chunk", type=int, default=8192,
                    help="Rows per sub-batch for the V-trace recompute forward (caps peak memory).")
-    g.add_argument("--gamma", type=float, default=0.997)
+    g.add_argument("--gamma", type=float, default=1.0)
     g.add_argument("--vtrace-reuse-old-values", dest="vtrace_use_current_values",
                    action="store_false", default=True,
                    help="Use the stored traj.old_values as the V-trace baseline instead of "
@@ -299,6 +316,7 @@ def _flatten_config(raw: dict[str, Any]) -> dict[str, Any]:
 
     ppo = raw.get("ppo", {}) or {}
     take(ppo.get("lr"), "lr")
+    take(ppo.get("trunk_lr_mult"), "trunk_lr_mult")
     take(ppo.get("clip_ratio"), "clip_ratio")
     take(ppo.get("value_coef"), "value_coef")
     take(ppo.get("value_clip_range"), "value_clip_range")
@@ -392,6 +410,7 @@ def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argpar
         "max_steps": args.max_steps,
         "resume": args.resume,
         "lr": args.lr,
+        "trunk_lr_mult": args.trunk_lr_mult,
         "clip_ratio": args.clip_ratio,
         "value_coef": args.value_coef,
         "value_clip_range": args.value_clip_range,
@@ -440,7 +459,34 @@ def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argpar
     config = LearnerConfig(**cfg_kwargs)
     if not config.init_checkpoint:
         parser.error("--init-checkpoint is required (BC warm-start + frozen KL-to-BC anchor)")
+    try:
+        _validate_w7_config(config)
+    except ValueError as error:
+        parser.error(str(error))
     return config, args
+
+
+def _validate_w7_config(config: LearnerConfig) -> None:
+    """Enforce the canonical on-policy contract before loading a checkpoint."""
+    require_canonical_ppo_architecture(config.architecture)
+    if float(config.gamma) != 1.0:
+        raise ValueError(f"canonical PPO requires terminal gamma=1.0, got {config.gamma}")
+    if not 2 <= int(config.ppo_epochs) <= 4:
+        raise ValueError("canonical PPO requires 2-4 update epochs")
+    if not 0.005 <= float(config.target_kl) <= 0.01:
+        raise ValueError("canonical PPO requires target_kl in [0.005, 0.01]")
+    if float(config.clip_ratio) != 0.1:
+        raise ValueError(f"canonical PPO requires clip_ratio=0.1, got {config.clip_ratio}")
+    if not math.isfinite(float(config.trunk_lr_mult)) or not (
+        0.0 < float(config.trunk_lr_mult) <= 0.1
+    ):
+        raise ValueError("canonical PPO requires trunk_lr_mult in (0, 0.1]")
+    if int(config.max_staleness) < 0:
+        raise ValueError("max_staleness must be non-negative")
+    if not bool(config.use_vtrace) and int(config.max_staleness) != 0:
+        raise ValueError(
+            "PPO without V-trace requires max_staleness=0 (version-exact rollouts)"
+        )
 
 
 # --------------------------------------------------------------------------- KL-to-BC anneal
@@ -1119,18 +1165,24 @@ def train(
     root = dist.run_root(config.run_base, config.run_name)
     dist.ensure_run_dirs(root)
 
-    # 1. FROZEN KL-to-BC anchor: ALWAYS the BC checkpoint, regardless of resume (the anchor is the
-    # behavior-cloned policy by definition; the β-anneal pulls π_θ toward it).
-    bc_anchor = load_frozen_bc_anchor(
-        config.init_checkpoint, architecture=config.architecture, device=device
-    )
+    _validate_w7_config(config)
 
-    # 1b. TRAINABLE policy + optimizer. FIX C1: resume from the freshest step_{N}.pt when present.
+    # 1. TRAINABLE policy + separate FROZEN anchor.  A cold start loads both
+    # copies through one equality-checked factory call; a resume intentionally
+    # restores the trainable checkpoint while keeping the exact initializer as
+    # its immutable anchor.
     resume_ckpt = find_resume_checkpoint(root) if getattr(config, "resume", True) else None
     if resume_ckpt is not None:
+        bc_anchor = load_frozen_bc_anchor(
+            config.init_checkpoint, architecture=config.architecture, device=device
+        )
         resume_step, resume_path = resume_ckpt
         policy = load_ppo_policy(str(resume_path), architecture=config.architecture, device=device)
-        optimizer = make_ppo_optimizer(policy, learning_rate=config.lr)
+        optimizer = make_ppo_optimizer(
+            policy,
+            learning_rate=config.lr,
+            trunk_lr_mult=config.trunk_lr_mult,
+        )
         opt_path = _opt_path_for(resume_path)
         if opt_path.exists():
             try:
@@ -1157,9 +1209,18 @@ def train(
             flush=True,
         )
     else:
-        # Cold start: BC warm-start, fresh optimizer, step 0.
-        policy = load_ppo_policy(config.init_checkpoint, architecture=config.architecture, device=device)
-        optimizer = make_ppo_optimizer(policy, learning_rate=config.lr)
+        # Cold start: exact corrected parent, separately loaded frozen anchor,
+        # fresh optimizer, step 0.
+        policy, bc_anchor = load_exact_parent_and_frozen_anchor(
+            config.init_checkpoint,
+            architecture=config.architecture,
+            device=device,
+        )
+        optimizer = make_ppo_optimizer(
+            policy,
+            learning_rate=config.lr,
+            trunk_lr_mult=config.trunk_lr_mult,
+        )
         step = 0
         current_version = 0
 

@@ -57,7 +57,7 @@ DEFAULT_OPPONENTS = "random,heuristic,jsettlers_lite,catanatron_ab3"
 # Seat names used by ColonistMultiAgentEnv (must match train_ppo.py).
 SEAT_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
 
-# Max league/opponent checkpoints kept resident per worker process. Each frozen xdim_graph
+# Max league/opponent checkpoints kept resident per worker process. Each frozen entity_graph
 # snapshot is ~140MB; over a 6h run the learner can publish 100+ of them, so an unbounded cache
 # OOMs the 16GB container. Cap with an LRU (see ``_OpponentResolver``).
 DEFAULT_OPPONENT_CACHE_SIZE = 8
@@ -306,7 +306,7 @@ def _run_actor_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
 
     run_name = str(chunk["run_name"])
     worker_id = str(chunk["worker_id"])
-    architecture = str(chunk.get("architecture", "xdim_graph"))
+    architecture = str(chunk.get("architecture", "entity_graph"))
     device = str(chunk.get("device", "cpu"))  # actors run CPU-only inference
     games = int(chunk["games"])
     game_offset = int(chunk["game_offset"])
@@ -461,7 +461,7 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
 
     run_name = str(payload["run_name"])
     container_id = str(payload["worker_id"])
-    architecture = str(payload.get("architecture", "xdim_graph"))
+    architecture = str(payload.get("architecture", "entity_graph"))
     device = str(payload.get("device", "cpu"))  # actors run CPU-only inference
     games_per_worker = int(payload["games_per_worker"])
     games_per_shard = max(1, int(payload["games_per_shard"]))
@@ -727,7 +727,7 @@ def ppo_learner(config_payload: dict[str, Any]) -> dict[str, Any]:
     run_name = str(config_payload["run_name"])
     init_checkpoint = str(config_payload["init_checkpoint"])
     run_base = str(config_payload.get("run_base", str(VOLUME_ROOT)))
-    architecture = str(config_payload.get("architecture", "xdim_graph"))
+    architecture = str(config_payload.get("architecture", "entity_graph"))
     device = str(config_payload.get("device", "cuda"))
 
     # Make sure the run dirs exist before the learner scans them (matches actor-side bootstrap).
@@ -1044,7 +1044,7 @@ def smoke(
     lag_stall_rounds: int = DEFAULT_LAG_STALL_ROUNDS,
     lag_stall_sleep: float = DEFAULT_LAG_STALL_SLEEP,
     seed: int = 70_628_650,
-    architecture: str = "xdim_graph",
+    architecture: str = "entity_graph",
     device: str = "cpu",
     track: str = "2p_no_trade",
     vps_to_win: int = 10,
@@ -1111,7 +1111,7 @@ def launch_ppo_actors(
     lag_stall_rounds: int = DEFAULT_LAG_STALL_ROUNDS,
     lag_stall_sleep: float = DEFAULT_LAG_STALL_SLEEP,
     seed: int = 70_628_700,
-    architecture: str = "xdim_graph",
+    architecture: str = "entity_graph",
     device: str = "cpu",
     track: str = "2p_no_trade",
     vps_to_win: int = 10,
@@ -1166,13 +1166,13 @@ def launch_learner(
     init_checkpoint: str = "/data/bc_warmstart/current.pt",
     run_base: str = str(VOLUME_ROOT),
     gpu: str = "A100",
-    architecture: str = "xdim_graph",
+    architecture: str = "entity_graph",
     device: str = "cuda",
     max_steps: int = 0,
     shards_per_step: int = 16,
     max_staleness: int = 4,
     lr: float = 2.0e-4,
-    clip_ratio: float = 0.15,
+    clip_ratio: float = 0.1,
     value_coef: float = 0.5,
     entropy_coef: float = 0.01,
     ppo_epochs: int = 2,
@@ -1251,13 +1251,13 @@ def run_learner_blocking(
     init_checkpoint: str = "/data/bc_warmstart/current.pt",
     run_base: str = str(VOLUME_ROOT),
     gpu: str = "A100",
-    architecture: str = "xdim_graph",
+    architecture: str = "entity_graph",
     device: str = "cuda",
     max_steps: int = 1,
     shards_per_step: int = 16,
     max_staleness: int = 4,
     lr: float = 2.0e-4,
-    clip_ratio: float = 0.15,
+    clip_ratio: float = 0.1,
     value_coef: float = 0.5,
     entropy_coef: float = 0.01,
     ppo_epochs: int = 2,

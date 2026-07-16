@@ -1809,10 +1809,20 @@ def _ppo_update_entity_graph_body(
                 dtype=torch.float32,
                 device=policy.device,
             )
-            entropy = (entropy_values / torch.log(legal_counts)).mean()
+            normalized_entropy = entropy_values / torch.log(legal_counts)
+            if bool(batch_policy_active.any()):
+                entropy = normalized_entropy[batch_policy_active].mean()
+            else:
+                entropy = normalized_entropy.new_tensor(0.0)
             with torch.no_grad():
-                approx_kl = (batch_old_log_probs - log_probs).mean()
-                clip_fraction = ((torch.abs(ratio - 1.0) > clip_ratio).float().mean())
+                per_sample_kl = batch_old_log_probs - log_probs
+                per_sample_clipped = (torch.abs(ratio - 1.0) > clip_ratio).float()
+                if bool(batch_policy_active.any()):
+                    approx_kl = per_sample_kl[batch_policy_active].mean()
+                    clip_fraction = per_sample_clipped[batch_policy_active].mean()
+                else:
+                    approx_kl = per_sample_kl.new_tensor(0.0)
+                    clip_fraction = per_sample_clipped.new_tensor(0.0)
             if ema_policy is not None and ema_policy_kl_coef > 0.0:
                 with torch.no_grad():
                     ema_outputs = _entity_graph_outputs(ema_policy, batch_samples, return_q=False)
@@ -1828,10 +1838,16 @@ def _ppo_update_entity_graph_body(
                 # PPO ratios. Otherwise temp-controlled actors can drift in behavior space
                 # while reporting a tiny raw-logit KL.
                 log_policy = nn.functional.log_softmax(behavior_logits, dim=-1)
-                ema_policy_kl = (
+                per_sample_ema_policy_kl = (
                     ema_policy_t
                     * (torch.log(torch.clamp(ema_policy_t, min=1e-8)) - log_policy)
-                ).sum(dim=-1).mean()
+                ).sum(dim=-1)
+                if bool(batch_policy_active.any()):
+                    ema_policy_kl = per_sample_ema_policy_kl[
+                        batch_policy_active
+                    ].mean()
+                else:
+                    ema_policy_kl = per_sample_ema_policy_kl.new_tensor(0.0)
             else:
                 ema_policy_kl = values.new_tensor(0.0)
             loss = (
@@ -2385,9 +2401,61 @@ def _resize_context_tensor(value, *, feature_size: int):
     return padded
 
 
-def make_ppo_optimizer(policy: TorchPPOPolicy, *, learning_rate: float):
+def make_ppo_optimizer(
+    policy: TorchPPOPolicy,
+    *,
+    learning_rate: float,
+    trunk_lr_mult: float = 1.0,
+):
     import torch
 
+    trunk_lr_mult = float(trunk_lr_mult)
+    if not math.isfinite(trunk_lr_mult) or not 0.0 < trunk_lr_mult <= 1.0:
+        raise ValueError("trunk_lr_mult must be finite and in (0, 1]")
+    if _is_entity_graph_policy(policy) and trunk_lr_mult != 1.0:
+        # The entity model scores actions directly from its shared state, so
+        # "head" means every action/value-specific late module. Everything
+        # else is the representation trunk protected by the lower LR.
+        head_prefixes = (
+            "action_",
+            "static_action_residual_proj",
+            "target_gather_proj",
+            "edge_policy_",
+            "logit_scale",
+            "value_",
+            "q_head",
+            "final_vp_head",
+            "aux_",
+            "belief_resource_head",
+            "deliberation_halt_head",
+        )
+        trunk_parameters = []
+        head_parameters = []
+        for name, parameter in policy.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            destination = (
+                head_parameters
+                if name.startswith(head_prefixes)
+                else trunk_parameters
+            )
+            destination.append(parameter)
+        if not trunk_parameters or not head_parameters:
+            raise ValueError("entity_graph PPO optimizer could not partition trunk and heads")
+        return torch.optim.Adam(
+            [
+                {
+                    "name": "protected_trunk",
+                    "params": trunk_parameters,
+                    "lr": float(learning_rate) * trunk_lr_mult,
+                },
+                {
+                    "name": "policy_value_heads",
+                    "params": head_parameters,
+                    "lr": float(learning_rate),
+                },
+            ]
+        )
     return torch.optim.Adam(_policy_parameters(policy), lr=learning_rate)
 
 

@@ -1,7 +1,7 @@
 {
   "track": "2p_no_trade",
   "algorithm": "ppo",
-  "arch": "candidate",
+  "arch": "entity_graph",
   "seed": 1,
   "run_dir": "runs/self_play/gpu_ppo_2p_v1",
   "hidden_size": 512,
@@ -10,18 +10,20 @@
   "rollout": {
     "decisions_per_rank": 262144,
     "max_decisions_per_game": 1000,
-    "gamma": 0.997,
+    "gamma": 1.0,
     "gae_lambda": 0.95
   },
   "ppo": {
     "epochs": 2,
     "minibatch_size": 65536,
-    "clip_ratio": 0.15,
+    "clip_ratio": 0.1,
     "entropy_coef": 0.01,
     "value_coef": 0.5,
     "max_grad_norm": 1.0,
     "lr": 0.0002,
-    "value_clip_range": 0.2
+    "trunk_lr_mult": 0.1,
+    "value_clip_range": 0.2,
+    "target_kl": 0.0075
   },
   "opponents": {
     "latest_self": 0.70,
