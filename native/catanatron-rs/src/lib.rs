@@ -9567,7 +9567,7 @@ pub mod python_bindings {
         // victim; it never serializes discard resources, bought dev identity,
         // stolen resource, or any other ActionRecord result/value secret. ----
         let mut event_tokens = vec![0.0f64; event_history_limit * ENTITY_EVENT_FEATURE_SIZE];
-        let event_target_ids = vec![-1i64; event_history_limit * 4];
+        let mut event_target_ids = vec![-1i64; event_history_limit * 4];
         let mut event_mask = vec![false; event_history_limit];
         if meaningful_public_history && event_history_limit > 0 {
             let meaningful = state
@@ -9612,6 +9612,45 @@ pub mod python_bindings {
                     .position(|&entry| entry == type_name)
                 {
                     event_tokens[base + 17 + type_index] = 1.0;
+                }
+                let target_base = row * 4;
+                match &record.action.value {
+                    ActionValue::Node(node)
+                        if matches!(
+                            record.action.action_type,
+                            ActionType::BuildSettlement | ActionType::BuildCity
+                        ) =>
+                    {
+                        event_target_ids[target_base + 1] = *node as i64;
+                    }
+                    ActionValue::Edge(edge)
+                        if record.action.action_type == ActionType::BuildRoad =>
+                    {
+                        let (a, b) = canonical_edge(*edge);
+                        if let Some(&edge_id) = edge_to_id.get(&(a as i16, b as i16)) {
+                            event_target_ids[target_base + 2] = edge_id as i64;
+                        }
+                    }
+                    ActionValue::Robber(coordinate, victim)
+                        if record.action.action_type == ActionType::MoveRobber =>
+                    {
+                        if let Some(&tile_id) = coordinate_to_hex.get(coordinate) {
+                            event_target_ids[target_base] = tile_id;
+                        }
+                        if let Some(victim) = victim
+                            && let Some(target_index) = entity_player_index(color_name(*victim))
+                        {
+                            event_target_ids[target_base + 3] = target_index as i64;
+                        }
+                    }
+                    _ => {}
+                }
+                if event_target_ids[target_base] >= 0 {
+                    event_tokens[base + 14] = entity_scale(event_target_ids[target_base], 19.0);
+                } else if event_target_ids[target_base + 1] >= 0 {
+                    event_tokens[base + 14] = entity_scale(event_target_ids[target_base + 1], 54.0);
+                } else if event_target_ids[target_base + 2] >= 0 {
+                    event_tokens[base + 14] = entity_scale(event_target_ids[target_base + 2], 72.0);
                 }
                 if let ActionValue::Robber(_, Some(victim)) = &record.action.value
                     && let Some(target_index) = entity_player_index(color_name(*victim))
@@ -10557,12 +10596,13 @@ pub mod python_bindings {
             // DISCARD width is hidden-hand-dependent and therefore unknown.
             py_game.game.state.action_public_legal_counts.push(0);
 
-            let topology = PyEntityTopology {
+            let mut topology = PyEntityTopology {
                 hex_vertex_ids: vec![vec![-1; 6]; 19],
                 hex_edge_ids: vec![vec![-1; 6]; 19],
                 edge_vertex_ids: vec![vec![-1; 2]; 72],
                 port_base_nodes: vec![vec![-1; 2]; 16],
             };
+            topology.edge_vertex_ids[19] = vec![0, 1];
             let colors = py_game.game.state.colors.clone();
             let policy_action_ids = vec![0; py_game.game.playable_actions.len()];
             let enabled = build_entity_feature_arrays(
@@ -10590,6 +10630,12 @@ pub mod python_bindings {
                 .unwrap();
             assert_eq!(enabled.event_tokens[last + 17 + discard_index], 1.0);
             assert_eq!(enabled.event_tokens[last + 35], 0.0);
+            assert_eq!(enabled.event_target_ids[2], 19);
+            assert_eq!(enabled.event_tokens[14], 19.0 / 72.0);
+            assert_eq!(
+                enabled.event_target_ids[(enabled.event_history_limit - 1) * 4 + 2],
+                -1
+            );
 
             let legacy = build_entity_feature_arrays(
                 &py_game.game,

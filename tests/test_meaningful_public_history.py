@@ -6,6 +6,7 @@ from catan_zero.rl.entity_token_features import (
     ACTION_TYPES,
     EVENT_FEATURE_SIZE,
     _event_mask,
+    _event_target_ids,
     _event_tokens,
 )
 from catan_zero.rl.meaningful_history import (
@@ -93,6 +94,10 @@ def test_filter_runs_before_exact_32_event_cap():
 
 
 def test_existing_event_encoder_uses_32_meaningful_rows_without_schema_growth():
+    topology = {
+        "coordinate_to_hex": {(0, 0, 0): 8},
+        "edge_to_id": {},
+    }
     payload = {
         "event_log": [
             _event("ROLL"),
@@ -103,7 +108,7 @@ def test_existing_event_encoder_uses_32_meaningful_rows_without_schema_growth():
     }
     tokens = _event_tokens(
         payload,
-        {},
+        topology,
         history_limit=32,
         meaningful_public_history=True,
     )
@@ -120,7 +125,58 @@ def test_existing_event_encoder_uses_32_meaningful_rows_without_schema_growth():
     move_robber = ACTION_TYPES.index("MOVE_ROBBER")
     assert tokens[30, 17 + build_city] == 1.0
     assert tokens[31, 17 + move_robber] == 1.0
+    assert tokens[31, 14] == np.float16(8 / 19)
     assert tokens[31, 36 + 1] == 1.0  # RED public robber victim.
+
+
+def test_meaningful_event_targets_bind_public_build_and_robber_locations():
+    topology = {
+        "coordinate_to_hex": {(0, 0, 0): 8},
+        "edge_to_id": {(3, 7): 19},
+    }
+    payload = {
+        "event_log": [
+            _event("ROLL"),
+            _event("BUILD_SETTLEMENT", value=12),
+            _event("BUILD_ROAD", value=[7, 3]),
+            _event("MOVE_ROBBER", value=[[0, 0, 0], "RED"]),
+        ]
+    }
+
+    targets = _event_target_ids(
+        payload,
+        topology,
+        history_limit=32,
+        meaningful_public_history=True,
+    )
+
+    assert np.all(targets[:29] == -1)
+    assert targets[29].tolist() == [-1, 12, -1, -1]
+    assert targets[30].tolist() == [-1, -1, 19, -1]
+    assert targets[31].tolist() == [8, -1, -1, 1]
+    tokens = _event_tokens(
+        payload,
+        topology,
+        history_limit=32,
+        meaningful_public_history=True,
+    )
+    assert tokens[29, 14] == np.float16(12 / 54)
+    assert tokens[30, 14] == np.float16(19 / 72)
+    assert tokens[31, 14] == np.float16(8 / 19)
+
+
+def test_event_action_id_zero_has_explicit_validity_bit():
+    event = _event("BUILD_SETTLEMENT", value=12)
+    event["payload"]["action"]["index"] = 0
+    tokens = _event_tokens(
+        {"event_log": [event]},
+        {"coordinate_to_hex": {}, "edge_to_id": {}},
+        history_limit=32,
+        meaningful_public_history=True,
+    )
+
+    assert tokens[-1, 35] == 0.0
+    assert tokens[-1, 40] == 1.0
 
 
 def test_native_record_translation_redacts_every_hidden_card_identity():
@@ -150,3 +206,10 @@ def test_native_record_translation_redacts_every_hidden_card_identity():
     assert "public_legal_action_count_before" not in events[1]["payload"]
     assert events[2]["payload"]["result"] == "hidden_stolen_resource"
     assert not is_meaningful_public_event(events[2])
+    targets = _event_target_ids(
+        {"event_log": events},
+        {"coordinate_to_hex": {(0, 0, 0): 8}, "edge_to_id": {}},
+        history_limit=32,
+        meaningful_public_history=True,
+    )
+    assert np.all(targets == -1)

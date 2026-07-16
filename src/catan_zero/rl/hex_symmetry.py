@@ -11,8 +11,12 @@ tables -- with exactly two orientation-dependent scalar features to fix up:
   * ``hex_tokens[:, 1:4]`` -- the tile cube-coordinate ``/4``. It is a fixed
     function of the tile *slot*, so after permuting rows we simply restore the
     canonical per-slot coordinate (no matrix multiply needed).
-  * ``event_tokens[:, 35]`` -- a scaled past-action id encoding a board target.
-    Optionally relabelled through the action permutation ``pi_act``.
+  * ``event_tokens[:, 14]`` -- the normalized exact public spatial target.
+  * ``event_tokens[:, 35]`` -- a scaled past-action id encoding a board target,
+    valid only when slot 40 is set by the producer.
+
+Both event features are relabelled with their exact ``event_target_ids``;
+catalog action ids additionally pass through the action permutation ``pi_act``.
 
 Every other feature is intrinsic to its entity (resource, ownership, pips,
 ports, ...) and rides along with the permuted token row unchanged.
@@ -38,8 +42,10 @@ N_SYMMETRIES = 12
 # avoid a heavy import at table-build time; asserted against it in tests).
 _HEX_COORD_SLICE = slice(1, 4)
 _LEGAL_ACTION_ID_DIM = 1
+_EVENT_SPATIAL_TARGET_DIM = 14
 _EVENT_ACTION_ID_DIM = 35
 _EVENT_ACTION_ID_SCALE = 607.0
+_EVENT_ACTION_ID_VALID_DIM = 40
 
 
 def _import_catanatron():
@@ -262,11 +268,11 @@ class HexSymmetry:
                     f"event_mask shape {present.shape} != event action ids {ids.shape}"
                 )
             # Slot 35 historically used 0 both for the valid spatial action id
-            # zero and for "producer did not encode an action id".  Occupancy
-            # alone therefore cannot prove that zero is an action identity.
-            # Require the event's explicit public board target before applying
-            # a D6 action permutation; targetless native history must remain
-            # targetless instead of acquiring a fabricated rotated action id.
+            # zero and for "producer did not encode an action id".  Slot 40 is
+            # the producer-authenticated validity bit; target presence alone
+            # is insufficient because native history now carries exact public
+            # board targets without reconstructing a catalog id.
+            id_valid = ev_tok[:, :, _EVENT_ACTION_ID_VALID_DIM] > 0.5
             event_targets = entity.get("event_target_ids")
             if event_targets is None:
                 has_spatial_target = np.zeros_like(present)
@@ -285,6 +291,7 @@ class HexSymmetry:
                 has_spatial_target = np.any(event_targets[:, :, :3] >= 0, axis=-1)
             spatial = (
                 present
+                & id_valid
                 & has_spatial_target
                 & (ids >= 0)
                 & (ids < self.pi_act.shape[1])
@@ -313,6 +320,30 @@ class HexSymmetry:
                 event_targets[:, :, 2] = self._remap_values(
                     event_targets[:, :, 2], fwd_edge
                 )
+                spatial_target = np.zeros(present.shape, dtype=np.float32)
+                hex_target = event_targets[:, :, 0] >= 0
+                vertex_target = (~hex_target) & (event_targets[:, :, 1] >= 0)
+                edge_target = (
+                    (~hex_target)
+                    & (~vertex_target)
+                    & (event_targets[:, :, 2] >= 0)
+                )
+                spatial_target[hex_target] = (
+                    event_targets[:, :, 0][hex_target] / 19.0
+                )
+                spatial_target[vertex_target] = (
+                    event_targets[:, :, 1][vertex_target] / 54.0
+                )
+                spatial_target[edge_target] = (
+                    event_targets[:, :, 2][edge_target] / 72.0
+                )
+                has_spatial_target = hex_target | vertex_target | edge_target
+                ev_tok[:, :, _EVENT_SPATIAL_TARGET_DIM] = np.where(
+                    has_spatial_target,
+                    spatial_target,
+                    ev_tok[:, :, _EVENT_SPATIAL_TARGET_DIM],
+                ).astype(ev_tok.dtype)
+                out["event_tokens"] = ev_tok
                 out["event_target_ids"] = event_targets
 
         return out

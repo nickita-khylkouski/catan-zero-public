@@ -177,7 +177,7 @@ def test_optional_arrays_are_the_only_default_schema_difference() -> None:
 
 @pytest.mark.parametrize(
     ("used_full_search", "expected_policy_weight"),
-    ((True, 1.0), (False, 4.0 / 128.0)),
+    ((True, 1.0), (False, 0.0)),
 )
 def test_decision_row_preserves_active_search_evidence_in_legal_order(
     monkeypatch: pytest.MonkeyPatch,
@@ -235,7 +235,11 @@ def test_decision_row_preserves_active_search_evidence_in_legal_order(
     assert float(row["policy_weight_multiplier"]) == pytest.approx(
         expected_policy_weight
     )
-    assert row["_search_visit_counts"].tolist() == [3, 1]
-    assert row["_search_completed_q"].tolist() == pytest.approx([0.2, 0.05])
+    if used_full_search:
+        assert row["_search_visit_counts"].tolist() == [3, 1]
+        assert row["_search_completed_q"].tolist() == pytest.approx([0.2, 0.05])
+    else:
+        assert "_search_visit_counts" not in row
+        assert "_search_completed_q" not in row
     assert row["target_policy"].tolist() == pytest.approx([1.0, 0.0])
     assert row["target_policy_mask"].tolist() == [True, True]

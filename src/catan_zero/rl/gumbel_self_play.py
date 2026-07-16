@@ -145,8 +145,6 @@ SEARCH_EVIDENCE_VERSION = 1
 # quarter of a full-search row. The confidence denominator matches the current
 # 2p production full-search budget, so the common 16-visit fast root is 0.125x
 # while a 32-visit fast root reaches the conservative 0.25 cap.
-FAST_SEARCH_POLICY_WEIGHT_MAX = 0.25
-FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS = 128
 # Search targets need provenance that is independent from observation masking.
 # ``public_observation=True`` only constrains neural-network features; it does
 # not prove that the planner's cloned world state was information-safe.
@@ -715,67 +713,6 @@ def _game_outcome_fields(
     }
 
 
-def _fast_search_policy_confidence_weight(
-    result: Any,
-    *,
-    legal_actions: Sequence[int],
-    target_policy: np.ndarray,
-    is_forced: bool,
-) -> float:
-    """Return bounded policy confidence for a real, valid fast search.
-
-    ``used_full_search=False`` also represents forced trajectory-only rows and
-    raw-policy wide-root shortcuts. Positive simulation evidence distinguishes
-    an actual low-budget search from those no-search paths. Malformed targets
-    or visit accounting remain policy-inactive rather than silently training
-    on an unauthenticated distribution.
-    """
-
-    legal = tuple(int(action) for action in legal_actions)
-    if is_forced or len(legal) <= 1:
-        return 0.0
-
-    raw_simulations = getattr(result, "simulations_used", 0)
-    if isinstance(raw_simulations, bool) or not isinstance(
-        raw_simulations, (int, np.integer)
-    ):
-        return 0.0
-    simulations = int(raw_simulations)
-    if simulations <= 0:
-        return 0.0
-
-    policy = np.asarray(target_policy, dtype=np.float64)
-    if (
-        policy.shape != (len(legal),)
-        or not bool(np.all(np.isfinite(policy)))
-        or bool(np.any(policy < 0.0))
-    ):
-        return 0.0
-    total = float(policy.sum(dtype=np.float64))
-    if not math.isfinite(total) or not math.isclose(
-        total, 1.0, rel_tol=1.0e-5, abs_tol=1.0e-5
-    ):
-        return 0.0
-
-    visit_counts = getattr(result, "visit_counts", {})
-    if not isinstance(visit_counts, Mapping):
-        return 0.0
-    raw_visits = [visit_counts.get(action, 0) for action in legal]
-    if any(
-        isinstance(value, bool) or not isinstance(value, (int, np.integer))
-        for value in raw_visits
-    ):
-        return 0.0
-    visits = np.asarray(raw_visits, dtype=np.int64)
-    if bool(np.any(visits < 0)) or int(visits.sum()) != simulations:
-        return 0.0
-
-    return min(
-        FAST_SEARCH_POLICY_WEIGHT_MAX,
-        simulations / float(FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS),
-    )
-
-
 def _build_decision_row(
     game: Any,
     *,
@@ -902,13 +839,6 @@ def _build_decision_row(
         dtype=np.float32,
     )
     afterstate_target_mask = np.isfinite(afterstate_target)
-    fast_policy_weight = _fast_search_policy_confidence_weight(
-        result,
-        legal_actions=legal_rust,
-        target_policy=target_policy,
-        is_forced=is_forced,
-    )
-
     best_rust = int(result.selected_action)
     best_policy = mapped[legal_rust.index(best_rust)]
 
@@ -949,9 +879,16 @@ def _build_decision_row(
         "has_final_actual_vps": False,
         "action_mask_version": ACTION_MASK_VERSION,
         "policy_weight_multiplier": np.float32(
-            0.0
-            if is_forced
-            else (1.0 if result.used_full_search else fast_policy_weight)
+            # Playout-cap randomization deliberately spends cheap n_fast
+            # searches to advance trajectories/value outcomes, but only the
+            # independently selected n_full roots are policy teachers.  Giving
+            # n_fast rows even a bounded positive weight silently changes an
+            # "n128 teacher" corpus into a mixed n16/n128 policy objective.
+            # Keep the paid fast-search distribution as evidence for sealed
+            # reliability experiments, not as production policy authority.
+            1.0
+            if result.used_full_search and not is_forced
+            else 0.0
         ),
         # Forced rows remain terminal-outcome value examples even when
         # trajectory_only skips the discarded root-Q/afterstate computation.

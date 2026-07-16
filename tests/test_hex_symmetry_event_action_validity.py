@@ -14,11 +14,14 @@ def _synthetic_symmetry() -> HexSymmetry:
     # only the event action-id validity contract.
     pi_act = np.tile(np.arange(2, dtype=np.int64), (N_SYMMETRIES, 1))
     pi_act[1:] = np.array([1, 0], dtype=np.int64)
+    fwd_vertex = identities(54)
+    fwd_vertex[1:, 7] = 8
+    fwd_vertex[1:, 8] = 7
     return HexSymmetry(
         fwd_hex=identities(19),
         inv_hex=identities(19),
-        fwd_vertex=identities(54),
-        inv_vertex=identities(54),
+        fwd_vertex=fwd_vertex,
+        inv_vertex=fwd_vertex.copy(),
         fwd_edge=identities(72),
         inv_edge=identities(72),
         pi_act=pi_act,
@@ -57,3 +60,31 @@ def test_targetless_event_action_zero_stays_zero_for_every_symmetry() -> None:
             out["event_target_ids"][0, 0],
             np.array([-1, -1, -1, -1], dtype=np.int64),
         )
+
+
+def test_targeted_event_without_action_id_stays_zero_for_every_symmetry() -> None:
+    symmetry = _synthetic_symmetry()
+    entity = _synthetic_entity()
+    entity["event_target_ids"][0, 0, 1] = 7
+
+    for orientation in range(N_SYMMETRIES):
+        out = symmetry.permute_entity_batch(
+            entity,
+            orientation,
+            relabel_events=True,
+        )
+        assert out["event_tokens"][0, 0, 35] == 0.0
+        expected_target = 7 if orientation == 0 else 8
+        assert out["event_target_ids"][0, 0, 1] == expected_target
+        assert np.isclose(out["event_tokens"][0, 0, 14], expected_target / 54.0)
+
+
+def test_valid_action_zero_relabels_when_targeted() -> None:
+    symmetry = _synthetic_symmetry()
+    entity = _synthetic_entity()
+    entity["event_target_ids"][0, 0, 1] = 7
+    entity["event_tokens"][0, 0, 40] = 1.0
+
+    out = symmetry.permute_entity_batch(entity, 1, relabel_events=True)
+
+    assert out["event_tokens"][0, 0, 35] == 1.0 / 607.0

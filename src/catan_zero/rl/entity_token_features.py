@@ -356,7 +356,10 @@ def build_entity_token_features(
             meaningful_public_history=meaningful_public_history,
         ),
         "event_target_ids": _event_target_ids(
-            payload, topology, history_limit=effective_history_limit
+            payload,
+            topology,
+            history_limit=effective_history_limit,
+            meaningful_public_history=meaningful_public_history,
         ),
         "hex_mask": np.ones(19, dtype=np.bool_),
         "vertex_mask": np.ones(54, dtype=np.bool_),
@@ -770,7 +773,6 @@ def _event_tokens(
     history_limit: int,
     meaningful_public_history: bool = False,
 ) -> np.ndarray:
-    del topology
     events = _selected_history_events(
         payload,
         history_limit=history_limit,
@@ -789,6 +791,13 @@ def _event_tokens(
         actor_index = _player_index(str(event.get("actor", "")))
         if actor_index is not None:
             tokens[row, 10 + actor_index] = 1.0
+        target_ids = _event_public_target_ids(event, topology)
+        if target_ids[0] >= 0:
+            tokens[row, 14] = _scale(target_ids[0], 19)
+        elif target_ids[1] >= 0:
+            tokens[row, 14] = _scale(target_ids[1], 54)
+        elif target_ids[2] >= 0:
+            tokens[row, 14] = _scale(target_ids[2], 72)
         turn_key = event.get("turn_key") or (0, 0)
         if isinstance(turn_key, (list, tuple)) and len(turn_key) >= 2:
             tokens[row, 15] = _scale(turn_key[0], 512)
@@ -800,6 +809,11 @@ def _event_tokens(
         action_id = _event_action_id(event)
         if action_id is not None:
             tokens[row, 35] = _scale(action_id, 607)
+            # Slot 35 historically used zero for both the valid action id 0
+            # and "producer did not encode an id".  Keep an explicit validity
+            # bit so D6 augmentation never fabricates action zero for a native
+            # history row that only carries a public spatial target.
+            tokens[row, 40] = 1.0
         target_index = _player_index(str(_event_target_player(event)))
         if target_index is not None:
             tokens[row, 36 + target_index] = 1.0
@@ -807,10 +821,22 @@ def _event_tokens(
 
 
 def _event_target_ids(
-    payload: dict[str, Any], topology: dict[str, Any], *, history_limit: int
+    payload: dict[str, Any],
+    topology: dict[str, Any],
+    *,
+    history_limit: int,
+    meaningful_public_history: bool = False,
 ) -> np.ndarray:
-    del topology
-    return np.full((history_limit, 4), -1, dtype=np.int16)
+    events = _selected_history_events(
+        payload,
+        history_limit=history_limit,
+        meaningful_public_history=meaningful_public_history,
+    )
+    targets = np.full((history_limit, 4), -1, dtype=np.int16)
+    offset = history_limit - len(events)
+    for index, event in enumerate(events):
+        targets[offset + index] = _event_public_target_ids(event, topology)
+    return targets
 
 
 def _event_mask(
@@ -1021,6 +1047,41 @@ def _event_action_id(event: dict[str, Any]) -> int | None:
     if not action:
         return None
     return _safe_int(action.get("index"))
+
+
+def _event_public_target_ids(
+    event: dict[str, Any], topology: dict[str, Any]
+) -> np.ndarray:
+    """Encode only exact public board/player targets from one past action."""
+
+    target = np.full(4, -1, dtype=np.int16)
+    action = _event_action(event) or {}
+    action_type = str(action.get("action_type", ""))
+    value = action.get("value")
+    if action_type in {"BUILD_SETTLEMENT", "BUILD_CITY"}:
+        target[1] = _safe_int(value, default=-1)
+    elif action_type == "BUILD_ROAD":
+        edge = _edge_pair(value)
+        if edge is not None:
+            target[2] = topology["edge_to_id"].get(edge, -1)
+    elif action_type == "MOVE_ROBBER":
+        if isinstance(value, (list, tuple)) and value:
+            coordinate = _coordinate(value[0])
+            if coordinate is not None:
+                target[0] = topology["coordinate_to_hex"].get(coordinate, -1)
+            if len(value) >= 2 and value[1] is not None:
+                player_id = _player_index(str(value[1]))
+                if player_id is not None:
+                    target[3] = player_id
+        elif isinstance(value, dict):
+            coordinate = _coordinate(value.get("coordinate"))
+            if coordinate is not None:
+                target[0] = topology["coordinate_to_hex"].get(coordinate, -1)
+            victim = value.get("victim")
+            player_id = _player_index(str(victim)) if victim is not None else None
+            if player_id is not None:
+                target[3] = player_id
+    return target
 
 
 def _event_target_player(event: dict[str, Any]) -> str:
