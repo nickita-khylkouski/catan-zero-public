@@ -5,21 +5,34 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import multiprocessing as mp
+from pathlib import Path
 import sys
 import time
 from typing import Any
 
-import numpy as np
+_TOOLS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _TOOLS_DIR.parent
+_SRC_DIR = _REPO_ROOT / "src"
+for _checkout_path in (_REPO_ROOT, _SRC_DIR, _TOOLS_DIR):
+    while str(_checkout_path) in sys.path:
+        sys.path.remove(str(_checkout_path))
+    sys.path.insert(0, str(_checkout_path))
 
-from catan_zero.rl import ppo_distributed as dist
-from catan_zero.rl.config_cli import _explicit_cli_dests
-from catan_zero.rl.ppo_policy_factory import (
+import numpy as np  # noqa: E402
+
+from catan_zero.rl import ppo_distributed as dist  # noqa: E402
+from catan_zero.rl.config_cli import _explicit_cli_dests  # noqa: E402
+from catan_zero.rl.ppo_policy_factory import (  # noqa: E402
     CANONICAL_PPO_ARCHITECTURE,
     load_ppo_policy,
     validate_canonical_ppo_actor_contract,
 )
-from catan_zero.rl.ppo_run_manifest import ManifestError, PPORunManifest, load_manifest
-from catan_zero.rl.torch_ppo import collect_ppo_episode
+from catan_zero.rl.ppo_run_manifest import (  # noqa: E402
+    ManifestError,
+    PPORunManifest,
+    load_manifest,
+)
+from catan_zero.rl.torch_ppo import collect_ppo_episode  # noqa: E402
 try:
     from factory_common import make_named_policy, parse_track
 except ModuleNotFoundError as error:  # package import; direct script uses the sibling import

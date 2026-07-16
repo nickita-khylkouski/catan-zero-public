@@ -45,8 +45,12 @@ import numpy as np
 # Make the sibling ``tools/`` modules importable (factory_common, evaluate_scoreboard) whether
 # the learner is launched as ``python tools/ppo_distributed_learner.py`` or ``-m``.
 _TOOLS_DIR = Path(__file__).resolve().parent
-if str(_TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_DIR))
+_REPO_ROOT = _TOOLS_DIR.parent
+_SRC_DIR = _REPO_ROOT / "src"
+for _checkout_path in (_REPO_ROOT, _SRC_DIR, _TOOLS_DIR):
+    while str(_checkout_path) in sys.path:
+        sys.path.remove(str(_checkout_path))
+    sys.path.insert(0, str(_checkout_path))
 
 from catan_zero.rl import ppo_distributed as dist  # noqa: E402
 from catan_zero.rl.config_cli import _explicit_cli_dests  # noqa: E402
