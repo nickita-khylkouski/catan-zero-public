@@ -13931,10 +13931,14 @@ def main(
     # sidecar so a stop/crash continues with warm moments + correct LR position rather
     # than restarting Adam from zero (the fresh-Adam catastrophic-forgetting risk called
     # out by the --lr-warmup-steps guard). Called on ALL ranks (FSDP restore is a
-    # collective) BEFORE the training loop, after the optimizer is built. Fail-safe: the
-    # champion and any --grow-from-checkpoint arm have no matching sidecar, so this
-    # returns False and training proceeds with a fresh optimizer -- the expected first
-    # fine-tune behaviour; the win is on resuming a run this code started.
+    # collective) BEFORE the training loop, after the optimizer is built. An explicit
+    # resume request is an exact-continuation contract: missing sidecars fail closed.
+    # Model-only warm starts remain available through --no-resume-optimizer.
+    _validate_optimizer_resume_request(
+        requested=bool(args.resume_optimizer),
+        init_checkpoint=str(args.init_checkpoint),
+        optimizer_available=optimizer is not None,
+    )
     optimizer_restored = False
     resume_progress = None
     if optimizer is not None and args.init_checkpoint and bool(args.resume_optimizer):
@@ -13948,32 +13952,29 @@ def main(
 
         optimizer_path = optimizer_sidecar_path(args.init_checkpoint)
         progress_path = training_progress_sidecar_path(args.init_checkpoint)
-        if optimizer_path.exists() or progress_path.exists():
-            if not optimizer_path.exists() or not progress_path.exists():
-                raise SystemExit(
-                    "incomplete resumable checkpoint set: model, optimizer, and "
-                    "training-progress sidecars must all belong to one atomic commit; "
-                    "use --no-resume-optimizer for an explicit fresh-optimizer start"
-                )
-            try:
-                resume_progress = load_training_progress(
-                    args.init_checkpoint,
-                    expected_recipe_identity=resume_recipe_identity,
-                )
-            except TrainingProgressError as error:
-                raise SystemExit(
-                    f"refusing incompatible optimizer resume: {error}; use "
-                    "--no-resume-optimizer for an explicit fresh-optimizer start"
-                ) from error
-            optimizer_restored = bool(
-                load_optimizer_state(args.init_checkpoint, policy.model, optimizer, ddp)
+        _require_optimizer_resume_sidecars(
+            optimizer_path=optimizer_path,
+            progress_path=progress_path,
+        )
+        try:
+            resume_progress = load_training_progress(
+                args.init_checkpoint,
+                expected_recipe_identity=resume_recipe_identity,
             )
-            if not optimizer_restored:
-                raise SystemExit(
-                    "training progress validated but optimizer restore failed; refusing "
-                    "to restart Adam/LR state silently (use --no-resume-optimizer for "
-                    "an explicit fresh-optimizer start)"
-                )
+        except TrainingProgressError as error:
+            raise SystemExit(
+                f"refusing incompatible optimizer resume: {error}; use "
+                "--no-resume-optimizer for an explicit fresh-optimizer start"
+            ) from error
+        optimizer_restored = bool(
+            load_optimizer_state(args.init_checkpoint, policy.model, optimizer, ddp)
+        )
+        if not optimizer_restored:
+            raise SystemExit(
+                "training progress validated but optimizer restore failed; refusing "
+                "to restart Adam/LR state silently (use --no-resume-optimizer for "
+                "an explicit fresh-optimizer start)"
+            )
         _rank0_print(
             json.dumps(
                 {
@@ -15316,6 +15317,11 @@ def main(
         resumed=resume_progress is not None,
         global_step=global_step,
         max_steps=int(args.max_steps),
+    )
+    _validate_resumed_epoch_boundary(
+        resumed=resume_progress is not None,
+        completed_epochs=start_epoch,
+        epoch_limit=effective_epoch_limit,
     )
     policy_dose_cutoff_optimizer_step = (
         int(global_step)
@@ -34824,6 +34830,58 @@ def _validate_exact_optimizer_step_dose(
             "exact optimizer-step dose was not reached: "
             f"requested={int(max_steps)} applied={int(applied_steps)} "
             f"effective_epoch_limit={int(epoch_limit)}"
+        )
+
+
+def _require_optimizer_resume_sidecars(
+    *, optimizer_path: Path, progress_path: Path
+) -> None:
+    """Require the complete durable state promised by --resume-optimizer."""
+
+    missing = [
+        label
+        for label, path in (
+            ("optimizer", optimizer_path),
+            ("training-progress", progress_path),
+        )
+        if not path.is_file()
+    ]
+    if missing:
+        raise SystemExit(
+            "incomplete resumable checkpoint set: model, optimizer, and "
+            "training-progress sidecars must all belong to one atomic commit; "
+            f"missing={missing}; use --no-resume-optimizer for an explicit "
+            "fresh-optimizer start"
+        )
+
+
+def _validate_optimizer_resume_request(
+    *, requested: bool, init_checkpoint: str, optimizer_available: bool
+) -> None:
+    """Reject a resume flag that cannot possibly restore optimizer state."""
+
+    if not requested:
+        return
+    if not str(init_checkpoint).strip():
+        raise SystemExit("--resume-optimizer requires --init-checkpoint")
+    if not optimizer_available:
+        raise SystemExit("--resume-optimizer requires a live training optimizer")
+
+
+def _validate_resumed_epoch_boundary(
+    *, resumed: bool, completed_epochs: int, epoch_limit: int
+) -> None:
+    """Refuse an exact continuation whose configured epoch dose is complete."""
+
+    if not resumed:
+        return
+    completed = int(completed_epochs)
+    limit = int(epoch_limit)
+    if completed >= limit:
+        raise SystemExit(
+            "resumed completed_epochs already reaches --epochs: "
+            f"completed={completed} epochs={limit}; the requested dose is "
+            "complete, so no optimizer update or checkpoint save will be performed"
         )
 
 

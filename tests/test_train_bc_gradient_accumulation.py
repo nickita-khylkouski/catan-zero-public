@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -9,7 +10,10 @@ from tools.train_bc import (
     _advance_global_step,
     _effective_training_epoch_limit,
     _gradient_sync_context,
+    _require_optimizer_resume_sidecars,
+    _validate_optimizer_resume_request,
     _validate_exact_optimizer_step_dose,
+    _validate_resumed_epoch_boundary,
     _validate_resumed_max_step_boundary,
 )
 
@@ -147,6 +151,99 @@ def test_resume_beyond_step_cap_is_invalid() -> None:
 
 
 @pytest.mark.parametrize(
+    ("optimizer_present", "progress_present"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_explicit_optimizer_resume_requires_both_regular_sidecars(
+    tmp_path: Path,
+    optimizer_present: bool,
+    progress_present: bool,
+) -> None:
+    optimizer_path = tmp_path / "model.pt.optimizer.pt"
+    progress_path = tmp_path / "model.pt.training-progress.json"
+    if optimizer_present:
+        optimizer_path.write_bytes(b"optimizer")
+    if progress_present:
+        progress_path.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="incomplete resumable checkpoint set"):
+        _require_optimizer_resume_sidecars(
+            optimizer_path=optimizer_path,
+            progress_path=progress_path,
+        )
+
+
+def test_explicit_optimizer_resume_accepts_complete_sidecar_set(
+    tmp_path: Path,
+) -> None:
+    optimizer_path = tmp_path / "model.pt.optimizer.pt"
+    progress_path = tmp_path / "model.pt.training-progress.json"
+    optimizer_path.write_bytes(b"optimizer")
+    progress_path.write_text("{}\n", encoding="utf-8")
+
+    _require_optimizer_resume_sidecars(
+        optimizer_path=optimizer_path,
+        progress_path=progress_path,
+    )
+
+
+@pytest.mark.parametrize(
+    ("init_checkpoint", "optimizer_available", "message"),
+    [
+        ("", True, "requires --init-checkpoint"),
+        ("model.pt", False, "requires a live training optimizer"),
+    ],
+)
+def test_optimizer_resume_request_requires_restorable_context(
+    init_checkpoint: str,
+    optimizer_available: bool,
+    message: str,
+) -> None:
+    with pytest.raises(SystemExit, match=message):
+        _validate_optimizer_resume_request(
+            requested=True,
+            init_checkpoint=init_checkpoint,
+            optimizer_available=optimizer_available,
+        )
+
+
+def test_fresh_optimizer_request_does_not_require_resume_context() -> None:
+    _validate_optimizer_resume_request(
+        requested=False,
+        init_checkpoint="",
+        optimizer_available=False,
+    )
+
+
+def test_resume_at_completed_epoch_dose_refuses_no_work_save() -> None:
+    with pytest.raises(
+        SystemExit,
+        match="already reaches --epochs.*no optimizer update or checkpoint save",
+    ):
+        _validate_resumed_epoch_boundary(
+            resumed=True,
+            completed_epochs=3,
+            epoch_limit=3,
+        )
+
+
+@pytest.mark.parametrize(
+    ("resumed", "completed_epochs", "epoch_limit"),
+    [(False, 3, 3), (True, 2, 3)],
+)
+def test_resume_epoch_guard_allows_fresh_or_incomplete_dose(
+    resumed: bool,
+    completed_epochs: int,
+    epoch_limit: int,
+) -> None:
+    _validate_resumed_epoch_boundary(
+        resumed=resumed,
+        completed_epochs=completed_epochs,
+        epoch_limit=epoch_limit,
+    )
+
+
+@pytest.mark.parametrize(
     ("resumed", "global_step", "max_steps"),
     [
         (True, 31, 32),
@@ -171,12 +268,29 @@ def test_resume_step_cap_guard_precedes_uniform_and_weighted_sampler_paths() -> 
 
     source = inspect.getsource(train_bc.main)
     restore = source.index("_restore_training_progress_state(")
-    guard = source.index("_validate_resumed_max_step_boundary(")
+    step_guard = source.index("_validate_resumed_max_step_boundary(")
+    epoch_guard = source.index("_validate_resumed_epoch_boundary(")
     epoch_loop = source.index("for epoch in range(")
     order = source.index("order = _epoch_order(")
-    terminal_save = source.index("_save_policy(", guard)
+    terminal_save = source.index("_save_policy(", epoch_guard)
 
-    assert restore < guard < epoch_loop < order < terminal_save
+    assert restore < step_guard < epoch_guard < epoch_loop < order < terminal_save
+
+
+def test_optimizer_resume_sidecars_are_required_before_restore_attempt() -> None:
+    import inspect
+
+    from tools import train_bc
+
+    source = inspect.getsource(train_bc.main)
+    explicit_resume = source.index(
+        "if optimizer is not None and args.init_checkpoint and bool(args.resume_optimizer)"
+    )
+    sidecar_guard = source.index("_require_optimizer_resume_sidecars(", explicit_resume)
+    progress_load = source.index("resume_progress = load_training_progress(", sidecar_guard)
+    optimizer_load = source.index("load_optimizer_state(", progress_load)
+
+    assert explicit_resume < sidecar_guard < progress_load < optimizer_load
 
 
 def test_epoch_progress_is_resumable_until_terminal_admission_finishes() -> None:
