@@ -1413,3 +1413,169 @@ def test_unforced_phase_ddp_reducer_merges_unequal_rank_counts(monkeypatch) -> N
     finalized = train_bc._finalize_phase_stats(reduced)  # noqa: SLF001
     assert finalized["OPEN"]["top1_accuracy"] == pytest.approx(0.5)
     assert finalized["ROBBER"]["top3_accuracy"] == pytest.approx(0.5)
+
+
+def test_policy_target_distribution_metrics_follow_soft_teacher_and_opening_index() -> None:
+    import torch
+    from tools import train_bc
+
+    logits = torch.tensor(
+        [
+            [3.0, 2.0, -4.0],
+            [3.0, 2.0, 1.0],
+            [0.0, 4.0, 2.0],
+        ]
+    )
+    targets = torch.tensor(
+        [
+            [0.40, 0.60, 0.00],
+            [0.05, 0.15, 0.80],
+            [0.10, 0.70, 0.20],
+        ]
+    )
+    has_soft = torch.tensor([True, True, True])
+    active = torch.tensor([True, True, False])
+    support = torch.ones_like(targets, dtype=torch.bool)
+    data = {
+        "phase": np.asarray(
+            [
+                "BUILD_INITIAL_SETTLEMENT",
+                "BUILD_INITIAL_SETTLEMENT",
+                "PLAY_TURN",
+            ]
+        ),
+        "decision_index": np.asarray([0, 2, 9], dtype=np.int32),
+    }
+
+    sufficient = train_bc._policy_target_distribution_stats(  # noqa: SLF001
+        data,
+        np.arange(3, dtype=np.int64),
+        logits,
+        targets,
+        has_soft,
+        active,
+        support,
+    )
+    metrics = train_bc._finalize_policy_target_distribution_stats(  # noqa: SLF001
+        sufficient
+    )
+
+    assert metrics["weighting"] == "uniform_soft_target_policy_active_rows"
+    assert metrics["objective_weighted"] is False
+    assert metrics["overall"]["rows"] == 2
+    assert metrics["overall"]["teacher_argmax_top1_accuracy"] == 0.0
+    assert metrics["overall"]["teacher_argmax_top3_accuracy"] == 1.0
+    assert metrics["overall"]["model_top1_target_mass"] == pytest.approx(
+        (0.40 + 0.05) / 2.0
+    )
+    assert metrics["overall"]["model_top3_target_mass"] == pytest.approx(1.0)
+    assert metrics["overall"]["kl_target_model"] == pytest.approx(
+        metrics["overall"]["excess_cross_entropy_above_target_entropy"]
+    )
+    assert metrics["phase"]["BUILD_INITIAL_SETTLEMENT"]["rows"] == 2
+    assert metrics["opening_decision_index"]["0"]["rows"] == 1
+    assert metrics["opening_decision_index"]["2"]["rows"] == 1
+    assert "9" not in metrics["opening_decision_index"]
+
+
+def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
+    monkeypatch,
+) -> None:
+    import torch.distributed as dist
+    from tools import train_bc
+
+    local = {
+        "schema_version": "policy-target-distribution-sufficient-stats-v1",
+        "overall": {
+            **train_bc._empty_policy_target_metric_parts(),  # noqa: SLF001
+            "rows": 1.0,
+            "teacher_argmax_top1_correct": 1.0,
+            "cross_entropy_sum": 0.5,
+            "target_entropy_sum": 0.2,
+            "kl_target_model_sum": 0.3,
+            "excess_cross_entropy_sum": 0.3,
+        },
+        "phase": {},
+        "opening_decision_index": {},
+    }
+    remote = {
+        "schema_version": "policy-target-distribution-sufficient-stats-v1",
+        "overall": {
+            **train_bc._empty_policy_target_metric_parts(),  # noqa: SLF001
+            "rows": 3.0,
+            "teacher_argmax_top1_correct": 1.0,
+            "teacher_argmax_top3_correct": 2.0,
+            "cross_entropy_sum": 2.5,
+            "target_entropy_sum": 1.0,
+            "kl_target_model_sum": 1.5,
+            "excess_cross_entropy_sum": 1.5,
+        },
+        "phase": {},
+        "opening_decision_index": {},
+    }
+
+    def fake_all_gather_object(output, value):
+        assert value == local
+        output[:] = [local, remote]
+
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_object)
+    reduced = train_bc._reduce_policy_target_distribution_stats(  # noqa: SLF001
+        local,
+        {"enabled": True, "world_size": 2, "rank": 0, "local_rank": 0},
+    )
+    metrics = train_bc._finalize_policy_target_distribution_stats(  # noqa: SLF001
+        reduced
+    )["overall"]
+    assert metrics["rows"] == 4
+    assert metrics["teacher_argmax_top1_accuracy"] == pytest.approx(0.5)
+    assert metrics["teacher_argmax_top3_accuracy"] == pytest.approx(0.5)
+    assert metrics["soft_target_cross_entropy"] == pytest.approx(0.75)
+    assert metrics["target_entropy"] == pytest.approx(0.30)
+    assert metrics["kl_target_model"] == pytest.approx(0.45)
+
+
+def test_objective_validation_aggregates_teacher_metrics_by_eligible_density() -> None:
+    from tools import train_bc
+
+    def report(*, samples: int, rows: float, hits: float) -> dict:
+        parts = train_bc._empty_policy_target_metric_parts()  # noqa: SLF001
+        parts.update(
+            {
+                "rows": rows,
+                "teacher_argmax_top1_correct": hits,
+                "teacher_argmax_top3_correct": rows,
+                "cross_entropy_sum": rows,
+                "target_entropy_sum": rows * 0.25,
+                "kl_target_model_sum": rows * 0.75,
+                "excess_cross_entropy_sum": rows * 0.75,
+                "model_top1_target_mass_sum": rows * 0.5,
+                "model_top3_target_mass_sum": rows * 0.9,
+            }
+        )
+        return {
+            "samples": samples,
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "loss_denominators": {},
+            "policy_target_distribution_sufficient_statistics": {
+                "schema_version": (
+                    "policy-target-distribution-sufficient-stats-v1"
+                ),
+                "overall": parts,
+                "phase": {},
+                "opening_decision_index": {},
+            },
+        }
+
+    metrics, _ = train_bc._objective_measure_validation_aggregate(  # noqa: SLF001
+        [
+            report(samples=10, rows=5.0, hits=2.0),
+            report(samples=20, rows=10.0, hits=8.0),
+        ],
+        np.asarray([0.5, 0.5]),
+    )
+    target = metrics["policy_target_distribution_metrics"]["overall"]
+    assert target["row_probability"] == pytest.approx(0.5)
+    assert target["teacher_argmax_top1_accuracy"] == pytest.approx(0.6)
+    assert target["teacher_argmax_top3_accuracy"] == pytest.approx(1.0)
+    assert target["soft_target_cross_entropy"] == pytest.approx(1.0)

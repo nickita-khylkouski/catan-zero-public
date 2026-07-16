@@ -14158,6 +14158,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             float(args.policy_dose_lr_area) > 0.0
         ),
     )
+    weighted_policy_aux_stream = (
+        policy_aux_sampling_weights is not None
+        and str(args.policy_aux_sampling_mode)
+        == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+    )
+    policy_aux_global_draw_offset = (
+        _restore_policy_aux_global_draw_offset(
+            resume_progress,
+            required=weighted_policy_aux_stream,
+        )
+    )
     _validate_resumed_max_step_boundary(
         resumed=resume_progress is not None,
         global_step=global_step,
@@ -14433,9 +14444,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             )
             global_aux_draw_offset = (
-                int(epoch)
-                * int(local_aux_draws)
-                * int(ddp["world_size"])
+                int(policy_aux_global_draw_offset)
                 if weighted_cycle_mode
                 else 0
             )
@@ -14608,6 +14617,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         phase_stats = _empty_phase_stats()
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
+        policy_target_distribution_stats: dict[str, object] = {}
         policy_base_phase_stats = _empty_phase_stats()
         policy_aux_phase_stats = _empty_phase_stats()
         policy_base_phase_stats_unforced = _empty_phase_stats()
@@ -14904,6 +14914,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                         if policy_aux_batch is not None
                         else {}
                     ),
+                )
+            if weighted_cycle_mode and aux_source_rows is not None:
+                policy_aux_global_draw_offset = (
+                    _advance_policy_aux_global_draw_offset(
+                        policy_aux_global_draw_offset,
+                        local_draws=len(aux_source_rows),
+                        ddp=ddp,
+                    )
                 )
             loss = float(batch_metrics["loss"])
             accuracy = float(batch_metrics["accuracy"])
@@ -15348,6 +15366,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 batch_metrics.get("phase_stats_unforced", {}),
             )
             _merge_phase_stats(teacher_stats, batch_metrics["teacher_stats"])
+            _merge_policy_target_distribution_stats(
+                policy_target_distribution_stats,
+                batch_metrics.get("policy_target_distribution_stats", {}),
+            )
             _merge_phase_stats(
                 policy_base_phase_stats,
                 batch_metrics.get("policy_base_phase_stats", {}),
@@ -15656,6 +15678,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         phase_stats = _reduce_nested_count_stats(phase_stats, ddp)
         phase_stats_unforced = _reduce_nested_count_stats(phase_stats_unforced, ddp)
         teacher_stats = _reduce_nested_count_stats(teacher_stats, ddp)
+        policy_target_distribution_stats = (
+            _reduce_policy_target_distribution_stats(
+                policy_target_distribution_stats, ddp
+            )
+        )
         policy_base_phase_stats = _reduce_nested_count_stats(
             policy_base_phase_stats, ddp
         )
@@ -16233,11 +16260,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "q_score_rows_ge2": int(round(epoch_extra_sums["q_score_rows_ge2"])),
                 "q_score_rows_ge2_fraction": epoch_extra_sums["q_score_rows_ge2"] / max(total_count, 1.0),
                 "policy_metric_semantics": {
-                    "schema_version": "train-policy-stream-metrics-v1",
+                    "schema_version": "train-policy-stream-metrics-v2",
                     "headline_scope": "base_plus_aux_count_weighted",
                     "base_scope": "positive_policy_weight_rows_in_base_forward",
                     "aux_scope": "all_rows_in_policy_aux_forward",
-                    "accuracy_weighting": "uniform_active_row_count",
+                    "sampled_action_accuracy_weighting": (
+                        "uniform_active_row_count"
+                    ),
+                    "sampled_action_accuracy_deprecated": True,
+                    "teacher_distribution_metric": (
+                        "policy_target_distribution_metrics"
+                    ),
+                    "teacher_distribution_weighting": (
+                        "uniform_soft_target_policy_active_rows"
+                    ),
                     "epoch_aggregation": "sum_sufficient_stats_then_ddp_reduce",
                     "loss_weighting_unchanged": True,
                 },
@@ -16338,15 +16374,37 @@ def main(argv: Sequence[str] | None = None) -> None:
                     epoch_extra_sums["advantage_weight_mean_sum"]
                     / max(epoch_extra_sums["advantage_weight_rows"], 1.0)
                 ),
-                "policy_base_accuracy": policy_base_accuracy,
-                "policy_aux_accuracy": policy_aux_accuracy,
-                "policy_total_accuracy": policy_total_accuracy,
-                "accuracy_active_count": int(round(policy_total_active)),
-                "accuracy": policy_total_accuracy,
-                "policy_base_top3_accuracy": policy_base_top3_accuracy,
-                "policy_aux_top3_accuracy": policy_aux_top3_accuracy,
-                "policy_total_top3_accuracy": policy_total_top3_accuracy,
-                "top3_accuracy": policy_total_top3_accuracy,
+                "policy_base_sampled_action_top1_accuracy": (
+                    policy_base_accuracy
+                ),
+                "policy_aux_sampled_action_top1_accuracy": (
+                    policy_aux_accuracy
+                ),
+                "policy_total_sampled_action_top1_accuracy": (
+                    policy_total_accuracy
+                ),
+                "sampled_action_accuracy_active_count": int(
+                    round(policy_total_active)
+                ),
+                "sampled_action_top1_accuracy": policy_total_accuracy,
+                "policy_base_sampled_action_top3_accuracy": (
+                    policy_base_top3_accuracy
+                ),
+                "policy_aux_sampled_action_top3_accuracy": (
+                    policy_aux_top3_accuracy
+                ),
+                "policy_total_sampled_action_top3_accuracy": (
+                    policy_total_top3_accuracy
+                ),
+                "sampled_action_top3_accuracy": policy_total_top3_accuracy,
+                "policy_target_distribution_metrics": (
+                    _finalize_policy_target_distribution_stats(
+                        policy_target_distribution_stats
+                    )
+                ),
+                "policy_target_distribution_sufficient_statistics": (
+                    policy_target_distribution_stats
+                ),
                 **(
                     {
                         "optimizer_observability": {
@@ -16374,6 +16432,91 @@ def main(argv: Sequence[str] | None = None) -> None:
                     if optimizer_observed_steps
                     else {}
                 ),
+                "policy_base_sampled_action_phase_accuracy": _finalize_phase_stats(
+                    policy_base_phase_stats
+                ),
+                "policy_aux_sampled_action_phase_accuracy": _finalize_phase_stats(
+                    policy_aux_phase_stats
+                ),
+                "policy_total_sampled_action_phase_accuracy": _finalize_phase_stats(
+                    phase_stats
+                ),
+                "sampled_action_phase_accuracy": _finalize_phase_stats(
+                    phase_stats
+                ),
+                "policy_base_sampled_action_phase_accuracy_excluding_forced": (
+                    _finalize_phase_stats(policy_base_phase_stats_unforced)
+                ),
+                "policy_aux_sampled_action_phase_accuracy_excluding_forced": (
+                    _finalize_phase_stats(policy_aux_phase_stats_unforced)
+                ),
+                "policy_total_sampled_action_phase_accuracy_excluding_forced": (
+                    _finalize_phase_stats(phase_stats_unforced)
+                ),
+                "sampled_action_phase_accuracy_excluding_forced": (
+                    _finalize_phase_stats(phase_stats_unforced)
+                ),
+                "policy_base_sampled_action_teacher_group_accuracy": _finalize_phase_stats(
+                    policy_base_teacher_stats
+                ),
+                "policy_aux_sampled_action_teacher_group_accuracy": _finalize_phase_stats(
+                    policy_aux_teacher_stats
+                ),
+                "policy_total_sampled_action_teacher_group_accuracy": _finalize_phase_stats(
+                    teacher_stats
+                ),
+                "sampled_action_teacher_group_accuracy": (
+                    _finalize_phase_stats(teacher_stats)
+                ),
+                "legacy_sampled_action_compat": {
+                    "policy_base_accuracy": policy_base_accuracy,
+                    "policy_aux_accuracy": policy_aux_accuracy,
+                    "policy_total_accuracy": policy_total_accuracy,
+                    "accuracy_active_count": int(round(policy_total_active)),
+                    "accuracy": policy_total_accuracy,
+                    "policy_base_top3_accuracy": (
+                        policy_base_top3_accuracy
+                    ),
+                    "policy_aux_top3_accuracy": policy_aux_top3_accuracy,
+                    "policy_total_top3_accuracy": (
+                        policy_total_top3_accuracy
+                    ),
+                    "top3_accuracy": policy_total_top3_accuracy,
+                    "policy_base_phase_accuracy": _finalize_phase_stats(
+                        policy_base_phase_stats
+                    ),
+                    "policy_aux_phase_accuracy": _finalize_phase_stats(
+                        policy_aux_phase_stats
+                    ),
+                    "policy_total_phase_accuracy": _finalize_phase_stats(
+                        phase_stats
+                    ),
+                    "phase_accuracy": _finalize_phase_stats(phase_stats),
+                    "phase_accuracy_excluding_forced": (
+                        _finalize_phase_stats(phase_stats_unforced)
+                    ),
+                    "teacher_accuracy": _finalize_phase_stats(
+                        teacher_stats
+                    ),
+                },
+                "legacy_sampled_action_metric_semantics": {
+                    "deprecated": True,
+                    "replacement": "policy_target_distribution_metrics",
+                    "target": "temperature_sampled_action_taken",
+                    "not_teacher_imitation": True,
+                },
+                # Temporary top-level compatibility aliases for existing
+                # dashboards/executors. New selection must consume the
+                # distribution metrics above.
+                "policy_base_accuracy": policy_base_accuracy,
+                "policy_aux_accuracy": policy_aux_accuracy,
+                "policy_total_accuracy": policy_total_accuracy,
+                "accuracy_active_count": int(round(policy_total_active)),
+                "accuracy": policy_total_accuracy,
+                "policy_base_top3_accuracy": policy_base_top3_accuracy,
+                "policy_aux_top3_accuracy": policy_aux_top3_accuracy,
+                "policy_total_top3_accuracy": policy_total_top3_accuracy,
+                "top3_accuracy": policy_total_top3_accuracy,
                 "policy_base_phase_accuracy": _finalize_phase_stats(
                     policy_base_phase_stats
                 ),
@@ -16385,15 +16528,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "phase_accuracy": _finalize_phase_stats(phase_stats),
                 "policy_base_phase_accuracy_excluding_forced": (
-                    _finalize_phase_stats(policy_base_phase_stats_unforced)
+                    _finalize_phase_stats(
+                        policy_base_phase_stats_unforced
+                    )
                 ),
                 "policy_aux_phase_accuracy_excluding_forced": (
-                    _finalize_phase_stats(policy_aux_phase_stats_unforced)
+                    _finalize_phase_stats(
+                        policy_aux_phase_stats_unforced
+                    )
                 ),
                 "policy_total_phase_accuracy_excluding_forced": (
                     _finalize_phase_stats(phase_stats_unforced)
                 ),
-                "phase_accuracy_excluding_forced": _finalize_phase_stats(phase_stats_unforced),
+                "phase_accuracy_excluding_forced": _finalize_phase_stats(
+                    phase_stats_unforced
+                ),
                 "policy_base_teacher_accuracy": _finalize_phase_stats(
                     policy_base_teacher_stats
                 ),
@@ -16762,6 +16911,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     cumulative_categorical_training_weight
                 ),
                 policy_objective_lr_area=policy_objective_lr_area,
+                policy_aux_global_draw_offset=policy_aux_global_draw_offset,
                 policy_kl_controller_state=(
                     None
                     if policy_kl_controller is None
@@ -16941,6 +17091,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         scalar_training_weight_sum=cumulative_scalar_training_weight,
         categorical_training_weight_sum=cumulative_categorical_training_weight,
         policy_objective_lr_area=policy_objective_lr_area,
+        policy_aux_global_draw_offset=policy_aux_global_draw_offset,
         policy_kl_controller_state=(
             None
             if policy_kl_controller is None
@@ -17564,6 +17715,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
         "policy_aux_loss_weight": float(args.policy_aux_loss_weight),
         "policy_aux_sampling_mode": str(args.policy_aux_sampling_mode),
+        "policy_aux_global_draw_offset": int(policy_aux_global_draw_offset),
         "policy_aux_active_rows": int(
             sum(int(metric.get("policy_aux_active_rows", 0)) for metric in metrics)
         ),
@@ -18105,6 +18257,15 @@ def _train_candidate_batch(
     policy_base_soft_active_rows = (
         int((has_soft & active).sum().item()) if soft_targets is not None else 0
     )
+    policy_target_distribution_stats = _policy_target_distribution_stats(
+        data,
+        batch,
+        masked,
+        soft_targets,
+        has_soft,
+        active,
+        soft_support,
+    )
     active_np = active.detach().cpu().numpy().astype(bool)
     if diagnostics:
         predictions_np = predictions.detach().cpu().numpy()
@@ -18159,11 +18320,18 @@ def _train_candidate_batch(
         # sufficient-stat schema as the xdim/entity path. Epoch aggregation is
         # architecture-independent and fails closed when these counts drift.
         "policy_metric_semantics": {
-            "schema_version": "train-policy-stream-metrics-v1",
+            "schema_version": "train-policy-stream-metrics-v2",
             "headline_scope": "base_plus_aux_count_weighted",
             "base_scope": "positive_policy_weight_rows_in_base_forward",
             "aux_scope": "all_rows_in_policy_aux_forward",
-            "accuracy_weighting": "uniform_active_row_count",
+            "sampled_action_accuracy_weighting": "uniform_active_row_count",
+            "sampled_action_accuracy_deprecated": True,
+            "teacher_distribution_metric": (
+                "policy_target_distribution_stats"
+            ),
+            "teacher_distribution_weighting": (
+                "uniform_soft_target_policy_active_rows"
+            ),
             "loss_weighting_unchanged": True,
         },
         "policy_base_row_count": int(len(batch)),
@@ -18190,6 +18358,9 @@ def _train_candidate_batch(
             policy_base_soft_active_rows
         ),
         "soft_distillation_active_rows": int(policy_base_soft_active_rows),
+        "policy_target_distribution_stats": (
+            policy_target_distribution_stats
+        ),
         "active_count": active_count,
         "value_active_count": int(value_active_count),
         "_value_active_row_mask": (
@@ -19155,6 +19326,7 @@ def _train_xdim_batch(
         policy_aux_phase_stats: dict = {}
         policy_aux_phase_stats_unforced: dict = {}
         policy_aux_teacher_stats: dict = {}
+        policy_aux_target_distribution_stats: dict[str, object] = {}
         policy_aux_kl_anchor_loss = torch.tensor(
             0.0, dtype=torch.float32, device=policy.device
         )
@@ -19269,6 +19441,17 @@ def _train_xdim_batch(
                 # AUX admission requires every sampled row to have positive
                 # policy weight, so its soft-row and soft-active counts match.
                 policy_aux_soft_active_rows = policy_aux_soft_rows
+            policy_aux_target_distribution_stats = (
+                _policy_target_distribution_stats(
+                    policy_aux_data,
+                    policy_aux_batch,
+                    aux_outputs["logits"],
+                    aux_soft,
+                    aux_has_soft,
+                    aux_weights > 0.0,
+                    aux_support,
+                )
+            )
             if diagnostics:
                 aux_predictions_np = aux_predictions.detach().cpu().numpy()
                 aux_targets_np = aux_actions.detach().cpu().numpy()
@@ -19829,6 +20012,19 @@ def _train_xdim_batch(
     policy_total_soft_active_rows = (
         policy_base_soft_active_rows + policy_aux_soft_active_rows
     )
+    policy_target_distribution_stats = _policy_target_distribution_stats(
+        data,
+        batch,
+        outputs["logits"],
+        soft_targets,
+        has_soft,
+        active,
+        soft_support,
+    )
+    _merge_policy_target_distribution_stats(
+        policy_target_distribution_stats,
+        policy_aux_target_distribution_stats,
+    )
     active_np = active.detach().cpu().numpy().astype(bool)
     if diagnostics:
         predictions_np = predictions.detach().cpu().numpy()
@@ -20004,11 +20200,18 @@ def _train_xdim_batch(
         # let epoch/DDP aggregation reconstruct each stream without averaging
         # per-batch means or confusing policy loss weights with metric weights.
         "policy_metric_semantics": {
-            "schema_version": "train-policy-stream-metrics-v1",
+            "schema_version": "train-policy-stream-metrics-v2",
             "headline_scope": "base_plus_aux_count_weighted",
             "base_scope": "positive_policy_weight_rows_in_base_forward",
             "aux_scope": "all_rows_in_policy_aux_forward",
-            "accuracy_weighting": "uniform_active_row_count",
+            "sampled_action_accuracy_weighting": "uniform_active_row_count",
+            "sampled_action_accuracy_deprecated": True,
+            "teacher_distribution_metric": (
+                "policy_target_distribution_stats"
+            ),
+            "teacher_distribution_weighting": (
+                "uniform_soft_target_policy_active_rows"
+            ),
             "loss_weighting_unchanged": True,
         },
         "policy_base_row_count": int(len(batch)),
@@ -20042,6 +20245,9 @@ def _train_xdim_batch(
             policy_total_soft_active_rows
         ),
         "soft_distillation_active_rows": int(policy_total_soft_active_rows),
+        "policy_target_distribution_stats": (
+            policy_target_distribution_stats
+        ),
         "active_count": active_count,
         "value_active_count": int(value_active_count),
         "_value_active_row_mask": (
@@ -20102,6 +20308,9 @@ _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
     "value_categorical_clean_loss",
     "value_categorical_truncated_loss",
     "primary_value_loss",
+    "sampled_action_top1_accuracy",
+    "sampled_action_top3_accuracy",
+    # Deprecated aliases retained for historical objective-matched reports.
     "accuracy",
     "top3_accuracy",
     "soft_distillation_fraction",
@@ -20259,6 +20468,16 @@ def _combine_policy_aux_validation_metrics(
         else 0.0
     )
     combined = dict(base_metrics)
+    base_target_metrics = base_metrics.get(
+        "policy_target_distribution_metrics"
+    )
+    aux_target_metrics = aux_metrics.get(
+        "policy_target_distribution_metrics"
+    )
+    combined.pop("policy_target_distribution_metrics", None)
+    combined.pop(
+        "policy_target_distribution_sufficient_statistics", None
+    )
     combined.update(
         {
             "loss": combined_loss,
@@ -20281,6 +20500,10 @@ def _combine_policy_aux_validation_metrics(
             "base_raw_batch_mean_loss": float(
                 base_metrics.get("raw_batch_mean_loss", base_metrics["loss"])
             ),
+            "policy_base_target_distribution_metrics": (
+                base_target_metrics
+            ),
+            "policy_aux_target_distribution_metrics": aux_target_metrics,
         }
     )
     return combined
@@ -21116,17 +21339,27 @@ def _objective_measure_validation_aggregate(
             "weighted_numerator_per_sample": numerator_density,
             "weight_per_sample": denominator_density,
         }
-    # Policy accuracy is conditional on policy-active rows, just like policy
+    # Sampled-action agreement is conditional on policy-active rows, just like policy
     # cross-entropy.  In a scoped learner an excluded replay component reports
-    # zero active rows and therefore zero accuracy.  Weighting that placeholder
-    # zero by the component's sampling mass diluted fresh-policy accuracy (for
+    # zero active rows and therefore zero agreement. Weighting that placeholder
+    # zero by the component's sampling mass diluted fresh-policy agreement (for
     # the production .80/.20 split, .613 became .4904) even though replay never
-    # entered the policy objective.  Reconstruct both accuracy means from their
+    # entered the policy objective. Reconstruct both agreement means from their
     # explicit active-row denominator under the same component/game measure.
-    for key in ("accuracy", "top3_accuracy"):
+    for key in (
+        "sampled_action_top1_accuracy",
+        "sampled_action_top3_accuracy",
+        "accuracy",
+        "top3_accuracy",
+    ):
+        denominator_key = (
+            "sampled_action_accuracy_active_count"
+            if key.startswith("sampled_action_")
+            else "accuracy_active_count"
+        )
         if not all(
             key in report
-            and "accuracy_active_count" in report
+            and denominator_key in report
             and int(report.get("samples", 0)) > 0
             for report in reports
         ):
@@ -21135,7 +21368,7 @@ def _objective_measure_validation_aggregate(
         denominator_density = 0.0
         for probability, report in zip(normalized, reports, strict=True):
             samples = float(report["samples"])
-            denominator = float(report["accuracy_active_count"])
+            denominator = float(report[denominator_key])
             numerator_density += (
                 float(probability) * float(report[key]) * denominator / samples
             )
@@ -21149,6 +21382,58 @@ def _objective_measure_validation_aggregate(
             "weighted_numerator_per_sample": numerator_density,
             "weight_per_sample": denominator_density,
         }
+    if all(
+        isinstance(
+            report.get(
+                "policy_target_distribution_sufficient_statistics"
+            ),
+            dict,
+        )
+        and int(report.get("samples", 0)) > 0
+        for report in reports
+    ):
+        aggregate_target_stats: dict[str, object] = {}
+        for probability, report in zip(normalized, reports, strict=True):
+            samples = float(report["samples"])
+            source = report[
+                "policy_target_distribution_sufficient_statistics"
+            ]
+            scaled: dict[str, object] = {}
+            _merge_policy_target_distribution_stats(scaled, source)
+            for axis in ("overall", "phase", "opening_decision_index"):
+                axis_value = scaled.get(axis)
+                if axis == "overall" and isinstance(axis_value, dict):
+                    for key in ("rows", *_POLICY_TARGET_METRIC_SUM_KEYS):
+                        axis_value[key] = (
+                            float(axis_value.get(key, 0.0))
+                            * float(probability)
+                            / samples
+                        )
+                elif isinstance(axis_value, dict):
+                    for parts in axis_value.values():
+                        if not isinstance(parts, dict):
+                            continue
+                        for key in (
+                            "rows",
+                            *_POLICY_TARGET_METRIC_SUM_KEYS,
+                        ):
+                            parts[key] = (
+                                float(parts.get(key, 0.0))
+                                * float(probability)
+                                / samples
+                            )
+            _merge_policy_target_distribution_stats(
+                aggregate_target_stats, scaled
+            )
+        metrics["policy_target_distribution_metrics"] = (
+            _finalize_policy_target_distribution_stats(
+                aggregate_target_stats,
+                rows_are_density=True,
+            )
+        )
+        sufficient["policy_target_distribution_metrics"] = (
+            aggregate_target_stats
+        )
     # CAT-100 is a sum of separately normalized masked-head objectives.  A
     # synthetic row denominator for their already-summed batch mean is not a
     # sufficient statistic: label density differs by head and by game.  Carry
@@ -21676,6 +21961,7 @@ def evaluate_bc_batches(
         phase_stats = _empty_phase_stats()
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
+        policy_target_distribution_stats: dict[str, object] = {}
         value_mse_strata_sufficient_statistics: dict[
             str, dict[str, dict[str, float]]
         ] = {}
@@ -21837,6 +22123,10 @@ def evaluate_bc_batches(
                 batch_metrics.get("phase_stats_unforced", {}),
             )
             _merge_phase_stats(teacher_stats, batch_metrics["teacher_stats"])
+            _merge_policy_target_distribution_stats(
+                policy_target_distribution_stats,
+                batch_metrics.get("policy_target_distribution_stats", {}),
+            )
             _merge_value_validation_strata(
                 value_mse_strata_sufficient_statistics,
                 batch_metrics.get(
@@ -21860,6 +22150,11 @@ def evaluate_bc_batches(
         phase_stats = _reduce_nested_count_stats(phase_stats, ddp)
         phase_stats_unforced = _reduce_nested_count_stats(phase_stats_unforced, ddp)
         teacher_stats = _reduce_nested_count_stats(teacher_stats, ddp)
+        policy_target_distribution_stats = (
+            _reduce_policy_target_distribution_stats(
+                policy_target_distribution_stats, ddp
+            )
+        )
         value_mse_strata_sufficient_statistics = (
             _reduce_value_validation_strata(
                 value_mse_strata_sufficient_statistics, ddp
@@ -22001,11 +22296,60 @@ def evaluate_bc_batches(
                 extra_sums["advantage_weight_mean_sum"]
                 / max(extra_sums["advantage_weight_rows"], 1.0)
             ),
+            "sampled_action_accuracy_active_count": int(
+                round(active_count_total)
+            ),
+            "sampled_action_top1_accuracy": (
+                acc_sum / max(active_count_total, 1.0)
+            ),
+            "sampled_action_top3_accuracy": (
+                top3_sum / max(active_count_total, 1.0)
+            ),
+            "sampled_action_phase_accuracy": _finalize_phase_stats(
+                phase_stats
+            ),
+            "sampled_action_phase_accuracy_excluding_forced": (
+                _finalize_phase_stats(phase_stats_unforced)
+            ),
+            "sampled_action_teacher_group_accuracy": _finalize_phase_stats(
+                teacher_stats
+            ),
+            "policy_target_distribution_metrics": (
+                _finalize_policy_target_distribution_stats(
+                    policy_target_distribution_stats
+                )
+            ),
+            "policy_target_distribution_sufficient_statistics": (
+                policy_target_distribution_stats
+            ),
+            # Explicitly named compatibility surface for historical report
+            # consumers. These compare the model with the sampled trajectory
+            # action, never with the soft MCTS target distribution.
+            "legacy_sampled_action_compat": {
+                "accuracy_active_count": int(round(active_count_total)),
+                "accuracy": acc_sum / max(active_count_total, 1.0),
+                "top3_accuracy": top3_sum / max(active_count_total, 1.0),
+                "phase_accuracy": _finalize_phase_stats(phase_stats),
+                "phase_accuracy_excluding_forced": (
+                    _finalize_phase_stats(phase_stats_unforced)
+                ),
+                "teacher_accuracy": _finalize_phase_stats(teacher_stats),
+            },
+            "legacy_sampled_action_metric_semantics": {
+                "deprecated": True,
+                "replacement": "policy_target_distribution_metrics",
+                "target": "temperature_sampled_action_taken",
+                "not_teacher_imitation": True,
+            },
+            # Top-level aliases remain temporarily for existing executors and
+            # dashboards. Their semantics are explicitly bound above.
             "accuracy_active_count": int(round(active_count_total)),
             "accuracy": acc_sum / max(active_count_total, 1.0),
             "top3_accuracy": top3_sum / max(active_count_total, 1.0),
             "phase_accuracy": _finalize_phase_stats(phase_stats),
-            "phase_accuracy_excluding_forced": _finalize_phase_stats(phase_stats_unforced),
+            "phase_accuracy_excluding_forced": _finalize_phase_stats(
+                phase_stats_unforced
+            ),
             "teacher_accuracy": _finalize_phase_stats(teacher_stats),
             # Legacy drift telemetry. This reverse-KL ratio is retained for report
             # compatibility and anchor diagnostics, but is not a calibrated teacher
@@ -22227,6 +22571,17 @@ def _eval_candidate_batch(
         targets_np = actions.detach().cpu().numpy()
         logits_np = masked.detach().cpu().numpy()
         active_np = active.detach().cpu().numpy().astype(bool)
+        policy_target_distribution_stats = (
+            _policy_target_distribution_stats(
+                data,
+                batch,
+                masked,
+                soft_targets,
+                has_soft,
+                active,
+                soft_support,
+            )
+        )
         return {
             "loss": float(loss.item()),
             "policy_loss": float(policy_loss.item()),
@@ -22247,6 +22602,13 @@ def _eval_candidate_batch(
                 int((has_soft & active).sum().item()) if soft_targets is not None else 0
             ),
             "active_count": active_count,
+            "sampled_action_top1_accuracy": float(accuracy.item()),
+            "sampled_action_top3_accuracy": float(top3_accuracy.item()),
+            "policy_target_distribution_stats": (
+                policy_target_distribution_stats
+            ),
+            # Batch-local compatibility aliases. Serialized reports rename
+            # these so sampled behavior cannot be mistaken for teacher fit.
             "accuracy": float(accuracy.item()),
             "top3_accuracy": float(top3_accuracy.item()),
             "phase_stats": _field_stats(
@@ -22739,6 +23101,17 @@ def _eval_xdim_batch(
             q_skip_teacher_prefixes=q_skip_teacher_prefixes,
         )
         active_np = active.detach().cpu().numpy().astype(bool)
+        policy_target_distribution_stats = (
+            _policy_target_distribution_stats(
+                data,
+                batch,
+                outputs["logits"],
+                soft_targets,
+                has_soft,
+                active,
+                soft_support,
+            )
+        )
         # Success telemetry (gen-1 recipe): KL(model||prior_policy) vs the
         # reference KL(target_policy||prior_policy) on a held-out gen slice.
         prior_kl = _prior_kl_telemetry(data, batch, outputs["logits"], policy.device)
@@ -22878,6 +23251,13 @@ def _eval_xdim_batch(
                 int((has_soft & active).sum().item()) if soft_targets is not None else 0
             ),
             "active_count": active_count,
+            "sampled_action_top1_accuracy": float(accuracy.item()),
+            "sampled_action_top3_accuracy": float(top3_accuracy.item()),
+            "policy_target_distribution_stats": (
+                policy_target_distribution_stats
+            ),
+            # Batch-local compatibility aliases. Serialized reports rename
+            # these so sampled behavior cannot be mistaken for teacher fit.
             "accuracy": float(accuracy.item()),
             "top3_accuracy": float(top3_accuracy.item()),
             "phase_stats": _field_stats(
@@ -28690,6 +29070,306 @@ def _topk_full_accuracy(masked_logits, actions, *, k: int, mask=None):
     if mask is not None:
         return _masked_metric_mean(hits, mask)
     return hits.mean()
+
+
+_POLICY_TARGET_METRIC_SUM_KEYS = (
+    "teacher_argmax_top1_correct",
+    "teacher_argmax_top3_correct",
+    "cross_entropy_sum",
+    "target_entropy_sum",
+    "kl_target_model_sum",
+    "excess_cross_entropy_sum",
+    "model_top1_target_mass_sum",
+    "model_top3_target_mass_sum",
+)
+
+
+def _empty_policy_target_metric_parts() -> dict[str, float]:
+    return {
+        "rows": 0.0,
+        **{key: 0.0 for key in _POLICY_TARGET_METRIC_SUM_KEYS},
+    }
+
+
+def _policy_target_metric_parts(
+    logits,
+    soft_targets,
+    has_soft,
+    active,
+    support,
+) -> dict[str, np.ndarray]:
+    """Return per-row teacher-distribution diagnostics without another forward.
+
+    ``action_taken`` is a temperature sample from the search policy and is not
+    the supervised target when soft distillation is active.  These diagnostics
+    therefore compare the model with the complete stored teacher distribution.
+    """
+
+    import torch
+
+    if soft_targets is None:
+        return {}
+    eligible = has_soft.to(dtype=torch.bool) & active.to(dtype=torch.bool)
+    if not torch.any(eligible):
+        return {}
+    log_probs = _support_log_softmax(logits, support)
+    targets = soft_targets.float()
+    teacher_argmax = torch.argmax(targets, dim=-1)
+    model_top3 = torch.topk(
+        logits,
+        k=min(3, int(logits.shape[-1])),
+        dim=-1,
+    ).indices
+    cross_entropy = -(targets * log_probs).sum(dim=-1)
+    target_entropy = -(
+        targets
+        * torch.where(
+            targets > 0.0,
+            torch.log(torch.clamp(targets, min=1.0e-30)),
+            torch.zeros_like(targets),
+        )
+    ).sum(dim=-1)
+    model_top1 = model_top3[:, 0]
+    top1_mass = targets.gather(1, model_top1.unsqueeze(-1)).squeeze(-1)
+    top3_mass = targets.gather(1, model_top3).sum(dim=-1)
+    selected = eligible.detach().cpu().numpy().astype(np.bool_, copy=False)
+    return {
+        "eligible": selected,
+        "teacher_argmax_top1_correct": (
+            model_top1 == teacher_argmax
+        ).detach().cpu().numpy().astype(np.float64, copy=False),
+        "teacher_argmax_top3_correct": (
+            model_top3 == teacher_argmax.unsqueeze(-1)
+        ).any(dim=-1).detach().cpu().numpy().astype(np.float64, copy=False),
+        "cross_entropy_sum": cross_entropy.detach().float().cpu().numpy(),
+        "target_entropy_sum": target_entropy.detach().float().cpu().numpy(),
+        "kl_target_model_sum": (
+            cross_entropy - target_entropy
+        ).detach().float().cpu().numpy(),
+        # Kept separately in the schema because it is the most interpretable
+        # optimization gap, even though CE-H(target) is algebraically the same
+        # quantity as KL(target||model).
+        "excess_cross_entropy_sum": (
+            cross_entropy - target_entropy
+        ).detach().float().cpu().numpy(),
+        "model_top1_target_mass_sum": top1_mass.detach().float().cpu().numpy(),
+        "model_top3_target_mass_sum": top3_mass.detach().float().cpu().numpy(),
+    }
+
+
+def _sum_policy_target_metric_rows(
+    row_metrics: Mapping[str, np.ndarray],
+    mask: np.ndarray | None = None,
+) -> dict[str, float]:
+    if not row_metrics:
+        return _empty_policy_target_metric_parts()
+    selected = np.asarray(
+        row_metrics["eligible"], dtype=np.bool_
+    ).copy()
+    if mask is not None:
+        selected &= np.asarray(mask, dtype=np.bool_)
+    result = _empty_policy_target_metric_parts()
+    result["rows"] = float(np.count_nonzero(selected))
+    for key in _POLICY_TARGET_METRIC_SUM_KEYS:
+        result[key] = float(
+            np.asarray(row_metrics[key], dtype=np.float64)[selected].sum()
+        )
+    return result
+
+
+def _policy_target_distribution_stats(
+    data: object,
+    batch: np.ndarray,
+    logits,
+    soft_targets,
+    has_soft,
+    active,
+    support,
+) -> dict[str, object]:
+    row_metrics = _policy_target_metric_parts(
+        logits, soft_targets, has_soft, active, support
+    )
+    result: dict[str, object] = {
+        "schema_version": "policy-target-distribution-sufficient-stats-v1",
+        "overall": _sum_policy_target_metric_rows(row_metrics),
+        "phase": {},
+        "opening_decision_index": {},
+    }
+    if not row_metrics:
+        return result
+    phases = (
+        np.asarray(data["phase"][batch]).astype(str)
+        if "phase" in data
+        else np.full(len(batch), "unknown", dtype="<U7")
+    )
+    phase_stats = result["phase"]
+    assert isinstance(phase_stats, dict)
+    for phase in sorted(set(phases.tolist())):
+        phase_stats[str(phase)] = _sum_policy_target_metric_rows(
+            row_metrics, phases == phase
+        )
+    opening = phases == "BUILD_INITIAL_SETTLEMENT"
+    if np.any(opening):
+        decision_indices = np.asarray(
+            _batch_array_or_fill(
+                data,
+                "decision_index",
+                batch,
+                -1,
+                dtype=np.int64,
+            ),
+            dtype=np.int64,
+        )
+        opening_stats = result["opening_decision_index"]
+        assert isinstance(opening_stats, dict)
+        for decision_index in sorted(set(decision_indices[opening].tolist())):
+            opening_stats[str(int(decision_index))] = (
+                _sum_policy_target_metric_rows(
+                    row_metrics,
+                    opening & (decision_indices == decision_index),
+                )
+            )
+    return result
+
+
+def _merge_policy_target_distribution_stats(
+    target: dict[str, object],
+    source: Mapping[str, object],
+) -> None:
+    if not source:
+        return
+    if not target:
+        target.update(
+            {
+                "schema_version": (
+                    "policy-target-distribution-sufficient-stats-v1"
+                ),
+                "overall": _empty_policy_target_metric_parts(),
+                "phase": {},
+                "opening_decision_index": {},
+            }
+        )
+    for axis in ("overall", "phase", "opening_decision_index"):
+        source_axis = source.get(axis)
+        if axis == "overall":
+            if not isinstance(source_axis, Mapping):
+                continue
+            target_axis = target.setdefault(
+                axis, _empty_policy_target_metric_parts()
+            )
+            assert isinstance(target_axis, dict)
+            for key in ("rows", *_POLICY_TARGET_METRIC_SUM_KEYS):
+                target_axis[key] = float(target_axis.get(key, 0.0)) + float(
+                    source_axis.get(key, 0.0)
+                )
+            continue
+        if not isinstance(source_axis, Mapping):
+            continue
+        target_axis = target.setdefault(axis, {})
+        assert isinstance(target_axis, dict)
+        for label, parts in source_axis.items():
+            if not isinstance(parts, Mapping):
+                continue
+            target_parts = target_axis.setdefault(
+                str(label), _empty_policy_target_metric_parts()
+            )
+            for key in ("rows", *_POLICY_TARGET_METRIC_SUM_KEYS):
+                target_parts[key] = float(target_parts.get(key, 0.0)) + float(
+                    parts.get(key, 0.0)
+                )
+
+
+def _reduce_policy_target_distribution_stats(
+    stats: dict[str, object],
+    ddp: dict[str, int | bool],
+) -> dict[str, object]:
+    if not ddp["enabled"]:
+        return stats
+    import torch.distributed as dist
+
+    gathered: list[dict[str, object] | None] = [None] * int(ddp["world_size"])
+    dist.all_gather_object(gathered, stats)
+    merged: dict[str, object] = {}
+    for item in gathered:
+        if item:
+            _merge_policy_target_distribution_stats(merged, item)
+    return merged
+
+
+def _finalize_policy_target_metric_parts(
+    parts: Mapping[str, object],
+    *,
+    rows_are_density: bool = False,
+) -> dict[str, float | int]:
+    rows = float(parts.get("rows", 0.0))
+    denominator = rows if rows > 0.0 else 1.0
+    result: dict[str, float | int] = {
+        "teacher_argmax_top1_accuracy": float(
+            parts.get("teacher_argmax_top1_correct", 0.0)
+        )
+        / denominator,
+        "teacher_argmax_top3_accuracy": float(
+            parts.get("teacher_argmax_top3_correct", 0.0)
+        )
+        / denominator,
+        "soft_target_cross_entropy": float(
+            parts.get("cross_entropy_sum", 0.0)
+        )
+        / denominator,
+        "target_entropy": float(parts.get("target_entropy_sum", 0.0))
+        / denominator,
+        "kl_target_model": float(parts.get("kl_target_model_sum", 0.0))
+        / denominator,
+        "excess_cross_entropy_above_target_entropy": float(
+            parts.get("excess_cross_entropy_sum", 0.0)
+        )
+        / denominator,
+        "model_top1_target_mass": float(
+            parts.get("model_top1_target_mass_sum", 0.0)
+        )
+        / denominator,
+        "model_top3_target_mass": float(
+            parts.get("model_top3_target_mass_sum", 0.0)
+        )
+        / denominator,
+    }
+    if rows_are_density:
+        result["row_probability"] = rows
+    else:
+        result["rows"] = int(round(rows))
+    return result
+
+
+def _finalize_policy_target_distribution_stats(
+    stats: Mapping[str, object],
+    *,
+    rows_are_density: bool = False,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "schema_version": "policy-target-distribution-metrics-v1",
+        "weighting": "uniform_soft_target_policy_active_rows",
+        "objective_weighted": False,
+        "overall": _finalize_policy_target_metric_parts(
+            stats.get("overall", {})
+            if isinstance(stats.get("overall"), Mapping)
+            else {},
+            rows_are_density=rows_are_density,
+        ),
+    }
+    for axis in ("phase", "opening_decision_index"):
+        source = stats.get(axis)
+        result[axis] = (
+            {
+                str(label): _finalize_policy_target_metric_parts(
+                    parts, rows_are_density=rows_are_density
+                )
+                for label, parts in sorted(source.items())
+                if isinstance(parts, Mapping)
+            }
+            if isinstance(source, Mapping)
+            else {}
+        )
+    return result
 
 
 def _field_stats(
@@ -37081,6 +37761,51 @@ def _restore_training_progress_state(
     )
 
 
+def _restore_policy_aux_global_draw_offset(
+    progress: dict[str, object] | None,
+    *,
+    required: bool,
+) -> int:
+    """Restore the exact position in the weighted AUX global draw stream.
+
+    Epoch numbers cannot reconstruct this position because a capped final epoch
+    can consume fewer draws than earlier epochs. Weighted-cycle resumes therefore
+    require the cumulative draw offset committed with the optimizer checkpoint.
+    """
+
+    if progress is None:
+        return 0
+    if required and "policy_aux_global_draw_offset" not in progress:
+        raise SystemExit(
+            "resumed weighted-cycle policy AUX run lacks cumulative global draw "
+            "offset"
+        )
+    value = progress.get("policy_aux_global_draw_offset", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SystemExit(
+            "resumed checkpoint has invalid policy AUX global draw offset"
+        )
+    return int(value)
+
+
+def _advance_policy_aux_global_draw_offset(
+    offset: int,
+    *,
+    local_draws: int,
+    ddp: Mapping[str, int | bool],
+) -> int:
+    """Advance one rank-strided AUX stream by draws consumed on every rank."""
+
+    start = int(offset)
+    draws = int(local_draws)
+    if start < 0 or draws < 0:
+        raise ValueError("policy AUX global draw offset/count must be non-negative")
+    world = int(ddp["world_size"]) if ddp.get("enabled", False) else 1
+    if world <= 0:
+        raise ValueError("policy AUX world size must be positive")
+    return start + draws * world
+
+
 def _save_optimizer_sidecar(checkpoint_path: str, policy, optimizer, ddp: dict):
     """CAT-128 patch #8 wrapper: persist optimizer (Adam) state as
     ``<checkpoint_path>.optimizer.pt`` via the shared FSDP-safe util. MUST be called on
@@ -37128,6 +37853,7 @@ def _save_training_progress_sidecar(
     scalar_training_weight_sum: float,
     categorical_training_weight_sum: float,
     policy_objective_lr_area: float,
+    policy_aux_global_draw_offset: int,
     policy_kl_controller_state: dict[str, object] | None = None,
     ddp: dict,
 ) -> None:
@@ -37219,6 +37945,9 @@ def _save_training_progress_sidecar(
                 categorical_training_weight_sum
             ),
             policy_objective_lr_area=float(policy_objective_lr_area),
+            policy_aux_global_draw_offset=int(
+                policy_aux_global_draw_offset
+            ),
             policy_kl_controller_state=policy_kl_controller_state,
             ddp=ddp,
         )
