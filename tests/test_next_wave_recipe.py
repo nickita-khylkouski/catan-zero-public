@@ -280,6 +280,12 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert recipe["max_steps"] == 0
     assert recipe["base_sampler"] == "coverage_importance_v1"
     assert recipe["minimum_policy_effective_rows_per_global_batch"] == 32.0
+    assert recipe["forced_action_weight"] == 0.0
+    assert recipe["forced_row_value_weight"] == 1.0
+    assert (
+        recipe["forced_row_value_action_type_weights"]
+        == "END_TURN=1.0,ROLL=1.0"
+    )
     assert recipe["lr"] == 6e-5
     assert recipe["lr_warmup_steps"] == 250
     assert recipe["global_batch_size"] == 512
@@ -324,10 +330,10 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert "final_vp_head" in recipe["require_feature_learning_signal_modules"]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:59702b9735eda81e45170cd4d45ca342d5d08bb761bfa5c967d24c0960563a02"
+        "sha256:b9932d38227e924a75b87c98a5fc0b3dba2551bfbb36f625754bd7255b8b5828"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:22d081f54e5ec6693ff40d7b87ada5374f56eff45add34827cd10aff15d44c2e"
+        "sha256:c0c3c6af412ab0fd43951b1a150dd76de8840253d87a1379f51e95fa8b899592"
     )
 
 

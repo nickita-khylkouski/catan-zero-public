@@ -134,6 +134,13 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # synthetic 50/50 winner/loser prior: the scalar value consumed by MCTS
     # must remain an expected return under the natural trajectory measure.
     "value_player_outcome_balance_mode": "none",
+    # Mechanical actions have no policy target, but their states remain valid
+    # value evidence.  The coherent commissioning runs retained both typed
+    # boundaries at full value weight; no causal result supports silently
+    # reducing END_TURN in the production objective.
+    "forced_action_weight": 0.0,
+    "forced_row_value_weight": 1.0,
+    "forced_row_value_action_type_weights": "END_TURN=1.0,ROLL=1.0",
     # Stored coherent search policies are already normalized teacher targets.
     # train_bc's scalar temperature applies only to score-derived targets;
     # sealing 0.7 here previously described an objective the optimizer never

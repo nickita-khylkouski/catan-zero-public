@@ -77,15 +77,15 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
 
 `tools/generate_gumbel_selfplay_data.py` remains the internal historical replay
 executor. New launches must not address its experiment-by-flag interface
-directly; the schema-18 config above is the complete science contract.
+directly; the schema-19 config above is the complete science contract.
 
 Post-wave admission must prove every worker used teacher v2 and emitted learner
 rows v5, with the legacy `adapter_version` row column equal to the learner
 identity. Forced rows retain `policy_weight_multiplier=0` and
 `value_weight_multiplier=1` in the immutable shard. Training continues to use
-equal per-game value mass, retains forced `ROLL` states at value weight 1.0
-because opponent-turn search evaluates that boundary, and reduces forced
-`END_TURN` states to 0.1 because interior search bypasses that mechanical state.
+equal per-game value mass and retains both forced `ROLL` and `END_TURN` states
+at value weight 1.0. Their actions remain policy-inactive, but both boundaries
+are valid value evidence; reducing either weight requires a causal ablation.
 
 The five-percent reliability slice is selected by a stable hash of audit seed,
 game seed, and decision index. Its duplicate search uses independent
