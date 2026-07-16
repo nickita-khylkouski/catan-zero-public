@@ -11,8 +11,6 @@ from catan_zero.rl.graph_history_features import (
     GRAPH_HISTORY_FEATURE_SIZE,
     build_graph_history_feature_vector,
 )
-
-
 RESOURCE_NAMES = ("wood", "brick", "sheep", "wheat", "ore")
 
 
@@ -141,13 +139,20 @@ def test_colonist_multiagent_env_observation_payload_is_actor_safe() -> None:
         assert payload["actor"] == actor
         assert payload["legal_actions"] == info["valid_actions"]
         assert payload["legal_action_descriptions"] == info["legal_action_descriptions"]
+        assert isinstance(payload["is_road_building"], bool)
+        assert isinstance(payload["free_roads_available"], int)
+        assert isinstance(payload["current_discard_count"], int)
         assert "resources" in payload["players"][actor]
         assert "development_cards" in payload["players"][actor]
+        assert "has_played_development_card_in_turn" in payload["players"][actor]
+        assert "playable_development_cards" in payload["players"][actor]
 
         for opponent in set(info["player_names"]) - {actor}:
             opponent_payload = payload["players"][opponent]
             assert "resources" not in opponent_payload
             assert "development_cards" not in opponent_payload
+            assert "has_played_development_card_in_turn" not in opponent_payload
+            assert "playable_development_cards" not in opponent_payload
             assert "resource_card_count" in opponent_payload
             assert "development_card_count" in opponent_payload
 

@@ -1907,9 +1907,19 @@ def _rows_to_arrays(
     out: dict[str, np.ndarray] = {}
     legal_width = max(int(np.asarray(row["legal_action_ids"]).shape[0]) for row in rows)
     for key in (*BASE_KEYS, *EXTRA_KEYS):
-        if key not in rows[0]:
-            continue
-        values = [row[key] for row in rows]
+        if key == "opponent_type":
+            # A single shard can contain both ordinary neural games and the
+            # external-bot exploiter lane.  Only exploiter rows carry this
+            # field by design, so its presence must not depend on which game
+            # happened to be first in the shard.  Preserve the column whenever
+            # any row has it and use the empty string for non-exploiter rows.
+            if not any(key in row for row in rows):
+                continue
+            values = [row.get(key, "") for row in rows]
+        else:
+            if key not in rows[0]:
+                continue
+            values = [row[key] for row in rows]
         if key in {
             "legal_action_ids",
             "target_policy",

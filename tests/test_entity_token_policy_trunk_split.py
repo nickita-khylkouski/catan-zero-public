@@ -190,6 +190,48 @@ def test_split_value_gradient_scale_zero_stops_shared_prefix_not_private_tower()
     )
 
 
+def test_split_value_history_target_gather_does_not_leak_into_policy_suffix():
+    """The history side input must respect the same late-tower boundary."""
+    model = EntityGraphNet(
+        _config(
+            state_layers=3,
+            value_tower_split_layers=1,
+            meaningful_public_history=True,
+            event_history_limit=16,
+            meaningful_public_history_target_gather=True,
+        )
+    ).train()
+    batch = _batch(
+        batch_size=3,
+        action_width=5,
+        event_width=16,
+        live_event_width=7,
+    )
+    event_targets = -torch.ones(3, 16, 4, dtype=torch.long)
+    event_targets[:, :, 1] = torch.arange(16).remainder(54)
+    batch["event_target_ids"] = event_targets
+    with torch.no_grad():
+        model.meaningful_history_residual_gate.fill_(0.1)
+        model.meaningful_history_target_proj[1].weight.copy_(
+            torch.eye(model.config.hidden_size)
+        )
+
+    model.zero_grad(set_to_none=True)
+    model(batch, value_trunk_grad_scale=0.25)["value"].sum().backward()
+
+    # Value still learns from the shared prefix and its private suffix, but the
+    # final policy block is no longer a hidden route around the split.
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
+        for parameter in model.blocks[1].parameters()
+    )
+    assert all(parameter.grad is None for parameter in model.blocks[2].parameters())
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
+        for parameter in model.value_blocks.parameters()
+    )
+
+
 def test_policy_value_only_output_selection_is_bit_identical_and_skips_final_vp():
     model = EntityGraphNet(_config()).eval()
     batch = _batch()

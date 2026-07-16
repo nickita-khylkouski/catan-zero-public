@@ -1320,7 +1320,32 @@ class EntityGraphNet:
                         torch.nn.functional.gelu(self.deliberation_fusion_norm(fused))
                     )
                 history_delta = None
+                value_history_delta = None
                 if self.meaningful_public_history_enabled:
+                    def pooled_history_delta(piece):
+                        # Event rows stay masked from the mature trunk. Their
+                        # bounded pooled representation enters only through the
+                        # residual gates. Scaling by the fixed cap preserves
+                        # event-count mass as well as content.
+                        history_weight = event_mask.to(piece.dtype).unsqueeze(-1)
+                        pooled = (piece * history_weight).sum(dim=1) / float(
+                            self.meaningful_public_history_normalization
+                        )
+                        delta = pooled * self.meaningful_history_residual_gate
+                        if (
+                            self.meaningful_public_history_pooling
+                            == ORDERED_ATTENTION_V2
+                        ):
+                            delta = (
+                                delta
+                                + self.meaningful_history_sequence(
+                                    piece, event_mask
+                                )
+                                * self.meaningful_history_ordered_gate
+                            )
+                        return delta
+
+                    value_event_piece = event_piece
                     if self.meaningful_public_history_target_gather_enabled:
                         target_batch = batch
                         if event_token_limit is not None:
@@ -1343,33 +1368,51 @@ class EntityGraphNet:
                             event_piece
                             + self.meaningful_history_target_proj(history_targets)
                         )
-                    # Event rows stay masked from the mature trunk. Their
-                    # bounded pooled representation enters only through this
-                    # exact-zero gate, so history activation cannot perturb an
-                    # incumbent before the first optimizer step. Scaling by the
-                    # fixed cap preserves event-count mass as well as content.
-                    history_weight = event_mask.to(event_piece.dtype).unsqueeze(-1)
-                    pooled_history = (
-                        event_piece * history_weight
-                    ).sum(dim=1) / float(
-                        self.meaningful_public_history_normalization
-                    )
-                    history_delta = (
-                        pooled_history * self.meaningful_history_residual_gate
-                    )
-                    if (
-                        self.meaningful_public_history_pooling
-                        == ORDERED_ATTENTION_V2
-                    ):
-                        ordered_history = self.meaningful_history_sequence(
-                            event_piece, event_mask
-                        )
-                        history_delta = (
-                            history_delta
-                            + ordered_history
-                            * self.meaningful_history_ordered_gate
-                        )
+                        if self.value_tower_split_layers:
+                            if value_tower_input is None:
+                                raise RuntimeError(
+                                    "value tower split boundary was not captured"
+                                )
+                            # The policy suffix is private to the policy branch.
+                            # Gathering value-history targets from final policy
+                            # tokens created a hidden scalar-value path through
+                            # that suffix, defeating the late-tower split once
+                            # the zero-initialised target projection learned.
+                            # Bind the value-side history adapter to the true
+                            # shared boundary instead; score_actions applies the
+                            # configured value gradient scale to this complete
+                            # shared-prefix path before the private value suffix.
+                            value_history_targets = (
+                                self._gather_entity_target_tokens(
+                                    value_tower_input,
+                                    target_batch,
+                                    target_key="event_target_ids",
+                                )
+                            )
+                            if (
+                                value_history_targets.shape[:2]
+                                != value_event_piece.shape[:2]
+                            ):
+                                raise RuntimeError(
+                                    "value public-history event/target width drift: "
+                                    f"{tuple(value_event_piece.shape[:2])} != "
+                                    f"{tuple(value_history_targets.shape[:2])}"
+                                )
+                            value_event_piece = (
+                                value_event_piece
+                                + self.meaningful_history_target_proj(
+                                    value_history_targets
+                                )
+                            )
+                    history_delta = pooled_history_delta(event_piece)
                     state = state + history_delta
+                    if self.value_tower_split_layers:
+                        if self.meaningful_public_history_target_gather_enabled:
+                            value_history_delta = pooled_history_delta(
+                                value_event_piece
+                            )
+                        else:
+                            value_history_delta = history_delta
                 if self.moe_enabled:
                     return (
                         tokens,
@@ -1382,14 +1425,14 @@ class EntityGraphNet:
                 if self.value_tower_split_layers:
                     if value_tower_input is None:
                         raise RuntimeError("value tower split boundary was not captured")
-                    if history_delta is None:
-                        history_delta = torch.zeros_like(state)
+                    if value_history_delta is None:
+                        value_history_delta = torch.zeros_like(state)
                     return (
                         tokens,
                         padding_mask,
                         state,
                         value_tower_input,
-                        history_delta,
+                        value_history_delta,
                     )
                 return tokens, padding_mask, state
 

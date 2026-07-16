@@ -15,9 +15,12 @@ TARGET="${1:-all}"
 # shellcheck disable=SC2016
 read -r -d '' REMOTE <<'REMOTE_EOF' || true
 set -uo pipefail
-# GPU line: idx util mem
+# GPU line: idx util mem.  Utilization is an instantaneous sample and may be
+# zero while a fully resident service is waiting for requests, so memory and
+# live CUDA clients are part of the occupancy contract too.
 GPU=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader,nounits 2>/dev/null)
-NG=$(echo "$GPU" | grep -c .); BUSY=$(echo "$GPU" | awk -F',[ ]*' '$2+0>50{c++}END{print c+0}')
+COMPUTE_APPS=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true)
+NG=$(echo "$GPU" | grep -c .); BUSY=$(echo "$GPU" | awk -F',[ ]*' '$2+0>50 || $3+0>128{c++}END{print c+0}')
 UTILAVG=$(echo "$GPU" | awk -F',[ ]*' '{s+=$2;n++}END{if(n)printf "%d",s/n; else print 0}')
 MEMMAX=$(echo "$GPU" | awk -F',[ ]*' '{if($3+0>m)m=$3}END{print m+0}')
 # role inference from live cmdlines (first match wins), + MPS presence
@@ -38,6 +41,11 @@ elif grep -qE "(^|[ /])pytest([ ]|$)|python[^ ]* -m pytest" <<< "$CMDS"; then RO
 elif grep -q "generate_gumbel_selfplay_data" <<< "$CMDS"; then
     if [ "${NF:-0}" -ge 128 ]; then ROLE="GEN-TEACHER(n${NF})"; elif [ -n "${NF:-}" ]; then ROLE="GEN-VOLUME(n${NF})"; else ROLE="GEN"; fi
 fi
+FOREIGN_COMPUTE=$(awk -F',[ ]*' 'NF >= 2 && $2 !~ /nvidia-cuda-mps-server/ {n++} END {print n+0}' <<< "$COMPUTE_APPS")
+if [ "$ROLE" = "idle" ] && [ "$FOREIGN_COMPUTE" -gt 0 ]; then
+    FIRST_COMPUTE=$(awk -F',[ ]*' 'NF >= 2 && $2 !~ /nvidia-cuda-mps-server/ {print $2; exit}' <<< "$COMPUTE_APPS")
+    ROLE="OTHER-COMPUTE(${FIRST_COMPUTE:-unknown})"
+fi
 # A stale pipe socket survives `echo quit | nvidia-cuda-mps-control`; process
 # state, not filesystem residue, is the source of truth.
 MPS="no-mps"
@@ -46,8 +54,8 @@ ps -eo comm=,args= 2>/dev/null \
   && MPS="MPS"
 JOB_PROCS=$(grep -cE "generate_gumbel_selfplay_data|train_bc.py|posthoc_teacher_gap_probe|a1_b200_(batch|microbatch)_probe|a1_b200_microbatch_quality|all_reduce_perf|gumbel_search_(cross_net|vs_bot|vs_raw)_h2h" <<< "$CMDS")
 GEN_PIPELINES=$(grep -c "generate_gumbel_selfplay_data" <<< "$CMDS")
-printf "gpus=%s busy=%s util_avg=%s%% mem_max=%sMiB | role=%s %s | %s | job_procs=%s gen_pipelines=%s\n" \
-  "$NG" "$BUSY" "$UTILAVG" "$MEMMAX" "$ROLE" "$DETAIL" "$MPS" "$JOB_PROCS" "$GEN_PIPELINES"
+printf "gpus=%s busy=%s util_avg=%s%% mem_max=%sMiB | role=%s %s | %s | cuda_clients=%s job_procs=%s gen_pipelines=%s\n" \
+  "$NG" "$BUSY" "$UTILAVG" "$MEMMAX" "$ROLE" "$DETAIL" "$MPS" "$FOREIGN_COMPUTE" "$JOB_PROCS" "$GEN_PIPELINES"
 REMOTE_EOF
 
 TMP=$(mktemp -d)

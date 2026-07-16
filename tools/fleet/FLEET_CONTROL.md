@@ -54,11 +54,14 @@ MPS client while preserving the server. Post-stop memory was exactly 78 MiB on a
 ## fleet_status.sh — one-read fleet view
 `fleet_status.sh [alias|all]`   (read-only, parallel)
 
-Per box: `gpus`, `busy` (>50%), `util_avg`, `mem_max`, inferred **role** (TRAINING / GATE(cross-net)
+Per box: `gpus`, `busy` (>50% instantaneous utilization or >128 MiB resident memory),
+`util_avg`, `mem_max`, inferred **role** (TRAINING / GATE(cross-net)
 / EVAL(vs-bot) / EVAL(vs-raw) / TEST(pytest) / GEN-TEACHER(nNN) / GEN-VOLUME(nNN) / idle from live cmdlines), MPS on/off, and
 matching generation/training process count plus `gen_pipelines`, the number of
 live generator processes (so dual mode is visible rather than mistaken for a
-duplicate launch).
+duplicate launch). Unknown CUDA clients are reported as `OTHER-COMPUTE(...)`
+rather than `idle`; this catches fully resident request-driven services whose
+instantaneous utilization happens to be zero.
 
 The retired `fleet_launch_safe.sh` was removed. It pointed at the old runsix tree and old MPS
 recipe. Do not use it.

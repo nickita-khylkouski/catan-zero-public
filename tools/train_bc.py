@@ -14048,6 +14048,36 @@ def main(
         str(args.value_phase_weights),
         policy_phase_weights=policy_phase_weight_map,
     )
+    teacher_weight_realization = _validate_loss_weight_map_realization(
+        data,
+        teacher_weight_map,
+        column="teacher_name",
+        option="--teacher-weights",
+    )
+    policy_phase_weight_realization = _validate_loss_weight_map_realization(
+        data,
+        policy_phase_weight_map,
+        column="phase",
+        option="--phase-weights",
+    )
+    value_phase_weight_realization = _validate_loss_weight_map_realization(
+        data,
+        value_phase_weight_map,
+        column="phase",
+        option="--value-phase-weights",
+    )
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "loss_weight_map_realization",
+                "teacher": teacher_weight_realization,
+                "policy_phase": policy_phase_weight_realization,
+                "value_phase": value_phase_weight_realization,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
     forced_row_value_action_type_weight_map = (
         _parse_forced_row_value_action_type_weights(
             args.forced_row_value_action_type_weights
@@ -18942,6 +18972,11 @@ def main(
         "phase_weights": _parse_weight_map(args.phase_weights),
         "value_phase_weights": value_phase_weight_map,
         "value_phase_weights_source": value_phase_weights_source,
+        "loss_weight_map_realization": {
+            "teacher": teacher_weight_realization,
+            "policy_phase": policy_phase_weight_realization,
+            "value_phase": value_phase_weight_realization,
+        },
         "forced_action_weight": args.forced_action_weight,
         "per_game_policy_weight": bool(args.per_game_policy_weight),
         "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
@@ -33863,6 +33898,84 @@ def _parse_weight_map(raw: str) -> dict[str, float]:
         name, value = item.split("=", 1)
         weights[name.strip()] = float(value)
     return weights
+
+
+def _validate_loss_weight_map_realization(
+    data: Mapping[str, object],
+    weights: Mapping[str, float],
+    *,
+    column: str,
+    option: str,
+) -> dict[str, object]:
+    """Prove that a configured loss-weight treatment changes real rows.
+
+    Phase and teacher maps are science coefficients, not best-effort labels.
+    Historically a spelling/case/schema drift (for example ``play_turn`` vs
+    ``PLAY_TURN``) matched zero rows and silently reduced the requested
+    treatment to the control objective.  Non-finite or negative multipliers
+    were even worse: they could poison or reverse gradients before the generic
+    finite-loss guard noticed.  Admit the treatment once, before derived-array
+    construction or GPU work, and bind its exact realized row support.
+    """
+
+    configured = {str(name): float(value) for name, value in weights.items()}
+    if not configured:
+        return {
+            "schema_version": "loss-weight-map-realization-v1",
+            "option": str(option),
+            "column": str(column),
+            "configured": {},
+            "realized_rows": {},
+        }
+    malformed = {
+        name: value
+        for name, value in configured.items()
+        if not name or not math.isfinite(value) or value < 0.0
+    }
+    if malformed:
+        raise SystemExit(
+            f"{option} multipliers must use non-empty labels and finite values "
+            f">= 0; malformed={malformed}"
+        )
+    if column not in data:
+        raise SystemExit(
+            f"{option} requires corpus column {column!r}; refusing a silent no-op"
+        )
+    rows = int(len(data["action_taken"]))
+    values = data[column]
+    present = _string_column_present_values(values, rows=rows)
+    missing = sorted(set(configured).difference(present))
+    if missing:
+        preview = sorted(present)[:16]
+        raise SystemExit(
+            f"{option} configured label(s) absent from corpus {column!r}: "
+            f"{missing}; present={preview}"
+        )
+    realized_rows: dict[str, int] = {}
+    value_counts = getattr(values, "value_counts", None)
+    if callable(value_counts):
+        counts = {str(name): int(count) for name, count in value_counts().items()}
+        realized_rows = {name: counts.get(name, 0) for name in configured}
+    else:
+        materialized = np.asarray(values).astype(str)
+        if materialized.shape != (rows,):
+            raise SystemExit(
+                f"{option} corpus column {column!r} must have shape ({rows},), "
+                f"got {materialized.shape}"
+            )
+        realized_rows = {
+            name: int(np.count_nonzero(materialized == name))
+            for name in configured
+        }
+    if any(count <= 0 for count in realized_rows.values()):
+        raise RuntimeError(f"{option} realization count drift: {realized_rows}")
+    return {
+        "schema_version": "loss-weight-map-realization-v1",
+        "option": str(option),
+        "column": str(column),
+        "configured": dict(sorted(configured.items())),
+        "realized_rows": dict(sorted(realized_rows.items())),
+    }
 
 
 def _resolve_value_phase_weights(

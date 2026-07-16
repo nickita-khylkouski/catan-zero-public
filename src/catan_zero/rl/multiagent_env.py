@@ -256,10 +256,19 @@ class ColonistMultiAgentEnv:
         if actor_color is None:
             raise ValueError(f"unknown actor: {actor_name}")
         valid = self.valid_actions(actor_name)
+        state = self.game.state
         payload = {
             "actor": actor_name,
             "current_player": self.current_player_name(),
-            "current_prompt": self.game.state.current_prompt.name,
+            "current_prompt": state.current_prompt.name,
+            # Entity adapter v4 consumes these public rule-state values.  They
+            # must be present on the Python payload just as they are in the
+            # native Rust snapshot path; omission silently zeroed slots 9:12.
+            "is_road_building": bool(state.is_road_building),
+            "free_roads_available": int(state.free_roads_available),
+            "current_discard_count": int(
+                state.discard_counts[state.current_player_index]
+            ),
             "players": self._player_payloads(actor_color),
             "board": self._board_payload(),
             "bank": self._bank_payload(),
@@ -934,9 +943,29 @@ class ColonistMultiAgentEnv:
                     card: state.player_state[f"{key}_{card}_IN_HAND"]
                     for card in self.DEVELOPMENT_CARDS
                 }
-                player_payload["has_played_development_card_this_turn"] = (
+                # Keep this actor-private/public-rule surface identical to the
+                # native Rust snapshot adapter consumed by entity adapter v4.
+                # The old ``..._this_turn`` spelling was not read by
+                # ``_global_tokens`` and silently forced slot 8 to zero on the
+                # Python feature path.
+                player_payload["has_played_development_card_in_turn"] = (
                     state.player_state[f"{key}_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN"]
                 )
+                # Catanatron stores one OWNED_AT_START boolean per card type,
+                # whereas the native engine stores the corresponding count.
+                # When the flag is true all currently held cards of that type
+                # are old enough to play; otherwise none are.  Exclude hidden
+                # VP cards, which have no play action and are intentionally not
+                # part of the four-slot public-rule feature contract.
+                player_payload["playable_development_cards"] = {
+                    card: (
+                        state.player_state[f"{key}_{card}_IN_HAND"]
+                        if state.player_state[f"{key}_{card}_OWNED_AT_START"]
+                        else 0
+                    )
+                    for card in self.DEVELOPMENT_CARDS
+                    if card != self.VICTORY_POINT
+                }
             payloads[name] = player_payload
         return payloads
 

@@ -236,18 +236,22 @@ def _assert_exact_recipe(
     if coherent_public:
         search = current_science.search()
         generation = current_science.generation()
+        evaluator = current_science.evaluator()
+        opponent_mix_recipe = "--opponent-mix-manifest" in original_values
         expected_value_flags = {
             "--n-full": str(search["n_full"]),
             "--n-fast": str(search["n_fast"]),
             "--p-full": str(search["p_full"]),
-            "--n-full-wide": str(search["n_full_wide"]),
-            "--n-full-wide-threshold": str(search["n_full_wide_threshold"]),
             "--c-scale": str(search["c_scale"]),
             "--c-visit": str(search["c_visit"]),
             "--sigma-eval": str(search["sigma_eval"]),
             "--max-depth": str(search["max_depth"]),
             "--max-decisions": str(generation["max_decisions"]),
-            "--workers": str(generation["workers_per_gpu"]),
+            "--workers": str(
+                contract.OPPONENT_MIX_WORKERS_PER_GPU
+                if opponent_mix_recipe
+                else generation["workers_per_gpu"]
+            ),
             "--device": str(generation["device"]),
             "--symmetry-averaged-eval-threshold": str(
                 search["symmetry_averaged_eval_threshold"]
@@ -267,33 +271,126 @@ def _assert_exact_recipe(
             ),
             "--late-temperature": str(generation["late_temperature"]),
             "--event-history-limit": str(generation["event_history_limit"]),
+            "--teacher-entity-feature-adapter-version": str(
+                generation["teacher_entity_feature_adapter_version"]
+            ),
+            "--learner-entity-feature-adapter-version": str(
+                generation["learner_entity_feature_adapter_version"]
+            ),
         }
+        if not opponent_mix_recipe:
+            expected_value_flags.update(
+                {
+                    "--eval-server-max-batch": str(
+                        generation["eval_server_max_batch"]
+                    ),
+                    "--eval-server-max-wait-ms": str(
+                        generation["eval_server_max_wait_ms"]
+                    ),
+                    "--eval-server-timeout-ms": str(
+                        generation["eval_server_timeout_ms"]
+                    ),
+                    "--eval-server-batch-timeout-sec": str(
+                        generation["eval_server_batch_timeout_sec"]
+                    ),
+                    "--eval-server-matmul-precision": str(
+                        generation["eval_server_matmul_precision"]
+                    ),
+                    "--eval-server-transport": str(
+                        generation["eval_server_transport"]
+                    ),
+                    "--eval-server-shared-memory-slot-bytes": str(
+                        generation["eval_server_shared_memory_slot_bytes"]
+                    ),
+                    "--eval-server-cuda-graph-warmup-iterations": str(
+                        generation["eval_server_cuda_graph_warmup_iterations"]
+                    ),
+                }
+            )
+        # Optional adaptive-budget values are omitted from the rendered argv
+        # when disabled.  Requiring the string ``"None"`` made the adopted
+        # base-n128 recipe impossible to canary even though the production
+        # renderer correctly omitted both flags.
+        for flag, value in (
+            ("--n-full-wide", search["n_full_wide"]),
+            ("--n-full-wide-threshold", search["n_full_wide_threshold"]),
+        ):
+            if value is not None:
+                expected_value_flags[flag] = str(value)
+        if not opponent_mix_recipe:
+            bucket_flag = "--eval-server-cuda-graph-batch-buckets"
+            try:
+                bucket_start = list(original).index(bucket_flag) + 1
+            except ValueError as error:
+                raise CanaryError(f"source recipe omits {bucket_flag}") from error
+            actual_buckets: list[int] = []
+            for token in original[bucket_start:]:
+                if token.startswith("--"):
+                    break
+                actual_buckets.append(int(token))
+            if actual_buckets != generation["eval_server_cuda_graph_batch_buckets"]:
+                raise CanaryError(
+                    "source recipe EvalServer CUDA Graph buckets differ from current science"
+                )
+
+        def science_switch(flag: str, enabled: bool) -> str:
+            return flag if enabled else "--no-" + flag.removeprefix("--")
+
+        switch_contract = {
+            "--symmetry-averaged-eval": bool(search["symmetry_averaged_eval"]),
+            "--public-observation": bool(evaluator["public_observation"]),
+            "--information-set-search": bool(search["information_set_search"]),
+            "--coherent-public-belief-search": bool(
+                search["coherent_public_belief_search"]
+            ),
+            "--lazy-interior-chance": bool(search["lazy_interior_chance"]),
+            "--correct-rust-chance-spectra": bool(
+                search["correct_rust_chance_spectra"]
+            ),
+            "--belief-chance-spectra": bool(search["belief_chance_spectra"]),
+            "--wide-roots-always-full": bool(search["wide_roots_always_full"]),
+            "--exact-budget-sh": bool(search["exact_budget_sh"]),
+            "--native-mcts-hot-loop": bool(generation["native_mcts_hot_loop"]),
+            "--rust-featurize": bool(evaluator["rust_featurize"]),
+            "--eval-server": (
+                False if opponent_mix_recipe else bool(generation["eval_server"])
+            ),
+            "--record-automatic-transitions": bool(
+                generation["record_automatic_transitions"]
+            ),
+            "--meaningful-public-history": bool(
+                generation["meaningful_public_history"]
+            ),
+            "--preserve-search-evidence": bool(
+                generation["preserve_search_evidence"]
+            ),
+        }
+        if not opponent_mix_recipe:
+            switch_contract.update(
+                {
+                    "--eval-server-local-fallback": bool(
+                        generation["eval_server_local_fallback"]
+                    ),
+                    "--eval-server-request-collector": bool(
+                        generation["eval_server_request_collector"]
+                    ),
+                    "--eval-server-cuda-graph": bool(
+                        generation["eval_server_cuda_graph"]
+                    ),
+                }
+            )
         required_switches = {
-            "--symmetry-averaged-eval",
-            "--public-observation",
-            "--no-information-set-search",
-            "--coherent-public-belief-search",
-            "--lazy-interior-chance",
-            "--correct-rust-chance-spectra",
-            "--no-belief-chance-spectra",
-            "--wide-roots-always-full",
-            "--native-mcts-hot-loop",
-            "--rust-featurize",
-            "--no-eval-server",
-            "--no-record-automatic-transitions",
-            "--meaningful-public-history",
+            *(
+                science_switch(flag, enabled)
+                for flag, enabled in switch_contract.items()
+            ),
             "--score-actions",
             "--seed-claim",
             "--resume",
         }
         forbidden_flags = {
-            "--information-set-search",
-            "--belief-chance-spectra",
-            "--no-coherent-public-belief-search",
-            "--no-wide-roots-always-full",
-            "--record-automatic-transitions",
-            "--no-meaningful-public-history",
-            "--no-public-observation",
+            science_switch(flag, not enabled)
+            for flag, enabled in switch_contract.items()
         }
     else:
         expected_value_flags = static_canary.EXPECTED_VALUE_FLAGS

@@ -672,7 +672,23 @@ _OPTIONAL_GENERATION_KEYS = {
     "target_reliability_audit_fraction",
     "target_reliability_audit_seed",
     "preserve_search_evidence",
+    "preserve_root_prior_value",
+    "eval_server_max_batch",
+    "eval_server_max_neural_rows",
+    "eval_server_max_wait_ms",
+    "eval_server_timeout_ms",
+    "eval_server_batch_timeout_sec",
+    "eval_server_local_fallback",
+    "eval_server_matmul_precision",
+    "eval_server_request_collector",
+    "eval_server_transport",
+    "eval_server_shared_memory_slot_bytes",
+    "eval_server_event_token_limit",
+    "eval_server_cuda_graph",
+    "eval_server_cuda_graph_batch_buckets",
+    "eval_server_cuda_graph_warmup_iterations",
 }
+OPPONENT_MIX_WORKERS_PER_GPU = 16
 
 
 class ContractError(ValueError):
@@ -2722,10 +2738,8 @@ def _validate_generation(generation: dict[str, Any]) -> None:
         )
     if generation["format"] != "npz":
         raise ContractError("the A1 postflight scanner currently requires format=npz")
-    if generation["device"] != "cuda" or bool(generation["eval_server"]):
-        raise ContractError(
-            "A1 renders per-GPU CUDA jobs with eval_server=false (MPS is host-managed)"
-        )
+    if generation["device"] != "cuda":
+        raise ContractError("A1 renders only per-GPU CUDA jobs")
     if int(generation["workers_per_gpu"]) <= 0 or int(generation["shard_size"]) <= 0:
         raise ContractError("workers_per_gpu and shard_size must be positive")
     if "temperature_clock" in generation:
@@ -2748,7 +2762,9 @@ def _validate_current_runtime_execution(
 ) -> None:
     """Keep historical locks replayable while new waves use the fast sealed path."""
 
-    if draft_schema != DRAFT_SCHEMA:
+    if draft_schema == LEGACY_DRAFT_SCHEMA:
+        if bool(generation.get("eval_server", False)):
+            raise ContractError("historical v2 A1 locks require eval_server=false")
         return
     if evaluator.get("rust_featurize") is not True:
         raise ContractError(
@@ -2757,6 +2773,20 @@ def _validate_current_runtime_execution(
     if generation.get("native_mcts_hot_loop") is not True:
         raise ContractError(
             "current v3 waves require the capability-sealed native MCTS hot loop"
+        )
+    expected_generation = current_science.generation()
+    runtime_drift = {
+        field: {
+            "expected": expected_generation.get(field),
+            "actual": generation.get(field),
+        }
+        for field in current_science.PRODUCTION_GENERATION_RUNTIME_FIELD_MAP
+        if generation.get(field) != expected_generation.get(field)
+    }
+    if runtime_drift:
+        raise ContractError(
+            "current v3 generation runtime differs from the authenticated "
+            f"schema19 recipe: {runtime_drift}"
         )
 
 
@@ -8283,6 +8313,13 @@ def _generator_argv(
     search = lock["science"]["search_operator"]
     evaluator = lock["science"]["evaluator"]
     generation = lock["generation"]
+    opponent_mix_job = job["category"] != "current_producer"
+    runtime_workers = (
+        OPPONENT_MIX_WORKERS_PER_GPU
+        if opponent_mix_job
+        else int(generation["workers_per_gpu"])
+    )
+    runtime_eval_server = False if opponent_mix_job else bool(generation["eval_server"])
     producer = _producer(lock)
     argv = [
         "tools/generate_gumbel_selfplay_data.py",
@@ -8291,7 +8328,7 @@ def _generator_argv(
         "--games",
         str(job["attempts"]),
         "--workers",
-        str(generation["workers_per_gpu"]),
+        str(runtime_workers),
         "--checkpoint",
         producer["path"],
         "--device",
@@ -8371,10 +8408,51 @@ def _generator_argv(
         str(search["determinization_min_simulations"]),
         _bool_flag("--public-observation", bool(evaluator["public_observation"])),
         _bool_flag("--rust-featurize", bool(evaluator["rust_featurize"])),
-        _bool_flag("--eval-server", bool(generation["eval_server"])),
+        _bool_flag("--eval-server", runtime_eval_server),
         "--seed-claim",
         "--resume",
     ]
+    # Current coherent locks bind the retained schema19 EvalServer frontier
+    # explicitly. Historical locks omit these keys and therefore reproduce
+    # their original argv byte-for-byte through the parser's historical
+    # defaults.
+    eval_server_values = (
+        ("--eval-server-max-batch", "eval_server_max_batch"),
+        ("--eval-server-max-neural-rows", "eval_server_max_neural_rows"),
+        ("--eval-server-max-wait-ms", "eval_server_max_wait_ms"),
+        ("--eval-server-timeout-ms", "eval_server_timeout_ms"),
+        ("--eval-server-batch-timeout-sec", "eval_server_batch_timeout_sec"),
+        ("--eval-server-matmul-precision", "eval_server_matmul_precision"),
+        ("--eval-server-transport", "eval_server_transport"),
+        (
+            "--eval-server-shared-memory-slot-bytes",
+            "eval_server_shared_memory_slot_bytes",
+        ),
+        (
+            "--eval-server-event-token-limit",
+            "eval_server_event_token_limit",
+        ),
+        (
+            "--eval-server-cuda-graph-warmup-iterations",
+            "eval_server_cuda_graph_warmup_iterations",
+        ),
+    )
+    for flag, key in eval_server_values:
+        if runtime_eval_server and key in generation and generation[key] is not None:
+            argv.extend((flag, str(generation[key])))
+    if runtime_eval_server and "eval_server_cuda_graph_batch_buckets" in generation:
+        argv.append("--eval-server-cuda-graph-batch-buckets")
+        argv.extend(
+            str(bucket)
+            for bucket in generation["eval_server_cuda_graph_batch_buckets"]
+        )
+    for flag, key in (
+        ("--eval-server-local-fallback", "eval_server_local_fallback"),
+        ("--eval-server-request-collector", "eval_server_request_collector"),
+        ("--eval-server-cuda-graph", "eval_server_cuda_graph"),
+    ):
+        if runtime_eval_server and key in generation:
+            argv.append(_bool_flag(flag, bool(generation[key])))
     if "coherent_public_belief_search" in search:
         argv.append(
             _bool_flag(
@@ -8413,6 +8491,13 @@ def _generator_argv(
             (
                 "--learner-entity-feature-adapter-version",
                 str(generation["learner_entity_feature_adapter_version"]),
+            )
+        )
+    if "teacher_entity_feature_adapter_version" in generation:
+        argv.extend(
+            (
+                "--teacher-entity-feature-adapter-version",
+                str(generation["teacher_entity_feature_adapter_version"]),
             )
         )
     if "target_reliability_audit_fraction" in generation:
@@ -9339,10 +9424,14 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
     evaluator = lock["science"]["evaluator"]
     generation = lock["generation"]
     late_decisions = generation["late_temperature_decisions"]
-    return {
+    fields = {
         "out_dir": job["output_dir"],
         "games": int(job["attempts"]),
-        "workers": int(generation["workers_per_gpu"]),
+        "workers": (
+            OPPONENT_MIX_WORKERS_PER_GPU
+            if job["category"] != "current_producer"
+            else int(generation["workers_per_gpu"])
+        ),
         "checkpoint": _producer(lock)["path"],
         "device": generation["device"],
         "n_full": search["n_full"],
@@ -9400,6 +9489,9 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "learner_entity_feature_adapter_version": generation.get(
             "learner_entity_feature_adapter_version"
         ),
+        "teacher_entity_feature_adapter_version": generation.get(
+            "teacher_entity_feature_adapter_version"
+        ),
         "event_history_limit": generation.get("event_history_limit", 64),
         "target_reliability_audit_fraction": generation.get(
             "target_reliability_audit_fraction", 0.0
@@ -9424,13 +9516,84 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
         "base_seed": int(job["base_seed"]),
         "shard_size": generation["shard_size"],
         "format": generation["format"],
-        "eval_server": generation["eval_server"],
+        "eval_server": (
+            False
+            if job["category"] != "current_producer"
+            else generation["eval_server"]
+        ),
+        "eval_server_max_batch": generation.get("eval_server_max_batch", 64),
+        "eval_server_max_neural_rows": generation.get(
+            "eval_server_max_neural_rows"
+        ),
+        "eval_server_max_wait_ms": generation.get("eval_server_max_wait_ms", 0.0),
+        "eval_server_timeout_ms": generation.get("eval_server_timeout_ms", 20_000.0),
+        "eval_server_batch_timeout_sec": generation.get(
+            "eval_server_batch_timeout_sec", 0.0
+        ),
+        "eval_server_local_fallback": generation.get(
+            "eval_server_local_fallback", False
+        ),
+        "eval_server_matmul_precision": generation.get(
+            "eval_server_matmul_precision", "highest"
+        ),
+        "eval_server_request_collector": generation.get(
+            "eval_server_request_collector", False
+        ),
+        "eval_server_transport": generation.get("eval_server_transport", "mp_queue"),
+        "eval_server_shared_memory_slot_bytes": generation.get(
+            "eval_server_shared_memory_slot_bytes", 4 * 1024 * 1024
+        ),
+        "eval_server_event_token_limit": generation.get(
+            "eval_server_event_token_limit"
+        ),
+        "eval_server_cuda_graph": generation.get("eval_server_cuda_graph", False),
+        "eval_server_cuda_graph_batch_buckets": generation.get(
+            "eval_server_cuda_graph_batch_buckets",
+            (8, 16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192),
+        ),
+        "eval_server_cuda_graph_warmup_iterations": generation.get(
+            "eval_server_cuda_graph_warmup_iterations", 3
+        ),
         "opponent_pool_manifest": None,
         "exploiter_fraction": None,
         "seed_claim": True,
         "ledger_claim_label": job["claim_label"],
         "skip_guards": False,
     }
+    # Runtime knobs introduced after the historical waves are part of the
+    # current schema-19 contract only when the sealed science contract names
+    # them.  Projecting parser defaults into an older lock changes its typed
+    # config hash and makes an otherwise immutable historical manifest
+    # impossible to replay.
+    current_runtime_only = (
+        "teacher_entity_feature_adapter_version",
+        "eval_server_max_batch",
+        "eval_server_max_neural_rows",
+        "eval_server_max_wait_ms",
+        "eval_server_timeout_ms",
+        "eval_server_batch_timeout_sec",
+        "eval_server_local_fallback",
+        "eval_server_matmul_precision",
+        "eval_server_request_collector",
+        "eval_server_transport",
+        "eval_server_shared_memory_slot_bytes",
+        "eval_server_event_token_limit",
+        "eval_server_cuda_graph",
+        "eval_server_cuda_graph_batch_buckets",
+        "eval_server_cuda_graph_warmup_iterations",
+    )
+    for key in current_runtime_only:
+        if key not in generation:
+            fields.pop(key, None)
+    if job["category"] != "current_producer":
+        # Opponent pools construct multiple local evaluators and are rejected
+        # by the shared EvalServer prototype. Bind the supported parser-default
+        # local/MPS runtime instead of claiming unused server settings.
+        fields.update(
+            eval_server_max_batch=64,
+            eval_server_request_collector=False,
+        )
+    return fields
 
 
 def _expected_generate_config_provenance(

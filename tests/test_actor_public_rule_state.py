@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -12,10 +14,59 @@ from catan_zero.rl.entity_token_features import (
     PUBLIC_RULE_STATE_FEATURE_SLICE,
     _global_tokens,
 )
+from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
 
 
 class _Env:
     pass
+
+
+def _python_player_payload_fixture() -> SimpleNamespace:
+    cards = (
+        "KNIGHT",
+        "YEAR_OF_PLENTY",
+        "MONOPOLY",
+        "ROAD_BUILDING",
+        "VICTORY_POINT",
+    )
+    resources = ("WOOD", "BRICK", "SHEEP", "WHEAT", "ORE")
+    player_state: dict[str, object] = {}
+    for color in ("BLUE", "RED"):
+        player_state.update(
+            {
+                f"{color}_VICTORY_POINTS": 2,
+                f"{color}_ACTUAL_VICTORY_POINTS": 2,
+                f"{color}_HAS_ARMY": False,
+                f"{color}_HAS_ROAD": False,
+                f"{color}_ROADS_AVAILABLE": 15,
+                f"{color}_SETTLEMENTS_AVAILABLE": 5,
+                f"{color}_CITIES_AVAILABLE": 4,
+                f"{color}_HAS_ROLLED": True,
+                f"{color}_LONGEST_ROAD_LENGTH": 0,
+                f"{color}_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN": False,
+            }
+        )
+        for resource in resources:
+            player_state[f"{color}_{resource}_IN_HAND"] = 0
+        for card in cards:
+            player_state[f"{color}_{card}_IN_HAND"] = 0
+            if card != "VICTORY_POINT":
+                player_state[f"{color}_{card}_OWNED_AT_START"] = False
+                player_state[f"{color}_PLAYED_{card}"] = 0
+
+    fake = SimpleNamespace(
+        game=SimpleNamespace(state=SimpleNamespace(player_state=player_state)),
+        player_colors=("BLUE", "RED"),
+        DEVELOPMENT_CARDS=cards,
+        RESOURCES=resources,
+        VICTORY_POINT="VICTORY_POINT",
+        player_key=lambda _state, color: color,
+        player_num_resource_cards=lambda _state, _color: 0,
+        player_num_dev_cards=lambda _state, color: sum(
+            int(player_state[f"{color}_{card}_IN_HAND"]) for card in cards
+        ),
+    )
+    return fake
 
 
 def _payload() -> dict:
@@ -40,6 +91,39 @@ def _payload() -> dict:
         "legal_actions": (),
         "bank": {},
     }
+
+
+def test_python_observation_payload_matches_public_rule_state_feature_contract():
+    fake = _python_player_payload_fixture()
+    state = fake.game.state.player_state
+    state["BLUE_HAS_PLAYED_DEVELOPMENT_CARD_IN_TURN"] = True
+    state["BLUE_KNIGHT_IN_HAND"] = 2
+    state["BLUE_KNIGHT_OWNED_AT_START"] = True
+    state["BLUE_MONOPOLY_IN_HAND"] = 1
+    state["BLUE_MONOPOLY_OWNED_AT_START"] = False
+
+    players = ColonistMultiAgentEnv._player_payloads(fake, "BLUE")
+    assert players["BLUE"]["has_played_development_card_in_turn"] is True
+    assert players["BLUE"]["playable_development_cards"] == {
+        "KNIGHT": 2,
+        "YEAR_OF_PLENTY": 0,
+        "MONOPOLY": 0,
+        "ROAD_BUILDING": 0,
+    }
+    assert "has_played_development_card_in_turn" not in players["RED"]
+    assert "playable_development_cards" not in players["RED"]
+
+    payload = _payload()
+    payload["players"] = players
+    encoded = _global_tokens(
+        _Env(), payload, "BLUE", encode_actor_public_rule_state=True
+    )
+    np.testing.assert_allclose(
+        encoded[0, PUBLIC_RULE_STATE_FEATURE_SLICE][[0, 4, 6]],
+        np.asarray([1.0, 0.4, 0.0], dtype=np.float32),
+        rtol=0,
+        atol=3e-4,
+    )
 
 
 def test_adapter_v4_exposes_current_actor_rule_state_without_reinterpreting_v3():

@@ -112,6 +112,59 @@ def _run(
 def test_launcher_shell_syntax_is_valid() -> None:
     subprocess.run(["bash", "-n", str(LAUNCHER)], check=True)
     subprocess.run(["bash", "-n", str(DETACHER)], check=True)
+    subprocess.run(["bash", "-n", str(STATUS)], check=True)
+
+
+def test_fleet_status_does_not_call_resident_cuda_service_idle(
+    tmp_path: Path,
+) -> None:
+    """A request-driven GPU service may sample at 0% while owning all memory."""
+
+    home = tmp_path / "home"
+    home.mkdir()
+    fleet_conf = home / ".catan_fleet.conf"
+    fleet_conf.write_text(
+        "declare -A HOST=( [b200]=127.0.0.1 )\n"
+        f"GPU_SSH_KEY={home / 'unused-test-key'}\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text("#!/usr/bin/env bash\nexec bash -s\n")
+    fake_ssh.chmod(0o755)
+    fake_smi = fake_bin / "nvidia-smi"
+    fake_smi.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$*\" == *\"--query-gpu=index,utilization.gpu,memory.used\"* ]]; then\n"
+        "  printf '0, 0, 170000\\n1, 0, 170000\\n'\n"
+        "elif [[ \"$*\" == *\"--query-compute-apps=pid,process_name,used_memory\"* ]]; then\n"
+        "  printf '4242, sglang::scheduler_TP0, 169900\\n'\n"
+        "fi\n"
+    )
+    fake_smi.chmod(0o755)
+    fake_ps = fake_bin / "ps"
+    fake_ps.write_text("#!/usr/bin/env bash\nprintf 'init\\n'\n")
+    fake_ps.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(home),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "FLEET_CONF": str(fleet_conf),
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(STATUS), "b200"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "busy=2" in result.stdout
+    assert "role=OTHER-COMPUTE(sglang::scheduler_TP0)" in result.stdout
+    assert "cuda_clients=1" in result.stdout
 
 
 def test_launch_detached_publishes_a_live_pid_equal_to_its_sid(tmp_path: Path) -> None:

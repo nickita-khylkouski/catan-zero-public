@@ -27,6 +27,7 @@ GENERATOR_CONFIG_PATH = (
     REPO_ROOT
     / "configs/generation/coherent_public_n128.schema19.json"
 )
+PRODUCTION_RECIPE_CATALOG_PATH = REPO_ROOT / "configs/production_recipes.json"
 GENERATOR_GUARD_PATH = (
     REPO_ROOT
     / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
@@ -262,6 +263,57 @@ PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT = {
     # root expansion, before search backups mutate root_value. Generation and
     # memmap materialization must retain this distinct field and mask.
     "preserve_root_prior_value": True,
+}
+PRODUCTION_GENERATION_RUNTIME_FIELD_MAP = {
+    "track": "track",
+    "vps_to_win": "vps_to_win",
+    "obs_width": "obs_width",
+    "max_decisions": "max_decisions",
+    "temperature_clock": "temperature_clock",
+    "temperature_decisions": "temperature_decisions",
+    "temperature_high": "temperature_high",
+    "temperature_low": "temperature_low",
+    "late_temperature_decisions": "late_temperature_decisions",
+    "late_temperature": "late_temperature",
+    "record_automatic_transitions": "record_automatic_transitions",
+    "meaningful_public_history": "meaningful_public_history",
+    "event_history_limit": "event_history_limit",
+    "teacher_entity_feature_adapter_version": (
+        "teacher_entity_feature_adapter_version"
+    ),
+    "learner_entity_feature_adapter_version": (
+        "learner_entity_feature_adapter_version"
+    ),
+    "workers_per_gpu": "workers",
+    "shard_size": "shard_size",
+    "format": "fmt",
+    "device": "device",
+    "eval_server": "eval_server",
+    "eval_server_max_batch": "eval_server_max_batch",
+    "eval_server_max_neural_rows": "eval_server_max_neural_rows",
+    "eval_server_max_wait_ms": "eval_server_max_wait_ms",
+    "eval_server_timeout_ms": "eval_server_timeout_ms",
+    "eval_server_batch_timeout_sec": "eval_server_batch_timeout_sec",
+    "eval_server_local_fallback": "eval_server_local_fallback",
+    "eval_server_matmul_precision": "eval_server_matmul_precision",
+    "eval_server_request_collector": "eval_server_request_collector",
+    "eval_server_transport": "eval_server_transport",
+    "eval_server_shared_memory_slot_bytes": (
+        "eval_server_shared_memory_slot_bytes"
+    ),
+    "eval_server_event_token_limit": "eval_server_event_token_limit",
+    "eval_server_cuda_graph": "eval_server_cuda_graph",
+    "eval_server_cuda_graph_batch_buckets": (
+        "eval_server_cuda_graph_batch_buckets"
+    ),
+    "eval_server_cuda_graph_warmup_iterations": (
+        "eval_server_cuda_graph_warmup_iterations"
+    ),
+    "native_mcts_hot_loop": "native_mcts_hot_loop",
+    "target_reliability_audit_fraction": "target_reliability_audit_fraction",
+    "target_reliability_audit_seed": "target_reliability_audit_seed",
+    "preserve_search_evidence": "preserve_search_evidence",
+    "preserve_root_prior_value": "preserve_root_prior_value",
 }
 
 
@@ -636,10 +688,46 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
     """Bind the generator recipe and guard to the target-quality authority."""
 
     generator = _read_object(GENERATOR_CONFIG_PATH)
+    catalog = _read_object(PRODUCTION_RECIPE_CATALOG_PATH)
+    recipes = catalog.get("recipes", {}).get("generate", [])
+    expected_relative_path = str(GENERATOR_CONFIG_PATH.relative_to(REPO_ROOT))
+    catalog_records = [
+        item
+        for item in recipes
+        if isinstance(item, dict) and item.get("path") == expected_relative_path
+    ]
+    if len(catalog_records) != 1:
+        raise ScienceContractError(
+            "current coherent generator is not uniquely authenticated by the "
+            "production recipe catalog"
+        )
+    canonical_sha256 = _content_sha256(generator).removeprefix("sha256:")
+    if (
+        generator.get("pipeline") != "generate"
+        or generator.get("schema_version") != 19
+        or catalog_records[0].get("canonical_sha256") != canonical_sha256
+    ):
+        raise ScienceContractError(
+            "current coherent generator catalog authentication drifted"
+        )
     fields = generator.get("fields")
     if not isinstance(fields, dict):
         raise ScienceContractError("coherent generator config fields are missing")
     generation = contract["generation"]
+    runtime_drift = {
+        science_field: {
+            "config_field": config_field,
+            "science": generation.get(science_field),
+            "catalog": fields.get(config_field),
+        }
+        for science_field, config_field in PRODUCTION_GENERATION_RUNTIME_FIELD_MAP.items()
+        if generation.get(science_field) != fields.get(config_field)
+    }
+    if runtime_drift:
+        raise ScienceContractError(
+            "current science generation runtime differs from authenticated "
+            f"catalog schema19 recipe: {runtime_drift}"
+        )
     search_value = contract["operator"]["search"]
     expected_generator = {
         **PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT,
@@ -690,6 +778,9 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
         "--learner-entity-feature-adapter-version": (
             expected_generator["learner_entity_feature_adapter_version"]
         ),
+        "--teacher-entity-feature-adapter-version": generation[
+            "teacher_entity_feature_adapter_version"
+        ],
     }
     guard_drift = {
         flag: {
@@ -704,6 +795,16 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
         raise ScienceContractError(
             "current coherent generator target-quality guard drifted: "
             f"{guard_drift}"
+        )
+    critical_only = {
+        "--workers",
+        "--eval-server",
+    }
+    missing_critical = sorted(critical_only - critical)
+    if missing_critical:
+        raise ScienceContractError(
+            "current coherent generator guard omits variable-arity runtime "
+            f"flags: {missing_critical}"
         )
 
 

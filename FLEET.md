@@ -174,8 +174,12 @@ Interpreter is auto-resolved (`$GEN_PY` → `~/venv/bin/python` → `<tree>/.ven
   inspect it before `run --go`, then require `status` and `audit` to pass.
   Never execute rendered argv manually and never merge canary rows or its
   ledger into production.
-- **A1 runtime:** one generator per physical GPU, 16 workers/GPU,
-  systemd-managed MPS, EvalServer off, strict FP32, public-observation masking,
+- **A1 runtime:** one generator per physical GPU. Current-producer jobs use 128
+  cross-game workers and one strict-FP32 EvalServer/GPU (batch cap 96,
+  immediate collector drain). Recent-history and hard-negative opponent-mix
+  jobs use the supported 16-worker local/MPS path because the EvalServer does
+  not yet route multiple checkpoint evaluators. MPS remains attested for both,
+  with public-observation masking,
   `n_full=128`, `n_fast=16`, `p_full=0.25`, deployed `c_scale=0.10` on every
   source category, D1 rescaling off,
   and D6 averaging from legal width 20. `n_full_wide` and its threshold are

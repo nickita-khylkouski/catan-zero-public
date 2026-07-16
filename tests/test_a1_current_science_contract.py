@@ -176,6 +176,15 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     generator = json.loads(
         current_science.GENERATOR_CONFIG_PATH.read_text(encoding="utf-8")
     )["fields"]
+    for science_field, config_field in (
+        current_science.PRODUCTION_GENERATION_RUNTIME_FIELD_MAP.items()
+    ):
+        assert generation[science_field] == generator[config_field]
+    assert generation["workers_per_gpu"] == 128
+    assert generation["eval_server"] is True
+    assert generation["eval_server_max_batch"] == 96
+    assert generation["eval_server_request_collector"] is True
+    assert generation["eval_server_matmul_precision"] == "highest"
     assert generator["boundary_value_particles"] == 1
     assert generator["exact_budget_sh"] is False
     assert generator["exact_budget_sh_min_n"] == 0
@@ -197,6 +206,48 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     assert lint["expected_values"][
         "--learner-entity-feature-adapter-version"
     ] == current_science.CURRENT_LEARNER_ENTITY_ADAPTER
+    assert "--workers" in lint["critical_flags"]
+    assert "--eval-server" in lint["critical_flags"]
+    assert "--workers" not in lint["expected_values"]
+    assert "--eval-server" not in lint["expected_values"]
+    assert "--eval-server-max-batch" not in lint["critical_flags"]
+    assert "--eval-server-request-collector" not in lint["critical_flags"]
+
+
+@pytest.mark.parametrize(
+    ("config_field", "bad_value"),
+    (("workers", 16), ("eval_server", False)),
+)
+def test_current_contract_rejects_authenticated_catalog_runtime_mismatch(
+    tmp_path, monkeypatch, config_field: str, bad_value
+) -> None:
+    generator = json.loads(
+        current_science.GENERATOR_CONFIG_PATH.read_text(encoding="utf-8")
+    )
+    generator["fields"][config_field] = bad_value
+    generator_path = tmp_path / "coherent_public_n128.schema19.json"
+    generator_path.write_text(json.dumps(generator), encoding="utf-8")
+
+    catalog = json.loads(
+        current_science.PRODUCTION_RECIPE_CATALOG_PATH.read_text(encoding="utf-8")
+    )
+    catalog["recipes"]["generate"][0]["path"] = generator_path.name
+    catalog["recipes"]["generate"][0]["canonical_sha256"] = (
+        current_science._content_sha256(generator).removeprefix("sha256:")
+    )
+    catalog_path = tmp_path / "production_recipes.json"
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+
+    monkeypatch.setattr(current_science, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(current_science, "GENERATOR_CONFIG_PATH", generator_path)
+    monkeypatch.setattr(
+        current_science, "PRODUCTION_RECIPE_CATALOG_PATH", catalog_path
+    )
+    with pytest.raises(
+        current_science.ScienceContractError,
+        match="runtime differs from authenticated catalog schema19 recipe",
+    ):
+        current_science.load()
 
 
 @pytest.mark.parametrize("bad_value", (None, 0, 2))

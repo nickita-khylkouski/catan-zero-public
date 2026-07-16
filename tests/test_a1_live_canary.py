@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools.fleet import a1_live_canary as canary
+from tools import prelaunch_guard
 
 
 def _source_argv(out_dir: str, base_seed: int, claim: str) -> list[str]:
@@ -88,6 +89,133 @@ def _source_config_provenance(base_seed: int) -> dict:
     }
     value["provenance_sha256"] = canary._digest(value)
     return value
+
+
+def _current_coherent_lock_job() -> tuple[dict, dict]:
+    lock = {
+        "schema_version": canary.contract.LOCK_SCHEMA,
+        "science": {
+            "search_operator": canary.current_science.search(),
+            "evaluator": canary.current_science.evaluator(),
+        },
+        "generation": canary.current_science.generation(),
+        "checkpoints": [
+            {
+                "role": "producer",
+                "path": "/models/current-coherent-producer.pt",
+                "sha256": "sha256:" + "1" * 64,
+            }
+        ],
+        "provenance": {
+            "guard_config": {
+                "path": (
+                    "configs/guards/"
+                    "a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
+                )
+            }
+        },
+    }
+    job = {
+        "category": "current_producer",
+        "output_dir": "/home/ubuntu/catan-zero-production/current-coherent",
+        "attempts": 150,
+        "base_seed": 400_000_000_000,
+        "claim_label": "current-coherent-render",
+    }
+    return lock, job
+
+
+def _current_coherent_source_argv() -> list[str]:
+    """Render one current-producer command through the production renderer."""
+
+    lock, job = _current_coherent_lock_job()
+    return canary.contract._generator_argv(lock, job, mix_paths={})  # noqa: SLF001
+
+
+def test_current_coherent_render_accepts_disabled_adaptive_budget() -> None:
+    lock, job = _current_coherent_lock_job()
+    source = _current_coherent_source_argv()
+    derived = canary._replace_values(
+        source,
+        {
+            "--out-dir": "/home/ubuntu/gen_out/a1-live-canary-coherent/gpu0",
+            "--games": "16",
+            "--base-seed": str(canary.contract.VAL_ONLY_SEED_RANGE[0]),
+            "--ledger-claim-label": "val-current-coherent-gpu0",
+        },
+    )
+
+    # The adopted base-n128 operator omits nullable adaptive values and renders
+    # both false and true boolean science fields explicitly.
+    assert "--n-full-wide" not in source
+    assert "--n-full-wide-threshold" not in source
+    assert "--no-wide-roots-always-full" in source
+    assert "--record-automatic-transitions" in source
+    assert canary._flag_value(source, "--workers") == "128"
+    assert "--eval-server" in source
+    assert canary._flag_value(source, "--eval-server-max-batch") == "96"
+    assert "--eval-server-request-collector" in source
+    assert canary._flag_value(source, "--eval-server-matmul-precision") == "highest"
+    bucket_index = source.index("--eval-server-cuda-graph-batch-buckets")
+    assert source[bucket_index + 1 : bucket_index + 13] == [
+        str(value)
+        for value in lock["generation"]["eval_server_cuda_graph_batch_buckets"]
+    ]
+    canary._assert_exact_recipe(source, derived)
+
+    provenance = canary.contract._expected_generate_config_provenance(  # noqa: SLF001
+        lock, job, opponent_mix_manifest=None
+    )
+    projected = provenance["config"]["fields"]
+    generation = canary.current_science.generation()
+    for science_field, config_field in (
+        canary.current_science.PRODUCTION_GENERATION_RUNTIME_FIELD_MAP.items()
+    ):
+        assert projected[config_field] == generation[science_field]
+
+
+def test_current_opponent_mix_render_uses_supported_local_mps_runtime() -> None:
+    lock, job = _current_coherent_lock_job()
+    job["category"] = "recent_history"
+    mix_path = Path("/sealed/recent_history.opponent-mix.json")
+    source = canary.contract._generator_argv(  # noqa: SLF001
+        lock, job, mix_paths={"recent_history": mix_path}
+    )
+    derived = canary._replace_values(
+        source,
+        {
+            "--out-dir": "/home/ubuntu/gen_out/a1-live-canary-mix/gpu0",
+            "--games": "16",
+            "--base-seed": str(canary.contract.VAL_ONLY_SEED_RANGE[0]),
+            "--ledger-claim-label": "val-current-mix-gpu0",
+        },
+    )
+    assert canary._flag_value(source, "--workers") == "16"
+    assert "--no-eval-server" in source
+    assert "--eval-server" not in source
+    assert canary._flag_value(source, "--opponent-mix-manifest") == str(mix_path)
+    canary._assert_exact_recipe(source, derived)
+
+    guard_path = (
+        canary.contract.REPO_ROOT
+        / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
+    )
+    guard = json.loads(guard_path.read_text(encoding="utf-8"))
+    lint = next(item["args"] for item in guard["guards"] if item["name"] == "cli_flag_lint")
+    result = prelaunch_guard.guard_cli_flag_lint(
+        argv=source[1:],
+        critical_flags=lint["critical_flags"],
+        expected_values=lint["expected_values"],
+        forbidden_flags=lint.get("forbidden_flags", ()),
+        parser=canary.contract.generation_cli.build_parser(),
+    )
+    assert result.passed, result.reason
+
+    provenance = canary.contract._expected_generate_config_provenance(  # noqa: SLF001
+        lock, job, opponent_mix_manifest=str(mix_path)
+    )
+    assert provenance["config"]["fields"]["workers"] == 16
+    assert provenance["config"]["fields"]["eval_server"] is False
 
 
 def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

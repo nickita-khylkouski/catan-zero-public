@@ -66,7 +66,8 @@ Operator workstation
   -> one detached lane supervisor per physical GPU
   -> three deterministic source-category jobs per lane
   -> CPU game workers
-  -> one MPS-managed generator per GPU (EvalServer off)
+  -> current producer: one strict-FP32 EvalServer/GPU, 128 workers, batch cap 96
+  -> opponent-mix sources: supported local/MPS evaluators, 16 workers/GPU
   -> Rust game state, features, and Gumbel chance MCTS
   -> strict-FP32 entity-graph policy forward
   -> NPZ decision shards plus manifests
@@ -143,9 +144,9 @@ teacher/volume box split and no H100 held out for training:
 | H100 topology | eight 4-GPU hosts + four 8-GPU hosts = 64 GPUs |
 | Search budget | `n_full=128`, `n_fast=16`, `p_full=0.25` |
 | Adaptive budget | disabled (`n_full_wide=null`, threshold null, always-full false) |
-| Search calibration | c-visit 50.0, deployed producer c-scale .10 on all three source categories, D1 off, sigma_eval .98 |
+| Search calibration | c-visit 50.0, deployed producer c-scale .10 on all three source categories, D1 off, sigma_eval .79 |
 | Symmetry | D6 averaged evaluation on from legal width 20 |
-| Runtime | one generator/GPU, 16 workers/GPU, systemd-managed MPS, EvalServer off |
+| Runtime | one generator/GPU; current producer uses 128 workers + strict-FP32 EvalServer (cap 96); opponent-mix jobs use 16-worker local/MPS evaluation; systemd-managed MPS retained |
 | Precision/masking | strict FP32, public observations, masked checkpoints |
 | Source jobs | balanced-prefix quotas: current 150/GPU; recent 29 on first 8 GPUs then 28; hard-negative 10 on first 24 then 9 |
 | Attempts | selected quota plus fixed 5/2/1 reserve per category job; reserves are excluded before training |
@@ -235,7 +236,9 @@ Before the 64-H100 rollout, complete the private fleet configuration in Section
 eight-GPU host. Use validation-only seeds and outputs, never production claims,
 unless executing the first real jobs through the executor's exact resume
 transaction. The canary must reproduce global n128/n_fast16/p_full.25, D6 at
-width 20, no adaptive budget, 16 workers/GPU, MPS, and EvalServer off.
+width 20 and no adaptive budget. Canary both authenticated paths: current
+producer at 128 workers with schema19 EvalServer (strict FP32, cap 96), and an
+opponent-mix source at 16 workers with EvalServer explicitly disabled.
 
 Inspect the executor's default dry run before adding `--go`. Accept only if all
 selected GPUs attach to the managed MPS service, guards pass, output rows and
@@ -269,7 +272,9 @@ semantics. Stop with a dry inspection followed by the same command plus
 
 The older 80k/72k per-GPU threshold and 2.20M rows/hour projection belong to
 the historical w128 EvalServer capacity experiment. They are not acceptance
-thresholds for the sealed 16-worker/MPS A1 runtime.
+thresholds by themselves. The schema19 runtime adopts that measured EvalServer
+shape, but the live canary must establish capacity with the real checkpoint and
+current meaningful-history payloads before a fleet projection is accepted.
 
 ## 8. Private fleet configuration
 

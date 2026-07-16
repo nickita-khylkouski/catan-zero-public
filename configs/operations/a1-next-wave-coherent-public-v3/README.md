@@ -20,8 +20,13 @@ The typed generator resolves the internal historical engine settings
 `--preserve-search-evidence`; callers do not override them. The learner
 separately binds `--value-phase-weights none` so the policy's phase sampler
 cannot silently redefine the value-state distribution.
-The current typed generator artifact is schema 18, which binds
-`boundary_value_particles` into generation and evaluation identity. The
+The current typed generator artifact is schema 19, which binds
+`boundary_value_particles` and the retained H100 EvalServer runtime into
+generation and evaluation identity. Current-producer jobs run one generator
+per physical GPU with 128 cross-game workers, strict-FP32 EvalServer inference,
+an immediate request collector, and a 96-request batch cap. Opponent-mix jobs
+use the generator's supported 16-worker local/MPS evaluator path because the
+EvalServer cannot yet route multiple checkpoint evaluators. The
 schema-16 artifact remains byte-identical historical evidence and must not be
 used as the current launch config.
 

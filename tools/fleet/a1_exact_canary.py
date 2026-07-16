@@ -67,6 +67,7 @@ FORBIDDEN_FLAGS = {
     "--no-information-set-search",
     "--belief-chance-spectra",
 }
+MULTI_VALUE_FLAGS = {"--eval-server-cuda-graph-batch-buckets"}
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -94,8 +95,12 @@ def _flag_map(argv: Any, *, job_id: str) -> tuple[dict[str, str], set[str]]:
         if item in values or item in switches:
             raise CanaryError(f"{job_id}: duplicate flag {item}")
         if index + 1 < len(argv) and not argv[index + 1].startswith("--"):
-            values[item] = argv[index + 1]
-            index += 2
+            value_end = index + 2
+            if item in MULTI_VALUE_FLAGS:
+                while value_end < len(argv) and not argv[value_end].startswith("--"):
+                    value_end += 1
+            values[item] = "\x1f".join(argv[index + 1 : value_end])
+            index = value_end
         else:
             switches.add(item)
             index += 1
