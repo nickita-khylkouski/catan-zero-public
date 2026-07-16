@@ -75,6 +75,7 @@ MATCHED_QUICK_SCREEN_SELECTION_RULE = {
     "tie_break": "lowest_optimizer_step_on_exact_tie",
 }
 INTERMEDIATE_CHECKPOINT_SCHEMA = "train-bc-intermediate-checkpoint-v1"
+SCRATCH_TRAINING_RECEIPT_SCHEMA = "a1-scratch-training-receipt-v1"
 CHECKPOINT_SELECTION_STEPS = (64, 96, 128)
 BRANCH_CHALLENGE_LINEAGE_SCHEMA = "a1-branch-challenge-lineage-v1"
 RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v3"
@@ -849,6 +850,7 @@ def _verify_training_report(
     production_target_gather_completion: bool = False,
     production_temperature_completion: bool = False,
     production_composite: bool = False,
+    scratch_training: bool = False,
 ) -> dict[str, Any]:
     report = _load_json(path)
     if sum((production_l1_completion, production_target_gather_completion,
@@ -1107,6 +1109,20 @@ def _verify_training_report(
     init_sha = report.get("init_checkpoint_sha256")
     curriculum_parent = report.get("a1_curriculum_parent")
     architecture_upgrade_binding: dict[str, Any] | None = None
+    if scratch_training:
+        initialization = contract.get("science", {}).get("learner_initialization")
+        if (
+            initialization != current_science.learner_initialization()
+            or initialization.get("mode") != "from_scratch"
+            or report.get("init_checkpoint") is not None
+            or init_sha is not None
+            or curriculum_parent is not None
+            or report.get("a1_scratch_training_binding") is None
+        ):
+            raise PromotionError(
+                "scratch candidate report lost native initialization authority"
+            )
+        return report
     if init_sha != producer_sha:
         lineage_value = report.get("a1_lineage_dose")
         try:
@@ -2442,6 +2458,42 @@ def _verify_one_dose_training_receipt(
     if checkpoint_selection_requested and legacy_snapshot is not None:
         raise PromotionError("legacy promotion snapshots cannot select intermediate doses")
     raw_schema = _load_json(path).get("schema_version")
+    # Import lazily: one_dose imports the recovery gate, which imports this
+    # module. Importing the scratch executor at module load would close that
+    # historical cycle before one_dose has defined its runtime helpers.
+    from tools import a1_scratch_train as scratch_train
+
+    if raw_schema == scratch_train.RECEIPT_SCHEMA:
+        if checkpoint_selection_requested:
+            raise PromotionError(
+                "scratch training receipt does not authorize checkpoint selection"
+            )
+        try:
+            value = scratch_train.verify_receipt(path, contract_lock=contract_lock)
+        except scratch_train.ScratchTrainError as error:
+            raise PromotionError(f"scratch training receipt refused: {error}") from error
+        outputs = value["outputs"]
+        checkpoint_ref = outputs.get("checkpoint")
+        report_ref = outputs.get("report")
+        if checkpoint_ref != {
+            "path": str(candidate_path),
+            "sha256": candidate_sha256,
+        } or report_ref != {
+            "path": str(training_report_path),
+            "sha256": training_report_sha256,
+        }:
+            raise PromotionError(
+                "scratch training receipt output bytes differ from candidate/report"
+            )
+        return {
+            "path": str(path),
+            "sha256": _sha256(path),
+            "receipt_sha256": value["receipt_sha256"],
+            "claim": value["claim"],
+            "claim_state_sha256": value["claim_state_sha256"],
+            "execution_binding_sha256": _digest_value(value["execution_binding"]),
+            "evaluation_parent_sha256": value["evaluation_parent_sha256"],
+        }
     _require_training_receipt_initialization_authority(contract)
     if checkpoint_selection_requested and raw_schema != one_dose.RECEIPT_SCHEMA:
         raise PromotionError(
@@ -8172,9 +8224,19 @@ def _verify_adjudication(
     training_receipt_preview = _load_json(training_receipt)
     training_receipt_schema = training_receipt_preview.get("schema_version")
     preview_input_binding = training_receipt_preview.get("input_binding")
+    scratch_training = (
+        training_receipt_schema == SCRATCH_TRAINING_RECEIPT_SCHEMA
+    )
     production_composite = (
         isinstance(preview_input_binding, dict)
-        and preview_input_binding.get("data_kind") == "production_composite_v2"
+        and (
+            preview_input_binding.get("data_kind") == "production_composite_v2"
+            or (
+                isinstance(preview_input_binding.get("corpus"), dict)
+                and preview_input_binding["corpus"].get("data_kind")
+                == "production_composite_v2"
+            )
+        )
     )
     production_l1_completion = (
         training_receipt_schema == "a1-production-l1-rerun-completion-v1"
@@ -8198,6 +8260,7 @@ def _verify_adjudication(
             production_target_gather_completion=production_target_gather_completion,
             production_temperature_completion=production_temperature_completion,
             production_composite=production_composite,
+            scratch_training=scratch_training,
         )
     training_receipt_ref = _verify_one_dose_training_receipt(
         training_receipt,
@@ -8225,6 +8288,7 @@ def _verify_adjudication(
             production_target_gather_completion=production_target_gather_completion,
             production_temperature_completion=production_temperature_completion,
             production_composite=production_composite,
+            scratch_training=scratch_training,
         )
     champion_raw = _require_exact_keys(
         value["champion"],

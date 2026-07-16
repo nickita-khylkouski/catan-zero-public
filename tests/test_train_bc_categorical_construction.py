@@ -12,7 +12,9 @@ from catan_zero.rl.config_cli import apply_config_file
 from catan_zero.rl.self_play import make_env_config
 from tools.train_bc import (
     _game_seed_set_sha256,
+    _resolve_effective_meaningful_public_history,
     _resolve_effective_value_categorical_bins,
+    _resolve_value_phase_weights,
     _training_data_fingerprint,
     _warm_start_grow,
     build_parser,
@@ -178,6 +180,70 @@ def test_train_config_hash_captures_data_init_grow_and_holdout_identity() -> Non
     assert len({base.config_hash(), *(variant.config_hash() for variant in variants)}) == (
         1 + len(variants)
     )
+
+
+def test_value_phase_weights_can_explicitly_opt_out_of_policy_phase_repair() -> None:
+    inherited, inherited_source = _resolve_value_phase_weights(
+        "",
+        policy_phase_weights={"PLAY_TURN": 4.0},
+    )
+    explicit_none, none_source = _resolve_value_phase_weights(
+        "none",
+        policy_phase_weights={"PLAY_TURN": 4.0},
+    )
+    explicit_map, map_source = _resolve_value_phase_weights(
+        "MOVE_ROBBER=2.0",
+        policy_phase_weights={"PLAY_TURN": 4.0},
+    )
+
+    assert inherited == {"PLAY_TURN": 4.0}
+    assert inherited_source == "policy_phase_weights"
+    assert explicit_none == {}
+    assert none_source == "explicit_none"
+    assert explicit_map == {"MOVE_ROBBER": 2.0}
+    assert map_source == "explicit_map"
+
+
+def test_history_v2_resolver_uses_adapter_owned_cap_and_target_gather() -> None:
+    args = SimpleNamespace(
+        arch="entity_graph",
+        meaningful_public_history=True,
+        meaningful_public_history_pooling="ordered_attention_v2",
+        meaningful_public_history_target_gather=True,
+        event_history_limit=64,
+        entity_feature_adapter_version=(
+            "rust_entity_adapter_v5_meaningful_history_v2"
+        ),
+        public_rule_state_features=True,
+        init_checkpoint="",
+        grow_from_checkpoint="",
+    )
+
+    assert _resolve_effective_meaningful_public_history(args) == (
+        True,
+        64,
+        "ordered_attention_v2",
+        True,
+    )
+
+
+def test_history_v2_resolver_rejects_legacy_cap() -> None:
+    args = SimpleNamespace(
+        arch="entity_graph",
+        meaningful_public_history=True,
+        meaningful_public_history_pooling="ordered_attention_v2",
+        meaningful_public_history_target_gather=True,
+        event_history_limit=32,
+        entity_feature_adapter_version=(
+            "rust_entity_adapter_v5_meaningful_history_v2"
+        ),
+        public_rule_state_features=True,
+        init_checkpoint="",
+        grow_from_checkpoint="",
+    )
+
+    with pytest.raises(SystemExit, match="expected=64"):
+        _resolve_effective_meaningful_public_history(args)
 
 
 def test_memmap_fingerprint_and_validation_seed_hash_are_content_stable(tmp_path) -> None:

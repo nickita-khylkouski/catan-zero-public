@@ -307,6 +307,7 @@ def build_train_command(
         ("--attention-heads", "attention_heads"),
         ("--graph-dropout", "graph_dropout"),
         ("--entity-state-trunk", "entity_state_trunk"),
+        ("--entity-feature-adapter-version", "entity_feature_adapter_version"),
         ("--meaningful-public-history-pooling", "meaningful_public_history_pooling"),
         ("--event-history-limit", "event_history_limit"),
     ):
@@ -330,6 +331,11 @@ def build_train_command(
             "cuda",
             "--graph-history-features",
         ]
+    )
+    command.append(
+        "--meaningful-public-history-target-gather"
+        if model["meaningful_public_history_target_gather"]
+        else "--no-meaningful-public-history-target-gather"
     )
     command.append(
         "--public-rule-state-features"
@@ -400,12 +406,23 @@ def build_train_command(
         ("phase_weights", "--phase-weights"),
         ("value_phase_weights", "--value-phase-weights"),
     )
+    optional_scalar_defaults = {
+        "public_card_lr_mult": 1.0,
+        "target_reliability_confidence_floor": 0.25,
+    }
     for key, flag in scalar_fields:
-        _add(command, flag, recipe[key])
+        if key in optional_scalar_defaults:
+            _add(command, flag, recipe.get(key, optional_scalar_defaults[key]))
+        else:
+            _add(command, flag, recipe[key])
     command.extend(
         [
             "--no-resume-optimizer",
-            "--no-fused-optimizer",
+            (
+                "--fused-optimizer"
+                if recipe["fused_optimizer"]
+                else "--no-fused-optimizer"
+            ),
             "--value-head-type",
             "mse",
             "--value-categorical-bins",
@@ -413,7 +430,16 @@ def build_train_command(
             "--policy-kl-anchor-direction",
             str(recipe.get("policy_kl_anchor_direction", "forward")),
             "--mask-hidden-info",
-            "--no-symmetry-augment",
+            (
+                "--symmetry-augment"
+                if recipe["symmetry_augment"]
+                else "--no-symmetry-augment"
+            ),
+            (
+                "--symmetry-augment-events"
+                if recipe["symmetry_augment_events"]
+                else "--no-symmetry-augment-events"
+            ),
             "--validation-fraction",
             "0.05",
             "--validation-seed",

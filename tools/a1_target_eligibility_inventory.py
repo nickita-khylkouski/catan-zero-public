@@ -17,6 +17,7 @@ opponent actions that were intentionally omitted from own-side-only data.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -26,6 +27,11 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 from catan_zero.rl.action_mask import ActionCatalog
+from catan_zero.rl.entity_feature_adapter import (
+    ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
+)
+from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig
+from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluatorConfig
 
 
 SCHEMA = "a1-target-eligibility-inventory-v1"
@@ -94,6 +100,13 @@ SEARCH_EVIDENCE_COLUMNS = frozenset(
         "search_completed_q_flat",
     }
 )
+# Historical manifests were fingerprinted with this deliberately incomplete
+# flat projection.  Keep it append-only so archived composites remain
+# inspectable under the exact identity rule that originally admitted them.
+LEGACY_POLICY_TARGET_IDENTITY_SCHEMA = (
+    "policy-target-manifest-operator-identity-v1-legacy-partial"
+)
+POLICY_TARGET_IDENTITY_SCHEMA = "policy-target-teacher-identity-v2"
 OPERATOR_FIELDS = (
     "producer_checkpoint_sha256",
     "target_information_regime",
@@ -125,6 +138,32 @@ OPERATOR_FIELDS = (
     "forced_root_target_mode",
     "preserve_search_evidence",
     "search_evidence_schema",
+)
+TARGET_SEMANTIC_FIELDS = (
+    "target_information_regime",
+    "forced_root_target_mode",
+    "record_automatic_transitions",
+    "public_observation",
+    "meaningful_public_history",
+    "event_history_limit",
+    "meaningful_public_history_schema",
+    "public_card_count_feature_schema",
+    "temperature_clock",
+    "preserve_search_evidence",
+    "search_evidence_schema",
+)
+EXECUTION_SEMANTIC_FIELDS = (
+    "native_mcts_hot_loop",
+    "root_wave_batching",
+    "rust_featurize",
+)
+PRODUCER_CODE_IDENTITY_FIELDS = (
+    "runtime_code_tree_sha256",
+    "reviewed_code_tree_sha256",
+    "checkout_tree_sha256",
+    "code_tree_sha256",
+    "git_commit",
+    "producer_git_commit",
 )
 
 
@@ -718,30 +757,221 @@ def inspect_memmap(
     }
 
 
-def _nested_operator(mapping: Mapping[str, Any]) -> dict[str, Any]:
+def _operator_candidates(mapping: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     candidates: list[Mapping[str, Any]] = [mapping]
-    cli_args = mapping.get("cli_args")
-    if isinstance(cli_args, Mapping):
-        candidates.append(cli_args)
-    science = mapping.get("science")
-    if isinstance(science, Mapping):
-        for key in ("effective_search_config", "search_operator", "search"):
-            value = science.get(key)
-            if isinstance(value, Mapping):
-                candidates.append(value)
-    operator = mapping.get("operator")
-    if isinstance(operator, Mapping) and isinstance(operator.get("search"), Mapping):
-        candidates.append(operator["search"])
+    for key in ("cli_args", "fields", "generation", "evaluator"):
+        value = mapping.get(key)
+        if isinstance(value, Mapping):
+            candidates.append(value)
+    for parent_key in ("science", "operator"):
+        parent = mapping.get(parent_key)
+        if isinstance(parent, Mapping):
+            candidates.append(parent)
+            for key in (
+                "effective_search_config",
+                "search_operator",
+                "search",
+                "evaluator",
+                "generation",
+            ):
+                value = parent.get(key)
+                if isinstance(value, Mapping):
+                    candidates.append(value)
+    return candidates
+
+
+def _first_operator_value(
+    candidates: Iterable[Mapping[str, Any]], field: str
+) -> Any:
+    for candidate in candidates:
+        if field in candidate:
+            return candidate[field]
+    return None
+
+
+def _nested_operator(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    candidates = _operator_candidates(mapping)
     result: dict[str, Any] = {}
     for field in OPERATOR_FIELDS:
-        for candidate in candidates:
-            if field in candidate:
-                result[field] = candidate[field]
-                break
+        value = _first_operator_value(candidates, field)
+        if value is not None:
+            result[field] = value
     regime = result.get("target_information_regime")
     if isinstance(regime, str):
         result["operator_family"] = _operator_family(regime)
     return result
+
+
+def _resolved_dataclass_config(
+    cls: type[Any],
+    candidates: list[Mapping[str, Any]],
+    *,
+    exclude: frozenset[str] = frozenset(),
+    overrides: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve effective defaults so newly added knobs change target identity."""
+
+    defaults = dataclasses.asdict(cls())
+    result: dict[str, Any] = {}
+    overrides = {} if overrides is None else dict(overrides)
+    for field in dataclasses.fields(cls):
+        name = field.name
+        if name in exclude:
+            continue
+        value = overrides.get(name, _first_operator_value(candidates, name))
+        if value is None and name not in overrides:
+            value = defaults[name]
+        result[name] = value
+    return json.loads(_canonical_bytes(result))
+
+
+def _producer_code_identity(
+    manifest: Mapping[str, Any],
+    authority: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    candidates = _operator_candidates(manifest)
+    if authority is not None:
+        candidates.extend(_operator_candidates(authority))
+        provenance = authority.get("provenance")
+        if isinstance(provenance, Mapping):
+            candidates.append(provenance)
+    result = {
+        field: value
+        for field in PRODUCER_CODE_IDENTITY_FIELDS
+        if (value := _first_operator_value(candidates, field)) is not None
+    }
+    return result
+
+
+def _canonical_policy_target_identity(
+    manifest: Mapping[str, Any],
+    *,
+    authority: Mapping[str, Any] | None,
+    strict_current: bool,
+) -> dict[str, Any]:
+    """Build the scientific identity of a stored policy label.
+
+    Current sealed waves resolve the complete live search/evaluator dataclass,
+    including defaults.  Historical manifests retain the legacy projection
+    because they cannot retroactively prove fields or code revisions that were
+    never recorded.
+    """
+
+    if not strict_current:
+        legacy = _nested_operator(manifest)
+        return {
+            "schema_version": LEGACY_POLICY_TARGET_IDENTITY_SCHEMA,
+            "completeness": "historical_partial_explicit",
+            "operator": legacy,
+        }
+
+    candidates = _operator_candidates(manifest)
+    if authority is not None:
+        candidates.extend(_operator_candidates(authority))
+    checkpoint_sha = _first_operator_value(
+        candidates, "producer_checkpoint_sha256"
+    )
+    teacher_adapter = _first_operator_value(
+        candidates, "teacher_entity_feature_adapter_version"
+    )
+    code_identity = _producer_code_identity(manifest, authority)
+    missing = []
+    if not isinstance(checkpoint_sha, str) or not checkpoint_sha.startswith("sha256:"):
+        missing.append("producer_checkpoint_sha256")
+    if not isinstance(teacher_adapter, str) or not teacher_adapter:
+        missing.append("teacher_entity_feature_adapter_version")
+    if not code_identity:
+        missing.append("producer_code_identity")
+    regime = _first_operator_value(candidates, "target_information_regime")
+    if not isinstance(regime, str) or not regime:
+        missing.append("target_information_regime")
+    if missing:
+        raise InventoryError(
+            "current policy-target identity is incomplete; missing "
+            f"{sorted(missing)}"
+        )
+
+    evaluator_overrides = {
+        "entity_feature_adapter_version": teacher_adapter,
+    }
+    search = _resolved_dataclass_config(
+        GumbelChanceMCTSConfig,
+        candidates,
+        exclude=frozenset({"seed"}),
+    )
+    evaluator = _resolved_dataclass_config(
+        EntityGraphRustEvaluatorConfig,
+        candidates,
+        exclude=frozenset({"cache_size"}),
+        overrides=evaluator_overrides,
+    )
+    target_semantics = {
+        field: _first_operator_value(candidates, field)
+        for field in TARGET_SEMANTIC_FIELDS
+    }
+    execution_semantics = {
+        field: _first_operator_value(candidates, field)
+        for field in EXECUTION_SEMANTIC_FIELDS
+    }
+    return {
+        "schema_version": POLICY_TARGET_IDENTITY_SCHEMA,
+        "completeness": "current_exact_fail_closed",
+        "producer_checkpoint": {"sha256": checkpoint_sha},
+        "producer_code_identity": code_identity,
+        "teacher_feature_contract": {
+            "entity_feature_adapter_schema": (
+                ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA
+            ),
+            "entity_feature_adapter_version": teacher_adapter,
+            "public_card_count_feature_schema": target_semantics[
+                "public_card_count_feature_schema"
+            ],
+            "meaningful_public_history_schema": target_semantics[
+                "meaningful_public_history_schema"
+            ],
+        },
+        "target_information_regime": regime,
+        "operator_family": _operator_family(regime),
+        "effective_search_config": search,
+        "effective_evaluator_config": evaluator,
+        "target_semantics": target_semantics,
+        "execution_semantics": execution_semantics,
+    }
+
+
+def _source_contract_payload(
+    source_authority: Mapping[str, Any], *, scope: str
+) -> dict[str, Any] | None:
+    raw: Any
+    if scope == "fresh":
+        raw = source_authority.get("current_contract")
+    else:
+        historical = source_authority.get("historical_replay")
+        raw = (
+            historical.get("source_contract")
+            if isinstance(historical, Mapping)
+            else None
+        )
+    if not isinstance(raw, Mapping):
+        return None
+    path_value = raw.get("path")
+    if not isinstance(path_value, str):
+        return None
+    path = Path(path_value).expanduser().resolve(strict=True)
+    expected = raw.get("file_sha256")
+    actual = _file_sha256(path)
+    if isinstance(expected, str) and expected != actual:
+        raise InventoryError(f"operator authority hash drift: {path}")
+    return _load_json(path)
+
+
+def _is_current_exact_authority(authority: Mapping[str, Any] | None) -> bool:
+    if not isinstance(authority, Mapping):
+        return False
+    provenance = authority.get("provenance")
+    return isinstance(provenance, Mapping) and isinstance(
+        provenance.get("runtime_code_tree_sha256"), str
+    )
 
 
 def _operator_authorities(source_authority: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -782,10 +1012,16 @@ def _operator_authorities(source_authority: Mapping[str, Any]) -> list[dict[str,
 
 def _manifest_operator_groups(source_authority: Mapping[str, Any]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    scope_authorities = {
+        scope: _source_contract_payload(source_authority, scope=scope)
+        for scope in ("fresh", "historical_replay")
+    }
 
     def consume(scope: str, records: Any) -> None:
         if not isinstance(records, list):
             return
+        authority = scope_authorities[scope]
+        strict_current = scope == "fresh" and _is_current_exact_authority(authority)
         for record in records:
             if not isinstance(record, Mapping) or not isinstance(
                 record.get("artifact"), Mapping
@@ -797,24 +1033,46 @@ def _manifest_operator_groups(source_authority: Mapping[str, Any]) -> list[dict[
             if actual != artifact.get("file_sha256"):
                 raise InventoryError(f"generation manifest hash drift: {path}")
             manifest = _load_json(path)
-            operator = _nested_operator(manifest)
+            identity = _canonical_policy_target_identity(
+                manifest,
+                authority=authority,
+                strict_current=strict_current,
+            )
+            operator = (
+                identity["operator"]
+                if identity["schema_version"] == LEGACY_POLICY_TARGET_IDENTITY_SCHEMA
+                else identity
+            )
             # Old manifests attest the regime even when the detailed search
             # fields live only in the sealed contract authority.
-            regime = str(manifest.get("target_information_regime", "unknown"))
-            operator.setdefault("target_information_regime", regime)
-            operator.setdefault("operator_family", _operator_family(regime))
-            operator.setdefault(
-                "preserve_search_evidence",
-                bool(manifest.get("preserve_search_evidence", False)),
+            if identity["schema_version"] == LEGACY_POLICY_TARGET_IDENTITY_SCHEMA:
+                regime = str(manifest.get("target_information_regime", "unknown"))
+                operator.setdefault("target_information_regime", regime)
+                operator.setdefault("operator_family", _operator_family(regime))
+                operator.setdefault(
+                    "preserve_search_evidence",
+                    bool(manifest.get("preserve_search_evidence", False)),
+                )
+                operator.setdefault(
+                    "search_evidence_schema",
+                    manifest.get("search_evidence_schema"),
+                )
+                identity["operator"] = operator
+            digest = (
+                _value_sha256(operator)
+                if identity["schema_version"]
+                == LEGACY_POLICY_TARGET_IDENTITY_SCHEMA
+                else _value_sha256(identity)
             )
-            operator.setdefault("search_evidence_schema", manifest.get("search_evidence_schema"))
-            digest = _value_sha256(operator)
             key = (scope, str(record.get("category", "unknown")), digest)
             group = grouped.setdefault(
                 key,
                 {
                     "scope": scope,
                     "category": str(record.get("category", "unknown")),
+                    "identity_schema_version": identity["schema_version"],
+                    "identity_completeness": identity["completeness"],
+                    "policy_target_identity": identity,
                     "operator": operator,
                     "operator_sha256": digest,
                     "manifest_count": 0,
@@ -879,17 +1137,31 @@ def _policy_operator_identity_inventory(
         }
     )
     mixed = len(identities) > 1
+    exact_identity_required = any(
+        item.get("identity_completeness") == "current_exact_fail_closed"
+        for item in relevant
+    )
     return {
-        "schema_version": "policy-target-manifest-identity-inventory-v1",
+        "schema_version": "policy-target-manifest-identity-inventory-v2",
         "policy_active_component_ids": sorted(expected_components),
         "manifest_covered_component_ids": sorted(covered_components),
         "missing_manifest_identity_component_ids": missing,
         "realized_operator_sha256": identities,
+        "realized_identity_schema_versions": sorted(
+            {
+                str(item["identity_schema_version"])
+                for item in relevant
+                if isinstance(item.get("identity_schema_version"), str)
+            }
+        ),
+        "exact_identity_required": exact_identity_required,
         "mixed_policy_target_operators": mixed,
-        # Missing legacy provenance remains visible but is not newly made a
-        # hard error here; train_bc's explicit accepted-identity mode is the
-        # fail-closed boundary for exact-identity campaigns.
-        "policy_operator_uniform": not mixed,
+        # Missing historical provenance remains diagnostic. A current sealed
+        # wave, however, cannot claim an exact teacher identity while any
+        # policy-active component lacks a generation-manifest identity.
+        "policy_operator_uniform": (
+            not mixed and (not exact_identity_required or not missing)
+        ),
     }
 
 
@@ -1218,7 +1490,17 @@ def build_inventory(
             f"composite:{label}"
             for label in composite_result["policy_activation_invalid_components"]
         )
-    targets_eligible = incompatible == 0 and not activation_invalid
+    identity_invalid = (
+        []
+        if composite_result is None
+        or composite_result["policy_targets_eligible_for_requested_learner"]
+        else ["composite"]
+    )
+    targets_eligible = (
+        incompatible == 0
+        and not activation_invalid
+        and not identity_invalid
+    )
     value: dict[str, Any] = {
         "schema_version": SCHEMA,
         "required_target_information_regime": required_regime,
@@ -1229,6 +1511,7 @@ def build_inventory(
             "policy_active_rows": active,
             "incompatible_policy_active_rows": incompatible,
             "policy_activation_invalid_components": activation_invalid,
+            "policy_target_identity_invalid_scopes": identity_invalid,
             "policy_targets_eligible_for_requested_learner": targets_eligible,
             "old_targets_remain_policy_active": incompatible > 0,
             "decision": (

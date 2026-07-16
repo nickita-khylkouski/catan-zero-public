@@ -394,6 +394,14 @@ class EntityGraphConfig:
     public_rule_state_feature_schema: str = (
         PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
     )
+    # Bind each retained public-history event to the post-trunk board/player
+    # entity it affected.  Event target ids have always been stored beside the
+    # event tokens, but the dense Transformer historically dropped that tensor
+    # before device transfer; only relational trunks consumed it.  This
+    # zero-output residual makes the join available to the production-shaped
+    # Transformer without changing an incumbent checkpoint at activation.
+    # Appended last for positional legacy-pickle compatibility.
+    meaningful_public_history_target_gather: bool = False
 
 
 class EntityGraphNet:
@@ -637,6 +645,23 @@ class EntityGraphNet:
                         self.meaningful_history_ordered_gate = nn.Parameter(
                             torch.zeros(h)
                         )
+                    self.meaningful_public_history_target_gather_enabled = bool(
+                        getattr(
+                            cfg,
+                            "meaningful_public_history_target_gather",
+                            False,
+                        )
+                    )
+                    if self.meaningful_public_history_target_gather_enabled:
+                        self.meaningful_history_target_proj = nn.Sequential(
+                            nn.LayerNorm(h),
+                            nn.Linear(h, h, bias=False),
+                        )
+                        nn.init.zeros_(
+                            self.meaningful_history_target_proj[1].weight
+                        )
+                else:
+                    self.meaningful_public_history_target_gather_enabled = False
                 self.type_embedding = nn.Parameter(torch.zeros(7, h))
                 self.cls_token = nn.Parameter(torch.zeros(1, 1, h))
                 if self.state_trunk == "transformer":
@@ -1245,6 +1270,28 @@ class EntityGraphNet:
                     )
                 history_delta = None
                 if self.meaningful_public_history_enabled:
+                    if self.meaningful_public_history_target_gather_enabled:
+                        target_batch = batch
+                        if event_token_limit is not None:
+                            target_batch = dict(batch)
+                            target_batch["event_target_ids"] = batch[
+                                "event_target_ids"
+                            ][:, :event_token_limit]
+                        history_targets = self._gather_entity_target_tokens(
+                            tokens,
+                            target_batch,
+                            target_key="event_target_ids",
+                        )
+                        if history_targets.shape[:2] != event_piece.shape[:2]:
+                            raise RuntimeError(
+                                "public-history event/target width drift: "
+                                f"{tuple(event_piece.shape[:2])} != "
+                                f"{tuple(history_targets.shape[:2])}"
+                            )
+                        event_piece = (
+                            event_piece
+                            + self.meaningful_history_target_proj(history_targets)
+                        )
                     # Event rows stay masked from the mature trunk. Their
                     # bounded pooled representation enters only through this
                     # exact-zero gate, so history activation cannot perturb an
@@ -1770,14 +1817,20 @@ class EntityGraphNet:
                     event_mask,
                 )
 
-            def _gather_target_tokens(self, tokens, batch: dict[str, Any]):
-                """Pool post-trunk board tokens for each action's targets.
+            def _gather_entity_target_tokens(
+                self,
+                tokens,
+                batch: dict[str, Any],
+                *,
+                target_key: str,
+            ):
+                """Pool post-trunk board/player tokens for typed target ids.
 
-                `legal_action_target_ids` is [B, A, 4] with a FIXED column ->
+                ``target_key`` is [B, N, 4] with a FIXED column ->
                 entity-type mapping (verified against the featurizer,
-                `_legal_action_target_ids`): col0=hex id (0-18), col1=vertex/
-                node id (0-53), col2=edge id (0-71), col3=player id (0-3), each
-                -1 when that target type is absent for the action. These are
+                action/event target builders): col0=hex id (0-18), col1=vertex/
+                node id (0-53), col2=edge id (0-71), col3=player id (0-3),
+                each -1 when that target type is absent. These are
                 per-entity-type indices, NOT indices into the concatenated
                 token sequence, so we add the constant per-type start offsets
                 of the CLS-prefixed [CLS | hex | vertex | edge | player |
@@ -1785,12 +1838,12 @@ class EntityGraphNet:
                 edge counts are fixed (19/54/72) and player tokens are always
                 4 rows, so the offsets are constants; we still derive them from
                 the live shapes so the mapping stays correct if the layout ever
-                changes. Valid targets are mean-pooled; an action with no board
-                target (e.g. ROLL, END_TURN) pools to the zero vector.
+                changes. Valid targets are mean-pooled; an item with no board
+                or player target pools to the zero vector.
                 """
                 import torch
 
-                target_ids = batch["legal_action_target_ids"].long()  # [B, A, 4]
+                target_ids = batch[target_key].long()
                 # Start index of each targeted type in the concatenated
                 # sequence (CLS occupies index 0).
                 offsets = torch.tensor(
@@ -1807,18 +1860,27 @@ class EntityGraphNet:
                     torch.zeros_like(target_ids),
                 ).clamp_(0, seq_len - 1)
                 batch_size = int(target_ids.shape[0])
-                num_actions = int(target_ids.shape[1])
-                flat_index = gather_index.reshape(batch_size, num_actions * 4)
+                item_count = int(target_ids.shape[1])
+                flat_index = gather_index.reshape(batch_size, item_count * 4)
                 gathered = torch.gather(
                     tokens,
                     1,
                     flat_index.unsqueeze(-1).expand(-1, -1, width),
-                ).reshape(batch_size, num_actions, 4, width)
-                weight = valid.to(gathered.dtype).unsqueeze(-1)  # [B, A, 4, 1]
+                ).reshape(batch_size, item_count, 4, width)
+                weight = valid.to(gathered.dtype).unsqueeze(-1)
                 pooled = (gathered * weight).sum(dim=2) / weight.sum(dim=2).clamp_(
                     min=1.0
                 )
-                return pooled  # [B, A, h]
+                return pooled
+
+            def _gather_target_tokens(self, tokens, batch: dict[str, Any]):
+                """Backward-compatible legal-action target gather."""
+
+                return self._gather_entity_target_tokens(
+                    tokens,
+                    batch,
+                    target_key="legal_action_target_ids",
+                )
 
             def _value_pool(self, state, tokens, padding_mask):
                 """Learned probe token cross-attends over all output tokens.
@@ -1929,6 +1991,13 @@ class EntityGraphPolicy:
         ):
             raise ValueError(
                 "order-aware public-history pooling requires "
+                "meaningful_public_history=True"
+            )
+        if bool(
+            getattr(config, "meaningful_public_history_target_gather", False)
+        ) and not bool(getattr(config, "meaningful_public_history", False)):
+            raise ValueError(
+                "public-history target gather requires "
                 "meaningful_public_history=True"
             )
         if bool(getattr(config, "meaningful_public_history", False)):
@@ -2066,6 +2135,7 @@ class EntityGraphPolicy:
         ),
         event_history_limit: int = 64,
         meaningful_public_history_pooling: str = MASKED_MEAN_V1,
+        meaningful_public_history_target_gather: bool = False,
         value_tower_split_layers: int = 0,
         public_rule_state_features: bool = False,
         public_rule_state_feature_schema: str = (
@@ -2130,6 +2200,9 @@ class EntityGraphPolicy:
                 meaningful_public_history_pooling=str(
                     meaningful_public_history_pooling or MASKED_MEAN_V1
                 ),
+                meaningful_public_history_target_gather=bool(
+                    meaningful_public_history_target_gather
+                ),
                 value_tower_split_layers=int(value_tower_split_layers),
                 public_rule_state_features=bool(public_rule_state_features),
                 public_rule_state_feature_schema=str(
@@ -2179,6 +2252,13 @@ class EntityGraphPolicy:
             or getattr(self.config, "action_target_gather", False)
             or getattr(self.config, "edge_policy_head", False)
         )
+        needs_event_targets = bool(
+            getattr(
+                self.config,
+                "meaningful_public_history_target_gather",
+                False,
+            )
+        )
         needs_topology = str(
             getattr(self.config, "state_trunk", "transformer")
         ) != "transformer" or bool(
@@ -2199,6 +2279,7 @@ class EntityGraphPolicy:
                     and key != "_symmetry_legal_action_ids"
                 )
                 or (needs_topology and key in _RELATIONAL_TOPOLOGY_KEYS)
+                or (needs_event_targets and key == "event_target_ids")
                 or (needs_legal_action_mask and key == "legal_action_mask")
             )
             and (key != "legal_action_target_ids" or needs_action_targets)
@@ -2802,6 +2883,7 @@ class EntityGraphPolicy:
             "meaningful_history_residual_gate",
             "meaningful_history_ordered_gate",
             "meaningful_history_sequence.",
+            "meaningful_history_target_proj.",
             "public_rule_state_residual.",
         )
         if bool(allow_missing_optional_parameters):
@@ -2950,6 +3032,51 @@ def _assert_entity_batch_shapes(
             raise ValueError(
                 "padded legal action carries a target id: "
                 f"row={int(row)} action={int(action)} column={int(column)}"
+            )
+
+    if bool(
+        getattr(config, "meaningful_public_history_target_gather", False)
+    ):
+        key = "event_target_ids"
+        if key not in entity_batch:
+            raise ValueError(
+                "public-history target gather requires entity batch field "
+                "event_target_ids"
+            )
+        target_ids = np.asarray(entity_batch[key])
+        event_width = int(np.asarray(entity_batch["event_tokens"]).shape[1])
+        expected_shape = (batch_size, event_width, 4)
+        if target_ids.shape != expected_shape:
+            raise ValueError(f"{key} shape {target_ids.shape} != {expected_shape}")
+        if not np.issubdtype(target_ids.dtype, np.integer):
+            raise ValueError(f"{key} must contain integer per-namespace ids")
+        namespace_widths = np.asarray(
+            (
+                19,
+                54,
+                72,
+                int(np.asarray(entity_batch["player_tokens"]).shape[1]),
+            ),
+            dtype=np.int64,
+        )
+        invalid = (target_ids < -1) | (
+            target_ids >= namespace_widths.reshape(1, 1, 4)
+        )
+        if bool(np.any(invalid)):
+            row, event, column = np.argwhere(invalid)[0]
+            raise ValueError(
+                "event_target_ids contains an out-of-range local id: "
+                f"row={int(row)} event={int(event)} column={int(column)} "
+                f"value={int(target_ids[row, event, column])} "
+                f"namespace_width={int(namespace_widths[column])}"
+            )
+        event_mask = np.asarray(entity_batch["event_mask"], dtype=np.bool_)
+        padded_has_target = (~event_mask)[..., None] & (target_ids != -1)
+        if bool(np.any(padded_has_target)):
+            row, event, column = np.argwhere(padded_has_target)[0]
+            raise ValueError(
+                "padded public-history event carries a target id: "
+                f"row={int(row)} event={int(event)} column={int(column)}"
             )
 
     if str(getattr(config, "state_trunk", "transformer")) != "transformer" or bool(

@@ -44,49 +44,62 @@ CURRENT_TEACHER_ENTITY_ADAPTER = (
     "rust_entity_adapter_v2_land_topology_ports_maritime"
 )
 CURRENT_LEARNER_ENTITY_ADAPTER = (
-    "rust_entity_adapter_v4_actor_public_rule_state"
+    "rust_entity_adapter_v5_meaningful_history_v2"
 )
 CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
-    "structured_action_value,card_count_v2,meaningful_history,public_rule_state"
+    "structured_action_value,card_count_v2,meaningful_history,"
+    "history_target_gather,public_rule_state"
 )
 CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
     "entity_graph.static_action_residual+legal_action_value_residual+"
     "public_card_count_features+meaningful_public_history+"
-    "actor_public_rule_state.v4"
+    "meaningful_history_target_gather+"
+    "actor_public_rule_state.v5"
 )
+CURRENT_MEANINGFUL_HISTORY_POOLING = "ordered_attention_v2"
 PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
-    # These fields retain the reviewed 4096-row logical dose identity. The
-    # checkpoint-initialized one-dose executor is not an execution projection
-    # for the native scratch learner; a scratch launcher must separately bind
-    # its realized distributed topology before production use.
+    # The checked-in recipe is a representation-learning run from random
+    # initialization, not the f7 trust-region commissioning experiment.  It
+    # therefore trains by complete corpus coverage rather than inheriting the
+    # fine-tune frontier's 32-step cap.
     "world_size": 1,
     "batch_size": 4096,
     "global_batch_size": 4096,
     "grad_accum_steps": 1,
-    # The coherent active-policy frontier peaked before the historical
-    # 128-step dose: step 32 scored 56.25% vs f7 and 51.17% vs v5, while the
-    # terminal step-128 checkpoint fell to 51.95% and 45.31%.  The denser
-    # coherent sampler therefore uses the observed short-dose optimum instead
-    # of inheriting the old corpus's optimizer-step count.
-    "max_steps": 32,
+    "epochs": 3,
+    "max_steps": 0,
     "resume_optimizer": False,
+    "optimizer": "adamw",
     "lr": 6e-5,
-    "lr_warmup_steps": 16,
-    "lr_schedule": "flat",
+    "lr_warmup_steps": 100,
+    "lr_schedule": "cosine",
+    "weight_decay": 0.01,
+    "fused_optimizer": True,
+    "amp": "bf16",
     "value_lr_mult": 1.0,
-    "value_trunk_grad_scale": 1.0,
+    # Policy/value gradients are frequently opposed in the shared trunk. Keep
+    # the value head fully trainable while halving only its shared-trunk
+    # contribution.
+    "value_trunk_grad_scale": 0.5,
     # Reporting is part of production admission even though it does not alter
-    # the optimizer trajectory. Two observations over the 32-step dose must
-    # prove every commissioned v4 path received gradient and an actual update.
+    # the optimizer trajectory. The full scratch dose must prove every
+    # commissioned v5 path received gradient and an actual update.
     "train_diagnostics_every_batches": 16,
     "objective_gradient_interference_every_batches": 16,
     "require_feature_learning_signal_modules": (
         "event_encoder,legal_action_value_residual_proj,"
         "legal_action_value_static_proj,meaningful_history_residual_gate,"
+        "meaningful_history_ordered_gate,meaningful_history_target_proj,"
         "public_card_count_residual,public_rule_state_residual,"
         "static_action_residual_proj"
     ),
     "minimum_feature_learning_signal_observations": 2,
+    "final_vp_loss_weight": 0.05,
+    "symmetry_augment": True,
+    # History action ids and board-entity target ids must rotate with the board.
+    # Sealing this separately prevents a future parser-default change from
+    # producing geometrically contradictory augmented rows.
+    "symmetry_augment_events": True,
     # The coherent corpus's natural policy-active distribution assigns only
     # 34.16% of policy objective mass to ordinary PLAY_TURN decisions; the
     # successful selected-dose corpus assigned 66.08%.  Fourfold PLAY_TURN
@@ -94,11 +107,14 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # normalization, keeping mandatory prompts supervised without letting
     # them dominate the strategic policy update.
     "phase_weights": "PLAY_TURN=4.0",
+    # Policy phase repair must not silently starve opening/robber/discard value
+    # calibration.
+    "value_phase_weights": "none",
 }
 PRODUCTION_LEARNER_INITIALIZATION_CONTRACT = {
     "mode": "from_scratch",
     "entity_feature_adapter_version": (
-        "rust_entity_adapter_v4_actor_public_rule_state"
+        "rust_entity_adapter_v5_meaningful_history_v2"
     ),
     "checkpoint": None,
     "optimizer_state": "fresh",
@@ -121,11 +137,15 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
         "dev_used_road_building_free_roads_discard_remainder_playable_dev_counts"
     ),
     "meaningful_public_history": True,
-    "meaningful_public_history_pooling": "masked_mean_v1",
-    "event_history_limit": 32,
+    "meaningful_public_history_schema": (
+        "meaningful_public_history_2p_no_trade_v2"
+    ),
+    "meaningful_public_history_pooling": CURRENT_MEANINGFUL_HISTORY_POOLING,
+    "meaningful_public_history_target_gather": True,
+    "event_history_limit": 64,
     "mask_hidden_info": True,
     "entity_feature_adapter_version": (
-        "rust_entity_adapter_v4_actor_public_rule_state"
+        "rust_entity_adapter_v5_meaningful_history_v2"
     ),
     "require_35m_model": True,
 }
@@ -153,9 +173,6 @@ PRODUCTION_TARGET_QUALITY_LEARNER_CONTRACT = {
     # Raw search disagreement is not target correctness. Production may only
     # prioritize it again after the reliability audit has qualified a recipe.
     "policy_surprise_weight": 0.0,
-    "per_game_policy_surprise_weighting": False,
-    "target_reliability_confidence_weighting": True,
-    "target_reliability_confidence_floor": 0.25,
 }
 PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT = {
     # A stable root hash selects this audit slice without consuming gameplay or
@@ -163,6 +180,9 @@ PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT = {
     # without turning the duplicate reference search into the dominant cost.
     "target_reliability_audit_fraction": 0.05,
     "target_reliability_audit_seed": 20260716,
+    # Completed-Q and visit evidence cost far less than one percent of the
+    # corpus and are required to calibrate or reconstruct teacher reliability.
+    "preserve_search_evidence": True,
 }
 
 
@@ -241,7 +261,7 @@ def _load() -> dict[str, Any]:
     if learner_value.get("initialization") != PRODUCTION_LEARNER_INITIALIZATION_CONTRACT:
         raise ScienceContractError(
             "current coherent learner initialization must be native from-scratch "
-            "v4 with fresh optimizer state"
+            "v5 with fresh optimizer state"
         )
     if (
         learner_value.get("model_construction")
@@ -315,6 +335,19 @@ def _load() -> dict[str, Any]:
         raise ScienceContractError(
             "current coherent learner target-quality contract drifted: "
             f"{target_quality_learner_drift}"
+        )
+    if bool(recipe.get("target_reliability_confidence_weighting", False)):
+        raise ScienceContractError(
+            "the five-percent duplicate-search audit is diagnostic evidence, "
+            "not corpus-wide learner weighting"
+        )
+    if bool(recipe.get("per_game_policy_surprise_weighting", False)):
+        raise ScienceContractError(
+            "per-game surprise weighting is not part of the production learner"
+        )
+    if float(recipe.get("public_card_lr_mult", 1.0)) != 1.0:
+        raise ScienceContractError(
+            "from-scratch public-card features must use the base optimizer LR"
         )
     generation_value = value["generation"]
     if (

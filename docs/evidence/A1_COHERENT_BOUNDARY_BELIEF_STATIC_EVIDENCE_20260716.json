@@ -1,0 +1,83 @@
+{
+  "schema": "a1-coherent-boundary-belief-static-evidence-v1",
+  "date": "2026-07-16",
+  "scope": "static_code_audit",
+  "production_change": false,
+  "finding": {
+    "severity": "high",
+    "summary": "coherent-public search reuses one sampled opponent development-card allocation for the entire current-turn tree and its opponent-boundary continuation value",
+    "resource_hand_caveat": "in two-player no-trade, public bank composition plus the root actor's known hand fixes the sole opponent's resource composition by conservation",
+    "remaining_hidden_variables": [
+      "opponent face-down development-card identities",
+      "opponent hidden victory points",
+      "remaining development-card deck order",
+      "history-conditioned probability of hidden development-card allocations"
+    ],
+    "operator_effect": "extra simulations reduce within-world tree noise but do not integrate boundary belief; nonlinear completed-Q normalization and policy improvement make the result an operator bias, not only zero-mean label noise"
+  },
+  "code_evidence": [
+    {
+      "path": "src/catan_zero/search/gumbel_chance_mcts.py",
+      "symbol": "GumbelChanceMCTS._search_coherent_public_belief",
+      "fact": "calls determinize_for_player once and searches that one sampled world with the full budget"
+    },
+    {
+      "path": "src/catan_zero/search/native_gumbel_mcts.py",
+      "symbol": "NativeGumbelChanceMCTS._search_single_world",
+      "fact": "passes the already sampled world to one native gumbel_search arena"
+    },
+    {
+      "path": "native/gumbel_mcts_rs/src/lib.rs",
+      "symbol": "GumbelMctsEngine::simulate / is_root_turn_boundary",
+      "fact": "stops at the first opponent/new-turn node and reuses that node's prior value after one expansion"
+    },
+    {
+      "path": "src/catan_zero/search/neural_rust_mcts.py",
+      "symbol": "EntityGraphRustEvaluator.evaluate",
+      "fact": "evaluates from the side-to-act perspective, preserving that actor's own sampled private hand, then negates for root perspective"
+    },
+    {
+      "path": "native/catanatron-rs/src/lib.rs",
+      "symbol": "Game::determinize_for_player",
+      "fact": "samples opponent development cards from conservation constraints and currently requires observer == current player"
+    },
+    {
+      "path": "tests/test_information_set_mcts.py",
+      "symbol": "test_coherent_public_belief_uses_one_sanitized_full_budget_tree",
+      "fact": "asserts exactly one determinization seed for a coherent n128 search"
+    }
+  ],
+  "matched_compute_experiment": {
+    "control": "coherent n128 boundary K1",
+    "arms": [
+      "boundary K2 at matched neural rows",
+      "boundary K4 at matched neural rows",
+      "legacy root PIMC P4 at matched total compute"
+    ],
+    "adjudicator": "boundary K16 with multiple tree seeds and larger budget",
+    "match_units": [
+      "neural_evaluations_used",
+      "native simulations",
+      "wall time"
+    ],
+    "primary_metrics": [
+      "policy JSD to adjudicator",
+      "top-one agreement",
+      "adjudicator completed-Q regret",
+      "belief-seed top-one flip rate",
+      "Q-rank stability"
+    ]
+  },
+  "recommended_fix": {
+    "name": "coherent_current_turn_tree_with_boundary_value_particles",
+    "default_particle_count": 1,
+    "commissioning_particle_counts": [
+      2,
+      4
+    ],
+    "native_requirement": "a new non-current-observer determinization primitive that preserves the root observer's information and never depends on authoritative hidden identities",
+    "evaluator_requirement": "a value-only batched boundary API; opponent priors across hidden-dependent legal sets must not be fabricated or averaged",
+    "provenance_requirement": "particle count, belief implementation version, seed contract, and neural evaluation count must bind teacher identity"
+  },
+  "production_recommendation": "retain coherent n128 K1 as baseline; do not presume global n256 is stronger until matched-compute boundary-particle adjudication"
+}

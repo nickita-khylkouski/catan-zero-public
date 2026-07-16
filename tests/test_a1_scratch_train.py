@@ -174,6 +174,11 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--no-resume-optimizer") == 1
     assert command.count("--no-public-card-count-residual-bias") == 1
     assert command.count("--public-rule-state-features") == 1
+    assert command.count("--meaningful-public-history-target-gather") == 1
+    assert command.count("--entity-feature-adapter-version") == 1
+    assert command.count("--fused-optimizer") == 1
+    assert command.count("--symmetry-augment") == 1
+    assert command.count("--symmetry-augment-events") == 1
     assert command.count("--required-target-information-regime") == 1
     assert command[command.index("--train-diagnostics-every-batches") + 1] == "16"
     assert (
@@ -222,8 +227,14 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
         ],
         entity_feature_adapter_version=model["entity_feature_adapter_version"],
         meaningful_public_history=model["meaningful_public_history"],
+        meaningful_public_history_schema=model[
+            "meaningful_public_history_schema"
+        ],
         meaningful_public_history_pooling=model[
             "meaningful_public_history_pooling"
+        ],
+        meaningful_public_history_target_gather=model[
+            "meaningful_public_history_target_gather"
         ],
         event_history_limit=model["event_history_limit"],
         **train_bc._structured_action_create_kwargs(args),  # noqa: SLF001
@@ -275,9 +286,13 @@ def _runtime_args() -> SimpleNamespace:
         public_card_count_features=model["public_card_count_features"],
         public_card_count_residual_bias=model["public_card_count_residual_bias"],
         public_rule_state_features=model["public_rule_state_features"],
+        entity_feature_adapter_version=model["entity_feature_adapter_version"],
         meaningful_public_history=model["meaningful_public_history"],
         meaningful_public_history_pooling=model[
             "meaningful_public_history_pooling"
+        ],
+        meaningful_public_history_target_gather=model[
+            "meaningful_public_history_target_gather"
         ],
         event_history_limit=model["event_history_limit"],
         mask_hidden_info=model["mask_hidden_info"],

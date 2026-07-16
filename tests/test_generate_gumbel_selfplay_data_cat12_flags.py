@@ -56,6 +56,9 @@ def _worker_args(**overrides) -> dict:
         "vps_to_win": 10,
         "obs_width": 806,
         "meaningful_public_history": False,
+        "learner_entity_feature_adapter_version": (
+            cli.CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        ),
         "event_history_limit": 64,
         "record_automatic_transitions": True,
         "base_seed": 1,

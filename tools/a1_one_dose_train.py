@@ -5480,7 +5480,11 @@ def _build_direct_train_command(
             str(recipe["lr_schedule"]),
             "--weight-decay",
             str(recipe["weight_decay"]),
-            "--no-fused-optimizer",
+            (
+                "--fused-optimizer"
+                if bool(recipe["fused_optimizer"])
+                else "--no-fused-optimizer"
+            ),
             "--value-lr-mult",
             str(recipe["value_lr_mult"]),
             "--action-module-lr-mult",
@@ -5549,7 +5553,16 @@ def _build_direct_train_command(
             "--amp",
             str(recipe["amp"]),
             "--mask-hidden-info",
-            "--no-symmetry-augment",
+            (
+                "--symmetry-augment"
+                if bool(recipe["symmetry_augment"])
+                else "--no-symmetry-augment"
+            ),
+            (
+                "--symmetry-augment-events"
+                if bool(recipe.get("symmetry_augment_events", True))
+                else "--no-symmetry-augment-events"
+            ),
             "--forced-action-weight",
             str(recipe["forced_action_weight"]),
             "--forced-row-value-weight",

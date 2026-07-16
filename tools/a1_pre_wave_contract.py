@@ -58,6 +58,7 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     RUST_ENTITY_ADAPTER_V2,
     RUST_ENTITY_ADAPTER_V3,
     RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
     require_known_entity_feature_adapter,
 )
 from catan_zero.rl.entity_token_features import ACTION_TYPES  # noqa: E402
@@ -76,7 +77,9 @@ from catan_zero.rl.gumbel_self_play import (  # noqa: E402
 )
 from catan_zero.rl.meaningful_history import (  # noqa: E402
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT,
 )
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
@@ -655,6 +658,9 @@ _OPTIONAL_GENERATION_KEYS = {
     "event_history_limit",
     "learner_entity_feature_adapter_version",
     "teacher_entity_feature_adapter_version",
+    "target_reliability_audit_fraction",
+    "target_reliability_audit_seed",
+    "preserve_search_evidence",
 }
 
 
@@ -2128,6 +2134,11 @@ def _validate_guard_payload(
         "learner_entity_feature_adapter_version": (
             "--learner-entity-feature-adapter-version"
         ),
+        "target_reliability_audit_fraction": (
+            "--target-reliability-audit-fraction"
+        ),
+        "target_reliability_audit_seed": "--target-reliability-audit-seed",
+        "preserve_search_evidence": "--preserve-search-evidence",
     }
     for key, flag in optional_generation_flags.items():
         if key in generation:
@@ -2562,10 +2573,6 @@ def _validate_generation(generation: dict[str, Any]) -> None:
                 "current meaningful-history waves must retain automatic "
                 "transitions as value-only learner rows"
             )
-        if int(generation["event_history_limit"]) != MEANINGFUL_PUBLIC_HISTORY_LIMIT:
-            raise ContractError(
-                "meaningful-history waves require the reviewed 32-event bound"
-            )
     adapter_keys = {
         "learner_entity_feature_adapter_version",
         "teacher_entity_feature_adapter_version",
@@ -2583,15 +2590,53 @@ def _validate_generation(generation: dict[str, Any]) -> None:
         teacher_adapter = require_known_entity_feature_adapter(
             generation["teacher_entity_feature_adapter_version"]
         )
-        if learner_adapter != RUST_ENTITY_ADAPTER_V4:
+        if learner_adapter != RUST_ENTITY_ADAPTER_V5:
             raise ContractError(
-                "current generation learner rows must use the reviewed v4 actor "
-                "public-rule-state adapter"
+                "current generation learner rows must use the reviewed v5 "
+                "ordered-history/public-rule-state adapter"
             )
         if teacher_adapter != RUST_ENTITY_ADAPTER_V2:
             raise ContractError(
                 "the pinned pre-metadata producer must remain explicitly bound "
                 "to the historical v2 teacher adapter"
+            )
+        if int(generation["event_history_limit"]) != MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT:
+            raise ContractError(
+                "v5 meaningful-history waves require the reviewed 64-event bound"
+            )
+    reliability_keys = {
+        "target_reliability_audit_fraction",
+        "target_reliability_audit_seed",
+        "preserve_search_evidence",
+    }
+    present_reliability_keys = reliability_keys.intersection(generation)
+    if present_reliability_keys and present_reliability_keys != reliability_keys:
+        raise ContractError(
+            "generation target-reliability fields are atomic; missing="
+            f"{sorted(reliability_keys - present_reliability_keys)}"
+        )
+    if present_reliability_keys:
+        fraction = generation["target_reliability_audit_fraction"]
+        seed = generation["target_reliability_audit_seed"]
+        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+            raise ContractError(
+                "generation.target_reliability_audit_fraction must be numeric"
+            )
+        if not 0.0 <= float(fraction) <= 1.0:
+            raise ContractError(
+                "generation.target_reliability_audit_fraction must be in [0,1]"
+            )
+        if type(seed) is not int:
+            raise ContractError(
+                "generation.target_reliability_audit_seed must be an integer"
+            )
+        if type(generation["preserve_search_evidence"]) is not bool:
+            raise ContractError(
+                "generation.preserve_search_evidence must be a JSON boolean"
+            )
+        if float(fraction) > 0.0 and generation["preserve_search_evidence"] is not True:
+            raise ContractError(
+                "target-reliability auditing requires preserved search evidence"
             )
     for key in (
         "vps_to_win",
@@ -8278,6 +8323,22 @@ def _generator_argv(
                 str(generation["learner_entity_feature_adapter_version"]),
             )
         )
+    if "target_reliability_audit_fraction" in generation:
+        argv.extend(
+            (
+                "--target-reliability-audit-fraction",
+                str(generation["target_reliability_audit_fraction"]),
+                "--target-reliability-audit-seed",
+                str(generation["target_reliability_audit_seed"]),
+            )
+        )
+    if "preserve_search_evidence" in generation:
+        argv.append(
+            _bool_flag(
+                "--preserve-search-evidence",
+                bool(generation["preserve_search_evidence"]),
+            )
+        )
     if lock.get("schema_version") == GENERATION_ARM_LOCK_SCHEMA:
         argv.extend(
             (
@@ -9247,6 +9308,15 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
             "learner_entity_feature_adapter_version"
         ),
         "event_history_limit": generation.get("event_history_limit", 64),
+        "target_reliability_audit_fraction": generation.get(
+            "target_reliability_audit_fraction", 0.0
+        ),
+        "target_reliability_audit_seed": generation.get(
+            "target_reliability_audit_seed", 0
+        ),
+        "preserve_search_evidence": generation.get(
+            "preserve_search_evidence", False
+        ),
         "temperature_move_fraction": float(generation["temperature_decisions"])
         / float(generation["max_decisions"]),
         "temperature_high": generation["temperature_high"],
@@ -9493,13 +9563,24 @@ def _meaningful_public_event_authority(
     """Return the source-bound opt-in history authority for fresh v1.6 rows."""
 
     adapter_version = require_known_entity_feature_adapter(adapter_version)
-    native = information_surface.native_meaningful_public_history_capability()
+    native = information_surface.native_meaningful_public_history_capability(
+        adapter_version
+    )
+    expected_schema = (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+        if adapter_version == RUST_ENTITY_ADAPTER_V5
+        else MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    )
+    expected_limit = (
+        MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT
+        if adapter_version == RUST_ENTITY_ADAPTER_V5
+        else MEANINGFUL_PUBLIC_HISTORY_LIMIT
+    )
     if (
         native.get("available") is not True
         or native.get("opt_in") is not True
-        or native.get("history_schema")
-        != MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
-        or native.get("history_limit") != MEANINGFUL_PUBLIC_HISTORY_LIMIT
+        or native.get("history_schema") != expected_schema
+        or native.get("history_limit") != expected_limit
     ):
         raise ContractError("native meaningful-public-history capability drift")
     return {
@@ -9507,8 +9588,8 @@ def _meaningful_public_event_authority(
         "base_adapter_event_history_semantic": ENTITY_FEATURE_ADAPTER_SPECS[
             adapter_version
         ].event_history,
-        "event_history_semantic": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
-        "history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        "event_history_semantic": expected_schema,
+        "history_limit": expected_limit,
         "native_inference": native,
     }
 
@@ -9737,7 +9818,8 @@ def _require_shard_feature_semantics(
             action_catalog=action_catalog,
             where=where,
         )
-        if expected_adapter in {RUST_ENTITY_ADAPTER_V3, RUST_ENTITY_ADAPTER_V4}
+        if expected_adapter
+        in {RUST_ENTITY_ADAPTER_V3, RUST_ENTITY_ADAPTER_V4, RUST_ENTITY_ADAPTER_V5}
         else None
     )
 
@@ -9767,7 +9849,7 @@ def _require_shard_feature_semantics(
     if np.any(~np.isfinite(event_tokens)):
         raise ContractError(f"{where}: event_tokens contain non-finite values")
     if meaningful_public_history:
-        if int(event_history_limit) != MEANINGFUL_PUBLIC_HISTORY_LIMIT:
+        if int(event_history_limit) != int(authority["history_limit"]):
             raise ContractError(f"{where}: unreviewed event-history limit")
         if int(event_mask.shape[1]) != int(event_history_limit):
             raise ContractError(
@@ -9792,7 +9874,7 @@ def _require_shard_feature_semantics(
             "structured_action_resources": structured_action_resource_scan,
             "event_history": {
                 "authenticated_empty": False,
-                "semantic": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+                "semantic": authority["event_history_semantic"],
                 "event_mask_scan": scan,
             },
         }
@@ -11580,7 +11662,7 @@ def audit_outputs(
             **event_authority,
             "authenticated_empty": not meaningful_public_history,
             **(
-                {"semantic": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION}
+                {"semantic": event_authority["event_history_semantic"]}
                 if meaningful_public_history
                 else {}
             ),

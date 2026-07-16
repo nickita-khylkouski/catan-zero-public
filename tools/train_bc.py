@@ -83,13 +83,15 @@ from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
     RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
     checkpoint_entity_feature_adapter_metadata,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
 )
 from catan_zero.rl.meaningful_history import (
-    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    meaningful_public_history_limit,
 )
 from catan_zero.rl.ordered_history import (
     MASKED_MEAN_V1,
@@ -533,6 +535,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--entity-feature-adapter-version",
+        default=None,
+        help=(
+            "Explicit append-only entity feature semantic for a fresh model. "
+            "Omitted preserves historical inference (v4 when public-rule-state "
+            "features are enabled, otherwise the current generic adapter). "
+            "Adapter v5 atomically selects meaningful-history schema v2/cap 64."
+        ),
+    )
+    parser.add_argument(
         "--static-action-residual",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -580,7 +592,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--event-history-limit",
         type=int,
         default=None,
-        help="Event-token limit; meaningful public history requires exactly 32.",
+        help=(
+            "Event-token limit. Meaningful public history requires the exact cap "
+            "owned by its schema: 32 for v1 and 64 for adapter-v5 history-v2."
+        ),
     )
     parser.add_argument(
         "--meaningful-public-history-pooling",
@@ -590,6 +605,17 @@ def build_parser() -> argparse.ArgumentParser:
             "History aggregation owned by the checkpoint. Omitted inherits an "
             "init/grow checkpoint; ordered_attention_v2 adds a zero-gated "
             "order-aware branch without replacing the legacy masked mean."
+        ),
+    )
+    parser.add_argument(
+        "--meaningful-public-history-target-gather",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Join each retained public-history event to the board entity it "
+            "targeted before pooling. This is checkpoint-owned and requires "
+            "--meaningful-public-history. Omitted inherits an init checkpoint "
+            "and is disabled for a fresh legacy model."
         ),
     )
     parser.add_argument(
@@ -1588,8 +1614,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "Comma-separated phase weights for the VALUE head, e.g. "
-            "robber=8.0,initial_build=5.0 (FIX A5). Falls back to --phase-weights when empty, "
-            "so the value head is phase-repaired the same way as the policy by default."
+            "robber=8.0,initial_build=5.0 (FIX A5). Empty or 'inherit' preserves "
+            "the historical behavior and inherits --phase-weights. Use the explicit "
+            "sentinel 'none' to keep policy phase repair out of the value objective."
         ),
     )
     parser.add_argument(
@@ -2758,7 +2785,7 @@ def _checkpoint_value_tower_split_layers(checkpoint_path: str) -> int:
 
 def _checkpoint_meaningful_public_history(
     checkpoint_path: str,
-) -> tuple[bool, int, str]:
+) -> tuple[bool, int, str, str, bool]:
     """Read the bounded event-history input contract from a checkpoint."""
 
     import torch
@@ -2774,11 +2801,22 @@ def _checkpoint_meaningful_public_history(
     config = config_attr_view(checkpoint["config"])
     enabled = bool(getattr(config, "meaningful_public_history", False))
     limit = int(getattr(config, "event_history_limit", 64) or 0)
+    schema = str(
+        getattr(
+            config,
+            "meaningful_public_history_schema",
+            MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+        )
+        or MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    )
     pooling = str(
         getattr(config, "meaningful_public_history_pooling", MASKED_MEAN_V1)
         or MASKED_MEAN_V1
     )
-    return enabled, limit, pooling
+    target_gather = bool(
+        getattr(config, "meaningful_public_history_target_gather", False)
+    )
+    return enabled, limit, schema, pooling, target_gather
 
 
 def _sha256_existing_file(path: str | Path) -> str:
@@ -4113,16 +4151,35 @@ def _validate_flywheel_component_provenance(
     if schema_version == "flywheel-replay-component-v2":
         expected.add("source_authority_manifest")
         if corpus_meta.get("policy_target_identity_sha256") is not None:
-            expected.add("policy_target_identity_sha256")
+            expected.update(
+                {
+                    "policy_target_identity",
+                    "policy_target_identity_sha256",
+                }
+            )
         if corpus_meta.get("policy_target_completeness") is not None:
             expected.add("policy_target_completeness")
     if not isinstance(payload, dict) or set(payload) != expected:
         raise SystemExit("flywheel component provenance fields differ from schema")
     if "policy_target_identity_sha256" in expected:
         identity = payload.get("policy_target_identity_sha256")
+        identity_payload = payload.get("policy_target_identity")
+        identity_hash_payload = identity_payload
+        if (
+            isinstance(identity_payload, dict)
+            and identity_payload.get("schema_version")
+            == "policy-target-manifest-operator-identity-v1-legacy-partial"
+        ):
+            # Historical inventories predate the full identity envelope and
+            # intentionally fingerprint only their explicit operator projection.
+            identity_hash_payload = identity_payload.get("operator")
         if (
             not _is_sha256(identity)
             or identity != corpus_meta.get("policy_target_identity_sha256")
+            or not isinstance(identity_payload, dict)
+            or identity_payload != corpus_meta.get("policy_target_identity")
+            or not isinstance(identity_hash_payload, dict)
+            or _canonical_json_sha256(identity_hash_payload) != identity
         ):
             raise SystemExit(
                 "flywheel component policy-target identity provenance drift"
@@ -7992,6 +8049,13 @@ def _effective_a1_learner_training_recipe(
         "ddp_shard_data",
     )
     effective = {field: getattr(args, field) for field in bound_fields}
+    if bool(getattr(args, "symmetry_augment", False)):
+        # Event/action ids and event target ids are part of the spatial input.
+        # A symmetry-enabled recipe must bind whether that history is relabelled;
+        # relying on the parser default can silently create contradictory rows.
+        effective["symmetry_augment_events"] = bool(
+            getattr(args, "symmetry_augment_events", True)
+        )
     value_balance_mode = str(
         getattr(args, "value_player_outcome_balance_mode", "none")
     )
@@ -8242,7 +8306,7 @@ def _validate_a1_decisive_training_semantics(
         "distributed_symmetry_contract": (
             "not_applicable"
             if not symmetry_augment or world_size == 1
-            else "incomplete"
+            else "shared_rank_stream_exact_v1"
         ),
         "advantage_policy_weighting": advantage_mode,
         "distributed_advantage_contract": (
@@ -8258,11 +8322,12 @@ def _validate_a1_decisive_training_semantics(
             "decisive A1 training requires --grad-accum-steps 1 until exact "
             "union-weighted gradient accumulation is implemented and sealed"
         )
-    if world_size > 1 and symmetry_augment:
-        raise SystemExit(
-            "decisive distributed A1 training rejects --symmetry-augment until "
-            "the per-rank RNG and checkpoint/resume contract is complete"
-        )
+    # Non-sharded DDP rank-strides one padded global order into equally sized
+    # local batches. Every rank therefore consumes the same number of symmetry
+    # RNG draws in the same order. The shared seeded stream stays aligned, and
+    # the rank-0 symmetry state stored in the progress sidecar is sufficient to
+    # reconstruct every rank on resume. Different ranks apply those draws to
+    # different source rows, producing a true global D6-augmented batch.
     if world_size > 1 and advantage_mode != "none":
         raise SystemExit(
             "decisive distributed A1 training rejects advantage policy weighting "
@@ -8586,8 +8651,11 @@ def _validate_a1_scratch_runtime_projection(
 ) -> None:
     """Fail closed unless argv constructs every field of sealed scratch science."""
 
+    requested_adapter = getattr(args, "entity_feature_adapter_version", None)
     runtime_adapter = (
-        RUST_ENTITY_ADAPTER_V4
+        require_known_entity_feature_adapter(requested_adapter)
+        if requested_adapter
+        else RUST_ENTITY_ADAPTER_V4
         if bool(args.public_rule_state_features)
         else CURRENT_RUST_ENTITY_ADAPTER_VERSION
     )
@@ -8627,6 +8695,10 @@ def _validate_a1_scratch_runtime_projection(
             args.meaningful_public_history_pooling
         )
         != model["meaningful_public_history_pooling"],
+        "meaningful_public_history_target_gather": bool(
+            args.meaningful_public_history_target_gather
+        )
+        != model["meaningful_public_history_target_gather"],
         "event_history_limit": int(args.event_history_limit)
         != model["event_history_limit"],
         "mask_hidden_info": bool(args.mask_hidden_info)
@@ -9918,7 +9990,7 @@ def _public_card_count_create_kwargs(
 
 def _resolve_effective_meaningful_public_history(
     args: argparse.Namespace,
-) -> tuple[bool, int, str]:
+) -> tuple[bool, int, str, bool]:
     requested_raw = getattr(args, "meaningful_public_history", None)
     requested = None if requested_raw is None else bool(requested_raw)
     requested_limit_raw = getattr(args, "event_history_limit", None)
@@ -9931,22 +10003,46 @@ def _resolve_effective_meaningful_public_history(
     requested_pooling = (
         None if requested_pooling_raw is None else str(requested_pooling_raw)
     )
+    requested_target_gather_raw = getattr(
+        args, "meaningful_public_history_target_gather", None
+    )
+    requested_target_gather = (
+        None
+        if requested_target_gather_raw is None
+        else bool(requested_target_gather_raw)
+    )
     if str(args.arch) != "entity_graph":
-        if requested or requested_pooling not in (None, MASKED_MEAN_V1):
+        if (
+            requested
+            or requested_pooling not in (None, MASKED_MEAN_V1)
+            or requested_target_gather
+        ):
             raise SystemExit(
                 "meaningful public history is supported only for --arch entity_graph"
             )
-        return False, 64, MASKED_MEAN_V1
+        return False, 64, MASKED_MEAN_V1, False
 
     checkpoint_path = str(
         getattr(args, "init_checkpoint", "")
         or getattr(args, "grow_from_checkpoint", "")
         or ""
     )
-    inherited_enabled, inherited_limit, inherited_pooling = (
+    (
+        inherited_enabled,
+        inherited_limit,
+        inherited_schema,
+        inherited_pooling,
+        inherited_target_gather,
+    ) = (
         _checkpoint_meaningful_public_history(checkpoint_path)
         if checkpoint_path
-        else (False, 64, MASKED_MEAN_V1)
+        else (
+            False,
+            64,
+            MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+            MASKED_MEAN_V1,
+            False,
+        )
     )
     init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
     if init_checkpoint and requested is not None and requested != inherited_enabled:
@@ -9976,27 +10072,58 @@ def _resolve_effective_meaningful_public_history(
             f"cli={requested_pooling}. Upgrade the checkpoint or omit the "
             "flag to inherit its exact architecture."
         )
+    if (
+        init_checkpoint
+        and requested_target_gather is not None
+        and requested_target_gather != inherited_target_gather
+    ):
+        raise SystemExit(
+            "--meaningful-public-history-target-gather does not match "
+            f"--init-checkpoint: checkpoint={inherited_target_gather} "
+            f"cli={requested_target_gather}. Upgrade the checkpoint or omit "
+            "the flag to inherit its exact architecture."
+        )
     enabled = inherited_enabled if requested is None else requested
     pooling = (
         inherited_pooling if requested_pooling is None else requested_pooling
     )
+    target_gather = (
+        inherited_target_gather
+        if requested_target_gather is None
+        else requested_target_gather
+    )
     if pooling not in SUPPORTED_HISTORY_POOLING:
         raise SystemExit(f"unsupported meaningful public-history pooling: {pooling}")
     if enabled:
-        if requested_limit not in (None, MEANINGFUL_PUBLIC_HISTORY_LIMIT):
-            raise SystemExit(
-                "--meaningful-public-history requires --event-history-limit 32"
+        if init_checkpoint:
+            schema = inherited_schema
+        else:
+            requested_adapter = getattr(
+                args, "entity_feature_adapter_version", None
             )
-        return True, MEANINGFUL_PUBLIC_HISTORY_LIMIT, pooling
-    if pooling != MASKED_MEAN_V1:
+            if requested_adapter:
+                adapter = require_known_entity_feature_adapter(requested_adapter)
+            elif bool(getattr(args, "public_rule_state_features", False)):
+                adapter = RUST_ENTITY_ADAPTER_V4
+            else:
+                adapter = CURRENT_RUST_ENTITY_ADAPTER_VERSION
+            schema = _history_schema_for_entity_adapter(adapter)
+        expected_limit = meaningful_public_history_limit(schema)
+        if requested_limit not in (None, expected_limit):
+            raise SystemExit(
+                "--meaningful-public-history event cap does not match its schema: "
+                f"schema={schema} expected={expected_limit} cli={requested_limit}"
+            )
+        return True, expected_limit, pooling, bool(target_gather)
+    if pooling != MASKED_MEAN_V1 or target_gather:
         raise SystemExit(
-            "ordered public-history pooling requires "
+            "ordered public-history pooling and target gather require "
             "--meaningful-public-history"
         )
     limit = inherited_limit if requested_limit is None else requested_limit
     if not 0 <= int(limit) <= 64:
         raise SystemExit("--event-history-limit must be in [0, 64]")
-    return False, int(limit), MASKED_MEAN_V1
+    return False, int(limit), MASKED_MEAN_V1, False
 
 
 def _validate_outcome_conditioned_policy_distillation(
@@ -10719,6 +10846,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.meaningful_public_history,
         args.event_history_limit,
         args.meaningful_public_history_pooling,
+        args.meaningful_public_history_target_gather,
     ) = _resolve_effective_meaningful_public_history(args)
     _preflight_init_checkpoint_architecture(args, ddp)
     a1_preflight_meta: dict[str, object] | None = None
@@ -10937,6 +11065,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.meaningful_public_history,
         args.event_history_limit,
         args.meaningful_public_history_pooling,
+        args.meaningful_public_history_target_gather,
     ) = _resolve_effective_meaningful_public_history(args)
     args.policy_target_reanalysis = None
     if str(args.data_format) != "memmap":
@@ -11537,17 +11666,32 @@ def main(argv: Sequence[str] | None = None) -> None:
                     device=args.device,
                     strict_metadata=not bool(args.allow_legacy_action_mask_upgrade),
                 )
+                loaded_adapter = policy_entity_feature_adapter_version(policy)
+                requested_adapter = getattr(
+                    args, "entity_feature_adapter_version", None
+                )
+                if requested_adapter is not None and require_known_entity_feature_adapter(
+                    requested_adapter
+                ) != loaded_adapter:
+                    raise SystemExit(
+                        "--entity-feature-adapter-version does not match the "
+                        f"init checkpoint: requested={requested_adapter!r} "
+                        f"checkpoint={loaded_adapter!r}"
+                    )
                 policy.config = dataclasses.replace(
                     policy.config,
                     meaningful_public_history=bool(
                         args.meaningful_public_history
                     ),
                     meaningful_public_history_schema=(
-                        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+                        _history_schema_for_entity_adapter(loaded_adapter)
                     ),
                     event_history_limit=int(args.event_history_limit),
                     meaningful_public_history_pooling=str(
                         args.meaningful_public_history_pooling
+                    ),
+                    meaningful_public_history_target_gather=bool(
+                        args.meaningful_public_history_target_gather
                     ),
                     public_rule_state_features=bool(
                         args.public_rule_state_features
@@ -11571,6 +11715,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             _assert_init_config_matches(policy, args)
         else:
             if args.arch == "entity_graph":
+                training_adapter = _resolved_training_entity_adapter(args)
                 policy = EntityGraphPolicy.create(
                     env_config=env_config,
                     hidden_size=args.hidden_size,
@@ -11600,9 +11745,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
                     ),
                     entity_feature_adapter_version=(
-                        RUST_ENTITY_ADAPTER_V4
-                        if bool(args.public_rule_state_features)
-                        else CURRENT_RUST_ENTITY_ADAPTER_VERSION
+                        training_adapter
                     ),
                     **_structured_action_create_kwargs(args),
                     value_tower_split_layers=int(
@@ -11612,11 +11755,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                         args.meaningful_public_history
                     ),
                     meaningful_public_history_schema=(
-                        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+                        _history_schema_for_entity_adapter(training_adapter)
                     ),
                     event_history_limit=int(args.event_history_limit),
                     meaningful_public_history_pooling=str(
                         args.meaningful_public_history_pooling
+                    ),
+                    meaningful_public_history_target_gather=bool(
+                        args.meaningful_public_history_target_gather
                     ),
                     state_trunk=str(args.entity_state_trunk),
                     relational_block_pattern=str(args.relational_block_pattern),
@@ -12180,8 +12326,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     n = len(data["action_taken"])
     teacher_weight_map = _parse_weight_map(args.teacher_weights)
     policy_phase_weight_map = _parse_weight_map(args.phase_weights)
-    value_phase_weights_raw = args.value_phase_weights or args.phase_weights
-    value_phase_weight_map = _parse_weight_map(value_phase_weights_raw)
+    (
+        value_phase_weight_map,
+        value_phase_weights_source,
+    ) = _resolve_value_phase_weights(
+        str(args.value_phase_weights),
+        policy_phase_weights=policy_phase_weight_map,
+    )
     forced_row_value_action_type_weight_map = (
         _parse_forced_row_value_action_type_weights(
             args.forced_row_value_action_type_weights
@@ -12393,6 +12544,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "teacher_weights": teacher_weight_map,
             "policy_phase_weights": policy_phase_weight_map,
             "value_phase_weights": value_phase_weight_map,
+            "value_phase_weights_source": value_phase_weights_source,
             "forced_action_weight": float(args.forced_action_weight),
             "winner_sample_weight": float(args.winner_sample_weight),
             "loser_sample_weight": float(args.loser_sample_weight),
@@ -16033,7 +16185,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "ddp_find_unused_parameters": bool(args.ddp_find_unused_parameters),
         "teacher_weights": _parse_weight_map(args.teacher_weights),
         "phase_weights": _parse_weight_map(args.phase_weights),
-        "value_phase_weights": _parse_weight_map(value_phase_weights_raw),
+        "value_phase_weights": value_phase_weight_map,
+        "value_phase_weights_source": value_phase_weights_source,
         "forced_action_weight": args.forced_action_weight,
         "per_game_policy_weight": bool(args.per_game_policy_weight),
         "per_game_policy_weight_mode": str(args.per_game_policy_weight_mode),
@@ -30046,6 +30199,56 @@ def _parse_weight_map(raw: str) -> dict[str, float]:
     return weights
 
 
+def _resolve_value_phase_weights(
+    raw: str,
+    *,
+    policy_phase_weights: Mapping[str, float],
+) -> tuple[dict[str, float], str]:
+    """Resolve value-phase weighting without conflating omission with opt-out.
+
+    Historical runs used an empty value map to inherit policy phase weights.
+    Keep that replay behavior, while giving new recipes an explicit ``none``
+    sentinel so a policy-only sampling repair cannot silently distort value
+    calibration.
+    """
+
+    normalized = str(raw or "").strip()
+    if normalized.lower() in {"", "inherit"}:
+        return dict(policy_phase_weights), "policy_phase_weights"
+    if normalized.lower() == "none":
+        return {}, "explicit_none"
+    return _parse_weight_map(normalized), "explicit_map"
+
+
+def _resolved_training_entity_adapter(args: argparse.Namespace) -> str:
+    requested = getattr(args, "entity_feature_adapter_version", None)
+    if requested:
+        resolved = require_known_entity_feature_adapter(requested)
+    elif bool(getattr(args, "public_rule_state_features", False)):
+        resolved = RUST_ENTITY_ADAPTER_V4
+    else:
+        resolved = CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    if resolved == RUST_ENTITY_ADAPTER_V5:
+        if not bool(getattr(args, "public_rule_state_features", False)):
+            raise SystemExit(
+                "entity adapter v5 requires --public-rule-state-features"
+            )
+        if not bool(getattr(args, "meaningful_public_history", False)):
+            raise SystemExit(
+                "entity adapter v5 requires --meaningful-public-history"
+            )
+        if int(getattr(args, "event_history_limit", 0)) != 64:
+            raise SystemExit("entity adapter v5 requires --event-history-limit 64")
+    return resolved
+
+
+def _history_schema_for_entity_adapter(adapter_version: object) -> str:
+    resolved = require_known_entity_feature_adapter(adapter_version)
+    if resolved == RUST_ENTITY_ADAPTER_V5:
+        return MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+    return MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+
+
 _ACTION_TYPE_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 
 
@@ -30392,6 +30595,24 @@ def _checkpoint_config_mismatches(
                 f"cli={requested_history_pooling}; upgrade the checkpoint "
                 "with --flags ordered_history"
             )
+        checkpoint_history_target_gather = bool(
+            getattr(config, "meaningful_public_history_target_gather", False)
+        )
+        requested_history_target_gather_raw = getattr(
+            args, "meaningful_public_history_target_gather", None
+        )
+        requested_history_target_gather = (
+            checkpoint_history_target_gather
+            if requested_history_target_gather_raw is None
+            else bool(requested_history_target_gather_raw)
+        )
+        if checkpoint_history_target_gather != requested_history_target_gather:
+            mismatches.append(
+                "meaningful_public_history_target_gather "
+                f"checkpoint={checkpoint_history_target_gather} "
+                f"cli={requested_history_target_gather}; upgrade the checkpoint "
+                "with the history target-gather adapter"
+            )
     return mismatches
 
 
@@ -30602,6 +30823,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "meaningful_history_residual_gate",
         "meaningful_history_ordered_gate",
         "meaningful_history_sequence",
+        "meaningful_history_target_proj",
         "type_embedding",
         "cls_token",
         "blocks",
@@ -30623,6 +30845,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "meaningful_history_residual_gate",
         "meaningful_history_ordered_gate",
         "meaningful_history_sequence",
+        "meaningful_history_target_proj",
     ),
     "policy_head": ("action_bias", "logit_scale"),
     # Keep optional action-local adapters independently freezable.  Grouping
@@ -30729,6 +30952,7 @@ def _effective_entity_graph_architecture_report(
             ),
             "event_history_limit": 64,
             "meaningful_public_history_pooling": MASKED_MEAN_V1,
+            "meaningful_public_history_target_gather": False,
             "requested_edge_policy_head": bool(requested_edge_policy_head),
             "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
             "requested_aux_settlement_pointer_head": bool(
@@ -30803,6 +31027,9 @@ def _effective_entity_graph_architecture_report(
                 MASKED_MEAN_V1,
             )
             or MASKED_MEAN_V1
+        ),
+        "meaningful_public_history_target_gather": bool(
+            getattr(config, "meaningful_public_history_target_gather", False)
         ),
         "belief_resource_head": bool(
             getattr(config, "belief_resource_head", False)

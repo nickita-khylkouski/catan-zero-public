@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 from tools import a1_target_eligibility_inventory as inventory
 
@@ -332,3 +333,164 @@ def test_manifest_operator_identity_includes_checkpoint_and_cli_search_fields(
         group["operator"]["producer_checkpoint_sha256"] for group in groups
     } == {"sha256:" + "a" * 64, "sha256:" + "b" * 64}
     assert len({group["operator_sha256"] for group in groups}) == 2
+
+
+def test_current_manifest_identity_resolves_complete_teacher_and_code_contract(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "current.lock.json"
+    lock_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "a1-generation-arm-lock-v-current",
+                "science": {
+                    "evaluator": {
+                        "value_squash": "clip",
+                    }
+                },
+                "provenance": {
+                    "runtime_code_tree_sha256": "sha256:" + "c" * 64,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "producer_checkpoint_sha256": "sha256:" + "a" * 64,
+                "teacher_entity_feature_adapter_version": (
+                    "rust_entity_adapter_v2_land_topology_ports_maritime"
+                ),
+                "target_information_regime": inventory.COHERENT_REGIME,
+                "cli_args": {
+                    "n_full": 128,
+                    "n_fast": 16,
+                    "p_full": 0.25,
+                    "c_visit": 50.0,
+                    "c_scale": 0.1,
+                    "max_depth": 80,
+                    "belief_chance_spectra": False,
+                    "determinization_min_simulations": 32,
+                    "raw_policy_above_width": None,
+                    "rescale_noise_floor_c": 0.0,
+                    "public_observation": True,
+                    "rust_featurize": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    groups = inventory._manifest_operator_groups(  # noqa: SLF001
+        {
+            "current_contract": {
+                "path": str(lock_path),
+                "file_sha256": inventory._file_sha256(lock_path),  # noqa: SLF001
+            },
+            "fresh_generation_manifests": [
+                {
+                    "category": "n128",
+                    "artifact": {
+                        "path": str(manifest_path),
+                        "file_sha256": inventory._file_sha256(  # noqa: SLF001
+                            manifest_path
+                        ),
+                    },
+                }
+            ],
+        }
+    )
+
+    assert len(groups) == 1
+    identity = groups[0]["policy_target_identity"]
+    assert identity["schema_version"] == inventory.POLICY_TARGET_IDENTITY_SCHEMA
+    assert identity["completeness"] == "current_exact_fail_closed"
+    assert identity["effective_search_config"]["c_visit"] == 50.0
+    assert identity["effective_search_config"]["max_depth"] == 80
+    assert identity["effective_search_config"]["belief_chance_spectra"] is False
+    assert identity["effective_evaluator_config"]["value_squash"] == "clip"
+    assert identity["teacher_feature_contract"][
+        "entity_feature_adapter_version"
+    ] == "rust_entity_adapter_v2_land_topology_ports_maritime"
+    assert identity["producer_code_identity"]["runtime_code_tree_sha256"] == (
+        "sha256:" + "c" * 64
+    )
+
+
+def test_current_manifest_identity_fails_closed_without_teacher_adapter(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "current.lock.json"
+    lock_path.write_text(
+        json.dumps(
+            {
+                "provenance": {
+                    "runtime_code_tree_sha256": "sha256:" + "c" * 64,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "producer_checkpoint_sha256": "sha256:" + "a" * 64,
+                "target_information_regime": inventory.COHERENT_REGIME,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        inventory.InventoryError,
+        match="teacher_entity_feature_adapter_version",
+    ):
+        inventory._manifest_operator_groups(  # noqa: SLF001
+            {
+                "current_contract": {
+                    "path": str(lock_path),
+                    "file_sha256": inventory._file_sha256(lock_path),  # noqa: SLF001
+                },
+                "fresh_generation_manifests": [
+                    {
+                        "category": "n128",
+                        "artifact": {
+                            "path": str(manifest_path),
+                            "file_sha256": inventory._file_sha256(  # noqa: SLF001
+                                manifest_path
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
+
+
+def test_aggregate_cannot_hide_composite_target_identity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        inventory,
+        "inspect_composite",
+        lambda **_kwargs: {
+            "policy_active_rows": 10,
+            "incompatible_policy_active_rows": 0,
+            "policy_activation_invalid_components": [],
+            "policy_targets_eligible_for_requested_learner": False,
+        },
+    )
+
+    result = inventory.build_inventory(
+        corpora=[],
+        composite=tmp_path / "descriptor.json",
+        rd_contract=None,
+        required_regime=inventory.COHERENT_REGIME,
+    )
+
+    assert result["aggregate"]["policy_targets_eligible_for_requested_learner"] is False
+    assert result["aggregate"]["policy_target_identity_invalid_scopes"] == [
+        "composite"
+    ]

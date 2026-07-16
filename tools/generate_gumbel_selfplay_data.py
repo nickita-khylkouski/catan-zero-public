@@ -51,8 +51,16 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_VERSION_KEY,
 )
 from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
+    RUST_ENTITY_ADAPTER_V5,
     policy_entity_feature_adapter_version,
+    require_known_entity_feature_adapter,
+)
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    meaningful_public_history_limit,
 )
 from catan_zero.rl.gumbel_self_play import (
     COLORS,
@@ -97,22 +105,33 @@ PUBLIC_AWARD_FEATURE_PROVENANCE_SCHEMA = "public-award-feature-provenance-v1"
 PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE = "authoritative_v1"
 
 
-def _requested_history_options(worker_args: dict[str, Any]) -> tuple[bool, int]:
+def _requested_history_options(
+    worker_args: dict[str, Any],
+) -> tuple[bool, int, str]:
     """Normalize the row contract exactly as self-play/native featurization do."""
     enabled = bool(worker_args.get("meaningful_public_history", False))
+    adapter = require_known_entity_feature_adapter(
+        worker_args.get("learner_entity_feature_adapter_version")
+        or CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    schema = (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+        if adapter == RUST_ENTITY_ADAPTER_V5
+        else MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    )
     limit = int(worker_args.get("event_history_limit", 64) or 0)
     if enabled:
-        limit = min(limit, 32)
-    return enabled, limit
-
-
-def _history_contracts_match(
-    left: tuple[bool, int], right: tuple[bool, int]
-) -> bool:
-    """Limits affect features only while meaningful public history is enabled."""
-    if left[0] != right[0]:
-        return False
-    return not left[0] or left[1] == right[1]
+        expected_limit = meaningful_public_history_limit(schema)
+        # v1 historically accepted a larger generic event cap and normalized it
+        # to the schema's fixed 32-token surface.  Preserve that compatibility
+        # for archived callers.  v5/v2 is a new explicit contract and therefore
+        # fails closed rather than silently changing the requested learner input.
+        if adapter == RUST_ENTITY_ADAPTER_V5 and limit != expected_limit:
+            raise ValueError(
+                f"{adapter} requires event_history_limit={expected_limit}, got {limit}"
+            )
+        limit = expected_limit
+    return enabled, limit, schema
 
 
 def _assert_evaluator_history_contract(
@@ -124,16 +143,36 @@ def _assert_evaluator_history_contract(
         # HeuristicRustEvaluator consumes the game directly and has no neural
         # feature surface to reconcile with the emitted training rows.
         return
-    requested = _requested_history_options(worker_args)
-    actual = _policy_history_options(policy)
-    if not _history_contracts_match(actual, requested):
+    # Learner rows are intentionally allowed to advance beyond the
+    # checkpoint-bound teacher input surface. Validate the row history
+    # contract independently, then bind the evaluator only to the declared
+    # teacher adapter. Requiring teacher history == learner history made the
+    # separate teacher/learner adapter design impossible to execute.
+    requested_history = _requested_history_options(worker_args)
+    actual_adapter = policy_entity_feature_adapter_version(policy)
+    expected_adapter = worker_args.get("teacher_entity_feature_adapter_version")
+    if expected_adapter is not None:
+        if actual_adapter != require_known_entity_feature_adapter(expected_adapter):
+            raise ValueError(
+                "teacher evaluator adapter does not match the declared target "
+                f"producer: evaluator={actual_adapter!r} expected={expected_adapter!r}"
+            )
+        return
+
+    # Legacy callers had one shared teacher/row feature contract.  Continue to
+    # enforce that contract when no separate teacher adapter is declared.
+    actual_history = _policy_history_options(policy)
+    histories_match = (
+        actual_history[0] == requested_history[0]
+        and (
+            not actual_history[0]
+            or actual_history[1:] == requested_history[1:]
+        )
+    )
+    if not histories_match:
         raise ValueError(
-            "teacher evaluator public-history contract does not match requested "
-            "self-play rows: "
-            f"evaluator meaningful_public_history={actual[0]}, "
-            f"event_history_limit={actual[1]}; requested "
-            f"meaningful_public_history={requested[0]}, "
-            f"event_history_limit={requested[1]}"
+            "teacher evaluator public-history contract does not match emitted rows: "
+            f"evaluator={actual_history!r} rows={requested_history!r}"
         )
 
 
@@ -163,7 +202,13 @@ def _load_compatible_archived_evaluator(
             "archived opponent entity feature adapter does not match producer: "
             f"opponent={opponent_adapter!r}; producer={producer_adapter!r}"
         )
-    _assert_evaluator_history_contract(evaluator, worker_args)
+    producer_history = _policy_history_options(producer_policy)
+    opponent_history = _policy_history_options(opponent_policy)
+    if opponent_history != producer_history:
+        raise ValueError(
+            "archived opponent public-history contract does not match producer: "
+            f"opponent={opponent_history!r}; producer={producer_history!r}"
+        )
     return evaluator
 
 
@@ -1753,6 +1798,9 @@ def _server_worker_entry(
                 worker_args["_eval_server_meaningful_public_history"]
             ),
             event_history_limit=int(worker_args["_eval_server_event_history_limit"]),
+            meaningful_public_history_schema=str(
+                worker_args["_eval_server_meaningful_public_history_schema"]
+            ),
             needs_action_targets=bool(needs_action_targets),
             needs_relational_topology=bool(needs_relational_topology),
             event_token_limit=event_token_limit,
@@ -1830,21 +1878,44 @@ def _run_eval_server_batch(
     try:
         server.start()
         meta = server.wait_ready(timeout=300.0)
+        server_history_schema = str(
+            meta.get(
+                "meaningful_public_history_schema",
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+            )
+        )
         server_history = (
             bool(meta["meaningful_public_history"]),
             int(meta["event_history_limit"]),
+            server_history_schema,
         )
         for wargs in worker_args:
             requested_history = _requested_history_options(wargs)
-            if not _history_contracts_match(requested_history, server_history):
+            expected_teacher_adapter = wargs.get(
+                "teacher_entity_feature_adapter_version"
+            )
+            if (
+                expected_teacher_adapter is not None
+                and str(meta["entity_feature_adapter"])
+                != require_known_entity_feature_adapter(expected_teacher_adapter)
+            ):
+                raise ValueError(
+                    "eval-server checkpoint adapter does not match the declared "
+                    f"teacher: checkpoint={meta['entity_feature_adapter']!r} "
+                    f"expected={expected_teacher_adapter!r}"
+                )
+            histories_match = (
+                server_history[0] == requested_history[0]
+                and (
+                    not server_history[0]
+                    or server_history[1:] == requested_history[1:]
+                )
+            )
+            if expected_teacher_adapter is None and not histories_match:
                 raise ValueError(
                     "eval-server checkpoint public-history contract does not match "
-                    "requested self-play rows: "
-                    f"checkpoint meaningful_public_history={server_history[0]}, "
-                    f"event_history_limit={server_history[1]}; requested "
-                    f"meaningful_public_history={requested_history[0]}, "
-                    f"event_history_limit={requested_history[1]} for worker "
-                    f"{wargs.get('worker_index', '?')}"
+                    f"emitted rows: checkpoint={server_history!r} "
+                    f"rows={requested_history!r}"
                 )
         print(
             json.dumps(
@@ -1868,6 +1939,9 @@ def _run_eval_server_batch(
             )
             wargs["_eval_server_meaningful_public_history"] = server_history[0]
             wargs["_eval_server_event_history_limit"] = server_history[1]
+            wargs["_eval_server_meaningful_public_history_schema"] = (
+                server_history[2]
+            )
             request_queue_for_client = getattr(server, "request_queue_for_client", None)
             client_request_queue = (
                 request_queue_for_client(client_id)
@@ -2168,9 +2242,7 @@ def _run_worker(
             "learner_entity_feature_adapter_version"
         ),
         event_history_limit=(
-            min(int(worker_args.get("event_history_limit", 64)), 32)
-            if bool(worker_args.get("meaningful_public_history", False))
-            else int(worker_args.get("event_history_limit", 64))
+            _requested_history_options(worker_args)[1]
         ),
         record_automatic_transitions=bool(
             worker_args.get("record_automatic_transitions", True)

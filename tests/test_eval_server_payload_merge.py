@@ -286,7 +286,11 @@ def test_remote_client_preserves_checkpoint_history_featurization_contract() -> 
         event_history_limit=32,
     )
 
-    assert _policy_history_options(local_policy) == (True, 32)
+    assert _policy_history_options(local_policy) == (
+        True,
+        32,
+        "meaningful_public_history_2p_no_trade_v1",
+    )
     assert _policy_history_options(remote.policy) == _policy_history_options(
         local_policy
     )

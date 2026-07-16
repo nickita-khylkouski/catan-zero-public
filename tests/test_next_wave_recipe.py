@@ -103,10 +103,10 @@ def test_next_wave_typed_generation_config_is_exact_schema_15_recipe() -> None:
     assert cfg.eval_cache_size == 0
     assert cfg.shard_size == 512
     assert cfg.meaningful_public_history is True
-    assert cfg.event_history_limit == 32
+    assert cfg.event_history_limit == 64
     assert cfg.record_automatic_transitions is True
     assert cfg.learner_entity_feature_adapter_version == (
-        "rust_entity_adapter_v4_actor_public_rule_state"
+        "rust_entity_adapter_v5_meaningful_history_v2"
     )
     assert cfg.temperature_clock == "nonforced_choice"
     assert (cfg.temperature_decisions, cfg.late_temperature_decisions) == (40, 100)
@@ -246,14 +246,17 @@ def test_next_wave_learner_preserves_all_forced_value_states() -> None:
     assert "DISCARD_RESOURCE" not in recipe["forced_row_value_action_type_weights"]
 
 
-def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> None:
+def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() -> None:
     payload = json.loads(SCIENCE_CONTRACT.read_text(encoding="utf-8"))
     recipe = payload["learner"]["training_recipe"]
 
-    assert recipe["max_steps"] == 32
+    assert recipe["epochs"] == 3
+    assert recipe["max_steps"] == 0
     assert recipe["lr"] == 6e-5
-    assert recipe["lr_warmup_steps"] == 16
-    assert recipe["lr_warmup_steps"] == recipe["max_steps"] // 2
+    assert recipe["lr_warmup_steps"] == 100
+    assert recipe["fused_optimizer"] is True
+    assert recipe["symmetry_augment"] is True
+    assert recipe["symmetry_augment_events"] is True
     assert recipe["value_lr_mult"] == 1.0
     assert recipe["per_game_value_weight"] is True
     assert (
@@ -276,12 +279,15 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
     assert "event_encoder" in recipe[
         "require_feature_learning_signal_modules"
     ]
+    assert "meaningful_history_target_proj" in recipe[
+        "require_feature_learning_signal_modules"
+    ]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:ff7a80f1269ddfeef5e1c5e2002b0261c29e7701b461aea691a687c5ef323ad8"
+        "sha256:8d00ca55c4d5cc52c7cec4fda0051b4d23b438ea076292c9bacd7a1990347a30"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:d5de0569c8a3f756f7a36ab13ae3811c89915e675074a6b8a9083d618922840b"
+        "sha256:cb4a71d3f561d299c67acbd02f358fd9195a989db934e6dc1638fd4f66064360"
     )
 
 
@@ -345,7 +351,7 @@ def _contract_fields(*, coherent: bool) -> tuple[dict, dict, dict]:
             {
                 "record_automatic_transitions": True,
                 "meaningful_public_history": True,
-                "event_history_limit": 32,
+                "event_history_limit": fields["event_history_limit"],
             }
         )
         regime = TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
@@ -439,14 +445,14 @@ def test_pre_wave_contract_binds_coherent_regime_and_runtime_fields(
     assert argv[argv.index("--temperature-clock") + 1] == "nonforced_choice"
     assert "--record-automatic-transitions" in argv
     assert "--meaningful-public-history" in argv
-    assert argv[argv.index("--event-history-limit") + 1] == "32"
+    assert argv[argv.index("--event-history-limit") + 1] == "64"
     cli = contract._expected_cli_fields(lock, job)  # noqa: SLF001
     assert cli["coherent_public_belief_search"] is True
     assert cli["forced_root_target_mode"] == "trajectory_only"
     assert cli["temperature_clock"] == "nonforced_choice"
     assert cli["record_automatic_transitions"] is True
     assert cli["meaningful_public_history"] is True
-    assert cli["event_history_limit"] == 32
+    assert cli["event_history_limit"] == 64
 
     # S1 owns the independent c_scale receipt; this test isolates the guard's
     # exact coherent operator/temperature binding from that evidence fixture.

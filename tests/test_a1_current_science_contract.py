@@ -58,9 +58,11 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     ) == {
         "event_encoder",
         "legal_action_value_residual_proj",
-        "legal_action_value_static_proj",
-        "meaningful_history_residual_gate",
-        "public_card_count_residual",
+            "legal_action_value_static_proj",
+            "meaningful_history_residual_gate",
+            "meaningful_history_ordered_gate",
+            "meaningful_history_target_proj",
+            "public_card_count_residual",
         "public_rule_state_residual",
         "static_action_residual_proj",
     }
@@ -78,7 +80,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         ("optimizer_state", "resume"),
     ),
 )
-def test_current_contract_rejects_non_scratch_v4_initialization(
+def test_current_contract_rejects_non_scratch_v5_initialization(
     tmp_path, monkeypatch, field: str, bad_value
 ) -> None:
     contract = copy.deepcopy(current_science.load())
@@ -89,7 +91,7 @@ def test_current_contract_rejects_non_scratch_v4_initialization(
 
     with pytest.raises(
         current_science.ScienceContractError,
-        match="native from-scratch v4",
+        match="native from-scratch v5",
     ):
         current_science.load()
 
@@ -212,8 +214,7 @@ def test_current_contract_rejects_diagnostic_policy_aux_leak(
     ("field", "bad_value"),
     (
         ("per_game_policy_surprise_weighting", True),
-        ("target_reliability_confidence_weighting", False),
-        ("target_reliability_confidence_floor", 0.0),
+        ("target_reliability_confidence_weighting", True),
     ),
 )
 def test_current_contract_rejects_unsafe_target_quality_learner_drift(
@@ -227,6 +228,6 @@ def test_current_contract_rejects_unsafe_target_quality_learner_drift(
 
     with pytest.raises(
         current_science.ScienceContractError,
-        match="learner target-quality contract drifted",
+        match="weighting|surprise",
     ):
         current_science.load()

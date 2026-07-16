@@ -1127,7 +1127,7 @@ def _build_fresh_component(
     output_root: Path,
     expected_games: int,
     source_authority: Mapping[str, str],
-    policy_target_identity_sha256: str,
+    policy_target_identity: Mapping[str, Any],
     policy_target_completeness: Mapping[str, Any],
     build_memmap_fn: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
@@ -1145,6 +1145,7 @@ def _build_fresh_component(
             f"fresh {category} mass differs from selected whole-game quota: {mass}"
         )
     version = int(producer["version"])
+    policy_target_identity_sha256 = str(policy_target_identity["sha256"])
     provenance = {
         "schema_version": "flywheel-replay-component-v2",
         "component_id": category,
@@ -1164,6 +1165,7 @@ def _build_fresh_component(
         "shard_inventory_sha256": canonical_sha256(records),
         "component_mass": mass,
         "source_authority_manifest": dict(source_authority),
+        "policy_target_identity": dict(policy_target_identity["payload"]),
         "policy_target_identity_sha256": policy_target_identity_sha256,
         "policy_target_completeness": dict(policy_target_completeness),
     }
@@ -1177,6 +1179,7 @@ def _build_fresh_component(
         "file_sha256": _file_sha256(provenance_path),
     }
     meta["flywheel_component_provenance"] = provenance_ref
+    meta["policy_target_identity"] = dict(policy_target_identity["payload"])
     meta["policy_target_identity_sha256"] = policy_target_identity_sha256
     meta["policy_target_completeness"] = dict(policy_target_completeness)
     _atomic_json(meta_path, meta)
@@ -1197,7 +1200,7 @@ def _build_fresh_component(
 
 def _fresh_policy_target_identities(
     source_authority: Mapping[str, str],
-) -> dict[str, str]:
+) -> dict[str, dict[str, Any]]:
     """Resolve one exact search-teacher identity for every fresh component."""
 
     payload = _load_json(Path(str(source_authority["path"])))
@@ -1207,8 +1210,8 @@ def _fresh_policy_target_identities(
         raise CompositeBuildError(
             f"cannot resolve fresh policy-target identities: {error}"
         ) from error
-    by_category: dict[str, set[str]] = {
-        category: set() for category in FRESH_SOURCE_GAME_RATIOS
+    by_category: dict[str, dict[str, dict[str, Any]]] = {
+        category: {} for category in FRESH_SOURCE_GAME_RATIOS
     }
     for group in groups:
         category = str(group.get("category", ""))
@@ -1218,25 +1221,36 @@ def _fresh_policy_target_identities(
                 raise CompositeBuildError(
                     f"fresh category {category!r} has malformed target identity"
                 )
-            by_category[category].add(identity)
+            identity_payload = group.get("policy_target_identity")
+            if not isinstance(identity_payload, Mapping):
+                raise CompositeBuildError(
+                    f"fresh category {category!r} has no versioned target identity"
+                )
+            by_category[category][identity] = dict(identity_payload)
     malformed = {
-        category: sorted(identities)
-        for category, identities in by_category.items()
-        if len(identities) != 1
+        category: sorted(identity_payloads)
+        for category, identity_payloads in by_category.items()
+        if len(identity_payloads) != 1
     }
     if malformed:
         raise CompositeBuildError(
             "fresh categories do not bind exactly one policy-target operator: "
             f"{malformed}"
         )
-    realized = {next(iter(identities)) for identities in by_category.values()}
+    realized = {
+        next(iter(identity_payloads))
+        for identity_payloads in by_category.values()
+    }
     if len(realized) != 1:
         raise CompositeBuildError(
             "fresh policy components were produced by different search operators"
         )
     return {
-        category: next(iter(identities))
-        for category, identities in by_category.items()
+        category: {
+            "sha256": next(iter(identity_payloads)),
+            "payload": next(iter(identity_payloads.values())),
+        }
+        for category, identity_payloads in by_category.items()
     }
 
 
@@ -1907,7 +1921,7 @@ def build_post_wave_composite(
             output_root=root,
             expected_games=int(expected_games[category]),
             source_authority=source_authority,
-            policy_target_identity_sha256=policy_target_identities[category],
+            policy_target_identity=policy_target_identities[category],
             policy_target_completeness=target_activation["categories"][category],
             build_memmap_fn=build_memmap_fn,
         )

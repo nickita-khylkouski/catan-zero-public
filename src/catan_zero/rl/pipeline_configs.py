@@ -236,6 +236,7 @@ class TrainConfig(PipelineConfig):
     meaningful_public_history_schema: str = "meaningful_public_history_2p_no_trade_v1"
     event_history_limit: int | None = None
     meaningful_public_history_pooling: str | None = None
+    meaningful_public_history_target_gather: bool | None = None
     # Checkpoint-owned interpretation of player-token longest-road slot 12.
     # This changes the learner's actual input tensor and therefore must be in
     # both the experiment hash and optimizer-resume identity.
@@ -468,6 +469,9 @@ class GenerateConfig(PipelineConfig):
     # enabled the generator admits only coherent exact-n128 roots.
     target_reliability_audit_fraction: float = 0.0
     target_reliability_audit_seed: int = 0
+    # Preserve completed-Q and visit-count tensors needed for post-hoc target
+    # stability calibration and exact policy-target reconstruction.
+    preserve_search_evidence: bool = False
     n_full_wide: int | None = None
     n_full_wide_threshold: int | None = None
     wide_roots_always_full: bool = False

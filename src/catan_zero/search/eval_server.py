@@ -956,6 +956,7 @@ def _server_main(
     (
         handshake["meaningful_public_history"],
         handshake["event_history_limit"],
+        handshake["meaningful_public_history_schema"],
     ) = _policy_history_options(policy)
     handshake["needs_action_targets"] = _policy_needs_action_targets(policy)
     handshake["needs_relational_topology"] = _policy_needs_relational_topology(policy)
@@ -1442,6 +1443,9 @@ class EvalServer:
                 self._handshake["meaningful_public_history"]
             ),
             "event_history_limit": int(self._handshake["event_history_limit"]),
+            "meaningful_public_history_schema": str(
+                self._handshake["meaningful_public_history_schema"]
+            ),
             "needs_action_targets": bool(
                 self._handshake.get("needs_action_targets", True)
             ),
@@ -1543,6 +1547,9 @@ class _RemoteForwardProxy:
         public_card_count_features: bool = False,
         meaningful_public_history: bool = False,
         event_history_limit: int = 64,
+        meaningful_public_history_schema: str = (
+            "meaningful_public_history_2p_no_trade_v1"
+        ),
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
     ) -> None:
@@ -1560,6 +1567,9 @@ class _RemoteForwardProxy:
             public_card_count_features=bool(public_card_count_features),
             meaningful_public_history=bool(meaningful_public_history),
             event_history_limit=int(event_history_limit),
+            meaningful_public_history_schema=str(
+                meaningful_public_history_schema
+            ),
         )
         self.entity_feature_adapter_version = (
             _require_implemented_entity_feature_adapter(
@@ -1617,6 +1627,9 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         public_card_count_features: bool = False,
         meaningful_public_history: bool = False,
         event_history_limit: int = 64,
+        meaningful_public_history_schema: str = (
+            "meaningful_public_history_2p_no_trade_v1"
+        ),
         needs_action_targets: bool = True,
         needs_relational_topology: bool = False,
         event_token_limit: int | None = None,
@@ -1635,6 +1648,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             public_card_count_features=public_card_count_features,
             meaningful_public_history=meaningful_public_history,
             event_history_limit=event_history_limit,
+            meaningful_public_history_schema=meaningful_public_history_schema,
             value_categorical_bins=value_categorical_bins,
             value_categorical_head_available=value_categorical_head_available,
         )

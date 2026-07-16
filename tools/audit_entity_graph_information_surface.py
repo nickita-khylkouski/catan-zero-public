@@ -366,7 +366,9 @@ def native_inference_event_history_capability() -> dict[str, Any]:
     }
 
 
-def native_meaningful_public_history_capability() -> dict[str, Any]:
+def native_meaningful_public_history_capability(
+    adapter_version: str | None = None,
+) -> dict[str, Any]:
     """Describe the reviewed opt-in native public-history surface.
 
     The legacy adapter contract above remains default-empty for old checkpoints
@@ -378,16 +380,29 @@ def native_meaningful_public_history_capability() -> dict[str, Any]:
     from catan_zero.rl.entity_token_features import ENTITY_TOKEN_SCHEMA_VERSION
     from catan_zero.rl.meaningful_history import (
         MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
         MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+        MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT,
     )
+    from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
+
+    history_v2 = str(adapter_version or "") == RUST_ENTITY_ADAPTER_V5
 
     return {
         "schema": "native-meaningful-public-history-capability-v1",
         "entity_token_schema": ENTITY_TOKEN_SCHEMA_VERSION,
         "available": True,
         "opt_in": True,
-        "history_schema": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
-        "history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        "history_schema": (
+            MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+            if history_v2
+            else MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+        ),
+        "history_limit": (
+            MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT
+            if history_v2
+            else MEANINGFUL_PUBLIC_HISTORY_LIMIT
+        ),
         "providers": [
             "catanatron_rs.build_entity_features_flat",
             "catan_zero.search.neural_rust_mcts._entity_payload_from_rust_snapshot",
