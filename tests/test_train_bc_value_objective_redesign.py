@@ -347,6 +347,7 @@ def _evaluate(
     truncation_weight: float = 0.25,
     data_loader_workers: int = 0,
     data_loader_prefetch: int = 2,
+    scalar_value_objective: str = "mse",
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
 ) -> dict:
@@ -384,6 +385,7 @@ def _evaluate(
         value_root_blend_global_compat=(target_lambda != 1.0),
         data_loader_workers=data_loader_workers,
         data_loader_prefetch=data_loader_prefetch,
+        scalar_value_objective=scalar_value_objective,
         scalar_value_loss_readout=scalar_value_loss_readout,
         scalar_value_loss_scale=scalar_value_loss_scale,
     )
@@ -464,6 +466,139 @@ def test_xdim_validation_can_score_the_deployed_scalar_search_readout() -> None:
     assert raw["value_loss"] == pytest.approx(5.0)
     assert deployed["value_loss"] == pytest.approx(expected)
     assert deployed["loss"] == pytest.approx(expected)
+
+
+def test_binary_win_bce_contract_is_explicit_and_requires_deployed_readout() -> None:
+    args = SimpleNamespace(
+        scalar_value_objective="binary_win_bce",
+        scalar_value_loss_readout="deployed_tanh",
+        scalar_value_loss_scale=1.5,
+    )
+    assert train_bc._scalar_value_loss_contract(args) == {
+        "schema_version": "scalar-value-objective-v2",
+        "objective": "binary_win_bce",
+        "readout": "deployed_tanh",
+        "scale": 1.5,
+        "target_formula": "(z + 1) / 2",
+        "logit_formula": "2 * scale * raw",
+        "deployed_value_formula": "tanh(raw * scale)",
+        "matches_scalar_mcts_when_value_squash_tanh": True,
+    }
+    args.scalar_value_loss_readout = "raw"
+    with pytest.raises(SystemExit, match="requires.*deployed_tanh"):
+        train_bc._scalar_value_loss_contract(args)
+
+
+def test_scalar_mse_contract_remains_byte_compatible() -> None:
+    assert train_bc._scalar_value_loss_contract(
+        SimpleNamespace(
+            scalar_value_objective="mse",
+            scalar_value_loss_readout="deployed_tanh",
+            scalar_value_loss_scale=1.0,
+        )
+    ) == {
+        "schema_version": "scalar-value-loss-readout-v1",
+        "readout": "deployed_tanh",
+        "scale": 1.0,
+        "formula": "tanh(raw * scale)",
+        "matches_scalar_mcts_when_value_squash_tanh": True,
+    }
+
+
+def test_binary_win_bce_uses_logistic_equivalent_of_deployed_tanh() -> None:
+    torch = pytest.importorskip("torch")
+    raw = torch.tensor([-2.0, 0.0, 2.0], requires_grad=True)
+    targets = torch.tensor([-1.0, 0.0, 1.0])
+
+    objective, mse, prediction = train_bc._scalar_value_objective_errors(
+        raw,
+        targets,
+        objective="binary_win_bce",
+        readout="deployed_tanh",
+        scale=1.25,
+    )
+
+    expected_logits = raw * 2.5
+    expected_targets = (targets + 1.0) * 0.5
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        expected_logits,
+        expected_targets,
+        reduction="none",
+    )
+    assert torch.allclose(objective, expected)
+    assert torch.allclose(prediction, torch.tanh(raw * 1.25))
+    assert torch.allclose(mse, (prediction - targets) ** 2)
+    objective.mean().backward()
+    assert raw.grad is not None
+    assert torch.isfinite(raw.grad).all()
+
+
+def test_binary_win_bce_preserves_gradient_on_confidently_wrong_value() -> None:
+    torch = pytest.importorskip("torch")
+    target = torch.tensor([-1.0])
+    raw_mse = torch.tensor([4.0], requires_grad=True)
+    mse, _, _ = train_bc._scalar_value_objective_errors(
+        raw_mse,
+        target,
+        objective="mse",
+        readout="deployed_tanh",
+        scale=1.0,
+    )
+    mse.mean().backward()
+    mse_gradient = abs(float(raw_mse.grad.item()))
+
+    raw_bce = torch.tensor([4.0], requires_grad=True)
+    bce, _, _ = train_bc._scalar_value_objective_errors(
+        raw_bce,
+        target,
+        objective="binary_win_bce",
+        readout="deployed_tanh",
+        scale=1.0,
+    )
+    bce.mean().backward()
+    bce_gradient = abs(float(raw_bce.grad.item()))
+
+    assert bce_gradient > 100.0 * mse_gradient
+
+
+def test_xdim_binary_win_bce_keeps_mse_as_a_separate_diagnostic() -> None:
+    torch = pytest.importorskip("torch")
+    policy, data = _validation_fixture()
+    with torch.no_grad():
+        policy.model.marker.fill_(2.0)
+
+    metrics = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        scalar_value_objective="binary_win_bce",
+        scalar_value_loss_readout="deployed_tanh",
+        scalar_value_loss_scale=1.0,
+    )
+
+    # Two wins and two losses at one shared logit produce the balanced binary
+    # CE below. The deployed MSE is intentionally different and independently
+    # aggregated so reports cannot call BCE "scalar MSE".
+    expected_bce = (
+        torch.nn.functional.binary_cross_entropy_with_logits(
+            torch.full((4,), 4.0),
+            torch.tensor([1.0, 0.0, 0.0, 1.0]),
+        )
+        .detach()
+        .item()
+    )
+    bounded = float(np.tanh(2.0))
+    expected_mse = ((bounded - 1.0) ** 2 + (bounded + 1.0) ** 2) / 2.0
+    assert metrics["value_loss"] == pytest.approx(expected_bce)
+    assert metrics["scalar_value_mse_diagnostic"] == pytest.approx(
+        expected_mse
+    )
+    assert metrics["primary_value_loss_kind"] == "binary_win_bce"
+    assert metrics["loss"] == pytest.approx(expected_bce)
+    assert metrics["loss_denominators"][
+        "scalar_value_mse_diagnostic"
+    ] == pytest.approx(4.0)
 
 
 def test_xdim_validation_hlgauss_is_categorical_primary_not_double_weighted() -> None:
@@ -697,3 +832,55 @@ def test_xdim_train_and_validation_share_deployed_tanh_value_semantics() -> None
 
     assert trained["value_loss"] == pytest.approx(validated["value_loss"])
     assert trained["loss"] == pytest.approx(validated["loss"])
+
+
+def test_xdim_train_and_validation_share_binary_win_bce_semantics() -> None:
+    torch = pytest.importorskip("torch")
+    policy, data = _validation_fixture()
+    with torch.no_grad():
+        policy.model.marker.fill_(1.25)
+    optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
+    batch = np.arange(len(data["action_taken"]), dtype=np.int64)
+    weights = np.ones(len(batch), dtype=np.float32)
+
+    trained = _train_xdim_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        weights,
+        weights,
+        1.0,
+        0.0,
+        "policy",
+        0.5,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        (),
+        10,
+        "none",
+        1.0,
+        5.0,
+        0.0,
+        diagnostics=False,
+        scalar_value_objective="binary_win_bce",
+        scalar_value_loss_readout="deployed_tanh",
+        scalar_value_loss_scale=1.0,
+    )
+    validated = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        scalar_value_objective="binary_win_bce",
+        scalar_value_loss_readout="deployed_tanh",
+    )
+
+    assert trained["value_loss"] == pytest.approx(validated["value_loss"])
+    assert trained["scalar_value_mse_diagnostic"] == pytest.approx(
+        validated["scalar_value_mse_diagnostic"]
+    )
+    assert trained["primary_value_loss_kind"] == "binary_win_bce"
+    assert validated["primary_value_loss_kind"] == "binary_win_bce"

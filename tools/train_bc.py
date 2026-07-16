@@ -1400,6 +1400,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--scalar-value-objective",
+        choices=("mse", "binary_win_bce"),
+        default="mse",
+        help=(
+            "Objective applied to the scalar value head. 'mse' preserves the "
+            "historical regression objective selected by "
+            "--scalar-value-loss-readout. 'binary_win_bce' is an experimental "
+            "Bernoulli win/loss objective: target=(z+1)/2 and "
+            "logit=2*--scalar-value-loss-scale*raw. It therefore requires "
+            "--scalar-value-loss-readout=deployed_tanh, whose deployed search "
+            "value remains tanh(scale*raw)."
+        ),
+    )
+    parser.add_argument(
         "--scalar-value-loss-readout",
         choices=("raw", "deployed_tanh"),
         default="raw",
@@ -2259,12 +2273,35 @@ def _resolve_value_objective_weights(args) -> tuple[float, float]:
 
 
 def _scalar_value_loss_contract(args) -> dict[str, object]:
+    objective = str(getattr(args, "scalar_value_objective", "mse"))
     mode = str(getattr(args, "scalar_value_loss_readout", "raw"))
     scale = float(getattr(args, "scalar_value_loss_scale", 1.0))
+    if objective not in {"mse", "binary_win_bce"}:
+        raise SystemExit(f"unknown scalar value objective: {objective!r}")
     if mode not in {"raw", "deployed_tanh"}:
         raise SystemExit(f"unknown scalar value loss readout: {mode!r}")
     if not math.isfinite(scale) or scale <= 0.0:
         raise SystemExit("--scalar-value-loss-scale must be finite and > 0")
+    if objective == "binary_win_bce":
+        if mode != "deployed_tanh":
+            raise SystemExit(
+                "--scalar-value-objective=binary_win_bce requires "
+                "--scalar-value-loss-readout=deployed_tanh so the Bernoulli "
+                "probability and deployed scalar value are the same readout"
+            )
+        return {
+            "schema_version": "scalar-value-objective-v2",
+            "objective": objective,
+            "readout": mode,
+            "scale": scale,
+            "target_formula": "(z + 1) / 2",
+            "logit_formula": "2 * scale * raw",
+            "deployed_value_formula": "tanh(raw * scale)",
+            "matches_scalar_mcts_when_value_squash_tanh": True,
+        }
+    # Preserve the exact historical contract at the default. Existing sealed
+    # MSE recipes and checkpoint receipts must not drift merely because the
+    # experimental objective became available.
     return {
         "schema_version": "scalar-value-loss-readout-v1",
         "readout": mode,
@@ -2289,6 +2326,72 @@ def _scalar_value_loss_prediction(raw_value, *, readout: str, scale: float):
         # the same function after converting the network output to a host float.
         return torch.tanh(raw_value.float() * float(scale))
     raise ValueError(f"unknown scalar value loss readout: {mode!r}")
+
+
+def _scalar_value_objective_errors(
+    raw_value,
+    outcome_targets,
+    *,
+    objective: str,
+    readout: str,
+    scale: float,
+):
+    """Return ``(objective_error, deployed_mse_error, value_prediction)``.
+
+    Binary win BCE uses the exact logistic parameterization corresponding to
+    the deployed tanh value:
+
+    ``2 * sigmoid(2*x) - 1 == tanh(x)``.
+
+    The MSE diagnostic is intentionally computed separately from the selected
+    training objective so BCE runs remain comparable to historical scalar
+    validation without mislabelling BCE as MSE.
+    """
+
+    import torch
+    from torch import nn
+
+    mode = str(objective)
+    value_prediction = _scalar_value_loss_prediction(
+        raw_value,
+        readout=readout,
+        scale=scale,
+    )
+    mse_error = nn.functional.mse_loss(
+        value_prediction,
+        outcome_targets,
+        reduction="none",
+    )
+    if mode == "mse":
+        return mse_error, mse_error, value_prediction
+    if mode != "binary_win_bce":
+        raise ValueError(f"unknown scalar value objective: {mode!r}")
+    if str(readout) != "deployed_tanh":
+        raise ValueError(
+            "binary_win_bce requires the deployed_tanh scalar value readout"
+        )
+    target = outcome_targets.float()
+    if not bool(torch.isfinite(target).all()):
+        raise ValueError("binary_win_bce received non-finite value targets")
+    if bool(((target < -1.0) | (target > 1.0)).any()):
+        raise ValueError("binary_win_bce value targets must lie in [-1, 1]")
+    binary_target = (target + 1.0) * 0.5
+    binary_logit = raw_value.float() * (2.0 * float(scale))
+    objective_error = nn.functional.binary_cross_entropy_with_logits(
+        binary_logit,
+        binary_target,
+        reduction="none",
+    )
+    return objective_error, mse_error, value_prediction
+
+
+def _scalar_value_primary_loss_kind(objective: str) -> str:
+    mode = str(objective)
+    if mode == "mse":
+        return "scalar_mse"
+    if mode == "binary_win_bce":
+        return "binary_win_bce"
+    raise ValueError(f"unknown scalar value objective: {mode!r}")
 
 
 def _value_trunk_gradient_routing(
@@ -2426,6 +2529,9 @@ def _value_training_metadata(
         "schema_version": "value-training-v1",
         "primary_readout": primary_readout,
         "trained_value_readouts": trained_readouts,
+        "scalar_value_objective": str(
+            getattr(args, "scalar_value_objective", "mse")
+        ),
         "resolved_scalar_mse_weight": float(scalar_weight),
         "resolved_categorical_ce_weight": float(categorical_weight),
         "hlgauss_scalar_aux_loss_weight": float(
@@ -5286,6 +5392,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "policy_kl_target", "policy_kl_dual_lr", "policy_kl_max_weight",
         "policy_target_blend_semantics", "q_loss_weight", "soft_target_source",
         "soft_target_temperature", "soft_target_weight",
+        "scalar_value_objective", "scalar_value_loss_readout",
+        "scalar_value_loss_scale",
         "truncated_vp_margin_value_weight",
         "value_target_lambda",
         "value_categorical_bins", "value_categorical_loss_weight",
@@ -6241,6 +6349,9 @@ def _validate_composite_learner_recipe_authorization(
         "soft_target_min_legal_coverage": float,
         "soft_target_temperature": float,
         "soft_target_weight": float,
+        "scalar_value_objective": str,
+        "scalar_value_loss_readout": str,
+        "scalar_value_loss_scale": float,
         "truncated_vp_margin_value_weight": float,
         "value_target_lambda": float,
         "value_categorical_bins": int,
@@ -8350,6 +8461,23 @@ def _validate_a1_learner_objective(
         raise SystemExit(
             "A1 scalar value loss scale differs from the immutable contract"
         )
+    expected_scalar_objective = str(
+        objective.get(
+            "scalar_value_objective",
+            (
+                bound.get("learner_training_recipe", {})
+                if isinstance(bound.get("learner_training_recipe"), dict)
+                else {}
+            ).get("scalar_value_objective", "mse"),
+        )
+    )
+    if (
+        str(getattr(args, "scalar_value_objective", "mse"))
+        != expected_scalar_objective
+    ):
+        raise SystemExit(
+            "A1 scalar value objective differs from the immutable contract"
+        )
     if mode == "mse":
         if int(getattr(args, "value_categorical_bins", 0)) != 0:
             raise SystemExit("A1 scalar learner cannot construct categorical bins")
@@ -8544,6 +8672,14 @@ def _effective_a1_learner_training_recipe(
     scalar_value_loss_scale = float(
         getattr(args, "scalar_value_loss_scale", 1.0)
     )
+    scalar_value_objective = str(
+        getattr(args, "scalar_value_objective", "mse")
+    )
+    if scalar_value_objective != "mse":
+        # Experimental scalar objectives are science-critical and must be
+        # represented explicitly in every sealed recipe. The historical MSE
+        # default remains omitted so old recipe hashes stay byte-identical.
+        effective["scalar_value_objective"] = scalar_value_objective
     if scalar_value_loss_readout != "raw" or scalar_value_loss_scale != 1.0:
         # Historical scalar recipes optimize the raw head and omit these
         # additive fields. New recipes bind the exact deployed search operator.
@@ -12440,6 +12576,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             {
                 "progress": "value_objective",
                 "value_head_type": str(args.value_head_type),
+                "scalar_value_objective": str(args.scalar_value_objective),
                 "primary_value_loss_weight": float(args.value_loss_weight),
                 "resolved_scalar_mse_weight": resolved_scalar_value_weight,
                 "resolved_categorical_ce_weight": resolved_categorical_value_weight,
@@ -14313,6 +14450,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.advantage_weight_cap,
                     args.advantage_weight_floor,
                     args.amp,
+                    scalar_value_objective=str(args.scalar_value_objective),
                     scalar_value_loss_readout=str(
                         args.scalar_value_loss_readout
                     ),
@@ -14804,6 +14942,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "policy_base_loss": 0.0,
             "policy_aux_loss": 0.0,
             "value_loss": 0.0,
+            "scalar_value_mse_diagnostic": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
             "policy_kl_anchor_loss": 0.0,
@@ -14828,6 +14967,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "policy_base_loss": 0.0,
             "policy_aux_loss": 0.0,
             "value_loss": 0.0,
+            "scalar_value_mse_diagnostic": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
             "policy_kl_anchor_loss": 0.0,
@@ -15169,6 +15309,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.advantage_weight_cap,
                     args.advantage_weight_floor,
                     args.amp,
+                    scalar_value_objective=str(args.scalar_value_objective),
                     scalar_value_loss_readout=str(
                         args.scalar_value_loss_readout
                     ),
@@ -15618,6 +15759,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             for key in (
                 "policy_loss",
                 "value_loss",
+                "scalar_value_mse_diagnostic",
                 "final_vp_loss",
                 "q_loss",
                 "policy_kl_anchor_loss",
@@ -16213,6 +16355,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         value_loss_epoch = _metric_from_sum_denominator(
             epoch_extra_sums["value_loss"], epoch_extra_denominators["value_loss"]
         )
+        scalar_value_mse_diagnostic_epoch = _metric_from_sum_denominator(
+            epoch_extra_sums["scalar_value_mse_diagnostic"],
+            epoch_extra_denominators["scalar_value_mse_diagnostic"],
+        )
         final_vp_loss_epoch = _metric_from_sum_denominator(
             epoch_extra_sums["final_vp_loss"], epoch_extra_denominators["final_vp_loss"]
         )
@@ -16549,7 +16695,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "observations": epoch_objective_gradient_observations,
                 },
                 "value_loss": value_loss_epoch,
-                "scalar_value_mse_diagnostic": value_loss_epoch,
+                "scalar_value_mse_diagnostic": (
+                    scalar_value_mse_diagnostic_epoch
+                ),
                 "final_vp_loss": final_vp_loss_epoch,
                 "q_loss": q_loss_epoch,
                 **auxiliary_loss_epochs,
@@ -16562,7 +16710,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "primary_value_loss_kind": (
                     "hlgauss_ce"
                     if resolved_categorical_value_weight > 0.0
-                    else "scalar_mse"
+                    else _scalar_value_primary_loss_kind(
+                        args.scalar_value_objective
+                    )
                 ),
                 "loss_denominators": {
                     key: value
@@ -16926,6 +17076,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 data_loader_workers=int(args.data_loader_workers),
                 data_loader_prefetch=int(args.data_loader_prefetch),
+                scalar_value_objective=str(args.scalar_value_objective),
                 scalar_value_loss_readout=str(args.scalar_value_loss_readout),
                 scalar_value_loss_scale=float(args.scalar_value_loss_scale),
                 value_validation_action_types_by_id=(
@@ -17028,6 +17179,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 data_sharded=bool(args.ddp_shard_data),
                 data_loader_workers=int(args.data_loader_workers),
                 data_loader_prefetch=int(args.data_loader_prefetch),
+                scalar_value_objective=str(args.scalar_value_objective),
                 scalar_value_loss_readout=str(args.scalar_value_loss_readout),
                 scalar_value_loss_scale=float(args.scalar_value_loss_scale),
                 value_validation_action_types_by_id=(
@@ -17075,6 +17227,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     data_sharded=bool(args.ddp_shard_data),
                     data_loader_workers=int(args.data_loader_workers),
                     data_loader_prefetch=int(args.data_loader_prefetch),
+                    scalar_value_objective=str(args.scalar_value_objective),
                     scalar_value_loss_readout=str(args.scalar_value_loss_readout),
                     scalar_value_loss_scale=float(args.scalar_value_loss_scale),
                     value_validation_action_types_by_id=(
@@ -18188,6 +18341,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_trunk_grad_scale": args.value_trunk_grad_scale,
         "value_gradient_routing": args.value_gradient_routing,
         "resolved_scalar_value_loss_weight": resolved_scalar_value_weight,
+        "scalar_value_objective": str(args.scalar_value_objective),
         "scalar_value_loss_contract": args.scalar_value_loss_contract,
         "truncated_vp_margin_value_weight": float(args.truncated_vp_margin_value_weight),
         "final_vp_loss_weight": args.final_vp_loss_weight,
@@ -18457,6 +18611,7 @@ def _train_candidate_batch(
     max_grad_norm: float = 1.0,
     diagnostics: bool = True,
     truncated_vp_margin_value_weight: float = 0.0,
+    scalar_value_objective: str = "mse",
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
 ) -> dict:
@@ -18475,11 +18630,6 @@ def _train_candidate_batch(
     actions = torch.as_tensor(data["action_taken"][batch].astype(np.int64), device=policy.device)
     valid = _valid_lists(data["legal_action_ids"][batch])
     logits, raw_values = policy.forward(obs, context_t)
-    values = _scalar_value_loss_prediction(
-        raw_values,
-        readout=scalar_value_loss_readout,
-        scale=scalar_value_loss_scale,
-    )
     masked = _torch_ppo_masked_logits(logits, valid, policy.action_size)
     policy_weights = torch.as_tensor(
         policy_sample_weights[batch],
@@ -18529,11 +18679,24 @@ def _train_candidate_batch(
         truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
     )
     value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+    scalar_value_mse_diagnostic = torch.tensor(
+        0.0, dtype=torch.float32, device=policy.device
+    )
     value_active_mask = torch.zeros(
         len(batch), dtype=torch.bool, device=policy.device
     )
     if outcome_targets is not None:
-        value_error = nn.functional.mse_loss(values, outcome_targets, reduction="none")
+        (
+            value_error,
+            scalar_value_mse_error,
+            _value_prediction,
+        ) = _scalar_value_objective_errors(
+            raw_values,
+            outcome_targets,
+            objective=scalar_value_objective,
+            readout=scalar_value_loss_readout,
+            scale=scalar_value_loss_scale,
+        )
         value_loss = _weighted_mean_loss(
             value_error,
             value_weights * outcome_confidence,
@@ -18544,12 +18707,29 @@ def _train_candidate_batch(
             value_weights * outcome_confidence,
             mask=has_outcome,
         )
+        scalar_value_mse_diagnostic = _weighted_mean_loss(
+            scalar_value_mse_error,
+            value_weights * outcome_confidence,
+            mask=has_outcome,
+        )
+        (
+            scalar_value_mse_diagnostic_sum,
+            scalar_value_mse_diagnostic_denominator,
+        ) = _weighted_loss_parts(
+            scalar_value_mse_error,
+            value_weights * outcome_confidence,
+            mask=has_outcome,
+        )
         value_active_mask = has_outcome & (
             (value_weights * outcome_confidence) > 0.0
         )
         value_active_count = int(value_active_mask.sum().item())
     else:
         value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+        (
+            scalar_value_mse_diagnostic_sum,
+            scalar_value_mse_diagnostic_denominator,
+        ) = _zero_loss_parts(policy.device)
         value_active_count = 0
     loss = float(policy_loss_weight) * policy_loss + float(value_loss_weight) * value_loss
     if not torch.isfinite(loss):
@@ -18640,6 +18820,13 @@ def _train_candidate_batch(
         "loss": float(loss.item()),
         "policy_loss": float(policy_loss.item()),
         "value_loss": float(value_loss.item()),
+        "primary_value_loss": float(value_loss.item()),
+        "primary_value_loss_kind": _scalar_value_primary_loss_kind(
+            scalar_value_objective
+        ),
+        "scalar_value_mse_diagnostic": float(
+            scalar_value_mse_diagnostic.item()
+        ),
         "final_vp_loss": 0.0,
         "q_loss": 0.0,
         "policy_loss_weighted_sum": float(policy_loss_sum.item()),
@@ -18648,6 +18835,12 @@ def _train_candidate_batch(
         "policy_aux_loss_weight_sum": 0.0,
         "value_loss_weighted_sum": float(value_loss_sum.item()),
         "value_loss_weight_sum": float(value_loss_denominator.item()),
+        "scalar_value_mse_diagnostic_weighted_sum": float(
+            scalar_value_mse_diagnostic_sum.item()
+        ),
+        "scalar_value_mse_diagnostic_weight_sum": float(
+            scalar_value_mse_diagnostic_denominator.item()
+        ),
         "final_vp_loss_weighted_sum": 0.0,
         "final_vp_loss_weight_sum": 0.0,
         "q_loss_weighted_sum": 0.0,
@@ -19490,6 +19683,7 @@ def _train_xdim_batch(
     measure_objective_gradient_interference: bool = False,
     measure_aux_gradient_geometry_only: bool = False,
     value_trunk_grad_scale: float = 1.0,
+    scalar_value_objective: str = "mse",
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
     fixed_policy_weight_mean: float | None = None,
@@ -19827,22 +20021,43 @@ def _train_xdim_batch(
             + float(policy_aux_loss_weight) * policy_aux_loss
         )
         value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        scalar_value_mse_diagnostic = torch.tensor(
+            0.0, dtype=torch.float32, device=policy.device
+        )
         final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         value_active_mask = torch.zeros(
             len(batch), dtype=torch.bool, device=policy.device
         )
         if value_outcome_targets is not None and "value" in outputs:
-            scalar_value_prediction = _scalar_value_loss_prediction(
+            (
+                value_error,
+                scalar_value_mse_error,
+                _scalar_value_prediction,
+            ) = _scalar_value_objective_errors(
                 outputs["value"],
+                value_outcome_targets,
+                objective=scalar_value_objective,
                 readout=scalar_value_loss_readout,
                 scale=scalar_value_loss_scale,
             )
-            value_error = nn.functional.mse_loss(
-                scalar_value_prediction, value_outcome_targets, reduction="none"
-            )
             value_loss = _weighted_mean_loss(
                 value_error,
+                value_weights * outcome_confidence,
+                mask=value_has_outcome,
+                fixed_weight_mean=fixed_value_effective_weight_mean,
+            )
+            scalar_value_mse_diagnostic = _weighted_mean_loss(
+                scalar_value_mse_error,
+                value_weights * outcome_confidence,
+                mask=value_has_outcome,
+                fixed_weight_mean=fixed_value_effective_weight_mean,
+            )
+            (
+                scalar_value_mse_diagnostic_sum,
+                scalar_value_mse_diagnostic_denominator,
+            ) = _weighted_loss_parts(
+                scalar_value_mse_error,
                 value_weights * outcome_confidence,
                 mask=value_has_outcome,
                 fixed_weight_mean=fixed_value_effective_weight_mean,
@@ -19859,6 +20074,10 @@ def _train_xdim_batch(
             value_active_count = int(value_active_mask.sum().item())
         else:
             value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+            (
+                scalar_value_mse_diagnostic_sum,
+                scalar_value_mse_diagnostic_denominator,
+            ) = _zero_loss_parts(policy.device)
             value_active_count = 0
         if vp_targets is not None and "final_vp" in outputs:
             vp_error = nn.functional.mse_loss(outputs["final_vp"], vp_targets, reduction="none")
@@ -20488,9 +20707,11 @@ def _train_xdim_batch(
         "primary_value_loss_kind": (
             "hlgauss_ce"
             if float(value_categorical_loss_weight) > 0.0
-            else "scalar_mse"
+            else _scalar_value_primary_loss_kind(scalar_value_objective)
         ),
-        "scalar_value_mse_diagnostic": float(value_loss.item()),
+        "scalar_value_mse_diagnostic": float(
+            scalar_value_mse_diagnostic.item()
+        ),
         "policy_loss_weighted_sum": float(
             (policy_loss.detach() * policy_base_loss_denominator).item()
         ),
@@ -20508,6 +20729,12 @@ def _train_xdim_batch(
         "policy_aux_loss_coefficient": float(policy_aux_loss_weight),
         "value_loss_weighted_sum": float(value_loss_sum.item()),
         "value_loss_weight_sum": float(value_loss_denominator.item()),
+        "scalar_value_mse_diagnostic_weighted_sum": float(
+            scalar_value_mse_diagnostic_sum.item()
+        ),
+        "scalar_value_mse_diagnostic_weight_sum": float(
+            scalar_value_mse_diagnostic_denominator.item()
+        ),
         "final_vp_loss_weighted_sum": float(final_vp_loss_sum.item()),
         "final_vp_loss_weight_sum": float(final_vp_loss_denominator.item()),
         "q_loss_weighted_sum": float(q_loss_sum.item()),
@@ -21530,6 +21757,10 @@ def _finalize_value_validation_strata(
 _TRAINING_OBJECTIVE_METRIC_KEYS = (
     "policy_loss",
     "value_loss",
+    # Diagnostic only (its coefficient is absent/zero), but it needs the same
+    # exact component/game/row aggregation as the scalar objective so BCE
+    # reports remain comparable to historical MSE.
+    "scalar_value_mse_diagnostic",
     "final_vp_loss",
     "q_loss",
     "policy_kl_anchor_loss",
@@ -21898,12 +22129,6 @@ def _objective_measure_validation_aggregate(
             if target_prior_legacy > 1.0e-8
             else 0.0
         )
-    # These are aliases of reconstructed objective terms, not independently
-    # normalized game means. Leaving the weighted game-average values in place
-    # made the report internally inconsistent after exact sufficient-statistic
-    # aggregation and could steer value-arm selection with a different measure.
-    if "value_loss" in metrics:
-        metrics["scalar_value_mse_diagnostic"] = metrics["value_loss"]
     if coefficients:
         categorical_active = float(
             coefficients.get("value_categorical_loss", 0.0)
@@ -22223,6 +22448,7 @@ def evaluate_bc_batches(
     value_root_blend_global_compat: bool = False,
     data_loader_workers: int = 0,
     data_loader_prefetch: int = 2,
+    scalar_value_objective: str = "mse",
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
     value_validation_action_types_by_id: tuple[str, ...] | None = None,
@@ -22238,6 +22464,7 @@ def evaluate_bc_batches(
         extra_sums: dict[str, float] = {
             "policy_loss": 0.0,
             "value_loss": 0.0,
+            "scalar_value_mse_diagnostic": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
             "policy_kl_anchor_loss": 0.0,
@@ -22266,6 +22493,7 @@ def evaluate_bc_batches(
         extra_denominators: dict[str, float] = {
             "policy_loss": 0.0,
             "value_loss": 0.0,
+            "scalar_value_mse_diagnostic": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
             "policy_kl_anchor_loss": 0.0,
@@ -22376,6 +22604,7 @@ def evaluate_bc_batches(
                 amp,
                 policy_target_blend_semantics=policy_target_blend_semantics,
                 truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+                scalar_value_objective=scalar_value_objective,
                 scalar_value_loss_readout=scalar_value_loss_readout,
                 scalar_value_loss_scale=scalar_value_loss_scale,
                 **eval_fn_extra_kwargs,
@@ -22384,6 +22613,7 @@ def evaluate_bc_batches(
             for key in (
                 "policy_loss",
                 "value_loss",
+                "scalar_value_mse_diagnostic",
                 "final_vp_loss",
                 "q_loss",
                 "policy_kl_anchor_loss",
@@ -22503,6 +22733,10 @@ def evaluate_bc_batches(
         value_loss_eval = _metric_from_sum_denominator(
             extra_sums["value_loss"], extra_denominators["value_loss"]
         )
+        scalar_value_mse_diagnostic_eval = _metric_from_sum_denominator(
+            extra_sums["scalar_value_mse_diagnostic"],
+            extra_denominators["scalar_value_mse_diagnostic"],
+        )
         final_vp_loss_eval = _metric_from_sum_denominator(
             extra_sums["final_vp_loss"], extra_denominators["final_vp_loss"]
         )
@@ -22567,7 +22801,7 @@ def evaluate_bc_batches(
             "component_reconstructed_loss": component_reconstructed_loss,
             "policy_loss": policy_loss_eval,
             "value_loss": value_loss_eval,
-            "scalar_value_mse_diagnostic": value_loss_eval,
+            "scalar_value_mse_diagnostic": scalar_value_mse_diagnostic_eval,
             "value_mse_strata": _finalize_value_validation_strata(
                 value_mse_strata_sufficient_statistics
             ),
@@ -22587,7 +22821,7 @@ def evaluate_bc_batches(
             "primary_value_loss_kind": (
                 "hlgauss_ce"
                 if float(value_categorical_loss_weight) > 0.0
-                else "scalar_mse"
+                else _scalar_value_primary_loss_kind(scalar_value_objective)
             ),
             "loss_denominators": {
                 key: value
@@ -22820,6 +23054,7 @@ def _eval_candidate_batch(
     *,
     policy_target_blend_semantics: str = POLICY_TARGET_BLEND_LEGACY_V1,
     truncated_vp_margin_value_weight: float = 0.0,
+    scalar_value_objective: str = "mse",
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
 ) -> dict:
@@ -22840,11 +23075,6 @@ def _eval_candidate_batch(
         actions = torch.as_tensor(data["action_taken"][batch].astype(np.int64), device=policy.device)
         valid = _valid_lists(data["legal_action_ids"][batch])
         logits, raw_values = policy.forward(obs, context_t)
-        values = _scalar_value_loss_prediction(
-            raw_values,
-            readout=scalar_value_loss_readout,
-            scale=scalar_value_loss_scale,
-        )
         masked = _torch_ppo_masked_logits(logits, valid, policy.action_size)
         policy_weights = torch.as_tensor(
             policy_sample_weights[batch],
@@ -22888,16 +23118,47 @@ def _eval_candidate_batch(
             truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
         )
         value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+        scalar_value_mse_diagnostic = torch.tensor(
+            0.0, dtype=torch.float32, device=policy.device
+        )
         if outcome_targets is not None:
-            value_error = nn.functional.mse_loss(values, outcome_targets, reduction="none")
+            (
+                value_error,
+                scalar_value_mse_error,
+                _value_prediction,
+            ) = _scalar_value_objective_errors(
+                raw_values,
+                outcome_targets,
+                objective=scalar_value_objective,
+                readout=scalar_value_loss_readout,
+                scale=scalar_value_loss_scale,
+            )
             value_loss_sum, value_loss_denominator = _weighted_loss_parts(
                 value_error,
                 value_weights * outcome_confidence,
                 mask=has_outcome,
             )
             value_loss = value_loss_sum / torch.clamp(value_loss_denominator, min=1e-6)
+            (
+                scalar_value_mse_diagnostic_sum,
+                scalar_value_mse_diagnostic_denominator,
+            ) = _weighted_loss_parts(
+                scalar_value_mse_error,
+                value_weights * outcome_confidence,
+                mask=has_outcome,
+            )
+            scalar_value_mse_diagnostic = (
+                scalar_value_mse_diagnostic_sum
+                / torch.clamp(
+                    scalar_value_mse_diagnostic_denominator, min=1e-6
+                )
+            )
         else:
             value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+            (
+                scalar_value_mse_diagnostic_sum,
+                scalar_value_mse_diagnostic_denominator,
+            ) = _zero_loss_parts(policy.device)
         loss = float(policy_loss_weight) * policy_loss + float(value_loss_weight) * value_loss
         predictions = torch.argmax(masked, dim=-1)
         active = policy_weights > 0.0
@@ -22923,12 +23184,25 @@ def _eval_candidate_batch(
             "loss": float(loss.item()),
             "policy_loss": float(policy_loss.item()),
             "value_loss": float(value_loss.item()),
+            "primary_value_loss": float(value_loss.item()),
+            "primary_value_loss_kind": _scalar_value_primary_loss_kind(
+                scalar_value_objective
+            ),
+            "scalar_value_mse_diagnostic": float(
+                scalar_value_mse_diagnostic.item()
+            ),
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
             "policy_loss_weighted_sum": float(policy_loss_sum.item()),
             "policy_loss_weight_sum": float(policy_loss_denominator.item()),
             "value_loss_weighted_sum": float(value_loss_sum.item()),
             "value_loss_weight_sum": float(value_loss_denominator.item()),
+            "scalar_value_mse_diagnostic_weighted_sum": float(
+                scalar_value_mse_diagnostic_sum.item()
+            ),
+            "scalar_value_mse_diagnostic_weight_sum": float(
+                scalar_value_mse_diagnostic_denominator.item()
+            ),
             "final_vp_loss_weighted_sum": 0.0,
             "final_vp_loss_weight_sum": 0.0,
             "q_loss_weighted_sum": 0.0,
@@ -23011,6 +23285,7 @@ def _eval_xdim_batch(
     value_target_lambda: float = 1.0,
     value_root_blend_phases: tuple[str, ...] = (),
     value_root_blend_global_compat: bool = False,
+    scalar_value_objective: str = "mse",
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
     value_validation_action_types_by_id: tuple[str, ...] | None = None,
@@ -23146,17 +23421,23 @@ def _eval_xdim_batch(
             policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
             policy_loss = policy_loss_sum / torch.clamp(policy_loss_denominator, min=1e-6)
             value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+            scalar_value_mse_diagnostic = torch.tensor(
+                0.0, dtype=torch.float32, device=policy.device
+            )
             value_mse_strata_sufficient_statistics = {}
             final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             if value_outcome_targets is not None and "value" in outputs:
-                scalar_value_prediction = _scalar_value_loss_prediction(
+                (
+                    value_error,
+                    scalar_value_mse_error,
+                    _scalar_value_prediction,
+                ) = _scalar_value_objective_errors(
                     outputs["value"],
+                    value_outcome_targets,
+                    objective=scalar_value_objective,
                     readout=scalar_value_loss_readout,
                     scale=scalar_value_loss_scale,
-                )
-                value_error = nn.functional.mse_loss(
-                    scalar_value_prediction, value_outcome_targets, reduction="none"
                 )
                 value_loss_sum, value_loss_denominator = _weighted_loss_parts(
                     value_error,
@@ -23164,12 +23445,26 @@ def _eval_xdim_batch(
                     mask=value_has_outcome,
                 )
                 value_loss = value_loss_sum / torch.clamp(value_loss_denominator, min=1e-6)
+                (
+                    scalar_value_mse_diagnostic_sum,
+                    scalar_value_mse_diagnostic_denominator,
+                ) = _weighted_loss_parts(
+                    scalar_value_mse_error,
+                    value_weights * outcome_confidence,
+                    mask=value_has_outcome,
+                )
+                scalar_value_mse_diagnostic = (
+                    scalar_value_mse_diagnostic_sum
+                    / torch.clamp(
+                        scalar_value_mse_diagnostic_denominator, min=1e-6
+                    )
+                )
                 effective_value_weights = value_weights * outcome_confidence
                 value_mse_strata_sufficient_statistics = (
                     _value_validation_strata_parts(
                         data,
                         batch,
-                        value_error,
+                        scalar_value_mse_error,
                         effective_value_weights,
                         value_has_outcome & (effective_value_weights > 0.0),
                         action_types_by_id=value_validation_action_types_by_id,
@@ -23177,6 +23472,10 @@ def _eval_xdim_batch(
                 )
             else:
                 value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
+                (
+                    scalar_value_mse_diagnostic_sum,
+                    scalar_value_mse_diagnostic_denominator,
+                ) = _zero_loss_parts(policy.device)
             if vp_targets is not None and "final_vp" in outputs:
                 vp_error = nn.functional.mse_loss(outputs["final_vp"], vp_targets, reduction="none")
                 final_vp_loss_sum, final_vp_loss_denominator = _weighted_loss_parts(
@@ -23549,9 +23848,11 @@ def _eval_xdim_batch(
             "primary_value_loss_kind": (
                 "hlgauss_ce"
                 if float(value_categorical_loss_weight) > 0.0
-                else "scalar_mse"
+                else _scalar_value_primary_loss_kind(scalar_value_objective)
             ),
-            "scalar_value_mse_diagnostic": float(value_loss.item()),
+            "scalar_value_mse_diagnostic": float(
+                scalar_value_mse_diagnostic.item()
+            ),
             "value_mse_strata_sufficient_statistics": (
                 value_mse_strata_sufficient_statistics
             ),
@@ -23559,6 +23860,12 @@ def _eval_xdim_batch(
             "policy_loss_weight_sum": float(policy_loss_denominator.item()),
             "value_loss_weighted_sum": float(value_loss_sum.item()),
             "value_loss_weight_sum": float(value_loss_denominator.item()),
+            "scalar_value_mse_diagnostic_weighted_sum": float(
+                scalar_value_mse_diagnostic_sum.item()
+            ),
+            "scalar_value_mse_diagnostic_weight_sum": float(
+                scalar_value_mse_diagnostic_denominator.item()
+            ),
             "final_vp_loss_weighted_sum": float(final_vp_loss_sum.item()),
             "final_vp_loss_weight_sum": float(final_vp_loss_denominator.item()),
             "q_loss_weighted_sum": float(q_loss_sum.item()),
@@ -38063,6 +38370,9 @@ def _training_resume_recipe_identity(
         # restore Adam/RNG/LR state under another.
         "public_card_lr_mult": float(
             getattr(args, "public_card_lr_mult", 1.0)
+        ),
+        "scalar_value_objective": str(
+            getattr(args, "scalar_value_objective", "mse")
         ),
         "scalar_value_loss_readout": str(
             getattr(args, "scalar_value_loss_readout", "raw")

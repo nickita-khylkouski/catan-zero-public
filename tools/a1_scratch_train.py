@@ -611,6 +611,7 @@ def build_train_command(
         ("soft_target_temperature", "--soft-target-temperature"),
         ("soft_target_min_legal_coverage", "--soft-target-min-legal-coverage"),
         ("value_loss_weight", "--value-loss-weight"),
+        ("scalar_value_objective", "--scalar-value-objective"),
         ("scalar_value_loss_readout", "--scalar-value-loss-readout"),
         ("scalar_value_loss_scale", "--scalar-value-loss-scale"),
         ("value_target_lambda", "--value-target-lambda"),
@@ -639,6 +640,7 @@ def build_train_command(
     )
     optional_scalar_defaults = {
         "public_card_lr_mult": 1.0,
+        "scalar_value_objective": "mse",
         "target_reliability_confidence_floor": 0.25,
         "policy_dose_lr_area": 0.0,
         "policy_dose_reference_global_batch_size": 0,
