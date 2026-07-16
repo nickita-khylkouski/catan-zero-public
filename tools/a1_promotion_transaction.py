@@ -767,6 +767,10 @@ def _training_evaluation_parent_sha256(
     """Return the causal learner parent, never an initializer transform."""
 
     curriculum_parent = report.get("a1_curriculum_parent")
+    if curriculum_parent is not None:
+        raise PromotionError(
+            "candidate chaining/curriculum lineage is not promotion-eligible"
+        )
     lineage_value = report.get("a1_lineage_dose")
     function_upgrade = (
         lineage_value.get("function_preserving_upgrade")
@@ -798,9 +802,7 @@ def _training_evaluation_parent_sha256(
     if explicit is not None:
         return _validate_sha256(explicit, where="training receipt evaluation parent")
     return (
-        curriculum_parent.get("generation_producer_sha256")
-        if isinstance(curriculum_parent, Mapping)
-        else function_upgrade.get("source_checkpoint_sha256")
+        function_upgrade.get("source_checkpoint_sha256")
         if isinstance(function_upgrade, Mapping)
         else report.get("init_checkpoint_sha256")
     )
@@ -1106,6 +1108,10 @@ def _verify_training_report(
     )
     init_sha = report.get("init_checkpoint_sha256")
     curriculum_parent = report.get("a1_curriculum_parent")
+    if curriculum_parent is not None:
+        raise PromotionError(
+            "candidate chaining/curriculum lineage is not promotion-eligible"
+        )
     architecture_upgrade_binding: dict[str, Any] | None = None
     if init_sha != producer_sha:
         lineage_value = report.get("a1_lineage_dose")
@@ -1166,51 +1172,10 @@ def _verify_training_report(
             ):
                 raise PromotionError("architecture-upgraded initializer bytes drifted")
         else:
-            # A combined-196k candidate is the sole supported curriculum
-            # exception. Its parent receipt is independently authenticated.
-            parent_checkpoint = (
-                curriculum_parent.get("parent_checkpoint")
-                if isinstance(curriculum_parent, dict)
-                else None
+            raise PromotionError(
+                "candidate training report init checkpoint differs from producer "
+                "without a typed function-preserving initializer transition"
             )
-            if (
-                not is_dual
-                or not isinstance(curriculum_parent, dict)
-                or set(curriculum_parent)
-                != {
-                    "schema_version",
-                    "receipt_path",
-                    "receipt_sha256",
-                    "parent_arm_id",
-                    "parent_subset_id",
-                    "parent_checkpoint",
-                    "generation_producer_sha256",
-                }
-                or curriculum_parent.get("schema_version")
-                != "a1-curriculum-parent-binding-v1"
-                or curriculum_parent.get("parent_arm_id") != "n256"
-                or curriculum_parent.get("parent_subset_id") != "full-56k"
-                or curriculum_parent.get("generation_producer_sha256") != producer_sha
-                or not isinstance(parent_checkpoint, dict)
-                or set(parent_checkpoint) != {"path", "sha256"}
-                or parent_checkpoint.get("sha256") != init_sha
-            ):
-                raise PromotionError(
-                    "candidate training report init checkpoint differs from producer"
-                )
-            parent_path = _canonical_existing_file(
-                Path(str(parent_checkpoint["path"])),
-                where="curriculum parent checkpoint",
-            )
-            parent_receipt = _canonical_existing_file(
-                Path(str(curriculum_parent["receipt_path"])),
-                where="curriculum parent receipt",
-            )
-            if (
-                _sha256(parent_path) != init_sha
-                or _sha256(parent_receipt) != curriculum_parent.get("receipt_sha256")
-            ):
-                raise PromotionError("curriculum parent checkpoint/receipt bytes drifted")
     elif report.get("a1_lineage_dose", {}).get("initializer_transition_chain") is not None:
         raise PromotionError("exact-parent report cannot claim an initializer transition")
     steps = report.get("steps_completed")
@@ -8300,7 +8265,6 @@ def _verify_adjudication(
         base=base,
         where="champion",
     )
-    curriculum_parent = training_report_payload.get("a1_curriculum_parent")
     lineage_value = training_report_payload.get("a1_lineage_dose")
     function_upgrade = (
         lineage_value.get("function_preserving_upgrade")
@@ -8333,13 +8297,12 @@ def _verify_adjudication(
             "candidate training parent/init checkpoint differs from adjudicated "
             "promotion baseline"
         )
-    # Ordinary candidates also bind the exact init path. Curriculum candidates
-    # legitimately warm-start from an intermediate dose, while their sealed
-    # generation producer remains the promotion parent checked above.
+    # Ordinary candidates bind the exact parent path. The only accepted
+    # initializer differences are replayed, typed function-preserving
+    # transforms; learned intermediate candidates are never valid initializers.
     init_path = training_report_payload.get("init_checkpoint")
     if (
         not branch_challenge
-        and curriculum_parent is None
         and function_upgrade is None
         and initializer_transition_chain is None
         and init_path is not None

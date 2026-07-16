@@ -5847,6 +5847,121 @@ def test_role_search_config_accepts_only_complete_native_runtime_binding() -> No
             )
 
 
+def _curriculum_training_report(
+    tmp_path: Path,
+) -> tuple[Path, Path, dict[str, Any]]:
+    producer = tmp_path / "producer.pt"
+    learned_parent = tmp_path / "n256-candidate.pt"
+    candidate = tmp_path / "combined-candidate.pt"
+    parent_receipt = tmp_path / "n256-training-receipt.json"
+    producer.write_bytes(b"raw producer")
+    learned_parent.write_bytes(b"learned n256 candidate")
+    candidate.write_bytes(b"combined candidate")
+    _write_json(parent_receipt, {"status": "complete"})
+
+    contract = _contract(producer=producer)
+    recipe = {
+        "world_size": 8,
+        "batch_size": 512,
+        "grad_accum_steps": 1,
+        "global_batch_size": 4096,
+        "ddp_shard_data": False,
+        "symmetry_augment": False,
+        "epochs": 1,
+        "max_steps": 0,
+    }
+    parent_dose = one_dose.lineage.direct_lineage_dose(
+        declared_producer_sha256=promotion._sha256(producer),
+        init_checkpoint_sha256=promotion._sha256(producer),
+        current_sampled_rows=56_000,
+        current_optimizer_steps=14,
+    )
+    lineage_dose = one_dose.lineage.curriculum_lineage_dose(
+        declared_producer_sha256=promotion._sha256(producer),
+        init_checkpoint_sha256=promotion._sha256(learned_parent),
+        parent_receipt_sha256=promotion._sha256(parent_receipt),
+        parent_lineage_dose=parent_dose,
+        current_sampled_rows=140_000,
+        current_optimizer_steps=35,
+    )
+    curriculum_parent = {
+        "schema_version": "a1-curriculum-parent-binding-v1",
+        "receipt_path": str(parent_receipt),
+        "receipt_sha256": promotion._sha256(parent_receipt),
+        "parent_arm_id": "n256",
+        "parent_subset_id": "full-56k",
+        "parent_checkpoint": _checkpoint_ref(learned_parent),
+        "generation_producer_sha256": promotion._sha256(producer),
+    }
+    report = {
+        "a1_contract_sha256": contract["contract_sha256"],
+        "a1_learner_training_recipe_sha256": promotion._digest_value(recipe),
+        "a1_bound_learner_training_recipe": recipe,
+        "a1_dual_arm_execution_binding": {"schema_version": "test-binding"},
+        "a1_decisive_training_semantics": {
+            "schema_version": "a1-decisive-training-semantics-v1",
+            "gradient_accumulation_contract": "single_microbatch_exact",
+            "grad_accum_steps": 1,
+        },
+        "a1_lineage_dose": lineage_dose,
+        "a1_curriculum_parent": curriculum_parent,
+        "arch": "entity_graph",
+        "mask_hidden_info": True,
+        "symmetry_augment": False,
+        "track": "2p_no_trade",
+        "vps_to_win": 10,
+        "world_size": 8,
+        "batch_size": 512,
+        "grad_accum_steps": 1,
+        "steps_completed": 35,
+        "epochs": 1,
+        "max_steps": 0,
+        "checkpoint": str(candidate),
+        "init_checkpoint": str(learned_parent),
+        "init_checkpoint_sha256": promotion._sha256(learned_parent),
+    }
+    report_path = tmp_path / "curriculum-report.json"
+    _write_json(report_path, report)
+    return report_path, candidate, contract
+
+
+def test_promotion_rejects_authenticated_candidate_curriculum_lineage(
+    tmp_path: Path,
+) -> None:
+    report, candidate, contract = _curriculum_training_report(tmp_path)
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="candidate chaining/curriculum lineage is not promotion-eligible",
+    ):
+        promotion._verify_training_report(
+            report,
+            contract=contract,
+            contract_sha256=contract["contract_sha256"],
+            candidate_path=candidate,
+            candidate_sha256=promotion._sha256(candidate),
+        )
+
+
+def test_evaluation_parent_refuses_curriculum_baseline_alias() -> None:
+    producer_sha = "sha256:" + "a" * 64
+    report = {
+        "init_checkpoint_sha256": "sha256:" + "b" * 64,
+        "a1_curriculum_parent": {
+            "generation_producer_sha256": producer_sha,
+        },
+    }
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="candidate chaining/curriculum lineage is not promotion-eligible",
+    ):
+        promotion._training_evaluation_parent_sha256(  # noqa: SLF001
+            report,
+            {"evaluation_parent_sha256": producer_sha},
+        )
+
+
 def _typed_final_training_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
