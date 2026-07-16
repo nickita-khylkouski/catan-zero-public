@@ -36,11 +36,52 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     _new_search_telemetry,
     _resolve_c_scales,
     _resolve_role_search_calibration,
+    _resolve_raw_policy_thresholds,
     _resolve_value_squashes,
     _resolve_search_budgets,
     play_one_h2h_game,
     _validate_information_set_recipe,
 )
+
+
+def test_role_specific_raw_policy_thresholds_enable_three_panel_decomposition() -> None:
+    shared = SimpleNamespace(
+        raw_policy_above_width=None,
+        candidate_raw_policy_above_width=None,
+        baseline_raw_policy_above_width=None,
+    )
+    assert _resolve_raw_policy_thresholds(shared) == {
+        "candidate_raw_policy_above_width": None,
+        "baseline_raw_policy_above_width": None,
+    }
+    raw_cross = SimpleNamespace(
+        raw_policy_above_width=0,
+        candidate_raw_policy_above_width=None,
+        baseline_raw_policy_above_width=None,
+    )
+    assert set(_resolve_raw_policy_thresholds(raw_cross).values()) == {0}
+    uplift = SimpleNamespace(
+        raw_policy_above_width=None,
+        candidate_raw_policy_above_width=None,
+        baseline_raw_policy_above_width=0,
+    )
+    assert _resolve_raw_policy_thresholds(uplift) == {
+        "candidate_raw_policy_above_width": None,
+        "baseline_raw_policy_above_width": 0,
+    }
+
+
+def test_build_search_config_accepts_role_specific_raw_policy_operator() -> None:
+    worker_args = {
+        "n_full": 128,
+        "max_depth": 80,
+        "correct_rust_chance_spectra": True,
+    }
+    searched = _build_search_config(worker_args, seed=1)
+    raw = _build_search_config(worker_args, seed=1, raw_policy_above_width=0)
+
+    assert searched.raw_policy_above_width is None
+    assert raw.raw_policy_above_width == 0
 
 
 def test_direct_cli_help_resolves_replay_contract_sibling_import() -> None:

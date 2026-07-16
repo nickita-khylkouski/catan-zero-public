@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 15
+CONFIG_SCHEMA_VERSION = 16
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -629,6 +629,12 @@ class EvalConfig(PipelineConfig):
     candidate_wide_roots_always_full: bool | None = None
     baseline_wide_roots_always_full: bool | None = None
     raw_policy_above_width: int | None = None
+    # Cross-net evaluation can independently replace either role's search
+    # operator with raw-prior argmax (0 => every multi-action root).  This is
+    # used by the three-panel neural/search decomposition contract:
+    # raw-vs-raw, searched-vs-searched, and searched-candidate-vs-own-raw.
+    candidate_raw_policy_above_width: int | None = None
+    baseline_raw_policy_above_width: int | None = None
     max_depth: int = 80
     max_decisions: int = 300
     c_visit: float = 50.0

@@ -90,6 +90,7 @@ HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
 INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA = "a1-internal-h2h-engine-identity-v1"
 ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
 H2H_SEARCH_RNG_DERIVATION = "sha256(game_seed,seat_color)-u64-v1"
+_UNSET = object()
 
 
 def _native_runtime_extension_path() -> Path:
@@ -843,6 +844,36 @@ def _resolve_search_budgets(args: Any) -> dict[str, int | None]:
     }
 
 
+def _resolve_raw_policy_thresholds(args: Any) -> dict[str, int | None]:
+    """Resolve the raw-policy cutoff independently for each checkpoint role.
+
+    A cutoff of zero means every multi-action root uses the evaluator's raw
+    prior argmax. Forced single-action roots are already operator-invariant.
+    Keeping the shared flag as fallback preserves all existing invocations.
+    """
+
+    def _get(name: str, default: Any = None) -> Any:
+        if isinstance(args, dict):
+            return args.get(name, default)
+        return getattr(args, name, default)
+
+    shared = _get("raw_policy_above_width")
+    candidate = _get("candidate_raw_policy_above_width")
+    baseline = _get("baseline_raw_policy_above_width")
+    return {
+        "candidate_raw_policy_above_width": (
+            int(candidate)
+            if candidate is not None
+            else (int(shared) if shared is not None else None)
+        ),
+        "baseline_raw_policy_above_width": (
+            int(baseline)
+            if baseline is not None
+            else (int(shared) if shared is not None else None)
+        ),
+    }
+
+
 def _resolve_c_scales(args: Any) -> dict[str, float]:
     """Resolve effective candidate/baseline sigma scales.
 
@@ -991,6 +1022,7 @@ def _build_search_config(
     rescale_noise_floor_c: float | None = None,
     sigma_eval: float | None = None,
     sigma_reference_visits: int | None = None,
+    raw_policy_above_width: int | None | object = _UNSET,
 ) -> GumbelChanceMCTSConfig:
     """`n_full` defaults to `worker_args["n_full"]` when not given explicitly.
 
@@ -1080,8 +1112,17 @@ def _build_search_config(
         n_full_wide_threshold=resolved_n_full_wide_threshold,
         raw_policy_above_width=(
             int(worker_args["raw_policy_above_width"])
-            if worker_args.get("raw_policy_above_width") is not None
-            else None
+            if raw_policy_above_width is _UNSET
+            and worker_args.get("raw_policy_above_width") is not None
+            else (
+                None
+                if raw_policy_above_width is _UNSET
+                else (
+                    int(raw_policy_above_width)
+                    if raw_policy_above_width is not None
+                    else None
+                )
+            )
         ),
         symmetry_averaged_eval=bool(worker_args.get("symmetry_averaged_eval", False)),
         symmetry_averaged_eval_threshold=(
@@ -1205,6 +1246,7 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     worker_seed = int(worker_args["worker_seed"])
     budgets = _resolve_search_budgets(worker_args)
     c_scales = _resolve_c_scales(worker_args)
+    raw_policy_thresholds = _resolve_raw_policy_thresholds(worker_args)
     role_search = _resolve_role_search_calibration(worker_args)
     candidate_n_full = int(budgets["candidate_n_full"])
     baseline_n_full = int(budgets["baseline_n_full"])
@@ -1217,6 +1259,9 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full_wide_threshold=budgets["candidate_n_full_wide_threshold"],
             wide_roots_always_full=budgets["candidate_wide_roots_always_full"],
             c_scale=c_scales["candidate_c_scale"],
+            raw_policy_above_width=raw_policy_thresholds[
+                "candidate_raw_policy_above_width"
+            ],
             **role_search["candidate"],
         ),
         candidate_evaluator,
@@ -1231,6 +1276,9 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
             n_full_wide_threshold=budgets["baseline_n_full_wide_threshold"],
             wide_roots_always_full=budgets["baseline_wide_roots_always_full"],
             c_scale=c_scales["baseline_c_scale"],
+            raw_policy_above_width=raw_policy_thresholds[
+                "baseline_raw_policy_above_width"
+            ],
             **role_search["baseline"],
         ),
         baseline_evaluator,
@@ -1449,6 +1497,26 @@ def main() -> None:
         help=(
             "CAT-25 rollout-doubling arm: search budget for the baseline role only. "
             "Default None = fall back to --n-full (byte-identical to every prior caller)."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-raw-policy-above-width",
+        type=int,
+        default=None,
+        help=(
+            "Candidate-only raw-policy cutoff. Zero makes the candidate use "
+            "raw-prior argmax at every multi-action root; default inherits "
+            "--raw-policy-above-width."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-raw-policy-above-width",
+        type=int,
+        default=None,
+        help=(
+            "Baseline-only raw-policy cutoff. Zero makes the baseline use "
+            "raw-prior argmax at every multi-action root; default inherits "
+            "--raw-policy-above-width."
         ),
     )
     parser.add_argument("--max-depth", type=int, default=80)
@@ -1829,6 +1897,10 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     add_config_flags(parser, default_purpose="gumbel_search_cross_net_h2h")
     args = parser.parse_args()
+    for role in ("candidate", "baseline"):
+        threshold = getattr(args, f"{role}_raw_policy_above_width")
+        if threshold is not None and int(threshold) < 0:
+            parser.error(f"--{role}-raw-policy-above-width must be non-negative")
     resolved_budgets = _resolve_search_budgets(args)
     for role in ("candidate", "baseline"):
         if (
@@ -1865,6 +1937,7 @@ def main() -> None:
         c_scales = _resolve_c_scales(resolved_args)
         squashes = _resolve_value_squashes(resolved_args)
         role_search = _resolve_role_search_calibration(resolved_args)
+        raw_policy_thresholds = _resolve_raw_policy_thresholds(resolved_args)
         return EvalConfig.from_namespace(
             resolved_args,
             mode="cross_net",
@@ -1884,6 +1957,12 @@ def main() -> None:
                 "candidate_wide_roots_always_full"
             ],
             baseline_wide_roots_always_full=budgets["baseline_wide_roots_always_full"],
+            candidate_raw_policy_above_width=raw_policy_thresholds[
+                "candidate_raw_policy_above_width"
+            ],
+            baseline_raw_policy_above_width=raw_policy_thresholds[
+                "baseline_raw_policy_above_width"
+            ],
             candidate_c_scale=c_scales["candidate_c_scale"],
             baseline_c_scale=c_scales["baseline_c_scale"],
             candidate_value_squash=squashes["candidate_value_squash"],
@@ -1923,6 +2002,7 @@ def main() -> None:
     c_scales = _resolve_c_scales(args)
     value_squashes = _resolve_value_squashes(args)
     role_search = _resolve_role_search_calibration(args)
+    raw_policy_thresholds = _resolve_raw_policy_thresholds(args)
 
     high_regret_suite_path: Path | None = None
     high_regret_planned_engine: dict[str, str] | None = None
@@ -2067,6 +2147,12 @@ def main() -> None:
                 if args.raw_policy_above_width is not None
                 else None
             ),
+            "candidate_raw_policy_above_width": raw_policy_thresholds[
+                "candidate_raw_policy_above_width"
+            ],
+            "baseline_raw_policy_above_width": raw_policy_thresholds[
+                "baseline_raw_policy_above_width"
+            ],
             "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
             "symmetry_averaged_eval_threshold": (
                 int(args.symmetry_averaged_eval_threshold)
@@ -2269,6 +2355,7 @@ def _build_summary(
     c_scales = _resolve_c_scales(args)
     value_squashes = _resolve_value_squashes(args)
     role_search = _resolve_role_search_calibration(args)
+    raw_policy_thresholds = _resolve_raw_policy_thresholds(args)
 
     return {
         "candidate_checkpoint": args.candidate,
@@ -2305,14 +2392,34 @@ def _build_summary(
             },
         },
         "comparison_contract": (
-            "paired_same_seed_color_swap_role_specific_search_operators"
-            if (
-                c_scales["candidate_c_scale"] != c_scales["baseline_c_scale"]
-                or value_squashes["candidate_value_squash"]
-                != value_squashes["baseline_value_squash"]
-                or role_search["candidate"] != role_search["baseline"]
+            "paired_same_seed_color_swap_raw_networks"
+            if set(raw_policy_thresholds.values()) == {0}
+            else (
+                "paired_same_seed_color_swap_candidate_search_vs_own_raw"
+                if (
+                    candidate_checkpoint_sha256 == baseline_checkpoint_sha256
+                    and raw_policy_thresholds[
+                        "candidate_raw_policy_above_width"
+                    ]
+                    is None
+                    and raw_policy_thresholds[
+                        "baseline_raw_policy_above_width"
+                    ]
+                    == 0
+                )
+                else (
+                    "paired_same_seed_color_swap_role_specific_search_operators"
+                    if (
+                        c_scales["candidate_c_scale"]
+                        != c_scales["baseline_c_scale"]
+                        or value_squashes["candidate_value_squash"]
+                        != value_squashes["baseline_value_squash"]
+                        or role_search["candidate"] != role_search["baseline"]
+                        or len(set(raw_policy_thresholds.values())) > 1
+                    )
+                    else "paired_same_seed_color_swap_shared_search_operator"
+                )
             )
-            else "paired_same_seed_color_swap_shared_search_operator"
         ),
         "search_rng_contract": {
             "derivation": H2H_SEARCH_RNG_DERIVATION,
@@ -2403,6 +2510,24 @@ def _build_summary(
             if args.raw_policy_above_width is not None
             else None
         ),
+        "candidate_raw_policy_above_width": raw_policy_thresholds[
+            "candidate_raw_policy_above_width"
+        ],
+        "baseline_raw_policy_above_width": raw_policy_thresholds[
+            "baseline_raw_policy_above_width"
+        ],
+        "root_operator_by_role": {
+            "candidate": (
+                "raw_prior_argmax_all_multi_action_roots"
+                if raw_policy_thresholds["candidate_raw_policy_above_width"] == 0
+                else "gumbel_chance_mcts"
+            ),
+            "baseline": (
+                "raw_prior_argmax_all_multi_action_roots"
+                if raw_policy_thresholds["baseline_raw_policy_above_width"] == 0
+                else "gumbel_chance_mcts"
+            ),
+        },
         "symmetry_averaged_eval": bool(args.symmetry_averaged_eval),
         "symmetry_averaged_eval_threshold": (
             int(args.symmetry_averaged_eval_threshold)
