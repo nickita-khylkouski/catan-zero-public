@@ -1,0 +1,48 @@
+{
+  "schema_version": "catan-zero-production-placement-evidence-v1",
+  "date": "2026-07-16",
+  "repository_commit": "e01b24604b29c13bd2c6b7c04ed17afce8c4254f",
+  "repository_clean": true,
+  "host_role": "supplied-eight-h100-canary",
+  "device_count": 8,
+  "device_names": [
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 80GB HBM3"
+  ],
+  "runtime": {
+    "python_version": "3.11.15",
+    "torch_version": "2.11.0+cu128",
+    "torch_cuda_version": "12.8",
+    "nvidia_driver_version": "580.105.08",
+    "catanatron_rs_version": "0.1.12",
+    "catanatron_rs_wheel_sha256": "e8e61626e5e99c9c61dcf79e3cc639d2070eb73dc79ea99a50efdece4cf34765"
+  },
+  "checks": [
+    {
+      "pipeline": "generate",
+      "required_accelerator_model": "NVIDIA H100",
+      "plan_sha256": "ab97c918d3cc9e3880bacf08ed7e3a394c0e6fd466c8438cddf8038c8cc7cdd2",
+      "doctor_ok": true,
+      "doctor_errors": [],
+      "exit_code": 0
+    },
+    {
+      "pipeline": "train",
+      "recipe": "a1-parent-update-35m-b200",
+      "required_accelerator_model": "NVIDIA B200",
+      "plan_sha256": "c0277975a60a73cefed3bc8459714e197dcc90282316d96dab786bec8b1dfd76",
+      "doctor_ok": false,
+      "doctor_errors": [
+        "production placement requires only NVIDIA B200 devices"
+      ],
+      "exit_code": 2
+    }
+  ],
+  "execution_boundary": "doctor-only; no generation, training, or evaluation subprocess was started"
+}

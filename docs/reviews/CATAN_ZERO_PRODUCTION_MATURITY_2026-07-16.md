@@ -175,9 +175,14 @@ The repository has 430 test files. `scripts/gate.sh` runs the full suite plus
 native parity, CLI goldens, and a bit-identical champion no-op check. This audit
 ran 129 focused production and training-contract tests locally. On an isolated
 checkout of pushed commit `cac1466`, the supplied host reported eight NVIDIA
-H100 80GB HBM3 devices; 42 exact-runtime production tests passed, the production
-doctor passed for generation, and an eight-device BF16 matrix smoke returned
-finite results on every GPU. No long training or generation job was started.
+H100 80GB HBM3 devices; 42 exact-runtime production tests passed and an
+eight-device BF16 matrix smoke returned finite results on every GPU. The final
+placement gate was then tested from clean pushed commit `e01b246`: generation
+passed with zero doctor errors, while the B200 parent-update recipe failed closed
+with exit code 2 on the same eight H100s. The exact runtime and plan hashes are
+preserved in
+[`PRODUCTION_PLACEMENT_H100_E01B246_20260716.json`](../evidence/PRODUCTION_PLACEMENT_H100_E01B246_20260716.json).
+No long training or generation job was started.
 
 The gap is automatic enforcement. There are zero checked-in GitHub workflow
 files, and the gate intentionally quarantines two tests. Local macOS cannot load
