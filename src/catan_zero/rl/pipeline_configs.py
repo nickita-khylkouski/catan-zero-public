@@ -466,6 +466,7 @@ class GenerateConfig(PipelineConfig):
     # Stored learner features can intentionally advance beyond the
     # checkpoint-bound teacher adapter. None preserves the historical tied
     # evaluator/row contract.
+    teacher_entity_feature_adapter_version: str | None = None
     learner_entity_feature_adapter_version: str | None = None
     meaningful_public_history: bool = False
     event_history_limit: int = 64

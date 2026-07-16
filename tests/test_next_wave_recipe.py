@@ -112,6 +112,9 @@ def test_next_wave_typed_generation_config_is_exact_schema_18_recipe() -> None:
     assert cfg.learner_entity_feature_adapter_version == (
         "rust_entity_adapter_v5_meaningful_history_v2"
     )
+    assert cfg.teacher_entity_feature_adapter_version == (
+        "rust_entity_adapter_v2_land_topology_ports_maritime"
+    )
     assert cfg.temperature_clock == "nonforced_choice"
     assert (cfg.temperature_decisions, cfg.late_temperature_decisions) == (40, 100)
     assert cfg.late_temperature == 0.1

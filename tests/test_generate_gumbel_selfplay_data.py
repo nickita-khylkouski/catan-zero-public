@@ -245,6 +245,29 @@ def test_learner_row_adapter_flag_is_typed_and_defaults_to_tied_contract() -> No
     )
 
 
+def test_teacher_adapter_flag_is_typed_and_science_hashed() -> None:
+    parser = cli.build_parser()
+    default = parser.parse_args(["--out-dir", "/tmp/teacher-adapter-default"])
+    explicit = parser.parse_args(
+        [
+            "--out-dir",
+            "/tmp/teacher-adapter-explicit",
+            "--teacher-entity-feature-adapter-version",
+            RUST_ENTITY_ADAPTER_V2,
+        ]
+    )
+
+    assert default.teacher_entity_feature_adapter_version is None
+    assert explicit.teacher_entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V2
+    assert (
+        GenerateConfig.from_namespace(explicit).teacher_entity_feature_adapter_version
+        == RUST_ENTITY_ADAPTER_V2
+    )
+    assert GenerateConfig.from_namespace(explicit).config_hash() != (
+        GenerateConfig.from_namespace(default).config_hash()
+    )
+
+
 def test_boundary_value_particles_are_science_hashed() -> None:
     legacy = GenerateConfig(games=0)
     particles = GenerateConfig(games=0, boundary_value_particles=4)

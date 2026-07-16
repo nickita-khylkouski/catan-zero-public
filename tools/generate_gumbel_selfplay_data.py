@@ -827,6 +827,14 @@ def build_parser() -> argparse.ArgumentParser:
         "empty/native history behavior.",
     )
     parser.add_argument(
+        "--teacher-entity-feature-adapter-version",
+        choices=sorted(IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS),
+        default=None,
+        help="Versioned feature adapter consumed by the checkpoint-backed teacher. "
+        "Set this explicitly when stored learner rows use a newer adapter; the "
+        "loaded checkpoint must attest the declared teacher adapter.",
+    )
+    parser.add_argument(
         "--learner-entity-feature-adapter-version",
         choices=sorted(IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS),
         default=None,
@@ -1629,6 +1637,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "learner_entity_feature_adapter_version": (
                     args.learner_entity_feature_adapter_version
+                ),
+                "teacher_entity_feature_adapter_version": (
+                    args.teacher_entity_feature_adapter_version
                 ),
                 "event_history_limit": int(args.event_history_limit),
                 "record_automatic_transitions": bool(
