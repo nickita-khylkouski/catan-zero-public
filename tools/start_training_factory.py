@@ -55,6 +55,16 @@ def main() -> None:
     )
     parser.add_argument("--bc-epochs", type=int, default=2)
     parser.add_argument(
+        "--bc-max-steps",
+        type=int,
+        default=128,
+        help=(
+            "Hard optimizer-step dose for BC. Production factory runs must bind a "
+            "positive finite dose; 128 matches the current short-dose contract. "
+            "Use 0 only with --quality-gate none for an explicit historical replay."
+        ),
+    )
+    parser.add_argument(
         "--bc-global-batch-size",
         type=int,
         default=4096,
@@ -122,6 +132,11 @@ def main() -> None:
     )
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument(
+        "--optimizer",
+        choices=("adam", "adamw"),
+        default="adam",
+    )
+    parser.add_argument(
         "--lr-warmup-steps",
         type=int,
         default=16,
@@ -130,6 +145,42 @@ def main() -> None:
             "short-dose learner contract instead of exposing a full-rate first update."
         ),
     )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("flat", "cosine", "linear"),
+        default="flat",
+    )
+    parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--value-lr-mult",
+        type=float,
+        default=1.0,
+        help=(
+            "Value-readout LR multiplier. Fresh production defaults to full-rate "
+            "value-head learning; use trunk controls, not a reduced value-head LR, "
+            "when the goal is to protect the shared representation."
+        ),
+    )
+    parser.add_argument(
+        "--trunk-lr-mult",
+        type=float,
+        default=1.0,
+        help="Explicit shared-trunk optimizer LR multiplier.",
+    )
+    parser.add_argument(
+        "--value-trunk-grad-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale only value-family gradients entering the shared trunk while "
+            "leaving the value-readout parameter gradient intact."
+        ),
+    )
+    parser.add_argument("--policy-kl-anchor-weight", type=float, default=0.0)
+    parser.add_argument("--policy-kl-target", type=float, default=None)
+    parser.add_argument("--policy-kl-dual-lr", type=float, default=0.01)
+    parser.add_argument("--policy-kl-max-weight", type=float, default=1.0)
     parser.add_argument("--soft-target-temperature", type=float, default=0.7)
     parser.add_argument(
         "--soft-target-weight",
@@ -242,6 +293,13 @@ def main() -> None:
         raise SystemExit("--torchrun-nproc-per-node must be >= 1")
     if grad_accum_steps < 1:
         raise SystemExit("--bc-grad-accum-steps must be >= 1")
+    if int(args.bc_max_steps) < 0:
+        raise SystemExit("--bc-max-steps must be >= 0")
+    if args.quality_gate == "production" and int(args.bc_max_steps) <= 0:
+        raise SystemExit(
+            "production factory runs require a positive --bc-max-steps dose; "
+            "unbounded epoch-only training is forbidden"
+        )
     topology_divisor = world_size * grad_accum_steps
     if args.bc_batch_size is None:
         global_batch_size = int(args.bc_global_batch_size)
@@ -435,6 +493,8 @@ def main() -> None:
             str(args.vps_to_win),
             "--epochs",
             str(args.bc_epochs),
+            "--max-steps",
+            str(args.bc_max_steps),
             "--batch-size",
             str(local_batch_size),
             "--grad-accum-steps",
@@ -445,8 +505,24 @@ def main() -> None:
             str(args.hidden_size),
             "--lr",
             str(args.lr),
+            "--optimizer",
+            args.optimizer,
             "--lr-warmup-steps",
             str(args.lr_warmup_steps),
+            "--lr-schedule",
+            args.lr_schedule,
+            "--weight-decay",
+            str(args.weight_decay),
+            "--max-grad-norm",
+            str(args.max_grad_norm),
+            "--value-lr-mult",
+            str(args.value_lr_mult),
+            "--trunk-lr-mult",
+            str(args.trunk_lr_mult),
+            "--value-trunk-grad-scale",
+            str(args.value_trunk_grad_scale),
+            "--policy-kl-anchor-weight",
+            str(args.policy_kl_anchor_weight),
             "--soft-target-temperature",
             str(args.soft_target_temperature),
             "--soft-target-weight",
@@ -520,6 +596,18 @@ def main() -> None:
             else []
         )
         + (["--training-rng-rank-offset"] if world_size > 1 else [])
+        + (
+            [
+                "--policy-kl-target",
+                str(args.policy_kl_target),
+                "--policy-kl-dual-lr",
+                str(args.policy_kl_dual_lr),
+                "--policy-kl-max-weight",
+                str(args.policy_kl_max_weight),
+            ]
+            if args.policy_kl_target is not None
+            else []
+        )
         + [
             "--checkpoint",
             str(bc_checkpoint),
@@ -613,6 +701,16 @@ def main() -> None:
                 else "derived_from_global_batch"
             ),
             "training_rng_rank_offset": world_size > 1,
+            "max_optimizer_steps": int(args.bc_max_steps),
+            "optimizer": str(args.optimizer),
+            "value_lr_mult": float(args.value_lr_mult),
+            "trunk_lr_mult": float(args.trunk_lr_mult),
+            "value_trunk_grad_scale": float(args.value_trunk_grad_scale),
+            "policy_kl_target": (
+                None
+                if args.policy_kl_target is None
+                else float(args.policy_kl_target)
+            ),
         },
     }
     write_json(run_dir / "pipeline_manifest.json", manifest)

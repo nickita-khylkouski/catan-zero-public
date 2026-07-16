@@ -70,11 +70,19 @@ def test_factory_keeps_default_global_batch_constant_across_world_sizes(
         "effective_global_batch_size": 4096,
         "batch_size_source": "derived_from_global_batch",
         "training_rng_rank_offset": world_size > 1,
+        "max_optimizer_steps": 128,
+        "optimizer": "adam",
+        "value_lr_mult": 1.0,
+        "trunk_lr_mult": 1.0,
+        "value_trunk_grad_scale": 1.0,
+        "policy_kl_target": None,
     }
     command = _train_command(manifest)
     assert command.count("--training-rng-rank-offset") == int(world_size > 1)
     assert command[command.index("--batch-size") + 1] == str(expected_local_batch)
     assert command[command.index("--grad-accum-steps") + 1] == "1"
+    assert command[command.index("--max-steps") + 1] == "128"
+    assert command[command.index("--value-lr-mult") + 1] == "1.0"
     assert command[command.index("--soft-target-weight") + 1] == "0.0"
     assert command[
         command.index("--policy-target-blend-semantics") + 1
@@ -202,6 +210,63 @@ def test_factory_uses_public_equal_game_training_contract(tmp_path: Path) -> Non
     assert resolved.per_game_value_weight is True
     assert resolved.per_game_value_weight_mode == "equal"
     assert resolved.lr_warmup_steps == 16
+    assert resolved.max_steps == 128
+    assert resolved.value_lr_mult == pytest.approx(1.0)
+    assert resolved.trunk_lr_mult == pytest.approx(1.0)
+    assert resolved.value_trunk_grad_scale == pytest.approx(1.0)
+    assert resolved.resume_optimizer is False
+
+
+def test_factory_forwards_explicit_trust_and_value_controls(tmp_path: Path) -> None:
+    result = _dry_run(
+        tmp_path,
+        "--value-lr-mult",
+        "1.5",
+        "--trunk-lr-mult",
+        "0.25",
+        "--value-trunk-grad-scale",
+        "0.5",
+        "--policy-kl-anchor-weight",
+        "0.02",
+        "--policy-kl-target",
+        "0.03",
+        "--policy-kl-dual-lr",
+        "0.5",
+        "--policy-kl-max-weight",
+        "0.8",
+    )
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    train_argv = command[command.index("tools/train_bc.py") + 1 :]
+    resolved = train_bc.build_parser().parse_args(train_argv)
+    assert resolved.value_lr_mult == pytest.approx(1.5)
+    assert resolved.trunk_lr_mult == pytest.approx(0.25)
+    assert resolved.value_trunk_grad_scale == pytest.approx(0.5)
+    assert resolved.policy_kl_anchor_weight == pytest.approx(0.02)
+    assert resolved.policy_kl_target == pytest.approx(0.03)
+    assert resolved.policy_kl_dual_lr == pytest.approx(0.5)
+    assert resolved.policy_kl_max_weight == pytest.approx(0.8)
+
+
+def test_production_factory_refuses_unbounded_epoch_only_training(
+    tmp_path: Path,
+) -> None:
+    result = _dry_run(tmp_path, "--bc-max-steps", "0")
+
+    assert result.returncode != 0
+    assert "positive --bc-max-steps" in result.stderr
+
+    replay = _dry_run(
+        tmp_path / "replay",
+        "--quality-gate",
+        "none",
+        "--bc-max-steps",
+        "0",
+    )
+    assert replay.returncode == 0, replay.stderr
+    command = _train_command(_manifest(tmp_path / "replay"))
+    assert command[command.index("--max-steps") + 1] == "0"
 
 
 def test_factory_converts_teacher_rows_before_entity_training(tmp_path: Path) -> None:
@@ -361,4 +426,10 @@ def test_explicit_local_batch_override_is_manifested_without_reinterpretation(
         "effective_global_batch_size": 4096,
         "batch_size_source": "explicit_rank_local_override",
         "training_rng_rank_offset": True,
+        "max_optimizer_steps": 128,
+        "optimizer": "adam",
+        "value_lr_mult": 1.0,
+        "trunk_lr_mult": 1.0,
+        "value_trunk_grad_scale": 1.0,
+        "policy_kl_target": None,
     }

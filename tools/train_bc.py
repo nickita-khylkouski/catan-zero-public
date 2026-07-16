@@ -15497,6 +15497,107 @@ def _route_mixed_public_award_batch(
     return routed
 
 
+def _meaningful_event_history_batch(
+    data: dict,
+    batch: np.ndarray,
+    *,
+    limit: int,
+) -> dict[str, np.ndarray]:
+    """Return the semantic history window without assuming its storage side.
+
+    Fresh meaningful-history shards are width 32 and right-aligned.  The
+    width-64 memmap ABI pads those tensors on the *right*, while older
+    converted corpora may carry the semantic window at the tail.  Selecting
+    ``[:, -limit:]`` therefore erased every live event from current corpora.
+    Preserve a zero-copy slice for either canonical layout and normalize only
+    genuinely mixed/non-canonical batches.
+    """
+
+    event_tokens = np.asarray(data["event_tokens"][batch])
+    event_target_ids = np.asarray(data["event_target_ids"][batch])
+    event_mask = np.asarray(data["event_mask"][batch], dtype=np.bool_)
+    if (
+        event_tokens.ndim != 3
+        or event_target_ids.ndim != 3
+        or event_mask.ndim != 2
+        or event_tokens.shape[:2] != event_mask.shape
+        or event_target_ids.shape[:2] != event_mask.shape
+    ):
+        raise RuntimeError(
+            "meaningful event-history tensor shape drift: "
+            f"tokens={event_tokens.shape} targets={event_target_ids.shape} "
+            f"mask={event_mask.shape}"
+        )
+    width = int(event_mask.shape[1])
+    if not 0 <= int(limit) <= width:
+        raise RuntimeError(
+            f"meaningful event-history limit {limit} outside storage width {width}"
+        )
+    if width == int(limit):
+        return {
+            "event_tokens": event_tokens,
+            "event_target_ids": event_target_ids,
+            "event_mask": event_mask,
+        }
+
+    def _is_right_aligned(mask: np.ndarray) -> bool:
+        counts = mask.sum(axis=1, dtype=np.int64)
+        columns = np.arange(mask.shape[1], dtype=np.int64)[None, :]
+        expected = columns >= (mask.shape[1] - counts)[:, None]
+        return bool(np.array_equal(mask, expected))
+
+    prefix_mask = event_mask[:, :limit]
+    if not bool(np.any(event_mask[:, limit:])) and _is_right_aligned(prefix_mask):
+        return {
+            "event_tokens": event_tokens[:, :limit],
+            "event_target_ids": event_target_ids[:, :limit],
+            "event_mask": prefix_mask,
+        }
+
+    suffix_start = width - int(limit)
+    suffix_mask = event_mask[:, suffix_start:]
+    if not bool(np.any(event_mask[:, :suffix_start])) and _is_right_aligned(
+        suffix_mask
+    ):
+        return {
+            "event_tokens": event_tokens[:, suffix_start:],
+            "event_target_ids": event_target_ids[:, suffix_start:],
+            "event_mask": suffix_mask,
+        }
+
+    live_counts = event_mask.sum(axis=1, dtype=np.int64)
+    if bool(np.any(live_counts > int(limit))):
+        raise RuntimeError(
+            "meaningful event-history row exceeds semantic limit: "
+            f"max_live={int(live_counts.max())} limit={limit}"
+        )
+    normalized_tokens = np.zeros(
+        (event_tokens.shape[0], int(limit), event_tokens.shape[2]),
+        dtype=event_tokens.dtype,
+    )
+    normalized_targets = np.full(
+        (event_target_ids.shape[0], int(limit), event_target_ids.shape[2]),
+        -1,
+        dtype=event_target_ids.dtype,
+    )
+    normalized_mask = np.zeros(
+        (event_mask.shape[0], int(limit)), dtype=np.bool_
+    )
+    for row, count in enumerate(live_counts.tolist()):
+        if count == 0:
+            continue
+        live = np.flatnonzero(event_mask[row])
+        destination = slice(int(limit) - int(count), int(limit))
+        normalized_tokens[row, destination] = event_tokens[row, live]
+        normalized_targets[row, destination] = event_target_ids[row, live]
+        normalized_mask[row, destination] = True
+    return {
+        "event_tokens": normalized_tokens,
+        "event_target_ids": normalized_targets,
+        "event_mask": normalized_mask,
+    }
+
+
 def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
     missing = [key for key in ENTITY_BATCH_KEYS if key not in data]
     if missing:
@@ -15531,12 +15632,9 @@ def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
             key: data[key][batch] for key in ENTITY_BATCH_KEYS if key not in event_keys
         }
         limit = int(_MEANINGFUL_EVENT_HISTORY_LIMIT)
-        # Producer tensors are right-aligned: the newest live events occupy
-        # the tail and padding is at the head. Cropping the left prefix here
-        # silently trained on padding while native serving consumed history.
-        result["event_tokens"] = data["event_tokens"][batch][:, -limit:]
-        result["event_target_ids"] = data["event_target_ids"][batch][:, -limit:]
-        result["event_mask"] = data["event_mask"][batch][:, -limit:]
+        result.update(
+            _meaningful_event_history_batch(data, batch, limit=limit)
+        )
     else:
         result = {key: data[key][batch] for key in ENTITY_BATCH_KEYS}
     if _PUBLIC_CARD_COUNT_FEATURES_ENABLED:
