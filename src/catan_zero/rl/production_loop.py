@@ -57,10 +57,6 @@ STAGE_ARTIFACT_BINDINGS: Mapping[str, tuple[tuple[str, str, str, bool], ...]] = 
         ("harvest_relocation", "input", "--harvest-relocation", True),
         ("audit_receipt", "output", "--out", False),
     ),
-    "composite": (
-        ("audit_receipt", "input", "--post-wave-audit", True),
-        ("training_data", "output", "--out", False),
-    ),
     "train": (
         ("training_data", "input", "--data", True),
         ("candidate_checkpoint", "output", "--checkpoint", False),
@@ -234,6 +230,79 @@ def _bind_stage_artifacts(
                     "direction": "output",
                     "flag": "--destination/relocation_map.json",
                     "path": relocation,
+                },
+            )
+        )
+    if name == "audit":
+        audit_out = Path(_flag_path(command, "--out", stage=name))
+        selected_games = _normalize_artifact_path(
+            str(audit_out.with_suffix(".selected_games.json"))
+        )
+        if selected_games not in outputs:
+            raise ProductionLoopError(
+                "audit outputs must declare OUT.selected_games.json"
+            )
+        bindings.append(
+            {
+                "kind": "selected_game_manifest",
+                "direction": "output",
+                "flag": "--out.selected_games.json",
+                "path": selected_games,
+            }
+        )
+    if name == "composite":
+        audit_receipt = _flag_path(command, "--post-wave-audit", stage=name)
+        selected_games = _flag_path(
+            command, "--selected-game-manifest", stage=name
+        )
+        if audit_receipt not in inputs or audit_receipt not in predecessor_outputs:
+            raise ProductionLoopError(
+                "composite must consume the immediate audit --out through "
+                "--post-wave-audit"
+            )
+        if selected_games not in inputs or selected_games not in predecessor_outputs:
+            raise ProductionLoopError(
+                "composite must consume the immediate audit selected-game manifest "
+                "through --selected-game-manifest"
+            )
+        output_root = Path(_flag_path(command, "--out", stage=name))
+        descriptor = _normalize_artifact_path(
+            str(output_root / "memmap_composite.json")
+        )
+        build_receipt = _normalize_artifact_path(
+            str(output_root / "build_receipt.json")
+        )
+        missing = {descriptor, build_receipt}.difference(outputs)
+        if missing:
+            raise ProductionLoopError(
+                "composite outputs must declare OUT/memmap_composite.json and "
+                f"OUT/build_receipt.json; missing={sorted(missing)}"
+            )
+        bindings.extend(
+            (
+                {
+                    "kind": "audit_receipt",
+                    "direction": "input",
+                    "flag": "--post-wave-audit",
+                    "path": audit_receipt,
+                },
+                {
+                    "kind": "selected_game_manifest",
+                    "direction": "input",
+                    "flag": "--selected-game-manifest",
+                    "path": selected_games,
+                },
+                {
+                    "kind": "training_data",
+                    "direction": "output",
+                    "flag": "--out/memmap_composite.json",
+                    "path": descriptor,
+                },
+                {
+                    "kind": "composite_build_receipt",
+                    "direction": "output",
+                    "flag": "--out/build_receipt.json",
+                    "path": build_receipt,
                 },
             )
         )
@@ -504,6 +573,66 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
             outputs=outputs,
             predecessor_outputs=previous_outputs,
         )
+        if name == "train" and tool_name == "tools/a1_one_dose_train.py":
+            composite_receipt = _flag_path(
+                command, "--composite-build-receipt", stage=name
+            )
+            if (
+                composite_receipt not in inputs
+                or composite_receipt not in previous_outputs
+            ):
+                raise ProductionLoopError(
+                    "one-dose training must consume the immediate composite "
+                    "OUT/build_receipt.json through --composite-build-receipt"
+                )
+            training_receipt = _flag_path(command, "--receipt", stage=name)
+            training_report = _flag_path(command, "--report", stage=name)
+            if training_receipt not in outputs:
+                raise ProductionLoopError(
+                    "one-dose --receipt must be a declared train output"
+                )
+            if training_report not in outputs:
+                raise ProductionLoopError(
+                    "one-dose --report must be a declared train output"
+                )
+            artifact_bindings.extend(
+                (
+                    {
+                        "kind": "composite_build_receipt",
+                        "direction": "input",
+                        "flag": "--composite-build-receipt",
+                        "path": composite_receipt,
+                    },
+                    {
+                        "kind": "training_report",
+                        "direction": "output",
+                        "flag": "--report",
+                        "path": training_report,
+                    },
+                    {
+                        "kind": "training_execution_receipt",
+                        "direction": "output",
+                        "flag": "--receipt",
+                        "path": training_receipt,
+                    },
+                )
+            )
+            if "--architecture-upgrade-receipt" in command:
+                upgrade_receipt = _flag_path(
+                    command, "--architecture-upgrade-receipt", stage=name
+                )
+                if upgrade_receipt not in inputs:
+                    raise ProductionLoopError(
+                        "--architecture-upgrade-receipt must be a declared train input"
+                    )
+                artifact_bindings.append(
+                    {
+                        "kind": "architecture_upgrade_receipt",
+                        "direction": "input",
+                        "flag": "--architecture-upgrade-receipt",
+                        "path": upgrade_receipt,
+                    }
+                )
         if name == "train" and tool_name == "tools/a1_scratch_train.py":
             execution_receipt = _flag_path(
                 command, "--execution-receipt", stage=name
@@ -577,9 +706,16 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
         for binding in normalized_stages["promote"]["artifact_bindings"]
         if binding["kind"] == "training_execution_receipt"
     )
-    if training_receipt not in normalized_stages["train"]["outputs"]:
+    issued_training_receipts = {
+        binding["path"]
+        for binding in normalized_stages["train"]["artifact_bindings"]
+        if binding["kind"] == "training_execution_receipt"
+        and binding["direction"] == "output"
+    }
+    if training_receipt not in issued_training_receipts:
         raise ProductionLoopError(
-            "promotion --training-receipt must be an exact train-stage output"
+            "promotion --training-receipt must be the exact typed train-stage "
+            "execution receipt"
         )
     return normalized
 

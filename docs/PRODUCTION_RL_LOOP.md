@@ -15,9 +15,9 @@ generate  H100 sealed executor receipt
    ↓
 harvest   direct host-to-controller SSH harvest relocation receipt
    ↓
-audit     post-wave audit and selected-game receipt
+audit     post-wave audit and selected-game manifest
    ↓
-composite authenticated memmap/composite build receipt
+composite authenticated memmap descriptor and build receipt
    ↓
 train     B200 checkpoint, report, and training receipt
    ↓
@@ -41,8 +41,14 @@ evaluation configs. The coordinator does not reinterpret those settings.
 - Commands are argument arrays, never shell strings.
 - Each stage consumes an immutable output from its immediate predecessor.
 - Typed CLI bindings prove that the composite is the learner's actual
-  `--data`, the learner checkpoint is the evaluator's actual `--candidate`,
-  and the evaluation receipt is promotion's actual `--adjudication`.
+  `--data`, its build receipt is the learner's actual
+  `--composite-build-receipt`, the learner checkpoint is the evaluator's
+  actual `--candidate`, and the typed evaluation adjudication is promotion's
+  actual `--adjudication`.
+- The audit edge is the pair `OUT` and `OUT.selected_games.json`; the composite
+  edge is the pair `OUT/memmap_composite.json` and
+  `OUT/build_receipt.json`. The output directory itself is not a substitute
+  for either typed artifact.
 - Stage outputs must be fresh file or directory artifacts. Successful outputs, inputs, commands, and
   logs are content-addressed in `state.json`.
 - Restarting the same turn replays hashes and resumes after the last committed
@@ -65,7 +71,7 @@ evaluation configs. The coordinator does not reinterpret those settings.
 | harvest | `tools/fleet/a1_harvest_transaction.py` |
 | audit | `tools/a1_pre_wave_contract.py audit` |
 | composite | `tools/a1_build_post_wave_composite.py` |
-| train | `tools/train.py`, issued `a1_one_dose_train.py --go`, `a1_scratch_train.py` |
+| train | issued `a1_one_dose_train.py --go`, `a1_scratch_train.py --go` |
 | evaluate | `tools/evaluate.py` |
 | promote | `tools/a1_promotion_transaction.py promote --go` |
 
@@ -78,3 +84,10 @@ original tools; this exclusion applies to new work.
 The current scratch learner is still scientifically uncommissioned until its
 optimizer horizon is selected. The coordinator makes a commissioned turn
 repeatable; it does not manufacture authorization for an unresolved recipe.
+
+`tools/evaluate.py` emits the matched internal H2H source report. It does not
+by itself emit `a1-promotion-adjudication-v2`: mechanism calibration, external
+panel, high-regret, bucket-veto, cohort-exclusion, and adjudication artifacts
+must still be produced by the typed promotion-artifact transaction. A loop
+configuration must not alias the raw H2H `--out` path to promotion's
+`--adjudication`.

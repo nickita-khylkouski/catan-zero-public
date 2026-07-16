@@ -28,6 +28,20 @@ for flag in ("--source", "--executor-receipt", "--harvest-relocation", "--post-w
     if flag in args:
         source = Path(args[args.index(flag) + 1])
         break
+if Path(sys.argv[0]).name == "a1_build_post_wave_composite.py":
+    root = Path(args[args.index("--out") + 1])
+    root.mkdir(parents=True, exist_ok=True)
+    prefix = "" if source is None else source.read_text()
+    (root / "memmap_composite.json").write_text(prefix + Path(sys.argv[0]).name + "\n")
+    (root / "build_receipt.json").write_text("build receipt\n")
+    raise SystemExit(0)
+if Path(sys.argv[0]).name == "a1_pre_wave_contract.py":
+    out = Path(args[args.index("--out") + 1])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    prefix = "" if source is None else source.read_text()
+    out.write_text(prefix + Path(sys.argv[0]).name + "\n")
+    out.with_suffix(".selected_games.json").write_text("selected games\n")
+    raise SystemExit(0)
 outputs = []
 for flag in ("--emit", "--execution-receipt", "--checkpoint", "--report", "--out", "--receipt"):
     if flag in args:
@@ -81,11 +95,12 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
     previous = initial
     stages: dict[str, dict[str, object]] = {}
     for name in STAGES:
-        output = (
-            tmp_path / "harvest" / "relocation_map.json"
-            if name == "harvest"
-            else tmp_path / f"{name}.json"
-        )
+        if name == "harvest":
+            output = tmp_path / "harvest" / "relocation_map.json"
+        elif name == "composite":
+            output = tmp_path / "composite" / "memmap_composite.json"
+        else:
+            output = tmp_path / f"{name}.json"
         command = [sys.executable, str(tool_paths[name])]
         if name == "generate":
             command += [
@@ -114,16 +129,29 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
                 str(output),
             ]
         elif name == "composite":
-            command += ["--post-wave-audit", str(previous), "--out", str(output)]
+            command += [
+                "--selected-game-manifest",
+                str(previous.with_suffix(".selected_games.json")),
+                "--post-wave-audit",
+                str(previous),
+                "--out",
+                str(output.parent),
+            ]
         elif name == "train":
             training_receipt = tmp_path / "training-receipt.json"
+            training_report = tmp_path / "training-report.json"
+            composite_receipt = tmp_path / "composite" / "build_receipt.json"
             command += [
                 "--go",
                 "--data",
                 str(previous),
+                "--composite-build-receipt",
+                str(composite_receipt),
                 "--checkpoint",
                 str(output),
                 "--report",
+                str(training_report),
+                "--receipt",
                 str(training_receipt),
             ]
         elif name == "evaluate":
@@ -140,11 +168,20 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
                 str(output),
             ]
         outputs = [str(output)]
+        if name == "audit":
+            outputs.append(str(output.with_suffix(".selected_games.json")))
+        if name == "composite":
+            outputs.append(str(output.parent / "build_receipt.json"))
         if name == "train":
-            outputs.append(str(training_receipt))
+            outputs.extend((str(training_report), str(training_receipt)))
+        inputs = [str(previous)]
+        if name == "composite":
+            inputs.append(str(previous.with_suffix(".selected_games.json")))
+        if name == "train":
+            inputs.append(str(composite_receipt))
         stages[name] = {
             "command": command,
-            "inputs": [str(previous)],
+            "inputs": inputs,
             "outputs": outputs,
             "timeout_seconds": 10,
         }
@@ -185,7 +222,7 @@ def test_loop_binds_and_executes_exact_artifact_chain(tmp_path: Path) -> None:
         "kind": "training_data",
         "direction": "input",
         "flag": "--data",
-        "path": str((tmp_path / "composite.json").resolve()),
+        "path": str((tmp_path / "composite" / "memmap_composite.json").resolve()),
     }
     state = execute(loaded, state_dir=state_dir)
     assert state["completed_stages"] == list(STAGES)
@@ -215,6 +252,27 @@ def test_train_data_must_be_exact_immediate_composite_output(tmp_path: Path) -> 
     config_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ProductionLoopError, match="exact immediate predecessor"):
+        load_config(config_path, state_dir=tmp_path / "state")
+
+
+def test_promotion_cannot_substitute_training_report_for_execution_receipt(
+    tmp_path: Path,
+) -> None:
+    _repository, config_path, _final, payload = _fixture(tmp_path)
+    stages = payload["stages"]
+    assert isinstance(stages, dict)
+    train = stages["train"]
+    promote = stages["promote"]
+    assert isinstance(train, dict) and isinstance(promote, dict)
+    train_command = train["command"]
+    promote_command = promote["command"]
+    assert isinstance(train_command, list) and isinstance(promote_command, list)
+    training_report = train_command[train_command.index("--report") + 1]
+    promote_command[promote_command.index("--training-receipt") + 1] = training_report
+    promote["inputs"] = [str(tmp_path / "evaluate.json"), training_report]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ProductionLoopError, match="typed train-stage execution receipt"):
         load_config(config_path, state_dir=tmp_path / "state")
 
 
@@ -320,7 +378,7 @@ def test_scratch_requires_go_and_fresh_execution_receipt(tmp_path: Path) -> None
         sys.executable,
         str(scratch),
         "--data",
-        str(tmp_path / "composite.json"),
+        str(tmp_path / "composite" / "memmap_composite.json"),
         "--checkpoint",
         str(tmp_path / "train.json"),
     ]
@@ -364,7 +422,7 @@ def test_scratch_plan_only_or_invalid_execution_receipt_cannot_advance(
         sys.executable,
         str(scratch),
         "--data",
-        str(tmp_path / "composite.json"),
+        str(tmp_path / "composite" / "memmap_composite.json"),
         "--checkpoint",
         str(tmp_path / "train.json"),
         "--receipt",
@@ -373,7 +431,10 @@ def test_scratch_plan_only_or_invalid_execution_receipt_cannot_advance(
         str(execution_receipt),
         "--go",
     ]
-    train["inputs"] = [str(tmp_path / "composite.json"), str(plan_receipt)]
+    train["inputs"] = [
+        str(tmp_path / "composite" / "memmap_composite.json"),
+        str(plan_receipt),
+    ]
     train["outputs"] = [str(tmp_path / "train.json"), str(execution_receipt)]
     promote = stages["promote"]
     assert isinstance(promote, dict) and isinstance(promote["command"], list)
