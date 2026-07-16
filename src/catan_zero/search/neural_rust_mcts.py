@@ -19,6 +19,8 @@ from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
     RUST_ENTITY_ADAPTER_V3,
+    RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
 )
@@ -2248,7 +2250,12 @@ def _structured_action(
         args["resource"] = _resource_name(value)
     elif (
         action_type == "PLAY_YEAR_OF_PLENTY"
-        and adapter_version == RUST_ENTITY_ADAPTER_V3
+        and adapter_version
+        in {
+            RUST_ENTITY_ADAPTER_V3,
+            RUST_ENTITY_ADAPTER_V4,
+            RUST_ENTITY_ADAPTER_V5,
+        }
     ):
         resources = value if isinstance(value, (list, tuple)) else ()
         args["resources"] = [

@@ -1,10 +1,13 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from catan_zero.rl.entity_feature_adapter import (
     RUST_ENTITY_ADAPTER_V2,
     RUST_ENTITY_ADAPTER_V3,
+    RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
 )
 from catan_zero.rl.entity_token_features import _legal_action_tokens
 from catan_zero.search.neural_rust_mcts import _structured_action
@@ -22,7 +25,12 @@ def _tokens(actions: list[dict]) -> np.ndarray:
         payload,
         {},
         encode_structured_action_resources=(
-            actions[0]["adapter_version"] == RUST_ENTITY_ADAPTER_V3
+            actions[0]["adapter_version"]
+            in {
+                RUST_ENTITY_ADAPTER_V3,
+                RUST_ENTITY_ADAPTER_V4,
+                RUST_ENTITY_ADAPTER_V5,
+            }
         ),
     )
 
@@ -57,27 +65,37 @@ def test_v2_preserves_lossy_resource_action_contract() -> None:
     assert tokens[1, 30] == 1.0  # Singular identity existed only as a kind.
 
 
-def test_v3_encodes_yop_bundle_and_singular_resource_identity() -> None:
+@pytest.mark.parametrize(
+    "adapter_version",
+    [
+        RUST_ENTITY_ADAPTER_V3,
+        RUST_ENTITY_ADAPTER_V4,
+        RUST_ENTITY_ADAPTER_V5,
+    ],
+)
+def test_modern_adapters_encode_yop_bundle_and_singular_resource_identity(
+    adapter_version: str,
+) -> None:
     actions = [
         _action(
             311,
             ["RED", "PLAY_YEAR_OF_PLENTY", ["WOOD", "ORE"]],
-            RUST_ENTITY_ADAPTER_V3,
+            adapter_version,
         ),
         _action(
             305,
             ["RED", "PLAY_MONOPOLY", "WOOD"],
-            RUST_ENTITY_ADAPTER_V3,
+            adapter_version,
         ),
         _action(
             309,
             ["RED", "PLAY_MONOPOLY", "ORE"],
-            RUST_ENTITY_ADAPTER_V3,
+            adapter_version,
         ),
         _action(
             185,
             ["RED", "DISCARD_RESOURCE", "ORE"],
-            RUST_ENTITY_ADAPTER_V3,
+            adapter_version,
         ),
     ]
 
