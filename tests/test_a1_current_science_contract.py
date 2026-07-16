@@ -24,6 +24,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     assert model["public_card_count_residual_bias"] is False
     assert model["public_rule_state_features"] is True
     assert model["value_tower_split_layers"] == 1
+    assert model["legal_action_value_set_statistics"] is True
     assert model["actor_public_rule_state"].startswith("dev_used_")
     assert recipe["value_trunk_grad_scale"] == 0.25
     assert recipe["post_policy_dose_value_trunk_grad_scale"] == 0.0
@@ -65,6 +66,9 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         "final_vp_head",
         "legal_action_value_residual_proj",
         "legal_action_value_static_proj",
+        "legal_action_value_max_proj",
+        "legal_action_value_count_proj",
+        "legal_action_value_static_max_proj",
         "meaningful_history_residual_gate",
         "meaningful_history_ordered_gate",
         "meaningful_history_sequence",

@@ -232,6 +232,7 @@ class TrainConfig(PipelineConfig):
     # Main resolves the inherit sentinel to concrete bools before hashing.
     static_action_residual: bool | None = None
     legal_action_value_residual: bool | None = None
+    legal_action_value_set_statistics: bool | None = None
     meaningful_public_history: bool | None = None
     meaningful_public_history_schema: str = "meaningful_public_history_2p_no_trade_v1"
     event_history_limit: int | None = None

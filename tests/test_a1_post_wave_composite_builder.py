@@ -923,14 +923,9 @@ def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
         "recent_history",
         "hard_negative",
     ]
-    assert descriptor["value_training_component_ids"] == [
-        "current_producer",
-        "recent_history",
-        "hard_negative",
-    ]
-    # Replay remains authenticated and sampled in the composite for explicit
-    # reanalysis/state-evidence consumers; it is not silently used as an
-    # off-policy terminal-return label for the current scratch value head.
+    assert descriptor["value_training_component_ids"] == ["current_producer"]
+    # Replay and mixed-opponent rows remain authenticated for policy/state
+    # coverage; only producer self-play supplies the canonical search value.
     assert replay["replay_component_ids"] == ["historical_replay"]
     assert [
         component["component_id"] for component in descriptor["components"]
@@ -954,9 +949,12 @@ def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
         descriptor["learner_recipe_overrides"]["per_game_value_weight_mode"]
         == "equal"
     )
-    assert descriptor["learner_recipe_overrides"][
-        "value_player_outcome_balance_mode"
-    ] == "sampler_balanced_v1"
+    assert (
+        descriptor["learner_recipe_overrides"][
+            "value_player_outcome_balance_mode"
+        ]
+        == "none"
+    )
     assert descriptor["learner_recipe_overrides"][
         "policy_target_blend_semantics"
     ] == "policy_target_fallback_v2"

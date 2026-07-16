@@ -25,6 +25,7 @@ def _make_entity_policy(
     public_card_count_features: bool = False,
     public_card_count_residual_bias: bool = True,
     public_rule_state_features: bool = False,
+    legal_set_stats: bool = False,
 ):
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.entity_feature_adapter import (
@@ -48,6 +49,7 @@ def _make_entity_policy(
         or value_tower_split_layers
         or public_card_count_features
         or public_rule_state_features
+        or legal_set_stats
     ):
         config = replace(
             policy.config,
@@ -60,6 +62,9 @@ def _make_entity_policy(
             public_card_count_features=bool(public_card_count_features),
             public_card_count_residual_bias=bool(public_card_count_residual_bias),
             public_rule_state_features=bool(public_rule_state_features),
+            static_action_residual=bool(legal_set_stats),
+            legal_action_value_residual=bool(legal_set_stats),
+            legal_action_value_set_statistics=bool(legal_set_stats),
         )
         policy = EntityGraphPolicy(
             config,
@@ -97,6 +102,9 @@ def test_value_head_module_attrs_covers_all_value_adjacent_heads() -> None:
         "value_head",
         "legal_action_value_residual_proj",
         "legal_action_value_static_proj",
+        "legal_action_value_max_proj",
+        "legal_action_value_count_proj",
+        "legal_action_value_static_max_proj",
         "value_categorical_head",
         "final_vp_head",
         "value_uncertainty_head",
@@ -152,6 +160,23 @@ def test_mult_other_than_one_splits_value_head_params_into_their_own_group() -> 
 
     all_trainable = {id(p) for p in policy.model.parameters() if p.requires_grad}
     assert base_param_ids | value_param_ids == all_trainable
+
+
+def test_value_multiplier_covers_legal_set_statistics_modules() -> None:
+    policy = _make_entity_policy(legal_set_stats=True)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=0.3
+    )
+    value_ids = {id(parameter) for parameter in groups[1]["params"]}
+    for attr_name in (
+        "legal_action_value_max_proj",
+        "legal_action_value_count_proj",
+        "legal_action_value_static_max_proj",
+    ):
+        assert {
+            id(parameter)
+            for parameter in getattr(policy.model, attr_name).parameters()
+        } <= value_ids
 
 
 def test_value_multiplier_covers_optional_value_attention_pool() -> None:

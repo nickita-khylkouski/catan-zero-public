@@ -407,6 +407,7 @@ def build_train_command(
         [
             "--static-action-residual",
             "--legal-action-value-residual",
+            "--legal-action-value-set-statistics",
             "--public-card-count-features",
             "--no-public-card-count-residual-bias",
             "--meaningful-public-history",

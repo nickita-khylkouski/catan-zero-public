@@ -25,7 +25,7 @@ CONTRACT_PATH = (
 TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract.template.json"
 GENERATOR_CONFIG_PATH = (
     REPO_ROOT
-    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema15.json"
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema16.json"
 )
 GENERATOR_GUARD_PATH = (
     REPO_ROOT
@@ -48,10 +48,12 @@ CURRENT_LEARNER_ENTITY_ADAPTER = (
 )
 CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
     "structured_action_value,card_count_v2,meaningful_history,"
-    "history_target_gather,public_rule_state,value_tower_split1"
+    "history_target_gather,legal_set_statistics,public_rule_state,"
+    "value_tower_split1"
 )
 CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
     "entity_graph.static_action_residual+legal_action_value_residual+"
+    "legal_action_value_set_statistics+"
     "public_card_count_features+meaningful_public_history+"
     "meaningful_history_target_gather+"
     "actor_public_rule_state.v5+value_tower_split1"
@@ -71,6 +73,10 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "grad_accum_steps": 1,
     "epochs": 3,
     "max_steps": 0,
+    # Preserve a playing-strength selection frontier inside the full scratch
+    # run. Promotion selects among these checkpoints using matched H2H evidence,
+    # never the training loss.
+    "checkpoint_steps": "8,16,32,64,128,256,512,1024",
     "base_sampler": "coverage_importance_v1",
     "resume_optimizer": False,
     "optimizer": "adamw",
@@ -78,6 +84,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "lr_warmup_steps": 250,
     "lr_schedule": "cosine",
     "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
     "fused_optimizer": True,
     "amp": "bf16",
     "value_lr_mult": 1.0,
@@ -99,7 +106,9 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "objective_gradient_interference_every_batches": 16,
     "require_feature_learning_signal_modules": (
         "event_encoder,legal_action_value_residual_proj,"
-        "legal_action_value_static_proj,meaningful_history_residual_gate,"
+        "legal_action_value_static_proj,legal_action_value_max_proj,"
+        "legal_action_value_count_proj,legal_action_value_static_max_proj,"
+        "meaningful_history_residual_gate,"
         "meaningful_history_ordered_gate,meaningful_history_sequence,"
         "meaningful_history_target_proj,"
         "public_card_count_residual,public_rule_state_residual,"
@@ -108,6 +117,11 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     ),
     "minimum_feature_learning_signal_observations": 2,
     "final_vp_loss_weight": 0.05,
+    # Equal-per-game weighting already prevents long trajectories from
+    # dominating.  Do not additionally force every source component to a
+    # synthetic 50/50 winner/loser prior: the scalar value consumed by MCTS
+    # must remain an expected return under the natural trajectory measure.
+    "value_player_outcome_balance_mode": "none",
     # Stored coherent search policies are already normalized teacher targets.
     # train_bc's scalar temperature applies only to score-derived targets;
     # sealing 0.7 here previously described an objective the optimizer never
@@ -150,6 +164,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "entity_state_trunk": "transformer",
     "static_action_residual": True,
     "legal_action_value_residual": True,
+    "legal_action_value_set_statistics": True,
     "value_tower_split_layers": 1,
     "public_card_count_features": True,
     "public_card_count_residual_bias": False,

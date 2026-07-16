@@ -402,6 +402,16 @@ class EntityGraphConfig:
     # Transformer without changing an incumbent checkpoint at activation.
     # Appended last for positional legacy-pickle compatibility.
     meaningful_public_history_target_gather: bool = False
+    # The first legal-action value repair retained a structural alias: masked
+    # means cannot distinguish a narrow legal set from a wide one when their
+    # means match, and a single strategically decisive action is diluted by
+    # many ordinary actions. This opt-in v2 branch adds value-private masked
+    # maxima plus stable linear/log legal-count features. Every projection is
+    # bias-free and exact-zero initialized, so activating the flag is a
+    # function-preserving warm start. The flag requires
+    # legal_action_value_residual because it extends that exact-mask contract.
+    # Appended last for positional legacy-pickle compatibility.
+    legal_action_value_set_statistics: bool = False
 
 
 class EntityGraphNet:
@@ -843,6 +853,17 @@ class EntityGraphNet:
                 self.legal_action_value_residual_enabled = bool(
                     getattr(cfg, "legal_action_value_residual", False)
                 )
+                self.legal_action_value_set_statistics_enabled = bool(
+                    getattr(cfg, "legal_action_value_set_statistics", False)
+                )
+                if (
+                    self.legal_action_value_set_statistics_enabled
+                    and not self.legal_action_value_residual_enabled
+                ):
+                    raise ValueError(
+                        "legal_action_value_set_statistics requires "
+                        "legal_action_value_residual"
+                    )
                 if self.legal_action_value_residual_enabled:
                     self.legal_action_value_residual_proj = nn.Linear(
                         h, h, bias=False
@@ -858,6 +879,24 @@ class EntityGraphNet:
                             bias=False,
                         )
                         nn.init.zeros_(self.legal_action_value_static_proj.weight)
+                    if self.legal_action_value_set_statistics_enabled:
+                        self.legal_action_value_max_proj = nn.Linear(
+                            h, h, bias=False
+                        )
+                        self.legal_action_value_count_proj = nn.Linear(
+                            2, h, bias=False
+                        )
+                        nn.init.zeros_(self.legal_action_value_max_proj.weight)
+                        nn.init.zeros_(self.legal_action_value_count_proj.weight)
+                        if self.static_action_residual_enabled:
+                            self.legal_action_value_static_max_proj = nn.Linear(
+                                STATIC_ACTION_RESIDUAL_FEATURE_SIZE,
+                                h,
+                                bias=False,
+                            )
+                            nn.init.zeros_(
+                                self.legal_action_value_static_max_proj.weight
+                            )
                 self.value_head = nn.Sequential(
                     nn.Linear(h, h),
                     nn.GELU(),
@@ -1528,6 +1567,52 @@ class EntityGraphNet:
                             value_state
                             + self.legal_action_value_static_proj(static_affordance)
                         )
+                    if self.legal_action_value_set_statistics_enabled:
+                        legal_count = action_weight.sum(dim=1)
+                        masked_actions = encoded_actions.masked_fill(
+                            ~action_mask.bool().unsqueeze(-1),
+                            torch.finfo(encoded_actions.dtype).min,
+                        )
+                        legal_action_max = masked_actions.max(dim=1).values
+                        if value_trunk_grad_scale == 0.0:
+                            legal_action_max = legal_action_max.detach()
+                        elif value_trunk_grad_scale != 1.0:
+                            legal_action_max = (
+                                legal_action_max.detach()
+                                + value_trunk_grad_scale
+                                * (
+                                    legal_action_max
+                                    - legal_action_max.detach()
+                                )
+                            )
+                        catalog_size = max(float(self.config.action_size), 1.0)
+                        count = legal_count.to(value_state.dtype)
+                        count_features = torch.cat(
+                            (
+                                count / catalog_size,
+                                torch.log1p(count)
+                                / max(math.log1p(catalog_size), 1.0),
+                            ),
+                            dim=-1,
+                        )
+                        value_state = (
+                            value_state
+                            + self.legal_action_value_max_proj(legal_action_max)
+                            + self.legal_action_value_count_proj(count_features)
+                        )
+                        if hasattr(
+                            self, "legal_action_value_static_max_proj"
+                        ):
+                            masked_static = static_features.float().masked_fill(
+                                ~action_mask.bool().unsqueeze(-1),
+                                torch.finfo(torch.float32).min,
+                            )
+                            value_state = (
+                                value_state
+                                + self.legal_action_value_static_max_proj(
+                                    masked_static.max(dim=1).values
+                                )
+                            )
                 value = self.value_head(value_state).squeeze(-1)
                 if self.value_attention_pool:
                     value = value + self._value_pool(
@@ -2124,6 +2209,7 @@ class EntityGraphPolicy:
         aux_settlement_pointer_head: bool = False,
         static_action_residual: bool = False,
         legal_action_value_residual: bool = False,
+        legal_action_value_set_statistics: bool = False,
         public_card_count_features: bool = False,
         public_card_count_feature_schema: str = (
             PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION
@@ -2177,6 +2263,9 @@ class EntityGraphPolicy:
                 static_action_residual=bool(static_action_residual),
                 legal_action_value_residual=bool(
                     legal_action_value_residual
+                ),
+                legal_action_value_set_statistics=bool(
+                    legal_action_value_set_statistics
                 ),
                 public_card_count_features=bool(public_card_count_features),
                 public_card_count_feature_schema=str(public_card_count_feature_schema),
@@ -2879,6 +2968,9 @@ class EntityGraphPolicy:
             "static_action_residual_proj.",
             "legal_action_value_residual_proj.",
             "legal_action_value_static_proj.",
+            "legal_action_value_max_proj.",
+            "legal_action_value_count_proj.",
+            "legal_action_value_static_max_proj.",
             "public_card_count_residual.",
             "meaningful_history_residual_gate",
             "meaningful_history_ordered_gate",

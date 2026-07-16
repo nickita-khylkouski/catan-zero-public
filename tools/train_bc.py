@@ -579,6 +579,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--legal-action-value-set-statistics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Extend the legal-action value residual with masked action/static "
+            "maxima and normalized/log legal-count features. This is a "
+            "checkpoint-owned architecture flag: omitted inherits an init/grow "
+            "checkpoint and is disabled for a fresh model. Enabling it requires "
+            "--legal-action-value-residual."
+        ),
+    )
+    parser.add_argument(
         "--value-tower-split-layers",
         type=int,
         default=None,
@@ -3045,7 +3057,7 @@ def _checkpoint_public_rule_state_features(checkpoint_path: str) -> bool:
 
 def _checkpoint_structured_action_residuals(
     checkpoint_path: str,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, bool]:
     """Read the checkpoint-owned structured action/value architecture flags."""
 
     import torch
@@ -3062,6 +3074,7 @@ def _checkpoint_structured_action_residuals(
     return (
         bool(getattr(config, "static_action_residual", False)),
         bool(getattr(config, "legal_action_value_residual", False)),
+        bool(getattr(config, "legal_action_value_set_statistics", False)),
     )
 
 
@@ -5763,8 +5776,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             and overrides.get("per_game_policy_weight_mode") == "equal"
             and overrides.get("per_game_value_weight") is True
             and overrides.get("per_game_value_weight_mode") == "equal"
-            and overrides.get("value_player_outcome_balance_mode")
-            == "sampler_balanced_v1"
+            and overrides.get("value_player_outcome_balance_mode") == "none"
             and overrides.get("loser_sample_weight") == 1.0
             and overrides.get("soft_target_temperature") == 0.7
             and overrides.get("soft_target_weight") == 1.0
@@ -5777,7 +5789,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         ):
             raise SystemExit(
                 "promotion-eligible flywheel composite requires sampler-aware "
-                "equal policy/value game weighting plus sampler-balanced value outcomes"
+                "equal policy/value game weighting under the natural outcome prior"
             )
         flywheel_replay_contract = dict(raw_contract)
     return {
@@ -8379,11 +8391,6 @@ def _effective_a1_learner_training_recipe(
         effective["symmetry_augment_events"] = bool(
             getattr(args, "symmetry_augment_events", True)
         )
-    value_balance_mode = str(
-        getattr(args, "value_player_outcome_balance_mode", "none")
-    )
-    if value_balance_mode != "none":
-        effective["value_player_outcome_balance_mode"] = value_balance_mode
     policy_target_blend_semantics = str(
         getattr(
             args,
@@ -8434,8 +8441,10 @@ def _effective_a1_learner_training_recipe(
         effective["per_game_policy_weight_mode"] = str(
             args.per_game_policy_weight_mode
         )
-    if bool(getattr(args, "static_action_residual", False)) or bool(
-        getattr(args, "legal_action_value_residual", False)
+    if (
+        bool(getattr(args, "static_action_residual", False))
+        or bool(getattr(args, "legal_action_value_residual", False))
+        or bool(getattr(args, "legal_action_value_set_statistics", False))
     ):
         # Additive checkpoint architecture. Historical recipes retain their
         # exact seal while an enabled repair cannot disappear from recipe
@@ -8444,6 +8453,8 @@ def _effective_a1_learner_training_recipe(
         effective["legal_action_value_residual"] = bool(
             args.legal_action_value_residual
         )
+        if bool(getattr(args, "legal_action_value_set_statistics", False)):
+            effective["legal_action_value_set_statistics"] = True
     if int(getattr(args, "value_tower_split_layers", 0) or 0) > 0:
         effective["value_tower_split_layers"] = int(
             args.value_tower_split_layers
@@ -9017,6 +9028,10 @@ def _validate_a1_scratch_runtime_projection(
         != model["static_action_residual"],
         "legal_action_value_residual": bool(args.legal_action_value_residual)
         != model["legal_action_value_residual"],
+        "legal_action_value_set_statistics": bool(
+            getattr(args, "legal_action_value_set_statistics", False)
+        )
+        != model["legal_action_value_set_statistics"],
         "value_tower_split_layers": int(args.value_tower_split_layers)
         != model["value_tower_split_layers"],
         "public_card_count_features": bool(args.public_card_count_features)
@@ -9361,6 +9376,22 @@ def _validate_a1_learner_training_recipe(
         raise SystemExit("A1 contract has no typed learner training recipe")
     immutable_expected = expected
     effective = _effective_a1_learner_training_recipe(args, ddp)
+    # These fields postdate the historical effective-recipe tuple. Replay them
+    # only when the immutable authority explicitly binds them, preserving old
+    # recipe shapes while making current scratch commands exact.
+    late_bound_values = {
+        "checkpoint_steps": str(getattr(args, "checkpoint_steps", "") or ""),
+        "max_grad_norm": float(getattr(args, "max_grad_norm", 1.0)),
+        "post_policy_dose_value_trunk_grad_scale": float(
+            getattr(args, "post_policy_dose_value_trunk_grad_scale", 1.0)
+        ),
+        "value_player_outcome_balance_mode": str(
+            getattr(args, "value_player_outcome_balance_mode", "none")
+        ),
+    }
+    for key, value in late_bound_values.items():
+        if key in expected:
+            effective[key] = value
     # Static parent-KL direction was added to newer sealed recipes after the
     # original effective-recipe field tuple. It is trajectory-relevant when
     # anchoring is active, so replay it whenever the immutable authority binds
@@ -10238,29 +10269,39 @@ def _resolve_effective_public_rule_state_features(
 
 def _resolve_effective_structured_action_residuals(
     args: argparse.Namespace,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, bool]:
     """Resolve fresh/resume/grow structured-action architecture exactly."""
 
     requested_static_raw = getattr(args, "static_action_residual", None)
     requested_legal_raw = getattr(args, "legal_action_value_residual", None)
+    requested_set_stats_raw = getattr(
+        args, "legal_action_value_set_statistics", None
+    )
     requested_static = (
         None if requested_static_raw is None else bool(requested_static_raw)
     )
     requested_legal = None if requested_legal_raw is None else bool(requested_legal_raw)
+    requested_set_stats = (
+        None
+        if requested_set_stats_raw is None
+        else bool(requested_set_stats_raw)
+    )
     if str(args.arch) != "entity_graph":
-        if requested_static or requested_legal:
+        if requested_static or requested_legal or requested_set_stats:
             raise SystemExit(
                 "structured action residuals are supported only for "
                 "--arch entity_graph"
             )
-        return False, False
+        return False, False, False
 
     init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
     grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
     if init_checkpoint:
-        inherited_static, inherited_legal = _checkpoint_structured_action_residuals(
-            init_checkpoint
-        )
+        (
+            inherited_static,
+            inherited_legal,
+            inherited_set_stats,
+        ) = _checkpoint_structured_action_residuals(init_checkpoint)
         mismatches = []
         if requested_static is not None and requested_static != inherited_static:
             mismatches.append(
@@ -10272,6 +10313,14 @@ def _resolve_effective_structured_action_residuals(
                 f"legal_action_value_residual checkpoint={inherited_legal} "
                 f"cli={requested_legal}"
             )
+        if (
+            requested_set_stats is not None
+            and requested_set_stats != inherited_set_stats
+        ):
+            mismatches.append(
+                "legal_action_value_set_statistics "
+                f"checkpoint={inherited_set_stats} cli={requested_set_stats}"
+            )
         if mismatches:
             raise SystemExit(
                 "structured action residual flags do not match --init-checkpoint: "
@@ -10279,19 +10328,34 @@ def _resolve_effective_structured_action_residuals(
                 + ". Upgrade the checkpoint with the structured_action_value "
                 "upgrade or omit the flags to inherit its exact architecture."
             )
-        return inherited_static, inherited_legal
+        return inherited_static, inherited_legal, inherited_set_stats
     if grow_checkpoint:
-        inherited_static, inherited_legal = _checkpoint_structured_action_residuals(
-            grow_checkpoint
-        )
-        return (
+        (
+            inherited_static,
+            inherited_legal,
+            inherited_set_stats,
+        ) = _checkpoint_structured_action_residuals(grow_checkpoint)
+        result = (
             inherited_static if requested_static is None else requested_static,
             inherited_legal if requested_legal is None else requested_legal,
+            (
+                inherited_set_stats
+                if requested_set_stats is None
+                else requested_set_stats
+            ),
         )
-    return (
-        False if requested_static is None else requested_static,
-        False if requested_legal is None else requested_legal,
-    )
+    else:
+        result = (
+            False if requested_static is None else requested_static,
+            False if requested_legal is None else requested_legal,
+            False if requested_set_stats is None else requested_set_stats,
+        )
+    if result[2] and not result[1]:
+        raise SystemExit(
+            "--legal-action-value-set-statistics requires "
+            "--legal-action-value-residual"
+        )
+    return result
 
 
 def _resolve_effective_value_tower_split_layers(
@@ -10336,6 +10400,9 @@ def _structured_action_create_kwargs(
     return {
         "static_action_residual": bool(args.static_action_residual),
         "legal_action_value_residual": bool(args.legal_action_value_residual),
+        "legal_action_value_set_statistics": bool(
+            getattr(args, "legal_action_value_set_statistics", False)
+        ),
     }
 
 
@@ -11256,6 +11323,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     (
         args.static_action_residual,
         args.legal_action_value_residual,
+        args.legal_action_value_set_statistics,
     ) = _resolve_effective_structured_action_residuals(args)
     args.value_tower_split_layers = (
         _resolve_effective_value_tower_split_layers(args)
@@ -11483,6 +11551,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     (
         args.static_action_residual,
         args.legal_action_value_residual,
+        args.legal_action_value_set_statistics,
     ) = _resolve_effective_structured_action_residuals(args)
     args.value_tower_split_layers = (
         _resolve_effective_value_tower_split_layers(args)
@@ -32319,6 +32388,7 @@ def _checkpoint_config_mismatches(
         for field in (
             "static_action_residual",
             "legal_action_value_residual",
+            "legal_action_value_set_statistics",
         ):
             checkpoint_enabled = bool(getattr(config, field, False))
             requested_enabled = bool(getattr(args, field, False))
@@ -32658,6 +32728,9 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "value_head",
         "legal_action_value_residual_proj",
         "legal_action_value_static_proj",
+        "legal_action_value_max_proj",
+        "legal_action_value_count_proj",
+        "legal_action_value_static_max_proj",
         "value_categorical_head",
         "final_vp_head",
         "value_uncertainty_head",
@@ -32736,6 +32809,7 @@ def _effective_entity_graph_architecture_report(
             "topology_residual_adapter": False,
             "static_action_residual": False,
             "legal_action_value_residual": False,
+            "legal_action_value_set_statistics": False,
             "value_tower_split_layers": 0,
             "public_card_count_features": False,
             "public_card_count_residual_bias": False,
@@ -32780,6 +32854,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "legal_action_value_residual": bool(
             getattr(config, "legal_action_value_residual", False)
+        ),
+        "legal_action_value_set_statistics": bool(
+            getattr(config, "legal_action_value_set_statistics", False)
         ),
         "value_tower_split_layers": int(
             getattr(config, "value_tower_split_layers", 0) or 0
@@ -33068,6 +33145,9 @@ VALUE_HEAD_MODULE_ATTRS: tuple[str, ...] = (
     "value_head",
     "legal_action_value_residual_proj",
     "legal_action_value_static_proj",
+    "legal_action_value_max_proj",
+    "legal_action_value_count_proj",
+    "legal_action_value_static_max_proj",
     "value_categorical_head",
     "final_vp_head",
     "value_uncertainty_head",

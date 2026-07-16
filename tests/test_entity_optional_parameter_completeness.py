@@ -61,6 +61,13 @@ def _remove_first_parameter(path, prefix: str, *, output):
             "legal_action_value_residual_proj.",
         ),
         (
+            {
+                "legal_action_value_residual": True,
+                "legal_action_value_set_statistics": True,
+            },
+            "legal_action_value_count_proj.",
+        ),
+        (
             {"public_card_count_features": True},
             "public_card_count_residual.",
         ),

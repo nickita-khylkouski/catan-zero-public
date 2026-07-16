@@ -108,11 +108,11 @@ _CURRENT_VALUE_PLAYER_OUTCOME_BALANCE_MODE = _CURRENT_LEARNER_RECIPE.get(
 if (
     _CURRENT_PER_GAME_VALUE_WEIGHT is not True
     or _CURRENT_PER_GAME_VALUE_WEIGHT_MODE != "equal"
-    or _CURRENT_VALUE_PLAYER_OUTCOME_BALANCE_MODE != "sampler_balanced_v1"
+    or _CURRENT_VALUE_PLAYER_OUTCOME_BALANCE_MODE != "none"
 ):
     raise RuntimeError(
         "current science contract must bind equal per-game value weighting and "
-        "sampler-balanced player/outcome coverage"
+        "the natural terminal-outcome prior"
     )
 
 
@@ -1798,14 +1798,17 @@ def _build_descriptor(
             STORED_POLICY_COMPONENT_TEMPERATURES
         ),
         "entity_feature_adapter_component_versions": adapter_versions,
-        # Terminal outcomes estimate the return of the behavior/continuation
-        # policy that generated each trajectory.  Historical replay came from
-        # an older policy lineage, so including it here would train the current
-        # scratch value head on a different Bellman operator than the one used
-        # by the fresh coherent-search actor.  Keep replay in ``components``
-        # and ``flywheel_replay_contract`` for explicit reanalysis, but make
-        # fresh on-policy outcomes the production value baseline.
-        "value_training_component_ids": fresh_component_ids,
+        # Terminal outcomes estimate the return of the complete continuation
+        # policy that generated each trajectory.  In opponent-pool games only
+        # producer-seat roots are recorded, but the other seat is controlled by
+        # an archived/hard-negative policy and that identity is provenance, not
+        # a neural input.  Those rows retain current-producer search-policy
+        # targets, but their terminal z belongs to a different, unobserved
+        # continuation operator.  Canonical search-value learning therefore
+        # uses producer self-play outcomes only.  Mixed-opponent rows remain
+        # policy/state evidence; a future population value must be a separately
+        # conditioned head rather than aliasing this one.
+        "value_training_component_ids": ["current_producer"],
         "aux_subgoal_component_ids": aux_subgoal_component_ids,
         "flywheel_replay_contract": replay_contract,
         "source_authority_manifest": source_authority["path"],

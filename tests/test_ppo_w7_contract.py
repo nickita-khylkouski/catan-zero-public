@@ -144,6 +144,7 @@ def test_real_entity_optimizer_keeps_value_affordance_residual_at_head_lr() -> N
         state_layers=1,
         attention_heads=2,
         legal_action_value_residual=True,
+        legal_action_value_set_statistics=True,
         seed=0,
     )
     optimizer = make_ppo_optimizer(
@@ -155,10 +156,16 @@ def test_real_entity_optimizer_keeps_value_affordance_residual_at_head_lr() -> N
     head_ids = {id(parameter) for parameter in groups["policy_value_heads"]["params"]}
     trunk_ids = {id(parameter) for parameter in groups["protected_trunk"]["params"]}
 
-    residual_ids = {
-        id(parameter)
-        for parameter in policy.model.legal_action_value_residual_proj.parameters()
-    }
+    residual_ids = set()
+    for module_name in (
+        "legal_action_value_residual_proj",
+        "legal_action_value_max_proj",
+        "legal_action_value_count_proj",
+    ):
+        residual_ids.update(
+            id(parameter)
+            for parameter in getattr(policy.model, module_name).parameters()
+        )
     encoder_ids = {id(parameter) for parameter in policy.model.hex_encoder.parameters()}
     assert residual_ids <= head_ids
     assert residual_ids.isdisjoint(trunk_ids)

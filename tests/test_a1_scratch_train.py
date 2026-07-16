@@ -176,6 +176,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert "--resume-optimizer" not in command
     assert command.count("--no-resume-optimizer") == 1
     assert command.count("--no-public-card-count-residual-bias") == 1
+    assert command.count("--legal-action-value-set-statistics") == 1
     assert command.count("--public-rule-state-features") == 1
     assert command[command.index("--value-tower-split-layers") + 1] == "1"
     assert command.count("--meaningful-public-history-target-gather") == 1
@@ -284,6 +285,7 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     args = SimpleNamespace(
         static_action_residual=True,
         legal_action_value_residual=True,
+        legal_action_value_set_statistics=True,
         public_card_count_residual_bias=False,
     )
     policy = EntityGraphPolicy.create(
@@ -322,6 +324,7 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     )
     assert policy.config.static_action_residual is True
     assert policy.config.legal_action_value_residual is True
+    assert policy.config.legal_action_value_set_statistics is True
 
 
 def test_planned_receipt_is_semantically_authenticated(tmp_path: Path) -> None:
@@ -384,6 +387,9 @@ def _runtime_args() -> SimpleNamespace:
         entity_state_trunk=model["entity_state_trunk"],
         static_action_residual=model["static_action_residual"],
         legal_action_value_residual=model["legal_action_value_residual"],
+        legal_action_value_set_statistics=model[
+            "legal_action_value_set_statistics"
+        ],
         value_tower_split_layers=model["value_tower_split_layers"],
         public_card_count_features=model["public_card_count_features"],
         public_card_count_residual_bias=model["public_card_count_residual_bias"],

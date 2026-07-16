@@ -2464,7 +2464,7 @@ def _verify_production_composite_inputs(
         or learner_overrides != composite_builder.LEARNER_RECIPE_OVERRIDES
         or meta.get("policy_kl_anchor_component_ids") != []
         or meta.get("policy_distillation_component_ids") != expected_ids[:3]
-        or meta.get("value_training_component_ids") != expected_ids[:3]
+        or meta.get("value_training_component_ids") != expected_ids[:1]
         or not isinstance(meta.get("entity_feature_adapter_component_versions"), dict)
         or set(meta["entity_feature_adapter_component_versions"]) != set(expected_ids)
         or len(set(meta["entity_feature_adapter_component_versions"].values())) != 1
@@ -3780,7 +3780,11 @@ FRESH_POLICY_DISTILLATION_COMPONENT_IDS = (
     "recent_history",
     "hard_negative",
 )
-FRESH_VALUE_TRAINING_COMPONENT_IDS = FRESH_POLICY_DISTILLATION_COMPONENT_IDS
+# Only current-producer self-play has the continuation policy represented by
+# the canonical search value head.  Mixed-opponent rows retain valid producer
+# search-policy targets, but their terminal outcome depends on an opponent
+# identity that is provenance-only rather than a model input.
+FRESH_VALUE_TRAINING_COMPONENT_IDS = ("current_producer",)
 ALL_POST_WAVE_COMPONENT_IDS = (
     *FRESH_POLICY_DISTILLATION_COMPONENT_IDS,
     "historical_replay",

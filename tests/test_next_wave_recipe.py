@@ -33,7 +33,7 @@ from tools.build_memmap_corpus import (  # noqa: E402
 
 CONFIG = (
     REPO
-    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema15.json"
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema16.json"
 )
 GUARD = (
     REPO
@@ -82,10 +82,10 @@ def test_meaningful_history_uses_legacy_compatible_memmap_width() -> None:
     assert np.all(normalized["event_target_ids"][:, 32:] == -1)
 
 
-def test_next_wave_typed_generation_config_is_exact_schema_15_recipe() -> None:
+def test_next_wave_typed_generation_config_is_exact_schema_16_recipe() -> None:
     payload = json.loads(CONFIG.read_text())
     assert payload["pipeline"] == GenerateConfig.PIPELINE
-    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 15
+    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 16
 
     cfg = GenerateConfig(**payload["fields"])
     assert cfg.canonical_payload() == payload
@@ -261,10 +261,7 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert recipe["symmetry_augment_events"] is True
     assert recipe["value_lr_mult"] == 1.0
     assert recipe["per_game_value_weight"] is True
-    assert (
-        recipe["value_player_outcome_balance_mode"]
-        == "sampler_balanced_v1"
-    )
+    assert recipe["value_player_outcome_balance_mode"] == "none"
     assert recipe["scalar_value_loss_readout"] == "deployed_tanh"
     assert recipe["scalar_value_loss_scale"] == payload["operator"]["evaluator"][
         "value_scale"
@@ -293,10 +290,10 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert "final_vp_head" in recipe["require_feature_learning_signal_modules"]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:7335f52852dc2f47da0549fa3452fe4745b59892acf334450bc8a2594fa6fc5b"
+        "sha256:ced6c4b3bb1166a1955f5f5b4e07fbd1e6a47ae4f469b48e744a751e73332f8c"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:de611839f74fdd0fad8f38f93acfbb1e3109a0c7aaf58ae64270189d5f2a946c"
+        "sha256:42d806dc223674e32e126be631687870c3905fd841c291d2597ce6f9eda0135c"
     )
 
 
@@ -315,7 +312,25 @@ def test_canonical_short_dose_reconstructs_byte_exactly_in_trainer() -> None:
         {"world_size": 1, "rank": 0, "local_rank": 0, "enabled": False},
     )
 
-    assert effective == recipe
+    late_bound_fields = {
+        "checkpoint_steps",
+        "max_grad_norm",
+        "post_policy_dose_value_trunk_grad_scale",
+        "value_player_outcome_balance_mode",
+    }
+    assert effective == {
+        key: value for key, value in recipe.items() if key not in late_bound_fields
+    }
+    assert args.checkpoint_steps == recipe["checkpoint_steps"]
+    assert args.max_grad_norm == recipe["max_grad_norm"]
+    assert (
+        args.post_policy_dose_value_trunk_grad_scale
+        == recipe["post_policy_dose_value_trunk_grad_scale"]
+    )
+    assert (
+        args.value_player_outcome_balance_mode
+        == recipe["value_player_outcome_balance_mode"]
+    )
 
 
 def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:

@@ -530,7 +530,7 @@ def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
         "learner_recipe_overrides_sha256": "sha256:" + "4" * 64,
         "policy_kl_anchor_component_ids": [],
         "policy_distillation_component_ids": component_ids[:3],
-        "value_training_component_ids": component_ids[:3],
+        "value_training_component_ids": component_ids[:1],
         "aux_subgoal_target_contract_sha256": "sha256:" + "a" * 64,
         "public_award_feature_transition_contract_sha256": "sha256:" + "b" * 64,
         "source_authority_semantic_sha256": "sha256:" + "c" * 64,

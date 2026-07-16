@@ -2418,7 +2418,7 @@ def make_ppo_optimizer(
         # else is the representation trunk protected by the lower LR.
         head_prefixes = (
             "action_",
-            "legal_action_value_residual_proj",
+            "legal_action_value_",
             "static_action_residual_proj",
             "target_gather_proj",
             "edge_policy_",
