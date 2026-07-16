@@ -634,18 +634,39 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
     production_plan = tmp_path / "production-plan.json"
     production_plan.write_text("{}")
     subset = tmp_path / "production-roots.npz"
-    identities = np.asarray(
-        [f"sha256:{index:064x}" for index in range(final.EXPECTED_ROOTS)]
+    training_games = np.arange(100_000, 100_020, dtype=np.int64)
+    validation_games = np.arange(200_000, 200_004, dtype=np.int64)
+    selected_games = np.repeat(
+        np.concatenate((training_games, validation_games)), 8
     )
-    game_seeds = np.arange(100_000, 100_000 + final.EXPECTED_ROOTS, dtype=np.int64)
-    row_indices = np.arange(final.EXPECTED_ROOTS, dtype=np.int64)
-    decision_indices = np.arange(final.EXPECTED_ROOTS, dtype=np.int64) + 10
+    realized_count = int(selected_games.size)
+    identities = np.asarray(
+        [f"sha256:{index:064x}" for index in range(realized_count)]
+    )
+    game_seeds = selected_games
+    row_indices = np.arange(realized_count, dtype=np.int64)
+    decision_cycle = np.asarray([5, 15, 35, 65, 105, 155, 205, 7], dtype=np.int64)
+    decision_indices = np.tile(decision_cycle, len(selected_games) // 8)
+    phase_cycle = np.asarray(
+        [
+            "BUILD_INITIAL_ROAD",
+            "BUILD_INITIAL_SETTLEMENT",
+            "DISCARD",
+            "MOVE_ROBBER",
+            "PLAY_TURN",
+            "PLAY_TURN",
+            "PLAY_TURN",
+            "PLAY_TURN",
+        ]
+    )
+    phases = np.tile(phase_cycle, len(selected_games) // 8)
     np.savez(
         subset,
         identity_sha256=identities,
         game_seed=game_seeds,
         row_index=row_indices,
         decision_index=decision_indices,
+        phase=phases,
     )
     ready = [
         {
@@ -654,8 +675,10 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
             "decision_index": int(decision_indices[index]),
             "identity_sha256": str(identities[index]),
         }
-        for index in range(final.EXPECTED_ROOTS)
+        for index in range(realized_count)
     ]
+    validation_manifest_sha = "sha256:" + "a" * 64
+    validation_seed_set_sha = "sha256:" + "b" * 64
     prep_value = {
         "schema_version": final.PREP_INVENTORY_SCHEMA,
         "authority": {"is_authority": False, "may_launch_search": False},
@@ -664,22 +687,45 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
             "satisfied": True,
             "independent_from_all_declared_eval_pair_seeds": True,
             "independent_from_diagnostic_selected_rows": True,
-            "independent_from_learner_holdout_games": True,
-            "required_fully_reconstructable_strategic_roots": final.EXPECTED_ROOTS,
-            "observed_fully_reconstructable_strategic_roots": final.EXPECTED_ROOTS,
-            "first_8192_ready_root_key_set_sha256": final.value_sha256(ready),
+            "learner_validation_manifest_file_sha256": validation_manifest_sha,
+            "learner_validation_game_seed_set_sha256": validation_seed_set_sha,
+            "learner_validation_target_covered": True,
+            "learner_validation_optimizer_excluded": True,
+            "required_fully_reconstructable_strategic_roots": realized_count,
+            "observed_fully_reconstructable_strategic_roots": realized_count,
+            "ready_root_prefix_count": realized_count,
+            "ready_root_prefix_sha256": final.value_sha256(ready),
         },
     }
     prep = tmp_path / "prep.json"
     _write_sealed(prep, prep_value, "inventory_sha256")
+    root_breadth = final.alignment._stage_c_root_breadth_inventory(  # noqa: SLF001
+        corpus_game_seeds=np.concatenate((training_games, validation_games)),
+        validation_game_seeds=validation_games,
+        selected_game_seeds=game_seeds,
+        selected_decision_indices=decision_indices,
+        selected_phases=phases,
+    )
     plan = {
         "plan_sha256": "sha256:" + "p" * 64,
+        "learner_validation_scope": {
+            "manifest": {
+                "path": str(tmp_path / "validation.json"),
+                "file_sha256": validation_manifest_sha,
+            },
+            "validation_game_seed_count": len(validation_games),
+            "validation_game_seed_set_sha256": validation_seed_set_sha,
+            "target_covered": True,
+            "optimizer_excluded": True,
+            "external_final_gate_authority": False,
+        },
         "subset": {
             "artifact": {"path": str(subset)},
-            "selected_rows": final.EXPECTED_ROOTS,
-            "requested_rows": final.EXPECTED_ROOTS,
-            "chunks": final.EXPECTED_PARTITIONS,
+            "selected_rows": realized_count,
+            "requested_rows": realized_count + 8,
+            "chunks": 7,
             "selection_seed": 42,
+            "game_first_selection": {"root_breadth": root_breadth},
         },
         "execution": {"executor_semantics": final.EXPECTED_EXECUTOR},
         "target_policy_target_identity": {
@@ -692,7 +738,7 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
     np.savez(
         forbidden,
         identity_sha256=np.asarray(["sha256:" + "f" * 64]),
-        game_seed=np.asarray([200_000], dtype=np.int64),
+        game_seed=np.asarray([400_000], dtype=np.int64),
     )
     eval_report = tmp_path / "eval.json"
     eval_report.write_text(
@@ -712,8 +758,28 @@ def test_root_manifest_refuses_diagnostic_or_eval_overlap(
         forbidden_subset_paths=[forbidden],
         forbidden_eval_paths=[eval_report],
     )
-    assert manifest["root_count"] == final.EXPECTED_ROOTS
+    assert manifest["root_count"] == realized_count
+    assert manifest["requested_root_budget"] == realized_count + 8
+    assert manifest["partition_count"] == 7
+    assert manifest["learner_validation_scope"]["target_covered"] is True
     assert manifest["diagnostic_root_overlap_count"] == 0
+
+    bad_prep_value = copy.deepcopy(prep_value)
+    bad_prep_value["proof"]["learner_validation_manifest_file_sha256"] = (
+        "sha256:" + "c" * 64
+    )
+    bad_prep = tmp_path / "prep-bad-validation.json"
+    _write_sealed(bad_prep, bad_prep_value, "inventory_sha256")
+    with pytest.raises(
+        final.FinalReplicationError,
+        match="preparation evidence drifted",
+    ):
+        final.build_root_manifest(
+            production_plan_path=production_plan,
+            prep_inventory_path=bad_prep,
+            forbidden_subset_paths=[forbidden],
+            forbidden_eval_paths=[eval_report],
+        )
 
     np.savez(
         forbidden,

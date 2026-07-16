@@ -63,9 +63,9 @@ from catan_zero.search.neural_rust_mcts import (  # noqa: E402
 )
 
 
-PLAN_SCHEMA = "a1-stage-c-teacher-alignment-plan-v1"
+PLAN_SCHEMA = "a1-stage-c-teacher-alignment-plan-v2"
 OVERLAY_SCHEMA = "a1-stage-c-target-eligibility-overlay-v1"
-SUBSET_SCHEMA = "a1-stage-c-reanalysis-subset-v1"
+SUBSET_SCHEMA = "a1-stage-c-reanalysis-subset-v2"
 COHERENT_REGIME = "public_belief_single_tree_v1"
 OPERATOR_IDENTITY_SCHEMA_V1 = "a1-operator-bound-policy-target-identity-v1"
 OPERATOR_IDENTITY_SCHEMA_V2 = "a1-operator-bound-policy-target-identity-v2"
@@ -94,6 +94,39 @@ RELIABILITY_CLASS = {
     "not_collected": 0,
     "unaudited_neutral_sentinel": 1,
     "duplicate_search_audited": 2,
+}
+ROOT_BREADTH_SCHEMA = "a1-stage-c-policy-root-breadth-v1"
+ROOT_BREADTH_REQUIRED_PHASES = (
+    "BUILD_INITIAL_ROAD",
+    "BUILD_INITIAL_SETTLEMENT",
+    "DISCARD",
+    "MOVE_ROBBER",
+    "PLAY_TURN",
+)
+ROOT_BREADTH_DECISION_BINS = (
+    ("d000_009", 0, 10),
+    ("d010_029", 10, 30),
+    ("d030_059", 30, 60),
+    ("d060_099", 60, 100),
+    ("d100_149", 100, 150),
+    ("d150_199", 150, 200),
+    ("d200_plus", 200, None),
+)
+ROOT_BREADTH_CONTRACT = {
+    "minimum_unique_game_fraction": 0.95,
+    "minimum_roots_per_represented_game": 8,
+    "minimum_phase_fraction": 0.01,
+    "minimum_decision_bin_fraction": 0.01,
+    "required_phases": list(ROOT_BREADTH_REQUIRED_PHASES),
+    "decision_index_bins": [
+        {
+            "name": name,
+            "start_inclusive": start,
+            "stop_exclusive": stop,
+        }
+        for name, start, stop in ROOT_BREADTH_DECISION_BINS
+    ],
+    "required_scopes": ["training", "validation"],
 }
 SEARCH_FIELDS = (
     "n_full",
@@ -694,11 +727,193 @@ def _width_bucket(width: int) -> str:
 
 
 def _stable_u64(seed: int, *values: int) -> int:
-    payload = ":".join(("a1-stage-c-subset-v1", str(seed), *(str(v) for v in values)))
+    payload = ":".join(
+        ("a1-stage-c-game-first-subset-v2", str(seed), *(str(v) for v in values))
+    )
     return int.from_bytes(hashlib.sha256(payload.encode("ascii")).digest()[:8], "big")
 
 
-def _select_stratified(
+def _decision_bucket(decision_index: int) -> str:
+    for name, start, stop in ROOT_BREADTH_DECISION_BINS:
+        if decision_index >= start and (stop is None or decision_index < stop):
+            return name
+    raise AlignmentError("Stage-C decision index is negative")
+
+
+def _root_breadth_scope(
+    *,
+    population_game_seeds: np.ndarray,
+    selected_game_seeds: np.ndarray,
+    selected_decision_indices: np.ndarray,
+    selected_phases: np.ndarray,
+) -> dict[str, Any]:
+    population = np.unique(np.asarray(population_game_seeds, dtype=np.int64))
+    games = np.asarray(selected_game_seeds, dtype=np.int64)
+    decisions = np.asarray(selected_decision_indices, dtype=np.int64)
+    phases = np.asarray(selected_phases).astype(str, copy=False)
+    if (
+        population.size == 0
+        or games.ndim != 1
+        or decisions.shape != games.shape
+        or phases.shape != games.shape
+        or np.any(decisions < 0)
+    ):
+        raise AlignmentError("Stage-C root-breadth inputs are malformed")
+    selected_unique, roots_per_game = np.unique(games, return_counts=True)
+    if np.setdiff1d(selected_unique, population).size:
+        raise AlignmentError("Stage-C selected root references a game outside its split")
+    phase_counts = {
+        phase: int(np.count_nonzero(phases == phase))
+        for phase in ROOT_BREADTH_REQUIRED_PHASES
+    }
+    unknown_phases = sorted(set(phases.tolist()) - set(ROOT_BREADTH_REQUIRED_PHASES))
+    decision_counts = {
+        name: int(
+            np.count_nonzero(
+                (decisions >= start)
+                & (True if stop is None else (decisions < stop))
+            )
+        )
+        for name, start, stop in ROOT_BREADTH_DECISION_BINS
+    }
+    selected_count = int(games.size)
+    population_count = int(population.size)
+    selected_game_count = int(selected_unique.size)
+    denominator = max(selected_count, 1)
+    return {
+        "population_game_count": population_count,
+        "selected_root_count": selected_count,
+        "selected_game_count": selected_game_count,
+        "unique_game_fraction": selected_game_count / population_count,
+        "missing_game_count": population_count - selected_game_count,
+        "roots_per_represented_game": {
+            "minimum": int(roots_per_game.min()) if roots_per_game.size else 0,
+            "maximum": int(roots_per_game.max()) if roots_per_game.size else 0,
+            "mean": (
+                float(selected_count / selected_game_count)
+                if selected_game_count
+                else 0.0
+            ),
+        },
+        "phase_counts": phase_counts,
+        "phase_fractions": {
+            phase: count / denominator for phase, count in phase_counts.items()
+        },
+        "unknown_phases": unknown_phases,
+        "decision_index_bin_counts": decision_counts,
+        "decision_index_bin_fractions": {
+            name: count / denominator for name, count in decision_counts.items()
+        },
+    }
+
+
+def _root_breadth_failures(
+    scopes: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    failures: list[str] = []
+    for scope_name, scope in scopes.items():
+        if (
+            float(scope["unique_game_fraction"])
+            < float(ROOT_BREADTH_CONTRACT["minimum_unique_game_fraction"])
+        ):
+            failures.append(f"{scope_name}:unique_game_fraction")
+        if (
+            int(scope["roots_per_represented_game"]["minimum"])
+            < int(ROOT_BREADTH_CONTRACT["minimum_roots_per_represented_game"])
+        ):
+            failures.append(f"{scope_name}:minimum_roots_per_represented_game")
+        if scope["unknown_phases"]:
+            failures.append(f"{scope_name}:unknown_phases")
+        for phase, fraction in scope["phase_fractions"].items():
+            if float(fraction) < float(ROOT_BREADTH_CONTRACT["minimum_phase_fraction"]):
+                failures.append(f"{scope_name}:phase:{phase}")
+        for name, fraction in scope["decision_index_bin_fractions"].items():
+            if float(fraction) < float(
+                ROOT_BREADTH_CONTRACT["minimum_decision_bin_fraction"]
+            ):
+                failures.append(f"{scope_name}:decision_bin:{name}")
+    return failures
+
+
+def _stage_c_root_breadth_inventory(
+    *,
+    corpus_game_seeds: np.ndarray,
+    validation_game_seeds: np.ndarray,
+    selected_game_seeds: np.ndarray,
+    selected_decision_indices: np.ndarray,
+    selected_phases: np.ndarray,
+) -> dict[str, Any]:
+    all_games = np.unique(np.asarray(corpus_game_seeds, dtype=np.int64))
+    validation_games = np.unique(
+        np.asarray(validation_game_seeds, dtype=np.int64)
+    )
+    if np.setdiff1d(validation_games, all_games).size:
+        raise AlignmentError("Stage-C validation split names a game outside the corpus")
+    selected_games = np.asarray(selected_game_seeds, dtype=np.int64)
+    decisions = np.asarray(selected_decision_indices, dtype=np.int64)
+    phases = np.asarray(selected_phases).astype(str, copy=False)
+    if (
+        selected_games.ndim != 1
+        or decisions.shape != selected_games.shape
+        or phases.shape != selected_games.shape
+    ):
+        raise AlignmentError("Stage-C selected root-breadth arrays are misaligned")
+    selected_validation = np.isin(selected_games, validation_games)
+    scopes = {
+        "training": _root_breadth_scope(
+            population_game_seeds=np.setdiff1d(all_games, validation_games),
+            selected_game_seeds=selected_games[~selected_validation],
+            selected_decision_indices=decisions[~selected_validation],
+            selected_phases=phases[~selected_validation],
+        ),
+        "validation": _root_breadth_scope(
+            population_game_seeds=validation_games,
+            selected_game_seeds=selected_games[selected_validation],
+            selected_decision_indices=decisions[selected_validation],
+            selected_phases=phases[selected_validation],
+        ),
+    }
+    failures = _root_breadth_failures(scopes)
+    value: dict[str, Any] = {
+        "schema_version": ROOT_BREADTH_SCHEMA,
+        "contract": json.loads(json.dumps(ROOT_BREADTH_CONTRACT)),
+        "scopes": scopes,
+        "passed": not failures,
+        "failures": failures,
+    }
+    value["inventory_sha256"] = _value_sha256(value)
+    return value
+
+
+def _verify_stage_c_root_breadth_inventory(
+    value: object, *, selected_rows: int
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AlignmentError("Stage-C root-breadth inventory is missing")
+    unsigned = dict(value)
+    stated = unsigned.pop("inventory_sha256", None)
+    scopes = value.get("scopes")
+    if (
+        value.get("schema_version") != ROOT_BREADTH_SCHEMA
+        or stated != _value_sha256(unsigned)
+        or value.get("contract") != ROOT_BREADTH_CONTRACT
+        or not isinstance(scopes, dict)
+        or set(scopes) != set(ROOT_BREADTH_CONTRACT["required_scopes"])
+        or value.get("passed") is not True
+        or value.get("failures") != []
+        or _root_breadth_failures(scopes) != []
+        or sum(
+            int(scope.get("selected_root_count", -1))
+            for scope in scopes.values()
+            if isinstance(scope, Mapping)
+        )
+        != int(selected_rows)
+    ):
+        raise AlignmentError("Stage-C root-breadth inventory failed or drifted")
+    return json.loads(json.dumps(value))
+
+
+def _select_game_first(
     *,
     rows: np.ndarray,
     game_seeds: np.ndarray,
@@ -708,12 +923,19 @@ def _select_stratified(
     surprise: np.ndarray,
     reliability_class: np.ndarray,
     policy_status: np.ndarray,
+    population_game_seeds: np.ndarray,
+    validation_game_seeds: np.ndarray,
     limit: int,
     selection_seed: int,
     max_rows_per_game: int,
-) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
-    if limit <= 0 or max_rows_per_game <= 0:
-        raise AlignmentError("subset limit and max rows per game must be positive")
+) -> tuple[np.ndarray, np.ndarray, dict[str, int], dict[str, Any]]:
+    minimum_roots = int(ROOT_BREADTH_CONTRACT["minimum_roots_per_represented_game"])
+    minimum_fraction = float(ROOT_BREADTH_CONTRACT["minimum_unique_game_fraction"])
+    if limit <= 0 or max_rows_per_game < minimum_roots:
+        raise AlignmentError(
+            "Stage-C subset budget must be positive and max rows per game must "
+            f"be at least {minimum_roots}"
+        )
     arrays = (
         game_seeds,
         decision_indices,
@@ -724,76 +946,230 @@ def _select_stratified(
         policy_status,
     )
     if any(np.asarray(value).shape != rows.shape for value in arrays):
-        raise AlignmentError("stratified subset inputs are not row-aligned")
+        raise AlignmentError("game-first subset inputs are not row-aligned")
     if not len(rows):
+        raise AlignmentError("no multi-action policy roots are available for reanalysis")
+
+    games = np.asarray(game_seeds, dtype=np.int64)
+    decisions = np.asarray(decision_indices, dtype=np.int64)
+    phase_values = np.asarray(phases).astype(str, copy=False)
+    population = np.unique(np.asarray(population_game_seeds, dtype=np.int64))
+    validation = np.unique(np.asarray(validation_game_seeds, dtype=np.int64))
+    if (
+        np.setdiff1d(validation, population).size
+        or np.setdiff1d(np.unique(games), population).size
+    ):
+        raise AlignmentError("Stage-C candidate or validation game is outside the corpus")
+    training = np.setdiff1d(population, validation)
+    candidate_positions_by_game: dict[int, list[int]] = {}
+    for position, game in enumerate(games.tolist()):
+        candidate_positions_by_game.setdefault(int(game), []).append(position)
+
+    scopes = {"training": training, "validation": validation}
+    qualified_by_scope: dict[str, list[int]] = {}
+    required_games_by_scope: dict[str, int] = {}
+    coverage: dict[str, Any] = {}
+    for scope_name, scope_games in scopes.items():
+        if len(scope_games) == 0:
+            raise AlignmentError(f"Stage-C {scope_name} game population is empty")
+        qualified = [
+            int(game)
+            for game in scope_games.tolist()
+            if len(candidate_positions_by_game.get(int(game), ())) >= minimum_roots
+        ]
+        required = int(math.ceil(minimum_fraction * len(scope_games)))
+        if len(qualified) < required:
+            raise AlignmentError(
+                "Stage-C candidate coverage cannot satisfy root breadth: "
+                f"{scope_name} has {len(qualified)}/{len(scope_games)} games with "
+                f"at least {minimum_roots} multi-action roots; requires {required}"
+            )
+        qualified_by_scope[scope_name] = qualified
+        required_games_by_scope[scope_name] = required
+        coverage[scope_name] = {
+            "population_game_count": int(len(scope_games)),
+            "games_with_minimum_candidate_roots": int(len(qualified)),
+            "required_selected_game_count": required,
+        }
+    minimum_breadth_roots = minimum_roots * sum(required_games_by_scope.values())
+    if limit < minimum_breadth_roots:
         raise AlignmentError(
-            "no multi-action policy roots are available for reanalysis"
+            "Stage-C subset budget cannot satisfy root breadth: "
+            f"requested={limit} required_at_least={minimum_breadth_roots}"
         )
-    quantiles = np.quantile(surprise.astype(np.float64), [0.25, 0.5, 0.75])
+
+    selected_games: dict[str, list[int]] = {}
+    for scope_index, scope_name in enumerate(("training", "validation")):
+        ordered = sorted(
+            qualified_by_scope[scope_name],
+            key=lambda game: (_stable_u64(selection_seed, scope_index, game), game),
+        )
+        selected_games[scope_name] = ordered[: required_games_by_scope[scope_name]]
+    remaining_game_capacity = limit // minimum_roots - sum(
+        len(values) for values in selected_games.values()
+    )
+    extras = sorted(
+        (
+            _stable_u64(selection_seed, 2, game),
+            scope_name,
+            game,
+        )
+        for scope_name in ("training", "validation")
+        for game in qualified_by_scope[scope_name]
+        if game not in set(selected_games[scope_name])
+    )
+    for _key, scope_name, game in extras[: max(remaining_game_capacity, 0)]:
+        selected_games[scope_name].append(game)
+    selected_game_set = {
+        game for values in selected_games.values() for game in values
+    }
+
+    quantiles = np.quantile(np.asarray(surprise, dtype=np.float64), [0.25, 0.5, 0.75])
     surprise_bins = np.searchsorted(quantiles, surprise, side="right")
-    candidates: list[tuple[int, int, str]] = []
-    for position, row in enumerate(rows.tolist()):
-        stratum = "|".join(
-            (
-                str(phases[position]),
-                _width_bucket(int(legal_widths[position])),
-                f"surprise_q{int(surprise_bins[position])}",
-                f"reliability_{int(reliability_class[position])}",
-                f"policy_status_{int(policy_status[position])}",
+    full_strata = np.asarray(
+        [
+            "|".join(
+                (
+                    str(phase_values[position]),
+                    _width_bucket(int(legal_widths[position])),
+                    f"surprise_q{int(surprise_bins[position])}",
+                    f"reliability_{int(reliability_class[position])}",
+                    f"policy_status_{int(policy_status[position])}",
+                )
             )
-        )
-        candidates.append(
-            (
-                _stable_u64(
-                    selection_seed,
-                    int(game_seeds[position]),
-                    int(decision_indices[position]),
-                    int(row),
-                ),
-                position,
-                stratum,
-            )
-        )
-    # Enforce game diversity before balancing strata.
-    by_hash = sorted(candidates)
-    per_game: dict[int, int] = {}
-    admitted: list[tuple[int, int, str]] = []
-    for item in by_hash:
-        game = int(game_seeds[item[1]])
-        if per_game.get(game, 0) >= max_rows_per_game:
-            continue
-        per_game[game] = per_game.get(game, 0) + 1
-        admitted.append(item)
-    groups: dict[str, list[tuple[int, int, str]]] = {}
-    for item in admitted:
-        groups.setdefault(item[2], []).append(item)
-    for values in groups.values():
-        values.sort()
+            for position in range(len(rows))
+        ],
+        dtype=str,
+    )
     selected_positions: list[int] = []
-    round_index = 0
-    sorted_strata = sorted(groups)
-    target = min(limit, len(admitted))
-    while len(selected_positions) < target:
+    selected_position_set: set[int] = set()
+    per_game_selected: dict[int, int] = {}
+    for game in sorted(
+        selected_game_set,
+        key=lambda value: (_stable_u64(selection_seed, 3, value), value),
+    ):
+        candidates: list[tuple[int, int, str, str]] = []
+        for position in candidate_positions_by_game[game]:
+            candidates.append(
+                (
+                    _stable_u64(
+                        selection_seed,
+                        game,
+                        int(decisions[position]),
+                        int(rows[position]),
+                    ),
+                    position,
+                    str(phase_values[position]),
+                    _decision_bucket(int(decisions[position])),
+                )
+            )
+        candidates.sort()
+        covered_phases: set[str] = set()
+        covered_decision_bins: set[str] = set()
+        while per_game_selected.get(game, 0) < minimum_roots:
+            remaining = [
+                item for item in candidates if item[1] not in selected_position_set
+            ]
+            if not remaining:
+                raise AlignmentError(
+                    f"Stage-C qualified game {game} lost its breadth roots"
+                )
+            _key, position, phase, decision_bin = min(
+                remaining,
+                key=lambda item: (
+                    -int(item[2] not in covered_phases)
+                    - int(item[3] not in covered_decision_bins),
+                    item[0],
+                    item[1],
+                ),
+            )
+            selected_positions.append(position)
+            selected_position_set.add(position)
+            per_game_selected[game] = per_game_selected.get(game, 0) + 1
+            covered_phases.add(phase)
+            covered_decision_bins.add(decision_bin)
+
+    extra_groups: dict[str, list[tuple[int, int, int]]] = {}
+    for game in selected_game_set:
+        for position in candidate_positions_by_game[game]:
+            if position in selected_position_set:
+                continue
+            extra_groups.setdefault(str(full_strata[position]), []).append(
+                (
+                    _stable_u64(
+                        selection_seed,
+                        game,
+                        int(decisions[position]),
+                        int(rows[position]),
+                    ),
+                    game,
+                    position,
+                )
+            )
+    for values in extra_groups.values():
+        values.sort()
+    extra_cursors = {stratum: 0 for stratum in extra_groups}
+    while len(selected_positions) < limit:
         progressed = False
-        for stratum in sorted_strata:
-            values = groups[stratum]
-            if round_index < len(values):
-                selected_positions.append(values[round_index][1])
-                progressed = True
-                if len(selected_positions) == target:
+        for stratum in sorted(extra_groups):
+            values = extra_groups[stratum]
+            cursor = extra_cursors[stratum]
+            while cursor < len(values):
+                _key, game, position = values[cursor]
+                cursor += 1
+                if per_game_selected[game] < max_rows_per_game:
+                    selected_positions.append(position)
+                    selected_position_set.add(position)
+                    per_game_selected[game] += 1
+                    progressed = True
                     break
+            extra_cursors[stratum] = cursor
+            if len(selected_positions) == limit:
+                break
         if not progressed:
             break
-        round_index += 1
-    selected_positions_array = np.asarray(selected_positions, dtype=np.int64)
-    selected_strata = np.asarray(
-        [candidates[position][2] for position in selected_positions], dtype=str
-    )
-    counts = {
+
+    positions = np.asarray(selected_positions, dtype=np.int64)
+    selected_strata = full_strata[positions]
+    stratum_counts = {
         stratum: int(np.count_nonzero(selected_strata == stratum))
         for stratum in np.unique(selected_strata)
     }
-    return selected_positions_array, selected_strata, counts
+    selected_game_candidate_mask = np.isin(games, list(selected_game_set))
+    candidate_counts_by_stratum = {
+        stratum: int(
+            np.count_nonzero(selected_game_candidate_mask & (full_strata == stratum))
+        )
+        for stratum in np.unique(full_strata[selected_game_candidate_mask])
+    }
+    inventory = _stage_c_root_breadth_inventory(
+        corpus_game_seeds=population,
+        validation_game_seeds=validation,
+        selected_game_seeds=games[positions],
+        selected_decision_indices=decisions[positions],
+        selected_phases=phase_values[positions],
+    )
+    if inventory["passed"] is not True:
+        raise AlignmentError(
+            "Stage-C selected roots cannot satisfy root breadth: "
+            + ",".join(inventory["failures"])
+        )
+    selection = {
+        "schema_version": "a1-stage-c-game-first-selection-v1",
+        "requested_root_budget": int(limit),
+        "minimum_breadth_root_count": int(minimum_breadth_roots),
+        "breadth_root_count": int(minimum_roots * len(selected_game_set)),
+        "extra_root_count": int(len(positions) - minimum_roots * len(selected_game_set)),
+        "max_rows_per_game": int(max_rows_per_game),
+        "candidate_coverage": coverage,
+        "selected_game_counts": {
+            name: int(len(values)) for name, values in selected_games.items()
+        },
+        "candidate_counts_by_stratum": candidate_counts_by_stratum,
+        "root_breadth": inventory,
+    }
+    selection["selection_sha256"] = _value_sha256(selection)
+    return positions, selected_strata, stratum_counts, selection
 
 
 def _artifact_ref(path: Path) -> dict[str, Any]:
@@ -820,6 +1196,22 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise AlignmentError(f"coherent corpus admission refused: {error}") from error
     corpus_record = admission["corpus"]
     corpus_root = Path(str(corpus_record["data_path"])).resolve(strict=True)
+    validation_ref = corpus_record.get("validation_manifest")
+    if not isinstance(validation_ref, Mapping):
+        raise AlignmentError("coherent corpus admission lost its validation manifest")
+    try:
+        validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
+            Path(str(validation_ref["path"])),
+            validation_fraction=0.05,
+            validation_seed=17,
+            validation_max_samples=0,
+            validation_game_seed_ranges=[],
+        )
+    except SystemExit as error:
+        raise AlignmentError(
+            f"coherent corpus validation manifest refused: {error}"
+        ) from error
+    validation_game_seeds = np.asarray(validation["game_seeds"], dtype=np.int64)
     source_contract_path = Path(str(admission["contract"]["path"]))
     source_checkpoint = Path(
         str(
@@ -879,7 +1271,12 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     surprise = _policy_surprise(data, candidate_rows)
     candidate_reliability = reliability_classes[candidate_rows]
     candidate_status = policy_status[candidate_rows]
-    selected_positions, selected_strata, stratum_counts = _select_stratified(
+    (
+        selected_positions,
+        selected_strata,
+        stratum_counts,
+        game_first_selection,
+    ) = _select_game_first(
         rows=candidate_rows,
         game_seeds=game_seeds,
         decision_indices=decision_indices,
@@ -888,6 +1285,8 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         surprise=surprise,
         reliability_class=candidate_reliability,
         policy_status=candidate_status,
+        population_game_seeds=np.asarray(data["game_seed"], dtype=np.int64),
+        validation_game_seeds=validation_game_seeds,
         limit=int(args.subset_rows),
         selection_seed=int(args.selection_seed),
         max_rows_per_game=int(args.max_rows_per_game),
@@ -998,6 +1397,21 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "file_sha256": _file_sha256(admission_path),
             "admission_sha256": admission["admission_sha256"],
         },
+        "learner_validation_scope": {
+            "manifest": {
+                "path": str(Path(str(validation_ref["path"])).resolve(strict=True)),
+                "file_sha256": str(validation["file_sha256"]),
+            },
+            "validation_game_seed_count": int(
+                validation["validation_game_seed_count"]
+            ),
+            "validation_game_seed_set_sha256": str(
+                validation["validation_game_seed_set_sha256"]
+            ),
+            "target_covered": True,
+            "optimizer_excluded": True,
+            "external_final_gate_authority": False,
+        },
         "evidence_lifetimes": {
             "state_evidence": "reusable_if_information_surface_and_reconstruction_hold",
             "terminal_value_evidence": "reusable_independent_of_search_operator",
@@ -1030,8 +1444,12 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "requested_rows": int(args.subset_rows),
             "selection_seed": int(args.selection_seed),
             "max_rows_per_game": int(args.max_rows_per_game),
+            "game_first_selection": game_first_selection,
             "stratification": [
+                "training_validation_scope",
+                "game_first_minimum_root_quota",
                 "phase",
+                "decision_index_bin",
                 "legal_width_bucket",
                 "stored_policy_surprise_quartile",
                 "reliability_evidence_class",
@@ -1067,6 +1485,38 @@ def _verify_plan(path: Path) -> dict[str, Any]:
     stated = unsigned.pop("plan_sha256", None)
     if plan.get("schema_version") != PLAN_SCHEMA or stated != _value_sha256(unsigned):
         raise AlignmentError("Stage-C plan schema or semantic digest drifted")
+    validation_scope = plan.get("learner_validation_scope")
+    if not isinstance(validation_scope, Mapping):
+        raise AlignmentError("Stage-C plan lacks learner validation scope")
+    validation_ref = validation_scope.get("manifest")
+    if not isinstance(validation_ref, Mapping):
+        raise AlignmentError("Stage-C learner validation manifest binding is malformed")
+    validation_path = _regular_file(
+        Path(str(validation_ref["path"])), where="Stage-C learner validation manifest"
+    )
+    try:
+        validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
+            validation_path,
+            validation_fraction=0.05,
+            validation_seed=17,
+            validation_max_samples=0,
+            validation_game_seed_ranges=[],
+        )
+    except SystemExit as error:
+        raise AlignmentError(
+            f"Stage-C learner validation manifest refused: {error}"
+        ) from error
+    if (
+        validation_ref.get("file_sha256") != _file_sha256(validation_path)
+        or validation_scope.get("validation_game_seed_count")
+        != validation["validation_game_seed_count"]
+        or validation_scope.get("validation_game_seed_set_sha256")
+        != validation["validation_game_seed_set_sha256"]
+        or validation_scope.get("target_covered") is not True
+        or validation_scope.get("optimizer_excluded") is not True
+        or validation_scope.get("external_final_gate_authority") is not False
+    ):
+        raise AlignmentError("Stage-C learner validation scope drifted")
     for identity_key in (
         "source_policy_target_identity",
         "target_policy_target_identity",
@@ -1128,12 +1578,46 @@ def _verify_plan(path: Path) -> dict[str, Any]:
         raise AlignmentError("Stage-C selected subset bytes drifted")
     with np.load(subset_path, allow_pickle=False) as arrays:
         count = len(arrays["row_index"])
+        selection = plan["subset"].get("game_first_selection")
+        if not isinstance(selection, Mapping):
+            raise AlignmentError("Stage-C game-first selection receipt is missing")
+        selection_unsigned = dict(selection)
+        selection_stated = selection_unsigned.pop("selection_sha256", None)
         if (
             count != int(plan["subset"]["selected_rows"])
             or any(len(arrays[name]) != count for name in arrays.files)
             or np.unique(arrays["identity_sha256"]).size != count
+            or selection.get("schema_version")
+            != "a1-stage-c-game-first-selection-v1"
+            or selection_stated != _value_sha256(selection_unsigned)
+            or int(selection.get("breadth_root_count", -1))
+            + int(selection.get("extra_root_count", -1))
+            != count
+            or int(selection.get("requested_root_budget", -1))
+            != int(plan["subset"].get("requested_rows", -1))
+            or int(selection.get("max_rows_per_game", -1))
+            != int(plan["subset"].get("max_rows_per_game", -1))
+            or not {"game_seed", "decision_index", "phase"} <= set(arrays.files)
         ):
             raise AlignmentError("Stage-C selected subset row identity drifted")
+        sealed_breadth = _verify_stage_c_root_breadth_inventory(
+            selection.get("root_breadth"),
+            selected_rows=count,
+        )
+        source_data = train_bc.MemmapCorpus(
+            Path(str(overlay["corpus"]["path"])).resolve(strict=True)
+        )
+        replayed_breadth = _stage_c_root_breadth_inventory(
+            corpus_game_seeds=np.asarray(source_data["game_seed"], dtype=np.int64),
+            validation_game_seeds=np.asarray(validation["game_seeds"], dtype=np.int64),
+            selected_game_seeds=np.asarray(arrays["game_seed"], dtype=np.int64),
+            selected_decision_indices=np.asarray(
+                arrays["decision_index"], dtype=np.int64
+            ),
+            selected_phases=np.asarray(arrays["phase"]).astype(str),
+        )
+        if replayed_breadth != sealed_breadth:
+            raise AlignmentError("Stage-C selected subset root breadth does not replay")
     return {"path": str(plan_path), "file_sha256": _file_sha256(plan_path), **plan}
 
 
@@ -1144,9 +1628,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--coherent-corpus-admission", required=True, type=Path)
     plan.add_argument("--target-operator-contract", required=True, type=Path)
     plan.add_argument("--target-checkpoint", required=True, type=Path)
-    plan.add_argument("--subset-rows", type=int, default=8192)
+    plan.add_argument("--subset-rows", type=int, default=65_536)
     plan.add_argument("--selection-seed", type=int, default=20260715)
-    plan.add_argument("--max-rows-per-game", type=int, default=4)
+    plan.add_argument("--max-rows-per-game", type=int, default=16)
     plan.add_argument("--chunks", type=int, default=64)
     plan.add_argument("--output-root", required=True, type=Path)
     plan.add_argument("--write", required=True, type=Path)

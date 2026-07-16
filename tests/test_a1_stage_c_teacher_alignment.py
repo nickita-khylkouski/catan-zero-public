@@ -170,33 +170,109 @@ def test_policy_surprise_masks_illegal_actions_and_is_finite() -> None:
     assert surprise.tolist() == pytest.approx([expected, 0.0], abs=1e-6)
 
 
-def test_stratified_subset_is_deterministic_and_caps_each_game() -> None:
-    rows = np.arange(12, dtype=np.int64)
-    games = np.repeat(np.asarray([10, 11, 12, 13], dtype=np.int64), 3)
-    decisions = np.tile(np.arange(3, dtype=np.int64), 4)
-    phases = np.asarray(["opening"] * 6 + ["play_turn"] * 6)
-    widths = np.asarray([2, 4, 8, 16, 32, 3] * 2, dtype=np.int64)
-    surprise = np.linspace(0.0, 1.1, 12, dtype=np.float32)
-    reliability = np.asarray([0, 1, 2] * 4, dtype=np.uint8)
-    status = np.asarray([0, 1, 2] * 4, dtype=np.uint8)
-    kwargs = dict(
-        rows=rows,
-        game_seeds=games,
-        decision_indices=decisions,
-        phases=phases,
-        legal_widths=widths,
-        surprise=surprise,
-        reliability_class=reliability,
-        policy_status=status,
-        limit=8,
-        selection_seed=91,
-        max_rows_per_game=2,
-    )
-    first = alignment._select_stratified(**kwargs)
-    second = alignment._select_stratified(**kwargs)
+def _game_first_inputs(*, short_training_games: set[int] | None = None) -> dict:
+    training_games = np.arange(100, 120, dtype=np.int64)
+    validation_games = np.arange(200, 204, dtype=np.int64)
+    all_games = np.concatenate((training_games, validation_games))
+    phases = alignment.ROOT_BREADTH_REQUIRED_PHASES
+    decisions = (5, 15, 35, 65, 105, 155, 205, 7, 25, 85)
+    rows: list[int] = []
+    games: list[int] = []
+    decision_indices: list[int] = []
+    phase_values: list[str] = []
+    for game in all_games.tolist():
+        roots = 7 if short_training_games and game in short_training_games else 10
+        for ordinal in range(roots):
+            rows.append(len(rows))
+            games.append(game)
+            decision_indices.append(decisions[ordinal])
+            phase_values.append(phases[ordinal % len(phases)])
+    count = len(rows)
+    return {
+        "rows": np.asarray(rows, dtype=np.int64),
+        "game_seeds": np.asarray(games, dtype=np.int64),
+        "decision_indices": np.asarray(decision_indices, dtype=np.int64),
+        "phases": np.asarray(phase_values),
+        "legal_widths": np.full(count, 4, dtype=np.int64),
+        "surprise": np.linspace(0.0, 1.0, count, dtype=np.float32),
+        "reliability_class": np.zeros(count, dtype=np.uint8),
+        "policy_status": np.zeros(count, dtype=np.uint8),
+        "population_game_seeds": all_games,
+        "validation_game_seeds": validation_games,
+        "selection_seed": 91,
+        "max_rows_per_game": 10,
+    }
+
+
+def test_game_first_selector_is_deterministic_and_seals_split_breadth() -> None:
+    kwargs = _game_first_inputs()
+
+    first = alignment._select_game_first(**kwargs, limit=200)  # noqa: SLF001
+    second = alignment._select_game_first(**kwargs, limit=200)  # noqa: SLF001
+
     np.testing.assert_array_equal(first[0], second[0])
     np.testing.assert_array_equal(first[1], second[1])
-    assert first[2] == second[2]
-    selected_games = games[first[0]]
-    assert len(first[0]) == 8
-    assert max(np.unique(selected_games, return_counts=True)[1]) <= 2
+    assert first[2:] == second[2:]
+    selection = first[3]
+    assert selection["breadth_root_count"] == 24 * 8
+    assert selection["extra_root_count"] == 8
+    assert selection["selected_game_counts"] == {"training": 20, "validation": 4}
+    assert selection["root_breadth"]["passed"] is True
+    selected_games = kwargs["game_seeds"][first[0]]
+    roots_per_game = np.unique(selected_games, return_counts=True)[1]
+    assert roots_per_game.min() >= 8
+    assert roots_per_game.max() <= 10
+
+
+def test_game_first_selector_fails_before_reanalysis_on_candidate_coverage() -> None:
+    kwargs = _game_first_inputs(short_training_games={100, 101})
+
+    with pytest.raises(
+        alignment.AlignmentError,
+        match="training has 18/20 games.*requires 19",
+    ):
+        alignment._select_game_first(**kwargs, limit=200)  # noqa: SLF001
+
+
+def test_game_first_selector_accepts_exact_95_percent_game_coverage() -> None:
+    kwargs = _game_first_inputs(short_training_games={100})
+
+    selection = alignment._select_game_first(  # noqa: SLF001
+        **kwargs, limit=200
+    )[3]
+
+    training = selection["root_breadth"]["scopes"]["training"]
+    assert training["selected_game_count"] == 19
+    assert training["unique_game_fraction"] == pytest.approx(0.95)
+    assert training["roots_per_represented_game"]["minimum"] >= 8
+
+
+def test_game_first_selector_fails_before_reanalysis_on_small_budget() -> None:
+    kwargs = _game_first_inputs()
+
+    with pytest.raises(
+        alignment.AlignmentError,
+        match="requested=183 required_at_least=184",
+    ):
+        alignment._select_game_first(**kwargs, limit=183)  # noqa: SLF001
+
+
+def test_stage_c_alignment_defaults_fund_game_first_breadth() -> None:
+    args = alignment.build_parser().parse_args(
+        [
+            "plan",
+            "--coherent-corpus-admission",
+            "admission.json",
+            "--target-operator-contract",
+            "operator.json",
+            "--target-checkpoint",
+            "checkpoint.pt",
+            "--output-root",
+            "output",
+            "--write",
+            "plan.json",
+        ]
+    )
+
+    assert args.subset_rows == 65_536
+    assert args.max_rows_per_game == 16

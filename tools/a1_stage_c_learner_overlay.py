@@ -49,47 +49,18 @@ from catan_zero.rl.target_reliability import (  # noqa: E402
 )
 
 
-EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v1"
-MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v1"
-ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v1"
-SAMPLING_SCHEMA = "a1-stage-c-policy-sampling-distribution-v1"
-ROOT_BREADTH_SCHEMA = "a1-stage-c-policy-root-breadth-v1"
+EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v2"
+MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v2"
+ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v2"
+SAMPLING_SCHEMA = "a1-stage-c-policy-sampling-distribution-v2"
+ROOT_BREADTH_SCHEMA = alignment.ROOT_BREADTH_SCHEMA
 POLICY_TEACHER = "stage_c_coherent_n128_reanalysis"
 SAMPLING_COLUMN = "stage_c_policy_sampling_weight"
 SAMPLING_ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
 DEFAULT_PRODUCTION_WEIGHT_CAP = 4.0
-ROOT_BREADTH_REQUIRED_PHASES = (
-    "BUILD_INITIAL_ROAD",
-    "BUILD_INITIAL_SETTLEMENT",
-    "DISCARD",
-    "MOVE_ROBBER",
-    "PLAY_TURN",
-)
-ROOT_BREADTH_DECISION_BINS = (
-    ("d000_009", 0, 10),
-    ("d010_029", 10, 30),
-    ("d030_059", 30, 60),
-    ("d060_099", 60, 100),
-    ("d100_149", 100, 150),
-    ("d150_199", 150, 200),
-    ("d200_plus", 200, None),
-)
-ROOT_BREADTH_CONTRACT = {
-    "minimum_unique_game_fraction": 0.95,
-    "minimum_roots_per_represented_game": 8,
-    "minimum_phase_fraction": 0.01,
-    "minimum_decision_bin_fraction": 0.01,
-    "required_phases": list(ROOT_BREADTH_REQUIRED_PHASES),
-    "decision_index_bins": [
-        {
-            "name": name,
-            "start_inclusive": start,
-            "stop_exclusive": stop,
-        }
-        for name, start, stop in ROOT_BREADTH_DECISION_BINS
-    ],
-    "required_scopes": ["training", "validation"],
-}
+ROOT_BREADTH_REQUIRED_PHASES = alignment.ROOT_BREADTH_REQUIRED_PHASES
+ROOT_BREADTH_DECISION_BINS = alignment.ROOT_BREADTH_DECISION_BINS
+ROOT_BREADTH_CONTRACT = alignment.ROOT_BREADTH_CONTRACT
 REWRITTEN_COLUMNS = frozenset(
     {
         "policy_weight_multiplier",
@@ -530,6 +501,25 @@ def _export_sampling_population(
     phases = np.asarray(data["phase"][candidate_rows]).astype(str)
     legal_widths = legal_widths_all[candidate_rows]
     surprise = alignment._policy_surprise(data, candidate_rows)  # noqa: SLF001
+    source_admission_path = Path(
+        str(plan["source_corpus_admission"]["path"])
+    ).resolve(strict=True)
+    try:
+        _admission_path, source_admission = active_campaign._load_admission(  # noqa: SLF001
+            source_admission_path
+        )
+        validation_ref = source_admission["corpus"]["validation_manifest"]
+        validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
+            Path(str(validation_ref["path"])),
+            validation_fraction=0.05,
+            validation_seed=17,
+            validation_max_samples=0,
+            validation_game_seed_ranges=[],
+        )
+    except (active_campaign.CampaignError, KeyError, SystemExit) as error:
+        raise OverlayError(
+            f"Stage-C selector validation split refused: {error}"
+        ) from error
     replay_kwargs = {
         "rows": candidate_rows,
         "game_seeds": game_seeds,
@@ -539,28 +529,35 @@ def _export_sampling_population(
         "surprise": surprise,
         "reliability_class": reliability_classes[candidate_rows],
         "policy_status": policy_status[candidate_rows],
+        "population_game_seeds": np.asarray(data["game_seed"], dtype=np.int64),
+        "validation_game_seeds": np.asarray(
+            validation["game_seeds"], dtype=np.int64
+        ),
         "selection_seed": int(plan["subset"]["selection_seed"]),
         "max_rows_per_game": int(plan["subset"]["max_rows_per_game"]),
     }
-    replay_positions, replay_strata, replay_selected_counts = (
-        alignment._select_stratified(  # noqa: SLF001
-            **replay_kwargs,
-            limit=int(plan["subset"]["requested_rows"]),
-        )
+    (
+        replay_positions,
+        replay_strata,
+        replay_selected_counts,
+        replay_selection,
+    ) = alignment._select_game_first(  # noqa: SLF001
+        **replay_kwargs,
+        limit=int(plan["subset"]["requested_rows"]),
     )
     if not np.array_equal(candidate_rows[replay_positions], selected_rows) or not np.array_equal(
         replay_strata.astype(str), np.asarray(subset["stratum"]).astype(str)
     ):
         raise OverlayError("current code cannot replay the sealed Stage-C selection")
-    _all_positions, _all_strata, population_counts = alignment._select_stratified(  # noqa: SLF001
-        **replay_kwargs,
-        limit=len(candidate_rows),
-    )
+    population_counts = replay_selection["candidate_counts_by_stratum"]
     declared_selected = {
         str(key): int(value)
         for key, value in plan["subset"]["stratum_counts"].items()
     }
-    if replay_selected_counts != declared_selected:
+    if (
+        replay_selected_counts != declared_selected
+        or replay_selection != plan["subset"].get("game_first_selection")
+    ):
         raise OverlayError("replayed selected stratum counts differ from the plan")
     subset_strata = {
         int(row): str(stratum)
@@ -582,9 +579,9 @@ def _export_sampling_population(
     return {
         "schema_version": SAMPLING_SCHEMA,
         "selected_subset": _artifact(subset_path),
-        "population_definition": "post_max_rows_per_game_admitted_population",
-        "candidate_rows_before_game_cap": int(candidate_rows.size),
-        "admitted_rows_after_game_cap": int(sum(population_counts.values())),
+        "population_definition": "selected_game_candidate_population",
+        "candidate_rows_before_game_selection": int(candidate_rows.size),
+        "selected_game_candidate_rows": int(sum(population_counts.values())),
         "planned_selected_rows": int(selected_rows.size),
         "selected_rows": int(patch_rows.size),
         "selection_seed": int(plan["subset"]["selection_seed"]),

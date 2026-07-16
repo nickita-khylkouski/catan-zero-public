@@ -46,14 +46,12 @@ from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 
 ADJUDICATION_SCHEMA = "a1-stage-c-recipe-adjudication-v2"
 TIEBREAK_SCHEMA = "a1-stage-c-v5-dose-tiebreak-common-crn-v1"
-ROOT_MANIFEST_SCHEMA = "a1-stage-c-independent-root-manifest-v1"
-FINAL_CORPUS_ADMISSION_SCHEMA = "a1-stage-c-final-corpus-admission-v1"
-FINAL_AUTHORITY_SCHEMA = "a1-stage-c-final-matched-replication-authority-v2"
+ROOT_MANIFEST_SCHEMA = "a1-stage-c-independent-root-manifest-v2"
+FINAL_CORPUS_ADMISSION_SCHEMA = "a1-stage-c-final-corpus-admission-v2"
+FINAL_AUTHORITY_SCHEMA = "a1-stage-c-final-matched-replication-authority-v3"
 FRESH_FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
 CAMPAIGN_SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v6"
 EXPECTED_ARM = "STRATEGIC_BALANCED"
-EXPECTED_ROOTS = 8_192
-EXPECTED_PARTITIONS = 64
 EXPECTED_PAIRS = 128
 EXPECTED_GAMES = EXPECTED_PAIRS * 2
 EXPECTED_COMPARISON = "paired_same_seed_color_swap_shared_search_operator"
@@ -61,7 +59,7 @@ EXPECTED_ENGINE_SCHEMA = "a1-internal-h2h-engine-identity-v1"
 EXPECTED_POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
 EXPECTED_OPERATOR = "public_belief_single_tree_v1"
 EXPECTED_EXECUTOR = "coherent_public_belief_n128_reanalysis_v1"
-PREP_INVENTORY_SCHEMA = "a1-stage-c-final-prep-independent-root-inventory-v1"
+PREP_INVENTORY_SCHEMA = "a1-stage-c-final-prep-independent-root-inventory-v2"
 EXPECTED_SELECTION_RULE = (
     "select_step16_as_recipe_only_when_common_crn_v5_score_exceeds_step8_on_"
     "fresh256_and_combined384;retain_all_incumbent_h0_negative_evidence;"
@@ -1072,6 +1070,26 @@ def build_root_manifest(
     subset_path, arrays = _subset_arrays(Path(str(subset_ref["path"])))
     identities = np.asarray(arrays["identity_sha256"]).astype(str)
     game_seeds = np.asarray(arrays["game_seed"], dtype=np.int64)
+    selected_count = int(plan.get("subset", {}).get("selected_rows", -1))
+    requested_count = int(plan.get("subset", {}).get("requested_rows", -1))
+    partition_count = int(plan.get("subset", {}).get("chunks", -1))
+    learner_validation = plan.get("learner_validation_scope")
+    if not isinstance(learner_validation, dict):
+        raise FinalReplicationError("final plan lost learner validation scope")
+    validation_manifest = learner_validation.get("manifest")
+    if not isinstance(validation_manifest, dict):
+        raise FinalReplicationError("final plan learner validation binding is malformed")
+    try:
+        plan_root_breadth = overlay._verify_stage_c_root_breadth_inventory(  # noqa: SLF001
+            plan.get("subset", {})
+            .get("game_first_selection", {})
+            .get("root_breadth"),
+            selected_rows=selected_count,
+        )
+    except overlay.OverlayError as error:
+        raise FinalReplicationError(
+            f"final plan policy-root breadth refused: {error}"
+        ) from error
     prep_path, prep = _load_json(
         prep_inventory_path, where="independent-root preparation evidence"
     )
@@ -1083,18 +1101,28 @@ def build_root_manifest(
         prep.get("schema_version") != PREP_INVENTORY_SCHEMA
         or prep_stated != value_sha256(prep_unsigned)
         or not isinstance(ready, list)
-        or len(ready) < EXPECTED_ROOTS
+        or selected_count <= 0
+        or requested_count < selected_count
+        or partition_count <= 0
+        or partition_count > selected_count
+        or len(ready) < selected_count
         or not isinstance(proof, dict)
         or proof.get("satisfied") is not True
         or proof.get("independent_from_all_declared_eval_pair_seeds") is not True
         or proof.get("independent_from_diagnostic_selected_rows") is not True
-        or proof.get("independent_from_learner_holdout_games") is not True
+        or proof.get("learner_validation_manifest_file_sha256")
+        != validation_manifest.get("file_sha256")
+        or proof.get("learner_validation_game_seed_set_sha256")
+        != learner_validation.get("validation_game_seed_set_sha256")
+        or proof.get("learner_validation_target_covered") is not True
+        or proof.get("learner_validation_optimizer_excluded") is not True
         or int(proof.get("required_fully_reconstructable_strategic_roots", -1))
-        != EXPECTED_ROOTS
+        != selected_count
         or int(proof.get("observed_fully_reconstructable_strategic_roots", -1))
-        < EXPECTED_ROOTS
-        or proof.get("first_8192_ready_root_key_set_sha256")
-        != value_sha256(ready[:EXPECTED_ROOTS])
+        < selected_count
+        or int(proof.get("ready_root_prefix_count", -1)) != selected_count
+        or proof.get("ready_root_prefix_sha256")
+        != value_sha256(ready[:selected_count])
         or prep.get("authority", {}).get("is_authority") is not False
         or prep.get("authority", {}).get("may_launch_search") is not False
     ):
@@ -1105,22 +1133,19 @@ def build_root_manifest(
         "decision_index": np.asarray(arrays.get("decision_index", []), dtype=np.int64),
         "identity_sha256": identities,
     }
-    if any(value.shape != (EXPECTED_ROOTS,) for value in required_ready_columns.values()):
+    if any(value.shape != (selected_count,) for value in required_ready_columns.values()):
         raise FinalReplicationError("final subset lacks exact prepared root columns")
-    for position, prepared in enumerate(ready[:EXPECTED_ROOTS]):
+    for position, prepared in enumerate(ready[:selected_count]):
         if any(
             str(required_ready_columns[name][position]) != str(prepared[name])
             for name in required_ready_columns
         ):
             raise FinalReplicationError(
-                "final plan does not consume the first 8,192 replay-qualified roots"
+                "final plan does not consume its ordered replay-qualified roots"
             )
     if (
-        len(identities) != EXPECTED_ROOTS
-        or np.unique(identities).size != EXPECTED_ROOTS
-        or int(plan["subset"].get("selected_rows", -1)) != EXPECTED_ROOTS
-        or int(plan["subset"].get("requested_rows", -1)) != EXPECTED_ROOTS
-        or int(plan["subset"].get("chunks", -1)) != EXPECTED_PARTITIONS
+        len(identities) != selected_count
+        or np.unique(identities).size != selected_count
         or plan.get("execution", {}).get("executor_semantics") != EXPECTED_EXECUTOR
         or plan.get("target_policy_target_identity", {}).get(
             "target_information_regime"
@@ -1133,7 +1158,9 @@ def build_root_manifest(
         )
         != 128
     ):
-        raise FinalReplicationError("final plan is not the exact 8,192-root/64-way n128 slice")
+        raise FinalReplicationError(
+            "final plan is not a valid realized-root coherent n128 slice"
+        )
     forbidden_identity: set[str] = set()
     forbidden_games: set[int] = set()
     forbidden_subsets = []
@@ -1166,14 +1193,16 @@ def build_root_manifest(
         "preparation_evidence": {
             **_artifact(prep_path),
             "inventory_sha256": prep_stated,
-            "first_8192_ready_root_key_set_sha256": proof[
-                "first_8192_ready_root_key_set_sha256"
-            ],
+            "ready_root_prefix_count": selected_count,
+            "ready_root_prefix_sha256": proof["ready_root_prefix_sha256"],
             "is_authority": False,
         },
+        "learner_validation_scope": copy.deepcopy(learner_validation),
         "subset": _artifact(subset_path),
-        "root_count": EXPECTED_ROOTS,
-        "partition_count": EXPECTED_PARTITIONS,
+        "root_count": selected_count,
+        "requested_root_budget": requested_count,
+        "partition_count": partition_count,
+        "policy_root_breadth": plan_root_breadth,
         "root_identity_set_sha256": _set_sha(identities.tolist()),
         "game_seed_set_sha256": _set_sha(game_seeds.tolist()),
         "unique_game_seeds": int(np.unique(game_seeds).size),
@@ -1307,6 +1336,8 @@ def build_final_corpus_admission(
             admission["policy_distillation_contract"]
         ),
         "policy_root_breadth": root_breadth,
+        "selected_root_count": int(roots["root_count"]),
+        "partition_count": int(roots["partition_count"]),
         "target_policy_target_identity_sha256": merge[
             "target_policy_target_identity_sha256"
         ],
@@ -1378,6 +1409,8 @@ def verify_final_corpus_admission(path: Path) -> dict[str, Any]:
         or payload.get("auto_promotion") is not False
         or payload.get("fresh_independent_target_bytes") is not True
         or payload.get("diagnostic_overlay_or_target_bytes_reused") is not False
+        or int(payload.get("selected_root_count", -1)) != root_manifest_count
+        or int(payload.get("partition_count", -1)) <= 0
         or payload.get("teacher_experiment_role")
         != {
             "role": "current_coherent_operator_control",
@@ -1537,6 +1570,8 @@ def build_final_authority(
             "max_optimizer_steps": 32,
             "checkpoint_steps": [8, 12, 16, 32],
             "policy_root_breadth": copy.deepcopy(corpus["policy_root_breadth"]),
+            "selected_root_count": int(corpus["selected_root_count"]),
+            "partition_count": int(corpus["partition_count"]),
             "topology": {
                 "name": "b200-8gpu-ddp",
                 "world_size": 8,
@@ -1677,6 +1712,9 @@ def verify_final_authority(path: Path) -> dict[str, Any]:
         or payload.get("training", {}).get("diagnostic_recipe_selected_step") != 16
         or payload.get("training", {}).get("max_optimizer_steps") != 32
         or payload.get("training", {}).get("checkpoint_steps") != [8, 12, 16, 32]
+        or int(payload.get("training", {}).get("selected_root_count", -1))
+        != selected_root_count
+        or int(payload.get("training", {}).get("partition_count", -1)) <= 0
         or differing(treatment_recipe)
         != {"value_lr_mult", "value_trunk_grad_scale"}
         or differing(quarter_recipe) != {"trunk_lr_mult"}
