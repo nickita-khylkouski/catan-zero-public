@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 from tools import selfplay_loop
 from tools.selfplay_loop import _build_generation_cmd
+import pytest
 
 
 def _flag_value(cmd: list[str], flag: str) -> str:
@@ -25,6 +26,11 @@ def _make_args() -> SimpleNamespace:
         device="cuda",
         base_seed=500_000_000_000,
     )
+
+
+def test_legacy_selfplay_loop_execution_is_retired() -> None:
+    with pytest.raises(SystemExit, match="obsolete n64/PIMC"):
+        selfplay_loop.main()
 
 
 def test_generation_cmd_contains_critical_production_flags() -> None:

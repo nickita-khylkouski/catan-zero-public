@@ -1,9 +1,13 @@
-"""Continuous self-play training loop (Step 7 orchestrator).
+"""RETIRED legacy self-play training loop.
 
-Runs generation -> merge -> train -> gate -> promote/rollback repeatedly,
-journaling every step so the loop is resumable after a crash or host outage.
+This file remains importable only for forensic replay and tests of historical
+command construction. Executing it is refused because it binds the obsolete
+n64/PIMC generator, provenance-poor generic merge, mixed-policy value labels,
+and gateless promotion. The current A1 sealed generation -> authenticated
+composite -> scratch learner -> promotion transaction is the sole production
+path.
 
-v1 scope (deliberate):
+Historical v1 scope:
   - Single-host generation (the B200 pilot topology). Multi-host generation is
     launched manually per the gen-1 runbook and can be folded in later by
     swapping `run_generation` for a fan-out implementation.
@@ -47,6 +51,12 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from sprt_gate import GATE_CONFIGS  # noqa: E402
+
+RETIREMENT_ERROR = (
+    "tools/selfplay_loop.py is retired and cannot execute: it uses the obsolete "
+    "n64/PIMC + generic-manifest + gateless-promotion pipeline. Use the current "
+    "sealed A1 iteration orchestrator."
+)
 
 
 # ----------------------------------------------------------------------- state
@@ -228,6 +238,12 @@ def run_gate(gen_dir: Path, candidate: str, baseline: str, args: argparse.Namesp
 
 # --------------------------------------------------------------------- loop
 def main() -> int:
+    raise SystemExit(RETIREMENT_ERROR)
+
+
+def _retired_main_for_forensic_reference() -> int:
+    """Historical implementation retained temporarily for code archaeology."""
+
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--seed-checkpoint", required=True)
     p.add_argument("--loop-dir", required=True)
