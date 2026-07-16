@@ -1001,6 +1001,51 @@ def _load_parent(
     policy = _load_policy(
         str(_required(prepared["report"], "arch")), path, str(prepared["device"])
     )
+    # The learner can make a legacy checkpoint consume the authoritative
+    # public-award feature surface by zero-initializing the newly meaningful
+    # player-input column before optimizer step 1.  That transition is bound
+    # in the training report but deliberately does not rewrite the immutable
+    # parent checkpoint.  Reconstruct it here so parent→candidate movement is
+    # measured from the actual initialized model, not from a differently
+    # interpreted copy of the same bytes.
+    award_training = prepared["report"].get("public_award_feature_training")
+    current_award = str(
+        getattr(policy, "public_award_feature_contract", "legacy_zero_v0")
+    )
+    effective_award = str(prepared["award_contract"])
+    reconstructed_award_transition = None
+    if current_award != effective_award:
+        if (
+            not isinstance(award_training, dict)
+            or str(award_training.get("initializer_contract")) != current_award
+            or str(award_training.get("effective_contract")) != effective_award
+        ):
+            raise SystemExit(
+                "parent checkpoint public-award transition is not authenticated "
+                "by the training report"
+            )
+        reconstructed_award_transition = (
+            prepared["train_bc"]._configure_public_award_feature_training(
+                policy,
+                prepared["data"],
+                argparse.Namespace(
+                    public_award_feature_contract=effective_award,
+                    allow_mixed_public_award_feature_contracts=bool(
+                        award_training.get("mixed_corpus_acknowledged", False)
+                    ),
+                ),
+            )
+        )
+        for field in (
+            "initializer_contract",
+            "effective_contract",
+            "legacy_column_zero_initialized",
+        ):
+            if reconstructed_award_transition.get(field) != award_training.get(field):
+                raise SystemExit(
+                    "reconstructed parent public-award transition differs from "
+                    f"training report field {field}"
+                )
     surface = _policy_input_surface(prepared, policy, role="parent checkpoint")
     return (
         policy,
@@ -1008,6 +1053,9 @@ def _load_parent(
             "path": str(path),
             "sha256": sha256,
             "report_binding_field": None if binding is None else binding[0],
+            "reconstructed_public_award_transition": (
+                reconstructed_award_transition
+            ),
         },
         surface,
     )
