@@ -174,7 +174,9 @@ def _namespace(
             "scalar_value_objective": str(
                 treatment.get("scalar_value_objective", "mse")
             ),
-            "value_tower_split_layers": 0,
+            "value_tower_split_layers": (
+                train_bc._checkpoint_value_tower_split_layers(str(initializer))
+            ),
             "train_diagnostics_every_batches": 8,
             "objective_gradient_interference_every_batches": 8,
             "validation_game_seed_ranges": VALIDATION_RANGES,
@@ -234,6 +236,13 @@ def main() -> None:
     parser.add_argument("--go", action="store_true")
     public = parser.parse_args()
     public.output.mkdir(parents=True, exist_ok=True)
+    actual_initializer_sha256 = _sha256(public.initializer.resolve(strict=True))
+    if actual_initializer_sha256 != public.initializer_sha256:
+        raise SystemExit(
+            "initializer bytes differ from --initializer-sha256: "
+            f"expected={public.initializer_sha256} "
+            f"actual={actual_initializer_sha256}"
+        )
     args = _namespace(
         arm=public.arm,
         base_config=public.base_config,
@@ -251,7 +260,7 @@ def main() -> None:
         "promotion_eligible": False,
         "initializer": {
             "path": str(public.initializer.resolve(strict=True)),
-            "sha256": _sha256(public.initializer.resolve(strict=True)),
+            "sha256": actual_initializer_sha256,
         },
         "data": str(public.data.resolve(strict=True)),
         "target_identity_sha256": public.target_identity_sha256,
