@@ -75,7 +75,7 @@ def test_factory_keeps_default_global_batch_constant_across_world_sizes(
     assert command.count("--training-rng-rank-offset") == int(world_size > 1)
     assert command[command.index("--batch-size") + 1] == str(expected_local_batch)
     assert command[command.index("--grad-accum-steps") + 1] == "1"
-    assert command[command.index("--soft-target-weight") + 1] == "1.0"
+    assert command[command.index("--soft-target-weight") + 1] == "0.0"
     assert command[
         command.index("--policy-target-blend-semantics") + 1
     ] == "policy_target_fallback_v2"
@@ -104,6 +104,76 @@ def test_factory_keeps_forced_policy_rows_out_of_fresh_training(tmp_path: Path) 
     assert result.returncode == 0, result.stderr
     command = _train_command(_manifest(tmp_path))
     assert command[command.index("--forced-action-weight") + 1] == "0.0"
+
+
+def test_factory_converts_entity_tokens_and_masks_hidden_inputs(tmp_path: Path) -> None:
+    result = _dry_run(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    manifest = _manifest(tmp_path)
+    commands = manifest["commands"]
+    conversion = next(
+        command
+        for command in commands
+        if "tools/convert_teacher_to_entity_tokens.py" in command
+    )
+    training = _train_command(manifest)
+    conversion_index = commands.index(conversion)
+    training_index = commands.index(training)
+
+    assert conversion_index < training_index
+    assert conversion[conversion.index("--data") + 1] == str(
+        tmp_path / "teacher_data"
+    )
+    assert conversion[conversion.index("--out") + 1] == str(
+        tmp_path / "teacher_data_entity"
+    )
+    assert "--graph-history-features" in conversion
+    assert training[training.index("--data") + 1] == str(
+        tmp_path / "teacher_data_entity"
+    )
+    assert "--graph-history-features" in training
+    assert "--mask-hidden-info" in training
+    assert manifest["bc_training_data"] == {
+        "curated": str(tmp_path / "teacher_data"),
+        "entity_converted": str(tmp_path / "teacher_data_entity"),
+        "effective": str(tmp_path / "teacher_data_entity"),
+        "graph_history_features": True,
+        "mask_hidden_info": True,
+        "soft_target_weight": 0.0,
+    }
+
+
+def test_factory_can_render_explicit_omniscient_soft_target_replay(
+    tmp_path: Path,
+) -> None:
+    result = _dry_run(
+        tmp_path,
+        "--no-mask-hidden-info",
+        "--soft-target-weight",
+        "1.0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    assert "--mask-hidden-info" not in command
+    assert command[command.index("--soft-target-weight") + 1] == "1.0"
+
+
+def test_non_entity_factory_skips_entity_conversion_and_masking(
+    tmp_path: Path,
+) -> None:
+    result = _dry_run(tmp_path, "--arch", "xdim_lite")
+
+    assert result.returncode == 0, result.stderr
+    manifest = _manifest(tmp_path)
+    assert not any(
+        "tools/convert_teacher_to_entity_tokens.py" in command
+        for command in manifest["commands"]
+    )
+    command = _train_command(manifest)
+    assert command[command.index("--data") + 1] == str(tmp_path / "teacher_data")
+    assert "--mask-hidden-info" not in command
 
 
 def test_factory_trains_the_scalar_readout_deployed_by_search(tmp_path: Path) -> None:

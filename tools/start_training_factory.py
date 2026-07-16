@@ -101,6 +101,25 @@ def main() -> None:
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--graph-tokens", type=int, default=32)
     parser.add_argument("--graph-layers", type=int, default=4)
+    parser.add_argument(
+        "--graph-history-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Generate and replay the graph/history observation schema. Fresh 35M "
+            "entity-graph training defaults to the production history-enabled schema."
+        ),
+    )
+    parser.add_argument(
+        "--mask-hidden-info",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Train entity_graph checkpoints on the public-observation player-token "
+            "surface used at deployment. Disable only for an explicit historical "
+            "omniscient replay."
+        ),
+    )
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument(
         "--lr-warmup-steps",
@@ -112,7 +131,17 @@ def main() -> None:
         ),
     )
     parser.add_argument("--soft-target-temperature", type=float, default=0.7)
-    parser.add_argument("--soft-target-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--soft-target-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Search-policy target weight. The classical teacher factory does not "
+            "produce an authenticated public-information search-policy regime, so "
+            "fresh public-observation runs default to hard teacher actions. Use 1.0 "
+            "only with an explicitly compatible target producer or legacy replay."
+        ),
+    )
     parser.add_argument(
         "--policy-target-blend-semantics",
         choices=("policy_target_fallback_v2", "legacy_interpolate_v1"),
@@ -322,6 +351,9 @@ def main() -> None:
             "--mixed-seats",
             "--mixed-seat-mode",
             "random",
+        ]
+        + (["--graph-history-features"] if args.graph_history_features else [])
+        + [
             "--out",
             str(raw_data_dir),
         ],
@@ -373,6 +405,11 @@ def main() -> None:
                 "--shard-size",
                 "50000",
             ]
+            + (
+                ["--graph-history-features"]
+                if args.graph_history_features
+                else []
+            )
         )
     bc_launcher = [args.python]
     if world_size > 1:
@@ -441,11 +478,20 @@ def main() -> None:
             else [
                 "--graph-layers",
                 str(args.graph_layers),
-                "--mask-hidden-info",
                 "--per-game-policy-weight",
                 "--per-game-value-weight",
             ]
             if args.arch == "entity_graph"
+            else []
+        )
+        + (
+            ["--graph-history-features"]
+            if args.graph_history_features
+            else []
+        )
+        + (
+            ["--mask-hidden-info"]
+            if args.arch == "entity_graph" and args.mask_hidden_info
             else []
         )
         + (["--init-checkpoint", args.init_checkpoint] if args.init_checkpoint else [])
@@ -544,6 +590,18 @@ def main() -> None:
         "run_dir": str(run_dir),
         "commands": commands,
         "allow_ppo": bool(args.allow_ppo),
+        "bc_training_data": {
+            "curated": str(data_dir),
+            "entity_converted": (
+                str(entity_data_dir) if args.arch == "entity_graph" else None
+            ),
+            "effective": str(training_data_dir),
+            "graph_history_features": bool(args.graph_history_features),
+            "mask_hidden_info": bool(
+                args.arch == "entity_graph" and args.mask_hidden_info
+            ),
+            "soft_target_weight": float(args.soft_target_weight),
+        },
         "bc_training_topology": {
             "world_size": world_size,
             "rank_local_batch_size": local_batch_size,
