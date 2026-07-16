@@ -35,12 +35,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from catan_zero.rl.ppo_run_manifest import PPORunManifest
+
 POLICY_DIRNAME = "policy"
 CURRENT_WEIGHTS_NAME = "current.pt"
 VERSION_FILENAME = "version.json"
 VERSIONED_WEIGHTS_GLOB = "weights_v*.pt"
 RUN_CONTRACT_FILENAME = "run_contract.json"
 RUN_CONTRACT_SCHEMA = "canonical_entity_ppo_run_v1"
+RUN_MANIFEST_FILENAME = "run_manifest_v2.json"
+RUN_MANIFEST_BINDING_SCHEMA = "canonical_entity_ppo_run_binding_v2"
 # How many old versioned weight files to keep on disk (newest N). The rest are GC'd by
 # publish_weights so a multi-day run does not accumulate hundreds of stale checkpoints.
 KEEP_VERSIONED_WEIGHTS = 3
@@ -80,6 +84,10 @@ def version_path(root: str | os.PathLike) -> Path:
 
 def run_contract_path(root: str | os.PathLike) -> Path:
     return Path(root) / RUN_CONTRACT_FILENAME
+
+
+def run_manifest_path(root: str | os.PathLike) -> Path:
+    return Path(root) / RUN_MANIFEST_FILENAME
 
 
 def trajectories_dir(root: str | os.PathLike, worker_id: str | None = None) -> Path:
@@ -157,6 +165,130 @@ def bind_run_contract(
 
     # Publish complete bytes with atomic create-if-absent semantics. Multiple
     # actors may race; the loser verifies the winner's exact payload.
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    try:
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return verify_existing()
+
+
+class RunManifestError(RuntimeError):
+    """A production PPO run or trajectory does not match its bound v2 manifest."""
+
+
+def _require_manifest_sha256(value: Any, *, where: str) -> str:
+    if (
+        type(value) is not str
+        or not value.startswith("sha256:")
+        or len(value) != len("sha256:") + 64
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise RunManifestError(f"{where} must be sha256:<64 lowercase hex>")
+    return value
+
+
+def _assert_pristine_v2_root(root: Path) -> None:
+    allowed_empty_directories = {
+        POLICY_DIRNAME,
+        TRAJ_DIRNAME,
+        CONSUMED_DIRNAME,
+        CHECKPOINTS_DIRNAME,
+        LEAGUE_DIRNAME,
+        EVAL_DIRNAME,
+    }
+    temporary_prefix = f".{RUN_MANIFEST_FILENAME}."
+    for entry in root.iterdir():
+        if entry.name in allowed_empty_directories:
+            if entry.is_symlink() or not entry.is_dir() or any(entry.iterdir()):
+                raise RunManifestError(
+                    f"refusing to bind v2 manifest over preexisting runtime artifacts: {entry}"
+                )
+            continue
+        if entry.name == RUN_MANIFEST_FILENAME:
+            # Another concurrent binder may have published or be publishing the
+            # same immutable file after this caller's initial existence check.
+            continue
+        if entry.name.startswith(temporary_prefix) and entry.name.endswith(".tmp"):
+            if entry.is_symlink():
+                raise RunManifestError(
+                    f"refusing to bind v2 manifest over preexisting runtime artifacts: {entry}"
+                )
+            if entry.is_file() or not entry.exists():
+                # A peer may unlink its temporary between directory iteration
+                # and this check after successfully publishing the hard link.
+                continue
+            raise RunManifestError(
+                f"refusing to bind v2 manifest over preexisting runtime artifacts: {entry}"
+            )
+        raise RunManifestError(
+            f"refusing to bind v2 manifest over preexisting runtime artifacts: {entry}"
+        )
+
+
+def bind_run_manifest(
+    root: str | os.PathLike, manifest: PPORunManifest
+) -> dict[str, Any]:
+    """Atomically bind an exact, executable v2 manifest to a new production root.
+
+    The historical v1 ``run_contract.json`` is deliberately neither read nor
+    rewritten by this API. A root already carrying that contract must remain a
+    v1 root; v2 commissioning starts in a separate directory.
+    """
+
+    if not isinstance(manifest, PPORunManifest):
+        raise RunManifestError("v2 run binding requires a PPORunManifest")
+    if manifest.status != "bound":
+        raise RunManifestError("v2 production binding requires manifest status='bound'")
+
+    root_path = Path(root)
+    root_path.mkdir(parents=True, exist_ok=True)
+    if run_contract_path(root_path).exists():
+        raise RunManifestError("refusing to bind v2 manifest over a historical v1 root")
+
+    manifest_sha256 = _require_manifest_sha256(
+        manifest.sha256(), where="manifest sha256"
+    )
+    payload = {
+        "schema": RUN_MANIFEST_BINDING_SCHEMA,
+        "manifest_sha256": manifest_sha256,
+        "manifest": json.loads(manifest.canonical_json()),
+    }
+    path = run_manifest_path(root_path)
+
+    def verify_existing() -> dict[str, Any]:
+        if path.is_symlink() or not path.is_file():
+            raise RunManifestError(
+                f"invalid PPO v2 run manifest binding file at {path}"
+            )
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RunManifestError(
+                f"invalid PPO v2 run manifest binding at {path}"
+            ) from error
+        if existing != payload:
+            raise RunManifestError(
+                "PPO v2 run manifest mismatch: immutable production identity changed; "
+                f"expected={existing!r} requested={payload!r}"
+            )
+        return existing
+
+    if path.exists():
+        return verify_existing()
+
+    _assert_pristine_v2_root(root_path)
+
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     temporary.write_text(
         json.dumps(payload, sort_keys=True, separators=(",", ":")),
@@ -285,8 +417,15 @@ def read_version(root: str | os.PathLike) -> PublishedVersion | None:
 
 
 # --------------------------------------------------------------- trajectory shards
-def write_trajectory_shard(root: str | os.PathLike, worker_id: str, shard_index: int,
-                           trajectories: list[Any], *, policy_version: int) -> Path:
+def write_trajectory_shard(
+    root: str | os.PathLike,
+    worker_id: str,
+    shard_index: int,
+    trajectories: list[Any],
+    *,
+    policy_version: int,
+    run_manifest_sha256: str | None = None,
+) -> Path:
     """Pickle a list[PPOTrajectory] to ``trajectories/{worker_id}/shard_{n:06d}.pkl`` atomically.
 
     Wrapped in an envelope so the learner can filter by policy_version (staleness) and worker.
@@ -302,16 +441,36 @@ def write_trajectory_shard(root: str | os.PathLike, worker_id: str, shard_index:
         "created_at": time.time(),
         "trajectories": trajectories,
     }
+    if run_manifest_sha256 is not None:
+        envelope["run_manifest_sha256"] = _require_manifest_sha256(
+            run_manifest_sha256, where="trajectory run_manifest_sha256"
+        )
     with open(tmp, "wb") as fh:
         pickle.dump(envelope, fh, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, path)
     return path
 
 
-def read_trajectory_shard(path: str | os.PathLike) -> dict[str, Any]:
+def read_trajectory_shard(
+    path: str | os.PathLike, *, expected_run_manifest_sha256: str | None = None
+) -> dict[str, Any]:
     """Return the envelope dict; ``envelope['trajectories']`` is the list[PPOTrajectory]."""
+    if expected_run_manifest_sha256 is not None:
+        expected_run_manifest_sha256 = _require_manifest_sha256(
+            expected_run_manifest_sha256, where="expected run_manifest_sha256"
+        )
     with open(path, "rb") as fh:
-        return pickle.load(fh)
+        envelope = pickle.load(fh)
+    if expected_run_manifest_sha256 is not None:
+        if not isinstance(envelope, dict):
+            raise RunManifestError("trajectory shard envelope must be an object")
+        actual = envelope.get("run_manifest_sha256")
+        if actual != expected_run_manifest_sha256:
+            raise RunManifestError(
+                "trajectory run manifest mismatch: "
+                f"expected={expected_run_manifest_sha256!r} actual={actual!r}"
+            )
+    return envelope
 
 
 def _consumed_marker(root: str | os.PathLike, shard_path: Path) -> Path:
@@ -320,11 +479,18 @@ def _consumed_marker(root: str | os.PathLike, shard_path: Path) -> Path:
     return consumed_dir(root) / str(rel).replace(os.sep, "__")
 
 
-def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = None,
-                           min_policy_version: int = 0, stable_secs: float = 0.0,
-                           max_policy_version: int | None = None,
-                           with_envelope: bool = False, newest_first: bool = False,
-                           volume_reload_fn: Callable[[], Any] | None = None) -> Iterator[Any]:
+def iter_unconsumed_shards(
+    root: str | os.PathLike,
+    *,
+    max_shards: int | None = None,
+    min_policy_version: int = 0,
+    stable_secs: float = 0.0,
+    max_policy_version: int | None = None,
+    with_envelope: bool = False,
+    newest_first: bool = False,
+    volume_reload_fn: Callable[[], Any] | None = None,
+    expected_run_manifest_sha256: str | None = None,
+) -> Iterator[Any]:
     """Yield shard paths not yet marked consumed.
 
     Versions outside the inclusive ``[min_policy_version, max_policy_version]``
@@ -356,6 +522,10 @@ def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = 
             volume_reload_fn()
         except Exception:  # reload is best-effort; never crash the learner on it
             pass
+    if expected_run_manifest_sha256 is not None:
+        expected_run_manifest_sha256 = _require_manifest_sha256(
+            expected_run_manifest_sha256, where="expected run_manifest_sha256"
+        )
     base = trajectories_dir(root)
     if not base.exists():
         return
@@ -369,6 +539,7 @@ def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = 
         or max_policy_version is not None
         or with_envelope
         or newest_first
+        or expected_run_manifest_sha256 is not None
     )
 
     def version_is_rejected(envelope: Any) -> bool:
@@ -392,7 +563,10 @@ def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = 
                 envelope = None
                 if need_envelope:
                     try:
-                        envelope = read_trajectory_shard(shard)
+                        envelope = read_trajectory_shard(
+                            shard,
+                            expected_run_manifest_sha256=expected_run_manifest_sha256,
+                        )
                     except (pickle.UnpicklingError, EOFError, OSError):
                         continue
                     if version_is_rejected(envelope):
@@ -419,7 +593,10 @@ def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = 
             if stable_secs > 0.0 and (now - mtime) < stable_secs:
                 continue
             try:
-                envelope = read_trajectory_shard(shard)
+                envelope = read_trajectory_shard(
+                    shard,
+                    expected_run_manifest_sha256=expected_run_manifest_sha256,
+                )
             except (pickle.UnpicklingError, EOFError, OSError):
                 continue
             pv = int(envelope.get("policy_version", 0))
