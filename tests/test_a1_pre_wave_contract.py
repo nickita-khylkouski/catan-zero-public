@@ -906,6 +906,12 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert payload["science"]["learner_initialization"] == (
         contract.current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
     )
+    assert payload["science"]["learner_model_construction"] == (
+        contract.current_science.PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT
+    )
+    assert payload["science"]["learner_execution_topology"] == (
+        contract.current_science.PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
+    )
     assert recipe["amp"] == "none"
     assert recipe["max_steps"] == 32
     assert recipe["forced_action_weight"] == 0.0

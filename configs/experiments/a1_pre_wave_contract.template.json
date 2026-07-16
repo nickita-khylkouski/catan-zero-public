@@ -58,6 +58,35 @@
       "checkpoint": null,
       "optimizer_state": "fresh"
     },
+    "learner_model_construction": {
+      "arch": "entity_graph",
+      "hidden_size": 640,
+      "graph_layers": 6,
+      "attention_heads": 8,
+      "graph_dropout": 0.05,
+      "entity_state_trunk": "transformer",
+      "static_action_residual": true,
+      "legal_action_value_residual": true,
+      "public_card_count_features": true,
+      "meaningful_public_history": true,
+      "meaningful_public_history_pooling": "masked_mean_v1",
+      "event_history_limit": 32,
+      "mask_hidden_info": true,
+      "entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+      "require_35m_model": true
+    },
+    "learner_execution_topology": {
+      "schema_version": "a1-scratch-training-topology-v1",
+      "launcher": "torch.distributed.run",
+      "name": "b200-8gpu-ddp",
+      "world_size": 8,
+      "physical_gpus": [0, 1, 2, 3, 4, 5, 6, 7],
+      "local_batch_size": 512,
+      "grad_accum_steps": 1,
+      "global_batch_size": 4096,
+      "ddp_shard_data": false,
+      "training_rng_rank_offset": true
+    },
     "learner_training_recipe": {
       "track": "2p_no_trade",
       "vps_to_win": 10,

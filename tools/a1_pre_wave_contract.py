@@ -6841,6 +6841,8 @@ def build_lock(
     scratch_science_keys = base_science_keys | {
         "science_schema_version",
         "learner_initialization",
+        "learner_model_construction",
+        "learner_execution_topology",
     }
     science_keys = frozenset(science)
     if science_keys not in {
@@ -6854,6 +6856,8 @@ def build_lock(
         )
     raw_search = dict(science["search"])
     learner_initialization: dict[str, Any] | None = None
+    learner_model_construction: dict[str, Any] | None = None
+    learner_execution_topology: dict[str, Any] | None = None
     if science_keys == scratch_science_keys:
         if science["science_schema_version"] != CURRENT_SCIENCE_SCHEMA:
             raise ContractError("current scratch science schema drifted")
@@ -6863,6 +6867,18 @@ def build_lock(
         ):
             raise ContractError("current scratch learner initialization drifted")
         learner_initialization = dict(science["learner_initialization"])
+        if (
+            science["learner_model_construction"]
+            != current_science.PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT
+        ):
+            raise ContractError("current scratch learner model construction drifted")
+        learner_model_construction = dict(science["learner_model_construction"])
+        if (
+            science["learner_execution_topology"]
+            != current_science.PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
+        ):
+            raise ContractError("current scratch learner execution topology drifted")
+        learner_execution_topology = dict(science["learner_execution_topology"])
     if (
         draft_schema == DRAFT_SCHEMA
         and current_science.is_coherent_search(raw_search)
@@ -7345,6 +7361,14 @@ def build_lock(
                     "learner_initialization_sha256": _digest_value(
                         learner_initialization
                     ),
+                    "learner_model_construction": learner_model_construction,
+                    "learner_model_construction_sha256": _digest_value(
+                        learner_model_construction
+                    ),
+                    "learner_execution_topology": learner_execution_topology,
+                    "learner_execution_topology_sha256": _digest_value(
+                        learner_execution_topology
+                    ),
                 }
             ),
             "evidence": evidence,
@@ -7570,13 +7594,27 @@ def verify_lock(
         for value in (learner_initialization, initialization_sha256, science_schema)
     )
     if initialization_fields_present:
+        learner_model_construction = lock["science"].get(
+            "learner_model_construction"
+        )
+        learner_execution_topology = lock["science"].get(
+            "learner_execution_topology"
+        )
         if (
             science_schema != CURRENT_SCIENCE_SCHEMA
             or learner_initialization
             != current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
             or initialization_sha256 != _digest_value(learner_initialization)
+            or learner_model_construction
+            != current_science.PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT
+            or lock["science"].get("learner_model_construction_sha256")
+            != _digest_value(learner_model_construction)
+            or learner_execution_topology
+            != current_science.PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
+            or lock["science"].get("learner_execution_topology_sha256")
+            != _digest_value(learner_execution_topology)
         ):
-            raise ContractError("sealed learner initialization authority drift")
+            raise ContractError("sealed scratch learner authority drift")
     if _digest_value(evaluator) != lock["science"]["evaluator_sha256"]:
         raise ContractError("evaluator digest mismatch")
     if evaluator["value_readout"] != lock["science"]["value_readout"]:
