@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -59,19 +58,17 @@ def test_canonical_generation_and_evaluation_accept_only_exact_payload(
     ),
 )
 def test_canonical_training_accepts_only_exact_payload(
-    relative_path: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    relative_path: str,
 ) -> None:
     source = ROOT / relative_path
     train._load_recipe(source)  # noqa: SLF001
 
     payload = json.loads(source.read_text(encoding="utf-8"))
     payload["train_config"]["fields"]["action_target_gather"] = False
-    drifted = tmp_path / source.name
-    drifted.write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr(train, "require_production_recipe", lambda **_kwargs: "test")
-
-    with pytest.raises(SystemExit, match="exact commissioned payload"):
-        train._load_recipe(drifted)  # noqa: SLF001
+    with pytest.raises(train.ProductionRecipeError, match="recipe bytes drifted"):
+        train.require_production_recipe(
+            entrypoint="train", path=source, payload=payload
+        )
 
 
 def test_canonical_training_routes_fresh_scratch_through_authenticated_planner(
@@ -111,29 +108,11 @@ def test_canonical_training_rejects_role_substitution(
     payload["engine_settings"]["initialization_mode"] = "scratch_fresh_optimizer"
     drifted = tmp_path / source.name
     drifted.write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr(train, "require_production_recipe", lambda **_kwargs: "test")
-
-    with pytest.raises(SystemExit, match="exact commissioned payload"):
-        train._load_recipe(drifted)  # noqa: SLF001
-
-
-def test_canonical_training_binds_allowlisted_digest_to_role(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    source = ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json"
-    payload = json.loads(source.read_text(encoding="utf-8"))
-    payload["engine_settings"]["initialization_mode"] = "scratch_fresh_optimizer"
-    digest = hashlib.sha256(
-        json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("ascii")
-    ).hexdigest()
-    allowlist = dict(train.CANONICAL_CONFIG_ROLES_BY_SHA256)
-    allowlist[digest] = "parent_fresh_optimizer"
-    monkeypatch.setattr(train, "CANONICAL_CONFIG_ROLES_BY_SHA256", allowlist)
-    monkeypatch.setattr(train, "require_production_recipe", lambda **_kwargs: "test")
-    drifted = tmp_path / source.name
-    drifted.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        train,
+        "require_production_recipe",
+        lambda **_kwargs: "a1-parent-update-35m-b200",
+    )
 
     with pytest.raises(SystemExit, match="role does not match"):
         train._load_recipe(drifted)  # noqa: SLF001

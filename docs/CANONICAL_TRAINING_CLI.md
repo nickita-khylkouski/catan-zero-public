@@ -74,11 +74,12 @@ torchrun --standalone --nproc-per-node=8 tools/train.py \
 That recipe reproduces the commissioned 8×64 global batch, fresh AdamW,
 48-step exact dose, flat `6e-5` learning rate with 16 warmup steps, full value
 and shared-trunk routing, split1 value topology, and authenticated coherent
-teacher identity. It records the review frontier at steps 8, 12, 16, 24, 32,
-and 48. The launcher retains the first five as model-only `_stepNNNN`
-snapshots; the normal terminal `candidate.pt` is the step-48 member of the
-frontier. Candidate chaining, optimizer resume, grow-from initialization, and
-an unrecognized teacher target are rejected.
+teacher semantics. It retains model-only review snapshots at steps 8, 12, 16,
+24, and 32; the normal terminal `candidate.pt` is step 48. Candidate chaining,
+optimizer resume, and grow-from initialization are rejected. The recipe does
+not pin one turn's producer hash: the authenticated single corpus supplies its
+exact policy-target identity, and the trainer admits it only when all active
+policy rows resolve to one uniform operator identity.
 
 The checked-in `a1_current_35m_b200.schema1.json` recipe remains the native-v5
 **fresh-scratch** architecture recipe.  It is not the checkpoint-initialized

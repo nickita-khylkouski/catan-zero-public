@@ -22,7 +22,7 @@
         "path": "configs/training/a1_current_35m_b200.schema1.json"
       },
       {
-        "canonical_sha256": "ed804b9180e6ee773cd85590d69bdd79160a2813ba4ead012eb7b7d1f4e43cd7",
+        "canonical_sha256": "ada85baa252882011c93614cd5fabea5211442e4769a1255d37f92862682a137",
         "name": "a1-parent-update-35m-b200",
         "path": "configs/training/a1_parent_update_35m_b200.schema1.json"
       }

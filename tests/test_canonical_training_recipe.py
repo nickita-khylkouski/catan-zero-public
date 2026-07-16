@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import hashlib
 import json
 from pathlib import Path
 
@@ -102,18 +101,15 @@ def test_canonical_scratch_recipe_rejects_candidate_chaining() -> None:
         (PARENT_RECIPE, "parent_fresh_optimizer"),
     ),
 )
-def test_canonical_recipe_hash_allowlist_is_bound_to_role(
+def test_canonical_recipe_catalog_is_bound_to_role(
     recipe: Path, role: str
 ) -> None:
     payload = json.loads(recipe.read_text(encoding="utf-8"))
-    digest = hashlib.sha256(
-        json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("ascii")
-    ).hexdigest()
-
     assert payload["engine_settings"]["initialization_mode"] == role
-    assert train.CANONICAL_CONFIG_ROLES_BY_SHA256[digest] == role
+    catalog_name = train.require_production_recipe(
+        entrypoint="train", path=recipe, payload=payload
+    )
+    assert train.CANONICAL_CONFIG_ROLES_BY_CATALOG_NAME[catalog_name] == role
     train._load_recipe(recipe)
 
 
@@ -124,10 +120,7 @@ def test_parent_update_recipe_reproduces_split1_full_step48() -> None:
 
     assert engine["initialization_mode"] == "parent_fresh_optimizer"
     assert engine["base_sampler"] == "weighted_replacement_v1"
-    assert engine["checkpoint_steps"] == "8,12,16,24,32,48"
-    assert engine["accepted_policy_target_identity_sha256"] == [
-        "sha256:d1f6686a2f00012aa54a729f4850e1333d59e57783d323c6a2d2d2a15ab02fed"
-    ]
+    assert engine["checkpoint_steps"] == "8,12,16,24,32"
     assert fields["batch_size"] == 64
     assert 8 * fields["batch_size"] == 512
     assert fields["epochs"] == 999
@@ -163,7 +156,7 @@ def test_parent_update_recipe_reproduces_split1_full_step48() -> None:
     assert payload["train_config"]["schema_version"] == 19
 
 
-def test_parent_update_requires_exact_parent_and_forwards_teacher_identity() -> None:
+def test_parent_update_requires_exact_parent_and_uses_corpus_target_identity() -> None:
     config, engine = train._load_recipe(PARENT_RECIPE)
     with pytest.raises(SystemExit, match="requires --init-checkpoint"):
         train._engine_namespace(
@@ -180,13 +173,10 @@ def test_parent_update_requires_exact_parent_and_forwards_teacher_identity() -> 
     assert resolved.init_checkpoint == "/tmp/f7.pt"
     assert resolved.resume_optimizer is False
     assert resolved.grow_from_checkpoint == ""
-    assert resolved.accepted_policy_target_identity_sha256 == [
-        "sha256:d1f6686a2f00012aa54a729f4850e1333d59e57783d323c6a2d2d2a15ab02fed"
-    ]
+    assert resolved.accepted_policy_target_identity_sha256 == []
 
     from tools import train_bc
 
-    assert resolved.checkpoint_steps == "8,12,16,24,32"
     assert train_bc._parse_checkpoint_steps(
         resolved.checkpoint_steps, max_steps=resolved.max_steps
     ) == (8, 12, 16, 24, 32)

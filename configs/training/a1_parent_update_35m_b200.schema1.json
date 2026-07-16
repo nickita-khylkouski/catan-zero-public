@@ -1,10 +1,7 @@
 {
   "engine_settings": {
-    "accepted_policy_target_identity_sha256": [
-      "sha256:d1f6686a2f00012aa54a729f4850e1333d59e57783d323c6a2d2d2a15ab02fed"
-    ],
     "base_sampler": "weighted_replacement_v1",
-    "checkpoint_steps": "8,12,16,24,32,48",
+    "checkpoint_steps": "8,12,16,24,32",
     "data_loader_prefetch": 4,
     "data_loader_workers": 4,
     "entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
