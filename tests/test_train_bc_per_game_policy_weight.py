@@ -70,6 +70,43 @@ def test_equal_mode_equalizes_positive_policy_mass_across_game_lengths_and_categ
     assert float(weights.mean()) == pytest.approx(1.0)
 
 
+def test_play_turn_fourfold_weight_restores_strategic_policy_majority():
+    # One synthetic game with the same aggregate mandatory:PLAY_TURN policy
+    # mass ratio measured in the admitted coherent corpus. Equal-per-game
+    # normalization preserves the within-game phase split, so this directly
+    # exercises the production ordering: phase weighting, then game
+    # normalization, then global mean normalization.
+    data = {
+        "action_taken": np.arange(3, dtype=np.int16),
+        "game_seed": np.asarray([11, 11, 11], dtype=np.int64),
+        "legal_action_ids": np.tile(
+            np.asarray([[1, 2]], dtype=np.int16), (3, 1)
+        ),
+        "phase": np.asarray(["DISCARD", "MOVE_ROBBER", "PLAY_TURN"]),
+        "policy_weight_multiplier": np.asarray(
+            [1.030303, 1.030303, 1.0], dtype=np.float32
+        ),
+    }
+    baseline = build_sample_weights(
+        data,
+        **_base_kwargs(),
+        per_game_policy_weight=True,
+        per_game_policy_weight_mode="equal",
+    )
+    repaired = build_sample_weights(
+        data,
+        **{**_base_kwargs(), "phase_weights": {"PLAY_TURN": 4.0}},
+        per_game_policy_weight=True,
+        per_game_policy_weight_mode="equal",
+    )
+    play = data["phase"] == "PLAY_TURN"
+    baseline_share = float(baseline[play].sum() / baseline.sum())
+    repaired_share = float(repaired[play].sum() / repaired.sum())
+
+    assert baseline_share == pytest.approx(0.326733, abs=1e-6)
+    assert repaired_share == pytest.approx(0.66, abs=1e-6)
+
+
 def test_sqrt_mode_retains_sqrt_original_positive_game_mass_ratio():
     data = _data()
     original = np.asarray(data["policy_weight_multiplier"], dtype=np.float64)

@@ -54,6 +54,13 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "lr_schedule": "flat",
     "value_lr_mult": 1.0,
     "value_trunk_grad_scale": 1.0,
+    # The coherent corpus's natural policy-active distribution assigns only
+    # 34.16% of policy objective mass to ordinary PLAY_TURN decisions; the
+    # successful selected-dose corpus assigned 66.08%.  Fourfold PLAY_TURN
+    # weighting restores 66.49% after the existing equal-per-game
+    # normalization, keeping mandatory prompts supervised without letting
+    # them dominate the strategic policy update.
+    "phase_weights": "PLAY_TURN=4.0",
 }
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
     {"policy_aux_active_batch_size", "policy_aux_loss_weight"}

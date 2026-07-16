@@ -19,6 +19,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     ) in current_science.PRODUCTION_TARGET_QUALITY_LEARNER_CONTRACT.items():
         assert recipe[key] == expected
     assert not current_science.DIAGNOSTIC_POLICY_AUX_FIELDS & set(recipe)
+    assert recipe["phase_weights"] == "PLAY_TURN=4.0"
 
 
 def test_current_target_quality_generation_is_bound_to_config_and_guard() -> None:
@@ -57,6 +58,7 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
         ("value_trunk_grad_scale", 0.1),
         ("grad_accum_steps", 4),
         ("max_steps", 1024),
+        ("phase_weights", ""),
     ),
 )
 def test_current_contract_rejects_diagnostic_training_settings(

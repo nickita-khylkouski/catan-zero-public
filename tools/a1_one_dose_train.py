@@ -1731,18 +1731,24 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         "hlgauss_sigma_ratio": None,
     }:
         raise ExecutorError("current A1 one-dose executor requires scalar MSE/readout")
+    coherent_search = current_science.is_coherent_search(search)
+    expected_value_lr_mult = (
+        current_science.PRODUCTION_LEARNER_SIGNAL_CONTRACT["value_lr_mult"]
+        if coherent_search
+        else 0.3
+    )
     if (
         recipe["world_size"] != 1
         or recipe["global_batch_size"] != 4096
         or recipe["optimizer"] != "adam"
         or recipe["resume_optimizer"] is not False
         or recipe["fused_optimizer"] is not False
-        or recipe["value_lr_mult"] != 0.3
+        or recipe["value_lr_mult"] != expected_value_lr_mult
     ):
         raise ExecutorError(
             "sealed A1 topology/optimizer invariants are not one-B200 fresh Adam"
         )
-    if current_science.is_coherent_search(search) and (
+    if coherent_search and (
         recipe.get("scalar_value_loss_readout") != "deployed_tanh"
         or recipe.get("scalar_value_loss_scale")
         != (science.get("evaluator") or {}).get("value_scale")

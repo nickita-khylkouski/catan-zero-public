@@ -58,3 +58,11 @@ Gumbel/chance/belief streams and never selects the live move. The learner binds
 global and per-game surprise sampling disabled. This prevents raw
 search-vs-parent disagreement from amplifying unstable labels before duplicate
 search has measured their reliability.
+
+The learner also binds `--phase-weights PLAY_TURN=4.0`. On the admitted
+959,142-row coherent corpus, equal-per-game policy weighting otherwise assigns
+only 34.16% of policy objective mass to ordinary `PLAY_TURN` decisions and
+65.84% to opening, discard, and robber prompts. The 4x multiplier restores
+66.49% `PLAY_TURN` mass, matching the 66.08% strategic-turn share of the
+historically successful selected-dose corpus while retaining supervision for
+every mandatory multi-action prompt.

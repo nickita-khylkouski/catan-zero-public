@@ -1,0 +1,88 @@
+{
+  "schema_version": "a1-effective-policy-signal-audit-v1",
+  "date_utc": "2026-07-16",
+  "scope": "read-only B200 learner reports and admitted coherent memmap",
+  "sources": {
+    "successful_selected_dose_report": "/home/ubuntu/catan-zero-production/runs/learner/a1-v5-recovery-n128-p4-64000games-64gpu-20260714-r2-one-dose-r4/train.report.json",
+    "coherent_active_policy_report": "/home/ubuntu/experimental_nonpromotable/coherent-n128-active-policy-20260715-r1/campaign/run-b412bff/arms/P100/train.report.json",
+    "coherent_corpus_meta": "/home/ubuntu/experimental_nonpromotable/coherent-n128-active-policy-20260715-r1/data/coherent-n128-memmap/corpus_meta.json",
+    "stage_c_strategic_report": "/home/ubuntu/experimental_nonpromotable/stage-c-aligned-learner-ced4b14b-9fd85c3-r1/arms/strategic-balanced/learner/train.report.json",
+    "stage_c_production_report": "/home/ubuntu/experimental_nonpromotable/stage-c-aligned-learner-ced4b14b-9fd85c3-r1/arms/production-weighted/learner/train.report.json"
+  },
+  "measurements": {
+    "successful_selected_dose": {
+      "base_row_draws": 524288,
+      "policy_active_row_draws": 65227,
+      "policy_objective_mass_by_phase": {
+        "BUILD_INITIAL_ROAD": 560373.262789011,
+        "BUILD_INITIAL_SETTLEMENT": 564049.4492833614,
+        "DISCARD": 2109688.8388426304,
+        "MOVE_ROBBER": 2467753.99296546,
+        "PLAY_TURN": 11107696.108711958
+      },
+      "play_turn_policy_mass_fraction": 0.6607962978617528
+    },
+    "coherent_corpus_before_phase_repair": {
+      "rows": 959142,
+      "positive_policy_rows": 495290,
+      "positive_policy_effective_sample_size": 442715.1910860155,
+      "policy_objective_mass_by_phase": {
+        "BUILD_INITIAL_ROAD": 70991.84014868736,
+        "BUILD_INITIAL_SETTLEMENT": 70991.84014868736,
+        "DISCARD": 210174.17382073402,
+        "MOVE_ROBBER": 279318.0692972541,
+        "PLAY_TURN": 327666.1077029705
+      },
+      "play_turn_policy_mass_fraction": 0.3416241777372704
+    },
+    "coherent_corpus_with_play_turn_4x": {
+      "phase_weights": "PLAY_TURN=4.0",
+      "play_turn_policy_mass_fraction": 0.6648879084894487,
+      "positive_policy_effective_sample_size": 298746.1854967201
+    },
+    "historical_policy_aux_sweep": {
+      "arms": {
+        "P10": {
+          "policy_aux_batch_size": 46,
+          "policy_aux_draws": 47104
+        },
+        "P25": {
+          "policy_aux_batch_size": 116,
+          "policy_aux_draws": 118784
+        },
+        "P50": {
+          "policy_aux_batch_size": 232,
+          "policy_aux_draws": 237568
+        },
+        "P100": {
+          "policy_aux_batch_size": 463,
+          "policy_aux_draws": 474112
+        }
+      },
+      "objective_semantics": "each arm used one independently normalized full-strength policy auxiliary mean; batch size changed Monte Carlo variance and row coverage, not the auxiliary objective coefficient"
+    },
+    "stage_c_repetition": {
+      "strategic_balanced": {
+        "policy_aux_draws": 16384,
+        "unique_source_rows": 6832,
+        "unique_source_fraction": 0.4169921875
+      },
+      "production_weighted": {
+        "policy_aux_draws": 16384,
+        "unique_source_rows": 5917,
+        "unique_source_fraction": 0.36114501953125
+      }
+    }
+  },
+  "ruled_out_current_production_failures": {
+    "ddp_rank_overlap": "policy auxiliary ranks stride one deterministic global draw stream",
+    "ddp_padding": "the sealed 524288-row dose is exactly divisible by the 4096-row global batch",
+    "identical_torch_dropout_streams": "the current production recipe binds training_rng_rank_offset=true",
+    "weighted_base_row_repetition": "the current direct coherent production recipe has no authenticated component sampler and no policy auxiliary stream, so its base path uses an unpadded permutation"
+  },
+  "root_cause": "the coherent teacher changed the policy-active phase distribution, but the learner retained an empty phase_weights contract; mandatory opening, discard, and robber prompts therefore consumed 65.84% of policy objective mass instead of the 33.92% used by the successful selected-dose learner",
+  "repair": {
+    "phase_weights": "PLAY_TURN=4.0",
+    "effect": "restores strategic PLAY_TURN policy mass from 34.16% to 66.49%, matching the successful selected-dose 66.08% reference while retaining every mandatory multi-action target"
+  }
+}
