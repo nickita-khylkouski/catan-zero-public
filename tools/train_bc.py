@@ -32616,12 +32616,42 @@ def _checkpoint_dose_telemetry(
         selected = {
             name: module_rows[name] for name in module_names if name in module_rows
         }
+        signal_fields = (
+            "max_pre_clip_grad_norm",
+            "mean_parameter_delta_norm",
+            "mean_parameter_update_rms",
+        )
+
+        def _has_nonzero_signal(row: object) -> bool:
+            if not isinstance(row, dict):
+                return False
+            for field in signal_fields:
+                try:
+                    value = float(row.get(field, 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value) and value > 0.0:
+                    return True
+            return False
+
+        nonzero_signal_modules = sorted(
+            name
+            for name, row in selected.items()
+            if _has_nonzero_signal(row)
+        )
+        zero_signal_modules = sorted(
+            name for name in selected if name not in nonzero_signal_modules
+        )
         return {
             "enabled": bool(enabled),
             "independent_loss_objective": False,
             "measurement": "total_objective_parameter_path_gradient",
             "status": (
-                "observed"
+                (
+                    "observed_nonzero"
+                    if nonzero_signal_modules
+                    else "observed_zero"
+                )
                 if selected
                 else (
                     "awaiting_diagnostic_cadence"
@@ -32629,6 +32659,8 @@ def _checkpoint_dose_telemetry(
                     else "not_configured"
                 )
             ),
+            "nonzero_signal_modules": nonzero_signal_modules,
+            "zero_signal_modules": zero_signal_modules,
             "modules": selected,
         }
 

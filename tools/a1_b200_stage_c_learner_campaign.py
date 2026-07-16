@@ -503,7 +503,8 @@ def _checkpoint_feature_learning_signal(
         or any(
             not isinstance(feature_paths.get(name), dict)
             or feature_paths[name].get("enabled") is not True
-            or feature_paths[name].get("status") != "observed"
+            or feature_paths[name].get("status")
+            not in {"observed", "observed_nonzero"}
             for name in ("public_card", "meaningful_history")
         )
     ):
@@ -516,7 +517,7 @@ def _checkpoint_feature_learning_signal(
         "feature_paths": {
             name: {
                 "enabled": True,
-                "status": "observed",
+                "status": feature_paths[name]["status"],
             }
             for name in ("public_card", "meaningful_history")
         },

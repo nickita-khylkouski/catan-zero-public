@@ -596,17 +596,87 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
     }
     assert dose["optimizer"]["clipped_fraction"] == pytest.approx(0.25)
     assert dose["shared_trunk_objective_gradients"]["observed_steps"] == 1
-    assert dose["feature_path_gradients"]["public_card"]["status"] == "observed"
+    assert (
+        dose["feature_path_gradients"]["public_card"]["status"]
+        == "observed_nonzero"
+    )
     assert (
         dose["feature_path_gradients"]["meaningful_history"]["status"]
-        == "observed"
+        == "observed_nonzero"
     )
+    assert dose["feature_path_gradients"]["public_card"][
+        "nonzero_signal_modules"
+    ] == ["public_card_count_residual"]
+    assert dose["feature_path_gradients"]["public_card"][
+        "zero_signal_modules"
+    ] == []
+    assert dose["feature_path_gradients"]["meaningful_history"][
+        "nonzero_signal_modules"
+    ] == ["event_encoder"]
     assert (
         dose["feature_path_gradients"]["public_card"][
             "independent_loss_objective"
         ]
         is False
     )
+
+
+def test_checkpoint_dose_telemetry_distinguishes_zero_signal_modules() -> None:
+    zero_signal = {
+        "mean_pre_clip_grad_norm": 0.0,
+        "max_pre_clip_grad_norm": 0.0,
+        "mean_parameter_delta_norm": 0.0,
+        "mean_parameter_update_rms": 0.0,
+        "mean_relative_parameter_delta": 0.0,
+        "parameter_count": 8,
+    }
+    nonzero_signal = {
+        **zero_signal,
+        "mean_pre_clip_grad_norm": 0.25,
+        "max_pre_clip_grad_norm": 0.25,
+        "mean_parameter_delta_norm": 0.01,
+        "mean_parameter_update_rms": 0.001,
+    }
+    metric = {
+        "samples": 1,
+        "module_optimizer_observability": {
+            "observed_steps": 1,
+            "norm_scope": "global_replicated",
+            "modules": {
+                "public_card_count_residual": dict(zero_signal),
+                "event_encoder": dict(zero_signal),
+                "meaningful_history_residual_gate": dict(nonzero_signal),
+            },
+        },
+    }
+
+    dose = train_bc._checkpoint_dose_telemetry(
+        [metric],
+        optimizer_step=1,
+        optimizer_observed_steps=1,
+        optimizer_clipped_steps=0,
+        optimizer_zero_objective_steps=0,
+        optimizer_pre_clip_grad_norm_sum=0.25,
+        optimizer_pre_clip_grad_norm_max=0.25,
+        objective_gradient_cadence_batches=1,
+        train_diagnostic_cadence_batches=1,
+        public_card_enabled=True,
+        meaningful_history_enabled=True,
+    )
+
+    public_card = dose["feature_path_gradients"]["public_card"]
+    assert public_card["status"] == "observed_zero"
+    assert public_card["nonzero_signal_modules"] == []
+    assert public_card["zero_signal_modules"] == [
+        "public_card_count_residual"
+    ]
+
+    history = dose["feature_path_gradients"]["meaningful_history"]
+    assert history["status"] == "observed_nonzero"
+    assert history["nonzero_signal_modules"] == [
+        "meaningful_history_residual_gate"
+    ]
+    assert history["zero_signal_modules"] == ["event_encoder"]
 
 
 def test_checkpoint_dose_refuses_policy_aux_coefficient_drift() -> None:
