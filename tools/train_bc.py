@@ -39818,7 +39818,10 @@ def _write_entity_checkpoint(
 
 
 if __name__ == "__main__":
-    raise SystemExit(
-        "tools/train_bc.py is an internal training engine, not a supported CLI. "
-        "Launch new runs with tools/train.py and a checked-in canonical config."
-    )
+    # Sealed historical receipts and the authenticated A1 scratch/one-dose
+    # executors bind this exact script path and invoke it as a subprocess.
+    # Keep that compatibility boundary executable until those receipts have an
+    # explicit replay adapter.  New human-authored launches still belong on
+    # tools/train.py; that is a support-policy boundary, not permission to
+    # invalidate already-issued execution authorities.
+    main()

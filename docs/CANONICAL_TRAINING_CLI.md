@@ -37,11 +37,12 @@ torchrun --standalone --nproc-per-node=8 tools/train.py \
   --report /path/to/report.json
 ```
 
-`tools/train_bc.py` remains temporarily importable as an internal compatibility
-engine because sealed historical receipts bind its functions and bytes. Direct
-execution now refuses immediately; it no longer exposes its experimental parser
-as a runnable CLI. Once sealed replay is routed through an explicit legacy
-adapter, the parser implementation can be deleted from the engine entirely.
+`tools/train_bc.py` remains executable as an internal compatibility engine
+because sealed historical receipts and the authenticated scratch/one-dose
+executors bind its script path, functions, and bytes. It is not a supported
+interface for new hand-authored runs. Once sealed replay and those executors are
+routed through an explicit legacy adapter, the parser implementation can be
+deleted from the engine entirely.
 
 GitHub Actions workflows were removed. Cluster execution and local explicit
 commands are now the only supported run surfaces.

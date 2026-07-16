@@ -9,8 +9,10 @@ longer assembled from dozens of command-line switches.
 - `tools/evaluate.py`: 9 options
 - `tools/train.py`: config-first learner entrypoint
 
-The older executors remain importable for authenticated historical replay and
-specialized R&D tools. They are not production launch interfaces.
+The older executors remain executable for authenticated historical replay,
+sealed scratch/one-dose orchestration, and specialized R&D tools. They are not
+interfaces for new hand-authored production launches; disabling their script
+entrypoints would invalidate existing byte-bound authorities.
 
 ## Retired generation experiments
 
