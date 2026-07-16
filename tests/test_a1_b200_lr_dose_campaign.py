@@ -18,6 +18,237 @@ def _sha(path: Path) -> str:
     return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
 
 
+def _write_native_eval(
+    root: Path,
+    *,
+    arm: str,
+    candidate_sha: str,
+    f7: tuple[float, float, float],
+    v5: tuple[float, float, float],
+    baseline_shas: dict[str, str],
+) -> Path:
+    rows = {}
+    for role, (mu, lower, upper) in {"f7": f7, "v5": v5}.items():
+        report = root / f"{arm}-vs-{role}.pooled.json"
+        payload = {
+            "candidate_checkpoint_sha256": candidate_sha,
+            "baseline_checkpoint_sha256": baseline_shas[role],
+            "paired_score_regularized_mu": mu,
+            "paired_score_regularized_95ci": [lower, upper],
+            "pairs_requested": 100,
+            "complete_pairs": 100,
+            "games_requested": 200,
+            "games_played": 200,
+            "games_with_winner": 200,
+            "games_truncated": 0,
+            "pairs_truncated_excluded": 0,
+            "errors": [],
+        }
+        report.write_text(json.dumps(payload), encoding="utf-8")
+        rows[f"arm-vs-{role}"] = {
+            "paired_score_regularized_mu": mu,
+            "paired_score_regularized_95ci": [lower, upper],
+            "report": str(report),
+        }
+    summary = root / f"{arm}.native-eval-summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "schema_version": campaign.NATIVE_EVAL_SUMMARY_SCHEMA,
+                "arms": {arm: rows},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return summary
+
+
+def test_robust_selector_rejects_f7_only_ranking_reversal(tmp_path: Path) -> None:
+    baseline_shas = {
+        "f7": "sha256:" + "7" * 64,
+        "v5": "sha256:" + "5" * 64,
+    }
+    candidate_shas = {
+        arm: "sha256:" + digit * 64
+        for arm, digit in zip(campaign.ARMS, "abcd", strict=True)
+    }
+    # B is the tempting f7-only winner but collapses against v5. C has the
+    # strongest worst-baseline lower bound and must win the robust objective.
+    scores = {
+        "A": ((0.55, 0.50, 0.60), (0.51, 0.46, 0.56)),
+        "B": ((0.65, 0.60, 0.70), (0.42, 0.37, 0.47)),
+        "C": ((0.58, 0.53, 0.63), (0.57, 0.52, 0.62)),
+        "D": ((0.54, 0.49, 0.59), (0.53, 0.48, 0.58)),
+    }
+    evaluations = {
+        arm: _write_native_eval(
+            tmp_path,
+            arm=arm,
+            candidate_sha=candidate_shas[arm],
+            f7=scores[arm][0],
+            v5=scores[arm][1],
+            baseline_shas=baseline_shas,
+        )
+        for arm in campaign.ARMS
+    }
+    receipts = {
+        arm: {"checkpoint_sha256": candidate_shas[arm]}
+        for arm in campaign.ARMS
+    }
+
+    winner, ranking, evidence = campaign._rank_authenticated_evaluations(
+        receipt_records=receipts,
+        evaluation_paths=evaluations,
+    )
+
+    assert winner == "C"
+    assert [row["arm"] for row in ranking] == ["C", "D", "A", "B"]
+    assert evidence["baseline_checkpoint_sha256_by_role"] == baseline_shas
+    assert evidence["arms"]["B"]["robust_worst_baseline_95ci_lower"] == 0.37
+
+
+def test_robust_selector_accepts_real_flat_matchup_summary_shape(
+    tmp_path: Path,
+) -> None:
+    baseline_shas = {
+        "f7": "sha256:" + "7" * 64,
+        "v5": "sha256:" + "5" * 64,
+    }
+    candidate_shas = {
+        arm: "sha256:" + digit * 64
+        for arm, digit in zip(campaign.ARMS, "abcd", strict=True)
+    }
+    rows = []
+    for arm_index, arm in enumerate(campaign.ARMS):
+        for role, base_mu in (("f7", 0.55), ("v5", 0.54)):
+            mu = base_mu - 0.01 * arm_index
+            report = tmp_path / f"{arm}-{role}.pooled.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "candidate_checkpoint_sha256": candidate_shas[arm],
+                        "baseline_checkpoint_sha256": baseline_shas[role],
+                        "paired_score_regularized_mu": mu,
+                        "paired_score_regularized_95ci": [mu - 0.05, mu + 0.05],
+                        "pairs_requested": 128,
+                        "complete_pairs": 128,
+                        "games_played": 256,
+                        "games_with_winner": 256,
+                        "games_truncated": 0,
+                        "pairs_truncated_excluded": 0,
+                        "errors": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rows.append(
+                {
+                    "matchup": f"{arm.lower()}-vs-{role}",
+                    "paired_score_regularized_mu": mu,
+                    "paired_score_regularized_95ci": [mu - 0.05, mu + 0.05],
+                    "report": str(report),
+                }
+            )
+    summary = tmp_path / "r5-results-summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "schema_version": campaign.NATIVE_EVAL_SUMMARY_SCHEMA,
+                "rows": rows,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    winner, ranking, evidence = campaign._rank_authenticated_evaluations(
+        receipt_records={
+            arm: {"checkpoint_sha256": candidate_shas[arm]}
+            for arm in campaign.ARMS
+        },
+        evaluation_paths={arm: summary for arm in campaign.ARMS},
+    )
+
+    assert winner == "A"
+    assert [row["arm"] for row in ranking] == list(campaign.ARMS)
+    assert set(evidence["arms"]["A"]["comparisons"]) == {"f7", "v5"}
+
+
+def test_robust_selector_rejects_incomplete_or_mismatched_evidence(
+    tmp_path: Path,
+) -> None:
+    baseline_shas = {
+        "f7": "sha256:" + "7" * 64,
+        "v5": "sha256:" + "5" * 64,
+    }
+    candidate_shas = {
+        arm: "sha256:" + digit * 64
+        for arm, digit in zip(campaign.ARMS, "abcd", strict=True)
+    }
+    evaluations = {
+        arm: _write_native_eval(
+            tmp_path,
+            arm=arm,
+            candidate_sha=candidate_shas[arm],
+            f7=(0.55, 0.50, 0.60),
+            v5=(0.54, 0.49, 0.59),
+            baseline_shas=baseline_shas,
+        )
+        for arm in campaign.ARMS
+    }
+    receipts = {
+        arm: {"checkpoint_sha256": candidate_shas[arm]}
+        for arm in campaign.ARMS
+    }
+    bad_report = tmp_path / "A-vs-v5.pooled.json"
+    payload = json.loads(bad_report.read_text(encoding="utf-8"))
+    payload["games_truncated"] = 1
+    payload["games_with_winner"] = 199
+    bad_report.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(campaign.CampaignError, match="incomplete or truncated"):
+        campaign._rank_authenticated_evaluations(
+            receipt_records=receipts,
+            evaluation_paths=evaluations,
+        )
+
+
+def test_winner_argument_is_only_an_assertion() -> None:
+    campaign._verify_winner_assertion(None, "C")
+    campaign._verify_winner_assertion("C", "C")
+    with pytest.raises(campaign.CampaignError, match="disagrees"):
+        campaign._verify_winner_assertion("B", "C")
+
+
+def test_robust_selector_refuses_unresolved_top_tie(tmp_path: Path) -> None:
+    baseline_shas = {
+        "f7": "sha256:" + "7" * 64,
+        "v5": "sha256:" + "5" * 64,
+    }
+    candidate_shas = {
+        arm: "sha256:" + digit * 64
+        for arm, digit in zip(campaign.ARMS, "abcd", strict=True)
+    }
+    evaluations = {}
+    for arm in campaign.ARMS:
+        tied_top = arm in {"B", "C"}
+        evaluations[arm] = _write_native_eval(
+            tmp_path,
+            arm=arm,
+            candidate_sha=candidate_shas[arm],
+            f7=(0.60, 0.55, 0.65) if tied_top else (0.50, 0.45, 0.55),
+            v5=(0.58, 0.53, 0.63) if tied_top else (0.49, 0.44, 0.54),
+            baseline_shas=baseline_shas,
+        )
+    with pytest.raises(campaign.CampaignError, match="ambiguous"):
+        campaign._rank_authenticated_evaluations(
+            receipt_records={
+                arm: {"checkpoint_sha256": candidate_shas[arm]}
+                for arm in campaign.ARMS
+            },
+            evaluation_paths=evaluations,
+        )
+
+
 def test_campaign_seals_independent_parent_arms_and_policy_active_target(
     tmp_path: Path,
 ) -> None:

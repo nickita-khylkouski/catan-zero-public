@@ -3,9 +3,11 @@
 
 The four 128-step arms differ only in LR and warmup. Every arm replays the
 sealed one-dose transaction from the same explicitly hash-bound parent with a
-fresh optimizer. After playing-strength evaluation, an operator records one
-winner and may replay *that recipe* to 256 steps from the original parent; a
-candidate checkpoint is never used as another candidate's initializer.
+fresh optimizer. After playing-strength evaluation, the selector authenticates
+each arm against both f7 and v5 and chooses the recipe with the strongest
+worst-baseline lower confidence bound. That recipe may be replayed to 256 steps
+from the original parent; a candidate checkpoint is never used as another
+candidate's initializer.
 
 This tool deliberately does not choose a production champion. It is a
 diagnostic campaign runner around :mod:`tools.a1_one_dose_train`; production
@@ -27,7 +29,13 @@ from typing import Any, Mapping, Sequence
 
 
 SCHEMA = "a1-b200-lr-dose-campaign-v1"
-SELECTION_SCHEMA = "a1-b200-lr-dose-selection-v1"
+SELECTION_SCHEMA = "a1-b200-lr-dose-selection-v2"
+NATIVE_EVAL_SUMMARY_SCHEMA = "a1-r5-native-eval-summary-v1"
+EVALUATION_BASELINE_ROLES = ("f7", "v5")
+SELECTION_OBJECTIVE = (
+    "maximize_minimum_baseline_paired_score_regularized_95ci_lower"
+)
+SELECTION_SECONDARY = "maximize_minimum_baseline_paired_score_regularized_mu"
 WORLD_SIZE = 8
 GLOBAL_BATCH_SIZE = 4096
 SHORT_STEPS = 128
@@ -356,7 +364,10 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             for arm, values in ARMS.items()
         },
         "selection_contract": {
-            "primary": "paired_playing_strength",
+            "primary": SELECTION_OBJECTIVE,
+            "secondary": SELECTION_SECONDARY,
+            "required_baselines": list(EVALUATION_BASELINE_ROLES),
+            "evaluation_summary_schema": NATIVE_EVAL_SUMMARY_SCHEMA,
             "validation_loss_may_select_checkpoint_within_arm_only": True,
             "all_four_one_dose_receipts_required": True,
             "all_four_evaluation_receipts_required": True,
@@ -776,11 +787,332 @@ def _parse_bindings(values: Sequence[str], *, label: str) -> dict[str, Path]:
     return result
 
 
+def _load_json_object(path: Path, *, where: str) -> dict[str, Any]:
+    resolved = _regular_file(path, where=where)
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise CampaignError(f"cannot load {where}: {error}") from error
+    if not isinstance(payload, dict):
+        raise CampaignError(f"{where} must be one JSON object")
+    return payload
+
+
+def _finite_score(value: object, *, where: str) -> float:
+    if isinstance(value, bool):
+        raise CampaignError(f"{where} must be a finite numeric score")
+    try:
+        score = float(value)
+    except (TypeError, ValueError) as error:
+        raise CampaignError(f"{where} must be a finite numeric score") from error
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise CampaignError(f"{where} must be in [0,1]")
+    return score
+
+
+def _score_interval(value: object, *, where: str) -> tuple[float, float]:
+    if isinstance(value, Mapping):
+        lower = value.get("lower", value.get("low"))
+        upper = value.get("upper", value.get("high"))
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        lower, upper = value
+    else:
+        raise CampaignError(f"{where} must be [lower,upper] or a lower/upper object")
+    result = (
+        _finite_score(lower, where=f"{where}.lower"),
+        _finite_score(upper, where=f"{where}.upper"),
+    )
+    if result[0] > result[1]:
+        raise CampaignError(f"{where} lower bound exceeds upper bound")
+    return result
+
+
+def _evaluation_rows(
+    payload: Mapping[str, Any], *, arm: str, where: str
+) -> dict[str, Mapping[str, Any]]:
+    """Normalize the existing R5 summary's mapping/list encodings.
+
+    Historical writers emitted either ``arms[ARM]["arm-vs-f7"]`` mappings or
+    one flat ``rows``/``evaluations`` list. Supporting both is safe because the
+    role and arm still have to resolve exactly once and every row's pooled
+    report is authenticated below.
+    """
+
+    if payload.get("schema_version") != NATIVE_EVAL_SUMMARY_SCHEMA:
+        raise CampaignError(f"{where} is not {NATIVE_EVAL_SUMMARY_SCHEMA}")
+    candidates: list[Mapping[str, Any]] = []
+    arms = payload.get("arms")
+    if isinstance(arms, Mapping):
+        record = arms.get(arm)
+        if isinstance(record, Mapping):
+            for key, value in record.items():
+                if isinstance(value, Mapping):
+                    candidates.append(
+                        {**value, "_comparison_key": str(key), "_bound_arm": arm}
+                    )
+    for key in ("rows", "evaluations", "comparisons"):
+        rows = payload.get(key)
+        if isinstance(rows, list):
+            candidates.extend(row for row in rows if isinstance(row, Mapping))
+    if not candidates:
+        # A per-arm summary may place the two comparison rows at top level.
+        for key in ("arm-vs-f7", "arm_vs_f7", "arm-vs-v5", "arm_vs_v5"):
+            value = payload.get(key)
+            if isinstance(value, Mapping):
+                candidates.append(
+                    {**value, "_comparison_key": key, "_bound_arm": arm}
+                )
+
+    resolved: dict[str, Mapping[str, Any]] = {}
+    for row in candidates:
+        identity = str(
+            row.get(
+                "comparison",
+                row.get(
+                    "comparison_id",
+                    row.get(
+                        "matchup",
+                        row.get("baseline_role", row.get("_comparison_key", "")),
+                    ),
+                ),
+            )
+        ).lower()
+        explicit_row_arm = row.get("arm", row.get("_bound_arm"))
+        if explicit_row_arm is None:
+            for separator in ("-vs-", "_vs_"):
+                if separator in identity:
+                    explicit_row_arm = identity.split(separator, 1)[0]
+                    break
+        row_arm = str(explicit_row_arm if explicit_row_arm is not None else arm).upper()
+        if row_arm != arm:
+            continue
+        matching_roles = [
+            role
+            for role in EVALUATION_BASELINE_ROLES
+            if identity in {role, f"arm-vs-{role}", f"arm_vs_{role}"}
+            or identity in {f"{arm.lower()}-vs-{role}", f"{arm.lower()}_vs_{role}"}
+        ]
+        if len(matching_roles) != 1:
+            continue
+        role = matching_roles[0]
+        if role in resolved:
+            raise CampaignError(f"{where} has ambiguous duplicate {arm}-vs-{role} rows")
+        resolved[role] = row
+    missing = sorted(set(EVALUATION_BASELINE_ROLES) - set(resolved))
+    if missing:
+        raise CampaignError(f"{where} is missing {arm} comparisons for {missing}")
+    return resolved
+
+
+def _report_path_from_row(
+    row: Mapping[str, Any], *, summary_path: Path, where: str
+) -> Path:
+    raw = row.get("report", row.get("report_path", row.get("pooled_report")))
+    if isinstance(raw, Mapping):
+        raw = raw.get("path")
+    if not isinstance(raw, str) or not raw:
+        raise CampaignError(f"{where} has no pooled report path")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = summary_path.parent / candidate
+    return _regular_file(candidate, where=f"{where} pooled report")
+
+
+def _metric_from_report_or_row(
+    report: Mapping[str, Any],
+    row: Mapping[str, Any],
+    *,
+    key: str,
+    where: str,
+) -> object:
+    row_value = row.get(key)
+    if row_value is None:
+        raise CampaignError(f"{where} row is missing {key}")
+    report_value = report.get(key)
+    if report_value is not None and report_value != row_value:
+        raise CampaignError(f"{where} summary/report {key} mismatch")
+    return row_value
+
+
+def _authenticate_evaluation_row(
+    *,
+    arm: str,
+    role: str,
+    row: Mapping[str, Any],
+    summary_path: Path,
+    candidate_sha256: str,
+) -> dict[str, Any]:
+    where = f"arm {arm} versus {role}"
+    report_path = _report_path_from_row(row, summary_path=summary_path, where=where)
+    report = _load_json_object(report_path, where=f"{where} pooled report")
+    actual_candidate = _normalize_sha256(
+        str(report.get("candidate_checkpoint_sha256", "")),
+        where=f"{where} candidate checkpoint",
+    )
+    if actual_candidate != candidate_sha256:
+        raise CampaignError(
+            f"{where} candidate checkpoint does not match arm receipt: "
+            f"expected={candidate_sha256} actual={actual_candidate}"
+        )
+    if row.get("candidate_checkpoint_sha256") is not None and _normalize_sha256(
+        str(row["candidate_checkpoint_sha256"]),
+        where=f"{where} summary candidate checkpoint",
+    ) != actual_candidate:
+        raise CampaignError(f"{where} summary candidate checkpoint disagrees with report")
+    baseline_sha256 = _normalize_sha256(
+        str(report.get("baseline_checkpoint_sha256", "")),
+        where=f"{where} baseline checkpoint",
+    )
+    if row.get("baseline_checkpoint_sha256") is not None and _normalize_sha256(
+        str(row["baseline_checkpoint_sha256"]),
+        where=f"{where} summary baseline checkpoint",
+    ) != baseline_sha256:
+        raise CampaignError(f"{where} summary baseline checkpoint disagrees with report")
+    if report.get("errors") != []:
+        raise CampaignError(f"{where} pooled report contains errors")
+    pairs_requested = int(report.get("pairs_requested", -1))
+    complete_pairs = int(report.get("complete_pairs", -1))
+    games_played = int(report.get("games_played", -1))
+    games_with_winner = int(report.get("games_with_winner", -1))
+    games_truncated = int(report.get("games_truncated", -1))
+    games_requested = int(report.get("games_requested", pairs_requested * 2))
+    if (
+        pairs_requested <= 0
+        or complete_pairs != pairs_requested
+        or games_requested != pairs_requested * 2
+        or games_played != games_requested
+        or games_with_winner != games_requested
+        or games_truncated != 0
+        or int(report.get("pairs_truncated_excluded", 0)) != 0
+    ):
+        raise CampaignError(
+            f"{where} pooled report is incomplete or truncated: "
+            f"pairs={complete_pairs}/{pairs_requested} "
+            f"games={games_with_winner}/{games_requested} "
+            f"truncated={games_truncated}"
+        )
+    mu = _finite_score(
+        _metric_from_report_or_row(
+            report,
+            row,
+            key="paired_score_regularized_mu",
+            where=where,
+        ),
+        where=f"{where} paired score",
+    )
+    lower, upper = _score_interval(
+        _metric_from_report_or_row(
+            report,
+            row,
+            key="paired_score_regularized_95ci",
+            where=where,
+        ),
+        where=f"{where} paired score 95ci",
+    )
+    if not lower <= mu <= upper:
+        raise CampaignError(f"{where} point score lies outside its 95ci")
+    return {
+        "baseline_role": role,
+        "candidate_checkpoint_sha256": actual_candidate,
+        "baseline_checkpoint_sha256": baseline_sha256,
+        "paired_score_regularized_mu": mu,
+        "paired_score_regularized_95ci": [lower, upper],
+        "pairs_requested": pairs_requested,
+        "complete_pairs": complete_pairs,
+        "games_played": games_played,
+        "games_truncated": games_truncated,
+        "report": str(report_path),
+        "report_file_sha256": _file_sha256(report_path),
+    }
+
+
+def _rank_authenticated_evaluations(
+    *,
+    receipt_records: Mapping[str, Mapping[str, Any]],
+    evaluation_paths: Mapping[str, Path],
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    baseline_sha_by_role: dict[str, str] = {}
+    arm_evidence: dict[str, Any] = {}
+    ranking: list[dict[str, Any]] = []
+    for arm in ARMS:
+        summary_path = evaluation_paths[arm]
+        summary = _load_json_object(
+            summary_path, where=f"arm {arm} evaluation summary"
+        )
+        rows = _evaluation_rows(
+            summary, arm=arm, where=f"arm {arm} evaluation summary"
+        )
+        candidate_sha = str(receipt_records[arm]["checkpoint_sha256"])
+        comparisons: dict[str, Any] = {}
+        for role in EVALUATION_BASELINE_ROLES:
+            evidence = _authenticate_evaluation_row(
+                arm=arm,
+                role=role,
+                row=rows[role],
+                summary_path=summary_path,
+                candidate_sha256=candidate_sha,
+            )
+            baseline = evidence["baseline_checkpoint_sha256"]
+            previous = baseline_sha_by_role.setdefault(role, baseline)
+            if previous != baseline:
+                raise CampaignError(
+                    f"baseline checkpoint drift for role {role}: "
+                    f"expected={previous} arm={arm} actual={baseline}"
+                )
+            comparisons[role] = evidence
+        worst_lower = min(
+            float(value["paired_score_regularized_95ci"][0])
+            for value in comparisons.values()
+        )
+        worst_mu = min(
+            float(value["paired_score_regularized_mu"])
+            for value in comparisons.values()
+        )
+        record = {
+            "arm": arm,
+            "robust_worst_baseline_95ci_lower": worst_lower,
+            "robust_worst_baseline_point_score": worst_mu,
+            "comparisons": comparisons,
+        }
+        arm_evidence[arm] = {
+            "summary": str(summary_path),
+            "summary_file_sha256": _file_sha256(summary_path),
+            **record,
+        }
+        ranking.append(record)
+    ranking.sort(
+        key=lambda value: (
+            -float(value["robust_worst_baseline_95ci_lower"]),
+            -float(value["robust_worst_baseline_point_score"]),
+            str(value["arm"]),
+        )
+    )
+    if len(ranking) < 2 or (
+        ranking[0]["robust_worst_baseline_95ci_lower"]
+        == ranking[1]["robust_worst_baseline_95ci_lower"]
+        and ranking[0]["robust_worst_baseline_point_score"]
+        == ranking[1]["robust_worst_baseline_point_score"]
+    ):
+        raise CampaignError(
+            "playing-strength evidence is ambiguous after the declared robust "
+            "primary and secondary objectives"
+        )
+    return str(ranking[0]["arm"]), ranking, {
+        "baseline_checkpoint_sha256_by_role": baseline_sha_by_role,
+        "arms": arm_evidence,
+    }
+
+
+def _verify_winner_assertion(asserted: str | None, actual: str) -> None:
+    if asserted is not None and asserted != actual:
+        raise CampaignError(
+            f"--winner={asserted} disagrees with authenticated robust winner {actual}"
+        )
+
+
 def _select(args: argparse.Namespace) -> dict[str, Any]:
     campaign_path = _regular_file(args.campaign, where="campaign plan")
     campaign = _load_bound_json(campaign_path, schema=SCHEMA)
-    if args.winner not in ARMS:
-        raise CampaignError("winner must be A, B, C, or D")
     receipts = _parse_bindings(args.arm_receipt, label="arm receipt")
     evaluations = _parse_bindings(args.evaluation, label="evaluation")
     receipt_records: dict[str, Any] = {}
@@ -794,15 +1126,29 @@ def _select(args: argparse.Namespace) -> dict[str, Any]:
             "file_sha256": completed["receipt_file_sha256"],
             "checkpoint_sha256": completed["artifacts"]["checkpoint"]["sha256"],
         }
+    winner, ranking, authenticated_evidence = _rank_authenticated_evaluations(
+        receipt_records=receipt_records,
+        evaluation_paths=evaluations,
+    )
+    _verify_winner_assertion(args.winner, winner)
     selection: dict[str, Any] = {
         "schema_version": SELECTION_SCHEMA,
         "campaign": str(campaign_path),
         "campaign_file_sha256": _file_sha256(campaign_path),
         "campaign_sha256": campaign["campaign_sha256"],
-        "winner": args.winner,
-        "selection_basis": "operator_declared_after_paired_playing_strength",
+        "winner": winner,
+        "winner_assertion": args.winner,
+        "selection_basis": "algorithmic_authenticated_robust_playing_strength",
+        "selection_objective": {
+            "primary": SELECTION_OBJECTIVE,
+            "secondary": SELECTION_SECONDARY,
+            "required_baselines": list(EVALUATION_BASELINE_ROLES),
+            "tie_policy": "refuse_if_primary_and_secondary_are_tied",
+        },
+        "ranking": ranking,
+        "authenticated_playing_strength_evidence": authenticated_evidence,
         "winner_recipe": _arm_overrides(
-            args.winner,
+            winner,
             max_steps=LONG_STEPS,
             policy_aux_active_batch_size=int(
                 campaign["policy_active_dose"]["policy_aux_active_batch_size"]
@@ -818,7 +1164,7 @@ def _select(args: argparse.Namespace) -> dict[str, Any]:
             arm: {"path": str(path), "file_sha256": _file_sha256(path)}
             for arm, path in evaluations.items()
         },
-        "long_dose_output_subdir": f"winner/{args.winner}-steps256",
+        "long_dose_output_subdir": f"winner/{winner}-steps256",
     }
     selection["selection_sha256"] = _value_sha256(selection)
     return selection
@@ -863,7 +1209,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     select = sub.add_parser("select", help="bind evaluated winner after all arms")
     select.add_argument("--campaign", required=True, type=Path)
-    select.add_argument("--winner", required=True, choices=tuple(ARMS))
+    select.add_argument(
+        "--winner",
+        choices=tuple(ARMS),
+        default=None,
+        help=(
+            "Optional assertion of the algorithmic winner. It cannot select or "
+            "override an arm and is rejected if it disagrees with the evidence."
+        ),
+    )
     select.add_argument("--arm-receipt", action="append", default=[], metavar="ARM=PATH")
     select.add_argument("--evaluation", action="append", default=[], metavar="ARM=PATH")
     select.add_argument("--write", required=True, type=Path)
