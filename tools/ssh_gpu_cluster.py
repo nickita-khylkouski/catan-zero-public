@@ -11,14 +11,27 @@ from typing import Any
 
 
 DEFAULT_CONFIG = Path("configs/gpu_cluster_hosts.json")
+RETIRED_FLEET_ACK_FLAG = "--acknowledge-retired-json-fleet"
+_MUTATING_COMMANDS = frozenset({"run", "sync", "setup", "launch-train"})
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Operate SSH GPU workers without running local training."
+        description=(
+            "LEGACY JSON-fleet utility. Current operations use tools/fleet and "
+            "$FLEET_CONF; remote mutations require an explicit retirement acknowledgement."
+        )
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--workers", type=int, default=6)
+    parser.add_argument(
+        RETIRED_FLEET_ACK_FLAG,
+        action="store_true",
+        help=(
+            "Acknowledge that this utility uses the retired JSON host registry and "
+            "legacy PPO recipes. Required for live run/sync/setup/launch-train actions."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("inventory")
@@ -63,8 +76,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _refuse_live_retired_fleet_action(args: argparse.Namespace) -> None:
+    """Keep stale JSON hosts and legacy PPO recipes inert by default."""
+
+    command = str(args.command)
+    dry_run = bool(getattr(args, "dry_run", False))
+    live_mutation = command in _MUTATING_COMMANDS and (
+        command == "run" or not dry_run
+    )
+    if live_mutation and not bool(args.acknowledge_retired_json_fleet):
+        raise SystemExit(
+            f"{command!r} is a live action in the retired JSON-fleet utility. "
+            "Current operations must use tools/fleet with $FLEET_CONF. For an "
+            "intentional historical replay only, pass "
+            f"{RETIRED_FLEET_ACK_FLAG} explicitly."
+        )
+
+
 def main() -> None:
     args = build_parser().parse_args()
+    _refuse_live_retired_fleet_action(args)
     config = load_config(Path(args.config))
     if args.command == "inventory":
         payload = parallel_hosts(config, args.workers, inventory_host)
