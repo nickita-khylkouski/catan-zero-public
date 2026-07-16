@@ -93,6 +93,7 @@ MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V
     "actor_public_rule_state.v4"
 )
 MODULE_CURRENT_V5 = "entity_graph.current_v5_coherent_learner.v1"
+MODULE_VALUE_TOWER_SPLIT_1 = "entity_graph.value_tower_split.1_from_6layer.v1"
 MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY = (
     "entity_graph.meaningful_public_history.ordered_attention.v2"
 )
@@ -502,6 +503,36 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
         },
         "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V5,
     },
+    # Clone the final mature policy block and state normalization into a
+    # private value suffix.  Unlike a zero-output residual, these new tensors
+    # must be exact source clones: the split value path is therefore
+    # bit-identical at step zero while later value updates can stop fighting
+    # the policy in the shared final block.
+    MODULE_VALUE_TOWER_SPLIT_1: {
+        "flags": {"value_tower_split_layers": 1},
+        "new_parameter_initialization": {
+            **{
+                f"value_blocks.0.{suffix}": f"source_clone:blocks.5.{suffix}"
+                for suffix in (
+                    "attn.in_proj_bias",
+                    "attn.in_proj_weight",
+                    "attn.out_proj.bias",
+                    "attn.out_proj.weight",
+                    "ff.0.bias",
+                    "ff.0.weight",
+                    "ff.3.bias",
+                    "ff.3.weight",
+                    "norm_attn.bias",
+                    "norm_attn.weight",
+                    "norm_ff.bias",
+                    "norm_ff.weight",
+                )
+            },
+            "value_state_norm.bias": "source_clone:state_norm.bias",
+            "value_state_norm.weight": "source_clone:state_norm.weight",
+        },
+        "config_delta": {"value_tower_split_layers": 1},
+    },
     MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY: {
         "flags": {
             "meaningful_public_history": True,
@@ -880,6 +911,14 @@ def inspect_upgrade(
             )
         elif kind == "seeded_torch_default":
             expected = seeded_reference[name]
+        elif kind.startswith("source_clone:"):
+            source_name = kind.removeprefix("source_clone:")
+            if source_name not in before_model:
+                raise UpgradeError(
+                    f"source-clone parameter is absent from checkpoint: "
+                    f"{name} <- {source_name}"
+                )
+            expected = before_model[source_name]
         else:
             raise UpgradeError(f"unknown allowlisted initialization {kind!r}: {name}")
         if not _tensor_equal_exact(tensor, expected):
