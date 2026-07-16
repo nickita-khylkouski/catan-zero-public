@@ -37,7 +37,7 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 
 
-SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v2"
+SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v3"
 EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v1"
 FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v2"
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
@@ -56,7 +56,9 @@ LR_WARMUP_STEPS = 16
 MAX_PARENT_KL = 0.03
 MAX_TRUNK_RELATIVE_L2 = 0.03
 ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
-FROZEN_ADAPTER_GROUPS = "meaningful_history_gate,public_card_residual"
+TRAINABLE_ADAPTER_MODULES = frozenset(
+    {"meaningful_history_residual_gate", "public_card_count_residual"}
+)
 
 
 class CampaignError(RuntimeError):
@@ -337,8 +339,9 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         "optimizer_surface_contract": {
             "shared_trunk_trainable": True,
             "value_trunk_grad_scale": 0.1,
-            "frozen_adapter_groups": sorted(FROZEN_ADAPTER_GROUPS.split(",")),
-            "frozen_adapters_optimizer_excluded": True,
+            "trainable_adapter_modules": sorted(TRAINABLE_ADAPTER_MODULES),
+            "implicit_data_driven_freeze": False,
+            "explicit_freeze_modules": "",
         },
         "inputs": {
             "python": str(python),
@@ -405,12 +408,21 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
             raise CampaignError(f"campaign input bytes changed: {path_key}")
     overlay.verify_overlay_admission(Path(str(inputs["overlay_admission"])))
     recipe = plan.get("recipe", {})
+    optimizer_surface = plan.get("optimizer_surface_contract")
     if (
         plan.get("arm") not in ARMS
         or float(recipe.get("value_trunk_grad_scale", -1.0)) != 0.1
         or float(recipe.get("soft_target_min_legal_coverage", -1.0)) != 1.0
         or float(recipe.get("policy_kl_anchor_weight", -1.0)) != 0.0
         or bool(recipe.get("per_game_policy_surprise_weighting", True))
+        or optimizer_surface
+        != {
+            "shared_trunk_trainable": True,
+            "value_trunk_grad_scale": 0.1,
+            "trainable_adapter_modules": sorted(TRAINABLE_ADAPTER_MODULES),
+            "implicit_data_driven_freeze": False,
+            "explicit_freeze_modules": "",
+        }
     ):
         raise CampaignError("Stage-C clean learner semantics drifted")
     if plan.get("command_sha256") != _value_sha256(_one_dose_command(plan)):
@@ -453,14 +465,12 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
     )
     if (
         float(report.get("value_trunk_grad_scale", -1.0)) != 0.1
-        or not isinstance(freeze, dict)
-        or freeze.get("frozen_groups") != sorted(FROZEN_ADAPTER_GROUPS.split(","))
-        or set(freeze.get("frozen_submodules", ()))
-        != {"meaningful_history_residual_gate", "public_card_count_residual"}
-        or freeze.get("all_require_grad_false") is not True
-        or int(freeze.get("optimizer_excluded_parameter_tensors", 0)) <= 0
+        or str(report.get("freeze_modules", "")) != ""
+        or freeze is not None
     ):
-        raise CampaignError("completed learner did not exclude both new adapters")
+        raise CampaignError(
+            "completed learner did not keep both feature adapters trainable"
+        )
     aux_draws = int(report.get("policy_aux_active_rows", -1))
     unique_rows = int(report.get("policy_aux_unique_source_rows", -1))
     expected_aux_draws = POLICY_AUX_ACTIVE_BATCH_SIZE * WORLD_SIZE * MAX_STEPS

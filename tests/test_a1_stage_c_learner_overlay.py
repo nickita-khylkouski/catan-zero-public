@@ -218,15 +218,19 @@ def test_production_stage_c_validation_preserves_its_weighted_measure() -> None:
     assert report["final_validation_weights"]["max"] > 1.0
 
 
-def test_clean_stage_c_recipe_freezes_only_new_adapters() -> None:
+def test_clean_stage_c_recipe_commissions_new_adapters() -> None:
     from tools import a1_b200_stage_c_learner_campaign as campaign
 
     recipe = campaign._recipe()  # noqa: SLF001
-    # The authenticated Stage-C overlay triggers this freeze inside train_bc;
-    # it is not an unsealed generic one-dose recipe override.
+    # Dataset metadata must not silently mutate the optimizer surface. Legacy
+    # isolation remains available through the explicit freeze groups below.
     assert "freeze_modules" not in recipe
     assert recipe["value_trunk_grad_scale"] == pytest.approx(0.1)
     assert recipe["soft_target_min_legal_coverage"] == pytest.approx(1.0)
+    assert campaign.TRAINABLE_ADAPTER_MODULES == {
+        "meaningful_history_residual_gate",
+        "public_card_count_residual",
+    }
     assert train_bc.ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS[
         "public_card_residual"
     ] == ("public_card_count_residual",)

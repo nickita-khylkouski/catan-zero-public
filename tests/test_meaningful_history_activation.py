@@ -6,6 +6,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from catan_zero.deduction_tracker import (  # noqa: E402
+    DEDUCTION_FEATURE_SIZE,
+    DEDUCTION_FEATURES_KEY,
+)
 from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE  # noqa: E402
 from catan_zero.rl.entity_token_features import (  # noqa: E402
     EDGE_FEATURE_SIZE,
@@ -22,7 +26,9 @@ from catan_zero.rl.entity_token_policy import (  # noqa: E402
 )
 
 
-def _config(*, history: bool, dropout: float = 0.0) -> EntityGraphConfig:
+def _config(
+    *, history: bool, public_cards: bool = False, dropout: float = 0.0
+) -> EntityGraphConfig:
     base = EntityGraphConfig(
         action_size=32,
         static_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
@@ -37,6 +43,8 @@ def _config(*, history: bool, dropout: float = 0.0) -> EntityGraphConfig:
         base,
         meaningful_public_history=history,
         event_history_limit=32 if history else 64,
+        public_card_count_features=public_cards,
+        public_card_count_residual_bias=False,
     )
 
 
@@ -68,6 +76,9 @@ def _batch(*, active_history: bool, event_width: int = 32) -> dict:
     batch["event_mask"].fill_(False)
     if active_history:
         batch["event_mask"][:, -4:] = True
+    batch[DEDUCTION_FEATURES_KEY] = torch.rand(
+        2, 4, DEDUCTION_FEATURE_SIZE, generator=generator
+    )
     return batch
 
 
@@ -111,6 +122,49 @@ def test_zero_gate_learns_immediately_and_then_history_changes_outputs():
         gate.fill_(0.25)
         activated = model(batch)["logits"]
     assert not torch.equal(baseline, activated)
+
+
+def test_combined_zero_initialized_adapters_receive_optimizer_signal() -> None:
+    torch.manual_seed(20260716)
+    model = EntityGraphNet(_config(history=True, public_cards=True)).train()
+    batch = _batch(active_history=True)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    history_before = model.meaningful_history_residual_gate.detach().clone()
+    card_before = model.public_card_count_residual.weight.detach().clone()
+    event_before = [
+        parameter.detach().clone()
+        for parameter in model.event_encoder.parameters()
+    ]
+
+    for step in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        outputs = model(batch, return_final_vp=False)
+        loss = torch.nn.functional.cross_entropy(
+            outputs["logits"], torch.tensor([0, 1])
+        ) + outputs["value"].square().mean()
+        loss.backward()
+        if step == 0:
+            assert model.meaningful_history_residual_gate.grad is not None
+            assert (
+                model.meaningful_history_residual_gate.grad.abs().sum().item()
+                > 0.0
+            )
+            assert model.public_card_count_residual.weight.grad is not None
+            assert (
+                model.public_card_count_residual.weight.grad.abs().sum().item()
+                > 0.0
+            )
+        optimizer.step()
+
+    assert not torch.equal(history_before, model.meaningful_history_residual_gate)
+    assert not torch.equal(card_before, model.public_card_count_residual.weight)
+    assert any(
+        not torch.equal(before, after)
+        for before, after in zip(
+            event_before, model.event_encoder.parameters(), strict=True
+        )
+    )
 
 
 def test_zero_gate_preserves_incumbent_dropout_rng_and_event_encoder_gradients():

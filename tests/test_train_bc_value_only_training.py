@@ -12,6 +12,7 @@ from tools.train_bc import (
     ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS,
     _apply_lr_warmup,
     _lr_warmup_multiplier,
+    _resolve_entity_graph_freeze_groups,
     _set_entity_graph_modules_trainable,
     _train_xdim_batch,
     load_teacher_data,
@@ -136,6 +137,19 @@ def test_set_entity_graph_modules_trainable_freezes_and_restores() -> None:
     assert all(p.requires_grad for p in policy.model.hex_encoder.parameters())
     # action_encoder/policy_head were not re-enabled -- still frozen.
     assert all(not p.requires_grad for p in policy.model.action_encoder.parameters())
+
+
+def test_freeze_groups_are_explicit_not_data_driven() -> None:
+    assert _resolve_entity_graph_freeze_groups(
+        freeze_modules="", train_value_only=False
+    ) == set()
+    assert _resolve_entity_graph_freeze_groups(
+        freeze_modules="public_card_residual,meaningful_history_gate",
+        train_value_only=False,
+    ) == {"public_card_residual", "meaningful_history_gate"}
+    assert _resolve_entity_graph_freeze_groups(
+        freeze_modules="", train_value_only=True
+    ) == set(ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS)
 
 
 def test_value_heads_group_freezes_scalar_categorical_and_auxiliary_readouts() -> None:

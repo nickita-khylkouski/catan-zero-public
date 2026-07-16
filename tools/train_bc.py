@@ -10795,28 +10795,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 ddp,
             )
-        freeze_module_groups = set(_parse_prefixes(args.freeze_modules))
-        stage_c_overlay_meta = (
-            data.meta.get("stage_c_policy_overlay")
-            if isinstance(getattr(data, "meta", None), dict)
-            else None
+        # Trainability is an optimizer-recipe decision, never a hidden property
+        # of the dataset descriptor. Stage-C overlays previously froze both
+        # zero-initialized input adapters here even when ``--freeze-modules``
+        # was empty. That made the enabled history/card paths permanently
+        # function-preserving: the frozen zero history gate also blocked every
+        # gradient into ``event_encoder``. Legacy isolation remains available
+        # through the existing explicit module groups.
+        freeze_module_groups = _resolve_entity_graph_freeze_groups(
+            freeze_modules=args.freeze_modules,
+            train_value_only=bool(args.train_value_only),
         )
-        stage_c_clean_adapter_freeze = bool(
-            isinstance(stage_c_overlay_meta, dict)
-            and stage_c_overlay_meta.get("schema_version")
-            == "a1-stage-c-policy-overlay-admission-binding-v1"
-            and stage_c_overlay_meta.get("sampling_distribution", {}).get(
-                "schema_version"
-            )
-            == "a1-stage-c-policy-sampling-distribution-v1"
-        )
-        if stage_c_clean_adapter_freeze:
-            freeze_module_groups |= {
-                "public_card_residual",
-                "meaningful_history_gate",
-            }
-        if bool(args.train_value_only):
-            freeze_module_groups |= ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS
         if freeze_module_groups:
             if args.arch != "entity_graph":
                 raise SystemExit(
@@ -10827,17 +10816,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 policy.model, freeze_module_groups, trainable=False
             )
             touched_names = set(touched)
-            required_stage_c_adapters = {
-                "public_card_count_residual",
-                "meaningful_history_residual_gate",
-            }
-            if stage_c_clean_adapter_freeze and not (
-                required_stage_c_adapters <= touched_names
-            ):
-                raise SystemExit(
-                    "clean Stage-C learner is missing a required frozen adapter: "
-                    f"{sorted(required_stage_c_adapters - touched_names)}"
-                )
             unwrapped_for_freeze = getattr(policy.model, "module", policy.model)
             frozen_parameters = {
                 name: parameter
@@ -26589,10 +26567,10 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "topology_residual_adapter",
     ),
     "action_encoder": ("action_encoder",),
-    # Granular commissioning freezes for the function-preserving v2 input
-    # adapters.  They also belong to ``trunk`` for legacy all-trunk freezes,
-    # but clean target-alignment learners must be able to exclude only these
-    # new zero-initialized paths while continuing to update the mature trunk.
+    # Granular explicit isolation controls for function-preserving input
+    # adapters. They also belong to ``trunk`` for legacy all-trunk freezes, but
+    # ordinary feature-bearing training leaves them trainable so their zero
+    # initialization can commission from the learner objective.
     "public_card_residual": ("public_card_count_residual",),
     "meaningful_history_gate": (
         "meaningful_history_residual_gate",
@@ -26638,6 +26616,21 @@ ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS: frozenset[str] = frozenset(
         "static_action_residual",
     }
 )
+
+
+def _resolve_entity_graph_freeze_groups(
+    *, freeze_modules: str, train_value_only: bool
+) -> set[str]:
+    """Resolve only caller-visible optimizer freezes.
+
+    Corpus metadata may authenticate labels, scopes, and sampling measures, but
+    it must not silently change which model parameters receive gradients.
+    """
+
+    groups = set(_parse_prefixes(freeze_modules))
+    if train_value_only:
+        groups |= ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS
+    return groups
 
 
 def _effective_entity_graph_architecture_report(

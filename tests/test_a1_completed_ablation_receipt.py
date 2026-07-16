@@ -97,17 +97,8 @@ def test_stage_c_run_adopts_authenticated_completed_receipt_without_subprocess(
     unique_rows = 128
     report = {
         "value_trunk_grad_scale": 0.1,
-        "training_information_surface": {
-            "explicit_module_freeze": {
-                "frozen_groups": sorted(campaign.FROZEN_ADAPTER_GROUPS.split(",")),
-                "frozen_submodules": [
-                    "meaningful_history_residual_gate",
-                    "public_card_count_residual",
-                ],
-                "all_require_grad_false": True,
-                "optimizer_excluded_parameter_tensors": 2,
-            }
-        },
+        "freeze_modules": "",
+        "training_information_surface": {},
         "policy_aux_active_rows": aux_draws,
         "policy_aux_unique_source_rows": unique_rows,
         "policy_aux_reuse_factor": aux_draws / unique_rows,
