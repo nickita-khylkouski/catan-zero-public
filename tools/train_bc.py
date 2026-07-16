@@ -3552,12 +3552,45 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
             not isinstance(target_activation, dict)
             or target_activation != audit.get("target_activation")
             or target_activation.get("schema_version")
-            != "a1-selected-target-activation-v1"
+            not in {
+                "a1-selected-target-activation-v1",
+                "a1-selected-target-activation-v3",
+            }
             or target_activation.get("passed") is not True
             or payload["post_wave_audit"].get("target_activation_sha256")
             != target_activation.get("target_activation_sha256")
         ):
             raise SystemExit("flywheel fresh target-activation authority drift")
+        if target_activation.get("schema_version") == (
+            "a1-selected-target-activation-v3"
+        ):
+            if (
+                target_activation.get("policy_target_completeness_rule")
+                != (
+                    "every policy-active row has finite nonnegative normalized "
+                    "target_policy and target_policy_mask == "
+                    "(legal_action_ids >= 0)"
+                )
+                or any(
+                    int(category.get("counts", {}).get(
+                        "policy_target_complete_rows", -1
+                    ))
+                    != int(category.get("counts", {}).get(
+                        "policy_active_rows", -2
+                    ))
+                    or int(category.get("counts", {}).get(
+                        "policy_target_incomplete_rows", -1
+                    ))
+                    != 0
+                    for category in target_activation.get(
+                        "categories", {}
+                    ).values()
+                    if isinstance(category, dict)
+                )
+            ):
+                raise SystemExit(
+                    "flywheel policy-target completeness authority drift"
+                )
         unhashed_activation = dict(target_activation)
         declared_activation = unhashed_activation.pop(
             "target_activation_sha256", None
@@ -4023,6 +4056,8 @@ def _validate_flywheel_component_provenance(
         expected.add("source_authority_manifest")
         if corpus_meta.get("policy_target_identity_sha256") is not None:
             expected.add("policy_target_identity_sha256")
+        if corpus_meta.get("policy_target_completeness") is not None:
+            expected.add("policy_target_completeness")
     if not isinstance(payload, dict) or set(payload) != expected:
         raise SystemExit("flywheel component provenance fields differ from schema")
     if "policy_target_identity_sha256" in expected:
@@ -4033,6 +4068,25 @@ def _validate_flywheel_component_provenance(
         ):
             raise SystemExit(
                 "flywheel component policy-target identity provenance drift"
+            )
+    if "policy_target_completeness" in expected:
+        completeness = payload.get("policy_target_completeness")
+        if (
+            not isinstance(completeness, dict)
+            or completeness != corpus_meta.get("policy_target_completeness")
+            or int(completeness.get("counts", {}).get(
+                "policy_target_complete_rows", -1
+            ))
+            != int(completeness.get("counts", {}).get(
+                "policy_active_rows", -2
+            ))
+            or int(completeness.get("counts", {}).get(
+                "policy_target_incomplete_rows", -1
+            ))
+            != 0
+        ):
+            raise SystemExit(
+                "flywheel component policy-target completeness provenance drift"
             )
     if schema_version not in {
         "flywheel-replay-component-v1",
@@ -10557,6 +10611,39 @@ def main(argv: Sequence[str] | None = None) -> None:
             "admission because rank 0 sees only its local NPZ subset; use the "
             "shared memmap/non-sharded corpus path"
         )
+    policy_target_completeness = _rank0_authoritative_call(
+        ddp,
+        "policy-target completeness admission",
+        lambda: _policy_target_completeness_report(
+            data,
+            policy_loss_weight=float(args.policy_loss_weight),
+            train_value_only=bool(args.train_value_only),
+            soft_target_source=str(args.soft_target_source),
+            soft_target_weight=float(args.soft_target_weight),
+            policy_target_blend_semantics=str(
+                args.policy_target_blend_semantics
+            ),
+            soft_target_temperature=float(args.soft_target_temperature),
+            soft_target_min_legal_coverage=float(
+                args.soft_target_min_legal_coverage
+            ),
+            require_exact_public_policy=bool(
+                args.mask_hidden_info
+                and str(args.required_target_information_regime)
+                == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+            ),
+        ),
+    )
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "policy_target_completeness_admission",
+                **policy_target_completeness,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
     hard_action_target_admission = _rank0_authoritative_call(
         ddp,
         "hard-action target admission",
@@ -10570,6 +10657,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             acknowledged_authoritative_targets=bool(
                 args.acknowledge_authoritative_hard_action_targets
             ),
+            policy_target_completeness=policy_target_completeness,
         ),
     )
     _rank0_print(
@@ -10642,6 +10730,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             per_game_policy_surprise_weighting=bool(
                 args.per_game_policy_surprise_weighting
             ),
+            soft_target_source=str(args.soft_target_source),
+            soft_target_temperature=float(args.soft_target_temperature),
+            soft_target_min_legal_coverage=float(
+                args.soft_target_min_legal_coverage
+            ),
+            policy_target_completeness=policy_target_completeness,
         ),
     )
     _rank0_print(
@@ -21465,6 +21559,188 @@ def load_teacher_data(
     return {key: _concat_padded(key, values) for key, values in arrays.items()}
 
 
+def _policy_target_completeness_report(
+    data,
+    *,
+    policy_loss_weight: float,
+    train_value_only: bool,
+    soft_target_source: str,
+    soft_target_weight: float,
+    policy_target_blend_semantics: str,
+    soft_target_temperature: float,
+    soft_target_min_legal_coverage: float,
+    require_exact_public_policy: bool,
+    chunk_rows: int = 262_144,
+) -> dict[str, object]:
+    """Replay which policy rows can reach hard ``action_taken`` fallback.
+
+    Coherent-public production requires more than a non-empty distribution:
+    every policy-active row must carry a finite normalized stored policy whose
+    authenticated support is exactly the complete legal-action set.  This scan
+    is chunked so the admission proof remains bounded for multi-million-row
+    memmap composites.
+    """
+
+    rows = int(len(data["action_taken"]))
+    active = np.ones(rows, dtype=np.bool_)
+    if "policy_weight_multiplier" in data:
+        multiplier = np.asarray(data["policy_weight_multiplier"])
+        if multiplier.shape != (rows,):
+            raise SystemExit(
+                "policy_weight_multiplier shape drift during policy-target admission"
+            )
+        active = multiplier > 0.0
+    policy_active_rows = int(np.count_nonzero(active))
+    objective_active = bool(
+        float(policy_loss_weight) > 0.0
+        and not bool(train_value_only)
+        and policy_active_rows > 0
+    )
+    fallback_semantics = bool(
+        objective_active
+        and str(policy_target_blend_semantics) == POLICY_TARGET_BLEND_FALLBACK_V2
+        and float(soft_target_weight) == 1.0
+    )
+    usable_rows = 0
+    exact_rows = 0
+    fallback_rows = policy_active_rows if objective_active else 0
+    incomplete_examples: list[int] = []
+    digest = hashlib.sha256()
+    digest.update(b"coherent-public-policy-target-completeness-v1\0")
+
+    if objective_active and fallback_semantics:
+        fallback_rows = 0
+        for start in range(0, rows, max(1, int(chunk_rows))):
+            stop = min(rows, start + max(1, int(chunk_rows)))
+            local_active = active[start:stop]
+            if not np.any(local_active):
+                continue
+            batch = np.arange(start, stop, dtype=np.int64)[local_active]
+            soft = _soft_target_array(
+                data,
+                batch,
+                float(soft_target_temperature),
+                str(soft_target_source),
+            )
+            legal = np.asarray(data["legal_action_ids"][batch])
+            if soft is None:
+                usable = np.zeros(batch.size, dtype=np.bool_)
+            else:
+                target, support = soft
+                usable = _has_distillation_distribution(
+                    target,
+                    support,
+                    legal_action_ids=legal,
+                    min_legal_coverage=float(soft_target_min_legal_coverage),
+                )
+            usable_rows += int(np.count_nonzero(usable))
+            fallback_rows += int(np.count_nonzero(~usable))
+
+            exact = np.zeros(batch.size, dtype=np.bool_)
+            if (
+                str(soft_target_source) == "policy"
+                and "target_policy" in data
+                and "target_policy_mask" in data
+            ):
+                raw_target = np.asarray(data["target_policy"][batch], dtype=np.float32)
+                raw_support = np.asarray(
+                    data["target_policy_mask"][batch], dtype=np.bool_
+                )
+                legal_support = legal >= 0
+                if (
+                    raw_target.shape == legal.shape
+                    and raw_support.shape == legal.shape
+                ):
+                    finite_nonnegative = np.all(
+                        (~legal_support)
+                        | (np.isfinite(raw_target) & (raw_target >= 0.0)),
+                        axis=1,
+                    )
+                    padded_clean = np.all(
+                        legal_support
+                        | (
+                            ~raw_support
+                            & np.isfinite(raw_target)
+                            & (raw_target == 0.0)
+                        ),
+                        axis=1,
+                    )
+                    mass = np.sum(
+                        np.where(legal_support, raw_target, 0.0),
+                        axis=1,
+                        dtype=np.float64,
+                    )
+                    exact = (
+                        np.all(raw_support == legal_support, axis=1)
+                        & finite_nonnegative
+                        & padded_clean
+                        & np.isclose(mass, 1.0, rtol=1.0e-6, atol=1.0e-6)
+                    )
+                    digest.update(
+                        np.asarray(batch, dtype="<i8").tobytes(order="C")
+                    )
+                    digest.update(
+                        np.asarray(legal, dtype="<i2").tobytes(order="C")
+                    )
+                    digest.update(
+                        np.asarray(raw_support, dtype=np.uint8).tobytes(order="C")
+                    )
+                    digest.update(
+                        np.asarray(raw_target, dtype="<f4").tobytes(order="C")
+                    )
+            exact_rows += int(np.count_nonzero(exact))
+            rejected = batch[~exact]
+            if rejected.size and len(incomplete_examples) < 16:
+                incomplete_examples.extend(
+                    map(int, rejected[: 16 - len(incomplete_examples)].tolist())
+                )
+
+    report: dict[str, object] = {
+        "schema_version": "policy-target-completeness-admission-v1",
+        "policy_active_rows": policy_active_rows,
+        "policy_objective_active": objective_active,
+        "soft_target_source": str(soft_target_source),
+        "soft_target_weight": float(soft_target_weight),
+        "policy_target_blend_semantics": str(policy_target_blend_semantics),
+        "soft_target_min_legal_coverage": float(
+            soft_target_min_legal_coverage
+        ),
+        "usable_soft_target_rows": usable_rows,
+        "exact_complete_public_soft_target_rows": exact_rows,
+        "hard_action_fallback_rows": fallback_rows,
+        "require_exact_public_policy": bool(require_exact_public_policy),
+        "incomplete_row_examples": incomplete_examples,
+        "row_evidence_sha256": "sha256:" + digest.hexdigest(),
+    }
+    if bool(require_exact_public_policy) and objective_active:
+        config_errors = []
+        if str(soft_target_source) != "policy":
+            config_errors.append("soft_target_source must equal 'policy'")
+        if float(soft_target_weight) != 1.0:
+            config_errors.append("soft_target_weight must equal 1.0")
+        if str(policy_target_blend_semantics) != POLICY_TARGET_BLEND_FALLBACK_V2:
+            config_errors.append(
+                "policy_target_blend_semantics must equal policy_target_fallback_v2"
+            )
+        if float(soft_target_min_legal_coverage) != 1.0:
+            config_errors.append("soft_target_min_legal_coverage must equal 1.0")
+        if config_errors:
+            raise SystemExit(
+                "coherent-public policy-target completeness configuration drift: "
+                + "; ".join(config_errors)
+            )
+        if exact_rows != policy_active_rows or fallback_rows:
+            raise SystemExit(
+                "coherent-public policy-target completeness failed: every "
+                "policy-active row must have finite normalized target_policy with "
+                "target_policy_mask exactly equal to all legal_action_ids; "
+                f"complete={exact_rows}/{policy_active_rows}, "
+                f"hard_fallback_rows={fallback_rows}, "
+                f"examples={incomplete_examples}"
+            )
+    return report
+
+
 def _validate_hard_action_target_admission(
     data,
     data_path: str | Path,
@@ -21474,6 +21750,7 @@ def _validate_hard_action_target_admission(
     train_value_only: bool,
     production: bool,
     acknowledged_authoritative_targets: bool,
+    policy_target_completeness: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Keep played-action provenance separate from search-target provenance.
 
@@ -21485,7 +21762,11 @@ def _validate_hard_action_target_admission(
 
     rows = int(len(data["action_taken"]))
     potential_hard_action_rows = rows
-    if "policy_weight_multiplier" in data:
+    if policy_target_completeness is not None:
+        potential_hard_action_rows = int(
+            policy_target_completeness.get("hard_action_fallback_rows", rows)
+        )
+    elif "policy_weight_multiplier" in data:
         multiplier = np.asarray(data["policy_weight_multiplier"])
         if multiplier.shape != (rows,):
             raise SystemExit(
@@ -21562,6 +21843,11 @@ def _validate_hard_action_target_admission(
         "public_information_authenticated": public_authenticated,
         "diagnostic_acknowledgement": bool(acknowledged_authoritative_targets),
         "production": bool(production),
+        "policy_target_completeness": (
+            None
+            if policy_target_completeness is None
+            else dict(policy_target_completeness)
+        ),
     }
     if not hard_action_active:
         return report
@@ -21604,6 +21890,10 @@ def _validate_target_information_admission(
     ),
     policy_kl_target: float | None = None,
     per_game_policy_surprise_weighting: bool = False,
+    soft_target_source: str = "policy",
+    soft_target_temperature: float = 0.7,
+    soft_target_min_legal_coverage: float = 0.5,
+    policy_target_completeness: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Fail closed before public-information training consumes search targets.
 
@@ -21787,6 +22077,43 @@ def _validate_target_information_admission(
             "coherent-public search-policy distillation requires "
             "policy_target_fallback_v2 with soft_target_weight=1.0"
         )
+    if (
+        bool(mask_hidden_info)
+        and required_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+        and "soft_policy" in objectives
+    ):
+        completeness = (
+            _policy_target_completeness_report(
+                data,
+                policy_loss_weight=float(policy_loss_weight),
+                train_value_only=False,
+                soft_target_source=str(soft_target_source),
+                soft_target_weight=weight,
+                policy_target_blend_semantics=semantics,
+                soft_target_temperature=float(soft_target_temperature),
+                soft_target_min_legal_coverage=float(
+                    soft_target_min_legal_coverage
+                ),
+                require_exact_public_policy=True,
+            )
+            if policy_target_completeness is None
+            else dict(policy_target_completeness)
+        )
+        if (
+            completeness.get("require_exact_public_policy") is not True
+            or int(completeness.get("hard_action_fallback_rows", -1)) != 0
+            or int(
+                completeness.get(
+                    "exact_complete_public_soft_target_rows", -1
+                )
+            )
+            != int(completeness.get("policy_active_rows", -2))
+        ):
+            raise SystemExit(
+                "coherent-public target-information admission lacks an exact "
+                "policy-target completeness proof"
+            )
+        report["policy_target_completeness"] = completeness
     report["played_action_mixed_into_usable_policy_target"] = bool(
         semantics == POLICY_TARGET_BLEND_LEGACY_V1 and 0.0 < weight < 1.0
     )

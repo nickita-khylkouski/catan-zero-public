@@ -20,6 +20,7 @@ def _data(
         "action_taken": np.zeros(n, dtype=np.int16),
         "legal_action_ids": np.tile(np.asarray([[0, 1]], dtype=np.int16), (n, 1)),
         "target_policy": np.tile(np.asarray([[0.6, 0.4]], dtype=np.float32), (n, 1)),
+        "target_policy_mask": np.ones((n, 2), dtype=np.bool_),
         "target_scores": np.tile(np.asarray([[0.2, -0.1]], dtype=np.float32), (n, 1)),
         "target_information_regime": np.asarray(regimes),
     }
@@ -43,6 +44,7 @@ def _admit(data: dict, **overrides):
         "value_target_lambda": 1.0,
         "policy_kl_anchor_weight": 0.0,
         "policy_surprise_weight": 0.0,
+        "soft_target_min_legal_coverage": 1.0,
     }
     kwargs.update(overrides)
     return _validate_target_information_admission(data, **kwargs)
@@ -70,6 +72,17 @@ def test_coherent_public_belief_targets_are_admitted():
         TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
     )
     assert report["search_target_objectives"] == ["soft_policy"]
+    assert report["policy_target_completeness"]["hard_action_fallback_rows"] == 0
+
+
+def test_coherent_public_belief_rejects_sparse_soft_target_fallback():
+    data = _data([TARGET_INFORMATION_REGIME_PUBLIC_COHERENT])
+    data["target_policy_mask"][0, 1] = False
+    data["target_policy"][0, 1] = 0.0
+    data["target_policy"][0, 0] = 1.0
+
+    with pytest.raises(SystemExit, match="every policy-active row"):
+        _admit(data)
 
 
 @pytest.mark.parametrize(

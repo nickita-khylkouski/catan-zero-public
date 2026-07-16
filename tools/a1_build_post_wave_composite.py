@@ -940,6 +940,7 @@ def _filter_wave_shards(
                         game_seeds=seeds,
                         selected_mask=selected_mask,
                         where=f"{job_id}:{source.name}",
+                        require_policy_target_completeness=True,
                         wide_full_threshold=(
                             int(
                                 lock["science"]["search_operator"][
@@ -959,7 +960,7 @@ def _filter_wave_shards(
                         ),
                     )
                     activation_chunk = {
-                        "schema_version": contract.TARGET_ACTIVATION_CHUNK_SCHEMA,
+                        "schema_version": activation["schema_version"],
                         "job_id": job_id,
                         "source_sha256": before_sha,
                         "counts": activation["counts"],
@@ -1127,6 +1128,7 @@ def _build_fresh_component(
     expected_games: int,
     source_authority: Mapping[str, str],
     policy_target_identity_sha256: str,
+    policy_target_completeness: Mapping[str, Any],
     build_memmap_fn: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     if not records:
@@ -1163,6 +1165,7 @@ def _build_fresh_component(
         "component_mass": mass,
         "source_authority_manifest": dict(source_authority),
         "policy_target_identity_sha256": policy_target_identity_sha256,
+        "policy_target_completeness": dict(policy_target_completeness),
     }
     provenance_path = output_root / "provenance" / f"{category}.json"
     _atomic_json(provenance_path, provenance)
@@ -1175,6 +1178,7 @@ def _build_fresh_component(
     }
     meta["flywheel_component_provenance"] = provenance_ref
     meta["policy_target_identity_sha256"] = policy_target_identity_sha256
+    meta["policy_target_completeness"] = dict(policy_target_completeness)
     _atomic_json(meta_path, meta)
     return {
         "component_id": category,
@@ -1904,6 +1908,7 @@ def build_post_wave_composite(
             expected_games=int(expected_games[category]),
             source_authority=source_authority,
             policy_target_identity_sha256=policy_target_identities[category],
+            policy_target_completeness=target_activation["categories"][category],
             build_memmap_fn=build_memmap_fn,
         )
         for category in FRESH_SOURCE_GAME_RATIOS

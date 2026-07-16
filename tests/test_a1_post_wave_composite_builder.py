@@ -292,6 +292,13 @@ def _write_source(path: Path, *, base_seed: int, version: int | None) -> None:
         "decision_index": np.zeros(2, dtype=np.int32),
         "is_forced": np.zeros(2, dtype=bool),
         "used_full_search": np.asarray([True, False]),
+        "legal_action_ids": np.tile(
+            np.asarray([[1, 2]], dtype=np.int16), (2, 1)
+        ),
+        "target_policy": np.tile(
+            np.asarray([[0.6, 0.4]], dtype=np.float32), (2, 1)
+        ),
+        "target_policy_mask": np.ones((2, 2), dtype=bool),
         "policy_weight_multiplier": np.asarray([1.0, 0.0], dtype=np.float32),
         "value_weight_multiplier": np.ones(2, dtype=np.float32),
     }
@@ -335,6 +342,10 @@ def _write_training_source(
         "legal_action_ids": np.tile(np.asarray([[1, 2]], dtype=np.int16), (rows, 1)),
         "legal_action_context": np.zeros((rows, 2, 1), dtype=np.float16),
         "action_taken": np.tile(np.asarray([1, 2], dtype=np.int16), game_count),
+        "target_policy": np.tile(
+            np.asarray([[0.6, 0.4]], dtype=np.float32), (rows, 1)
+        ),
+        "target_policy_mask": np.ones((rows, 2), dtype=bool),
         "decision_index": np.tile(np.asarray([0, 1], dtype=np.int32), game_count),
         "game_seed": seeds,
         "terminated": np.ones(rows, dtype=bool),
@@ -601,9 +612,10 @@ def _audit_fixture(
                 game_seeds=seeds,
                 selected_mask=selected_mask,
                 where=str(job["job_id"]),
+                require_policy_target_completeness=True,
             )
         chunk = {
-            "schema_version": contract.TARGET_ACTIVATION_CHUNK_SCHEMA,
+            "schema_version": activation["schema_version"],
             "job_id": str(job["job_id"]),
             "source_sha256": record["sha256"],
             "counts": activation["counts"],

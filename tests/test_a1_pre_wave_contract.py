@@ -3448,6 +3448,51 @@ def test_selected_target_activation_authenticates_exact_n128_fast_policy_zero(
     assert "fast_search_policy_confidence" not in report
 
 
+def test_current_target_activation_binds_complete_policy_support(
+    tmp_path: Path,
+) -> None:
+    arrays = {
+        "game_seed": np.asarray([10, 10], dtype=np.int64),
+        "decision_index": np.asarray([0, 1], dtype=np.int32),
+        "is_forced": np.asarray([False, False]),
+        "used_full_search": np.asarray([True, False]),
+        "legal_action_ids": np.asarray([[1, 2], [1, 2]], dtype=np.int16),
+        "target_policy": np.asarray(
+            [[0.7, 0.3], [0.6, 0.4]], dtype=np.float32
+        ),
+        "target_policy_mask": np.ones((2, 2), dtype=bool),
+        "policy_weight_multiplier": np.asarray([1.0, 0.0], dtype=np.float32),
+        "value_weight_multiplier": np.ones(2, dtype=np.float32),
+    }
+    shard = tmp_path / "target-activation-complete.npz"
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        chunk = contract._selected_target_activation_chunk(  # noqa: SLF001
+            payload,
+            game_seeds=arrays["game_seed"],
+            selected_mask=np.ones(2, dtype=bool),
+            where="fixture",
+            require_policy_target_completeness=True,
+        )
+
+    assert chunk["schema_version"] == contract.TARGET_ACTIVATION_CHUNK_SCHEMA_V3
+    assert chunk["counts"]["policy_target_complete_rows"] == 1
+    assert chunk["counts"]["policy_target_incomplete_rows"] == 0
+
+    arrays["target_policy_mask"][0, 1] = False
+    arrays["target_policy"][0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match="complete authenticated"):
+            contract._selected_target_activation_chunk(  # noqa: SLF001
+                payload,
+                game_seeds=arrays["game_seed"],
+                selected_mask=np.ones(2, dtype=bool),
+                where="fixture",
+                require_policy_target_completeness=True,
+            )
+
+
 @pytest.mark.parametrize(
     ("include_simulations", "fast_weight", "error"),
     (

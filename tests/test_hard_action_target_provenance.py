@@ -129,6 +129,35 @@ def test_value_only_training_does_not_require_hard_action_admission(
     assert report["hard_action_objective_active"] is False
 
 
+def test_complete_soft_policy_proof_makes_hard_fallback_inactive(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "data"
+    _write_manifest(data, None)
+    completeness = {
+        "schema_version": "policy-target-completeness-admission-v1",
+        "policy_active_rows": 1,
+        "hard_action_fallback_rows": 0,
+    }
+
+    report = train_bc._validate_hard_action_target_admission(  # noqa: SLF001
+        {
+            "action_taken": np.asarray([1], dtype=np.int16),
+            "policy_weight_multiplier": np.asarray([1.0], dtype=np.float32),
+        },
+        data,
+        mask_hidden_info=True,
+        policy_loss_weight=1.0,
+        train_value_only=False,
+        production=True,
+        acknowledged_authoritative_targets=False,
+        policy_target_completeness=completeness,
+    )
+
+    assert report["potential_hard_action_policy_active_rows"] == 0
+    assert report["hard_action_objective_active"] is False
+
+
 def test_transformation_never_upgrades_missing_lineage_to_public() -> None:
     contract = propagated_hard_action_target_information(
         [{"manifest.json": {"track": "2p_no_trade"}}]

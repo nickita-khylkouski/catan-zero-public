@@ -125,6 +125,8 @@ TARGET_ACTIVATION_SCHEMA = "a1-selected-target-activation-v1"
 TARGET_ACTIVATION_CHUNK_SCHEMA = "a1-selected-target-activation-chunk-v1"
 TARGET_ACTIVATION_SCHEMA_V2 = "a1-selected-target-activation-v2"
 TARGET_ACTIVATION_CHUNK_SCHEMA_V2 = "a1-selected-target-activation-chunk-v2"
+TARGET_ACTIVATION_SCHEMA_V3 = "a1-selected-target-activation-v3"
+TARGET_ACTIVATION_CHUNK_SCHEMA_V3 = "a1-selected-target-activation-chunk-v3"
 # A two-sided Hoeffding bound is used because the full/fast decision is a
 # Bernoulli draw for every non-forced root.  The bound is family-wise across
 # source categories and deliberately has no fitted/tunable tolerance.
@@ -9824,12 +9826,20 @@ _TARGET_ACTIVATION_COUNT_KEYS = (
     "policy_inactive_rows",
     "value_active_rows",
 )
+_COMPLETE_TARGET_ACTIVATION_COUNT_KEYS = _TARGET_ACTIVATION_COUNT_KEYS + (
+    "policy_target_complete_rows",
+    "policy_target_incomplete_rows",
+)
 _ADAPTIVE_TARGET_ACTIVATION_COUNT_KEYS = _TARGET_ACTIVATION_COUNT_KEYS + (
     "randomized_non_forced_rows",
     "randomized_full_search_non_forced_rows",
     "randomized_fast_search_non_forced_rows",
     "wide_full_search_non_forced_rows",
     "mandatory_full_search_non_forced_rows",
+)
+_ADAPTIVE_COMPLETE_TARGET_ACTIVATION_COUNT_KEYS = (
+    _COMPLETE_TARGET_ACTIVATION_COUNT_KEYS
+    + _ADAPTIVE_TARGET_ACTIVATION_COUNT_KEYS[len(_TARGET_ACTIVATION_COUNT_KEYS) :]
 )
 
 
@@ -9864,6 +9874,7 @@ def _selected_target_activation_chunk(
     selected_mask: np.ndarray,
     where: str,
     wide_full_threshold: int | None = None,
+    require_policy_target_completeness: bool = False,
 ) -> dict[str, Any]:
     """Authenticate the exact selected-row policy/value gradient switches.
 
@@ -9882,6 +9893,10 @@ def _selected_target_activation_chunk(
         "policy_weight_multiplier",
         "value_weight_multiplier",
     }
+    if require_policy_target_completeness:
+        required.update(
+            {"legal_action_ids", "target_policy", "target_policy_mask"}
+        )
     if wide_full_threshold is not None:
         required.update(
             {"target_policy_mask", "decision_class", "decision_taxonomy_schema"}
@@ -10012,9 +10027,66 @@ def _selected_target_activation_chunk(
         )
 
     rows = int(selected_seeds.size)
+    policy_active = selected_policy > 0.0
+    selected_legal = selected_target = selected_target_mask = None
+    complete_target = np.zeros(rows, dtype=np.bool_)
+    incomplete_active = np.zeros(rows, dtype=np.bool_)
+    if require_policy_target_completeness:
+        raw_legal = np.asarray(payload["legal_action_ids"])
+        raw_target = np.asarray(payload["target_policy"])
+        raw_target_mask = np.asarray(payload["target_policy_mask"])
+        if (
+            raw_legal.ndim != 2
+            or raw_legal.shape[0] != seeds.shape[0]
+            or raw_target.shape != raw_legal.shape
+            or raw_target_mask.shape != raw_legal.shape
+            or raw_target_mask.dtype.kind != "b"
+        ):
+            raise ContractError(
+                f"{where}: legal_action_ids/target_policy/target_policy_mask "
+                "must be aligned rank-2 arrays"
+            )
+        selected_legal = np.asarray(raw_legal[mask])
+        selected_target = np.asarray(raw_target[mask], dtype=np.float32)
+        selected_target_mask = np.asarray(raw_target_mask[mask], dtype=np.bool_)
+        legal_support = selected_legal >= 0
+        finite_nonnegative = np.all(
+            (~legal_support)
+            | (np.isfinite(selected_target) & (selected_target >= 0.0)),
+            axis=1,
+        )
+        padded_clean = np.all(
+            legal_support
+            | (
+                ~selected_target_mask
+                & np.isfinite(selected_target)
+                & (selected_target == 0.0)
+            ),
+            axis=1,
+        )
+        target_mass = np.sum(
+            np.where(legal_support, selected_target, 0.0),
+            axis=1,
+            dtype=np.float64,
+        )
+        complete_target = (
+            np.all(selected_target_mask == legal_support, axis=1)
+            & finite_nonnegative
+            & padded_clean
+            & np.isclose(target_mass, 1.0, rtol=1.0e-6, atol=1.0e-6)
+        )
+        incomplete_active = policy_active & ~complete_target
+        if np.any(incomplete_active):
+            examples = np.flatnonzero(incomplete_active)[:16]
+            raise ContractError(
+                f"{where}: policy-active rows lack complete authenticated public "
+                "target_policy support; target_policy_mask must exactly match all "
+                "legal_action_ids and finite nonnegative mass must sum to 1; "
+                f"local_rows={examples.tolist()}"
+            )
     forced_rows = int(np.count_nonzero(forced))
     full_rows = int(np.count_nonzero(full_non_forced))
-    policy_active_rows = int(np.count_nonzero(selected_policy > 0.0))
+    policy_active_rows = int(np.count_nonzero(policy_active))
     counts = {
         "rows": rows,
         "forced_rows": forced_rows,
@@ -10025,6 +10097,17 @@ def _selected_target_activation_chunk(
         "policy_inactive_rows": rows - policy_active_rows,
         "value_active_rows": rows,
     }
+    if require_policy_target_completeness:
+        counts.update(
+            {
+                "policy_target_complete_rows": int(
+                    np.count_nonzero(policy_active & complete_target)
+                ),
+                "policy_target_incomplete_rows": int(
+                    np.count_nonzero(incomplete_active)
+                ),
+            }
+        )
     if wide_non_forced is not None and mandatory_non_forced is not None:
         randomized = np.asarray(
             (~forced) & ~wide_non_forced & ~mandatory_non_forced,
@@ -10059,6 +10142,21 @@ def _selected_target_activation_chunk(
         ("value_weight_multiplier", np.ones(rows, dtype=np.uint8)),
     ]
     chunk_schema = TARGET_ACTIVATION_CHUNK_SCHEMA
+    if require_policy_target_completeness:
+        assert selected_legal is not None
+        assert selected_target is not None
+        assert selected_target_mask is not None
+        chunk_schema = TARGET_ACTIVATION_CHUNK_SCHEMA_V3
+        activation_arrays.extend(
+            (
+                ("legal_action_ids", selected_legal.astype("<i2", copy=False)),
+                ("target_policy", selected_target.astype("<f4", copy=False)),
+                (
+                    "target_policy_mask",
+                    selected_target_mask.astype(np.uint8, copy=False),
+                ),
+            )
+        )
     if np.any(positive_fast):
         chunk_schema = TARGET_ACTIVATION_CHUNK_SCHEMA_V2
         activation_arrays[4] = (
@@ -10118,6 +10216,7 @@ def _normalize_target_activation_chunk(raw: object) -> dict[str, Any]:
         not in {
             TARGET_ACTIVATION_CHUNK_SCHEMA,
             TARGET_ACTIVATION_CHUNK_SCHEMA_V2,
+            TARGET_ACTIVATION_CHUNK_SCHEMA_V3,
         }
         or not isinstance(chunk.get("job_id"), str)
         or not chunk["job_id"]
@@ -10127,7 +10226,9 @@ def _normalize_target_activation_chunk(raw: object) -> dict[str, Any]:
         or set(counts)
         not in (
             set(_TARGET_ACTIVATION_COUNT_KEYS),
+            set(_COMPLETE_TARGET_ACTIVATION_COUNT_KEYS),
             set(_ADAPTIVE_TARGET_ACTIVATION_COUNT_KEYS),
+            set(_ADAPTIVE_COMPLETE_TARGET_ACTIVATION_COUNT_KEYS),
         )
         or any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
@@ -10171,11 +10272,33 @@ def _build_target_activation_report(
         isinstance(wide_full_threshold, bool) or int(wide_full_threshold) <= 1
     ):
         raise ContractError("target-activation adaptive-wide threshold is invalid")
-    count_keys = (
-        _ADAPTIVE_TARGET_ACTIVATION_COUNT_KEYS
-        if adaptive
-        else _TARGET_ACTIVATION_COUNT_KEYS
-    )
+    normalized_by_category = {
+        category: [
+            _normalize_target_activation_chunk(chunk)
+            for chunk in chunks_by_category[category]
+        ]
+        for category in expected_categories
+    }
+    completeness_modes = {
+        chunk["schema_version"] == TARGET_ACTIVATION_CHUNK_SCHEMA_V3
+        for chunks in normalized_by_category.values()
+        for chunk in chunks
+    }
+    if len(completeness_modes) != 1:
+        raise ContractError("target-activation completeness schema is mixed")
+    complete_targets = bool(next(iter(completeness_modes), False))
+    if adaptive:
+        count_keys = (
+            _ADAPTIVE_COMPLETE_TARGET_ACTIVATION_COUNT_KEYS
+            if complete_targets
+            else _ADAPTIVE_TARGET_ACTIVATION_COUNT_KEYS
+        )
+    else:
+        count_keys = (
+            _COMPLETE_TARGET_ACTIVATION_COUNT_KEYS
+            if complete_targets
+            else _TARGET_ACTIVATION_COUNT_KEYS
+        )
     statistical_contract = {
         "method": "two_sided_hoeffding_familywise_v1",
         "familywise_alpha": TARGET_ACTIVATION_FAMILYWISE_ALPHA,
@@ -10200,10 +10323,7 @@ def _build_target_activation_report(
     all_passed = True
     saw_v2_chunk = False
     for category in expected_categories:
-        chunks = [
-            _normalize_target_activation_chunk(chunk)
-            for chunk in chunks_by_category[category]
-        ]
+        chunks = normalized_by_category[category]
         counts = {key: 0 for key in count_keys}
         for chunk in chunks:
             if set(chunk["counts"]) != set(count_keys):
@@ -10245,6 +10365,14 @@ def _build_target_activation_report(
         ):
             raise ContractError(
                 f"target-activation counts are internally inconsistent for {category}"
+            )
+        if complete_targets and (
+            counts["policy_target_complete_rows"]
+            != counts["policy_active_rows"]
+            or counts["policy_target_incomplete_rows"] != 0
+        ):
+            raise ContractError(
+                f"policy-target completeness counts are inconsistent for {category}"
             )
         if adaptive and (
             counts["randomized_non_forced_rows"]
@@ -10331,9 +10459,13 @@ def _build_target_activation_report(
         raise ContractError("target-activation fast-policy schema/count drift")
     report: dict[str, Any] = {
         "schema_version": (
-            TARGET_ACTIVATION_SCHEMA_V2
-            if fast_policy_active
-            else TARGET_ACTIVATION_SCHEMA
+            TARGET_ACTIVATION_SCHEMA_V3
+            if complete_targets
+            else (
+                TARGET_ACTIVATION_SCHEMA_V2
+                if fast_policy_active
+                else TARGET_ACTIVATION_SCHEMA
+            )
         ),
         "policy_activation_rule": (
             "full non-forced rows == 1; forced rows == 0; fast non-forced rows "
@@ -10355,6 +10487,16 @@ def _build_target_activation_report(
             else {}
         ),
         "value_activation_rule": "value_weight_multiplier == 1.0",
+        **(
+            {
+                "policy_target_completeness_rule": (
+                    "every policy-active row has finite nonnegative normalized "
+                    "target_policy and target_policy_mask == (legal_action_ids >= 0)"
+                )
+            }
+            if complete_targets
+            else {}
+        ),
         "sealed_p_full": 0.25,
         **(
             {"adaptive_wide_full_threshold": int(wide_full_threshold)}
@@ -11096,6 +11238,7 @@ def audit_outputs(
                             selected_mask=selected_mask,
                             where=f"{job['job_id']}:{shard.name}",
                             wide_full_threshold=wide_full_threshold,
+                            require_policy_target_completeness=True,
                         )
                         activation_chunk = {
                             "schema_version": activation["schema_version"],

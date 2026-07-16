@@ -258,10 +258,12 @@ def _load() -> dict[str, Any]:
         recipe.get("policy_target_blend_semantics")
         != POLICY_TARGET_BLEND_FALLBACK_V2
         or recipe.get("soft_target_weight") != 1.0
+        or recipe.get("soft_target_source") != "policy"
+        or recipe.get("soft_target_min_legal_coverage") != 1.0
     ):
         raise ScienceContractError(
-            "current coherent learner must bind pure authenticated policy CE "
-            "with hard-action fallback only"
+            "current coherent learner must bind complete authenticated policy CE "
+            "with no reachable hard-action fallback"
         )
     learner_signal_drift = {
         key: {

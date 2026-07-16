@@ -264,12 +264,15 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
     assert recipe["scalar_value_loss_scale"] == payload["operator"]["evaluator"][
         "value_scale"
     ]
+    assert recipe["soft_target_source"] == "policy"
+    assert recipe["soft_target_weight"] == 1.0
+    assert recipe["soft_target_min_legal_coverage"] == 1.0
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:223e73ae29d743c035cb59ecfae983d5f36c0e8443dccb8a61534c14731748e1"
+        "sha256:285bde6feb7ec1d28754387a8d462a4d832169b1b611f23149168e427d6498fb"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:ccf629f15591783c8c037918eaedd297f9fc50f4d0c074f74d9abb8e474162f2"
+        "sha256:f09b71052cd8910e526ac41ce00237aa7ba890155e287d38aeed6add99e37ddc"
     )
 
 
