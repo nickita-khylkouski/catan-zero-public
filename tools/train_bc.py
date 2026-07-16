@@ -11787,24 +11787,43 @@ def main(argv: Sequence[str] | None = None) -> None:
             if coherent_direct_policy_aux
             else None
         )
-        policy_aux_preconditioning_weights = (
-            policy_surprise_aux_preconditioning
-            if exact_per_game_surprise or legacy_policy_surprise
-            else stage_c_base[0]
-            if stage_c_base is not None
-            else (
-                np.ones(len(train_indices), dtype=np.float64)
-                if coherent_direct_policy_aux
-                else component_game_sampling
+        if stage_c_base is not None:
+            policy_aux_preconditioning_weights = stage_c_base[0]
+            if exact_per_game_surprise or legacy_policy_surprise:
+                assert policy_surprise_aux_preconditioning is not None
+                policy_aux_preconditioning_weights = (
+                    _compose_stage_c_policy_surprise_sampling_weights(
+                        data,
+                        train_indices,
+                        policy_surprise_aux_preconditioning,
+                        policy_aux_preconditioning_weights,
+                    )
+                )
+        else:
+            policy_aux_preconditioning_weights = (
+                policy_surprise_aux_preconditioning
+                if exact_per_game_surprise or legacy_policy_surprise
+                else (
+                    np.ones(len(train_indices), dtype=np.float64)
+                    if coherent_direct_policy_aux
+                    else component_game_sampling
+                )
             )
-        )
         if policy_aux_preconditioning_weights is None:
             raise SystemExit("policy auxiliary sampler lost its base measure")
         policy_aux_base_measure = (
-            "coherent_direct_x_exact_per_game_policy_surprise"
-            if coherent_direct_policy_aux and exact_per_game_surprise
-            else stage_c_base[1]
+            (
+                f"{stage_c_base[1]}_x_exact_per_game_policy_surprise"
+                if exact_per_game_surprise
+                else f"{stage_c_base[1]}_x_legacy_policy_surprise"
+                if legacy_policy_surprise
+                else stage_c_base[1]
+            )
             if stage_c_base is not None
+            else "coherent_direct_x_exact_per_game_policy_surprise"
+            if coherent_direct_policy_aux and exact_per_game_surprise
+            else "coherent_direct_x_legacy_policy_surprise"
+            if coherent_direct_policy_aux and legacy_policy_surprise
             else "coherent_direct_uniform_row"
             if coherent_direct_policy_aux
             else "authenticated_component_x_exact_per_game_policy_surprise"
@@ -11833,18 +11852,31 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if coherent_direct_policy_aux
                 else None
             )
-            validation_preconditioning = (
-                np.asarray(
-                    policy_surprise_weights_full[validation_indices],
-                    dtype=np.float64,
+            if stage_c_validation_base is not None:
+                validation_preconditioning = stage_c_validation_base[0]
+                if exact_per_game_surprise or legacy_policy_surprise:
+                    validation_preconditioning = (
+                        _compose_stage_c_policy_surprise_sampling_weights(
+                            data,
+                            validation_indices,
+                            np.asarray(
+                                policy_surprise_weights_full[validation_indices],
+                                dtype=np.float64,
+                            ),
+                            validation_preconditioning,
+                        )
+                    )
+            else:
+                validation_preconditioning = (
+                    np.asarray(
+                        policy_surprise_weights_full[validation_indices],
+                        dtype=np.float64,
+                    )
+                    if exact_per_game_surprise or legacy_policy_surprise
+                    else validation_component_game_sampling
+                    if validation_component_game_sampling is not None
+                    else np.ones(len(validation_indices), dtype=np.float64)
                 )
-                if exact_per_game_surprise or legacy_policy_surprise
-                else stage_c_validation_base[0]
-                if stage_c_validation_base is not None
-                else validation_component_game_sampling
-                if validation_component_game_sampling is not None
-                else np.ones(len(validation_indices), dtype=np.float64)
-            )
             if exact_per_game_surprise and validation_component_game_sampling is not None:
                 validation_preconditioning = (
                     _compose_per_game_policy_surprise_sampling_weights(
@@ -29500,6 +29532,55 @@ def _conditioned_policy_aux_sampling_weights(
     return conditioned
 
 
+def _compose_stage_c_policy_surprise_sampling_weights(
+    data,
+    indices: np.ndarray,
+    surprise_factors: np.ndarray,
+    stage_c_sampling_weights: np.ndarray,
+) -> np.ndarray:
+    """Apply surprise inside the authenticated Stage-C selected-root measure.
+
+    Stage-C weights are zero outside the reanalysed selected roots, so the
+    ordinary component composer cannot accept them.  Preserve the Stage-C mass
+    of every represented game exactly, and use surprise only to redistribute
+    that mass among selected roots from the same game.  This prevents enabling
+    ``--per-game-policy-surprise-weighting`` from silently replacing the
+    strategic/production Stage-C arm with a different global sampler.
+    """
+
+    rows = np.asarray(indices, dtype=np.int64)
+    factors = np.asarray(surprise_factors, dtype=np.float64)
+    base = np.asarray(stage_c_sampling_weights, dtype=np.float64)
+    if factors.shape != rows.shape or base.shape != rows.shape:
+        raise ValueError("Stage-C policy-surprise sampling alignment drift")
+    if (
+        not np.isfinite(factors).all()
+        or np.any(factors <= 0.0)
+        or not np.isfinite(base).all()
+        or np.any(base < 0.0)
+    ):
+        raise ValueError("Stage-C policy-surprise inputs are invalid")
+    if not np.any(base > 0.0):
+        raise ValueError("Stage-C policy-surprise base has no selected-root mass")
+
+    game_seeds = np.asarray(data["game_seed"][rows], dtype=np.int64)
+    _games, inverse = np.unique(game_seeds, return_inverse=True)
+    game_count = int(inverse.max()) + 1 if inverse.size else 0
+    before = np.bincount(inverse, weights=base, minlength=game_count)
+    combined = base * factors
+    after = np.bincount(inverse, weights=combined, minlength=game_count)
+    represented = before > 0.0
+    if np.any(after[represented] <= 0.0):
+        raise RuntimeError("Stage-C policy-surprise erased a represented game")
+    scales = np.ones(game_count, dtype=np.float64)
+    scales[represented] = before[represented] / after[represented]
+    combined *= scales[inverse]
+    restored = np.bincount(inverse, weights=combined, minlength=game_count)
+    if not np.allclose(restored, before, rtol=0.0, atol=1.0e-9):
+        raise RuntimeError("Stage-C policy-surprise changed per-game sampling mass")
+    return combined
+
+
 def _stage_c_policy_aux_base_measure(
     data,
     train_indices: np.ndarray,
@@ -29514,7 +29595,10 @@ def _stage_c_policy_aux_base_measure(
     if (
         not isinstance(sampling, dict)
         or sampling.get("schema_version")
-        != "a1-stage-c-policy-sampling-distribution-v1"
+        not in {
+            "a1-stage-c-policy-sampling-distribution-v1",
+            "a1-stage-c-policy-sampling-distribution-v2",
+        }
         or sampling.get("column") != "stage_c_policy_sampling_weight"
         or sampling.get("arm")
         not in {"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"}

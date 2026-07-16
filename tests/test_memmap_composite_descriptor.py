@@ -561,6 +561,75 @@ def test_policy_aux_conditioning_preserves_authenticated_base_measure() -> None:
     assert conditioned == pytest.approx([0.0, 2.0 / 7.0, 1.0 / 7.0, 4.0 / 7.0])
 
 
+def test_stage_c_surprise_composition_preserves_selected_mass_per_game() -> None:
+    class _StageCCorpus:
+        def __getitem__(self, key: str) -> np.ndarray:
+            assert key == "game_seed"
+            return np.asarray([10, 10, 10, 20, 20, 30], dtype=np.int64)
+
+    base = np.asarray([0.0, 2.0, 1.0, 4.0, 0.0, 3.0], dtype=np.float64)
+    surprise = np.asarray([9.0, 1.0, 3.0, 2.0, 8.0, 7.0], dtype=np.float64)
+    combined = train_bc._compose_stage_c_policy_surprise_sampling_weights(
+        _StageCCorpus(),
+        np.arange(6, dtype=np.int64),
+        surprise,
+        base,
+    )
+
+    # Unselected roots stay outside the Stage-C objective.
+    assert combined[[0, 4]].tolist() == [0.0, 0.0]
+    # Surprise redistributes roots inside game 10.
+    assert combined[2] > combined[1]
+    # The Stage-C game measure itself remains exact.
+    assert combined[:3].sum() == pytest.approx(base[:3].sum())
+    assert combined[3:5].sum() == pytest.approx(base[3:5].sum())
+    assert combined[5:].sum() == pytest.approx(base[5:].sum())
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "a1-stage-c-policy-sampling-distribution-v1",
+        "a1-stage-c-policy-sampling-distribution-v2",
+    ],
+)
+def test_stage_c_policy_aux_accepts_current_and_historical_sampling_schema(
+    schema: str,
+) -> None:
+    class _StageCCorpus:
+        meta = {
+            "stage_c_policy_overlay": {
+                "sampling_distribution": {
+                    "schema_version": schema,
+                    "column": "stage_c_policy_sampling_weight",
+                    "arm": "STRATEGIC_BALANCED",
+                }
+            }
+        }
+
+        def __contains__(self, key: str) -> bool:
+            return key in {
+                "stage_c_policy_sampling_weight",
+                "policy_weight_multiplier",
+            }
+
+        def __getitem__(self, key: str) -> np.ndarray:
+            return {
+                "stage_c_policy_sampling_weight": np.asarray(
+                    [1.0, 0.0, 1.0], dtype=np.float64
+                ),
+                "policy_weight_multiplier": np.asarray(
+                    [1.0, 0.0, 1.0], dtype=np.float32
+                ),
+            }[key]
+
+    weights, label = train_bc._stage_c_policy_aux_base_measure(  # noqa: SLF001
+        _StageCCorpus(), np.arange(3, dtype=np.int64)
+    )
+    assert weights.tolist() == [1.0, 0.0, 1.0]
+    assert label == "stage_c_strategic_balanced"
+
+
 def test_policy_aux_phase_allocation_sets_exact_phase_shares() -> None:
     active = np.asarray([0.10, 0.20, 0.30, 0.40, 0.0], dtype=np.float64)
     phases = np.asarray(["PLAY", "PLAY", "ROBBER", "DISCARD", "PLAY"])
