@@ -897,6 +897,61 @@ def test_entity_graph_prefetch_allowlist_omits_only_dense_obs():
     assert value_weights.tolist() == [14.0, 11.0, 13.0, 12.0]
 
 
+class _NoParameterModel:
+    def parameters(self):
+        return iter(())
+
+
+class _ProfilePolicy:
+    def __init__(self, policy_type: str):
+        self.policy_type = policy_type
+        self.action_size = 8
+        self.context_action_feature_size = 3
+        self.model = _NoParameterModel()
+        self.device = "cpu"
+
+
+def test_batch_profile_accepts_prefetched_entity_batch_without_dense_obs():
+    data = {
+        "legal_action_ids": np.asarray([[1, 3, -1], [2, -1, -1]], dtype=np.int64),
+        "legal_action_context": np.zeros((2, 3, 3), dtype=np.float32),
+        "hex_tokens": np.zeros((2, 19, 7), dtype=np.float32),
+        "event_tokens": np.zeros((2, 32, 5), dtype=np.float32),
+    }
+
+    profile = train_bc._batch_profile(
+        _ProfilePolicy("entity_graph"),
+        data,
+        np.arange(2, dtype=np.int64),
+    )
+
+    assert profile["input_representation"] == "entity_tokens"
+    assert profile["obs_shape"] is None
+    assert profile["legal_action_ids_shape"] == [2, 3]
+    assert profile["hex_tokens_shape"] == [2, 19, 7]
+    assert profile["event_tokens_shape"] == [2, 32, 5]
+
+
+def test_batch_profile_keeps_dense_observation_contract():
+    data = {
+        "obs": np.zeros((3, 11), dtype=np.float32),
+        "legal_action_ids": np.asarray(
+            [[1, 3, -1], [2, -1, -1], [4, 5, 6]], dtype=np.int64
+        ),
+        "legal_action_context": np.zeros((3, 3, 3), dtype=np.float32),
+    }
+
+    profile = train_bc._batch_profile(
+        _ProfilePolicy("candidate"),
+        data,
+        np.asarray([2, 0], dtype=np.int64),
+    )
+
+    assert profile["input_representation"] == "dense_obs"
+    assert profile["obs_shape"] == [2, 11]
+    assert profile["legal_action_ids_shape"] == [2, 3]
+
+
 def test_prefetch_materialization_allowlist_rejects_unknown_columns():
     data = train_bc.ConcatMemmapCorpus(
         [_TinyEntityPrefetchCorpus([0, 1]), _TinyEntityPrefetchCorpus([10, 11])]

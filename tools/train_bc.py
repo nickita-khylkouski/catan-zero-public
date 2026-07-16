@@ -30807,6 +30807,7 @@ def _ensure_policy_action_mask_version(
 
 def _batch_profile(policy, data: dict, batch: np.ndarray) -> dict:
     config = getattr(policy, "config", None)
+    policy_type = str(getattr(policy, "policy_type", ""))
     action_size = int(getattr(policy, "action_size", getattr(config, "action_size", 0)))
     context_size = int(
         getattr(
@@ -30819,7 +30820,12 @@ def _batch_profile(policy, data: dict, batch: np.ndarray) -> dict:
     legal_counts = np.sum(valid >= 0, axis=1)
     profile = {
         "batch_size": int(len(batch)),
-        "obs_shape": list(data["obs"][batch].shape),
+        "input_representation": (
+            "entity_tokens" if policy_type == "entity_graph" else "dense_obs"
+        ),
+        "obs_shape": (
+            list(data["obs"][batch].shape) if "obs" in data else None
+        ),
         "legal_action_ids_shape": list(valid.shape),
         "legal_action_context_shape": list(data["legal_action_context"][batch].shape),
         "dense_action_context_shape": [int(len(batch)), action_size, context_size],
@@ -30829,7 +30835,12 @@ def _batch_profile(policy, data: dict, batch: np.ndarray) -> dict:
         "parameter_count": int(_parameter_count(policy)),
         "cuda": _cuda_memory(policy),
     }
-    if getattr(policy, "policy_type", "") == "entity_graph":
+    if policy_type != "entity_graph" and profile["obs_shape"] is None:
+        raise RuntimeError(
+            "dense batch profiling requires obs; only entity_graph batches may "
+            "omit the unused legacy dense observation"
+        )
+    if policy_type == "entity_graph":
         for key in (
             "hex_tokens",
             "vertex_tokens",
