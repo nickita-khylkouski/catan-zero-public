@@ -314,6 +314,74 @@ def _checkpoint_feature_learning_signal(
     }
 
 
+def _authenticate_checkpoint_snapshot(
+    report: Mapping[str, Any],
+    *,
+    step: int,
+    checkpoint: Path,
+    terminal_checkpoint: Path,
+) -> dict[str, Any]:
+    """Bind checkpoint-local telemetry to the exact saved checkpoint bytes."""
+
+    resolved = checkpoint.resolve(strict=True)
+    digest = _file_sha256(resolved)
+    if step == MAX_STEPS:
+        try:
+            reported = Path(str(report["checkpoint"])).resolve(strict=True)
+        except (KeyError, OSError) as error:
+            raise CampaignError(
+                "completed learner report has no terminal checkpoint binding"
+            ) from error
+        if reported != resolved or resolved != terminal_checkpoint.resolve(strict=True):
+            raise CampaignError("terminal checkpoint differs from the completed report")
+        return {
+            "schema_version": "stage-c-checkpoint-report-binding-v1",
+            "optimizer_step": step,
+            "checkpoint": str(resolved),
+            "checkpoint_sha256": digest,
+            "source": "receipt_bound_terminal_checkpoint",
+        }
+
+    records = report.get("intermediate_checkpoints")
+    if not isinstance(records, list):
+        raise CampaignError("completed learner report has no intermediate checkpoints")
+    matches = [
+        row
+        for row in records
+        if isinstance(row, dict)
+        and _integer(row.get("optimizer_step"), default=-1) == step
+    ]
+    if len(matches) != 1:
+        raise CampaignError(
+            f"checkpoint {step} intermediate binding is missing or duplicated"
+        )
+    record = matches[0]
+    try:
+        reported = Path(str(record["checkpoint"])).resolve(strict=True)
+        size_bytes = int(record["size_bytes"])
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise CampaignError(
+            f"checkpoint {step} intermediate binding is malformed"
+        ) from error
+    if (
+        record.get("schema_version") != "train-bc-intermediate-checkpoint-v1"
+        or record.get("same_training_trajectory") is not True
+        or reported != resolved
+        or record.get("checkpoint_sha256") != digest
+        or size_bytes != resolved.stat().st_size
+    ):
+        raise CampaignError(
+            f"checkpoint {step} bytes differ from the completed learner report"
+        )
+    return {
+        "schema_version": "stage-c-checkpoint-report-binding-v1",
+        "optimizer_step": step,
+        "checkpoint": str(resolved),
+        "checkpoint_sha256": digest,
+        "source": "authenticated_intermediate_checkpoint",
+    }
+
+
 def _recipe() -> dict[str, Any]:
     return {
         "epochs": 1,
@@ -1248,8 +1316,17 @@ def _fingerprint(
         raise CampaignError("separate parent functional used the wrong checkpoint")
     records = []
     commands = []
+    terminal_checkpoint = Path(
+        str(plan["expected_artifacts"]["terminal_checkpoint"])
+    ).resolve(strict=True)
     for step in CHECKPOINT_STEPS:
         checkpoint = _checkpoint_path(plan, step).resolve(strict=True)
+        checkpoint_binding = _authenticate_checkpoint_snapshot(
+            report_payload,
+            step=step,
+            checkpoint=checkpoint,
+            terminal_checkpoint=terminal_checkpoint,
+        )
         functional_path = _functional_artifact_path(
             output_root,
             step,
@@ -1336,6 +1413,7 @@ def _fingerprint(
                 "step": step,
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": _file_sha256(checkpoint),
+                "checkpoint_report_binding": checkpoint_binding,
                 "parent_kl": parent_kl,
                 "fresh_parent_target_kl_mean": fresh_gap["parent_target_kl_mean"],
                 "candidate_target_kl_mean": fresh_gap["candidate_target_kl_mean"],

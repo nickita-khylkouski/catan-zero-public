@@ -322,6 +322,26 @@ def test_stage_c_fingerprint_binds_report_emitted_holdout(
     receipt_path = output_root / "learner" / "one-dose.receipt.json"
     receipt_path.write_text("sealed receipt\n", encoding="utf-8")
     terminal_checkpoint = output_root / "learner" / "candidate.pt"
+    report["checkpoint"] = str(terminal_checkpoint)
+    report["intermediate_checkpoints"] = [
+        {
+            "schema_version": "train-bc-intermediate-checkpoint-v1",
+            "optimizer_step": step,
+            "checkpoint": str(
+                output_root / "learner" / f"candidate_step{step:04d}.pt"
+            ),
+            "checkpoint_sha256": one_dose._file_sha256(  # noqa: SLF001
+                output_root / "learner" / f"candidate_step{step:04d}.pt"
+            ),
+            "size_bytes": (
+                output_root / "learner" / f"candidate_step{step:04d}.pt"
+            ).stat().st_size,
+            "same_training_trajectory": True,
+            "optimizer_sidecar": None,
+        }
+        for step in campaign.INTERMEDIATE_CHECKPOINT_STEPS
+    ]
+    _write_json(report_path, report)
     authenticated = {
         "receipt_sha256": "sha256:" + "6" * 64,
         "outputs": {
@@ -491,6 +511,47 @@ def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> N
     assert commissioned["authenticated"] is True
     assert selected is not None
     assert selected["step"] == 16
+
+
+def test_checkpoint_signal_is_bound_to_exact_intermediate_bytes(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "candidate_step0016.pt"
+    checkpoint.write_bytes(b"step-16-original")
+    terminal = tmp_path / "candidate.pt"
+    terminal.write_bytes(b"terminal")
+    report = _completed_feature_signal_report()
+    report["checkpoint"] = str(terminal)
+    report["intermediate_checkpoints"] = [
+        {
+            "schema_version": "train-bc-intermediate-checkpoint-v1",
+            "optimizer_step": 16,
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": one_dose._file_sha256(checkpoint),  # noqa: SLF001
+            "size_bytes": checkpoint.stat().st_size,
+            "same_training_trajectory": True,
+            "optimizer_sidecar": None,
+        }
+    ]
+
+    binding = campaign._authenticate_checkpoint_snapshot(  # noqa: SLF001
+        report,
+        step=16,
+        checkpoint=checkpoint,
+        terminal_checkpoint=terminal,
+    )
+    assert binding["checkpoint_sha256"] == one_dose._file_sha256(  # noqa: SLF001
+        checkpoint
+    )
+
+    checkpoint.write_bytes(b"step-16-replaced")
+    with pytest.raises(campaign.CampaignError, match="bytes differ"):
+        campaign._authenticate_checkpoint_snapshot(  # noqa: SLF001
+            report,
+            step=16,
+            checkpoint=checkpoint,
+            terminal_checkpoint=terminal,
+        )
 
 
 def test_stage_c_reuses_authenticated_transitional_fresh_parent_evidence() -> None:
