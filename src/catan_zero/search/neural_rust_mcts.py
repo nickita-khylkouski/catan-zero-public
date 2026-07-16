@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import queue
 import threading
 import time
@@ -33,6 +32,7 @@ from catan_zero.rl.meaningful_history import (
     public_events_from_native_action_records,
 )
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
+from catan_zero.search.prior_temperature import effective_prior_temperature
 
 
 # Backward-compatible public alias used by teacher-data writers.  The canonical
@@ -459,10 +459,10 @@ class EntityGraphRustEvaluator:
         temperature a second time.
         """
 
-        temperature = float(self.config.prior_temperature)
-        if not math.isfinite(temperature) or temperature <= 0.0:
-            raise ValueError("prior_temperature must be finite and positive")
-        return temperature
+        return effective_prior_temperature(
+            self.config.prior_temperature,
+            name="prior_temperature",
+        )
 
     def _entity_batch_via_rust(
         self,
@@ -834,7 +834,7 @@ class EntityGraphRustEvaluator:
             return_q=False,
         )
         logits = outputs["logits"].detach().float().cpu().numpy()[0]
-        temperature = max(float(self.config.prior_temperature), 1.0e-6)
+        temperature = self.applied_prior_temperature
         priors_arr = _softmax(logits / temperature)
         priors = {
             int(action): float(probability)
@@ -1003,7 +1003,7 @@ class EntityGraphRustEvaluator:
         )
 
         logits = np.asarray(avg["logits"], dtype=np.float64)
-        temperature = max(float(self.config.prior_temperature), 1.0e-6)
+        temperature = self.applied_prior_temperature
         priors_arr = _softmax(logits / temperature)
         priors = {
             int(action): float(probability)
@@ -1277,7 +1277,7 @@ class EntityGraphRustEvaluator:
                 )
             logits_batch = outputs["logits"].detach().float().cpu().numpy()
             values = self._value_output(outputs).detach().float().cpu().numpy()
-            temperature = max(float(self.config.prior_temperature), 1.0e-6)
+            temperature = self.applied_prior_temperature
             for batch_row, (request_index, batch_request) in enumerate(
                 zip(pending_indices, pending_batch_requests)
             ):
@@ -1581,7 +1581,7 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 )
             logits_batch = outputs["logits"].detach().float().cpu().numpy()
             values = self._value_output(outputs).detach().float().cpu().numpy()
-            temperature = max(float(self.config.prior_temperature), 1.0e-6)
+            temperature = self.applied_prior_temperature
             for index, request in enumerate(requests):
                 width = len(request.legal_actions)
                 logits = logits_batch[index, :width]

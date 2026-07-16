@@ -30,10 +30,44 @@ def test_neural_evaluator_reports_the_temperature_already_applied() -> None:
     assert evaluator.applied_prior_temperature == pytest.approx(2.0)
 
 
+def test_neural_evaluator_reports_the_effective_clamped_temperature() -> None:
+    evaluator = object.__new__(EntityGraphRustEvaluator)
+    evaluator.config = EntityGraphRustEvaluatorConfig(prior_temperature=1.0e-9)
+
+    assert evaluator.applied_prior_temperature == pytest.approx(1.0e-6)
+
+
 def test_search_applies_temperature_for_raw_prior_evaluator() -> None:
     search = _search(search_temperature=2.0, evaluator=object())
 
     assert search._effective_prior_temperature() == pytest.approx(2.0)
+
+
+def test_raw_prior_search_uses_the_same_minimum_effective_temperature() -> None:
+    search = _search(search_temperature=1.0e-9, evaluator=object())
+
+    assert search._effective_prior_temperature() == pytest.approx(1.0e-6)
+
+
+def test_subfloor_neural_temperature_contract_records_effective_operator() -> None:
+    evaluator = object.__new__(EntityGraphRustEvaluator)
+    evaluator.config = EntityGraphRustEvaluatorConfig(prior_temperature=1.0e-9)
+    search = _search(search_temperature=1.0e-9, evaluator=evaluator)
+
+    contract = search.prior_temperature_application_contract()
+
+    assert contract["configured_search_prior_temperature"] == pytest.approx(1.0e-9)
+    assert contract["evaluator_applied_prior_temperature"] == pytest.approx(1.0e-6)
+    assert contract["effective_search_prior_temperature"] == pytest.approx(1.0)
+    assert contract["effective_logit_temperature"] == pytest.approx(1.0e-6)
+
+
+def test_explicit_applied_temperature_marker_is_not_silently_relabelled() -> None:
+    evaluator = SimpleNamespace(applied_prior_temperature=1.0e-9)
+    search = _search(search_temperature=1.0e-9, evaluator=evaluator)
+
+    with pytest.raises(ValueError, match="conflicting prior_temperature"):
+        search._effective_prior_temperature()
 
 
 @pytest.mark.parametrize("search_temperature", [1.0, 2.0])

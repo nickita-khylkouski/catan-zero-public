@@ -57,6 +57,10 @@ from catan_zero.search.rust_mcts import (
     _terminal_or_zero,
 )
 from catan_zero.search.public_belief import PublicBelief
+from catan_zero.search.prior_temperature import (
+    effective_prior_temperature,
+    positive_prior_temperature,
+)
 from catan_zero.search.rng_streams import (
     boundary_value_particle_seed,
     domain_separated_search_seed,
@@ -978,11 +982,10 @@ class GumbelChanceMCTS:
         self.config = config or GumbelChanceMCTSConfig()
         if not math.isfinite(float(self.config.temperature)):
             raise ValueError("temperature must be finite")
-        if (
-            not math.isfinite(float(self.config.prior_temperature))
-            or float(self.config.prior_temperature) <= 0.0
-        ):
-            raise ValueError("prior_temperature must be finite and positive")
+        effective_prior_temperature(
+            self.config.prior_temperature,
+            name="prior_temperature",
+        )
         if (
             self.config.sigma_reference_visits is not None
             and int(self.config.sigma_reference_visits) < 0
@@ -1104,18 +1107,18 @@ class GumbelChanceMCTS:
         conflicting non-unit values.
         """
 
-        search_temperature = float(self.config.prior_temperature)
-        if not math.isfinite(search_temperature) or search_temperature <= 0.0:
-            raise ValueError("prior_temperature must be finite and positive")
+        search_temperature = effective_prior_temperature(
+            self.config.prior_temperature,
+            name="prior_temperature",
+        )
         evaluator = getattr(self, "evaluator", None)
         applied_raw = getattr(evaluator, "applied_prior_temperature", None)
         if applied_raw is None:
             return search_temperature
-        applied_temperature = float(applied_raw)
-        if not math.isfinite(applied_temperature) or applied_temperature <= 0.0:
-            raise ValueError(
-                "evaluator applied_prior_temperature must be finite and positive"
-            )
+        applied_temperature = positive_prior_temperature(
+            applied_raw,
+            name="evaluator applied_prior_temperature",
+        )
         if math.isclose(applied_temperature, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
             return search_temperature
         if (
@@ -1140,7 +1143,14 @@ class GumbelChanceMCTS:
         configured_search = float(self.config.prior_temperature)
         evaluator = getattr(self, "evaluator", None)
         applied_raw = getattr(evaluator, "applied_prior_temperature", None)
-        evaluator_applied = 1.0 if applied_raw is None else float(applied_raw)
+        evaluator_applied = (
+            1.0
+            if applied_raw is None
+            else positive_prior_temperature(
+                applied_raw,
+                name="evaluator applied_prior_temperature",
+            )
+        )
         effective_search = self._effective_prior_temperature()
         effective_logit_temperature = evaluator_applied * effective_search
         return {
