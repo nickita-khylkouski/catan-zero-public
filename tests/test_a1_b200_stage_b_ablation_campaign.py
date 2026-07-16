@@ -76,10 +76,10 @@ def test_selected_dose_binds_stage_a_arm_multiplier_step_and_checkpoint(
 
     assert dose["selected_arm"] == "P50"
     assert dose["active_policy_branch_multiplier"] == pytest.approx(0.5)
-    assert dose["policy_aux_active_batch_size"] == 232
+    assert dose["policy_aux_active_batch_size"] == 128
     assert dose["optimizer_steps"] == 32
     assert dose["checkpoint_steps"] == [8, 12, 16, 32]
-    assert dose["expected_aux_active_row_draws"] == 232 * 8 * 32
+    assert dose["expected_aux_active_row_draws"] == 128 * 8 * 32
     assert dose["reference_parent_kl"] == pytest.approx(0.012)
     assert dose["reference_trunk_relative_l2"] == pytest.approx(0.006)
     assert dose["stage_a_selected_checkpoint"]["role"] == (
@@ -505,7 +505,8 @@ def _recovery_selection_fixture(
             "max_steps": 128,
             "lr": lr,
             "lr_warmup_steps": 16,
-            "policy_aux_active_batch_size": 463,
+            "policy_aux_active_batch_size": 128,
+            "policy_aux_loss_weight": 0.25,
             "per_game_policy_surprise_weighting": False,
             "public_card_lr_mult": 1.0,
             "trunk_lr_mult": 1.0,
@@ -584,7 +585,8 @@ def _recovery_selection_fixture(
                 {
                     "arm": arm,
                     **row,
-                    "eligible": step == 32,
+                    "teacher_gap_closure_diagnostic_only": True,
+                    "eligible": True,
                 }
             )
         fingerprint_payload = {
@@ -648,8 +650,10 @@ def _recovery_selection_fixture(
         "selection_contract": {
             "parent_kl_max": 0.03,
             "trunk_relative_l2_max": 0.03,
-            "positive_teacher_gap_closure_required": True,
-            "objective": "max_teacher_gap_closure_within_frozen_trust_and_trunk_budgets",
+            "teacher_gap_closure_ranking_authority": False,
+            "teacher_gap_closure_admission_authority": False,
+            "paired_playing_strength_is_final_authority": True,
+            "objective": "minimum_update_within_frozen_trust_and_trunk_budgets",
             "tie_break": [
                 "min_parent_kl",
                 "min_trunk_relative_l2",
@@ -678,7 +682,7 @@ def _recovery_selection_fixture(
         lambda _plan, arm, _fingerprint: receipt_by_arm[arm],
     )
     winner = next(
-        row for row in candidates if row["arm"] == "LOWLR_V25" and row["step"] == 32
+        row for row in candidates if row["arm"] == "LOWLR_V25" and row["step"] == 8
     )
     selection = {
         "schema_version": campaign.RECOVERY_SELECTION_SCHEMA,
@@ -715,15 +719,15 @@ def test_recovery_selection_binds_exact_winner_fingerprint_and_recipe(
 
     assert dose["authority_kind"] == "direction_corrected_recovery_selection"
     assert dose["selected_arm"] == "LOWLR_V25"
-    assert dose["optimizer_steps"] == 32
-    assert dose["checkpoint_steps"] == [8, 32]
-    assert dose["policy_aux_active_batch_size"] == 463
-    assert dose["active_policy_branch_multiplier"] == pytest.approx(1.0)
-    assert dose["reference_parent_kl"] == pytest.approx(0.02)
-    assert dose["reference_trunk_relative_l2"] == pytest.approx(0.008)
-    assert dose["reference_teacher_gap_closure"] == pytest.approx(0.06)
+    assert dose["optimizer_steps"] == 8
+    assert dose["checkpoint_steps"] == [8]
+    assert dose["policy_aux_active_batch_size"] == 128
+    assert dose["active_policy_branch_multiplier"] == pytest.approx(0.25)
+    assert dose["reference_parent_kl"] == pytest.approx(0.01)
+    assert dose["reference_trunk_relative_l2"] == pytest.approx(0.004)
+    assert dose["reference_teacher_gap_closure"] == pytest.approx(-0.01)
     assert dose["selected_recipe_overrides"]["lr"] == pytest.approx(3.0e-5)
-    assert dose["trust_contract"]["policy_kl_target"] == pytest.approx(0.02)
+    assert dose["trust_contract"]["policy_kl_target"] == pytest.approx(0.01)
     assert dose["recovery_receipt"]["receipt_sha256"].startswith("sha256:")
 
     public_dose = campaign.load_recovery_selected_dose(selection_path)

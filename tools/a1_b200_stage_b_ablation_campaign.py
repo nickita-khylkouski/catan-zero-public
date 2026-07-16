@@ -660,7 +660,11 @@ def _load_recovery_selection(
         or not all(
             math.isfinite(value) and value > 0.0 for value in (parent_kl_cap, trunk_cap)
         )
-        or contract.get("positive_teacher_gap_closure_required") is not True
+        or contract.get("teacher_gap_closure_ranking_authority") is not False
+        or contract.get("teacher_gap_closure_admission_authority") is not False
+        or contract.get("paired_playing_strength_is_final_authority") is not True
+        or contract.get("objective")
+        != "minimum_update_within_frozen_trust_and_trunk_budgets"
     ):
         raise CampaignError("recovery selection contract/trajectory drifted")
 
@@ -762,9 +766,8 @@ def _load_recovery_selection(
             candidate = {
                 "arm": arm,
                 **copy.deepcopy(dict(row)),
-                "eligible": (
-                    parent_kl <= parent_kl_cap and trunk <= trunk_cap and closure > 0.0
-                ),
+                "teacher_gap_closure_diagnostic_only": True,
+                "eligible": parent_kl <= parent_kl_cap and trunk <= trunk_cap,
             }
             candidates.append(candidate)
 
@@ -795,10 +798,9 @@ def _load_recovery_selection(
     winner = sorted(
         eligible,
         key=lambda row: (
-            -float(row["teacher_gap_closure"]),
+            int(row["step"]),
             float(row["parent_kl"]),
             float(row["trunk_relative_l2"]),
-            int(row["step"]),
             str(row["arm"]),
         ),
     )[0]
@@ -811,6 +813,7 @@ def _load_recovery_selection(
     try:
         step = int(winner["step"])
         aux_batch = int(winner_recipe["policy_aux_active_batch_size"])
+        aux_loss_weight = float(winner_recipe["policy_aux_loss_weight"])
         lr = float(winner_recipe["lr"])
         warmup = int(winner_recipe["lr_warmup_steps"])
         reference_parent_kl = float(winner["parent_kl"])
@@ -823,22 +826,30 @@ def _load_recovery_selection(
         name
         for name, recipe in stage_a.ARMS.items()
         if int(recipe["policy_aux_active_batch_size"]) == aux_batch
+        and math.isclose(
+            float(recipe["policy_aux_loss_weight"]),
+            aux_loss_weight,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
     ]
     checkpoint = _regular_file(
         Path(str(winner["checkpoint"])), where="recovery selected checkpoint"
     )
     if (
         len(matching_stage_a_arms) != 1
+        or not math.isfinite(aux_loss_weight)
+        or aux_loss_weight <= 0.0
         or not math.isfinite(lr)
         or lr <= 0.0
         or warmup < 0
         or winner.get("checkpoint_sha256") != _file_sha256(checkpoint)
         or reference_parent_kl <= 0.0
-        or reference_parent_kl > parent_kl_cap
-        or reference_trunk <= 0.0
-        or reference_trunk > trunk_cap
-        or reference_closure <= 0.0
-    ):
+            or reference_parent_kl > parent_kl_cap
+            or reference_trunk <= 0.0
+            or reference_trunk > trunk_cap
+            or not math.isfinite(reference_closure)
+        ):
         raise CampaignError("recovery selected checkpoint/dose binding drifted")
     stage_a_arm = matching_stage_a_arms[0]
     selected_fingerprint_ref = refs[winner_arm]
@@ -1390,8 +1401,10 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
                 source["selection_contract"]["max_trunk_relative_l2"]
             ),
             "objective": (
-                "max_teacher_gap_closure_at_nearest_stage_a_parent_kl_and_trunk_drift"
+                "dose_matched_fingerprint_nomination_only"
             ),
+            "teacher_gap_closure_ranking_authority": False,
+            "paired_playing_strength_is_final_authority": True,
             "playing_strength_evaluation_required": True,
         },
         "inputs": {
@@ -2313,7 +2326,7 @@ def _compare(
         sorted(
             eligible,
             key=lambda row: (
-                -row["teacher_gap_closure"],
+                row["step"],
                 row["parent_kl"],
                 row["trunk_relative_l2"],
                 row["arm"],
@@ -2337,6 +2350,8 @@ def _compare(
         "arm_fingerprints": records,
         "causal_effects_vs_base": effects,
         "fingerprint_leader": copy.deepcopy(leader),
+        "fingerprint_leader_selection": "minimum_dose_within_fingerprint_budgets",
+        "teacher_gap_closure_ranking_authority": False,
         "leader_is_diagnostic_not_promoted": True,
         "playing_strength_evaluation_still_required": True,
     }

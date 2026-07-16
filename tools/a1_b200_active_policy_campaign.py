@@ -1808,7 +1808,6 @@ def _select(
             ):
                 raise CampaignError(f"arm {arm} step {step} metrics are non-finite")
             within = parent_kl <= cap_kl and trunk <= cap_trunk
-            positive = closure > 0.0
             candidate = {
                 "arm": arm,
                 "step": step,
@@ -1818,8 +1817,8 @@ def _select(
                 "trunk_relative_l2": trunk,
                 "teacher_gap_closure": closure,
                 "within_drift_budgets": within,
-                "positive_teacher_gap_closure": positive,
-                "eligible": within and positive,
+                "teacher_gap_closure_diagnostic_only": True,
+                "eligible": within,
             }
             candidates.append(candidate)
             if candidate["eligible"]:
