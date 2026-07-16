@@ -299,6 +299,12 @@ def main() -> None:
         raise SystemExit("--torchrun-nproc-per-node must be >= 1")
     if grad_accum_steps < 1:
         raise SystemExit("--bc-grad-accum-steps must be >= 1")
+    if args.quality_gate == "production" and grad_accum_steps != 1:
+        raise SystemExit(
+            "production factory runs require --bc-grad-accum-steps 1 until "
+            "train_bc implements exact union-weighted gradient accumulation; "
+            "use --quality-gate none only for an explicit diagnostic replay"
+        )
     if int(args.bc_max_steps) < 0:
         raise SystemExit("--bc-max-steps must be >= 0")
     if args.quality_gate == "production" and int(args.bc_max_steps) <= 0:

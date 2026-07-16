@@ -435,9 +435,13 @@ def test_factory_accepts_explicit_current_prompt_phase_treatment(
     assert command[command.index("--phase-weights") + 1] == treatment
 
 
-def test_factory_accounts_for_gradient_accumulation_in_global_batch(tmp_path: Path) -> None:
+def test_factory_none_quality_gate_accounts_for_accumulation_in_global_batch(
+    tmp_path: Path,
+) -> None:
     result = _dry_run(
         tmp_path,
+        "--quality-gate",
+        "none",
         "--torchrun-nproc-per-node",
         "2",
         "--bc-grad-accum-steps",
@@ -448,6 +452,17 @@ def test_factory_accounts_for_gradient_accumulation_in_global_batch(tmp_path: Pa
     topology = _manifest(tmp_path)["bc_training_topology"]
     assert topology["rank_local_batch_size"] == 512
     assert topology["effective_global_batch_size"] == 4096
+
+
+def test_factory_refuses_approximate_gradient_accumulation_in_production(
+    tmp_path: Path,
+) -> None:
+    result = _dry_run(tmp_path, "--bc-grad-accum-steps", "2")
+
+    assert result.returncode != 0
+    assert "exact union-weighted gradient accumulation" in result.stderr
+    assert "--quality-gate none" in result.stderr
+    assert not (tmp_path / "pipeline_manifest.json").exists()
 
 
 def test_factory_refuses_non_divisible_global_batch(tmp_path: Path) -> None:
@@ -469,6 +484,8 @@ def test_explicit_local_batch_override_is_manifested_without_reinterpretation(
 ) -> None:
     result = _dry_run(
         tmp_path,
+        "--quality-gate",
+        "none",
         "--torchrun-nproc-per-node",
         "2",
         "--bc-grad-accum-steps",
@@ -487,7 +504,7 @@ def test_explicit_local_batch_override_is_manifested_without_reinterpretation(
         "batch_size_source": "explicit_rank_local_override",
         "training_rng_rank_offset": True,
         "max_optimizer_steps": 128,
-        "exact_max_optimizer_steps": True,
+        "exact_max_optimizer_steps": False,
         "optimizer": "adam",
         "value_lr_mult": 1.0,
         "trunk_lr_mult": 1.0,
