@@ -153,6 +153,15 @@ class _FakeTrainBC:
         self.calls["action_catalog_env"] = env_config
         return self.action_catalog
 
+    def _action_catalog_type_projection(self, action_catalog, configured_weights):
+        assert action_catalog is self.action_catalog
+        assert configured_weights == {}
+        return np.ones(3, dtype=np.float64), (
+            "ROLL",
+            "END_TURN",
+            "BUILD_ROAD",
+        )
+
     def evaluate_bc_batches(self, *args, **kwargs):
         self.calls["evaluate"] = (args, kwargs)
         self.evaluate_calls.append((args, kwargs))
@@ -505,6 +514,11 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert kwargs["scalar_value_objective"] == "mse"
     assert kwargs["scalar_value_loss_readout"] == "deployed_tanh"
     assert kwargs["scalar_value_loss_scale"] == pytest.approx(1.25)
+    assert kwargs["value_validation_action_types_by_id"] == (
+        "ROLL",
+        "END_TURN",
+        "BUILD_ROAD",
+    )
     objective = result["shared_holdout"]["objective_reconstruction"]
     assert objective["target_reliability_confidence_weighting"] is True
     assert objective["forced_row_value_action_type_weights"] == {"END_TURN": 0.2}

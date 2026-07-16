@@ -229,6 +229,22 @@ def _forced_row_value_recipe(
     return weights, train_bc._action_catalog_for_env_config(env_config)
 
 
+def _value_validation_action_types_by_id(report: dict[str, Any]) -> tuple[str, ...]:
+    """Rebuild the authoritative action-type catalog used by value strata."""
+
+    graph_history_features = _required(report, "graph_history_features")
+    if type(graph_history_features) is not bool:  # noqa: E721
+        raise SystemExit("training report 'graph_history_features' must be a boolean")
+    env_config = train_bc.parse_track(
+        str(_required(report, "track")),
+        vps_to_win=int(_required(report, "vps_to_win")),
+        use_graph_history_features=graph_history_features,
+    )
+    action_catalog = train_bc._action_catalog_for_env_config(env_config)
+    _, action_types = train_bc._action_catalog_type_projection(action_catalog, {})
+    return action_types
+
+
 def run_rescore(
     *,
     report_path: Path,
@@ -293,6 +309,9 @@ def run_rescore(
         data, policy_weights
     )
     forced_type_weights, forced_action_catalog = _forced_row_value_recipe(report)
+    value_validation_action_types_by_id = _value_validation_action_types_by_id(
+        report
+    )
     value_weights = train_bc.build_value_sample_weights(
         data,
         phase_weights=_weight_map(
@@ -380,6 +399,9 @@ def run_rescore(
             scalar_value_objective=scalar_objective,
             scalar_value_loss_readout=scalar_readout,
             scalar_value_loss_scale=scalar_scale,
+            value_validation_action_types_by_id=(
+                value_validation_action_types_by_id
+            ),
         )
 
     runtime_binding = train_bc._assert_checkout_runtime_binding()

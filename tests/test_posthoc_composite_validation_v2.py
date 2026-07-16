@@ -210,6 +210,15 @@ def test_run_rescore_is_read_only_and_emits_natural_v2(
         "_action_catalog_for_env_config",
         lambda config: action_catalog,
     )
+    action_types = ("ROLL", "END_TURN", "BUILD_ROAD")
+    monkeypatch.setattr(
+        posthoc.train_bc,
+        "_action_catalog_type_projection",
+        lambda catalog, weights: (
+            np.ones(len(action_types), dtype=np.float64),
+            action_types,
+        ),
+    )
     value_scope_calls = []
     monkeypatch.setattr(
         posthoc.train_bc,
@@ -270,9 +279,9 @@ def test_run_rescore_is_read_only_and_emits_natural_v2(
     )
     assert all(
         call["scalar_value_objective"] == "mse"
-        and
-        call["scalar_value_loss_readout"] == "deployed_tanh"
+        and call["scalar_value_loss_readout"] == "deployed_tanh"
         and call["scalar_value_loss_scale"] == 1.5
+        and call["value_validation_action_types_by_id"] == action_types
         for call in evaluate_calls
     )
     assert result["scalar_value_loss_contract"] == {

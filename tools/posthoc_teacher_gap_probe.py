@@ -562,6 +562,24 @@ def _forced_row_value_recipe(
     return weights, train_bc._action_catalog_for_env_config(env_config)
 
 
+def _value_validation_action_types_by_id(
+    train_bc, report: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """Rebuild the authoritative action-type catalog used by value strata."""
+
+    graph_history_features = _required(report, "graph_history_features")
+    if type(graph_history_features) is not bool:  # noqa: E721
+        raise SystemExit("training report 'graph_history_features' must be a boolean")
+    env_config = train_bc.parse_track(
+        str(_required(report, "track")),
+        vps_to_win=int(_required(report, "vps_to_win")),
+        use_graph_history_features=graph_history_features,
+    )
+    action_catalog = train_bc._action_catalog_for_env_config(env_config)
+    _, action_types = train_bc._action_catalog_type_projection(action_catalog, {})
+    return action_types
+
+
 def _scope_identity(data, report: Mapping[str, Any]) -> dict[str, Any]:
     """Bind the component eligibility actually reconstructed by the probe."""
 
@@ -790,6 +808,9 @@ def _prepare_probe(
     forced_type_weights, forced_action_catalog = _forced_row_value_recipe(
         train_bc, report
     )
+    value_validation_action_types_by_id = _value_validation_action_types_by_id(
+        train_bc, report
+    )
     value_weights = train_bc.build_value_sample_weights(
         data,
         phase_weights=_weight_map(
@@ -883,6 +904,9 @@ def _prepare_probe(
         "award_contract": award_contract,
         "objective_reconstruction": objective_reconstruction,
         "policy_teacher_gap_objective": policy_teacher_gap_objective,
+        "value_validation_action_types_by_id": (
+            value_validation_action_types_by_id
+        ),
         "scalar_value_objective": scalar_objective,
         "scalar_value_loss_readout": scalar_readout,
         "scalar_value_loss_scale": scalar_scale,
@@ -1053,6 +1077,9 @@ def _evaluate_policy_metrics(
         scalar_value_objective=str(prepared["scalar_value_objective"]),
         scalar_value_loss_readout=str(prepared["scalar_value_loss_readout"]),
         scalar_value_loss_scale=float(prepared["scalar_value_loss_scale"]),
+        value_validation_action_types_by_id=tuple(
+            prepared["value_validation_action_types_by_id"]
+        ),
     )
     policy_aux = prepared.get("policy_aux_validation")
     if policy_aux is None:
@@ -1103,6 +1130,9 @@ def _evaluate_policy_metrics(
             scalar_value_objective=str(prepared["scalar_value_objective"]),
             scalar_value_loss_readout=str(prepared["scalar_value_loss_readout"]),
             scalar_value_loss_scale=float(prepared["scalar_value_loss_scale"]),
+            value_validation_action_types_by_id=tuple(
+                prepared["value_validation_action_types_by_id"]
+            ),
         )
         combined = train_bc._combine_policy_aux_validation_metrics(
             base_metrics,
