@@ -8,6 +8,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
 use std::f64;
+use std::ops::Index;
 
 use catanatron_rs::{
     execute_spectrum, generate_playable_actions, spectrum_probabilities, starting_devcard_bank,
@@ -378,6 +379,82 @@ struct ActionStats {
     afterstate_value: Option<f64>,
 }
 
+/// Dense local-action storage.
+///
+/// Every node's action keys are the contiguous local indices
+/// `0..playable_actions.len()`. A `HashMap<usize, _>` therefore paid hashing,
+/// one allocation per map, and pointer-heavy iteration without representing
+/// any sparsity. Keep the small map-like surface used by search while storing
+/// values contiguously. This is an implementation-only change: insertion and
+/// iteration order remain the canonical playable-action order.
+#[derive(Clone, Debug, Default)]
+struct DenseActionMap<T>(Vec<T>);
+
+impl<T> DenseActionMap<T> {
+    #[inline]
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    fn insert(&mut self, key: usize, value: T) {
+        if key == self.0.len() {
+            self.0.push(value);
+        } else if let Some(slot) = self.0.get_mut(key) {
+            *slot = value;
+        } else {
+            panic!(
+                "dense action insertion must be contiguous: key={key} len={}",
+                self.0.len()
+            );
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: &usize) -> Option<&T> {
+        self.0.get(*key)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, key: &usize) -> Option<&mut T> {
+        self.0.get_mut(*key)
+    }
+
+    #[inline]
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.0.iter()
+    }
+
+    #[inline]
+    fn keys(&self) -> impl Iterator<Item = usize> {
+        0..self.0.len()
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.0.iter().enumerate()
+    }
+}
+
+impl<T> Index<&usize> for DenseActionMap<T> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, index: &usize) -> &Self::Output {
+        &self.0[*index]
+    }
+}
+
 impl ActionStats {
     fn new(prior: f64) -> Self {
         Self {
@@ -427,8 +504,8 @@ struct Node {
     prior_uncertainty: f64,
     visits: i32,
     value_sum: f64,
-    actions: HashMap<usize, ActionStats>,
-    action_logits: HashMap<usize, f64>,
+    actions: DenseActionMap<ActionStats>,
+    action_logits: DenseActionMap<f64>,
     playable_actions: Vec<Action>,
     expanded: bool,
 }
@@ -442,8 +519,8 @@ impl Node {
             prior_uncertainty: 0.0,
             visits: 0,
             value_sum: 0.0,
-            actions: HashMap::new(),
-            action_logits: HashMap::new(),
+            actions: DenseActionMap::new(),
+            action_logits: DenseActionMap::new(),
             playable_actions: Vec::new(),
             expanded: false,
         }
@@ -654,7 +731,7 @@ impl GumbelMctsEngine {
         let local_visit_counts: Vec<_> = root
             .actions
             .iter()
-            .map(|(&local, stats)| (local, stats.visits))
+            .map(|(local, stats)| (local, stats.visits))
             .collect();
         let mut visit_counts: Vec<_> = local_visit_counts
             .iter()
@@ -664,21 +741,22 @@ impl GumbelMctsEngine {
             .actions
             .iter()
             .filter(|(_, s)| s.visits > 0)
-            .map(|(&i, s)| Ok((to_global(i)?, s.q())))
+            .map(|(i, s)| Ok((to_global(i)?, s.q())))
             .collect::<Result<_, String>>()?;
         let mut priors: Vec<_> = root
             .actions
             .iter()
-            .map(|(&i, s)| Ok((to_global(i)?, s.prior)))
+            .map(|(i, s)| Ok((to_global(i)?, s.prior)))
             .collect::<Result<_, String>>()?;
         let mut completed_q_values: Vec<_> = completed_q
             .iter()
-            .map(|(&local, value)| Ok((to_global(local)?, *value)))
+            .enumerate()
+            .map(|(local, value)| Ok((to_global(local)?, *value)))
             .collect::<Result<_, String>>()?;
         let mut afterstate_values: Vec<_> = root
             .actions
             .iter()
-            .filter_map(|(&i, s)| s.afterstate_value.map(|v| Ok((to_global(i)?, v))))
+            .filter_map(|(i, s)| s.afterstate_value.map(|v| Ok((to_global(i)?, v))))
             .collect::<Result<_, String>>()?;
 
         let selected = if self.config.play_sh_winner {
@@ -860,15 +938,14 @@ impl GumbelMctsEngine {
         n_simulations: i32,
         evaluator: &mut E,
     ) -> Result<(usize, i32), String> {
-        let mut legal: Vec<usize> = arena.get(root_idx).actions.keys().copied().collect();
-        legal.sort_unstable();
+        let legal: Vec<usize> = arena.get(root_idx).actions.keys().collect();
         let num_legal = legal.len();
         let m = self.root_candidate_count(num_legal);
         let mut gumbel: HashMap<usize, f64> = HashMap::new();
         for &aid in &legal {
             gumbel.insert(aid, self.sample_gumbel());
         }
-        let logits: HashMap<usize, f64> = arena.get(root_idx).action_logits.clone();
+        let logits = arena.get(root_idx).action_logits.clone();
         let mut top_k: Vec<usize> = legal.clone();
         top_k.sort_by(|&a, &b| {
             let sa = gumbel[&a] + logits.get(&a).copied().unwrap_or(0.0);
@@ -896,7 +973,7 @@ impl GumbelMctsEngine {
                 visit = rerank_candidates(visit, |action| {
                     gumbel[&action]
                         + logits.get(&action).copied().unwrap_or(0.0)
-                        + scale * rq.get(&action).copied().unwrap_or(0.0)
+                        + scale * rq.get(action).copied().unwrap_or(0.0)
                 });
                 // Exact-budget phases eliminate candidates just like the
                 // reference SH operator. Sorting the old full `remaining`
@@ -921,10 +998,10 @@ impl GumbelMctsEngine {
             remaining.sort_by(|&a, &b| {
                 let sa = gumbel[&a]
                     + logits.get(&a).copied().unwrap_or(0.0)
-                    + scale * rq.get(&a).copied().unwrap_or(0.0);
+                    + scale * rq.get(a).copied().unwrap_or(0.0);
                 let sb = gumbel[&b]
                     + logits.get(&b).copied().unwrap_or(0.0)
-                    + scale * rq.get(&b).copied().unwrap_or(0.0);
+                    + scale * rq.get(b).copied().unwrap_or(0.0);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
             remaining.truncate((count / 2).max(1) as usize);
@@ -1335,12 +1412,7 @@ impl GumbelMctsEngine {
         )
     }
 
-    fn completed_q(
-        &self,
-        arena: &Arena,
-        node_idx: usize,
-        root_color: Color,
-    ) -> HashMap<usize, f64> {
+    fn completed_q(&self, arena: &Arena, node_idx: usize, root_color: Color) -> Vec<f64> {
         let node = arena.get(node_idx);
         let root_to_act = node.game.state.current_color() == root_color;
         let sign = if root_to_act { 1.0 } else { -1.0 };
@@ -1348,9 +1420,7 @@ impl GumbelMctsEngine {
         let total_child_visits: i32 = node.actions.values().map(|s| s.visits).sum();
         let mut visited_prior_sum = 0.0;
         let mut visited_q_sum = 0.0;
-        let mut action_ids = node.actions.keys().copied().collect::<Vec<_>>();
-        action_ids.sort_unstable();
-        for action_id in action_ids {
+        for action_id in node.actions.keys() {
             let stats = &node.actions[&action_id];
             if stats.visits > 0 {
                 visited_prior_sum += stats.prior;
@@ -1370,17 +1440,17 @@ impl GumbelMctsEngine {
         let node_value = sign * node.prior_value;
         let v_mix = (node_value + total_child_visits as f64 * weighted_q)
             / (1.0 + total_child_visits as f64);
-        let mut completed: HashMap<usize, f64> = HashMap::new();
-        for (&aid, stats) in &node.actions {
+        let mut completed = Vec::with_capacity(node.actions.0.len());
+        for (_aid, stats) in node.actions.iter() {
             if stats.visits > 0 {
                 let q = if use_weighted {
                     stats.weighted_q()
                 } else {
                     stats.q()
                 };
-                completed.insert(aid, sign * q);
+                completed.push(sign * q);
             } else {
-                completed.insert(aid, v_mix);
+                completed.push(v_mix);
             }
         }
         if self.config.variance_aware_q {
@@ -1393,21 +1463,20 @@ impl GumbelMctsEngine {
         &self,
         arena: &Arena,
         node_idx: usize,
-        completed: &mut HashMap<usize, f64>,
+        completed: &mut [f64],
         v_mix: f64,
     ) {
         let node = arena.get(node_idx);
-        let mut visited: Vec<(usize, &ActionStats)> = node
+        let visited: Vec<(usize, &ActionStats)> = node
             .actions
             .iter()
             .filter(|(_, s)| s.visits > 0)
-            .map(|(&k, v)| (k, v))
+            .map(|(k, v)| (k, v))
             .collect();
-        visited.sort_unstable_by_key(|(action_id, _)| *action_id);
         if visited.len() < 2 {
             return;
         }
-        let visited_qs: Vec<f64> = visited.iter().map(|(id, _)| completed[id]).collect();
+        let visited_qs: Vec<f64> = visited.iter().map(|(id, _)| completed[*id]).collect();
         let mean_q: f64 = visited_qs.iter().sum::<f64>() / visited_qs.len() as f64;
         let signal_var: f64 =
             visited_qs.iter().map(|q| (q - mean_q).powi(2)).sum::<f64>() / visited_qs.len() as f64;
@@ -1422,36 +1491,36 @@ impl GumbelMctsEngine {
             let mean_se_sq: f64 = se_sqs.iter().sum::<f64>() / se_sqs.len() as f64;
             let lam = signal_var / (signal_var + mean_se_sq);
             for (id, _) in &visited {
-                let q = completed[id];
-                completed.insert(*id, v_mix + lam * (q - v_mix));
+                let q = completed[*id];
+                completed[*id] = v_mix + lam * (q - v_mix);
             }
         } else {
             let k = self.config.variance_aware_k;
             for (id, stats) in &visited {
                 let se_sq = stats.q_variance() / stats.visits as f64;
                 let shrink = signal_var / (signal_var + k * se_sq);
-                let q = completed[id];
-                completed.insert(*id, v_mix + shrink * (q - v_mix));
+                let q = completed[*id];
+                completed[*id] = v_mix + shrink * (q - v_mix);
             }
         }
     }
 
-    fn rescale_completed_q(&self, cq: &HashMap<usize, f64>) -> HashMap<usize, f64> {
+    fn rescale_completed_q(&self, cq: &[f64]) -> Vec<f64> {
         if cq.is_empty() {
-            return HashMap::new();
+            return Vec::new();
         }
-        let min_q = cq.values().fold(f64::INFINITY, |a, &b| a.min(b));
-        let max_q = cq.values().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let min_q = cq.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let max_q = cq.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
         let denom = (max_q - min_q) + 1e-8;
-        cq.iter().map(|(&k, &v)| (k, (v - min_q) / denom)).collect()
+        cq.iter().map(|&value| (value - min_q) / denom).collect()
     }
 
     fn rescaled_completed_q_with_noise(
         &self,
         arena: &Arena,
         node_idx: usize,
-        cq: &HashMap<usize, f64>,
-    ) -> HashMap<usize, f64> {
+        cq: &[f64],
+    ) -> Vec<f64> {
         let rescaled = self.rescale_completed_q(cq);
         self.apply_noise_floor(arena, node_idx, cq, &rescaled)
     }
@@ -1460,22 +1529,21 @@ impl GumbelMctsEngine {
         &self,
         arena: &Arena,
         node_idx: usize,
-        cq: &HashMap<usize, f64>,
-        rescaled: &HashMap<usize, f64>,
-    ) -> HashMap<usize, f64> {
+        cq: &[f64],
+        rescaled: &[f64],
+    ) -> Vec<f64> {
         let c = self.config.rescale_noise_floor_c;
         if c <= 0.0 || rescaled.is_empty() {
-            return rescaled.clone();
+            return rescaled.to_vec();
         }
         if self.config.rescale_noise_floor_initial_road_only
             && (node_idx != 0
                 || self.config.attested_root_phase.as_deref() != Some("BUILD_INITIAL_ROAD"))
         {
-            return rescaled.clone();
+            return rescaled.to_vec();
         }
-        let values: Vec<f64> = cq.values().copied().collect();
-        let raw_spread = values.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b))
-            - values.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let raw_spread = cq.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b))
+            - cq.iter().fold(f64::INFINITY, |a, &b| a.min(b));
         let visits: Vec<i32> = arena
             .get(node_idx)
             .actions
@@ -1500,29 +1568,23 @@ impl GumbelMctsEngine {
         };
         rescaled
             .iter()
-            .map(|(&k, &v)| (k, 0.5 + alpha * (v - 0.5)))
+            .map(|&value| 0.5 + alpha * (value - 0.5))
             .collect()
     }
 
-    fn improved_policy(
-        &self,
-        arena: &Arena,
-        node_idx: usize,
-        cq: &HashMap<usize, f64>,
-    ) -> Vec<(usize, f64)> {
+    fn improved_policy(&self, arena: &Arena, node_idx: usize, cq: &[f64]) -> Vec<(usize, f64)> {
         let scale = self.sigma_scale(arena, node_idx);
         let rq = self.rescaled_completed_q_with_noise(arena, node_idx, cq);
         let node = arena.get(node_idx);
         let mut scores: Vec<(usize, f64)> = node
             .actions
             .keys()
-            .map(|&aid| {
+            .map(|aid| {
                 let logit = node.action_logits.get(&aid).copied().unwrap_or(0.0);
-                let rqv = rq.get(&aid).copied().unwrap_or(0.0);
+                let rqv = rq.get(aid).copied().unwrap_or(0.0);
                 (aid, logit + scale * rqv)
             })
             .collect();
-        scores.sort_unstable_by_key(|(action_id, _)| *action_id);
         let max_score = scores.iter().fold(f64::NEG_INFINITY, |a, &(_, b)| a.max(b));
         for (_, s) in scores.iter_mut() {
             *s = ((*s - max_score).clamp(-40.0, 40.0)).exp();
@@ -1741,7 +1803,7 @@ impl GumbelMctsEngine {
             .get(root_idx)
             .actions
             .iter()
-            .map(|(&local, stats)| Ok((self.action_ids(&legal[local..=local])?[0], stats.prior)))
+            .map(|(local, stats)| Ok((self.action_ids(&legal[local..=local])?[0], stats.prior)))
             .collect::<Result<_, String>>()?;
         priors_vec.sort_unstable_by_key(|(action, _)| *action);
         if priors_vec.is_empty() {
@@ -1977,7 +2039,7 @@ mod tests {
         let interior_idx = arena.alloc(node);
         assert_eq!(root_idx, 0);
         assert_eq!(interior_idx, 1);
-        let completed_q = HashMap::from([(0, 0.400004), (1, 0.399996)]);
+        let completed_q = vec![0.400004, 0.399996];
 
         let plain =
             GumbelMctsEngine::new(SearchConfig::default()).rescale_completed_q(&completed_q);

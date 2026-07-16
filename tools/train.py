@@ -33,13 +33,16 @@ from catan_zero.rl.pipeline_configs import (  # noqa: E402
 
 CANONICAL_TRAIN_LAUNCH_SCHEMA = 1
 CANONICAL_CONFIG_SHA256 = (
-    "e31e2fab6467530a1f057d5e0c05d28dc1b0c96d8e2d76fec477d0bd209559d3"
+    "a93c4ca95c62bade6955bdfccdf716ccd965223a40bf0fe6d64ab1426f8123ae"
 )
 _ENGINE_SETTING_KEYS = frozenset(
     {
         "base_sampler",
         "checkpoint_steps",
+        "data_loader_prefetch",
+        "data_loader_workers",
         "entity_feature_adapter_version",
+        "initialization_mode",
         "minimum_feature_learning_signal_observations",
         "objective_gradient_interference_every_batches",
         "public_rule_state_features",
@@ -145,6 +148,17 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
     unknown = sorted(set(engine) - _ENGINE_SETTING_KEYS)
     if unknown:
         raise SystemExit(f"unknown canonical engine setting(s): {unknown}")
+    for name, minimum in (
+        ("data_loader_workers", 0),
+        ("data_loader_prefetch", 1),
+    ):
+        if name not in engine:
+            continue
+        value = engine[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise SystemExit(
+                f"canonical engine setting {name} must be an integer >= {minimum}"
+            )
     return config, dict(engine)
 
 
@@ -218,6 +232,37 @@ def _engine_namespace(
     }
     args = _engine_default_namespace(internal_parser)
     settings = dict(config.field_values())
+    engine_settings = dict(engine_settings)
+    initialization_mode = str(
+        engine_settings.pop("initialization_mode", "") or ""
+    )
+    if initialization_mode not in {
+        "scratch_fresh_optimizer",
+        "parent_fresh_optimizer",
+    }:
+        raise SystemExit(
+            "canonical train recipe must bind initialization_mode to "
+            "scratch_fresh_optimizer or parent_fresh_optimizer"
+        )
+    requested_parent = str(public_args.init_checkpoint or config.init_checkpoint or "")
+    requested_growth = str(config.grow_from_checkpoint or "")
+    if initialization_mode == "scratch_fresh_optimizer":
+        if requested_parent or requested_growth or bool(config.resume_optimizer):
+            raise SystemExit(
+                "scratch_fresh_optimizer recipe forbids parent/grow checkpoints "
+                "and optimizer resume; use a distinct parent recipe instead of "
+                "silently changing the experiment initializer"
+            )
+    elif not requested_parent:
+        raise SystemExit(
+            "parent_fresh_optimizer recipe requires --init-checkpoint (or a "
+            "recipe-bound init_checkpoint)"
+        )
+    elif requested_growth or bool(config.resume_optimizer):
+        raise SystemExit(
+            "parent_fresh_optimizer requires an exact parent checkpoint and fresh "
+            "optimizer; grow-from and optimizer resume are different experiments"
+        )
     settings.update(engine_settings)
     settings.update(
         {

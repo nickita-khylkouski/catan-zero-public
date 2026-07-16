@@ -41,10 +41,10 @@
 - **How it's used here:** Self-play decisions are emitted as NPZ shards and converted to streaming memmap corpora for large training runs.
 - **What you need to follow:** Preserve schema/provenance fields, group validation by whole game seed, and use fresh output directories.
 
-### `multiprocessing` + native/MPS inference
+### `multiprocessing` + native/EvalServer inference
 - **Category:** Parallel inference
-- **How it's used here:** Independent game workers retain CPU parallelism. Native Rust search and feature construction feed CUDA inference; the current generator supports direct per-process CUDA/MPS operation and retains EvalServer as a measured batching alternative.
-- **What you need to follow:** One generator belongs to one physical GPU. Native feature construction is the default. Do not silently return to the Python/JSON feature path.
+- **How it's used here:** Independent game workers retain CPU parallelism. Native Rust search and feature construction feed one strict-FP32 EvalServer per GPU, which batches leaf rows across workers. The retained n128 topology uses immediate queue draining, a 96-request cap, and the ordinary multiprocessing queue transport.
+- **What you need to follow:** One generator and one EvalServer belong to one physical GPU. Native feature construction is the default. Do not silently return to the Python/JSON feature path, TF32, CUDA Graph padding, or the slower shared-memory transport.
 
 ### Explicit local/cluster verification
 - **Category:** Verification
@@ -70,6 +70,7 @@ Fleet launcher
   → multiprocessing game workers
   → catanatron_rs.Game + native Gumbel MCTS
   → native entity/context features
+  → one cross-worker EvalServer per GPU
   → batched EntityGraphPolicy forward
   → NPZ decision shards
   → curated memmap corpus
@@ -145,6 +146,7 @@ Fleet launcher
   - `perf_snapshot.py` and `bench_eval_server.py` — standing performance probes.
 - **Connects to:** Every package module and filesystem artifact contract.
 - **Contribute here if:** Work changes an end-to-end experiment or deployment workflow.
+- **Training input path:** The canonical B200 recipe overlaps memmap reconstruction with GPU work using four materialization threads and a four-batch bounded prefetch window. The epoch iterator must remain lazy; rebuilding every batch-index array duplicates the complete row order on every DDP rank.
 
 ### `/tools/fleet`
 - **Owns:** Alias-based host resolution and guarded launch/stop/status operations.
@@ -186,10 +188,10 @@ Fleet launcher
 - **If wrong →** Audit the checkpoint loader and current training save metadata.
 - **Verify:** `src/catan_zero/search/neural_rust_mcts.py` and `src/catan_zero/rl/entity_token_policy.py`
 
-### [HIGH CONFIDENCE] EvalServer is not the current sealed default
-- **Status:** Retired assumption.
-- **Current evidence:** Production generation has used direct per-GPU MPS workers; EvalServer remains available but is not the current sealed default.
-- **Action:** Read the current operation contract before changing inference topology.
+### [HIGH CONFIDENCE] EvalServer is the canonical config-first generation path
+- **Evidence:** The canonical generation config selects strict-FP32 EvalServer batching with a 96-request cap, immediate draining, and the request collector. Historical paired H100 evidence measured 155,619 versus 87,742 rows/hour for EvalServer versus local evaluators.
+- **If correct →** Keep one server per physical GPU and size workers by host CPU topology; an eight-GPU host cannot blindly reuse a four-GPU host's total process count.
+- **Verify:** `configs/generation/coherent_public_n128.schema17.json`, `tools/generate.py`, and `docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md`.
 
 ### [HIGH CONFIDENCE] Native feature construction is the current default
 - **Evidence:** The canonical generation/evaluation configs and evaluator dataclass select Rust features. Accepted B200 evidence measures neural forward at 3.726 ms of a 4.500 ms native-feature leaf, or 82.8%.
@@ -207,6 +209,11 @@ Fleet launcher
 - **If correct →** Do not interpret a plan receipt as a runnable flywheel turn.
 - **Verify:** `configs/operations/a1-next-wave-coherent-public-v3/science.contract.json` and `tools/a1_scratch_train.py`.
 
+### [HIGH CONFIDENCE] Scratch and parent-update learners are different experiments
+- **Evidence:** The compact trainer now requires an explicit `initialization_mode`. The checked-in native-v5 recipe binds `scratch_fresh_optimizer` and rejects parent/grow checkpoints or restored optimizer state.
+- **If correct →** Never copy the measured 32-step checkpoint-initialized frontier into the fresh 41.7M-parameter scratch recipe. Create a separate parent recipe with exact parent bytes and fresh Adam.
+- **Verify:** `tools/train.py`, `configs/training/a1_current_35m_b200.schema1.json`, and `docs/evidence/A1_COHERENT_DOSE_FRONTIER_20260716.json`.
+
 ### [HIGH CONFIDENCE] Checked-in fleet manifests are historical, not live authority
 - **Evidence:** The previous H100 fleet has been archived and at least one accepted alias points at a host not owned by this project.
 - **If correct →** Require a fresh private owner-attested inventory before any generation/evaluation fan-out.
@@ -220,11 +227,14 @@ Fleet launcher
 1. **Performance-only versus search-semantic changes** — only the former can use parity alone; the latter need paired strength gates.
 2. **Config-first production configuration** — masking, search, architecture, optimizer, and feature settings live in complete checked-in typed configs. The public CLI is only run identity and placement.
 3. **One owner and one canonical path per box** — use alias-based fleet tools, fresh outputs, explicit PIDs, and heartbeat supervision.
+4. **Objective signal is not aggregate loss** — forced one-action rows have zero policy mass but retain value supervision; checkpoint selection uses the measured playing-strength frontier, not monotonic teacher closure.
 
 ### Common Mistakes to Avoid
 - ❌ Expose several GPUs to one `--device cuda` generator → ✅ launch one generator/eval-server per physical GPU.
 - ❌ Multiply seed claims by worker count → ✅ workers partition `--games`; claim games per GPU only.
 - ❌ Treat more correlated rows as more value labels → ✅ measure independent game outcomes and group validation by game.
+- ❌ Chain a candidate into the next learner arm → ✅ independently reload the exact declared parent with fresh optimizer state.
+- ❌ Downweight turn-boundary value rows by default → ✅ retain full `ROLL`/`END_TURN` value weight until a phase-calibrated ablation proves otherwise.
 - ❌ Apply the archived optimization patch bundle wholesale → ✅ land individually tested changes with current-stack benchmarks.
 - ❌ Claim the four-player benchmark from two-player results → ✅ keep separate powered evaluation milestones.
 

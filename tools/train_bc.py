@@ -25381,35 +25381,45 @@ def _iterate_training_batches(
     Threads (not processes) share the read-only memmaps safely and avoid the
     fork-duplication pitfall of DataLoader workers.
     """
-    batches = [
-        train_indices[order[start : start + batch_size]]
-        for start in range(0, len(order), batch_size)
-    ]
-    batches = [b for b in batches if len(b) > 0]
+    # Do not eagerly construct one NumPy array per batch.  On a multi-million
+    # row corpus that duplicated the complete epoch index stream and retained
+    # tens of thousands of tiny arrays on every DDP rank before the first GPU
+    # step.  Resolve only the bounded synchronous/current-prefetch window.
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    num_batches = (len(order) + batch_size - 1) // batch_size
 
-    aux_batches: list[np.ndarray] | None = None
+    def _batch_at(index: int) -> np.ndarray:
+        start = index * batch_size
+        stop = min(start + batch_size, len(order))
+        return train_indices[order[start:stop]]
+
     if policy_aux_rows is not None:
         aux_rows = np.asarray(policy_aux_rows, dtype=np.int64)
         aux_size = int(policy_aux_batch_size)
         if aux_size <= 0 or aux_rows.ndim != 1:
             raise RuntimeError("policy auxiliary prefetch shape is invalid")
-        expected = len(batches) * aux_size
+        expected = num_batches * aux_size
         if len(aux_rows) != expected:
             raise RuntimeError(
                 "policy auxiliary draw dose drift: "
                 f"rows={len(aux_rows)} expected={expected}"
             )
-        aux_batches = [
-            aux_rows[start : start + aux_size]
-            for start in range(0, len(aux_rows), aux_size)
-        ]
+
+        def _aux_batch_at(index: int) -> np.ndarray:
+            start = index * aux_size
+            return aux_rows[start : start + aux_size]
+    else:
+        _aux_batch_at = None
 
     if num_workers <= 0 or not isinstance(data, (MemmapCorpus, ConcatMemmapCorpus)):
-        for index, batch in enumerate(batches):
-            if aux_batches is None:
+        for index in range(num_batches):
+            batch = _batch_at(index)
+            if _aux_batch_at is None:
                 yield data, batch, policy_sample_weights, value_sample_weights
             else:
-                aux_batch = aux_batches[index]
+                aux_batch = _aux_batch_at(index)
                 yield (
                     data,
                     batch,
@@ -25524,23 +25534,23 @@ def _iterate_training_batches(
     with ThreadPoolExecutor(max_workers=int(num_workers)) as executor:
         pending: deque = deque()
         next_index = 0
-        while next_index < len(batches) and len(pending) < prefetch:
+        while next_index < num_batches and len(pending) < prefetch:
             pending.append(
                 executor.submit(
                     _materialize,
-                    batches[next_index],
-                    None if aux_batches is None else aux_batches[next_index],
+                    _batch_at(next_index),
+                    None if _aux_batch_at is None else _aux_batch_at(next_index),
                 )
             )
             next_index += 1
         while pending:
             future = pending.popleft()
-            if next_index < len(batches):
+            if next_index < num_batches:
                 pending.append(
                     executor.submit(
                         _materialize,
-                        batches[next_index],
-                        None if aux_batches is None else aux_batches[next_index],
+                        _batch_at(next_index),
+                        None if _aux_batch_at is None else _aux_batch_at(next_index),
                     )
                 )
                 next_index += 1

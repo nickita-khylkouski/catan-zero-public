@@ -23,9 +23,12 @@ for import_root in (REPO_ROOT, SRC_ROOT):
         sys.path.remove(str(import_root))
     sys.path.insert(0, str(import_root))
 
-from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION, GenerateConfig
+from catan_zero.rl.pipeline_configs import (  # noqa: E402
+    CONFIG_SCHEMA_VERSION,
+    GenerateConfig,
+)
 
-from generate_gumbel_selfplay_data import main as _legacy_executor_main
+from generate_gumbel_selfplay_data import main as _legacy_executor_main  # noqa: E402
 
 
 CANONICAL_OPTION_COUNT = 9
@@ -87,6 +90,20 @@ REQUIRED_SCIENCE_FIELDS = {
     "wide_candidates_threshold": 24,
     "native_mcts_hot_loop": True,
     "rust_featurize": True,
+    # Retained H100 frontier: one strict-FP32 policy process batches leaves
+    # across game workers. TF32, CUDA graphs, and shared-memory transport were
+    # all measured and rejected. Do not set event_token_limit=0 here: unlike
+    # the historical empty-event checkpoint, the canonical learner consumes
+    # meaningful public history.
+    "eval_server": True,
+    "eval_server_max_batch": 96,
+    "eval_server_max_wait_ms": 0.0,
+    "eval_server_matmul_precision": "highest",
+    "eval_server_request_collector": True,
+    "eval_server_transport": "mp_queue",
+    "eval_server_event_token_limit": None,
+    "eval_server_cuda_graph": False,
+    "eval_server_local_fallback": False,
     "record_automatic_transitions": True,
     "meaningful_public_history": True,
     "event_history_limit": 64,
@@ -114,7 +131,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--games", type=int, required=True)
-    parser.add_argument("--workers", type=int, required=True)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Placement override; defaults to the config's commissioned 128 "
+            "cross-game EvalServer workers."
+        ),
+    )
     parser.add_argument("--base-seed", type=int, required=True)
     parser.add_argument("--claim-label", required=True)
     parser.add_argument(
@@ -182,8 +207,6 @@ def _executor_argv(args: argparse.Namespace) -> list[str]:
         str(output),
         "--games",
         str(args.games),
-        "--workers",
-        str(args.workers),
         "--base-seed",
         str(args.base_seed),
         "--ledger-claim-label",
@@ -193,6 +216,8 @@ def _executor_argv(args: argparse.Namespace) -> list[str]:
         "--config-purpose",
         args.config.stem,
     ]
+    if args.workers is not None:
+        forwarded.extend(("--workers", str(args.workers)))
     if args.resume:
         forwarded.append("--resume")
     return forwarded
@@ -210,7 +235,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("canonical generation CLI exceeded its ten-option budget")
     if args.games < 1:
         parser.error("--games must be positive")
-    if args.workers < 1:
+    if args.workers is not None and args.workers < 1:
         parser.error("--workers must be positive")
     if args.base_seed < 0:
         parser.error("--base-seed must be non-negative")
