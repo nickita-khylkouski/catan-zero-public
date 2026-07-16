@@ -133,8 +133,12 @@ Use an ordered causal encoder or recurrent state. Do not mean-pool away order.
 
 ## W4: value repair
 
-The control restores `ROLL` and `END_TURN` value weights to `1.0`. Policy weight
-remains zero on single-action prompts.
+Policy weight remains zero on single-action prompts. The commissioned scratch
+recipe retains `ROLL` value weight at `1.0`, because opponent-turn search
+queries the pre-roll boundary, while forced `END_TURN` receives `0.1`, because
+interior search advances through that mechanical transition before querying
+the value network. This replaces the earlier blanket `1.0/1.0` control after
+the native search-consumption audit separated the two roles.
 
 Compare independent arms:
 

@@ -27,23 +27,21 @@ production learner. The full retrain must construct a native v5 model rather
 than relabeling or resuming a v2/v3 checkpoint.
 
 The same authority now binds the fresh model construction and physical
-execution separately from the logical 4096-row dose. The model enables both
+execution separately from the logical 512-row global batch. The model enables both
 structured-action residual paths, public-card counts, and ordered meaningful
 public history with target-entity gather at construction time. History is
 retained at the adapter-v5 cap of 64 events. Execution is exactly 8 B200 ranks
-× 512 rows × one accumulation step; no launcher may reinterpret the logical
-`1 × 4096` recipe as an arbitrary topology.
+× 64 rows × one accumulation step; no launcher may reinterpret the logical
+global batch of 512 as an arbitrary topology.
 
 `tools/a1_scratch_train.py` authenticates the admitted post-wave composite and
 renders the exact native-v5, bias-free 35M command plus a digest-bound planning
-receipt. It is intentionally plan-only today. The current candidate recipe is
-epoch-bound (`epochs=3`, `max_steps=0`) with fresh AdamW, cosine decay, BF16,
-and the sealed symmetry/history relabeling flags, but the execution topology
-still records `optimization_schedule_status=unresolved` and
-`go_authorized=false`. Until a complete scratch-optimizer schedule authority is
-reviewed, the planner exposes no execution switch and `train_bc` rejects its
-child marker before data loading; every planning receipt is diagnostic-only and
-non-promotion-eligible.
+receipt. The current candidate recipe is epoch-bound (`epochs=3`,
+`max_steps=0`) with fresh AdamW, 250-step warmup, cosine decay, BF16, and the
+sealed symmetry/history relabeling flags. The commissioned global batch of 512
+provides roughly eight times as many optimizer updates as the rejected
+fine-tune-sized global batch of 4096. Execution remains receipt- and
+contract-gated.
 
 Generate through the sealed pre-wave control plane. For a direct lane command:
 
@@ -82,7 +80,10 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
 Post-wave admission must prove every worker used teacher v2 and emitted learner
 rows v5, with the legacy `adapter_version` row column equal to the learner
 identity. Forced rows retain `policy_weight_multiplier=0` and
-`value_weight_multiplier=1`; training continues to use equal per-game value mass.
+`value_weight_multiplier=1` in the immutable shard. Training continues to use
+equal per-game value mass, retains forced `ROLL` states at value weight 1.0
+because opponent-turn search evaluates that boundary, and reduces forced
+`END_TURN` states to 0.1 because interior search bypasses that mechanical state.
 
 The five-percent reliability slice is selected by a stable hash of audit seed,
 game seed, and decision index. Its duplicate search uses independent

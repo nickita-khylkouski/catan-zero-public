@@ -156,7 +156,7 @@
         "symmetry_augment_events": true,
       "forced_action_weight": 0.0,
       "forced_row_value_weight": 1.0,
-      "forced_row_value_action_type_weights": "END_TURN=1.0,ROLL=1.0",
+      "forced_row_value_action_type_weights": "END_TURN=0.1,ROLL=1.0",
       "per_game_policy_weight": true,
       "per_game_policy_weight_mode": "equal",
       "training_rng_rank_offset": true,
