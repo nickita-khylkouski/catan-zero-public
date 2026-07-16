@@ -231,6 +231,19 @@ def test_clean_stage_c_recipe_commissions_new_adapters() -> None:
         "meaningful_history_residual_gate",
         "public_card_count_residual",
     }
+    assert campaign.FEATURE_SIGNAL_MODULES == {
+        "event_encoder",
+        "meaningful_history_residual_gate",
+        "public_card_count_residual",
+    }
+    assert campaign.EFFECTIVE_FEATURE_CONTRACT[
+        "meaningful_public_history"
+    ] is True
+    assert (
+        campaign.MINIMUM_FEATURE_SIGNAL_OBSERVATIONS
+        * campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+        == campaign.MAX_STEPS
+    )
     assert train_bc.ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS[
         "public_card_residual"
     ] == ("public_card_count_residual",)

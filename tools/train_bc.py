@@ -26669,6 +26669,9 @@ def _effective_entity_graph_architecture_report(
             "legal_action_value_residual": False,
             "public_card_count_features": False,
             "meaningful_public_history": False,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
             "event_history_limit": 64,
             "meaningful_public_history_pooling": MASKED_MEAN_V1,
             "requested_edge_policy_head": bool(requested_edge_policy_head),
@@ -26707,6 +26710,14 @@ def _effective_entity_graph_architecture_report(
         ),
         "meaningful_public_history": bool(
             getattr(config, "meaningful_public_history", False)
+        ),
+        "meaningful_public_history_schema": str(
+            getattr(
+                config,
+                "meaningful_public_history_schema",
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+            )
+            or MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
         ),
         "event_history_limit": int(
             getattr(config, "event_history_limit", 64) or 0

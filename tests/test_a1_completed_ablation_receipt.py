@@ -14,6 +14,63 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _completed_feature_signal_report() -> dict[str, object]:
+    module_row = {
+        "mean_pre_clip_grad_norm": 0.4,
+        "max_pre_clip_grad_norm": 0.6,
+        "mean_parameter_delta_norm": 0.02,
+        "mean_parameter_update_rms": 0.001,
+        "mean_relative_parameter_delta": 0.03,
+        "parameter_count": 8,
+    }
+    return {
+        **campaign.EFFECTIVE_FEATURE_CONTRACT,
+        "train_diagnostics_every_batches": (campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES),
+        "module_optimizer_observability": {
+            "schema_version": "module-optimizer-observability-v1",
+            "observed_steps": campaign.MINIMUM_FEATURE_SIGNAL_OBSERVATIONS,
+            "cadence_batches": campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES,
+            "norm_scope": "global_replicated",
+            "modules": {
+                module_name: dict(module_row)
+                for module_name in campaign.FEATURE_SIGNAL_MODULES
+            },
+        },
+    }
+
+
+def test_stage_c_feature_learning_signal_is_evidence_backed() -> None:
+    report = _completed_feature_signal_report()
+    campaign._verify_completed_feature_learning_signal(report)  # noqa: SLF001
+
+    disabled = copy.deepcopy(report)
+    disabled["meaningful_public_history"] = False
+    with pytest.raises(campaign.CampaignError, match="feature contract drifted"):
+        campaign._verify_completed_feature_learning_signal(  # noqa: SLF001
+            disabled
+        )
+
+    for module_name in campaign.FEATURE_SIGNAL_MODULES:
+        missing_signal = copy.deepcopy(report)
+        missing_signal["module_optimizer_observability"]["modules"][  # type: ignore[index]
+            module_name
+        ]["mean_parameter_update_rms"] = 0.0
+        with pytest.raises(
+            campaign.CampaignError,
+            match=f"positive commissioned feature.*{module_name}",
+        ):
+            campaign._verify_completed_feature_learning_signal(  # noqa: SLF001
+                missing_signal
+            )
+
+    no_observations = copy.deepcopy(report)
+    no_observations["module_optimizer_observability"] = None
+    with pytest.raises(campaign.CampaignError, match="observation cadence"):
+        campaign._verify_completed_feature_learning_signal(  # noqa: SLF001
+            no_observations
+        )
+
+
 def test_completed_code_binding_authenticates_historical_checkout(
     tmp_path: Path,
 ) -> None:
@@ -96,6 +153,7 @@ def test_stage_c_run_adopts_authenticated_completed_receipt_without_subprocess(
     )
     unique_rows = 128
     report = {
+        **_completed_feature_signal_report(),
         "value_trunk_grad_scale": 0.1,
         "freeze_modules": "",
         "training_information_surface": {},

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+)
 from tools.train_bc import (
     _checkpoint_config_mismatches,
     _effective_entity_graph_architecture_report,
@@ -56,6 +59,34 @@ def test_non_entity_report_preserves_requested_cli_values() -> None:
     assert report["edge_policy_head"] is True
     assert report["aux_subgoal_heads"] is True
     assert report["aux_settlement_pointer_head"] is True
+    assert (
+        report["meaningful_public_history_schema"]
+        == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    )
+
+
+def test_report_binds_effective_meaningful_history_contract() -> None:
+    policy = SimpleNamespace(
+        policy_type="entity_graph",
+        config=SimpleNamespace(
+            public_card_count_features=True,
+            meaningful_public_history=True,
+            meaningful_public_history_schema=(MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION),
+            event_history_limit=32,
+            meaningful_public_history_pooling="masked_mean_v1",
+        ),
+    )
+
+    report = _effective_entity_graph_architecture_report(policy)
+
+    assert report["public_card_count_features"] is True
+    assert report["meaningful_public_history"] is True
+    assert (
+        report["meaningful_public_history_schema"]
+        == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    )
+    assert report["event_history_limit"] == 32
+    assert report["meaningful_public_history_pooling"] == "masked_mean_v1"
 
 
 def test_requested_settlement_pointer_rejects_legacy_warm_start() -> None:

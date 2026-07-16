@@ -31,13 +31,21 @@ for root in (REPO_ROOT, REPO_ROOT / "tools"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+)
+from catan_zero.rl.meaningful_history import (  # noqa: E402
+    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+)
+from catan_zero.rl.ordered_history import MASKED_MEAN_V1  # noqa: E402
 from tools import a1_b200_active_policy_campaign as stage_a  # noqa: E402
 from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
 from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 
 
-SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v3"
+SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v4"
 EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v1"
 FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v2"
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
@@ -59,6 +67,23 @@ ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
 TRAINABLE_ADAPTER_MODULES = frozenset(
     {"meaningful_history_residual_gate", "public_card_count_residual"}
 )
+FEATURE_SIGNAL_MODULES = frozenset({*TRAINABLE_ADAPTER_MODULES, "event_encoder"})
+TRAIN_DIAGNOSTIC_CADENCE_BATCHES = 16
+MINIMUM_FEATURE_SIGNAL_OBSERVATIONS = MAX_STEPS // TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+POSITIVE_OPTIMIZER_SIGNAL_FIELDS = (
+    "mean_pre_clip_grad_norm",
+    "max_pre_clip_grad_norm",
+    "mean_parameter_delta_norm",
+    "mean_parameter_update_rms",
+)
+EFFECTIVE_FEATURE_CONTRACT = {
+    "entity_feature_adapter_version": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    "public_card_count_features": True,
+    "meaningful_public_history": True,
+    "meaningful_public_history_schema": (MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION),
+    "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    "meaningful_public_history_pooling": MASKED_MEAN_V1,
+}
 
 
 class CampaignError(RuntimeError):
@@ -123,6 +148,74 @@ def _load_plan(path: Path) -> tuple[Path, dict[str, Any]]:
     if plan.get("schema_version") != SCHEMA or stated != _value_sha256(unsigned):
         raise CampaignError("Stage-C learner campaign schema/digest drifted")
     return resolved, plan
+
+
+def _verify_completed_feature_learning_signal(
+    report: Mapping[str, Any],
+) -> None:
+    """Require direct evidence that both commissioned feature paths learned."""
+
+    def _integer(value: object, *, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    architecture_drift = {
+        field: {"expected": expected, "actual": report.get(field)}
+        for field, expected in EFFECTIVE_FEATURE_CONTRACT.items()
+        if report.get(field) != expected
+    }
+    if architecture_drift:
+        raise CampaignError(
+            "completed learner effective feature contract drifted: "
+            f"{architecture_drift}"
+        )
+
+    observability = report.get("module_optimizer_observability")
+    if (
+        _integer(report.get("train_diagnostics_every_batches"), default=-1)
+        != TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+        or not isinstance(observability, dict)
+        or observability.get("schema_version") != "module-optimizer-observability-v1"
+        or _integer(observability.get("observed_steps"), default=0)
+        < MINIMUM_FEATURE_SIGNAL_OBSERVATIONS
+        or _integer(observability.get("cadence_batches"), default=-1)
+        != TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+        or observability.get("norm_scope") != "global_replicated"
+    ):
+        raise CampaignError(
+            "completed learner lacks the authenticated feature optimizer "
+            "observation cadence"
+        )
+
+    modules = observability.get("modules")
+    if not isinstance(modules, dict):
+        raise CampaignError("completed learner feature optimizer modules are missing")
+    failures: dict[str, object] = {}
+    for module_name in sorted(FEATURE_SIGNAL_MODULES):
+        row = modules.get(module_name)
+        if not isinstance(row, dict):
+            failures[module_name] = "missing"
+            continue
+        failed_fields = []
+        for field in POSITIVE_OPTIMIZER_SIGNAL_FIELDS:
+            try:
+                value = float(row.get(field, math.nan))
+            except (TypeError, ValueError):
+                value = math.nan
+            if not math.isfinite(value) or value <= 0.0:
+                failed_fields.append(field)
+        parameter_count = _integer(row.get("parameter_count"), default=0)
+        if parameter_count <= 0:
+            failed_fields.append("parameter_count")
+        if failed_fields:
+            failures[module_name] = failed_fields
+    if failures:
+        raise CampaignError(
+            "completed learner did not demonstrate positive commissioned "
+            f"feature gradients and updates: {failures}"
+        )
 
 
 def _recipe() -> dict[str, Any]:
@@ -343,6 +436,17 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "implicit_data_driven_freeze": False,
             "explicit_freeze_modules": "",
         },
+        "feature_learning_signal_contract": {
+            "effective_architecture": dict(EFFECTIVE_FEATURE_CONTRACT),
+            "module_optimizer_observability_schema": (
+                "module-optimizer-observability-v1"
+            ),
+            "norm_scope": "global_replicated",
+            "diagnostic_cadence_batches": TRAIN_DIAGNOSTIC_CADENCE_BATCHES,
+            "minimum_observed_steps": MINIMUM_FEATURE_SIGNAL_OBSERVATIONS,
+            "required_modules": sorted(FEATURE_SIGNAL_MODULES),
+            "required_positive_fields": list(POSITIVE_OPTIMIZER_SIGNAL_FIELDS),
+        },
         "inputs": {
             "python": str(python),
             "one_dose_trainer": str(trainer),
@@ -409,6 +513,7 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
     overlay.verify_overlay_admission(Path(str(inputs["overlay_admission"])))
     recipe = plan.get("recipe", {})
     optimizer_surface = plan.get("optimizer_surface_contract")
+    feature_signal = plan.get("feature_learning_signal_contract")
     if (
         plan.get("arm") not in ARMS
         or float(recipe.get("value_trunk_grad_scale", -1.0)) != 0.1
@@ -422,6 +527,18 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
             "trainable_adapter_modules": sorted(TRAINABLE_ADAPTER_MODULES),
             "implicit_data_driven_freeze": False,
             "explicit_freeze_modules": "",
+        }
+        or feature_signal
+        != {
+            "effective_architecture": dict(EFFECTIVE_FEATURE_CONTRACT),
+            "module_optimizer_observability_schema": (
+                "module-optimizer-observability-v1"
+            ),
+            "norm_scope": "global_replicated",
+            "diagnostic_cadence_batches": (TRAIN_DIAGNOSTIC_CADENCE_BATCHES),
+            "minimum_observed_steps": MINIMUM_FEATURE_SIGNAL_OBSERVATIONS,
+            "required_modules": sorted(FEATURE_SIGNAL_MODULES),
+            "required_positive_fields": list(POSITIVE_OPTIMIZER_SIGNAL_FIELDS),
         }
     ):
         raise CampaignError("Stage-C clean learner semantics drifted")
@@ -471,6 +588,7 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
         raise CampaignError(
             "completed learner did not keep both feature adapters trainable"
         )
+    _verify_completed_feature_learning_signal(report)
     aux_draws = int(report.get("policy_aux_active_rows", -1))
     unique_rows = int(report.get("policy_aux_unique_source_rows", -1))
     expected_aux_draws = POLICY_AUX_ACTIVE_BATCH_SIZE * WORLD_SIZE * MAX_STEPS

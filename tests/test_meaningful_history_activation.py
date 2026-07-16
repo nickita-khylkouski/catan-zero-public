@@ -136,6 +136,7 @@ def test_combined_zero_initialized_adapters_receive_optimizer_signal() -> None:
         parameter.detach().clone()
         for parameter in model.event_encoder.parameters()
     ]
+    event_after_step_one = None
 
     for step in range(2):
         optimizer.zero_grad(set_to_none=True)
@@ -144,25 +145,51 @@ def test_combined_zero_initialized_adapters_receive_optimizer_signal() -> None:
             outputs["logits"], torch.tensor([0, 1])
         ) + outputs["value"].square().mean()
         loss.backward()
+        assert model.meaningful_history_residual_gate.grad is not None
+        assert (
+            model.meaningful_history_residual_gate.grad.abs().sum().item()
+            > 0.0
+        )
+        assert model.public_card_count_residual.weight.grad is not None
+        assert (
+            model.public_card_count_residual.weight.grad.abs().sum().item()
+            > 0.0
+        )
+        event_gradient = sum(
+            float(parameter.grad.detach().square().sum().item())
+            for parameter in model.event_encoder.parameters()
+            if parameter.grad is not None
+        )
         if step == 0:
-            assert model.meaningful_history_residual_gate.grad is not None
-            assert (
-                model.meaningful_history_residual_gate.grad.abs().sum().item()
-                > 0.0
-            )
-            assert model.public_card_count_residual.weight.grad is not None
-            assert (
-                model.public_card_count_residual.weight.grad.abs().sum().item()
-                > 0.0
-            )
+            assert event_gradient == 0.0
+        else:
+            assert event_gradient > 0.0
         optimizer.step()
+        if step == 0:
+            assert not torch.equal(
+                history_before, model.meaningful_history_residual_gate
+            )
+            assert not torch.equal(
+                card_before, model.public_card_count_residual.weight
+            )
+            assert all(
+                torch.equal(before, after)
+                for before, after in zip(
+                    event_before, model.event_encoder.parameters(), strict=True
+                )
+            )
+            event_after_step_one = [
+                parameter.detach().clone()
+                for parameter in model.event_encoder.parameters()
+            ]
 
     assert not torch.equal(history_before, model.meaningful_history_residual_gate)
     assert not torch.equal(card_before, model.public_card_count_residual.weight)
+    assert event_after_step_one is not None
     assert any(
         not torch.equal(before, after)
         for before, after in zip(
-            event_before, model.event_encoder.parameters(), strict=True
+            event_after_step_one, model.event_encoder.parameters(), strict=True
         )
     )
 
