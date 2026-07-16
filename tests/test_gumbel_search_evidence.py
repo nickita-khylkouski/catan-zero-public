@@ -200,6 +200,12 @@ def test_decision_row_preserves_active_search_evidence_in_legal_order(
     monkeypatch.setattr(
         self_play, "rust_policy_action_ids", lambda *_args, **_kwargs: (3, 4)
     )
+    # This test isolates persisted search evidence, not adapter construction.
+    # The canonical learner-feature path now resolves the public adapter once
+    # before calling the two featurizers mocked below.
+    monkeypatch.setattr(
+        self_play, "_resolve_entity_adapter", lambda *_args, **_kwargs: object()
+    )
     monkeypatch.setattr(
         self_play,
         "rust_game_to_entity_batch",

@@ -87,6 +87,9 @@ def test_new_width_controls_are_appended_for_positional_pickle_safety():
         "information_set_target_aggregation",
         "gameplay_policy_aggregation",
         "rescale_noise_floor_initial_road_only",
+        "coherent_public_belief_search",
+        "rng_stream_separation",
+        "boundary_value_particles",
     )
 
 

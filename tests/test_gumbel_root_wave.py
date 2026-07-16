@@ -134,6 +134,12 @@ def _build_search(
     mcts.config = config
     mcts.evaluator = evaluator
     mcts.rng = random.Random(config.seed)
+    # Mirror the constructor's legacy/default stream contract. These tests
+    # deliberately use object.__new__ to avoid the optional Rust-engine guard,
+    # so every constructor-owned RNG alias must be installed by the fixture.
+    mcts._gumbel_rng = mcts.rng
+    mcts._chance_rng = mcts.rng
+    mcts._belief_rng = mcts.rng
     mcts._fetch_legal_actions = lambda game: _context(game, chance=chance)  # type: ignore[method-assign]
 
     root = _GNode(game=_Game(), root_color="RED", expanded=True)
