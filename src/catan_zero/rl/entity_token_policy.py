@@ -1287,10 +1287,10 @@ class EntityGraphNet:
                 if self.legal_action_value_residual_enabled:
                     action_mask = batch.get("legal_action_mask")
                     if action_mask is None:
-                        action_mask = torch.ones(
-                            encoded_actions.shape[:2],
-                            dtype=torch.bool,
-                            device=encoded_actions.device,
+                        raise ValueError(
+                            "legal_action_value_residual requires the exact "
+                            "legal_action_mask; padded actions must never enter "
+                            "the value affordance"
                         )
                     if tuple(action_mask.shape) != tuple(encoded_actions.shape[:2]):
                         raise ValueError(
@@ -1976,6 +1976,9 @@ class EntityGraphPolicy:
         needs_public_card_counts = bool(
             getattr(self.config, "public_card_count_features", False)
         )
+        needs_legal_action_mask = bool(
+            getattr(self.config, "legal_action_value_residual", False)
+        )
         batch = {
             key: torch.as_tensor(value, device=self.device)
             for key, value in entity_batch.items()
@@ -1985,6 +1988,7 @@ class EntityGraphPolicy:
                     and key != "_symmetry_legal_action_ids"
                 )
                 or (needs_topology and key in _RELATIONAL_TOPOLOGY_KEYS)
+                or (needs_legal_action_mask and key == "legal_action_mask")
             )
             and (key != "legal_action_target_ids" or needs_action_targets)
             and (key != DEDUCTION_FEATURES_KEY or needs_public_card_counts)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -20,6 +21,7 @@ from catan_zero.rl.entity_token_policy import (  # noqa: E402
     STATIC_ACTION_RESIDUAL_FEATURE_SIZE,
     EntityGraphConfig,
     EntityGraphNet,
+    EntityGraphPolicy,
 )
 
 
@@ -164,3 +166,59 @@ def test_padded_actions_do_not_change_legal_affordance_value() -> None:
         original = model(batch)["value"]
         padded_changed = model(changed)["value"]
     torch.testing.assert_close(original, padded_changed, rtol=0.0, atol=0.0)
+
+
+def test_policy_wrapper_preserves_legal_mask_for_value_affordance() -> None:
+    torch.manual_seed(13)
+    config = _config(legal_action_value_residual=True)
+    policy = EntityGraphPolicy(
+        config,
+        np.zeros(
+            (config.action_size, config.static_action_feature_size),
+            dtype=np.float32,
+        ),
+        device="cpu",
+    )
+    policy.model.eval()
+    with torch.no_grad():
+        policy.model.legal_action_value_residual_proj.weight.copy_(
+            torch.eye(config.hidden_size)
+        )
+
+    batch = _batch()
+    batch["legal_action_mask"][:, -1] = False
+    entity = {
+        key: value.numpy()
+        for key, value in batch.items()
+        if key not in {"legal_action_context", "legal_action_static_features"}
+    }
+    legal_ids = np.tile(
+        np.asarray([1, 2, 3, 4, -1], dtype=np.int64),
+        (batch["legal_action_tokens"].shape[0], 1),
+    )
+    changed = {key: np.array(value, copy=True) for key, value in entity.items()}
+    changed["legal_action_tokens"][:, -1] += 10_000.0
+    changed_context = batch["legal_action_context"].numpy().copy()
+    changed_context[:, -1] -= 10_000.0
+
+    with torch.no_grad():
+        original = policy.forward_legal_np(
+            entity,
+            legal_ids,
+            batch["legal_action_context"].numpy(),
+        )["value"]
+        padded_changed = policy.forward_legal_np(
+            changed,
+            legal_ids,
+            changed_context,
+        )["value"]
+    torch.testing.assert_close(original, padded_changed, rtol=0.0, atol=0.0)
+
+
+def test_value_affordance_fails_closed_without_legal_mask() -> None:
+    model = EntityGraphNet(_config(legal_action_value_residual=True)).eval()
+    batch = _batch()
+    del batch["legal_action_mask"]
+
+    with pytest.raises(ValueError, match="requires the exact legal_action_mask"):
+        model(batch)
