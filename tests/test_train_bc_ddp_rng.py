@@ -179,6 +179,105 @@ def test_sampler_seed_decouples_every_numpy_data_trajectory_from_torch_seed() ->
     assert np.array_equal(left_symmetry, right_symmetry)
 
 
+@pytest.mark.parametrize("world_size", (2, 8))
+def test_symmetry_stream_is_global_rank_strided_not_rank_replayed(
+    world_size: int,
+) -> None:
+    seed = 20260705
+    local_rows = 64
+    rank_generators = [np.random.default_rng(seed) for _ in range(world_size)]
+    rank_draws = [
+        train_bc._draw_global_rank_strided_symmetry_ids(  # noqa: SLF001
+            rank_generators[rank],
+            n_symmetries=12,
+            local_rows=local_rows,
+            rank=rank,
+            world_size=world_size,
+        )
+        for rank in range(world_size)
+    ]
+
+    # Reassemble the logical global batch in the same rank-strided topology as
+    # _epoch_order. It must be exactly the one-process stream, not W replays of
+    # its first local_rows entries.
+    reconstructed = np.empty(local_rows * world_size, dtype=np.int64)
+    for rank, draws in enumerate(rank_draws):
+        reconstructed[rank::world_size] = draws
+    expected = np.random.default_rng(seed).integers(
+        12, size=local_rows * world_size
+    )
+    assert np.array_equal(reconstructed, expected)
+    assert not np.array_equal(rank_draws[0], rank_draws[1])
+
+    # Every rank advanced through the same complete global batch, retaining the
+    # existing one-shared-state checkpoint invariant.
+    states = [generator.bit_generator.state for generator in rank_generators]
+    assert train_bc._require_shared_symmetry_rng_state(states) == states[0]  # noqa: SLF001
+
+
+def test_rank_strided_symmetry_resume_replays_exact_continuation() -> None:
+    seed = 7813
+    world_size = 4
+    generators = [np.random.default_rng(seed) for _ in range(world_size)]
+    for rank, generator in enumerate(generators):
+        train_bc._draw_global_rank_strided_symmetry_ids(  # noqa: SLF001
+            generator,
+            n_symmetries=12,
+            local_rows=37,
+            rank=rank,
+            world_size=world_size,
+        )
+    checkpoint_state = train_bc._require_shared_symmetry_rng_state(  # noqa: SLF001
+        [generator.bit_generator.state for generator in generators]
+    )
+    assert checkpoint_state is not None
+
+    uninterrupted = [
+        train_bc._draw_global_rank_strided_symmetry_ids(  # noqa: SLF001
+            generator,
+            n_symmetries=12,
+            local_rows=19,
+            rank=rank,
+            world_size=world_size,
+        )
+        for rank, generator in enumerate(generators)
+    ]
+    resumed_generators = [np.random.default_rng() for _ in range(world_size)]
+    for generator in resumed_generators:
+        generator.bit_generator.state = copy.deepcopy(checkpoint_state)
+    resumed = [
+        train_bc._draw_global_rank_strided_symmetry_ids(  # noqa: SLF001
+            generator,
+            n_symmetries=12,
+            local_rows=19,
+            rank=rank,
+            world_size=world_size,
+        )
+        for rank, generator in enumerate(resumed_generators)
+    ]
+    assert all(
+        np.array_equal(before, after)
+        for before, after in zip(uninterrupted, resumed, strict=True)
+    )
+
+
+def test_single_rank_symmetry_stream_is_byte_for_byte_legacy() -> None:
+    seed = 991
+    historical = np.random.default_rng(seed)
+    topology_correct = np.random.default_rng(seed)
+    for local_rows in (0, 1, 64, 17):
+        expected = historical.integers(12, size=local_rows)
+        actual = train_bc._draw_global_rank_strided_symmetry_ids(  # noqa: SLF001
+            topology_correct,
+            n_symmetries=12,
+            local_rows=local_rows,
+            rank=0,
+            world_size=1,
+        )
+        assert np.array_equal(actual, expected)
+    assert topology_correct.bit_generator.state == historical.bit_generator.state
+
+
 def test_shared_symmetry_rng_state_requires_exact_rank_alignment() -> None:
     rng = np.random.default_rng(20260705)
     rng.integers(12, size=37)

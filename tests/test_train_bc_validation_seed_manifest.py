@@ -679,7 +679,7 @@ def test_decisive_distributed_a1_rejects_unsealed_semantics(
         )
 
 
-def test_decisive_distributed_a1_binds_shared_symmetry_stream() -> None:
+def test_decisive_distributed_a1_binds_global_rank_strided_symmetry_stream() -> None:
     contract = _validate_a1_decisive_training_semantics(
         _decisive_semantics_args(symmetry_augment=True),
         {"world_size": 8, "enabled": True},
@@ -688,7 +688,7 @@ def test_decisive_distributed_a1_binds_shared_symmetry_stream() -> None:
     assert contract["decisive"] is True
     assert (
         contract["distributed_symmetry_contract"]
-        == "shared_rank_stream_exact_v1"
+        == "global_rank_strided_stream_exact_v2"
     )
 
 
@@ -711,7 +711,7 @@ def test_explicit_a1_diagnostic_authority_records_but_does_not_promote_unsafe_kn
     )
     assert (
         contract["distributed_symmetry_contract"]
-        == "shared_rank_stream_exact_v1"
+        == "global_rank_strided_stream_exact_v2"
     )
     assert contract["distributed_advantage_contract"] == (
         "global_normalization_unsealed_for_a1"

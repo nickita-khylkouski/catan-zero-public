@@ -9212,10 +9212,10 @@ def _validate_a1_decisive_training_semantics(
 
     * gradient accumulation currently averages already-normalized microbatch
       means, not the exact union-weighted numerator/denominator;
-    * distributed symmetry augmentation uses one shared NumPy stream whose
-      cross-rank state equality is checked before every resumable checkpoint;
-      this is restart-exact but intentionally not a rank-independent stream;
-      and
+    * distributed symmetry augmentation consumes one logical global NumPy
+      stream and gives each rank its ``rank::world_size`` slice; the underlying
+      stream state remains equal across ranks and is checked before every
+      resumable checkpoint; and
     * outcome-value advantage weighting was historically rank-local under DDP.
       Its new global normalization still needs a fresh, explicitly reviewed A1
       seal before it can affect a promotable candidate.
@@ -9247,7 +9247,7 @@ def _validate_a1_decisive_training_semantics(
         "distributed_symmetry_contract": (
             "not_applicable"
             if not symmetry_augment or world_size == 1
-            else "shared_rank_stream_exact_v1"
+            else "global_rank_strided_stream_exact_v2"
         ),
         "advantage_policy_weighting": advantage_mode,
         "distributed_advantage_contract": (
@@ -9264,11 +9264,12 @@ def _validate_a1_decisive_training_semantics(
             "union-weighted gradient accumulation is implemented and sealed"
         )
     # Non-sharded DDP rank-strides one padded global order into equally sized
-    # local batches. Every rank therefore consumes the same number of symmetry
-    # RNG draws in the same order. The shared seeded stream stays aligned, and
-    # the rank-0 symmetry state stored in the progress sidecar is sufficient to
-    # reconstruct every rank on resume. Different ranks apply those draws to
-    # different source rows, producing a true global D6-augmented batch.
+    # local batches. Symmetry augmentation mirrors that topology: every rank
+    # advances an identical copy of the generator by one *global* batch, then
+    # retains only its rank-strided draw positions. The shared generator state
+    # therefore remains checkpointable once while no two ranks replay the same
+    # local draw positions. Sharded DDP pads every local order to the distributed
+    # maximum batch multiple and has the same equal-consumption invariant.
     if world_size > 1 and advantage_mode != "none":
         raise SystemExit(
             "decisive distributed A1 training rejects advantage policy weighting "
@@ -16053,6 +16054,8 @@ def main(
                     symmetry_kwargs = {
                         "symmetry": symmetry,
                         "symmetry_rng": symmetry_rng,
+                        "symmetry_rank": int(ddp["rank"]),
+                        "symmetry_world_size": int(ddp["world_size"]),
                         "symmetry_relabel_events": bool(
                             getattr(args, "symmetry_augment_events", True)
                         ),
@@ -20013,6 +20016,8 @@ def _forward_legal_np_for_batch(
     value_trunk_grad_scale: float = 1.0,
     symmetry=None,
     symmetry_rng=None,
+    symmetry_rank: int = 0,
+    symmetry_world_size: int = 1,
     symmetry_relabel_events: bool = True,
 ) -> dict:
     if getattr(policy, "policy_type", "") == "entity_graph":
@@ -20026,7 +20031,13 @@ def _forward_legal_np_for_batch(
             n_sym = int(symmetry.fwd_hex.shape[0])
             b = int(np.asarray(entity["hex_tokens"]).shape[0])
             gen = symmetry_rng if symmetry_rng is not None else np.random.default_rng()
-            g = gen.integers(n_sym, size=b)
+            g = _draw_global_rank_strided_symmetry_ids(
+                gen,
+                n_symmetries=n_sym,
+                local_rows=b,
+                rank=symmetry_rank,
+                world_size=symmetry_world_size,
+            )
             symmetry_ids = g
             entity = symmetry.permute_entity_batch(
                 entity,
@@ -20458,6 +20469,8 @@ def _train_xdim_batch(
     value_root_blend_global_compat: bool = False,
     symmetry=None,
     symmetry_rng=None,
+    symmetry_rank: int = 0,
+    symmetry_world_size: int = 1,
     symmetry_relabel_events: bool = True,
     grad_accum_steps: int = 1,
     accum_do_zero_grad: bool = True,
@@ -20512,6 +20525,8 @@ def _train_xdim_batch(
             value_trunk_grad_scale=value_trunk_grad_scale,
             symmetry=symmetry,
             symmetry_rng=symmetry_rng,
+            symmetry_rank=symmetry_rank,
+            symmetry_world_size=symmetry_world_size,
             symmetry_relabel_events=symmetry_relabel_events,
         )
         hard_loss = nn.functional.cross_entropy(outputs["logits"], target, reduction="none")
@@ -20689,6 +20704,8 @@ def _train_xdim_batch(
                 return_final_vp=False,
                 symmetry=symmetry,
                 symmetry_rng=symmetry_rng,
+                symmetry_rank=symmetry_rank,
+                symmetry_world_size=symmetry_world_size,
                 symmetry_relabel_events=symmetry_relabel_events,
             )
             if float(policy_kl_anchor_weight) != 0.0 or bool(
@@ -35827,6 +35844,58 @@ def _resolved_sampler_seed(args: argparse.Namespace) -> int:
 
     value = getattr(args, "sampler_seed", None)
     return int(args.seed if value is None else value)
+
+
+def _draw_global_rank_strided_symmetry_ids(
+    rng: np.random.Generator,
+    *,
+    n_symmetries: int,
+    local_rows: int,
+    rank: int,
+    world_size: int,
+) -> np.ndarray:
+    """Draw one topology-correct D6 id per rank-local row.
+
+    DDP obtains its local data as ``global_order[rank::world_size]``. Mirror
+    that exact mapping for augmentation: every rank advances an identical copy
+    of the generator through the complete logical global batch and keeps only
+    its rank-strided positions. This has three important properties:
+
+    * concatenating the rank slices by global position exactly reproduces one
+      single-process generator draw;
+    * every rank's underlying generator finishes in the same state, so the
+      existing one-state resumable checkpoint contract remains exact; and
+    * ``world_size == 1`` executes the historical ``integers(..., size=b)``
+      call unchanged.
+
+    The caller must preserve the learner's equal local-batch-size invariant.
+    Both non-sharded and sharded DDP epoch-order builders pad to provide it.
+    """
+
+    count = int(local_rows)
+    size = int(world_size)
+    position = int(rank)
+    choices = int(n_symmetries)
+    if count < 0:
+        raise ValueError("local symmetry row count must be non-negative")
+    if choices <= 0:
+        raise ValueError("symmetry count must be positive")
+    if size <= 0 or position < 0 or position >= size:
+        raise ValueError(
+            f"invalid symmetry DDP topology rank={position} world_size={size}"
+        )
+    if size == 1:
+        return np.asarray(rng.integers(choices, size=count), dtype=np.int64)
+    global_draws = np.asarray(
+        rng.integers(choices, size=count * size), dtype=np.int64
+    )
+    local = global_draws[position::size]
+    if local.shape != (count,):
+        raise RuntimeError(
+            "rank-strided symmetry draw shape drift: "
+            f"local={local.shape} expected={(count,)}"
+        )
+    return local
 
 
 def _initialize_training_rng(
