@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -34,6 +35,7 @@ def _contract(
     n_full_wide=None,
     producer: Path | None = None,
     c_scale: float = 0.03,
+    max_steps: int = 0,
 ) -> dict:
     recipe = {
         "world_size": 1,
@@ -41,7 +43,7 @@ def _contract(
         "mask_hidden_info": True,
         "symmetry_augment": False,
         "epochs": 1,
-        "max_steps": 0,
+        "max_steps": max_steps,
     }
     producer = producer or Path("/producer.pt")
     search = {
@@ -490,6 +492,8 @@ def _modernize_one_dose_receipt(
     *,
     world_size: int = 8,
     with_intermediate: bool = False,
+    malformed_progress: bool = False,
+    impossible_terminal_dose: bool = False,
 ) -> tuple[dict, dict]:
     receipt_path = fixture["training_receipt"]
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -529,6 +533,12 @@ def _modernize_one_dose_receipt(
             "--sealed-a1",
         ]
     )
+    command.append("--no-resume-optimizer")
+    sealed_max_steps = int(
+        fixture["contract"]["science"]["learner_training_recipe"]["max_steps"]
+    )
+    if sealed_max_steps > 0:
+        command.append("--exact-max-steps")
     execution_binding = one_dose._execution_binding(
         command=command, environment=one_dose._child_environment(gpus)
     )
@@ -549,13 +559,21 @@ def _modernize_one_dose_receipt(
     )
     lineage_dose = {"schema_version": "test-lineage-dose-v1", "current_sampled_rows": 524_288}
     outputs = receipt["outputs"]
-    progress = Path(str(candidate) + ".training-progress.json")
-    progress.write_text('{"progress_sha256":"sha256:test"}\n', encoding="utf-8")
+    if with_intermediate and not impossible_terminal_dose:
+        outputs.update(
+            {
+                "corpus_row_count": 524_293,
+                "training_row_count": 524_288,
+                "validation_row_count": 5,
+            }
+        )
+    expected_steps = (
+        sealed_max_steps
+        if sealed_max_steps > 0
+        else math.ceil(outputs["training_row_count"] / 4096)
+    )
     outputs.update(
         {
-            "training_progress": str(progress),
-            "training_progress_sha256": promotion._sha256(progress),
-            "training_progress_payload_sha256": "sha256:" + "4" * 64,
             "sample_receipt_state_sha256": None,
             "sample_order_sha256": None,
             "row_set_sha256": None,
@@ -569,7 +587,7 @@ def _modernize_one_dose_receipt(
             "validation_split_receipt_sha256": None,
         }
     )
-    outputs["steps_completed"] = 128 if with_intermediate else 7
+    outputs["steps_completed"] = 128 if impossible_terminal_dose else expected_steps
     intermediate_records = []
     if with_intermediate:
         import torch
@@ -608,7 +626,7 @@ def _modernize_one_dose_receipt(
         outputs["intermediate_checkpoints"] = intermediate_records
         report["checkpoint_steps_requested"] = [64, 96]
         report["intermediate_checkpoints"] = intermediate_records
-        report["steps_completed"] = 128
+        report["steps_completed"] = outputs["steps_completed"]
     input_binding = {
         "schema_version": one_dose.REPORT_INPUT_BINDING_SCHEMA,
         "contract_sha256": fixture["contract"]["contract_sha256"],
@@ -656,6 +674,62 @@ def _modernize_one_dose_receipt(
             "grad_accum_steps": 1,
             "effective_global_batch_size": 4096,
             "a1_lineage_dose": lineage_dose,
+            "epochs": int(
+                fixture["contract"]["science"]["learner_training_recipe"]["epochs"]
+            ),
+            "max_steps": sealed_max_steps,
+            "exact_max_steps": sealed_max_steps > 0,
+            "steps_completed": outputs["steps_completed"],
+            "total_training_steps": outputs["steps_completed"],
+            "resume_optimizer": False,
+            "optimizer_restored": False,
+            "resumed_optimizer_step": None,
+            "resumed_completed_epochs": None,
+        }
+    )
+    resume_identity = {
+        "schema_version": "train-bc-resume-recipe-v1",
+        "normalized_train_config_sha256": "sha256:" + "a" * 64,
+        "grad_accum_steps": 1,
+        "world_size": world_size,
+        "ddp_shard_data": False,
+        "fsdp": False,
+        "policy_aux_active_batch_size": 0,
+    }
+    report["training_resume_recipe_identity"] = resume_identity
+    report["training_resume_recipe_identity_sha256"] = promotion._digest_value(
+        resume_identity
+    )
+    progress = Path(str(candidate) + ".training-progress.json")
+    if malformed_progress:
+        progress.write_text('{"progress_sha256":"sha256:test"}\n', encoding="utf-8")
+        progress_payload_sha256 = "sha256:" + "4" * 64
+    else:
+        from catan_zero.rl.optim_state import save_training_progress
+
+        save_training_progress(
+            candidate,
+            optimizer_step=outputs["steps_completed"],
+            completed_epochs=1,
+            recipe_identity=resume_identity,
+            rng_state={"fixture": True},
+            rank_numpy_rng_states=[{"fixture_rank": rank} for rank in range(world_size)],
+            symmetry_rng_state=None,
+            rank_torch_rng_states=[
+                {"cpu": [], "cuda": None} for _rank in range(world_size)
+            ],
+            scalar_training_weight_sum=1.0,
+            categorical_training_weight_sum=0.0,
+            ddp=None,
+        )
+        progress_payload_sha256 = json.loads(
+            progress.read_text(encoding="utf-8")
+        )["progress_sha256"]
+    outputs.update(
+        {
+            "training_progress": str(progress),
+            "training_progress_sha256": promotion._sha256(progress),
+            "training_progress_payload_sha256": progress_payload_sha256,
         }
     )
     _write_json(report_path, report)
@@ -731,6 +805,7 @@ def _fixture(
     n_full: int = 128,
     champion: Path | None = None,
     branch_parent: Path | None = None,
+    max_steps: int = 0,
 ) -> dict:
     champion = champion or tmp_path / "champion.pt"
     candidate = tmp_path / "candidate.pt"
@@ -766,11 +841,13 @@ def _fixture(
     contract_path.write_text("{}\n", encoding="utf-8")
     producer = branch_parent or champion
     promotion_mode = "branch_challenge" if branch_parent is not None else "promotion_parent"
-    contract = _contract(n_full=n_full, producer=producer)
+    contract = _contract(n_full=n_full, producer=producer, max_steps=max_steps)
     # The n196 negative fixture must still be constructible so execution can
     # prove the contract is rejected before any mutation/evidence processing.
     evidence_contract = (
-        contract if n_full == 128 else _contract(n_full=128, producer=producer)
+        contract
+        if n_full == 128
+        else _contract(n_full=128, producer=producer, max_steps=max_steps)
     )
     evidence_semantics = promotion._sealed_evaluation_semantics(evidence_contract)
     candidate_search_config = promotion._candidate_search_config(evidence_contract)
@@ -1833,6 +1910,239 @@ def test_dry_run_accepts_exact_authenticated_eight_rank_one_dose_topology(
     )["outputs"]["execution_binding_sha256"]
 
 
+def test_dry_run_accepts_authenticated_positive_cap_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path, max_steps=1)
+    _receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+
+    plan = _execute(fixture, go=False)
+
+    assert plan["candidate"]["sha256"] == promotion._sha256(fixture["candidate"])
+
+
+def test_modern_one_dose_rejects_report_output_progress_step_disagreement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    receipt["outputs"]["steps_completed"] = 2
+    _rewrite_one_dose_receipt(fixture["training_receipt"], receipt)
+
+    with pytest.raises(
+        promotion.PromotionError, match="exact optimizer-step terminal"
+    ):
+        promotion._verify_one_dose_training_receipt(
+            fixture["training_receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_modern_one_dose_rejects_total_training_steps_disagreement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    report = json.loads(fixture["report"].read_text(encoding="utf-8"))
+    report["total_training_steps"] = 0
+    _write_json(fixture["report"], report)
+    receipt["outputs"]["report_sha256"] = promotion._sha256(fixture["report"])
+    _rewrite_one_dose_receipt(fixture["training_receipt"], receipt)
+
+    with pytest.raises(
+        promotion.PromotionError, match="exact optimizer-step terminal"
+    ):
+        promotion._verify_one_dose_training_receipt(
+            fixture["training_receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_modern_one_dose_rejects_authenticated_progress_step_disagreement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    progress_path = Path(receipt["outputs"]["training_progress"])
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress["optimizer_step"] = 2
+    progress.pop("progress_sha256")
+    progress["progress_sha256"] = promotion._digest_value(progress)
+    _write_json(progress_path, progress)
+    receipt["outputs"]["training_progress_sha256"] = promotion._sha256(progress_path)
+    receipt["outputs"]["training_progress_payload_sha256"] = progress[
+        "progress_sha256"
+    ]
+    _rewrite_one_dose_receipt(fixture["training_receipt"], receipt)
+
+    with pytest.raises(
+        promotion.PromotionError, match="exact optimizer-step terminal"
+    ):
+        promotion._verify_one_dose_training_receipt(
+            fixture["training_receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_modern_one_dose_rejects_self_consistent_wrong_resume_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    report = json.loads(fixture["report"].read_text(encoding="utf-8"))
+    wrong_identity = dict(report["training_resume_recipe_identity"])
+    wrong_identity["grad_accum_steps"] = 2
+    report["training_resume_recipe_identity"] = wrong_identity
+    report["training_resume_recipe_identity_sha256"] = promotion._digest_value(
+        wrong_identity
+    )
+    _write_json(fixture["report"], report)
+    progress_path = Path(receipt["outputs"]["training_progress"])
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress["recipe_identity"] = wrong_identity
+    progress["recipe_identity_sha256"] = promotion._digest_value(wrong_identity)
+    progress.pop("progress_sha256")
+    progress["progress_sha256"] = promotion._digest_value(progress)
+    _write_json(progress_path, progress)
+    receipt["outputs"]["report_sha256"] = promotion._sha256(fixture["report"])
+    receipt["outputs"]["training_progress_sha256"] = promotion._sha256(progress_path)
+    receipt["outputs"]["training_progress_payload_sha256"] = progress[
+        "progress_sha256"
+    ]
+    _rewrite_one_dose_receipt(fixture["training_receipt"], receipt)
+
+    with pytest.raises(
+        promotion.PromotionError, match="authenticated resume-recipe identity"
+    ):
+        promotion._verify_one_dose_training_receipt(
+            fixture["training_receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_modern_one_dose_rejects_report_that_claims_optimizer_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    report = json.loads(fixture["report"].read_text(encoding="utf-8"))
+    report["resume_optimizer"] = True
+    report["optimizer_restored"] = True
+    report["resumed_optimizer_step"] = 7
+    _write_json(fixture["report"], report)
+    receipt["outputs"]["report_sha256"] = promotion._sha256(fixture["report"])
+    _rewrite_one_dose_receipt(fixture["training_receipt"], receipt)
+
+    with pytest.raises(promotion.PromotionError, match="fresh optimizer trajectory"):
+        promotion._verify_one_dose_training_receipt(
+            fixture["training_receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_modern_one_dose_rejects_resume_optimizer_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    command = [
+        "--resume-optimizer" if token == "--no-resume-optimizer" else token
+        for token in receipt["command"]
+    ]
+    execution_binding = one_dose._execution_binding(
+        command=command, environment=receipt["execution_binding"]["environment"]
+    )
+    report = json.loads(fixture["report"].read_text(encoding="utf-8"))
+    report[one_dose.REPORT_EXECUTION_BINDING_FIELD] = execution_binding
+    _write_json(fixture["report"], report)
+    receipt.update(
+        {
+            "command": command,
+            "command_sha256": promotion._digest_value(command),
+            "execution_binding": execution_binding,
+            "training_transaction_sha256": one_dose._training_transaction_sha256(
+                command=command, input_binding=receipt["input_binding"]
+            ),
+        }
+    )
+    receipt["outputs"]["execution_binding_sha256"] = promotion._digest_value(
+        execution_binding
+    )
+    receipt["outputs"]["report_sha256"] = promotion._sha256(fixture["report"])
+    _rewrite_one_dose_receipt(fixture["training_receipt"], receipt)
+
+    with pytest.raises(promotion.PromotionError, match="fresh optimizer trajectory"):
+        promotion._verify_one_dose_training_receipt(
+            fixture["training_receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
 def test_eight_rank_one_dose_topology_fails_closed_on_gpu_ownership_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2046,12 +2356,16 @@ def test_post_wave_composite_report_uses_authenticated_outer_ddp_receipt(
     assert plan["candidate"]["sha256"] == promotion._sha256(fixture["candidate"])
 
 
-def test_explicit_same_trajectory_checkpoint_selection_replays_64_96_128(
+def test_explicit_same_trajectory_checkpoint_selection_rejects_malformed_impossible_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = _fixture(tmp_path)
     receipt, modern = _modernize_one_dose_receipt(
-        fixture, world_size=8, with_intermediate=True
+        fixture,
+        world_size=8,
+        with_intermediate=True,
+        malformed_progress=True,
+        impossible_terminal_dose=True,
     )
     monkeypatch.setattr(
         one_dose,
@@ -2098,20 +2412,21 @@ def test_explicit_same_trajectory_checkpoint_selection_replays_64_96_128(
     selection_path = tmp_path / "checkpoint-selection.json"
     _write_json(selection_path, selection)
 
-    verified = promotion._verify_one_dose_training_receipt(
-        fixture["training_receipt"],
-        contract_lock=fixture["contract_path"],
-        contract=fixture["contract"],
-        candidate_path=Path(selected["checkpoint"]),
-        candidate_sha256=selected["checkpoint_sha256"],
-        training_report_path=fixture["report"],
-        training_report_sha256=promotion._sha256(fixture["report"]),
-        checkpoint_selection_path=selection_path,
-        checkpoint_selection_sha256=promotion._sha256(selection_path),
-    )
-
-    assert verified["checkpoint_selection"]["selected_optimizer_step"] == 96
-    assert verified["report_checkpoint"] == _checkpoint_ref(fixture["candidate"])
+    with pytest.raises(
+        promotion.PromotionError,
+        match="authenticated training progress|exact optimizer-step terminal",
+    ):
+        promotion._verify_one_dose_training_receipt(
+            fixture["training_receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=Path(selected["checkpoint"]),
+            candidate_sha256=selected["checkpoint_sha256"],
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+            checkpoint_selection_path=selection_path,
+            checkpoint_selection_sha256=promotion._sha256(selection_path),
+        )
 
 
 def test_checkpoint_selection_rejects_candidate_chaining_marker(

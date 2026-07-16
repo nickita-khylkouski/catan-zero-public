@@ -1223,6 +1223,159 @@ def _require_exact_capped_one_dose_terminal(
         )
 
 
+def _expected_modern_one_dose_optimizer_steps(
+    *,
+    training_row_count: object,
+    effective_global_batch_size: object,
+    recipe: Mapping[str, Any],
+) -> int:
+    """Reconstruct the only legitimate terminal step for an ordinary one-dose run."""
+
+    if (
+        isinstance(training_row_count, bool)
+        or not isinstance(training_row_count, int)
+        or training_row_count <= 0
+        or isinstance(effective_global_batch_size, bool)
+        or not isinstance(effective_global_batch_size, int)
+        or effective_global_batch_size <= 0
+    ):
+        raise PromotionError("modern one-dose row/batch dose is invalid")
+    if recipe.get("epochs") != 1:
+        raise PromotionError("ordinary modern one-dose promotion requires exactly one epoch")
+    available_steps = math.ceil(training_row_count / effective_global_batch_size)
+    max_steps = recipe.get("max_steps")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
+        raise PromotionError("sealed one-dose recipe has an invalid max_steps")
+    if max_steps == 0:
+        return int(available_steps)
+    if available_steps < max_steps:
+        raise PromotionError(
+            "sealed positive max_steps exceeds the optimizer steps realizable from "
+            "the authenticated one-epoch training partition"
+        )
+    return int(max_steps)
+
+
+def _verify_modern_one_dose_terminal(
+    *,
+    checkpoint: Path,
+    progress_path: Path,
+    report: Mapping[str, Any],
+    outputs: Mapping[str, Any],
+    recipe: Mapping[str, Any],
+    command: Sequence[str],
+    effective_global_batch_size: int,
+) -> dict[str, Any]:
+    """Replay progress and exact-dose/fresh-optimizer evidence for modern receipts."""
+
+    expected_steps = _expected_modern_one_dose_optimizer_steps(
+        training_row_count=outputs.get("training_row_count"),
+        effective_global_batch_size=effective_global_batch_size,
+        recipe=recipe,
+    )
+    resume_identity = report.get("training_resume_recipe_identity")
+    if (
+        not isinstance(resume_identity, dict)
+        or report.get("training_resume_recipe_identity_sha256")
+        != _digest_value(resume_identity)
+        or resume_identity.get("schema_version") != "train-bc-resume-recipe-v1"
+        or _validate_sha256(
+            resume_identity.get("normalized_train_config_sha256"),
+            where="one-dose normalized resume-config sha256",
+        )
+        != resume_identity.get("normalized_train_config_sha256")
+        or resume_identity.get("grad_accum_steps")
+        != recipe.get("grad_accum_steps")
+        or resume_identity.get("world_size") != recipe.get("world_size")
+        or resume_identity.get("ddp_shard_data")
+        is not bool(recipe.get("ddp_shard_data", False))
+        or resume_identity.get("fsdp") is not bool(recipe.get("fsdp", False))
+        or resume_identity.get("policy_aux_active_batch_size")
+        != int(recipe.get("policy_aux_active_batch_size", 0))
+    ):
+        raise PromotionError(
+            "modern one-dose report lacks an authenticated resume-recipe identity"
+        )
+    from catan_zero.rl.optim_state import (
+        TrainingProgressError,
+        load_training_progress,
+        training_progress_sidecar_path,
+    )
+
+    try:
+        expected_progress_path = training_progress_sidecar_path(checkpoint).resolve(
+            strict=True
+        )
+        if progress_path != expected_progress_path:
+            raise PromotionError(
+                "one-dose receipt points at a non-canonical training-progress marker"
+            )
+        progress_payload = load_training_progress(
+            checkpoint, expected_recipe_identity=resume_identity
+        )
+    except PromotionError:
+        raise
+    except (
+        AttributeError,
+        OSError,
+        TypeError,
+        ValueError,
+        TrainingProgressError,
+    ) as error:
+        raise PromotionError(
+            f"one-dose authenticated training progress refused: {error}"
+        ) from error
+
+    max_steps = int(recipe["max_steps"])
+    exact_capped = max_steps > 0
+    if (
+        command.count("--no-resume-optimizer") != 1
+        or "--resume-optimizer" in command
+        or report.get("resume_optimizer") is not False
+        or report.get("optimizer_restored") is not False
+        or "resumed_optimizer_step" not in report
+        or report.get("resumed_optimizer_step") is not None
+        or "resumed_completed_epochs" not in report
+        or report.get("resumed_completed_epochs") is not None
+        or (
+            "resume_optimizer" in recipe
+            and recipe.get("resume_optimizer") is not False
+        )
+    ):
+        raise PromotionError(
+            "modern one-dose receipt does not prove a fresh optimizer trajectory"
+        )
+    if exact_capped:
+        _require_exact_capped_one_dose_terminal(
+            report=report,
+            outputs=outputs,
+            recipe=recipe,
+            command=command,
+        )
+    elif (
+        "--exact-max-steps" in command
+        or report.get("exact_max_steps") is not False
+    ):
+        raise PromotionError(
+            "uncapped one-dose receipt incorrectly claims an exact max-step cap"
+        )
+    if (
+        report.get("effective_global_batch_size") != effective_global_batch_size
+        or report.get("steps_completed") != expected_steps
+        or report.get("total_training_steps") != expected_steps
+        or outputs.get("steps_completed") != expected_steps
+        or progress_payload.get("optimizer_step") != expected_steps
+        or progress_payload.get("completed_epochs") != 1
+        or progress_payload.get("progress_sha256")
+        != outputs.get("training_progress_payload_sha256")
+    ):
+        raise PromotionError(
+            "modern one-dose report/receipt/progress do not prove the exact "
+            "optimizer-step terminal"
+        )
+    return progress_payload
+
+
 def _reconstruct_completed_central_final(
     receipt: Mapping[str, Any],
     *,
@@ -2992,27 +3145,19 @@ def _verify_one_dose_training_receipt(
     )
     if _sha256(optimizer) != outputs["optimizer_sidecar_sha256"]:
         raise PromotionError("one-dose optimizer-sidecar bytes drifted")
+    progress: Path | None = None
     if modern_receipt:
         progress = _canonical_existing_file(
             _absolute(outputs["training_progress"], base=path.parent),
             where="one-dose training-progress marker",
         )
-        progress_payload = _load_json(progress)
-        sealed_max_steps = int(
-            contract["science"]["learner_training_recipe"]["max_steps"]
-        )
         if (
             _sha256(progress) != outputs["training_progress_sha256"]
-            or not isinstance(outputs["training_progress_payload_sha256"], str)
-            or (
-                sealed_max_steps > 0
-                and (
-                    progress_payload.get("progress_sha256")
-                    != outputs["training_progress_payload_sha256"]
-                    or progress_payload.get("optimizer_step") != sealed_max_steps
-                    or progress_payload.get("completed_epochs") != 1
-                )
+            or _validate_sha256(
+                outputs["training_progress_payload_sha256"],
+                where="one-dose training-progress payload sha256",
             )
+            != outputs["training_progress_payload_sha256"]
         ):
             raise PromotionError("one-dose training-progress provenance drifted")
     if outputs["execution_binding_sha256"] != _digest_value(execution_binding):
@@ -3139,6 +3284,19 @@ def _verify_one_dose_training_receipt(
             != _digest_value(effective_recipe)
         ):
             raise PromotionError("modern one-dose input/report/topology binding drifted")
+        if progress is None:
+            raise PromotionError("modern one-dose receipt lacks training progress")
+        _verify_modern_one_dose_terminal(
+            checkpoint=output_checkpoint,
+            progress_path=progress,
+            report=report,
+            outputs=outputs,
+            recipe=effective_recipe,
+            command=command,
+            effective_global_batch_size=int(
+                value["training_topology"]["global_batch_size"]
+            ),
+        )
         expected_transaction = one_dose._training_transaction_sha256(  # noqa: SLF001
             command=command, input_binding=input_binding
         )
