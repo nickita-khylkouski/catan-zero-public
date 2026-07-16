@@ -153,7 +153,39 @@ def _verified(tmp_path: Path) -> dict:
             "empty_payload_inventory_acknowledgements": [],
             "training_event_history_trainable": True,
         },
+        "accepted_policy_target_identity_sha256": "sha256:" + "a" * 64,
     }
+
+
+def test_scratch_target_identity_requires_one_operator_for_policy_scope() -> None:
+    identity = "sha256:" + "a" * 64
+    meta = {
+        "policy_distillation_component_ids": ["current", "recent"],
+        "components": [
+            {
+                "component_id": "current",
+                "corpus_meta": {"policy_target_identity_sha256": identity},
+            },
+            {
+                "component_id": "recent",
+                "corpus_meta": {"policy_target_identity_sha256": identity},
+            },
+            {
+                "component_id": "replay",
+                "corpus_meta": {},
+            },
+        ],
+    }
+
+    assert scratch._accepted_policy_target_identity(meta) == identity  # noqa: SLF001
+    meta["components"][1]["corpus_meta"]["policy_target_identity_sha256"] = (
+        "sha256:" + "b" * 64
+    )
+    with pytest.raises(
+        scratch.ScratchTrainError,
+        match="do not share one exact target operator",
+    ):
+        scratch._accepted_policy_target_identity(meta)  # noqa: SLF001
 
 
 def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> None:
@@ -176,6 +208,9 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert "--resume-optimizer" not in command
     assert command.count("--no-resume-optimizer") == 1
     assert command.count("--no-public-card-count-residual-bias") == 1
+    assert command[
+        command.index("--accepted-policy-target-identity-sha256") + 1
+    ] == "sha256:" + "a" * 64
     assert command.count("--action-target-gather") == 1
     assert command.count("--legal-action-value-set-statistics") == 1
     assert command.count("--public-rule-state-features") == 1

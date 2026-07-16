@@ -234,6 +234,55 @@ def _require_plan_authority_matches_verified(
         raise ScratchTrainError("scratch plan authority differs from verified inputs")
 
 
+def _accepted_policy_target_identity(meta: Mapping[str, Any]) -> str:
+    """Resolve the one exact teacher operator admitted to scratch policy CE."""
+
+    components = meta.get("components")
+    distillation_ids = meta.get("policy_distillation_component_ids")
+    if not isinstance(components, list) or not isinstance(distillation_ids, list):
+        raise ScratchTrainError(
+            "scratch composite lacks an explicit policy-distillation target scope"
+        )
+    by_id = {
+        str(component.get("component_id")): component
+        for component in components
+        if isinstance(component, Mapping)
+    }
+    identities: set[str] = set()
+    missing: list[str] = []
+    for component_id in distillation_ids:
+        component = by_id.get(str(component_id))
+        corpus_meta = (
+            component.get("corpus_meta")
+            if isinstance(component, Mapping)
+            else None
+        )
+        identity = (
+            corpus_meta.get("policy_target_identity_sha256")
+            if isinstance(corpus_meta, Mapping)
+            else None
+        )
+        if identity is None:
+            missing.append(str(component_id))
+        elif not train_bc._is_sha256(str(identity)):  # noqa: SLF001
+            raise ScratchTrainError(
+                f"scratch policy component {component_id!r} has malformed "
+                "target identity"
+            )
+        else:
+            identities.add(str(identity))
+    if missing:
+        raise ScratchTrainError(
+            "scratch policy components lack exact target identity: "
+            + ", ".join(missing)
+        )
+    if len(identities) != 1:
+        raise ScratchTrainError(
+            "scratch policy components do not share one exact target operator"
+        )
+    return next(iter(identities))
+
+
 def verify_inputs(
     *,
     lock_path: Path,
@@ -265,6 +314,9 @@ def verify_inputs(
             verified,
             logical_recipe=science["logical_recipe"],
             topology=science["execution_topology"],
+        )
+        verified["accepted_policy_target_identity_sha256"] = (
+            _accepted_policy_target_identity(meta)
         )
     except (
         contract.ContractError,
@@ -378,6 +430,13 @@ def build_train_command(
     report: Path,
 ) -> list[str]:
     recipe = dict(verified["recipe"])
+    accepted_policy_target_identity = str(
+        verified.get("accepted_policy_target_identity_sha256", "")
+    )
+    if not train_bc._is_sha256(accepted_policy_target_identity):  # noqa: SLF001
+        raise ScratchTrainError(
+            "scratch training requires one verified policy-target identity"
+        )
     model = dict(verified["model_construction"])
     topology = dict(verified["execution_topology"])
     plan_authority = _scratch_plan_authority(verified)
@@ -556,6 +615,8 @@ def build_train_command(
             "0",
             "--required-target-information-regime",
             current_science.target_information_regime(),
+            "--accepted-policy-target-identity-sha256",
+            accepted_policy_target_identity,
             "--public-award-feature-contract",
             "authoritative_v1",
             "--allow-mixed-public-award-feature-contracts",
