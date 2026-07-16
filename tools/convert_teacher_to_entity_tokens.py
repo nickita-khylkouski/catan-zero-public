@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import hashlib
 import io
 import json
 import os
@@ -31,7 +32,8 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from factory_common import parse_track, write_json
+from factory_common import parse_track, write_json  # noqa: E402
+from curate_teacher_data import _input_manifests  # noqa: E402
 
 # Additive-only (CAT-59): included in shards only when --emit-deduction-features
 # is passed. `(4, DEDUCTION_FEATURE_SIZE)` per row, same per-player-slot
@@ -157,6 +159,7 @@ def main() -> None:
     )
     summary: dict[str, Any] = {
         "inputs": args.data,
+        "input_manifests": _input_manifests(args.data),
         "out": str(output),
         "track": args.track,
         "vps_to_win": int(args.vps_to_win),
@@ -164,6 +167,7 @@ def main() -> None:
         "emit_deduction_features": bool(args.emit_deduction_features),
         "schema": ENTITY_TOKEN_SCHEMA_VERSION,
         "entity_feature_adapter_version": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        "tool_provenance": _tool_provenance(),
         "partition_count": int(args.partition_count),
         "partition_index": int(args.partition_index),
         "loaded_rows": 0,
@@ -271,6 +275,35 @@ def main() -> None:
     print(json.dumps(summary, indent=2, sort_keys=True))
     if summary["mismatches"]:
         raise SystemExit(1)
+
+
+def _tool_provenance() -> dict[str, Any]:
+    """Bind the replay/entity transformation and its feature semantics.
+
+    The input manifests preserve the authenticated teacher-generation lineage;
+    these hashes additionally identify the conversion code that produced the
+    entity-token tensors consumed by training.
+    """
+
+    repo_root = Path(__file__).resolve().parents[1]
+    files = [
+        "tools/convert_teacher_to_entity_tokens.py",
+        "src/catan_zero/rl/entity_token_features.py",
+        "src/catan_zero/rl/entity_feature_adapter.py",
+        "src/catan_zero/rl/multiagent_env.py",
+        "src/catan_zero/rl/action_features.py",
+    ]
+    hashes: dict[str, str] = {}
+    for name in files:
+        path = repo_root / name
+        try:
+            hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return {
+        "file_sha256": hashes,
+        "feature_semantics_files": files,
+    }
 
 
 def _iter_seed_rows(
