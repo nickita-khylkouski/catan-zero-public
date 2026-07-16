@@ -33,9 +33,7 @@ impl GameWrapper {
         let value = public_card_deductions_to_json_value(&self.game, observer)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         serde_json::to_string(&value).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "public card deductions: {error}"
-            ))
+            pyo3::exceptions::PyValueError::new_err(format!("public card deductions: {error}"))
         })
     }
 
