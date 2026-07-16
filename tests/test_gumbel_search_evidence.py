@@ -177,7 +177,7 @@ def test_optional_arrays_are_the_only_default_schema_difference() -> None:
 
 @pytest.mark.parametrize(
     ("used_full_search", "expected_policy_weight"),
-    ((True, 1.0), (False, 4.0 / 64.0)),
+    ((True, 1.0), (False, 4.0 / 128.0)),
 )
 def test_decision_row_preserves_active_search_evidence_in_legal_order(
     monkeypatch: pytest.MonkeyPatch,

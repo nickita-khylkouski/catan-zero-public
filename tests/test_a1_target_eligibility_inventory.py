@@ -112,7 +112,7 @@ def test_inventory_accepts_authenticated_bounded_fast_policy_activity(
     root = _write_corpus(
         tmp_path,
         [0, 1, 2],
-        policy_weights=[1.0, 0.25, 0.0],
+        policy_weights=[1.0, 0.125, 0.0],
         used_full_search=[True, False, False],
         simulations_used=[64, 16, 0],
     )

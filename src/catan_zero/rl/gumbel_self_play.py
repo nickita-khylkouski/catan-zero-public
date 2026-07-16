@@ -142,10 +142,11 @@ SEARCH_EVIDENCE_SCHEMA = "gumbel_root_search_evidence_v1"
 SEARCH_EVIDENCE_VERSION = 1
 # Fast searches are useful policy teachers, but materially noisier than full
 # searches. Scale their weight with actual root visits and cap them at one
-# quarter of a full-search row; 16 visits (the production fast budget) reaches
-# that cap against the historical 64-visit full-search reference.
+# quarter of a full-search row. The confidence denominator matches the current
+# 2p production full-search budget, so the common 16-visit fast root is 0.125x
+# while a 32-visit fast root reaches the conservative 0.25 cap.
 FAST_SEARCH_POLICY_WEIGHT_MAX = 0.25
-FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS = 64
+FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS = 128
 # Search targets need provenance that is independent from observation masking.
 # ``public_observation=True`` only constrains neural-network features; it does
 # not prove that the planner's cloned world state was information-safe.

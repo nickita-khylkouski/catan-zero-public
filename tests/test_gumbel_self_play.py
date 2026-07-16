@@ -492,7 +492,7 @@ def test_fast_search_policy_confidence_accepts_valid_search_evidence():
         is_forced=False,
     )
 
-    assert weight == pytest.approx(0.25)
+    assert weight == pytest.approx(0.125)
 
 
 @pytest.mark.parametrize(

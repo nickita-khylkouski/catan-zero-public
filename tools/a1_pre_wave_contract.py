@@ -10058,7 +10058,7 @@ def _build_target_activation_report(
         ),
         "policy_activation_rule": (
             "full non-forced rows == 1; forced rows == 0; fast non-forced rows "
-            "are legacy 0 or min(0.25, simulations_used/64)"
+            "are legacy 0 or min(0.25, simulations_used/128)"
             if fast_policy_active
             else "policy_weight_multiplier == int(used_full_search and not is_forced)"
         ),

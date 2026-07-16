@@ -3262,7 +3262,7 @@ def test_selected_target_activation_authenticates_bounded_fast_policy_weights(
         "used_full_search": np.asarray([True, True, False, False]),
         "simulations_used": np.asarray([64, 0, 16, 8], dtype=np.int32),
         "policy_weight_multiplier": np.asarray(
-            [1.0, 0.0, 0.25, 0.125], dtype=np.float32
+            [1.0, 0.0, 0.125, 0.0625], dtype=np.float32
         ),
         "value_weight_multiplier": np.ones(4, dtype=np.float32),
         "target_policy": np.asarray(
@@ -3304,7 +3304,7 @@ def test_selected_target_activation_authenticates_bounded_fast_policy_weights(
     assert report["schema_version"] == contract.TARGET_ACTIVATION_SCHEMA_V2
     assert report["fast_search_policy_confidence"] == {
         "max_weight": 0.25,
-        "reference_simulations": 64,
+        "reference_simulations": 128,
         "legacy_zero_weight_compatible": True,
     }
 
