@@ -914,6 +914,7 @@ def _verify_training_report(
     production_temperature_completion: bool = False,
     production_composite: bool = False,
     scratch_execution: bool = False,
+    production_recipe_override: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     report = _load_json(path)
     if sum((production_l1_completion, production_target_gather_completion,
@@ -1122,8 +1123,16 @@ def _verify_training_report(
         # central binding and receipt carry the contract/recipe authority.
         recipe_sha = None
     else:
-        recipe = contract["science"]["learner_training_recipe"]
-        recipe_sha = contract["science"]["learner_training_recipe_sha256"]
+        recipe = (
+            dict(production_recipe_override)
+            if production_composite and production_recipe_override is not None
+            else contract["science"]["learner_training_recipe"]
+        )
+        recipe_sha = (
+            _digest_value(recipe)
+            if production_composite and production_recipe_override is not None
+            else contract["science"]["learner_training_recipe_sha256"]
+        )
     _verify_symmetry_training_provenance(
         report, recipe, where="candidate training report"
     )
@@ -3599,6 +3608,9 @@ def _verify_one_dose_training_receipt(
     receipt_schema = value.get("schema_version")
     is_retry = receipt_schema == one_dose.RETRY_RECEIPT_SCHEMA
     is_upgrade = receipt_schema == one_dose.UPGRADE_RECEIPT_SCHEMA
+    canonical_parent_update = value.get("canonical_parent_update")
+    if canonical_parent_update is not None:
+        expected_keys.add("canonical_parent_update")
     modern_receipt = "input_binding" in value
     if modern_receipt:
         expected_keys |= {
@@ -3711,14 +3723,65 @@ def _verify_one_dose_training_receipt(
             raise PromotionError(f"architecture-upgrade receipt refused: {error}") from error
         if upgrade_value != raw_upgrade:
             raise PromotionError("training receipt architecture-upgrade evidence drifted")
-        expected_identity = _digest_value(
-            {
-                "schema_version": "a1-architecture-upgrade-training-identity-v1",
-                "contract_sha256": contract["contract_sha256"],
-                "upgrade_receipt_sha256": receipt_ref["sha256"],
-                "upgrade_receipt_digest": upgrade_value["receipt_sha256"],
-            }
-        )
+        if canonical_parent_update is None:
+            expected_identity = _digest_value(
+                {
+                    "schema_version": "a1-architecture-upgrade-training-identity-v1",
+                    "contract_sha256": contract["contract_sha256"],
+                    "upgrade_receipt_sha256": receipt_ref["sha256"],
+                    "upgrade_receipt_digest": upgrade_value["receipt_sha256"],
+                }
+            )
+        else:
+            parent_authority = _require_exact_keys(
+                canonical_parent_update,
+                {
+                    "schema_version",
+                    "config",
+                    "config_sha256",
+                    "recipe",
+                    "recipe_sha256",
+                    "parent_checkpoint_sha256",
+                    "composite_descriptor_sha256",
+                    "composite_build_receipt_sha256",
+                    "authority_sha256",
+                },
+                where="canonical parent-update authority",
+            )
+            authority_unhashed = dict(parent_authority)
+            authority_sha = authority_unhashed.pop("authority_sha256")
+            config_path = _canonical_existing_file(
+                Path(str(parent_authority["config"])),
+                where="canonical parent-update config",
+            )
+            producers = [
+                record
+                for record in contract.get("checkpoints", [])
+                if isinstance(record, dict) and record.get("role") == "producer"
+            ]
+            if (
+                parent_authority["schema_version"]
+                != "a1-canonical-parent-update-authority-v1"
+                or config_path
+                != one_dose.CANONICAL_PARENT_UPDATE_CONFIG.resolve(strict=True)
+                or _sha256(config_path) != parent_authority["config_sha256"]
+                or parent_authority["recipe_sha256"]
+                != _digest_value(parent_authority["recipe"])
+                or authority_sha != _digest_value(authority_unhashed)
+                or len(producers) != 1
+                or parent_authority["parent_checkpoint_sha256"]
+                != producers[0].get("sha256")
+            ):
+                raise PromotionError("canonical parent-update authority drifted")
+            expected_identity = _digest_value(
+                {
+                    "schema_version": "a1-canonical-parent-update-claim-v1",
+                    "contract_sha256": contract["contract_sha256"],
+                    "parent_update_authority_sha256": authority_sha,
+                    "upgrade_receipt_sha256": receipt_ref["sha256"],
+                    "upgrade_receipt_digest": upgrade_value["receipt_sha256"],
+                }
+            )
         if value.get("claim_identity_sha256") != expected_identity:
             raise PromotionError("architecture-upgrade training identity drifted")
     gpu = value["gpu"]
@@ -3731,7 +3794,7 @@ def _verify_one_dose_training_receipt(
                 raise PromotionError("8-rank one-dose topology must own GPU 0 as primary")
             selected_gpus = list(one_dose.B200_8GPU_DDP_GPUS)
             topology_name = one_dose.B200_8GPU_DDP_TOPOLOGY
-            local_batch_size = 512
+            local_batch_size = 64 if canonical_parent_update is not None else 512
         else:
             selected_gpus = [gpu]
             topology_name = one_dose.LEGACY_SINGLE_GPU_TOPOLOGY
@@ -3743,7 +3806,7 @@ def _verify_one_dose_training_receipt(
             "physical_gpus": selected_gpus,
             "local_batch_size": local_batch_size,
             "grad_accum_steps": 1,
-            "global_batch_size": 4096,
+            "global_batch_size": 512 if canonical_parent_update is not None else 4096,
             "dose_preserving": True,
         }
         gpu_names = value["gpu_names"]
@@ -3978,10 +4041,15 @@ def _verify_one_dose_training_receipt(
         )
 
     report = _load_json(output_report)
+    sealed_recipe = (
+        canonical_parent_update["recipe"]
+        if isinstance(canonical_parent_update, dict)
+        else contract["science"]["learner_training_recipe"]
+    )
     _require_exact_capped_one_dose_terminal(
         report=report,
         outputs=outputs,
-        recipe=contract["science"]["learner_training_recipe"],
+        recipe=sealed_recipe,
         command=command,
     )
     if report.get(one_dose.REPORT_EXECUTION_BINDING_FIELD) != execution_binding:
@@ -4013,6 +4081,8 @@ def _verify_one_dose_training_receipt(
             "central_published_executor_authority",
             "binding_sha256",
         }
+        if canonical_parent_update is not None:
+            input_keys.add("canonical_parent_update")
         if input_binding.get("data_kind") == "production_composite_v2":
             input_keys |= {
                 "trainer_authority",
@@ -4040,7 +4110,7 @@ def _verify_one_dose_training_receipt(
             raise PromotionError("modern one-dose input-binding schema drifted")
         input_unhashed = dict(input_binding)
         input_digest = input_unhashed.pop("binding_sha256", None)
-        effective_recipe = dict(contract["science"]["learner_training_recipe"])
+        effective_recipe = dict(sealed_recipe)
         effective_recipe.update(
             {
                 "world_size": world_size,
@@ -4068,6 +4138,8 @@ def _verify_one_dose_training_receipt(
             != outputs["validation_row_count"]
             or input_binding.get("sealed_learner_recipe_sha256")
             != value["learner_training_recipe_sha256"]
+            or input_binding.get("canonical_parent_update")
+            != canonical_parent_update
             or input_binding.get("effective_learner_recipe_sha256")
             != _digest_value(effective_recipe)
         ):
@@ -9612,6 +9684,13 @@ def _verify_adjudication(
     from tools import a1_scratch_train as scratch_train
 
     scratch_execution = training_receipt_schema == scratch_train.EXECUTION_SCHEMA
+    preview_parent_update = training_receipt_preview.get("canonical_parent_update")
+    production_recipe_override = (
+        preview_parent_update.get("recipe")
+        if isinstance(preview_parent_update, dict)
+        and isinstance(preview_parent_update.get("recipe"), dict)
+        else None
+    )
     if selection_path is None:
         training_report_payload = _verify_training_report(
             training_path,
@@ -9624,6 +9703,7 @@ def _verify_adjudication(
             production_temperature_completion=production_temperature_completion,
             production_composite=production_composite,
             scratch_execution=scratch_execution,
+            production_recipe_override=production_recipe_override,
         )
     training_receipt_ref = _verify_one_dose_training_receipt(
         training_receipt,
@@ -9652,6 +9732,7 @@ def _verify_adjudication(
             production_temperature_completion=production_temperature_completion,
             production_composite=production_composite,
             scratch_execution=scratch_execution,
+            production_recipe_override=production_recipe_override,
         )
     champion_raw = _require_exact_keys(
         value["champion"],

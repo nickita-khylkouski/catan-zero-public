@@ -372,11 +372,22 @@ def run(out: Path) -> dict[str, object] | None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument(
+        "--local-batch-size",
+        type=int,
+        choices=(64, 512),
+        default=512,
+        help="64 commissions the canonical global-512 parent update",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    global LOCAL_BATCH_SIZE, GLOBAL_BATCH_SIZE, SYNTHETIC_ROWS  # noqa: PLW0603
+    LOCAL_BATCH_SIZE = int(args.local_batch_size)
+    GLOBAL_BATCH_SIZE = WORLD_SIZE * LOCAL_BATCH_SIZE
+    SYNTHETIC_ROWS = GLOBAL_BATCH_SIZE * 2 + 97
     try:
         run(args.out)
     except (CanaryError, OSError, ValueError) as error:

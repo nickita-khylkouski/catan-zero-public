@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 from contextlib import ExitStack, contextmanager
 import errno
 import fcntl
@@ -48,6 +49,7 @@ from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import a1_build_post_wave_composite as composite_builder  # noqa: E402
 from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
 from tools import train_bc  # noqa: E402
+from tools import train as canonical_train  # noqa: E402
 from tools import a1_lineage_dose as lineage  # noqa: E402
 from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
 from tools import a1_ddp_epoch_canary as ddp_canary  # noqa: E402
@@ -143,6 +145,9 @@ DATA_LOADER_PREFETCH = 2
 LEGACY_SINGLE_GPU_TOPOLOGY = "legacy-single-gpu"
 B200_8GPU_DDP_TOPOLOGY = "b200-8gpu-ddp"
 B200_8GPU_DDP_GPUS = tuple(range(8))
+CANONICAL_PARENT_UPDATE_CONFIG = (
+    _REPO_ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json"
+)
 TRAINING_TOPOLOGIES: dict[str, dict[str, Any]] = {
     LEGACY_SINGLE_GPU_TOPOLOGY: {
         "world_size": 1,
@@ -1030,6 +1035,10 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
     }
+    if isinstance(verified.get("canonical_parent_update"), dict):
+        payload["canonical_parent_update"] = copy.deepcopy(
+            verified["canonical_parent_update"]
+        )
     if verified.get("data_kind") == "production_composite_v2":
         trainer_authority = _require_current_production_trainer_authority(verified)
         assert trainer_authority is not None
@@ -1706,7 +1715,9 @@ def _verify_training_lock(
     return lock, authority
 
 
-def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _require_a1_science(
+    lock: dict[str, Any], *, allow_canonical_parent_update: bool = False
+) -> tuple[dict[str, Any], dict[str, Any]]:
     science = lock.get("science")
     if not isinstance(science, dict):
         raise ExecutorError("sealed A1 contract has no science section")
@@ -1745,7 +1756,7 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
             raise ExecutorError(
                 "sealed coherent learner initialization differs from current science"
             )
-        if initialization["mode"] == "from_scratch":
+        if initialization["mode"] == "from_scratch" and not allow_canonical_parent_update:
             raise ExecutorError(
                 "current coherent-public v3 learner is contract-bound to native "
                 "from-scratch initialization; the checkpoint-initialized one-dose "
@@ -1774,7 +1785,7 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         if coherent_search
         else 0.3
     )
-    if (
+    if not allow_canonical_parent_update and (
         recipe["world_size"] != 1
         or recipe["global_batch_size"] != 4096
         or recipe["optimizer"] != "adam"
@@ -2084,6 +2095,7 @@ def verify_training_inputs(
     frozen_repo: Path | None = None,
     frozen_verifier_sha256: str | None = None,
     coherent_corpus_admission: Path | None = None,
+    allow_canonical_parent_update: bool = False,
 ) -> dict[str, Any]:
     """Replay the sealed lock and complete audit→memmap→holdout chain."""
 
@@ -2119,7 +2131,9 @@ def verify_training_inputs(
             frozen_repo=frozen_repo,
             frozen_verifier_sha256=frozen_verifier_sha256,
         )
-        recipe, objective = _require_a1_science(lock)
+        recipe, objective = _require_a1_science(
+            lock, allow_canonical_parent_update=allow_canonical_parent_update
+        )
         if coherent_corpus_admission is not None:
             if data_path.is_file() or composite_build_receipt is not None:
                 raise ExecutorError(
@@ -2228,6 +2242,105 @@ def verify_training_inputs(
             "validation_game_seed_set_sha256"
         ],
     }
+
+
+def bind_canonical_parent_update_recipe(
+    verified: dict[str, Any], config_path: Path
+) -> dict[str, Any]:
+    """Bind the commissioned 48-step parent update as production authority.
+
+    The generation lock remains the authority for producer/data/search identity.
+    This checked-in catalog recipe is the independent learner authority.  It is
+    deliberately not represented as a generic ablation: the exact recipe was
+    commissioned against f7, while arbitrary overrides remain diagnostic-only.
+    """
+
+    try:
+        path = config_path.expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(f"cannot resolve parent-update config: {error}") from error
+    expected = CANONICAL_PARENT_UPDATE_CONFIG.resolve(strict=True)
+    if path != expected or path.is_symlink():
+        raise ExecutorError(
+            "parent update must use the exact checked-in canonical config"
+        )
+    try:
+        config, engine = canonical_train._load_recipe(path)  # noqa: SLF001
+    except SystemExit as error:
+        raise ExecutorError(f"canonical parent-update config refused: {error}") from error
+    if engine.get("initialization_mode") != "parent_fresh_optimizer":
+        raise ExecutorError("canonical recipe is not a parent-fresh-optimizer update")
+    if verified.get("data_kind") != "production_composite_v2":
+        raise ExecutorError("canonical parent update requires a production composite")
+    recipe = dataclasses.asdict(config)
+    # The schema records the per-rank B200 batch.  Bind a logical one-rank
+    # recipe here so bind_training_topology can prove the exact 8x64=512 dose.
+    recipe.update(
+        {
+            "world_size": 1,
+            "batch_size": 512,
+            "grad_accum_steps": 1,
+            "global_batch_size": 512,
+        }
+    )
+    required = {
+        "max_steps": 48,
+        "optimizer": "adamw",
+        "resume_optimizer": False,
+        "lr": 6e-5,
+        "lr_warmup_steps": 16,
+        "lr_schedule": "flat",
+        "amp": "bf16",
+        "symmetry_augment": True,
+        "training_rng_rank_offset": True,
+    }
+    drift = {
+        key: {"expected": expected_value, "actual": recipe.get(key)}
+        for key, expected_value in required.items()
+        if recipe.get(key) != expected_value
+    }
+    if drift:
+        raise ExecutorError(f"canonical parent-update recipe drift: {drift}")
+    if engine.get("value_tower_split_layers") != 1:
+        raise ExecutorError("canonical parent-update value tower split drift")
+    authority = {
+        "schema_version": "a1-canonical-parent-update-authority-v1",
+        "config": str(path),
+        "config_sha256": _file_sha256(path),
+        "recipe": recipe,
+        "recipe_sha256": _value_sha256(recipe),
+        "parent_checkpoint_sha256": verified["producer"]["sha256"],
+        "composite_descriptor_sha256": verified["corpus_meta_file_sha256"],
+        "composite_build_receipt_sha256": verified["composite_build_receipt"][
+            "file_sha256"
+        ],
+    }
+    authority["authority_sha256"] = _value_sha256(authority)
+    upgrade = verified.get("function_preserving_upgrade")
+    if (
+        not isinstance(upgrade, dict)
+        or upgrade.get("module")
+        != architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1
+        or upgrade.get("source") != verified["producer"]
+    ):
+        raise ExecutorError(
+            "canonical parent update requires the direct producer-to-current-v5+split1 "
+            "function-preserving upgrade receipt"
+        )
+    result = dict(verified)
+    result["bound_recipe"] = recipe
+    result["recipe"] = dict(recipe)
+    result["canonical_parent_update"] = authority
+    result["claim_identity_sha256"] = _value_sha256(
+        {
+            "schema_version": "a1-canonical-parent-update-claim-v1",
+            "contract_sha256": verified["contract_sha256"],
+            "parent_update_authority_sha256": authority["authority_sha256"],
+            "upgrade_receipt_sha256": upgrade["receipt"]["sha256"],
+            "upgrade_receipt_digest": upgrade["receipt_sha256"],
+        }
+    )
+    return result
 
 
 def _component_game_identity_sha256(
@@ -2768,13 +2881,23 @@ def bind_training_topology(
         gpus = (gpu,)
     bound = dict(verified.get("bound_recipe", verified["recipe"]))
     effective = dict(verified["recipe"])
+    canonical_parent_update = isinstance(
+        verified.get("canonical_parent_update"), dict
+    )
+    if canonical_parent_update and topology == B200_8GPU_DDP_TOPOLOGY:
+        spec = {
+            "world_size": 8,
+            "local_batch_size": 64,
+            "grad_accum_steps": 1,
+            "global_batch_size": 512,
+        }
     if (
-        int(bound["global_batch_size"]) != 4096
+        int(bound["global_batch_size"]) != (512 if canonical_parent_update else 4096)
         or int(bound["world_size"]) != 1
-        or int(bound["batch_size"]) != 4096
+        or int(bound["batch_size"]) != (512 if canonical_parent_update else 4096)
         or int(bound["grad_accum_steps"]) != 1
     ):
-        raise ExecutorError("sealed recipe is not the exact legacy 4096-global dose")
+        raise ExecutorError("sealed recipe does not match its logical global dose")
     effective.update(
         {
             "world_size": int(spec["world_size"]),
@@ -2906,8 +3029,10 @@ def _verify_ddp_canary_receipt(
         or created_unix_ns > now_ns
         or now_ns - created_unix_ns > MAX_DDP_CANARY_AGE_NS
         or payload.get("world_size") != 8
-        or payload.get("local_batch_size") != 512
-        or payload.get("global_batch_size") != 4096
+        or (
+            payload.get("local_batch_size"),
+            payload.get("global_batch_size"),
+        ) not in {(512, 4096), (64, 512)}
         or payload.get("ddp_shard_data") is not False
         or payload.get("training_rng_rank_offset") is not True
         or not isinstance(payload.get("training_rng_contracts"), list)
@@ -3119,6 +3244,13 @@ def bind_ddp_canary(
     if receipt_path is None:
         raise ExecutorError("8-GPU production topology requires --ddp-canary-receipt")
     canary = _verify_ddp_canary_receipt(receipt_path, reference_time_ns=time.time_ns())
+    if (
+        canary["semantic_identity"]["local_batch_size"]
+        != topology.get("local_batch_size")
+        or canary["semantic_identity"]["global_batch_size"]
+        != topology.get("global_batch_size")
+    ):
+        raise ExecutorError("DDP canary batch topology differs from learner topology")
     return _bind_verified_ddp_canary(verified, canary)
 
 
@@ -11855,6 +11987,10 @@ def _execute_locked(
         evidence_payload["function_preserving_upgrade"] = verified[
             "function_preserving_upgrade"
         ]
+    if isinstance(verified.get("canonical_parent_update"), dict):
+        evidence_payload["canonical_parent_update"] = copy.deepcopy(
+            verified["canonical_parent_update"]
+        )
     terminal_claim_payload = dict(evidence_payload)
     terminal_claim_payload["schema_version"] = (
         RETRY_CLAIM_SCHEMA
@@ -11982,6 +12118,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "immutable allowlisted zero-diff initializer receipt; exact producer "
             "bytes remain the default"
+        ),
+    )
+    parser.add_argument(
+        "--canonical-parent-update-config",
+        type=Path,
+        default=None,
+        help=(
+            "exact checked-in 48-step f7 parent-update recipe; requires the "
+            "direct current-v5+split1 upgrade and production composite"
         ),
     )
     parser.add_argument(
@@ -12208,6 +12353,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             for value in (*final_required_values, args.final_warmed_initializer)
         )
         stage_c_final_requested = args.stage_c_final_authority is not None
+        canonical_parent_update_requested = (
+            args.canonical_parent_update_config is not None
+        )
         if stage_c_final_requested != (args.stage_c_final_arm is not None):
             raise ExecutorError(
                 "--stage-c-final-authority and --stage-c-final-arm are required together"
@@ -12279,6 +12427,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         generic_ablation_requested = bool(
             args.ablation_id or args.recipe_overrides_json
         )
+        if canonical_parent_update_requested and (
+            generic_ablation_requested
+            or aux_requested
+            or p1_requested
+            or final_requested
+            or stage_c_final_requested
+            or args.architecture_upgrade_receipt is None
+            or args.topology != B200_8GPU_DDP_TOPOLOGY
+            or args.gpu != 0
+        ):
+            raise ExecutorError(
+                "canonical parent update requires direct upgrade receipt and exact "
+                "b200-8gpu-ddp GPU0 ownership; diagnostics are forbidden"
+            )
         if (
             args.coherent_corpus_admission is not None
             and not (generic_ablation_requested or stage_c_final_requested)
@@ -12343,6 +12505,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.frozen_verifier_sha256 if frozen_requested else None
             ),
             coherent_corpus_admission=args.coherent_corpus_admission,
+            allow_canonical_parent_update=canonical_parent_update_requested,
         )
         if args.architecture_upgrade_receipt is not None:
             verified = bind_function_preserving_upgrade(
@@ -12352,6 +12515,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_diagnostic_recent_history_source=bool(args.diagnostic_dose_curve),
                 independent_parent_authority_path=(args.independent_parent_authority),
                 allow_stage_c_final_current_parent=stage_c_final_requested,
+            )
+        if canonical_parent_update_requested:
+            assert args.canonical_parent_update_config is not None
+            verified = bind_canonical_parent_update_recipe(
+                verified, args.canonical_parent_update_config
             )
         if stage_c_final_requested:
             assert args.stage_c_final_authority is not None

@@ -38,7 +38,6 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_promotion_transaction as promotion  # noqa: E402
 from tools import a1_flywheel_turn as flywheel  # noqa: E402
 from tools import a1_current_science_contract as current_science  # noqa: E402
-from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
 
 
 STATE_SCHEMA = "a1-iteration-state-v1"
@@ -541,6 +540,7 @@ def initialize_next(
     evaluation_parent: Path,
     initializer: Path,
     architecture_upgrade_receipt: Path | None,
+    canonical_parent_update_config: Path | None = None,
     checkpoint: Path,
     report: Path,
     training_receipt: Path,
@@ -586,16 +586,38 @@ def initialize_next(
         "recipe_overrides_json": recipe_overrides_json,
         "ablation_code_tree_sha256": ablation_code_tree_sha256,
         "reviewed_lock_file_sha256": reviewed_lock_file_sha256,
+        "canonical_parent_update_config": (
+            None
+            if canonical_parent_update_config is None
+            else _file_ref(
+                canonical_parent_update_config,
+                where="canonical parent-update config",
+            )
+        ),
     }
     python_ref = _executable_ref(python, where="learner python")
     try:
-        verified = _verify_training_binding(
-            verify_fn,
-            lock_path=lock_path,
-            data_path=data_path,
-            validation_path=validation_path,
-            composite_build_receipt=composite_build_receipt,
+        verify_kwargs = {
+            "lock_path": lock_path,
+            "data_path": data_path,
+            "validation_path": validation_path,
+            "composite_build_receipt": composite_build_receipt,
+        }
+        if canonical_parent_update_config is not None:
+            verify_kwargs["allow_canonical_parent_update"] = True
+        verified = verify_fn(**verify_kwargs)
+        if architecture_upgrade_receipt is not None:
+            verified = one_dose.bind_function_preserving_upgrade(
+                verified, architecture_upgrade_receipt
+            )
+        if canonical_parent_update_config is not None:
+            verified = one_dose.bind_canonical_parent_update_recipe(
+                verified, canonical_parent_update_config
+            )
+        verified = one_dose.bind_training_topology(
+            verified, topology=topology, gpu=gpu
         )
+        verified = one_dose.bind_ddp_canary(verified, ddp_canary_receipt)
         search = verified.get("lock", {}).get("science", {}).get(
             "search_operator", {}
         )
@@ -607,7 +629,10 @@ def initialize_next(
                     "current coherent-public turn must use the contract-bound "
                     "8xB200 topology"
                 )
-            if initialization["mode"] == "from_scratch":
+            if (
+                initialization["mode"] == "from_scratch"
+                and canonical_parent_update_config is None
+            ):
                 raise IterationError(
                     "current coherent-public v3 learner is contract-bound to native "
                     "from-scratch initialization; the checkpoint-initialized one-dose "
@@ -624,15 +649,13 @@ def initialize_next(
                     "production lock; generic diagnostic ablation arguments would "
                     "make the candidate promotion-ineligible"
                 )
-            try:
-                upgrade = architecture_upgrade.verify_receipt(
-                    architecture_upgrade_receipt
-                )
-            except architecture_upgrade.UpgradeError as error:
-                raise IterationError(
-                    f"current coherent-public architecture receipt refused: {error}"
-                ) from error
-            if upgrade.get("module") != learner_contract["architecture_upgrade_module"]:
+            upgrade = verified.get("function_preserving_upgrade")
+            if not isinstance(upgrade, dict):
+                raise IterationError("architecture upgrade was not bound")
+            if canonical_parent_update_config is None and (
+                upgrade.get("module")
+                != learner_contract["architecture_upgrade_module"]
+            ):
                 raise IterationError(
                     "current coherent-public turn requires the combined structured-"
                     "action/value + bias-free public-card + meaningful-history v3 "
@@ -1003,6 +1026,11 @@ def _dose_argv(state: dict[str, Any], *, go: bool) -> list[str]:
             canary = options.get("ddp_canary_receipt")
             if isinstance(canary, dict):
                 argv.extend(["--ddp-canary-receipt", str(canary["path"])])
+            parent_update = options.get("canonical_parent_update_config")
+            if isinstance(parent_update, dict):
+                argv.extend(
+                    ["--canonical-parent-update-config", str(parent_update["path"])]
+                )
             if options.get("ablation_id"):
                 argv.extend(
                     [
@@ -1029,17 +1057,49 @@ def _reverify_state_training(
     training = state["training"]
     validation = training.get("validation_manifest")
     composite = training.get("composite_build_receipt")
-    return _verify_training_binding(
-        verify_fn,
-        lock_path=Path(training["lock"]["path"]),
-        data_path=Path(training["data"]),
-        validation_path=(
+    options = training.get("dose_options")
+    parent_update = (
+        options.get("canonical_parent_update_config")
+        if isinstance(options, dict)
+        else None
+    )
+    kwargs = {
+        "lock_path": Path(training["lock"]["path"]),
+        "data_path": Path(training["data"]),
+        "validation_path": (
             Path(validation["path"]) if isinstance(validation, dict) else None
         ),
-        composite_build_receipt=(
+        "composite_build_receipt": (
             Path(composite["path"]) if isinstance(composite, dict) else None
         ),
-    )
+    }
+    if isinstance(parent_update, dict):
+        kwargs["allow_canonical_parent_update"] = True
+    verified = verify_fn(**kwargs)
+    if training.get("initialization_mode") == "next_turn":
+        turn = json.loads(
+            Path(training["flywheel_turn"]["path"]).read_text(encoding="utf-8")
+        )
+        initializer = turn.get("initializer") if isinstance(turn, dict) else None
+        receipt = initializer.get("receipt") if isinstance(initializer, dict) else None
+        if isinstance(receipt, dict):
+            verified = one_dose.bind_function_preserving_upgrade(
+                verified, Path(str(receipt["path"]))
+            )
+        if isinstance(parent_update, dict):
+            verified = one_dose.bind_canonical_parent_update_recipe(
+                verified, Path(str(parent_update["path"]))
+            )
+        topology = str(options.get("topology", one_dose.LEGACY_SINGLE_GPU_TOPOLOGY))
+        verified = one_dose.bind_training_topology(
+            verified, topology=topology, gpu=int(training["gpu"])
+        )
+        canary = options.get("ddp_canary_receipt")
+        verified = one_dose.bind_ddp_canary(
+            verified,
+            Path(str(canary["path"])) if isinstance(canary, dict) else None,
+        )
+    return verified
 
 
 def _run_tool(
@@ -1517,12 +1577,18 @@ def dose_dry_run(
                 ) from error
             _verify_next_turn_binding(state, verified=verified)
         plan = _run_json_tool(_dose_argv(state, go=False), runner=runner)
+        expected_world_size = (
+            8
+            if state["training"].get("dose_options", {}).get("topology")
+            == one_dose.B200_8GPU_DDP_TOPOLOGY
+            else 1
+        )
         if (
             plan.get("schema_version") != one_dose.PLAN_SCHEMA
             or plan.get("mode") != "dry-run"
             or plan.get("contract_sha256") != state["training"]["contract_sha256"]
             or plan.get("global_n_full") != 128
-            or plan.get("world_size") != 1
+            or plan.get("world_size") != expected_world_size
             or plan.get("checkpoint") != state["training"]["checkpoint"]
             or plan.get("report") != state["training"]["report"]
             or plan.get("receipt") != state["training"]["receipt"]
@@ -1554,8 +1620,16 @@ def _load_complete_training_receipt(state: dict[str, Any]) -> dict[str, Any]:
     stated = unhashed.pop("receipt_sha256", None)
     if stated != one_dose._value_sha256(unhashed):  # noqa: SLF001
         raise IterationError("A1 training receipt digest mismatch")
+    canonical_parent_update = isinstance(
+        training.get("dose_options", {}).get("canonical_parent_update_config"), dict
+    )
+    expected_receipt_schema = (
+        one_dose.UPGRADE_RECEIPT_SCHEMA
+        if canonical_parent_update
+        else one_dose.RECEIPT_SCHEMA
+    )
     if (
-        payload.get("schema_version") != one_dose.RECEIPT_SCHEMA
+        payload.get("schema_version") != expected_receipt_schema
         or payload.get("status") != "complete"
         or payload.get("contract_sha256") != training["contract_sha256"]
         or payload.get("command_sha256") != state["training_plan"].get("command_sha256")
@@ -1583,7 +1657,13 @@ def _load_complete_training_receipt(state: dict[str, Any]) -> dict[str, Any]:
         if claim_path != expected_claim:
             raise IterationError("A1 training receipt binds the wrong durable claim")
         claim = one_dose._load_claim_state(  # noqa: SLF001
-            claim_path, contract_sha256=training["contract_sha256"]
+            claim_path,
+            contract_sha256=training["contract_sha256"],
+            claim_identity_sha256=(
+                str(payload["claim_identity_sha256"])
+                if canonical_parent_update
+                else None
+            ),
         )
     except (one_dose.ExecutorError, OSError) as error:
         raise IterationError(
@@ -1911,6 +1991,7 @@ def build_parser() -> argparse.ArgumentParser:
     next_init.add_argument("--evaluation-parent", required=True, type=Path)
     next_init.add_argument("--initializer", required=True, type=Path)
     next_init.add_argument("--architecture-upgrade-receipt", type=Path)
+    next_init.add_argument("--canonical-parent-update-config", type=Path)
     next_init.add_argument("--checkpoint", required=True, type=Path)
     next_init.add_argument("--report", required=True, type=Path)
     next_init.add_argument("--training-receipt", required=True, type=Path)
@@ -1988,6 +2069,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 evaluation_parent=args.evaluation_parent,
                 initializer=args.initializer,
                 architecture_upgrade_receipt=args.architecture_upgrade_receipt,
+                canonical_parent_update_config=args.canonical_parent_update_config,
                 checkpoint=args.checkpoint,
                 report=args.report,
                 training_receipt=args.training_receipt,

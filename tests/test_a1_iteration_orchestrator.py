@@ -488,6 +488,41 @@ def test_next_turn_upgrade_receipt_is_forwarded_to_one_dose(tmp_path: Path) -> N
     assert argv[index + 1] == str(receipt)
 
 
+def test_next_turn_canonical_parent_update_is_forwarded_to_one_dose(
+    tmp_path: Path,
+) -> None:
+    receipt = _write(tmp_path / "upgrade.receipt.json", "receipt")
+    config = _write(tmp_path / "parent-update.json", "config")
+    turn_path = tmp_path / "turn.json"
+    turn_path.write_text(
+        json.dumps({"initializer": {"receipt": {"path": str(receipt)}}}),
+        encoding="utf-8",
+    )
+    state = {
+        "training": {
+            "initialization_mode": "next_turn",
+            "flywheel_turn": {"path": str(turn_path)},
+            "lock": {"path": "lock"},
+            "data": "data",
+            "validation_manifest": {"path": "validation"},
+            "checkpoint": "candidate",
+            "report": "report",
+            "receipt": "training-receipt",
+            "python": {"path": "python"},
+            "gpu": 0,
+            "dose_options": {
+                "topology": iteration.one_dose.B200_8GPU_DDP_TOPOLOGY,
+                "canonical_parent_update_config": {"path": str(config)},
+            },
+        }
+    }
+
+    argv = iteration._dose_argv(state, go=False)
+
+    index = argv.index("--canonical-parent-update-config")
+    assert argv[index + 1] == str(config)
+
+
 def test_bootstrap_initialize_is_explicit(tmp_path: Path) -> None:
     verified, paths = _verified(tmp_path)
     with pytest.raises(iteration.IterationError, match="explicit"):

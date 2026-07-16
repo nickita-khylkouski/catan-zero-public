@@ -1496,6 +1496,39 @@ def test_production_trainer_authority_binds_current_science_import() -> None:
     assert "tools/a1_feature_signal_admission.py" in records
 
 
+def test_canonical_parent_update_binds_48_step_8x64_recipe() -> None:
+    producer = {"path": "/checkpoint/f7.pt", "sha256": "sha256:" + "1" * 64}
+    verified = {
+        "contract_sha256": "sha256:" + "2" * 64,
+        "data_kind": "production_composite_v2",
+        "producer": producer,
+        "corpus_meta_file_sha256": "sha256:" + "3" * 64,
+        "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
+        "function_preserving_upgrade": {
+            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+            "source": producer,
+            "receipt": {"sha256": "sha256:" + "5" * 64},
+            "receipt_sha256": "sha256:" + "6" * 64,
+        },
+    }
+
+    bound = executor.bind_canonical_parent_update_recipe(
+        verified, executor.CANONICAL_PARENT_UPDATE_CONFIG
+    )
+    bound = executor.bind_training_topology(
+        bound, topology=executor.B200_8GPU_DDP_TOPOLOGY, gpu=0
+    )
+
+    assert bound["recipe"]["max_steps"] == 48
+    assert bound["recipe"]["optimizer"] == "adamw"
+    assert bound["recipe"]["world_size"] == 8
+    assert bound["recipe"]["batch_size"] == 64
+    assert bound["recipe"]["global_batch_size"] == 512
+    assert bound["canonical_parent_update"]["parent_checkpoint_sha256"] == (
+        producer["sha256"]
+    )
+
+
 def test_production_failure_receipt_binds_current_trainer_authority(
     tmp_path: Path,
 ) -> None:
