@@ -8,7 +8,7 @@ fallback as one source of truth while removing the per-simulation Python loop.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from catan_zero.search.gumbel_chance_mcts import (
     GumbelChanceMCTS,
@@ -39,6 +39,9 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         allow_python_fallback: bool = False,
     ) -> None:
         super().__init__(config, evaluator)
+        self._leaf_evaluation_observer: (
+            Callable[[Any, tuple[int, ...], str], None] | None
+        ) = None
         self.using_native_hot_loop = native_hot_loop_available()
         self._validate_native_semantics()
         if not self.using_native_hot_loop and not allow_python_fallback:
@@ -47,6 +50,31 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 "is unavailable; install the matching native wheel or explicitly "
                 "set allow_python_fallback=True"
             )
+
+    def set_leaf_evaluation_observer(
+        self,
+        observer: Callable[[Any, tuple[int, ...], str], None] | None,
+    ) -> None:
+        """Observe native leaf queries without confusing them with the root.
+
+        The PyO3 bridge already hands Python an independent clone of every
+        evaluated game. A bounded frontier recorder may retain selected clones
+        safely; the default ``None`` path adds no featurization or persistence.
+        """
+
+        if observer is not None and not callable(observer):
+            raise TypeError("leaf evaluation observer must be callable or None")
+        self._leaf_evaluation_observer = observer
+
+    def _observe_leaf_evaluation(
+        self,
+        native_game: Any,
+        legal: tuple[int, ...],
+        root_color: str,
+    ) -> None:
+        observer = getattr(self, "_leaf_evaluation_observer", None)
+        if observer is not None:
+            observer(native_game, legal, str(root_color))
 
     def _validate_native_semantics(self) -> None:
         unsupported: list[str] = []
@@ -255,8 +283,10 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         colors = tuple(self.config.colors)
 
         def evaluate(native_game: Any, legal: list[int], root_color: str):
+            legal_tuple = tuple(int(action) for action in legal)
+            self._observe_leaf_evaluation(native_game, legal_tuple, root_color)
             return self.evaluator.evaluate(
-                native_game, tuple(legal), root_color=root_color, colors=colors
+                native_game, legal_tuple, root_color=root_color, colors=colors
             )
 
         evaluate_many = None
@@ -270,13 +300,31 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                     raise RuntimeError(
                         "native evaluation batch mixed root perspectives"
                     )
+                normalized = [
+                    (request[0], tuple(int(action) for action in request[1]))
+                    for request in requests
+                ]
+                for native_game, legal in normalized:
+                    self._observe_leaf_evaluation(
+                        native_game, legal, str(requests[0][2])
+                    )
                 return self.evaluator.evaluate_many(
-                    [(request[0], tuple(request[1])) for request in requests],
+                    normalized,
                     root_color=next(iter(root_colors)),
                     colors=colors,
                 )
 
-        root_evaluator = None
+        # Always provide a distinct root callback.  The native bridge otherwise
+        # falls back to ``evaluate`` and a frontier recorder would silently
+        # capture trajectory roots as counterfactual leaves.
+        def root_evaluator(native_game: Any, legal: list[int], root_color: str):
+            return self.evaluator.evaluate(
+                native_game,
+                tuple(int(action) for action in legal),
+                root_color=root_color,
+                colors=colors,
+            )
+
         native_legal = tuple(
             int(action)
             for action in game.playable_action_indices(

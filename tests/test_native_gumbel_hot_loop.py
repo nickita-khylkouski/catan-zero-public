@@ -285,6 +285,83 @@ def test_native_particle_root_callback_replays_immutable_precomputed_d6(
     assert result.simulations_used == 32
 
 
+def test_native_leaf_observer_excludes_root_and_covers_scalar_and_batch(
+    monkeypatch,
+) -> None:
+    root_game = object()
+    scalar_leaf = object()
+    batch_leaf = object()
+    observed = []
+
+    class _Game:
+        def playable_action_indices(self, colors, map_kind):
+            assert tuple(colors) == ("RED", "BLUE")
+            assert map_kind is None
+            return [3, 7]
+
+    class _Evaluator:
+        def evaluate(self, game, legal, *, root_color, colors):
+            del game, root_color, colors
+            return ({int(action): 1.0 / len(legal) for action in legal}, 0.25)
+
+        def evaluate_many(self, requests, *, root_color, colors):
+            return [
+                self.evaluate(
+                    game, legal, root_color=root_color, colors=colors
+                )
+                for game, legal in requests
+            ]
+
+    def fake_search(
+        game,
+        evaluator,
+        config,
+        *,
+        evaluator_many,
+        root_evaluator,
+        force_full,
+    ):
+        del config, force_full
+        root_evaluator(root_game, [3, 7], "RED")
+        evaluator(scalar_leaf, [3], "RED")
+        evaluator_many([(batch_leaf, [7], "RED")])
+        return {
+            "selected_action": 3,
+            "improved_policy": {3: 0.5, 7: 0.5},
+            "visit_counts": {3: 1, 7: 1},
+            "q_values": {3: 0.0, 7: 0.0},
+            "priors": {3: 0.5, 7: 0.5},
+            "root_value": 0.25,
+            "used_full_search": True,
+            "simulations_used": 2,
+            "afterstate_values": {},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(gumbel_search=fake_search),
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(seed=7)
+    search.evaluator = _Evaluator()
+    search.rng = random.Random(7)
+    search.using_native_hot_loop = True
+    search.set_leaf_evaluation_observer(
+        lambda game, legal, root_color: observed.append(
+            (game, legal, root_color)
+        )
+    )
+
+    result = search._search_single_world(_Game(), force_full=True)
+
+    assert result.simulations_used == 2
+    assert observed == [
+        (scalar_leaf, (3,), "RED"),
+        (batch_leaf, (7,), "RED"),
+    ]
+
+
 def test_native_config_maps_sigma_reference_visits() -> None:
     # Mapping is a pure Python boundary contract.  Do not require the installed
     # wheel to advertise the new capability here: the separate test below
