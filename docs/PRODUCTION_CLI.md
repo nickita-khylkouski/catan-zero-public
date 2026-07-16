@@ -64,7 +64,12 @@ the exact eight-rank DDP topology. Evaluation accepts a typed `devices` list.
   is ready and requires an exact `init_checkpoint`. It launches the cataloged
   compact trainer with eight DDP ranks and a fresh optimizer.
 - PPO: represented but blocked. The retained exact-initializer canary was
-  harmful and no canonical PPO recipe exists.
+  harmful and no canonical PPO recipe exists. The local H100 path now has a
+  strict hashed v2 manifest, manifest-stamped shards, and per-update exact
+  recovery, validated by a one-update smoke and restart. This does not
+  commission PPO: the checked manifest is a template and the Modal wrappers
+  are not yet v2-manifest-bound. See
+  [`PPO_V2_MANIFEST_H100_SMOKE_20260716.md`](evidence/PPO_V2_MANIFEST_H100_SMOKE_20260716.md).
 
 `plan` and `prepare` remain available for blocked scratch training so operators
 can inspect and authenticate the exact future command and artifacts without
