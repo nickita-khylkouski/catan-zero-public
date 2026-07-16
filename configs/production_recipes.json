@@ -20,6 +20,11 @@
         "canonical_sha256": "eea4fbfec0b77bf2fce7950977425bde883f7cb7f430035a3b0b061af009a8ae",
         "name": "a1-current-35m-b200",
         "path": "configs/training/a1_current_35m_b200.schema1.json"
+      },
+      {
+        "canonical_sha256": "ed804b9180e6ee773cd85590d69bdd79160a2813ba4ead012eb7b7d1f4e43cd7",
+        "name": "a1-parent-update-35m-b200",
+        "path": "configs/training/a1_parent_update_35m_b200.schema1.json"
       }
     ]
   }

@@ -1,11 +1,10 @@
 # Canonical training configuration adapter
 
 `tools/train.py` is the compact config adapter for a commissioned learner
-recipe; it is not, by itself, launch authority. The only checked-in recipe is
-currently `scratch_fresh_optimizer`, so direct invocation fails closed and
-routes operators through `tools/a1_scratch_train.py`. The scratch executor
-authenticates the lock, admitted composite, build receipt, topology, and
-planning receipt before it can execute.
+recipe. Fresh-scratch execution requires the stronger authority in
+`tools/a1_scratch_train.py`, which authenticates the lock, admitted composite,
+build receipt, topology, and planning receipt. The independently commissioned
+parent-update recipe may use the compact adapter with an exact parent.
 
 The public entrypoint exposes eight options:
 
@@ -21,11 +20,17 @@ The public entrypoint exposes eight options:
 ```
 
 Architecture, optimization, masking, sampling, value objectives, diagnostics,
-and model-admission settings live in the checked-in typed recipe:
+and model-admission settings live in one of two exact checked-in recipes:
 
 ```text
-configs/training/a1_current_35m_b200.schema1.json
+configs/training/a1_current_35m_b200.schema1.json         # fresh scratch
+configs/training/a1_parent_update_35m_b200.schema1.json   # exact parent update
 ```
+
+The launcher authenticates the complete normalized JSON payload and binds its
+hash to its initialization role. Changing a field requires commissioning a new
+recipe; changing only `initialization_mode` cannot turn one recipe into the
+other.
 
 The launcher decodes that recipe into `TrainConfig` and hands an in-memory
 namespace to the engine. It does not reconstruct or parse the legacy
@@ -54,7 +59,28 @@ Inspect and commission that exact plan, then rerun the same command with
 `--go`. Do not add `--go` to an unreviewed plan and do not invoke
 `tools/train.py` directly for this recipe.
 
-The checked-in `a1_current_35m_b200.schema1.json` recipe is the native-v5
+The independently commissioned split1 FULL parent update is launched with the
+separate parent recipe and an exact parent checkpoint:
+
+```bash
+torchrun --standalone --nproc-per-node=8 tools/train.py \
+  --config configs/training/a1_parent_update_35m_b200.schema1.json \
+  --data /path/to/authenticated_single_corpus.json \
+  --init-checkpoint /path/to/exact-f7-parent.pt \
+  --checkpoint /path/to/candidate.pt \
+  --report /path/to/report.json
+```
+
+That recipe reproduces the commissioned 8×64 global batch, fresh AdamW,
+48-step exact dose, flat `6e-5` learning rate with 16 warmup steps, full value
+and shared-trunk routing, split1 value topology, and authenticated coherent
+teacher identity. It records the review frontier at steps 8, 12, 16, 24, 32,
+and 48. The launcher retains the first five as model-only `_stepNNNN`
+snapshots; the normal terminal `candidate.pt` is the step-48 member of the
+frontier. Candidate chaining, optimizer resume, grow-from initialization, and
+an unrecognized teacher target are rejected.
+
+The checked-in `a1_current_35m_b200.schema1.json` recipe remains the native-v5
 **fresh-scratch** architecture recipe.  It is not the checkpoint-initialized
 coherent dose-frontier experiment.  In particular, the measured 32-step
 frontier must not be copied into this recipe: that evidence started from the

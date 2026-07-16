@@ -26,6 +26,10 @@ APPROVED = {
         "a1-current-35m-b200",
     ),
 }
+APPROVED_PARENT_UPDATE = (
+    "configs/training/a1_parent_update_35m_b200.schema1.json",
+    "a1-parent-update-35m-b200",
+)
 
 
 @pytest.mark.parametrize("entrypoint", sorted(APPROVED))
@@ -37,6 +41,17 @@ def test_checked_in_production_recipe_is_authenticated(entrypoint: str) -> None:
         require_production_recipe(
             entrypoint=entrypoint, path=path, payload=payload
         )
+        == expected_name
+    )
+
+
+def test_checked_in_parent_update_recipe_is_authenticated() -> None:
+    relative, expected_name = APPROVED_PARENT_UPDATE
+    path = ROOT / relative
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert (
+        require_production_recipe(entrypoint="train", path=path, payload=payload)
         == expected_name
     )
 

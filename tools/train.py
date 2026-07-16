@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -35,8 +36,17 @@ from catan_zero.rl.production_recipe_catalog import (  # noqa: E402
 
 
 CANONICAL_TRAIN_LAUNCH_SCHEMA = 1
+CANONICAL_CONFIG_ROLES_BY_SHA256 = {
+    "eea4fbfec0b77bf2fce7950977425bde883f7cb7f430035a3b0b061af009a8ae": (
+        "scratch_fresh_optimizer"
+    ),
+    "ed804b9180e6ee773cd85590d69bdd79160a2813ba4ead012eb7b7d1f4e43cd7": (
+        "parent_fresh_optimizer"
+    ),
+}
 _ENGINE_SETTING_KEYS = frozenset(
     {
+        "accepted_policy_target_identity_sha256",
         "base_sampler",
         "checkpoint_steps",
         "data_loader_prefetch",
@@ -105,6 +115,26 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
         require_production_recipe(entrypoint="train", path=source, payload=payload)
     except ProductionRecipeError as error:
         raise SystemExit(str(error)) from error
+    engine = payload.get("engine_settings")
+    if not isinstance(engine, dict):
+        raise SystemExit("canonical train config engine_settings must be an object")
+    payload_sha256 = hashlib.sha256(
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+    ).hexdigest()
+    expected_role = CANONICAL_CONFIG_ROLES_BY_SHA256.get(payload_sha256)
+    if expected_role is None:
+        raise SystemExit(
+            "canonical train config is not the exact commissioned payload: "
+            f"actual_sha256={payload_sha256}"
+        )
+    recipe_role = str(engine.get("initialization_mode", "") or "")
+    if recipe_role != expected_role:
+        raise SystemExit(
+            "canonical train config role does not match its commissioned payload: "
+            f"expected_role={expected_role!r} actual_role={recipe_role!r}"
+        )
     if payload.get("launcher_schema") != CANONICAL_TRAIN_LAUNCH_SCHEMA:
         raise SystemExit(
             "canonical train config launcher_schema must be "
@@ -135,9 +165,6 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
     config = config_from_payload(train_payload)
     if not isinstance(config, TrainConfig):
         raise SystemExit("canonical train config did not decode as TrainConfig")
-    engine = payload.get("engine_settings", {})
-    if not isinstance(engine, dict):
-        raise SystemExit("canonical train config engine_settings must be an object")
     unknown = sorted(set(engine) - _ENGINE_SETTING_KEYS)
     if unknown:
         raise SystemExit(f"unknown canonical engine setting(s): {unknown}")
@@ -256,6 +283,24 @@ def _engine_namespace(
             "parent_fresh_optimizer requires an exact parent checkpoint and fresh "
             "optimizer; grow-from and optimizer resume are different experiments"
         )
+    # The checked-in frontier includes the terminal dose for reviewability, while
+    # train_bc writes that dose to the canonical terminal checkpoint automatically.
+    # Forward only true intermediate snapshots to avoid duplicating the terminal
+    # checkpoint under a second filename.
+    checkpoint_frontier = str(engine_settings.get("checkpoint_steps", "") or "")
+    if checkpoint_frontier and int(config.max_steps) > 0:
+        try:
+            frontier_steps = tuple(
+                int(part.strip()) for part in checkpoint_frontier.split(",")
+            )
+        except ValueError as error:
+            raise SystemExit(
+                "canonical checkpoint frontier must be comma-separated integers"
+            ) from error
+        if frontier_steps and frontier_steps[-1] == int(config.max_steps):
+            engine_settings["checkpoint_steps"] = ",".join(
+                str(step) for step in frontier_steps[:-1]
+            )
     settings.update(engine_settings)
     settings.update(
         {
