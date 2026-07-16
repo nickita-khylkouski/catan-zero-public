@@ -1283,12 +1283,15 @@ def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
     assert metric["samples"] == metric["policy_base_row_count"] == 6
     assert metric["policy_aux_row_count"] == 0
     assert metric["policy_total_row_count"] == 6
-    assert metric["policy_base_accuracy_active_count"] == 5
+    # The default policy objective now excludes one-legal-action plumbing.
+    # Four OPEN rows remain active: one row is explicitly weight-zero and the
+    # FORCED row receives the default forced_action_weight=0.
+    assert metric["policy_base_accuracy_active_count"] == 4
     assert metric["policy_aux_accuracy_active_count"] == 0
-    assert metric["policy_total_accuracy_active_count"] == 5
+    assert metric["policy_total_accuracy_active_count"] == 4
     assert metric["policy_total_accuracy"] == metric["accuracy"]
     assert metric["policy_total_phase_accuracy"] == metric["phase_accuracy"]
-    assert metric["policy_base_phase_accuracy"]["FORCED"]["count"] == 1
+    assert "FORCED" not in metric["policy_base_phase_accuracy"]
     assert metric["policy_base_phase_accuracy"]["OPEN"]["count"] == 4
     unforced = metric["policy_base_phase_accuracy_excluding_forced"]
     assert unforced == metric["policy_total_phase_accuracy_excluding_forced"]
