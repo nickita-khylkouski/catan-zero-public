@@ -26,7 +26,7 @@ for import_root in (REPO_ROOT, SRC_ROOT):
 from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION, EvalConfig
 
 
-CANONICAL_OPTION_COUNT = 9
+CANONICAL_OPTION_COUNT = 10
 CANONICAL_CONFIG_SHA256 = (
     "00e001f832cbfc5464aa32efef0a6db980bd37709f1924b833bdc61c6d4b1efd"
 )
@@ -41,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pairs", type=int, required=True)
     parser.add_argument("--workers", type=int, required=True)
     parser.add_argument("--devices", required=True)
+    parser.add_argument(
+        "--threads-per-worker",
+        type=int,
+        default=0,
+        help="CPU thread cap per evaluator worker (0 lets the executor derive it).",
+    )
     parser.add_argument("--base-seed", type=int, required=True)
     parser.add_argument("--held-out-suite", type=Path)
     return parser
@@ -155,6 +161,8 @@ def _executor_argv(args: argparse.Namespace) -> list[str]:
         str(args.workers),
         "--devices",
         args.devices,
+        "--threads-per-worker",
+        str(args.threads_per_worker),
         "--base-seed",
         str(args.base_seed),
         "--dump-config",
@@ -183,6 +191,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--pairs must be positive")
     if args.workers < 1:
         parser.error("--workers must be positive")
+    if args.threads_per_worker < 0:
+        parser.error("--threads-per-worker must be non-negative")
     if args.base_seed < 0:
         parser.error("--base-seed must be non-negative")
     try:
