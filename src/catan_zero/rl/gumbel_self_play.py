@@ -57,8 +57,10 @@ from catan_zero.rl.action_mask import ActionCatalog
 from catan_zero.rl.decision_taxonomy import (
     AUTOMATIC_TRANSITION,
     DECISION_TAXONOMY_SCHEMA_VERSION,
+    WIDE_CHOICE_MIN_LEGAL_ACTIONS,
     classify_public_decision,
     decision_requires_full_search,
+    search_budget_reason,
 )
 from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_SEMANTIC,
@@ -237,6 +239,7 @@ EXTRA_KEYS = (
     "is_forced",
     "decision_class",
     "decision_taxonomy_schema",
+    "search_budget_reason",
     "prior_policy",
     # CAT-100: realized-trajectory auxiliary targets. These are present on
     # every production row; unavailable targets use NaN (binary/scalar) or -1
@@ -861,6 +864,7 @@ def _build_decision_row(
     ),
     event_history_limit: int = 64,
     decision_class: str = "normal_choice",
+    search_budget_reason_value: str = "normal_choice_playout_cap_randomization",
     entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     if target_information_regime not in TARGET_INFORMATION_REGIMES:
@@ -989,6 +993,7 @@ def _build_decision_row(
         "is_forced": bool(is_forced),
         "decision_class": str(decision_class),
         "decision_taxonomy_schema": DECISION_TAXONOMY_SCHEMA_VERSION,
+        "search_budget_reason": str(search_budget_reason_value),
         "simulations_used": np.int32(result.simulations_used),
         # Search-root supervision is admitted only for real, non-forced FULL
         # searches. Fast PCR rows contribute bounded policy supervision but
@@ -1261,12 +1266,12 @@ def play_one_game(
     behavior: both seats use `evaluator`, every decision is recorded, and
     `_build_decision_row` omits the two provenance columns entirely.
 
-    Single-legal-action prompts are engine transitions, not policy decisions:
-    they are applied directly without neural inference, MCTS, or a training
-    row. Public mandatory multi-choice prompts (initial placement, discard,
-    robber placement, and Road Building placements) always use the full search
-    budget. Other roots retain playout-cap randomization; wide roots are
-    upgraded by the MCTS configuration.
+    Single-legal-action prompts are automatic transitions with no policy
+    authority. Public opening, robber, Road Building, first-discard, and wide
+    multi-choice roots always use the full search budget. Repeated discards by
+    the same actor and ordinary roots retain playout-cap randomization: paying
+    n128 again for each card in one mandatory discard sequence duplicates one
+    local choice while reducing strategic-root coverage.
 
     Both seats are driven by the same `mcts`. Its RNG advances naturally across
     decisions inside this game; `run_worker_games` assigns each absolute game a
@@ -1354,10 +1359,6 @@ def play_one_game(
             automatic_class = classify_public_decision(
                 None,
                 legal_action_count=1,
-                wide_threshold=max(
-                    2,
-                    int(getattr(mcts.config, "n_full_wide_threshold", 20) or 20),
-                ),
             )
             if automatic_class != AUTOMATIC_TRANSITION:
                 raise RuntimeError("single-action root lost automatic classification")
@@ -1389,10 +1390,11 @@ def play_one_game(
         decision_class = classify_public_decision(
             snapshot,
             legal_action_count=len(legal_rust),
-            wide_threshold=max(
-                2,
-                int(getattr(mcts.config, "n_full_wide_threshold", 20) or 20),
-            ),
+        )
+        budget_reason = search_budget_reason(
+            snapshot,
+            decision_class=decision_class,
+            eval_override=eval_override,
         )
         aux_states.append(rust_aux_state_from_snapshot(snapshot))
         if aux_hex_ids is None:
@@ -1525,6 +1527,7 @@ def play_one_game(
                 ),
                 event_history_limit=int(config.event_history_limit),
                 decision_class=decision_class,
+                search_budget_reason_value=budget_reason,
                 entity_feature_adapter_version=(
                     learner_entity_feature_adapter_version
                 ),
@@ -3237,6 +3240,21 @@ def run_worker_games(
         "search_execution_contract": _search_execution_contract(
             search_config, native_mcts_hot_loop=bool(native_mcts_hot_loop)
         ),
+        "decision_taxonomy_schema": DECISION_TAXONOMY_SCHEMA_VERSION,
+        "search_budget_contract": {
+            "full_search_classes": [
+                "mandatory_sequence_start",
+                "wide_choice",
+            ],
+            "playout_cap_randomized_classes": [
+                "mandatory_sequence_continuation",
+                "normal_choice",
+            ],
+            "automatic_transition_search": False,
+            "public_state_only": True,
+            "wide_choice_min_legal_actions": WIDE_CHOICE_MIN_LEGAL_ACTIONS,
+            "wide_choice_threshold_independent_of_n_full_wide": True,
+        },
         "search_rng_contract": {
             "schema_version": "gumbel-game-search-rng-v1",
             "worker_seed": int(worker_seed),

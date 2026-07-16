@@ -62,6 +62,7 @@ from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
     meaningful_public_history_limit,
 )
+from catan_zero.rl.decision_taxonomy import DECISION_TAXONOMY_SCHEMA_VERSION
 from catan_zero.rl.gumbel_self_play import (
     COLORS,
     GumbelSelfPlayConfig,
@@ -2579,6 +2580,7 @@ def _merge_worker_summaries(
             if bool(getattr(args, "preserve_search_evidence", False))
             else None
         ),
+        "decision_taxonomy_schema": DECISION_TAXONOMY_SCHEMA_VERSION,
         "workers": len(results),
         "n_full": int(args.n_full),
         "n_fast": int(args.n_fast),
