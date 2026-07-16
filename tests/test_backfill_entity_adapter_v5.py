@@ -70,6 +70,21 @@ def test_replay_identity_is_byte_exact_and_fails_closed():
         backfill._require_exact("global_tokens", expected, changed, 7)
 
 
+def test_adapter_v5_preserves_expanded_history_but_source_legal_width():
+    event = np.zeros((64, 41), dtype=np.float16)
+    old_event = np.zeros((32, 41), dtype=np.float16)
+    legal = np.zeros((3, 50), dtype=np.float16)
+    padded_legal = np.zeros((54, 50), dtype=np.float16)
+
+    assert backfill._adapter_target_shape("event_tokens", event, old_event) == (
+        64,
+        41,
+    )
+    assert backfill._adapter_target_shape(
+        "legal_action_tokens", legal, padded_legal
+    ) == (54, 50)
+
+
 def test_receipt_hash_binds_canonical_payload():
     left = {"schema": "x", "rows": 3}
     right = {"rows": 3, "schema": "x"}

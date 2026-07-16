@@ -164,6 +164,17 @@ def _load_bindings(path: Path) -> tuple[argparse.Namespace, dict[str, Any]]:
         )
     checkpoint = _absolute(value["checkpoint"], field="checkpoint", must_exist=False)
     report = _absolute(value["report"], field="report", must_exist=False)
+    protected = {
+        data,
+        parent,
+        initializer,
+        path.resolve(strict=True),
+        *([Path(receipt).resolve(strict=True)] if receipt else []),
+    }
+    if checkpoint == report or checkpoint in protected or report in protected:
+        raise ArmError("R&D output paths must be distinct from every bound input")
+    if checkpoint.exists() or report.exists():
+        raise ArmError("R&D checkpoint and report outputs must be fresh")
     lock_raw = value.get("host_lock_file", "/tmp/catan_zero_train_bc_trunk25.lock")
     if not isinstance(lock_raw, str) or not Path(lock_raw).is_absolute():
         raise ArmError("host_lock_file must be an absolute path")
@@ -186,8 +197,10 @@ def _stamp_report(
     *,
     arm_path: Path,
     arm: Mapping[str, Any],
+    arm_sha256: str,
     bindings_path: Path,
     bindings: Mapping[str, Any],
+    bindings_sha256: str,
 ) -> None:
     path = Path(report_path).resolve(strict=True)
     report = _load_json(path, what="training report")
@@ -195,11 +208,11 @@ def _stamp_report(
         "schema_version": ARM_SCHEMA,
         "name": ARM_NAME,
         "arm_config": str(arm_path.resolve(strict=True)),
-        "arm_config_sha256": canonical_train._sha256(arm_path),  # noqa: SLF001
+        "arm_config_sha256": arm_sha256,
         "base_recipe": copy.deepcopy(arm["base_recipe"]),
         "overrides": copy.deepcopy(arm["overrides"]),
         "bindings": str(bindings_path.resolve(strict=True)),
-        "bindings_sha256": canonical_train._sha256(bindings_path),  # noqa: SLF001
+        "bindings_sha256": bindings_sha256,
         "input_bindings": {
             key: copy.deepcopy(bindings[key])
             for key in (
@@ -212,8 +225,47 @@ def _stamp_report(
         },
     }
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    os.replace(temporary, path)
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _require_single_node_eight_rank_geometry() -> None:
+    expected = {
+        "WORLD_SIZE": REQUIRED_WORLD_SIZE,
+        "LOCAL_WORLD_SIZE": REQUIRED_WORLD_SIZE,
+        "GROUP_RANK": 0,
+    }
+    for name, required in expected.items():
+        try:
+            actual = int(os.environ.get(name, "-1"))
+        except ValueError as error:
+            raise ArmError(f"{name} must be an integer") from error
+        if actual != required:
+            raise ArmError(f"{name} must be {required}; actual={actual}")
+    try:
+        rank = int(os.environ.get("RANK", "-1"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    except ValueError as error:
+        raise ArmError("RANK and LOCAL_RANK must be integers") from error
+    if rank != local_rank or rank not in range(REQUIRED_WORLD_SIZE):
+        raise ArmError(
+            "single-node rank geometry requires RANK == LOCAL_RANK in [0, 8)"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -225,14 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size != REQUIRED_WORLD_SIZE:
-        raise SystemExit(
-            f"{ARM_NAME} requires WORLD_SIZE={REQUIRED_WORLD_SIZE}; actual={world_size}"
-        )
     arm_path = Path(args.arm_config).expanduser().resolve(strict=True)
     bindings_path = Path(args.bindings).expanduser().resolve(strict=True)
     try:
+        _require_single_node_eight_rank_geometry()
+        arm_sha256 = canonical_train._sha256(arm_path)  # noqa: SLF001
+        bindings_sha256 = canonical_train._sha256(bindings_path)  # noqa: SLF001
         config, engine, arm = _load_arm(arm_path)
         public_args, bindings = _load_bindings(bindings_path)
     except (OSError, ArmError) as error:
@@ -247,6 +297,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     train_bc.main(engine_args)
     if int(os.environ.get("RANK", "0")) == 0:
+        if (
+            canonical_train._sha256(arm_path) != arm_sha256  # noqa: SLF001
+            or canonical_train._sha256(bindings_path)  # noqa: SLF001
+            != bindings_sha256
+        ):
+            raise SystemExit("R&D arm or bindings changed during training")
         canonical_train._bind_parent_report(  # noqa: SLF001
             public_args.report,
             initialization=initialization,
@@ -255,8 +311,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             public_args.report,
             arm_path=arm_path,
             arm=arm,
+            arm_sha256=arm_sha256,
             bindings_path=bindings_path,
             bindings=bindings,
+            bindings_sha256=bindings_sha256,
         )
 
 

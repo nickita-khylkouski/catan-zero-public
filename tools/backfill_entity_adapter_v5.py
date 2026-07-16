@@ -223,6 +223,22 @@ def _padded(value: np.ndarray, target_shape: tuple[int, ...], *, fill: int | flo
     return result
 
 
+def _adapter_target_shape(
+    key: str, value: np.ndarray, source_row: np.ndarray
+) -> tuple[int, ...]:
+    """Choose the storage shape for a regenerated adapter-v5 tensor.
+
+    Legal-action tensors remain padded to the source corpus' fixed legal
+    width.  Event tensors are different: adapter-v5 deliberately expands the
+    meaningful-history window from 32 to 64 events.  Reusing the adapter-v2
+    row shape here silently discarded half of the commissioned history signal.
+    """
+
+    if key in {"event_tokens", "event_target_ids", "event_mask"}:
+        return tuple(np.asarray(value).shape)
+    return tuple(np.asarray(source_row).shape)
+
+
 def _apply_missing_automatic_transition(
     game: Any,
     *,
@@ -399,7 +415,9 @@ def _replay_archive(
                 )
                 for key in ADAPTER_OWNED_KEYS:
                     value = np.asarray(v5[key])
-                    target_shape = tuple(np.asarray(archive[key][row]).shape)
+                    target_shape = _adapter_target_shape(
+                        key, value, np.asarray(archive[key][row])
+                    )
                     if value.shape != target_shape:
                         fill: int | float | bool = 0
                         if key in {"legal_action_target_ids", "event_target_ids"}:
