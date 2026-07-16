@@ -269,11 +269,14 @@ def test_run_rescore_is_read_only_and_emits_natural_v2(
         call["belief_resource_loss_weight"] == 0.4 for call in evaluate_calls
     )
     assert all(
+        call["scalar_value_objective"] == "mse"
+        and
         call["scalar_value_loss_readout"] == "deployed_tanh"
         and call["scalar_value_loss_scale"] == 1.5
         for call in evaluate_calls
     )
     assert result["scalar_value_loss_contract"] == {
+        "objective": "mse",
         "readout": "deployed_tanh",
         "scale": 1.5,
     }
@@ -310,4 +313,34 @@ def test_scalar_value_loss_args_preserve_legacy_raw_and_reject_drift() -> None:
                     "formula": "raw",
                 }
             }
+        )
+
+
+def test_scalar_value_loss_spec_authenticates_binary_objective() -> None:
+    report = {
+        "scalar_value_objective": "binary_win_bce",
+        "scalar_value_loss_contract": {
+            "schema_version": "scalar-value-objective-v2",
+            "objective": "binary_win_bce",
+            "readout": "deployed_tanh",
+            "scale": 1.5,
+            "target_formula": "(z + 1) / 2",
+            "logit_formula": "2 * scale * raw",
+            "deployed_value_formula": "tanh(raw * scale)",
+            "matches_scalar_mcts_when_value_squash_tanh": True,
+        }
+    }
+
+    assert posthoc._scalar_value_loss_spec(report) == (
+        "binary_win_bce",
+        "deployed_tanh",
+        1.5,
+    )
+    report["scalar_value_loss_contract"]["logit_formula"] = "raw"
+    with pytest.raises(SystemExit, match="malformed"):
+        posthoc._scalar_value_loss_spec(report)
+
+    with pytest.raises(SystemExit, match="missing its typed"):
+        posthoc._scalar_value_loss_spec(
+            {"scalar_value_objective": "binary_win_bce"}
         )

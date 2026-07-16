@@ -475,15 +475,44 @@ def _root_blend_args(report: Mapping[str, Any]) -> tuple[tuple[str, ...], bool]:
     return tuple(phases), mode == "global_compat"
 
 
-def _scalar_value_loss_args(report: Mapping[str, Any]) -> tuple[str, float]:
-    """Return the report-authenticated scalar learner readout."""
+def _scalar_value_loss_spec(
+    report: Mapping[str, Any],
+) -> tuple[str, str, float]:
+    """Return the report-authenticated scalar objective and readout."""
 
+    declared_objective = str(report.get("scalar_value_objective", "mse"))
     contract = report.get("scalar_value_loss_contract")
     if contract is None:
-        return "raw", 1.0
+        if declared_objective != "mse":
+            raise SystemExit(
+                "scalar value objective is missing its typed loss contract"
+            )
+        return "mse", "raw", 1.0
     if not isinstance(contract, Mapping):
         raise SystemExit("scalar_value_loss_contract must be a JSON object")
-    if contract.get("schema_version") != "scalar-value-loss-readout-v1":
+    schema = contract.get("schema_version")
+    if schema == "scalar-value-objective-v2":
+        try:
+            scale = float(contract["scale"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise SystemExit("scalar value loss scale must be numeric") from error
+        if (
+            contract.get("objective") != "binary_win_bce"
+            or contract.get("readout") != "deployed_tanh"
+            or not np.isfinite(scale)
+            or scale <= 0.0
+            or contract.get("target_formula") != "(z + 1) / 2"
+            or contract.get("logit_formula") != "2 * scale * raw"
+            or contract.get("deployed_value_formula") != "tanh(raw * scale)"
+            or contract.get("matches_scalar_mcts_when_value_squash_tanh") is not True
+        ):
+            raise SystemExit("binary scalar value loss contract is malformed")
+        if "scalar_value_objective" in report and declared_objective != "binary_win_bce":
+            raise SystemExit(
+                "scalar value objective differs from its typed loss contract"
+            )
+        return "binary_win_bce", "deployed_tanh", scale
+    if schema != "scalar-value-loss-readout-v1":
         raise SystemExit("unsupported scalar_value_loss_contract schema")
     readout = str(contract.get("readout", ""))
     if readout not in {"raw", "deployed_tanh"}:
@@ -497,6 +526,17 @@ def _scalar_value_loss_args(report: Mapping[str, Any]) -> tuple[str, float]:
     expected_formula = "raw" if readout == "raw" else "tanh(raw * scale)"
     if contract.get("formula") != expected_formula:
         raise SystemExit("scalar value loss formula differs from its typed contract")
+    if declared_objective != "mse":
+        raise SystemExit(
+            "scalar value objective differs from its typed loss contract"
+        )
+    return "mse", readout, scale
+
+
+def _scalar_value_loss_args(report: Mapping[str, Any]) -> tuple[str, float]:
+    """Backward-compatible readout-only view."""
+
+    _objective, readout, scale = _scalar_value_loss_spec(report)
     return readout, scale
 
 
@@ -774,7 +814,7 @@ def _prepare_probe(
     award_contract = str(_required(report, "public_award_feature_contract"))
     train_bc._PUBLIC_AWARD_FEATURE_CONTRACT = award_contract
     blend_phases, blend_global = _root_blend_args(report)
-    scalar_readout, scalar_scale = _scalar_value_loss_args(report)
+    scalar_objective, scalar_readout, scalar_scale = _scalar_value_loss_spec(report)
     scope_identity = _scope_identity(data, report)
     objective_reconstruction = {
         "schema_version": "posthoc-objective-reconstruction-v1",
@@ -806,6 +846,7 @@ def _prepare_probe(
         "value_root_blend_global_compat": blend_global,
         "value_target_lambda": float(_required(report, "value_target_lambda")),
         "scalar_value_loss_contract": {
+            "objective": scalar_objective,
             "readout": scalar_readout,
             "scale": scalar_scale,
         },
@@ -842,6 +883,7 @@ def _prepare_probe(
         "award_contract": award_contract,
         "objective_reconstruction": objective_reconstruction,
         "policy_teacher_gap_objective": policy_teacher_gap_objective,
+        "scalar_value_objective": scalar_objective,
         "scalar_value_loss_readout": scalar_readout,
         "scalar_value_loss_scale": scalar_scale,
         "shared_holdout": {
@@ -1008,6 +1050,7 @@ def _evaluate_policy_metrics(
         value_target_lambda=float(_required(report, "value_target_lambda")),
         value_root_blend_phases=blend_phases,
         value_root_blend_global_compat=blend_global,
+        scalar_value_objective=str(prepared["scalar_value_objective"]),
         scalar_value_loss_readout=str(prepared["scalar_value_loss_readout"]),
         scalar_value_loss_scale=float(prepared["scalar_value_loss_scale"]),
     )
@@ -1057,6 +1100,7 @@ def _evaluate_policy_metrics(
             policy_kl_anchor_direction=str(
                 report.get("policy_kl_anchor_direction", "forward")
             ),
+            scalar_value_objective=str(prepared["scalar_value_objective"]),
             scalar_value_loss_readout=str(prepared["scalar_value_loss_readout"]),
             scalar_value_loss_scale=float(prepared["scalar_value_loss_scale"]),
         )
@@ -1181,16 +1225,19 @@ def _value_quality_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:
     except (KeyError, TypeError, ValueError) as error:
         raise SystemExit("posthoc value-quality metrics are malformed") from error
     if (
-        kind != "scalar_mse"
+        kind not in {"scalar_mse", "binary_win_bce"}
         or not math.isfinite(primary)
         or not math.isfinite(scalar_mse)
         or not math.isfinite(raw_value)
         or weighted_mass <= 0.0
-        or not math.isclose(primary, scalar_mse, rel_tol=0.0, abs_tol=1.0e-12)
         or not math.isclose(primary, raw_value, rel_tol=0.0, abs_tol=1.0e-12)
+        or (
+            kind == "scalar_mse"
+            and not math.isclose(primary, scalar_mse, rel_tol=0.0, abs_tol=1.0e-12)
+        )
     ):
         raise SystemExit(
-            "posthoc value-quality metric does not match the scalar-MSE objective"
+            "posthoc value-quality metric does not match its scalar objective"
         )
     return {
         "schema_version": VALUE_QUALITY_SCHEMA,

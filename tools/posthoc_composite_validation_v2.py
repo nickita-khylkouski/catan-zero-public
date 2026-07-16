@@ -145,15 +145,42 @@ def _root_blend_args(report: dict[str, Any]) -> tuple[tuple[str, ...], bool]:
     return tuple(phases), mode == "global_compat"
 
 
-def _scalar_value_loss_args(report: dict[str, Any]) -> tuple[str, float]:
-    """Reconstruct the exact scalar readout optimized by the learner."""
+def _scalar_value_loss_spec(report: dict[str, Any]) -> tuple[str, str, float]:
+    """Reconstruct the exact scalar objective and readout optimized by the learner."""
 
+    declared_objective = str(report.get("scalar_value_objective", "mse"))
     contract = report.get("scalar_value_loss_contract")
     if contract is None:
-        return "raw", 1.0
+        if declared_objective != "mse":
+            raise SystemExit(
+                "scalar value objective is missing its typed loss contract"
+            )
+        return "mse", "raw", 1.0
     if not isinstance(contract, dict):
         raise SystemExit("scalar_value_loss_contract must be a JSON object")
-    if contract.get("schema_version") != "scalar-value-loss-readout-v1":
+    schema = contract.get("schema_version")
+    if schema == "scalar-value-objective-v2":
+        try:
+            scale = float(contract["scale"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise SystemExit("scalar value loss scale must be numeric") from error
+        if (
+            contract.get("objective") != "binary_win_bce"
+            or contract.get("readout") != "deployed_tanh"
+            or not np.isfinite(scale)
+            or scale <= 0.0
+            or contract.get("target_formula") != "(z + 1) / 2"
+            or contract.get("logit_formula") != "2 * scale * raw"
+            or contract.get("deployed_value_formula") != "tanh(raw * scale)"
+            or contract.get("matches_scalar_mcts_when_value_squash_tanh") is not True
+        ):
+            raise SystemExit("binary scalar value loss contract is malformed")
+        if "scalar_value_objective" in report and declared_objective != "binary_win_bce":
+            raise SystemExit(
+                "scalar value objective differs from its typed loss contract"
+            )
+        return "binary_win_bce", "deployed_tanh", scale
+    if schema != "scalar-value-loss-readout-v1":
         raise SystemExit("unsupported scalar_value_loss_contract schema")
     readout = str(contract.get("readout", ""))
     if readout not in {"raw", "deployed_tanh"}:
@@ -167,6 +194,17 @@ def _scalar_value_loss_args(report: dict[str, Any]) -> tuple[str, float]:
     expected_formula = "raw" if readout == "raw" else "tanh(raw * scale)"
     if contract.get("formula") != expected_formula:
         raise SystemExit("scalar value loss formula differs from its typed contract")
+    if declared_objective != "mse":
+        raise SystemExit(
+            "scalar value objective differs from its typed loss contract"
+        )
+    return "mse", readout, scale
+
+
+def _scalar_value_loss_args(report: dict[str, Any]) -> tuple[str, float]:
+    """Backward-compatible readout-only view."""
+
+    _objective, readout, scale = _scalar_value_loss_spec(report)
     return readout, scale
 
 
@@ -290,7 +328,7 @@ def run_rescore(
         )
     )
     blend_phases, blend_global = _root_blend_args(report)
-    scalar_readout, scalar_scale = _scalar_value_loss_args(report)
+    scalar_objective, scalar_readout, scalar_scale = _scalar_value_loss_spec(report)
     ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
 
     def evaluate(indices: np.ndarray) -> dict:
@@ -339,6 +377,7 @@ def run_rescore(
             value_target_lambda=float(_required(report, "value_target_lambda")),
             value_root_blend_phases=blend_phases,
             value_root_blend_global_compat=blend_global,
+            scalar_value_objective=scalar_objective,
             scalar_value_loss_readout=scalar_readout,
             scalar_value_loss_scale=scalar_scale,
         )
@@ -399,6 +438,7 @@ def run_rescore(
         "device": device,
         "batch_size": eval_batch_size,
         "scalar_value_loss_contract": {
+            "objective": scalar_objective,
             "readout": scalar_readout,
             "scale": scalar_scale,
         },

@@ -502,6 +502,7 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert kwargs["moe_balance_loss_weight"] == 0.01
     assert kwargs["value_root_blend_phases"] == ("PLAY_TURN",)
     assert kwargs["value_root_blend_global_compat"] is False
+    assert kwargs["scalar_value_objective"] == "mse"
     assert kwargs["scalar_value_loss_readout"] == "deployed_tanh"
     assert kwargs["scalar_value_loss_scale"] == pytest.approx(1.25)
     objective = result["shared_holdout"]["objective_reconstruction"]
@@ -510,6 +511,7 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert objective["policy_kl_anchor_direction"] == "reverse"
     assert objective["value_target_lambda"] == pytest.approx(1.0)
     assert objective["scalar_value_loss_contract"] == {
+        "objective": "mse",
         "readout": "deployed_tanh",
         "scale": 1.25,
     }
@@ -523,6 +525,44 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert result["value_quality"]["value"] == pytest.approx(0.4)
     assert result["inputs"]["checkpoint"]["sha256"].startswith("sha256:")
     assert result["inputs"]["training_report"]["sha256"].startswith("sha256:")
+
+
+def test_binary_value_contract_and_quality_projection_are_preserved() -> None:
+    module = _module()
+    report = {
+        "scalar_value_objective": "binary_win_bce",
+        "scalar_value_loss_contract": {
+            "schema_version": "scalar-value-objective-v2",
+            "objective": "binary_win_bce",
+            "readout": "deployed_tanh",
+            "scale": 1.25,
+            "target_formula": "(z + 1) / 2",
+            "logit_formula": "2 * scale * raw",
+            "deployed_value_formula": "tanh(raw * scale)",
+            "matches_scalar_mcts_when_value_squash_tanh": True,
+        }
+    }
+    assert module._scalar_value_loss_spec(report) == (
+        "binary_win_bce",
+        "deployed_tanh",
+        1.25,
+    )
+    projection = module._value_quality_projection(
+        {
+            "primary_value_loss": 0.7,
+            "scalar_value_mse_diagnostic": 0.4,
+            "value_loss": 0.7,
+            "primary_value_loss_kind": "binary_win_bce",
+            "loss_denominators": {"value_loss": 8.0},
+        }
+    )
+    assert projection["metric_kind"] == "binary_win_bce"
+    assert projection["value"] == pytest.approx(0.7)
+    assert projection["scalar_value_mse_diagnostic"] == pytest.approx(0.4)
+
+    report["scalar_value_loss_contract"]["target_formula"] = "z"
+    with pytest.raises(SystemExit, match="malformed"):
+        module._scalar_value_loss_spec(report)
 
 
 def test_authenticated_scope_makes_excluded_replay_weights_inert(tmp_path, monkeypatch):

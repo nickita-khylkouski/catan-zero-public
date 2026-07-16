@@ -21642,6 +21642,8 @@ def _value_validation_strata_parts(
     value_weights,
     value_active_mask,
     *,
+    prediction=None,
+    target=None,
     action_types_by_id: tuple[str, ...] | None = None,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Exact scalar-value MSE sufficient statistics by strategic row class.
@@ -21664,6 +21666,22 @@ def _value_validation_strata_parts(
     ):
         raise ValueError("value validation stratum input shape drift")
     effective = np.where(active, weights, 0.0)
+    predictions = (
+        np.asarray(prediction.detach().float().cpu(), dtype=np.float64)
+        if prediction is not None
+        else None
+    )
+    targets = (
+        np.asarray(target.detach().float().cpu(), dtype=np.float64)
+        if target is not None
+        else None
+    )
+    if (predictions is None) != (targets is None):
+        raise ValueError("value validation prediction/target must be provided together")
+    if predictions is not None and (
+        predictions.shape != errors.shape or targets.shape != errors.shape
+    ):
+        raise ValueError("value validation prediction/target shape drift")
     legal = np.asarray(data["legal_action_ids"][batch])
     if legal.ndim != 2 or legal.shape[0] != len(batch):
         raise ValueError("value validation requires rectangular legal actions")
@@ -21681,11 +21699,43 @@ def _value_validation_strata_parts(
         selected = np.asarray(mask, dtype=np.bool_) & active
         row_weights = effective[selected]
         axis_report = result.setdefault(axis, {})
-        axis_report[str(label)] = {
+        parts = {
             "weighted_sum": float(np.dot(errors[selected], row_weights)),
             "weight_sum": float(row_weights.sum()),
             "rows": float(np.count_nonzero(selected)),
         }
+        if predictions is not None and targets is not None:
+            selected_predictions = predictions[selected]
+            selected_targets = targets[selected]
+            parts.update(
+                {
+                    "weighted_residual_sum": float(
+                        np.dot(
+                            selected_predictions - selected_targets,
+                            row_weights,
+                        )
+                    ),
+                    "weighted_prediction_sum": float(
+                        np.dot(selected_predictions, row_weights)
+                    ),
+                    "weighted_target_sum": float(
+                        np.dot(selected_targets, row_weights)
+                    ),
+                    "weighted_prediction_sq_sum": float(
+                        np.dot(selected_predictions**2, row_weights)
+                    ),
+                    "weighted_target_sq_sum": float(
+                        np.dot(selected_targets**2, row_weights)
+                    ),
+                    "weighted_prediction_target_sum": float(
+                        np.dot(
+                            selected_predictions * selected_targets,
+                            row_weights,
+                        )
+                    ),
+                }
+            )
+        axis_report[str(label)] = parts
 
     forced = legal_widths == 1
     _add("decision_class", "forced", forced)
@@ -21730,6 +21780,17 @@ def _value_validation_strata_parts(
             & (forced_labels != "ROLL")
             & (forced_labels != "END_TURN"),
         )
+        _add("query_state", "turn_start_roll", forced & (forced_labels == "ROLL"))
+        _add(
+            "query_state",
+            "turn_end_end_turn",
+            forced & (forced_labels == "END_TURN"),
+        )
+        _add(
+            "query_state",
+            "other",
+            ~(forced & ((forced_labels == "ROLL") | (forced_labels == "END_TURN"))),
+        )
     return result
 
 
@@ -21740,11 +21801,9 @@ def _merge_value_validation_strata(
     for axis, strata in source.items():
         target_axis = target.setdefault(axis, {})
         for label, parts in strata.items():
-            target_parts = target_axis.setdefault(
-                label, {"weighted_sum": 0.0, "weight_sum": 0.0, "rows": 0.0}
-            )
-            for key in ("weighted_sum", "weight_sum", "rows"):
-                target_parts[key] += float(parts.get(key, 0.0))
+            target_parts = target_axis.setdefault(label, {})
+            for key, value in parts.items():
+                target_parts[key] = target_parts.get(key, 0.0) + float(value)
 
 
 def _reduce_value_validation_strata(
@@ -21768,21 +21827,60 @@ def _reduce_value_validation_strata(
 def _finalize_value_validation_strata(
     strata: dict[str, dict[str, dict[str, float]]],
 ) -> dict[str, dict[str, dict[str, float | int]]]:
-    return {
-        axis: {
-            label: {
-                "mse": (
-                    float(parts.get("weighted_sum", 0.0))
-                    / float(parts.get("weight_sum", 0.0))
-                    if float(parts.get("weight_sum", 0.0)) > 0.0
+    def _one(parts: Mapping[str, float]) -> dict[str, float | int]:
+        weight = float(parts.get("weight_sum", 0.0))
+        mse = float(parts.get("weighted_sum", 0.0)) / weight if weight > 0.0 else 0.0
+        result: dict[str, float | int] = {
+            "mse": mse,
+            "weighted_sum": float(parts.get("weighted_sum", 0.0)),
+            "weight_sum": weight,
+            "rows": int(round(float(parts.get("rows", 0.0)))),
+        }
+        if "weighted_residual_sum" not in parts:
+            return result
+        denominator = max(weight, 1.0e-30)
+        prediction_mean = (
+            float(parts.get("weighted_prediction_sum", 0.0)) / denominator
+        )
+        target_mean = float(parts.get("weighted_target_sum", 0.0)) / denominator
+        prediction_variance = max(
+            float(parts.get("weighted_prediction_sq_sum", 0.0)) / denominator
+            - prediction_mean**2,
+            0.0,
+        )
+        target_variance = max(
+            float(parts.get("weighted_target_sq_sum", 0.0)) / denominator
+            - target_mean**2,
+            0.0,
+        )
+        covariance = (
+            float(parts.get("weighted_prediction_target_sum", 0.0)) / denominator
+            - prediction_mean * target_mean
+        )
+        correlation_denominator = math.sqrt(
+            prediction_variance * target_variance
+        )
+        result.update(
+            {
+                "rmse": math.sqrt(max(mse, 0.0)),
+                "bias": (
+                    float(parts.get("weighted_residual_sum", 0.0)) / weight
+                    if weight > 0.0
                     else 0.0
                 ),
-                "weighted_sum": float(parts.get("weighted_sum", 0.0)),
-                "weight_sum": float(parts.get("weight_sum", 0.0)),
-                "rows": int(round(float(parts.get("rows", 0.0)))),
+                "prediction_mean": prediction_mean if weight > 0.0 else 0.0,
+                "target_mean": target_mean if weight > 0.0 else 0.0,
+                "pearson": (
+                    covariance / correlation_denominator
+                    if correlation_denominator > 0.0
+                    else 0.0
+                ),
             }
-            for label, parts in labels.items()
-        }
+        )
+        return result
+
+    return {
+        axis: {label: _one(parts) for label, parts in labels.items()}
         for axis, labels in strata.items()
     }
 
@@ -21849,9 +21947,7 @@ def _objective_measure_validation_aggregate(
                 )
             )
             for label in labels:
-                weighted_sum_density = 0.0
-                weight_sum_density = 0.0
-                rows_density = 0.0
+                density_parts: dict[str, float] = {}
                 for probability, report in zip(normalized, reports, strict=True):
                     samples = float(report["samples"])
                     parts = (
@@ -21859,45 +21955,33 @@ def _objective_measure_validation_aggregate(
                         .get(axis, {})
                         .get(label, {})
                     )
-                    weighted_sum_density += (
-                        float(probability)
-                        * float(parts.get("weighted_sum", 0.0))
-                        / samples
-                    )
-                    weight_sum_density += (
-                        float(probability)
-                        * float(parts.get("weight_sum", 0.0))
-                        / samples
-                    )
-                    rows_density += (
-                        float(probability)
-                        * float(parts.get("rows", 0.0))
-                        / samples
-                    )
-                aggregate_strata.setdefault(axis, {})[label] = {
-                    "weighted_sum": weighted_sum_density,
-                    "weight_sum": weight_sum_density,
-                    "rows": rows_density,
+                    for key, value in parts.items():
+                        density_parts[key] = density_parts.get(key, 0.0) + (
+                            float(probability) * float(value) / samples
+                        )
+                aggregate_strata.setdefault(axis, {})[label] = density_parts
+        finalized_strata = _finalize_value_validation_strata(aggregate_strata)
+        metrics["value_mse_strata"] = {}
+        for axis, labels in finalized_strata.items():
+            metrics["value_mse_strata"][axis] = {}
+            for label, finalized in labels.items():
+                density = aggregate_strata[axis][label]
+                metrics["value_mse_strata"][axis][label] = {
+                    key: value
+                    for key, value in finalized.items()
+                    if key not in {"weighted_sum", "weight_sum", "rows"}
                 }
-        metrics["value_mse_strata"] = {
-            axis: {
-                label: {
-                    "mse": (
-                        float(parts["weighted_sum"])
-                        / float(parts["weight_sum"])
-                        if float(parts["weight_sum"]) > 0.0
-                        else 0.0
-                    ),
-                    "weighted_numerator_per_sample": float(
-                        parts["weighted_sum"]
-                    ),
-                    "weight_per_sample": float(parts["weight_sum"]),
-                    "row_probability": float(parts["rows"]),
-                }
-                for label, parts in labels.items()
-            }
-            for axis, labels in aggregate_strata.items()
-        }
+                metrics["value_mse_strata"][axis][label].update(
+                    {
+                        "weighted_numerator_per_sample": float(
+                            density.get("weighted_sum", 0.0)
+                        ),
+                        "weight_per_sample": float(
+                            density.get("weight_sum", 0.0)
+                        ),
+                        "row_probability": float(density.get("rows", 0.0)),
+                    }
+                )
         metrics["value_mse_strata_measure"] = (
             "objective_measure_weighted_density"
         )
@@ -23464,7 +23548,7 @@ def _eval_xdim_batch(
                 (
                     value_error,
                     scalar_value_mse_error,
-                    _scalar_value_prediction,
+                    scalar_value_prediction,
                 ) = _scalar_value_objective_errors(
                     outputs["value"],
                     value_outcome_targets,
@@ -23500,6 +23584,8 @@ def _eval_xdim_batch(
                         scalar_value_mse_error,
                         effective_value_weights,
                         value_has_outcome & (effective_value_weights > 0.0),
+                        prediction=scalar_value_prediction,
+                        target=value_outcome_targets,
                         action_types_by_id=value_validation_action_types_by_id,
                     )
                 )

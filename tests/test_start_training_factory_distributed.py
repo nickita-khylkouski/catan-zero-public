@@ -269,6 +269,22 @@ def test_factory_trains_the_scalar_readout_deployed_by_search(tmp_path: Path) ->
     assert resolved.scalar_value_loss_scale == pytest.approx(1.0)
 
 
+def test_factory_forwards_experimental_scalar_value_objective(tmp_path: Path) -> None:
+    result = _dry_run(
+        tmp_path,
+        "--scalar-value-objective",
+        "binary_win_bce",
+    )
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    train_argv = command[command.index("tools/train_bc.py") + 1 :]
+    resolved = train_bc.build_parser().parse_args(train_argv)
+
+    assert resolved.scalar_value_objective == "binary_win_bce"
+    assert resolved.scalar_value_loss_readout == "deployed_tanh"
+
+
 def test_factory_uses_public_equal_game_training_contract(tmp_path: Path) -> None:
     result = _dry_run(tmp_path)
 

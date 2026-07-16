@@ -255,6 +255,15 @@ def main() -> None:
     )
     parser.add_argument("--value-loss-weight", type=float, default=0.25)
     parser.add_argument(
+        "--scalar-value-objective",
+        choices=("mse", "binary_win_bce"),
+        default="mse",
+        help=(
+            "Scalar value training objective. The experimental binary_win_bce "
+            "arm is probability-compatible with the deployed tanh readout."
+        ),
+    )
+    parser.add_argument(
         "--truncated-vp-margin-value-weight",
         type=float,
         default=0.25,
@@ -604,6 +613,8 @@ def main() -> None:
             str(args.loser_sample_weight),
             "--value-loss-weight",
             str(args.value_loss_weight),
+            "--scalar-value-objective",
+            args.scalar_value_objective,
             "--truncated-vp-margin-value-weight",
             str(args.truncated_vp_margin_value_weight),
             "--scalar-value-loss-readout",
