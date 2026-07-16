@@ -1124,6 +1124,22 @@ class GumbelChanceMCTS:
             base_seed, "belief"
         )
 
+    def seed_game_search_rngs(self, seed: int) -> None:
+        """Reset every per-game search input from one schedule-invariant seed.
+
+        ``seed_search_rngs`` preserves the historical generation contract on
+        the default shared-stream path, including its config-seeded public
+        belief materialization. Evaluation reuses search objects across worker
+        schedules, so it needs the stronger contract: both stateful streams and
+        stateless coherent belief worlds derive from the game/seat seed.
+        """
+
+        base_seed = int(seed)
+        self.seed_search_rngs(base_seed)
+        self._belief_materialization_seed = domain_separated_search_seed(
+            base_seed, "belief"
+        )
+
     def new_game(self, *, seed: int | None = None) -> Any:
         catanatron_rs = _require_rust_module()
         return catanatron_rs.Game.simple(list(self.config.colors), seed=seed)

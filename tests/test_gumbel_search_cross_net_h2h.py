@@ -236,6 +236,34 @@ def test_h2h_search_rng_reset_uses_full_stream_reset_contract() -> None:
     assert searches["baseline"].values == [seeds["baseline"]]
 
 
+def test_h2h_search_rng_reset_binds_belief_materialization_to_game() -> None:
+    class SearchRecorder:
+        def __init__(self) -> None:
+            self.game_values: list[int] = []
+            self.legacy_values: list[int] = []
+
+        def seed_game_search_rngs(self, value: int) -> None:
+            self.game_values.append(int(value))
+
+        def seed_search_rngs(self, value: int) -> None:
+            self.legacy_values.append(int(value))
+
+    searches = {
+        "candidate": SearchRecorder(),
+        "baseline": SearchRecorder(),
+    }
+    seeds = h2h._reset_game_search_rngs(
+        searches,
+        role_by_color={"RED": "candidate", "BLUE": "baseline"},
+        game_seed=42,
+    )
+
+    assert searches["candidate"].game_values == [seeds["candidate"]]
+    assert searches["baseline"].game_values == [seeds["baseline"]]
+    assert searches["candidate"].legacy_values == []
+    assert searches["baseline"].legacy_values == []
+
+
 def test_pinned_replay_scope_is_safe_during_path_aba_hash_and_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1357,7 +1385,9 @@ def test_play_game_records_exact_role_simulations_and_decision_change(monkeypatc
 
         def player_state_json(self, color):
             return (
-                '{"victory_points": 10}' if color == "RED" else '{"victory_points": 2}'
+                '{"victory_points": 6, "actual_victory_points": 10}'
+                if color == "RED"
+                else '{"victory_points": 4, "actual_victory_points": 4}'
             )
 
     game = FakeGame()
@@ -1405,6 +1435,11 @@ def test_play_game_records_exact_role_simulations_and_decision_change(monkeypatc
     )
 
     assert record["candidate_won"] is True
+    assert record["final_vps"] == {"RED": 6, "BLUE": 4}
+    assert record["final_public_vps"] == {"RED": 6, "BLUE": 4}
+    assert record["final_actual_vps"] == {"RED": 10, "BLUE": 4}
+    assert "blowout" in record["buckets"]
+    assert "close" not in record["buckets"]
     candidate_telemetry = dict(telemetry["candidate"])
     elapsed = candidate_telemetry.pop("search_elapsed_sec")
     assert candidate_telemetry == {

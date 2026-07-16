@@ -674,9 +674,20 @@ def play_one_h2h_game(
     truncated = not terminal
     winner = str(game.winning_color()) if terminal else None
     final_vps: dict[str, int] = {}
+    final_actual_vps: dict[str, int] = {}
     for color in COLORS:
         state = json.loads(game.player_state_json(color))
-        final_vps[color] = int(state.get("victory_points", 0) or 0)
+        final_vps[color] = int(
+            state.get("public_victory_points", state.get("victory_points", 0))
+            or 0
+        )
+        final_actual_vps[color] = int(
+            state.get(
+                "actual_victory_points",
+                state.get("victory_points", 0),
+            )
+            or 0
+        )
 
     candidate_color = next(
         color for color, role in role_by_color.items() if role == "candidate"
@@ -698,7 +709,8 @@ def play_one_h2h_game(
     if max_legal_count >= 41:
         buckets.append("41+")
     vp_margin = abs(
-        final_vps.get(candidate_color, 0) - final_vps.get(baseline_color, 0)
+        final_actual_vps.get(candidate_color, 0)
+        - final_actual_vps.get(baseline_color, 0)
     )
     buckets.append("blowout" if vp_margin >= 3 else "close")
 
@@ -712,6 +724,8 @@ def play_one_h2h_game(
         "truncated": bool(truncated),
         "decisions": int(decision_index),
         "final_vps": final_vps,
+        "final_public_vps": final_vps,
+        "final_actual_vps": final_actual_vps,
         "candidate_won": candidate_won,
         "buckets": sorted(set(buckets)),
         "max_legal_count": max_legal_count,
@@ -1208,8 +1222,11 @@ def _reset_game_search_rngs(
         role = str(role_by_color[color])
         seed = _game_search_seed(game_seed=int(game_seed), seat_color=color)
         search = mcts_by_role[role]
+        game_reset = getattr(search, "seed_game_search_rngs", None)
         reset = getattr(search, "seed_search_rngs", None)
-        if callable(reset):
+        if callable(game_reset):
+            game_reset(seed)
+        elif callable(reset):
             reset(seed)
         else:
             # Retain compatibility with tiny test doubles and older wrappers;

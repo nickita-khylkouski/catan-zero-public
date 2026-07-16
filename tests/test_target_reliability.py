@@ -97,6 +97,22 @@ def test_default_search_reseed_preserves_legacy_materialization_seed() -> None:
     )
 
 
+def test_game_search_reseed_removes_worker_seed_from_materialization() -> None:
+    searches = []
+    for worker_seed in (17, 23):
+        search = GumbelChanceMCTS.__new__(GumbelChanceMCTS)
+        search.config = GumbelChanceMCTSConfig(seed=worker_seed)
+        search.rng = random.Random(worker_seed)
+        search.seed_game_search_rngs(999)
+        searches.append(search)
+
+    expected = domain_separated_search_seed(999, "belief")
+    assert [search._boundary_value_base_seed for search in searches] == [999, 999]
+    assert [
+        search._belief_materialization_seed for search in searches
+    ] == [expected, expected]
+
+
 def _entity_features(legal_width: int) -> dict[str, np.ndarray]:
     features: dict[str, np.ndarray] = {}
     for key in gumbel_self_play.ENTITY_KEYS:
