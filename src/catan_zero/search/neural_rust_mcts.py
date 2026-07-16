@@ -134,6 +134,38 @@ def _assert_value_readout_available(
             "(expected 'scalar' or 'categorical')"
         )
     if readout == "scalar":
+        # Legacy checkpoints predate value-training-v1 and are intentionally
+        # admitted as scalar (their typed bridge is enforced by production
+        # contracts).  Once a checkpoint carries modern value-training
+        # metadata, however, the loader's validated readout list is
+        # authoritative.  In particular, an HL-Gauss-only run keeps the
+        # historical scalar module in the architecture but does not optimize
+        # it.  Allowing the default scalar evaluator to consume that dormant
+        # head would silently evaluate a different function from the trained
+        # objective merely because callers omitted --value-readout.
+        value_training = getattr(policy, "value_training", None)
+        trained_readouts = {
+            str(item)
+            for item in getattr(policy, "trained_value_readouts", ())
+            if str(item) in {"scalar", "categorical"}
+        }
+        if isinstance(value_training, dict) and "scalar" not in trained_readouts:
+            provenance_errors = tuple(
+                str(error)
+                for error in getattr(policy, "_value_training_provenance_errors", ())
+            )
+            error_detail = (
+                f"; validation errors: {', '.join(provenance_errors)}"
+                if provenance_errors
+                else ""
+            )
+            raise ValueError(
+                "value_readout='scalar' requires positive value-training-v1 "
+                "provenance when modern value-training metadata is present; "
+                "the checkpoint does not attest that its scalar readout was "
+                f"optimized{error_detail}. Select a trained readout or load a "
+                "scalar-trained checkpoint."
+            )
         return
 
     model = getattr(policy, "model", None)
