@@ -54,8 +54,30 @@ DEFAULT_KILL_TIMEOUT_SECONDS = 5.0
 COHERENT_WORKER_SELFPLAY_CONFIG = {
     "meaningful_public_history": True,
     "event_history_limit": 32,
-    "record_automatic_transitions": False,
 }
+
+
+def _record_automatic_transitions(contract: Mapping[str, Any]) -> bool:
+    """Return the authenticated forced-transition row contract.
+
+    The v1 R&D intervention omitted sole-action rows; v2 restores them as
+    value-only evidence.  Derive the expected worker/config surface from the
+    sealed contract instead of freezing either generation's semantics in the
+    executor.
+    """
+
+    operator = contract.get("operator")
+    value = (
+        operator.get("record_automatic_transitions")
+        if isinstance(operator, Mapping)
+        else None
+    )
+    if not isinstance(value, bool):
+        raise ExecutorError(
+            "coherent target contract lacks boolean "
+            "operator.record_automatic_transitions"
+        )
+    return value
 
 
 def _canonical(value: object) -> bytes:
@@ -1275,7 +1297,7 @@ def _validate_lane_manifest(
         "opponent_mix_manifest": None,
         "opponent_pool_manifest": None,
         "preserve_search_evidence": True,
-        "record_automatic_transitions": False,
+        "record_automatic_transitions": _record_automatic_transitions(contract),
         "meaningful_public_history": True,
         "event_history_limit": 32,
     }
@@ -1553,7 +1575,7 @@ def _resolved_config_record(
         "wide_roots_always_full": False,
         "opponent_mix_manifest": None,
         "opponent_pool_manifest": None,
-        "record_automatic_transitions": False,
+        "record_automatic_transitions": _record_automatic_transitions(contract),
         "meaningful_public_history": True,
         "event_history_limit": 32,
     }
@@ -1585,14 +1607,21 @@ def _normalized_sha256(value: object) -> str:
 
 
 def _verify_coherent_worker_selfplay_config(
-    manifest: Mapping[str, Any], *, where: str
+    manifest: Mapping[str, Any],
+    *,
+    contract: Mapping[str, Any],
+    where: str,
 ) -> None:
     selfplay_config = manifest.get("selfplay_config")
     if not isinstance(selfplay_config, Mapping):
         raise ExecutorError(f"worker manifest lacks selfplay_config: {where}")
+    expected_config = {
+        **COHERENT_WORKER_SELFPLAY_CONFIG,
+        "record_automatic_transitions": _record_automatic_transitions(contract),
+    }
     drift = {
         key: {"expected": expected, "actual": selfplay_config.get(key)}
-        for key, expected in COHERENT_WORKER_SELFPLAY_CONFIG.items()
+        for key, expected in expected_config.items()
         if type(selfplay_config.get(key)) is not type(expected)
         or selfplay_config.get(key) != expected
     }
@@ -1776,7 +1805,11 @@ def _verify_worker_payload(
         raise ExecutorError(
             f"worker manifest drift for {lane['lane_id']}/{worker_id}: {drift}"
         )
-    _verify_coherent_worker_selfplay_config(manifest, where=str(manifest_path))
+    _verify_coherent_worker_selfplay_config(
+        manifest,
+        contract=contract,
+        where=str(manifest_path),
+    )
     if (
         int(progress.get("games_succeeded", -1)) != expected_games
         or int(progress.get("games_failed", -1)) != 0
@@ -1935,7 +1968,9 @@ def _verify_existing_completion(
                         artifact
                     )
                     _verify_coherent_worker_selfplay_config(
-                        worker_manifest, where=str(artifact)
+                        worker_manifest,
+                        contract=contract,
+                        where=str(artifact),
                     )
                 else:
                     artifact_sha256 = (

@@ -14076,9 +14076,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             )
         if policy_aux_validation_sampling_weights is not None:
+            # AUX training draws rows from q (the conditioned sampler) and then
+            # applies the ordinary policy loss weight w inside that draw.  Its
+            # population CE is therefore E_q[w * CE] / E_q[w], not E_q[CE].
+            # Using q alone here made validation overweight games with many
+            # policy-active roots and could select a different dose than the
+            # optimizer actually trained.  Keep q separately for the parent-KL
+            # measure, whose training contract is intentionally unweighted
+            # within each sampled stream.
+            policy_aux_validation_loss_weights = (
+                _policy_aux_validation_objective_weights(
+                    policy_aux_validation_sampling_weights,
+                    np.asarray(policy_sample_weights)[validation_indices],
+                )
+            )
             aux_policy_weights = _IndexedValidationWeights(
                 validation_indices,
-                policy_aux_validation_sampling_weights,
+                policy_aux_validation_loss_weights,
             )
             aux_value_weights = _IndexedValidationWeights(
                 validation_indices,
@@ -14118,6 +14132,63 @@ def main(argv: Sequence[str] | None = None) -> None:
                     value_validation_action_types_by_id
                 ),
             )
+            effective_anchor_weight = (
+                float(args.policy_kl_anchor_weight)
+                if policy_kl_controller is None
+                else float(policy_kl_controller.coefficient)
+            )
+            if effective_anchor_weight != 0.0:
+                aux_anchor_weights = _IndexedValidationWeights(
+                    validation_indices,
+                    policy_aux_validation_sampling_weights,
+                )
+                validation_policy_aux_anchor = evaluate_bc_batches(
+                    policy,
+                    data,
+                    validation_indices,
+                    aux_anchor_weights,
+                    aux_value_weights,
+                    args.batch_size,
+                    args.soft_target_temperature,
+                    args.soft_target_weight,
+                    args.soft_target_source,
+                    args.soft_target_min_legal_coverage,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    _parse_prefixes(args.q_skip_teacher_prefixes),
+                    args.vps_to_win,
+                    args.advantage_policy_weighting,
+                    args.advantage_temperature,
+                    args.advantage_weight_cap,
+                    args.advantage_weight_floor,
+                    ddp,
+                    args.amp,
+                    # A unit coefficient activates the metric. The configured
+                    # coefficient is applied once by the two-stream combiner.
+                    policy_kl_anchor_weight=1.0,
+                    policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
+                    policy_kl_use_policy_weights=True,
+                    data_sharded=bool(args.ddp_shard_data),
+                    data_loader_workers=int(args.data_loader_workers),
+                    data_loader_prefetch=int(args.data_loader_prefetch),
+                    scalar_value_loss_readout=str(args.scalar_value_loss_readout),
+                    scalar_value_loss_scale=float(args.scalar_value_loss_scale),
+                    value_validation_action_types_by_id=(
+                        value_validation_action_types_by_id
+                    ),
+                )
+                validation_policy_aux["policy_kl_anchor_loss"] = float(
+                    validation_policy_aux_anchor["policy_kl_anchor_loss"]
+                )
+                validation_policy_aux.setdefault("loss_denominators", {})[
+                    "policy_kl_anchor_loss"
+                ] = float(
+                    validation_policy_aux_anchor.get("loss_denominators", {}).get(
+                        "policy_kl_anchor_loss", 0.0
+                    )
+                )
             base_wrapper = metrics[-1].get("validation_objective_matched")
             base_objective_metrics = (
                 base_wrapper["metrics"]
@@ -14154,6 +14225,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "sampling_weight_mass": float(
                             policy_aux_validation_sampling_weights.sum()
                         ),
+                        "policy_loss_weight_mass": float(
+                            policy_aux_validation_loss_weights.sum()
+                        ),
+                        "policy_loss_measure": "conditioned_sampling_x_policy_weight",
+                        "policy_kl_measure": "conditioned_sampling",
                         "metrics": validation_policy_aux,
                     },
                 }
@@ -17084,6 +17160,35 @@ class _IndexedValidationWeights:
         return self._weights[positions]
 
 
+def _policy_aux_validation_objective_weights(
+    sampling_weights: np.ndarray,
+    policy_loss_weights: np.ndarray,
+) -> np.ndarray:
+    """Return the held-out density for the AUX policy CE objective.
+
+    The auxiliary stream samples from ``q`` and applies row loss weight ``w``
+    after sampling. Enumerating held-out rows must therefore use density
+    ``q*w``. Conditioning ``q`` only on positive ``w`` is admission, not a
+    replacement for the loss weight itself.
+    """
+
+    sampling = np.asarray(sampling_weights, dtype=np.float64)
+    loss_weights = np.asarray(policy_loss_weights, dtype=np.float64)
+    if sampling.ndim != 1 or loss_weights.shape != sampling.shape:
+        raise ValueError("policy AUX validation objective weight shape drift")
+    if (
+        not np.isfinite(sampling).all()
+        or not np.isfinite(loss_weights).all()
+        or np.any(sampling < 0.0)
+        or np.any(loss_weights < 0.0)
+    ):
+        raise ValueError("policy AUX validation objective weights are invalid")
+    effective = sampling * loss_weights
+    if float(effective.sum()) <= 0.0:
+        raise ValueError("policy AUX validation objective has no positive mass")
+    return effective
+
+
 def _combine_policy_aux_validation_metrics(
     base_metrics: dict,
     aux_metrics: dict,
@@ -17925,6 +18030,7 @@ def evaluate_bc_batches(
     truncated_vp_margin_value_weight: float = 0.0,
     policy_kl_anchor_weight: float = 0.0,
     policy_kl_anchor_direction: str = "forward",
+    policy_kl_use_policy_weights: bool = False,
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
     belief_resource_loss_weight: float = 0.0,
@@ -18020,6 +18126,9 @@ def evaluate_bc_batches(
             eval_fn_extra_kwargs = {
                 "policy_kl_anchor_weight": float(policy_kl_anchor_weight),
                 "policy_kl_anchor_direction": str(policy_kl_anchor_direction),
+                "policy_kl_use_policy_weights": bool(
+                    policy_kl_use_policy_weights
+                ),
                 "value_uncertainty_loss_weight": float(value_uncertainty_loss_weight),
                 "aux_subgoal_loss_weight": float(aux_subgoal_loss_weight),
                 "belief_resource_loss_weight": float(
@@ -18634,6 +18743,7 @@ def _eval_xdim_batch(
     truncated_vp_margin_value_weight: float = 0.0,
     policy_kl_anchor_weight: float = 0.0,
     policy_kl_anchor_direction: str = "forward",
+    policy_kl_use_policy_weights: bool = False,
     value_uncertainty_loss_weight: float = 0.0,
     aux_subgoal_loss_weight: float = 0.0,
     belief_resource_loss_weight: float = 0.0,
@@ -18660,6 +18770,7 @@ def _eval_xdim_batch(
             dtype=torch.float32,
             device=policy.device,
         )
+        policy_kl_measure_weights = policy_weights
         value_weights = torch.as_tensor(
             value_sample_weights[batch],
             dtype=torch.float32,
@@ -18843,6 +18954,11 @@ def _eval_xdim_batch(
                 outputs["logits"],
                 policy.device,
                 direction=policy_kl_anchor_direction,
+                sample_weights=(
+                    policy_kl_measure_weights
+                    if policy_kl_use_policy_weights
+                    else None
+                ),
             )
             if anchor is not None:
                 (
@@ -23192,6 +23308,7 @@ def _policy_kl_anchor_loss_parts(
     device,
     *,
     direction: str = "forward",
+    sample_weights=None,
 ):
     """Return conditional anchor mean plus its eligible-row sum/denominator.
 
@@ -23241,6 +23358,19 @@ def _policy_kl_anchor_loss_parts(
         device=device,
     )
     weights = (terms["has_prior"] & non_forced).to(torch.float32)
+    if sample_weights is not None:
+        external = torch.as_tensor(
+            sample_weights,
+            dtype=torch.float32,
+            device=device,
+        )
+        if external.shape != weights.shape:
+            raise ValueError("policy KL anchor sample-weight shape drift")
+        if not bool(torch.isfinite(external).all().item()) or bool(
+            (external < 0.0).any().item()
+        ):
+            raise ValueError("policy KL anchor sample weights are invalid")
+        weights = weights * external
     scope_mask = _policy_kl_anchor_scope_mask(data, batch)
     if scope_mask is not None:
         eligible = torch.as_tensor(scope_mask, dtype=torch.bool, device=device)
@@ -27409,6 +27539,7 @@ def _effective_entity_graph_architecture_report(
             "static_action_residual": False,
             "legal_action_value_residual": False,
             "public_card_count_features": False,
+            "public_card_count_residual_bias": False,
             "meaningful_public_history": False,
             "meaningful_public_history_schema": (
                 MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
@@ -27448,6 +27579,11 @@ def _effective_entity_graph_architecture_report(
         ),
         "public_card_count_features": bool(
             getattr(config, "public_card_count_features", False)
+        ),
+        "public_card_count_residual_bias": (
+            bool(getattr(config, "public_card_count_residual_bias", True))
+            if bool(getattr(config, "public_card_count_features", False))
+            else False
         ),
         "meaningful_public_history": bool(
             getattr(config, "meaningful_public_history", False)
@@ -27771,6 +27907,19 @@ def _build_optimizer_param_groups(
         if float(public_card_lr_mult) != 1.0
         else []
     )
+    if float(public_card_lr_mult) != 1.0:
+        public_card_residual = getattr(module, "public_card_count_residual", None)
+        if (
+            public_card_residual is not None
+            and getattr(public_card_residual, "bias", None) is not None
+        ):
+            raise SystemExit(
+                "--public-card-lr-mult != 1.0 requires the bias-free public-card "
+                "residual topology. Legacy v1 adapters contain a trainable "
+                "intercept that changes every player token even when the public-card "
+                "evidence row is all zero; replay them only at multiplier 1.0 or "
+                "upgrade with the v2/v3 bias-free receipt."
+            )
     public_card_param_ids = {id(p) for p in public_card_params}
     trunk_params = (
         [

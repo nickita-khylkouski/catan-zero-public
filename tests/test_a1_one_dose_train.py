@@ -1870,6 +1870,48 @@ def test_public_card_lr_multiplier_refuses_every_non_card_initializer(
         )
 
 
+@pytest.mark.parametrize(
+    "legacy_module",
+    [
+        executor.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+        executor.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
+    ],
+)
+def test_public_card_lr_multiplier_refuses_legacy_biased_initializer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_module: str,
+) -> None:
+    verified, _base_path, _base = _descriptor_bound_production_verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    code_sha = "sha256:" + "7" * 64
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": code_sha, "records": []},
+    )
+    legacy = {
+        **_fake_public_card_upgrade(verified, tmp_path),
+        "module": legacy_module,
+    }
+    monkeypatch.setattr(
+        executor.architecture_upgrade,
+        "verify_receipt",
+        lambda _path: legacy,
+    )
+    bound = executor.bind_function_preserving_upgrade(
+        verified, Path(legacy["receipt"]["path"])
+    )
+
+    with pytest.raises(executor.ExecutorError, match="bias-free"):
+        executor.bind_learner_ablation(
+            bound,
+            ablation_id="legacy-biased-card4",
+            overrides_json='{"public_card_lr_mult":4.0}',
+            reviewed_code_tree_sha256=code_sha,
+        )
+
+
 def test_generic_ablation_can_bind_trunk_lr_and_adaptive_parent_kl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

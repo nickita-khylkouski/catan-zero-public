@@ -7,10 +7,23 @@ from tools.train_bc import (
     _combine_policy_aux_validation_metrics,
     _IndexedValidationWeights,
     _objective_measure_validation_aggregate,
+    _policy_aux_validation_objective_weights,
     evaluate_composite_validation_measure,
     objective_matched_validation_component_metrics,
     objective_matched_validation_metrics,
 )
+
+
+def test_policy_aux_validation_applies_sampling_and_loss_measures() -> None:
+    # q conditions on policy-active rows; w equalizes the two games' objective
+    # mass despite the second game contributing three active roots.
+    q = np.full(4, 0.25, dtype=np.float64)
+    w = np.asarray([1.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0])
+
+    effective = _policy_aux_validation_objective_weights(q, w)
+
+    assert effective == pytest.approx(q * w)
+    assert effective[0] == pytest.approx(effective[1:].sum())
 
 
 def test_policy_aux_validation_reconstructs_the_training_objective() -> None:

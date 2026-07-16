@@ -70,6 +70,7 @@ def test_report_binds_effective_meaningful_history_contract() -> None:
         policy_type="entity_graph",
         config=SimpleNamespace(
             public_card_count_features=True,
+            public_card_count_residual_bias=False,
             meaningful_public_history=True,
             meaningful_public_history_schema=(MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION),
             event_history_limit=32,
@@ -80,6 +81,7 @@ def test_report_binds_effective_meaningful_history_contract() -> None:
     report = _effective_entity_graph_architecture_report(policy)
 
     assert report["public_card_count_features"] is True
+    assert report["public_card_count_residual_bias"] is False
     assert report["meaningful_public_history"] is True
     assert (
         report["meaningful_public_history_schema"]

@@ -22,6 +22,7 @@ def _make_entity_policy(
     edge_policy_head: bool = False,
     value_attention_pool: bool = False,
     public_card_count_features: bool = False,
+    public_card_count_residual_bias: bool = True,
 ):
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.self_play import make_env_config
@@ -48,6 +49,7 @@ def _make_entity_policy(
             edge_policy_head=bool(edge_policy_head),
             value_attention_pool=bool(value_attention_pool),
             public_card_count_features=bool(public_card_count_features),
+            public_card_count_residual_bias=bool(public_card_count_residual_bias),
         )
         policy = EntityGraphPolicy(
             config,
@@ -267,7 +269,10 @@ def test_trunk_lr_multiplier_changes_only_canonical_entity_graph_trunk() -> None
 def test_public_card_lr_multiplier_overrides_trunk_group_for_shared_freeze_surface() -> (
     None
 ):
-    policy = _make_entity_policy(public_card_count_features=True)
+    policy = _make_entity_policy(
+        public_card_count_features=True,
+        public_card_count_residual_bias=False,
+    )
     groups = _build_optimizer_param_groups(
         policy.model,
         base_lr=2e-4,
@@ -302,6 +307,22 @@ def test_public_card_lr_multiplier_overrides_trunk_group_for_shared_freeze_surfa
     ]
     assert len(assigned) == len(set(assigned))
     assert set(assigned) == set(expected)
+
+
+def test_public_card_lr_multiplier_refuses_legacy_biased_residual() -> None:
+    policy = _make_entity_policy(
+        public_card_count_features=True,
+        public_card_count_residual_bias=True,
+    )
+
+    with pytest.raises(SystemExit, match="bias-free public-card"):
+        _build_optimizer_param_groups(
+            policy.model,
+            base_lr=2e-4,
+            value_lr_mult=1.0,
+            public_card_lr_mult=4.0,
+            architecture="entity_graph",
+        )
 
 
 def test_trunk_lr_multiplier_fails_closed_for_unsupported_architecture() -> None:

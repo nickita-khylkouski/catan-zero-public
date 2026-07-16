@@ -169,6 +169,28 @@ def test_default_matches_forward_kl_over_prior_rows():
     assert int(has_prior.sum().item()) == 2
 
 
+def test_anchor_can_reconstruct_an_explicit_sampling_measure():
+    data = _base_data()
+    batch = np.arange(3)
+    logits = _logits()
+    weights = torch.tensor([1.0, 3.0, 99.0], dtype=torch.float32)
+    parts = _policy_kl_anchor_loss_parts(
+        data,
+        batch,
+        logits,
+        torch.device("cpu"),
+        sample_weights=weights,
+    )
+    terms = _prior_kl_telemetry(data, batch, logits, torch.device("cpu"))
+
+    assert parts is not None
+    mean, weighted_sum, denominator = parts
+    expected_sum = terms["kl_prior_model"][0] + 3.0 * terms["kl_prior_model"][1]
+    assert weighted_sum == pytest.approx(expected_sum)
+    assert denominator.item() == pytest.approx(4.0)
+    assert mean == pytest.approx(expected_sum / 4.0)
+
+
 def test_legacy_reverse_direction_is_explicit_and_matches_telemetry():
     data = _base_data()
     batch = np.arange(3)

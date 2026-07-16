@@ -3289,21 +3289,22 @@ def bind_learner_ablation(
             "aux_subgoal_loss_weight ablation requires the receipt-backed "
             "shared aux-head initializer"
         )
-    if "public_card_lr_mult" in overrides and not (
-        isinstance(upgrade, dict)
-        and upgrade.get("module")
-        in {
-            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
+    public_card_lr_override = overrides.get("public_card_lr_mult")
+    if type(public_card_lr_override) is float and public_card_lr_override != 1.0:
+        bias_free_public_card_modules = {
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
-            architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
             architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
         }
-    ):
-        raise ExecutorError(
-            "public_card_lr_mult requires the receipt-backed public-card "
-            "function-preserving initializer"
-        )
+        if (
+            not isinstance(upgrade, dict)
+            or upgrade.get("module") not in bias_free_public_card_modules
+        ):
+            raise ExecutorError(
+                "non-unit public_card_lr_mult requires a receipt-backed bias-free "
+                "public-card v2/v3 initializer; legacy v1 residuals contain a "
+                "trainable intercept and may be replayed only at multiplier 1.0"
+            )
     aux_batch_declared = "policy_aux_active_batch_size" in overrides
     aux_weight_declared = "policy_aux_loss_weight" in overrides
     if aux_batch_declared != aux_weight_declared:

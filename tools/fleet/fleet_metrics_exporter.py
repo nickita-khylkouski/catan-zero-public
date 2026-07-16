@@ -83,7 +83,7 @@ EXPECTED_COHERENT_PUBLIC_A1_RECIPE: dict[str, Any] = {
     "correct_rust_chance_spectra": True,
     "native_mcts_hot_loop": True,
     "forced_root_target_mode": "trajectory_only",
-    "record_automatic_transitions": False,
+    "record_automatic_transitions": True,
     "meaningful_public_history": True,
     "event_history_limit": 32,
     "rust_featurize": True,

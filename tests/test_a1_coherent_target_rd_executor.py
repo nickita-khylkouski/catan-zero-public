@@ -229,8 +229,15 @@ def test_native_runtime_record_binds_loaded_extension_to_wheel_member() -> None:
 
 
 def test_worker_manifest_requires_actual_coherent_row_surface() -> None:
+    v1_contract = {"operator": {"record_automatic_transitions": False}}
     executor._verify_coherent_worker_selfplay_config(
-        {"selfplay_config": dict(executor.COHERENT_WORKER_SELFPLAY_CONFIG)},
+        {
+            "selfplay_config": {
+                **executor.COHERENT_WORKER_SELFPLAY_CONFIG,
+                "record_automatic_transitions": False,
+            }
+        },
+        contract=v1_contract,
         where="worker_000/manifest.json",
     )
 
@@ -243,8 +250,71 @@ def test_worker_manifest_requires_actual_coherent_row_surface() -> None:
                     "record_automatic_transitions": True,
                 }
             },
+            contract=v1_contract,
             where="worker_000/manifest.json",
         )
+
+
+def test_worker_manifest_accepts_v2_forced_value_row_surface() -> None:
+    executor._verify_coherent_worker_selfplay_config(
+        {
+            "selfplay_config": {
+                **executor.COHERENT_WORKER_SELFPLAY_CONFIG,
+                "record_automatic_transitions": True,
+            }
+        },
+        contract={"operator": {"record_automatic_transitions": True}},
+        where="worker_000/manifest.json",
+    )
+
+
+def test_resolved_v2_config_accepts_retained_automatic_transitions(
+    tmp_path: Path,
+) -> None:
+    contract = {
+        "operator": {"record_automatic_transitions": True},
+        "execution": {"workers_per_gpu": 16},
+        "producer_checkpoint": {"sha256": "sha256:" + "a" * 64},
+    }
+    lane = {"lane_id": "b200_gpu0", "base_seed": 700, "games": 1024}
+    fields = {
+        "base_seed": 700,
+        "games": 1024,
+        "workers": 16,
+        "producer_checkpoint_sha256": contract["producer_checkpoint"]["sha256"],
+        "public_observation": True,
+        "coherent_public_belief_search": True,
+        "information_set_search": False,
+        "determinization_particles": 1,
+        "n_full": 128,
+        "n_fast": 16,
+        "p_full": 0.25,
+        "n_full_wide": None,
+        "n_full_wide_threshold": None,
+        "wide_roots_always_full": False,
+        "opponent_mix_manifest": None,
+        "opponent_pool_manifest": None,
+        "record_automatic_transitions": True,
+        "meaningful_public_history": True,
+        "event_history_limit": 32,
+    }
+    config = {"pipeline": "generate", "schema_version": 13, "fields": fields}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    full_hash = executor._digest(config)
+    manifest = {
+        "config_hash": "sha256:" + full_hash.removeprefix("sha256:")[:16],
+        "full_config_hash": full_hash,
+    }
+
+    record = executor._resolved_config_record(
+        path,
+        lane=lane,
+        contract=contract,
+        manifest=manifest,
+    )
+
+    assert record["full_config_hash"] == full_hash
 
 
 def test_group_authority_requires_exact_session_leader_identity(
