@@ -207,6 +207,17 @@ def test_actor_handoff_requires_consecutive_decision_and_actor_change() -> None:
     assert nxt.tolist() == [2]
 
 
+def test_actor_handoff_rejects_post_chance_next_actor_row() -> None:
+    end, nxt = actor_handoff_pairs(
+        np.asarray(["end_turn", "post_roll_play_turn"]),
+        np.asarray(["g", "g"]),
+        np.asarray([10, 11]),
+        np.asarray(["BLUE", "RED"]),
+    )
+    assert end.tolist() == []
+    assert nxt.tolist() == []
+
+
 def test_game_bootstrap_is_deterministic_and_clustered() -> None:
     q = np.asarray([0.8, 0.6, -0.7, -0.5])
     z = np.asarray([1.0, 1.0, -1.0, -1.0])
@@ -270,6 +281,17 @@ def test_build_report_includes_required_slices_and_handoff_consistency(
             "terminal_label_opposition_fraction"
         ]
         == 1.0
+    )
+    assert (
+        report["actor_handoff_consistency"]["prediction_sum_zero_is_required"]
+        is False
+    )
+    assert report["actor_handoff_consistency"]["mean_paired_value_sum"] == pytest.approx(
+        0.0
+    )
+    assert (
+        report["metric_semantics"]["actor_handoff_paired_value_sum"]
+        .startswith("deployed_value(before END_TURN")
     )
     assert "spearman_q_z" in report["global"]
     assert "spearman_q_z" in report["global"]["game_bootstrap_95ci"]

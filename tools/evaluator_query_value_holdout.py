@@ -16,7 +16,14 @@ reports:
   reliability bins;
 * exact phase and legal-width slices;
 * whole-game bootstrap confidence intervals; and
-* END_TURN -> next-actor value antisymmetry.
+* END_TURN -> next-actor paired value contrast.
+
+The terminal labels of an END_TURN row and the next actor's pre-ROLL row are
+exact opposites in the two-player zero-sum track.  Their model predictions are
+not required to be exact negatives, however: the public-observation contract
+retains the acting player's own private hand, so the two rows condition on
+different information sets.  The paired sum remains useful as a bias/drift
+diagnostic, but it is not a perspective-correctness gate.
 
 Only naturally terminated games carry outcome labels and enter the report.
 The default game/row limits are intentionally finite.  The artifact is
@@ -58,7 +65,7 @@ from phase_sliced_value_calibration import (
 )
 
 
-SCHEMA_VERSION = "evaluator-query-value-holdout-v1"
+SCHEMA_VERSION = "evaluator-query-value-holdout-v2"
 PLAYER_NAMES = ("BLUE", "RED")
 SUPPORTED_ACTION_MASK_VERSIONS = frozenset(
     {ActionCatalog.version, "colonist-multiagent-v1"}
@@ -623,7 +630,14 @@ def actor_handoff_pairs(
     decision_indices: np.ndarray,
     players: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return aligned END_TURN and immediate next-actor row indices."""
+    """Return END_TURN rows followed by the next actor's pre-ROLL root.
+
+    Requiring ``pre_roll`` prevents a missing automatic-transition row (or a
+    malformed decision trace) from comparing the old actor's pre-handoff value
+    with a post-chance state.  The returned rows have opposite terminal labels,
+    but their predictions are actor-conditioned and therefore need not sum to
+    zero.
+    """
 
     classes = np.asarray(root_classes).astype(str)
     games = np.asarray(game_ids).astype(str)
@@ -639,7 +653,11 @@ def actor_handoff_pairs(
             if classes[row] != "end_turn":
                 continue
             next_row = by_decision.get(int(decisions[row]) + 1)
-            if next_row is None or actors[next_row] == actors[row]:
+            if (
+                next_row is None
+                or actors[next_row] == actors[row]
+                or classes[next_row] != "pre_roll"
+            ):
                 continue
             end_rows.append(int(row))
             next_rows.append(next_row)
@@ -733,8 +751,8 @@ def build_report(
         )
 
     if len(end_rows):
-        antisymmetry_error = q[end_rows] + q[next_rows]
-        absolute_error = np.abs(antisymmetry_error)
+        paired_value_sum = q[end_rows] + q[next_rows]
+        absolute_paired_value_sum = np.abs(paired_value_sum)
         pair_games = game_ids[end_rows]
         handoff = {
             "n_pairs": int(len(end_rows)),
@@ -742,18 +760,30 @@ def build_report(
             "terminal_label_opposition_fraction": float(
                 np.mean(z[end_rows] == -z[next_rows])
             ),
-            "mean_signed_antisymmetry_error": float(np.mean(antisymmetry_error)),
-            "mean_absolute_antisymmetry_error": float(np.mean(absolute_error)),
-            "rmse_antisymmetry_error": float(
-                np.sqrt(np.mean(antisymmetry_error**2))
+            "mean_end_turn_value": float(np.mean(q[end_rows])),
+            "mean_next_actor_pre_roll_value": float(np.mean(q[next_rows])),
+            "mean_paired_value_sum": float(np.mean(paired_value_sum)),
+            "mean_absolute_paired_value_sum": float(
+                np.mean(absolute_paired_value_sum)
             ),
-            "mean_absolute_error_game_bootstrap_95ci": (
+            "rmse_paired_value_sum": float(
+                np.sqrt(np.mean(paired_value_sum**2))
+            ),
+            "mean_absolute_paired_value_sum_game_bootstrap_95ci": (
                 _mean_game_bootstrap_interval(
-                    absolute_error,
+                    absolute_paired_value_sum,
                     pair_games,
                     samples=bootstrap_samples,
                     seed=bootstrap_seed + 10_000,
                 )
+            ),
+            "prediction_sum_zero_is_required": False,
+            "prediction_sum_zero_non_requirement_reason": (
+                "the two rows use different actor-centric information sets; "
+                "public observation preserves each acting player's own private hand"
+            ),
+            "valid_hard_invariant": (
+                "terminal labels must be opposite for every paired two-player game"
             ),
         }
     else:
@@ -761,15 +791,25 @@ def build_report(
             "n_pairs": 0,
             "n_games": 0,
             "terminal_label_opposition_fraction": None,
-            "mean_signed_antisymmetry_error": None,
-            "mean_absolute_antisymmetry_error": None,
-            "rmse_antisymmetry_error": None,
-            "mean_absolute_error_game_bootstrap_95ci": {
+            "mean_end_turn_value": None,
+            "mean_next_actor_pre_roll_value": None,
+            "mean_paired_value_sum": None,
+            "mean_absolute_paired_value_sum": None,
+            "rmse_paired_value_sum": None,
+            "mean_absolute_paired_value_sum_game_bootstrap_95ci": {
                 "low": None,
                 "high": None,
                 "valid_resamples": 0,
                 "requested_resamples": int(bootstrap_samples),
             },
+            "prediction_sum_zero_is_required": False,
+            "prediction_sum_zero_non_requirement_reason": (
+                "the two rows use different actor-centric information sets; "
+                "public observation preserves each acting player's own private hand"
+            ),
+            "valid_hard_invariant": (
+                "terminal labels must be opposite for every paired two-player game"
+            ),
         }
 
     return {
@@ -791,9 +831,11 @@ def build_report(
             "confidence_intervals": (
                 "2.5/97.5 percentiles from whole-game cluster bootstrap"
             ),
-            "actor_handoff_antisymmetry": (
-                "deployed_value(before END_TURN, old actor) + "
-                "deployed_value(next root, new actor)"
+            "actor_handoff_paired_value_sum": (
+                "deployed_value(before END_TURN, old actor) + deployed_value("
+                "next pre-ROLL root, new actor); diagnostic for shared bias/drift "
+                "only, not a zero-target invariant because observations are "
+                "actor-conditioned information sets"
             ),
         },
         "evaluator_binding": {
