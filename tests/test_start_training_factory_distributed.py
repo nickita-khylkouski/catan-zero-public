@@ -71,6 +71,7 @@ def test_factory_keeps_default_global_batch_constant_across_world_sizes(
         "batch_size_source": "derived_from_global_batch",
         "training_rng_rank_offset": world_size > 1,
         "max_optimizer_steps": 128,
+        "exact_max_optimizer_steps": True,
         "optimizer": "adam",
         "value_lr_mult": 1.0,
         "trunk_lr_mult": 1.0,
@@ -211,6 +212,7 @@ def test_factory_uses_public_equal_game_training_contract(tmp_path: Path) -> Non
     assert resolved.per_game_value_weight_mode == "equal"
     assert resolved.lr_warmup_steps == 16
     assert resolved.max_steps == 128
+    assert resolved.exact_max_steps is True
     assert resolved.value_lr_mult == pytest.approx(1.0)
     assert resolved.trunk_lr_mult == pytest.approx(1.0)
     assert resolved.value_trunk_grad_scale == pytest.approx(1.0)
@@ -323,6 +325,7 @@ def test_factory_none_quality_gate_disables_implicit_35m_teacher_gate(
     assert "--skip-teacher-quality-gate" in command
     assert "--require-strict-35m-teacher" not in command
     assert "--require-production-35m-teacher" not in command
+    assert "--exact-max-steps" not in command
     assert "--require-35m-model" in command
 
 
@@ -484,6 +487,7 @@ def test_explicit_local_batch_override_is_manifested_without_reinterpretation(
         "batch_size_source": "explicit_rank_local_override",
         "training_rng_rank_offset": True,
         "max_optimizer_steps": 128,
+        "exact_max_optimizer_steps": True,
         "optimizer": "adam",
         "value_lr_mult": 1.0,
         "trunk_lr_mult": 1.0,

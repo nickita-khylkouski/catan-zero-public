@@ -611,6 +611,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--exact-max-steps",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Require exactly --max-steps applied optimizer updates. When the "
+            "configured epoch count would end first, continue deterministic "
+            "epoch passes until the step dose is reached. This is opt-in so "
+            "historical epoch-bounded recipes retain their existing semantics."
+        ),
+    )
+    parser.add_argument(
         "--grad-accum-steps",
         type=int,
         default=1,
@@ -9836,6 +9847,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         argv=raw_argv,
         expected_pipeline=TrainConfig.PIPELINE,
     )
+    effective_epoch_limit = _effective_training_epoch_limit(
+        configured_epochs=int(args.epochs),
+        max_steps=int(args.max_steps),
+        exact_max_steps=bool(args.exact_max_steps),
+    )
     if bool(args.per_game_policy_surprise_weighting) and float(
         args.policy_surprise_weight
     ) > 0.0:
@@ -12213,7 +12229,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         cumulative_categorical_training_weight,
     ) = _restore_training_progress_state(
         resume_progress,
-        epochs=int(args.epochs),
+        epochs=effective_epoch_limit,
         rng=rng,
         symmetry_rng=symmetry_rng,
         ddp=ddp,
@@ -12261,7 +12277,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     accum = max(1, int(args.grad_accum_steps))
     central_realized_sample_evidence: dict[str, object] | None = None
     aux_stage_realized_sample_evidence: dict[str, object] | None = None
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(start_epoch, effective_epoch_limit):
         remaining_order_samples = None
         if int(args.max_steps) > 0 and epoch_sample_weights is not None:
             # Weighted sampling is with replacement, so a bounded draw is the
@@ -14445,6 +14461,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         if args.max_steps > 0 and global_step >= args.max_steps:
             break
+    _validate_exact_optimizer_step_dose(
+        exact_max_steps=bool(args.exact_max_steps),
+        max_steps=int(args.max_steps),
+        applied_steps=int(global_step),
+        epoch_limit=int(effective_epoch_limit),
+    )
     # Called on every rank (see _save_policy): rank-0 write for DDP/single, and a
     # collective full-state-dict gather for FSDP (C1). MUST stay unconditional --
     # the FSDP gather is collective, so wrapping in `if rank==0` would deadlock/skip
@@ -14705,7 +14727,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "train_samples": int(len(train_indices)),
         "validation_samples": int(len(validation_indices)),
         "epochs": args.epochs,
+        "effective_epoch_limit": int(effective_epoch_limit),
         "max_steps": int(args.max_steps),
+        "exact_max_steps": bool(args.exact_max_steps),
         "steps_completed": int(global_step),
         "batch_size": args.batch_size,
         "grad_accum_steps": int(args.grad_accum_steps),
@@ -28404,6 +28428,34 @@ def _lr_warmup_multiplier(step: int, warmup_steps: int) -> float:
     if warmup_steps <= 0:
         return 1.0
     return min(1.0, float(step + 1) / float(warmup_steps))
+
+
+def _effective_training_epoch_limit(
+    *, configured_epochs: int, max_steps: int, exact_max_steps: bool
+) -> int:
+    """Return the epoch ceiling while preserving legacy max-step semantics.
+
+    A non-empty corpus can apply at least one optimizer update per epoch. An
+    exact step dose therefore needs at most ``max_steps`` epoch passes. The
+    post-loop assertion remains authoritative because an empty or all-zero
+    objective can apply no updates and must fail closed instead of spinning.
+    """
+    if not exact_max_steps:
+        return int(configured_epochs)
+    if int(max_steps) <= 0:
+        raise SystemExit("--exact-max-steps requires --max-steps > 0")
+    return max(int(configured_epochs), int(max_steps))
+
+
+def _validate_exact_optimizer_step_dose(
+    *, exact_max_steps: bool, max_steps: int, applied_steps: int, epoch_limit: int
+) -> None:
+    if exact_max_steps and int(applied_steps) != int(max_steps):
+        raise RuntimeError(
+            "exact optimizer-step dose was not reached: "
+            f"requested={int(max_steps)} applied={int(applied_steps)} "
+            f"effective_epoch_limit={int(epoch_limit)}"
+        )
 
 
 def _apply_lr_warmup(optimizer, *, base_lr: float, step: int, warmup_steps: int) -> float:

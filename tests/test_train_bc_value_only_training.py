@@ -1326,6 +1326,66 @@ def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
     assert unforced["OPEN"]["count"] == 4
 
 
+def test_exact_max_steps_continues_past_configured_epoch_limit(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import json
+
+    from catan_zero.rl.self_play import make_env_config
+    from tools import train_bc
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(6))
+    winner = str(np.asarray(data["player"]).astype(str)[0])
+    data["winner"] = np.asarray([winner] * 6, dtype=object)
+    if "terminated" in data:
+        data["terminated"] = np.ones(6, dtype=np.bool_)
+    if "truncated" in data:
+        data["truncated"] = np.zeros(6, dtype=np.bool_)
+    monkeypatch.setattr(
+        train_bc, "load_teacher_data", lambda _path, **_kwargs: data
+    )
+    monkeypatch.setattr(
+        train_bc,
+        "_env_config_for_teacher_data",
+        lambda _args, _data, _ddp: make_env_config(vps_to_win=3),
+    )
+    report_path = tmp_path / "exact-dose-report.json"
+    train_bc.main(
+        [
+            "--data",
+            str(tmp_path / "shard"),
+            "--checkpoint",
+            str(tmp_path / "exact-dose.pt"),
+            "--report",
+            str(report_path),
+            "--arch",
+            "candidate",
+            "--device",
+            "cpu",
+            "--hidden-size",
+            "16",
+            "--epochs",
+            "1",
+            "--max-steps",
+            "3",
+            "--exact-max-steps",
+            "--batch-size",
+            "4",
+            "--validation-fraction",
+            "0",
+            "--skip-guards",
+        ]
+    )
+    capsys.readouterr()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["epochs"] == 1
+    assert report["effective_epoch_limit"] == 3
+    assert report["exact_max_steps"] is True
+    assert report["steps_completed"] == 3
+    assert report["value_training"]["optimizer_steps"] == 3
+    assert len(report["metrics"]) == 2
+
+
 def test_unforced_phase_ddp_reducer_merges_unequal_rank_counts(monkeypatch) -> None:
     import torch.distributed as dist
     from tools import train_bc

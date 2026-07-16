@@ -592,6 +592,7 @@ def main() -> None:
             if args.quality_gate == "strict"
             else ["--skip-teacher-quality-gate"]
         )
+        + (["--exact-max-steps"] if args.quality_gate == "production" else [])
         + (
             [
                 "--require-35m-model",
@@ -710,6 +711,7 @@ def main() -> None:
             ),
             "training_rng_rank_offset": world_size > 1,
             "max_optimizer_steps": int(args.bc_max_steps),
+            "exact_max_optimizer_steps": args.quality_gate == "production",
             "optimizer": str(args.optimizer),
             "value_lr_mult": float(args.value_lr_mult),
             "trunk_lr_mult": float(args.trunk_lr_mult),

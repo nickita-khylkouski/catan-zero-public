@@ -7,7 +7,9 @@ import pytest
 from tools.train_bc import (
     _accumulation_group_size,
     _advance_global_step,
+    _effective_training_epoch_limit,
     _gradient_sync_context,
+    _validate_exact_optimizer_step_dose,
 )
 
 
@@ -88,6 +90,32 @@ def test_skipped_zero_objective_group_does_not_consume_max_step_budget() -> None
     )
     assert global_step == max_steps
     assert global_step >= max_steps
+
+
+def test_exact_step_dose_extends_epoch_ceiling_without_changing_legacy_mode() -> None:
+    assert _effective_training_epoch_limit(
+        configured_epochs=2, max_steps=128, exact_max_steps=False
+    ) == 2
+    assert _effective_training_epoch_limit(
+        configured_epochs=2, max_steps=128, exact_max_steps=True
+    ) == 128
+
+
+def test_exact_step_dose_requires_a_positive_step_target() -> None:
+    with pytest.raises(SystemExit, match="requires --max-steps > 0"):
+        _effective_training_epoch_limit(
+            configured_epochs=2, max_steps=0, exact_max_steps=True
+        )
+
+
+def test_exact_step_dose_fails_closed_when_no_batch_applies_an_update() -> None:
+    with pytest.raises(RuntimeError, match="requested=128 applied=0"):
+        _validate_exact_optimizer_step_dose(
+            exact_max_steps=True,
+            max_steps=128,
+            applied_steps=0,
+            epoch_limit=128,
+        )
 
 
 def test_nonstepping_microbatch_cannot_claim_an_optimizer_update() -> None:
