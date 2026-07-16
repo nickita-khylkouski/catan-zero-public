@@ -1172,6 +1172,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--policy-dose-lr-area",
+        type=float,
+        default=0.0,
+        help=(
+            "Independent integrated-LR budget for policy distillation. 0 keeps "
+            "policy loss active for the full run (historical behavior). A positive "
+            "budget meters sum(policy_coefficient * scheduled_base_lr) and reduces "
+            "the final boundary step so policy CE reaches exactly that dose, then "
+            "turns policy CE off while value and representation learning continue. "
+            "This avoids coupling the policy optimum to the longer value horizon."
+        ),
+    )
+    parser.add_argument(
         "--policy-aux-active-batch-size",
         type=int,
         default=0,
@@ -2422,11 +2435,27 @@ def _policy_training_signal_attestation(
     base_draws = sum(int(metric.get("samples", 0)) for metric in metrics)
     total_draws = base_draws + aux_active_rows
     effective_weight_sum = sum(
-        float((metric.get("loss_denominators") or {}).get("policy_loss", 0.0))
+        float(
+            metric.get(
+                "policy_objective_effective_weight_sum",
+                (metric.get("loss_denominators") or {}).get(
+                    "policy_loss", 0.0
+                ),
+            )
+        )
         for metric in metrics
     )
     policy_enabled = coefficient > 0.0 and not bool(train_value_only)
-    active_rows = base_active_rows + aux_active_rows
+    active_rows = sum(
+        int(
+            metric.get(
+                "policy_objective_active_rows",
+                int(metric.get("policy_base_active_rows", 0))
+                + int(metric.get("policy_aux_active_rows", 0)),
+            )
+        )
+        for metric in metrics
+    )
     trained = bool(
         policy_enabled
         and int(optimizer_steps) > 0
@@ -2481,6 +2510,33 @@ def _validate_policy_loss_weight(value: float) -> float:
             f"got {value}"
         )
     return value
+
+
+def _policy_weight_for_lr_area(
+    base_weight: float,
+    *,
+    scheduled_base_lr: float,
+    consumed_lr_area: float,
+    target_lr_area: float,
+) -> float:
+    """Meter policy imitation by integrated optimizer dose, not step count."""
+
+    coefficient = _validate_policy_loss_weight(base_weight)
+    learning_rate = float(scheduled_base_lr)
+    consumed = float(consumed_lr_area)
+    target = float(target_lr_area)
+    if not all(math.isfinite(value) for value in (learning_rate, consumed, target)):
+        raise ValueError("policy LR-area inputs must be finite")
+    if learning_rate < 0.0 or consumed < 0.0 or target < 0.0:
+        raise ValueError("policy LR-area inputs must be non-negative")
+    if target == 0.0 or coefficient == 0.0:
+        return coefficient
+    remaining = max(0.0, target - consumed)
+    if remaining == 0.0:
+        return 0.0
+    if learning_rate == 0.0:
+        return coefficient
+    return min(coefficient, remaining / learning_rate)
 
 
 def _optimizer_lr_dose_attestation(
@@ -10799,6 +10855,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.policy_loss_weight = _validate_policy_loss_weight(
         args.policy_loss_weight
     )
+    if not math.isfinite(float(args.policy_dose_lr_area)) or float(
+        args.policy_dose_lr_area
+    ) < 0.0:
+        raise SystemExit("--policy-dose-lr-area must be finite and >= 0")
+    if float(args.policy_dose_lr_area) > 0.0:
+        policy_group_multipliers = {
+            "--trunk-lr-mult": float(args.trunk_lr_mult),
+            "--action-module-lr-mult": float(args.action_module_lr_mult),
+            "--public-card-lr-mult": float(args.public_card_lr_mult),
+        }
+        drift = {
+            name: value
+            for name, value in policy_group_multipliers.items()
+            if value != 1.0
+        }
+        if drift:
+            raise SystemExit(
+                "--policy-dose-lr-area currently requires unit LR multipliers "
+                "for every policy-affecting optimizer group; a scalar dose cannot "
+                f"represent group-specific LR areas: {drift}"
+            )
     if float(args.belief_resource_loss_weight) < 0.0:
         raise SystemExit("--belief-resource-loss-weight must be >= 0")
     if float(args.belief_resource_loss_weight) > 0.0:
@@ -13575,6 +13652,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     optimizer_lr_applied_updates = 0
     optimizer_schedule_multiplier_sum = 0.0
     optimizer_lr_area_by_group = [0.0 for _ in optimizer.param_groups]
+    policy_objective_lr_area = 0.0
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
     intermediate_checkpoints: list[dict[str, object]] = []
     checkpoint_dose_snapshots: list[dict[str, object]] = []
@@ -13944,6 +14022,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_aux_active_count = 0.0
         epoch_policy_base_effective_weight = 0.0
         epoch_policy_aux_effective_weight = 0.0
+        epoch_policy_objective_active_rows = 0.0
+        epoch_policy_objective_effective_weight = 0.0
         epoch_value_active_count = 0.0
         epoch_anchor_eligible_count = 0.0
         epoch_policy_kl_weighted_objective_sum = 0.0
@@ -14141,6 +14221,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if policy_kl_controller is None
                 else float(policy_kl_controller.coefficient)
             )
+            scheduled_base_lr = float(args.lr) * float(applied_lr_multiplier)
+            batch_policy_loss_weight = _policy_weight_for_lr_area(
+                float(args.policy_loss_weight),
+                scheduled_base_lr=scheduled_base_lr,
+                consumed_lr_area=policy_objective_lr_area,
+                target_lr_area=float(args.policy_dose_lr_area),
+            )
             if train_fn is _train_xdim_batch:
                 train_fn_extra_kwargs["policy_kl_anchor_weight"] = (
                     batch_policy_kl_coefficient
@@ -14182,7 +14269,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.soft_target_weight,
                     args.soft_target_source,
                     args.soft_target_min_legal_coverage,
-                    args.policy_loss_weight,
+                    batch_policy_loss_weight,
                     resolved_scalar_value_weight,
                     args.final_vp_loss_weight,
                     args.q_loss_weight,
@@ -14291,6 +14378,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             if optimizer_step_applied:
                 optimizer_lr_applied_updates += 1
                 optimizer_schedule_multiplier_sum += float(applied_lr_multiplier)
+                policy_objective_lr_area += (
+                    float(batch_policy_loss_weight) * scheduled_base_lr
+                )
                 for group_index, group in enumerate(optimizer.param_groups):
                     optimizer_lr_area_by_group[group_index] += float(group["lr"])
             if optimizer_observability is not None:
@@ -14428,6 +14518,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             epoch_policy_aux_effective_weight += float(
                 batch_metrics.get("policy_aux_loss_weight_sum", 0.0)
             )
+            if float(batch_policy_loss_weight) > 0.0:
+                epoch_policy_objective_active_rows += (
+                    active_count
+                    + float(batch_metrics.get("policy_aux_active_count", 0))
+                )
+                epoch_policy_objective_effective_weight += float(
+                    batch_policy_loss_weight
+                ) * (
+                    float(batch_metrics.get("policy_base_loss_weight_sum", 0.0))
+                    + float(batch_metrics.get("policy_aux_loss_weight_sum", 0.0))
+                )
             epoch_value_active_count += float(
                 batch_metrics.get("value_active_count", 0)
             )
@@ -14886,6 +14987,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy_aux_effective_weight_total = _reduce_scalar_sum(
             float(epoch_policy_aux_effective_weight), ddp
         )
+        policy_objective_active_rows_total = _reduce_scalar_sum(
+            float(epoch_policy_objective_active_rows), ddp
+        )
+        policy_objective_effective_weight_total = _reduce_scalar_sum(
+            float(epoch_policy_objective_effective_weight), ddp
+        )
         value_active_count_total = _reduce_scalar_sum(
             float(epoch_value_active_count), ddp
         )
@@ -15263,6 +15370,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_total_effective_weight_sum": (
                     policy_base_effective_weight_total
                     + policy_aux_effective_weight_total
+                ),
+                "policy_objective_active_rows": int(
+                    policy_objective_active_rows_total
+                ),
+                "policy_objective_effective_weight_sum": (
+                    policy_objective_effective_weight_total
                 ),
                 "value_active_rows": int(value_active_count_total),
                 "policy_kl_anchor_eligible_rows": int(
@@ -16458,6 +16571,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_target_blend_semantics": args.policy_target_blend_semantics,
         "soft_target_min_legal_coverage": args.soft_target_min_legal_coverage,
         "policy_loss_weight": args.policy_loss_weight,
+        "policy_dose_lr_area": float(args.policy_dose_lr_area),
+        "policy_objective_lr_area": float(policy_objective_lr_area),
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
         "policy_aux_loss_weight": float(args.policy_aux_loss_weight),
         "policy_aux_active_rows": int(
@@ -18566,6 +18681,14 @@ def _train_xdim_batch(
         raise FloatingPointError(f"non-finite BC loss: {float(loss.detach().cpu())}")
     backward_loss = loss / float(grad_accum_steps) if int(grad_accum_steps) > 1 else loss
     backward_loss.backward()
+    policy_only_gradients_suppressed: tuple[str, ...] = ()
+    if (
+        float(policy_loss_weight) == 0.0
+        and float(policy_kl_anchor_weight) == 0.0
+    ):
+        policy_only_gradients_suppressed = (
+            _suppress_inactive_policy_only_gradients(policy, optimizer)
+        )
     optimizer_observability = None
     optimizer_step_applied = False
     if accum_do_step:
@@ -18895,6 +19018,9 @@ def _train_xdim_batch(
             {"optimizer_observability": optimizer_observability}
             if optimizer_observability is not None
             else {}
+        ),
+        "policy_only_gradients_suppressed": list(
+            policy_only_gradients_suppressed
         ),
         "optimizer_step_applied": bool(optimizer_step_applied),
     }
@@ -28293,6 +28419,41 @@ def _finish_optimizer_observability(
         "module_parameter_counts": state["module_parameter_counts"],
         "module_norm_scope": state["module_norm_scope"],
     }
+
+
+def _suppress_inactive_policy_only_gradients(
+    policy,
+    optimizer=None,
+) -> tuple[str, ...]:
+    """Stop momentum/AdamW drift after policy distillation is disabled."""
+
+    module = getattr(policy.model, "module", policy.model)
+    parameters: list[tuple[str, object]] = []
+    for module_name in ("action_bias", "edge_policy_mlp"):
+        submodule = getattr(module, module_name, None)
+        if submodule is not None:
+            parameters.extend(
+                (f"{module_name}.{name}", parameter)
+                for name, parameter in submodule.named_parameters()
+            )
+    logit_scale = getattr(module, "logit_scale", None)
+    if logit_scale is not None:
+        parameters.append(("logit_scale", logit_scale))
+    if int(getattr(module, "value_tower_split_layers", 0) or 0) > 0:
+        state_norm = getattr(module, "state_norm", None)
+        if state_norm is not None:
+            parameters.extend(
+                (f"state_norm.{name}", parameter)
+                for name, parameter in state_norm.named_parameters()
+            )
+    suppressed: list[str] = []
+    for name, parameter in parameters:
+        if parameter.grad is not None:
+            parameter.grad = None
+            suppressed.append(name)
+        if optimizer is not None:
+            optimizer.state.pop(parameter, None)
+    return tuple(sorted(suppressed))
 
 
 def _validate_max_grad_norm(value: float) -> float:

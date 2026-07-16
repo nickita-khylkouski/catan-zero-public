@@ -380,6 +380,7 @@ def build_train_command(
             "--minimum-feature-learning-signal-observations",
         ),
         ("policy_loss_weight", "--policy-loss-weight"),
+        ("policy_dose_lr_area", "--policy-dose-lr-area"),
         ("soft_target_source", "--soft-target-source"),
         ("soft_target_weight", "--soft-target-weight"),
         ("policy_target_blend_semantics", "--policy-target-blend-semantics"),
@@ -415,6 +416,7 @@ def build_train_command(
     optional_scalar_defaults = {
         "public_card_lr_mult": 1.0,
         "target_reliability_confidence_floor": 0.25,
+        "policy_dose_lr_area": 0.0,
     }
     for key, flag in scalar_fields:
         if key in optional_scalar_defaults:
