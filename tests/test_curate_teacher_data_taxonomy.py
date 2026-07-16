@@ -9,15 +9,23 @@ from tools.curate_teacher_data import (
 )
 
 
-def _shard(*, phases: list[str], actions: list[int]) -> dict[str, np.ndarray]:
+def _shard(
+    *,
+    phases: list[str],
+    actions: list[int],
+    action_mask_versions: list[str] | None = None,
+) -> dict[str, np.ndarray]:
     n = len(phases)
     legal = np.asarray(actions, dtype=np.int16).reshape(n, 1)
+    if action_mask_versions is None:
+        action_mask_versions = ["colonist-multiagent-v1"] * n
     return {
         "action_taken": np.asarray(actions, dtype=np.int16),
         "legal_action_ids": legal,
         "teacher_name": np.full(n, "teacher"),
         "target_score_source": np.full(n, ""),
         "phase": np.asarray(phases),
+        "action_mask_version": np.asarray(action_mask_versions),
         "target_policy": np.ones((n, 1), dtype=np.float32),
         "target_scores": np.zeros((n, 1), dtype=np.float32),
         "truncated": np.zeros(n, dtype=np.bool_),
@@ -82,6 +90,55 @@ def test_roll_filter_decodes_action_id_when_phase_is_play_turn():
     assert report["dropped_roll"] == 1
 
 
+def test_roll_filter_refuses_unknown_action_id_schema():
+    roll_action = next(iter(ROLL_ACTION_IDS))
+    shard = _shard(
+        phases=["PLAY_TURN"],
+        actions=[roll_action],
+        action_mask_versions=["future-reordered-v9"],
+    )
+
+    with np.testing.assert_raises_regex(
+        SystemExit, "mixed or unsupported nonempty action_mask_version"
+    ):
+        _curate(
+            shard,
+            forced_keep_prob=1.0,
+            roll_keep_prob=0.0,
+        )
+
+
+def test_unknown_schema_is_not_decoded_when_roll_filter_is_disabled():
+    roll_action = next(iter(ROLL_ACTION_IDS))
+    keep, report, policy_weights, _value_weights = _curate(
+        _shard(
+            phases=["PLAY_TURN"],
+            actions=[roll_action],
+            action_mask_versions=["future-reordered-v9"],
+        ),
+        forced_keep_prob=1.0,
+        roll_keep_prob=1.0,
+    )
+
+    assert bool(keep[0])
+    assert policy_weights[0] == 1.0
+    assert report["kept_policy_effective_roll"] == 0
+
+
+def test_roll_filter_refuses_mixed_nonempty_supported_schemas():
+    roll_action = next(iter(ROLL_ACTION_IDS))
+    shard = _shard(
+        phases=["PLAY_TURN", "PLAY_TURN"],
+        actions=[roll_action, roll_action],
+        action_mask_versions=["colonist-multiagent-v1", "catanatron-flat-v1"],
+    )
+
+    with np.testing.assert_raises_regex(
+        SystemExit, "mixed or unsupported nonempty action_mask_version"
+    ):
+        _curate(shard, roll_keep_prob=0.0)
+
+
 def test_duplicate_subtraction_reports_roll_by_action_id():
     roll_action = next(iter(ROLL_ACTION_IDS))
     shard = _shard(
@@ -118,3 +175,15 @@ def test_legacy_lowercase_phase_aliases_remain_supported():
 
     assert keep.all()
     assert policy_weights.all()
+
+
+def test_explicit_legacy_roll_phase_needs_no_numeric_schema():
+    keep, report, policy_weights, _value_weights = _curate(
+        _shard(phases=["roll"], actions=[7], action_mask_versions=[""]),
+        forced_keep_prob=1.0,
+        roll_keep_prob=0.0,
+    )
+
+    assert not bool(keep[0])
+    assert policy_weights[0] == 0.0
+    assert report["dropped_roll"] == 1

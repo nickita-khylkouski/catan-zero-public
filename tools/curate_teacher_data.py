@@ -55,13 +55,51 @@ def _action_ids_for_type(action_type: str) -> frozenset[int]:
 
 
 ROLL_ACTION_IDS = _action_ids_for_type("ROLL")
+ROLL_BASE_CATALOG_ACTION_MASK_VERSIONS = frozenset(
+    {
+        ActionCatalog.version,
+        # ColonistMultiAgentEnv allocates ActionCatalog first and appends its
+        # trade/negotiation actions after ``_base_action_space_n``.  Base ids,
+        # including ROLL, are therefore byte-for-byte the flat-v1 catalog.
+        "colonist-multiagent-v1",
+    }
+)
 
 
-def _roll_row_mask(action: np.ndarray, phases: np.ndarray) -> np.ndarray:
-    """Identify ROLL by action id, retaining only the explicit legacy alias."""
+def _roll_row_mask(
+    action: np.ndarray,
+    phases: np.ndarray,
+    action_mask_versions: np.ndarray,
+    *,
+    require_supported_version: bool = False,
+) -> np.ndarray:
+    """Identify ROLL only where the row's action-id schema proves its meaning."""
 
     normalized_phases = np.char.upper(np.asarray(phases).astype(str))
-    return np.isin(action, tuple(ROLL_ACTION_IDS)) | (normalized_phases == "ROLL")
+    versions = np.asarray(action_mask_versions).astype(str)
+    if versions.shape != np.asarray(action).shape:
+        raise SystemExit(
+            "action_mask_version must be row-aligned before decoding ROLL ids: "
+            f"versions={versions.shape} actions={np.asarray(action).shape}"
+        )
+    nonempty_versions = set(versions[versions != ""].tolist())
+    unsupported = nonempty_versions - ROLL_BASE_CATALOG_ACTION_MASK_VERSIONS
+    if require_supported_version and (unsupported or len(nonempty_versions) > 1):
+        raise SystemExit(
+            "--roll-keep-prob cannot decode a mixed or unsupported nonempty "
+            "action_mask_version set: "
+            f"observed={sorted(nonempty_versions)} "
+            f"supported={sorted(ROLL_BASE_CATALOG_ACTION_MASK_VERSIONS)}"
+        )
+    supported_rows = np.isin(
+        versions, tuple(ROLL_BASE_CATALOG_ACTION_MASK_VERSIONS)
+    )
+    id_roll = supported_rows & np.isin(action, tuple(ROLL_ACTION_IDS))
+    # Old shards sometimes stored the action type itself as the phase.  That
+    # label is self-describing and does not rely on a numeric action schema.
+    return id_roll | (normalized_phases == "ROLL")
+
+
 KEYS = (
     "obs",
     "legal_action_ids",
@@ -809,6 +847,9 @@ def _curate_shard_mask(
     score_sources = np.asarray(shard.get("target_score_source", np.full(n, "", dtype="<U1"))).astype(str)
     score_source_labels = np.where(score_sources == "", "none", score_sources)
     phases = np.asarray(shard.get("phase", np.full(n, "", dtype="<U1"))).astype(str)
+    action_mask_versions = np.asarray(
+        shard.get("action_mask_version", np.full(n, "", dtype="<U1"))
+    ).astype(str)
     phase_labels = np.where(phases == "", "unknown", phases)
     target_policy = np.asarray(shard.get("target_policy", np.zeros((n, 0))), dtype=np.float32)
     target_scores = np.asarray(shard.get("target_scores", np.full((n, 0), np.nan)), dtype=np.float32)
@@ -840,7 +881,12 @@ def _curate_shard_mask(
     # and made --roll-keep-prob a silent no-op.  Retain the legacy phase alias,
     # but use the recorded action id for the production schema.
     normalized_phases = np.char.upper(phases)
-    is_roll = _roll_row_mask(action, phases)
+    is_roll = _roll_row_mask(
+        action,
+        phases,
+        action_mask_versions,
+        require_supported_version=float(roll_keep_prob) < 1.0,
+    )
     roll_drop = is_roll & (rng.random(n) > float(roll_keep_prob))
     important = np.isin(normalized_phases, tuple(IMPORTANT_PHASES))
     protect_forced = important & (not bool(drop_forced_in_important_phases))
@@ -1006,7 +1052,10 @@ def _subtract_dropped_duplicates(
     score_source_labels = np.where(score_sources == "", "none", score_sources)
     phases = np.asarray(shard.get("phase", np.full(n, "", dtype="<U1"))).astype(str)
     action = np.asarray(shard["action_taken"], dtype=np.int16)
-    is_roll = _roll_row_mask(action, phases)
+    action_mask_versions = np.asarray(
+        shard.get("action_mask_version", np.full(n, "", dtype="<U1"))
+    ).astype(str)
+    is_roll = _roll_row_mask(action, phases, action_mask_versions)
     phase_labels = np.where(phases == "", "unknown", phases)
     legal = np.asarray(shard["legal_action_ids"], dtype=np.int16)
     legal_counts = np.sum(legal >= 0, axis=1)
