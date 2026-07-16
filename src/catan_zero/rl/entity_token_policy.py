@@ -2454,7 +2454,12 @@ class EntityGraphPolicy:
                 schema == "value-training-v1"
                 and not provenance_errors
                 and optimizer_steps > 0
-                and completed_epochs > 0
+                # Bounded dose checkpoints are intentionally saved inside the
+                # first epoch.  ``completed_epochs == 0`` is therefore valid
+                # provenance when applied optimizer steps and positive
+                # objective mass attest that the readout was updated.  Keep
+                # rejecting impossible negative epoch counts.
+                and completed_epochs >= 0
             )
             if "scalar" in inner_readouts and base_valid:
                 if scalar_weight > 0.0 and scalar_mass > 0.0:

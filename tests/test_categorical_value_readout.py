@@ -214,7 +214,10 @@ def test_checkpoint_value_training_provenance_distinguishes_upgrade_from_trainin
             "resolved_categorical_ce_weight": 0.25,
             "hlgauss_bins": 9,
             "optimizer_steps": 10,
-            "completed_epochs": 1,
+            # Dose-selection checkpoints are saved during the first epoch.
+            # Applied steps plus positive objective mass, not a completed
+            # epoch, attest that this readout was actually optimized.
+            "completed_epochs": 0,
             "scalar_training_weight_sum": 0.0,
             "categorical_training_weight_sum": 128.0,
         },
@@ -224,6 +227,29 @@ def test_checkpoint_value_training_provenance_distinguishes_upgrade_from_trainin
     EntityGraphRustEvaluator(
         trained,
         config=EntityGraphRustEvaluatorConfig(value_readout="categorical"),
+    )
+
+    scalar_mid_epoch_path = tmp_path / "scalar_mid_epoch.pt"
+    categorical.save(
+        scalar_mid_epoch_path,
+        value_training={
+            "schema_version": "value-training-v1",
+            "primary_readout": "scalar",
+            "trained_value_readouts": ["scalar"],
+            "resolved_scalar_mse_weight": 0.25,
+            "resolved_categorical_ce_weight": 0.0,
+            "hlgauss_bins": 9,
+            "optimizer_steps": 10,
+            "completed_epochs": 0,
+            "scalar_training_weight_sum": 128.0,
+            "categorical_training_weight_sum": 0.0,
+        },
+    )
+    scalar_mid_epoch = EntityGraphPolicy.load(scalar_mid_epoch_path, device="cpu")
+    assert scalar_mid_epoch.trained_value_readouts == ("scalar",)
+    EntityGraphRustEvaluator(
+        scalar_mid_epoch,
+        config=EntityGraphRustEvaluatorConfig(value_readout="scalar"),
     )
 
     forged_path = tmp_path / "forged_zero_step.pt"
@@ -249,6 +275,27 @@ def test_checkpoint_value_training_provenance_distinguishes_upgrade_from_trainin
             forged,
             config=EntityGraphRustEvaluatorConfig(value_readout="categorical"),
         )
+
+    forged_negative_epoch_path = tmp_path / "forged_negative_epoch.pt"
+    categorical.save(
+        forged_negative_epoch_path,
+        value_training={
+            "schema_version": "value-training-v1",
+            "primary_readout": "categorical",
+            "trained_value_readouts": ["categorical"],
+            "resolved_scalar_mse_weight": 0.0,
+            "resolved_categorical_ce_weight": 0.25,
+            "hlgauss_bins": 9,
+            "optimizer_steps": 10,
+            "completed_epochs": -1,
+            "scalar_training_weight_sum": 0.0,
+            "categorical_training_weight_sum": 128.0,
+        },
+    )
+    forged_negative_epoch = EntityGraphPolicy.load(
+        forged_negative_epoch_path, device="cpu"
+    )
+    assert "categorical" not in forged_negative_epoch.trained_value_readouts
 
 
 def test_sync_and_evaluate_many_use_the_selected_readout(
