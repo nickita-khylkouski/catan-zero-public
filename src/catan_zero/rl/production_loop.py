@@ -306,14 +306,11 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         pass
     # The session leader may exit on SIGTERM while a descendant ignores it.
-    # Probe and kill the group even after ``wait`` returns for the leader.
-    try:
-        os.killpg(process.pid, 0)
-    except ProcessLookupError:
-        return
+    # Kill the original group directly: a separate signal-0 probe races group
+    # teardown and can return EPERM on macOS after the leader is reaped.
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         return
     if process.poll() is None:
         process.wait()
