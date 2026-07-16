@@ -787,8 +787,8 @@ def build_parser() -> argparse.ArgumentParser:
         "'5006335:5006667,6406335:6406667'). These games are excluded from training "
         "gradients and reported as validation telemetry each epoch -- same mechanism as "
         "--validation-fraction, just with a precomputed selection instead of a random one. "
-        "--validation-max-samples still applies (subsamples the explicit set if it exceeds "
-        "the cap).",
+        "Requires --validation-max-samples 0 so exact whole games are retained; the "
+        "global default row cap is intentionally rejected for explicit ranges.",
     )
     parser.add_argument(
         "--validation-game-seed-manifest",
@@ -2824,6 +2824,65 @@ def _policy_weight_for_lr_area(
     if learning_rate == 0.0:
         return coefficient
     return min(coefficient, remaining / (learning_rate * multiplier))
+
+
+def _policy_microbatch_weight_for_lr_area(
+    base_weight: float,
+    *,
+    scheduled_base_lr: float,
+    consumed_lr_area: float,
+    target_lr_area: float,
+    pending_group_lr_area_weight: float,
+    globally_base_active: bool,
+    globally_aux_active: bool,
+    policy_aux_loss_weight: float,
+    accumulation_group_size: int,
+) -> float:
+    """Resolve an exact boundary coefficient for one accumulated microbatch.
+
+    Base and AUX policy means are independently normalized, and every
+    microbatch is divided by the actual accumulation-group size.  Boundary
+    metering must therefore use the streams that will really contribute to
+    this microbatch and subtract dose already pending in the same optimizer
+    group.  Using merely the presence of an AUX batch undercharges base-only
+    and AUX-only boundaries; ignoring pending gradients can overshoot them.
+    """
+
+    coefficient = _validate_policy_loss_weight(base_weight)
+    learning_rate = float(scheduled_base_lr)
+    pending_weight = float(pending_group_lr_area_weight)
+    aux_weight = float(policy_aux_loss_weight)
+    group_size = int(accumulation_group_size)
+    if not math.isfinite(pending_weight) or pending_weight < 0.0:
+        raise ValueError(
+            "pending policy LR-area weight must be finite and non-negative"
+        )
+    if not math.isfinite(aux_weight) or aux_weight < 0.0:
+        raise ValueError("policy AUX objective weight must be finite and non-negative")
+    if group_size < 1:
+        raise ValueError("policy accumulation group size must be positive")
+    pending_area = learning_rate * pending_weight
+    effective_consumed = float(consumed_lr_area) + pending_area
+    stream_multiplier = float(bool(globally_base_active)) + (
+        aux_weight * float(bool(globally_aux_active))
+    )
+    # An objective-empty microbatch spends no policy dose. Keep the configured
+    # coefficient while the boundary remains open so value-only work cannot
+    # trigger post-dose representation freezing.
+    if stream_multiplier == 0.0:
+        return _policy_weight_for_lr_area(
+            coefficient,
+            scheduled_base_lr=learning_rate,
+            consumed_lr_area=effective_consumed,
+            target_lr_area=target_lr_area,
+        )
+    return _policy_weight_for_lr_area(
+        coefficient,
+        scheduled_base_lr=learning_rate,
+        consumed_lr_area=effective_consumed,
+        target_lr_area=target_lr_area,
+        objective_multiplier=stream_multiplier / group_size,
+    )
 
 
 def _policy_objective_fraction(
@@ -13461,6 +13520,17 @@ def main(
                     policy_loss_weight=float(args.policy_loss_weight),
                     scalar_value_loss_weight=float(resolved_scalar_value_weight),
                     final_vp_loss_weight=float(args.final_vp_loss_weight),
+                    categorical_value_loss_weight=float(
+                        resolved_categorical_value_weight
+                    ),
+                    q_loss_weight=float(args.q_loss_weight),
+                    policy_kl_anchor_weight=float(args.policy_kl_anchor_weight),
+                    value_uncertainty_loss_weight=float(
+                        args.value_uncertainty_loss_weight
+                    ),
+                    aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
+                    belief_resource_loss_weight=float(args.belief_resource_loss_weight),
+                    moe_balance_loss_weight=float(args.moe_balance_loss_weight),
                 )
             )
         value_balance_mode = str(args.value_player_outcome_balance_mode)
@@ -15272,17 +15342,30 @@ def main(
                 else float(policy_kl_controller.coefficient)
             )
             scheduled_base_lr = float(args.lr) * float(applied_lr_multiplier)
-            policy_stream_objective_multiplier = 1.0 + (
-                float(args.policy_aux_loss_weight)
-                if policy_aux_batch is not None
-                else 0.0
+            local_base_policy_active_rows = int(
+                np.count_nonzero(np.asarray(batch_policy_weights) > 0.0)
             )
-            batch_policy_loss_weight = _policy_weight_for_lr_area(
+            local_aux_policy_active_rows = (
+                0 if policy_aux_batch is None else int(len(policy_aux_batch))
+            )
+            (
+                globally_base_policy_active,
+                globally_aux_policy_active,
+            ) = _global_policy_stream_presence(
+                local_base_active_rows=local_base_policy_active_rows,
+                local_aux_active_rows=local_aux_policy_active_rows,
+                ddp=ddp,
+            )
+            batch_policy_loss_weight = _policy_microbatch_weight_for_lr_area(
                 float(args.policy_loss_weight),
                 scheduled_base_lr=scheduled_base_lr,
                 consumed_lr_area=policy_objective_lr_area,
                 target_lr_area=float(args.policy_dose_lr_area),
-                objective_multiplier=policy_stream_objective_multiplier,
+                pending_group_lr_area_weight=policy_group_lr_area_weight,
+                globally_base_active=globally_base_policy_active,
+                globally_aux_active=globally_aux_policy_active,
+                policy_aux_loss_weight=float(args.policy_aux_loss_weight),
+                accumulation_group_size=accumulation_group_size,
             )
             batch_policy_objective_fraction = _policy_objective_fraction(
                 batch_policy_loss_weight,
@@ -15523,21 +15606,22 @@ def main(
             optimizer_step_applied = bool(
                 batch_metrics.get("optimizer_step_applied", accum_do_step)
             )
-            (
-                globally_base_policy_active,
-                globally_aux_policy_active,
-            ) = _global_policy_stream_presence(
-                local_base_active_rows=int(
-                    batch_metrics.get(
-                        "policy_base_active_count",
-                        batch_metrics.get("active_count", 0),
-                    )
-                ),
-                local_aux_active_rows=int(
-                    batch_metrics.get("policy_aux_active_count", 0)
-                ),
-                ddp=ddp,
+            realized_local_base_active = int(
+                batch_metrics.get(
+                    "policy_base_active_count",
+                    batch_metrics.get("active_count", 0),
+                )
             )
+            realized_local_aux_active = int(
+                batch_metrics.get("policy_aux_active_count", 0)
+            )
+            if bool(realized_local_base_active) != bool(
+                local_base_policy_active_rows
+            ) or bool(realized_local_aux_active) != bool(local_aux_policy_active_rows):
+                raise RuntimeError(
+                    "pre-forward policy stream presence drifted from the "
+                    "realized objective"
+                )
             (
                 microbatch_lr_area_weight,
                 microbatch_objective_fraction,
@@ -35824,6 +35908,13 @@ def _coverage_objective_active_training_scope(
     policy_loss_weight: float,
     scalar_value_loss_weight: float,
     final_vp_loss_weight: float,
+    categorical_value_loss_weight: float = 0.0,
+    q_loss_weight: float = 0.0,
+    policy_kl_anchor_weight: float = 0.0,
+    value_uncertainty_loss_weight: float = 0.0,
+    aux_subgoal_loss_weight: float = 0.0,
+    belief_resource_loss_weight: float = 0.0,
+    moe_balance_loss_weight: float = 0.0,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Remove composite components that feed no enabled coverage objective.
 
@@ -35857,9 +35948,27 @@ def _coverage_objective_active_training_scope(
         )
     all_components = set(range(component_count))
     active_components: set[int] = set()
-    enabled_objectives: list[int] = []
+    objective_weights = (
+        float(policy_loss_weight),
+        float(scalar_value_loss_weight),
+        float(final_vp_loss_weight),
+        float(categorical_value_loss_weight),
+        float(q_loss_weight),
+        float(policy_kl_anchor_weight),
+        float(value_uncertainty_loss_weight),
+        float(aux_subgoal_loss_weight),
+        float(belief_resource_loss_weight),
+        float(moe_balance_loss_weight),
+    )
+    if any(
+        not math.isfinite(weight) or weight < 0.0
+        for weight in objective_weights
+    ):
+        raise SystemExit("coverage objective weights must be finite and non-negative")
+    enabled_flags = np.asarray(
+        [int(weight > 0.0) for weight in objective_weights], dtype=np.uint8
+    )
     if float(policy_loss_weight) > 0.0:
-        enabled_objectives.append(0)
         active_components.update(
             (
                 int(value)
@@ -35872,11 +35981,15 @@ def _coverage_objective_active_training_scope(
             )
             else all_components
         )
-    if (
-        float(scalar_value_loss_weight) > 0.0
-        or float(final_vp_loss_weight) > 0.0
+    if any(
+        weight > 0.0
+        for weight in (
+            scalar_value_loss_weight,
+            final_vp_loss_weight,
+            categorical_value_loss_weight,
+            value_uncertainty_loss_weight,
+        )
     ):
-        enabled_objectives.append(1)
         active_components.update(
             (
                 int(value)
@@ -35887,7 +36000,41 @@ def _coverage_objective_active_training_scope(
             if bool(getattr(data, "value_training_scope_authenticated", False))
             else all_components
         )
-    if not enabled_objectives:
+    if float(policy_kl_anchor_weight) > 0.0:
+        active_components.update(
+            (
+                int(value)
+                for value in getattr(
+                    data, "policy_kl_anchor_component_indices", tuple()
+                )
+            )
+            if bool(getattr(data, "policy_kl_anchor_scope_authenticated", False))
+            else all_components
+        )
+    if float(aux_subgoal_loss_weight) > 0.0:
+        active_components.update(
+            (
+                int(value)
+                for value in getattr(
+                    data, "aux_subgoal_component_indices", tuple()
+                )
+            )
+            if bool(getattr(data, "aux_subgoal_scope_authenticated", False))
+            else all_components
+        )
+    # Q, public-belief, and MoE balance objectives have no narrower
+    # authenticated component namespace. Preserve every admitted component
+    # whenever one is enabled rather than deleting valid supervision.
+    if any(
+        weight > 0.0
+        for weight in (
+            q_loss_weight,
+            belief_resource_loss_weight,
+            moe_balance_loss_weight,
+        )
+    ):
+        active_components.update(all_components)
+    if not np.any(enabled_flags):
         raise SystemExit(
             "coverage_importance_v1 has no enabled supported training objective"
         )
@@ -35944,14 +36091,15 @@ def _coverage_objective_active_training_scope(
         "coverage_objective_component_rows_before": before_counts,
         "coverage_objective_component_rows_after": after_counts,
         "coverage_objective_conditional_ratios": conditional_ratios,
+        "coverage_objective_enabled_flags": enabled_flags,
         "coverage_objective_scope_summary": np.asarray(
             [
                 int(indices.size),
                 int(filtered.size),
                 int(indices.size - filtered.size),
                 active_mass,
-                int(0 in enabled_objectives),
-                int(1 in enabled_objectives),
+                int(enabled_flags[0]),
+                int(np.any(enabled_flags[[1, 2, 3, 6]])),
             ],
             dtype=np.float64,
         ),
@@ -35968,6 +36116,7 @@ def _coverage_objective_active_scope_report(
         "coverage_objective_component_rows_before",
         "coverage_objective_component_rows_after",
         "coverage_objective_conditional_ratios",
+        "coverage_objective_enabled_flags",
         "coverage_objective_scope_summary",
     }
     missing = sorted(required.difference(derived))
@@ -35999,12 +36148,29 @@ def _coverage_objective_active_scope_report(
     summary = np.asarray(
         derived["coverage_objective_scope_summary"], dtype=np.float64
     )
+    enabled_flags = np.asarray(
+        derived["coverage_objective_enabled_flags"], dtype=np.uint8
+    )
+    objective_names = (
+        "policy",
+        "scalar_value_loss",
+        "final_vp_loss",
+        "categorical_value_loss",
+        "q_loss",
+        "policy_kl_anchor",
+        "value_uncertainty_loss",
+        "aux_subgoal_loss",
+        "belief_resource_loss",
+        "moe_balance_loss",
+    )
     component_count = len(component_ids)
     if (
         before.shape != (component_count,)
         or after.shape != (component_count,)
         or conditional.shape != (component_count,)
         or summary.shape != (6,)
+        or enabled_flags.shape != (len(objective_names),)
+        or np.any((enabled_flags != 0) & (enabled_flags != 1))
         or np.any(active < 0)
         or np.any(active >= component_count)
         or len(np.unique(active)) != len(active)
@@ -36025,13 +36191,10 @@ def _coverage_objective_active_scope_report(
         for index, component_id in enumerate(component_ids)
     }
     report: dict[str, object] = {
-        "schema_version": "coverage-objective-active-scope-v1",
+        "schema_version": "coverage-objective-active-scope-v2",
         "enabled_objectives": [
             name
-            for enabled, name in (
-                (bool(summary[4]), "policy"),
-                (bool(summary[5]), "value_or_final_vp"),
-            )
+            for enabled, name in zip(enabled_flags, objective_names, strict=True)
             if enabled
         ],
         "authenticated_training_split_row_count": int(summary[0]),
@@ -37456,12 +37619,12 @@ def _value_independent_evidence_report(
         raise ValueError("value evidence accounting inputs are malformed")
     if len(rows) == 0:
         return {
-            "schema_version": "value-independent-evidence-v1",
+            "schema_version": "value-independent-evidence-v2",
             "status": "empty_training_partition",
         }
     if "game_seed" not in data or "winner" not in data:
         return {
-            "schema_version": "value-independent-evidence-v1",
+            "schema_version": "value-independent-evidence-v2",
             "status": "unavailable_missing_game_seed_or_winner",
             "training_rows": int(len(rows)),
         }
@@ -37487,7 +37650,7 @@ def _value_independent_evidence_report(
     clean = (row_weights > 0.0) & (winners != "") & ~truncated
     if not np.any(clean):
         return {
-            "schema_version": "value-independent-evidence-v1",
+            "schema_version": "value-independent-evidence-v2",
             "status": "no_clean_terminal_value_rows",
             "training_rows": int(len(rows)),
             "positive_value_weight_rows": int(np.count_nonzero(row_weights > 0.0)),
@@ -37524,12 +37687,17 @@ def _value_independent_evidence_report(
     clean_rows = int(np.count_nonzero(clean))
     games = int(len(unique_games))
     return {
-        "schema_version": "value-independent-evidence-v1",
+        "schema_version": "value-independent-evidence-v2",
         "status": "ok" if contradictory_games == 0 else "contradictory_game_outcomes",
         "training_rows": int(len(rows)),
         "positive_value_weight_rows": int(np.count_nonzero(row_weights > 0.0)),
         "clean_terminal_value_rows": clean_rows,
         "independent_terminal_games": games,
+        "game_identity_namespace": (
+            "component_id+game_seed"
+            if callable(getattr(data, "component_indices_for_rows", None))
+            else "game_seed"
+        ),
         "row_labels_per_independent_outcome": clean_rows / max(games, 1),
         "repeated_label_fraction": 1.0 - games / max(clean_rows, 1),
         "game_weight_effective_sample_size": float(game_ess),

@@ -291,6 +291,12 @@ def test_campaign_seals_independent_parent_arms_and_policy_active_target(
         assert override["lr_warmup_steps"] == expected["lr_warmup_steps"]
         assert override["max_steps"] == 128
         assert override["policy_aux_active_batch_size"] == 463
+        assert override["per_game_policy_surprise_weighting"] is False
+        assert override["public_card_lr_mult"] == 1.0
+        assert (
+            override["forced_row_value_action_type_weights"]
+            == "END_TURN=0.1,ROLL=1.0"
+        )
 
 
 class _Composite(dict):
@@ -449,19 +455,17 @@ def test_completed_campaign_report_requires_real_policy_and_module_dose(
                     "observed_steps": 8,
                     "modules": {"blocks": {"mean_pre_clip_grad_norm": 1.0}},
                 },
-                "per_game_policy_surprise_weighting": True,
-                "public_card_lr_mult": 4.0,
+                "per_game_policy_surprise_weighting": False,
+                "public_card_lr_mult": 1.0,
                 "forced_row_value_action_type_weights": {
                     "END_TURN": 0.1,
-                    "ROLL": 0.25,
+                    "ROLL": 1.0,
                 },
                 "policy_aux_sampling": {
                     "schema_version": "train-policy-aux-sampling-v1",
                     "enabled": True,
-                    "base_measure": (
-                        "authenticated_component_x_exact_per_game_policy_surprise"
-                    ),
-                    "exact_per_game_policy_surprise_weighting": True,
+                    "base_measure": "authenticated_component",
+                    "exact_per_game_policy_surprise_weighting": False,
                     "preconditioning_weights": {
                         "content_sha256": "sha256:" + "1" * 64,
                     },
@@ -504,7 +508,7 @@ def test_lr_dose_profile_is_carried_by_and_replayed_from_descriptor(
             one_dose.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
         ),
         "value_training_component_ids": list(
-            one_dose.ALL_POST_WAVE_COMPONENT_IDS
+            one_dose.FRESH_VALUE_TRAINING_COMPONENT_IDS
         ),
     }
     base_path = tmp_path / "production.json"

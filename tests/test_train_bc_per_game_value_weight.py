@@ -40,6 +40,7 @@ def test_value_evidence_reports_independent_games_not_repeated_rows() -> None:
         np.asarray([0.5, 0.5, 1.0], dtype=np.float32),
     )
 
+    assert report["schema_version"] == "value-independent-evidence-v2"
     assert report["status"] == "ok"
     assert report["clean_terminal_value_rows"] == 3
     assert report["independent_terminal_games"] == 2
@@ -87,6 +88,7 @@ def test_value_evidence_namespaces_reused_seeds_by_component() -> None:
     assert report["independent_terminal_games"] == 2
     assert report["contradictory_terminal_outcome_games"] == 0
     assert report["game_weight_effective_sample_size"] == pytest.approx(1.8)
+    assert report["game_identity_namespace"] == "component_id+game_seed"
 
 
 def test_per_game_value_weight_equalizes_total_mass_across_game_lengths() -> None:

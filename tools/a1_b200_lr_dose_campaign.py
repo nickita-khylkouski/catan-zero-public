@@ -44,9 +44,13 @@ SCIENCE_CONTRACT_RELATIVE = Path(
     "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json"
 )
 EXISTING_CORPUS_SCIENCE_FIELDS = {
-    "forced_row_value_action_type_weights": "END_TURN=1.0,ROLL=1.0",
-    "per_game_policy_surprise_weighting": True,
-    "public_card_lr_mult": 4.0,
+    "forced_row_value_action_type_weights": "END_TURN=0.1,ROLL=1.0",
+    # These are omitted from the canonical recipe when they retain the trainer
+    # defaults. Bind the effective values so the campaign cannot resurrect an
+    # obsolete experimental optimizer/sampler treatment merely because the
+    # fields are absent.
+    "per_game_policy_surprise_weighting": False,
+    "public_card_lr_mult": 1.0,
 }
 ARMS: dict[str, dict[str, int | float]] = {
     "A": {"lr": 3e-5, "lr_warmup_steps": 100},
@@ -146,8 +150,8 @@ def _arm_overrides(
         raise CampaignError(f"unknown campaign arm {arm!r}")
     recipe: dict[str, object] = {
         **{
-            key: science_recipe[key]
-            for key in EXISTING_CORPUS_SCIENCE_FIELDS
+            key: science_recipe.get(key, expected)
+            for key, expected in EXISTING_CORPUS_SCIENCE_FIELDS.items()
         },
         "epochs": 1,
         "max_steps": int(max_steps),
@@ -246,9 +250,12 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(science_recipe, dict):
         raise CampaignError("canonical science contract has no learner training recipe")
     science_drift = {
-        key: {"expected": expected, "actual": science_recipe.get(key)}
+        key: {
+            "expected": expected,
+            "actual": science_recipe.get(key, expected),
+        }
         for key, expected in EXISTING_CORPUS_SCIENCE_FIELDS.items()
-        if science_recipe.get(key) != expected
+        if science_recipe.get(key, expected) != expected
     }
     if science_drift:
         raise CampaignError(
@@ -622,13 +629,12 @@ def _verify_training_report(
         not isinstance(aux_sampler, dict)
         or aux_sampler.get("schema_version") != "train-policy-aux-sampling-v1"
         or aux_sampler.get("enabled") is not True
-        or aux_sampler.get("base_measure")
-        != "authenticated_component_x_exact_per_game_policy_surprise"
-        or aux_sampler.get("exact_per_game_policy_surprise_weighting") is not True
-        or report.get("per_game_policy_surprise_weighting") is not True
-        or float(report.get("public_card_lr_mult", -1.0)) != 4.0
+        or aux_sampler.get("base_measure") != "authenticated_component"
+        or aux_sampler.get("exact_per_game_policy_surprise_weighting") is not False
+        or report.get("per_game_policy_surprise_weighting") is not False
+        or float(report.get("public_card_lr_mult", -1.0)) != 1.0
         or report.get("forced_row_value_action_type_weights")
-        != {"END_TURN": 0.1, "ROLL": 0.25}
+        != {"END_TURN": 0.1, "ROLL": 1.0}
     ):
         raise CampaignError("training report lost canonical learner/sampler semantics")
     expected_parent = campaign["lineage_contract"]["expected_parent_sha256"]

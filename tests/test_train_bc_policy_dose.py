@@ -38,6 +38,48 @@ def test_policy_lr_area_accounts_for_independent_aux_objective() -> None:
     ) == pytest.approx(0.5)
 
 
+@pytest.mark.parametrize(
+    ("base_active", "aux_active", "expected_weight"),
+    [
+        (True, False, 0.25),
+        (False, True, 1.0),
+    ],
+)
+def test_policy_lr_area_boundary_uses_realized_streams(
+    base_active: bool,
+    aux_active: bool,
+    expected_weight: float,
+) -> None:
+    assert train_bc._policy_microbatch_weight_for_lr_area(  # noqa: SLF001
+        1.0,
+        scheduled_base_lr=0.01,
+        consumed_lr_area=0.0,
+        target_lr_area=0.0025,
+        pending_group_lr_area_weight=0.0,
+        globally_base_active=base_active,
+        globally_aux_active=aux_active,
+        policy_aux_loss_weight=0.25,
+        accumulation_group_size=1,
+    ) == pytest.approx(expected_weight)
+
+
+def test_policy_lr_area_boundary_accounts_for_pending_accumulation_dose() -> None:
+    # The first microbatch has already contributed 0.5 full-dose equivalents
+    # to this two-microbatch optimizer group. The boundary coefficient for the
+    # second base-policy microbatch must spend only the remaining 0.001 LR-area.
+    assert train_bc._policy_microbatch_weight_for_lr_area(  # noqa: SLF001
+        1.0,
+        scheduled_base_lr=0.01,
+        consumed_lr_area=0.0,
+        target_lr_area=0.006,
+        pending_group_lr_area_weight=0.5,
+        globally_base_active=True,
+        globally_aux_active=False,
+        policy_aux_loss_weight=1.0,
+        accumulation_group_size=2,
+    ) == pytest.approx(0.2)
+
+
 def test_zero_policy_dose_preserves_historical_constant_weight() -> None:
     assert train_bc._policy_weight_for_lr_area(  # noqa: SLF001
         0.75,

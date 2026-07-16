@@ -702,6 +702,67 @@ def test_coverage_scope_preserves_all_components_for_unscoped_enabled_objective(
     )
 
 
+@pytest.mark.parametrize(
+    "weight_name",
+    [
+        "categorical_value_loss_weight",
+        "q_loss_weight",
+        "policy_kl_anchor_weight",
+        "value_uncertainty_loss_weight",
+        "aux_subgoal_loss_weight",
+        "belief_resource_loss_weight",
+        "moe_balance_loss_weight",
+    ],
+)
+def test_coverage_scope_admits_each_supported_objective_family(
+    weight_name: str,
+) -> None:
+    data = _objective_scoped_composite()
+    data.policy_kl_anchor_component_indices = (1,)
+    data.policy_kl_anchor_scope_authenticated = True
+    data.aux_subgoal_component_indices = (2,)
+    data.aux_subgoal_scope_authenticated = True
+    weights = {
+        "policy_loss_weight": 0.0,
+        "scalar_value_loss_weight": 0.0,
+        "final_vp_loss_weight": 0.0,
+        "categorical_value_loss_weight": 0.0,
+        "q_loss_weight": 0.0,
+        "policy_kl_anchor_weight": 0.0,
+        "value_uncertainty_loss_weight": 0.0,
+        "aux_subgoal_loss_weight": 0.0,
+        "belief_resource_loss_weight": 0.0,
+        "moe_balance_loss_weight": 0.0,
+    }
+    weights[weight_name] = 1.0
+
+    active, arrays = train_bc._coverage_objective_active_training_scope(
+        data,
+        np.arange(len(data), dtype=np.int64),
+        **weights,
+    )
+    active_components = arrays["coverage_objective_component_indices"].tolist()
+
+    if weight_name in {
+        "categorical_value_loss_weight",
+        "value_uncertainty_loss_weight",
+    }:
+        assert active_components == [0, 1, 2]
+        assert active.tolist() == list(range(8))
+    elif weight_name == "policy_kl_anchor_weight":
+        assert active_components == [1]
+        assert active.tolist() == [4, 5]
+    elif weight_name == "aux_subgoal_loss_weight":
+        assert active_components == [2]
+        assert active.tolist() == [6, 7]
+    else:
+        assert active_components == [0, 1, 2, 3]
+        assert active.tolist() == list(range(len(data)))
+
+    report = train_bc._coverage_objective_active_scope_report(data, arrays)
+    assert report["enabled_objectives"] == [weight_name.removesuffix("_weight")]
+
+
 def test_policy_aux_conditioning_preserves_authenticated_base_measure() -> None:
     base = np.asarray([0.30, 0.20, 0.10, 0.40], dtype=np.float64)
     multiplier = np.asarray([0.0, 1.0, 2.0, 1.0], dtype=np.float32)

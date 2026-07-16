@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from catan_zero.rl._catanatron import import_catanatron_module
+from tools import train_bc
 from tools.train_bc import (
     _bounded_count_fraction,
     ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS,
@@ -17,6 +18,14 @@ from tools.train_bc import (
     _train_xdim_batch,
     load_teacher_data,
 )
+
+
+def test_explicit_validation_range_help_requires_whole_game_holdout() -> None:
+    action = train_bc.build_parser()._option_string_actions[  # noqa: SLF001
+        "--validation-game-seed-ranges"
+    ]
+    assert "--validation-max-samples 0" in str(action.help)
+    assert "still applies" not in str(action.help)
 
 
 def test_bounded_count_fraction_rejects_mixed_ddp_scopes() -> None:
@@ -507,7 +516,6 @@ def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
     tmp_path, monkeypatch
 ) -> None:
     import torch
-    from tools import train_bc
 
     data = _write_and_load_shard(tmp_path, _collect_real_samples(3))
     batch = np.arange(len(data["action_taken"]))
