@@ -17334,6 +17334,13 @@ _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
     "active_policy_teacher_gap_closure",
 )
 
+COMPOSITE_VALIDATION_MEASURE_SCHEMA = "composite-validation-measure-v2"
+COMPOSITE_VALIDATION_MEASURE = (
+    "authenticated_component_then_uniform_game_then_uniform_row_"
+    "with_objective_weight_density"
+)
+COMPOSITE_VALIDATION_PROVENANCE_SCHEMA = "composite-validation-provenance-v1"
+
 
 class _IndexedValidationWeights:
     """Expose held-out row weights without allocating a corpus-sized vector."""
@@ -17486,8 +17493,151 @@ def _combine_policy_aux_validation_metrics(
     return combined
 
 
+def _validated_objective_matched_validation_wrapper(
+    epoch_metrics: dict,
+    *,
+    require_matched: bool,
+    require_provenance: bool,
+) -> dict | None:
+    """Validate the complete authenticated validation wrapper before use."""
+
+    matched = epoch_metrics.get("validation_objective_matched")
+    if not isinstance(matched, dict):
+        if require_matched:
+            raise ValueError(
+                "authenticated composite adjudication requires objective-matched "
+                "validation; raw concatenated-row fallback is not admissible"
+            )
+        return None
+    schema = matched.get("schema_version")
+    measure = matched.get("measure")
+    allowed_measure = (
+        measure == COMPOSITE_VALIDATION_MEASURE
+        if schema == COMPOSITE_VALIDATION_MEASURE_SCHEMA
+        else (
+            schema == "policy-aux-validation-measure-v1"
+            and measure == f"{COMPOSITE_VALIDATION_MEASURE}+conditioned_policy_aux"
+        )
+    )
+    metrics = matched.get("metrics")
+    components = matched.get("components")
+    ratios = matched.get("component_sampling_ratios")
+    samples = matched.get("samples")
+    games = matched.get("games")
+    if (
+        matched.get("objective_matched") is not True
+        or not allowed_measure
+        or not isinstance(metrics, dict)
+        or not isinstance(components, dict)
+        or len(components) < 2
+        or not isinstance(ratios, dict)
+        or set(components) != set(ratios)
+        or isinstance(samples, bool)
+        or not isinstance(samples, int)
+        or samples <= 0
+        or isinstance(games, bool)
+        or not isinstance(games, int)
+        or games <= 0
+    ):
+        if require_matched or matched:
+            raise ValueError("objective-matched validation wrapper is malformed")
+        return None
+    ratio_values = np.asarray(list(ratios.values()), dtype=np.float64)
+    if (
+        ratio_values.shape != (len(ratios),)
+        or not np.isfinite(ratio_values).all()
+        or np.any(ratio_values <= 0.0)
+        or not math.isclose(
+            float(ratio_values.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9
+        )
+    ):
+        raise ValueError("objective-matched component ratios are malformed")
+    coverage: dict[str, dict[str, object]] = {}
+    component_rows = 0
+    component_games = 0
+    component_indices: set[int] = set()
+    for component_id, ratio in ratios.items():
+        report = components.get(component_id)
+        if not isinstance(component_id, str) or not component_id:
+            raise ValueError("objective-matched component id is malformed")
+        if not isinstance(report, dict):
+            raise ValueError("objective-matched component coverage is malformed")
+        index = report.get("component_index")
+        rows = report.get("rows")
+        component_game_count = report.get("games")
+        min_rows = report.get("min_rows_per_game")
+        max_rows = report.get("max_rows_per_game")
+        component_metrics = report.get("metrics")
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or rows <= 0
+            or isinstance(component_game_count, bool)
+            or not isinstance(component_game_count, int)
+            or component_game_count <= 0
+            or isinstance(min_rows, bool)
+            or not isinstance(min_rows, int)
+            or min_rows <= 0
+            or isinstance(max_rows, bool)
+            or not isinstance(max_rows, int)
+            or max_rows < min_rows
+            or not component_game_count * min_rows
+            <= rows
+            <= component_game_count * max_rows
+            or not isinstance(component_metrics, dict)
+            or report.get("authenticated_sampling_ratio") != ratio
+        ):
+            raise ValueError(
+                f"objective-matched component coverage is malformed: {component_id}"
+            )
+        component_indices.add(index)
+        component_rows += rows
+        component_games += component_game_count
+        coverage[component_id] = {
+            "component_index": index,
+            "authenticated_sampling_ratio": ratio,
+            "rows": rows,
+            "games": component_game_count,
+            "min_rows_per_game": min_rows,
+            "max_rows_per_game": max_rows,
+        }
+    if (
+        component_indices != set(range(len(components)))
+        or component_rows != samples
+        or component_games != games
+    ):
+        raise ValueError("objective-matched component coverage totals are malformed")
+    provenance = matched.get("provenance")
+    provenance_sha256 = matched.get("provenance_sha256")
+    if provenance is None and provenance_sha256 is None and not require_provenance:
+        return matched
+    if (
+        not isinstance(provenance, dict)
+        or provenance.get("schema_version")
+        != COMPOSITE_VALIDATION_PROVENANCE_SCHEMA
+        or provenance.get("measure") != COMPOSITE_VALIDATION_MEASURE
+        or not _is_sha256(provenance.get("descriptor_fingerprint"))
+        or not _is_sha256(provenance.get("payload_inventory_sha256"))
+        or not _is_sha256(provenance.get("validation_game_seed_set_sha256"))
+        or provenance.get("component_coverage_sha256")
+        != _canonical_json_sha256(coverage)
+        or provenance_sha256 != _canonical_json_sha256(provenance)
+    ):
+        raise ValueError("objective-matched validation provenance is malformed")
+    source_authority = provenance.get("source_authority_semantic_sha256")
+    if source_authority is not None and not _is_sha256(source_authority):
+        raise ValueError("objective-matched source authority is malformed")
+    return matched
+
+
 def objective_matched_validation_metrics(
-    epoch_metrics: dict, *, require_matched: bool = False
+    epoch_metrics: dict,
+    *,
+    require_matched: bool = False,
+    require_provenance: bool = False,
 ) -> dict:
     """Return promotion-facing validation means, with historical fallback.
 
@@ -17496,27 +17646,31 @@ def objective_matched_validation_metrics(
     Centralizing this choice prevents downstream sweep/adjudication code from
     accidentally continuing to rank new composite candidates by raw row mix.
     """
-    matched = epoch_metrics.get("validation_objective_matched")
-    if isinstance(matched, dict):
-        metrics = matched.get("metrics")
-        if matched.get("objective_matched") is True and isinstance(metrics, dict):
-            return metrics
-    if require_matched:
-        raise ValueError(
-            "authenticated composite adjudication requires objective-matched "
-            "validation; raw concatenated-row fallback is not admissible"
-        )
+    matched = _validated_objective_matched_validation_wrapper(
+        epoch_metrics,
+        require_matched=require_matched,
+        require_provenance=require_provenance,
+    )
+    if matched is not None:
+        return matched["metrics"]
     legacy = epoch_metrics.get("validation")
     return legacy if isinstance(legacy, dict) else {}
 
 
 def objective_matched_validation_component_metrics(
-    epoch_metrics: dict, *, require_matched: bool = False
+    epoch_metrics: dict,
+    *,
+    require_matched: bool = False,
+    require_provenance: bool = False,
 ) -> dict[str, dict]:
     """Return per-component metrics from an authenticated matched wrapper."""
 
-    matched = epoch_metrics.get("validation_objective_matched")
-    if isinstance(matched, dict) and matched.get("objective_matched") is True:
+    matched = _validated_objective_matched_validation_wrapper(
+        epoch_metrics,
+        require_matched=require_matched,
+        require_provenance=require_provenance,
+    )
+    if matched is not None:
         components = matched.get("components")
         if isinstance(components, dict) and components:
             result = {}
@@ -17526,11 +17680,6 @@ def objective_matched_validation_component_metrics(
                     raise ValueError("objective-matched component metrics are malformed")
                 result[component_id] = metrics
             return result
-    if require_matched:
-        raise ValueError(
-            "authenticated composite adjudication requires per-component "
-            "objective-matched validation metrics"
-        )
     return {}
 
 
@@ -18124,6 +18273,16 @@ def evaluate_composite_validation_measure(
         )
     components = np.asarray(data.component_indices_for_rows(indices), dtype=np.int64)
     seeds = np.asarray(data["game_seed"][indices], dtype=np.int64)
+    metadata = getattr(data, "meta", None)
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("schema") != "memmap_composite_v2"
+        or not _is_sha256(metadata.get("descriptor_fingerprint"))
+        or not _is_sha256(metadata.get("payload_inventory_sha256"))
+    ):
+        raise SystemExit(
+            "objective-matched validation requires authenticated composite provenance"
+        )
     component_reports: dict[str, dict[str, object]] = {}
     all_game_reports: list[dict] = []
     all_game_weights: list[float] = []
@@ -18175,12 +18334,36 @@ def evaluate_composite_validation_measure(
     aggregate, aggregate_sufficient = _objective_measure_validation_aggregate(
         all_game_reports, np.asarray(all_game_weights, dtype=np.float64)
     )
-    return {
-        "schema_version": "composite-validation-measure-v2",
-        "measure": (
-            "authenticated_component_then_uniform_game_then_uniform_row_"
-            "with_objective_weight_density"
+    coverage = {
+        component_id: {
+            key: component_reports[component_id][key]
+            for key in (
+                "component_index",
+                "authenticated_sampling_ratio",
+                "rows",
+                "games",
+                "min_rows_per_game",
+                "max_rows_per_game",
+            )
+        }
+        for component_id in component_reports
+    }
+    provenance = {
+        "schema_version": COMPOSITE_VALIDATION_PROVENANCE_SCHEMA,
+        "measure": COMPOSITE_VALIDATION_MEASURE,
+        "descriptor_fingerprint": metadata["descriptor_fingerprint"],
+        "payload_inventory_sha256": metadata["payload_inventory_sha256"],
+        "source_authority_semantic_sha256": metadata.get(
+            "source_authority_semantic_sha256"
         ),
+        "validation_game_seed_set_sha256": _game_seed_set_sha256(
+            np.unique(seeds)
+        ),
+        "component_coverage_sha256": _canonical_json_sha256(coverage),
+    }
+    return {
+        "schema_version": COMPOSITE_VALIDATION_MEASURE_SCHEMA,
+        "measure": COMPOSITE_VALIDATION_MEASURE,
         "objective_matched": True,
         "samples": int(indices.size),
         "games": int(
@@ -18197,6 +18380,8 @@ def evaluate_composite_validation_measure(
         ),
         "metrics": aggregate,
         "components": component_reports,
+        "provenance": provenance,
+        "provenance_sha256": _canonical_json_sha256(provenance),
         **(
             {"objective_measure_sufficient_statistics": aggregate_sufficient}
             if aggregate_sufficient is not None
@@ -20201,6 +20386,9 @@ def load_teacher_data_memmap(
             "descriptor_path": authenticated["descriptor_path"],
             "descriptor_fingerprint": authenticated["descriptor_fingerprint"],
             "payload_inventory_sha256": authenticated["payload_inventory_sha256"],
+            "source_authority_semantic_sha256": authenticated.get(
+                "source_authority_semantic_sha256"
+            ),
             "diagnostic_only": bool(authenticated["diagnostic_only"]),
             "promotion_eligible": bool(authenticated["promotion_eligible"]),
             "flywheel_replay_contract": authenticated.get(

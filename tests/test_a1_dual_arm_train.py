@@ -788,12 +788,37 @@ def test_epoch_outputs_prefer_objective_matched_validation_when_present(
     payload = json.loads(report.read_text(encoding="utf-8"))
     for epoch, metric in enumerate(payload["metrics"], start=1):
         metric["validation"]["loss"] = 90.0 + epoch
+        first_rows = verified["validation_rows"] // 2
+        second_rows = verified["validation_rows"] - first_rows
         metric["validation_objective_matched"] = {
             "schema_version": "composite-validation-measure-v2",
+            "measure": dual.train_bc.COMPOSITE_VALIDATION_MEASURE,
             "objective_matched": True,
             "samples": verified["validation_rows"],
+            "games": 2,
+            "component_sampling_ratios": {"left": 0.5, "right": 0.5},
             "metrics": {
                 "loss": 1.0 + epoch / 10.0,
+            },
+            "components": {
+                "left": {
+                    "component_index": 0,
+                    "authenticated_sampling_ratio": 0.5,
+                    "games": 1,
+                    "rows": first_rows,
+                    "min_rows_per_game": first_rows,
+                    "max_rows_per_game": first_rows,
+                    "metrics": {"loss": 1.0},
+                },
+                "right": {
+                    "component_index": 1,
+                    "authenticated_sampling_ratio": 0.5,
+                    "games": 1,
+                    "rows": second_rows,
+                    "min_rows_per_game": second_rows,
+                    "max_rows_per_game": second_rows,
+                    "metrics": {"loss": 1.0},
+                },
             },
         }
     report.write_text(json.dumps(payload), encoding="utf-8")

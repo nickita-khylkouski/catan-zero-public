@@ -86,6 +86,12 @@ class _Composite:
         # game. This deliberately makes raw-row and game-uniform measures differ.
         self._game_seed = np.asarray([11, 12, 12, 12, 21, 21], dtype=np.int64)
         self.component_offsets = np.asarray([0, 4, 6], dtype=np.int64)
+        self.meta = {
+            "schema": "memmap_composite_v2",
+            "descriptor_fingerprint": "sha256:" + "d" * 64,
+            "payload_inventory_sha256": "sha256:" + "e" * 64,
+            "source_authority_semantic_sha256": "sha256:" + "a" * 64,
+        }
 
     def __getitem__(self, key: str):
         if key != "game_seed":
@@ -128,6 +134,19 @@ def test_objective_matched_validation_is_component_then_game_then_row() -> None:
     assert report["components"]["replay"]["metrics"]["loss"] == 10.0
     assert report["component_sampling_ratios"] == {"n128": 0.75, "replay": 0.25}
     assert report["schema_version"] == "composite-validation-measure-v2"
+    assert report["provenance"]["schema_version"] == (
+        "composite-validation-provenance-v1"
+    )
+    assert report["provenance"]["descriptor_fingerprint"] == "sha256:" + "d" * 64
+    assert report["provenance"]["payload_inventory_sha256"] == "sha256:" + "e" * 64
+    assert report["provenance"]["source_authority_semantic_sha256"] == (
+        "sha256:" + "a" * 64
+    )
+    assert report["provenance"]["validation_game_seed_set_sha256"].startswith(
+        "sha256:"
+    )
+    assert report["provenance"]["component_coverage_sha256"].startswith("sha256:")
+    assert report["provenance_sha256"].startswith("sha256:")
     assert calls == [(0,), (1, 2, 3), (4, 5)]
 
 
@@ -147,33 +166,37 @@ def test_objective_matched_validation_rejects_missing_component_holdout() -> Non
         raise AssertionError("missing authenticated validation component was accepted")
 
 
-def test_downstream_metric_selector_prefers_matched_and_falls_back_historically() -> (
-    None
-):
-    epoch = {
-        "validation": {"loss": 99.0},
-        "validation_objective_matched": {
-            "objective_matched": True,
-            "metrics": {"loss": 4.0},
+def _matched_epoch() -> dict:
+    data = _Composite()
+    wrapper = evaluate_composite_validation_measure(
+        data,
+        np.arange(6, dtype=np.int64),
+        lambda indices: {
+            "loss": float(len(indices)),
+            "policy_loss": float(len(indices)),
+            "samples": int(len(indices)),
         },
+    )
+    return {
+        "validation": {"loss": 99.0},
+        "validation_objective_matched": wrapper,
     }
-    assert objective_matched_validation_metrics(epoch) == {"loss": 4.0}
+
+
+def test_downstream_metric_selector_prefers_matched_and_falls_back_historically() -> None:
+    epoch = _matched_epoch()
+    epoch["validation_objective_matched"]["metrics"]["loss"] = 4.0
+    assert objective_matched_validation_metrics(epoch)["loss"] == 4.0
     assert objective_matched_validation_metrics({"validation": {"loss": 2.0}}) == {
         "loss": 2.0
     }
 
 
 def test_downstream_component_selector_requires_authenticated_wrapper() -> None:
-    epoch = {
-        "validation_objective_matched": {
-            "objective_matched": True,
-            "components": {"replay": {"metrics": {"loss": 3.0}}},
-        }
-    }
-    assert objective_matched_validation_component_metrics(epoch) == {
-        "replay": {"loss": 3.0}
-    }
-    with pytest.raises(ValueError, match="per-component"):
+    epoch = _matched_epoch()
+    components = objective_matched_validation_component_metrics(epoch)
+    assert set(components) == {"n128", "replay"}
+    with pytest.raises(ValueError, match="objective-matched"):
         objective_matched_validation_component_metrics({}, require_matched=True)
 
 
@@ -185,9 +208,32 @@ def test_downstream_metric_selector_does_not_trust_unmarked_wrapper() -> None:
             "metrics": {"loss": 1.0},
         },
     }
-    assert objective_matched_validation_metrics(epoch) == {"loss": 2.0}
-    with pytest.raises(ValueError, match="raw concatenated-row fallback"):
+    with pytest.raises(ValueError, match="wrapper is malformed"):
+        objective_matched_validation_metrics(epoch)
+    with pytest.raises(ValueError, match="wrapper is malformed"):
         objective_matched_validation_metrics(epoch, require_matched=True)
+
+
+def test_downstream_metric_selector_rejects_malformed_component_coverage() -> None:
+    epoch = _matched_epoch()
+    epoch["validation_objective_matched"]["components"]["replay"]["rows"] += 1
+
+    with pytest.raises(ValueError, match="component coverage"):
+        objective_matched_validation_metrics(epoch, require_matched=True)
+
+
+def test_downstream_metric_selector_can_require_bound_provenance() -> None:
+    epoch = _matched_epoch()
+    assert objective_matched_validation_metrics(
+        epoch, require_matched=True, require_provenance=True
+    )
+    del epoch["validation_objective_matched"]["provenance"]
+    del epoch["validation_objective_matched"]["provenance_sha256"]
+
+    with pytest.raises(ValueError, match="provenance"):
+        objective_matched_validation_metrics(
+            epoch, require_matched=True, require_provenance=True
+        )
 
 
 def test_objective_measure_aggregates_weight_density_before_dividing() -> None:

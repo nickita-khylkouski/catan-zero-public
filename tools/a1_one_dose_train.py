@@ -9810,6 +9810,17 @@ def _verify_training_outputs(
             )
     if is_production_composite:
         matched = metrics[0].get("validation_objective_matched")
+        try:
+            train_bc.objective_matched_validation_metrics(
+                metrics[0],
+                require_matched=True,
+                require_provenance=True,
+            )
+        except ValueError as error:
+            raise ExecutorError(
+                "production acceptance requires authenticated objective-matched "
+                "validation provenance"
+            ) from error
         ratios = {
             "current_producer": 0.64,
             "recent_history": 0.12,
@@ -9824,6 +9835,9 @@ def _verify_training_outputs(
             matched.get("components") if isinstance(matched, dict) else None
         )
         matched_metrics = matched.get("metrics") if isinstance(matched, dict) else None
+        matched_provenance = (
+            matched.get("provenance") if isinstance(matched, dict) else None
+        )
         if (
             not isinstance(matched, dict)
             or matched.get("schema_version") != "composite-validation-measure-v2"
@@ -9843,6 +9857,17 @@ def _verify_training_outputs(
                 key not in matched_metrics
                 for key in ("loss", "policy_loss", "value_loss")
             )
+            or not isinstance(matched_provenance, dict)
+            or matched_provenance.get("measure")
+            != train_bc.COMPOSITE_VALIDATION_MEASURE
+            or matched_provenance.get("descriptor_fingerprint")
+            != verified["descriptor_fingerprint"]
+            or matched_provenance.get("payload_inventory_sha256")
+            != verified["payload_inventory_sha256"]
+            or matched_provenance.get("source_authority_semantic_sha256")
+            != verified.get("source_authority_semantic_sha256")
+            or matched_provenance.get("validation_game_seed_set_sha256")
+            != verified["trainer_validation_game_seed_set_sha256"]
         ):
             raise ExecutorError(
                 "production acceptance requires objective-matched composite validation"

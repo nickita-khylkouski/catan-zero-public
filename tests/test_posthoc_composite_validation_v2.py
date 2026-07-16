@@ -31,6 +31,12 @@ class _Composite:
 
     def __init__(self) -> None:
         self.seeds = np.asarray([11, 11, 12, 12, 21, 21], dtype=np.int64)
+        self.meta = {
+            "schema": "memmap_composite_v2",
+            "descriptor_fingerprint": "sha256:" + "d" * 64,
+            "payload_inventory_sha256": "sha256:" + "e" * 64,
+            "source_authority_semantic_sha256": None,
+        }
 
     def __getitem__(self, key: str):
         if key == "game_seed":

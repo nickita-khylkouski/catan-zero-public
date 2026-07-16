@@ -11,6 +11,37 @@ from tools import a1_b200_batch_probe as probe
 from tools import train_bc
 
 
+def _matched_validation(
+    metrics: dict, component_metrics: dict[str, dict]
+) -> dict:
+    component_ids = list(component_metrics)
+    ratio = 1.0 / len(component_ids)
+    components = {
+        component_id: {
+            "component_index": index,
+            "authenticated_sampling_ratio": ratio,
+            "games": 1,
+            "rows": 1,
+            "min_rows_per_game": 1,
+            "max_rows_per_game": 1,
+            "metrics": values,
+        }
+        for index, (component_id, values) in enumerate(component_metrics.items())
+    }
+    return {
+        "schema_version": "composite-validation-measure-v2",
+        "measure": train_bc.COMPOSITE_VALIDATION_MEASURE,
+        "objective_matched": True,
+        "samples": len(component_ids),
+        "games": len(component_ids),
+        "component_sampling_ratios": {
+            component_id: ratio for component_id in component_ids
+        },
+        "metrics": metrics,
+        "components": components,
+    }
+
+
 def _receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     receipt = tmp_path / "training.receipt.json"
     command = [
@@ -402,24 +433,17 @@ def test_summary_reports_efficiency_and_never_ranks_hbm(tmp_path: Path) -> None:
                             "mean_pre_clip_total_grad_norm": 1.2,
                         },
                             "validation": {"active_policy_teacher_gap_closure": 0.4},
-                            "validation_objective_matched": {
-                                "objective_matched": True,
-                                "metrics": {
-                                    "active_policy_teacher_gap_closure": 0.4
-                                },
-                                "components": {
+                            "validation_objective_matched": _matched_validation(
+                                {"active_policy_teacher_gap_closure": 0.4},
+                                {
                                     "replay": {
-                                        "metrics": {
-                                            "active_policy_teacher_gap_closure": -0.1
-                                        }
+                                        "active_policy_teacher_gap_closure": -0.1
                                     },
                                     "n128": {
-                                        "metrics": {
-                                            "active_policy_teacher_gap_closure": 0.5
-                                        }
+                                        "active_policy_teacher_gap_closure": 0.5
                                     },
                                 },
-                            },
+                            ),
                     }
                 ],
             }
@@ -495,19 +519,17 @@ def test_summary_uses_cheap_report_telemetry_when_timed_diagnostics_are_off(
                             "max_pre_clip_total_grad_norm": 2.0,
                             "zero_objective_steps_skipped": 0,
                         },
-                        "validation_objective_matched": {
-                            "objective_matched": True,
-                            "metrics": {
-                                "active_policy_teacher_gap_closure": 0.4
-                            },
-                            "components": {
-                                "replay": {
-                                    "metrics": {
+                            "validation_objective_matched": _matched_validation(
+                                {"active_policy_teacher_gap_closure": 0.4},
+                                {
+                                    "replay": {
                                         "active_policy_teacher_gap_closure": 0.4
-                                    }
-                                }
-                            },
-                        },
+                                    },
+                                    "current": {
+                                        "active_policy_teacher_gap_closure": 0.4
+                                    },
+                                },
+                            ),
                     }
                 ],
             }
