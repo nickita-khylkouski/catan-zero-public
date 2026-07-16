@@ -20,6 +20,13 @@ downstream of it. Land the fix, land the test, then generate.
 - `RL_AGENT_HANDOFF.md` — production RL operator runbook: release and artifact
   acceptance, fleet launch, seed allocation, corpus QA, DDP training, searched
   gates, promotion, rollback, and current integration gaps.
+- `docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md` — current collaboration
+  entry point for the P0 information-state, value-learning, search-target, and
+  PPO repairs. Large learner/generation runs remain paused until its P0 work
+  packages are resolved.
+- `docs/plans/A1_REPRESENTATION_VALUE_RECOVERY_PLAN_20260715.md` — parallel
+  workstream ownership, dependency order, experiment contract, and definition
+  of done for the repair cycle.
 - `src/`, `tools/`, `tests/` — the Python package described below (search,
   training, self-play generation, promotion gate, H2H evaluation). Use the
   verified current worktree and its next immutable H100 release, not an old

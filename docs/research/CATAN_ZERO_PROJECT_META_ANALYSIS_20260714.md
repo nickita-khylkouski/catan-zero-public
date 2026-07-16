@@ -6,6 +6,15 @@
 **Ultimate product target:** full four-player Catan with trading  
 **Status:** internal research paper and decision record; not a peer-reviewed strength claim
 
+> **2026-07-15 research addendum:** direct source tracing after this draft found
+> a more proximal representation/value failure: the neural state omits
+> development-card playability and other public multi-step rule state, the
+> value readout cannot recover those distinctions from legal actions, and
+> policy learning can damage the shared value representation. The exact
+> diagnosis and repair program are
+> `../audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md` and
+> `../plans/A1_REPRESENTATION_VALUE_RECOVERY_PLAN_20260715.md`.
+
 ## Abstract
 
 Catan Zero began as a broad behavior-cloning and PPO effort, evolved into a structured 35-million-parameter entity-token policy, and then pivoted to AlphaZero-style expert iteration with Gumbel MCTS. The project achieved three credible internal policy-improvement generations and large systems gains, including information-set-safe search, lazy chance expansion, Rust feature construction, a native MCTS hot loop, durable multi-host generation, eight-rank B200 training, and typed promotion transactions. It nevertheless failed to turn a large n128/n256 search corpus into an externally stronger successor.

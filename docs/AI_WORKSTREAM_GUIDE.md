@@ -3,6 +3,23 @@
 Use this guide when spawning other agents. Each workstream should produce a
 small, reviewable artifact and must not silently change the champion.
 
+## Current priority override — 2026-07-15
+
+The immediate work is no longer generic distributed infrastructure or another
+large data wave. Read
+`docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md` and claim one of its WP1-WP6
+repair packages. In priority order:
+
+1. public rule state and development-card playability;
+2. development-card action semantics and value affordances;
+3. ordered public history;
+4. value/trunk protection;
+5. reliable coherent-search targets;
+6. one canonical entity-graph PPO lane.
+
+Do not launch a large learner or self-play wave until WP1-WP5 are integrated
+into one function-preserving corrected parent.
+
 ## Global Rules
 
 - Do not run local RL training.
@@ -240,4 +257,3 @@ A workstream is useful if it makes one of these more true:
 - better evaluation confidence
 
 Everything else is secondary.
-

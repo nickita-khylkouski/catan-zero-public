@@ -6,6 +6,15 @@ promotion workflow to the RL operator. Read it before changing fleet state.
 The current production track is **2-player, no-trade, 10 VP**. Results from this
 track do not support a four-player full-trade strength claim.
 
+> **2026-07-15 diagnostic hold:** do not launch another large learner or
+> generation wave from this runbook yet. The audit in
+> `docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md` confirmed rules-critical
+> observation aliases, destructive policy/value shared-trunk interference, and
+> unqualified search-target noise. That document is the current implementation
+> authority for the repair cycle. This runbook remains the operational
+> transaction authority after the repaired model/data/search contract is
+> accepted.
+
 ## 1. Current handoff state
 
 | Item | State |
@@ -89,16 +98,19 @@ Use each source for its declared scope:
    ledgers for what actually ran.
 2. `docs/operations/A1_V5_64GPU_PRE_WAVE.md` plus the v3 lock/render for the
    current post-promotion generation and learner handoff.
-3. A dated owner-approved wave record for experiment thresholds and any policy
+3. `docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md` and
+   `docs/plans/A1_REPRESENTATION_VALUE_RECOVERY_PLAN_20260715.md` while the
+   July-15 diagnostic hold is active.
+4. A dated owner-approved wave record for experiment thresholds and any policy
    decision that supersedes an older plan.
-4. docs/plans/CATAN_ZERO_ROADMAP.md and CATAN_ZERO_MASTER_PLAN.md for the
+5. docs/plans/CATAN_ZERO_ROADMAP.md and CATAN_ZERO_MASTER_PLAN.md for the
    promotion ladder, tripwires, and research program.
-5. RL_AGENT_HANDOFF.md for the end-to-end operator transaction.
-6. FLEET.md and tools/fleet/FLEET_CONTROL.md for inventory, installation,
+6. RL_AGENT_HANDOFF.md for the end-to-end operator transaction.
+7. FLEET.md and tools/fleet/FLEET_CONTROL.md for inventory, installation,
    status, launch, and stop behavior.
-7. docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md for measured H100 evidence
+8. docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md for measured H100 evidence
    and the current role-pure data-engine experiment.
-8. CODEBASE_GUIDE.md for architecture and module ownership.
+9. CODEBASE_GUIDE.md for architecture and module ownership.
 
 Stop and update the documentation when same-scope sources disagree. Do not
 silently let a throughput recipe replace the roadmap's promotion policy.
