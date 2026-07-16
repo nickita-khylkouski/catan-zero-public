@@ -6,6 +6,7 @@
     "c_visit": 50.0,
     "checkpoint": null,
     "coherent_public_belief_search": true,
+    "boundary_value_particles": 1,
     "correct_rust_chance_spectra": true,
     "determinization_min_simulations": 32,
     "determinization_particles": 1,
