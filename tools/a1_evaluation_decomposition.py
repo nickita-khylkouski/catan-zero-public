@@ -231,6 +231,7 @@ def _role_operator(fields: Mapping[str, Any], role: str) -> dict[str, Any]:
         "rescale_noise_floor_c": f"{role}_rescale_noise_floor_c",
         "sigma_eval": f"{role}_sigma_eval",
         "sigma_reference_visits": f"{role}_sigma_reference_visits",
+        "boundary_value_particles": f"{role}_boundary_value_particles",
     }
     global_keys = {
         "map_kind",

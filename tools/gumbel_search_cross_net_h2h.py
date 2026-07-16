@@ -1207,7 +1207,14 @@ def _reset_game_search_rngs(
     for color in COLORS:
         role = str(role_by_color[color])
         seed = _game_search_seed(game_seed=int(game_seed), seat_color=color)
-        mcts_by_role[role].rng.seed(seed)
+        search = mcts_by_role[role]
+        reset = getattr(search, "seed_search_rngs", None)
+        if callable(reset):
+            reset(seed)
+        else:
+            # Retain compatibility with tiny test doubles and older wrappers;
+            # production Gumbel search objects expose the full reset contract.
+            search.rng.seed(seed)
         seeds_by_role[role] = seed
     return seeds_by_role
 

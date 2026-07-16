@@ -191,3 +191,55 @@ def test_decomposition_refuses_checkpoint_byte_drift(tmp_path: Path) -> None:
             searched_cross=searched,
             candidate_search_vs_raw=uplift,
         )
+
+
+def test_decomposition_authenticates_boundary_value_particle_operator(
+    tmp_path: Path,
+) -> None:
+    raw, searched, uplift = _panels(tmp_path)
+    for path in (raw, searched, uplift):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        config = EvalConfig(
+            **{
+                **payload["typed_config"]["fields"],
+                "boundary_value_particles": 4,
+            }
+        )
+        payload["typed_config"] = config.canonical_payload()
+        payload["config_hash"] = config.config_hash()
+        payload["full_config_hash"] = config.full_config_hash()
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    receipt = decomposition.build_decomposition(
+        raw_cross=raw,
+        searched_cross=searched,
+        candidate_search_vs_raw=uplift,
+    )
+
+    assert receipt["ready_for_promotion_adjudication"] is True
+
+
+def test_decomposition_rejects_boundary_value_particle_operator_drift(
+    tmp_path: Path,
+) -> None:
+    raw, searched, uplift = _panels(tmp_path)
+    payload = json.loads(uplift.read_text(encoding="utf-8"))
+    config = EvalConfig(
+        **{
+            **payload["typed_config"]["fields"],
+            "boundary_value_particles": 4,
+        }
+    )
+    payload["typed_config"] = config.canonical_payload()
+    payload["config_hash"] = config.config_hash()
+    payload["full_config_hash"] = config.full_config_hash()
+    uplift.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        decomposition.DecompositionError, match="changed the candidate search operator"
+    ):
+        decomposition.build_decomposition(
+            raw_cross=raw,
+            searched_cross=searched,
+            candidate_search_vs_raw=uplift,
+        )

@@ -214,6 +214,28 @@ def test_h2h_search_rng_reset_follows_seat_across_color_swap() -> None:
     ]
 
 
+def test_h2h_search_rng_reset_uses_full_stream_reset_contract() -> None:
+    class SearchRecorder:
+        def __init__(self) -> None:
+            self.values: list[int] = []
+
+        def seed_search_rngs(self, value: int) -> None:
+            self.values.append(int(value))
+
+    searches = {
+        "candidate": SearchRecorder(),
+        "baseline": SearchRecorder(),
+    }
+    seeds = h2h._reset_game_search_rngs(
+        searches,
+        role_by_color={"RED": "candidate", "BLUE": "baseline"},
+        game_seed=42,
+    )
+
+    assert searches["candidate"].values == [seeds["candidate"]]
+    assert searches["baseline"].values == [seeds["baseline"]]
+
+
 def test_pinned_replay_scope_is_safe_during_path_aba_hash_and_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

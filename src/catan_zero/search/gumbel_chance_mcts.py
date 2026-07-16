@@ -57,7 +57,10 @@ from catan_zero.search.rust_mcts import (
     _terminal_or_zero,
 )
 from catan_zero.search.public_belief import PublicBelief
-from catan_zero.search.rng_streams import domain_separated_search_seed
+from catan_zero.search.rng_streams import (
+    boundary_value_particle_seed,
+    domain_separated_search_seed,
+)
 
 __all__ = [
     "GumbelChanceMCTSConfig",
@@ -1091,6 +1094,12 @@ class GumbelChanceMCTS:
 
         base_seed = int(seed)
         self.rng.seed(base_seed)
+        # Boundary-world samples are a stateless function of this reset seed,
+        # coherent-search index, and particle index. Keeping the index outside
+        # every Random stream makes K=1/K>1 comparisons causal even on the
+        # historical shared-RNG path.
+        self._boundary_value_base_seed = base_seed
+        self._boundary_value_root_index = 0
         if not bool(self.config.rng_stream_separation):
             self._gumbel_rng = self.rng
             self._chance_rng = self.rng
@@ -1298,6 +1307,10 @@ class GumbelChanceMCTS:
             )
         root_color = str(game.current_color())
         root_phase = self._phase_gated_d1_root_phase(game)
+        boundary_value_root_index = int(
+            getattr(self, "_boundary_value_root_index", 0)
+        )
+        self._boundary_value_root_index = boundary_value_root_index + 1
 
         if self.config.forced_root_target_mode == "trajectory_only":
             authoritative_legal = _legal_action_indices(
@@ -1325,8 +1338,18 @@ class GumbelChanceMCTS:
         particle_count = int(self.config.boundary_value_particles)
         self._boundary_value_particle_seeds = (
             tuple(
-                int(self._belief_rng.getrandbits(64))
-                for _ in range(particle_count)
+                boundary_value_particle_seed(
+                    int(
+                        getattr(
+                            self,
+                            "_boundary_value_base_seed",
+                            self.config.seed,
+                        )
+                    ),
+                    root_index=boundary_value_root_index,
+                    particle_index=particle_index,
+                )
+                for particle_index in range(particle_count)
             )
             if particle_count > 1
             else ()

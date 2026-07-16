@@ -793,6 +793,84 @@ def test_boundary_value_particles_k1_draws_no_additional_rng() -> None:
     assert mcts._belief_rng.getstate() == expected.getstate()
 
 
+def test_boundary_value_particles_do_not_perturb_shared_search_rng() -> None:
+    class BoundaryAuthoritative(_AuthoritativeGame):
+        def determinize_from_observer_information(self, observer: str, seed: int):
+            return _SampledGame(seed, self.prompt)
+
+    def run(particles: int):
+        mcts = _mcts(n_full=128)
+        mcts.config = replace(
+            mcts.config,
+            information_set_search=False,
+            coherent_public_belief_search=True,
+            rng_stream_separation=False,
+            boundary_value_particles=particles,
+        )
+        mcts.evaluator.config.emit_uncertainty = False
+
+        def stop_before_traversal(
+            _self,
+            _sampled,
+            *,
+            force_full=None,
+            attested_root_phase=None,
+        ):
+            return force_full, attested_root_phase
+
+        mcts._search_single_world = MethodType(stop_before_traversal, mcts)
+        mcts.seed_search_rngs(918273)
+        mcts.search(BoundaryAuthoritative("irrelevant"), force_full=True)
+        return mcts.rng.getstate(), tuple(mcts._boundary_value_particle_seeds)
+
+    legacy_state, legacy_seeds = run(1)
+    particle_state, particle_seeds = run(4)
+
+    assert legacy_seeds == ()
+    assert len(particle_seeds) == 4
+    assert particle_state == legacy_state
+
+
+def test_boundary_value_particle_samples_are_matched_prefixes_at_each_root() -> None:
+    class BoundaryAuthoritative(_AuthoritativeGame):
+        def determinize_from_observer_information(self, observer: str, seed: int):
+            return _SampledGame(seed, self.prompt)
+
+    def run(particles: int) -> list[tuple[int, ...]]:
+        mcts = _mcts(n_full=128)
+        mcts.config = replace(
+            mcts.config,
+            information_set_search=False,
+            coherent_public_belief_search=True,
+            rng_stream_separation=False,
+            boundary_value_particles=particles,
+        )
+        mcts.evaluator.config.emit_uncertainty = False
+
+        def stop_before_traversal(
+            _self,
+            _sampled,
+            *,
+            force_full=None,
+            attested_root_phase=None,
+        ):
+            return force_full, attested_root_phase
+
+        mcts._search_single_world = MethodType(stop_before_traversal, mcts)
+        mcts.seed_search_rngs(192837)
+        roots: list[tuple[int, ...]] = []
+        for _ in range(2):
+            mcts.search(BoundaryAuthoritative("irrelevant"), force_full=True)
+            roots.append(tuple(mcts._boundary_value_particle_seeds))
+        return roots
+
+    k2 = run(2)
+    k4 = run(4)
+
+    assert k2[0] == k4[0][:2]
+    assert k2[1] == k4[1][:2]
+
+
 def test_boundary_value_particles_k1_uses_exact_legacy_boundary_expansion() -> None:
     class BoundaryGame:
         def winning_color(self):
