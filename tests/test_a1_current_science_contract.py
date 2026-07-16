@@ -24,6 +24,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     assert model["public_card_count_residual_bias"] is False
     assert model["public_rule_state_features"] is True
     assert model["value_tower_split_layers"] == 1
+    assert model["action_target_gather"] is True
     assert model["legal_action_value_set_statistics"] is True
     assert model["actor_public_rule_state"].startswith("dev_used_")
     assert recipe["value_trunk_grad_scale"] == 0.25
@@ -64,6 +65,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     ) == {
         "event_encoder",
         "final_vp_head",
+        "target_gather_proj",
         "legal_action_value_residual_proj",
         "legal_action_value_static_proj",
         "legal_action_value_max_proj",
@@ -114,6 +116,7 @@ def test_current_contract_rejects_non_scratch_v5_initialization(
     ("section", "field", "bad_value"),
     (
         ("model_construction", "static_action_residual", False),
+        ("model_construction", "action_target_gather", False),
         ("model_construction", "entity_feature_adapter_version", "legacy"),
         ("execution_topology", "world_size", 4),
         ("execution_topology", "local_batch_size", 1024),

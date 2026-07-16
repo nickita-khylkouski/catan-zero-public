@@ -48,11 +48,12 @@ CURRENT_LEARNER_ENTITY_ADAPTER = (
 )
 CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
     "structured_action_value,card_count_v2,meaningful_history,"
-    "history_target_gather,legal_set_statistics,public_rule_state,"
+    "history_target_gather,action_target_gather,legal_set_statistics,public_rule_state,"
     "value_tower_split1"
 )
 CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
-    "entity_graph.static_action_residual+legal_action_value_residual+"
+    "entity_graph.action_target_gather+static_action_residual+"
+    "legal_action_value_residual+"
     "legal_action_value_set_statistics+"
     "public_card_count_features+meaningful_public_history+"
     "meaningful_history_target_gather+"
@@ -105,7 +106,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "train_diagnostics_every_batches": 16,
     "objective_gradient_interference_every_batches": 16,
     "require_feature_learning_signal_modules": (
-        "event_encoder,legal_action_value_residual_proj,"
+        "event_encoder,target_gather_proj,legal_action_value_residual_proj,"
         "legal_action_value_static_proj,legal_action_value_max_proj,"
         "legal_action_value_count_proj,legal_action_value_static_max_proj,"
         "meaningful_history_residual_gate,"
@@ -154,14 +155,16 @@ PRODUCTION_LEARNER_INITIALIZATION_CONTRACT = {
 }
 PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "arch": "entity_graph",
-    # One private value block adds real capacity; width 632 keeps the complete
-    # split model just below the enforced 40M checkpoint ceiling.
-    "hidden_size": 632,
+    # One private value block plus the post-trunk action-target join adds real
+    # capacity; width 624 keeps the complete model below the enforced 40M
+    # checkpoint ceiling.
+    "hidden_size": 624,
     "graph_tokens": None,
     "graph_layers": 6,
     "attention_heads": 8,
     "graph_dropout": 0.05,
     "entity_state_trunk": "transformer",
+    "action_target_gather": True,
     "static_action_residual": True,
     "legal_action_value_residual": True,
     "legal_action_value_set_statistics": True,

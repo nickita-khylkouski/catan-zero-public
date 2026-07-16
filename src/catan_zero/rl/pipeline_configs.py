@@ -397,6 +397,11 @@ class TrainConfig(PipelineConfig):
     advantage_temperature: float = 1.0
     advantage_weight_cap: float = 5.0
     advantage_weight_floor: float = 0.05
+    # Post-trunk action-to-target entity join. Keep this at the end of the
+    # typed config so older positional dataclass payloads retain their field
+    # order. ``None`` is the CLI inherit sentinel; train_bc resolves it to the
+    # checkpoint-owned concrete architecture before hashing.
+    action_target_gather: bool | None = None
 
     @classmethod
     def from_namespace(cls, args: Any) -> "TrainConfig":

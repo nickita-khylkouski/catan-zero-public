@@ -176,6 +176,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert "--resume-optimizer" not in command
     assert command.count("--no-resume-optimizer") == 1
     assert command.count("--no-public-card-count-residual-bias") == 1
+    assert command.count("--action-target-gather") == 1
     assert command.count("--legal-action-value-set-statistics") == 1
     assert command.count("--public-rule-state-features") == 1
     assert command[command.index("--value-tower-split-layers") + 1] == "1"
@@ -207,6 +208,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
         command.index("--require-feature-learning-signal-modules") + 1
     ].split(",")
     assert "event_encoder" in required_modules
+    assert "target_gather_proj" in required_modules
     assert "public_rule_state_residual" in required_modules
     assert "--ddp-shard-data" not in command
     assert "--target-reliability-confidence-weighting" not in command
@@ -283,6 +285,7 @@ def test_scratch_topology_binder_does_not_require_legacy_4096_batch(
 def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     model = current_science.learner_model_construction()
     args = SimpleNamespace(
+        action_target_gather=True,
         static_action_residual=True,
         legal_action_value_residual=True,
         legal_action_value_set_statistics=True,
@@ -318,6 +321,7 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     assert policy.config.public_card_count_features is True
     assert policy.config.public_card_count_residual_bias is False
     assert policy.config.public_rule_state_features is True
+    assert policy.config.action_target_gather is True
     assert (
         policy.entity_feature_adapter_version
         == model["entity_feature_adapter_version"]
@@ -385,6 +389,7 @@ def _runtime_args() -> SimpleNamespace:
         attention_heads=model["attention_heads"],
         graph_dropout=model["graph_dropout"],
         entity_state_trunk=model["entity_state_trunk"],
+        action_target_gather=model["action_target_gather"],
         static_action_residual=model["static_action_residual"],
         legal_action_value_residual=model["legal_action_value_residual"],
         legal_action_value_set_statistics=model[
@@ -424,6 +429,7 @@ def test_scratch_runtime_projection_accepts_every_current_field() -> None:
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     (
+        ("action_target_gather", False),
         ("static_action_residual", False),
         ("public_card_count_residual_bias", True),
         ("public_rule_state_features", False),

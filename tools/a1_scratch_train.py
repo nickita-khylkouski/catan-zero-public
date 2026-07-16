@@ -405,6 +405,7 @@ def build_train_command(
         _add(command, flag, model[key])
     command.extend(
         [
+            "--action-target-gather",
             "--static-action-residual",
             "--legal-action-value-residual",
             "--legal-action-value-set-statistics",

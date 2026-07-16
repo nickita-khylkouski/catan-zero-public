@@ -2207,6 +2207,7 @@ class EntityGraphPolicy:
         topology_residual_adapter: bool = False,
         belief_resource_head: bool = False,
         aux_settlement_pointer_head: bool = False,
+        action_target_gather: bool = False,
         static_action_residual: bool = False,
         legal_action_value_residual: bool = False,
         legal_action_value_set_statistics: bool = False,
@@ -2260,6 +2261,7 @@ class EntityGraphPolicy:
                 topology_residual_adapter=bool(topology_residual_adapter),
                 belief_resource_head=bool(belief_resource_head),
                 aux_settlement_pointer_head=bool(aux_settlement_pointer_head),
+                action_target_gather=bool(action_target_gather),
                 static_action_residual=bool(static_action_residual),
                 legal_action_value_residual=bool(
                     legal_action_value_residual

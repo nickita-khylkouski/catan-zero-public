@@ -279,6 +279,9 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert "event_encoder" in recipe[
         "require_feature_learning_signal_modules"
     ]
+    assert "target_gather_proj" in recipe[
+        "require_feature_learning_signal_modules"
+    ]
     assert "meaningful_history_target_proj" in recipe[
         "require_feature_learning_signal_modules"
     ]
@@ -290,10 +293,10 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert "final_vp_head" in recipe["require_feature_learning_signal_modules"]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:ced6c4b3bb1166a1955f5f5b4e07fbd1e6a47ae4f469b48e744a751e73332f8c"
+        "sha256:3cf1a74225d562b48584796dd9148662893f0efb3c281e137cd5eeeb1c12876e"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:42d806dc223674e32e126be631687870c3905fd841c291d2597ce6f9eda0135c"
+        "sha256:490c32b0e843d6b38306fca186c31ada5efd16252b39a72377211334e457534f"
     )
 
 
