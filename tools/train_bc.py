@@ -11802,6 +11802,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 else train_indices[np.asarray(aux_order, dtype=np.int64)]
             ),
             policy_aux_batch_size=int(args.policy_aux_active_batch_size),
+            materialize_keys=(
+                _entity_graph_prefetch_materialization_keys(data)
+                if policy.policy_type == "entity_graph"
+                else None
+            ),
         )
         for batch_number, (_batch_tuple, _is_last_batch) in enumerate(
             _iter_with_last(batch_iterator), start=1
@@ -16027,6 +16032,11 @@ def evaluate_bc_batches(
                 value_sample_weights,
                 num_workers=int(data_loader_workers),
                 prefetch=int(data_loader_prefetch),
+                materialize_keys=(
+                    _entity_graph_prefetch_materialization_keys(data)
+                    if policy.policy_type == "entity_graph"
+                    else None
+                ),
             )
         ):
             batch_metrics = eval_fn(
@@ -17815,6 +17825,7 @@ def _iterate_training_batches(
     prefetch: int,
     policy_aux_rows: np.ndarray | None = None,
     policy_aux_batch_size: int = 0,
+    materialize_keys: tuple[str, ...] | None = None,
 ):
     """Yield ``(data, batch, policy_weights, value_weights)`` tuples for one epoch.
 
@@ -17873,7 +17884,19 @@ def _iterate_training_batches(
                 )
         return
 
-    keys = list(data.keys())
+    available_keys = tuple(data.keys())
+    if materialize_keys is None:
+        keys = available_keys
+    else:
+        keys = tuple(materialize_keys)
+        if len(keys) != len(set(keys)):
+            raise ValueError("prefetch materialization keys contain duplicates")
+        missing = set(keys) - set(available_keys)
+        if missing:
+            raise ValueError(
+                "prefetch materialization keys are absent from the corpus: "
+                + ",".join(sorted(missing))
+            )
 
     def _materialize(batch: np.ndarray, aux_batch: np.ndarray | None):
         rows = (
@@ -17985,6 +18008,11 @@ def _iterate_training_batches(
                 )
                 next_index += 1
             yield future.result()
+
+
+def _entity_graph_prefetch_materialization_keys(data) -> tuple[str, ...]:
+    """Keep every entity-graph column except its unused legacy dense input."""
+    return tuple(key for key in data.keys() if key != "obs")
 
 
 def load_teacher_data(

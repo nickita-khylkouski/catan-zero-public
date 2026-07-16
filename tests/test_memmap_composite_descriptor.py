@@ -460,6 +460,20 @@ class _TinyCorpus:
         return self._eager[key]
 
 
+class _TinyEntityPrefetchCorpus(_TinyCorpus):
+    def __init__(self, values):
+        super().__init__(values)
+        self._columns["obs"] = {
+            "kind": "fixed",
+            "dtype": "<f4",
+            "inner_shape": [1],
+        }
+        self._eager["obs"] = np.asarray(values, dtype=np.float32)[:, None]
+
+    def keys(self):
+        return ["row", "obs"]
+
+
 class _TinyGameCorpus:
     def __init__(self, seeds):
         array = np.asarray(seeds, dtype=np.int64)
@@ -736,6 +750,56 @@ def test_global_epoch_shuffle_interleaves_component_rows_with_prefetch():
     )
     observed = [data_part["row"][batch].tolist() for data_part, batch, _, _ in batches]
     assert observed == [[0, 10], [1, 11], [2, 12]]
+
+
+def test_entity_graph_prefetch_allowlist_omits_only_dense_obs():
+    data = train_bc.ConcatMemmapCorpus(
+        [_TinyEntityPrefetchCorpus([0, 1]), _TinyEntityPrefetchCorpus([10, 11])]
+    )
+    rows = np.asarray([3, 0, 2, 1], dtype=np.int64)
+    materialize_keys = train_bc._entity_graph_prefetch_materialization_keys(data)
+
+    assert materialize_keys == ("row",)
+    materialized, local, policy_weights, value_weights = next(
+        iter(
+            train_bc._iterate_training_batches(
+                data,
+                np.arange(4, dtype=np.int64),
+                rows,
+                4,
+                np.arange(1, 5, dtype=np.float32),
+                np.arange(11, 15, dtype=np.float32),
+                num_workers=1,
+                prefetch=1,
+                materialize_keys=materialize_keys,
+            )
+        )
+    )
+
+    assert set(materialized) == {"row", "_source_global_row_indices"}
+    assert materialized["row"].tolist() == [11, 0, 10, 1]
+    assert local.tolist() == [0, 1, 2, 3]
+    assert policy_weights.tolist() == [4.0, 1.0, 3.0, 2.0]
+    assert value_weights.tolist() == [14.0, 11.0, 13.0, 12.0]
+
+
+def test_prefetch_materialization_allowlist_rejects_unknown_columns():
+    data = train_bc.ConcatMemmapCorpus(
+        [_TinyEntityPrefetchCorpus([0, 1]), _TinyEntityPrefetchCorpus([10, 11])]
+    )
+    iterator = train_bc._iterate_training_batches(
+        data,
+        np.arange(4, dtype=np.int64),
+        np.arange(4, dtype=np.int64),
+        2,
+        np.ones(4, dtype=np.float32),
+        np.ones(4, dtype=np.float32),
+        num_workers=1,
+        prefetch=1,
+        materialize_keys=("row", "missing"),
+    )
+    with pytest.raises(ValueError, match="absent from the corpus: missing"):
+        next(iterator)
 
 
 def test_prefetch_preserves_source_bound_stored_policy_temperatures():
