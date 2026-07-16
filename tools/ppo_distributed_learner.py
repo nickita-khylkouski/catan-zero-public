@@ -1302,7 +1302,9 @@ def prune_checkpoints(root: str | os.PathLike, league: League, config: LearnerCo
     if not ckpts:
         return []
 
-    keep_last = max(0, int(getattr(config, "keep_last_checkpoints", 5)))
+    # Per-update recovery requires at least the newest generation even when an
+    # invalid/over-aggressive config requests zero retained checkpoints.
+    keep_last = max(1, int(getattr(config, "keep_last_checkpoints", 5)))
     milestone = int(getattr(config, "checkpoint_milestone_every", 500))
 
     keep_steps: set[int] = set()

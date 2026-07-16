@@ -353,6 +353,30 @@ def test_checkpoint_refuses_same_step_overwrite(tmp_path: Path) -> None:
         )
 
 
+def test_rotation_always_keeps_latest_recovery_checkpoint(tmp_path: Path) -> None:
+    model, optimizer = _adam_with_state()
+    for step in (1, 2):
+        learner._save_checkpoint_set(  # noqa: SLF001
+            policy=_TinyPolicy(model),
+            optimizer=optimizer,
+            root=tmp_path,
+            step=step,
+        )
+    config = learner.LearnerConfig(
+        run_base=str(tmp_path),
+        run_name="rotation",
+        init_checkpoint="parent.pt",
+        keep_last_checkpoints=0,
+        checkpoint_milestone_every=0,
+    )
+
+    learner.prune_checkpoints(tmp_path, League(), config)
+
+    latest = dist.checkpoints_dir(tmp_path) / "step_2.pt"
+    assert latest.is_file()
+    assert learner._opt_path_for(latest).is_file()  # noqa: SLF001
+
+
 def test_bounded_run_schedules_terminal_checkpoint_off_periodic_cadence() -> None:
     config = learner.LearnerConfig(
         run_base="runs/distributed",
