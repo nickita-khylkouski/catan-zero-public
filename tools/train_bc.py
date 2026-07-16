@@ -87,6 +87,7 @@ from catan_zero.rl.entity_feature_adapter import (
     checkpoint_entity_feature_adapter_metadata,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
+    resolve_checkpoint_entity_feature_adapter,
 )
 from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
@@ -3042,6 +3043,24 @@ def _checkpoint_meaningful_public_history(
         getattr(config, "meaningful_public_history_target_gather", False)
     )
     return enabled, limit, schema, pooling, target_gather
+
+
+def _checkpoint_entity_feature_adapter_version(checkpoint_path: str) -> str:
+    """Read the exact adapter semantics owned by an entity checkpoint."""
+
+    import torch
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint; cannot resolve "
+            "--entity-feature-adapter-version"
+        )
+    version, _source = resolve_checkpoint_entity_feature_adapter(
+        checkpoint.get("entity_feature_adapter"),
+        metadata_present="entity_feature_adapter" in checkpoint,
+    )
+    return version
 
 
 def _sha256_existing_file(path: str | Path) -> str:
@@ -35709,9 +35728,10 @@ def _training_resume_recipe_identity(
     the same reason: after the first grown checkpoint is saved, continuation must use
     the mutually-exclusive ``--init-checkpoint`` path rather than grow the architecture
     a second time. Everything else in the typed science config remains bound, augmented
-    with optimizer-step topology fields for backwards compatibility. This intentionally
-    rejects changing max_steps, warmup/decay, loss recipe, corpus, batch geometry, or
-    world size while reusing moments.
+    with optimizer-step topology and live science/admission fields that have not yet
+    migrated into ``TrainConfig``. This intentionally rejects changing max_steps,
+    warmup/decay, loss recipe, corpus, batch geometry, optimizer parameter-group rates,
+    sampling, architecture inputs, or terminal admission while reusing moments.
     """
     normalized = dataclasses.replace(
         train_config,
@@ -35721,6 +35741,42 @@ def _training_resume_recipe_identity(
         grow_from_checkpoint_sha256="",
         resume_optimizer=True,
     )
+    arch = str(getattr(args, "arch", getattr(train_config, "arch", "")) or "")
+    requested_adapter = getattr(args, "entity_feature_adapter_version", None)
+    init_checkpoint = str(
+        getattr(args, "init_checkpoint", "")
+        or getattr(train_config, "init_checkpoint", "")
+        or ""
+    )
+    if arch != "entity_graph":
+        resume_entity_adapter = ""
+    elif requested_adapter is not None:
+        resume_entity_adapter = require_known_entity_feature_adapter(
+            requested_adapter
+        )
+    elif init_checkpoint and Path(init_checkpoint).is_file():
+        # Init resumes inherit the checkpoint's append-only adapter contract.
+        # Do not infer v2/v3 from the same false public-feature flags.
+        resume_entity_adapter = _checkpoint_entity_feature_adapter_version(
+            init_checkpoint
+        )
+    elif (
+        bool(getattr(args, "public_rule_state_features", False))
+        and bool(getattr(args, "meaningful_public_history", False))
+        and int(getattr(args, "event_history_limit", 0) or 0) == 64
+    ):
+        # Resolved checkpoint-owned v5 semantics remain identifiable even when
+        # the continuation command inherits the adapter rather than spelling it.
+        resume_entity_adapter = RUST_ENTITY_ADAPTER_V5
+    elif bool(getattr(args, "public_rule_state_features", False)):
+        resume_entity_adapter = RUST_ENTITY_ADAPTER_V4
+    else:
+        resume_entity_adapter = CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    resume_history_schema = (
+        _history_schema_for_entity_adapter(resume_entity_adapter)
+        if resume_entity_adapter
+        else ""
+    )
     identity: dict[str, object] = {
         "schema_version": "train-bc-resume-recipe-v1",
         "normalized_train_config_sha256": normalized.full_config_hash(),
@@ -35729,6 +35785,95 @@ def _training_resume_recipe_identity(
         "ddp_shard_data": bool(args.ddp_shard_data),
         "fsdp": bool(args.fsdp),
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
+        "policy_dose_lr_area": float(
+            getattr(args, "policy_dose_lr_area", 0.0)
+        ),
+        "policy_dose_reference_global_batch_size": int(
+            getattr(args, "policy_dose_reference_global_batch_size", 0)
+        ),
+        # These live CLI fields alter the optimizer trajectory, model input, or
+        # terminal checkpoint admission but are not yet represented by TrainConfig.
+        # Keep them explicit here so progress saved under one interpretation cannot
+        # restore Adam/RNG/LR state under another.
+        "public_card_lr_mult": float(
+            getattr(args, "public_card_lr_mult", 1.0)
+        ),
+        "scalar_value_loss_readout": str(
+            getattr(args, "scalar_value_loss_readout", "raw")
+        ),
+        "scalar_value_loss_scale": float(
+            getattr(args, "scalar_value_loss_scale", 1.0)
+        ),
+        "value_player_outcome_balance_mode": str(
+            getattr(args, "value_player_outcome_balance_mode", "none")
+        ),
+        "base_sampler": str(
+            getattr(args, "base_sampler", BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1)
+        ),
+        "entity_feature_adapter_version": resume_entity_adapter,
+        "public_rule_state_features": bool(
+            getattr(args, "public_rule_state_features", False)
+        ),
+        "value_tower_split_layers": int(
+            getattr(args, "value_tower_split_layers", 0) or 0
+        ),
+        "meaningful_public_history": bool(
+            getattr(args, "meaningful_public_history", False)
+        ),
+        "meaningful_public_history_schema": str(resume_history_schema),
+        "event_history_limit": int(
+            getattr(args, "event_history_limit", 64) or 0
+        ),
+        "meaningful_public_history_pooling": str(
+            getattr(args, "meaningful_public_history_pooling", MASKED_MEAN_V1)
+            or MASKED_MEAN_V1
+        ),
+        "meaningful_public_history_target_gather": bool(
+            getattr(args, "meaningful_public_history_target_gather", False)
+        ),
+        "require_feature_learning_signal_modules": ",".join(
+            sorted(
+                {
+                    token.strip()
+                    for token in str(
+                        getattr(
+                            args, "require_feature_learning_signal_modules", ""
+                        )
+                        or ""
+                    ).split(",")
+                    if token.strip()
+                }
+            )
+        ),
+        "minimum_feature_learning_signal_observations": int(
+            getattr(args, "minimum_feature_learning_signal_observations", 0)
+        ),
+        "train_diagnostics_every_batches": int(
+            getattr(args, "train_diagnostics_every_batches", 0)
+        ),
+        "objective_gradient_interference_every_batches": int(
+            getattr(args, "objective_gradient_interference_every_batches", 0)
+        ),
+        "require_only_trainable_prefixes": ",".join(
+            sorted(
+                {
+                    token.strip()
+                    for token in str(
+                        getattr(args, "require_only_trainable_prefixes", "") or ""
+                    ).split(",")
+                    if token.strip()
+                }
+            )
+        ),
+        "accepted_policy_target_identity_sha256": sorted(
+            {
+                str(value)
+                for value in (
+                    getattr(args, "accepted_policy_target_identity_sha256", [])
+                    or []
+                )
+            }
+        ),
     }
     if getattr(args, "sampler_seed", None) is not None:
         # Omitted is the historical identity: the typed TrainConfig already

@@ -75,6 +75,38 @@ MATCHED_QUICK_SCREEN_SELECTION_RULE = {
     "tie_break": "lowest_optimizer_step_on_exact_tie",
 }
 INTERMEDIATE_CHECKPOINT_SCHEMA = "train-bc-intermediate-checkpoint-v1"
+MODERN_RESUME_RECIPE_REQUIRED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "normalized_train_config_sha256",
+        "grad_accum_steps",
+        "world_size",
+        "ddp_shard_data",
+        "fsdp",
+        "policy_aux_active_batch_size",
+        "policy_dose_lr_area",
+        "policy_dose_reference_global_batch_size",
+        "public_card_lr_mult",
+        "scalar_value_loss_readout",
+        "scalar_value_loss_scale",
+        "value_player_outcome_balance_mode",
+        "base_sampler",
+        "entity_feature_adapter_version",
+        "public_rule_state_features",
+        "value_tower_split_layers",
+        "meaningful_public_history",
+        "meaningful_public_history_schema",
+        "event_history_limit",
+        "meaningful_public_history_pooling",
+        "meaningful_public_history_target_gather",
+        "require_feature_learning_signal_modules",
+        "minimum_feature_learning_signal_observations",
+        "train_diagnostics_every_batches",
+        "objective_gradient_interference_every_batches",
+        "require_only_trainable_prefixes",
+        "accepted_policy_target_identity_sha256",
+    }
+)
 CHECKPOINT_SELECTION_STEPS = (64, 96, 128)
 BRANCH_CHALLENGE_LINEAGE_SCHEMA = "a1-branch-challenge-lineage-v1"
 RECEIPT_SCHEMA = "a1-promotion-transaction-receipt-v3"
@@ -1276,6 +1308,7 @@ def _verify_modern_one_dose_terminal(
     resume_identity = report.get("training_resume_recipe_identity")
     if (
         not isinstance(resume_identity, dict)
+        or not MODERN_RESUME_RECIPE_REQUIRED_FIELDS.issubset(resume_identity)
         or report.get("training_resume_recipe_identity_sha256")
         != _digest_value(resume_identity)
         or resume_identity.get("schema_version") != "train-bc-resume-recipe-v1"

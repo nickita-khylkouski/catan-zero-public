@@ -695,7 +695,35 @@ def _modernize_one_dose_receipt(
         "ddp_shard_data": False,
         "fsdp": False,
         "policy_aux_active_batch_size": 0,
+        "policy_dose_lr_area": 0.0,
+        "policy_dose_reference_global_batch_size": 0,
+        "public_card_lr_mult": 1.0,
+        "scalar_value_loss_readout": "raw",
+        "scalar_value_loss_scale": 1.0,
+        "value_player_outcome_balance_mode": "none",
+        "base_sampler": "weighted_replacement_v1",
+        "entity_feature_adapter_version": (
+            "rust_entity_adapter_v3_structured_action_resources"
+        ),
+        "public_rule_state_features": False,
+        "value_tower_split_layers": 0,
+        "meaningful_public_history": False,
+        "meaningful_public_history_schema": (
+            "meaningful_public_history_2p_no_trade_v1"
+        ),
+        "event_history_limit": 64,
+        "meaningful_public_history_pooling": "masked_mean_v1",
+        "meaningful_public_history_target_gather": False,
+        "require_feature_learning_signal_modules": "",
+        "minimum_feature_learning_signal_observations": 0,
+        "train_diagnostics_every_batches": 0,
+        "objective_gradient_interference_every_batches": 0,
+        "require_only_trainable_prefixes": "",
+        "accepted_policy_target_identity_sha256": [],
     }
+    assert promotion.MODERN_RESUME_RECIPE_REQUIRED_FIELDS.issubset(
+        resume_identity
+    )
     report["training_resume_recipe_identity"] = resume_identity
     report["training_resume_recipe_identity_sha256"] = promotion._digest_value(
         resume_identity
@@ -2046,6 +2074,67 @@ def test_modern_one_dose_rejects_self_consistent_wrong_resume_identity(
     _write_json(progress_path, progress)
     receipt["outputs"]["report_sha256"] = promotion._sha256(fixture["report"])
     receipt["outputs"]["training_progress_sha256"] = promotion._sha256(progress_path)
+    receipt["outputs"]["training_progress_payload_sha256"] = progress[
+        "progress_sha256"
+    ]
+    _rewrite_one_dose_receipt(fixture["training_receipt"], receipt)
+
+    with pytest.raises(
+        promotion.PromotionError, match="authenticated resume-recipe identity"
+    ):
+        promotion._verify_one_dose_training_receipt(
+            fixture["training_receipt"],
+            contract_lock=fixture["contract_path"],
+            contract=fixture["contract"],
+            candidate_path=fixture["candidate"],
+            candidate_sha256=promotion._sha256(fixture["candidate"]),
+            training_report_path=fixture["report"],
+            training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_modern_one_dose_rejects_self_consistent_incomplete_resume_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _fixture(tmp_path)
+    receipt, modern = _modernize_one_dose_receipt(fixture, world_size=8)
+    monkeypatch.setattr(
+        one_dose,
+        "_verify_ddp_canary_receipt",
+        lambda _path, *, reference_time_ns: modern["canary"],
+    )
+    report = json.loads(fixture["report"].read_text(encoding="utf-8"))
+    complete_identity = report["training_resume_recipe_identity"]
+    legacy_fields = {
+        "schema_version",
+        "normalized_train_config_sha256",
+        "grad_accum_steps",
+        "world_size",
+        "ddp_shard_data",
+        "fsdp",
+        "policy_aux_active_batch_size",
+    }
+    incomplete_identity = {
+        key: complete_identity[key] for key in legacy_fields
+    }
+    report["training_resume_recipe_identity"] = incomplete_identity
+    report["training_resume_recipe_identity_sha256"] = promotion._digest_value(
+        incomplete_identity
+    )
+    _write_json(fixture["report"], report)
+    progress_path = Path(receipt["outputs"]["training_progress"])
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress["recipe_identity"] = incomplete_identity
+    progress["recipe_identity_sha256"] = promotion._digest_value(
+        incomplete_identity
+    )
+    progress.pop("progress_sha256")
+    progress["progress_sha256"] = promotion._digest_value(progress)
+    _write_json(progress_path, progress)
+    receipt["outputs"]["report_sha256"] = promotion._sha256(fixture["report"])
+    receipt["outputs"]["training_progress_sha256"] = promotion._sha256(
+        progress_path
+    )
     receipt["outputs"]["training_progress_payload_sha256"] = progress[
         "progress_sha256"
     ]

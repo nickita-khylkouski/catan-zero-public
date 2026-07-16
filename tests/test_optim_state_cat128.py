@@ -410,6 +410,239 @@ def test_resume_identity_rejects_gradient_or_precision_recipe_drift(
     assert changed_identity != baseline_identity
 
 
+def _resume_identity_args(**overrides):
+    values = {
+        "arch": "entity_graph",
+        "seed": 1,
+        "sampler_seed": None,
+        "grad_accum_steps": 1,
+        "ddp_shard_data": False,
+        "fsdp": False,
+        "policy_aux_active_batch_size": 0,
+        "policy_dose_lr_area": 0.0,
+        "policy_dose_reference_global_batch_size": 0,
+        "public_card_lr_mult": 1.0,
+        "scalar_value_loss_readout": "raw",
+        "scalar_value_loss_scale": 1.0,
+        "value_player_outcome_balance_mode": "none",
+        "base_sampler": "weighted_replacement_v1",
+        "entity_feature_adapter_version": None,
+        "public_rule_state_features": False,
+        "value_tower_split_layers": 0,
+        "meaningful_public_history": False,
+        "event_history_limit": 64,
+        "meaningful_public_history_pooling": "masked_mean_v1",
+        "meaningful_public_history_target_gather": False,
+        "require_feature_learning_signal_modules": "",
+        "minimum_feature_learning_signal_observations": 0,
+        "train_diagnostics_every_batches": 0,
+        "objective_gradient_interference_every_batches": 0,
+        "require_only_trainable_prefixes": "",
+        "accepted_policy_target_identity_sha256": [],
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("policy_dose_lr_area", 0.0125),
+        ("policy_dose_reference_global_batch_size", 2048),
+        ("public_card_lr_mult", 4.0),
+        ("scalar_value_loss_readout", "deployed_tanh"),
+        ("scalar_value_loss_scale", 0.75),
+        ("value_player_outcome_balance_mode", "sampler_balanced_v1"),
+        ("base_sampler", "coverage_importance_v1"),
+        (
+            "entity_feature_adapter_version",
+            "rust_entity_adapter_v5_meaningful_history_v2",
+        ),
+        ("public_rule_state_features", True),
+        ("value_tower_split_layers", 1),
+        ("meaningful_public_history", True),
+        ("event_history_limit", 32),
+        ("meaningful_public_history_pooling", "ordered_attention_v2"),
+        ("meaningful_public_history_target_gather", True),
+        ("require_feature_learning_signal_modules", "event_encoder,value_head"),
+        ("minimum_feature_learning_signal_observations", 2),
+        ("train_diagnostics_every_batches", 16),
+        ("objective_gradient_interference_every_batches", 16),
+        ("require_only_trainable_prefixes", "public_card_count_residual"),
+        (
+            "accepted_policy_target_identity_sha256",
+            ["sha256:" + "a" * 64],
+        ),
+    ],
+)
+def test_resume_identity_rejects_untyped_trajectory_or_admission_drift(
+    field: str, changed_value
+) -> None:
+    """Every live trajectory/admission flag must participate in optimizer resume."""
+
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    config = TrainConfig(
+        init_checkpoint="epoch1.pt", init_checkpoint_sha256="sha256:a"
+    )
+    baseline = tb._training_resume_recipe_identity(
+        config, _resume_identity_args(), ddp
+    )
+    changed = tb._training_resume_recipe_identity(
+        config, _resume_identity_args(**{field: changed_value}), ddp
+    )
+
+    assert changed != baseline
+
+
+def test_resume_progress_rejects_public_card_group_multiplier_4x_to_2x(
+    tmp_path: Path,
+) -> None:
+    """Same optimizer group topology may not silently restore a different group LR."""
+
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    config = TrainConfig(
+        init_checkpoint="epoch1.pt", init_checkpoint_sha256="sha256:a"
+    )
+    four_x = tb._training_resume_recipe_identity(
+        config, _resume_identity_args(public_card_lr_mult=4.0), ddp
+    )
+    two_x = tb._training_resume_recipe_identity(
+        config, _resume_identity_args(public_card_lr_mult=2.0), ddp
+    )
+    checkpoint, _, _ = _committed_progress(tmp_path, recipe=four_x)
+
+    assert four_x["public_card_lr_mult"] == 4.0
+    assert two_x["public_card_lr_mult"] == 2.0
+    with pytest.raises(TrainingProgressError, match="recipe/schedule"):
+        load_training_progress(checkpoint, expected_recipe_identity=two_x)
+
+
+@pytest.mark.parametrize(
+    ("field", "first", "second"),
+    [
+        (
+            "require_feature_learning_signal_modules",
+            "value_head,event_encoder,value_head",
+            "event_encoder,value_head",
+        ),
+        (
+            "require_only_trainable_prefixes",
+            "value_head,public_card_count_residual",
+            "public_card_count_residual,value_head",
+        ),
+        (
+            "accepted_policy_target_identity_sha256",
+            ["sha256:" + "b" * 64, "sha256:" + "a" * 64],
+            [
+                "sha256:" + "a" * 64,
+                "sha256:" + "b" * 64,
+                "sha256:" + "a" * 64,
+            ],
+        ),
+    ],
+)
+def test_resume_identity_canonicalizes_order_insensitive_admission_sets(
+    field: str, first, second
+) -> None:
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    config = TrainConfig()
+
+    assert tb._training_resume_recipe_identity(
+        config, _resume_identity_args(**{field: first}), ddp
+    ) == tb._training_resume_recipe_identity(
+        config, _resume_identity_args(**{field: second}), ddp
+    )
+
+
+def test_resume_identity_infers_v5_history_schema_from_resolved_checkpoint_fields() -> (
+    None
+):
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    identity = tb._training_resume_recipe_identity(
+        TrainConfig(),
+        _resume_identity_args(
+            entity_feature_adapter_version=None,
+            public_rule_state_features=True,
+            meaningful_public_history=True,
+            event_history_limit=64,
+        ),
+        ddp,
+    )
+
+    assert (
+        identity["entity_feature_adapter_version"]
+        == "rust_entity_adapter_v5_meaningful_history_v2"
+    )
+    assert (
+        identity["meaningful_public_history_schema"]
+        == "meaningful_public_history_2p_no_trade_v2"
+    )
+
+
+def test_resume_identity_reads_legacy_v2_adapter_from_checkpoint(
+    tmp_path: Path,
+) -> None:
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    checkpoint = tmp_path / "legacy-entity.pt"
+    torch.save({"config": {}}, checkpoint)
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    identity = tb._training_resume_recipe_identity(
+        TrainConfig(init_checkpoint=str(checkpoint)),
+        _resume_identity_args(init_checkpoint=str(checkpoint)),
+        ddp,
+    )
+
+    assert (
+        identity["entity_feature_adapter_version"]
+        == "rust_entity_adapter_v2_land_topology_ports_maritime"
+    )
+    assert (
+        identity["meaningful_public_history_schema"]
+        == "meaningful_public_history_2p_no_trade_v1"
+    )
+
+
+def test_non_entity_resume_does_not_infer_legacy_entity_adapter(
+    tmp_path: Path,
+) -> None:
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    tb = _load_train_bc()
+    checkpoint = tmp_path / "xdim.pt"
+    torch.save({"config": {}, "policy_type": "xdim_lite"}, checkpoint)
+    ddp = {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0}
+    scratch = tb._training_resume_recipe_identity(
+        TrainConfig(arch="xdim_lite"),
+        _resume_identity_args(arch="xdim_lite"),
+        ddp,
+    )
+    resumed = tb._training_resume_recipe_identity(
+        TrainConfig(arch="xdim_lite", init_checkpoint=str(checkpoint)),
+        _resume_identity_args(
+            arch="xdim_lite", init_checkpoint=str(checkpoint)
+        ),
+        ddp,
+    )
+
+    assert scratch == resumed
+    assert resumed["entity_feature_adapter_version"] == ""
+    assert resumed["meaningful_public_history_schema"] == ""
+
+
 def test_resume_identity_normalizes_only_the_checkpoint_being_resumed() -> None:
     """Changing the checkpoint file is expected; changing the recipe is not."""
     from catan_zero.rl.pipeline_configs import TrainConfig
