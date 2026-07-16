@@ -2105,7 +2105,7 @@ def _policy_training_signal_attestation(
     sufficient statistics and fail closed before the final checkpoint is saved.
     """
 
-    coefficient = float(policy_loss_weight)
+    coefficient = _validate_policy_loss_weight(policy_loss_weight)
     base_active_rows = sum(
         int(metric.get("policy_base_active_rows", 0)) for metric in metrics
     )
@@ -2162,6 +2162,18 @@ def _policy_training_signal_attestation(
             f"effective_weight_sum={effective_weight_sum})"
         )
     return attestation
+
+
+def _validate_policy_loss_weight(value: float) -> float:
+    """Return a safe policy coefficient or reject anti-/undefined training."""
+
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise SystemExit(
+            "--policy-loss-weight must be finite and non-negative; "
+            f"got {value}"
+        )
+    return value
 
 
 def _optimizer_lr_dose_attestation(
@@ -9440,6 +9452,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("--target-reliability-confidence-floor must be in [0, 1]")
     _validate_adaptive_policy_kl_args(args)
     args.max_grad_norm = _validate_max_grad_norm(args.max_grad_norm)
+    args.policy_loss_weight = _validate_policy_loss_weight(
+        args.policy_loss_weight
+    )
     if float(args.belief_resource_loss_weight) < 0.0:
         raise SystemExit("--belief-resource-loss-weight must be >= 0")
     if float(args.belief_resource_loss_weight) > 0.0:

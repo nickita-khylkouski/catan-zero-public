@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import ast
+import math
+from pathlib import Path
+
 import pytest
 
 from tools import train_bc
@@ -63,6 +67,27 @@ def test_policy_signal_attestation_allows_explicit_value_only_training() -> None
     assert attestation["trained_policy_objective"] is False
 
 
+@pytest.mark.parametrize("coefficient", [-1.0, math.nan, math.inf, -math.inf])
+def test_policy_signal_attestation_rejects_unsafe_coefficients(
+    coefficient: float,
+) -> None:
+    with pytest.raises(
+        SystemExit, match="policy-loss-weight must be finite and non-negative"
+    ):
+        train_bc._policy_training_signal_attestation(
+            [
+                {
+                    "samples": 32,
+                    "policy_base_active_rows": 32,
+                    "loss_denominators": {"policy_loss": 32.0},
+                }
+            ],
+            policy_loss_weight=coefficient,
+            optimizer_steps=1,
+            train_value_only=False,
+        )
+
+
 def test_optimizer_lr_dose_attests_integrated_area_per_group() -> None:
     import torch
 
@@ -89,3 +114,95 @@ def test_optimizer_lr_dose_attests_integrated_area_per_group() -> None:
             "mean_applied_lr": pytest.approx(1.25e-4),
         }
     ]
+
+
+def test_policy_signal_attestation_is_wired_to_report_and_final_checkpoint() -> None:
+    """Source contract: computed evidence must survive both durable outputs."""
+
+    source_path = Path(train_bc.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    main = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+
+    early_validation = next(
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "args"
+            and target.attr == "policy_loss_weight"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "_validate_policy_loss_weight"
+    )
+    report_assignment = next(
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "report"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Dict)
+    )
+    assert early_validation.lineno < report_assignment.lineno
+    report_fields = {
+        key.value: value
+        for key, value in zip(
+            report_assignment.value.keys,
+            report_assignment.value.values,
+            strict=True,
+        )
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+    assert isinstance(report_fields["policy_training_signal"], ast.Name)
+    assert report_fields["policy_training_signal"].id == "policy_training_signal"
+
+    surface_assignments = [
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "training_information_surface"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Dict)
+    ]
+    assert any(
+        any(
+            isinstance(key, ast.Constant) and key.value == "policy_training_signal"
+            for key in assignment.value.keys
+        )
+        for assignment in surface_assignments
+    )
+
+    final_save = next(
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_save_policy"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Attribute)
+        and isinstance(node.args[1].value, ast.Name)
+        and node.args[1].value.id == "args"
+        and node.args[1].attr == "checkpoint"
+    )
+    checkpoint_surface = next(
+        keyword.value
+        for keyword in final_save.keywords
+        if keyword.arg == "training_information_surface"
+    )
+    assert isinstance(checkpoint_surface, ast.Call)
+    assert isinstance(checkpoint_surface.func, ast.Name)
+    assert checkpoint_surface.func.id == "_policy_kl_controller_surface"
+    assert isinstance(checkpoint_surface.args[0], ast.Name)
+    assert checkpoint_surface.args[0].id == "training_information_surface"
