@@ -20,21 +20,34 @@ def test_policy_aux_validation_reconstructs_the_training_objective() -> None:
             "raw_batch_mean_loss": 2.5,
             "policy_loss": 0.5,
             "value_loss": 1.5,
+            "policy_kl_anchor_loss": 0.1,
+            "loss_denominators": {"policy_kl_anchor_loss": 10.0},
         },
         {
             "samples": 40,
             "policy_loss": 1.2,
-            "loss_denominators": {"policy_loss": 3.0},
+            "policy_kl_anchor_loss": 0.5,
+            "loss_denominators": {
+                "policy_loss": 3.0,
+                "policy_kl_anchor_loss": 6.0,
+            },
         },
         policy_loss_weight=1.0,
         policy_aux_loss_weight=0.25,
+        policy_kl_anchor_weight=0.4,
     )
 
     assert combined["policy_base_loss"] == 0.5
     assert combined["policy_aux_loss"] == 1.2
     assert combined["policy_loss"] == pytest.approx(0.8)
-    assert combined["loss"] == pytest.approx(2.3)
-    assert combined["component_reconstructed_loss"] == pytest.approx(2.3)
+    assert combined["policy_kl_anchor_loss"] == pytest.approx(0.225)
+    assert combined["policy_kl_anchor_base_loss"] == 0.1
+    assert combined["policy_kl_anchor_aux_loss"] == 0.5
+    assert combined["policy_kl_anchor_controller_measure"] == pytest.approx(
+        1.75 / 11.5
+    )
+    assert combined["loss"] == pytest.approx(2.35)
+    assert combined["component_reconstructed_loss"] == pytest.approx(2.35)
     assert combined["base_raw_batch_mean_loss"] == 2.5
     assert combined["policy_aux_validation_effective_weight_sum"] == 3.0
 

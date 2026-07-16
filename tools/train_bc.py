@@ -12450,6 +12450,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
             "policy_kl_anchor_loss": 0.0,
+            "policy_kl_anchor_base_loss": 0.0,
+            "policy_kl_anchor_aux_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
             "belief_resource_loss": 0.0,
@@ -12470,6 +12472,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
             "policy_kl_anchor_loss": 0.0,
+            "policy_kl_anchor_base_loss": 0.0,
+            "policy_kl_anchor_aux_loss": 0.0,
             "value_uncertainty_loss": 0.0,
             "aux_subgoal_loss": 0.0,
             "belief_resource_loss": 0.0,
@@ -13015,6 +13019,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "final_vp_loss",
                 "q_loss",
                 "policy_kl_anchor_loss",
+                "policy_kl_anchor_base_loss",
+                "policy_kl_anchor_aux_loss",
                 "value_uncertainty_loss",
                 "aux_subgoal_loss",
                 "belief_resource_loss",
@@ -13507,6 +13513,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "value_categorical_loss",
             )
         }
+        auxiliary_loss_epochs["policy_kl_anchor_base_loss"] = (
+            _metric_from_sum_denominator(
+                epoch_extra_sums["policy_kl_anchor_base_loss"],
+                epoch_extra_denominators["policy_kl_anchor_base_loss"],
+            )
+        )
+        auxiliary_loss_epochs["policy_kl_anchor_aux_loss"] = (
+            _metric_from_sum_denominator(
+                epoch_extra_sums["policy_kl_anchor_aux_loss"],
+                epoch_extra_denominators["policy_kl_anchor_aux_loss"],
+            )
+        )
+        auxiliary_loss_epochs["policy_kl_anchor_loss"] = (
+            auxiliary_loss_epochs["policy_kl_anchor_base_loss"]
+            + float(args.policy_aux_loss_weight)
+            * auxiliary_loss_epochs["policy_kl_anchor_aux_loss"]
+        )
         auxiliary_loss_epochs["aux_subgoal_loss"] = sum(
             _metric_from_sum_denominator(
                 epoch_aux_subgoal_sums[field],
@@ -14071,6 +14094,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.advantage_weight_floor,
                 ddp,
                 args.amp,
+                policy_kl_anchor_weight=0.0,
+                policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
                 data_sharded=bool(args.ddp_shard_data),
                 data_loader_workers=int(args.data_loader_workers),
                 data_loader_prefetch=int(args.data_loader_prefetch),
@@ -14092,6 +14117,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 validation_policy_aux,
                 policy_loss_weight=float(args.policy_loss_weight),
                 policy_aux_loss_weight=float(args.policy_aux_loss_weight),
+                policy_kl_anchor_weight=(
+                    float(args.policy_kl_anchor_weight)
+                    if policy_kl_controller is None
+                    else float(policy_kl_controller.coefficient)
+                ),
             )
             objective_wrapper = (
                 dict(base_wrapper) if isinstance(base_wrapper, dict) else {}
@@ -16082,6 +16112,13 @@ def _train_xdim_batch(
         policy_aux_phase_stats: dict = {}
         policy_aux_phase_stats_unforced: dict = {}
         policy_aux_teacher_stats: dict = {}
+        policy_aux_kl_anchor_loss = torch.tensor(
+            0.0, dtype=torch.float32, device=policy.device
+        )
+        (
+            policy_aux_kl_anchor_loss_sum,
+            policy_aux_kl_anchor_loss_denominator,
+        ) = _zero_loss_parts(policy.device)
         if policy_aux_batch is not None:
             if policy_aux_data is None or policy_aux_sample_weights is None:
                 raise ValueError("incomplete policy auxiliary batch inputs")
@@ -16112,6 +16149,22 @@ def _train_xdim_batch(
                 symmetry_rng=symmetry_rng,
                 symmetry_relabel_events=symmetry_relabel_events,
             )
+            if float(policy_kl_anchor_weight) != 0.0 or bool(
+                policy_kl_anchor_measure
+            ):
+                aux_anchor = _policy_kl_anchor_loss_parts(
+                    policy_aux_data,
+                    policy_aux_batch,
+                    aux_outputs["logits"],
+                    policy.device,
+                    direction=policy_kl_anchor_direction,
+                )
+                if aux_anchor is not None:
+                    (
+                        policy_aux_kl_anchor_loss,
+                        policy_aux_kl_anchor_loss_sum,
+                        policy_aux_kl_anchor_loss_denominator,
+                    ) = aux_anchor
             aux_hard = nn.functional.cross_entropy(
                 aux_outputs["logits"], aux_actions, reduction="none"
             )
@@ -16261,8 +16314,13 @@ def _train_xdim_batch(
         # Policy-KL anchor (unfreeze-with-KL value-repair recipe): pull the trained
         # policy toward the seed's recorded prior_policy. Only computed when enabled,
         # so a 0-weight run is bit-identical to pre-anchor behavior.
-        kl_anchor_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
-        kl_anchor_loss_sum, kl_anchor_loss_denominator = _zero_loss_parts(policy.device)
+        policy_base_kl_anchor_loss = torch.tensor(
+            0.0, dtype=torch.float32, device=policy.device
+        )
+        (
+            policy_base_kl_anchor_loss_sum,
+            policy_base_kl_anchor_loss_denominator,
+        ) = _zero_loss_parts(policy.device)
         if float(policy_kl_anchor_weight) != 0.0 or bool(
             policy_kl_anchor_measure
         ):
@@ -16275,10 +16333,28 @@ def _train_xdim_batch(
             )
             if _anchor is not None:
                 (
-                    kl_anchor_loss,
-                    kl_anchor_loss_sum,
-                    kl_anchor_loss_denominator,
+                    policy_base_kl_anchor_loss,
+                    policy_base_kl_anchor_loss_sum,
+                    policy_base_kl_anchor_loss_denominator,
                 ) = _anchor
+        # The policy objective normalizes the base and high-surprise AUX streams
+        # independently. Apply the parent trust region to both streams with the
+        # same semantics; otherwise the dominant AUX gradient can move the trunk
+        # without appearing in the reported/controller KL. The controller keeps
+        # one interpretable mean over the effective two-stream measure.
+        (
+            kl_anchor_loss,
+            kl_anchor_loss_sum,
+            kl_anchor_loss_denominator,
+        ) = _combine_policy_kl_anchor_streams(
+            policy_base_kl_anchor_loss,
+            policy_base_kl_anchor_loss_sum,
+            policy_base_kl_anchor_loss_denominator,
+            policy_aux_kl_anchor_loss,
+            policy_aux_kl_anchor_loss_sum,
+            policy_aux_kl_anchor_loss_denominator,
+            aux_coefficient=float(policy_aux_loss_weight),
+        )
         # Value-uncertainty auxiliary head: regress the value head's own squared
         # error (z - v)^2 with a stop-gradient on v (KataGo short-term-error style;
         # Huber loss because the target is already a squared quantity). No-op unless
@@ -16752,7 +16828,26 @@ def _train_xdim_batch(
         "policy_kl_anchor_loss_weight_sum": float(
             kl_anchor_loss_denominator.item()
         ),
-        "policy_kl_anchor_eligible_rows": int(kl_anchor_loss_denominator.item()),
+        "policy_kl_anchor_eligible_rows": int(
+            policy_base_kl_anchor_loss_denominator.item()
+            + policy_aux_kl_anchor_loss_denominator.item()
+        ),
+        "policy_kl_anchor_base_loss": float(
+            policy_base_kl_anchor_loss.item()
+        ),
+        "policy_kl_anchor_base_loss_weighted_sum": float(
+            policy_base_kl_anchor_loss_sum.item()
+        ),
+        "policy_kl_anchor_base_loss_weight_sum": float(
+            policy_base_kl_anchor_loss_denominator.item()
+        ),
+        "policy_kl_anchor_aux_loss": float(policy_aux_kl_anchor_loss.item()),
+        "policy_kl_anchor_aux_loss_weighted_sum": float(
+            policy_aux_kl_anchor_loss_sum.item()
+        ),
+        "policy_kl_anchor_aux_loss_weight_sum": float(
+            policy_aux_kl_anchor_loss_denominator.item()
+        ),
         "value_uncertainty_loss": float(value_uncertainty_loss.item()),
         "value_uncertainty_loss_weighted_sum": float(
             value_uncertainty_loss_sum.item()
@@ -16982,6 +17077,7 @@ def _combine_policy_aux_validation_metrics(
     *,
     policy_loss_weight: float,
     policy_aux_loss_weight: float,
+    policy_kl_anchor_weight: float = 0.0,
 ) -> dict:
     """Reconstruct the exact two-stream policy objective used by training.
 
@@ -16999,17 +17095,46 @@ def _combine_policy_aux_validation_metrics(
         raise ValueError("policy AUX validation metrics are incomplete")
     coefficient = float(policy_aux_loss_weight)
     policy_coefficient = float(policy_loss_weight)
+    anchor_coefficient = float(policy_kl_anchor_weight)
     if not math.isfinite(coefficient) or coefficient < 0.0:
         raise ValueError("policy AUX validation coefficient is invalid")
     if not math.isfinite(policy_coefficient) or policy_coefficient < 0.0:
         raise ValueError("policy validation coefficient is invalid")
+    if not math.isfinite(anchor_coefficient) or anchor_coefficient < 0.0:
+        raise ValueError("policy KL validation coefficient is invalid")
 
     base_policy = float(base_metrics["policy_loss"])
     aux_policy = float(aux_metrics["policy_loss"])
+    base_anchor = float(base_metrics.get("policy_kl_anchor_loss", 0.0))
+    aux_anchor = float(aux_metrics.get("policy_kl_anchor_loss", 0.0))
     combined_policy = base_policy + coefficient * aux_policy
+    combined_anchor = base_anchor + coefficient * aux_anchor
     combined_loss = (
         float(base_metrics["loss"])
         + policy_coefficient * coefficient * aux_policy
+        + anchor_coefficient * coefficient * aux_anchor
+    )
+    base_anchor_denominator = float(
+        (base_metrics.get("loss_denominators") or {}).get(
+            "policy_kl_anchor_loss", 0.0
+        )
+    )
+    aux_anchor_denominator = float(
+        (aux_metrics.get("loss_denominators") or {}).get(
+            "policy_kl_anchor_loss", 0.0
+        )
+    )
+    controller_denominator = (
+        base_anchor_denominator + coefficient * aux_anchor_denominator
+    )
+    controller_anchor = (
+        (
+            base_anchor * base_anchor_denominator
+            + coefficient * aux_anchor * aux_anchor_denominator
+        )
+        / controller_denominator
+        if controller_denominator > 0.0
+        else 0.0
     )
     combined = dict(base_metrics)
     combined.update(
@@ -17020,6 +17145,11 @@ def _combine_policy_aux_validation_metrics(
             "policy_base_loss": base_policy,
             "policy_aux_loss": aux_policy,
             "policy_aux_loss_weight": coefficient,
+            "policy_kl_anchor_loss": combined_anchor,
+            "policy_kl_anchor_base_loss": base_anchor,
+            "policy_kl_anchor_aux_loss": aux_anchor,
+            "policy_kl_anchor_controller_measure": controller_anchor,
+            "policy_kl_anchor_controller_weight_sum": controller_denominator,
             "policy_aux_validation_samples": int(aux_metrics.get("samples", 0)),
             "policy_aux_validation_effective_weight_sum": float(
                 (aux_metrics.get("loss_denominators") or {}).get(
@@ -22981,6 +23111,34 @@ def per_game_policy_surprise_sampling_report(
             authenticated_component_sampling and enabled
         ),
     }
+
+
+def _combine_policy_kl_anchor_streams(
+    base_mean,
+    base_sum,
+    base_denominator,
+    aux_mean,
+    aux_sum,
+    aux_denominator,
+    *,
+    aux_coefficient: float,
+):
+    """Combine base/AUX trust-region objectives and controller evidence.
+
+    Policy CE treats the base and high-surprise streams as independently
+    normalized objectives, so the differentiable KL regularizer must do the
+    same. The adaptive controller instead consumes one effective-mixture mean;
+    returning its weighted sum/denominator preserves the existing target-KL
+    interpretation without leaving AUX drift invisible.
+    """
+
+    coefficient = float(aux_coefficient)
+    if not math.isfinite(coefficient) or coefficient < 0.0:
+        raise ValueError("policy AUX KL coefficient must be finite and non-negative")
+    objective = base_mean + coefficient * aux_mean
+    controller_sum = base_sum + coefficient * aux_sum
+    controller_denominator = base_denominator + coefficient * aux_denominator
+    return objective, controller_sum, controller_denominator
 
 
 def _policy_kl_anchor_loss(

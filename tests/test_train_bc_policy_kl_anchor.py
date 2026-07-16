@@ -15,11 +15,35 @@ import pytest
 import torch
 
 from tools.train_bc import (
+    _combine_policy_kl_anchor_streams,
     _policy_kl_anchor_loss,
     _policy_kl_anchor_loss_parts,
     _prior_kl_telemetry,
     _q_score_loss_parts,
 )
+
+
+def test_two_stream_anchor_backpropagates_through_aux_and_separates_controller() -> None:
+    base = torch.tensor(0.0, requires_grad=True)
+    aux = torch.tensor(0.5, requires_grad=True)
+    objective, controller_sum, controller_denominator = (
+        _combine_policy_kl_anchor_streams(
+            base,
+            torch.tensor(0.0),
+            torch.tensor(10.0),
+            aux,
+            torch.tensor(3.0),
+            torch.tensor(6.0),
+            aux_coefficient=0.25,
+        )
+    )
+
+    objective.backward()
+
+    assert base.grad.item() == pytest.approx(1.0)
+    assert aux.grad.item() == pytest.approx(0.25)
+    assert controller_sum.item() == pytest.approx(0.75)
+    assert controller_denominator.item() == pytest.approx(11.5)
 
 
 def _base_data(**overrides):
