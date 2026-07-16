@@ -3124,6 +3124,7 @@ def _post_policy_dose_value_trunk_routing(
     post_scale: float,
     target_lr_area: float,
     realized_policy_loss_weight: float,
+    pending_policy_lr_area_weight: float = 0.0,
 ) -> dict[str, object]:
     """Resolve the per-batch value boundary without redefining a zero-dose run."""
 
@@ -3131,6 +3132,7 @@ def _post_policy_dose_value_trunk_routing(
     post = float(post_scale)
     target = float(target_lr_area)
     policy_weight = float(realized_policy_loss_weight)
+    pending_weight = float(pending_policy_lr_area_weight)
     for name, value in (
         ("--value-trunk-grad-scale", base),
         ("--post-policy-dose-value-trunk-grad-scale", post),
@@ -3139,10 +3141,14 @@ def _post_policy_dose_value_trunk_routing(
             raise SystemExit(f"{name} must be finite and in [0, 1]")
     if not math.isfinite(target) or target < 0.0:
         raise SystemExit("--policy-dose-lr-area must be finite and >= 0")
+    if not math.isfinite(pending_weight) or pending_weight < 0.0:
+        raise ValueError(
+            "pending policy LR-area weight must be finite and non-negative"
+        )
     if target == 0.0:
         phase = "dormant_no_positive_policy_dose"
         effective = base
-    elif policy_weight > 0.0:
+    elif policy_weight > 0.0 or pending_weight > 0.0:
         phase = "pre_or_boundary_policy_dose"
         effective = base
     else:
@@ -3154,6 +3160,7 @@ def _post_policy_dose_value_trunk_routing(
         "effective_value_trunk_grad_scale": effective,
         "base_value_trunk_grad_scale": base,
         "post_policy_dose_value_trunk_grad_scale": post,
+        "pending_policy_lr_area_weight": pending_weight,
         "positive_policy_dose_enabled": target > 0.0,
         "shared_policy_representation_frozen": (
             phase == "post_policy_dose" and effective == 0.0
@@ -15404,6 +15411,9 @@ def main(
                     "grad_accum_steps": accumulation_group_size,
                     "accum_do_zero_grad": accum_do_zero_grad,
                     "accum_do_step": accum_do_step,
+                    "preserve_accumulated_policy_gradients": (
+                        policy_group_lr_area_weight > 0.0
+                    ),
                 }
             applied_lr_multiplier = _apply_lr_schedule(
                 optimizer,
@@ -15471,6 +15481,7 @@ def main(
                 ),
                 target_lr_area=float(args.policy_dose_lr_area),
                 realized_policy_loss_weight=batch_policy_loss_weight,
+                pending_policy_lr_area_weight=policy_group_lr_area_weight,
             )
             batch_value_trunk_grad_scale = float(
                 batch_post_policy_routing[
@@ -19906,6 +19917,7 @@ def _train_xdim_batch(
     grad_accum_steps: int = 1,
     accum_do_zero_grad: bool = True,
     accum_do_step: bool = True,
+    preserve_accumulated_policy_gradients: bool = False,
     policy_aux_data=None,
     policy_aux_batch: np.ndarray | None = None,
     policy_aux_sample_weights: np.ndarray | None = None,
@@ -20702,6 +20714,7 @@ def _train_xdim_batch(
     if (
         float(policy_loss_weight) == 0.0
         and float(policy_kl_anchor_weight) == 0.0
+        and not bool(preserve_accumulated_policy_gradients)
     ):
         policy_only_gradients_suppressed = (
             _suppress_inactive_policy_only_gradients(policy, optimizer)

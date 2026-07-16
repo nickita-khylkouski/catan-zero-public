@@ -763,6 +763,110 @@ def test_zero_objective_last_microbatch_applies_accumulated_nonzero_gradient(
     assert any(not torch.equal(before[name], after[name]) for name in before)
 
 
+def test_policy_dose_boundary_preserves_pending_accumulated_policy_gradient(
+    tmp_path,
+) -> None:
+    import torch
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(3))
+    batch = np.arange(len(data["action_taken"]))
+    active = np.ones(len(batch), dtype=np.float32)
+    zero = np.zeros(len(batch), dtype=np.float32)
+    policy = _make_entity_policy()
+    parameter = policy.model.action_bias.weight
+    before = parameter.detach().clone()
+    learning_rate = 1.0e-3
+    optimizer = torch.optim.SGD(policy.model.parameters(), lr=learning_rate)
+    common = {
+        "soft_target_temperature": 1.0,
+        "soft_target_weight": 0.0,
+        "soft_target_source": "scores",
+        "soft_target_min_legal_coverage": 0.0,
+        "value_loss_weight": 0.0,
+        "final_vp_loss_weight": 0.0,
+        "q_loss_weight": 0.0,
+        "q_skip_teacher_prefixes": (),
+        "vps_to_win": 10,
+        "advantage_policy_weighting": "none",
+        "advantage_temperature": 1.0,
+        "advantage_weight_cap": 5.0,
+        "advantage_weight_floor": 0.05,
+        "amp": "none",
+        "diagnostics": False,
+        "grad_accum_steps": 2,
+    }
+
+    first = _train_xdim_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        active,
+        zero,
+        policy_loss_weight=1.0,
+        accum_do_zero_grad=True,
+        accum_do_step=False,
+        **common,
+    )
+    pending_gradient = parameter.grad.detach().clone()
+    assert bool((pending_gradient.abs().sum() > 0.0).item())
+    pending_weight, _ = train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
+        policy_loss_weight=1.0,
+        policy_objective_fraction=1.0,
+        globally_base_objective_mass=1.0,
+        globally_aux_objective_mass=0.0,
+        policy_aux_loss_weight=1.0,
+        accumulation_group_size=2,
+    )
+    target_lr_area = learning_rate * pending_weight
+    boundary_weight = train_bc._policy_microbatch_weight_for_lr_area(  # noqa: SLF001
+        1.0,
+        scheduled_base_lr=learning_rate,
+        consumed_lr_area=0.0,
+        target_lr_area=target_lr_area,
+        pending_group_lr_area_weight=pending_weight,
+        globally_base_objective_mass=1.0,
+        globally_aux_objective_mass=0.0,
+        policy_aux_loss_weight=1.0,
+        accumulation_group_size=2,
+    )
+    routing = train_bc._post_policy_dose_value_trunk_routing(  # noqa: SLF001
+        base_scale=0.25,
+        post_scale=0.0,
+        target_lr_area=target_lr_area,
+        realized_policy_loss_weight=boundary_weight,
+        pending_policy_lr_area_weight=pending_weight,
+    )
+    second = _train_xdim_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        zero,
+        zero,
+        policy_loss_weight=boundary_weight,
+        value_trunk_grad_scale=float(
+            routing["effective_value_trunk_grad_scale"]
+        ),
+        preserve_accumulated_policy_gradients=True,
+        accum_do_zero_grad=False,
+        accum_do_step=True,
+        **common,
+    )
+
+    assert first["optimizer_step_applied"] is False
+    assert boundary_weight == 0.0
+    assert routing["phase"] == "pre_or_boundary_policy_dose"
+    assert routing["shared_policy_representation_frozen"] is False
+    assert second["optimizer_step_applied"] is True
+    torch.testing.assert_close(parameter.grad, pending_gradient)
+    torch.testing.assert_close(
+        parameter.detach(),
+        before - learning_rate * pending_gradient,
+    )
+    assert learning_rate * pending_weight == pytest.approx(target_lr_area)
+
+
 def test_nonzero_loss_with_exact_zero_gradient_preserves_optimizer_semantics() -> None:
     from types import SimpleNamespace
 
