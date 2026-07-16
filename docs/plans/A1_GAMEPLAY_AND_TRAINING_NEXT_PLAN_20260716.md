@@ -18,6 +18,76 @@ Completed production fixes:
 - Adaptive target-activation evidence now rejects decision classes outside the
   declared current taxonomy instead of silently counting them as randomized
   search.
+- Learner ablation and batch-probe reporting fields are now authenticated as
+  part of the effective recipe. Telemetry can no longer appear in a child
+  command without its sealed declaration.
+- `value_trunk_grad_scale` authorization is independent of policy-aux
+  activation. Value-routing experiments no longer fail merely because the
+  policy auxiliary objective is off, while the declared recipe and code-tree
+  binding remain mandatory.
+- S3 internal replay now retains the pooler's canonical planned/runtime native
+  engine identity instead of stripping it and validating a superseded neutral
+  identity.
+- Search compute accounting now reports exact per-search neural/cache counts
+  and fails closed when the native engine cannot supply them.
+- Self-play now binds the checkpoint-backed teacher adapter separately from
+  the newer learner-row adapter. A v2 teacher can therefore generate v5 rows
+  without falsely claiming that the checkpoint consumes v5 features.
+- Policy-dose accounting now selects the actual base-batch weights before
+  measuring active rows and objective mass. It no longer counts an entire
+  corpus vector or a prefetched policy-aux tail as the current base dose.
+- Canonical generation, evaluation, and training launchers authenticate the
+  complete commissioned config payload, and wheel release now requires the
+  current entity-feature and boundary-particle native capabilities.
+- The canonical learner now explicitly seals a fresh-scratch initializer,
+  full whole-game validation (`validation_max_samples=0`), no phantom MoE
+  objective, and full-strength END_TURN/ROLL value observations. This removes
+  an accidental 0.1 END_TURN value multiplier and prevents parent chaining.
+- One-dose and generic-ablation commands propagate the sealed MoE coefficient.
+  Historical pre-MoE authorities bind their inherited 0.01 default explicitly;
+  the current non-MoE scratch authority binds 0.0. Child parsing can no longer
+  silently change the declared effective recipe.
+- Resume identity now binds checkout code and effective matmul precision; DDP
+  startup fails closed on unknown storage topology; derived-array cache reuse
+  binds the objective-active scope.
+- Canonical generation now uses the retained 128-worker strict-FP32 EvalServer
+  frontier and authenticates its updated payload digest. The old digest had
+  made every canonical launch refuse before generation.
+- Gameplay probes now bind the checkpoint's adapter, masking, meaningful-history,
+  public-award, and action-context contracts instead of silently comparing
+  models on different observation spaces. Teacher-gap probes also reconstruct
+  the report-authenticated legacy-to-authoritative public-award initialization
+  before measuring parent-to-candidate movement, and reject non-boolean mixed-
+  corpus acknowledgements instead of coercing strings to true.
+- Function-preserving value-tower receipts now bind the exact six-layer
+  Transformer source topology. Copying block 5 is no longer accepted as proof
+  for a different layer count, trunk, existing split, or deliberation path.
+- Scratch admission now requires at least 32 Kish-effective policy rows per
+  global batch, and coherent arms bind initializer topology and bytes.
+  Policy-target temperature is applied exactly once rather than accidentally
+  sharpening or softening the teacher twice.
+
+Verification status:
+
+- The repaired training/campaign slice passes 469/469 both locally and on the
+  exclusive H100.
+- Canonical launcher/config and adjacent guard tests pass 109/109 on the H100.
+- A clean full H100 suite at commit `1f4228d` passed 5,888 tests with 26 skips
+  and zero failures in 20m13s. A second H100 suite pinned to `259a0a7` completed
+  5,987 passes and 26 skips in 20m22s with one stale scratch-recipe digest
+  assertion. The recipe already matched its loaded contract; later `main`
+  updated both bound digests, and the current recipe/launcher panel passes
+  81/81 on `db118d1`. The failed pinned run is retained rather than
+  mislabelled as green.
+- The latest teacher-gap award evidence panel passes 68/68 on `2e6e5c8`, and
+  the value-tower source-topology panel passes 59/59 on the H100.
+- The sealed topology-canary authority passes 78/78 on the H100. It requires
+  exactly eight visible H100s, an immutable reviewed plan, exact current V25
+  recipe projection, report-derived steps, finite gradient telemetry, and
+  durable partial-arm receipts.
+- The topology experiment has not run: no authenticated current-v3 scratch
+  composite and reviewed lock exists on the H100. The launcher correctly
+  refuses `--go`; inventing that authority would invalidate the comparison.
 
 Adjudicated architecture arms:
 
@@ -65,6 +135,10 @@ Adjudicated value routing:
    before enabling any confidence weighting.
 6. Keep `go_authorized=false` until the optimizer horizon, value routing, and
    role-aware road representation each have replayable evidence.
+7. Repeat the bounded evaluator-query holdout under an authenticated science
+   contract. Preserve the current diagnostic result as non-promotable; require
+   sealed cohort disjointness and evaluator-transform identity before using
+   opening, pre-roll, or actor-handoff calibration as a selection gate.
 
 ## Decision
 
@@ -122,18 +196,10 @@ Shrinking by 1.25% made the model about 47% slower per step and used about 60%
 more peak memory. The 79-dimensional heads fall off the efficient attention
 path.
 
-The parameter ceiling must not force an inefficient hidden dimension. Prefer
-width 640 and either:
-
-- raise the checkpoint-class ceiling enough to cover the useful architecture;
-  or
-- remove/compress a dormant readout such as the Q head, which is frozen and
-  unused when `q_loss_weight=0`.
-
-Commit `ad7f303` moved the commissioned contract to width 640, so the inefficient
-632-width result is now historical evidence rather than an open contract bug.
-Keep width 640 fixed while testing topology so architecture and kernel-path
-effects are not confounded.
+The commissioned contract now binds width 640 and a 42M parameter ceiling, so
+the inefficient 632-width result is historical evidence rather than an open
+contract bug. Keep both the width and ceiling fixed while testing topology; do
+not remove the Q head merely to satisfy the obsolete 40M limit.
 
 ### 3. Fresh-scratch value routing is selected in prose but not commissioned by evidence
 
@@ -249,16 +315,16 @@ gates.
 
 Run matched fresh-init architecture arms:
 
-1. `C640`: exact current width-640, gather, V25 contract.
-2. `T640`: `C640` plus topology residual/relational consumption.
-3. `E640`: edge-policy head only after `T640` identifies remaining policy
-   aliasing.
+1. `C640`: exact current width-640 gather control.
+2. `R640`: `C640` plus an action-private, role-aware road endpoint structure
+   that distinguishes anchor from frontier using live ownership/connectivity.
+
+Defer the edge-policy head. The measured global topology residual, unordered
+neighborhood pooling, and endpoint gate arms are rejected diagnostics, not
+candidate production arms.
 
 Keep a no-gather permutation probe as a causal test fixture, not as the claimed
 current baseline.
-
-If the 40M ceiling is immovable, first test omitting/compressing the dormant Q
-head rather than shrinking the Transformer width.
 
 Use the same initialization seed and identical rows. Start with:
 
@@ -305,9 +371,10 @@ Required measurements:
 
 Selection rule:
 
-- reject `V0` if it learns value more slowly or plateaus lower;
-- select the smallest nonzero scale that preserves policy learning while
-  materially improving game-disjoint value calibration;
+- select among `V0`, `V25`, and `V100` by game-disjoint calibration, policy
+  preservation, and tail risk;
+- permit `V0`; require a nonzero route only if it materially and repeatably
+  beats `V0` without policy or tail-risk regression;
 - only consider an annealed scale after a fixed-scale arm proves the need.
 
 ### P0-C: calibrate teacher reliability before weighting it
@@ -415,7 +482,7 @@ Only after P0-A/B/C and fresh v5 data:
 
 - use width 640;
 - use the selected target-binding path;
-- use the selected nonzero value-gradient route;
+- use the selected evidence-backed value-gradient route;
 - run the commissioned LR/warmup schedule;
 - stop at a small fixed optimizer horizon;
 - evaluate on the frozen position book and game-disjoint value-query holdout.
@@ -426,7 +493,8 @@ Do not promote based on aggregate loss alone.
 
 The large retrain may start only when all are true:
 
-- H100-efficient width and parameter budget are explicitly resolved;
+- H100-efficient width and parameter budget remain bound to the resolved
+  width-640/42M contract;
 - action-to-target binding passes causal sensitivity and holdout tests;
 - value routing is selected by a matched scratch experiment;
 - teacher reliability is calibrated by phase;
@@ -437,16 +505,19 @@ The large retrain may start only when all are true:
 
 ## Immediate next implementation order
 
-1. Check in the replayable decision museum, beginning with the observed f7
-   opening and Road Building failures plus paired counterfactuals.
-2. Add a separate non-promotable bounded H100 scratch runner; do not weaken the
-   B200 production authority or `go_authorized=false` gate.
-3. Run matched `C640`/`T640` 128--256-step canaries on identical rows and
+1. Extend the existing replayable decision museum with role-aware road cases
+   and paired counterfactuals; preserve its hash-bound evidence contract.
+2. Materialize and authenticate a reviewed plan/lock for the existing
+   `tools/a1_h100_scratch_canary.py`; do not weaken the B200 production
+   authority or `go_authorized=false` gate.
+3. Run matched `C640`/`R640` 128--256-step canaries on identical rows and
    initialization, including the action-target permutation probe.
-4. Materialize the evaluator-query/turn-boundary value holdout and run
-   V0/V25/V100 with matched optimizer exposure.
-5. Add neural-row accounting, deterministic ordinary-leaf batching, and the
-   fused native decision payload before scaling deep-oracle evidence.
+4. Repeat the existing evaluator-query/turn-boundary holdout under an
+   authenticated science/cohort contract, then run V0/V25/V100 with matched
+   optimizer exposure.
+5. Keep the landed exact neural-row/search accounting, and add deterministic
+   ordinary-leaf batching plus the fused native decision payload before
+   scaling deep-oracle evidence.
 6. Run phase-calibrated duplicate-search reliability, generate authenticated
    v5 data, and only then run the bounded scratch canary.
 7. Consider PPO only after the supervised architecture, value route, and

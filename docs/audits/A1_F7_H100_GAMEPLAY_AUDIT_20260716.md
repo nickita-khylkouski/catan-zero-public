@@ -3,17 +3,16 @@
 ## Scope and identity
 
 - Track: two-player, no trading.
-- This gameplay diagnostic was completed on `ubuntu@192.222.54.137` before the
-  exclusive GPU assignment changed. It is retained as historical gameplay
-  evidence, not as current hardware-validation authority.
-- All continuing experiments and every new H100 result used for current
-  production decisions run on `ubuntu@192.222.55.12`; other GPU hosts are no
-  longer used.
+- The exclusive current GPU host is `ubuntu@192.222.54.137`. The earlier line
+  naming `192.222.55.12` as the continuing host is superseded. All verification
+  reported by the current repair pass ran on `192.222.54.137`; other GPU hosts
+  were not used.
 - Hardware: eight NVIDIA H100 80GB HBM3 GPUs; CUDA preflight passed.
 - Public/tournament checkpoint: f7, SHA-256
   `f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4`.
-- The recovered v5 checkpoint with SHA-256 `6817ab05...39c` is generator-only
-  and is not treated as the deployed player.
+- The recovered v5 checkpoint with SHA-256
+  `6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c`
+  is generator-only and is not treated as the deployed player.
 - B200 evidence was read and transferred only; no B200 job was run.
 
 ## What f7 appears to understand
@@ -105,3 +104,42 @@ itself represent road connectivity, cutoffs, or Longest Road plans.
 The repaired public-behavior/opening tests passed 118/118 on the same H100
 host. One paired n32 search-versus-raw smoke test split 1-1 and is not treated
 as statistical strength evidence.
+
+## Bounded evaluator-query holdout
+
+A bounded evaluator-query diagnostic using explicit non-overlapping seed ranges
+was run against the authenticated f7 checkpoint. The immutable result is
+`/home/ubuntu/value-holdout-data/f7_query_holdout_37e64f0.json`, SHA-256
+`b8d785d1a0e4a43d5d634df95f18609553ed88a9931070d1b252c540e3194251`.
+
+| Slice | RMSE | Pearson | Spearman | ECE |
+|---|---:|---:|---:|---:|
+| Global | .819 | .565 | .591 | .065 |
+| Opening | .957 | .297 | — | — |
+| END_TURN | .836 | .555 | — | — |
+| Pre-roll | .752 | .674 | — | .156 |
+
+Actor-handoff mean absolute antisymmetry error was .246 across 62 pairs from
+16 games. The weak opening correlation, elevated pre-roll calibration error,
+and actor-handoff asymmetry are concrete value-learning targets; they are not
+evidence for promoting a checkpoint or changing the commissioned objective by
+themselves.
+
+The run used explicit seed ranges but no authenticated science contract.
+Therefore cohort disjointness and evaluator-transform identity are diagnostic
+claims rather than promotion-authenticated facts. The artifact is permanently
+`diagnostic_only=true` and `promotion_eligible=false`.
+
+## Repair closeout
+
+The clean H100 full suite at `1f4228d` passed 5,888 tests with 26 skips and no
+failures in 20m13s. A later suite pinned to `259a0a7` completed 5,987 passes and
+26 skips in 20m22s with one stale scratch-recipe digest assertion. Current
+`main` binds the updated recipe/file digests; its focused recipe and canonical
+launcher panel passes 81/81 on `db118d1`.
+
+Later focused H100 panels pass 68/68 for strict teacher-gap award evidence and
+59/59 for function-preserving value-tower source topology. These results do not
+authorize a training run. No long training job was run, and the topology canary
+correctly remained blocked because no authenticated current-v3 composite and
+reviewed lock exists.

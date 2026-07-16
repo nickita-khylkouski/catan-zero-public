@@ -1,0 +1,147 @@
+schema_version: catan-zero-training-gameplay-root-fix-handoff-v1
+created_at_utc: "2026-07-16T19:24:11Z"
+status: partial
+scope:
+  track: 2p_no_trading
+  objective: make training and gameplay evidence reliable before scratch retraining
+repository:
+  remote: https://github.com/nickita-khylkouski/catan-zero-public
+  integration_worktree: /private/tmp/catan-roll-integration
+  final_code_commit: a4ea87f7ddda3c0bb4800e4c6356d83bd1e7e367
+hardware:
+  exclusive_host: ubuntu@192.222.54.137
+  accelerator: 8x NVIDIA H100 80GB HBM3
+  verification_device: 7
+constraints:
+  b200_host: read_and_transfer_only
+  scratch_diagnostics:
+    diagnostic_only: true
+    promotion_eligible: false
+  production_training_authorized: false
+  full_head_suite_verified: false
+root_fixes:
+  - exact per-search neural and cache accounting; unknown native counts fail closed
+  - effective-recipe authentication for learner diagnostics and value-trunk routing
+  - exact S3 native internal-engine replay identity
+  - separate checkpoint-teacher and learner-row feature adapter identities
+  - policy-dose accounting from the actual base batch, excluding prefetched auxiliary rows
+  - fresh-scratch initializer, whole-game validation, zero non-MoE balance loss, and full END_TURN/ROLL value weight
+  - one-dose and generic-ablation propagation of the sealed MoE coefficient
+  - checkout-code, matmul-precision, DDP-storage, derived-cache-scope, and native-ABI bindings
+  - sealed H100 C640/T640 topology canary with bit-identical shared initialization
+  - canonical generation digest updated for the retained 128-worker strict-FP32 EvalServer frontier
+  - one bounded holdout authority is used consistently by teacher-gap probes
+  - checkpoint adapter, masking, history, award, and context contracts bind probe inputs
+  - teacher-gap probes reconstruct the report-authenticated parent award transition
+  - teacher-gap mixed-corpus evidence requires a real boolean instead of truthy coercion
+  - value-tower receipts bind the exact six-layer Transformer source topology
+  - coherent arms bind initializer topology and bytes
+  - scratch admission rejects batches below 32 Kish-effective policy rows
+  - policy-target prior temperature is applied exactly once
+evidence_hardening:
+  - replayable hash-bound strategic root evidence
+  - evaluator-query holdout with explicit non-overlapping seed ranges and provenance caveat
+compatibility_repairs:
+  - current native topology-cache, canary, fleet, and runtime fixtures refreshed without weakening guards
+selected_landed_commits:
+  - c58fbc
+  - cff664e
+  - dce28cc
+  - 37e64f0
+  - 769817c
+  - 83ffb03
+  - 2e8b8d5
+  - be75afb
+  - fa80338
+  - bfef196
+  - 6975793
+  - 4664980
+  - 1f4228d
+  - d87e051
+  - 8c59160
+  - d5e022a
+  - b7508ec
+  - 2e6e5c8
+  - 7a0362c
+  - dfcb21d
+  - 8a7332c
+  - 026086d
+  - 63341b1
+  - a4ea87f
+verification:
+  clean_full_suite:
+    commit: 1f4228d75b9e4572a38c011bedc3a67fad51f2a8
+    result: 5888_passed_26_skipped_0_failed
+    elapsed: 20m13s
+    log: /home/ubuntu/full-pytest-final-1f4228d.log
+  post_259a0a7_campaign_slice:
+    commit: 259a0a72885554f79bf74d80557da6a39718014c
+    result: 469_passed_0_failed
+  post_259a0a7_adjacent_slice:
+    commit: 259a0a72885554f79bf74d80557da6a39718014c
+    result: 592_passed_1_skipped_0_failed
+  b7508ec_probe_slice:
+    commit: b7508ecb91d3c7ba04a2b598fd9711a43a4e1290
+    result: 33_passed_0_failed
+    host: ubuntu@192.222.54.137
+    command: >-
+      python -m pytest -q tests/test_action_target_binding_probe.py
+      tests/test_f69_ranking_probe.py
+      tests/test_f74_symmetry_eval_feature_contract.py
+      tests/test_posthoc_teacher_gap_probe.py
+  strict_award_evidence_slice:
+    commit: 2e6e5c87190127e99c9e192b3fef83baecf64d7a
+    result: 68_passed_0_failed
+    host: ubuntu@192.222.54.137
+    command: >-
+      python -m pytest -q tests/test_posthoc_teacher_gap_probe.py
+      tests/test_public_award_training_contract.py
+      tests/test_entity_feature_adapter_checkpoint_contract.py
+      tests/test_meaningful_history_activation.py
+      tests/test_meaningful_history_target_gather.py
+      tests/test_ordered_meaningful_history.py
+      tests/test_eval_rust_feature_opt_in.py
+  value_tower_source_topology_slice:
+    commit: a4ea87f7ddda3c0bb4800e4c6356d83bd1e7e367
+    result: 59_passed_0_failed
+    host: ubuntu@192.222.54.137
+    command: >-
+      python -m pytest -q tests/test_a1_function_preserving_upgrade.py
+      tests/test_entity_value_tower_checkpoint_upgrade.py
+      tests/test_entity_token_policy_trunk_split.py
+      tests/test_f69_upgrade_checkpoint_config.py
+  current_recipe_and_launcher_slice:
+    commit: db118d1ea8fa45b3f6b7ed9663e400a656760bc1
+    result: 81_passed_0_failed
+    host: ubuntu@192.222.54.137
+    command: >-
+      python -m pytest -q tests/test_next_wave_recipe.py
+      tests/test_a1_current_science_contract.py
+      tests/test_a1_scratch_train.py
+      tests/test_canonical_launcher_config_identity.py
+  topology_authority:
+    result: 78_passed_0_failed
+    provenance: interactive H100 pytest output; durable log and exact command were not retained
+  post_259a0a7_full_suite:
+    commit: 259a0a72885554f79bf74d80557da6a39718014c
+    result: 5987_passed_26_skipped_1_failed_1_warning
+    elapsed: 1222.25s
+    failure: tests/test_next_wave_recipe.py::test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass
+    resolution: canonical recipe and file digests updated on later main; current focused panel passes 81/81
+    log: /home/ubuntu/full-pytest-current-259a0a7.log
+diagnostic_evidence:
+  f7_checkpoint_sha256: f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4
+  holdout_artifact: /home/ubuntu/value-holdout-data/f7_query_holdout_37e64f0.json
+  holdout_sha256: b8d785d1a0e4a43d5d634df95f18609553ed88a9931070d1b252c540e3194251
+  holdout_global_rmse: 0.819
+  holdout_global_pearson: 0.565
+  holdout_global_spearman: 0.591
+  holdout_global_ece: 0.065
+  actor_handoff_mean_absolute_antisymmetry_error: 0.246
+  provenance_caveat: no authenticated science contract; cohort and evaluator-transform claims remain diagnostic
+open_evidence_gates:
+  - no authenticated current-v3 scratch composite and reviewed lock exists on the H100
+  - the proposed role-aware road arm has no authenticated reviewed lock or run
+  - the sealed historical C640/T640 diagnostic launcher therefore remains unexecuted
+  - repeat evaluator holdout under authenticated cohort and evaluator-transform authority
+  - keep large scratch training go_authorized=false until optimizer, value-routing, and role-aware road evidence are replayable
