@@ -72,6 +72,14 @@ def test_factory_keeps_default_global_batch_constant_across_world_sizes(
     assert command[command.index("--grad-accum-steps") + 1] == "1"
 
 
+def test_factory_keeps_forced_policy_rows_out_of_fresh_training(tmp_path: Path) -> None:
+    result = _dry_run(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    assert command[command.index("--forced-action-weight") + 1] == "0.0"
+
+
 def test_factory_accounts_for_gradient_accumulation_in_global_batch(tmp_path: Path) -> None:
     result = _dry_run(
         tmp_path,

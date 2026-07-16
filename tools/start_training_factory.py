@@ -104,7 +104,17 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--soft-target-temperature", type=float, default=0.7)
     parser.add_argument("--soft-target-weight", type=float, default=0.7)
-    parser.add_argument("--forced-action-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--forced-action-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Policy-loss multiplier for one-legal-action transitions. Fresh "
+            "training defaults to zero because these mechanical rows carry no "
+            "action-selection information; pass an explicit nonzero value only "
+            "when replaying a historical recipe."
+        ),
+    )
     parser.add_argument(
         "--phase-weights",
         default="robber=3.0,initial_build=2.0,discard=1.5",
