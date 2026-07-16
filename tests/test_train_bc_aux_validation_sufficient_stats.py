@@ -14,6 +14,81 @@ from catan_zero.rl.aux_subgoal_targets import (
 torch = pytest.importorskip("torch")
 
 
+def test_policy_epoch_reconstructs_independent_base_and_aux_means() -> None:
+    metrics = train_bc._policy_stream_epoch_metrics(
+        {
+            # Two base batches: means 1 and 3 with denominators 1 and 9.
+            "policy_base_loss": 28.0,
+            # Two AUX batches: means 10 and 6 with denominators 1 and 1.
+            "policy_aux_loss": 16.0,
+            # The legacy combined/base-denominator statistic would report 4.4.
+            "policy_loss": 44.0,
+        },
+        {
+            "policy_base_loss": 10.0,
+            "policy_aux_loss": 2.0,
+            "policy_loss": 10.0,
+        },
+        aux_enabled=True,
+        aux_coefficient=0.25,
+    )
+
+    assert metrics == {
+        "policy_base_loss": pytest.approx(2.8),
+        "policy_aux_loss": pytest.approx(8.0),
+        "policy_loss": pytest.approx(4.8),
+    }
+
+
+def test_policy_epoch_without_aux_preserves_legacy_statistic() -> None:
+    metrics = train_bc._policy_stream_epoch_metrics(
+        {"policy_loss": 9.0},
+        {"policy_loss": 3.0},
+        aux_enabled=False,
+        aux_coefficient=1.0,
+    )
+
+    assert metrics == {
+        "policy_base_loss": 3.0,
+        "policy_aux_loss": 0.0,
+        "policy_loss": 3.0,
+    }
+
+
+def test_policy_epoch_aux_statistics_fail_closed_when_invalid() -> None:
+    with pytest.raises(ValueError, match="invalid"):
+        train_bc._policy_stream_epoch_metrics(
+            {
+                "policy_loss": 1.0,
+                "policy_base_loss": 1.0,
+                "policy_aux_loss": 1.0,
+            },
+            {
+                "policy_loss": 1.0,
+                "policy_base_loss": 1.0,
+                "policy_aux_loss": -1.0,
+            },
+            aux_enabled=True,
+            aux_coefficient=0.25,
+        )
+
+
+def test_policy_epoch_aux_statistics_fail_closed_when_missing() -> None:
+    with pytest.raises(ValueError, match="incomplete"):
+        train_bc._policy_stream_epoch_metrics(
+            {
+                "policy_loss": 1.0,
+                "policy_base_loss": 1.0,
+            },
+            {
+                "policy_loss": 1.0,
+                "policy_base_loss": 1.0,
+            },
+            aux_enabled=True,
+            aux_coefficient=0.25,
+        )
+
+
 def test_aux_subgoal_returns_one_exact_statistic_pair_per_masked_head() -> None:
     outputs = {
         "aux_longest_road": torch.zeros(4, requires_grad=True),

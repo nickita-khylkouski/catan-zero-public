@@ -409,9 +409,15 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
         "policy_aux_active_rows": 12,
         "policy_base_effective_weight_sum": 18.0,
         "policy_aux_effective_weight_sum": 9.0,
+        "policy_aux_loss_coefficient": 0.25,
         "value_active_rows": 60,
         "policy_kl_anchor_eligible_rows": 16,
-        "loss_denominators": {"policy_loss": 27.0, "value_loss": 51.0},
+        "loss_denominators": {
+            "policy_loss": 27.0,
+            "policy_base_loss": 18.0,
+            "policy_aux_loss": 9.0,
+            "value_loss": 51.0,
+        },
         "objective_gradient_interference": {
             "observations": [
                 {
@@ -462,6 +468,16 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
     assert dose["schema_version"] == train_bc.CHECKPOINT_DOSE_TELEMETRY_SCHEMA
     assert dose["active_rows"]["policy_total"] == 32
     assert dose["policy_effective_weight_sums"]["total"] == pytest.approx(27.0)
+    assert dose["policy_stream_objective"] == {
+        "schema_version": "train-policy-stream-objective-v1",
+        "formula": "base_mean + aux_coefficient * aux_mean",
+        "normalization": "independent_weighted_means",
+        "base_coefficient": 1.0,
+        "aux_enabled": True,
+        "aux_coefficient": 0.25,
+        "base_denominator": 18.0,
+        "aux_denominator": 9.0,
+    }
     assert dose["optimizer"]["clipped_fraction"] == pytest.approx(0.25)
     assert dose["shared_trunk_objective_gradients"]["observed_steps"] == 1
     assert dose["feature_path_gradients"]["public_card"]["status"] == "observed"
@@ -475,3 +491,85 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
         ]
         is False
     )
+
+
+def test_checkpoint_dose_refuses_policy_aux_coefficient_drift() -> None:
+    metrics = [
+        {
+            "samples": 1,
+            "policy_base_active_rows": 0,
+            "policy_aux_active_rows": 1,
+            "policy_base_effective_weight_sum": 0.0,
+            "policy_aux_effective_weight_sum": 1.0,
+            "policy_aux_loss_coefficient": coefficient,
+            "loss_denominators": {
+                "policy_base_loss": 0.0,
+                "policy_aux_loss": 1.0,
+            },
+        }
+        for coefficient in (0.25, 0.5)
+    ]
+
+    with pytest.raises(RuntimeError, match="changed"):
+        train_bc._checkpoint_dose_telemetry(
+            metrics,
+            optimizer_step=2,
+            optimizer_observed_steps=2,
+            optimizer_clipped_steps=0,
+            optimizer_zero_objective_steps=0,
+            optimizer_pre_clip_grad_norm_sum=1.0,
+            optimizer_pre_clip_grad_norm_max=0.5,
+            objective_gradient_cadence_batches=1,
+            train_diagnostic_cadence_batches=1,
+            public_card_enabled=False,
+            meaningful_history_enabled=False,
+        )
+
+
+def test_checkpoint_dose_allows_zero_base_mass_but_requires_aux_mass() -> None:
+    metric = {
+        "samples": 1,
+        "policy_base_active_rows": 0,
+        "policy_aux_active_rows": 1,
+        "policy_base_effective_weight_sum": 0.0,
+        "policy_aux_effective_weight_sum": 1.0,
+        "policy_aux_loss_coefficient": 0.25,
+        "loss_denominators": {
+            "policy_base_loss": 0.0,
+            "policy_aux_loss": 1.0,
+        },
+    }
+
+    dose = train_bc._checkpoint_dose_telemetry(
+        [metric],
+        optimizer_step=1,
+        optimizer_observed_steps=1,
+        optimizer_clipped_steps=0,
+        optimizer_zero_objective_steps=0,
+        optimizer_pre_clip_grad_norm_sum=0.5,
+        optimizer_pre_clip_grad_norm_max=0.5,
+        objective_gradient_cadence_batches=1,
+        train_diagnostic_cadence_batches=1,
+        public_card_enabled=False,
+        meaningful_history_enabled=False,
+    )
+
+    assert dose["policy_stream_objective"]["base_denominator"] == 0.0
+    assert dose["policy_stream_objective"]["aux_denominator"] == 1.0
+
+    metric["policy_aux_effective_weight_sum"] = 0.0
+    metric["loss_denominators"]["policy_aux_loss"] = 0.0
+    with pytest.raises(RuntimeError, match="positive AUX objective mass"):
+        train_bc._checkpoint_dose_telemetry(
+            [metric],
+            optimizer_step=1,
+            optimizer_observed_steps=1,
+            optimizer_clipped_steps=0,
+            optimizer_zero_objective_steps=0,
+            optimizer_pre_clip_grad_norm_sum=0.5,
+            optimizer_pre_clip_grad_norm_max=0.5,
+            objective_gradient_cadence_batches=1,
+            train_diagnostic_cadence_batches=1,
+            public_card_enabled=False,
+            meaningful_history_enabled=False,
+        )

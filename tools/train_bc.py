@@ -12512,6 +12512,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_losses = []
         epoch_extra_sums: dict[str, float] = {
             "policy_loss": 0.0,
+            "policy_base_loss": 0.0,
+            "policy_aux_loss": 0.0,
             "value_loss": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
@@ -12534,6 +12536,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         }
         epoch_extra_denominators: dict[str, float] = {
             "policy_loss": 0.0,
+            "policy_base_loss": 0.0,
+            "policy_aux_loss": 0.0,
             "value_loss": 0.0,
             "final_vp_loss": 0.0,
             "q_loss": 0.0,
@@ -13103,6 +13107,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                 else:
                     epoch_extra_sums[key] += float(batch_metrics.get(key, 0.0)) * len(batch)
                     epoch_extra_denominators[key] += float(len(batch))
+            if int(args.policy_aux_active_batch_size) > 0:
+                for key in ("policy_base_loss", "policy_aux_loss"):
+                    weighted_sum_key = f"{key}_weighted_sum"
+                    weight_sum_key = f"{key}_weight_sum"
+                    if (
+                        weighted_sum_key not in batch_metrics
+                        or weight_sum_key not in batch_metrics
+                    ):
+                        raise RuntimeError(
+                            "policy AUX training batch omitted independent "
+                            f"{key} sufficient statistics"
+                        )
+                    epoch_extra_sums[key] += float(
+                        batch_metrics[weighted_sum_key]
+                    )
+                    epoch_extra_denominators[key] += float(
+                        batch_metrics[weight_sum_key]
+                    )
             for field, parts in batch_metrics.get(
                 "aux_subgoal_loss_parts", {}
             ).items():
@@ -13230,6 +13252,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
                 checkpoint_partial_metric = {
                     "samples": int(round(checkpoint_counts["samples"])),
+                    "policy_aux_loss_coefficient": float(
+                        args.policy_aux_loss_weight
+                    ),
                     "policy_base_active_rows": int(
                         round(checkpoint_counts["policy_base_active_rows"])
                     ),
@@ -13554,9 +13579,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 }
                 for component_id in getattr(data, "component_ids", tuple())
             }
-        policy_loss_epoch = _metric_from_sum_denominator(
-            epoch_extra_sums["policy_loss"], epoch_extra_denominators["policy_loss"]
+        policy_stream_epoch = _policy_stream_epoch_metrics(
+            epoch_extra_sums,
+            epoch_extra_denominators,
+            aux_enabled=int(args.policy_aux_active_batch_size) > 0,
+            aux_coefficient=float(args.policy_aux_loss_weight),
         )
+        policy_loss_epoch = policy_stream_epoch["policy_loss"]
         value_loss_epoch = _metric_from_sum_denominator(
             epoch_extra_sums["value_loss"], epoch_extra_denominators["value_loss"]
         )
@@ -13800,6 +13829,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "raw_batch_mean_loss": loss_epoch,
                 "component_reconstructed_loss": component_reconstructed_loss,
                 "policy_loss": policy_loss_epoch,
+                "policy_base_loss": policy_stream_epoch["policy_base_loss"],
+                "policy_aux_loss": policy_stream_epoch["policy_aux_loss"],
+                "policy_aux_loss_coefficient": float(
+                    args.policy_aux_loss_weight
+                ),
                 "policy_base_active_rows": int(active_count_total),
                 "policy_aux_active_rows": int(aux_active_count_total),
                 "policy_aux_unique_source_rows": (
@@ -24158,6 +24192,78 @@ def _metric_from_sum_denominator(weighted_sum: float, denominator: float) -> flo
     return float(weighted_sum) / float(denominator)
 
 
+def _policy_stream_epoch_metrics(
+    weighted_sums: Mapping[str, float],
+    denominators: Mapping[str, float],
+    *,
+    aux_enabled: bool,
+    aux_coefficient: float,
+) -> dict[str, float]:
+    """Reconstruct the independently normalized policy-stream objective.
+
+    When AUX is enabled, training optimizes ``base_mean + c * aux_mean``.
+    Multiplying each batch's combined mean by the base denominator and pooling
+    those products instead computes a different objective whenever either
+    stream's denominator or loss changes across batches. Preserve and combine
+    the two streams' sufficient statistics independently instead.
+    """
+
+    coefficient = float(aux_coefficient)
+    if not math.isfinite(coefficient) or coefficient < 0.0:
+        raise ValueError("policy AUX epoch coefficient must be finite and non-negative")
+
+    if not aux_enabled:
+        policy_loss = _metric_from_sum_denominator(
+            weighted_sums["policy_loss"], denominators["policy_loss"]
+        )
+        return {
+            "policy_loss": policy_loss,
+            "policy_base_loss": policy_loss,
+            "policy_aux_loss": 0.0,
+        }
+
+    required = ("policy_base_loss", "policy_aux_loss")
+    missing = [
+        key
+        for key in required
+        if key not in weighted_sums or key not in denominators
+    ]
+    if missing:
+        raise ValueError(
+            f"policy stream epoch sufficient statistics are incomplete: {missing}"
+        )
+    invalid = {
+        key: {
+            "weighted_sum": weighted_sums[key],
+            "denominator": denominators[key],
+        }
+        for key in required
+        if (
+            not math.isfinite(float(weighted_sums[key]))
+            or not math.isfinite(float(denominators[key]))
+            or float(denominators[key]) < 0.0
+        )
+    }
+    if invalid:
+        raise ValueError(
+            f"policy stream epoch sufficient statistics are invalid: {invalid}"
+        )
+
+    base_loss = _metric_from_sum_denominator(
+        weighted_sums["policy_base_loss"],
+        denominators["policy_base_loss"],
+    )
+    aux_loss = _metric_from_sum_denominator(
+        weighted_sums["policy_aux_loss"],
+        denominators["policy_aux_loss"],
+    )
+    return {
+        "policy_loss": base_loss + coefficient * aux_loss,
+        "policy_base_loss": base_loss,
+        "policy_aux_loss": aux_loss,
+    }
+
+
 def _bounded_count_fraction(numerator: float, denominator: float, *, label: str) -> float:
     """Form a [0, 1] count fraction and reject mixed reduction scopes.
 
@@ -30248,11 +30354,19 @@ def _checkpoint_dose_telemetry(
 
     denominators: dict[str, float] = {}
     observations: list[dict[str, object]] = []
+    policy_aux_coefficients: list[float] = []
     for metric in metrics:
         for name, value in (metric.get("loss_denominators") or {}).items():
             denominators[str(name)] = denominators.get(str(name), 0.0) + float(
                 value
             )
+        if "policy_aux_loss_coefficient" in metric:
+            coefficient = float(metric["policy_aux_loss_coefficient"])
+            if not math.isfinite(coefficient) or coefficient < 0.0:
+                raise RuntimeError(
+                    "checkpoint dose has an invalid policy AUX coefficient"
+                )
+            policy_aux_coefficients.append(coefficient)
         observations.extend(
             observation
             for observation in (
@@ -30313,8 +30427,74 @@ def _checkpoint_dose_telemetry(
         ),
     }
     policy_effective["total"] = policy_effective["base"] + policy_effective["aux"]
-    denominators["policy_base_loss"] = policy_effective["base"]
+    for key, expected in (
+        ("policy_base_loss", policy_effective["base"]),
+        ("policy_aux_loss", policy_effective["aux"]),
+    ):
+        observed = denominators.get(key)
+        if observed is not None and not math.isclose(
+            float(observed), expected, rel_tol=1.0e-6, abs_tol=1.0e-6
+        ):
+            raise RuntimeError(
+                "checkpoint dose policy-stream denominator drift: "
+                f"{key}={observed}, effective_weight_sum={expected}"
+            )
+        denominators[key] = expected if observed is None else float(observed)
     denominators["active_policy_loss"] = policy_effective["aux"]
+    aux_enabled = bool(
+        active_rows["policy_aux"] > 0
+        or denominators["policy_aux_loss"] > 0.0
+    )
+    if aux_enabled:
+        if len(policy_aux_coefficients) != len(metrics):
+            raise RuntimeError(
+                "checkpoint dose policy AUX coefficient is missing from one or "
+                "more cumulative metrics"
+            )
+        first_coefficient = policy_aux_coefficients[0]
+        if first_coefficient <= 0.0 or any(
+            not math.isclose(
+                coefficient,
+                first_coefficient,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+            for coefficient in policy_aux_coefficients[1:]
+        ):
+            raise RuntimeError(
+                "checkpoint dose policy AUX coefficient changed within one "
+                "training trajectory"
+            )
+        if denominators["policy_aux_loss"] <= 0.0:
+            raise RuntimeError(
+                "checkpoint dose has AUX draws but no positive AUX objective mass"
+            )
+        aux_coefficient = first_coefficient
+    else:
+        if policy_aux_coefficients and any(
+            not math.isclose(
+                coefficient,
+                policy_aux_coefficients[0],
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
+            for coefficient in policy_aux_coefficients[1:]
+        ):
+            raise RuntimeError(
+                "checkpoint dose policy AUX coefficient changed within one "
+                "training trajectory"
+            )
+        aux_coefficient = 0.0
+    policy_stream_objective = {
+        "schema_version": "train-policy-stream-objective-v1",
+        "formula": "base_mean + aux_coefficient * aux_mean",
+        "normalization": "independent_weighted_means",
+        "base_coefficient": 1.0,
+        "aux_enabled": aux_enabled,
+        "aux_coefficient": aux_coefficient,
+        "base_denominator": float(denominators["policy_base_loss"]),
+        "aux_denominator": float(denominators["policy_aux_loss"]),
+    }
     for metric in metrics:
         for name, parts in (metric.get("aux_subgoal_loss_parts") or {}).items():
             if isinstance(parts, dict):
@@ -30371,6 +30551,7 @@ def _checkpoint_dose_telemetry(
         },
         "active_rows": active_rows,
         "policy_effective_weight_sums": policy_effective,
+        "policy_stream_objective": policy_stream_objective,
         "objective_effective_weight_sums": denominators,
         "optimizer": {
             "observed_steps": observed_steps,
