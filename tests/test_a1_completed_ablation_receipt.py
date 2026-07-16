@@ -76,6 +76,22 @@ def _checkpoint_dose_trajectory() -> dict[str, object]:
 
 
 def _completed_feature_signal_report() -> dict[str, object]:
+    objective_observations = [
+        {
+            "available": True,
+            "optimizer_step": step,
+            "policy_trunk_grad_norm": 0.8,
+            "policy_base_trunk_grad_norm": 0.6,
+            "policy_aux_trunk_grad_norm": 0.2,
+            "value_trunk_grad_norm": 0.3,
+            "trunk_gradient_cosine": 0.1,
+            "policy_base_aux_gradient_cosine": -0.1,
+        }
+        for step in (
+            campaign.OBJECTIVE_GRADIENT_CADENCE_BATCHES,
+            campaign.MAX_STEPS,
+        )
+    ]
     return {
         **campaign.EFFECTIVE_FEATURE_CONTRACT,
         "train_diagnostics_every_batches": (
@@ -85,6 +101,13 @@ def _completed_feature_signal_report() -> dict[str, object]:
             observed_steps=campaign.MINIMUM_FEATURE_SIGNAL_OBSERVATIONS
         ),
         "checkpoint_dose_trajectory": _checkpoint_dose_trajectory(),
+        "objective_gradient_interference_every_batches": (
+            campaign.OBJECTIVE_GRADIENT_CADENCE_BATCHES
+        ),
+        "objective_gradient_interference": {
+            "cadence_batches": campaign.OBJECTIVE_GRADIENT_CADENCE_BATCHES,
+            "observations": objective_observations,
+        },
     }
 
 
@@ -270,6 +293,27 @@ def test_stage_c_rejects_cached_functional_for_stale_holdout(tmp_path: Path) -> 
             4,
             allow_separate_parent=False,
             expected_bindings=current,
+        )
+
+
+def test_stage_c_objective_gradient_signal_is_evidence_backed() -> None:
+    report = _completed_feature_signal_report()
+    campaign._verify_completed_objective_gradient_signal(report)  # noqa: SLF001
+
+    no_observations = copy.deepcopy(report)
+    no_observations["objective_gradient_interference"]["observations"] = []  # type: ignore[index]
+    with pytest.raises(campaign.CampaignError, match="gradient observation cadence"):
+        campaign._verify_completed_objective_gradient_signal(  # noqa: SLF001
+            no_observations
+        )
+
+    missing_value = copy.deepcopy(report)
+    missing_value["objective_gradient_interference"]["observations"][0][  # type: ignore[index]
+        "value_trunk_grad_norm"
+    ] = 0.0
+    with pytest.raises(campaign.CampaignError, match="policy-base/AUX/value"):
+        campaign._verify_completed_objective_gradient_signal(  # noqa: SLF001
+            missing_value
         )
 
 

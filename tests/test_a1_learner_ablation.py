@@ -418,6 +418,7 @@ def test_coherent_ddp_child_preserves_exact_outer_ablation_marker() -> None:
                 "lr_warmup_steps": 16,
                 "max_steps": 128,
                 "policy_aux_active_batch_size": 46,
+                "policy_aux_loss_weight": 1.0,
             }
         ),
         reviewed_code_tree_sha256=code["code_tree_sha256"],
@@ -461,6 +462,31 @@ def test_coherent_ddp_child_preserves_exact_outer_ablation_marker() -> None:
     assert child_bound["learner_ablation"] == result["learner_ablation"]
 
 
+def test_short_dose_measures_objective_geometry_before_completion() -> None:
+    verified = _verified()
+    code = executor._current_ablation_code_binding(verified["lock"])
+    result = executor.bind_learner_ablation(
+        verified,
+        ablation_id="stage-c-short-geometry",
+        overrides_json=json.dumps({"max_steps": 32}),
+        reviewed_code_tree_sha256=code["code_tree_sha256"],
+        diagnostic_dose_curve=True,
+        diagnostic_checkpoint_steps="1,2,4,8,12,16,24",
+    )
+    reporting = result["learner_ablation"]["reporting_contract"]
+    assert reporting["objective_gradient_interference_every_batches"] == 16
+
+    command = executor.build_train_command(
+        result,
+        python=Path(sys.executable),
+        checkpoint=Path("/tmp/stage-c-short.pt"),
+        report=Path("/tmp/stage-c-short.json"),
+    )
+    assert command[
+        command.index("--objective-gradient-interference-every-batches") + 1
+    ] == "16"
+
+
 def test_coherent_ddp_child_preserves_adaptive_policy_kl_marker() -> None:
     verified = _verified()
     code = executor._current_ablation_code_binding(verified["lock"])
@@ -473,6 +499,7 @@ def test_coherent_ddp_child_preserves_adaptive_policy_kl_marker() -> None:
                 "lr_warmup_steps": 16,
                 "max_steps": 128,
                 "policy_aux_active_batch_size": 463,
+                "policy_aux_loss_weight": 1.0,
                 "policy_kl_anchor_direction": "forward",
                 "policy_kl_target": 0.027,
                 "policy_kl_dual_lr": 1.0,

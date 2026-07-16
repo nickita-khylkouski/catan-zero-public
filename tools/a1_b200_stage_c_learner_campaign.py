@@ -72,6 +72,8 @@ TRAINABLE_ADAPTER_MODULES = frozenset(
 FEATURE_SIGNAL_MODULES = frozenset({*TRAINABLE_ADAPTER_MODULES, "event_encoder"})
 TRAIN_DIAGNOSTIC_CADENCE_BATCHES = 16
 MINIMUM_FEATURE_SIGNAL_OBSERVATIONS = MAX_STEPS // TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+OBJECTIVE_GRADIENT_CADENCE_BATCHES = MAX_STEPS // 2
+MINIMUM_OBJECTIVE_GRADIENT_OBSERVATIONS = 2
 POSITIVE_OPTIMIZER_SIGNAL_FIELDS = (
     "mean_pre_clip_grad_norm",
     "max_pre_clip_grad_norm",
@@ -256,6 +258,76 @@ def _verify_completed_feature_learning_signal(
         minimum_observations=MINIMUM_FEATURE_SIGNAL_OBSERVATIONS,
         where="completed learner",
     )
+
+
+def _verify_completed_objective_gradient_signal(
+    report: Mapping[str, Any],
+) -> None:
+    """Require policy-base/AUX/value geometry before Stage-C evidence is usable."""
+
+    payload = report.get("objective_gradient_interference")
+    observations = payload.get("observations") if isinstance(payload, dict) else None
+    if (
+        _integer(
+            report.get("objective_gradient_interference_every_batches"),
+            default=-1,
+        )
+        != OBJECTIVE_GRADIENT_CADENCE_BATCHES
+        or not isinstance(payload, dict)
+        or _integer(payload.get("cadence_batches"), default=-1)
+        != OBJECTIVE_GRADIENT_CADENCE_BATCHES
+        or not isinstance(observations, list)
+        or len(observations) < MINIMUM_OBJECTIVE_GRADIENT_OBSERVATIONS
+    ):
+        raise CampaignError(
+            "completed learner lacks the authenticated policy/value gradient "
+            "observation cadence"
+        )
+    steps: list[int] = []
+    failures: dict[int, object] = {}
+    positive_fields = (
+        "policy_trunk_grad_norm",
+        "policy_base_trunk_grad_norm",
+        "policy_aux_trunk_grad_norm",
+        "value_trunk_grad_norm",
+    )
+    bounded_fields = (
+        "trunk_gradient_cosine",
+        "policy_base_aux_gradient_cosine",
+    )
+    for index, observation in enumerate(observations):
+        if not isinstance(observation, dict) or observation.get("available") is not True:
+            failures[index] = "unavailable"
+            continue
+        step = _integer(observation.get("optimizer_step"), default=-1)
+        steps.append(step)
+        bad_fields = []
+        for field in positive_fields:
+            try:
+                value = float(observation.get(field, math.nan))
+            except (TypeError, ValueError):
+                value = math.nan
+            if not math.isfinite(value) or value <= 0.0:
+                bad_fields.append(field)
+        for field in bounded_fields:
+            try:
+                value = float(observation.get(field, math.nan))
+            except (TypeError, ValueError):
+                value = math.nan
+            if not math.isfinite(value) or not -1.0 <= value <= 1.0:
+                bad_fields.append(field)
+        if bad_fields:
+            failures[index] = bad_fields
+    if (
+        failures
+        or steps != sorted(set(steps))
+        or not steps
+        or steps[-1] < OBJECTIVE_GRADIENT_CADENCE_BATCHES
+    ):
+        raise CampaignError(
+            "completed learner did not demonstrate measurable policy-base/AUX/"
+            f"value trunk geometry: failures={failures}, steps={steps}"
+        )
 
 
 def _checkpoint_feature_learning_signal(
@@ -625,6 +697,12 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         "optimizer_surface_contract": {
             "shared_trunk_trainable": True,
             "value_trunk_grad_scale": 0.1,
+            "objective_gradient_interference_cadence_batches": (
+                OBJECTIVE_GRADIENT_CADENCE_BATCHES
+            ),
+            "minimum_objective_gradient_observations": (
+                MINIMUM_OBJECTIVE_GRADIENT_OBSERVATIONS
+            ),
             "trainable_adapter_modules": sorted(TRAINABLE_ADAPTER_MODULES),
             "implicit_data_driven_freeze": False,
             "explicit_freeze_modules": "",
@@ -718,6 +796,12 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
         != {
             "shared_trunk_trainable": True,
             "value_trunk_grad_scale": 0.1,
+            "objective_gradient_interference_cadence_batches": (
+                OBJECTIVE_GRADIENT_CADENCE_BATCHES
+            ),
+            "minimum_objective_gradient_observations": (
+                MINIMUM_OBJECTIVE_GRADIENT_OBSERVATIONS
+            ),
             "trainable_adapter_modules": sorted(TRAINABLE_ADAPTER_MODULES),
             "implicit_data_driven_freeze": False,
             "explicit_freeze_modules": "",
@@ -805,6 +889,7 @@ def _authenticate_completed_stage_c_dose(
             "completed learner did not keep both feature adapters trainable"
         )
     _verify_completed_feature_learning_signal(report)
+    _verify_completed_objective_gradient_signal(report)
     return receipt_path, receipt, report_path, report
 
 
