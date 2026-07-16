@@ -1,5 +1,71 @@
 # A1 gameplay and training next plan — 2026-07-16
 
+## 2026-07-16 H100 adjudication update
+
+The original plan below correctly blocked the large scratch launch, but several
+of its premises have now been tested or repaired.
+
+Completed production fixes:
+
+- The scratch model is now width 640. On the exact current topology at batch
+  256, width 640 delivered 2,753 rows/s and 11.72 GiB peak allocation versus
+  2,077 rows/s and 17.90 GiB for width 624 on an H100 80GB.
+- The resulting 41,708,233-parameter model is bound to an explicit 42,000,000
+  model-construction ceiling. The generic trainer default remains 40,000,000.
+- The sealed scratch runtime projection is now called by the production
+  composite path. Architecture or ceiling CLI drift can no longer bypass a
+  valid plan before schedule admission.
+- Adaptive target-activation evidence now rejects decision classes outside the
+  declared current taxonomy instead of silently counting them as randomized
+  search.
+
+Adjudicated architecture arms:
+
+- Keep width 640 and eight heads.
+- Do not remove the Q head or compress the private value block merely to satisfy
+  the old 40M ceiling.
+- Do not enable the global topology residual adapter: it opened road sensitivity
+  but worsened six-fold held-out policy CE and cost roughly 13% throughput when
+  combined with target gather.
+- Do not enable the direct edge policy head yet: it improved settlement and
+  robber targets but regressed opening roads and normal play.
+- Do not add unordered one-hop target-neighborhood pooling: it made road logits
+  sensitive to topology but made road prediction worse.
+- Do not add the low-parameter endpoint/hex gate yet: it was a small overall CE
+  win on the adapter-v2 diagnostic shard, but opening-road sensitivity remained
+  effectively zero and settlement regressed.
+
+Adjudicated value routing:
+
+- `value_trunk_grad_scale=0.0` does not disable private value learning when
+  `value_tower_split_layers=1`; private value-tower/head gradients remain live.
+- Scale 0.25 sends a shared value gradient about 3.64 times the policy gradient
+  with near-orthogonal cosine on the measured batch.
+- Across 192-step matched folds, scale 0 was more stable while scale 0.25 had
+  both better individual folds and much worse tail failures. Neither arm is
+  authorized as a universal replacement from the current narrow diagnostic
+  data.
+
+### Next implementation and evidence gates
+
+1. Build a broader authenticated adapter-v5, whole-game diagnostic panel on the
+   H100. The transferred adapter-v2 shards are valid for causal architecture
+   screening, not for changing production learner science.
+2. Represent roads with an action-private, role-aware endpoint structure.
+   Opening roads need an anchor/frontier distinction; unordered endpoint or
+   neighborhood means cannot express direction. Preserve symmetry by deriving
+   roles from live ownership/connectivity rather than absolute board ids.
+3. Compare the role-aware road arm against current gather with identical seeds,
+   row order, and optimizer schedule. Require opening-road CE/rank improvement
+   without settlement, robber, discard, or normal-play regression.
+4. Run value-objective experiments on the broader v5 panel: scale 0 versus
+   staged/capped shared routing, value early stopping, and HL-Gauss. Select by
+   whole-game held-out calibration and tail risk, not mean MSE alone.
+5. Calibrate duplicate-search reliability by phase against a stronger reference
+   before enabling any confidence weighting.
+6. Keep `go_authorized=false` until the optimizer horizon, value routing, and
+   role-aware road representation each have replayable evidence.
+
 ## Decision
 
 Do not authorize the large scratch run yet.
