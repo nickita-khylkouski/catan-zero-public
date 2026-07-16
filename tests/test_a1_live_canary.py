@@ -77,6 +77,8 @@ def _source_config_provenance(base_seed: int) -> dict:
         determinization_particles=4,
         determinization_min_simulations=32,
         public_observation=True,
+        native_mcts_hot_loop=False,
+        rust_featurize=False,
     )
     value = {
         "pipeline": "generate",
@@ -255,6 +257,14 @@ def test_derives_exact_twelve_lane_validation_transaction(
         for lane in plan["_private"]["lanes"].values()
         if lane[0]["host_alias"] == "h100-8a"
     ) == list(range(8))
+    assert all(
+        command["config_provenance"]["config"]["fields"]["rust_featurize"]
+        is False
+        and "--no-rust-featurize" in command["argv"]
+        and "--rust-featurize" not in command["argv"]
+        for lane in plan["_private"]["lanes"].values()
+        for command in lane
+    )
     canary.validate_canary_plan(plan)
 
 
@@ -306,6 +316,8 @@ def test_derives_operator_selected_cohort_and_game_count(
         and "--rust-featurize" in command["argv"]
         and "--no-native-mcts-hot-loop" not in command["argv"]
         and "--no-rust-featurize" not in command["argv"]
+        and command["config_provenance"]["config"]["fields"]["rust_featurize"]
+        is True
         for lane in plan["_private"]["lanes"].values()
         for command in lane
     )
