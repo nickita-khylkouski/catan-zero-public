@@ -4,11 +4,50 @@ import numpy as np
 import pytest
 
 from tools.train_bc import (
+    _combine_policy_aux_validation_metrics,
+    _IndexedValidationWeights,
     _objective_measure_validation_aggregate,
     evaluate_composite_validation_measure,
     objective_matched_validation_component_metrics,
     objective_matched_validation_metrics,
 )
+
+
+def test_policy_aux_validation_reconstructs_the_training_objective() -> None:
+    combined = _combine_policy_aux_validation_metrics(
+        {
+            "loss": 2.0,
+            "raw_batch_mean_loss": 2.5,
+            "policy_loss": 0.5,
+            "value_loss": 1.5,
+        },
+        {
+            "samples": 40,
+            "policy_loss": 1.2,
+            "loss_denominators": {"policy_loss": 3.0},
+        },
+        policy_loss_weight=1.0,
+        policy_aux_loss_weight=0.25,
+    )
+
+    assert combined["policy_base_loss"] == 0.5
+    assert combined["policy_aux_loss"] == 1.2
+    assert combined["policy_loss"] == pytest.approx(0.8)
+    assert combined["loss"] == pytest.approx(2.3)
+    assert combined["component_reconstructed_loss"] == pytest.approx(2.3)
+    assert combined["base_raw_batch_mean_loss"] == 2.5
+    assert combined["policy_aux_validation_effective_weight_sum"] == 3.0
+
+
+def test_indexed_validation_weights_avoid_a_corpus_sized_allocation() -> None:
+    weights = _IndexedValidationWeights(
+        np.asarray([100, 5, 42], dtype=np.int64),
+        np.asarray([0.1, 0.2, 0.7], dtype=np.float64),
+    )
+
+    assert weights[np.asarray([42, 5], dtype=np.int64)].tolist() == [0.7, 0.2]
+    with pytest.raises(KeyError, match="outside"):
+        weights[np.asarray([6], dtype=np.int64)]
 
 
 class _Composite:

@@ -11181,16 +11181,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                 raise SystemExit(
                     "--per-game-policy-surprise-weighting requires game_seed"
                 )
-            surprise_kl, _surprise_has_prior = compute_policy_surprise_kl(
-                data, batch=train_indices
-            )
-            surprise_weights[train_indices] = (
-                per_game_capped_policy_surprise_sampling_weights(
-                    np.asarray(data["game_seed"][train_indices]),
-                    surprise_kl,
-                    np.asarray(policy_weights[train_indices]) > 0.0,
+            for split_indices in (train_indices, validation_indices):
+                if len(split_indices) == 0:
+                    continue
+                surprise_kl, _surprise_has_prior = compute_policy_surprise_kl(
+                    data, batch=split_indices
                 )
-            )
+                surprise_weights[split_indices] = (
+                    per_game_capped_policy_surprise_sampling_weights(
+                        np.asarray(data["game_seed"][split_indices]),
+                        surprise_kl,
+                        np.asarray(policy_weights[split_indices]) > 0.0,
+                    )
+                )
         elif float(args.policy_surprise_weight) > 0.0:
             surprise_kl, surprise_has_prior = compute_policy_surprise_kl(data)
             surprise_weights = policy_surprise_sampling_weights(
@@ -11541,6 +11544,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             policy_surprise_weights_full[train_indices], dtype=np.float32
         )
     policy_aux_sampling_weights = None
+    policy_aux_validation_sampling_weights = None
     policy_aux_preconditioning_weights = None
     policy_aux_base_measure = "off"
     policy_aux_phase_sampling_weights = getattr(
@@ -11606,6 +11610,54 @@ def main(argv: Sequence[str] | None = None) -> None:
                     policy_aux_phase_sampling_weights,
                 )
             )
+        if len(validation_indices):
+            validation_component_game_sampling = _composite_game_sampling_weights(
+                data, validation_indices
+            )
+            stage_c_validation_base = (
+                _stage_c_policy_aux_base_measure(data, validation_indices)
+                if coherent_direct_policy_aux
+                else None
+            )
+            validation_preconditioning = (
+                np.asarray(
+                    policy_surprise_weights_full[validation_indices],
+                    dtype=np.float64,
+                )
+                if exact_per_game_surprise or legacy_policy_surprise
+                else stage_c_validation_base[0]
+                if stage_c_validation_base is not None
+                else validation_component_game_sampling
+                if validation_component_game_sampling is not None
+                else np.ones(len(validation_indices), dtype=np.float64)
+            )
+            if exact_per_game_surprise and validation_component_game_sampling is not None:
+                validation_preconditioning = (
+                    _compose_per_game_policy_surprise_sampling_weights(
+                        data,
+                        validation_indices,
+                        np.asarray(
+                            policy_surprise_weights_full[validation_indices],
+                            dtype=np.float64,
+                        ),
+                        validation_component_game_sampling,
+                    )
+                )
+            policy_aux_validation_sampling_weights = (
+                _conditioned_policy_aux_sampling_weights(
+                    validation_preconditioning,
+                    np.asarray(policy_sample_weights)[validation_indices],
+                )
+            )
+            if bool(getattr(data, "policy_aux_phase_scope_authenticated", False)):
+                policy_aux_validation_sampling_weights = (
+                    _authenticated_policy_aux_phase_sampling_weights(
+                        data,
+                        validation_indices,
+                        policy_aux_validation_sampling_weights,
+                        policy_aux_phase_sampling_weights,
+                    )
+                )
     if int(ddp["rank"]) == 0:
         policy_sample_weight_report = sample_weight_quality(data, policy_sample_weights)
         value_sample_weight_report = sample_weight_quality(data, value_sample_weights)
@@ -11682,6 +11734,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ),
                 },
             }
+            if policy_aux_validation_sampling_weights is not None:
+                policy_aux_sampling_report["validation_sampling_weights"] = {
+                    "shape": list(policy_aux_validation_sampling_weights.shape),
+                    "dtype": str(policy_aux_validation_sampling_weights.dtype),
+                    "content_sha256": _array_content_sha256(
+                        policy_aux_validation_sampling_weights
+                    ),
+                    "mass": float(policy_aux_validation_sampling_weights.sum()),
+                }
         value_sample_weight_report["by_game"] = per_game_weight_quality(
             data, value_sample_weights
         )
@@ -13817,6 +13878,78 @@ def main(argv: Sequence[str] | None = None) -> None:
                     _evaluate_validation_indices,
                 )
             )
+        if policy_aux_validation_sampling_weights is not None:
+            aux_policy_weights = _IndexedValidationWeights(
+                validation_indices,
+                policy_aux_validation_sampling_weights,
+            )
+            aux_value_weights = _IndexedValidationWeights(
+                validation_indices,
+                np.zeros(len(validation_indices), dtype=np.float64),
+            )
+            validation_policy_aux = evaluate_bc_batches(
+                policy,
+                data,
+                validation_indices,
+                aux_policy_weights,
+                aux_value_weights,
+                args.batch_size,
+                args.soft_target_temperature,
+                args.soft_target_weight,
+                args.soft_target_source,
+                args.soft_target_min_legal_coverage,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                _parse_prefixes(args.q_skip_teacher_prefixes),
+                args.vps_to_win,
+                args.advantage_policy_weighting,
+                args.advantage_temperature,
+                args.advantage_weight_cap,
+                args.advantage_weight_floor,
+                ddp,
+                args.amp,
+                data_sharded=bool(args.ddp_shard_data),
+                data_loader_workers=int(args.data_loader_workers),
+                data_loader_prefetch=int(args.data_loader_prefetch),
+            )
+            base_wrapper = metrics[-1].get("validation_objective_matched")
+            base_objective_metrics = (
+                base_wrapper["metrics"]
+                if isinstance(base_wrapper, dict)
+                and isinstance(base_wrapper.get("metrics"), dict)
+                else validation_metrics
+            )
+            combined_validation = _combine_policy_aux_validation_metrics(
+                base_objective_metrics,
+                validation_policy_aux,
+                policy_loss_weight=float(args.policy_loss_weight),
+                policy_aux_loss_weight=float(args.policy_aux_loss_weight),
+            )
+            objective_wrapper = (
+                dict(base_wrapper) if isinstance(base_wrapper, dict) else {}
+            )
+            objective_wrapper.update(
+                {
+                    "schema_version": "policy-aux-validation-measure-v1",
+                    "measure": (
+                        f"{objective_wrapper.get('measure', 'weighted_held_out_base')}"
+                        "+conditioned_policy_aux"
+                    ),
+                    "objective_matched": True,
+                    "metrics": combined_validation,
+                    "policy_aux": {
+                        "measure": "held_out_conditioned_policy_aux",
+                        "loss_weight": float(args.policy_aux_loss_weight),
+                        "sampling_weight_mass": float(
+                            policy_aux_validation_sampling_weights.sum()
+                        ),
+                        "metrics": validation_policy_aux,
+                    },
+                }
+            )
+            metrics[-1]["validation_objective_matched"] = objective_wrapper
         _rank0_print(
             json.dumps(
                 {
@@ -16584,6 +16717,8 @@ _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
     "raw_batch_mean_loss",
     "component_reconstructed_loss",
     "policy_loss",
+    "policy_base_loss",
+    "policy_aux_loss",
     "value_loss",
     "scalar_value_mse_diagnostic",
     "final_vp_loss",
@@ -16611,6 +16746,93 @@ _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
     "active_policy_kl_target_prior_mean",
     "active_policy_teacher_gap_closure",
 )
+
+
+class _IndexedValidationWeights:
+    """Expose held-out row weights without allocating a corpus-sized vector."""
+
+    def __init__(self, row_indices: np.ndarray, weights: np.ndarray) -> None:
+        rows = np.asarray(row_indices, dtype=np.int64)
+        values = np.asarray(weights, dtype=np.float64)
+        if rows.ndim != 1 or values.shape != rows.shape:
+            raise ValueError("indexed validation weight shape drift")
+        order = np.argsort(rows, kind="stable")
+        self._rows = rows[order]
+        self._weights = values[order]
+        if len(self._rows) and np.any(self._rows[1:] == self._rows[:-1]):
+            raise ValueError("indexed validation rows must be unique")
+
+    def __getitem__(self, row_indices: np.ndarray) -> np.ndarray:
+        requested = np.asarray(row_indices, dtype=np.int64)
+        if requested.size == 0:
+            return np.empty(requested.shape, dtype=self._weights.dtype)
+        if self._rows.size == 0:
+            raise KeyError("validation requested a row from an empty weight measure")
+        positions = np.searchsorted(self._rows, requested)
+        if (
+            np.any(positions >= len(self._rows))
+            or np.any(self._rows[np.minimum(positions, len(self._rows) - 1)] != requested)
+        ):
+            raise KeyError("validation requested a row outside its weight measure")
+        return self._weights[positions]
+
+
+def _combine_policy_aux_validation_metrics(
+    base_metrics: dict,
+    aux_metrics: dict,
+    *,
+    policy_loss_weight: float,
+    policy_aux_loss_weight: float,
+) -> dict:
+    """Reconstruct the exact two-stream policy objective used by training.
+
+    The base and policy-AUX streams are normalized independently during the
+    optimizer step.  Validation must therefore evaluate each held-out measure
+    independently and combine their means with the configured AUX coefficient;
+    concatenating rows or omitting AUX silently scores a different learner.
+    """
+
+    if not isinstance(base_metrics, dict) or not isinstance(aux_metrics, dict):
+        raise ValueError("policy AUX validation metrics must be mappings")
+    if "loss" not in base_metrics or "policy_loss" not in base_metrics:
+        raise ValueError("base validation metrics are incomplete")
+    if "policy_loss" not in aux_metrics:
+        raise ValueError("policy AUX validation metrics are incomplete")
+    coefficient = float(policy_aux_loss_weight)
+    policy_coefficient = float(policy_loss_weight)
+    if not math.isfinite(coefficient) or coefficient < 0.0:
+        raise ValueError("policy AUX validation coefficient is invalid")
+    if not math.isfinite(policy_coefficient) or policy_coefficient < 0.0:
+        raise ValueError("policy validation coefficient is invalid")
+
+    base_policy = float(base_metrics["policy_loss"])
+    aux_policy = float(aux_metrics["policy_loss"])
+    combined_policy = base_policy + coefficient * aux_policy
+    combined_loss = (
+        float(base_metrics["loss"])
+        + policy_coefficient * coefficient * aux_policy
+    )
+    combined = dict(base_metrics)
+    combined.update(
+        {
+            "loss": combined_loss,
+            "component_reconstructed_loss": combined_loss,
+            "policy_loss": combined_policy,
+            "policy_base_loss": base_policy,
+            "policy_aux_loss": aux_policy,
+            "policy_aux_loss_weight": coefficient,
+            "policy_aux_validation_samples": int(aux_metrics.get("samples", 0)),
+            "policy_aux_validation_effective_weight_sum": float(
+                (aux_metrics.get("loss_denominators") or {}).get(
+                    "policy_loss", 0.0
+                )
+            ),
+            "base_raw_batch_mean_loss": float(
+                base_metrics.get("raw_batch_mean_loss", base_metrics["loss"])
+            ),
+        }
+    )
+    return combined
 
 
 def objective_matched_validation_metrics(
