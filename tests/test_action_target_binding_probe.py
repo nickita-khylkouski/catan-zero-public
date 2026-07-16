@@ -16,6 +16,13 @@ if str(_TOOLS_DIR) not in sys.path:
 import action_target_binding_probe as probe  # noqa: E402
 
 from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE  # noqa: E402
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    RUST_ENTITY_ADAPTER_V2,
+    RUST_ENTITY_ADAPTER_V5,
+)
+from catan_zero.rl.meaningful_history import (  # noqa: E402
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+)
 from catan_zero.rl.entity_token_features import (  # noqa: E402
     EDGE_FEATURE_SIZE,
     EVENT_FEATURE_SIZE,
@@ -130,9 +137,17 @@ def test_warmstart_gather_is_zero_output_then_admits_target_gradient():
         np.zeros((607, LEGAL_ACTION_FEATURE_SIZE), dtype=np.float32),
         seed=3,
         device="cpu",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V2,
     )
+    base.trained_with_masked_hidden_info = True
+    base.public_award_feature_contract = "authoritative_v1"
+    base.entity_feature_adapter_binding_source = "checkpoint_metadata"
     base.model.eval()
     treatment = probe._warmstart_gather(base, seed=5)
+    assert treatment.entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V2
+    assert treatment.trained_with_masked_hidden_info is True
+    assert treatment.public_award_feature_contract == "authoritative_v1"
+    assert treatment.entity_feature_adapter_binding_source == "checkpoint_metadata"
     entity = _entity("BUILD_SETTLEMENT")
     action_types = ["BUILD_SETTLEMENT"] * 6
     permuted, changed = probe.permute_action_targets(entity, action_types)
@@ -179,6 +194,76 @@ def test_warmstart_rejects_checkpoint_that_already_has_gather():
     )
     with pytest.raises(probe.ProbeError, match="already enables"):
         probe._warmstart_gather(policy, seed=11)
+
+
+def test_root_inputs_use_checkpoint_feature_contract(monkeypatch):
+    config = dataclasses.replace(
+        _config(),
+        meaningful_public_history=True,
+        meaningful_public_history_schema=MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+        event_history_limit=19,
+    )
+    policy = EntityGraphPolicy(
+        config,
+        np.zeros((607, LEGAL_ACTION_FEATURE_SIZE), dtype=np.float32),
+        seed=13,
+        device="cpu",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+    )
+    policy.trained_with_masked_hidden_info = True
+
+    class Game:
+        @staticmethod
+        def current_color():
+            return "BLUE"
+
+        @staticmethod
+        def playable_action_indices(_colors, _catalog):
+            return [1, 2]
+
+        @staticmethod
+        def playable_actions_json():
+            return '[["BLUE", "BUILD_ROAD"], ["BLUE", "BUILD_ROAD"]]'
+
+    observed = {}
+    monkeypatch.setattr(
+        probe, "rust_policy_action_ids", lambda *_args, **_kwargs: (10, 20)
+    )
+
+    def entity(*_args, **kwargs):
+        observed["entity"] = kwargs
+        return {"tokens": np.zeros((1, 1, 1), dtype=np.float32)}
+
+    def context(*_args, **kwargs):
+        observed["context"] = kwargs
+        return np.zeros((1, 2, CONTEXT_ACTION_FEATURE_SIZE), dtype=np.float32)
+
+    monkeypatch.setattr(probe, "rust_game_to_entity_batch", entity)
+    monkeypatch.setattr(probe, "rust_action_context_batch", context)
+
+    _entity_batch, legal_ids, _context, action_types = probe._root_inputs(
+        policy, Game(), context_fill=-4.0
+    )
+
+    assert legal_ids.tolist() == [[10, 20]]
+    assert action_types == ("BUILD_ROAD", "BUILD_ROAD")
+    assert observed["entity"]["public_observation"] is True
+    assert observed["entity"]["meaningful_public_history"] is True
+    assert observed["entity"]["history_limit"] == 19
+    assert (
+        observed["entity"]["meaningful_public_history_schema"]
+        == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+    )
+    assert (
+        observed["entity"]["entity_feature_adapter_version"]
+        == RUST_ENTITY_ADAPTER_V5
+    )
+    assert observed["context"]["fill"] == -4.0
+    assert observed["context"]["public_observation"] is True
+    assert (
+        observed["context"]["entity_feature_adapter_version"]
+        == RUST_ENTITY_ADAPTER_V5
+    )
 
 
 def test_target_identity_distinguishes_representation_identical_opening_edges():

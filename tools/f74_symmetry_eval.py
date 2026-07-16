@@ -38,11 +38,15 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
+from catan_zero.rl.entity_feature_adapter import (
+    policy_entity_feature_adapter_version,
+)
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 from catan_zero.rl.hex_symmetry import N_SYMMETRIES, build_hex_symmetry
 from catan_zero.search.neural_rust_mcts import (
     EntityGraphRustEvaluatorConfig,
     _assert_public_observation_matches_checkpoint_training,
+    _policy_history_options,
     rust_action_context_batch,
     rust_game_to_entity_batch,
     rust_policy_action_ids,
@@ -53,8 +57,14 @@ from sigma_trace_placement_root import COLORS, find_placement_roots
 
 
 def _root_entity(
-    policy: EntityGraphPolicy, game: Any, *, public_observation: bool = False
+    policy: EntityGraphPolicy,
+    game: Any,
+    *,
+    public_observation: bool = False,
+    context_fill: float = 0.0,
 ) -> dict[str, Any]:
+    history_enabled, history_limit, history_schema = _policy_history_options(policy)
+    adapter_version = policy_entity_feature_adapter_version(policy)
     acting = str(game.current_color())
     legal = tuple(int(a) for a in game.playable_action_indices(list(COLORS), None))
     pids = rust_policy_action_ids(game, legal, colors=COLORS, action_size=int(policy.action_size))
@@ -62,11 +72,17 @@ def _root_entity(
         game, legal, actor=acting, colors=COLORS,
         action_size=int(policy.action_size), policy_action_ids=pids,
         public_observation=bool(public_observation),
+        meaningful_public_history=history_enabled,
+        history_limit=history_limit,
+        meaningful_public_history_schema=history_schema,
+        entity_feature_adapter_version=adapter_version,
     )
     context = rust_action_context_batch(
         game, legal, actor=acting, colors=COLORS,
         action_size=int(policy.action_size), policy_action_ids=pids,
+        fill=float(context_fill),
         public_observation=bool(public_observation),
+        entity_feature_adapter_version=adapter_version,
     )
     legal_ids = np.asarray(pids, dtype=np.int64)[None, :]
     return {"entity": entity, "context": context, "legal_ids": legal_ids}
@@ -117,6 +133,12 @@ def main() -> None:
         help="Mask hidden opponent information during featurization. Must match "
         "the checkpoint's recorded training regime.",
     )
+    parser.add_argument(
+        "--context-fill",
+        type=float,
+        default=0.0,
+        help="Action-context padding fill used during probe inference.",
+    )
     parser.add_argument("--relabel-events", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
@@ -156,6 +178,7 @@ def main() -> None:
             policy,
             game.copy(),
             public_observation=bool(args.public_observation),
+            context_fill=float(args.context_fill),
         )
         avg = sym.average_forward(
             r["entity"], r["legal_ids"], r["context"], forward_fn,
@@ -212,6 +235,20 @@ def main() -> None:
         "n_symmetries": N_SYMMETRIES,
         "relabel_events": bool(args.relabel_events),
         "public_observation": bool(args.public_observation),
+        "entity_feature_adapter_version": policy_entity_feature_adapter_version(
+            policy
+        ),
+        "meaningful_public_history": bool(
+            _policy_history_options(policy)[0]
+        ),
+        "meaningful_public_history_schema": str(
+            _policy_history_options(policy)[2]
+        ),
+        "event_history_limit": int(_policy_history_options(policy)[1]),
+        "action_context_fill": float(args.context_fill),
+        "public_award_feature_contract": str(
+            policy.public_award_feature_contract
+        ),
         "symmetry_inconsistency": {
             "value_orientation_std": _stat([r["value_orientation_std"] for r in per_root]),
             "value_orientation_range": _stat([r["value_orientation_range"] for r in per_root]),

@@ -32,8 +32,12 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
+from catan_zero.rl.entity_feature_adapter import (
+    policy_entity_feature_adapter_version,
+)
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 from catan_zero.search.neural_rust_mcts import (
+    _policy_history_options,
     rust_action_context_batch,
     rust_game_to_entity_batch,
     rust_policy_action_ids,
@@ -66,7 +70,24 @@ def _upgraded_policy_from(base: EntityGraphPolicy, overrides: dict[str, Any]) ->
     from the base model and leaving the new (zero-init) params at init."""
     upgraded_config = dataclasses.replace(base.config, **overrides)
     static = base.static_action_features.detach().cpu().numpy()
-    upgraded = EntityGraphPolicy(upgraded_config, static, device=str(base.device))
+    upgraded = EntityGraphPolicy(
+        upgraded_config,
+        static,
+        device=str(base.device),
+        entity_feature_adapter_version=policy_entity_feature_adapter_version(base),
+    )
+    # This is a function-preserving in-memory clone of the loaded checkpoint,
+    # not a freshly trained policy. Preserve the checkpoint-bound information
+    # surface so the base/upgraded comparison consumes identical observations.
+    upgraded.trained_with_masked_hidden_info = bool(
+        getattr(base, "trained_with_masked_hidden_info", False)
+    )
+    upgraded.public_award_feature_contract = str(
+        base.public_award_feature_contract
+    )
+    upgraded.entity_feature_adapter_binding_source = str(
+        getattr(base, "entity_feature_adapter_binding_source", "legacy_policy")
+    )
     missing, unexpected = upgraded.model.load_state_dict(base.model.state_dict(), strict=False)
     disallowed = [k for k in missing if not k.startswith(
         ("target_gather_proj.", "action_cross_blocks.", "value_probe", "value_pool_head.", "q_head.")
@@ -77,9 +98,31 @@ def _upgraded_policy_from(base: EntityGraphPolicy, overrides: dict[str, Any]) ->
     return upgraded
 
 
-def _root_outputs(policy: EntityGraphPolicy, game: Any) -> dict[str, np.ndarray]:
+def _feature_contract(
+    policy: EntityGraphPolicy, *, context_fill: float = 0.0
+) -> dict[str, Any]:
+    history_enabled, history_limit, history_schema = _policy_history_options(policy)
+    return {
+        "entity_feature_adapter_version": policy_entity_feature_adapter_version(policy),
+        "public_observation": bool(
+            getattr(policy, "trained_with_masked_hidden_info", False)
+        ),
+        "meaningful_public_history": bool(history_enabled),
+        "meaningful_public_history_schema": str(history_schema),
+        "event_history_limit": int(history_limit),
+        "action_context_fill": float(context_fill),
+        "public_award_feature_contract": str(
+            policy.public_award_feature_contract
+        ),
+    }
+
+
+def _root_outputs(
+    policy: EntityGraphPolicy, game: Any, *, context_fill: float = 0.0
+) -> dict[str, np.ndarray]:
     import torch
 
+    feature_contract = _feature_contract(policy, context_fill=context_fill)
     acting_color = str(game.current_color())
     legal_actions = tuple(int(a) for a in game.playable_action_indices(list(COLORS), None))
     policy_action_ids = rust_policy_action_ids(
@@ -88,10 +131,24 @@ def _root_outputs(policy: EntityGraphPolicy, game: Any) -> dict[str, np.ndarray]
     entity = rust_game_to_entity_batch(
         game, legal_actions, actor=acting_color, colors=COLORS,
         action_size=int(policy.action_size), policy_action_ids=policy_action_ids,
+        public_observation=feature_contract["public_observation"],
+        meaningful_public_history=feature_contract["meaningful_public_history"],
+        history_limit=feature_contract["event_history_limit"],
+        meaningful_public_history_schema=feature_contract[
+            "meaningful_public_history_schema"
+        ],
+        entity_feature_adapter_version=feature_contract[
+            "entity_feature_adapter_version"
+        ],
     )
     context = rust_action_context_batch(
         game, legal_actions, actor=acting_color, colors=COLORS,
         action_size=int(policy.action_size), policy_action_ids=policy_action_ids,
+        fill=feature_contract["action_context_fill"],
+        public_observation=feature_contract["public_observation"],
+        entity_feature_adapter_version=feature_contract[
+            "entity_feature_adapter_version"
+        ],
     )
     legal_ids = np.asarray(policy_action_ids, dtype=np.int64)[None, :]
     with torch.no_grad():
@@ -125,10 +182,16 @@ def _aggregate(per_root: list[dict[str, Any]], field: str) -> dict[str, float]:
     }
 
 
-def probe(policy: EntityGraphPolicy, games: list[Any], label: str) -> dict[str, Any]:
+def probe(
+    policy: EntityGraphPolicy,
+    games: list[Any],
+    label: str,
+    *,
+    context_fill: float = 0.0,
+) -> dict[str, Any]:
     per_root = []
     for game in games:
-        out = _root_outputs(policy, game.copy())
+        out = _root_outputs(policy, game.copy(), context_fill=context_fill)
         per_root.append(
             {
                 "n_candidates": int(out["logits"].shape[0]),
@@ -157,6 +220,12 @@ def main() -> None:
     parser.add_argument("--n-states", type=int, default=20)
     parser.add_argument("--base-seed", type=int, default=500001)
     parser.add_argument(
+        "--context-fill",
+        type=float,
+        default=0.0,
+        help="Action-context padding fill used for both compared policies.",
+    )
+    parser.add_argument(
         "--flags",
         default="gather,cross:2,value",
         help="upgrade flags for the compared policy, e.g. 'gather,cross:2,value'",
@@ -174,8 +243,21 @@ def main() -> None:
     overrides = _parse_flags(args.flags)
     upgraded = _upgraded_policy_from(base, overrides)
 
-    base_result = probe(base, games, "base")
-    up_result = probe(upgraded, games, "upgraded")
+    base_contract = _feature_contract(base, context_fill=float(args.context_fill))
+    upgraded_contract = _feature_contract(
+        upgraded, context_fill=float(args.context_fill)
+    )
+    if upgraded_contract != base_contract:
+        raise RuntimeError(
+            "function-preserving upgrade changed the feature contract: "
+            f"base={base_contract!r} upgraded={upgraded_contract!r}"
+        )
+    base_result = probe(
+        base, games, "base", context_fill=float(args.context_fill)
+    )
+    up_result = probe(
+        upgraded, games, "upgraded", context_fill=float(args.context_fill)
+    )
 
     warm_start_max_diff = 0.0
     for br, ur in zip(base_result["_raw"], up_result["_raw"]):
@@ -188,6 +270,7 @@ def main() -> None:
     summary = {
         "checkpoint": args.checkpoint,
         "upgrade_flags": overrides,
+        "feature_contract": base_contract,
         "n_roots": base_result["n_roots"],
         "base": {"prior_spread": base_result["prior_spread"], "q_spread": base_result["q_spread"]},
         "upgraded": {"prior_spread": up_result["prior_spread"], "q_spread": up_result["q_spread"]},

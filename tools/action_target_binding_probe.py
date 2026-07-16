@@ -32,8 +32,12 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    policy_entity_feature_adapter_version,
+)
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy  # noqa: E402
 from catan_zero.search.neural_rust_mcts import (  # noqa: E402
+    _policy_history_options,
     rust_action_context_batch,
     rust_game_to_entity_batch,
     rust_policy_action_ids,
@@ -221,7 +225,14 @@ def collect_target_roots(
 def _root_inputs(
     policy: EntityGraphPolicy,
     game: Any,
+    *,
+    context_fill: float = 0.0,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, tuple[str, ...]]:
+    history_enabled, history_limit, history_schema = _policy_history_options(policy)
+    adapter_version = policy_entity_feature_adapter_version(policy)
+    public_observation = bool(
+        getattr(policy, "trained_with_masked_hidden_info", False)
+    )
     actor = str(game.current_color())
     legal_native_ids = tuple(
         int(action)
@@ -243,11 +254,11 @@ def _root_inputs(
         colors=COLORS,
         action_size=int(policy.action_size),
         policy_action_ids=policy_action_ids,
-        meaningful_public_history=bool(
-            getattr(policy.config, "meaningful_public_history", False)
-        ),
-        history_limit=int(getattr(policy.config, "event_history_limit", 64)),
-        entity_feature_adapter_version=policy.entity_feature_adapter_version,
+        public_observation=public_observation,
+        meaningful_public_history=history_enabled,
+        history_limit=history_limit,
+        meaningful_public_history_schema=history_schema,
+        entity_feature_adapter_version=adapter_version,
     )
     context = rust_action_context_batch(
         game,
@@ -256,6 +267,9 @@ def _root_inputs(
         colors=COLORS,
         action_size=int(policy.action_size),
         policy_action_ids=policy_action_ids,
+        fill=float(context_fill),
+        public_observation=public_observation,
+        entity_feature_adapter_version=adapter_version,
     )
     legal_ids = np.asarray(policy_action_ids, dtype=np.int64)[None, :]
     return entity, legal_ids, context, raw_action_types
@@ -274,7 +288,16 @@ def _warmstart_gather(base: EntityGraphPolicy, *, seed: int) -> EntityGraphPolic
         static,
         seed=int(seed),
         device=str(base.device),
-        entity_feature_adapter_version=base.entity_feature_adapter_version,
+        entity_feature_adapter_version=policy_entity_feature_adapter_version(base),
+    )
+    treatment.trained_with_masked_hidden_info = bool(
+        getattr(base, "trained_with_masked_hidden_info", False)
+    )
+    treatment.public_award_feature_contract = str(
+        base.public_award_feature_contract
+    )
+    treatment.entity_feature_adapter_binding_source = str(
+        getattr(base, "entity_feature_adapter_binding_source", "legacy_policy")
     )
     missing, unexpected = treatment.model.load_state_dict(
         base.model.state_dict(), strict=False
@@ -358,6 +381,7 @@ def run_probe(
     learning_rate: float,
     steps: int,
     initialization_seed: int,
+    context_fill: float = 0.0,
 ) -> dict[str, Any]:
     """Run the B0/G1 causal sequence and return a JSON-serializable report."""
 
@@ -377,7 +401,9 @@ def run_probe(
 
     prepared = []
     for action_type, game_seed, tick, game in roots:
-        entity, legal_ids, context, action_types = _root_inputs(base, game)
+        entity, legal_ids, context, action_types = _root_inputs(
+            base, game, context_fill=float(context_fill)
+        )
         target_permuted, changed_target_count = permute_action_targets(
             entity, action_types
         )
@@ -590,6 +616,21 @@ def run_probe(
             "source_action_target_gather": bool(
                 getattr(base.config, "action_target_gather", False)
             ),
+            "entity_feature_adapter_version": (
+                policy_entity_feature_adapter_version(base)
+            ),
+            "public_observation": bool(
+                getattr(base, "trained_with_masked_hidden_info", False)
+            ),
+            "meaningful_public_history": bool(_policy_history_options(base)[0]),
+            "meaningful_public_history_schema": str(
+                _policy_history_options(base)[2]
+            ),
+            "event_history_limit": int(_policy_history_options(base)[1]),
+            "action_context_fill": float(context_fill),
+            "public_award_feature_contract": str(
+                base.public_award_feature_contract
+            ),
         },
         "device": str(device),
         "commissioning": {
@@ -658,6 +699,7 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=0.05)
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--initialization-seed", type=int, default=20260716)
+    parser.add_argument("--context-fill", type=float, default=0.0)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
 
@@ -673,6 +715,7 @@ def main() -> None:
         learning_rate=float(args.learning_rate),
         steps=int(args.steps),
         initialization_seed=int(args.initialization_seed),
+        context_fill=float(args.context_fill),
     )
     write_json(args.out, report)
     print(json.dumps(_summary(report), indent=2, sort_keys=True))
