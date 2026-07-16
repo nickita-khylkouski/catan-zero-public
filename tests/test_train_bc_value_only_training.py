@@ -1034,3 +1034,184 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
         grad is not None and torch.count_nonzero(grad).item() > 0
         for grad in policy_grads
     )
+
+
+def test_policy_stream_metrics_preserve_unequal_base_aux_sufficient_stats(
+    tmp_path, monkeypatch
+) -> None:
+    import copy
+    import torch
+    from tools import train_bc
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(24))
+    legal = np.asarray(data["legal_action_ids"])
+    wide_rows = np.flatnonzero(np.sum(legal >= 0, axis=1) >= 4)
+    assert len(wide_rows) >= 4
+    aux_batch = wide_rows[:4].astype(np.int64)
+    base_batch = np.asarray(
+        [row for row in range(len(legal)) if row not in set(aux_batch)][:2],
+        dtype=np.int64,
+    )
+    assert len(base_batch) == 2
+
+    # Make every audited stratum deliberately stream-specific. Soft-target
+    # coverage also differs (1/2 base rows versus 3/4 AUX rows).
+    data["phase"] = np.asarray(
+        ["UNUSED"] * len(legal), dtype=object
+    )
+    data["teacher_name"] = np.asarray(
+        ["unused_teacher"] * len(legal), dtype=object
+    )
+    data["stream_marker"] = np.asarray(
+        ["unused"] * len(legal), dtype=object
+    )
+    data["soft_marker"] = np.zeros(len(legal), dtype=np.bool_)
+    data["phase"][base_batch] = "BASE_PHASE"
+    data["phase"][aux_batch] = "AUX_PHASE"
+    data["teacher_name"][base_batch] = "base_teacher"
+    data["teacher_name"][aux_batch] = "aux_teacher"
+    data["stream_marker"][base_batch] = "base"
+    data["stream_marker"][aux_batch] = "aux"
+    data["soft_marker"][base_batch[:1]] = True
+    data["soft_marker"][aux_batch[:3]] = True
+
+    original_forward = train_bc._forward_legal_np_for_batch
+
+    def controlled_forward(policy, data_arg, batch_arg, legal_ids, **kwargs):
+        outputs = original_forward(
+            policy, data_arg, batch_arg, legal_ids, **kwargs
+        )
+        logits = outputs["logits"]
+        target_columns = train_bc._target_columns(
+            legal_ids,
+            np.asarray(data_arg["action_taken"])[batch_arg].astype(np.int64),
+        )
+        legal_mask = torch.as_tensor(
+            np.asarray(legal_ids) >= 0, dtype=torch.bool, device=logits.device
+        )
+        forced = torch.where(
+            legal_mask,
+            torch.zeros_like(logits),
+            torch.full_like(logits, -1.0e9),
+        )
+        targets = torch.as_tensor(
+            target_columns, dtype=torch.long, device=logits.device
+        )
+        markers = np.asarray(data_arg["stream_marker"])[batch_arg]
+        for row, marker in enumerate(markers):
+            target = int(targets[row].item())
+            if marker == "base":
+                forced[row, target] = 100.0
+            elif marker == "aux":
+                forced[row, target] = -100.0
+                legal_columns = np.flatnonzero(np.asarray(legal_ids[row]) >= 0)
+                wrong = int(next(value for value in legal_columns if value != target))
+                forced[row, wrong] = 100.0
+        outputs["logits"] = logits * 0.0 + forced
+        return outputs
+
+    def controlled_soft_targets(data_arg, batch_arg, device, *_args):
+        legal_arg = np.asarray(data_arg["legal_action_ids"])[batch_arg]
+        support = legal_arg >= 0
+        enabled = np.asarray(data_arg["soft_marker"])[batch_arg]
+        targets = np.zeros_like(legal_arg, dtype=np.float32)
+        counts = np.maximum(support.sum(axis=1, keepdims=True), 1)
+        targets[enabled] = (
+            support[enabled].astype(np.float32) / counts[enabled]
+        )
+        return (
+            torch.as_tensor(targets, device=device),
+            torch.as_tensor(enabled, dtype=torch.bool, device=device),
+            torch.as_tensor(support, dtype=torch.bool, device=device),
+        )
+
+    monkeypatch.setattr(
+        train_bc, "_forward_legal_np_for_batch", controlled_forward
+    )
+    monkeypatch.setattr(train_bc, "_soft_targets_legal", controlled_soft_targets)
+    template = _make_entity_policy()
+    initial = copy.deepcopy(template.model.state_dict())
+    weights = np.zeros(len(legal), dtype=np.float32)
+    weights[base_batch] = np.asarray([1.0, 3.0], dtype=np.float32)
+    weights[aux_batch] = np.asarray([2.0, 4.0, 6.0, 8.0], dtype=np.float32)
+
+    def run(base_weights: np.ndarray):
+        policy = _make_entity_policy()
+        policy.model.load_state_dict(initial)
+        policy.model.eval()
+        optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
+        return _train_xdim_batch(
+            policy,
+            optimizer,
+            data,
+            base_batch,
+            base_weights,
+            np.ones(len(legal), dtype=np.float32),
+            soft_target_temperature=1.0,
+            soft_target_weight=1.0,
+            soft_target_source="policy",
+            soft_target_min_legal_coverage=0.0,
+            policy_loss_weight=1.0,
+            value_loss_weight=0.0,
+            final_vp_loss_weight=0.0,
+            q_loss_weight=0.0,
+            q_skip_teacher_prefixes=(),
+            vps_to_win=10,
+            advantage_policy_weighting="none",
+            advantage_temperature=1.0,
+            advantage_weight_cap=5.0,
+            advantage_weight_floor=0.05,
+            amp="none",
+            diagnostics=True,
+            policy_aux_data=data,
+            policy_aux_batch=aux_batch,
+            policy_aux_sample_weights=weights,
+        )
+
+    metrics = run(weights)
+    assert metrics["policy_base_row_count"] == 2
+    assert metrics["policy_aux_row_count"] == 4
+    assert metrics["policy_total_row_count"] == 6
+    assert metrics["policy_base_active_count"] == 2
+    assert metrics["policy_aux_active_count"] == 4
+    assert metrics["policy_total_active_count"] == 6
+    assert metrics["policy_base_correct_count"] == 2
+    assert metrics["policy_aux_correct_count"] == 0
+    assert metrics["policy_total_correct_count"] == 2
+    assert metrics["policy_base_top3_correct_count"] == 2
+    assert metrics["policy_aux_top3_correct_count"] == 0
+    assert metrics["policy_total_top3_correct_count"] == 2
+    assert metrics["policy_base_accuracy"] == 1.0
+    assert metrics["policy_aux_accuracy"] == 0.0
+    assert metrics["accuracy"] == pytest.approx(2.0 / 6.0)
+    assert metrics["policy_total_accuracy"] == metrics["accuracy"]
+    assert metrics["policy_base_top3_accuracy"] == 1.0
+    assert metrics["policy_aux_top3_accuracy"] == 0.0
+    assert metrics["policy_total_top3_accuracy"] == metrics["top3_accuracy"]
+    assert metrics["soft_distillation_base_rows"] == 1
+    assert metrics["soft_distillation_aux_rows"] == 3
+    assert metrics["soft_distillation_total_rows"] == 4
+    assert metrics["soft_distillation_rows"] == 4
+    assert metrics["soft_distillation_base_active_rows"] == 1
+    assert metrics["soft_distillation_aux_active_rows"] == 3
+    assert metrics["soft_distillation_active_rows"] == 4
+    assert metrics["policy_base_phase_stats"]["BASE_PHASE"]["count"] == 2
+    assert metrics["policy_aux_phase_stats"]["AUX_PHASE"]["count"] == 4
+    assert metrics["phase_stats"]["BASE_PHASE"]["count"] == 2
+    assert metrics["phase_stats"]["AUX_PHASE"]["count"] == 4
+    assert metrics["policy_total_phase_stats"] == metrics["phase_stats"]
+    assert metrics["policy_base_teacher_stats"]["base_teacher"]["count"] == 2
+    assert metrics["policy_aux_teacher_stats"]["aux_teacher"]["count"] == 4
+    assert metrics["policy_total_teacher_stats"] == metrics["teacher_stats"]
+
+    zero_base_weights = weights.copy()
+    zero_base_weights[base_batch] = 0.0
+    zero_base = run(zero_base_weights)
+    assert zero_base["policy_base_active_count"] == 0
+    assert zero_base["policy_base_correct_count"] == 0
+    assert zero_base["policy_base_accuracy"] == 0.0
+    assert zero_base["policy_aux_active_count"] == 4
+    assert zero_base["policy_total_active_count"] == 4
+    assert zero_base["accuracy"] == zero_base["policy_aux_accuracy"] == 0.0
+    assert zero_base["policy_base_phase_stats"] == {}
+    assert zero_base["policy_aux_phase_stats"]["AUX_PHASE"]["count"] == 4

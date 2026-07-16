@@ -12011,6 +12011,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         }
         epoch_acc = []
         epoch_top3 = []
+        epoch_policy_metric_counts = {
+            key: 0.0
+            for key in (
+                "policy_base_row_count",
+                "policy_aux_row_count",
+                "policy_base_active_count",
+                "policy_aux_active_count",
+                "policy_base_correct_count",
+                "policy_aux_correct_count",
+                "policy_base_top3_correct_count",
+                "policy_aux_top3_correct_count",
+                "soft_distillation_base_rows",
+                "soft_distillation_aux_rows",
+                "soft_distillation_base_active_rows",
+                "soft_distillation_aux_active_rows",
+            )
+        }
         epoch_count = 0
         epoch_active_count = 0.0
         epoch_aux_active_count = 0.0
@@ -12030,6 +12047,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         phase_stats = _empty_phase_stats()
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
+        policy_base_phase_stats = _empty_phase_stats()
+        policy_aux_phase_stats = _empty_phase_stats()
+        policy_base_phase_stats_unforced = _empty_phase_stats()
+        policy_aux_phase_stats_unforced = _empty_phase_stats()
+        policy_base_teacher_stats = _empty_phase_stats()
+        policy_aux_teacher_stats = _empty_phase_stats()
         total_batches = int(np.ceil(len(order) / max(1, args.batch_size)))
         # AUDIT FIX (LR schedule): the post-warmup decay curve needs an end point.
         # --max-steps (if set) is the true hard stop; otherwise fall back to the
@@ -12421,8 +12444,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             epoch_losses.append(loss * len(batch))
             active_count = float(batch_metrics.get("active_count", len(batch)))
-            epoch_acc.append(accuracy * active_count)
-            epoch_top3.append(float(batch_metrics["top3_accuracy"]) * active_count)
+            total_policy_active_count = float(
+                batch_metrics.get("policy_total_active_count", active_count)
+            )
+            epoch_acc.append(accuracy * total_policy_active_count)
+            epoch_top3.append(
+                float(batch_metrics["top3_accuracy"])
+                * total_policy_active_count
+            )
+            for key in epoch_policy_metric_counts:
+                epoch_policy_metric_counts[key] += float(
+                    batch_metrics.get(key, 0.0)
+                )
             epoch_active_count += active_count
             epoch_aux_active_count += float(
                 batch_metrics.get("policy_aux_active_count", 0)
@@ -12537,6 +12570,30 @@ def main(argv: Sequence[str] | None = None) -> None:
                 batch_metrics.get("phase_stats_unforced", {}),
             )
             _merge_phase_stats(teacher_stats, batch_metrics["teacher_stats"])
+            _merge_phase_stats(
+                policy_base_phase_stats,
+                batch_metrics.get("policy_base_phase_stats", {}),
+            )
+            _merge_phase_stats(
+                policy_aux_phase_stats,
+                batch_metrics.get("policy_aux_phase_stats", {}),
+            )
+            _merge_phase_stats(
+                policy_base_phase_stats_unforced,
+                batch_metrics.get("policy_base_phase_stats_unforced", {}),
+            )
+            _merge_phase_stats(
+                policy_aux_phase_stats_unforced,
+                batch_metrics.get("policy_aux_phase_stats_unforced", {}),
+            )
+            _merge_phase_stats(
+                policy_base_teacher_stats,
+                batch_metrics.get("policy_base_teacher_stats", {}),
+            )
+            _merge_phase_stats(
+                policy_aux_teacher_stats,
+                batch_metrics.get("policy_aux_teacher_stats", {}),
+            )
             epoch_count += len(batch)
             # An optimizer step (and its LR-schedule tick) happens once per
             # accumulation group; at accum==1 that is every batch. train_fn did
@@ -12784,6 +12841,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         phase_stats = _reduce_nested_count_stats(phase_stats, ddp)
         phase_stats_unforced = _reduce_nested_count_stats(phase_stats_unforced, ddp)
         teacher_stats = _reduce_nested_count_stats(teacher_stats, ddp)
+        policy_base_phase_stats = _reduce_nested_count_stats(
+            policy_base_phase_stats, ddp
+        )
+        policy_aux_phase_stats = _reduce_nested_count_stats(
+            policy_aux_phase_stats, ddp
+        )
+        policy_base_phase_stats_unforced = _reduce_nested_count_stats(
+            policy_base_phase_stats_unforced, ddp
+        )
+        policy_aux_phase_stats_unforced = _reduce_nested_count_stats(
+            policy_aux_phase_stats_unforced, ddp
+        )
+        policy_base_teacher_stats = _reduce_nested_count_stats(
+            policy_base_teacher_stats, ddp
+        )
+        policy_aux_teacher_stats = _reduce_nested_count_stats(
+            policy_aux_teacher_stats, ddp
+        )
+        epoch_policy_metric_counts = _reduce_named_sums(
+            epoch_policy_metric_counts, ddp
+        )
         loss_sum = float(np.sum(epoch_losses)) if epoch_losses else 0.0
         acc_sum = float(np.sum(epoch_acc)) if epoch_acc else 0.0
         top3_sum = float(np.sum(epoch_top3)) if epoch_top3 else 0.0
@@ -13030,6 +13108,112 @@ def main(argv: Sequence[str] | None = None) -> None:
             + resolved_categorical_value_weight
             * auxiliary_loss_epochs["value_categorical_loss"]
         )
+        policy_base_rows = float(
+            epoch_policy_metric_counts["policy_base_row_count"]
+        )
+        policy_aux_rows = float(
+            epoch_policy_metric_counts["policy_aux_row_count"]
+        )
+        policy_base_active = float(
+            epoch_policy_metric_counts["policy_base_active_count"]
+        )
+        policy_aux_active = float(
+            epoch_policy_metric_counts["policy_aux_active_count"]
+        )
+        if not math.isclose(
+            policy_base_rows, total_count, rel_tol=0.0, abs_tol=1.0e-6
+        ):
+            raise RuntimeError(
+                "base policy metric row count drifted from DDP epoch sample count"
+            )
+        if not math.isclose(
+            policy_base_active,
+            active_count_total,
+            rel_tol=0.0,
+            abs_tol=1.0e-6,
+        ) or not math.isclose(
+            policy_aux_active,
+            aux_active_count_total,
+            rel_tol=0.0,
+            abs_tol=1.0e-6,
+        ):
+            raise RuntimeError(
+                "policy metric sufficient statistics drifted from dose counters"
+            )
+        policy_total_rows = policy_base_rows + policy_aux_rows
+        policy_total_active = policy_base_active + policy_aux_active
+        policy_base_correct = float(
+            epoch_policy_metric_counts["policy_base_correct_count"]
+        )
+        policy_aux_correct = float(
+            epoch_policy_metric_counts["policy_aux_correct_count"]
+        )
+        policy_base_top3_correct = float(
+            epoch_policy_metric_counts["policy_base_top3_correct_count"]
+        )
+        policy_aux_top3_correct = float(
+            epoch_policy_metric_counts["policy_aux_top3_correct_count"]
+        )
+        policy_base_accuracy = _bounded_count_fraction(
+            policy_base_correct,
+            policy_base_active,
+            label="policy_base_accuracy",
+        )
+        policy_aux_accuracy = _bounded_count_fraction(
+            policy_aux_correct,
+            policy_aux_active,
+            label="policy_aux_accuracy",
+        )
+        policy_total_accuracy = _bounded_count_fraction(
+            policy_base_correct + policy_aux_correct,
+            policy_total_active,
+            label="policy_total_accuracy",
+        )
+        policy_base_top3_accuracy = _bounded_count_fraction(
+            policy_base_top3_correct,
+            policy_base_active,
+            label="policy_base_top3_accuracy",
+        )
+        policy_aux_top3_accuracy = _bounded_count_fraction(
+            policy_aux_top3_correct,
+            policy_aux_active,
+            label="policy_aux_top3_accuracy",
+        )
+        policy_total_top3_accuracy = _bounded_count_fraction(
+            policy_base_top3_correct + policy_aux_top3_correct,
+            policy_total_active,
+            label="policy_total_top3_accuracy",
+        )
+        policy_base_soft_rows = float(
+            epoch_policy_metric_counts["soft_distillation_base_rows"]
+        )
+        policy_aux_soft_rows = float(
+            epoch_policy_metric_counts["soft_distillation_aux_rows"]
+        )
+        policy_base_soft_active = float(
+            epoch_policy_metric_counts["soft_distillation_base_active_rows"]
+        )
+        policy_aux_soft_active = float(
+            epoch_policy_metric_counts["soft_distillation_aux_active_rows"]
+        )
+        policy_total_soft_rows = policy_base_soft_rows + policy_aux_soft_rows
+        policy_total_soft_active = (
+            policy_base_soft_active + policy_aux_soft_active
+        )
+        if not math.isclose(
+            policy_total_soft_rows,
+            float(epoch_extra_sums["soft_distillation_rows"]),
+            rel_tol=0.0,
+            abs_tol=1.0e-6,
+        ) or not math.isclose(
+            policy_total_soft_active,
+            float(epoch_extra_sums["soft_distillation_active_rows"]),
+            rel_tol=0.0,
+            abs_tol=1.0e-6,
+        ):
+            raise RuntimeError(
+                "policy soft-target sufficient statistics drifted from headline counts"
+            )
         metrics.append(
             {
                 "epoch": epoch + 1,
@@ -13115,17 +13299,102 @@ def main(argv: Sequence[str] | None = None) -> None:
                 },
                 "q_score_rows_ge2": int(round(epoch_extra_sums["q_score_rows_ge2"])),
                 "q_score_rows_ge2_fraction": epoch_extra_sums["q_score_rows_ge2"] / max(total_count, 1.0),
-                "soft_distillation_rows": int(round(epoch_extra_sums["soft_distillation_rows"])),
-                "soft_distillation_fraction": epoch_extra_sums["soft_distillation_rows"] / max(total_count, 1.0),
-                "soft_distillation_active_rows": int(
-                    round(epoch_extra_sums["soft_distillation_active_rows"])
+                "policy_metric_semantics": {
+                    "schema_version": "train-policy-stream-metrics-v1",
+                    "headline_scope": "base_plus_aux_count_weighted",
+                    "base_scope": "positive_policy_weight_rows_in_base_forward",
+                    "aux_scope": "all_rows_in_policy_aux_forward",
+                    "accuracy_weighting": "uniform_active_row_count",
+                    "epoch_aggregation": "sum_sufficient_stats_then_ddp_reduce",
+                    "loss_weighting_unchanged": True,
+                },
+                "policy_base_row_count": int(round(policy_base_rows)),
+                "policy_aux_row_count": int(round(policy_aux_rows)),
+                "policy_total_row_count": int(round(policy_total_rows)),
+                "policy_base_accuracy_active_count": int(
+                    round(policy_base_active)
                 ),
-                "soft_distillation_active_fraction": (
-                    _bounded_count_fraction(
-                        epoch_extra_sums["soft_distillation_active_rows"],
-                        active_count_total,
-                        label="soft_distillation_active_fraction",
-                    )
+                "policy_aux_accuracy_active_count": int(
+                    round(policy_aux_active)
+                ),
+                "policy_total_accuracy_active_count": int(
+                    round(policy_total_active)
+                ),
+                "policy_base_correct_count": int(round(policy_base_correct)),
+                "policy_aux_correct_count": int(round(policy_aux_correct)),
+                "policy_total_correct_count": int(
+                    round(policy_base_correct + policy_aux_correct)
+                ),
+                "policy_base_top3_correct_count": int(
+                    round(policy_base_top3_correct)
+                ),
+                "policy_aux_top3_correct_count": int(
+                    round(policy_aux_top3_correct)
+                ),
+                "policy_total_top3_correct_count": int(
+                    round(policy_base_top3_correct + policy_aux_top3_correct)
+                ),
+                "soft_distillation_base_rows": int(
+                    round(policy_base_soft_rows)
+                ),
+                "soft_distillation_aux_rows": int(
+                    round(policy_aux_soft_rows)
+                ),
+                "soft_distillation_total_rows": int(
+                    round(policy_total_soft_rows)
+                ),
+                "soft_distillation_rows": int(round(policy_total_soft_rows)),
+                "soft_distillation_base_fraction": _bounded_count_fraction(
+                    policy_base_soft_rows,
+                    policy_base_rows,
+                    label="soft_distillation_base_fraction",
+                ),
+                "soft_distillation_aux_fraction": _bounded_count_fraction(
+                    policy_aux_soft_rows,
+                    policy_aux_rows,
+                    label="soft_distillation_aux_fraction",
+                ),
+                "soft_distillation_total_fraction": _bounded_count_fraction(
+                    policy_total_soft_rows,
+                    policy_total_rows,
+                    label="soft_distillation_total_fraction",
+                ),
+                "soft_distillation_fraction": _bounded_count_fraction(
+                    policy_total_soft_rows,
+                    policy_total_rows,
+                    label="soft_distillation_fraction",
+                ),
+                "soft_distillation_base_active_rows": int(
+                    round(policy_base_soft_active)
+                ),
+                "soft_distillation_aux_active_rows": int(
+                    round(policy_aux_soft_active)
+                ),
+                "soft_distillation_total_active_rows": int(
+                    round(policy_total_soft_active)
+                ),
+                "soft_distillation_active_rows": int(
+                    round(policy_total_soft_active)
+                ),
+                "soft_distillation_base_active_fraction": _bounded_count_fraction(
+                    policy_base_soft_active,
+                    policy_base_active,
+                    label="soft_distillation_base_active_fraction",
+                ),
+                "soft_distillation_aux_active_fraction": _bounded_count_fraction(
+                    policy_aux_soft_active,
+                    policy_aux_active,
+                    label="soft_distillation_aux_active_fraction",
+                ),
+                "soft_distillation_total_active_fraction": _bounded_count_fraction(
+                    policy_total_soft_active,
+                    policy_total_active,
+                    label="soft_distillation_total_active_fraction",
+                ),
+                "soft_distillation_active_fraction": _bounded_count_fraction(
+                    policy_total_soft_active,
+                    policy_total_active,
+                    label="soft_distillation_active_fraction",
                 ),
                 "advantage_weight_rows": int(round(epoch_extra_sums["advantage_weight_rows"])),
                 "advantage_mean": (
@@ -13136,9 +13405,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     epoch_extra_sums["advantage_weight_mean_sum"]
                     / max(epoch_extra_sums["advantage_weight_rows"], 1.0)
                 ),
-                "accuracy_active_count": int(round(active_count_total)),
-                "accuracy": acc_sum / max(active_count_total, 1.0),
-                "top3_accuracy": top3_sum / max(active_count_total, 1.0),
+                "policy_base_accuracy": policy_base_accuracy,
+                "policy_aux_accuracy": policy_aux_accuracy,
+                "policy_total_accuracy": policy_total_accuracy,
+                "accuracy_active_count": int(round(policy_total_active)),
+                "accuracy": policy_total_accuracy,
+                "policy_base_top3_accuracy": policy_base_top3_accuracy,
+                "policy_aux_top3_accuracy": policy_aux_top3_accuracy,
+                "policy_total_top3_accuracy": policy_total_top3_accuracy,
+                "top3_accuracy": policy_total_top3_accuracy,
                 **(
                     {
                         "optimizer_observability": {
@@ -13166,8 +13441,35 @@ def main(argv: Sequence[str] | None = None) -> None:
                     if optimizer_observed_steps
                     else {}
                 ),
+                "policy_base_phase_accuracy": _finalize_phase_stats(
+                    policy_base_phase_stats
+                ),
+                "policy_aux_phase_accuracy": _finalize_phase_stats(
+                    policy_aux_phase_stats
+                ),
+                "policy_total_phase_accuracy": _finalize_phase_stats(
+                    phase_stats
+                ),
                 "phase_accuracy": _finalize_phase_stats(phase_stats),
+                "policy_base_phase_accuracy_excluding_forced": (
+                    _finalize_phase_stats(policy_base_phase_stats_unforced)
+                ),
+                "policy_aux_phase_accuracy_excluding_forced": (
+                    _finalize_phase_stats(policy_aux_phase_stats_unforced)
+                ),
+                "policy_total_phase_accuracy_excluding_forced": (
+                    _finalize_phase_stats(phase_stats_unforced)
+                ),
                 "phase_accuracy_excluding_forced": _finalize_phase_stats(phase_stats_unforced),
+                "policy_base_teacher_accuracy": _finalize_phase_stats(
+                    policy_base_teacher_stats
+                ),
+                "policy_aux_teacher_accuracy": _finalize_phase_stats(
+                    policy_aux_teacher_stats
+                ),
+                "policy_total_teacher_accuracy": _finalize_phase_stats(
+                    teacher_stats
+                ),
                 "teacher_accuracy": _finalize_phase_stats(teacher_stats),
             }
         )
@@ -15091,6 +15393,13 @@ def _train_xdim_batch(
         policy_base_loss_denominator = policy_loss_denominator
         policy_aux_loss_sum, _ = _zero_loss_parts(policy.device)
         policy_aux_active_count = 0
+        policy_aux_correct_count = 0
+        policy_aux_top3_correct_count = 0
+        policy_aux_soft_rows = 0
+        policy_aux_soft_active_rows = 0
+        policy_aux_phase_stats: dict = {}
+        policy_aux_phase_stats_unforced: dict = {}
+        policy_aux_teacher_stats: dict = {}
         if policy_aux_batch is not None:
             if policy_aux_data is None or policy_aux_sample_weights is None:
                 raise ValueError("incomplete policy auxiliary batch inputs")
@@ -15153,6 +15462,55 @@ def _train_xdim_batch(
             policy_aux_loss_sum = aux_sum
             policy_loss_sum = policy_loss_sum + aux_sum
             policy_aux_active_count = int(len(policy_aux_batch))
+            aux_predictions = torch.argmax(aux_outputs["logits"], dim=-1)
+            policy_aux_correct_count = int(
+                (aux_predictions == aux_actions).sum().item()
+            )
+            policy_aux_top3_correct_count = int(
+                round(
+                    float(
+                        _topk_legal_accuracy(
+                            aux_outputs["logits"], aux_actions, k=3
+                        ).item()
+                    )
+                    * policy_aux_active_count
+                )
+            )
+            if aux_soft is not None:
+                policy_aux_soft_rows = int(aux_has_soft.sum().item())
+                # AUX admission requires every sampled row to have positive
+                # policy weight, so its soft-row and soft-active counts match.
+                policy_aux_soft_active_rows = policy_aux_soft_rows
+            if diagnostics:
+                aux_predictions_np = aux_predictions.detach().cpu().numpy()
+                aux_targets_np = aux_actions.detach().cpu().numpy()
+                aux_logits_np = (
+                    aux_outputs["logits"].float().detach().cpu().numpy()
+                )
+                policy_aux_phase_stats = _field_stats(
+                    policy_aux_data,
+                    policy_aux_batch,
+                    aux_predictions_np,
+                    aux_targets_np,
+                    aux_logits_np,
+                    field="phase",
+                )
+                policy_aux_phase_stats_unforced = _field_stats_unforced(
+                    policy_aux_data,
+                    policy_aux_batch,
+                    aux_predictions_np,
+                    aux_targets_np,
+                    aux_logits_np,
+                    field="phase",
+                )
+                policy_aux_teacher_stats = _field_stats(
+                    policy_aux_data,
+                    policy_aux_batch,
+                    aux_predictions_np,
+                    aux_targets_np,
+                    aux_logits_np,
+                    field="teacher_name",
+                )
         # Preserve the complete base-policy objective. The auxiliary stream is
         # an additive dose measured relative to the base denominator, not a
         # larger joint batch that dilutes base learning by B/(B+A). Equivalently
@@ -15588,14 +15946,56 @@ def _train_xdim_batch(
     predictions = torch.argmax(outputs["logits"], dim=-1)
     active = policy_weights > 0.0
     active_count = int(active.sum().item())
-    accuracy = _masked_metric_mean((predictions == target).float(), active)
-    top3_accuracy = _topk_legal_accuracy(outputs["logits"], target, k=3, mask=active)
+    policy_base_correct_count = int(((predictions == target) & active).sum().item())
+    policy_base_top3_correct_count = int(
+        round(
+            float(
+                _topk_legal_accuracy(
+                    outputs["logits"], target, k=3, mask=active
+                ).item()
+            )
+            * active_count
+        )
+    )
+    policy_total_active_count = active_count + policy_aux_active_count
+    policy_total_correct_count = (
+        policy_base_correct_count + policy_aux_correct_count
+    )
+    policy_total_top3_correct_count = (
+        policy_base_top3_correct_count + policy_aux_top3_correct_count
+    )
+    policy_base_accuracy = policy_base_correct_count / max(active_count, 1)
+    policy_aux_accuracy = policy_aux_correct_count / max(
+        policy_aux_active_count, 1
+    )
+    policy_total_accuracy = policy_total_correct_count / max(
+        policy_total_active_count, 1
+    )
+    policy_base_top3_accuracy = policy_base_top3_correct_count / max(
+        active_count, 1
+    )
+    policy_aux_top3_accuracy = policy_aux_top3_correct_count / max(
+        policy_aux_active_count, 1
+    )
+    policy_total_top3_accuracy = policy_total_top3_correct_count / max(
+        policy_total_active_count, 1
+    )
+    policy_base_soft_rows = (
+        int(has_soft.sum().item()) if soft_targets is not None else 0
+    )
+    policy_base_soft_active_rows = (
+        int((has_soft & active).sum().item()) if soft_targets is not None else 0
+    )
+    policy_total_soft_rows = policy_base_soft_rows + policy_aux_soft_rows
+    policy_total_soft_active_rows = (
+        policy_base_soft_active_rows + policy_aux_soft_active_rows
+    )
     active_np = active.detach().cpu().numpy().astype(bool)
     if diagnostics:
         predictions_np = predictions.detach().cpu().numpy()
         target_np = target.detach().cpu().numpy()
         logits_np = outputs["logits"].float().detach().cpu().numpy()
-        phase_stats = _field_stats(
+        policy_base_phase_stats = _field_stats(
             data,
             batch[active_np],
             predictions_np[active_np],
@@ -15603,7 +16003,7 @@ def _train_xdim_batch(
             logits_np[active_np],
             field="phase",
         )
-        teacher_stats = _field_stats(
+        policy_base_teacher_stats = _field_stats(
             data,
             batch[active_np],
             predictions_np[active_np],
@@ -15611,7 +16011,7 @@ def _train_xdim_batch(
             logits_np[active_np],
             field="teacher_name",
         )
-        phase_stats_unforced = _field_stats_unforced(
+        policy_base_phase_stats_unforced = _field_stats_unforced(
             data,
             batch[active_np],
             predictions_np[active_np],
@@ -15619,7 +16019,23 @@ def _train_xdim_batch(
             logits_np[active_np],
             field="phase",
         )
+        phase_stats: dict = {}
+        phase_stats_unforced: dict = {}
+        teacher_stats: dict = {}
+        _merge_phase_stats(phase_stats, policy_base_phase_stats)
+        _merge_phase_stats(phase_stats, policy_aux_phase_stats)
+        _merge_phase_stats(
+            phase_stats_unforced, policy_base_phase_stats_unforced
+        )
+        _merge_phase_stats(
+            phase_stats_unforced, policy_aux_phase_stats_unforced
+        )
+        _merge_phase_stats(teacher_stats, policy_base_teacher_stats)
+        _merge_phase_stats(teacher_stats, policy_aux_teacher_stats)
     else:
+        policy_base_phase_stats = {}
+        policy_base_teacher_stats = {}
+        policy_base_phase_stats_unforced = {}
         phase_stats = {}
         teacher_stats = {}
         phase_stats_unforced = {}
@@ -15718,25 +16134,73 @@ def _train_xdim_batch(
         ),
         "q_score_rows_ge2": q_score_rows_ge2,
         **advantage_stats,
-        "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
+        # Headline policy telemetry is the count-weighted union of the base and
+        # additive AUX forward streams. Explicit sufficient statistics below
+        # let epoch/DDP aggregation reconstruct each stream without averaging
+        # per-batch means or confusing policy loss weights with metric weights.
+        "policy_metric_semantics": {
+            "schema_version": "train-policy-stream-metrics-v1",
+            "headline_scope": "base_plus_aux_count_weighted",
+            "base_scope": "positive_policy_weight_rows_in_base_forward",
+            "aux_scope": "all_rows_in_policy_aux_forward",
+            "accuracy_weighting": "uniform_active_row_count",
+            "loss_weighting_unchanged": True,
+        },
+        "policy_base_row_count": int(len(batch)),
+        "policy_aux_row_count": int(policy_aux_active_count),
+        "policy_total_row_count": int(len(batch) + policy_aux_active_count),
+        "policy_base_active_count": int(active_count),
+        "policy_aux_active_count": int(policy_aux_active_count),
+        "policy_total_active_count": int(policy_total_active_count),
+        "policy_base_correct_count": int(policy_base_correct_count),
+        "policy_aux_correct_count": int(policy_aux_correct_count),
+        "policy_total_correct_count": int(policy_total_correct_count),
+        "policy_base_top3_correct_count": int(policy_base_top3_correct_count),
+        "policy_aux_top3_correct_count": int(policy_aux_top3_correct_count),
+        "policy_total_top3_correct_count": int(
+            policy_total_top3_correct_count
+        ),
+        "soft_distillation_base_rows": int(policy_base_soft_rows),
+        "soft_distillation_aux_rows": int(policy_aux_soft_rows),
+        "soft_distillation_total_rows": int(policy_total_soft_rows),
+        "soft_distillation_rows": int(policy_total_soft_rows),
         # ``has_soft`` describes every row carrying a target distribution, but
         # policy_weight_multiplier deliberately makes most fast/forced rows
         # value-only.  Report the intersection as well: the unconditional count
         # made A1 look only ~49% soft-distilled even though 100% of the rows that
         # actually entered policy CE used the search distribution.
-        "soft_distillation_active_rows": (
-            int((has_soft & active).sum().item()) if soft_targets is not None else 0
+        "soft_distillation_base_active_rows": int(
+            policy_base_soft_active_rows
         ),
+        "soft_distillation_aux_active_rows": int(policy_aux_soft_active_rows),
+        "soft_distillation_total_active_rows": int(
+            policy_total_soft_active_rows
+        ),
+        "soft_distillation_active_rows": int(policy_total_soft_active_rows),
         "active_count": active_count,
-        "policy_aux_active_count": int(policy_aux_active_count),
         "value_active_count": int(value_active_count),
         "_value_active_row_mask": (
             value_active_mask.detach().cpu().numpy().astype(np.bool_, copy=False)
         ),
-        "accuracy": float(accuracy.item()),
-        "top3_accuracy": float(top3_accuracy.item()),
+        "policy_base_accuracy": float(policy_base_accuracy),
+        "policy_aux_accuracy": float(policy_aux_accuracy),
+        "policy_total_accuracy": float(policy_total_accuracy),
+        "accuracy": float(policy_total_accuracy),
+        "policy_base_top3_accuracy": float(policy_base_top3_accuracy),
+        "policy_aux_top3_accuracy": float(policy_aux_top3_accuracy),
+        "policy_total_top3_accuracy": float(policy_total_top3_accuracy),
+        "top3_accuracy": float(policy_total_top3_accuracy),
+        "policy_base_phase_stats": policy_base_phase_stats,
+        "policy_aux_phase_stats": policy_aux_phase_stats,
+        "policy_total_phase_stats": phase_stats,
         "phase_stats": phase_stats,
+        "policy_base_teacher_stats": policy_base_teacher_stats,
+        "policy_aux_teacher_stats": policy_aux_teacher_stats,
+        "policy_total_teacher_stats": teacher_stats,
         "teacher_stats": teacher_stats,
+        "policy_base_phase_stats_unforced": policy_base_phase_stats_unforced,
+        "policy_aux_phase_stats_unforced": policy_aux_phase_stats_unforced,
+        "policy_total_phase_stats_unforced": phase_stats_unforced,
         "phase_stats_unforced": phase_stats_unforced,
         **(
             {"optimizer_observability": optimizer_observability}
