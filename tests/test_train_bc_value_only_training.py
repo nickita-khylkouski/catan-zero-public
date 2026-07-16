@@ -1440,6 +1440,8 @@ def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
     assert metric["samples"] == metric["policy_base_row_count"] == 6
     assert metric["policy_aux_row_count"] == 0
     assert metric["policy_total_row_count"] == 6
+    assert metric["policy_base_loss"] == pytest.approx(metric["policy_loss"])
+    assert metric["policy_aux_loss"] == 0.0
     # The default policy objective now excludes one-legal-action plumbing.
     # Four OPEN rows remain active: one row is explicitly weight-zero and the
     # FORCED row receives the default forced_action_weight=0.
