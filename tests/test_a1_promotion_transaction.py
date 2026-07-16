@@ -988,6 +988,23 @@ def _fixture(
         ("champion_calibration", champion, 0.21),
     ):
         source = tmp_path / f"{role}.json"
+        deployed_view = {
+            "global": {"n": 4096, "value_rmse": rmse},
+            "by_phase": {
+                "opening_placement": {"n": 512, "value_rmse": rmse},
+                "robber": {"n": 256, "value_rmse": rmse},
+                "play_turn": {"n": 3328, "value_rmse": rmse},
+            },
+            "by_forced": {
+                "forced": {"n": 2048, "value_rmse": rmse},
+                "unforced": {"n": 2048, "value_rmse": rmse},
+            },
+            "by_legal_count_bucket": {
+                "1": {"n": 2048, "value_rmse": rmse},
+                "2-4": {"n": 1024, "value_rmse": rmse},
+                "41+": {"n": 1024, "value_rmse": rmse},
+            },
+        }
         _write_json(
             source,
             {
@@ -1022,18 +1039,15 @@ def _fixture(
                     "configured_effective_transform": "scalar_tanh",
                     "categorical_bypasses_scalar_tanh": False,
                     "views": {
-                        "raw_training_readout": {
-                            "global": {"n": 4096, "value_rmse": rmse}
-                        },
-                        "scalar_tanh": {
-                            "global": {"n": 4096, "value_rmse": rmse}
-                        },
-                        "scalar_clip": {
-                            "global": {"n": 4096, "value_rmse": rmse}
-                        },
+                        "raw_training_readout": deployed_view,
+                        "scalar_tanh": deployed_view,
+                        "scalar_clip": deployed_view,
                     },
                 },
                 "global": {"n": 4096, "value_rmse": rmse},
+                "by_phase": deployed_view["by_phase"],
+                "by_forced": deployed_view["by_forced"],
+                "by_legal_count_bucket": deployed_view["by_legal_count_bucket"],
             },
         )
         calibration_sources.append((role, source))
@@ -1529,7 +1543,15 @@ def _fixture(
         "mechanism_calibration": (
             calibration_sources,
             "pass",
-            {"value_readout": "scalar", "max_rmse_regression": 0.02},
+            {
+                "value_readout": "scalar",
+                "max_rmse_regression": 0.02,
+                "max_slice_rmse_regression": 0.02,
+                "minimum_slice_rows": 30,
+                "required_slices_if_present": list(
+                    promotion.REQUIRED_CALIBRATION_SLICES_IF_PRESENT
+                ),
+            },
         ),
         "internal_h2h": (
             (
@@ -3988,10 +4010,129 @@ def test_bucket_cannot_launder_regression_with_pass_status(tmp_path: Path) -> No
         _execute(fixture, go=False)
 
 
+def _calibration_non_regression_policy() -> dict:
+    return {
+        "value_readout": "scalar",
+        "max_rmse_regression": promotion.MAX_CALIBRATION_RMSE_REGRESSION,
+        "max_slice_rmse_regression": (
+            promotion.MAX_CALIBRATION_SLICE_RMSE_REGRESSION
+        ),
+        "minimum_slice_rows": promotion.MIN_CALIBRATION_SLICE_ROWS,
+        "required_slices_if_present": list(
+            promotion.REQUIRED_CALIBRATION_SLICES_IF_PRESENT
+        ),
+    }
+
+
+def _deployed_value_metrics(
+    *,
+    global_rmse: float = 0.20,
+    opening_rmse: float = 0.20,
+    wide_rmse: float = 0.20,
+    robber_rmse: float = 0.20,
+) -> dict:
+    return {
+        "global_rmse": global_rmse,
+        "slices": {
+            "by_phase:opening_placement": {
+                "n": 512,
+                "value_rmse": opening_rmse,
+            },
+            "by_legal_count_bucket:41+": {
+                "n": 1024,
+                "value_rmse": wide_rmse,
+            },
+            "by_phase:robber": {"n": 256, "value_rmse": robber_rmse},
+        },
+    }
+
+
+def test_calibration_non_regression_accepts_bound_load_bearing_slices() -> None:
+    promotion._verify_calibration_non_regression(  # noqa: SLF001
+        _calibration_non_regression_policy(),
+        expected_readout="scalar",
+        candidate_metrics=_deployed_value_metrics(),
+        champion_metrics=_deployed_value_metrics(global_rmse=0.21),
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "candidate_rmse"),
+    [
+        ("by_phase:opening_placement", 0.50),
+        ("by_phase:robber", 0.50),
+        ("by_legal_count_bucket:41+", 0.50),
+    ],
+)
+def test_calibration_non_regression_rejects_load_bearing_slice(
+    field: str, candidate_rmse: float
+) -> None:
+    candidate = _deployed_value_metrics()
+    candidate["slices"][field]["value_rmse"] = candidate_rmse
+
+    with pytest.raises(promotion.PromotionError, match="slice RMSE regression"):
+        promotion._verify_calibration_non_regression(  # noqa: SLF001
+            _calibration_non_regression_policy(),
+            expected_readout="scalar",
+            candidate_metrics=candidate,
+            champion_metrics=_deployed_value_metrics(),
+        )
+
+
+def test_calibration_non_regression_requires_minimum_rows_if_slice_exists() -> None:
+    candidate = _deployed_value_metrics()
+    champion = _deployed_value_metrics()
+    for metrics in (candidate, champion):
+        metrics["slices"]["by_phase:robber"]["n"] = (
+            promotion.MIN_CALIBRATION_SLICE_ROWS - 1
+        )
+
+    with pytest.raises(promotion.PromotionError, match="insufficient rows"):
+        promotion._verify_calibration_non_regression(  # noqa: SLF001
+            _calibration_non_regression_policy(),
+            expected_readout="scalar",
+            candidate_metrics=candidate,
+            champion_metrics=champion,
+        )
+
+
+def test_calibration_non_regression_rejects_present_slice_cohort_mismatch() -> None:
+    candidate = _deployed_value_metrics()
+    champion = _deployed_value_metrics()
+    del candidate["slices"]["by_phase:opening_placement"]
+
+    with pytest.raises(promotion.PromotionError, match="slice cohort differs"):
+        promotion._verify_calibration_non_regression(  # noqa: SLF001
+            _calibration_non_regression_policy(),
+            expected_readout="scalar",
+            candidate_metrics=candidate,
+            champion_metrics=champion,
+        )
+
+
+def test_calibration_non_regression_activates_future_boundary_slice() -> None:
+    candidate = _deployed_value_metrics()
+    champion = _deployed_value_metrics()
+    candidate["slices"]["by_phase:pre_roll"] = {"n": 96, "value_rmse": 0.50}
+    champion["slices"]["by_phase:pre_roll"] = {"n": 96, "value_rmse": 0.20}
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="slice RMSE regression for by_phase:pre_roll",
+    ):
+        promotion._verify_calibration_non_regression(  # noqa: SLF001
+            _calibration_non_regression_policy(),
+            expected_readout="scalar",
+            candidate_metrics=candidate,
+            champion_metrics=champion,
+        )
+
+
 @pytest.mark.parametrize(
     ("kind", "field"),
     [
         ("mechanism_calibration", "max_rmse_regression"),
+        ("mechanism_calibration", "max_slice_rmse_regression"),
         ("external_panel", "max_win_rate_regression"),
     ],
 )
@@ -4057,6 +4198,59 @@ def test_calibration_gate_scores_the_sealed_deployed_transform(tmp_path: Path) -
     )
 
     with pytest.raises(promotion.PromotionError, match="allowed RMSE regression"):
+        _execute(fixture, go=False)
+
+
+@pytest.mark.parametrize(
+    ("axis", "label"),
+    [
+        ("by_phase", "opening_placement"),
+        ("by_phase", "robber"),
+        ("by_legal_count_bucket", "41+"),
+    ],
+)
+def test_calibration_gate_rejects_load_bearing_slice_regression(
+    tmp_path: Path, axis: str, label: str
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def regress_slice(source: dict) -> None:
+        source["deployed_readout_diagnostics"]["views"]["scalar_tanh"][axis][
+            label
+        ]["value_rmse"] = 0.50
+
+    _mutate_evidence_source(
+        fixture,
+        kind="mechanism_calibration",
+        role="candidate_calibration",
+        mutate=regress_slice,
+    )
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="allowed slice RMSE regression",
+    ):
+        _execute(fixture, go=False)
+
+
+def test_calibration_gate_rejects_deployed_slice_inventory_drift(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def omit_deployed_opening(source: dict) -> None:
+        del source["deployed_readout_diagnostics"]["views"]["scalar_tanh"][
+            "by_phase"
+        ]["opening_placement"]
+
+    _mutate_evidence_source(
+        fixture,
+        kind="mechanism_calibration",
+        role="candidate_calibration",
+        mutate=omit_deployed_opening,
+    )
+
+    with pytest.raises(promotion.PromotionError, match="raw/deployed.*slice cohort"):
         _execute(fixture, go=False)
 
 

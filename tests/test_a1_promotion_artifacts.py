@@ -1209,7 +1209,15 @@ def _contract() -> dict:
         (
             "mechanism_calibration",
             "pass",
-            {"value_readout": "scalar", "max_rmse_regression": 0.02},
+            {
+                "value_readout": "scalar",
+                "max_rmse_regression": 0.02,
+                "max_slice_rmse_regression": 0.02,
+                "minimum_slice_rows": 30,
+                "required_slices_if_present": list(
+                    promotion.REQUIRED_CALIBRATION_SLICES_IF_PRESENT
+                ),
+            },
         ),
         (
             "internal_h2h",

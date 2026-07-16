@@ -161,6 +161,21 @@ HISTORICAL_MARKERLESS_A1_CONTRACT = {
     "training_receipt_digest": "sha256:187288dabbe4ce981196db63a2e73946587877f11afadcdc7994eec2b89067b1",
 }
 MAX_CALIBRATION_RMSE_REGRESSION = 0.02
+MAX_CALIBRATION_SLICE_RMSE_REGRESSION = 0.02
+MIN_CALIBRATION_SLICE_ROWS = 30
+REQUIRED_CALIBRATION_SLICES_IF_PRESENT = (
+    "by_phase:opening_placement",
+    "by_legal_count_bucket:41+",
+    "by_phase:robber",
+    # Forward-compatible aliases for a finer phase vocabulary.  The current
+    # v2 artifact pools ROLL/END_TURN into play_turn, but a future producer
+    # that exposes either boundary must make it load-bearing immediately.
+    "by_phase:MOVE_ROBBER",
+    "by_phase:pre_roll",
+    "by_phase:ROLL",
+    "by_phase:end_turn",
+    "by_phase:END_TURN",
+)
 MAX_EXTERNAL_WIN_RATE_REGRESSION = 0.02
 SUPERIORITY_ELO0 = 0.0
 SUPERIORITY_ELO1 = 15.0
@@ -5008,6 +5023,165 @@ def _verify_internal_h2h_engine_identity(
         )
 
 
+def _deployed_calibration_slice_metrics(
+    deployed_view: Mapping[str, Any],
+    *,
+    where: str,
+) -> dict[str, dict[str, float | int]]:
+    """Extract immutable slice counts/RMSE from the deployed readout view."""
+
+    slices: dict[str, dict[str, float | int]] = {}
+    for axis in ("by_phase", "by_forced", "by_legal_count_bucket"):
+        raw_axis = deployed_view.get(axis, {})
+        if not isinstance(raw_axis, dict):
+            raise PromotionError(f"{where}.{axis} must be an object")
+        for raw_label, raw_metrics in raw_axis.items():
+            if not isinstance(raw_label, str) or not raw_label:
+                raise PromotionError(f"{where}.{axis} has an invalid slice label")
+            if not isinstance(raw_metrics, dict):
+                raise PromotionError(
+                    f"{where}.{axis}.{raw_label} must be an object"
+                )
+            slice_ref = f"{axis}:{raw_label}"
+            if slice_ref in slices:
+                raise PromotionError(f"{where} duplicates slice {slice_ref}")
+            slices[slice_ref] = {
+                "n": _positive_int(
+                    raw_metrics.get("n"), where=f"{where}.{axis}.{raw_label}.n"
+                ),
+                "value_rmse": _finite_number(
+                    raw_metrics.get("value_rmse"),
+                    where=f"{where}.{axis}.{raw_label}.value_rmse",
+                    minimum=0.0,
+                ),
+            }
+    return slices
+
+
+def _verify_calibration_non_regression(
+    result: Any,
+    *,
+    expected_readout: str,
+    candidate_metrics: Mapping[str, Any],
+    champion_metrics: Mapping[str, Any],
+) -> None:
+    """Apply the sealed global and load-bearing-slice value tripwire."""
+
+    policy = _require_exact_keys(
+        result,
+        {
+            "value_readout",
+            "max_rmse_regression",
+            "max_slice_rmse_regression",
+            "minimum_slice_rows",
+            "required_slices_if_present",
+        },
+        where="mechanism calibration evidence.result",
+    )
+    if policy["value_readout"] != expected_readout:
+        raise PromotionError("mechanism calibration value_readout drift")
+    max_regression = _finite_number(
+        policy["max_rmse_regression"],
+        where="mechanism calibration max_rmse_regression",
+        minimum=0.0,
+    )
+    if max_regression != MAX_CALIBRATION_RMSE_REGRESSION:
+        raise PromotionError(
+            "mechanism calibration regression limit differs from the fixed policy"
+        )
+    candidate_rmse = _finite_number(
+        candidate_metrics.get("global_rmse"),
+        where="candidate calibration deployed global RMSE",
+        minimum=0.0,
+    )
+    champion_rmse = _finite_number(
+        champion_metrics.get("global_rmse"),
+        where="champion calibration deployed global RMSE",
+        minimum=0.0,
+    )
+    if candidate_rmse > champion_rmse + max_regression:
+        raise PromotionError(
+            "candidate calibration exceeds the allowed RMSE regression"
+        )
+    max_slice_regression = _finite_number(
+        policy["max_slice_rmse_regression"],
+        where="mechanism calibration max_slice_rmse_regression",
+        minimum=0.0,
+    )
+    if max_slice_regression != MAX_CALIBRATION_SLICE_RMSE_REGRESSION:
+        raise PromotionError(
+            "mechanism calibration slice regression limit differs from the fixed "
+            "policy"
+        )
+    minimum_slice_rows = _positive_int(
+        policy["minimum_slice_rows"],
+        where="mechanism calibration minimum_slice_rows",
+    )
+    if minimum_slice_rows != MIN_CALIBRATION_SLICE_ROWS:
+        raise PromotionError(
+            "mechanism calibration minimum slice rows differs from the fixed policy"
+        )
+    raw_required_slices = policy["required_slices_if_present"]
+    if (
+        not isinstance(raw_required_slices, list)
+        or raw_required_slices != list(REQUIRED_CALIBRATION_SLICES_IF_PRESENT)
+    ):
+        raise PromotionError(
+            "mechanism calibration required slice policy differs from the fixed "
+            "policy"
+        )
+    candidate_slices = candidate_metrics.get("slices")
+    champion_slices = champion_metrics.get("slices")
+    if not isinstance(candidate_slices, dict) or not isinstance(
+        champion_slices, dict
+    ):
+        raise PromotionError("mechanism calibration deployed slices must be objects")
+    for slice_ref in REQUIRED_CALIBRATION_SLICES_IF_PRESENT:
+        candidate_slice = candidate_slices.get(slice_ref)
+        champion_slice = champion_slices.get(slice_ref)
+        if candidate_slice is None and champion_slice is None:
+            continue
+        if not isinstance(candidate_slice, dict) or not isinstance(
+            champion_slice, dict
+        ):
+            raise PromotionError(
+                f"mechanism calibration required slice cohort differs for {slice_ref}"
+            )
+        candidate_n = _positive_int(
+            candidate_slice.get("n"),
+            where=f"candidate calibration required slice {slice_ref}.n",
+        )
+        champion_n = _positive_int(
+            champion_slice.get("n"),
+            where=f"champion calibration required slice {slice_ref}.n",
+        )
+        if candidate_n != champion_n:
+            raise PromotionError(
+                f"mechanism calibration required slice row count differs for "
+                f"{slice_ref}"
+            )
+        if candidate_n < minimum_slice_rows:
+            raise PromotionError(
+                f"mechanism calibration required slice {slice_ref} has "
+                f"insufficient rows: {candidate_n} < {minimum_slice_rows}"
+            )
+        candidate_slice_rmse = _finite_number(
+            candidate_slice.get("value_rmse"),
+            where=f"candidate calibration required slice {slice_ref}.value_rmse",
+            minimum=0.0,
+        )
+        champion_slice_rmse = _finite_number(
+            champion_slice.get("value_rmse"),
+            where=f"champion calibration required slice {slice_ref}.value_rmse",
+            minimum=0.0,
+        )
+        if candidate_slice_rmse > champion_slice_rmse + max_slice_regression:
+            raise PromotionError(
+                f"candidate calibration exceeds the allowed slice RMSE regression "
+                f"for {slice_ref}"
+            )
+
+
 def _verify_calibration_source(
     payload: dict[str, Any],
     *,
@@ -5019,7 +5193,7 @@ def _verify_calibration_source(
     where: str,
     contract: dict[str, Any] | None = None,
     allow_legacy_incumbent: bool = False,
-) -> tuple[float, dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if payload.get("schema_version") != "phase-sliced-value-calibration-v2":
         raise PromotionError(f"{where} is not phase-sliced-value-calibration-v2")
     if _absolute(payload.get("checkpoint"), base=checkpoint.parent) != checkpoint:
@@ -5186,9 +5360,12 @@ def _verify_calibration_source(
     if diagnostics.get("configured_effective_transform") != expected_transform:
         raise PromotionError(f"{where} deployed value transform differs from the sealed operator")
     views = diagnostics.get("views")
-    if not isinstance(views, dict) or not isinstance(views.get(expected_transform), dict):
+    if not isinstance(views, dict) or not isinstance(
+        views.get(expected_transform), dict
+    ):
         raise PromotionError(f"{where} lacks the sealed deployed readout view")
-    deployed_global = views[expected_transform].get("global")
+    deployed_view = views[expected_transform]
+    deployed_global = deployed_view.get("global")
     if not isinstance(deployed_global, dict):
         raise PromotionError(f"{where} deployed readout global metrics are missing")
     if deployed_global.get("n") != global_metrics.get("n"):
@@ -5198,6 +5375,25 @@ def _verify_calibration_source(
         where=f"{where}.deployed_readout_diagnostics.views.{expected_transform}.global.value_rmse",
         minimum=0.0,
     )
+    slice_metrics = _deployed_calibration_slice_metrics(
+        deployed_view,
+        where=(
+            f"{where}.deployed_readout_diagnostics.views.{expected_transform}"
+        ),
+    )
+    raw_slice_metrics = _deployed_calibration_slice_metrics(payload, where=where)
+    deployed_slice_counts = {
+        slice_ref: metrics["n"]
+        for slice_ref, metrics in sorted(slice_metrics.items())
+    }
+    raw_slice_counts = {
+        slice_ref: metrics["n"]
+        for slice_ref, metrics in sorted(raw_slice_metrics.items())
+    }
+    if deployed_slice_counts != raw_slice_counts:
+        raise PromotionError(
+            f"{where} raw/deployed calibration slice cohort differs"
+        )
     raw_shard_dirs = payload.get("shard_dirs")
     if raw_shard_dirs is None:
         raw_shard_dirs = [payload.get("shard_dir")]
@@ -5216,8 +5412,9 @@ def _verify_calibration_source(
         "shard_dirs": shard_dirs,
         "row_selection": {key: selection[key] for key in sorted(cohort_keys)},
         "global_n": global_metrics["n"],
+        "slice_counts": deployed_slice_counts,
     }
-    return rmse, cohort
+    return {"global_rmse": rmse, "slices": slice_metrics}, cohort
 
 
 def _require_calibration_matches_training_validation_manifest(
@@ -7507,14 +7704,7 @@ def _verify_promotion_evidence(
     if kind == "mechanism_calibration":
         if set(source_by_role) != {"candidate_calibration", "champion_calibration"}:
             raise PromotionError("mechanism calibration source roles mismatch")
-        result = _require_exact_keys(
-            result,
-            {"value_readout", "max_rmse_regression"},
-            where="mechanism calibration evidence.result",
-        )
-        if result["value_readout"] != expected_readout:
-            raise PromotionError("mechanism calibration value_readout drift")
-        candidate_rmse, candidate_cohort = _verify_calibration_source(
+        candidate_metrics, candidate_cohort = _verify_calibration_source(
             source_by_role["candidate_calibration"][1],
             source_path=source_by_role["candidate_calibration"][0],
             checkpoint=candidate_path,
@@ -7523,7 +7713,7 @@ def _verify_promotion_evidence(
             expected_value_squash=sealed_semantics["value_squash"],
             where="candidate calibration",
         )
-        champion_rmse, champion_cohort = _verify_calibration_source(
+        champion_metrics, champion_cohort = _verify_calibration_source(
             source_by_role["champion_calibration"][1],
             source_path=source_by_role["champion_calibration"][0],
             checkpoint=champion_path,
@@ -7538,19 +7728,12 @@ def _verify_promotion_evidence(
             raise PromotionError(
                 "candidate and champion calibration reports use different cohorts"
             )
-        max_regression = _finite_number(
-            result["max_rmse_regression"],
-            where="mechanism calibration max_rmse_regression",
-            minimum=0.0,
+        _verify_calibration_non_regression(
+            result,
+            expected_readout=expected_readout,
+            candidate_metrics=candidate_metrics,
+            champion_metrics=champion_metrics,
         )
-        if max_regression != MAX_CALIBRATION_RMSE_REGRESSION:
-            raise PromotionError(
-                "mechanism calibration regression limit differs from the fixed policy"
-            )
-        if candidate_rmse > champion_rmse + max_regression:
-            raise PromotionError(
-                "candidate calibration exceeds the allowed RMSE regression"
-            )
         if value["verdict"] != "pass":
             raise PromotionError("mechanism calibration verdict is not pass")
     elif kind == "internal_h2h":

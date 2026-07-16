@@ -1020,6 +1020,13 @@ def build_evidence_envelope(
         result = {
             "value_readout": promotion._contract_value_readout(contract),  # noqa: SLF001
             "max_rmse_regression": promotion.MAX_CALIBRATION_RMSE_REGRESSION,
+            "max_slice_rmse_regression": (
+                promotion.MAX_CALIBRATION_SLICE_RMSE_REGRESSION
+            ),
+            "minimum_slice_rows": promotion.MIN_CALIBRATION_SLICE_ROWS,
+            "required_slices_if_present": list(
+                promotion.REQUIRED_CALIBRATION_SLICES_IF_PRESENT
+            ),
         }
     elif kind == "internal_h2h" and promotion_mode == "branch_challenge":
         if set(roles) != {"internal_h2h_cohort_1", "internal_h2h_cohort_2"}:
