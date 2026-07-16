@@ -2,11 +2,12 @@
 """Seal and execute the 64-H100 active-policy candidate evaluation matrix.
 
 The coherent-n128 learner campaign names P10/P25/P50/P100 rather than the
-historical A/B/C/D LR arms.  This controller authenticates the campaign's
-in-budget arms, maps each arm's selected in-budget dose checkpoint against exact f7
-and the registry v5 incumbent, and partitions the full 64-H100 fleet across
-those matchups.  Every matchup reuses one common paired-seed cohort and swaps
-colors inside each pair.
+historical A/B/C/D LR arms.  This controller authenticates every in-budget
+epoch checkpoint, maps an explicit fleet-sized batch against exact f7 and the
+registry v5 incumbent, and partitions the full 64-H100 fleet across those
+matchups.  Multiple matrices cover a frontier larger than six candidates
+without silently selecting an epoch before gameplay.  Every matchup reuses one
+common paired-seed cohort and swaps colors inside each pair.
 
 Only the internal Rust-native coherent-public panel is authorized here.  The
 external pair claim remains an unlaunched placeholder so the ordinary fleet
@@ -17,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import copy
 import hashlib
 import json
 from pathlib import Path
@@ -38,10 +38,11 @@ from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.fleet import a1_h100_eval_fleet as fleet  # noqa: E402
 
 
-SCHEMA = "a1-active-policy-eval-matrix-v2"
+SCHEMA = "a1-active-policy-eval-matrix-v3"
 OPERATION_SCHEMA = "a1-active-policy-eval-matrix-operation-v1"
 COMPLETION_SCHEMA = "a1-active-policy-eval-matrix-completion-v1"
 BASELINES = ("f7", "v5")
+MAX_CANDIDATES_PER_MATRIX = 6
 
 
 class MatrixError(RuntimeError):
@@ -98,6 +99,7 @@ def _load_selection(
     campaign_ref = selection.get("campaign")
     eligible = selection.get("eligible_arms")
     rows = selection.get("arm_fingerprints")
+    eligible_candidates = selection.get("eligible_candidates")
     winner = selection.get("winner")
     winner_candidate = selection.get("winner_candidate")
     if (
@@ -129,12 +131,58 @@ def _load_selection(
             "path": winner_candidate.get("checkpoint"),
             "sha256": winner_candidate.get("checkpoint_sha256"),
         }
+        or not isinstance(eligible_candidates, list)
+        or not eligible_candidates
+        or winner_candidate not in eligible_candidates
     ):
         raise MatrixError("active-policy selection lost campaign/eligibility semantics")
     canonical_order = [arm for arm in active_campaign.ARMS if arm in set(eligible)]
     if eligible != canonical_order:
         raise MatrixError("active-policy eligible arms are not in canonical dose order")
+    candidate_keys: set[tuple[str, int]] = set()
+    for candidate in eligible_candidates:
+        if not isinstance(candidate, dict):
+            raise MatrixError("active-policy eligible candidate is malformed")
+        try:
+            key = (str(candidate["arm"]), int(candidate["step"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise MatrixError("active-policy eligible candidate identity is malformed") from error
+        if (
+            key in candidate_keys
+            or key[0] not in eligible
+            or candidate.get("eligible") is not True
+            or candidate.get("within_drift_budgets") is not True
+            or candidate
+            not in rows[key[0]].get("checkpoint_candidates", [])
+        ):
+            raise MatrixError("active-policy eligible candidate frontier drifted")
+        candidate_keys.add(key)
     return resolved, selection
+
+
+def _candidate_id(arm: str, step: int) -> str:
+    return f"{arm.lower()}-step{step:04d}"
+
+
+def _resolve_candidate_ids(
+    candidates: Mapping[str, Any], requested: Sequence[str] | None
+) -> list[str]:
+    available = list(candidates)
+    if requested:
+        selected = [str(value) for value in requested]
+        if len(selected) != len(set(selected)):
+            raise MatrixError("candidate ids must be unique")
+        unknown = sorted(set(selected) - set(available))
+        if unknown:
+            raise MatrixError(f"unknown active-policy candidate ids: {unknown}")
+    else:
+        selected = available
+    if len(selected) > MAX_CANDIDATES_PER_MATRIX:
+        raise MatrixError(
+            "active-policy frontier requires multiple fleet matrices; select at most "
+            f"{MAX_CANDIDATES_PER_MATRIX} candidate ids from {available}"
+        )
+    return selected
 
 
 def _load_authority(
@@ -183,6 +231,11 @@ def _load_authority(
     selection_rows = selection.get("arm_fingerprints")
     if not isinstance(selection_rows, dict):
         raise MatrixError("active-policy selection has no arm fingerprints")
+    eligible_by_arm: dict[str, list[dict[str, Any]]] = {
+        arm: [] for arm in selection["eligible_arms"]
+    }
+    for candidate in selection["eligible_candidates"]:
+        eligible_by_arm[str(candidate["arm"])].append(candidate)
     for arm in selection["eligible_arms"]:
         try:
             arm_completed = active_campaign._verify_completed_arm(campaign, arm)  # noqa: SLF001
@@ -197,16 +250,6 @@ def _load_authority(
         checkpoints = fingerprint.get("checkpoints")
         selection_row = selection_rows[arm]
         selected = selection_row.get("selected_checkpoint")
-        selected_fingerprint = None
-        if isinstance(checkpoints, list) and isinstance(selected, dict):
-            selected_fingerprint = next(
-                (
-                    checkpoint
-                    for checkpoint in checkpoints
-                    if checkpoint.get("step") == selected.get("step")
-                ),
-                None,
-            )
         if (
             selection_row.get("has_eligible_checkpoint") is not True
             or selection_row.get("file_sha256") != _file_sha256(fingerprint_path)
@@ -216,47 +259,73 @@ def _load_authority(
             or not isinstance(selected, dict)
             or selected.get("eligible") is not True
             or selected.get("within_drift_budgets") is not True
-            or selected.get("positive_teacher_gap_closure") is not True
-            or not isinstance(selected_fingerprint, dict)
-            or Path(str(selected.get("checkpoint", ""))).resolve(strict=True)
-            != Path(str(selected_fingerprint.get("checkpoint", ""))).resolve(
-                strict=True
-            )
-            or selected.get("checkpoint_sha256")
-            != selected_fingerprint.get("checkpoint_sha256")
-            or selected.get("checkpoint_sha256")
-            != _file_sha256(Path(str(selected["checkpoint"])).resolve(strict=True))
-            or float(selected.get("parent_kl", -1.0))
-            != float(selected_fingerprint.get("functional", {}).get("parent_kl", -2.0))
-            or float(selected.get("teacher_gap_closure", -1.0))
-            != float(
-                selected_fingerprint.get("functional", {}).get(
-                    "teacher_gap_closure", -2.0
-                )
-            )
-            or float(selected.get("trunk_relative_l2", -1.0))
-            != float(
-                selected_fingerprint.get("layer_drift", {}).get(
-                    "trunk_relative_l2", -2.0
-                )
-            )
         ):
             raise MatrixError(f"eligible arm {arm} selected checkpoint drifted")
         completed[arm] = arm_completed
-        candidates[arm] = {
-            "arm": arm,
-            "step": int(selected["step"]),
-            "checkpoint": str(Path(str(selected["checkpoint"])).resolve(strict=True)),
-            "checkpoint_sha256": str(selected["checkpoint_sha256"]),
-            "parent_kl": float(selected["parent_kl"]),
-            "trunk_relative_l2": float(selected["trunk_relative_l2"]),
-            "teacher_gap_closure": float(selected["teacher_gap_closure"]),
-        }
+        authenticated_steps: list[int] = []
+        for candidate in eligible_by_arm[arm]:
+            step = int(candidate["step"])
+            candidate_fingerprint = next(
+                (
+                    checkpoint
+                    for checkpoint in checkpoints
+                    if checkpoint.get("step") == step
+                ),
+                None,
+            )
+            if (
+                not isinstance(candidate_fingerprint, dict)
+                or Path(str(candidate.get("checkpoint", ""))).resolve(strict=True)
+                != Path(str(candidate_fingerprint.get("checkpoint", ""))).resolve(
+                    strict=True
+                )
+                or candidate.get("checkpoint_sha256")
+                != candidate_fingerprint.get("checkpoint_sha256")
+                or candidate.get("checkpoint_sha256")
+                != _file_sha256(
+                    Path(str(candidate["checkpoint"])).resolve(strict=True)
+                )
+                or float(candidate.get("parent_kl", -1.0))
+                != float(
+                    candidate_fingerprint.get("functional", {}).get(
+                        "parent_kl", -2.0
+                    )
+                )
+                or float(candidate.get("teacher_gap_closure", -1.0))
+                != float(
+                    candidate_fingerprint.get("functional", {}).get(
+                        "teacher_gap_closure", -2.0
+                    )
+                )
+                or float(candidate.get("trunk_relative_l2", -1.0))
+                != float(
+                    candidate_fingerprint.get("layer_drift", {}).get(
+                        "trunk_relative_l2", -2.0
+                    )
+                )
+            ):
+                raise MatrixError(
+                    f"eligible arm {arm} step {step} checkpoint drifted"
+                )
+            candidate_id = _candidate_id(arm, step)
+            candidates[candidate_id] = {
+                "candidate_id": candidate_id,
+                "arm": arm,
+                "step": step,
+                "checkpoint": str(
+                    Path(str(candidate["checkpoint"])).resolve(strict=True)
+                ),
+                "checkpoint_sha256": str(candidate["checkpoint_sha256"]),
+                "parent_kl": float(candidate["parent_kl"]),
+                "trunk_relative_l2": float(candidate["trunk_relative_l2"]),
+                "teacher_gap_closure": float(candidate["teacher_gap_closure"]),
+            }
+            authenticated_steps.append(step)
         fingerprints[arm] = {
             "path": str(fingerprint_path),
             "file_sha256": _file_sha256(fingerprint_path),
             "fingerprint_sha256": fingerprint["fingerprint_sha256"],
-            "selected_checkpoint": copy.deepcopy(selected_fingerprint),
+            "eligible_checkpoint_steps": authenticated_steps,
         }
 
     return {
@@ -332,6 +401,7 @@ def build_matrix(
     external_base_seed: int,
     trial_id: str,
     output_dir: Path,
+    candidate_ids: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], dict[Path, dict[str, Any]]]:
     manifest_path = manifest_path.expanduser().resolve(strict=True)
     output_dir = output_dir.expanduser().resolve(strict=False)
@@ -346,7 +416,14 @@ def build_matrix(
         registry_path=registry_path,
     )
     eligible = list(authority["selection"]["eligible_arms"])
-    matchups = [(arm, baseline) for arm in eligible for baseline in BASELINES]
+    selected_candidate_ids = _resolve_candidate_ids(
+        authority["candidates"], candidate_ids
+    )
+    matchups = [
+        (candidate_id, baseline)
+        for candidate_id in selected_candidate_ids
+        for baseline in BASELINES
+    ]
     groups = _balanced_host_groups(manifest, group_count=len(matchups))
     host_gpus = {
         str(host["alias"]): int(host["gpu_count"]) for host in manifest["hosts"]
@@ -374,8 +451,9 @@ def build_matrix(
     rows: list[dict[str, Any]] = []
     occupied: set[str] = set()
 
-    for (arm, baseline_name), aliases in zip(matchups, groups, strict=True):
-        candidate_authority = authority["candidates"][arm]
+    for (candidate_id, baseline_name), aliases in zip(matchups, groups, strict=True):
+        candidate_authority = authority["candidates"][candidate_id]
+        arm = candidate_authority["arm"]
         candidate = Path(candidate_authority["checkpoint"])
         baseline = authority["f7"] if baseline_name == "f7" else authority["v5"]
         comparison_mode = (
@@ -397,7 +475,7 @@ def build_matrix(
             internal_base_seed=internal_base_seed,
             external_base_seed=external_base_seed,
             workers_per_gpu=fleet.DEFAULT_WORKERS_PER_GPU,
-            iteration_id=f"{trial_id}-{arm.lower()}-{baseline_name}",
+            iteration_id=f"{trial_id}-{candidate_id}-{baseline_name}",
             seed_cohort_id=cohort,
             scope="full",
             host_aliases=aliases,
@@ -416,10 +494,11 @@ def build_matrix(
         if not slots or occupied & slots:
             raise MatrixError("active-policy matrix assigned a GPU twice or not at all")
         occupied |= slots
-        plan_path = output_dir / f"{arm.lower()}-vs-{baseline_name}.plan.json"
+        plan_path = output_dir / f"{candidate_id}-vs-{baseline_name}.plan.json"
         plans[plan_path] = plan
         rows.append(
             {
+                "candidate_id": candidate_id,
                 "arm": arm,
                 "baseline": baseline_name,
                 "comparison_mode": comparison_mode,
@@ -441,7 +520,7 @@ def build_matrix(
                 },
                 "paired_games": internal_pairs * 2,
                 "collect_output_dir": str(
-                    output_dir / "collected" / f"{arm.lower()}-vs-{baseline_name}"
+                    output_dir / "collected" / f"{candidate_id}-vs-{baseline_name}"
                 ),
             }
         )
@@ -473,8 +552,11 @@ def build_matrix(
             "selection_sha256": authority["selection"]["selection_sha256"],
             "eligible_arms": eligible,
             "winner": authority["selection"]["winner"],
+            "candidate_ids": selected_candidate_ids,
+            "available_candidate_ids": list(authority["candidates"]),
             "candidate_steps": {
-                arm: authority["candidates"][arm]["step"] for arm in eligible
+                candidate_id: authority["candidates"][candidate_id]["step"]
+                for candidate_id in selected_candidate_ids
             },
         },
         "arm_fingerprints": authority["fingerprints"],
@@ -562,14 +644,20 @@ def load_matrix(
         raise MatrixError("active-policy evaluation fleet manifest drifted")
 
     rows = matrix.get("matchups")
+    candidate_ids = matrix["selection"].get("candidate_ids")
+    if (
+        not isinstance(candidate_ids, list)
+        or candidate_ids != _resolve_candidate_ids(authority["candidates"], candidate_ids)
+    ):
+        raise MatrixError("active-policy candidate batch drifted")
     expected_matchups = {
-        (arm, baseline)
-        for arm in authority["selection"]["eligible_arms"]
+        (candidate_id, baseline)
+        for candidate_id in candidate_ids
         for baseline in BASELINES
     }
     if (
         not isinstance(rows, list)
-        or {(row.get("arm"), row.get("baseline")) for row in rows}
+        or {(row.get("candidate_id"), row.get("baseline")) for row in rows}
         != expected_matchups
     ):
         raise MatrixError("active-policy matchup set drifted")
@@ -577,8 +665,8 @@ def load_matrix(
     occupied: set[str] = set()
     for row in rows:
         plan = fleet.load_plan(Path(row["plan"]), manifest)
-        arm = str(row["arm"])
-        candidate = authority["candidates"][arm]
+        candidate_id = str(row["candidate_id"])
+        candidate = authority["candidates"][candidate_id]
         expected_baseline = authority["f7"] if row["baseline"] == "f7" else authority["v5"]
         slots = {
             str(job["slot_id"])
@@ -592,13 +680,16 @@ def load_matrix(
             or plan["pair_claims"]["internal"] != matrix["internal_claim"]
             or plan["candidate"]["source"] != candidate["checkpoint"]
             or plan["candidate"]["sha256"] != candidate["checkpoint_sha256"]
+            or row.get("arm") != candidate["arm"]
             or row.get("candidate", {}).get("optimizer_step") != candidate["step"]
             or plan["champion"]["source"] != str(expected_baseline)
             or plan["champion"]["sha256"] != fleet._sha256(expected_baseline)  # noqa: SLF001
             or slots != set(row["gpu_slots"])
             or occupied & slots
         ):
-            raise MatrixError(f"active-policy plan drifted for {arm}-{row['baseline']}")
+            raise MatrixError(
+                f"active-policy plan drifted for {candidate_id}-{row['baseline']}"
+            )
         occupied |= slots
         loaded.append((row, plan))
     expected_slots = {str(slot["slot_id"]) for slot in fleet.gpu_slots(manifest)}
@@ -619,7 +710,7 @@ def _parallel(
         }
         for future in as_completed(futures):
             row, plan = futures[future]
-            key = f"{row['arm']}-vs-{row['baseline']}"
+            key = f"{row['candidate_id']}-vs-{row['baseline']}"
             try:
                 payload = future.result()
             except Exception as error:  # preserve all other matchup evidence
@@ -730,6 +821,15 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--external-base-seed", type=int, required=True)
     plan.add_argument("--trial-id", required=True)
     plan.add_argument("--output-dir", type=Path, required=True)
+    plan.add_argument(
+        "--candidate-id",
+        action="append",
+        dest="candidate_ids",
+        help=(
+            "authenticated arm-step checkpoint id to evaluate; repeat up to six "
+            "times, and use multiple matrices to cover the full eligible frontier"
+        ),
+    )
     for name in ("launch", "collect"):
         operation = commands.add_parser(name)
         operation.add_argument("--go", action="store_true", required=True)
@@ -757,6 +857,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 external_base_seed=args.external_base_seed,
                 trial_id=args.trial_id,
                 output_dir=args.output_dir,
+                candidate_ids=args.candidate_ids,
             )
             matrix_path = args.output_dir.expanduser().resolve(strict=False) / "matrix.json"
             targets = [*plans, matrix_path]
@@ -770,6 +871,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "matrix": str(matrix_path),
                 "state_sha256": matrix["state_sha256"],
                 "eligible_arms": matrix["selection"]["eligible_arms"],
+                "candidate_ids": matrix["selection"]["candidate_ids"],
+                "available_candidate_ids": matrix["selection"][
+                    "available_candidate_ids"
+                ],
                 "matchups": len(matrix["matchups"]),
                 "physical_gpus": matrix["physical_gpus"],
                 "commands": matrix["commands"],
