@@ -333,6 +333,14 @@ def _engine_namespace(
 def main(argv: Sequence[str] | None = None) -> None:
     public_args = build_parser().parse_args(argv)
     config, engine_settings = _load_recipe(public_args.config)
+    if engine_settings.get("initialization_mode") == "scratch_fresh_optimizer":
+        raise SystemExit(
+            "tools/train.py is not launch authority for the checked-in "
+            "scratch_fresh_optimizer recipe. Use tools/a1_scratch_train.py "
+            "with --lock, --data, --composite-build-receipt, --checkpoint, "
+            "--report, and --receipt to create the authenticated plan; rerun "
+            "that same command with --go only after the plan is commissioned."
+        )
     engine_args = _engine_namespace(
         config=config,
         engine_settings=engine_settings,

@@ -7,7 +7,9 @@ longer assembled from dozens of command-line switches.
 
 - `tools/generate.py`: 9 options
 - `tools/evaluate.py`: 10 options
-- `tools/train.py`: config-first learner entrypoint
+- `tools/train.py`: config-first learner adapter; the checked-in fresh-scratch
+  recipe is launchable only through `tools/a1_scratch_train.py`'s authenticated
+  plan/`--go` flow
 
 The older executors remain executable for authenticated historical replay,
 sealed scratch/one-dose orchestration, and specialized R&D tools. They are not

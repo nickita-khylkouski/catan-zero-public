@@ -63,6 +63,35 @@ def test_canonical_training_accepts_only_exact_payload(tmp_path: Path) -> None:
         train._load_recipe(drifted)  # noqa: SLF001
 
 
+def test_canonical_training_routes_fresh_scratch_through_authenticated_planner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_engine_launch(**_kwargs) -> None:
+        pytest.fail("direct scratch launch reached the internal training engine")
+
+    monkeypatch.setattr(train, "_engine_namespace", unexpected_engine_launch)
+
+    with pytest.raises(
+        SystemExit,
+        match=(
+            r"not launch authority.*tools/a1_scratch_train\.py.*"
+            r"authenticated plan.*--go"
+        ),
+    ):
+        train.main(
+            [
+                "--config",
+                str(ROOT / "configs/training/a1_current_35m_b200.schema1.json"),
+                "--data",
+                "/authenticated/composite.json",
+                "--checkpoint",
+                "/outputs/candidate.pt",
+                "--report",
+                "/outputs/report.json",
+            ]
+        )
+
+
 @pytest.mark.parametrize("launcher", ("generate.py", "evaluate.py", "train.py"))
 def test_canonical_launchers_ignore_ambient_stale_pythonpath(
     launcher: str, tmp_path: Path
