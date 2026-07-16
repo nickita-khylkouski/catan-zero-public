@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::f64;
 
 use catanatron_rs::{
-    execute_spectrum, generate_playable_actions, starting_devcard_bank, Action, ActionSpace,
-    ActionType, ActionValue, Color, DevCard, Game, MapKind,
+    execute_spectrum, generate_playable_actions, spectrum_probabilities, starting_devcard_bank,
+    Action, ActionSpace, ActionType, ActionValue, Color, DevCard, Game, MapKind,
 };
 
 pub type Evaluation = (HashMap<usize, f64>, f64, f64);
@@ -309,6 +309,38 @@ fn temperature_scale_policy(
         *probability /= total;
     }
     Ok(scaled)
+}
+
+/// Materialize only the chance outcome selected by a single-sample traversal.
+///
+/// Interior lazy ROLL nodes are the production hot path. Calling
+/// `execute_spectrum` there constructs all eleven successor games even though
+/// one simulation consumes exactly one of them. Replaying the selected dice
+/// result preserves the same outcome ordering and transition semantics while
+/// avoiding ten unused game clones on a first visit.
+fn materialize_sampled_outcome(
+    game: &Game,
+    action: &Action,
+    outcome_index: usize,
+) -> Result<Game, String> {
+    if action.action_type == ActionType::Roll {
+        let roll = u8::try_from(outcome_index)
+            .ok()
+            .and_then(|index| index.checked_add(2))
+            .filter(|roll| *roll <= 12)
+            .ok_or_else(|| format!("ROLL outcome index {outcome_index} out of range (0..11)"))?;
+        let d1 = roll / 2;
+        let d2 = roll - d1;
+        let mut child = game.clone();
+        child.execute(action.clone(), false, Some(ActionValue::Dice(d1, d2)))?;
+        return Ok(child);
+    }
+
+    execute_spectrum(game, action)
+        .into_iter()
+        .nth(outcome_index)
+        .map(|(child, _probability)| child)
+        .ok_or_else(|| format!("outcome index {outcome_index} out of range"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,29 +1050,29 @@ impl GumbelMctsEngine {
         depth: i32,
         evaluator: &mut E,
     ) -> Result<f64, String> {
-        let child_exists = arena
+        let probabilities_initialized = arena
             .get(node_idx)
             .actions
             .get(&action_idx)
-            .is_some_and(|s| !s.children.is_empty());
-        if !child_exists {
-            let root_color = arena.get(node_idx).root_color;
-            let outcomes = {
+            .is_some_and(|stats| !stats.probabilities.is_empty());
+        if !probabilities_initialized {
+            let probabilities = {
                 let node = arena.get(node_idx);
-                execute_spectrum(&node.game, &node.playable_actions[action_idx])
+                spectrum_probabilities(&node.game, &node.playable_actions[action_idx])
             };
-            let total_prob: f64 = outcomes.iter().map(|(_, p)| *p).sum();
-            let probs: Vec<f64> = outcomes.iter().map(|(_, p)| *p / total_prob).collect();
-            let mut new_child_indices: Vec<usize> = Vec::with_capacity(outcomes.len());
-            for (child_game, _) in outcomes {
-                let child_node = Node::new(child_game, root_color);
-                new_child_indices.push(arena.alloc(child_node));
+            let total_probability: f64 = probabilities.iter().sum();
+            if probabilities.is_empty()
+                || !total_probability.is_finite()
+                || total_probability <= 0.0
+            {
+                return Err("single-sample chance action has no positive finite support".into());
             }
             let node = arena.get_mut(node_idx);
             let stats = node.actions.get_mut(&action_idx).unwrap();
-            for (i, child_idx) in new_child_indices.into_iter().enumerate() {
-                stats.children.insert(i, child_idx);
-                stats.probabilities.insert(i, probs[i]);
+            for (outcome_index, probability) in probabilities.into_iter().enumerate() {
+                stats
+                    .probabilities
+                    .insert(outcome_index, probability / total_probability);
             }
         }
         let outcome_index = {
@@ -1050,12 +1082,39 @@ impl GumbelMctsEngine {
             probs.sort_unstable_by_key(|(index, _)| *index);
             self.sample_outcome(&probs)
         };
-        let child_idx = arena
+        let existing_child = arena
             .get(node_idx)
             .actions
             .get(&action_idx)
             .unwrap()
-            .children[&outcome_index];
+            .children
+            .get(&outcome_index)
+            .copied();
+        let child_idx = match existing_child {
+            Some(child_idx) => child_idx,
+            None => {
+                let (child_game, root_color) = {
+                    let node = arena.get(node_idx);
+                    (
+                        materialize_sampled_outcome(
+                            &node.game,
+                            &node.playable_actions[action_idx],
+                            outcome_index,
+                        )?,
+                        node.root_color,
+                    )
+                };
+                let child_idx = arena.alloc(Node::new(child_game, root_color));
+                arena
+                    .get_mut(node_idx)
+                    .actions
+                    .get_mut(&action_idx)
+                    .unwrap()
+                    .children
+                    .insert(outcome_index, child_idx);
+                child_idx
+            }
+        };
         let value = self.simulate(arena, child_idx, depth + 1, None, evaluator)?;
         let child_unc = if self.config.uncertainty_backup_weighting {
             arena.get(child_idx).prior_uncertainty
@@ -1900,7 +1959,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("authoritative root-phase attestation"));
     }
-    use catanatron_rs::{ActionPrompt, Coordinate, Player, Resource};
+    use catanatron_rs::{game_to_json_value, ActionPrompt, Coordinate, Player, Resource};
 
     #[derive(Default)]
     struct CountingEvaluator {
@@ -2263,6 +2322,55 @@ mod tests {
         );
         assert!(!engine.expectation_backup(&no_victim, 1));
         assert!(engine.expectation_backup(&with_victim, 1));
+    }
+
+    #[test]
+    fn lazy_interior_roll_materializes_only_the_sampled_successor() {
+        let mut game = opening(83);
+        game.state.is_initial_build_phase = false;
+        game.state.current_prompt = ActionPrompt::PlayTurn;
+        game.state.player_state_mut(Color::Red).has_rolled = false;
+        game.playable_actions = generate_playable_actions(&game.state);
+        let roll = game
+            .playable_actions
+            .iter()
+            .find(|action| action.action_type == ActionType::Roll)
+            .cloned()
+            .expect("ROLL must be legal before the actor has rolled");
+
+        let reference = execute_spectrum(&game, &roll);
+        assert_eq!(reference.len(), 11);
+        for (outcome_index, (expected, _probability)) in reference.iter().enumerate() {
+            let actual = materialize_sampled_outcome(&game, &roll, outcome_index).unwrap();
+            assert_eq!(game_to_json_value(&actual), game_to_json_value(expected));
+        }
+
+        let mut node = Node::new(game, Color::Red);
+        node.playable_actions = vec![roll];
+        node.actions.insert(0, ActionStats::new(1.0));
+        node.action_logits.insert(0, 0.0);
+        node.expanded = true;
+        let mut arena = Arena::new();
+        let node_idx = arena.alloc(node);
+        let mut evaluator = CountingEvaluator::default();
+        let mut engine = GumbelMctsEngine::new(SearchConfig {
+            lazy_interior_chance: true,
+            seed: 17,
+            ..Default::default()
+        });
+
+        engine
+            .traverse_single_sample(&mut arena, node_idx, 0, 1, &mut evaluator)
+            .unwrap();
+
+        let stats = &arena.get(node_idx).actions[&0];
+        assert_eq!(stats.probabilities.len(), 11);
+        assert_eq!(
+            stats.children.len(),
+            1,
+            "one lazy visit must not clone ten unused dice successors"
+        );
+        assert_eq!(evaluator.leaf_calls, 1);
     }
 
     #[test]
