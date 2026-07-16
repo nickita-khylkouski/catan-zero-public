@@ -928,6 +928,8 @@ def test_batch_profile_accepts_prefetched_entity_batch_without_dense_obs():
     assert profile["input_representation"] == "entity_tokens"
     assert profile["obs_shape"] is None
     assert profile["legal_action_ids_shape"] == [2, 3]
+    assert profile["dense_action_context_materialized"] is False
+    assert profile["dense_action_context_shape"] is None
     assert profile["hex_tokens_shape"] == [2, 19, 7]
     assert profile["event_tokens_shape"] == [2, 32, 5]
 
@@ -950,6 +952,8 @@ def test_batch_profile_keeps_dense_observation_contract():
     assert profile["input_representation"] == "dense_obs"
     assert profile["obs_shape"] == [2, 11]
     assert profile["legal_action_ids_shape"] == [2, 3]
+    assert profile["dense_action_context_materialized"] is True
+    assert profile["dense_action_context_shape"] == [2, 8, 3]
 
 
 def test_prefetch_materialization_allowlist_rejects_unknown_columns():

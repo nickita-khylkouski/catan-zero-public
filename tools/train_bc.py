@@ -31609,7 +31609,12 @@ def _batch_profile(policy, data: dict, batch: np.ndarray) -> dict:
         ),
         "legal_action_ids_shape": list(valid.shape),
         "legal_action_context_shape": list(data["legal_action_context"][batch].shape),
-        "dense_action_context_shape": [int(len(batch)), action_size, context_size],
+        "dense_action_context_materialized": policy_type != "entity_graph",
+        "dense_action_context_shape": (
+            None
+            if policy_type == "entity_graph"
+            else [int(len(batch)), action_size, context_size]
+        ),
         "legal_actions_mean": float(np.mean(legal_counts)) if len(legal_counts) else 0.0,
         "legal_actions_p90": int(np.percentile(legal_counts, 90)) if len(legal_counts) else 0,
         "legal_actions_max": int(np.max(legal_counts)) if len(legal_counts) else 0,
