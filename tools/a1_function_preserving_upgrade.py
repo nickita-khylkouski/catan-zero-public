@@ -510,6 +510,12 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
     # the policy in the shared final block.
     MODULE_VALUE_TOWER_SPLIT_1: {
         "flags": {"value_tower_split_layers": 1},
+        "source_config_requirements": {
+            "state_trunk": "transformer",
+            "state_layers": 6,
+            "value_tower_split_layers": 0,
+            "latent_deliberation_steps": 0,
+        },
         "new_parameter_initialization": {
             **{
                 f"value_blocks.0.{suffix}": f"source_clone:blocks.5.{suffix}"
@@ -945,6 +951,17 @@ def inspect_upgrade(
     effective_before = dataclasses.asdict(EntityGraphConfig(**before_config))
     effective_expected = dataclasses.asdict(EntityGraphConfig(**expected_config))
     effective_after = dataclasses.asdict(EntityGraphConfig(**after_config))
+    source_requirements = spec.get("source_config_requirements", {})
+    source_mismatches = {
+        name: {"expected": expected, "actual": effective_before.get(name)}
+        for name, expected in source_requirements.items()
+        if effective_before.get(name) != expected
+    }
+    if source_mismatches:
+        raise UpgradeError(
+            "source checkpoint configuration does not satisfy module "
+            f"preconditions: {source_mismatches}"
+        )
     if effective_after != effective_expected:
         raise UpgradeError("effective checkpoint config delta is not allowlisted")
 

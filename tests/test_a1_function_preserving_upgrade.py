@@ -78,6 +78,61 @@ def _issued(tmp_path: Path) -> tuple[Path, dict]:
     return receipt, payload
 
 
+def _value_tower_split_checkpoints(
+    tmp_path: Path, *, source_overrides: dict[str, object] | None = None
+) -> tuple[Path, Path]:
+    source = tmp_path / "value-tower-source.pt"
+    upgraded = tmp_path / "value-tower-split.pt"
+    spec = upgrade.ALLOWLIST[upgrade.MODULE_VALUE_TOWER_SPLIT_1]
+    source_config = {
+        "action_size": 567,
+        "static_action_feature_size": 1,
+        "state_trunk": "transformer",
+        "state_layers": 6,
+        "value_tower_split_layers": 0,
+        "latent_deliberation_steps": 0,
+        **(source_overrides or {}),
+    }
+    source_model = {"shared.weight": torch.arange(4, dtype=torch.float32)}
+    for target_name, initializer in spec["new_parameter_initialization"].items():
+        source_name = initializer.removeprefix("source_clone:")
+        source_model.setdefault(
+            source_name,
+            torch.full((2,), float(len(source_model)), dtype=torch.float32),
+        )
+    torch.save(
+        {"config": {"fields": source_config}, "model": source_model, "epoch": 7},
+        source,
+    )
+    upgraded_model = dict(source_model)
+    for target_name, initializer in spec["new_parameter_initialization"].items():
+        upgraded_model[target_name] = source_model[
+            initializer.removeprefix("source_clone:")
+        ].clone()
+    torch.save(
+        {
+            "config": {
+                "fields": {**source_config, "value_tower_split_layers": 1}
+            },
+            "model": upgraded_model,
+            "epoch": 7,
+            "upgrade_provenance": {
+                "schema_version": "entity-graph-upgrade-v1",
+                "source_checkpoint_sha256": upgrade._sha(source).removeprefix(  # noqa: SLF001
+                    "sha256:"
+                ),
+                "flags": {"value_tower_split_layers": 1},
+                "initialization_seed": 1,
+                "trained_value_readouts_added": [],
+                "forward_max_diff": 0.0,
+                "forward_identical_at_init": True,
+            },
+        },
+        upgraded,
+    )
+    return source, upgraded
+
+
 def _topology_checkpoints(tmp_path: Path) -> tuple[Path, Path]:
     source, _gather = _checkpoints(tmp_path)
     upgraded = tmp_path / "champion-topology-gather.pt"
@@ -574,6 +629,47 @@ def test_receipt_replays_combined_topology_target_gather_upgrade(tmp_path: Path)
     assert evidence["new_parameter_initialization"][
         "topology_residual_adapter.source_projection.weight"
     ] == "identity"
+
+
+def test_value_tower_split_receipt_binds_exact_six_layer_source(tmp_path: Path) -> None:
+    source, initializer = _value_tower_split_checkpoints(tmp_path)
+
+    evidence = upgrade.inspect_upgrade(
+        source,
+        initializer,
+        module=upgrade.MODULE_VALUE_TOWER_SPLIT_1,
+    )
+
+    assert evidence["flags"] == {"value_tower_split_layers": 1}
+    assert set(evidence["new_parameters"]) == set(
+        upgrade.ALLOWLIST[upgrade.MODULE_VALUE_TOWER_SPLIT_1][
+            "new_parameter_initialization"
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "source_overrides",
+    [
+        {"state_layers": 8},
+        {"state_trunk": "rrt"},
+        {"value_tower_split_layers": 1},
+        {"latent_deliberation_steps": 1},
+    ],
+)
+def test_value_tower_split_receipt_rejects_wrong_source_topology(
+    tmp_path: Path, source_overrides: dict[str, object]
+) -> None:
+    source, initializer = _value_tower_split_checkpoints(
+        tmp_path, source_overrides=source_overrides
+    )
+
+    with pytest.raises(upgrade.UpgradeError, match="module preconditions"):
+        upgrade.inspect_upgrade(
+            source,
+            initializer,
+            module=upgrade.MODULE_VALUE_TOWER_SPLIT_1,
+        )
 
 
 @pytest.mark.parametrize("which", ("source", "upgraded"))
