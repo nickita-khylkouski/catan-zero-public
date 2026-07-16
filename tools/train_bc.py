@@ -12430,13 +12430,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 train_indices,
                 mode=value_balance_mode,
             )
-            if len(validation_indices):
-                value_weights = apply_value_player_outcome_balance(
-                    data,
-                    value_weights,
-                    validation_indices,
-                    mode=value_balance_mode,
-                )
 
         # Flag-off must remain exact rng.permutation, so these all-ones are only
         # retained for reporting and are not passed to _epoch_order. The exact
@@ -12736,6 +12729,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     validation_indices = derived["validation_indices"]
     if int(ddp["rank"]) == 0:
         value_player_outcome_balance_report = {
+            "application_scope": "training_only_natural_validation_v1",
             "training": value_player_outcome_balance_quality(
                 data,
                 value_sample_weights_before_player_outcome_balance,
@@ -12750,7 +12744,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     value_sample_weights_before_player_outcome_balance,
                     value_sample_weights,
                     np.asarray(validation_indices, dtype=np.int64),
-                    mode=str(args.value_player_outcome_balance_mode),
+                    mode="none",
                     per_game_weighting=value_per_game_weight_diagnostics,
                 )
                 if len(validation_indices)
