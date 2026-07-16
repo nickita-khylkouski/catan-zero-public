@@ -443,6 +443,9 @@ def test_stage_c_run_adopts_authenticated_completed_receipt_without_subprocess(
         "policy_target_contract": {
             "selected_unique_training_roots": 256,
             "selected_unique_roots_total": 300,
+            "root_breadth": {
+                "fixture_authority": "authenticated_by_mocked_verify_inputs"
+            },
         },
         "expected_artifacts": {
             "one_dose_receipt": str(receipt_path),
