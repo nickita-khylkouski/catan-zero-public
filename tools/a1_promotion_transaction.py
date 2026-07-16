@@ -6375,9 +6375,19 @@ def _incumbent_search_config(
         config = _sealed_evaluation_semantics(contract)
         config["c_scale"] = BOOTSTRAP_CHAMPION_C_SCALE
         return config
+    if not isinstance(raw, dict):
+        raise PromotionError(
+            "registry generator_champion search_config must be an object"
+        )
     sealed = _sealed_evaluation_semantics(contract)
+    identity_search_config = dict(raw)
+    normalized_raw = dict(raw)
+    if sealed["boundary_value_particles"] == 1:
+        normalized_raw.setdefault("boundary_value_particles", 1)
     actual = _require_exact_keys(
-        raw, set(sealed), where="registry generator_champion search_config"
+        normalized_raw,
+        set(sealed),
+        where="registry generator_champion search_config",
     )
     _finite_number(
         actual["c_scale"],
@@ -6406,7 +6416,8 @@ def _incumbent_search_config(
     )
     _validate_sha256(champion_sha256, where="incumbent checkpoint sha256")
     expected_identity_sha = _agent_identity(
-        {"path": str(champion_path), "sha256": champion_sha256}, actual
+        {"path": str(champion_path), "sha256": champion_sha256},
+        identity_search_config,
     )["agent_identity_sha256"]
     if identity_sha != expected_identity_sha:
         raise PromotionError(
@@ -6422,6 +6433,8 @@ def _normalize_search_runtime_binding(
     if not isinstance(raw, dict):
         raise PromotionError(f"{where} must be an object")
     actual = dict(raw)
+    if expected_search_config.get("boundary_value_particles") == 1:
+        actual.setdefault("boundary_value_particles", 1)
     runtime_keys = {"native_mcts_hot_loop", "mcts_implementation"}
     present_runtime = runtime_keys & set(actual)
     native_runtime_bound = False
@@ -6522,6 +6535,7 @@ def _role_search_config_from_runtime(
         "n_full_wide",
         "n_full_wide_threshold",
         "wide_roots_always_full",
+        "boundary_value_particles",
         "c_scale",
         "gameplay_policy_aggregation",
         "rescale_noise_floor_c",
@@ -6745,7 +6759,7 @@ def _verify_evaluation_baseline_binding(
             "path": str(expected_incumbent_path),
             "sha256": expected_incumbent_sha256,
         },
-        expected_incumbent_search_config,
+        incumbent["search_config"],
     )["agent_identity_sha256"]
     if incumbent["agent_identity_sha256"] != expected_identity:
         raise PromotionError(
@@ -6792,6 +6806,25 @@ def _sealed_evaluation_semantics(contract: dict[str, Any]) -> dict[str, Any]:
     n_full = search_value("n_full")
     if n_full != 128:
         raise PromotionError("sealed A1 promotion evaluation requires n_full=128")
+    # Issued PIMC/coherent locks predate boundary-decomposition search.  Those
+    # exact historical bytes mean the original one-boundary-state evaluator,
+    # not whatever a newer evaluator CLI happens to default to.
+    boundary_value_particles = search.get("boundary_value_particles", 1)
+    if (
+        type(boundary_value_particles) is not int
+        or boundary_value_particles < 1
+    ):
+        raise PromotionError(
+            "sealed A1 contract boundary_value_particles must be an integer >= 1"
+        )
+    if (
+        boundary_value_particles > 1
+        and search.get("coherent_public_belief_search") is not True
+    ):
+        raise PromotionError(
+            "sealed A1 contract boundary decomposition requires coherent-public "
+            "belief search"
+        )
     semantics = {
         "public_observation": evaluator_value("public_observation"),
         "belief_chance_spectra": search_value("belief_chance_spectra"),
@@ -6800,6 +6833,7 @@ def _sealed_evaluation_semantics(contract: dict[str, Any]) -> dict[str, Any]:
         "determinization_min_simulations": search_value(
             "determinization_min_simulations"
         ),
+        "boundary_value_particles": boundary_value_particles,
         "n_full": n_full,
         "n_fast": n_full,
         "p_full": 1.0,
@@ -7019,6 +7053,12 @@ def _verify_internal_h2h_source(
             "baseline_n_full_wide_threshold": sealed_semantics[
                 "n_full_wide_threshold"
             ],
+            "candidate_boundary_value_particles": candidate_search_config[
+                "boundary_value_particles"
+            ],
+            "baseline_boundary_value_particles": champion_search_config[
+                "boundary_value_particles"
+            ],
             "candidate_wide_roots_always_full": sealed_semantics[
                 "wide_roots_always_full"
             ],
@@ -7055,6 +7095,10 @@ def _verify_internal_h2h_source(
         expected_fields[key] = int(required_n_full)
     config_where = "pooled effective config" if pooled else "typed config"
     runtime_fields = dict(fields)
+    # Before boundary decomposition existed, reports omitted this field.  Such
+    # evidence can only describe the historical K1 evaluator, so preserve
+    # replay while preventing a current K4 report from being projected as K1.
+    runtime_fields.setdefault("boundary_value_particles", 1)
     # Historical cross-net reports had only the shared value_squash field.
     # Normalize that exact legacy shape, while binding new role-specific fields
     # so a diagnostic clip-vs-tanh operator cannot be laundered into promotion.
@@ -7070,6 +7114,7 @@ def _verify_internal_h2h_source(
     for role in ("candidate", "baseline"):
         for suffix in (
             "wide_roots_always_full",
+            "boundary_value_particles",
             "gameplay_policy_aggregation",
             "rescale_noise_floor_c",
             "sigma_eval",
@@ -7138,6 +7183,9 @@ def _verify_internal_h2h_source(
         "determinization_min_simulations": sealed_semantics[
             "determinization_min_simulations"
         ],
+        "boundary_value_particles": sealed_semantics[
+            "boundary_value_particles"
+        ],
         **(
             {
                 "coherent_public_belief_search": True,
@@ -7151,10 +7199,10 @@ def _verify_internal_h2h_source(
         ),
     }
     for key, expected in expected_information_recipe.items():
-        if fields.get(key) != expected:
+        if normalized_fields.get(key) != expected:
             raise PromotionError(
                 f"{where} typed config has unsafe information-set recipe: "
-                f"{key}={fields.get(key)!r}, expected {expected!r}"
+                f"{key}={normalized_fields.get(key)!r}, expected {expected!r}"
             )
     if (
         fields.get("candidate_n_full") != int(required_n_full)
@@ -7198,10 +7246,15 @@ def _verify_internal_h2h_source(
     if payload.get("public_observation") is not True:
         raise PromotionError(f"{where} must use public observations")
     for key, expected in expected_information_recipe.items():
-        if payload.get(key) != expected:
+        observed = (
+            payload.get(key, 1)
+            if key == "boundary_value_particles"
+            else payload.get(key)
+        )
+        if observed != expected:
             raise PromotionError(
                 f"{where} does not attest the sealed information-set recipe: "
-                f"{key}={payload.get(key)!r}"
+                f"{key}={observed!r}"
             )
     budgets = payload.get("search_budgets_by_role")
     expected_budget = {
@@ -7466,6 +7519,9 @@ def _verify_external_panel_source(
         "determinization_min_simulations": sealed_semantics[
             "determinization_min_simulations"
         ],
+        "boundary_value_particles": sealed_semantics[
+            "boundary_value_particles"
+        ],
         **(
             {
                 "coherent_public_belief_search": True,
@@ -7479,10 +7535,15 @@ def _verify_external_panel_source(
         ),
     }
     for key, expected in expected_information_recipe.items():
-        if payload.get(key) != expected:
+        observed = (
+            payload.get(key, 1)
+            if key == "boundary_value_particles"
+            else payload.get(key)
+        )
+        if observed != expected:
             raise PromotionError(
                 f"{where} does not attest the sealed information-set recipe: "
-                f"{key}={payload.get(key)!r}"
+                f"{key}={observed!r}"
             )
     if payload.get("candidate_value_readout") != "scalar":
         raise PromotionError(f"{where} must use the sealed scalar readout")
@@ -7523,9 +7584,11 @@ def _verify_external_panel_source(
     )
     if rate > 1.0:
         raise PromotionError(f"{where}.candidate_win_rate must be <= 1")
-    search_config = payload.get("search_config")
-    if not isinstance(search_config, dict) or not search_config:
+    raw_search_config = payload.get("search_config")
+    if not isinstance(raw_search_config, dict) or not raw_search_config:
         raise PromotionError(f"{where} has no resolved search_config")
+    search_config = dict(raw_search_config)
+    search_config.setdefault("boundary_value_particles", 1)
     verified_search_config = _verify_role_search_config(
         search_config,
         expected_search_config=deployed_search_config,
@@ -7535,6 +7598,9 @@ def _verify_external_panel_source(
         raise PromotionError(f"{where} search config differs from agent identity")
     if pooled:
         effective = payload.get("effective_search_config")
+        if isinstance(effective, dict):
+            effective = dict(effective)
+            effective.setdefault("boundary_value_particles", 1)
         if effective != search_config:
             raise PromotionError(
                 f"{where} pooled effective config differs from search_config"
@@ -7764,6 +7830,7 @@ def _verify_high_regret_source(
     if not isinstance(evaluation_config, dict):
         raise PromotionError(f"{where}.report has no evaluation_config")
     normalized_evaluation_config = dict(evaluation_config)
+    normalized_evaluation_config.setdefault("boundary_value_particles", 1)
     normalized_evaluation_config.setdefault(
         "candidate_value_squash", normalized_evaluation_config.get("value_squash")
     )
@@ -7773,6 +7840,7 @@ def _verify_high_regret_source(
     for role in ("candidate", "baseline"):
         for suffix in (
             "wide_roots_always_full",
+            "boundary_value_particles",
             "gameplay_policy_aggregation",
             "rescale_noise_floor_c",
             "sigma_eval",
@@ -7809,6 +7877,12 @@ def _verify_high_regret_source(
                 "n_full_wide_threshold"
             ],
             "baseline_n_full_wide_threshold": sealed_semantics["n_full_wide_threshold"],
+            "candidate_boundary_value_particles": candidate_search_config[
+                "boundary_value_particles"
+            ],
+            "baseline_boundary_value_particles": champion_search_config[
+                "boundary_value_particles"
+            ],
             "candidate_wide_roots_always_full": sealed_semantics[
                 "wide_roots_always_full"
             ],
@@ -9635,9 +9709,9 @@ def _verify_adjudication(
         where="adjudication deployed agents",
     )
     candidate_binding["agent_identity"] = candidate_identity
-    candidate_binding["search_config"] = candidate_identity["search_config"]
+    candidate_binding["search_config"] = candidate_search_config
     champion_binding["agent_identity"] = champion_identity
-    champion_binding["search_config"] = champion_identity["search_config"]
+    champion_binding["search_config"] = champion_search_config
     branch_lineage: dict[str, Any] | None = None
     if branch_challenge:
         branch_lineage = _verify_branch_challenge_lineage(

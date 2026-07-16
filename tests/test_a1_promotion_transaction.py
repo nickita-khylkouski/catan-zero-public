@@ -5894,6 +5894,86 @@ def test_internal_h2h_rejects_every_sealed_semantic_drift(
         _execute(fixture, go=False)
 
 
+def test_internal_h2h_rejects_boundary_value_particle_drift_from_k1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commit = subprocess.check_output(
+        ("git", "rev-parse", "HEAD"), text=True
+    ).strip()
+    monkeypatch.setattr(
+        promotion,
+        "_canonical_internal_h2h_engine_identity",
+        lambda: _test_internal_engine_identity(commit),
+    )
+    fixture = _fixture(tmp_path)
+
+    def drift_and_rehash(source: dict) -> None:
+        fields = source["typed_config"]["fields"]
+        fields["boundary_value_particles"] = 4
+        fields["candidate_boundary_value_particles"] = 4
+        fields["baseline_boundary_value_particles"] = 4
+        digest = hashlib.sha256(
+            promotion._canonical_bytes(source["typed_config"])
+        ).hexdigest()
+        source["config_hash"] = "sha256:" + digest[:16]
+        source["full_config_hash"] = "sha256:" + digest
+
+    _mutate_evidence_source(
+        fixture,
+        kind="internal_h2h",
+        role="internal_h2h",
+        mutate=drift_and_rehash,
+    )
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="boundary_value_particles|sealed A1 semantic drift",
+    ):
+        _execute(fixture, go=False)
+
+
+def test_historical_contract_defaults_boundary_value_particles_to_k1() -> None:
+    assert (
+        promotion._sealed_evaluation_semantics(_contract())[
+            "boundary_value_particles"
+        ]
+        == 1
+    )
+
+
+def test_historical_runtime_projection_defaults_only_k1_boundary_particles() -> None:
+    expected = promotion._sealed_evaluation_semantics(_contract())
+    historical = dict(expected)
+    historical.pop("boundary_value_particles")
+
+    normalized = promotion._normalize_search_runtime_binding(  # noqa: SLF001
+        historical,
+        expected_search_config=expected,
+        where="historical runtime",
+    )
+
+    assert normalized["boundary_value_particles"] == 1
+
+
+def test_internal_h2h_accepts_sealed_k1_boundary_value_particles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commit = subprocess.check_output(
+        ("git", "rev-parse", "HEAD"), text=True
+    ).strip()
+    monkeypatch.setattr(
+        promotion,
+        "_canonical_internal_h2h_engine_identity",
+        lambda: _test_internal_engine_identity(commit),
+    )
+
+    plan = _execute(_fixture(tmp_path), go=False)
+
+    assert plan["schema_version"] == promotion.RECEIPT_SCHEMA
+
+
 @pytest.mark.parametrize(
     "field",
     sorted(promotion._sealed_evaluation_semantics(_contract()).keys()),
