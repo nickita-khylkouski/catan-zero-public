@@ -185,6 +185,22 @@ def test_forced_row_action_type_map_rejects_unknown_catalog_type() -> None:
         )
 
 
+def test_forced_row_action_type_map_rejects_action_that_is_not_sole_legal() -> None:
+    catalog = ActionCatalog(("RED", "BLUE"))
+    roll = _catalog_action_id(catalog, "ROLL")
+    end_turn = _catalog_action_id(catalog, "END_TURN")
+    data = {
+        "action_taken": np.asarray([end_turn], dtype=np.int16),
+        "legal_action_ids": np.asarray([[roll, -1]], dtype=np.int32),
+    }
+    with pytest.raises(SystemExit, match="does not match its sole legal action"):
+        build_value_sample_weights(
+            data,
+            forced_row_value_action_type_weights={"ROLL": 1.0, "END_TURN": 1.0},
+            action_catalog=catalog,
+        )
+
+
 def test_authenticated_value_scope_can_make_replay_anchor_only() -> None:
     class _Composite:
         component_ids = ("n128", "n256", "gen3_replay")

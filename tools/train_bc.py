@@ -24811,6 +24811,22 @@ def _validated_forced_action_ids(
         raise SystemExit(
             "forced-row action_taken contains an id outside the active ActionCatalog"
         )
+    legal_column = data.get("legal_action_ids")
+    if legal_column is None:
+        raise SystemExit("forced-row action validation requires legal_action_ids")
+    forced_rows = np.flatnonzero(np.asarray(forced_mask, dtype=np.bool_))
+    forced_legal = np.asarray(legal_column[forced_rows])
+    if forced_legal.ndim != 2 or forced_legal.shape[0] != action_ids.shape[0]:
+        raise SystemExit("forced-row legal action payload is malformed")
+    sole_legal = np.where(forced_legal >= 0, forced_legal, -1).max(axis=1)
+    if np.any(sole_legal < 0) or not np.array_equal(action_ids, sole_legal):
+        mismatch = int(np.flatnonzero(action_ids != sole_legal)[0])
+        raise SystemExit(
+            "forced-row action_taken does not match its sole legal action: "
+            f"row={int(forced_rows[mismatch])} "
+            f"action_taken={int(action_ids[mismatch])} "
+            f"sole_legal_action={int(sole_legal[mismatch])}"
+        )
     return action_ids
 
 

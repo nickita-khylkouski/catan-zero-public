@@ -175,11 +175,11 @@ def test_next_wave_guard_is_executable_against_the_real_generator_parser() -> No
     assert result.passed, result.reason
 
 
-def test_next_wave_learner_overrides_keep_unlisted_forced_types_at_one() -> None:
+def test_next_wave_learner_preserves_all_forced_value_states() -> None:
     recipe = json.loads(LEARNER.read_text())
     assert recipe == {
         "forced_action_weight": 0.0,
-        "forced_row_value_action_type_weights": "END_TURN=0.1,ROLL=0.25",
+        "forced_row_value_action_type_weights": "END_TURN=1,ROLL=1",
         "forced_row_value_weight": 1.0,
         "max_steps": 128,
         "per_game_policy_surprise_weighting": True,
