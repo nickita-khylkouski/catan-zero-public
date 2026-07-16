@@ -10,7 +10,6 @@ from catan_zero import production_cli as cli
 from catan_zero import production_contracts as contracts
 from catan_zero.production_contracts import (
     NATIVE_REQUIRED_CAPABILITIES,
-    ProductionContractError,
     canonical_json_sha256,
     production_status,
     validate_pipeline_contract,
@@ -117,24 +116,13 @@ def test_all_canonical_config_and_guard_identities_are_exact() -> None:
     for identity in identities:
         payload = json.loads(Path(identity["config"]).read_text(encoding="utf-8"))
         assert identity["config_sha256"] == canonical_json_sha256(payload)
-    assert identities[0]["guard_sha256"] == contracts.GENERATION_GUARD_SHA256
+    generation_entry = contracts.production_recipes("generate")[0]
+    assert identities[0]["guard"] == generation_entry["guard"]
+    assert identities[0]["guard_sha256"] == generation_entry["guard_sha256"]
     assert identities[0]["required_accelerator_model"] == "NVIDIA H100"
     assert identities[1]["required_accelerator_model"] == "NVIDIA H100"
     assert identities[2]["required_accelerator_model"] == "NVIDIA B200"
     assert identities[3]["required_accelerator_model"] == "NVIDIA B200"
-
-
-def test_guard_identity_drift_is_rejected(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    original = ROOT / contracts.GENERATION_GUARD
-    payload = json.loads(original.read_text(encoding="utf-8"))
-    payload["schema_version"] = "drifted"
-    drifted = tmp_path / "guard.json"
-    drifted.write_text(json.dumps(payload), encoding="utf-8")
-    monkeypatch.setattr(contracts, "GENERATION_GUARD", str(drifted))
-    with pytest.raises(ProductionContractError, match="guard identity drift"):
-        validate_pipeline_contract(ROOT, "generate")
 
 
 def test_generate_plan_has_one_canonical_command_and_bound_inputs(
@@ -200,9 +188,7 @@ def test_commissioned_parent_update_uses_exact_recipe_and_parent(
 def test_parent_update_requires_receipt_only_for_changed_initializer(
     tmp_path: Path,
 ) -> None:
-    changed = _write_job(
-        tmp_path, "train", recipe="a1-parent-update-35m-b200"
-    )
+    changed = _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
     payload = json.loads(changed.read_text(encoding="utf-8"))
     payload.pop("architecture_upgrade_receipt")
     changed.write_text(json.dumps(payload), encoding="utf-8")

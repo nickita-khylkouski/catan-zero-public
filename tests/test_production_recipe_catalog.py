@@ -10,6 +10,7 @@ from catan_zero.rl.production_recipe_catalog import (
     production_recipes,
     require_production_recipe,
 )
+from catan_zero.rl import production_recipe_catalog as catalog
 from catan_zero.rl.pipeline_configs import config_from_payload
 
 
@@ -40,9 +41,7 @@ def test_checked_in_production_recipe_is_authenticated(entrypoint: str) -> None:
     path = ROOT / relative
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert (
-        require_production_recipe(
-            entrypoint=entrypoint, path=path, payload=payload
-        )
+        require_production_recipe(entrypoint=entrypoint, path=path, payload=payload)
         == expected_name
     )
 
@@ -66,6 +65,41 @@ def test_generation_recipe_round_trips_every_typed_science_field() -> None:
 
     assert resolved.field_values() == payload["fields"]
     assert resolved.preserve_root_prior_value is True
+
+
+def test_generation_guard_is_authenticated_by_the_same_catalog() -> None:
+    entry = production_recipes("generate")[0]
+
+    assert Path(entry["guard"]).is_absolute()
+    assert entry["guard_sha256"] == (
+        "ca2909a0f725b0af82f144ab1cc1b2db2b42b4d30676304031066842b2ded5a8"
+    )
+
+
+def test_generation_guard_drift_is_rejected_from_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    copied_root = tmp_path / "repo"
+    for relative in (
+        "configs/production_recipes.json",
+        APPROVED["generate"][0],
+        "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json",
+    ):
+        source = ROOT / relative
+        destination = copied_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+    guard = (
+        copied_root
+        / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
+    )
+    payload = json.loads(guard.read_text(encoding="utf-8"))
+    payload["schema_version"] = "drifted"
+    guard.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(catalog, "_repository_root", lambda: copied_root)
+
+    with pytest.raises(ProductionRecipeError, match="guard bytes drifted"):
+        production_recipes("generate")
 
 
 def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None:

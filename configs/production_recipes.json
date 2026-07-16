@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "recipes": {
     "evaluate": [
       {
@@ -11,6 +11,10 @@
     "generate": [
       {
         "canonical_sha256": "3878df62151135cad2fe1db0b8b138622471e9bb22c4fd3a18badfe9f674414b",
+        "guard": {
+          "canonical_sha256": "ca2909a0f725b0af82f144ab1cc1b2db2b42b4d30676304031066842b2ded5a8",
+          "path": "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
+        },
         "name": "coherent-public-n128",
         "path": "configs/generation/coherent_public_n128.schema19.json"
       }

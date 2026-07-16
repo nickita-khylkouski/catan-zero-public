@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-CATALOG_SCHEMA_VERSION = 1
+CATALOG_SCHEMA_VERSION = 2
 CATALOG_RELATIVE_PATH = Path("configs/production_recipes.json")
 SUPPORTED_ENTRYPOINTS = frozenset({"generate", "evaluate", "train"})
 
@@ -105,6 +105,13 @@ def _catalog_entry(
             raise ProductionRecipeError(
                 f"production recipe catalog {entrypoint}[{index}] must be an object"
             )
+        expected_keys = {"name", "path", "canonical_sha256"}
+        if entrypoint == "generate":
+            expected_keys.add("guard")
+        if set(value) != expected_keys:
+            raise ProductionRecipeError(
+                f"production recipe catalog {entrypoint}[{index}] fields drifted"
+            )
         name = value.get("name")
         path = value.get("path")
         digest = value.get("canonical_sha256")
@@ -132,6 +139,31 @@ def _catalog_entry(
             )
         seen_names.add(name)
         seen_paths.add(path)
+        if entrypoint == "generate":
+            guard = value.get("guard")
+            if not isinstance(guard, dict) or set(guard) != {
+                "path",
+                "canonical_sha256",
+            }:
+                raise ProductionRecipeError(
+                    "production generation recipe requires an exact guard identity"
+                )
+            guard_path = guard.get("path")
+            guard_digest = guard.get("canonical_sha256")
+            if (
+                not isinstance(guard_path, str)
+                or not guard_path
+                or Path(guard_path).is_absolute()
+                or ".." in Path(guard_path).parts
+                or not isinstance(guard_digest, str)
+                or len(guard_digest) != 64
+                or any(
+                    character not in "0123456789abcdef" for character in guard_digest
+                )
+            ):
+                raise ProductionRecipeError(
+                    "production generation recipe has an invalid guard identity"
+                )
         if path == relative:
             matches.append(value)
     if len(matches) != 1:
@@ -151,9 +183,7 @@ def require_production_recipe(
     if entrypoint not in SUPPORTED_ENTRYPOINTS:
         raise ProductionRecipeError(f"unsupported production entrypoint {entrypoint!r}")
     root = _repository_root()
-    entry = _catalog_entry(
-        root=root, entrypoint=entrypoint, requested_path=Path(path)
-    )
+    entry = _catalog_entry(root=root, entrypoint=entrypoint, requested_path=Path(path))
     expected = str(entry["canonical_sha256"])
     actual = canonical_json_sha256(payload)
     if actual != expected:
@@ -197,11 +227,42 @@ def production_recipes(entrypoint: str) -> tuple[dict[str, str], ...]:
         name = require_production_recipe(
             entrypoint=entrypoint, path=path, payload=payload
         )
-        authenticated.append(
-            {
-                "name": name,
-                "path": str(path.resolve()),
-                "canonical_sha256": canonical_json_sha256(payload),
-            }
-        )
+        authenticated_entry = {
+            "name": name,
+            "path": str(path.resolve()),
+            "canonical_sha256": canonical_json_sha256(payload),
+        }
+        if entrypoint == "generate":
+            guard = value["guard"]
+            assert isinstance(guard, dict)
+            guard_path = root / str(guard["path"])
+            try:
+                if guard_path.is_symlink():
+                    raise ProductionRecipeError(
+                        f"production generation guard must not be a symlink: {guard_path}"
+                    )
+                resolved_guard = guard_path.resolve(strict=True)
+                resolved_guard.relative_to(root)
+                guard_payload = json.loads(resolved_guard.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+                raise ProductionRecipeError(
+                    f"cannot authenticate production generation guard {guard_path}: {error}"
+                ) from error
+            if not resolved_guard.is_file() or resolved_guard.is_symlink():
+                raise ProductionRecipeError(
+                    f"production generation guard must be a regular file: {resolved_guard}"
+                )
+            actual_guard_sha256 = canonical_json_sha256(guard_payload)
+            expected_guard_sha256 = str(guard["canonical_sha256"])
+            if actual_guard_sha256 != expected_guard_sha256:
+                raise ProductionRecipeError(
+                    "approved production generation guard bytes drifted: "
+                    f"name={name!r} expected_sha256={expected_guard_sha256} "
+                    f"actual_sha256={actual_guard_sha256}"
+                )
+            authenticated_entry.update(
+                guard=str(resolved_guard),
+                guard_sha256=actual_guard_sha256,
+            )
+        authenticated.append(authenticated_entry)
     return tuple(authenticated)

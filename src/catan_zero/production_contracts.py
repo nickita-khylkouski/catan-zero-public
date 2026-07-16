@@ -53,12 +53,6 @@ TRAIN_ACCELERATOR_MODELS = {
     "a1-current-35m-b200": "NVIDIA B200",
     "a1-parent-update-35m-b200": "NVIDIA B200",
 }
-GENERATION_GUARD = (
-    "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
-)
-GENERATION_GUARD_SHA256 = (
-    "9d86aba856305cb98fef3d8a318d1e5fc82abfe011d7f93bb4bc1cd7be3fc4c1"
-)
 
 
 class ProductionContractError(RuntimeError):
@@ -145,15 +139,8 @@ def validate_pipeline_contract(
     guard_path: Path | None = None
     guard_sha256: str | None = None
     if pipeline == "generate":
-        guard_path = (repo / GENERATION_GUARD).resolve()
-        guard_payload = _read_json_object(guard_path, label=f"{pipeline} guard")
-        guard_sha256 = canonical_json_sha256(guard_payload)
-        if guard_sha256 != GENERATION_GUARD_SHA256:
-            raise ProductionContractError(
-                f"{pipeline} guard identity drift: "
-                f"expected={GENERATION_GUARD_SHA256} actual={guard_sha256} "
-                f"path={guard_path}"
-            )
+        guard_path = Path(entry["guard"])
+        guard_sha256 = entry["guard_sha256"]
     return {
         "schema_version": PRODUCTION_CONTRACT_SCHEMA,
         "pipeline": pipeline,

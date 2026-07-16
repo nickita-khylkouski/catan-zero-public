@@ -16,7 +16,7 @@
 # CPU-first: runs green off-GPU; use the current command output as evidence
 # instead of preserving a stale test-count snapshot in this launcher.
 # Usage:  bash scripts/gate.sh            # full gate
-#         bash scripts/gate.sh --only suite|parity|goldens|noop
+#         bash scripts/gate.sh --only authority|suite|parity|goldens|noop
 # Env:    PY=<python>  (default: .venv/bin/python)   REPO=<repo root>
 #         NOOP_CHAMPION=<checkpoint> (default: ~/bundle/champion_v0.pt)
 #         NOOP_ATOL=<float>  (default: unset = strict --atol 0.0 byte-exact;
@@ -43,6 +43,12 @@ GOLDENS=(tests/test_cli_config_drift.py
          tests/test_train_bc_cli_defaults.py
          tests/test_n_full_wide_raw_policy_above_width_cli.py
          tests/test_launcher_guard_wiring.py)
+AUTHORITY=(tests/test_production_recipe_catalog.py
+           tests/test_canonical_launcher_config_identity.py
+           tests/test_canonical_training_recipe.py
+           tests/test_production_cli.py
+           tests/test_production_loop.py
+           tests/test_production_runtime_contract.py)
 
 rc=0
 run() { echo -e "\n=== GATE STAGE: $1 ==="; shift; "$@"; local e=$?; [ $e -eq 0 ] || rc=1; return $e; }
@@ -50,6 +56,7 @@ run() { echo -e "\n=== GATE STAGE: $1 ==="; shift; "$@"; local e=$?; [ $e -eq 0 
 stage_suite()  { run suite "$PY" -m pytest tests/ -q -p no:cacheprovider "${QUARANTINE[@]}"; }
 stage_parity() { run "parity 19/19" "$PY" -m pytest "${PARITY[@]}" -q -p no:cacheprovider; }
 stage_goldens(){ run "CAT-75 CLI goldens" "$PY" -m pytest "${GOLDENS[@]}" -q -p no:cacheprovider; }
+stage_authority(){ run "production authority consistency" "$PY" -m pytest "${AUTHORITY[@]}" -q -p no:cacheprovider; }
 stage_noop()   {
   local atol_args=()
   local champion_args=()
@@ -64,7 +71,8 @@ case "$ONLY" in
   parity)  stage_parity ;;
   goldens) stage_goldens ;;
   noop)    stage_noop ;;
-  all)     stage_noop; stage_parity; stage_goldens; stage_suite ;;   # cheap checks first, full suite last
+  authority) stage_authority ;;
+  all)     stage_authority; stage_noop; stage_parity; stage_goldens; stage_suite ;;   # cheap checks first, full suite last
   *) echo "unknown --only '$ONLY'"; exit 2 ;;
 esac
 
