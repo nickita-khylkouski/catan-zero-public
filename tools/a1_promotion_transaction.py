@@ -2382,6 +2382,37 @@ def _verify_same_trajectory_checkpoint_selection(
     }
 
 
+def _require_training_receipt_initialization_authority(
+    contract: dict[str, Any],
+) -> None:
+    science = contract.get("science")
+    if not isinstance(science, dict):
+        raise PromotionError("promotion contract has no sealed science authority")
+    search = science.get("search_operator")
+    if not isinstance(search, dict) or not current_science.is_coherent_search(search):
+        return
+    initialization = science.get("learner_initialization")
+    if (
+        initialization
+        != current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
+        or science.get("learner_initialization_sha256")
+        != _digest_value(initialization)
+    ):
+        raise PromotionError(
+            "current coherent promotion contract has no authenticated learner "
+            "initialization authority"
+        )
+    if initialization != current_science.learner_initialization():
+        raise PromotionError(
+            "sealed coherent learner initialization differs from current science"
+        )
+    if initialization["mode"] == "from_scratch":
+        raise PromotionError(
+            "current coherent-public v3 is native from-scratch; checkpoint-initialized "
+            "one-dose and completion receipts are not promotion authority"
+        )
+
+
 def _verify_one_dose_training_receipt(
     path: Path,
     *,
@@ -2411,6 +2442,7 @@ def _verify_one_dose_training_receipt(
     if checkpoint_selection_requested and legacy_snapshot is not None:
         raise PromotionError("legacy promotion snapshots cannot select intermediate doses")
     raw_schema = _load_json(path).get("schema_version")
+    _require_training_receipt_initialization_authority(contract)
     if checkpoint_selection_requested and raw_schema != one_dose.RECEIPT_SCHEMA:
         raise PromotionError(
             "same-trajectory checkpoint selection requires an ordinary one-dose receipt"

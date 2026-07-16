@@ -1715,7 +1715,21 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
             )
         except current_science.ScienceContractError as error:
             raise ExecutorError(str(error)) from error
-        initialization = current_science.learner_initialization()
+        initialization = science.get("learner_initialization")
+        initialization_sha256 = science.get("learner_initialization_sha256")
+        if (
+            initialization
+            != current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
+            or initialization_sha256 != _value_sha256(initialization)
+        ):
+            raise ExecutorError(
+                "current coherent-public lock has no authenticated native scratch "
+                "learner initialization"
+            )
+        if initialization != current_science.learner_initialization():
+            raise ExecutorError(
+                "sealed coherent learner initialization differs from current science"
+            )
         if initialization["mode"] == "from_scratch":
             raise ExecutorError(
                 "current coherent-public v3 learner is contract-bound to native "

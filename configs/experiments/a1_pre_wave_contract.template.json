@@ -51,6 +51,13 @@
       "value_categorical_bins": "__UNRESOLVED__",
       "hlgauss_sigma_ratio": "__UNRESOLVED__"
     },
+    "science_schema_version": "a1-pre-wave-science-v2",
+    "learner_initialization": {
+      "mode": "from_scratch",
+      "entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+      "checkpoint": null,
+      "optimizer_state": "fresh"
+    },
     "learner_training_recipe": {
       "track": "2p_no_trade",
       "vps_to_win": 10,

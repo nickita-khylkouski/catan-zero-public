@@ -196,6 +196,7 @@ ATTEMPT_RESERVE_PER_JOB = {
     "recent_history": 2,
     "hard_negative": 1,
 }
+CURRENT_SCIENCE_SCHEMA = "a1-pre-wave-science-v2"
 
 # One deliberately short, single-B200 learner dose.  A search/data contract is
 # not scientifically reproducible if the optimizer or loss mixture can drift
@@ -6830,18 +6831,46 @@ def build_lock(
 
     base = draft_path.parent
     science = dict(draft["science"])
-    if set(science) != {
+    base_science_keys = {
         "search",
         "evaluator",
         "learner_value_objective",
         "learner_training_recipe",
         "evidence",
+    }
+    scratch_science_keys = base_science_keys | {
+        "science_schema_version",
+        "learner_initialization",
+    }
+    science_keys = frozenset(science)
+    if science_keys not in {
+        frozenset(base_science_keys),
+        frozenset(scratch_science_keys),
     }:
         raise ContractError(
             "science must have exactly search, evaluator, learner_value_objective, "
-            "learner_training_recipe, evidence"
+            "learner_training_recipe, evidence and, for native scratch v3, "
+            "science_schema_version plus learner_initialization"
         )
     raw_search = dict(science["search"])
+    learner_initialization: dict[str, Any] | None = None
+    if science_keys == scratch_science_keys:
+        if science["science_schema_version"] != CURRENT_SCIENCE_SCHEMA:
+            raise ContractError("current scratch science schema drifted")
+        if (
+            science["learner_initialization"]
+            != current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
+        ):
+            raise ContractError("current scratch learner initialization drifted")
+        learner_initialization = dict(science["learner_initialization"])
+    if (
+        draft_schema == DRAFT_SCHEMA
+        and current_science.is_coherent_search(raw_search)
+        and learner_initialization is None
+    ):
+        raise ContractError(
+            "current coherent draft must seal native scratch learner initialization"
+        )
     search = _search_operator(raw_search)
     effective_search = _effective_search(raw_search)
     evaluator = _effective_evaluator(dict(science["evaluator"]))
@@ -7307,6 +7336,17 @@ def build_lock(
             "learner_training_recipe_sha256": _digest_value(
                 learner_training_recipe
             ),
+            **(
+                {}
+                if learner_initialization is None
+                else {
+                    "science_schema_version": CURRENT_SCIENCE_SCHEMA,
+                    "learner_initialization": learner_initialization,
+                    "learner_initialization_sha256": _digest_value(
+                        learner_initialization
+                    ),
+                }
+            ),
             "evidence": evidence,
         },
         "generation": generation,
@@ -7522,6 +7562,21 @@ def verify_lock(
                 "effective search config does not reconstruct from selected operator"
             )
     target_information_regime = _target_information_regime_for_search(search)
+    learner_initialization = lock["science"].get("learner_initialization")
+    initialization_sha256 = lock["science"].get("learner_initialization_sha256")
+    science_schema = lock["science"].get("science_schema_version")
+    initialization_fields_present = any(
+        value is not None
+        for value in (learner_initialization, initialization_sha256, science_schema)
+    )
+    if initialization_fields_present:
+        if (
+            science_schema != CURRENT_SCIENCE_SCHEMA
+            or learner_initialization
+            != current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
+            or initialization_sha256 != _digest_value(learner_initialization)
+        ):
+            raise ContractError("sealed learner initialization authority drift")
     if _digest_value(evaluator) != lock["science"]["evaluator_sha256"]:
         raise ContractError("evaluator digest mismatch")
     if evaluator["value_readout"] != lock["science"]["value_readout"]:

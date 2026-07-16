@@ -120,6 +120,44 @@ def _contract(
     }
 
 
+def test_current_coherent_scratch_rejects_checkpoint_receipt_promotion() -> None:
+    initialization = promotion.current_science.learner_initialization()
+    contract = {
+        "science": {
+            "search_operator": promotion.current_science.search(),
+            "learner_initialization": initialization,
+            "learner_initialization_sha256": promotion._digest_value(initialization),
+        }
+    }
+
+    with pytest.raises(promotion.PromotionError, match="native from-scratch"):
+        promotion._require_training_receipt_initialization_authority(contract)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("learner_initialization", "learner_initialization_sha256"),
+)
+def test_current_coherent_promotion_requires_sealed_initialization(
+    field: str,
+) -> None:
+    initialization = promotion.current_science.learner_initialization()
+    science = {
+        "search_operator": promotion.current_science.search(),
+        "learner_initialization": initialization,
+        "learner_initialization_sha256": promotion._digest_value(initialization),
+    }
+    science.pop(field)
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="no authenticated learner initialization authority",
+    ):
+        promotion._require_training_receipt_initialization_authority(
+            {"science": science}
+        )
+
+
 def _checkpoint_ref(path: Path) -> dict[str, str]:
     return {"path": str(path), "sha256": promotion._sha256(path)}
 

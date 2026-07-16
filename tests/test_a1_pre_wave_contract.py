@@ -900,6 +900,12 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert payload["science"]["evaluator"]["rust_featurize"] is True
     assert payload["generation"]["native_mcts_hot_loop"] is True
     recipe = payload["science"]["learner_training_recipe"]
+    assert payload["science"]["science_schema_version"] == (
+        contract.CURRENT_SCIENCE_SCHEMA
+    )
+    assert payload["science"]["learner_initialization"] == (
+        contract.current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
+    )
     assert recipe["amp"] == "none"
     assert recipe["max_steps"] == 32
     assert recipe["forced_action_weight"] == 0.0
