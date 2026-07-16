@@ -32,16 +32,17 @@ from typing import Any, Mapping, Sequence
 # this interpreter (inserting a path cannot repair an existing sys.modules entry).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _REPO_SRC = (_REPO_ROOT / "src").resolve(strict=True)
-sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != _REPO_SRC]
+sys.path[:] = [
+    entry
+    for entry in sys.path
+    if Path(entry or ".").resolve() not in {_REPO_ROOT, _REPO_SRC}
+]
+sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_SRC))
 
 import numpy as np
 
-try:
-    from tools import a1_feature_signal_admission as feature_signal_admission
-except ModuleNotFoundError:
-    import a1_feature_signal_admission as feature_signal_admission
-
+from tools import a1_feature_signal_admission as feature_signal_admission
 from catan_zero.rl.config_cli import add_config_flags, apply_config_file, resolve_config
 from catan_zero.rl.aux_subgoal_targets import (
     AUX_SUBGOAL_TARGET_SEMANTIC,

@@ -56,7 +56,7 @@ def test_direct_script_ignores_ambient_stale_pythonpath(tmp_path: Path) -> None:
     environment["PYTHONPATH"] = str(stale)
     completed = subprocess.run(
         [sys.executable, str(REPO / "tools" / "train_bc.py"), "--help"],
-        cwd=REPO,
+        cwd=tmp_path,
         env=environment,
         text=True,
         stdout=subprocess.PIPE,
