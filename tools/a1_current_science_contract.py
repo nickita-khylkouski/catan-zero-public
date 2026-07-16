@@ -39,6 +39,7 @@ ADAPTIVE_FIELDS = (
     "n_full_wide_threshold",
     "wide_roots_always_full",
 )
+POLICY_TARGET_BLEND_FALLBACK_V2 = "policy_target_fallback_v2"
 
 
 class ScienceContractError(ValueError):
@@ -110,6 +111,16 @@ def _load() -> dict[str, Any]:
         "training_recipe",
     } or not isinstance(learner_value["training_recipe"], dict):
         raise ScienceContractError("current learner contract shape drifted")
+    recipe = learner_value["training_recipe"]
+    if (
+        recipe.get("policy_target_blend_semantics")
+        != POLICY_TARGET_BLEND_FALLBACK_V2
+        or recipe.get("soft_target_weight") != 1.0
+    ):
+        raise ScienceContractError(
+            "current coherent learner must bind pure authenticated policy CE "
+            "with hard-action fallback only"
+        )
     return value
 
 

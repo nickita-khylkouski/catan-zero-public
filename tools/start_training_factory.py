@@ -103,7 +103,12 @@ def main() -> None:
     parser.add_argument("--graph-layers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--soft-target-temperature", type=float, default=0.7)
-    parser.add_argument("--soft-target-weight", type=float, default=0.7)
+    parser.add_argument("--soft-target-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--policy-target-blend-semantics",
+        choices=("policy_target_fallback_v2", "legacy_interpolate_v1"),
+        default="policy_target_fallback_v2",
+    )
     parser.add_argument(
         "--forced-action-weight",
         type=float,
@@ -165,6 +170,13 @@ def main() -> None:
         help="Write/print the pipeline manifest without running commands.",
     )
     args = parser.parse_args()
+    if (
+        args.policy_target_blend_semantics == "policy_target_fallback_v2"
+        and args.soft_target_weight not in {0.0, 1.0}
+    ):
+        raise SystemExit(
+            "policy_target_fallback_v2 requires --soft-target-weight 0.0 or 1.0"
+        )
     world_size = int(args.torchrun_nproc_per_node)
     grad_accum_steps = int(args.bc_grad_accum_steps)
     if world_size < 1:
@@ -349,6 +361,8 @@ def main() -> None:
             str(args.soft_target_temperature),
             "--soft-target-weight",
             str(args.soft_target_weight),
+            "--policy-target-blend-semantics",
+            args.policy_target_blend_semantics,
             "--forced-action-weight",
             str(args.forced_action_weight),
             "--phase-weights",

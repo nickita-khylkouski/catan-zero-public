@@ -251,12 +251,13 @@ def _validate_historical_recipe(command: list[str]) -> None:
 
 
 def _historical_projection(command: list[str], inventories: Sequence[str]) -> list[str]:
-    """Remove only the four latest-main additions from a derived command."""
+    """Remove only the latest-main additions from a derived command."""
 
     projected = list(command)
     for flag, expected in (
         ("--max-grad-norm", "1.0"),
         ("--policy-aux-active-batch-size", "0"),
+        ("--policy-target-blend-semantics", "legacy_interpolate_v1"),
     ):
         if _option(projected, flag) != expected:
             raise L1Error(f"derived command drift at {flag}")
@@ -367,7 +368,16 @@ def prepare(
     _replace_option(command, "--init-checkpoint", parent["path"])
     _replace_option(command, "--checkpoint", str(output_root / "candidate.pt"))
     _replace_option(command, "--report", str(output_root / "train.report.json"))
-    command.extend(["--max-grad-norm", "1.0", "--policy-aux-active-batch-size", "0"])
+    command.extend(
+        [
+            "--max-grad-norm",
+            "1.0",
+            "--policy-aux-active-batch-size",
+            "0",
+            "--policy-target-blend-semantics",
+            "legacy_interpolate_v1",
+        ]
+    )
     for inventory in inventories:
         command.extend([ACK_FLAG, inventory])
     command.append(CROP_FLAG)

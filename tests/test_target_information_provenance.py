@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 
 from tools.train_bc import (
+    POLICY_TARGET_BLEND_FALLBACK_V2,
+    POLICY_TARGET_BLEND_LEGACY_V1,
     TARGET_INFORMATION_REGIME_PUBLIC,
     TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _validate_target_information_admission,
@@ -34,7 +36,8 @@ def _data(
 def _admit(data: dict, **overrides):
     kwargs = {
         "mask_hidden_info": True,
-        "soft_target_weight": 0.7,
+        "soft_target_weight": 1.0,
+        "policy_target_blend_semantics": POLICY_TARGET_BLEND_FALLBACK_V2,
         "policy_loss_weight": 1.0,
         "q_loss_weight": 0.0,
         "value_target_lambda": 1.0,
@@ -49,18 +52,42 @@ def test_public_information_set_targets_are_admitted():
     report = _admit(
         _data([TARGET_INFORMATION_REGIME_PUBLIC] * 3),
         required_target_information_regime=TARGET_INFORMATION_REGIME_PUBLIC,
+        soft_target_weight=0.7,
+        policy_target_blend_semantics=POLICY_TARGET_BLEND_LEGACY_V1,
     )
     assert report["unsafe_or_unknown_rows"] == 0
     assert report["search_target_objectives"] == ["soft_policy"]
 
 
 def test_coherent_public_belief_targets_are_admitted():
-    report = _admit(_data([TARGET_INFORMATION_REGIME_PUBLIC_COHERENT] * 3))
+    report = _admit(
+        _data([TARGET_INFORMATION_REGIME_PUBLIC_COHERENT] * 3),
+        soft_target_weight=1.0,
+        policy_target_blend_semantics=POLICY_TARGET_BLEND_FALLBACK_V2,
+    )
     assert report["unsafe_or_unknown_rows"] == 0
     assert report["required_target_information_regime"] == (
         TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
     )
     assert report["search_target_objectives"] == ["soft_policy"]
+
+
+@pytest.mark.parametrize(
+    ("semantics", "weight"),
+    [
+        (POLICY_TARGET_BLEND_LEGACY_V1, 0.9),
+        (POLICY_TARGET_BLEND_FALLBACK_V2, 0.9),
+    ],
+)
+def test_coherent_policy_targets_reject_played_action_blending(
+    semantics: str, weight: float
+):
+    with pytest.raises(SystemExit, match="requires|forbids"):
+        _admit(
+            _data([TARGET_INFORMATION_REGIME_PUBLIC_COHERENT]),
+            soft_target_weight=weight,
+            policy_target_blend_semantics=semantics,
+        )
 
 
 def test_public_pimc_is_not_silently_substituted_for_coherent_teacher():
@@ -148,5 +175,8 @@ def test_unmasked_training_keeps_explicit_omniscient_experiment_available():
     report = _admit(
         _data(["authoritative_hidden_state_search_v1"]),
         mask_hidden_info=False,
+        required_target_information_regime=TARGET_INFORMATION_REGIME_PUBLIC,
+        soft_target_weight=0.7,
+        policy_target_blend_semantics=POLICY_TARGET_BLEND_LEGACY_V1,
     )
     assert report["unsafe_or_unknown_rows"] == 1

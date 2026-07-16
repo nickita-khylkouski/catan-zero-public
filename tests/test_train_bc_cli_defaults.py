@@ -84,3 +84,12 @@ def test_soft_target_source_default_is_policy() -> None:
     prefer_scores remains a valid explicit choice (still in choices=)."""
     parser = _capture_parser()
     assert parser.get_default("soft_target_source") == "policy"
+
+
+def test_policy_target_default_is_pure_teacher_with_hard_fallback() -> None:
+    parser = _capture_parser()
+    assert parser.get_default("soft_target_weight") == pytest.approx(1.0)
+    assert (
+        parser.get_default("policy_target_blend_semantics")
+        == train_bc.POLICY_TARGET_BLEND_FALLBACK_V2
+    )

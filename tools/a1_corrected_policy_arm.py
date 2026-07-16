@@ -812,6 +812,7 @@ def _derive_command(
         "--policy-loss-weight": "1.0",
         "--soft-target-source": "policy",
         "--soft-target-weight": "0.9",
+        "--policy-target-blend-semantics": "legacy_interpolate_v1",
         "--soft-target-temperature": "0.7",
         "--soft-target-min-legal-coverage": "0.5",
         "--policy-aux-active-batch-size": "0",
@@ -865,6 +866,7 @@ def _next_supervision_contract(
     exact_options = {
         "--soft-target-source": "policy",
         "--soft-target-weight": "0.9",
+        "--policy-target-blend-semantics": "legacy_interpolate_v1",
         "--policy-aux-active-batch-size": "0",
         "--policy-kl-anchor-direction": "forward",
         "--policy-kl-anchor-weight": str(REPLAY_ANCHOR_WEIGHT),
@@ -893,6 +895,7 @@ def _next_supervision_contract(
         "replay_forward_kl_weight": 0.0,
         "soft_target_source": "policy",
         "soft_target_weight": 0.9,
+        "policy_target_blend_semantics": "legacy_interpolate_v1",
         "policy_aux_active_batch_size_per_rank": 0,
         "policy_active_row_dose": dict(policy_active_dose),
         "outcome_conditioned_policy_weighting": False,
@@ -901,6 +904,7 @@ def _next_supervision_contract(
             "value_training_scope.component_ids": component_ids,
             "memmap_composite.policy_kl_anchor_component_ids": component_ids,
             "soft_target_weight": 0.9,
+            "policy_target_blend_semantics": "legacy_interpolate_v1",
         },
     }
     contract["contract_sha256"] = _digest(contract)

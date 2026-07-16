@@ -85,6 +85,7 @@ SEALED_REPORT_RECIPE = {
     "policy_loss_weight": 1.0,
     "soft_target_source": "policy",
     "soft_target_weight": 0.9,
+    "policy_target_blend_semantics": "legacy_interpolate_v1",
     "soft_target_temperature": 0.7,
     "soft_target_min_legal_coverage": 0.5,
     "value_loss_weight": 0.25,
@@ -194,6 +195,11 @@ def _production_command(
     command[command.index(trainers[0])] = str(trainer.resolve(strict=True))
     _set(command, "--checkpoint", str(checkpoint))
     _set(command, "--report", str(report))
+    if "--policy-target-blend-semantics" in command:
+        _fail("diagnostic command unexpectedly already binds blend semantics")
+    command.extend(
+        ("--policy-target-blend-semantics", "legacy_interpolate_v1")
+    )
     if base.CROP_FLAG in command:
         _fail("diagnostic command unexpectedly already contains the production crop")
     command.append(base.CROP_FLAG)

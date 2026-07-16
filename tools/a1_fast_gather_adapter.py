@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.a1_fast_learner_loop import (
+from tools.a1_fast_learner_loop import (  # noqa: E402
     _checkpoint_config_fields,
     _file_sha,
     _load_json,
@@ -100,6 +100,7 @@ def _derive_command(
     checkpoint: Path,
     report: Path,
     soft_target_weight: float,
+    policy_target_blend_semantics: str,
     adapter: str,
     policy_aux_active_batch_size: int,
 ) -> list[str]:
@@ -118,6 +119,11 @@ def _derive_command(
     ):
         _set_option(command, flag, str(value))
     _set_option(command, "--soft-target-weight", str(float(soft_target_weight)))
+    _set_or_append(
+        command,
+        "--policy-target-blend-semantics",
+        policy_target_blend_semantics,
+    )
     _set_or_append(
         command,
         "--policy-aux-active-batch-size",
@@ -154,11 +160,23 @@ def run(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--upgrade-receipt-tool", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--soft-target-weight", type=float, default=0.9)
+    parser.add_argument(
+        "--policy-target-blend-semantics",
+        choices=("legacy_interpolate_v1", "policy_target_fallback_v2"),
+        default="legacy_interpolate_v1",
+    )
     parser.add_argument("--policy-aux-active-batch-size", type=int, default=0)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     if args.policy_aux_active_batch_size < 0:
         raise GatherAdapterError("policy-active auxiliary batch size must be non-negative")
+    if (
+        args.policy_target_blend_semantics == "policy_target_fallback_v2"
+        and args.soft_target_weight not in {0.0, 1.0}
+    ):
+        raise GatherAdapterError(
+            "policy_target_fallback_v2 requires soft-target-weight 0.0 or 1.0"
+        )
     if args.execute:
         _ensure_nofile_limit()
 
@@ -217,6 +235,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         checkpoint=checkpoint,
         report=report,
         soft_target_weight=args.soft_target_weight,
+        policy_target_blend_semantics=args.policy_target_blend_semantics,
         adapter=args.adapter,
         policy_aux_active_batch_size=args.policy_aux_active_batch_size,
     )
@@ -224,6 +243,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         "schema_version": "a1-fast-architecture-adapter-v1",
         "adapter": args.adapter,
         "policy_aux_active_batch_size": args.policy_aux_active_batch_size,
+        "policy_target_blend_semantics": args.policy_target_blend_semantics,
         "source_gather_manifest": {"path": str(source_manifest), "sha256": _file_sha(source_manifest)},
         "parent": {"path": str(parent), "sha256": _file_sha(parent)},
         "data": {"path": str(data), "sha256": _file_sha(data)},

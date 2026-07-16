@@ -317,6 +317,9 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
     assert descriptor["learner_recipe_overrides"]["policy_kl_anchor_weight"] == 0.0
     command = manifest["command"]
     assert arm._option(command, "--soft-target-weight") == "0.9"
+    assert arm._option(
+        command, "--policy-target-blend-semantics"
+    ) == "legacy_interpolate_v1"
     assert arm._option(command, "--policy-aux-active-batch-size") == "0"
     assert arm._option(command, "--policy-kl-anchor-weight") == "0.0"
     assert arm._option(command, "--policy-kl-anchor-direction") == "forward"
@@ -329,6 +332,9 @@ def test_prepares_exact_one_dose_winning_operator_control_without_launch(
         "crop_authenticated_empty_event_history"
     ] is True
     assert manifest["supervision_contract"]["soft_target_weight"] == 0.9
+    assert manifest["supervision_contract"][
+        "policy_target_blend_semantics"
+    ] == "legacy_interpolate_v1"
     assert manifest["supervision_contract"]["replay_objective"] == (
         "supervised_policy_and_value_exact_winning_operator"
     )

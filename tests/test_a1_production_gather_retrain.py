@@ -140,6 +140,15 @@ def test_prepares_and_replays_exact_four_rank_adapter_operator(
     assert gather.verify(path)["manifest"]["operator"] == manifest["operator"]
 
 
+def test_historical_gather_command_pins_legacy_blend_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest, _ = _fixture(tmp_path, monkeypatch)
+    assert gather.base._option(  # noqa: SLF001
+        manifest["command"], "--policy-target-blend-semantics"
+    ) == "legacy_interpolate_v1"
+
+
 def test_default_profile_remains_structurally_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -270,6 +279,7 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
         "steps_completed": 2048,
         "training_row_draws": 4_194_304,
         "soft_target_weight": 0.9,
+        "policy_target_blend_semantics": "legacy_interpolate_v1",
         "value_loss_weight": 0.25,
         "loser_sample_weight": 1.0,
         "action_module_lr_mult": 4.0,

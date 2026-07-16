@@ -74,6 +74,36 @@ def test_ablation_reuses_existing_weighting_knobs_and_binds_exact_drift() -> Non
     assert result["claim_identity_sha256"] != result["contract_sha256"]
 
 
+def test_historical_a1_recipe_renders_explicit_legacy_blend_semantics() -> None:
+    result = _bind(value_loss_weight=1.0)
+    assert "policy_target_blend_semantics" not in result["bound_recipe"]
+    command = executor.build_train_command(
+        result,
+        python=Path(sys.executable),
+        checkpoint=Path("/tmp/legacy-blend.pt"),
+        report=Path("/tmp/legacy-blend.json"),
+    )
+    assert command[
+        command.index("--policy-target-blend-semantics") + 1
+    ] == train_bc.POLICY_TARGET_BLEND_LEGACY_V1
+
+
+def test_a1_v2_policy_target_ablation_requires_pure_policy_weight() -> None:
+    with pytest.raises(executor.ExecutorError, match="requires soft_target_weight"):
+        _bind(
+            policy_target_blend_semantics=(
+                train_bc.POLICY_TARGET_BLEND_FALLBACK_V2
+            )
+        )
+    result = _bind(
+        policy_target_blend_semantics=train_bc.POLICY_TARGET_BLEND_FALLBACK_V2,
+        soft_target_weight=1.0,
+    )
+    assert result["recipe"]["policy_target_blend_semantics"] == (
+        train_bc.POLICY_TARGET_BLEND_FALLBACK_V2
+    )
+
+
 def test_value_trunk_gradient_ablation_is_typed_bound_and_rendered() -> None:
     result = _bind(value_trunk_grad_scale=0.0)
     ablation = result["learner_ablation"]

@@ -245,8 +245,17 @@ def test_production_command_adds_only_outputs_runtime_and_proven_empty_crop(
     expected[expected.index("--report") + 1] = str(
         tmp_path / "production" / "report.json"
     )
-    expected.append(temp.base.CROP_FLAG)
+    expected.extend(
+        [
+            "--policy-target-blend-semantics",
+            "legacy_interpolate_v1",
+            temp.base.CROP_FLAG,
+        ]
+    )
     assert production == expected
+    assert production[
+        production.index("--policy-target-blend-semantics") + 1
+    ] == "legacy_interpolate_v1"
     assert production.count(temp.base.CROP_FLAG) == 1
 
 

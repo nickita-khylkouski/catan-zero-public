@@ -247,6 +247,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "policy_loss_weight",
         "policy_aux_active_batch_size",
         "policy_aux_loss_weight",
+        "policy_target_blend_semantics",
         "soft_target_source",
         "soft_target_weight",
         "soft_target_temperature",
@@ -3363,7 +3364,8 @@ def bind_learner_ablation(
             else bool
             if key == "per_game_policy_surprise_weighting"
             else str
-            if key == "policy_kl_anchor_direction"
+            if key
+            in {"policy_kl_anchor_direction", "policy_target_blend_semantics"}
             else type(bound[key])
         )
         if type(value) is not expected_type:
@@ -3409,6 +3411,9 @@ def bind_learner_ablation(
         "per_game_policy_weight_mode": {"equal", "sqrt"},
         "per_game_value_weight_mode": {"equal", "sqrt"},
         "policy_kl_anchor_direction": {"forward"},
+        "policy_target_blend_semantics": set(
+            train_bc.POLICY_TARGET_BLEND_SEMANTICS
+        ),
     }
     for key, value in overrides.items():
         if key in numeric_domains:
@@ -3443,6 +3448,12 @@ def bind_learner_ablation(
         raise ExecutorError(
             "soft_target_temperature is inert for soft_target_source=policy; "
             "do not encode a fake ablation drift"
+        )
+    if effective.get("policy_target_blend_semantics") == (
+        train_bc.POLICY_TARGET_BLEND_FALLBACK_V2
+    ) and effective["soft_target_weight"] not in {0.0, 1.0}:
+        raise ExecutorError(
+            "policy_target_fallback_v2 requires soft_target_weight 0.0 or 1.0"
         )
     adaptive_fields = {
         "policy_kl_target",
@@ -5380,6 +5391,13 @@ def _build_direct_train_command(
             str(recipe["soft_target_source"]),
             "--soft-target-weight",
             str(recipe["soft_target_weight"]),
+            "--policy-target-blend-semantics",
+            str(
+                recipe.get(
+                    "policy_target_blend_semantics",
+                    train_bc.POLICY_TARGET_BLEND_LEGACY_V1,
+                )
+            ),
             "--soft-target-temperature",
             str(recipe["soft_target_temperature"]),
             "--soft-target-min-legal-coverage",

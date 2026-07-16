@@ -298,8 +298,9 @@ class TrainConfig(PipelineConfig):
     symmetry_augment: bool = False
     symmetry_augment_events: bool = True
     soft_target_temperature: float = 0.7
-    soft_target_weight: float = 0.7
+    soft_target_weight: float = 1.0
     soft_target_source: str = "policy"
+    policy_target_blend_semantics: str = "policy_target_fallback_v2"
     soft_target_min_legal_coverage: float = 0.5
     # Value-head weights -- the group the "flag-flips" work verifies.
     policy_loss_weight: float = 1.0

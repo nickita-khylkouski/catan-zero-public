@@ -201,6 +201,14 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
 )
 
 
+POLICY_TARGET_BLEND_LEGACY_V1 = "legacy_interpolate_v1"
+POLICY_TARGET_BLEND_FALLBACK_V2 = "policy_target_fallback_v2"
+POLICY_TARGET_BLEND_SEMANTICS = (
+    POLICY_TARGET_BLEND_FALLBACK_V2,
+    POLICY_TARGET_BLEND_LEGACY_V1,
+)
+
+
 # Set once from --mask-hidden-info in main(); read by _entity_batch so both the
 # train and eval decode paths mask identically. The corpus stays UNMASKED on
 # disk -- one corpus serves both masked and unmasked training regimes.
@@ -965,8 +973,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--soft-target-weight",
         type=float,
-        default=0.7,
-        help="Blend weight for soft distillation where soft labels exist; 1.0 means pure soft loss.",
+        default=1.0,
+        help=(
+            "Legacy interpolation coefficient, or an on/off switch under "
+            "policy_target_fallback_v2. New search-policy distillation uses 1.0: "
+            "usable authenticated policy targets receive pure policy CE and hard "
+            "action_taken CE is only a missing-target fallback."
+        ),
+    )
+    parser.add_argument(
+        "--policy-target-blend-semantics",
+        choices=POLICY_TARGET_BLEND_SEMANTICS,
+        default=POLICY_TARGET_BLEND_FALLBACK_V2,
+        help=(
+            "policy_target_fallback_v2 keeps played exploration actions out of "
+            "usable search-policy labels. legacy_interpolate_v1 exactly replays "
+            "historical alpha*soft+(1-alpha)*action_taken reports."
+        ),
     )
     parser.add_argument(
         "--soft-target-source",
@@ -4420,8 +4443,9 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "policy_loss_weight",
         "policy_kl_anchor_direction", "policy_kl_anchor_weight",
         "policy_kl_target", "policy_kl_dual_lr", "policy_kl_max_weight",
-        "q_loss_weight", "soft_target_source", "soft_target_temperature",
-        "soft_target_weight", "truncated_vp_margin_value_weight",
+        "policy_target_blend_semantics", "q_loss_weight", "soft_target_source",
+        "soft_target_temperature", "soft_target_weight",
+        "truncated_vp_margin_value_weight",
         "value_target_lambda",
         "value_categorical_bins", "value_categorical_loss_weight",
         "value_head_type", "value_hlgauss_sigma_ratio", "value_loss_weight",
@@ -5325,6 +5349,7 @@ def _validate_composite_learner_recipe_authorization(
         "policy_kl_target": float,
         "policy_kl_dual_lr": float,
         "policy_kl_max_weight": float,
+        "policy_target_blend_semantics": str,
         "q_loss_weight": float,
         "soft_target_source": str,
         "soft_target_min_legal_coverage": float,
@@ -7574,6 +7599,20 @@ def _effective_a1_learner_training_recipe(
         "ddp_shard_data",
     )
     effective = {field: getattr(args, field) for field in bound_fields}
+    policy_target_blend_semantics = str(
+        getattr(
+            args,
+            "policy_target_blend_semantics",
+            POLICY_TARGET_BLEND_LEGACY_V1,
+        )
+    )
+    if policy_target_blend_semantics != POLICY_TARGET_BLEND_LEGACY_V1:
+        # Historical A1 locks predate this versioned loss contract and retain
+        # their exact recipe shape when replayed with the explicit legacy CLI
+        # semantic. New pure-policy recipes bind the non-legacy semantic.
+        effective["policy_target_blend_semantics"] = (
+            policy_target_blend_semantics
+        )
     forced_type_weights = _parse_forced_row_value_action_type_weights(
         str(getattr(args, "forced_row_value_action_type_weights", "") or "")
     )
@@ -8576,6 +8615,8 @@ def _validate_a1_learner_training_recipe(
         authorized_extra_fields.add("policy_aux_loss_weight")
     if float(getattr(args, "value_trunk_grad_scale", 1.0)) != 1.0:
         authorized_extra_fields.add("value_trunk_grad_scale")
+    if "policy_target_blend_semantics" in effective:
+        authorized_extra_fields.add("policy_target_blend_semantics")
     if effective.get("forced_row_value_action_type_weights"):
         authorized_extra_fields.add("forced_row_value_action_type_weights")
     # a1_one_dose_train canonically expands these post-seal defaults for every
@@ -10087,6 +10128,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             data,
             mask_hidden_info=bool(args.mask_hidden_info),
             soft_target_weight=float(args.soft_target_weight),
+            policy_target_blend_semantics=str(
+                args.policy_target_blend_semantics
+            ),
             policy_loss_weight=float(args.policy_loss_weight),
             q_loss_weight=float(args.q_loss_weight),
             value_target_lambda=float(args.value_target_lambda),
@@ -12471,6 +12515,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         int(args.train_diagnostics_every_batches) > 0
                         and batch_number % int(args.train_diagnostics_every_batches) == 0
                     ),
+                    policy_target_blend_semantics=str(
+                        args.policy_target_blend_semantics
+                    ),
                     truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
                     **train_fn_extra_kwargs,
                     **accum_kwargs,
@@ -13722,6 +13769,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.advantage_weight_floor,
                 ddp,
                 args.amp,
+                policy_target_blend_semantics=str(
+                    args.policy_target_blend_semantics
+                ),
                 data_sharded=bool(args.ddp_shard_data),
                 truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
                 policy_kl_anchor_weight=(
@@ -14369,6 +14419,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "soft_target_weight": args.soft_target_weight,
         "soft_target_source": args.soft_target_source,
+        "policy_target_blend_semantics": args.policy_target_blend_semantics,
         "soft_target_min_legal_coverage": args.soft_target_min_legal_coverage,
         "policy_loss_weight": args.policy_loss_weight,
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
@@ -14710,6 +14761,7 @@ def _train_candidate_batch(
     advantage_weight_floor: float,
     amp: str = "none",
     *,
+    policy_target_blend_semantics: str = POLICY_TARGET_BLEND_LEGACY_V1,
     max_grad_norm: float = 1.0,
     diagnostics: bool = True,
     truncated_vp_margin_value_weight: float = 0.0,
@@ -14759,11 +14811,12 @@ def _train_candidate_batch(
     if soft_targets is not None:
         log_probs = _support_log_softmax(masked, soft_support)
         soft_loss = -(soft_targets * log_probs).sum(dim=-1)
-        alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
-        per_sample_loss = torch.where(
-            has_soft,
-            alpha * soft_loss + (1.0 - alpha) * hard_loss,
+        per_sample_loss = _policy_target_per_sample_loss(
             hard_loss,
+            soft_loss,
+            has_soft,
+            soft_target_weight=soft_target_weight,
+            blend_semantics=policy_target_blend_semantics,
         )
     else:
         per_sample_loss = hard_loss
@@ -15524,6 +15577,7 @@ def _train_xdim_batch(
     advantage_weight_floor: float,
     amp: str = "none",
     *,
+    policy_target_blend_semantics: str = POLICY_TARGET_BLEND_LEGACY_V1,
     max_grad_norm: float = 1.0,
     diagnostics: bool = True,
     truncated_vp_margin_value_weight: float = 0.0,
@@ -15607,11 +15661,12 @@ def _train_xdim_batch(
         if soft_targets is not None:
             log_probs = _support_log_softmax(outputs["logits"], soft_support)
             soft_loss = -(soft_targets * log_probs).sum(dim=-1)
-            alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
-            per_sample_loss = torch.where(
-                has_soft,
-                alpha * soft_loss + (1.0 - alpha) * hard_loss,
+            per_sample_loss = _policy_target_per_sample_loss(
                 hard_loss,
+                soft_loss,
+                has_soft,
+                soft_target_weight=soft_target_weight,
+                blend_semantics=policy_target_blend_semantics,
             )
         else:
             per_sample_loss = hard_loss
@@ -15757,11 +15812,12 @@ def _train_xdim_batch(
             if aux_soft is not None:
                 aux_log_probs = _support_log_softmax(aux_outputs["logits"], aux_support)
                 aux_soft_loss = -(aux_soft * aux_log_probs).sum(dim=-1)
-                alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
-                aux_per_sample = torch.where(
-                    aux_has_soft,
-                    alpha * aux_soft_loss + (1.0 - alpha) * aux_hard,
+                aux_per_sample = _policy_target_per_sample_loss(
                     aux_hard,
+                    aux_soft_loss,
+                    aux_has_soft,
+                    soft_target_weight=soft_target_weight,
+                    blend_semantics=policy_target_blend_semantics,
                 )
             else:
                 aux_per_sample = aux_hard
@@ -17051,6 +17107,7 @@ def evaluate_bc_batches(
     ddp: dict[str, int | bool],
     amp: str = "none",
     *,
+    policy_target_blend_semantics: str = POLICY_TARGET_BLEND_LEGACY_V1,
     data_sharded: bool = False,
     truncated_vp_margin_value_weight: float = 0.0,
     policy_kl_anchor_weight: float = 0.0,
@@ -17204,6 +17261,7 @@ def evaluate_bc_batches(
                 advantage_weight_cap,
                 advantage_weight_floor,
                 amp,
+                policy_target_blend_semantics=policy_target_blend_semantics,
                 truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
                 **eval_fn_extra_kwargs,
             )
@@ -17569,6 +17627,7 @@ def _eval_candidate_batch(
     advantage_weight_floor: float,
     amp: str = "none",
     *,
+    policy_target_blend_semantics: str = POLICY_TARGET_BLEND_LEGACY_V1,
     truncated_vp_margin_value_weight: float = 0.0,
 ) -> dict:
     del final_vp_loss_weight, q_loss_weight, amp
@@ -17612,11 +17671,12 @@ def _eval_candidate_batch(
         if soft_targets is not None:
             log_probs = _support_log_softmax(masked, soft_support)
             soft_loss = -(soft_targets * log_probs).sum(dim=-1)
-            alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
-            per_sample_loss = torch.where(
-                has_soft,
-                alpha * soft_loss + (1.0 - alpha) * hard_loss,
+            per_sample_loss = _policy_target_per_sample_loss(
                 hard_loss,
+                soft_loss,
+                has_soft,
+                soft_target_weight=soft_target_weight,
+                blend_semantics=policy_target_blend_semantics,
             )
         else:
             per_sample_loss = hard_loss
@@ -17721,6 +17781,7 @@ def _eval_xdim_batch(
     advantage_weight_floor: float,
     amp: str = "none",
     *,
+    policy_target_blend_semantics: str = POLICY_TARGET_BLEND_LEGACY_V1,
     truncated_vp_margin_value_weight: float = 0.0,
     policy_kl_anchor_weight: float = 0.0,
     policy_kl_anchor_direction: str = "forward",
@@ -17773,11 +17834,12 @@ def _eval_xdim_batch(
             if soft_targets is not None:
                 log_probs = _support_log_softmax(outputs["logits"], soft_support)
                 soft_loss = -(soft_targets * log_probs).sum(dim=-1)
-                alpha = float(np.clip(soft_target_weight, 0.0, 1.0))
-                per_sample_loss = torch.where(
-                    has_soft,
-                    alpha * soft_loss + (1.0 - alpha) * hard_loss,
+                per_sample_loss = _policy_target_per_sample_loss(
                     hard_loss,
+                    soft_loss,
+                    has_soft,
+                    soft_target_weight=soft_target_weight,
+                    blend_semantics=policy_target_blend_semantics,
                 )
             else:
                 per_sample_loss = hard_loss
@@ -19331,6 +19393,7 @@ def _validate_target_information_admission(
     *,
     mask_hidden_info: bool,
     soft_target_weight: float,
+    policy_target_blend_semantics: str = POLICY_TARGET_BLEND_FALLBACK_V2,
     policy_loss_weight: float,
     q_loss_weight: float,
     value_target_lambda: float,
@@ -19445,6 +19508,20 @@ def _validate_target_information_admission(
         active_regime_counts = {
             TARGET_INFORMATION_REGIME_UNKNOWN: int(active_indices.size)
         }
+    elif int(active_indices.size) == n:
+        # Preserve the count-only categorical fast path when every row is
+        # active. Some authenticated corpus columns intentionally expose
+        # value_counts without materializing or supporting row indexing.
+        active_regime_counts = dict(counts)
+    elif isinstance(regime_column, _MemmapCategoricalColumn) or bool(
+        getattr(regime_column, "supports_value_counts", False)
+    ):
+        active_regime_counts = {
+            str(value): int(count)
+            for value, count in regime_column.value_counts(
+                index=active_indices
+            ).items()
+        }
     else:
         active_regimes = np.asarray(regime_column[active_indices]).astype(str)
         active_regime_counts = {
@@ -19462,6 +19539,7 @@ def _validate_target_information_admission(
         "required_target_information_regime": required_regime,
         "search_objective_active_rows": int(active_indices.size),
         "search_objective_target_information_regime_counts": active_regime_counts,
+        "policy_target_blend_semantics": str(policy_target_blend_semantics),
         "mismatched_target_information_rows": mismatched_target_rows,
         "unsafe_or_unknown_rows": unsafe_count,
         "search_target_objectives": objectives,
@@ -19481,6 +19559,37 @@ def _validate_target_information_admission(
             "disable every listed search-target objective and train only on hard "
             "actions/realised outcomes."
         )
+    semantics = str(policy_target_blend_semantics)
+    if semantics not in POLICY_TARGET_BLEND_SEMANTICS:
+        raise SystemExit(
+            "policy_target_blend_semantics must name one exact supported loss "
+            f"contract, got {semantics!r}"
+        )
+    weight = float(soft_target_weight)
+    if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
+        raise SystemExit("soft_target_weight must be finite and in [0, 1]")
+    if semantics == POLICY_TARGET_BLEND_FALLBACK_V2 and weight not in {0.0, 1.0}:
+        raise SystemExit(
+            "policy_target_fallback_v2 forbids intermediate soft_target_weight: "
+            "use 1.0 for pure authenticated policy CE with hard fallback, 0.0 "
+            "to disable soft targets, or explicitly select legacy_interpolate_v1 "
+            "to replay a historical mixed-label report"
+        )
+    if (
+        required_regime == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+        and "soft_policy" in objectives
+        and (
+            semantics != POLICY_TARGET_BLEND_FALLBACK_V2
+            or weight != 1.0
+        )
+    ):
+        raise SystemExit(
+            "coherent-public search-policy distillation requires "
+            "policy_target_fallback_v2 with soft_target_weight=1.0"
+        )
+    report["played_action_mixed_into_usable_policy_target"] = bool(
+        semantics == POLICY_TARGET_BLEND_LEGACY_V1 and 0.0 < weight < 1.0
+    )
     return report
 
 
@@ -22524,6 +22633,47 @@ def _validate_aux_subgoal_training_contract(
 def _weighted_mean_loss(values, weights, *, mask=None):
     numerator, denominator = _weighted_loss_parts(values, weights, mask=mask)
     return _weighted_mean_from_parts(numerator, denominator)
+
+
+def _policy_target_per_sample_loss(
+    hard_loss,
+    soft_loss,
+    has_soft,
+    *,
+    soft_target_weight: float,
+    blend_semantics: str,
+):
+    """Apply one explicit, versioned policy-label contract.
+
+    ``policy_target_fallback_v2`` never mixes the played action into a usable
+    search-policy row.  This matters when ``action_taken`` was sampled for
+    self-play exploration: the sampled move advances the trajectory, while the
+    authenticated untempered search distribution remains the teacher label.
+
+    ``legacy_interpolate_v1`` preserves the historical alpha interpolation for
+    exact report/checkpoint replay.  New coherent/A1 recipes must opt into v2.
+    """
+
+    import torch
+
+    semantics = str(blend_semantics)
+    weight = float(soft_target_weight)
+    if semantics == POLICY_TARGET_BLEND_LEGACY_V1:
+        alpha = float(np.clip(weight, 0.0, 1.0))
+        return torch.where(
+            has_soft,
+            alpha * soft_loss + (1.0 - alpha) * hard_loss,
+            hard_loss,
+        )
+    if semantics != POLICY_TARGET_BLEND_FALLBACK_V2:
+        raise ValueError(f"unsupported policy-target blend semantics {semantics!r}")
+    if weight == 0.0:
+        return hard_loss
+    if weight != 1.0:
+        raise ValueError(
+            "policy_target_fallback_v2 requires soft_target_weight 0.0 or 1.0"
+        )
+    return torch.where(has_soft, soft_loss, hard_loss)
 
 
 def _weighted_mean_from_parts(numerator, denominator):

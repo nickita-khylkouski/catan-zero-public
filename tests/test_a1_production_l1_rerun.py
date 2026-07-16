@@ -27,6 +27,7 @@ def test_latest_main_additions_project_to_exact_historical_l1() -> None:
     inventories = ["sha256:" + char * 64 for char in "abc"]
     derived = historical + [
         "--max-grad-norm", "1.0", "--policy-aux-active-batch-size", "0",
+        "--policy-target-blend-semantics", "legacy_interpolate_v1",
         l1.ACK_FLAG, inventories[0], l1.ACK_FLAG, inventories[1],
         l1.ACK_FLAG, inventories[2], l1.CROP_FLAG,
     ]
@@ -83,6 +84,7 @@ def test_projection_rejects_extra_or_reordered_inventory_ack() -> None:
     inventories = ["a", "b", "c"]
     derived = _historical() + [
         "--max-grad-norm", "1.0", "--policy-aux-active-batch-size", "0",
+        "--policy-target-blend-semantics", "legacy_interpolate_v1",
         l1.ACK_FLAG, "b", l1.ACK_FLAG, "a", l1.ACK_FLAG, "c", l1.CROP_FLAG,
     ]
     with pytest.raises(l1.L1Error, match="order drift"):

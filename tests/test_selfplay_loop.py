@@ -6,10 +6,11 @@ temperature schedule and 65x more leaf evals.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
+from tools import selfplay_loop
 from tools.selfplay_loop import _build_generation_cmd
-from pathlib import Path
 
 
 def _flag_value(cmd: list[str], flag: str) -> str:
@@ -64,3 +65,28 @@ def test_generation_cmd_threads_caller_params() -> None:
     assert _flag_value(cmd, "--checkpoint") == "/ckpt.pt"
     # gen_index-scaled disjoint seed block
     assert _flag_value(cmd, "--base-seed") == str(500_000_000_000 + 3 * 10_000_019)
+
+
+def test_training_command_uses_pure_policy_target_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: list[str] = []
+
+    def _capture(command, *, log_path):
+        del log_path
+        captured.extend(command)
+        return 0
+
+    monkeypatch.setattr(selfplay_loop, "run", _capture)
+    args = SimpleNamespace(
+        lr=3e-5,
+        lr_warmup_steps=100,
+        batch_size=512,
+        device="cpu",
+    )
+    selfplay_loop.run_training(tmp_path, "/data", "/parent.pt", args)
+
+    assert _flag_value(captured, "--soft-target-weight") == "1.0"
+    assert _flag_value(
+        captured, "--policy-target-blend-semantics"
+    ) == "policy_target_fallback_v2"

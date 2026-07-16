@@ -70,6 +70,27 @@ def test_factory_keeps_default_global_batch_constant_across_world_sizes(
     command = _train_command(manifest)
     assert command[command.index("--batch-size") + 1] == str(expected_local_batch)
     assert command[command.index("--grad-accum-steps") + 1] == "1"
+    assert command[command.index("--soft-target-weight") + 1] == "1.0"
+    assert command[
+        command.index("--policy-target-blend-semantics") + 1
+    ] == "policy_target_fallback_v2"
+
+
+def test_factory_can_render_explicit_legacy_replay_semantics(tmp_path: Path) -> None:
+    result = _dry_run(
+        tmp_path,
+        "--soft-target-weight",
+        "0.9",
+        "--policy-target-blend-semantics",
+        "legacy_interpolate_v1",
+    )
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    assert command[command.index("--soft-target-weight") + 1] == "0.9"
+    assert command[
+        command.index("--policy-target-blend-semantics") + 1
+    ] == "legacy_interpolate_v1"
 
 
 def test_factory_keeps_forced_policy_rows_out_of_fresh_training(tmp_path: Path) -> None:
