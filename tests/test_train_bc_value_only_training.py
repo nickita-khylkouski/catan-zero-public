@@ -1215,3 +1215,102 @@ def test_policy_stream_metrics_preserve_unequal_base_aux_sufficient_stats(
     assert zero_base["accuracy"] == zero_base["policy_aux_accuracy"] == 0.0
     assert zero_base["policy_base_phase_stats"] == {}
     assert zero_base["policy_aux_phase_stats"]["AUX_PHASE"]["count"] == 4
+
+
+def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    import json
+
+    from catan_zero.rl.self_play import make_env_config
+    from tools import train_bc
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(6))
+    data["phase"] = np.asarray(["OPEN"] * 6, dtype=object)
+    data["phase"][0] = "FORCED"
+    data["teacher_name"] = np.asarray(["candidate_teacher"] * 6, dtype=object)
+    data["policy_weight_multiplier"] = np.ones(6, dtype=np.float32)
+    data["policy_weight_multiplier"][-1] = 0.0
+    forced_action = int(data["action_taken"][0])
+    data["legal_action_ids"][0] = -1
+    data["legal_action_ids"][0, 0] = forced_action
+
+    monkeypatch.setattr(
+        train_bc, "load_teacher_data", lambda _path, **_kwargs: data
+    )
+    monkeypatch.setattr(
+        train_bc,
+        "_env_config_for_teacher_data",
+        lambda _args, _data, _ddp: make_env_config(vps_to_win=3),
+    )
+    report_path = tmp_path / "candidate-report.json"
+    train_bc.main(
+        [
+            "--data",
+            str(tmp_path / "shard"),
+            "--checkpoint",
+            str(tmp_path / "candidate.pt"),
+            "--report",
+            str(report_path),
+            "--arch",
+            "candidate",
+            "--device",
+            "cpu",
+            "--hidden-size",
+            "16",
+            "--epochs",
+            "1",
+            "--batch-size",
+            "4",
+            "--validation-fraction",
+            "0",
+            "--train-diagnostics-every-batches",
+            "1",
+            "--skip-guards",
+        ]
+    )
+    capsys.readouterr()
+    metric = json.loads(report_path.read_text(encoding="utf-8"))["metrics"][0]
+    assert metric["samples"] == metric["policy_base_row_count"] == 6
+    assert metric["policy_aux_row_count"] == 0
+    assert metric["policy_total_row_count"] == 6
+    assert metric["policy_base_accuracy_active_count"] == 5
+    assert metric["policy_aux_accuracy_active_count"] == 0
+    assert metric["policy_total_accuracy_active_count"] == 5
+    assert metric["policy_total_accuracy"] == metric["accuracy"]
+    assert metric["policy_total_phase_accuracy"] == metric["phase_accuracy"]
+    assert metric["policy_base_phase_accuracy"]["FORCED"]["count"] == 1
+    assert metric["policy_base_phase_accuracy"]["OPEN"]["count"] == 4
+    unforced = metric["policy_base_phase_accuracy_excluding_forced"]
+    assert unforced == metric["policy_total_phase_accuracy_excluding_forced"]
+    assert unforced == metric["phase_accuracy_excluding_forced"]
+    assert set(unforced) == {"OPEN"}
+    assert unforced["OPEN"]["count"] == 4
+
+
+def test_unforced_phase_ddp_reducer_merges_unequal_rank_counts(monkeypatch) -> None:
+    import torch.distributed as dist
+    from tools import train_bc
+
+    local = {"OPEN": {"count": 1, "top1": 1, "top3": 1}}
+    remote = {
+        "OPEN": {"count": 3, "top1": 1, "top3": 2},
+        "ROBBER": {"count": 2, "top1": 0, "top3": 1},
+    }
+
+    def fake_all_gather_object(output, value):
+        assert value == local
+        output[:] = [local, remote]
+
+    monkeypatch.setattr(dist, "all_gather_object", fake_all_gather_object)
+    reduced = train_bc._reduce_nested_count_stats(  # noqa: SLF001
+        local,
+        {"enabled": True, "world_size": 2, "rank": 0, "local_rank": 0},
+    )
+    assert reduced == {
+        "OPEN": {"count": 4, "top1": 2, "top3": 3},
+        "ROBBER": {"count": 2, "top1": 0, "top3": 1},
+    }
+    finalized = train_bc._finalize_phase_stats(reduced)  # noqa: SLF001
+    assert finalized["OPEN"]["top1_accuracy"] == pytest.approx(0.5)
+    assert finalized["ROBBER"]["top3_accuracy"] == pytest.approx(0.5)

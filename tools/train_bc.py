@@ -81,7 +81,6 @@ from catan_zero.rl.meaningful_history import (
 )
 from catan_zero.rl.ordered_history import (
     MASKED_MEAN_V1,
-    ORDERED_ATTENTION_V2,
     SUPPORTED_HISTORY_POOLING,
 )
 from catan_zero.rl.target_reliability import (
@@ -12121,7 +12120,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             policy_aux_batch_size=int(args.policy_aux_active_batch_size),
             materialize_keys=(
                 _entity_graph_prefetch_materialization_keys(data)
-                if policy.policy_type == "entity_graph"
+                if getattr(policy, "policy_type", None) == "entity_graph"
                 else None
             ),
         )
@@ -12206,6 +12205,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             # micro-batch, defeating gradient accumulation's communication win.
             with _gradient_sync_context(policy.model, accum_do_step=accum_do_step):
                 objective_interference_kwargs: dict[str, object] = {}
+                symmetry_kwargs: dict[str, object] = {}
                 if train_fn is _train_xdim_batch:
                     interference_cadence = int(
                         args.objective_gradient_interference_every_batches
@@ -12218,6 +12218,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                         baseline_observed=objective_gradient_baseline_observed,
                         accum_do_step=accum_do_step,
                     )
+                    symmetry_kwargs = {
+                        "symmetry": symmetry,
+                        "symmetry_rng": symmetry_rng,
+                        "symmetry_relabel_events": bool(
+                            getattr(args, "symmetry_augment_events", True)
+                        ),
+                    }
                 batch_metrics = train_fn(
                     policy,
                     optimizer,
@@ -12246,14 +12253,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         and batch_number % int(args.train_diagnostics_every_batches) == 0
                     ),
                     truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
-                    symmetry=symmetry,
-                    symmetry_rng=symmetry_rng,
-                    symmetry_relabel_events=bool(
-                        getattr(args, "symmetry_augment_events", True)
-                    ),
                     **train_fn_extra_kwargs,
                     **accum_kwargs,
                     **objective_interference_kwargs,
+                    **symmetry_kwargs,
                     **(
                         {
                             "policy_aux_data": policy_aux_data,
@@ -14588,8 +14591,23 @@ def _train_candidate_batch(
     predictions = torch.argmax(masked, dim=-1)
     active = policy_weights > 0.0
     active_count = int(active.sum().item())
-    accuracy = _masked_metric_mean((predictions == actions).float(), active)
-    top3_accuracy = _topk_full_accuracy(masked, actions, k=3, mask=active)
+    policy_base_correct_count = int(((predictions == actions) & active).sum().item())
+    policy_base_top3_correct_count = int(
+        round(
+            float(_topk_full_accuracy(masked, actions, k=3, mask=active).item())
+            * active_count
+        )
+    )
+    policy_base_accuracy = policy_base_correct_count / max(active_count, 1)
+    policy_base_top3_accuracy = policy_base_top3_correct_count / max(
+        active_count, 1
+    )
+    policy_base_soft_rows = (
+        int(has_soft.sum().item()) if soft_targets is not None else 0
+    )
+    policy_base_soft_active_rows = (
+        int((has_soft & active).sum().item()) if soft_targets is not None else 0
+    )
     active_np = active.detach().cpu().numpy().astype(bool)
     if diagnostics:
         predictions_np = predictions.detach().cpu().numpy()
@@ -14640,19 +14658,65 @@ def _train_candidate_batch(
         "q_loss_weighted_sum": 0.0,
         "q_loss_weight_sum": 0.0,
         "q_score_rows_ge2": 0,
-        "soft_distillation_rows": int(has_soft.sum().item()) if soft_targets is not None else 0,
-        "soft_distillation_active_rows": (
-            int((has_soft & active).sum().item()) if soft_targets is not None else 0
+        # Candidate has no additive policy stream, but it must expose the same
+        # sufficient-stat schema as the xdim/entity path. Epoch aggregation is
+        # architecture-independent and fails closed when these counts drift.
+        "policy_metric_semantics": {
+            "schema_version": "train-policy-stream-metrics-v1",
+            "headline_scope": "base_plus_aux_count_weighted",
+            "base_scope": "positive_policy_weight_rows_in_base_forward",
+            "aux_scope": "all_rows_in_policy_aux_forward",
+            "accuracy_weighting": "uniform_active_row_count",
+            "loss_weighting_unchanged": True,
+        },
+        "policy_base_row_count": int(len(batch)),
+        "policy_aux_row_count": 0,
+        "policy_total_row_count": int(len(batch)),
+        "policy_base_active_count": int(active_count),
+        "policy_aux_active_count": 0,
+        "policy_total_active_count": int(active_count),
+        "policy_base_correct_count": int(policy_base_correct_count),
+        "policy_aux_correct_count": 0,
+        "policy_total_correct_count": int(policy_base_correct_count),
+        "policy_base_top3_correct_count": int(policy_base_top3_correct_count),
+        "policy_aux_top3_correct_count": 0,
+        "policy_total_top3_correct_count": int(policy_base_top3_correct_count),
+        "soft_distillation_base_rows": int(policy_base_soft_rows),
+        "soft_distillation_aux_rows": 0,
+        "soft_distillation_total_rows": int(policy_base_soft_rows),
+        "soft_distillation_rows": int(policy_base_soft_rows),
+        "soft_distillation_base_active_rows": int(
+            policy_base_soft_active_rows
         ),
+        "soft_distillation_aux_active_rows": 0,
+        "soft_distillation_total_active_rows": int(
+            policy_base_soft_active_rows
+        ),
+        "soft_distillation_active_rows": int(policy_base_soft_active_rows),
         "active_count": active_count,
         "value_active_count": int(value_active_count),
         "_value_active_row_mask": (
             value_active_mask.detach().cpu().numpy().astype(np.bool_, copy=False)
         ),
-        "accuracy": float(accuracy.item()),
-        "top3_accuracy": float(top3_accuracy.item()),
+        "policy_base_accuracy": float(policy_base_accuracy),
+        "policy_aux_accuracy": 0.0,
+        "policy_total_accuracy": float(policy_base_accuracy),
+        "accuracy": float(policy_base_accuracy),
+        "policy_base_top3_accuracy": float(policy_base_top3_accuracy),
+        "policy_aux_top3_accuracy": 0.0,
+        "policy_total_top3_accuracy": float(policy_base_top3_accuracy),
+        "top3_accuracy": float(policy_base_top3_accuracy),
+        "policy_base_phase_stats": phase_stats,
+        "policy_aux_phase_stats": {},
+        "policy_total_phase_stats": phase_stats,
         "phase_stats": phase_stats,
+        "policy_base_teacher_stats": teacher_stats,
+        "policy_aux_teacher_stats": {},
+        "policy_total_teacher_stats": teacher_stats,
         "teacher_stats": teacher_stats,
+        "policy_base_phase_stats_unforced": phase_stats_unforced,
+        "policy_aux_phase_stats_unforced": {},
+        "policy_total_phase_stats_unforced": phase_stats_unforced,
         "phase_stats_unforced": phase_stats_unforced,
         "optimizer_observability": optimizer_observability,
     }
@@ -16858,7 +16922,7 @@ def evaluate_bc_batches(
                 prefetch=int(data_loader_prefetch),
                 materialize_keys=(
                     _entity_graph_prefetch_materialization_keys(data)
-                    if policy.policy_type == "entity_graph"
+                    if getattr(policy, "policy_type", None) == "entity_graph"
                     else None
                 ),
             )
