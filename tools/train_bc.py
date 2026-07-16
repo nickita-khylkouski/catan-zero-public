@@ -15566,7 +15566,7 @@ def main(
                         else {}
                     ),
                 )
-            if weighted_cycle_mode and aux_source_rows is not None:
+            if weighted_policy_aux_stream and aux_source_rows is not None:
                 policy_aux_global_draw_offset = (
                     _advance_policy_aux_global_draw_offset(
                         policy_aux_global_draw_offset,

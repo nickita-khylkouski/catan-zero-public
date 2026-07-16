@@ -1284,6 +1284,16 @@ def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
     forced_action = int(data["action_taken"][0])
     data["legal_action_ids"][0] = -1
     data["legal_action_ids"][0, 0] = forced_action
+    # This test exercises policy reporting, but the production learner also
+    # admits value labels before training. Keep the synthetic terminal winner
+    # seated in its single game instead of inheriting a truncated sample prefix
+    # whose winner belongs to an unobserved player.
+    winner = str(np.asarray(data["player"]).astype(str)[0])
+    data["winner"] = np.asarray([winner] * 6, dtype=object)
+    if "terminated" in data:
+        data["terminated"] = np.ones(6, dtype=np.bool_)
+    if "truncated" in data:
+        data["truncated"] = np.zeros(6, dtype=np.bool_)
 
     monkeypatch.setattr(
         train_bc, "load_teacher_data", lambda _path, **_kwargs: data
