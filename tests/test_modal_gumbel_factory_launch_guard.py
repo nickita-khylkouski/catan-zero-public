@@ -17,7 +17,7 @@ import modal_gumbel_factory_launch_guard as guard  # noqa: E402
 
 FACTORY = TOOLS / "modal_gumbel_factory_gpu.py"
 GENERATION_CONFIG = (
-    REPO / "configs/generation/coherent_public_n128.schema18.json"
+    REPO / "configs/generation/coherent_public_n128.schema19.json"
 )
 PRODUCTION_RUNTIME = REPO / "configs/runtime/a1_production_runtime.json"
 

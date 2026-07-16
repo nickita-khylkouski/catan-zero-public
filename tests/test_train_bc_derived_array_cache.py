@@ -170,9 +170,13 @@ def test_coverage_rejects_unsupported_objective_before_cache_build() -> None:
 
 def test_policy_signal_floor_cannot_be_inert_under_weighted_sampler() -> None:
     args = SimpleNamespace(
-        **TrainConfig().field_values(),
-        base_sampler=train_bc.BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1,
-        minimum_policy_effective_rows_per_global_batch=32.0,
+        **(
+            TrainConfig().field_values()
+            | {
+                "base_sampler": train_bc.BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1,
+                "minimum_policy_effective_rows_per_global_batch": 32.0,
+            }
+        )
     )
 
     with pytest.raises(SystemExit, match="requires --base-sampler"):
@@ -184,9 +188,13 @@ def test_policy_signal_floor_cannot_be_inert_under_weighted_sampler() -> None:
 
 def test_policy_signal_floor_requires_enabled_policy_objective() -> None:
     args = SimpleNamespace(
-        **TrainConfig(policy_loss_weight=0.0).field_values(),
-        base_sampler=train_bc.BASE_SAMPLER_COVERAGE_IMPORTANCE_V1,
-        minimum_policy_effective_rows_per_global_batch=32.0,
+        **(
+            TrainConfig(policy_loss_weight=0.0).field_values()
+            | {
+                "base_sampler": train_bc.BASE_SAMPLER_COVERAGE_IMPORTANCE_V1,
+                "minimum_policy_effective_rows_per_global_batch": 32.0,
+            }
+        )
     )
 
     with pytest.raises(SystemExit, match="positive --policy-loss-weight"):

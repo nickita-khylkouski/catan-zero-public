@@ -95,8 +95,10 @@ _T = TypeVar("_T", bound="PipelineConfig")
 # evaluator payload without that field and one with it to claim the same
 # schema. Schema 17 first bound the boundary-particle count across every
 # search-bearing pipeline. Schema 18 additionally binds the value-label
-# outcome-balancing control used by the canonical learner.
-CONFIG_SCHEMA_VERSION = 18
+# outcome-balancing control used by the canonical learner. Schema 19 binds the
+# coverage sampler's minimum effective policy-signal admission floor; a
+# fail-closed run must not share an identity with the historical no-floor run.
+CONFIG_SCHEMA_VERSION = 19
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -321,6 +323,10 @@ class TrainConfig(PipelineConfig):
     soft_target_min_legal_coverage: float = 0.5
     # Value-head weights -- the group the "flag-flips" work verifies.
     policy_loss_weight: float = 1.0
+    # Changing this from zero to a positive floor can turn an otherwise
+    # identical corpus/optimizer recipe into a refusal before its first update.
+    # It is therefore part of the authoritative typed training identity.
+    minimum_policy_effective_rows_per_global_batch: float = 0.0
     policy_dose_lr_area: float = 0.0
     policy_dose_reference_global_batch_size: int = 0
     post_policy_dose_value_trunk_grad_scale: float = 1.0

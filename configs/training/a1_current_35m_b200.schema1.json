@@ -9,7 +9,6 @@
     "max_35m_params": 42000000,
     "min_35m_params": 41700000,
     "minimum_feature_learning_signal_observations": 2,
-    "minimum_policy_effective_rows_per_global_batch": 32.0,
     "objective_gradient_interference_every_batches": 16,
     "public_rule_state_features": true,
     "require_35m_model": true,
@@ -112,6 +111,7 @@
       "policy_kl_max_weight": 1.0,
       "policy_kl_target": null,
       "policy_loss_weight": 1.0,
+      "minimum_policy_effective_rows_per_global_batch": 32.0,
       "policy_surprise_cap": 4.0,
       "policy_surprise_weight": 0.0,
       "policy_target_blend_semantics": "policy_target_fallback_v2",
@@ -173,6 +173,6 @@
       "winner_sample_weight": 1.0
     },
     "pipeline": "train",
-    "schema_version": 18
+    "schema_version": 19
   }
 }

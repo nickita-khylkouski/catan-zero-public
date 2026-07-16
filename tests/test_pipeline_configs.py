@@ -75,6 +75,18 @@ def test_policy_aux_active_batch_size_changes_typed_train_hash() -> None:
     assert config_from_payload(policy_aux.canonical_payload()) == policy_aux
 
 
+def test_policy_signal_admission_floor_changes_typed_train_hash() -> None:
+    historical = TrainConfig(
+        minimum_policy_effective_rows_per_global_batch=0.0
+    )
+    fail_closed = TrainConfig(
+        minimum_policy_effective_rows_per_global_batch=32.0
+    )
+
+    assert historical.config_hash() != fail_closed.config_hash()
+    assert config_from_payload(fail_closed.canonical_payload()) == fail_closed
+
+
 def test_exact_step_dose_changes_typed_train_hash() -> None:
     epoch_bounded = TrainConfig(max_steps=128, exact_max_steps=False)
     exact_dose = TrainConfig(max_steps=128, exact_max_steps=True)

@@ -12,7 +12,7 @@
     "determinization_particles": 1,
     "device": "cuda",
     "eval_cache_size": 0,
-    "eval_server": true,
+    "eval_server": false,
     "eval_server_batch_timeout_sec": 0.0,
     "eval_server_cuda_graph": false,
     "eval_server_cuda_graph_batch_buckets": [
@@ -33,10 +33,10 @@
     "eval_server_event_token_limit": null,
     "eval_server_local_fallback": false,
     "eval_server_matmul_precision": "highest",
-    "eval_server_max_batch": 96,
+    "eval_server_max_batch": 64,
     "eval_server_max_neural_rows": null,
     "eval_server_max_wait_ms": 0.0,
-    "eval_server_request_collector": true,
+    "eval_server_request_collector": false,
     "eval_server_shared_memory_slot_bytes": 4194304,
     "eval_server_timeout_ms": 20000.0,
     "eval_server_transport": "mp_queue",
@@ -97,8 +97,8 @@
     "vps_to_win": 10,
     "wide_candidates_threshold": 24,
     "wide_roots_always_full": false,
-    "workers": 128
+    "workers": 1
   },
   "pipeline": "generate",
-  "schema_version": 18
+  "schema_version": 19
 }

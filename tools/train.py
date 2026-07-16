@@ -33,7 +33,7 @@ from catan_zero.rl.pipeline_configs import (  # noqa: E402
 
 CANONICAL_TRAIN_LAUNCH_SCHEMA = 1
 CANONICAL_CONFIG_SHA256 = (
-    "d8fcd2e669c2e7b4fc625119cfd4926470283ee49f820653324df84b1d5d1fd7"
+    "eea4fbfec0b77bf2fce7950977425bde883f7cb7f430035a3b0b061af009a8ae"
 )
 _ENGINE_SETTING_KEYS = frozenset(
     {
@@ -44,7 +44,6 @@ _ENGINE_SETTING_KEYS = frozenset(
         "entity_feature_adapter_version",
         "initialization_mode",
         "minimum_feature_learning_signal_observations",
-        "minimum_policy_effective_rows_per_global_batch",
         "objective_gradient_interference_every_batches",
         "public_rule_state_features",
         "require_35m_model",
@@ -160,18 +159,6 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
             raise SystemExit(
                 f"canonical engine setting {name} must be an integer >= {minimum}"
             )
-    policy_signal_floor = engine.get(
-        "minimum_policy_effective_rows_per_global_batch"
-    )
-    if (
-        isinstance(policy_signal_floor, bool)
-        or not isinstance(policy_signal_floor, (int, float))
-        or not 0.0 < float(policy_signal_floor)
-    ):
-        raise SystemExit(
-            "canonical engine setting "
-            "minimum_policy_effective_rows_per_global_batch must be a positive number"
-        )
     return config, dict(engine)
 
 

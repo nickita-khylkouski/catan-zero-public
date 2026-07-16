@@ -33,7 +33,7 @@ from generate_gumbel_selfplay_data import main as _legacy_executor_main  # noqa:
 
 CANONICAL_OPTION_COUNT = 9
 CANONICAL_CONFIG_SHA256 = (
-    "3bb1a9ddfd85dd370d6afa234e29c8cb9cb81bd384b0907c92693cd89af08f4d"
+    "748040c7957856d13b1203b2635dcba86cde23bbda941739d92b40db8fdcad8b"
 )
 
 # These are not tuning knobs on the production path anymore.  Historical

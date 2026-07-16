@@ -33,7 +33,7 @@ from tools.build_memmap_corpus import (  # noqa: E402
 
 CONFIG = (
     REPO
-    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema18.json"
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema19.json"
 )
 HISTORICAL_SCHEMA16_CONFIG = (
     REPO
@@ -89,7 +89,7 @@ def test_meaningful_history_uses_legacy_compatible_memmap_width() -> None:
 def test_next_wave_typed_generation_config_is_exact_schema_18_recipe() -> None:
     payload = json.loads(CONFIG.read_text())
     assert payload["pipeline"] == GenerateConfig.PIPELINE
-    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 18
+    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 19
 
     cfg = GenerateConfig(**payload["fields"])
     assert cfg.canonical_payload() == payload

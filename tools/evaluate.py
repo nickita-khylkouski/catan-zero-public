@@ -28,7 +28,7 @@ from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION, EvalConfig
 
 CANONICAL_OPTION_COUNT = 10
 CANONICAL_CONFIG_SHA256 = (
-    "00e001f832cbfc5464aa32efef0a6db980bd37709f1924b833bdc61c6d4b1efd"
+    "65eb8e8097d8138c97121ad6c55135b70e8f8ceec97032292374d6120078065a"
 )
 
 
