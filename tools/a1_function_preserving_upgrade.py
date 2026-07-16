@@ -205,6 +205,7 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
         },
         "new_parameter_initialization": {
             "legal_action_value_residual_proj.weight": "zeros",
+            "legal_action_value_static_proj.weight": "zeros",
             "static_action_residual_proj.bias": "zeros",
             "static_action_residual_proj.weight": "zeros",
         },

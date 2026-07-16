@@ -77,6 +77,7 @@ def test_value_head_module_attrs_covers_all_value_adjacent_heads() -> None:
     assert set(VALUE_HEAD_MODULE_ATTRS) == {
         "value_head",
         "legal_action_value_residual_proj",
+        "legal_action_value_static_proj",
         "value_categorical_head",
         "final_vp_head",
         "value_uncertainty_head",

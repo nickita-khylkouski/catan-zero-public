@@ -65,3 +65,39 @@ def test_replayed_promotion_staging_has_identical_registry_bytes(
     assert first_count == second_count == 1
     assert first == second
     assert promotion._sha256_bytes(first) == promotion._sha256_bytes(second)  # noqa: SLF001
+
+
+def test_standalone_go_requires_and_parses_dry_run_timestamp(monkeypatch) -> None:
+    common = [
+        "promote",
+        "--registry",
+        "registry.json",
+        "--current-pointer",
+        "CURRENT_CHAMPION",
+        "--contract-lock",
+        "contract.json",
+        "--adjudication",
+        "adjudication.json",
+        "--training-receipt",
+        "training.json",
+        "--cohort-exclusions",
+        "cohorts.json",
+        "--receipt",
+        "promotion.json",
+        "--reason",
+        "passed",
+        "--go",
+    ]
+    called = []
+    monkeypatch.setattr(
+        promotion,
+        "execute_promotion",
+        lambda **kwargs: called.append(kwargs) or {},
+    )
+
+    assert promotion.main(common) == 2
+    assert called == []
+    assert promotion.main(
+        [*common, "--registry-mutation-timestamp", "1234.5"]
+    ) == 0
+    assert called[0]["registry_mutation_timestamp"] == 1234.5

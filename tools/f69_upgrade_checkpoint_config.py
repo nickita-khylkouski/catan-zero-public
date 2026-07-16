@@ -74,6 +74,7 @@ NEW_PARAM_PREFIXES = (
     "topology_residual_adapter.",
     "static_action_residual_proj.",
     "legal_action_value_residual_proj.",
+    "legal_action_value_static_proj.",
     "public_card_count_residual.",
     "meaningful_history_residual_gate",
     "meaningful_history_ordered_gate",

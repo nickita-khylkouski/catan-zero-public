@@ -255,6 +255,8 @@ def test_value_only_smoke_freezes_complete_upgraded_policy_path() -> None:
             action_target_gather=True,
             edge_policy_head=True,
             action_cross_attention_layers=1,
+            static_action_residual=True,
+            legal_action_value_residual=True,
         ),
         base.static_action_features.detach().cpu().numpy(),
         device="cpu",
@@ -279,10 +281,20 @@ def test_value_only_smoke_freezes_complete_upgraded_policy_path() -> None:
         name: parameter
         for name, parameter in policy.model.named_parameters()
         if name.startswith(
-            ("target_gather_proj.", "edge_policy_mlp.", "action_cross_blocks.")
+            (
+                "target_gather_proj.",
+                "edge_policy_mlp.",
+                "action_cross_blocks.",
+                "static_action_residual_proj.",
+            )
         )
     }
     assert policy_adapter_params
+    assert all(not parameter.requires_grad for parameter in policy_adapter_params.values())
+    assert all(
+        parameter.requires_grad
+        for parameter in policy.model.legal_action_value_static_proj.parameters()
+    )
     policy_adapter_before = {
         name: parameter.detach().clone()
         for name, parameter in policy_adapter_params.items()

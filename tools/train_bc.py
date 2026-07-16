@@ -25807,6 +25807,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     "value_heads": (
         "value_head",
         "legal_action_value_residual_proj",
+        "legal_action_value_static_proj",
         "value_categorical_head",
         "final_vp_head",
         "value_uncertainty_head",
@@ -26099,6 +26100,7 @@ def _apply_lr_schedule(
 VALUE_HEAD_MODULE_ATTRS: tuple[str, ...] = (
     "value_head",
     "legal_action_value_residual_proj",
+    "legal_action_value_static_proj",
     "value_categorical_head",
     "final_vp_head",
     "value_uncertainty_head",

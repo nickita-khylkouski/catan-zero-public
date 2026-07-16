@@ -71,6 +71,14 @@ EXPECTED_COHERENT_PUBLIC_A1_RECIPE: dict[str, Any] = {
     "lazy_interior_chance": True,
     "belief_chance_spectra": False,
     "sigma_eval": 0.79,
+    "sigma_reference_visits": None,
+    "rescale_noise_floor_c": 0.0,
+    "rescale_noise_floor_initial_road_only": False,
+    "n_full_wide": None,
+    "n_full_wide_threshold": None,
+    "wide_roots_always_full": False,
+    "raw_policy_above_width": None,
+    "wide_candidates_threshold": 24,
     "coherent_public_belief_search": True,
     "correct_rust_chance_spectra": True,
     "native_mcts_hot_loop": True,
@@ -509,6 +517,8 @@ def snapshot_run(
             "c_visit",
             "max_depth",
             "sigma_eval",
+            "rescale_noise_floor_c",
+            "wide_candidates_threshold",
             "event_history_limit",
         )
     }
@@ -608,6 +618,22 @@ def snapshot_run(
         positive="--preserve-search-evidence",
         negative="--no-preserve-search-evidence",
     )
+    wide_roots_always_full = _recipe_bool_value(
+        "wide_roots_always_full",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--wide-roots-always-full",
+        negative="--no-wide-roots-always-full",
+    )
+    rescale_noise_floor_initial_road_only = _recipe_bool_value(
+        "rescale_noise_floor_initial_road_only",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--rescale-noise-floor-initial-road-only",
+        negative="--no-rescale-noise-floor-initial-road-only",
+    )
     determinization_particles = int(_number(recipe_source["determinization_particles"]))
     determinization_min_simulations = int(
         _number(recipe_source["determinization_min_simulations"])
@@ -622,7 +648,30 @@ def snapshot_run(
     c_visit = _number(recipe_source["c_visit"])
     max_depth = int(_number(recipe_source["max_depth"]))
     sigma_eval = _number(recipe_source["sigma_eval"])
+    rescale_noise_floor_c = _number(recipe_source["rescale_noise_floor_c"])
+    wide_candidates_threshold = int(
+        _number(recipe_source["wide_candidates_threshold"])
+    )
     event_history_limit = int(_number(recipe_source["event_history_limit"]))
+    optional_recipe_values = {
+        key: _recipe_value(
+            key,
+            manifest=manifest,
+            fields=fields,
+            argv=argv,
+            flag="--" + key.replace("_", "-"),
+        )
+        for key in (
+            "sigma_reference_visits",
+            "n_full_wide",
+            "n_full_wide_threshold",
+            "raw_policy_above_width",
+        )
+    }
+    optional_recipe_values = {
+        key: None if value is None else int(_number(value))
+        for key, value in optional_recipe_values.items()
+    }
     forced_root_target_mode = str(
         _recipe_value(
             "forced_root_target_mode",
@@ -679,6 +728,22 @@ def snapshot_run(
         effective_recipe.update(
             {
                 "sigma_eval": sigma_eval,
+                "sigma_reference_visits": optional_recipe_values[
+                    "sigma_reference_visits"
+                ],
+                "rescale_noise_floor_c": rescale_noise_floor_c,
+                "rescale_noise_floor_initial_road_only": (
+                    rescale_noise_floor_initial_road_only
+                ),
+                "n_full_wide": optional_recipe_values["n_full_wide"],
+                "n_full_wide_threshold": optional_recipe_values[
+                    "n_full_wide_threshold"
+                ],
+                "wide_roots_always_full": wide_roots_always_full,
+                "raw_policy_above_width": optional_recipe_values[
+                    "raw_policy_above_width"
+                ],
+                "wide_candidates_threshold": wide_candidates_threshold,
                 "coherent_public_belief_search": coherent_public_belief_search,
                 "correct_rust_chance_spectra": correct_rust_chance_spectra,
                 "native_mcts_hot_loop": native_mcts_hot_loop,

@@ -9402,6 +9402,15 @@ def build_parser() -> argparse.ArgumentParser:
     promote.add_argument("--receipt", required=True, type=Path)
     promote.add_argument("--reason", required=True)
     promote.add_argument("--lock-file", type=Path, default=None)
+    promote.add_argument(
+        "--registry-mutation-timestamp",
+        type=float,
+        default=None,
+        help=(
+            "Exact created_at value printed by the dry-run plan. Required with "
+            "--go so registry timestamps and after_sha256 replay byte-for-byte."
+        ),
+    )
     promote.add_argument("--go", action="store_true", help="commit; default is dry-run")
 
     recover = subparsers.add_parser(
@@ -9440,6 +9449,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "promote":
+            if args.go and args.registry_mutation_timestamp is None:
+                raise PromotionError(
+                    "standalone --go requires --registry-mutation-timestamp "
+                    "from the dry-run plan"
+                )
             result = execute_promotion(
                 registry_path=args.registry,
                 current_pointer=args.current_pointer,
@@ -9455,6 +9469,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reason=args.reason,
                 lock_path=args.lock_file,
                 go=bool(args.go),
+                registry_mutation_timestamp=args.registry_mutation_timestamp,
             )
         elif args.command == "recover":
             result = recover_transaction(

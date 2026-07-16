@@ -101,6 +101,7 @@ def test_combined_structured_action_upgrade_is_bit_exact_then_breaks_value_alias
     assert not unexpected
     assert set(missing) == {
         "legal_action_value_residual_proj.weight",
+        "legal_action_value_static_proj.weight",
         "static_action_residual_proj.bias",
         "static_action_residual_proj.weight",
     }
@@ -111,17 +112,12 @@ def test_combined_structured_action_upgrade_is_bit_exact_then_breaks_value_alias
     for key in baseline:
         assert torch.equal(baseline[key], upgraded[key]), key
 
-    # Model a learned resource-semantic path: distinct catalog features enter
-    # the action encoder, then the masked legal-set mean reaches scalar value.
+    # The value-private catalog path can learn resource semantics without
+    # changing the shared policy action encoder or static adapter.
     with torch.no_grad():
-        treatment.static_action_residual_proj.weight.zero_()
-        treatment.static_action_residual_proj.bias.zero_()
-        treatment.static_action_residual_proj.weight[
+        treatment.legal_action_value_static_proj.weight[
             :STATIC_ACTION_RESIDUAL_FEATURE_SIZE, :
         ] = torch.eye(STATIC_ACTION_RESIDUAL_FEATURE_SIZE)
-        treatment.legal_action_value_residual_proj.weight.copy_(
-            torch.eye(treatment.config.hidden_size)
-        )
 
     changed = {key: value.clone() for key, value in batch.items()}
     changed["legal_action_static_features"][:, 0, 0] += 3.0
@@ -129,6 +125,26 @@ def test_combined_structured_action_upgrade_is_bit_exact_then_breaks_value_alias
         before = treatment(batch)["value"]
         after = treatment(changed)["value"]
     assert not torch.equal(before, after)
+
+
+def test_value_private_static_adapter_gets_first_step_gradient() -> None:
+    model = EntityGraphNet(
+        _config(
+            static_action_residual=True,
+            legal_action_value_residual=True,
+        )
+    ).train()
+    batch = _batch(batch_size=3)
+    target = torch.tensor([-1.0, 0.0, 1.0])
+
+    torch.nn.functional.mse_loss(model(batch)["value"], target).backward()
+
+    gradient = model.legal_action_value_static_proj.weight.grad
+    assert gradient is not None
+    assert gradient.abs().sum().item() > 0.0
+    # The shared policy adapter remains gated on the first step.
+    assert model.static_action_residual_proj.weight.grad is not None
+    assert model.static_action_residual_proj.weight.grad.abs().sum().item() == 0.0
 
 
 def test_padded_actions_do_not_change_legal_affordance_value() -> None:

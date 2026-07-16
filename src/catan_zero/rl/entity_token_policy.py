@@ -742,6 +742,16 @@ class EntityGraphNet:
                         h, h, bias=False
                     )
                     nn.init.zeros_(self.legal_action_value_residual_proj.weight)
+                    if self.static_action_residual_enabled:
+                        # Value-private catalog path: value-only commissioning
+                        # can learn resource/target semantics without unfreezing
+                        # the shared static adapter and drifting policy logits.
+                        self.legal_action_value_static_proj = nn.Linear(
+                            STATIC_ACTION_RESIDUAL_FEATURE_SIZE,
+                            h,
+                            bias=False,
+                        )
+                        nn.init.zeros_(self.legal_action_value_static_proj.weight)
                 self.value_head = nn.Sequential(
                     nn.Linear(h, h),
                     nn.GELU(),
@@ -1303,6 +1313,14 @@ class EntityGraphNet:
                     value_state = value_state + self.legal_action_value_residual_proj(
                         legal_affordance
                     )
+                    if hasattr(self, "legal_action_value_static_proj"):
+                        static_affordance = (
+                            static_features.float() * action_weight
+                        ).sum(dim=1) / action_weight.sum(dim=1).clamp_min(1.0)
+                        value_state = (
+                            value_state
+                            + self.legal_action_value_static_proj(static_affordance)
+                        )
                 value = self.value_head(value_state).squeeze(-1)
                 if self.value_attention_pool:
                     value = value + self._value_pool(
@@ -2527,6 +2545,7 @@ class EntityGraphPolicy:
             "topology_residual_adapter.",
             "static_action_residual_proj.",
             "legal_action_value_residual_proj.",
+            "legal_action_value_static_proj.",
             "public_card_count_residual.",
             "meaningful_history_residual_gate",
             "meaningful_history_ordered_gate",
