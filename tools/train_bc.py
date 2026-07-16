@@ -16044,6 +16044,31 @@ def main(argv: Sequence[str] | None = None) -> None:
             getattr(args, "belief_resource_head", False)
         ),
     )
+    training_draw_accounting = _training_draw_accounting(metrics)
+    coverage_completed = bool(
+        base_sampler == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1
+        and start_epoch == 0
+        and int(args.max_steps) == 0
+        and len(metrics) == int(effective_epoch_limit)
+        and len(metrics) > 0
+    )
+    if coverage_completed:
+        unique_rows = int(len(train_indices))
+        base_draws = int(training_draw_accounting["base_training_row_draws"])
+        training_draw_accounting.update(
+            {
+                "training_row_draws_semantics": (
+                    "base_full_coverage_permutation_draw_events;"
+                    "deterministic_ddp_padding_may_repeat_rows;"
+                    "excludes_policy_aux"
+                ),
+                "unique_training_rows_drawn": unique_rows,
+                "base_training_row_reuse_factor": (
+                    float(base_draws) / unique_rows
+                ),
+                "complete_training_split_coverage": True,
+            }
+        )
     report = {
         "checkout_runtime_binding": checkout_runtime_binding,
         "training_resume_recipe_identity": resume_recipe_identity,
@@ -16082,7 +16107,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             * int(args.grad_accum_steps)
             * int(ddp["world_size"])
         ),
-        **_training_draw_accounting(metrics),
+        **training_draw_accounting,
         "amp": args.amp,
         "optimizer": args.optimizer,
         "lr": float(args.lr),
