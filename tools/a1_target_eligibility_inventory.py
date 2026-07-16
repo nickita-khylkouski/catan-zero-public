@@ -939,6 +939,27 @@ def _canonical_policy_target_identity(
     }
 
 
+def canonical_policy_target_identity(
+    manifest: Mapping[str, Any],
+    *,
+    authority: Mapping[str, Any] | None,
+    strict_current: bool = True,
+) -> dict[str, Any]:
+    """Public fail-closed constructor for a stored policy teacher identity."""
+
+    return _canonical_policy_target_identity(
+        manifest,
+        authority=authority,
+        strict_current=strict_current,
+    )
+
+
+def canonical_value_sha256(value: object) -> str:
+    """Return the repository's canonical semantic SHA-256 encoding."""
+
+    return _value_sha256(value)
+
+
 def _source_contract_payload(
     source_authority: Mapping[str, Any], *, scope: str
 ) -> dict[str, Any] | None:

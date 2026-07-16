@@ -53,7 +53,6 @@ DEFAULT_TERM_TIMEOUT_SECONDS = 10.0
 DEFAULT_KILL_TIMEOUT_SECONDS = 5.0
 COHERENT_WORKER_SELFPLAY_CONFIG = {
     "meaningful_public_history": True,
-    "event_history_limit": 32,
 }
 
 
@@ -76,6 +75,21 @@ def _record_automatic_transitions(contract: Mapping[str, Any]) -> bool:
         raise ExecutorError(
             "coherent target contract lacks boolean "
             "operator.record_automatic_transitions"
+        )
+    return value
+
+
+def _event_history_limit(contract: Mapping[str, Any]) -> int:
+    operator = contract.get("operator")
+    value = (
+        operator.get("event_history_limit")
+        if isinstance(operator, Mapping)
+        else None
+    )
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ExecutorError(
+            "coherent target contract lacks positive integer "
+            "operator.event_history_limit"
         )
     return value
 
@@ -1299,7 +1313,7 @@ def _validate_lane_manifest(
         "preserve_search_evidence": True,
         "record_automatic_transitions": _record_automatic_transitions(contract),
         "meaningful_public_history": True,
-        "event_history_limit": 32,
+        "event_history_limit": _event_history_limit(contract),
     }
     if not isinstance(cli, Mapping):
         issues.append("missing_cli_args")
@@ -1577,7 +1591,7 @@ def _resolved_config_record(
         "opponent_pool_manifest": None,
         "record_automatic_transitions": _record_automatic_transitions(contract),
         "meaningful_public_history": True,
-        "event_history_limit": 32,
+        "event_history_limit": _event_history_limit(contract),
     }
     drift = {
         key: {"expected": value, "actual": fields.get(key)}
@@ -1617,6 +1631,7 @@ def _verify_coherent_worker_selfplay_config(
         raise ExecutorError(f"worker manifest lacks selfplay_config: {where}")
     expected_config = {
         **COHERENT_WORKER_SELFPLAY_CONFIG,
+        "event_history_limit": _event_history_limit(contract),
         "record_automatic_transitions": _record_automatic_transitions(contract),
     }
     drift = {
@@ -1713,7 +1728,6 @@ def _verify_shard_arrays(
             for index in range(rows):
                 seed = int(seeds[index])
                 decision = int(decisions[index])
-                terminal = bool(terminated[index] or truncated[index])
                 if bool(truncated[index]):
                     raise ExecutorError(
                         f"truncated trajectory in accepted shard {path}"
@@ -1740,6 +1754,7 @@ def _verify_shard_arrays(
                     trace["current_seed"] = seed
                     trace["last_decision"] = decision
                     trace["current_seats"] = {int(seats[index])}
+                    trace["current_complete"] = bool(terminated[index])
                 else:
                     if decision != int(trace["last_decision"]) + 1:
                         raise ExecutorError(
@@ -1747,10 +1762,8 @@ def _verify_shard_arrays(
                         )
                     trace["last_decision"] = decision
                     trace["current_seats"].add(int(seats[index]))
-                trace["current_complete"] = terminal
-                if terminal and trace["current_seats"] != {0, 1}:
-                    raise ExecutorError(
-                        f"trajectory {seed} terminates without actions from both seats"
+                    trace["current_complete"] = bool(
+                        trace["current_complete"] and terminated[index]
                     )
             return {
                 "rows": rows,

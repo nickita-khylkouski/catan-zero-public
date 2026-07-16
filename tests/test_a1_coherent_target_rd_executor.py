@@ -81,7 +81,9 @@ def _coherent_shard(path: Path, *, corrupt_visit_sum: bool = False) -> None:
         game_seed=np.asarray([901, 901, 901], dtype=np.uint64),
         decision_index=np.asarray([0, 1, 2], dtype=np.int32),
         seat=np.asarray([0, 1, 0], dtype=np.int8),
-        terminated=np.asarray([False, False, True]),
+        # ``terminated`` is the completed game's outcome status repeated on
+        # every stored decision row, not an end-of-trajectory row marker.
+        terminated=np.asarray([True, True, True]),
         truncated=np.asarray([False, False, False]),
         policy_weight_multiplier=np.asarray([1.0, 0.0, 1.0], dtype=np.float32),
         target_information_regime=np.asarray(
@@ -108,6 +110,7 @@ def test_shard_closure_authenticates_search_evidence_and_full_trajectory(
         "current_seed": None,
         "last_decision": None,
         "current_complete": False,
+        "current_seats": set(),
     }
 
     result = executor._verify_shard_arrays(
@@ -134,6 +137,7 @@ def test_shard_closure_rejects_search_visit_sum_drift(tmp_path: Path) -> None:
                 "current_seed": None,
                 "last_decision": None,
                 "current_complete": False,
+                "current_seats": set(),
             },
         )
 
@@ -229,11 +233,17 @@ def test_native_runtime_record_binds_loaded_extension_to_wheel_member() -> None:
 
 
 def test_worker_manifest_requires_actual_coherent_row_surface() -> None:
-    v1_contract = {"operator": {"record_automatic_transitions": False}}
+    v1_contract = {
+        "operator": {
+            "record_automatic_transitions": False,
+            "event_history_limit": 32,
+        }
+    }
     executor._verify_coherent_worker_selfplay_config(
         {
             "selfplay_config": {
                 **executor.COHERENT_WORKER_SELFPLAY_CONFIG,
+                "event_history_limit": 32,
                 "record_automatic_transitions": False,
             }
         },
@@ -260,10 +270,16 @@ def test_worker_manifest_accepts_v2_forced_value_row_surface() -> None:
         {
             "selfplay_config": {
                 **executor.COHERENT_WORKER_SELFPLAY_CONFIG,
+                "event_history_limit": 32,
                 "record_automatic_transitions": True,
             }
         },
-        contract={"operator": {"record_automatic_transitions": True}},
+        contract={
+            "operator": {
+                "record_automatic_transitions": True,
+                "event_history_limit": 32,
+            }
+        },
         where="worker_000/manifest.json",
     )
 
@@ -272,7 +288,10 @@ def test_resolved_v2_config_accepts_retained_automatic_transitions(
     tmp_path: Path,
 ) -> None:
     contract = {
-        "operator": {"record_automatic_transitions": True},
+        "operator": {
+            "record_automatic_transitions": True,
+            "event_history_limit": 32,
+        },
         "execution": {"workers_per_gpu": 16},
         "producer_checkpoint": {"sha256": "sha256:" + "a" * 64},
     }
