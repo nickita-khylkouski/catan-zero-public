@@ -10,7 +10,7 @@
     ],
     "generate": [
       {
-        "canonical_sha256": "748040c7957856d13b1203b2635dcba86cde23bbda941739d92b40db8fdcad8b",
+        "canonical_sha256": "3878df62151135cad2fe1db0b8b138622471e9bb22c4fd3a18badfe9f674414b",
         "name": "coherent-public-n128",
         "path": "configs/generation/coherent_public_n128.schema19.json"
       }

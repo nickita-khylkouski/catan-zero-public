@@ -94,7 +94,7 @@ def test_status_exposes_only_commissioned_production_state() -> None:
         "authority": str(
             (ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json").resolve()
         ),
-        "authority_sha256": "ed804b9180e6ee773cd85590d69bdd79160a2813ba4ead012eb7b7d1f4e43cd7",
+        "authority_sha256": "ada85baa252882011c93614cd5fabea5211442e4769a1255d37f92862682a137",
     }
     assert status["pipelines"]["ppo"]["authorized"] is False
 
@@ -175,7 +175,7 @@ def test_commissioned_parent_update_uses_exact_recipe_and_parent(
     assert plan["readiness"]["authorized"] is True
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
-        "ed804b9180e6ee773cd85590d69bdd79160a2813ba4ead012eb7b7d1f4e43cd7"
+        "ada85baa252882011c93614cd5fabea5211442e4769a1255d37f92862682a137"
     )
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]
