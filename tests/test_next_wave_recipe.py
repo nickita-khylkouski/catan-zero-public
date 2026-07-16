@@ -262,10 +262,10 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
     ]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:8206af8607c61eb9a2f07aca0727a2889afa056f50ce90c602781166c621afab"
+        "sha256:4a32e48cad46efeefdebfa341de66caf3e5b3ff4279d986701dc535dd4e48e36"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:b336732ea6212c0fa162d3527c03986052f252c0714d7c63c6011ae79212d29a"
+        "sha256:05cd09b0ce8a9c6d7ddf1906eb087a513e8051a091c6c39f0990ca85e2e2ac85"
     )
 
 

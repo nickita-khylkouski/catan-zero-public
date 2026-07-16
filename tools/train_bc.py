@@ -7765,7 +7765,6 @@ def _effective_a1_learner_training_recipe(
         "weight_decay",
         "fused_optimizer",
         "value_lr_mult",
-        "value_trunk_grad_scale",
         "action_module_lr_mult",
         "trunk_lr_mult",
         "policy_loss_weight",
@@ -7899,16 +7898,24 @@ def _effective_a1_learner_training_recipe(
     per_game_policy_surprise_weighting = bool(
         getattr(args, "per_game_policy_surprise_weighting", False)
     )
-    if per_game_policy_surprise_weighting or generic_a1_ablation:
-        effective["per_game_policy_surprise_weighting"] = (
-            per_game_policy_surprise_weighting
-        )
     target_reliability_confidence_weighting = bool(
         getattr(args, "target_reliability_confidence_weighting", False)
     )
     target_reliability_confidence_floor = float(
         getattr(args, "target_reliability_confidence_floor", 0.25)
     )
+    if (
+        per_game_policy_surprise_weighting
+        or target_reliability_confidence_weighting
+        or generic_a1_ablation
+    ):
+        # Reliability weighting and surprise weighting are competing ways to
+        # redistribute policy mass. The current sealed recipe enables the
+        # former and explicitly disables the latter, so that false value is
+        # trajectory-critical rather than an omitted legacy default.
+        effective["per_game_policy_surprise_weighting"] = (
+            per_game_policy_surprise_weighting
+        )
     if target_reliability_confidence_weighting or generic_a1_ablation:
         effective["target_reliability_confidence_weighting"] = (
             target_reliability_confidence_weighting
@@ -7916,6 +7923,12 @@ def _effective_a1_learner_training_recipe(
         effective["target_reliability_confidence_floor"] = (
             target_reliability_confidence_floor
         )
+    if target_reliability_confidence_weighting:
+        # The current reliability-weighted contract explicitly seals the
+        # default shared-trunk scale. Historical recipes predate this field and
+        # must keep omitting the unit default; non-unit interventions were
+        # already added above.
+        effective["value_trunk_grad_scale"] = value_trunk_grad_scale
     if getattr(args, "policy_kl_target", None) is not None:
         # The fixed anchor's historical recipe shape remains untouched.  An
         # adaptive trust region is trajectory-changing and must be explicitly
