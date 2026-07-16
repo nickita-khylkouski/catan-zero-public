@@ -418,6 +418,17 @@ def test_stage_c_run_adopts_authenticated_completed_receipt_without_subprocess(
         campaign.POLICY_AUX_ACTIVE_BATCH_SIZE * campaign.WORLD_SIZE * campaign.MAX_STEPS
     )
     unique_rows = 128
+    validation_seed_set = "sha256:" + "7" * 64
+    validation_manifest_file_sha256 = "sha256:" + "8" * 64
+    validation_contract = {
+        "schema_version": campaign.LEARNER_VALIDATION_CONTRACT_SCHEMA,
+        "input_validation_manifest_file_sha256": validation_manifest_file_sha256,
+        "input_validation_manifest_sha256": "sha256:" + "9" * 64,
+        "validation_game_seed_count": 2,
+        "validation_game_seed_set_sha256": validation_seed_set,
+        "training_excluded_game_seed_count": 2,
+        "training_excluded_game_seed_set_sha256": validation_seed_set,
+    }
     report = {
         **_completed_feature_signal_report(),
         "value_trunk_grad_scale": 0.1,
@@ -427,6 +438,13 @@ def test_stage_c_run_adopts_authenticated_completed_receipt_without_subprocess(
         "policy_aux_unique_source_rows": unique_rows,
         "policy_aux_reuse_factor": aux_draws / unique_rows,
         "policy_base_active_rows": 7,
+        "input_validation_game_seed_manifest_sha256": (
+            validation_manifest_file_sha256
+        ),
+        "validation_game_seed_count": 2,
+        "validation_game_seed_set_sha256": validation_seed_set,
+        "training_excluded_game_seed_count": 2,
+        "training_excluded_game_seed_set_sha256": validation_seed_set,
     }
     _write_json(report_path, report)
     authenticated = {
@@ -448,6 +466,7 @@ def test_stage_c_run_adopts_authenticated_completed_receipt_without_subprocess(
                 "fixture_authority": "authenticated_by_mocked_verify_inputs"
             },
         },
+        "learner_validation_contract": validation_contract,
         "expected_artifacts": {
             "one_dose_receipt": str(receipt_path),
             "report": str(report_path),
@@ -582,6 +601,17 @@ def test_stage_c_fingerprint_binds_report_emitted_holdout(
             "data": str(data),
             "validation_manifest": str(input_manifest),
             "independent_parent_authority": str(authority_path),
+        },
+        "learner_validation_contract": {
+            "schema_version": campaign.LEARNER_VALIDATION_CONTRACT_SCHEMA,
+            "input_validation_manifest_file_sha256": report[
+                "input_validation_game_seed_manifest_sha256"
+            ],
+            "input_validation_manifest_sha256": "sha256:" + "7" * 64,
+            "validation_game_seed_count": 2,
+            "validation_game_seed_set_sha256": seed_set,
+            "training_excluded_game_seed_count": 2,
+            "training_excluded_game_seed_set_sha256": seed_set,
         },
         "expected_artifacts": {
             "one_dose_receipt": str(receipt_path),
