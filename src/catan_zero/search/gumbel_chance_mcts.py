@@ -640,16 +640,12 @@ class GumbelChanceMCTSConfig:
     # to changing which move gets played -- see SW-0 scope note on this
     # ticket).
     # A/B CAVEAT (train_bc interaction): the pruned rows are persisted with
-    # `target_policy == 0` on the zeroed actions, which `_build_decision_row`
-    # turns into `target_policy_mask == False` there. train_bc's soft-target
-    # coverage gate (`--soft-target-min-legal-coverage`) counts covered legal
-    # actions off exactly that mask, so a large `policy_target_min_visits` can
-    # drop a near-tied wide root below the coverage threshold and fall that row
-    # back to one-hot hard CE for the POLICY head -- i.e. the opposite of
-    # distilling the (correctly) pruned soft target. Any A/B enabling this knob
-    # should check the coverage-gate telemetry / lower `--soft-target-min-legal-
-    # coverage` accordingly. Default 0: an exact no-op, current behavior
-    # unchanged.
+    # `target_policy == 0` on the zeroed actions. `_build_decision_row` still
+    # marks every legal action as covered because the mask records teacher
+    # provenance, not positive mass. The learner therefore distills the pruned
+    # distribution over the complete legal softmax instead of treating its
+    # exact zeros as missing labels and falling back to the played action.
+    # Default 0: an exact no-op, current behavior unchanged.
     policy_target_min_visits: int = 0
 
     # --- CAT-61: V4 uncertainty-driven capped backup weighting (default OFF) ---

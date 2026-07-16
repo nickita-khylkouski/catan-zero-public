@@ -216,7 +216,7 @@ def test_decision_row_preserves_active_search_evidence_in_legal_order(
         _Game(),
         result=SearchResult(
             selected_action=10,
-            improved_policy={10: 0.75, 11: 0.25},
+            improved_policy={10: 1.0, 11: 0.0},
             visit_counts={10: 3, 11: 1},
             q_values={10: 0.2, 11: -0.1},
             priors={10: 0.6, 11: 0.4},
@@ -237,3 +237,5 @@ def test_decision_row_preserves_active_search_evidence_in_legal_order(
     )
     assert row["_search_visit_counts"].tolist() == [3, 1]
     assert row["_search_completed_q"].tolist() == pytest.approx([0.2, 0.05])
+    assert row["target_policy"].tolist() == pytest.approx([1.0, 0.0])
+    assert row["target_policy_mask"].tolist() == [True, True]

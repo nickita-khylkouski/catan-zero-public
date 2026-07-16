@@ -874,7 +874,12 @@ def _build_decision_row(
         [float(result.improved_policy.get(int(action), 0.0)) for action in legal_rust],
         dtype=np.float32,
     )
-    target_policy_mask = target_policy > 0.0
+    # The mask records which legal actions received an authenticated teacher
+    # label, not which labels happen to carry positive probability. SearchResult
+    # covers every legal root action by contract, so an exact zero (for example
+    # after policy-target pruning) is still a real label. Marking it missing
+    # makes the learner's coverage gate silently fall back to action_taken.
+    target_policy_mask = np.ones(target_policy.shape, dtype=np.bool_)
     # Root priors (pre-search network policy), same legal_rust ordering as
     # target_policy -- persisted so KL(improved_policy || prior) is
     # computable directly from shards without re-running the evaluator.
