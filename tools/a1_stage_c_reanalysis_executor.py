@@ -1298,7 +1298,12 @@ def _search_patch(
         or int(result.simulations_used)
         != _expected_forced_full_simulations(len(legal_rust), effective_config)
         or not math.isfinite(float(result.root_value))
+        or not -1.0 <= float(result.root_value) <= 1.0
         or not bool(result.q_values_root_perspective)
+        or not np.all(np.isfinite(target))
+        or np.any(target < 0.0)
+        or not np.all(np.isfinite(priors))
+        or np.any(priors < 0.0)
         or not np.all(np.isfinite(completed))
         or not np.isclose(float(target.sum()), 1.0, atol=1.0e-5)
         or not np.isclose(float(priors.sum()), 1.0, atol=1.0e-5)
@@ -1827,6 +1832,8 @@ def _verify_patch_arrays(
             or not np.all(np.isfinite(target))
             or np.any(target < 0.0)
             or not coverage_valid
+            or not np.all(np.isfinite(prior))
+            or np.any(prior < 0.0)
             or not np.array_equal(score_mask, np.isfinite(scores))
             or not np.all(np.asarray(arrays["completed_q_mask_flat"])[start:stop])
             or not np.isclose(float(target.sum()), 1.0, atol=1.0e-5)
@@ -1835,6 +1842,8 @@ def _verify_patch_arrays(
             or int(arrays["search_seed"][row])
             != _row_seed(str(arrays["identity_sha256"][row]))
             or not bool(arrays["root_value_mask"][row])
+            or not math.isfinite(float(arrays["root_value"][row]))
+            or not -1.0 <= float(arrays["root_value"][row]) <= 1.0
             or not bool(arrays["used_full_search"][row])
             or not bool(arrays["q_values_root_perspective"][row])
             or (

@@ -45,7 +45,6 @@ if str(REPO_ROOT) not in sys.path:
 if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-from tools import a1_b200_active_policy_campaign as active_campaign  # noqa: E402
 from tools import a1_target_eligibility_inventory as target_inventory  # noqa: E402
 from tools import train_bc  # noqa: E402
 from catan_zero.rl.target_reliability import (  # noqa: E402
@@ -806,6 +805,13 @@ def _artifact_ref(path: Path) -> dict[str, Any]:
 
 
 def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
+    # Import lazily: the campaign module imports the one-dose/final-replication
+    # stack, which reaches the learner overlay and reanalysis executor.  The
+    # executor imports this module for the sealed identity helpers, so importing
+    # the campaign at module load time forms an alignment -> ... -> executor ->
+    # alignment cycle and makes the selector CLI depend on import order.
+    from tools import a1_b200_active_policy_campaign as active_campaign
+
     try:
         admission_path, admission = active_campaign._load_admission(  # noqa: SLF001
             args.coherent_corpus_admission

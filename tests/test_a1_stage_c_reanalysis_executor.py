@@ -289,7 +289,7 @@ def test_effective_search_config_replays_sealed_coherent_native_fields(
     assert config.symmetry_averaged_eval_threshold == 20
 
 
-def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
+def _replacement_patch() -> tuple[dict[str, np.ndarray], dict[str, object]]:
     identity = "sha256:" + "a" * 64
     provenance = {
         "target_policy_target_identity_sha256": "sha256:" + "b" * 64,
@@ -342,11 +342,35 @@ def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
         },
     }
 
+    return arrays, receipt
+
+
+def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
+    arrays, receipt = _replacement_patch()
+
     executor._verify_patch_arrays(arrays, receipt=receipt)
     assert arrays["legal_action_offsets"].tolist() == [0, 2]
     assert arrays["target_reliability_audited"].tolist() == [False]
     assert arrays["target_reliability_confidence"].tolist() == [1.0]
     assert arrays["target_policy_mask_flat"].tolist() == [True, True]
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("root_value", np.nan),
+        ("root_value", 1.01),
+        ("prior_policy_flat", np.asarray([-0.25, 1.25], dtype=np.float32)),
+    ],
+)
+def test_patch_verifier_rejects_invalid_replacement_values(
+    column: str, value: object
+) -> None:
+    arrays, receipt = _replacement_patch()
+    arrays[column][...] = value
+
+    with pytest.raises(executor.ExecutorError, match="invalid search evidence"):
+        executor._verify_patch_arrays(arrays, receipt=receipt)
 
 
 def test_forced_full_simulation_accounting_replays_width_dependent_sh() -> None:
