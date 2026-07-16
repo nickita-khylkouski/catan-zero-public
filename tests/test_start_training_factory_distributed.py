@@ -313,6 +313,19 @@ def test_factory_explicitly_binds_guarded_optimizer_and_hard_target_recipe(
     assert admission["search_target_objectives"] == []
 
 
+def test_factory_none_quality_gate_disables_implicit_35m_teacher_gate(
+    tmp_path: Path,
+) -> None:
+    result = _dry_run(tmp_path, "--quality-gate", "none")
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    assert "--skip-teacher-quality-gate" in command
+    assert "--require-strict-35m-teacher" not in command
+    assert "--require-production-35m-teacher" not in command
+    assert "--require-35m-model" in command
+
+
 def test_factory_converts_teacher_rows_before_entity_training(tmp_path: Path) -> None:
     result = _dry_run(tmp_path)
 

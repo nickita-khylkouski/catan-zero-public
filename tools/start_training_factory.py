@@ -590,7 +590,7 @@ def main() -> None:
             if args.quality_gate == "production"
             else ["--require-strict-35m-teacher"]
             if args.quality_gate == "strict"
-            else []
+            else ["--skip-teacher-quality-gate"]
         )
         + (
             [
