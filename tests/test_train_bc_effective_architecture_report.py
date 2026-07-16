@@ -17,6 +17,7 @@ def test_report_uses_upgraded_checkpoint_config_not_cli_default() -> None:
             edge_policy_head=True,
             aux_subgoal_heads=False,
             aux_settlement_pointer_head=True,
+            legal_action_value_residual=True,
             state_trunk="transformer",
             relational_block_pattern="",
             relational_action_cross_layers=1,
@@ -35,6 +36,7 @@ def test_report_uses_upgraded_checkpoint_config_not_cli_default() -> None:
     assert report["action_cross_attention_layers"] == 1
     assert report["edge_policy_head"] is True
     assert report["aux_settlement_pointer_head"] is True
+    assert report["legal_action_value_residual"] is True
     assert report["requested_edge_policy_head"] is False
     assert report["requested_aux_settlement_pointer_head"] is False
 

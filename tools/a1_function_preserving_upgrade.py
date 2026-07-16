@@ -48,6 +48,9 @@ MODULE_BELIEF_RESOURCE_HEAD = "entity_graph.belief_resource_head.v1"
 MODULE_AUX_SUBGOAL_HEADS = "entity_graph.aux_subgoal_heads.v1"
 MODULE_AUX_SUBGOAL_POINTER_HEADS = "entity_graph.aux_subgoal_pointer_heads.v1"
 MODULE_STATIC_ACTION_RESIDUAL = "entity_graph.static_action_residual.v1"
+MODULE_STRUCTURED_ACTION_VALUE = (
+    "entity_graph.static_action_residual+legal_action_value_residual.v1"
+)
 MODULE_ACTION_CROSS_ATTENTION_1 = "entity_graph.action_cross_attention.1.v1"
 MODULE_PUBLIC_CARD_COUNT_FEATURES = "entity_graph.public_card_count_features.v1"
 MODULE_TARGET_GATHER_PUBLIC_CARD_COUNT = (
@@ -184,6 +187,21 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "static_action_residual_proj.weight": "zeros",
         },
         "config_delta": {"static_action_residual": True},
+    },
+    MODULE_STRUCTURED_ACTION_VALUE: {
+        "flags": {
+            "static_action_residual": True,
+            "legal_action_value_residual": True,
+        },
+        "new_parameter_initialization": {
+            "legal_action_value_residual_proj.weight": "zeros",
+            "static_action_residual_proj.bias": "zeros",
+            "static_action_residual_proj.weight": "zeros",
+        },
+        "config_delta": {
+            "static_action_residual": True,
+            "legal_action_value_residual": True,
+        },
     },
     MODULE_PUBLIC_CARD_COUNT_FEATURES: {
         "flags": {"public_card_count_features": True},
@@ -386,6 +404,8 @@ def _effective_config_receipt_view(value: Mapping[str, Any]) -> dict[str, Any]:
     result = dict(value)
     if result.get("public_card_count_residual_bias") is True:
         result.pop("public_card_count_residual_bias")
+    if result.get("legal_action_value_residual") is False:
+        result.pop("legal_action_value_residual")
     return result
 
 

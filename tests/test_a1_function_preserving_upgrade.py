@@ -172,6 +172,59 @@ def _belief_checkpoints(tmp_path: Path, *, seed: int = 73) -> tuple[Path, Path]:
     return source, output
 
 
+def _structured_action_value_checkpoints(
+    tmp_path: Path, *, seed: int = 83
+) -> tuple[Path, Path]:
+    from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE
+    from catan_zero.rl.entity_token_features import LEGAL_ACTION_FEATURE_SIZE
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+
+    source = tmp_path / "champion-structured-source.pt"
+    output = tmp_path / "champion-structured-value.pt"
+    config = EntityGraphConfig(
+        action_size=16,
+        static_action_feature_size=45,
+        context_action_feature_size=CONTEXT_ACTION_FEATURE_SIZE,
+        legal_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        dropout=0.0,
+    )
+    static = np.zeros((config.action_size, config.static_action_feature_size))
+    base = EntityGraphPolicy(config, static, seed=11, device="cpu")
+    base.save(source, mask_hidden_info=True)
+    treatment = EntityGraphPolicy(
+        dataclasses.replace(
+            config,
+            static_action_residual=True,
+            legal_action_value_residual=True,
+        ),
+        static,
+        seed=seed,
+        device="cpu",
+    )
+    missing, unexpected = treatment.model.load_state_dict(
+        base.model.state_dict(), strict=False
+    )
+    assert not unexpected
+    spec = upgrade.ALLOWLIST[upgrade.MODULE_STRUCTURED_ACTION_VALUE]
+    assert set(missing) == set(spec["new_parameter_initialization"])
+    treatment.save(output, mask_hidden_info=True)
+    raw = torch.load(output, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": upgrade._sha(source).removeprefix("sha256:"),  # noqa: SLF001
+        "flags": dict(spec["flags"]),
+        "initialization_seed": seed,
+        "trained_value_readouts_added": [],
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+    }
+    torch.save(raw, output)
+    return source, output
+
+
 def _aux_checkpoints(tmp_path: Path, *, seed: int = 79) -> tuple[Path, Path]:
     """Build the exact shared auxiliary initializer for both matched arms."""
 
@@ -250,6 +303,32 @@ def test_receipt_replays_exact_allowlisted_zero_diff_upgrade(tmp_path: Path) -> 
             Path(payload["upgraded_initializer"]["path"]),
             receipt,
         )
+
+
+def test_receipt_replays_structured_action_value_upgrade(tmp_path: Path) -> None:
+    source, initializer = _structured_action_value_checkpoints(tmp_path)
+    receipt = tmp_path / "structured-action-value.receipt.json"
+
+    issued = upgrade.issue_receipt(
+        source,
+        initializer,
+        receipt,
+        module=upgrade.MODULE_STRUCTURED_ACTION_VALUE,
+    )
+    verified = upgrade.verify_receipt(receipt)
+
+    assert verified["receipt_sha256"] == issued["receipt_sha256"]
+    assert verified["module"] == upgrade.MODULE_STRUCTURED_ACTION_VALUE
+    assert verified["flags"] == {
+        "static_action_residual": True,
+        "legal_action_value_residual": True,
+    }
+    assert verified["forward_max_diff"] == 0.0
+    assert verified["new_parameters"] == sorted(
+        upgrade.ALLOWLIST[upgrade.MODULE_STRUCTURED_ACTION_VALUE][
+            "new_parameter_initialization"
+        ]
+    )
 
 
 def test_bias_free_public_card_v2_upgrade_has_only_zero_weight_delta(

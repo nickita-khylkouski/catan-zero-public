@@ -57,6 +57,10 @@ def _remove_first_parameter(path, prefix: str, *, output):
         ({"edge_policy_head": True}, "edge_policy_mlp."),
         ({"static_action_residual": True}, "static_action_residual_proj."),
         (
+            {"legal_action_value_residual": True},
+            "legal_action_value_residual_proj.",
+        ),
+        (
             {"public_card_count_features": True},
             "public_card_count_residual.",
         ),
@@ -122,3 +126,4 @@ def test_legacy_checkpoint_with_all_new_flags_off_keeps_q_head_compatibility(
     assert loaded.config.action_target_gather is False
     assert loaded.config.aux_subgoal_heads is False
     assert loaded.config.static_action_residual is False
+    assert loaded.config.legal_action_value_residual is False

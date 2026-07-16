@@ -84,6 +84,8 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "edge_policy",
         "action_cross",
         "static_action_residual",
+        "public_card_residual",
+        "meaningful_history_gate",
     }
     assert "value_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
     assert (

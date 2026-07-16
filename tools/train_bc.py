@@ -24689,6 +24689,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     "static_action_residual": ("static_action_residual_proj",),
     "value_heads": (
         "value_head",
+        "legal_action_value_residual_proj",
         "value_categorical_head",
         "final_vp_head",
         "value_uncertainty_head",
@@ -24751,6 +24752,7 @@ def _effective_entity_graph_architecture_report(
             ),
             "topology_residual_adapter": False,
             "static_action_residual": False,
+            "legal_action_value_residual": False,
             "public_card_count_features": False,
             "meaningful_public_history": False,
             "event_history_limit": 64,
@@ -24781,6 +24783,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "static_action_residual": bool(
             getattr(config, "static_action_residual", False)
+        ),
+        "legal_action_value_residual": bool(
+            getattr(config, "legal_action_value_residual", False)
         ),
         "public_card_count_features": bool(
             getattr(config, "public_card_count_features", False)
@@ -24967,6 +24972,7 @@ def _apply_lr_schedule(
 # Missing attributes are harmless for XDimLite/XDimGraph.
 VALUE_HEAD_MODULE_ATTRS: tuple[str, ...] = (
     "value_head",
+    "legal_action_value_residual_proj",
     "value_categorical_head",
     "final_vp_head",
     "value_uncertainty_head",

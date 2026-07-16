@@ -113,6 +113,20 @@ def test_public_card_count_upgrade_flag_is_explicit_and_default_off():
     assert upgraded.public_card_count_residual_bias is True
 
 
+def test_structured_action_value_upgrade_enables_both_zero_diff_paths():
+    base = EntityGraphConfig(action_size=607, static_action_feature_size=45)
+    assert base.static_action_residual is False
+    assert base.legal_action_value_residual is False
+    overrides = upgrade_tool._parse_flags("structured_action_value")
+    assert overrides == {
+        "static_action_residual": True,
+        "legal_action_value_residual": True,
+    }
+    upgraded = upgrade_tool._build_upgraded_config(base, overrides)
+    assert upgraded.static_action_residual is True
+    assert upgraded.legal_action_value_residual is True
+
+
 def test_bias_free_public_card_count_upgrade_is_explicit_v2():
     base = EntityGraphConfig(action_size=607, static_action_feature_size=1)
     overrides = upgrade_tool._parse_flags("card_count_v2")

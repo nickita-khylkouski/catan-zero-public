@@ -346,6 +346,15 @@ class EntityGraphConfig:
     # guaranteed to contribute exactly zero even after the adapter is trained.
     # Appended last for positional legacy-pickle compatibility.
     public_card_count_residual_bias: bool = True
+    # Function-preserving scalar-value repair. Historically the value head saw
+    # only the pooled state token, so two identical public states with different
+    # legal affordances were forced to the same value. This opt-in branch
+    # masked-mean-pools the encoded legal actions and injects them through an
+    # exact-zero, bias-free projection. Pairing it with static_action_residual
+    # makes already-banked catalog ids expose Monopoly/Year-of-Plenty resource
+    # semantics without rewriting legacy shard tensors.
+    # Appended last for positional legacy-pickle compatibility.
+    legal_action_value_residual: bool = False
 
 
 class EntityGraphNet:
@@ -688,6 +697,14 @@ class EntityGraphNet:
                     )
                     nn.init.zeros_(self.static_action_residual_proj.weight)
                     nn.init.zeros_(self.static_action_residual_proj.bias)
+                self.legal_action_value_residual_enabled = bool(
+                    getattr(cfg, "legal_action_value_residual", False)
+                )
+                if self.legal_action_value_residual_enabled:
+                    self.legal_action_value_residual_proj = nn.Linear(
+                        h, h, bias=False
+                    )
+                    nn.init.zeros_(self.legal_action_value_residual_proj.weight)
                 self.value_head = nn.Sequential(
                     nn.Linear(h, h),
                     nn.GELU(),
@@ -1196,6 +1213,36 @@ class EntityGraphNet:
                     # value tensor while scaling only its upstream derivative.
                     value_state = state.detach() + value_trunk_grad_scale * (
                         state - state.detach()
+                    )
+                if self.legal_action_value_residual_enabled:
+                    action_mask = batch.get("legal_action_mask")
+                    if action_mask is None:
+                        action_mask = torch.ones(
+                            encoded_actions.shape[:2],
+                            dtype=torch.bool,
+                            device=encoded_actions.device,
+                        )
+                    if tuple(action_mask.shape) != tuple(encoded_actions.shape[:2]):
+                        raise ValueError(
+                            "legal_action_mask shape must match encoded actions: "
+                            f"{tuple(action_mask.shape)} != "
+                            f"{tuple(encoded_actions.shape[:2])}"
+                        )
+                    action_weight = action_mask.to(encoded_actions.dtype).unsqueeze(-1)
+                    legal_affordance = (encoded_actions * action_weight).sum(dim=1)
+                    legal_affordance = legal_affordance / action_weight.sum(
+                        dim=1
+                    ).clamp_min(1.0)
+                    if value_trunk_grad_scale == 0.0:
+                        legal_affordance = legal_affordance.detach()
+                    elif value_trunk_grad_scale != 1.0:
+                        legal_affordance = (
+                            legal_affordance.detach()
+                            + value_trunk_grad_scale
+                            * (legal_affordance - legal_affordance.detach())
+                        )
+                    value_state = value_state + self.legal_action_value_residual_proj(
+                        legal_affordance
                     )
                 value = self.value_head(value_state).squeeze(-1)
                 if self.value_attention_pool:
@@ -1716,6 +1763,7 @@ class EntityGraphPolicy:
         belief_resource_head: bool = False,
         aux_settlement_pointer_head: bool = False,
         static_action_residual: bool = False,
+        legal_action_value_residual: bool = False,
         public_card_count_features: bool = False,
         public_card_count_feature_schema: str = (
             PUBLIC_CARD_COUNT_FEATURE_SCHEMA_VERSION
@@ -1760,6 +1808,9 @@ class EntityGraphPolicy:
                 belief_resource_head=bool(belief_resource_head),
                 aux_settlement_pointer_head=bool(aux_settlement_pointer_head),
                 static_action_residual=bool(static_action_residual),
+                legal_action_value_residual=bool(
+                    legal_action_value_residual
+                ),
                 public_card_count_features=bool(public_card_count_features),
                 public_card_count_feature_schema=str(public_card_count_feature_schema),
                 public_card_count_residual_bias=bool(
@@ -2390,6 +2441,7 @@ class EntityGraphPolicy:
             "belief_resource_head.",
             "topology_residual_adapter.",
             "static_action_residual_proj.",
+            "legal_action_value_residual_proj.",
             "public_card_count_residual.",
             "meaningful_history_residual_gate",
         )

@@ -72,6 +72,7 @@ NEW_PARAM_PREFIXES = (
     "value_categorical_head.",
     "topology_residual_adapter.",
     "static_action_residual_proj.",
+    "legal_action_value_residual_proj.",
     "public_card_count_residual.",
     "meaningful_history_residual_gate",
 )
@@ -126,6 +127,12 @@ def _parse_flags(raw: str) -> dict[str, object]:
             overrides["belief_resource_head"] = True
         elif entry in ("static", "static_action_residual"):
             overrides["static_action_residual"] = True
+        elif entry in (
+            "structured_action_value",
+            "legal_action_value_residual",
+        ):
+            overrides["static_action_residual"] = True
+            overrides["legal_action_value_residual"] = True
         elif entry in ("card_count", "public_card_count_features"):
             overrides["public_card_count_features"] = True
         elif entry in (
