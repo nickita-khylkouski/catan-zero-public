@@ -70,6 +70,7 @@ def _fingerprint(
             {
                 "step": step,
                 "eligible": step != 16,
+                "feature_learning_signal_authenticated": step != 16,
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": final.file_sha256(checkpoint),
             }
@@ -81,6 +82,7 @@ def _fingerprint(
             "campaign_sha256": campaign["campaign_sha256"],
         },
         "checkpoints": records,
+        "completed_dose": {"feature_learning_signal_authenticated": True},
         "stored_generation_prior_used_as_selection_authority": False,
         "optimizer_batch_kl_used_as_trust_authority": False,
         "separate_exact_parent_evidence": {"selection_authority": True},
@@ -396,6 +398,25 @@ def test_external_adjudication_selects_balanced_step16_and_replays(
     path = tmp_path / "adjudication.json"
     final._write_json_immutable(path, adjudication)  # noqa: SLF001
     assert final.verify_adjudication(path) == adjudication
+
+
+def test_fingerprint_refuses_eligible_checkpoint_without_feature_signal(
+    tmp_path: Path,
+) -> None:
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(8,)
+    )
+    fingerprint["checkpoints"][0][
+        "feature_learning_signal_authenticated"
+    ] = False
+    fingerprint.pop("fingerprint_sha256")
+    bad_path = fingerprint_path.with_name("bad-fingerprint.json")
+    _write_sealed(bad_path, fingerprint, "fingerprint_sha256")
+
+    with pytest.raises(
+        final.FinalReplicationError, match="fingerprint semantics drifted"
+    ):
+        final._fingerprint(bad_path)  # noqa: SLF001
 
 
 def test_root_manifest_refuses_diagnostic_or_eval_overlap(

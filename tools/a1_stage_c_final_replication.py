@@ -48,7 +48,7 @@ TIEBREAK_SCHEMA = "a1-stage-c-v5-dose-tiebreak-common-crn-v1"
 ROOT_MANIFEST_SCHEMA = "a1-stage-c-independent-root-manifest-v1"
 FINAL_CORPUS_ADMISSION_SCHEMA = "a1-stage-c-final-corpus-admission-v1"
 FINAL_AUTHORITY_SCHEMA = "a1-stage-c-final-matched-replication-authority-v2"
-FRESH_FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v2"
+FRESH_FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v3"
 EXPECTED_ARM = "STRATEGIC_BALANCED"
 EXPECTED_ROOTS = 8_192
 EXPECTED_PARTITIONS = 64
@@ -216,6 +216,16 @@ def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
             "selection_authority"
         )
         is not True
+        or payload.get("completed_dose", {}).get(
+            "feature_learning_signal_authenticated"
+        )
+        is not True
+        or any(
+            item.get("eligible") is True
+            and item.get("feature_learning_signal_authenticated") is not True
+            for item in payload.get("checkpoints", [])
+            if isinstance(item, dict)
+        )
     ):
         raise FinalReplicationError("fresh-parent fingerprint semantics drifted")
     campaign_ref = payload.get("campaign")
@@ -264,6 +274,9 @@ def _checkpoint_record(
     ]
     if len(matches) != 1 or (
         require_fingerprint_eligible and matches[0].get("eligible") is not True
+    ) or (
+        require_fingerprint_eligible
+        and matches[0].get("feature_learning_signal_authenticated") is not True
     ):
         raise FinalReplicationError(
             f"selected step {step} is not one eligible fresh-parent checkpoint"

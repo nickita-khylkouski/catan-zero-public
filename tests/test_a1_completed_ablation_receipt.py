@@ -14,7 +14,7 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _completed_feature_signal_report() -> dict[str, object]:
+def _feature_observability(*, observed_steps: int) -> dict[str, object]:
     module_row = {
         "mean_pre_clip_grad_norm": 0.4,
         "max_pre_clip_grad_norm": 0.6,
@@ -24,18 +24,67 @@ def _completed_feature_signal_report() -> dict[str, object]:
         "parameter_count": 8,
     }
     return {
-        **campaign.EFFECTIVE_FEATURE_CONTRACT,
-        "train_diagnostics_every_batches": (campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES),
-        "module_optimizer_observability": {
-            "schema_version": "module-optimizer-observability-v1",
-            "observed_steps": campaign.MINIMUM_FEATURE_SIGNAL_OBSERVATIONS,
-            "cadence_batches": campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES,
-            "norm_scope": "global_replicated",
-            "modules": {
-                module_name: dict(module_row)
-                for module_name in campaign.FEATURE_SIGNAL_MODULES
-            },
+        "schema_version": "module-optimizer-observability-v1",
+        "observed_steps": observed_steps,
+        "cadence_batches": campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES,
+        "norm_scope": "global_replicated",
+        "modules": {
+            module_name: dict(module_row)
+            for module_name in campaign.FEATURE_SIGNAL_MODULES
         },
+    }
+
+
+def _checkpoint_dose_trajectory() -> dict[str, object]:
+    checkpoints = []
+    for step in campaign.CHECKPOINT_STEPS:
+        observed_steps = step // campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+        checkpoints.append(
+            {
+                "schema_version": "train-bc-checkpoint-dose-telemetry-v1",
+                "optimizer_step": step,
+                "module_optimizer_observability": (
+                    None
+                    if observed_steps == 0
+                    else _feature_observability(observed_steps=observed_steps)
+                ),
+                "feature_path_gradients": {
+                    "public_card": {
+                        "enabled": True,
+                        "status": (
+                            "observed"
+                            if observed_steps > 0
+                            else "awaiting_diagnostic_cadence"
+                        ),
+                    },
+                    "meaningful_history": {
+                        "enabled": True,
+                        "status": (
+                            "observed"
+                            if observed_steps > 0
+                            else "awaiting_diagnostic_cadence"
+                        ),
+                    },
+                },
+            }
+        )
+    return {
+        "schema_version": "train-bc-checkpoint-dose-trajectory-v1",
+        "checkpoint_steps": list(campaign.CHECKPOINT_STEPS),
+        "checkpoints": checkpoints,
+    }
+
+
+def _completed_feature_signal_report() -> dict[str, object]:
+    return {
+        **campaign.EFFECTIVE_FEATURE_CONTRACT,
+        "train_diagnostics_every_batches": (
+            campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+        ),
+        "module_optimizer_observability": _feature_observability(
+            observed_steps=campaign.MINIMUM_FEATURE_SIGNAL_OBSERVATIONS
+        ),
+        "checkpoint_dose_trajectory": _checkpoint_dose_trajectory(),
     }
 
 
@@ -168,6 +217,8 @@ def test_stage_c_run_adopts_authenticated_completed_receipt_without_subprocess(
         "outputs": {
             "checkpoint": str(checkpoint),
             "checkpoint_sha256": one_dose._file_sha256(checkpoint),  # noqa: SLF001
+            "report": str(report_path),
+            "report_sha256": one_dose._file_sha256(report_path),  # noqa: SLF001
         },
     }
     plan = {
@@ -179,6 +230,7 @@ def test_stage_c_run_adopts_authenticated_completed_receipt_without_subprocess(
         "expected_artifacts": {
             "one_dose_receipt": str(receipt_path),
             "report": str(report_path),
+            "terminal_checkpoint": str(checkpoint),
             "execution_receipt": str(execution_path),
         },
     }
@@ -218,6 +270,10 @@ def test_stage_c_fingerprint_binds_report_emitted_holdout(
     input_manifest.write_text("{}\n", encoding="utf-8")
     seed_set = "sha256:" + "3" * 64
     report = {
+        **_completed_feature_signal_report(),
+        "value_trunk_grad_scale": 0.1,
+        "freeze_modules": "",
+        "training_information_surface": {},
         "a1_contract_sha256": "sha256:" + "4" * 64,
         "data": str(data),
         "data_fingerprint": "sha256:" + "5" * 64,
@@ -263,6 +319,20 @@ def test_stage_c_fingerprint_binds_report_emitted_holdout(
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(str(step).encode("ascii"))
+    receipt_path = output_root / "learner" / "one-dose.receipt.json"
+    receipt_path.write_text("sealed receipt\n", encoding="utf-8")
+    terminal_checkpoint = output_root / "learner" / "candidate.pt"
+    authenticated = {
+        "receipt_sha256": "sha256:" + "6" * 64,
+        "outputs": {
+            "checkpoint": str(terminal_checkpoint),
+            "checkpoint_sha256": one_dose._file_sha256(  # noqa: SLF001
+                terminal_checkpoint
+            ),
+            "report": str(report_path),
+            "report_sha256": one_dose._file_sha256(report_path),  # noqa: SLF001
+        },
+    }
     plan = {
         "output_root": str(output_root),
         "inputs": {
@@ -271,9 +341,18 @@ def test_stage_c_fingerprint_binds_report_emitted_holdout(
             "validation_manifest": str(input_manifest),
             "independent_parent_authority": str(authority_path),
         },
-        "expected_artifacts": {"report": str(report_path)},
+        "expected_artifacts": {
+            "one_dose_receipt": str(receipt_path),
+            "report": str(report_path),
+            "terminal_checkpoint": str(terminal_checkpoint),
+        },
     }
     monkeypatch.setattr(campaign, "_verify_inputs", lambda _plan: None)
+    monkeypatch.setattr(
+        one_dose,
+        "_load_authenticated_completed_ablation_receipt",
+        lambda _path: copy.deepcopy(authenticated),
+    )
     result = campaign._fingerprint(  # noqa: SLF001
         tmp_path / "campaign.json", plan, go=False, device="cpu"
     )
@@ -286,10 +365,64 @@ def test_stage_c_fingerprint_binds_report_emitted_holdout(
     )
 
 
+def test_stage_c_fingerprint_refuses_frozen_adapter_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report_path = tmp_path / "train.report.json"
+    checkpoint = tmp_path / "candidate.pt"
+    receipt_path = tmp_path / "one-dose.receipt.json"
+    checkpoint.write_bytes(b"checkpoint")
+    receipt_path.write_text("sealed receipt\n", encoding="utf-8")
+    report = {
+        **_completed_feature_signal_report(),
+        "value_trunk_grad_scale": 0.1,
+        "freeze_modules": "",
+        "training_information_surface": {
+            "explicit_module_freeze": {
+                "frozen_submodules": [
+                    "meaningful_history_residual_gate",
+                    "public_card_count_residual",
+                ]
+            }
+        },
+    }
+    _write_json(report_path, report)
+    authenticated = {
+        "receipt_sha256": "sha256:" + "7" * 64,
+        "outputs": {
+            "checkpoint": str(checkpoint),
+            "checkpoint_sha256": one_dose._file_sha256(checkpoint),  # noqa: SLF001
+            "report": str(report_path),
+            "report_sha256": one_dose._file_sha256(report_path),  # noqa: SLF001
+        },
+    }
+    plan = {
+        "expected_artifacts": {
+            "one_dose_receipt": str(receipt_path),
+            "report": str(report_path),
+            "terminal_checkpoint": str(checkpoint),
+        }
+    }
+    monkeypatch.setattr(campaign, "_verify_inputs", lambda _plan: None)
+    monkeypatch.setattr(
+        one_dose,
+        "_load_authenticated_completed_ablation_receipt",
+        lambda _path: copy.deepcopy(authenticated),
+    )
+
+    with pytest.raises(
+        campaign.CampaignError, match="did not keep both feature adapters trainable"
+    ):
+        campaign._fingerprint(  # noqa: SLF001
+            tmp_path / "campaign.json", plan, go=False, device="cpu"
+        )
+
+
 def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -> None:
     records = [
         {
             "step": 8,
+            "feature_learning_signal_authenticated": False,
             "parent_kl": 0.01,
             "trunk_relative_l2": 0.01,
             # This looks excellent only against the stale generation prior.
@@ -299,7 +432,8 @@ def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -
             "fresh_parent_teacher_gap_relative_closure": -0.10,
         },
         {
-            "step": 12,
+            "step": 16,
+            "feature_learning_signal_authenticated": True,
             "parent_kl": 0.02,
             "trunk_relative_l2": 0.02,
             # The legacy metric is deliberately worse, while the exact fresh
@@ -314,8 +448,49 @@ def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -
     selected = campaign._select_fingerprint_winner(records)  # noqa: SLF001
 
     assert selected is not None
-    assert selected["step"] == 12
+    assert selected["step"] == 16
     assert selected["fresh_parent_teacher_gap_relative_closure"] == pytest.approx(0.25)
+
+
+def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> None:
+    report = _completed_feature_signal_report()
+    early = campaign._checkpoint_feature_learning_signal(  # noqa: SLF001
+        report, step=8
+    )
+    commissioned = campaign._checkpoint_feature_learning_signal(  # noqa: SLF001
+        report, step=16
+    )
+    records = [
+        {
+            "step": 8,
+            "feature_learning_signal_authenticated": early["authenticated"],
+            "parent_kl": 0.001,
+            "trunk_relative_l2": 0.001,
+            "fresh_parent_teacher_gap_absolute_closure": 0.5,
+            "fresh_parent_teacher_gap_relative_closure": 0.5,
+        },
+        {
+            "step": 16,
+            "feature_learning_signal_authenticated": commissioned[
+                "authenticated"
+            ],
+            "parent_kl": 0.02,
+            "trunk_relative_l2": 0.02,
+            "fresh_parent_teacher_gap_absolute_closure": 0.01,
+            "fresh_parent_teacher_gap_relative_closure": 0.01,
+        },
+    ]
+
+    selected = campaign._select_fingerprint_winner(records)  # noqa: SLF001
+
+    assert early == {
+        "authenticated": False,
+        "reason": "awaiting_feature_optimizer_observation_cadence",
+        "optimizer_step": 8,
+    }
+    assert commissioned["authenticated"] is True
+    assert selected is not None
+    assert selected["step"] == 16
 
 
 def test_stage_c_reuses_authenticated_transitional_fresh_parent_evidence() -> None:

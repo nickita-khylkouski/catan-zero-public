@@ -45,9 +45,9 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 
 
-SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v4"
+SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v5"
 EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v1"
-FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v2"
+FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v3"
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
 TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v1"
 SEPARATE_PARENT_GAP_SCHEMA = "posthoc-separate-parent-teacher-gap-v1"
@@ -150,49 +150,37 @@ def _load_plan(path: Path) -> tuple[Path, dict[str, Any]]:
     return resolved, plan
 
 
-def _verify_completed_feature_learning_signal(
-    report: Mapping[str, Any],
-) -> None:
-    """Require direct evidence that both commissioned feature paths learned."""
+def _integer(value: object, *, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-    def _integer(value: object, *, default: int) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
 
-    architecture_drift = {
-        field: {"expected": expected, "actual": report.get(field)}
-        for field, expected in EFFECTIVE_FEATURE_CONTRACT.items()
-        if report.get(field) != expected
-    }
-    if architecture_drift:
-        raise CampaignError(
-            "completed learner effective feature contract drifted: "
-            f"{architecture_drift}"
-        )
-
-    observability = report.get("module_optimizer_observability")
+def _verify_feature_optimizer_observability(
+    observability: object,
+    *,
+    minimum_observations: int,
+    where: str,
+) -> dict[str, Any]:
     if (
-        _integer(report.get("train_diagnostics_every_batches"), default=-1)
-        != TRAIN_DIAGNOSTIC_CADENCE_BATCHES
-        or not isinstance(observability, dict)
-        or observability.get("schema_version") != "module-optimizer-observability-v1"
+        not isinstance(observability, dict)
+        or observability.get("schema_version")
+        != "module-optimizer-observability-v1"
         or _integer(observability.get("observed_steps"), default=0)
-        < MINIMUM_FEATURE_SIGNAL_OBSERVATIONS
+        < minimum_observations
         or _integer(observability.get("cadence_batches"), default=-1)
         != TRAIN_DIAGNOSTIC_CADENCE_BATCHES
         or observability.get("norm_scope") != "global_replicated"
     ):
         raise CampaignError(
-            "completed learner lacks the authenticated feature optimizer "
-            "observation cadence"
+            f"{where} lacks the authenticated feature optimizer observation cadence"
         )
-
     modules = observability.get("modules")
     if not isinstance(modules, dict):
-        raise CampaignError("completed learner feature optimizer modules are missing")
+        raise CampaignError(f"{where} feature optimizer modules are missing")
     failures: dict[str, object] = {}
+    selected: dict[str, Any] = {}
     for module_name in sorted(FEATURE_SIGNAL_MODULES):
         row = modules.get(module_name)
         if not isinstance(row, dict):
@@ -211,11 +199,119 @@ def _verify_completed_feature_learning_signal(
             failed_fields.append("parameter_count")
         if failed_fields:
             failures[module_name] = failed_fields
+        else:
+            selected[module_name] = {
+                field: row[field] for field in POSITIVE_OPTIMIZER_SIGNAL_FIELDS
+            } | {"parameter_count": parameter_count}
     if failures:
         raise CampaignError(
-            "completed learner did not demonstrate positive commissioned "
-            f"feature gradients and updates: {failures}"
+            f"{where} did not demonstrate positive commissioned feature "
+            f"gradients and updates: {failures}"
         )
+    return {
+        "authenticated": True,
+        "schema_version": observability["schema_version"],
+        "observed_steps": _integer(
+            observability.get("observed_steps"), default=0
+        ),
+        "cadence_batches": TRAIN_DIAGNOSTIC_CADENCE_BATCHES,
+        "norm_scope": "global_replicated",
+        "modules": selected,
+    }
+
+
+def _verify_completed_feature_learning_signal(
+    report: Mapping[str, Any],
+) -> None:
+    """Require direct evidence that both commissioned feature paths learned."""
+
+    architecture_drift = {
+        field: {"expected": expected, "actual": report.get(field)}
+        for field, expected in EFFECTIVE_FEATURE_CONTRACT.items()
+        if report.get(field) != expected
+    }
+    if architecture_drift:
+        raise CampaignError(
+            "completed learner effective feature contract drifted: "
+            f"{architecture_drift}"
+        )
+
+    if (
+        _integer(report.get("train_diagnostics_every_batches"), default=-1)
+        != TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+    ):
+        raise CampaignError(
+            "completed learner lacks the authenticated feature optimizer "
+            "observation cadence"
+        )
+    _verify_feature_optimizer_observability(
+        report.get("module_optimizer_observability"),
+        minimum_observations=MINIMUM_FEATURE_SIGNAL_OBSERVATIONS,
+        where="completed learner",
+    )
+
+
+def _checkpoint_feature_learning_signal(
+    report: Mapping[str, Any], *, step: int
+) -> dict[str, Any]:
+    trajectory = report.get("checkpoint_dose_trajectory")
+    if (
+        not isinstance(trajectory, dict)
+        or trajectory.get("schema_version")
+        != "train-bc-checkpoint-dose-trajectory-v1"
+        or trajectory.get("checkpoint_steps") != list(CHECKPOINT_STEPS)
+        or not isinstance(trajectory.get("checkpoints"), list)
+    ):
+        raise CampaignError(
+            "completed learner lacks an authenticated checkpoint dose trajectory"
+        )
+    matches = [
+        row
+        for row in trajectory["checkpoints"]
+        if isinstance(row, dict)
+        and _integer(row.get("optimizer_step"), default=-1) == step
+    ]
+    if len(matches) != 1:
+        raise CampaignError(f"checkpoint {step} dose telemetry is missing or duplicated")
+    dose = matches[0]
+    if dose.get("schema_version") != "train-bc-checkpoint-dose-telemetry-v1":
+        raise CampaignError(f"checkpoint {step} dose telemetry schema drifted")
+    observability = dose.get("module_optimizer_observability")
+    if observability is None:
+        return {
+            "authenticated": False,
+            "reason": "awaiting_feature_optimizer_observation_cadence",
+            "optimizer_step": step,
+        }
+    evidence = _verify_feature_optimizer_observability(
+        observability,
+        minimum_observations=1,
+        where=f"checkpoint {step}",
+    )
+    feature_paths = dose.get("feature_path_gradients")
+    if (
+        not isinstance(feature_paths, dict)
+        or any(
+            not isinstance(feature_paths.get(name), dict)
+            or feature_paths[name].get("enabled") is not True
+            or feature_paths[name].get("status") != "observed"
+            for name in ("public_card", "meaningful_history")
+        )
+    ):
+        raise CampaignError(
+            f"checkpoint {step} feature-path gradient projection is malformed"
+        )
+    return {
+        **evidence,
+        "optimizer_step": step,
+        "feature_paths": {
+            name: {
+                "enabled": True,
+                "status": "observed",
+            }
+            for name in ("public_card", "meaningful_history")
+        },
+    }
 
 
 def _recipe() -> dict[str, Any]:
@@ -421,6 +517,8 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "max_parent_kl": MAX_PARENT_KL,
             "max_trunk_relative_l2": MAX_TRUNK_RELATIVE_L2,
             "requires_positive_fresh_parent_teacher_gap_closure": True,
+            "requires_checkpoint_local_feature_learning_signal": True,
+            "earliest_feature_signal_step": TRAIN_DIAGNOSTIC_CADENCE_BATCHES,
             "stored_generation_prior_selection_authority": False,
             "objective": (
                 "minimum_update_with_positive_fresh_parent_uptake_within_"
@@ -546,42 +644,53 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
         raise CampaignError("Stage-C learner command drifted from campaign")
 
 
-def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
-    _verify_inputs(plan)
-    command = _one_dose_command(plan)
-    if not go:
-        return {"mode": "dry-run", "command": command}
+def _authenticate_completed_stage_c_dose(
+    plan: Mapping[str, Any],
+) -> tuple[Path, dict[str, Any], Path, dict[str, Any]]:
     receipt_path = Path(str(plan["expected_artifacts"]["one_dose_receipt"]))
-    adopted_completed_receipt = receipt_path.exists() or receipt_path.is_symlink()
     try:
-        if adopted_completed_receipt:
-            # The trainer may have completed and durably receipted its exact
-            # dose before this outer campaign process was interrupted or hit a
-            # post-training wrapper bug. Authenticate first and never launch a
-            # second optimizer trajectory into that terminal namespace.
-            receipt = one_dose._load_authenticated_completed_ablation_receipt(  # noqa: SLF001
-                receipt_path
-            )
-        else:
-            result = subprocess.run([*command, "--go"], check=False)
-            if result.returncode != 0:
-                raise CampaignError(
-                    f"Stage-C aligned learner exited {result.returncode}"
-                )
-            receipt = one_dose._load_authenticated_completed_ablation_receipt(  # noqa: SLF001
-                receipt_path
-            )
+        receipt = one_dose._load_authenticated_completed_ablation_receipt(  # noqa: SLF001
+            receipt_path
+        )
     except one_dose.ExecutorError as error:
         raise CampaignError(
             f"completed Stage-C learner receipt refused: {error}"
         ) from error
+    outputs = receipt.get("outputs")
+    if not isinstance(outputs, dict):
+        raise CampaignError("completed Stage-C learner receipt has no outputs")
     report_path = Path(str(plan["expected_artifacts"]["report"])).resolve(strict=True)
+    terminal_checkpoint = Path(
+        str(plan["expected_artifacts"]["terminal_checkpoint"])
+    ).resolve(strict=True)
+    expected_bindings = (
+        ("report", "report_sha256", report_path),
+        ("checkpoint", "checkpoint_sha256", terminal_checkpoint),
+    )
+    for path_field, digest_field, expected_path in expected_bindings:
+        try:
+            actual_path = Path(str(outputs[path_field])).resolve(strict=True)
+        except (KeyError, OSError) as error:
+            raise CampaignError(
+                f"completed Stage-C receipt lacks {path_field} binding"
+            ) from error
+        if (
+            actual_path != expected_path
+            or outputs.get(digest_field) != _file_sha256(expected_path)
+        ):
+            raise CampaignError(
+                f"completed Stage-C receipt {path_field} binding drifted"
+            )
     report = _load_json(report_path, where="completed Stage-C learner report")[1]
-    freeze = report.get("training_information_surface", {}).get(
-        "explicit_module_freeze"
+    information_surface = report.get("training_information_surface")
+    freeze = (
+        information_surface.get("explicit_module_freeze")
+        if isinstance(information_surface, dict)
+        else None
     )
     if (
-        float(report.get("value_trunk_grad_scale", -1.0)) != 0.1
+        not isinstance(information_surface, dict)
+        or float(report.get("value_trunk_grad_scale", -1.0)) != 0.1
         or str(report.get("freeze_modules", "")) != ""
         or freeze is not None
     ):
@@ -589,6 +698,23 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
             "completed learner did not keep both feature adapters trainable"
         )
     _verify_completed_feature_learning_signal(report)
+    return receipt_path, receipt, report_path, report
+
+
+def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
+    _verify_inputs(plan)
+    command = _one_dose_command(plan)
+    if not go:
+        return {"mode": "dry-run", "command": command}
+    receipt_path = Path(str(plan["expected_artifacts"]["one_dose_receipt"]))
+    adopted_completed_receipt = receipt_path.exists() or receipt_path.is_symlink()
+    if not adopted_completed_receipt:
+        result = subprocess.run([*command, "--go"], check=False)
+        if result.returncode != 0:
+            raise CampaignError(f"Stage-C aligned learner exited {result.returncode}")
+    receipt_path, receipt, report_path, report = (
+        _authenticate_completed_stage_c_dose(plan)
+    )
     aux_draws = int(report.get("policy_aux_active_rows", -1))
     unique_rows = int(report.get("policy_aux_unique_source_rows", -1))
     expected_aux_draws = POLICY_AUX_ACTIVE_BATCH_SIZE * WORLD_SIZE * MAX_STEPS
@@ -1020,7 +1146,8 @@ def _select_fingerprint_winner(
     eligible = [
         row
         for row in records
-        if float(row["parent_kl"]) <= MAX_PARENT_KL
+        if row.get("feature_learning_signal_authenticated") is True
+        and float(row["parent_kl"]) <= MAX_PARENT_KL
         and float(row["trunk_relative_l2"]) <= MAX_TRUNK_RELATIVE_L2
         and float(row["fresh_parent_teacher_gap_relative_closure"]) > 0.0
         and float(row["fresh_parent_teacher_gap_absolute_closure"]) > 0.0
@@ -1043,9 +1170,10 @@ def _fingerprint(
     plan_path: Path, plan: Mapping[str, Any], *, go: bool, device: str
 ) -> dict[str, Any]:
     _verify_inputs(plan)
+    receipt_path, receipt, report, report_payload = (
+        _authenticate_completed_stage_c_dose(plan)
+    )
     output_root = Path(str(plan["output_root"])) / "fingerprints"
-    report = Path(str(plan["expected_artifacts"]["report"])).resolve(strict=True)
-    report_payload = _load_json(report, where="completed Stage-C learner report")[1]
     emitted_holdout = report_payload.get("validation_game_seed_manifest")
     if not isinstance(emitted_holdout, str) or not emitted_holdout:
         raise CampaignError(
@@ -1193,8 +1321,12 @@ def _fingerprint(
         )
         legacy_closure = fresh_gap["legacy_stored_prior_closure"]
         trunk = _trunk_relative_l2(drift)
+        feature_signal = _checkpoint_feature_learning_signal(
+            report_payload, step=step
+        )
         eligible = bool(
-            parent_kl <= MAX_PARENT_KL
+            feature_signal["authenticated"] is True
+            and parent_kl <= MAX_PARENT_KL
             and trunk <= MAX_TRUNK_RELATIVE_L2
             and fresh_gap["absolute_closure"] > 0.0
             and fresh_gap["relative_closure"] > 0.0
@@ -1219,6 +1351,10 @@ def _fingerprint(
                 "legacy_stored_generation_prior_teacher_gap_closure": legacy_closure,
                 "stored_generation_prior_selection_authority": False,
                 "trunk_relative_l2": trunk,
+                "feature_learning_signal_authenticated": feature_signal[
+                    "authenticated"
+                ],
+                "feature_learning_signal": feature_signal,
                 "eligible": eligible,
                 "functional": {
                     "path": str(functional_path),
@@ -1243,6 +1379,22 @@ def _fingerprint(
             "path": str(plan_path),
             "file_sha256": _file_sha256(plan_path),
             "campaign_sha256": plan["campaign_sha256"],
+        },
+        "completed_dose": {
+            "receipt": {
+                "path": str(receipt_path.resolve(strict=True)),
+                "file_sha256": _file_sha256(receipt_path),
+                "receipt_sha256": receipt["receipt_sha256"],
+            },
+            "report": {
+                "path": str(report),
+                "file_sha256": _file_sha256(report),
+            },
+            "terminal_checkpoint": {
+                "path": receipt["outputs"]["checkpoint"],
+                "file_sha256": receipt["outputs"]["checkpoint_sha256"],
+            },
+            "feature_learning_signal_authenticated": True,
         },
         "metric_scope": "frozen_whole_game_validation_policy_active_multi_action_rows",
         "validation_holdout": validation_binding,
