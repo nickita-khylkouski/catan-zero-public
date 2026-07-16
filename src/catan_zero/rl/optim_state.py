@@ -121,6 +121,7 @@ def save_training_progress(
     categorical_training_weight_sum: float,
     checkpoint_role: str,
     policy_objective_lr_area: float = 0.0,
+    policy_aux_global_draw_offset: int = 0,
     policy_kl_controller_state: dict[str, Any] | None = None,
     ddp: dict | None,
 ) -> Path | None:
@@ -167,6 +168,7 @@ def save_training_progress(
         "scalar_training_weight_sum": float(scalar_training_weight_sum),
         "categorical_training_weight_sum": float(categorical_training_weight_sum),
         "policy_objective_lr_area": float(policy_objective_lr_area),
+        "policy_aux_global_draw_offset": int(policy_aux_global_draw_offset),
     }
     if policy_kl_controller_state is not None:
         if not isinstance(policy_kl_controller_state, dict):
@@ -258,6 +260,17 @@ def load_training_progress(
     ):
         raise TrainingProgressError(
             "invalid training progress field policy_objective_lr_area"
+        )
+    policy_aux_global_draw_offset = payload.get(
+        "policy_aux_global_draw_offset", 0
+    )
+    if (
+        isinstance(policy_aux_global_draw_offset, bool)
+        or not isinstance(policy_aux_global_draw_offset, int)
+        or policy_aux_global_draw_offset < 0
+    ):
+        raise TrainingProgressError(
+            "invalid training progress field policy_aux_global_draw_offset"
         )
     if not isinstance(payload.get("rng_state"), dict):
         raise TrainingProgressError("training progress lacks numpy RNG state")

@@ -84,6 +84,84 @@ def test_cycle_continues_across_epoch_slices_before_restart() -> None:
     assert np.array_equal(combined, _order(weights, draws=4, seed=43))
 
 
+def test_full_partial_and_resumed_epochs_match_one_uninterrupted_global_stream() -> None:
+    weights = [1.0, 4.0, 2.0, 0.5, 3.0]
+    seed = 47
+    ddp = {"enabled": True, "world_size": 2}
+    offset = 0
+    segments = []
+
+    # A full epoch, a capped trailing epoch, then a resumed epoch. The persisted
+    # offset must describe actual globally consumed draws, not
+    # epoch_number*current_epoch_length.
+    for local_draws in (4, 1):
+        rank_orders = [
+            _order(
+                weights,
+                draws=local_draws,
+                seed=seed,
+                ddp={**ddp, "rank": rank},
+                offset=offset,
+            )
+            for rank in range(2)
+        ]
+        segments.append(np.column_stack(rank_orders).reshape(-1))
+        offset = train_bc._advance_policy_aux_global_draw_offset(  # noqa: SLF001
+            offset,
+            local_draws=local_draws,
+            ddp={**ddp, "rank": 0},
+        )
+
+    resumed_offset = train_bc._restore_policy_aux_global_draw_offset(  # noqa: SLF001
+        {"policy_aux_global_draw_offset": offset},
+        required=True,
+    )
+    resumed_local_draws = 3
+    resumed_rank_orders = [
+        _order(
+            weights,
+            draws=resumed_local_draws,
+            seed=seed,
+            ddp={**ddp, "rank": rank},
+            offset=resumed_offset,
+        )
+        for rank in range(2)
+    ]
+    segments.append(np.column_stack(resumed_rank_orders).reshape(-1))
+    offset = train_bc._advance_policy_aux_global_draw_offset(  # noqa: SLF001
+        resumed_offset,
+        local_draws=resumed_local_draws,
+        ddp={**ddp, "rank": 0},
+    )
+
+    realized = np.concatenate(segments)
+    uninterrupted = _order(weights, draws=offset, seed=seed)
+
+    assert realized.tolist() == uninterrupted.tolist()
+    assert offset == (4 + 1 + 3) * 2
+
+
+def test_resumed_midcycle_slice_uses_slice_relative_reuse_and_coverage_bounds() -> None:
+    short = train_bc._policy_aux_stream_slice_contract(  # noqa: SLF001
+        global_draw_offset=4,
+        global_draws=5,
+        eligible_rows=5,
+    )
+    with_full_cycle = train_bc._policy_aux_stream_slice_contract(  # noqa: SLF001
+        global_draw_offset=4,
+        global_draws=6,
+        eligible_rows=5,
+    )
+
+    # Five draws beginning at the final row of one cycle touch two cycles and
+    # may repeat a row, but do not contain any complete cycle.
+    assert short["maximum_source_row_reuse"] == 2
+    assert short["contains_complete_cycle"] is False
+    # One more draw completes the next aligned cycle, proving full coverage.
+    assert with_full_cycle["maximum_source_row_reuse"] == 2
+    assert with_full_cycle["contains_complete_cycle"] is True
+
+
 def test_zero_weight_rows_are_never_drawn() -> None:
     order = _order([0.0, 5.0, 0.0, 1.0, 0.0], draws=100, seed=5)
 

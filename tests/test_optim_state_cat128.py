@@ -85,6 +85,7 @@ def _committed_progress(
     recipe=None,
     controller_state=None,
     checkpoint_role="resumable_epoch",
+    policy_aux_global_draw_offset=0,
 ):
     ckpt = tmp_path / "checkpoint.pt"
     ckpt.write_bytes(b"model-v1")
@@ -111,6 +112,7 @@ def _committed_progress(
         scalar_training_weight_sum=123.5,
         categorical_training_weight_sum=44.0,
         checkpoint_role=checkpoint_role,
+        policy_aux_global_draw_offset=policy_aux_global_draw_offset,
         policy_kl_controller_state=controller_state,
         ddp=_DDP_SINGLE,
     )
@@ -118,12 +120,15 @@ def _committed_progress(
 
 
 def test_progress_commit_binds_model_optimizer_recipe_and_exact_step(tmp_path):
-    ckpt, identity, rng_state = _committed_progress(tmp_path)
+    ckpt, identity, rng_state = _committed_progress(
+        tmp_path, policy_aux_global_draw_offset=37
+    )
     loaded = load_training_progress(ckpt, expected_recipe_identity=identity)
     assert loaded["optimizer_step"] == 713
     assert loaded["completed_epochs"] == 2
     assert loaded["checkpoint_role"] == "resumable_epoch"
     assert loaded["rng_state"] == rng_state
+    assert loaded["policy_aux_global_draw_offset"] == 37
     assert training_progress_sidecar_path(ckpt).name.endswith(
         ".training-progress.json"
     )
@@ -376,6 +381,16 @@ def test_train_bc_restores_consumed_policy_lr_area() -> None:
     )
 
     assert restored[-1] == pytest.approx(0.0125)
+
+
+def test_weighted_aux_resume_without_cumulative_offset_fails_closed() -> None:
+    tb = _load_train_bc()
+
+    with pytest.raises(SystemExit, match="lacks cumulative global draw offset"):
+        tb._restore_policy_aux_global_draw_offset(  # noqa: SLF001
+            {"optimizer_step": 7},
+            required=True,
+        )
 
 
 def test_policy_dose_resume_without_consumed_area_fails_closed() -> None:

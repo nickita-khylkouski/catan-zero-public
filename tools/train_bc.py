@@ -14169,6 +14169,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             required=weighted_policy_aux_stream,
         )
     )
+    policy_aux_initial_global_draw_offset = int(
+        policy_aux_global_draw_offset
+    )
     _validate_resumed_max_step_boundary(
         resumed=resume_progress is not None,
         global_step=global_step,
@@ -17367,12 +17370,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "weighted policy AUX cycles completed without reuse evidence"
             )
         realized_draws = int(realized_reuse["draws"])
-        reuse_cap = int(math.ceil(realized_draws / eligible_rows))
+        realized_slice = _policy_aux_stream_slice_contract(
+            global_draw_offset=policy_aux_initial_global_draw_offset,
+            global_draws=realized_draws,
+            eligible_rows=eligible_rows,
+        )
+        slice_start = int(realized_slice["global_draw_start"])
+        slice_end = int(realized_slice["global_draw_end"])
+        reuse_cap = int(realized_slice["maximum_source_row_reuse"])
         if int(realized_reuse["max_source_row_reuse"]) > reuse_cap:
             raise RuntimeError("weighted policy AUX sampler exceeded its reuse cap")
+        complete_cycle_observed = bool(
+            realized_slice["contains_complete_cycle"]
+        )
         if (
             not bool(args.ddp_shard_data)
-            and realized_draws >= eligible_rows
+            and complete_cycle_observed
             and int(realized_reuse["unique_source_rows"]) != eligible_rows
         ):
             raise RuntimeError(
@@ -17382,6 +17395,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             policy_aux_sampling_report["realized_reuse_contract"] = {
                 "schema_version": "policy-aux-cycle-realized-reuse-v1",
                 "draws": realized_draws,
+                "global_draw_start": slice_start,
+                "global_draw_end": slice_end,
                 "eligible_positive_mass_rows": eligible_rows,
                 "unique_source_rows": int(
                     realized_reuse["unique_source_rows"]
@@ -17391,7 +17406,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "maximum_source_row_reuse_by_construction": reuse_cap,
                 "complete_eligible_coverage_required": bool(
-                    not args.ddp_shard_data and realized_draws >= eligible_rows
+                    not args.ddp_shard_data and complete_cycle_observed
                 ),
                 "contract_satisfied": True,
             }
@@ -37804,6 +37819,38 @@ def _advance_policy_aux_global_draw_offset(
     if world <= 0:
         raise ValueError("policy AUX world size must be positive")
     return start + draws * world
+
+
+def _policy_aux_stream_slice_contract(
+    *,
+    global_draw_offset: int,
+    global_draws: int,
+    eligible_rows: int,
+) -> dict[str, int | bool]:
+    """Coverage/reuse bounds for one possibly resumed weighted-cycle slice."""
+
+    start = int(global_draw_offset)
+    draws = int(global_draws)
+    cycle_size = int(eligible_rows)
+    if start < 0 or draws < 0 or cycle_size <= 0:
+        raise ValueError("invalid weighted policy AUX stream slice")
+    end = start + draws
+    maximum_reuse = (
+        0
+        if draws == 0
+        else int(math.ceil(((start % cycle_size) + draws) / cycle_size))
+    )
+    first_complete_cycle_start = (
+        (start + cycle_size - 1) // cycle_size
+    ) * cycle_size
+    return {
+        "global_draw_start": start,
+        "global_draw_end": end,
+        "maximum_source_row_reuse": maximum_reuse,
+        "contains_complete_cycle": (
+            first_complete_cycle_start + cycle_size <= end
+        ),
+    }
 
 
 def _save_optimizer_sidecar(checkpoint_path: str, policy, optimizer, ddp: dict):
