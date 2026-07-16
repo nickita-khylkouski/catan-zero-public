@@ -234,6 +234,9 @@ def test_decomposition_authenticates_boundary_value_particle_operator(
         payload["typed_config"] = config.canonical_payload()
         payload["config_hash"] = config.config_hash()
         payload["full_config_hash"] = config.full_config_hash()
+        if path in (raw, uplift):
+            payload["verdict"] = "H1"
+            payload["candidate_win_rate"] = 0.6
         path.write_text(json.dumps(payload), encoding="utf-8")
 
     receipt = decomposition.build_decomposition(
