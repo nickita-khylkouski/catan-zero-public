@@ -105,6 +105,7 @@
       "weight_decay": 0.0,
       "fused_optimizer": false,
       "value_lr_mult": 1.0,
+      "value_trunk_grad_scale": 1.0,
       "action_module_lr_mult": 1.0,
       "trunk_lr_mult": 1.0,
       "policy_loss_weight": 1.0,

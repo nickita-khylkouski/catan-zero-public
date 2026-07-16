@@ -40,6 +40,24 @@ ADAPTIVE_FIELDS = (
     "wide_roots_always_full",
 )
 POLICY_TARGET_BLEND_FALLBACK_V2 = "policy_target_fallback_v2"
+PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
+    # The science recipe is sealed in its legacy single-process representation;
+    # a1_one_dose_train overlays 8x512 while preserving the 4096-row global dose.
+    "world_size": 1,
+    "batch_size": 4096,
+    "global_batch_size": 4096,
+    "grad_accum_steps": 1,
+    "max_steps": 128,
+    "resume_optimizer": False,
+    "lr": 6e-5,
+    "lr_warmup_steps": 16,
+    "lr_schedule": "flat",
+    "value_lr_mult": 1.0,
+    "value_trunk_grad_scale": 1.0,
+}
+DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
+    {"policy_aux_active_batch_size", "policy_aux_loss_weight"}
+)
 
 
 class ScienceContractError(ValueError):
@@ -120,6 +138,25 @@ def _load() -> dict[str, Any]:
         raise ScienceContractError(
             "current coherent learner must bind pure authenticated policy CE "
             "with hard-action fallback only"
+        )
+    learner_signal_drift = {
+        key: {
+            "expected": expected,
+            "actual": recipe.get(key),
+        }
+        for key, expected in PRODUCTION_LEARNER_SIGNAL_CONTRACT.items()
+        if recipe.get(key) != expected
+    }
+    if learner_signal_drift:
+        raise ScienceContractError(
+            "current coherent learner inherited a diagnostic/approximate training "
+            f"setting: {learner_signal_drift}"
+        )
+    leaked_aux_fields = sorted(DIAGNOSTIC_POLICY_AUX_FIELDS & set(recipe))
+    if leaked_aux_fields:
+        raise ScienceContractError(
+            "current coherent base learner must not bind diagnostic active-policy "
+            f"AUX fields: {leaked_aux_fields}"
         )
     evaluator_value = operator["evaluator"]
     if (
