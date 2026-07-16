@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -289,6 +291,101 @@ def test_effective_search_config_replays_sealed_coherent_native_fields(
     assert config.symmetry_averaged_eval_threshold == 20
 
 
+def _generator_patch(
+    monkeypatch,
+    *,
+    root_value: float = 0.2,
+    target: tuple[float, float] = (0.7, 0.3),
+    prior: tuple[float, float] = (0.6, 0.4),
+) -> dict[str, object]:
+    config = SimpleNamespace(colors=("RED", "BLUE"), map_kind=None)
+    effective = executor.alignment._complete_effective_search_config(  # noqa: SLF001
+        {"n_full": 128}
+    )
+    plan = {
+        "target_policy_target_identity": {
+            "target_execution": executor.alignment.STAGE_C_TARGET_EXECUTION,
+            "effective_gumbel_config": effective,
+        }
+    }
+    result = SimpleNamespace(
+        improved_policy={101: target[0], 102: target[1]},
+        priors={101: prior[0], 102: prior[1]},
+        q_values={101: 0.4, 102: 0.1},
+        completed_q_values={101: 0.4, 102: 0.1},
+        used_full_search=True,
+        simulations_used=128,
+        root_value=root_value,
+        q_values_root_perspective=True,
+        selected_action=101,
+    )
+    game = SimpleNamespace(
+        playable_action_indices=lambda _colors, _map_kind: [101, 102]
+    )
+    monkeypatch.setattr(
+        executor, "_effective_search_config", lambda *_args, **_kwargs: config
+    )
+    monkeypatch.setattr(
+        executor, "create_gumbel_search", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        executor, "run_information_set_safe_search", lambda *_args, **_kwargs: result
+    )
+    monkeypatch.setattr(executor, "_target_checkpoint", lambda _plan: object())
+    monkeypatch.setattr(executor, "_checkpoint_action_size", lambda _path: 567)
+    monkeypatch.setattr(
+        executor,
+        "rust_policy_action_ids",
+        lambda *_args, **_kwargs: (11, 13),
+    )
+    return executor._search_patch(
+        plan=plan,
+        evaluator=object(),
+        reconstructed_game=game,
+        row_seed=73,
+        expected_legal_policy_ids=np.asarray([11, 13], dtype=np.int32),
+    )
+
+
+@pytest.mark.parametrize("root_value", [-1.0, 1.0])
+def test_search_patch_accepts_bounded_root_value_endpoints(
+    monkeypatch, root_value: float
+) -> None:
+    patch = _generator_patch(monkeypatch, root_value=root_value)
+
+    assert patch["root_value"] == root_value
+
+
+@pytest.mark.parametrize(
+    ("root_value", "target", "prior"),
+    [
+        (np.nan, (0.7, 0.3), (0.6, 0.4)),
+        (np.inf, (0.7, 0.3), (0.6, 0.4)),
+        (-1.01, (0.7, 0.3), (0.6, 0.4)),
+        (1.01, (0.7, 0.3), (0.6, 0.4)),
+        (0.2, (-0.25, 1.25), (0.6, 0.4)),
+        (0.2, (np.nan, 1.0), (0.6, 0.4)),
+        (0.2, (np.inf, 0.0), (0.6, 0.4)),
+        (0.2, (0.7, 0.3), (-0.25, 1.25)),
+        (0.2, (0.7, 0.3), (np.nan, 1.0)),
+        (0.2, (0.7, 0.3), (np.inf, 0.0)),
+    ],
+)
+def test_search_patch_rejects_invalid_replacement_values(
+    monkeypatch,
+    root_value: float,
+    target: tuple[float, float],
+    prior: tuple[float, float],
+) -> None:
+    with pytest.raises(executor.ExecutorError, match="incomplete or ambiguous"):
+        _generator_patch(
+            monkeypatch,
+            root_value=root_value,
+            target=target,
+            prior=prior,
+        )
+
+
 def _replacement_patch() -> tuple[dict[str, np.ndarray], dict[str, object]]:
     identity = "sha256:" + "a" * 64
     provenance = {
@@ -355,12 +452,29 @@ def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
     assert arrays["target_policy_mask_flat"].tolist() == [True, True]
 
 
+@pytest.mark.parametrize("root_value", [-1.0, 1.0])
+def test_patch_verifier_accepts_bounded_root_value_endpoints(
+    root_value: float,
+) -> None:
+    arrays, receipt = _replacement_patch()
+    arrays["root_value"][...] = root_value
+
+    executor._verify_patch_arrays(arrays, receipt=receipt)
+
+
 @pytest.mark.parametrize(
     ("column", "value"),
     [
         ("root_value", np.nan),
+        ("root_value", np.inf),
+        ("root_value", -1.01),
         ("root_value", 1.01),
+        ("target_policy_flat", np.asarray([-0.25, 1.25], dtype=np.float32)),
+        ("target_policy_flat", np.asarray([np.nan, 1.0], dtype=np.float32)),
+        ("target_policy_flat", np.asarray([np.inf, 0.0], dtype=np.float32)),
         ("prior_policy_flat", np.asarray([-0.25, 1.25], dtype=np.float32)),
+        ("prior_policy_flat", np.asarray([np.nan, 1.0], dtype=np.float32)),
+        ("prior_policy_flat", np.asarray([np.inf, 0.0], dtype=np.float32)),
     ],
 )
 def test_patch_verifier_rejects_invalid_replacement_values(
@@ -371,6 +485,25 @@ def test_patch_verifier_rejects_invalid_replacement_values(
 
     with pytest.raises(executor.ExecutorError, match="invalid search evidence"):
         executor._verify_patch_arrays(arrays, receipt=receipt)
+
+
+def test_stage_c_alignment_imports_before_executor_in_clean_process() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from tools import a1_stage_c_teacher_alignment; "
+                "from tools import a1_stage_c_reanalysis_executor"
+            ),
+        ],
+        cwd=executor.REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_forced_full_simulation_accounting_replays_width_dependent_sh() -> None:
