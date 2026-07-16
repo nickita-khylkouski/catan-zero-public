@@ -949,7 +949,7 @@ def _paired_score_metrics(report: Mapping[str, Any], *, where: str) -> dict[str,
     games = report.get("games")
     if not isinstance(games, list) or not games:
         raise CampaignError(f"{where} has no retained games for metric replay")
-    by_pair: dict[int, list[bool]] = {}
+    by_pair: dict[int, list[tuple[int, str, bool]]] = {}
     game_keys: list[tuple[int, str]] = []
     for index, game in enumerate(games):
         if not isinstance(game, Mapping):
@@ -961,17 +961,69 @@ def _paired_score_metrics(report: Mapping[str, Any], *, where: str) -> dict[str,
         if (
             isinstance(pair_id, bool)
             or not isinstance(pair_id, int)
+            or pair_id < 0
             or isinstance(seed, bool)
             or not isinstance(seed, int)
+            or seed < 0
             or orientation not in {"candidate_red", "candidate_blue"}
             or type(won) is not bool  # noqa: E721
         ):
             raise CampaignError(f"{where}.games[{index}] has invalid paired identity")
-        by_pair.setdefault(pair_id, []).append(won)
+        by_pair.setdefault(pair_id, []).append((seed, str(orientation), won))
         game_keys.append((seed, str(orientation)))
-    if any(len(outcomes) != 2 for outcomes in by_pair.values()):
-        raise CampaignError(f"{where} does not retain exactly two games per pair")
-    pair_scores = [sum(outcomes) / 2.0 for _, outcomes in sorted(by_pair.items())]
+
+    pair_scores: list[float] = []
+    for pair_id, pair_games in sorted(by_pair.items()):
+        if len(pair_games) != 2:
+            raise CampaignError(
+                f"{where} pair {pair_id} does not retain exactly two games"
+            )
+        seeds = {seed for seed, _orientation, _won in pair_games}
+        if len(seeds) != 1:
+            raise CampaignError(
+                f"{where} pair {pair_id} does not bind one game_seed"
+            )
+        orientations = {
+            orientation for _seed, orientation, _won in pair_games
+        }
+        if orientations != {"candidate_red", "candidate_blue"}:
+            raise CampaignError(
+                f"{where} pair {pair_id} does not retain both seat orientations"
+            )
+        pair_scores.append(
+            sum(int(won) for _seed, _orientation, won in pair_games) / 2.0
+        )
+
+    if len(set(game_keys)) != len(game_keys):
+        raise CampaignError(f"{where} contains duplicate retained game identities")
+
+    pair_count = len(pair_scores)
+    game_count = len(games)
+    candidate_wins = sum(
+        int(won)
+        for pair_games in by_pair.values()
+        for _seed, _orientation, won in pair_games
+    )
+    headline_counts = {
+        "pairs_requested": pair_count,
+        "complete_pairs": pair_count,
+        "games_played": game_count,
+        "games_with_winner": game_count,
+        "candidate_wins": candidate_wins,
+        "baseline_wins": game_count - candidate_wins,
+    }
+    for field, expected in headline_counts.items():
+        observed = report.get(field)
+        if (
+            isinstance(observed, bool)
+            or not isinstance(observed, int)
+            or observed != expected
+        ):
+            raise CampaignError(
+                f"{where} retained games disagree with headline {field}: "
+                f"expected={expected} actual={observed!r}"
+            )
+
     regularized = [0.0, 1.0, *pair_scores]
     mu = sum(regularized) / len(regularized)
     variance = sum((score - mu) ** 2 for score in regularized) / len(regularized)
@@ -982,6 +1034,16 @@ def _paired_score_metrics(report: Mapping[str, Any], *, where: str) -> dict[str,
         "split": sum(score == 0.5 for score in pair_scores),
         "ll": sum(score == 0.0 for score in pair_scores),
     }
+    expected_pair_diagnostics = {
+        "ww_pairs": counts["ww"],
+        "ll_pairs": counts["ll"],
+        "split_pairs": counts["split"],
+        "incomplete_pairs": 0,
+    }
+    if report.get("pair_diagnostics") != expected_pair_diagnostics:
+        raise CampaignError(
+            f"{where} retained games disagree with pair_diagnostics"
+        )
     return {
         "mu": mu,
         "se": se,

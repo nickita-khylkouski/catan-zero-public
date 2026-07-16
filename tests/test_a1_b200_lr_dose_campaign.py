@@ -341,6 +341,101 @@ def test_robust_selector_rejects_incomplete_or_mismatched_evidence(
         )
 
 
+def _paired_metric_report() -> dict:
+    games = [
+        {
+            "pair_id": 0,
+            "game_seed": 100,
+            "orientation": "candidate_red",
+            "candidate_won": True,
+        },
+        {
+            "pair_id": 0,
+            "game_seed": 100,
+            "orientation": "candidate_blue",
+            "candidate_won": False,
+        },
+        {
+            "pair_id": 1,
+            "game_seed": 101,
+            "orientation": "candidate_red",
+            "candidate_won": True,
+        },
+        {
+            "pair_id": 1,
+            "game_seed": 101,
+            "orientation": "candidate_blue",
+            "candidate_won": True,
+        },
+    ]
+    return {
+        "pairs_requested": 2,
+        "complete_pairs": 2,
+        "games_played": 4,
+        "games_with_winner": 4,
+        "candidate_wins": 3,
+        "baseline_wins": 1,
+        "pair_diagnostics": {
+            "ww_pairs": 1,
+            "ll_pairs": 0,
+            "split_pairs": 1,
+            "incomplete_pairs": 0,
+        },
+        "games": games,
+    }
+
+
+def test_paired_metric_replay_accepts_one_seed_and_both_seats_per_pair() -> None:
+    replay = campaign._paired_score_metrics(  # noqa: SLF001
+        _paired_metric_report(), where="valid panel"
+    )
+
+    assert replay["pair_counts"] == {"ww": 1, "split": 1, "ll": 0}
+    assert replay["game_keys"] == [
+        (100, "candidate_blue"),
+        (100, "candidate_red"),
+        (101, "candidate_blue"),
+        (101, "candidate_red"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda report: report["games"][1].__setitem__("game_seed", 101),
+            "one game_seed",
+        ),
+        (
+            lambda report: report["games"][1].__setitem__(
+                "orientation", "candidate_red"
+            ),
+            "both seat orientations",
+        ),
+        (
+            lambda report: [
+                game.__setitem__("game_seed", 100)
+                for game in report["games"][2:]
+            ],
+            "duplicate retained game identities",
+        ),
+        (
+            lambda report: report.__setitem__("candidate_wins", 2),
+            "headline candidate_wins",
+        ),
+    ],
+)
+def test_paired_metric_replay_rejects_malformed_pairing_and_headlines(
+    mutate,
+    message: str,
+) -> None:
+    report = _paired_metric_report()
+    mutate(report)
+
+    with pytest.raises(campaign.CampaignError, match=message):
+        campaign._paired_score_metrics(report, where="malformed panel")  # noqa: SLF001
+
+
 def test_winner_argument_is_only_an_assertion() -> None:
     campaign._verify_winner_assertion(None, "C")
     campaign._verify_winner_assertion("C", "C")
