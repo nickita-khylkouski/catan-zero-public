@@ -2979,6 +2979,30 @@ def _global_policy_stream_presence(
     return bool(global_presence[0].item()), bool(global_presence[1].item())
 
 
+def _base_policy_weights_for_training_batch(
+    policy_sample_weights: np.ndarray,
+    batch: np.ndarray,
+) -> np.ndarray:
+    """Select only the base rows whose policy objective is about to run.
+
+    The synchronous iterator passes corpus-wide weights with global batch
+    indices. Threaded prefetch instead passes weights materialized for the base
+    rows followed by any policy-AUX rows, with local base indices. Indexing by
+    ``batch`` is the common contract shared by both paths and matches the
+    selection performed by the loss itself.
+    """
+
+    weights = np.asarray(policy_sample_weights)
+    indices = np.asarray(batch)
+    if weights.ndim != 1:
+        raise ValueError("policy sample weights must be one-dimensional")
+    if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+        raise ValueError("training batch indices must be one-dimensional integers")
+    if np.any(indices < 0) or np.any(indices >= len(weights)):
+        raise IndexError("training batch indices exceed policy sample weights")
+    return weights[indices]
+
+
 def _global_policy_stream_objective_masses(
     *,
     local_base_effective_weight_sum: float,
@@ -15814,8 +15838,12 @@ def main(
                 else float(policy_kl_controller.coefficient)
             )
             scheduled_base_lr = float(args.lr) * float(applied_lr_multiplier)
+            base_batch_policy_weights = _base_policy_weights_for_training_batch(
+                batch_policy_weights,
+                batch,
+            )
             local_base_policy_active_rows = int(
-                np.count_nonzero(np.asarray(batch_policy_weights) > 0.0)
+                np.count_nonzero(base_batch_policy_weights > 0.0)
             )
             local_aux_policy_active_rows = (
                 0 if policy_aux_batch is None else int(len(policy_aux_batch))
@@ -15825,7 +15853,7 @@ def main(
                 globally_aux_policy_objective_mass,
             ) = _global_policy_stream_objective_masses(
                 local_base_effective_weight_sum=float(
-                    np.sum(batch_policy_weights, dtype=np.float64)
+                    np.sum(base_batch_policy_weights, dtype=np.float64)
                 ),
                 local_base_fixed_denominator=(
                     None
@@ -15835,7 +15863,7 @@ def main(
                             "policy_effective_weight_mean"
                         ]
                     )
-                    * len(batch_policy_weights)
+                    * len(base_batch_policy_weights)
                 ),
                 local_aux_active_rows=local_aux_policy_active_rows,
                 ddp=ddp,

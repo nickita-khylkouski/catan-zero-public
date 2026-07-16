@@ -116,6 +116,33 @@ def test_sparse_fixed_denominator_policy_batch_has_exact_lr_area_ledger() -> Non
     assert 0.01 * lr_area_weight == pytest.approx(0.0025)
 
 
+def test_policy_dose_base_weights_follow_synchronous_global_batch_indices() -> None:
+    corpus_weights = np.asarray([0.0, 2.0, 0.0, 5.0], dtype=np.float32)
+    batch = np.asarray([3, 1], dtype=np.int64)
+
+    selected = train_bc._base_policy_weights_for_training_batch(  # noqa: SLF001
+        corpus_weights,
+        batch,
+    )
+
+    np.testing.assert_array_equal(selected, np.asarray([5.0, 2.0]))
+
+
+def test_policy_dose_base_weights_exclude_prefetched_auxiliary_tail() -> None:
+    materialized_base_and_aux_weights = np.asarray(
+        [2.0, 0.0, 17.0, 19.0],
+        dtype=np.float32,
+    )
+    local_base_batch = np.asarray([0, 1], dtype=np.int64)
+
+    selected = train_bc._base_policy_weights_for_training_batch(  # noqa: SLF001
+        materialized_base_and_aux_weights,
+        local_base_batch,
+    )
+
+    np.testing.assert_array_equal(selected, np.asarray([2.0, 0.0]))
+
+
 def test_zero_policy_dose_preserves_historical_constant_weight() -> None:
     assert train_bc._policy_weight_for_lr_area(  # noqa: SLF001
         0.75,
