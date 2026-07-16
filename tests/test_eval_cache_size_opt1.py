@@ -17,6 +17,12 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 import generate_gumbel_selfplay_data as cli  # type: ignore  # noqa: E402
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+)
+from catan_zero.rl.meaningful_history import (  # noqa: E402
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+)
 
 
 def _min_argv(extra):
@@ -82,6 +88,11 @@ def test_eval_server_worker_threads_zero_cache_size_to_remote_client(monkeypatch
         "public_observation": True,
         "rust_featurize": True,
         "eval_cache_size": 0,
+        "_eval_server_meaningful_public_history": False,
+        "_eval_server_event_history_limit": 64,
+        "_eval_server_meaningful_public_history_schema": (
+            MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+        ),
     }
     result_queue = _ResultQueue()
 
@@ -92,6 +103,7 @@ def test_eval_server_worker_threads_zero_cache_size_to_remote_client(monkeypatch
         3,
         332,
         True,
+        CURRENT_RUST_ENTITY_ADAPTER_VERSION,
         False,
         False,
         0,

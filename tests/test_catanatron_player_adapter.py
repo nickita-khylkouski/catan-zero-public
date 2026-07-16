@@ -129,6 +129,11 @@ _EVENT_TURN_KEY_SLOTS = (15, 16)
 # so this test still strictly verifies action-id fidelity for every OTHER
 # action type (build, end_turn, move_robber, maritime_trade, play_*).
 _ACTION_ID_SLOT = 35
+# Slot 40 attests whether slot 35 contains a reconstructible exact action id.
+# Synthetic external-game history deliberately cannot reconstruct the same
+# chance/trade/discard ids masked below, so its validity bit must be excluded
+# with the id itself.
+_ACTION_ID_VALID_SLOT = 40
 _UNRECODABLE_ACTION_TYPE_COLUMNS = tuple(
     17 + ACTION_TYPES.index(kind)
     for kind in (
@@ -166,6 +171,8 @@ def _assert_features_match(feats_a: dict, feats_c: dict) -> None:
             )
             a[unrecodable_row, _ACTION_ID_SLOT] = 0
             c[unrecodable_row, _ACTION_ID_SLOT] = 0
+            a[unrecodable_row, _ACTION_ID_VALID_SLOT] = 0
+            c[unrecodable_row, _ACTION_ID_VALID_SLOT] = 0
             np.testing.assert_array_equal(
                 a, c, err_msg=f"mismatch in {key} (turn_key, and action_id for trade/ROLL/BUY_DEV rows, excluded)"
             )

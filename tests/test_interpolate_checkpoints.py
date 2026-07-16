@@ -8,6 +8,7 @@ import torch
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
+    LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
     checkpoint_entity_feature_adapter_metadata,
 )
 from tools.interpolate_checkpoints import (
@@ -242,7 +243,7 @@ def test_entity_graph_interpolation_accepts_missing_legacy_and_explicit_v2(
         value["static_action_features_sha256"] = "catalog-a"
     candidate_value["entity_feature_adapter"] = (
         checkpoint_entity_feature_adapter_metadata(
-            CURRENT_RUST_ENTITY_ADAPTER_VERSION
+            LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION
         )
     )
     torch.save(base_value, base)

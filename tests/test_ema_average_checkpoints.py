@@ -8,6 +8,7 @@ import torch
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ENTITY_FEATURE_ADAPTER_CHECKPOINT_SCHEMA,
+    LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
     checkpoint_entity_feature_adapter_metadata,
 )
 from tools.ema_average_checkpoints import (
@@ -228,7 +229,7 @@ def test_ema_accepts_missing_legacy_and_explicit_v2_adapter_metadata(
     a = _checkpoint(bias=0.0, step=0)
     b = _checkpoint(bias=1.0, step=1)
     b["entity_feature_adapter"] = checkpoint_entity_feature_adapter_metadata(
-        CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION
     )
     torch.save(a, tmp_path / "a.pt")
     torch.save(b, tmp_path / "b.pt")

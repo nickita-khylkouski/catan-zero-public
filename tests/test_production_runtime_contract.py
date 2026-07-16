@@ -22,7 +22,7 @@ def test_canonical_production_runtime_is_exact_and_self_consistent() -> None:
             "catanatron_rs-0.1.10-cp311-cp311-manylinux_2_34_x86_64.whl"
         ),
         "catanatron_rs_wheel_sha256": (
-            "1e4087072802a5429f7c873efda773c96f4bee63a95e62d7e172b255855f9ef8"
+            "8ff517696d22fce060f544e7fe869f1a2282906e51fde340a6dfd465793f66ca"
         ),
         "numpy_version": "2.4.6",
         "networkx_version": "3.6.1",
@@ -65,7 +65,7 @@ def test_installer_line_protocol_has_fixed_complete_order(capsys) -> None:
         "12.8",
         "0.1.10",
         "catanatron_rs-0.1.10-cp311-cp311-manylinux_2_34_x86_64.whl",
-        "1e4087072802a5429f7c873efda773c96f4bee63a95e62d7e172b255855f9ef8",
+        "8ff517696d22fce060f544e7fe869f1a2282906e51fde340a6dfd465793f66ca",
         "2.4.6",
         "3.6.1",
         "1.3.0",

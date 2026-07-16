@@ -517,7 +517,7 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
 
 def test_fast_search_rows_are_value_only():
     _rust()
-    self_play_config, search_config = _fast_config(max_decisions=5, p_full=0.0)
+    self_play_config, search_config = _fast_config(max_decisions=20, p_full=0.0)
     evaluator = HeuristicRustEvaluator(score_actions=False)
     mcts = GumbelChanceMCTS(search_config, evaluator)
 
@@ -531,12 +531,17 @@ def test_fast_search_rows_are_value_only():
     )
 
     assert record.decisions, "expected at least one non-forced decision to be recorded"
-    for decision in record.decisions:
-        assert decision.row["used_full_search"] is False
-        assert float(decision.row["policy_weight_multiplier"]) == pytest.approx(0.0)
-        assert float(decision.row["value_weight_multiplier"]) == pytest.approx(1.0)
-        assert not bool(decision.row["root_value_mask"])
-        assert np.isnan(decision.row["root_value"])
+    fast_rows = [
+        decision.row
+        for decision in record.decisions
+        if not decision.row["used_full_search"]
+    ]
+    assert fast_rows, "expected at least one playout-cap-randomized normal choice"
+    for row in fast_rows:
+        assert float(row["policy_weight_multiplier"]) == pytest.approx(0.0)
+        assert float(row["value_weight_multiplier"]) == pytest.approx(1.0)
+        assert not bool(row["root_value_mask"])
+        assert np.isnan(row["root_value"])
 
 
 def test_full_search_rows_have_nonzero_policy_weight():

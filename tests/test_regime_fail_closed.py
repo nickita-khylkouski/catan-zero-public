@@ -338,7 +338,12 @@ def test_logits_invariant_to_opponent_hand_permutation_when_masked():
     policy.model.eval()  # create() leaves train mode; active Dropout would break equality.
     policy.trained_with_masked_hidden_info = True
     evaluator = EntityGraphRustEvaluator(
-        policy, config=EntityGraphRustEvaluatorConfig(public_observation=True, cache_size=0)
+        policy,
+        config=EntityGraphRustEvaluatorConfig(
+            public_observation=True,
+            rust_featurize=False,
+            cache_size=0,
+        ),
     )
 
     game = _advance_to_multi_action_state(catanatron_rs, seed=5)
@@ -431,8 +436,7 @@ def test_belief_chance_spectra_dispatches_to_belief_robber_not_true_hand(monkeyp
     monkeypatch.setattr(gcm, "belief_move_robber_outcome_weights", _belief_spy)
     monkeypatch.setattr(gcm, "move_robber_victim_outcome_weights", _true_spy)
 
-    colors = [str(color) for color in json.loads(game.json_snapshot())["colors"]]
-    root_color = next(color for color in colors if color != str(game.current_color()))
+    root_color = str(game.current_color())
     node = _GNode(game=game.copy(), root_color=root_color)
     mcts = GumbelChanceMCTS(
         GumbelChanceMCTSConfig(seed=1, belief_chance_spectra=True),
@@ -475,8 +479,7 @@ def test_belief_chance_spectra_off_never_calls_belief_robber(monkeypatch):
 
     monkeypatch.setattr(gcm, "belief_move_robber_outcome_weights", _belief_spy)
 
-    colors = [str(color) for color in json.loads(game.json_snapshot())["colors"]]
-    root_color = next(color for color in colors if color != str(game.current_color()))
+    root_color = str(game.current_color())
     node = _GNode(game=game.copy(), root_color=root_color)
     mcts = GumbelChanceMCTS(
         GumbelChanceMCTSConfig(seed=1, belief_chance_spectra=False, correct_rust_chance_spectra=True),
@@ -508,13 +511,21 @@ def test_belief_chance_spectra_dispatches_to_belief_dev_deck_not_true_deck(monke
     real_belief = gcm.belief_buy_development_card_outcomes
     real_true = gcm.buy_development_card_real_outcomes
 
-    def _belief_spy(g, aj, *, cached_spectrum=None, perspective=None):
+    def _belief_spy(
+        g,
+        aj,
+        *,
+        cached_spectrum=None,
+        perspective=None,
+        materialization_seed=0,
+    ):
         belief_calls.append((aj, perspective))
         return real_belief(
             g,
             aj,
             cached_spectrum=cached_spectrum,
             perspective=perspective,
+            materialization_seed=materialization_seed,
         )
 
     def _true_spy(g, aj, *, cached_spectrum=None):
@@ -524,8 +535,7 @@ def test_belief_chance_spectra_dispatches_to_belief_dev_deck_not_true_deck(monke
     monkeypatch.setattr(gcm, "belief_buy_development_card_outcomes", _belief_spy)
     monkeypatch.setattr(gcm, "buy_development_card_real_outcomes", _true_spy)
 
-    colors = [str(color) for color in json.loads(game.json_snapshot())["colors"]]
-    root_color = next(color for color in colors if color != str(game.current_color()))
+    root_color = str(game.current_color())
     node = _GNode(game=game.copy(), root_color=root_color)
     mcts = GumbelChanceMCTS(
         GumbelChanceMCTSConfig(seed=1, belief_chance_spectra=True),

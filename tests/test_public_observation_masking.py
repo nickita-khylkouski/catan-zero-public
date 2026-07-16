@@ -6,8 +6,9 @@ Three layers:
      slots are zeroed; the actor and all public slots survive; and the UNMASKED
      tokens genuinely leaked (guards against a no-op mask).
   2. Planner belief chance spectra (drives real robber/dev nodes from seeded
-     random play): belief robber weights are uniform; belief dev weights follow
-     the belief deck; BASE_DEVELOPMENT_DECK matches the engine's initial deck.
+     random play): belief robber weights follow public conservation; belief dev
+     weights follow the belief deck; BASE_DEVELOPMENT_DECK matches the engine's
+     initial deck.
   3. Model invariance (guarded, needs a checkpoint + CUDA): evaluate() output is
      invariant to an opponent hidden-hand permutation when public_observation is
      ON, and NOT invariant when OFF (documents the leak the fix removes).
@@ -39,6 +40,7 @@ from catan_zero.search.gumbel_chance_mcts import (
     move_robber_victim_outcome_weights,
 )
 from catan_zero.search.rust_mcts import _require_rust_module
+from catan_zero.search.public_belief import PublicBelief, RESOURCES
 
 ACTOR = "BLUE"
 OPP = "RED"
@@ -185,15 +187,25 @@ def test_gumbel_row_writer_persists_public_observation(monkeypatch):
         def playable_actions_json(self):
             return json.dumps([[ACTOR, "END_TURN"], [ACTOR, "ROLL"]])
 
-    def _entity(*_args, public_observation=False, **_kwargs):
-        calls.append(("entity", bool(public_observation)))
+    resolved = object()
+
+    def _resolve(*_args, public_observation=False, **_kwargs):
+        calls.append(("resolve", bool(public_observation)))
+        return resolved
+
+    def _entity(*_args, **kwargs):
+        assert kwargs["resolved"] is resolved
         return {"player_tokens": np.zeros((1, 4, 31), dtype=np.float16)}
 
-    def _context(*_args, public_observation=False, **_kwargs):
+    def _context(*_args, public_observation=False, **kwargs):
+        assert kwargs["resolved"] is resolved
         calls.append(("context", bool(public_observation)))
         return np.zeros((1, 2, 18), dtype=np.float32)
 
     monkeypatch.setattr(self_play, "rust_policy_action_ids", lambda *_a, **_k: (3, 4))
+    monkeypatch.setattr(
+        self_play, "_resolve_entity_adapter", _resolve
+    )
     monkeypatch.setattr(self_play, "rust_game_to_entity_batch", _entity)
     monkeypatch.setattr(self_play, "rust_action_context_batch", _context)
 
@@ -216,7 +228,7 @@ def test_gumbel_row_writer_persists_public_observation(monkeypatch):
         obs_width=1,
     )
 
-    assert calls == [("entity", True), ("context", True)]
+    assert calls == [("resolve", True), ("context", True)]
 
 
 # --------------------------------------------------------------------------
@@ -281,11 +293,16 @@ def test_belief_robber_weights_do_not_condition_on_hidden_held_type_set():
     true = move_robber_victim_outcome_weights(game, action_json)
     belief = belief_move_robber_outcome_weights(game, action_json)
     assert belief, "belief robber produced no candidates for a non-empty victim"
-    # On the legacy fixed-five spectrum, belief keeps all five public resource
-    # identities with uniform mass, including true-hand-impossible no-op
-    # materializations.  Conditioning the candidate set on the true held types
-    # is exactly the hidden-information leak this path must avoid.
-    assert all(abs(w - 0.2) < 1e-9 for _i, w, _g in belief)
+    snapshot = json.loads(game.json_snapshot())
+    actor = str(action_json[0])
+    expected = PublicBelief.from_snapshot(
+        snapshot, perspective=actor
+    ).robber_steal_probabilities(str(action_json[2][1]))
+    actual = {RESOURCES[index]: weight for index, weight, _child in belief}
+    assert actual == pytest.approx(
+        {resource: weight for resource, weight in expected.items() if weight > 0.0}
+    )
+    assert sum(actual.values()) == pytest.approx(1.0)
     if true:
         assert {i for i, _w, _g in true}.issubset({i for i, _w, _g in belief})
 

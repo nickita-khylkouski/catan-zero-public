@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -69,10 +70,13 @@ def test_worker_uses_main_process_resolved_config_without_registry_reresolution(
     evaluator_configs = []
 
     class _FakeEvaluator:
+        def __init__(self):
+            self.policy = SimpleNamespace(config=SimpleNamespace())
+
         @classmethod
         def from_checkpoint(cls, *_args, **kwargs):
             evaluator_configs.append(kwargs["config"])
-            return object()
+            return cls()
 
     class _FakeMixRuntime:
         def __init__(self, *, config, evaluator_factory):
