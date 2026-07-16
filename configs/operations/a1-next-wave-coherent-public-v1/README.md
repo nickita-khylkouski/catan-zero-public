@@ -1,5 +1,14 @@
 # Next wave: coherent public-belief n128/adaptive-n256
 
+> **2026-07-15 diagnostic status:** this directory remains the immutable record
+> of the executable coherent-public experiment, but its learner treatments are
+> not current production selections. `ROLL=0.25`, `END_TURN=0.1`, the 4x
+> public-card residual LR, and surprise weighting were bundled without causal
+> isolation. Large execution is paused under
+> `docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md` and
+> `docs/plans/A1_REPRESENTATION_VALUE_RECOVERY_PLAN_20260715.md`. Preserve this
+> historical contract; do not reinterpret its issued artifacts.
+
 This is the versioned next-wave recipe. It does not reinterpret or modify any
 issued A1 generation guard, contract, seed claim, or corpus. The generation
 config has `games=0` and `checkpoint=null` deliberately: checkpoint identity,

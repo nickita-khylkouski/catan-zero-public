@@ -1,10 +1,13 @@
 # PPO Training Architecture Plan (catan-zero)
 
-**Status:** PLAN — not yet implemented for the 35M graph model. PPO machinery exists
-(`tools/train_ppo.py`, `src/catan_zero/rl/torch_ppo.py`) but runs only the legacy flat
-`TorchPPOPolicy`. This doc specifies the *system* architecture for running PPO self-play
-on the **35M graph model (`XDimGraphPolicy`)** across our heterogeneous fleet (B200 / GH200 /
-A100 GPUs + Modal/GCP CPU).
+**Status:** HISTORICAL PLAN. Entity-graph PPO updates, trajectory shards, a
+distributed learner, legal masking, GAE, clipping, and KL anchoring now exist.
+This document predates that implementation and incorrectly says PPO is
+legacy-flat-only. The current diagnosis and commissioning order live in
+`docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md` and
+`docs/plans/A1_REPRESENTATION_VALUE_RECOVERY_PLAN_20260715.md`. PPO remains
+blocked behind the shared observation/value repair, and launchers must select
+the current `entity_graph` architecture explicitly.
 
 Owner: catan-zero. Last updated: 2026-06-28.
 

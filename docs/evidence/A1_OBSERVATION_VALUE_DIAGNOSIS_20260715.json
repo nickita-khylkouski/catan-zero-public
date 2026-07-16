@@ -1,0 +1,182 @@
+{
+  "schema": "catan-zero-rl-diagnosis/v1",
+  "date": "2026-07-15",
+  "scope": "2p_no_trade_10vp",
+  "authority": {
+    "audit": "docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md",
+    "plan": "docs/plans/A1_REPRESENTATION_VALUE_RECOVERY_PLAN_20260715.md"
+  },
+  "execution_hold": {
+    "large_generation": true,
+    "large_learner": true,
+    "champion_mutation": true,
+    "reason": "P0 information-state, value-routing, and target-reliability defects"
+  },
+  "status_values": [
+    "OPEN",
+    "IMPLEMENTED",
+    "MEASURED",
+    "ACCEPTED",
+    "REJECTED"
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "CRITICAL",
+      "status": "OPEN",
+      "title": "Development-card playability aliases in the neural state",
+      "workstream": "W1",
+      "evidence": [
+        "native/catanatron-rs/src/lib.rs",
+        "src/catan_zero/search/neural_rust_mcts.py",
+        "src/catan_zero/rl/entity_token_features.py"
+      ],
+      "required_fix": "Versioned actor dev-used and per-type new/playable development-card features"
+    },
+    {
+      "id": "F2",
+      "severity": "CRITICAL",
+      "status": "OPEN",
+      "title": "Road Building and discard continuation state is dropped",
+      "workstream": "W1",
+      "evidence": [
+        "native/catanatron-rs/src/lib.rs",
+        "src/catan_zero/search/neural_rust_mcts.py",
+        "src/catan_zero/rl/entity_token_features.py"
+      ],
+      "required_fix": "Expose Road Building active/free-roads and discard remainder"
+    },
+    {
+      "id": "F3",
+      "severity": "HIGH",
+      "status": "OPEN",
+      "title": "Public development-card counts are partial and Knight count saturates",
+      "workstream": "W1",
+      "evidence": [
+        "src/catan_zero/rl/entity_token_features.py",
+        "native/catanatron-rs/src/lib.rs"
+      ],
+      "required_fix": "Use exact unsaturated public played-development counts"
+    },
+    {
+      "id": "F4",
+      "severity": "HIGH",
+      "status": "OPEN",
+      "title": "Monopoly and Year-of-Plenty resource semantics are weak",
+      "workstream": "W2",
+      "evidence": [
+        "src/catan_zero/search/neural_rust_mcts.py",
+        "src/catan_zero/rl/entity_token_features.py",
+        "src/catan_zero/rl/entity_token_policy.py"
+      ],
+      "required_fix": "Bind structured resource payloads directly into action scoring"
+    },
+    {
+      "id": "F5",
+      "severity": "HIGH",
+      "status": "OPEN",
+      "title": "Meaningful history loses order, turn boundaries, targets, and payloads",
+      "workstream": "W3",
+      "evidence": [
+        "src/catan_zero/rl/meaningful_history.py",
+        "src/catan_zero/rl/entity_token_features.py",
+        "src/catan_zero/rl/entity_token_policy.py"
+      ],
+      "required_fix": "Introduce ordered public history v2 with causal encoding"
+    },
+    {
+      "id": "F6",
+      "severity": "HIGH",
+      "status": "OPEN",
+      "title": "Value head is blind to legal affordances",
+      "workstream": "W2",
+      "evidence": [
+        "src/catan_zero/rl/entity_token_policy.py"
+      ],
+      "required_fix": "Provide a masked legal-action/affordance summary to value"
+    },
+    {
+      "id": "F7",
+      "severity": "CRITICAL",
+      "status": "OPEN",
+      "title": "Policy updates damage the shared value representation",
+      "workstream": "W4",
+      "evidence": [
+        "src/catan_zero/rl/entity_token_policy.py",
+        "tools/train_bc.py",
+        "configs/operations/a1-next-wave-coherent-public-v1/science.contract.json",
+        "docs/audits/A1_LEARNER_END_TO_END_FORENSICS_20260713.md"
+      ],
+      "required_fix": "Lower/protect shared trunk or split late policy and value towers"
+    },
+    {
+      "id": "F8",
+      "severity": "HIGH",
+      "status": "OPEN",
+      "title": "Forced-state value downweighting is unisolated",
+      "workstream": "W4",
+      "evidence": [
+        "configs/operations/a1-next-wave-coherent-public-v1/science.contract.json",
+        "tools/train_bc.py"
+      ],
+      "required_fix": "Restore 1.0 control and compare phase calibration causally"
+    },
+    {
+      "id": "F9",
+      "severity": "CRITICAL",
+      "status": "OPEN",
+      "title": "Search surprise does not establish policy-target reliability",
+      "workstream": "W5",
+      "evidence": [
+        "docs/audits/A1_PAID_SEARCH_TARGET_SEMANTICS_20260712.md",
+        "docs/audits/A1_LEARNER_END_TO_END_FORENSICS_20260713.md"
+      ],
+      "required_fix": "Reliability-qualify search targets and bind the exact operator"
+    },
+    {
+      "id": "F10",
+      "severity": "CRITICAL",
+      "status": "OPEN",
+      "title": "Historical learner parent and current producer/evaluator identity diverged",
+      "workstream": "W5",
+      "evidence": [
+        "tools/a1_b200_stage_c_learner_campaign.py",
+        "tools/a1_stage_c_final_replication.py"
+      ],
+      "required_fix": "Universally bind initializer, teacher, producer, and evaluation incumbent"
+    },
+    {
+      "id": "F11",
+      "severity": "MEDIUM",
+      "status": "OPEN",
+      "title": "PPO launchers can select a legacy architecture",
+      "workstream": "W7",
+      "evidence": [
+        "src/catan_zero/rl/ppo_policy_factory.py",
+        "tools/train_selfplay_gpu.py",
+        "tools/ppo_distributed_learner.py"
+      ],
+      "required_fix": "One explicit entity-graph PPO entry point with exact parent binding"
+    },
+    {
+      "id": "F12",
+      "severity": "MEDIUM",
+      "status": "OPEN",
+      "title": "Action-local topology remains a model ceiling",
+      "workstream": "W8",
+      "evidence": [
+        "docs/audits/A1_TOPOLOGY_GATHER_CAUSAL_AUDIT_20260713.md",
+        "src/catan_zero/rl/entity_token_policy.py"
+      ],
+      "required_fix": "Recommission target joins/topology only after P0 repair"
+    }
+  ],
+  "confirmed_non_bugs": [
+    "acting-player value sign",
+    "terminal outcome perspective",
+    "truncated-game handling",
+    "DDP weighted reductions",
+    "fresh optimizer in current final replication",
+    "audited public train/serve masking"
+  ]
+}

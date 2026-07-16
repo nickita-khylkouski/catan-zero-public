@@ -43,6 +43,14 @@ SYNTHESIZABLE_COLUMNS = frozenset(
         "afterstate_target",
         "afterstate_target_mask",
         "simulations_used",
+        "is_pool_game",
+        "opponent_version",
+        "opponent_tag",
+        "opponent_checkpoint_md5",
+        "opponent_type",
+        "opponent_provenance_present",
+        "training_source_category",
+        "training_source_category_verified",
         *AUX_TARGET_KEYS,
         # Historical replay predates the strict-future auxiliary-target
         # contract.  Version 0 means unversioned/ineligible and is synthesized
@@ -343,6 +351,21 @@ def _synthesized_column(corpus: Any, key: str):
         )
     if key == "simulations_used":
         return _ConstantColumn(corpus.row_count, 0, np.int32)
+    if key in {
+        "is_pool_game",
+        "opponent_provenance_present",
+        "training_source_category_verified",
+    }:
+        return _ConstantColumn(corpus.row_count, False, np.bool_)
+    if key == "opponent_version":
+        return _ConstantColumn(corpus.row_count, -1, np.int32)
+    if key in {
+        "opponent_tag",
+        "opponent_checkpoint_md5",
+        "opponent_type",
+        "training_source_category",
+    }:
+        return _ConstantColumn(corpus.row_count, "", "<U1")
     if key == AUX_SUBGOAL_TARGET_VERSION_KEY:
         return _ConstantColumn(corpus.row_count, 0, np.uint8)
     if key in {"aux_next_settlement", "aux_robber_target"}:

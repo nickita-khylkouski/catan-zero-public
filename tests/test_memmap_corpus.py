@@ -20,7 +20,10 @@ _TOOLS_DIR = _REPO / "tools"
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from build_memmap_corpus import build_memmap_corpus  # type: ignore  # noqa: E402
+from build_memmap_corpus import (  # type: ignore  # noqa: E402
+    _stamp_selected_game_source_provenance,
+    build_memmap_corpus,
+)
 import train_bc  # type: ignore  # noqa: E402
 from train_bc import (  # type: ignore  # noqa: E402
     ENTITY_BATCH_KEYS,
@@ -32,6 +35,8 @@ from train_bc import (  # type: ignore  # noqa: E402
     build_value_sample_weights,
     load_teacher_data,
     split_train_validation_indices,
+    teacher_data_quality,
+    teacher_provenance_quality,
 )
 
 # Shard data (runs/) is gitignored and only present in a full checkout, not in a
@@ -69,6 +74,100 @@ def _make_teacher_dir(tmp_path: Path, shard_paths: list[str]) -> Path:
     teacher_dir.mkdir()
     (teacher_dir / "manifest.json").write_text(json.dumps({"shards": shard_paths}))
     return teacher_dir
+
+
+def _minimal_teacher_shard(path: Path, *, seed: int, opponent: bool) -> None:
+    rows = 2
+    payload: dict[str, np.ndarray] = {
+        "obs": np.zeros((rows, 8), dtype=np.float16),
+        "legal_action_ids": np.asarray([[3, 9], [4, -1]], dtype=np.int16),
+        "legal_action_context": np.zeros((rows, 2, 5), dtype=np.float16),
+        "action_taken": np.asarray([3, 4], dtype=np.int16),
+        "target_policy": np.asarray([[0.75, 0.25], [1.0, 0.0]], dtype=np.float32),
+        "game_seed": np.full(rows, seed, dtype=np.int64),
+        "decision_index": np.arange(rows, dtype=np.int32),
+        "terminated": np.ones(rows, dtype=np.bool_),
+        "truncated": np.zeros(rows, dtype=np.bool_),
+    }
+    if opponent:
+        payload.update(
+            {
+                "is_pool_game": np.ones(rows, dtype=np.bool_),
+                "opponent_version": np.full(rows, 7, dtype=np.int32),
+                "opponent_tag": np.full(rows, "recent_history"),
+                "opponent_checkpoint_md5": np.full(rows, "deadbeef"),
+                "opponent_type": np.asarray(["", "catanatron_value"]),
+            }
+        )
+    np.savez(path, **payload)
+
+
+def test_opponent_provenance_survives_mixed_npz_and_memmap_paths(tmp_path):
+    plain = tmp_path / "plain.npz"
+    tagged = tmp_path / "tagged.npz"
+    _minimal_teacher_shard(plain, seed=101, opponent=False)
+    _minimal_teacher_shard(tagged, seed=202, opponent=True)
+    teacher = _make_teacher_dir(tmp_path, [str(plain), str(tagged)])
+    corpus_dir = tmp_path / "provenance.memmap"
+    build_memmap_corpus(teacher, corpus_dir, progress_every=0)
+
+    in_memory = load_teacher_data(teacher)
+    memmap = MemmapCorpus(corpus_dir)
+    fields = (
+        "is_pool_game",
+        "opponent_version",
+        "opponent_tag",
+        "opponent_checkpoint_md5",
+        "opponent_type",
+        "opponent_provenance_present",
+        "training_source_category",
+        "training_source_category_verified",
+    )
+    for field in fields:
+        np.testing.assert_array_equal(np.asarray(memmap[field]), np.asarray(in_memory[field]))
+
+    np.testing.assert_array_equal(memmap["opponent_provenance_present"][:], [False, False, True, True])
+    np.testing.assert_array_equal(memmap["opponent_version"][:], [-1, -1, 7, 7])
+    np.testing.assert_array_equal(
+        memmap["opponent_tag"][:].astype(str),
+        ["", "", "recent_history", "recent_history"],
+    )
+    quality = teacher_data_quality(in_memory)
+    assert quality["opponent_provenance_rows"] == 2
+    assert quality["opponent_tag_counts"] == {"recent_history": 2}
+    assert teacher_provenance_quality(memmap, chunk_rows=1)["opponent_provenance_fraction"] == 0.5
+
+
+def test_authenticated_selected_game_categories_are_stamped_without_guessing():
+    normalized = {
+        "game_seed": np.asarray([11, 11, 22, 33], dtype=np.int64),
+        "opponent_tag": np.asarray(["", "", "recent_history", "hard_negative"]),
+        "opponent_provenance_present": np.asarray([False, False, True, True]),
+    }
+    _stamp_selected_game_source_provenance(
+        normalized,
+        category_by_seed={11: "current_producer", 22: "recent_history", 33: "hard_negative"},
+        path=Path("sealed-shard.npz"),
+    )
+    np.testing.assert_array_equal(
+        normalized["training_source_category"],
+        ["current_producer", "current_producer", "recent_history", "hard_negative"],
+    )
+    assert normalized["training_source_category_verified"].all()
+
+
+def test_authenticated_source_category_rejects_raw_tag_contradiction():
+    normalized = {
+        "game_seed": np.asarray([22], dtype=np.int64),
+        "opponent_tag": np.asarray(["hard_negative"]),
+        "opponent_provenance_present": np.asarray([True]),
+    }
+    with pytest.raises(SystemExit, match="contradicts authenticated"):
+        _stamp_selected_game_source_provenance(
+            normalized,
+            category_by_seed={22: "recent_history"},
+            path=Path("contradictory-shard.npz"),
+        )
 
 
 @pytest.fixture(scope="module")

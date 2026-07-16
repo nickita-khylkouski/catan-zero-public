@@ -52,6 +52,7 @@ from tools import a1_lineage_dose as lineage  # noqa: E402
 from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
 from tools import a1_ddp_epoch_canary as ddp_canary  # noqa: E402
 from tools import a1_aux_pair_coordinator as aux_coordinator  # noqa: E402
+from tools import a1_stage_c_final_replication as stage_c_final  # noqa: E402
 from tools import a1_scientific_evidence as scientific_evidence  # noqa: E402
 from tools import audit_entity_graph_information_surface as information_surface  # noqa: E402
 
@@ -526,6 +527,7 @@ def _current_ablation_code_binding(lock: dict[str, Any]) -> dict[str, Any]:
         "tools/a1_ddp_epoch_canary.py",
         "tools/a1_function_preserving_upgrade.py",
         "tools/a1_one_dose_train.py",
+        "tools/a1_stage_c_final_replication.py",
         "tools/train_bc.py",
     )
     for relative_key in required_runtime_paths:
@@ -978,6 +980,18 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
                 "authority_sha256"
             )
             if isinstance(verified.get("final_replication_executor_authority"), dict)
+            else None
+        ),
+        "stage_c_final_replication_authority_sha256": (
+            verified.get("stage_c_final_replication_authority", {}).get(
+                "authority_sha256"
+            )
+            if isinstance(verified.get("stage_c_final_replication_authority"), dict)
+            else None
+        ),
+        "stage_c_final_replication_binding": (
+            copy.deepcopy(verified["stage_c_final_replication_binding"])
+            if isinstance(verified.get("stage_c_final_replication_binding"), dict)
             else None
         ),
         "central_published_executor_authority": (
@@ -1752,6 +1766,23 @@ def _verify_coherent_direct_training_inputs(
         ) from error
     if not isinstance(payload, dict):
         raise ExecutorError("coherent corpus admission must be a JSON object")
+    final_admission: dict[str, Any] | None = None
+    if payload.get("schema_version") == stage_c_final.FINAL_CORPUS_ADMISSION_SCHEMA:
+        try:
+            verified_final = stage_c_final.verify_final_corpus_admission(
+                admission_path
+            )
+        except stage_c_final.FinalReplicationError as error:
+            raise ExecutorError(
+                f"Stage-C final corpus admission refused: {error}"
+            ) from error
+        final_admission = copy.deepcopy(verified_final)
+        coherent_payload = final_admission.pop("_coherent_admission", None)
+        if not isinstance(coherent_payload, dict):
+            raise ExecutorError(
+                "Stage-C final admission lost its low-level coherent corpus"
+            )
+        payload = coherent_payload
     unsigned = dict(payload)
     stated = unsigned.pop("admission_sha256", None)
     if (
@@ -1867,12 +1898,18 @@ def _verify_coherent_direct_training_inputs(
     }
     direct_binding: dict[str, Any] = {
         "schema_version": train_bc.COHERENT_DIRECT_CORPUS_BINDING_SCHEMA,
-        "diagnostic_only": True,
+        "diagnostic_only": final_admission is None,
         "promotion_eligible": False,
+        "promotion_eligible_after_full_gate": final_admission is not None,
+        "full_gate_required": final_admission is not None,
         "corpus_admission": {
             "path": str(admission_path),
             "file_sha256": _file_sha256(admission_path),
-            "admission_sha256": stated,
+            "admission_sha256": (
+                final_admission["admission_sha256"]
+                if final_admission is not None
+                else stated
+            ),
         },
         "target_contract_sha256": contract["contract_sha256"],
         "producer_checkpoint_sha256": producer["sha256"],
@@ -1925,7 +1962,10 @@ def _verify_coherent_direct_training_inputs(
         "validation_game_seed_set_sha256": validation[
             "validation_game_seed_set_sha256"
         ],
-        "coherent_corpus_admission": copy.deepcopy(payload),
+        "coherent_corpus_admission": copy.deepcopy(
+            final_admission if final_admission is not None else payload
+        ),
+        "stage_c_final_corpus_admission": copy.deepcopy(final_admission),
         "coherent_direct_corpus_binding": direct_binding,
     }
 
@@ -2604,11 +2644,15 @@ def bind_training_topology(
     matched_aux = verified.get("learner_ablation", {}).get("matched_aux_regularization")
     central_p1 = verified.get("learner_ablation", {}).get("central_p1")
     central_learner = verified.get("central_learner_binding")
+    stage_c_final_binding = verified.get("stage_c_final_replication_binding")
     if (
-        matched_aux is not None or central_p1 is not None or central_learner is not None
+        matched_aux is not None
+        or central_p1 is not None
+        or central_learner is not None
+        or stage_c_final_binding is not None
     ) and topology != B200_8GPU_DDP_TOPOLOGY:
         raise ExecutorError(
-            "central P1/AUX arms require the exact b200-8gpu-ddp topology"
+            "central P1/AUX or Stage-C FINAL requires exact b200-8gpu-ddp topology"
         )
     if isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0:
         raise ExecutorError("training topology GPU must be a non-negative integer")
@@ -4998,6 +5042,161 @@ def bind_final_replication(
     return result
 
 
+def bind_stage_c_final_replication(
+    verified: dict[str, Any],
+    *,
+    authority_path: Path,
+    arm_name: str,
+    reviewed_code_tree_sha256: str,
+) -> dict[str, Any]:
+    """Bind a fresh current-parent replay of the externally selected Stage-C dose.
+
+    The diagnostic checkpoint selects only the optimizer-step count.  The
+    initializer and coherent teacher are both the exact authoritative current
+    parent named by the sealed final authority; candidate chaining is refused.
+    """
+
+    try:
+        authority = stage_c_final.verify_final_authority(authority_path)
+    except stage_c_final.FinalReplicationError as error:
+        raise ExecutorError(f"Stage-C final authority refused: {error}") from error
+    final_corpus = verified.get("stage_c_final_corpus_admission")
+    upgrade = verified.get("function_preserving_upgrade")
+    if not isinstance(final_corpus, dict) or not isinstance(upgrade, dict):
+        raise ExecutorError(
+            "Stage-C final requires its production corpus and zero-diff initializer"
+        )
+    authority_corpus = authority["final_corpus_admission"]
+    corpus_admission_path = Path(str(authority_corpus["path"])).resolve(strict=True)
+    verified_admission_path = Path(
+        str(verified["coherent_direct_corpus_binding"]["corpus_admission"]["path"])
+    ).resolve(strict=True)
+    if (
+        corpus_admission_path != verified_admission_path
+        or _file_sha256(corpus_admission_path)
+        != authority_corpus["file_sha256"]
+        or final_corpus.get("admission_sha256")
+        != authority_corpus["admission_sha256"]
+    ):
+        raise ExecutorError("Stage-C final authority binds different corpus bytes")
+    initializer = authority["initializer"]
+    if (
+        verified.get("producer") != initializer.get("exact_parent")
+        or upgrade.get("source") != initializer.get("exact_parent")
+        or upgrade.get("upgraded_initializer")
+        != initializer.get("upgraded_initializer")
+        or upgrade.get("receipt_sha256")
+        != initializer.get("upgrade_receipt_sha256")
+        or initializer.get("fresh_adam") is not True
+        or initializer.get("resume_optimizer") is not False
+        or initializer.get("candidate_chaining") is not False
+    ):
+        raise ExecutorError("Stage-C final current-parent initializer drifted")
+    lock_ref = authority["reviewed_code"]["lock"]
+    if (
+        verified.get("reviewed_lock_file_sha256")
+        != verified.get("lock_file_sha256")
+        or verified.get("lock_file_sha256") != lock_ref.get("file_sha256")
+        or Path(str(verified["lock_path"])).resolve(strict=True)
+        != Path(str(lock_ref["path"])).resolve(strict=True)
+    ):
+        raise ExecutorError("Stage-C final lock differs from reviewed authority")
+    code_binding = _current_ablation_code_binding(verified["lock"])
+    if (
+        reviewed_code_tree_sha256 != code_binding["code_tree_sha256"]
+        or authority["reviewed_code"]["code_tree_sha256"]
+        != reviewed_code_tree_sha256
+    ):
+        raise ExecutorError("Stage-C final code tree differs from reviewed authority")
+    arms = authority["training"].get("matched_arms")
+    if not isinstance(arms, dict) or arm_name not in arms:
+        raise ExecutorError(f"unknown Stage-C final matched arm: {arm_name}")
+    selected_arm = arms[arm_name]
+    selected_recipe = selected_arm.get("recipe")
+    if not isinstance(selected_recipe, dict):
+        raise ExecutorError("Stage-C final selected recipe is malformed")
+    allowed = A1_LEARNER_ABLATION_FIELDS | {"sampler_seed"}
+    if set(selected_recipe) - allowed:
+        raise ExecutorError(
+            "Stage-C final recipe changes a non-learner field: "
+            f"{sorted(set(selected_recipe) - allowed)}"
+        )
+    bound = dict(verified["recipe"])
+    effective = dict(bound)
+    effective.update(
+        {
+            "public_card_lr_mult": 1.0,
+            "per_game_policy_surprise_weighting": False,
+            "per_game_value_weight_mode": "equal",
+        }
+    )
+    effective.update(copy.deepcopy(selected_recipe))
+    selected_step = int(authority["diagnostic_selection"]["selected_step"])
+    max_steps = int(authority["training"]["max_optimizer_steps"])
+    checkpoint_steps = list(authority["training"]["checkpoint_steps"])
+    if (
+        int(effective.get("max_steps", -1)) != max_steps
+        or checkpoint_steps != [8, 12, 16, 32]
+        or checkpoint_steps[-1] != max_steps
+        or selected_arm.get("recipe_sha256") != _value_sha256(selected_recipe)
+        or effective.get("optimizer") != "adam"
+        or effective.get("resume_optimizer") is not False
+        or effective.get("fused_optimizer") is not False
+        or float(effective.get("value_target_lambda", -1.0)) != 1.0
+        or final_corpus.get("search_value_evidence", {}).get(
+            "naive_root_blend_authorized"
+        )
+        is not False
+        or final_corpus.get("search_value_evidence", {}).get(
+            "terminal_target_remains_authoritative"
+        )
+        is not True
+    ):
+        raise ExecutorError("Stage-C final fresh-Adam selected-dose recipe drifted")
+    binding = {
+        "schema_version": "a1-stage-c-final-matched-training-binding-v2",
+        "authority": {
+            "path": str(authority_path.resolve(strict=True)),
+            "file_sha256": _file_sha256(authority_path.resolve(strict=True)),
+            "authority_sha256": authority["authority_sha256"],
+        },
+        "current_parent_checkpoint_sha256": initializer["exact_parent"]["sha256"],
+        "initializer_checkpoint_sha256": initializer["upgraded_initializer"][
+            "sha256"
+        ],
+        "selected_diagnostic_step": selected_step,
+        "selected_diagnostic_checkpoint_sha256": authority[
+            "diagnostic_selection"
+        ]["selected_diagnostic_checkpoint_sha256"],
+        "selected_diagnostic_checkpoint_loaded": False,
+        "matched_arm": arm_name,
+        "matched_arm_role": selected_arm["role"],
+        "matched_sample_order": True,
+        "terminal_value_target_only": True,
+        "same_trajectory_checkpoint_steps": checkpoint_steps,
+        "external_adjudication_sha256": authority["external_adjudication"][
+            "adjudication_sha256"
+        ],
+        "independent_root_manifest_sha256": final_corpus["root_manifest"][
+            "root_manifest_sha256"
+        ],
+        "fresh_independent_target_bytes": True,
+        "diagnostic_only": False,
+        "promotion_eligible": False,
+        "eligible_for_full_gate": True,
+        "full_gate_required": True,
+        "auto_promotion": False,
+    }
+    result = dict(verified)
+    result["bound_recipe"] = bound
+    result["recipe"] = effective
+    result["stage_c_final_replication_authority"] = copy.deepcopy(authority)
+    result["stage_c_final_replication_binding"] = binding
+    result["stage_c_final_code_binding"] = code_binding
+    result["claim_identity_sha256"] = _value_sha256(binding)
+    return result
+
+
 def _build_direct_train_command(
     verified: dict[str, Any],
     *,
@@ -5235,6 +5434,16 @@ def _build_direct_train_command(
     max_steps = int(recipe.get("max_steps", 0))
     reporting = (verified.get("learner_ablation") or {}).get("reporting_contract", {})
     explicit_checkpoints = list(reporting.get("checkpoint_steps", ()))
+    if not explicit_checkpoints:
+        stage_c_final_binding = verified.get("stage_c_final_replication_binding")
+        if isinstance(stage_c_final_binding, dict):
+            explicit_checkpoints = [
+                int(step)
+                for step in stage_c_final_binding.get(
+                    "same_trajectory_checkpoint_steps", ()
+                )
+                if int(step) < max_steps
+            ]
     if explicit_checkpoints:
         # An explicit generic diagnostic schedule is topology/data-kind
         # independent.  The terminal max-step checkpoint remains the ordinary
@@ -5371,6 +5580,7 @@ def _build_direct_train_command(
         )
     central_binding = verified.get("central_learner_binding")
     learner_ablation = verified.get("learner_ablation")
+    stage_c_final_binding = verified.get("stage_c_final_replication_binding")
     if isinstance(central_binding, dict):
         command.append("--allow-concurrent-bc")
         if verified.get("data_kind") not in {
@@ -5482,6 +5692,11 @@ def _build_direct_train_command(
                     _canonical_bytes(matched_aux).decode("ascii"),
                 ]
             )
+    elif isinstance(stage_c_final_binding, dict):
+        # The authority and coherent-corpus binding are executor-owned report
+        # provenance.  The child receives only the exact optimizer flags and
+        # permission for its eight local DDP ranks to share one host.
+        command.append("--allow-concurrent-bc")
     if "--ddp-shard-data" in command:
         raise ExecutorError("sealed memmap learner may not shard corpus data by rank")
     return command
@@ -5685,6 +5900,7 @@ def bind_function_preserving_upgrade(
     allow_public_award_transition_source: bool = False,
     allow_diagnostic_recent_history_source: bool = False,
     independent_parent_authority_path: Path | None = None,
+    allow_stage_c_final_current_parent: bool = False,
 ) -> dict[str, Any]:
     """Select a non-byte-identical initializer only after replaying its receipt."""
 
@@ -5847,23 +6063,43 @@ def bind_function_preserving_upgrade(
     if coherent_binding is not None:
         if not isinstance(coherent_binding, dict):
             raise ExecutorError("coherent direct-corpus binding is malformed")
-        if independent_parent_authority is None:
+        is_stage_c_final = (
+            result.get("stage_c_final_corpus_admission") is not None
+        )
+        if is_stage_c_final and not allow_stage_c_final_current_parent:
+            raise ExecutorError(
+                "Stage-C final current-parent initialization requires its sealed "
+                "final-replication authority"
+            )
+        if is_stage_c_final and (
+            not source_matches_producer or independent_parent_authority is not None
+        ):
+            raise ExecutorError(
+                "Stage-C final must upgrade the exact current corpus producer"
+            )
+        if not is_stage_c_final and independent_parent_authority is None:
             raise ExecutorError(
                 "coherent direct corpus requires an independently authorized "
                 "learner parent before rendering training"
             )
         coherent_binding = copy.deepcopy(coherent_binding)
-        coherent_binding["learner_initializer"] = {
-            "role": "diagnostic_independent_parent",
+        initializer_binding = {
+            "role": (
+                "stage_c_final_exact_current_parent"
+                if is_stage_c_final
+                else "diagnostic_independent_parent"
+            ),
             "parent_checkpoint_sha256": upgrade["source"]["sha256"],
             "initializer_checkpoint_sha256": upgrade["upgraded_initializer"]["sha256"],
             "upgrade_module": upgrade["module"],
             "upgrade_receipt_file_sha256": receipt["sha256"],
             "upgrade_receipt_sha256": upgrade["receipt_sha256"],
-            "independent_parent_authority_sha256": independent_parent_authority[
-                "authority_sha256"
-            ],
         }
+        if independent_parent_authority is not None:
+            initializer_binding["independent_parent_authority_sha256"] = (
+                independent_parent_authority["authority_sha256"]
+            )
+        coherent_binding["learner_initializer"] = initializer_binding
         coherent_binding.pop("binding_sha256", None)
         coherent_binding["binding_sha256"] = _value_sha256(coherent_binding)
         result["coherent_direct_corpus_binding"] = coherent_binding
@@ -11222,9 +11458,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "diagnostic-only signed admission for one direct coherent-public "
-            "memmap; never interpreted as the historical 12k A1 corpus"
+            "signed admission for one direct coherent-public memmap; diagnostic "
+            "overlays require an ablation and independent FINAL slices require "
+            "--stage-c-final-authority"
         ),
+    )
+    parser.add_argument(
+        "--stage-c-final-authority",
+        type=Path,
+        default=None,
+        help=(
+            "sealed independent Stage-C current-parent replication authority; "
+            "selected diagnostic checkpoint bytes are never loaded"
+        ),
+    )
+    parser.add_argument(
+        "--stage-c-final-arm",
+        choices=stage_c_final.FINAL_ARM_NAMES,
+        default=None,
+        help="required matched control/treatment arm for --stage-c-final-authority",
     )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
@@ -11462,6 +11714,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             value not in (None, "")
             for value in (*final_required_values, args.final_warmed_initializer)
         )
+        stage_c_final_requested = args.stage_c_final_authority is not None
+        if stage_c_final_requested != (args.stage_c_final_arm is not None):
+            raise ExecutorError(
+                "--stage-c-final-authority and --stage-c-final-arm are required together"
+            )
         if final_requested and not all(
             value not in (None, "") for value in final_required_values
         ):
@@ -11475,6 +11732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if p1_requested and (
             aux_requested
             or final_requested
+            or stage_c_final_requested
             or args.ablation_id
             or args.recipe_overrides_json
         ):
@@ -11487,25 +11745,50 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "initializer flags must be supplied together"
             )
         if aux_requested and (
-            final_requested or args.ablation_id or args.recipe_overrides_json
+            final_requested
+            or stage_c_final_requested
+            or args.ablation_id
+            or args.recipe_overrides_json
         ):
             raise ExecutorError(
                 "central AUX arms cannot use generic ablation ids/overrides"
             )
-        if final_requested and (args.ablation_id or args.recipe_overrides_json):
+        if final_requested and (
+            stage_c_final_requested or args.ablation_id or args.recipe_overrides_json
+        ):
             raise ExecutorError("FINAL cannot use generic ablation ids/overrides")
-        if (aux_requested or p1_requested or final_requested) and not (
+        if stage_c_final_requested and (
+            args.ablation_id
+            or args.recipe_overrides_json
+            or args.independent_parent_authority is not None
+            or args.coherent_corpus_admission is None
+            or args.architecture_upgrade_receipt is None
+            or args.topology != B200_8GPU_DDP_TOPOLOGY
+            or args.gpu != 0
+        ):
+            raise ExecutorError(
+                "Stage-C FINAL requires coherent admission, zero-diff upgrade, "
+                "and physical b200-8gpu-ddp GPU0 ownership; generic/independent-"
+                "parent diagnostics are forbidden"
+            )
+        if (
+            aux_requested
+            or p1_requested
+            or final_requested
+            or stage_c_final_requested
+        ) and not (
             args.ablation_code_tree_sha256 and args.reviewed_lock_file_sha256
         ):
             raise ExecutorError(
-                "central P1/AUX/FINAL requires reviewed code-tree and final-lock digests"
+                "central P1/AUX/FINAL or Stage-C FINAL requires reviewed code-tree "
+                "and final-lock digests"
             )
         generic_ablation_requested = bool(
             args.ablation_id or args.recipe_overrides_json
         )
         if (
             args.coherent_corpus_admission is not None
-            and not generic_ablation_requested
+            and not (generic_ablation_requested or stage_c_final_requested)
         ):
             raise ExecutorError(
                 "--coherent-corpus-admission requires an explicit diagnostic ablation"
@@ -11559,6 +11842,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or aux_requested
                 or p1_requested
                 or final_requested
+                or stage_c_final_requested
                 else None
             ),
             frozen_repo=args.frozen_repo,
@@ -11574,6 +11858,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_public_award_transition_source=(aux_requested or final_requested),
                 allow_diagnostic_recent_history_source=bool(args.diagnostic_dose_curve),
                 independent_parent_authority_path=(args.independent_parent_authority),
+                allow_stage_c_final_current_parent=stage_c_final_requested,
+            )
+        if stage_c_final_requested:
+            assert args.stage_c_final_authority is not None
+            verified = bind_stage_c_final_replication(
+                verified,
+                authority_path=args.stage_c_final_authority,
+                arm_name=args.stage_c_final_arm,
+                reviewed_code_tree_sha256=args.ablation_code_tree_sha256,
             )
         if generic_ablation_requested:
             verified = bind_learner_ablation(
@@ -11745,6 +12038,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             raise ExecutorError(
                 "central P1/AUX/FINAL uses completion-only crash recovery; retries are forbidden"
+            )
+        if (
+            isinstance(verified.get("stage_c_final_replication_binding"), dict)
+            and args.retry_parent_claim is not None
+        ):
+            raise ExecutorError(
+                "Stage-C FINAL uses completion-only recovery; typed retries are forbidden"
             )
         if args.retry_parent_claim is not None:
             verified = authorize_failed_before_optimizer_retry(

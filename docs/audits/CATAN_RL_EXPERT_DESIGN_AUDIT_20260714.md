@@ -6,6 +6,15 @@
 
 **Status:** Evidence-backed design audit. Measurements below come from the authenticated V5 composite and its fresh current-producer component. This document separates implemented safeguards from deliberate approximations and unresolved hypotheses.
 
+> **2026-07-15 addendum:** the selected forced-value map and current history
+> representation are now provisional. A subsequent source audit confirmed
+> missing dev-card playability, Road Building/discard continuation state,
+> lossy unordered history, value blindness to legal affordances, and severe
+> policy/value shared-trunk imbalance. See
+> `docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md`. Preserve the measurements
+> below as historical evidence; do not treat every listed implementation
+> setting as the next production default.
+
 ## Implementation update
 
 The audit now has a runnable, opt-in next-wave implementation. Historical A1
