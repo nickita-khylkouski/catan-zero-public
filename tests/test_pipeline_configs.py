@@ -119,7 +119,7 @@ def test_current_canonical_train_recipe_does_not_inherit_policy_phase_weights() 
     assert config.value_player_outcome_balance_mode == "none"
     assert engine["base_sampler"] == "coverage_importance_v1"
     assert config.moe_routed_experts == 0
-    assert config.moe_balance_loss_weight == pytest.approx(0.01)
+    assert config.moe_balance_loss_weight == pytest.approx(0.0)
     assert _coverage_unsupported_objectives(
         config,
         categorical_value_loss_weight=config.value_categorical_loss_weight,
