@@ -1121,8 +1121,9 @@ class EntityGraphNet:
                 ``value_trunk_grad_scale`` is a training-only causal probe.  It
                 changes no forward value and leaves the value-head parameter
                 gradient untouched; it scales only the scalar value loss's
-                gradient at the shared state boundary.  The default takes the
-                historical path without adding an operation to the graph.
+                gradients at every shared state/token trunk boundary.  The
+                default takes the historical path without adding an operation
+                to the graph.
                 """
                 tokens, padding_mask, state = encoded_state[:3]
                 # The BC trainer freezes zero-objective optional heads and sets
@@ -1203,16 +1204,26 @@ class EntityGraphNet:
                     )
                 if value_trunk_grad_scale == 1.0:
                     value_state = state
+                    value_tokens = tokens
                 elif value_trunk_grad_scale == 0.0:
                     # Forward identity with an exact stop-gradient at the shared
-                    # boundary.  The value head still receives normal gradients.
+                    # boundary.  Both value readouts still receive normal
+                    # parameter gradients.
                     value_state = state.detach()
+                    value_tokens = tokens.detach()
                 else:
                     # ``state - state.detach()`` is exactly zero in the forward
                     # pass and has derivative one.  This therefore preserves the
                     # value tensor while scaling only its upstream derivative.
+                    # The attention-pool branch also reads post-trunk tokens, so
+                    # apply the same boundary there; otherwise an enabled pool
+                    # silently leaks full-strength scalar-value gradients into
+                    # the shared trunk.
                     value_state = state.detach() + value_trunk_grad_scale * (
                         state - state.detach()
+                    )
+                    value_tokens = tokens.detach() + value_trunk_grad_scale * (
+                        tokens - tokens.detach()
                     )
                 if self.legal_action_value_residual_enabled:
                     action_mask = batch.get("legal_action_mask")
@@ -1246,7 +1257,9 @@ class EntityGraphNet:
                     )
                 value = self.value_head(value_state).squeeze(-1)
                 if self.value_attention_pool:
-                    value = value + self._value_pool(state, tokens, padding_mask)
+                    value = value + self._value_pool(
+                        value_state, value_tokens, padding_mask
+                    )
                 outputs = {
                     "logits": logits,
                     "value": value,

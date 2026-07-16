@@ -1018,20 +1018,18 @@ def _value_trunk_treatment_exposure(
         ) from error
     if not math.isfinite(scalar_weight) or scalar_weight < 0.0:
         raise CampaignError("Stage-B scalar value objective weight is malformed")
-    active = scalar_weight > 0.0 and not value_attention_pool
+    # EntityGraphNet routes both the CLS readout and the optional attention-pool
+    # readout through the same scalar-value gradient boundary. Keep the flag in
+    # the receipt as architecture evidence, but it no longer invalidates the
+    # treatment exposure.
+    active = scalar_weight > 0.0
     return {
         "value_objective_contract": "scalar_mse",
         "scalar_value_loss_weight": scalar_weight,
         "value_attention_pool": bool(value_attention_pool),
         "value_trunk_treatment_structurally_active": active,
         "value_trunk_treatment_inactive_reason": (
-            None
-            if active
-            else (
-                "zero_scalar_mse_value_objective"
-                if scalar_weight <= 0.0
-                else "value_attention_pool_bypasses_single_shared_state_boundary"
-            )
+            None if active else "zero_scalar_mse_value_objective"
         ),
     }
 

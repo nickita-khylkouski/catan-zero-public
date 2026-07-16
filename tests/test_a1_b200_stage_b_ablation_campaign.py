@@ -324,15 +324,10 @@ def test_forced_treatment_activates_only_for_typed_one_legal_action_rows(
     [
         (0.25, False, True, None),
         (0.0, False, False, "zero_scalar_mse_value_objective"),
-        (
-            0.25,
-            True,
-            False,
-            "value_attention_pool_bypasses_single_shared_state_boundary",
-        ),
+        (0.25, True, True, None),
     ],
 )
-def test_value_trunk_arm_is_excluded_when_its_boundary_is_inert_or_bypassed(
+def test_value_trunk_arm_is_excluded_only_when_scalar_objective_is_inert(
     value_loss_weight: float,
     value_attention_pool: bool,
     active: bool,
