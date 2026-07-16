@@ -460,6 +460,7 @@ fn gumbel_search_capabilities() -> Vec<&'static str> {
         "belief_target_evidence",
         "initial_road_d1_scope",
         "public_award_feature_parity",
+        "entity_feature_adapter_version",
         "policy_temperature_semantics",
         "coherent_public_belief_search",
         "boundary_value_particles",

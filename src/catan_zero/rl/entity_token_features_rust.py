@@ -71,14 +71,23 @@ _REQUIRED_NATIVE_FEATURE_APIS = (
     "build_entity_features_flat",
     "build_action_context_flat",
 )
-_REQUIRED_NATIVE_FEATURE_CAPABILITY = "public_award_feature_parity"
+_REQUIRED_NATIVE_FEATURE_CAPABILITIES = frozenset(
+    {
+        "public_award_feature_parity",
+        "entity_feature_adapter_version",
+    }
+)
+
+
+def _missing_required_feature_capabilities(module: Any) -> set[str]:
+    capability_fn = getattr(module, "gumbel_search_capabilities", None)
+    if not callable(capability_fn):
+        return set(_REQUIRED_NATIVE_FEATURE_CAPABILITIES)
+    return set(_REQUIRED_NATIVE_FEATURE_CAPABILITIES) - set(capability_fn())
 
 
 def _has_required_feature_capability(module: Any) -> bool:
-    capability_fn = getattr(module, "gumbel_search_capabilities", None)
-    if not callable(capability_fn):
-        return False
-    return _REQUIRED_NATIVE_FEATURE_CAPABILITY in set(capability_fn())
+    return not _missing_required_feature_capabilities(module)
 
 
 def rust_feature_path_available() -> bool:
@@ -111,11 +120,18 @@ def require_rust_feature_path() -> None:
             "Rust feature path requested but the installed catanatron_rs wheel "
             f"is missing {', '.join(missing)}; refusing Python fallback"
         )
-    if not _has_required_feature_capability(catanatron_rs):
+    missing_capabilities = _missing_required_feature_capabilities(catanatron_rs)
+    if missing_capabilities:
+        reasons = []
+        if "public_award_feature_parity" in missing_capabilities:
+            reasons.append("stale public-award semantics")
+        if "entity_feature_adapter_version" in missing_capabilities:
+            reasons.append("stale entity-feature adapter ABI")
         raise RuntimeError(
             "Rust feature path requested but the installed catanatron_rs wheel "
-            f"does not advertise {_REQUIRED_NATIVE_FEATURE_CAPABILITY}; "
-            "refusing a native featurizer with stale public-award semantics"
+            "does not advertise "
+            f"{', '.join(sorted(missing_capabilities))}; refusing a native "
+            f"featurizer with {' and '.join(reasons)}"
         )
 
 
