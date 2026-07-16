@@ -801,6 +801,53 @@ def test_busy_requested_gpu_fails_before_seed_claim(
     assert ledger.read_text() == before
 
 
+def test_real_training_launch_has_bounded_cuda_and_nccl_preflight() -> None:
+    source = _source()
+    health_start = source.index("# NVML can report an idle")
+    state_creation = source.index("# ===== GO path =====")
+    health = source[health_start:state_creation]
+
+    assert '[ "$GO" = "1" ] && [ "$ROLE" = "train" ]' in health
+    assert 'timeout --signal=TERM --kill-after=5 45' in health
+    assert 'CUDA_VISIBLE_DEVICES="$GPU_CSV"' in health
+    assert 'TORCH_NCCL_ASYNC_ERROR_HANDLING=1' in health
+    assert 'torch.distributed.run --standalone --nproc_per_node="$NGPU"' in health
+    assert '"$CUDA_HEALTH_SCRIPT" --expected-devices "$NGPU" --collective' in health
+
+
+def test_failed_cuda_preflight_refuses_before_training_run_state(
+    launcher_env: dict[str, str], tmp_path: Path
+) -> None:
+    tree = Path(launcher_env["TREE"])
+    health_script = tree / "tools" / "cuda_health_preflight.py"
+    health_script.parent.mkdir()
+    health_script.write_text("# mocked by fake interpreter\n")
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    grow_from = tmp_path / "grow.pt"
+    grow_from.write_bytes(b"checkpoint")
+    fake_python = tmp_path / "python"
+    fake_python.write_text("#!/usr/bin/env bash\nexit 42\n")
+    fake_python.chmod(0o755)
+
+    result = _run(
+        launcher_env | {"PY": str(fake_python)},
+        "train",
+        "--data",
+        str(corpus),
+        "--grow-from",
+        str(grow_from),
+        "--trust-curated-data",
+        "--gpus",
+        "0",
+        "--go",
+    )
+
+    assert result.returncode == 3
+    assert "CUDA allocation health preflight failed or timed out (rc=42)" in result.stdout
+    assert not (tree.parent / "fleet_runs").exists()
+
+
 def test_active_mps_client_fails_before_seed_claim(
     launcher_env: dict[str, str], tmp_path: Path
 ) -> None:

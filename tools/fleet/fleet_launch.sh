@@ -426,6 +426,46 @@ else
   FAIL=1
 fi
 
+# NVML can report an idle, healthy-looking device while CUDA context creation
+# hangs in the kernel/driver.  A real training launch must prove the full path
+# before creating run state.  The outer process timeout is intentional: Python
+# timers and process-group timeouts cannot interrupt a blocked CUDA driver call.
+# Multi-GPU training additionally proves one allocation per rank and a real
+# NCCL all-reduce, instead of treating a successful Gloo control-plane probe as
+# evidence that the GPU data plane works.
+if [ "$GO" = "1" ] && [ "$ROLE" = "train" ] && [ "$FAIL" -eq 0 ]; then
+  CUDA_HEALTH_SCRIPT="$TREE/tools/cuda_health_preflight.py"
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "FAIL: GNU timeout is required for the CUDA health preflight"
+    FAIL=1
+  elif [ ! -f "$CUDA_HEALTH_SCRIPT" ]; then
+    echo "FAIL: CUDA health preflight is missing: $CUDA_HEALTH_SCRIPT"
+    FAIL=1
+  elif [ "$NGPU" -gt 1 ]; then
+    echo "checking: bounded CUDA allocation + NCCL health ($NGPU ranks)"
+    timeout --signal=TERM --kill-after=5 45 \
+        env CUDA_VISIBLE_DEVICES="$GPU_CSV" TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+        "$PY" -m torch.distributed.run --standalone --nproc_per_node="$NGPU" \
+        "$CUDA_HEALTH_SCRIPT" --expected-devices "$NGPU" --collective \
+        --process-group-timeout-seconds 20
+    CUDA_HEALTH_RC="$?"
+    if [ "$CUDA_HEALTH_RC" -ne 0 ]; then
+      echo "FAIL: CUDA allocation/NCCL health preflight failed or timed out (rc=$CUDA_HEALTH_RC)"
+      FAIL=1
+    fi
+  else
+    echo "checking: bounded CUDA allocation health (1 device)"
+    timeout --signal=TERM --kill-after=5 30 \
+        env CUDA_VISIBLE_DEVICES="$GPU_CSV" \
+        "$PY" "$CUDA_HEALTH_SCRIPT" --expected-devices 1
+    CUDA_HEALTH_RC="$?"
+    if [ "$CUDA_HEALTH_RC" -ne 0 ]; then
+      echo "FAIL: CUDA allocation health preflight failed or timed out (rc=$CUDA_HEALTH_RC)"
+      FAIL=1
+    fi
+  fi
+fi
+
 # --- build the pinned command per role -------------------------------------
 if [ "$ROLE" = "train" ]; then
   # CAT-128: torch.distributed.run via the RESOLVED venv python (never bare torchrun);
