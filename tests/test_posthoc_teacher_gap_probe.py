@@ -37,13 +37,18 @@ def _report() -> dict:
         "forced_action_weight": 0.1,
         "per_game_policy_weight": True,
         "per_game_policy_weight_mode": "sqrt",
+        "target_reliability_confidence_weighting": True,
+        "target_reliability_confidence_floor": 0.4,
         "forced_row_value_weight": 0.7,
+        "forced_row_value_action_type_weights": {"END_TURN": 0.2},
         "per_game_value_weight": True,
         "per_game_value_weight_mode": "equal",
         "winner_sample_weight": 1.2,
         "loser_sample_weight": 0.3,
         "vp_margin_weight": 0.4,
         "vps_to_win": 10,
+        "track": "2p_no_trade",
+        "graph_history_features": False,
         "mask_hidden_info": True,
         "public_award_feature_contract": "authoritative_v1",
         "public_card_count_features": False,
@@ -65,13 +70,21 @@ def _report() -> dict:
         "amp": "bf16",
         "truncated_vp_margin_value_weight": 0.25,
         "policy_kl_anchor_weight": 0.0,
+        "policy_kl_anchor_direction": "reverse",
         "value_uncertainty_loss_weight": 0.0,
         "aux_subgoal_loss_weight": 0.0,
+        "belief_resource_loss_weight": 0.2,
         "moe_balance_loss_weight": 0.01,
         "value_categorical_loss_weight": 0.0,
         "resolved_categorical_value_loss_weight": 0.0,
         "value_hlgauss_sigma_ratio": 0.75,
         "value_target_lambda": 1.0,
+        "value_root_blend_regime": {
+            "mode": "phase_gated",
+            "phases": ["PLAY_TURN"],
+        },
+        "policy_distillation_scope": None,
+        "value_training_scope": None,
     }
 
 
@@ -81,6 +94,9 @@ class _FakeTrainBC:
         self.corpus_loads = 0
         self.evaluate_calls = []
         self._MASK_HIDDEN_INFO_PLAYER_TOKENS = False
+        self.policy_scope_calls = []
+        self.value_scope_calls = []
+        self.action_catalog = object()
 
     def _training_data_fingerprint(self, path, data_format):
         self.calls["fingerprint"] = (path, data_format)
@@ -108,9 +124,25 @@ class _FakeTrainBC:
         self.calls["policy_weights"] = kwargs
         return np.asarray([1, 2, 3, 4, 5], dtype=np.float32)
 
+    def _apply_authenticated_policy_distillation_scope(self, data, weights):
+        self.policy_scope_calls.append(data)
+        return weights
+
     def build_value_sample_weights(self, data, **kwargs):
         self.calls["value_weights"] = kwargs
         return np.asarray([5, 4, 3, 2, 1], dtype=np.float32)
+
+    def _apply_authenticated_value_training_scope(self, data, weights):
+        self.value_scope_calls.append(data)
+        return weights
+
+    def parse_track(self, track, **kwargs):
+        self.calls["track"] = (track, kwargs)
+        return SimpleNamespace()
+
+    def _action_catalog_for_env_config(self, env_config):
+        self.calls["action_catalog_env"] = env_config
+        return self.action_catalog
 
     def evaluate_bc_batches(self, *args, **kwargs):
         self.calls["evaluate"] = (args, kwargs)
@@ -145,6 +177,14 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
 ):
     module = _module()
     report = _report()
+    report["policy_distillation_scope"] = {
+        "schema_version": "component-policy-distillation-scope-v1",
+        "component_ids": ["current"],
+    }
+    report["value_training_scope"] = {
+        "schema_version": "component-value-training-scope-v1",
+        "component_ids": ["current"],
+    }
     report_path, checkpoint, data, manifest = _paths(tmp_path, report)
     fake = _FakeTrainBC()
     policy = SimpleNamespace(name="policy")
@@ -172,13 +212,23 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
         "vps_to_win": 10,
         "per_game_policy_weight": True,
         "per_game_policy_weight_mode": "sqrt",
+        "target_reliability_confidence_weighting": True,
+        "target_reliability_confidence_floor": 0.4,
     }
+    assert fake.policy_scope_calls == [fake.calls["split"][0]]
     assert fake.calls["value_weights"] == {
         "phase_weights": {"main": 4.0},
         "forced_row_value_weight": 0.7,
+        "forced_row_value_action_type_weights": {"END_TURN": 0.2},
+        "action_catalog": fake.action_catalog,
         "per_game_value_weight": True,
         "per_game_value_weight_mode": "equal",
     }
+    assert fake.value_scope_calls == [fake.calls["split"][0]]
+    assert fake.calls["track"] == (
+        "2p_no_trade",
+        {"vps_to_win": 10, "use_graph_history_features": False},
+    )
     args, kwargs = fake.calls["evaluate"]
     assert args[0] is policy
     assert np.array_equal(args[2], [1, 3])
@@ -188,7 +238,16 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert args[6:10] == (0.7, 0.9, "policy", 0.5)
     assert args[10:14] == (1.0, 0.25, 0.0, 0.0)
     assert kwargs["truncated_vp_margin_value_weight"] == 0.25
+    assert kwargs["policy_kl_anchor_direction"] == "reverse"
+    assert kwargs["belief_resource_loss_weight"] == 0.2
     assert kwargs["moe_balance_loss_weight"] == 0.01
+    assert kwargs["value_root_blend_phases"] == ("PLAY_TURN",)
+    assert kwargs["value_root_blend_global_compat"] is False
+    objective = result["shared_holdout"]["objective_reconstruction"]
+    assert objective["target_reliability_confidence_weighting"] is True
+    assert objective["forced_row_value_action_type_weights"] == {"END_TURN": 0.2}
+    assert objective["policy_kl_anchor_direction"] == "reverse"
+    assert objective["value_target_lambda"] == pytest.approx(1.0)
     assert result["teacher_gap"] == {
         "active_policy_teacher_gap_rows": 2,
         "active_policy_kl_target_model_mean": 0.2,
@@ -198,6 +257,87 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     assert result["legacy_prior_kl"]["prior_kl_ratio"] == 0.75
     assert result["inputs"]["checkpoint"]["sha256"].startswith("sha256:")
     assert result["inputs"]["training_report"]["sha256"].startswith("sha256:")
+
+
+def test_authenticated_scope_makes_excluded_replay_weights_inert(tmp_path, monkeypatch):
+    module = _module()
+    report = _report()
+    report["policy_distillation_scope"] = {
+        "schema_version": "component-policy-distillation-scope-v1",
+        "component_ids": ["current"],
+    }
+    report["value_training_scope"] = {
+        "schema_version": "component-value-training-scope-v1",
+        "component_ids": ["current"],
+    }
+    report_path, _checkpoint, data_path, manifest = _paths(tmp_path, report)
+    fake = _FakeTrainBC()
+    corpus = SimpleNamespace(
+        action_taken=np.arange(5),
+        game_seed=np.arange(5),
+        component_ids=("current", "replay"),
+        policy_distillation_scope_authenticated=True,
+        policy_distillation_component_indices=(0,),
+        value_training_scope_authenticated=True,
+        value_training_component_indices=(0,),
+    )
+    fake.load_teacher_data_memmap = lambda path: corpus
+    fake.split_train_validation_indices = lambda data, **kwargs: {
+        "train": np.asarray([0, 2, 4]),
+        "validation": np.asarray([1, 3]),
+    }
+    fake._apply_authenticated_policy_distillation_scope = lambda data, weights: (
+        np.asarray([weights[0], weights[1], weights[2], 0, 0])
+    )
+    fake._apply_authenticated_value_training_scope = lambda data, weights: np.asarray(
+        [weights[0], weights[1], weights[2], 0, 0]
+    )
+    monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
+
+    first = module._prepare_probe(  # noqa: SLF001
+        report_path=report_path,
+        data_path=data_path,
+        validation_manifest_path=manifest,
+        device="cpu",
+    )
+    fake.build_sample_weights = lambda *args, **kwargs: np.asarray(
+        [1, 2, 3, 1_000_000, 2_000_000], dtype=np.float32
+    )
+    fake.build_value_sample_weights = lambda *args, **kwargs: np.asarray(
+        [5, 4, 3, 1_000_000, 2_000_000], dtype=np.float32
+    )
+    second = module._prepare_probe(  # noqa: SLF001
+        report_path=report_path,
+        data_path=data_path,
+        validation_manifest_path=manifest,
+        device="cpu",
+    )
+
+    assert np.array_equal(first["policy_weights"], second["policy_weights"])
+    assert np.array_equal(first["value_weights"], second["value_weights"])
+    assert first["policy_weights"][3:].tolist() == [0, 0]
+    assert first["value_weights"][3:].tolist() == [0, 0]
+    assert (
+        first["shared_holdout"]["identity_sha256"]
+        == second["shared_holdout"]["identity_sha256"]
+    )
+
+
+def test_authenticated_scope_rejects_training_report_component_drift():
+    module = _module()
+    report = _report()
+    report["policy_distillation_scope"] = {"component_ids": ["replay"]}
+    report["value_training_scope"] = {"component_ids": ["current"]}
+    corpus = SimpleNamespace(
+        component_ids=("current", "replay"),
+        policy_distillation_scope_authenticated=True,
+        policy_distillation_component_indices=(0,),
+        value_training_scope_authenticated=True,
+        value_training_component_indices=(0,),
+    )
+
+    with pytest.raises(SystemExit, match="differs from the loaded corpus"):
+        module._scope_identity(corpus, report)  # noqa: SLF001
 
 
 def test_functional_drift_uses_only_active_multi_action_rows():

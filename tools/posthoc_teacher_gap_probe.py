@@ -237,6 +237,94 @@ def _weight_map(value: Any, field: str) -> dict[str, float]:
     return {str(key): float(weight) for key, weight in value.items()}
 
 
+def _root_blend_args(report: Mapping[str, Any]) -> tuple[tuple[str, ...], bool]:
+    """Rebuild the checkpoint's authenticated root-value target operator."""
+
+    regime = report.get("value_root_blend_regime")
+    if not isinstance(regime, Mapping):
+        return (), False
+    mode = str(regime.get("mode", "disabled"))
+    phases = regime.get("phases", [])
+    if not isinstance(phases, list) or any(
+        not isinstance(item, str) for item in phases
+    ):
+        raise SystemExit("training report value-root-blend phases are malformed")
+    if mode not in {"disabled", "phase_gated", "global_compat"}:
+        raise SystemExit("training report value-root-blend mode is malformed")
+    return tuple(phases), mode == "global_compat"
+
+
+def _forced_row_value_recipe(
+    train_bc, report: Mapping[str, Any]
+) -> tuple[dict[str, float], object | None]:
+    """Rebuild the optional action-typed forced-row value weighting."""
+
+    raw = report.get("forced_row_value_action_type_weights")
+    if raw is None:
+        return {}, None
+    weights = _weight_map(raw, "forced_row_value_action_type_weights")
+    if not weights:
+        return {}, None
+    graph_history_features = _required(report, "graph_history_features")
+    if type(graph_history_features) is not bool:  # noqa: E721
+        raise SystemExit("training report 'graph_history_features' must be a boolean")
+    env_config = train_bc.parse_track(
+        str(_required(report, "track")),
+        vps_to_win=int(_required(report, "vps_to_win")),
+        use_graph_history_features=graph_history_features,
+    )
+    return weights, train_bc._action_catalog_for_env_config(env_config)
+
+
+def _scope_identity(data, report: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind the component eligibility actually reconstructed by the probe."""
+
+    component_ids = tuple(str(value) for value in getattr(data, "component_ids", ()))
+
+    def _one(
+        *, authenticated_attr: str, indices_attr: str, report_field: str
+    ) -> dict[str, Any]:
+        authenticated = bool(getattr(data, authenticated_attr, False))
+        indices = tuple(int(value) for value in getattr(data, indices_attr, ()))
+        if authenticated and (
+            not component_ids
+            or not indices
+            or any(index < 0 or index >= len(component_ids) for index in indices)
+        ):
+            raise SystemExit("authenticated objective component scope is malformed")
+        report_scope = report.get(report_field)
+        if authenticated and not isinstance(report_scope, Mapping):
+            raise SystemExit(
+                f"training report lacks authenticated {report_field!r} telemetry"
+            )
+        eligible_ids = (
+            [component_ids[index] for index in indices]
+            if authenticated
+            else list(component_ids)
+        )
+        if authenticated and report_scope.get("component_ids") != eligible_ids:
+            raise SystemExit(
+                f"training report {report_field!r} differs from the loaded corpus"
+            )
+        return {
+            "authenticated": authenticated,
+            "component_ids": eligible_ids,
+        }
+
+    return {
+        "policy_distillation": _one(
+            authenticated_attr="policy_distillation_scope_authenticated",
+            indices_attr="policy_distillation_component_indices",
+            report_field="policy_distillation_scope",
+        ),
+        "value_training": _one(
+            authenticated_attr="value_training_scope_authenticated",
+            indices_attr="value_training_component_indices",
+            report_field="value_training_scope",
+        ),
+    }
+
+
 def _canonical_sha256(value: object) -> str:
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -394,6 +482,18 @@ def _prepare_probe(
         per_game_policy_weight_mode=str(
             report.get("per_game_policy_weight_mode", "equal")
         ),
+        target_reliability_confidence_weighting=bool(
+            report.get("target_reliability_confidence_weighting", False)
+        ),
+        target_reliability_confidence_floor=float(
+            report.get("target_reliability_confidence_floor", 0.25)
+        ),
+    )
+    policy_weights = train_bc._apply_authenticated_policy_distillation_scope(
+        data, policy_weights
+    )
+    forced_type_weights, forced_action_catalog = _forced_row_value_recipe(
+        train_bc, report
     )
     value_weights = train_bc.build_value_sample_weights(
         data,
@@ -401,8 +501,13 @@ def _prepare_probe(
             _required(report, "value_phase_weights"), "value_phase_weights"
         ),
         forced_row_value_weight=float(_required(report, "forced_row_value_weight")),
+        forced_row_value_action_type_weights=forced_type_weights,
+        action_catalog=forced_action_catalog,
         per_game_value_weight=bool(_required(report, "per_game_value_weight")),
         per_game_value_weight_mode=str(_required(report, "per_game_value_weight_mode")),
+    )
+    value_weights = train_bc._apply_authenticated_value_training_scope(
+        data, value_weights
     )
     eval_batch_size = int(batch_size or _required(report, "batch_size"))
     if eval_batch_size < 1:
@@ -413,6 +518,28 @@ def _prepare_probe(
     )
     award_contract = str(_required(report, "public_award_feature_contract"))
     train_bc._PUBLIC_AWARD_FEATURE_CONTRACT = award_contract
+    blend_phases, blend_global = _root_blend_args(report)
+    scope_identity = _scope_identity(data, report)
+    objective_reconstruction = {
+        "schema_version": "posthoc-objective-reconstruction-v1",
+        "component_scopes": scope_identity,
+        "target_reliability_confidence_weighting": bool(
+            report.get("target_reliability_confidence_weighting", False)
+        ),
+        "target_reliability_confidence_floor": float(
+            report.get("target_reliability_confidence_floor", 0.25)
+        ),
+        "forced_row_value_action_type_weights": forced_type_weights,
+        "policy_kl_anchor_direction": str(
+            report.get("policy_kl_anchor_direction", "forward")
+        ),
+        "belief_resource_loss_weight": float(
+            report.get("belief_resource_loss_weight", 0.0)
+        ),
+        "value_root_blend_phases": list(blend_phases),
+        "value_root_blend_global_compat": blend_global,
+        "value_target_lambda": float(_required(report, "value_target_lambda")),
+    }
     holdout_semantics = {
         "schema_version": "posthoc-shared-holdout-identity/v1",
         "memmap_fingerprint": actual_fingerprint,
@@ -430,6 +557,7 @@ def _prepare_probe(
         "validation_seed": int(report["validation_seed"]),
         "validation_max_samples": int(report["validation_max_samples"]),
         "validation_game_seed_ranges": ranges,
+        "objective_reconstruction": objective_reconstruction,
     }
     return {
         "train_bc": train_bc,
@@ -441,6 +569,7 @@ def _prepare_probe(
         "device": str(device),
         "batch_size": eval_batch_size,
         "award_contract": award_contract,
+        "objective_reconstruction": objective_reconstruction,
         "shared_holdout": {
             **holdout_semantics,
             "identity_sha256": _canonical_sha256(holdout_semantics),
@@ -561,6 +690,7 @@ def _evaluate_policy_metrics(
             report.get("value_categorical_loss_weight", 0.0),
         )
     )
+    blend_phases, blend_global = _root_blend_args(report)
     return train_bc.evaluate_bc_batches(
         policy,
         prepared["data"],
@@ -588,14 +718,22 @@ def _evaluate_policy_metrics(
             _required(report, "truncated_vp_margin_value_weight")
         ),
         policy_kl_anchor_weight=float(_required(report, "policy_kl_anchor_weight")),
+        policy_kl_anchor_direction=str(
+            report.get("policy_kl_anchor_direction", "forward")
+        ),
         value_uncertainty_loss_weight=float(
             _required(report, "value_uncertainty_loss_weight")
         ),
         aux_subgoal_loss_weight=float(_required(report, "aux_subgoal_loss_weight")),
+        belief_resource_loss_weight=float(
+            report.get("belief_resource_loss_weight", 0.0)
+        ),
         moe_balance_loss_weight=float(_required(report, "moe_balance_loss_weight")),
         value_categorical_loss_weight=categorical_weight,
         value_hlgauss_sigma_ratio=float(_required(report, "value_hlgauss_sigma_ratio")),
         value_target_lambda=float(_required(report, "value_target_lambda")),
+        value_root_blend_phases=blend_phases,
+        value_root_blend_global_compat=blend_global,
     )
 
 
@@ -786,6 +924,7 @@ def run_probe(
         "batch_size": int(prepared["batch_size"]),
         "validation_rows": int(shared["validation_rows"]),
         "validation_game_seed_set_sha256": shared["validation_game_seed_set_sha256"],
+        "shared_holdout": shared,
         "teacher_gap": candidate["teacher_gap"],
         "teacher_gap_semantics": candidate["teacher_gap_semantics"],
         "legacy_stored_generation_prior_teacher_gap": candidate[
