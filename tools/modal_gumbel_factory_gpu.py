@@ -40,16 +40,21 @@ run from a checkout that has src/tools/vendor + the cp311 wheel at
   1. Upload the seed checkpoint once:
        modal volume put catan-zero-gumbel-data \
            <local checkpoint_masked.pt> checkpoints/v3a_masked/checkpoint.pt
-  2. SMALL validation (BLOCKS, prints per-part games/hr + aggregate):
+  2. SMALL validation (BLOCKS, prints per-part games/hr + aggregate). The first
+     invocation fails closed and prints the exact runtime/science/size
+     acknowledgement token required for a reviewed legacy-factory launch:
        modal run tools/modal_gumbel_factory_gpu.py::launch_gpu_pilot \
            --run-name gen1_modal_gpu/pilot_v1 \
            --checkpoint-rel checkpoints/v3a_masked/checkpoint.pt \
            --containers 4 --games-per-container 4
-  3. Full wave (GATED on team-lead go, cap 100 containers):
+  3. Full wave (GATED on team-lead go; launch size must be explicit). Its first
+     invocation also fails closed because the pilot token binds a different
+     size; review and supply the exact full-wave token printed by that attempt:
        modal run tools/modal_gumbel_factory_gpu.py::launch_gpu_gen \
            --run-name gen1_modal_gpu/wave1 \
            --checkpoint-rel checkpoints/v3a_masked/checkpoint.pt \
-           --containers 100 --games-per-container 500
+           --containers 44 --games-per-container 500 \
+           --acknowledge-factory-binding <exact-token>
      Spawns and exits; poll with ::summarize, then:
        modal volume get catan-zero-gumbel-data gen1_modal_gpu/wave1 <local_dir>
 """
@@ -101,6 +106,11 @@ APP_NAME = "catan-zero-gumbel-factory-gpu"
 VOLUME_NAME = "catan-zero-gumbel-data"
 REMOTE_ROOT = Path("/root/catan-zero")
 VOLUME_ROOT = Path("/data")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CANONICAL_GENERATION_CONFIG = (
+    REPO_ROOT / "configs/generation/coherent_public_n128.schema18.json"
+)
+PRODUCTION_RUNTIME_CONFIG = REPO_ROOT / "configs/runtime/a1_production_runtime.json"
 
 # The compiled pyo3 engine wheel (manylinux_2_34, cp311). Image uses python 3.11
 # so the cp311 wheel is the ABI match. Rebuilding the wheel? Update BOTH names.
@@ -147,6 +157,10 @@ volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 # environment -- see tests/test_gumbel_resume.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gumbel_factory_resume import resolve_part_resume_action  # noqa: E402
+from modal_gumbel_factory_launch_guard import (  # noqa: E402
+    build_launch_binding,
+    require_acknowledgement,
+)
 
 
 # ------------------------------------------------------------- child process
@@ -444,6 +458,10 @@ def gpu_part_worker(payload: dict[str, Any]) -> dict[str, Any]:
         "public_observation": bool(payload["public_observation"]),
         "base_seed": int(payload["base_seed"]),
         "game_index_start": int(payload["game_index_start"]),
+        "factory_launch_binding": payload["factory_launch_binding"],
+        "factory_launch_binding_sha256": payload["factory_launch_binding"][
+            "binding_sha256"
+        ],
         "elapsed_sec": elapsed,
         "games_per_hour": games_completed / max(elapsed / 3600.0, 1e-9),
         "shards": [
@@ -598,6 +616,45 @@ def _payloads(
     ]
 
 
+def _bind_and_acknowledge_payloads(
+    payloads: list[dict[str, Any]],
+    *,
+    containers: int,
+    games_per_container: int,
+    acknowledgement: str,
+) -> dict[str, Any]:
+    """Bind the exact stale factory inputs before any remote call is scheduled."""
+
+    if not payloads:
+        raise ValueError("refusing an empty Modal GPU factory launch")
+    operational = {
+        "run_name",
+        "run_id",
+        "part_index",
+        "games",
+        "game_index_start",
+        "commit_secs",
+        "resume",
+    }
+    launch_science = {
+        key: value for key, value in payloads[0].items() if key not in operational
+    }
+    binding = build_launch_binding(
+        factory_source=Path(__file__).resolve(),
+        wheel_path=Path(LOCAL_WHEEL_PATH),
+        accelerator="L4",
+        canonical_generation_config=CANONICAL_GENERATION_CONFIG,
+        production_runtime_config=PRODUCTION_RUNTIME_CONFIG,
+        launch_science=launch_science,
+        containers=containers,
+        games_per_container=games_per_container,
+    )
+    require_acknowledgement(binding, acknowledgement)
+    for payload in payloads:
+        payload["factory_launch_binding"] = binding
+    return binding
+
+
 @app.local_entrypoint()
 def launch_gpu_pilot(
     run_name: str = "gen1_modal_gpu/pilot_v1",
@@ -627,6 +684,7 @@ def launch_gpu_pilot(
     fmt: str = "npz_zst",
     commit_secs: float = 240.0,
     resume: bool = False,
+    acknowledge_factory_binding: str = "",
 ) -> None:
     """Small GPU validation run: a few L4 containers x a few games, BLOCKS.
 
@@ -668,6 +726,12 @@ def launch_gpu_pilot(
         commit_secs=commit_secs,
         resume=resume,
     )
+    factory_launch_binding = _bind_and_acknowledge_payloads(
+        payloads,
+        containers=containers,
+        games_per_container=games_per_container,
+        acknowledgement=acknowledge_factory_binding,
+    )
     started = time.perf_counter()
     print(
         json.dumps(
@@ -680,6 +744,9 @@ def launch_gpu_pilot(
                 "gpu": "L4",
                 "public_observation": public_observation,
                 "volume": VOLUME_NAME,
+                "factory_launch_binding_sha256": factory_launch_binding[
+                    "binding_sha256"
+                ],
             },
             sort_keys=True,
         ),
@@ -712,8 +779,8 @@ def launch_gpu_pilot(
 def launch_gpu_gen(
     run_name: str,
     checkpoint_rel: str,
-    containers: int = 100,
-    games_per_container: int = 500,
+    containers: int,
+    games_per_container: int,
     base_seed: int = DEFAULT_BASE_SEED,
     device: str = "cuda",
     public_observation: bool = True,
@@ -737,14 +804,18 @@ def launch_gpu_gen(
     fmt: str = "npz_zst",
     commit_secs: float = 240.0,
     resume: bool = False,
+    acknowledge_factory_binding: str = "",
 ) -> None:
-    """Full generation wave. GATED: pilot numbers + team-lead go. Cap 100 L4s.
+    """Full generation wave. GATED: pilot numbers + exact binding acknowledgement.
 
     Spawn-based (stragglers never block): fires all parts and exits. Poll with
     ::summarize; re-run with resume=True to fill failed/missing parts.
     """
     if containers > 100:
-        raise ValueError(f"containers={containers} exceeds the hard cap of 100 L4 GPUs.")
+        raise ValueError(
+            f"containers={containers} exceeds the 100-part request cap; "
+            "the separate concurrent Modal pool cap remains 44 L4 GPUs"
+        )
     _verify_disjoint_seeds(base_seed, containers, games_per_container)
     run_id = f"{run_name.replace('/', '_')}-{uuid.uuid4().hex[:12]}"
     payloads = _payloads(
@@ -778,6 +849,12 @@ def launch_gpu_gen(
         commit_secs=commit_secs,
         resume=resume,
     )
+    factory_launch_binding = _bind_and_acknowledge_payloads(
+        payloads,
+        containers=containers,
+        games_per_container=games_per_container,
+        acknowledgement=acknowledge_factory_binding,
+    )
     print(
         json.dumps(
             {
@@ -790,6 +867,9 @@ def launch_gpu_gen(
                 "public_observation": public_observation,
                 "base_seed": base_seed,
                 "volume": VOLUME_NAME,
+                "factory_launch_binding_sha256": factory_launch_binding[
+                    "binding_sha256"
+                ],
             },
             sort_keys=True,
         ),
