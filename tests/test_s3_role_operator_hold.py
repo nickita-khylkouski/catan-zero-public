@@ -107,9 +107,16 @@ def _source(tmp_path: Path) -> tuple[Path, Path]:
         "wide_selected_vs_prior_disagreement_rate": 0.5,
     }
     source = tmp_path / "source.json"
-    internal_engine_identity = (
-        promotion._canonical_internal_h2h_engine_identity()  # noqa: SLF001
-    )
+    # This unit fixture verifies exact replay of the current internal identity
+    # schema. Canonical compiled-runtime fingerprinting is covered on H100 and
+    # must not make the pure replay test platform-dependent.
+    internal_engine_identity = {
+        "schema_version": "a1-internal-h2h-engine-identity-v1",
+        "repo_commit": "a" * 40,
+        "native_wheel_sha256": "sha256:" + "b" * 64,
+        "evaluator_sha256": "sha256:" + "c" * 64,
+        "native_runtime_sha256": "sha256:" + "d" * 64,
+    }
     _write(
         source,
         {

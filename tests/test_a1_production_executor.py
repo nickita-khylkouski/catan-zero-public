@@ -1488,7 +1488,9 @@ def test_prepared_bridged_plan_resumes_through_one_bulk_stage_per_host(
 
     assert result["status"] == "launched"
     assert executor._public(plan) == public_before
-    assert [alias for alias, _count in bulk_calls] == [
+    # Hosts stage concurrently, so completion order is intentionally not
+    # deterministic. Every host must still be staged exactly once.
+    assert sorted(alias for alias, _count in bulk_calls) == [
         f"h{index:02d}" for index in range(10)
     ]
     assert all(count > 4 for _alias, count in bulk_calls)

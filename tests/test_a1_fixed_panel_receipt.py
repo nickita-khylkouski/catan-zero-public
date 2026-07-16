@@ -106,7 +106,12 @@ def _write_report(
     return path, checkpoint_sha
 
 
-def _aux_inputs(tmp_path: Path, *, panel_kind: str):
+def _aux_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    panel_kind: str,
+):
     baseline = tmp_path / "baseline.pt"
     baseline.write_bytes(b"baseline")
     baseline_sha = fleet._sha256(baseline)  # noqa: SLF001
@@ -144,6 +149,14 @@ def _aux_inputs(tmp_path: Path, *, panel_kind: str):
     )
     planned_engine_identity = neutral_engine_identity
     if panel_kind == "internal":
+        # Unit tests exercise the canonical identity comparison without
+        # requiring a platform-specific compiled extension in the controller
+        # environment. H100 integration tests cover the real runtime hash.
+        monkeypatch.setattr(
+            fleet,
+            "_native_runtime_sha256",
+            lambda: "sha256:" + "d" * 64,
+        )
         planned_engine_identity = fleet._internal_engine_identity(  # noqa: SLF001
             repo_commit=neutral_engine_identity["repo_commit"],
             wheel_sha256=neutral_engine_identity["native_wheel_sha256"],
@@ -176,8 +189,8 @@ def _aux_inputs(tmp_path: Path, *, panel_kind: str):
     return plan, arm_reports, checkpoints
 
 
-def _aux_internal_inputs(tmp_path: Path):
-    return _aux_inputs(tmp_path, panel_kind="internal")
+def _aux_internal_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    return _aux_inputs(tmp_path, monkeypatch, panel_kind="internal")
 
 
 def _mock_repool(
@@ -206,7 +219,7 @@ def _mock_neutral_repool(
 def test_fixed_panel_v2_replays_raw_games_into_points(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan, reports, checkpoints = _aux_internal_inputs(tmp_path)
+    plan, reports, checkpoints = _aux_internal_inputs(tmp_path, monkeypatch)
     _mock_repool(monkeypatch, reports)
     receipt = fleet.build_fixed_panel_receipt(
         family="AUX",
@@ -255,7 +268,9 @@ def test_fixed_panel_v2_replays_raw_games_into_points(
 def test_fixed_external_panel_binds_native_runtime_across_arms(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan, reports, checkpoints = _aux_inputs(tmp_path, panel_kind="external")
+    plan, reports, checkpoints = _aux_inputs(
+        tmp_path, monkeypatch, panel_kind="external"
+    )
     _mock_neutral_repool(monkeypatch, reports)
     receipt = fleet.build_fixed_panel_receipt(
         family="AUX",
@@ -291,7 +306,7 @@ def test_fixed_external_panel_binds_native_runtime_across_arms(
 def test_fixed_panel_refuses_resealed_forged_points(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan, reports, checkpoints = _aux_internal_inputs(tmp_path)
+    plan, reports, checkpoints = _aux_internal_inputs(tmp_path, monkeypatch)
     _mock_repool(monkeypatch, reports)
     receipt = fleet.build_fixed_panel_receipt(
         family="AUX",
@@ -328,7 +343,7 @@ def test_fixed_panel_refuses_resealed_forged_points(
 def test_fixed_panel_refuses_source_game_mutation_after_seal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan, reports, checkpoints = _aux_internal_inputs(tmp_path)
+    plan, reports, checkpoints = _aux_internal_inputs(tmp_path, monkeypatch)
     _mock_repool(monkeypatch, reports)
     receipt = fleet.build_fixed_panel_receipt(
         family="AUX",
@@ -376,7 +391,7 @@ def test_fixed_panel_refuses_resealed_operator_authority_drift(
     mutation: str,
     error: str,
 ) -> None:
-    plan, reports, checkpoints = _aux_internal_inputs(tmp_path)
+    plan, reports, checkpoints = _aux_internal_inputs(tmp_path, monkeypatch)
     report = json.loads(reports["AUXT"].read_text())
     if mutation == "search":
         report["effective_search_config"]["native_mcts_hot_loop"] = False
