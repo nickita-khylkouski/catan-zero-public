@@ -469,6 +469,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--static-action-residual",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable the structured static-action residual in the entity policy. "
+            "This is a checkpoint-owned architecture flag: omitted inherits an "
+            "init/grow checkpoint and is disabled for a fresh model."
+        ),
+    )
+    parser.add_argument(
+        "--legal-action-value-residual",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Condition the entity value head on the current legal-action set. "
+            "This is a checkpoint-owned architecture flag: omitted inherits an "
+            "init/grow checkpoint and is disabled for a fresh model."
+        ),
+    )
+    parser.add_argument(
         "--meaningful-public-history",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -2430,6 +2450,28 @@ def _checkpoint_public_card_count_features(checkpoint_path: str) -> bool:
         )
     config = config_attr_view(checkpoint["config"])
     return bool(getattr(config, "public_card_count_features", False))
+
+
+def _checkpoint_structured_action_residuals(
+    checkpoint_path: str,
+) -> tuple[bool, bool]:
+    """Read the checkpoint-owned structured action/value architecture flags."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve structured action residuals"
+        )
+    config = config_attr_view(checkpoint["config"])
+    return (
+        bool(getattr(config, "static_action_residual", False)),
+        bool(getattr(config, "legal_action_value_residual", False)),
+    )
 
 
 def _checkpoint_meaningful_public_history(
@@ -7546,6 +7588,16 @@ def _effective_a1_learner_training_recipe(
         effective["per_game_policy_weight_mode"] = str(
             args.per_game_policy_weight_mode
         )
+    if bool(getattr(args, "static_action_residual", False)) or bool(
+        getattr(args, "legal_action_value_residual", False)
+    ):
+        # Additive checkpoint architecture. Historical recipes retain their
+        # exact seal while an enabled repair cannot disappear from recipe
+        # admission or be confused with the legacy blind topology.
+        effective["static_action_residual"] = bool(args.static_action_residual)
+        effective["legal_action_value_residual"] = bool(
+            args.legal_action_value_residual
+        )
     # Additive opt-in objective: historical sealed recipes and old Namespace
     # fixtures predate this field and must remain byte-for-byte exact when it is
     # absent/off. A nonzero value is trajectory-changing and therefore enters
@@ -8773,6 +8825,75 @@ def _resolve_effective_public_card_count_features(
     return False if requested is None else requested
 
 
+def _resolve_effective_structured_action_residuals(
+    args: argparse.Namespace,
+) -> tuple[bool, bool]:
+    """Resolve fresh/resume/grow structured-action architecture exactly."""
+
+    requested_static_raw = getattr(args, "static_action_residual", None)
+    requested_legal_raw = getattr(args, "legal_action_value_residual", None)
+    requested_static = (
+        None if requested_static_raw is None else bool(requested_static_raw)
+    )
+    requested_legal = None if requested_legal_raw is None else bool(requested_legal_raw)
+    if str(args.arch) != "entity_graph":
+        if requested_static or requested_legal:
+            raise SystemExit(
+                "structured action residuals are supported only for "
+                "--arch entity_graph"
+            )
+        return False, False
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited_static, inherited_legal = _checkpoint_structured_action_residuals(
+            init_checkpoint
+        )
+        mismatches = []
+        if requested_static is not None and requested_static != inherited_static:
+            mismatches.append(
+                f"static_action_residual checkpoint={inherited_static} "
+                f"cli={requested_static}"
+            )
+        if requested_legal is not None and requested_legal != inherited_legal:
+            mismatches.append(
+                f"legal_action_value_residual checkpoint={inherited_legal} "
+                f"cli={requested_legal}"
+            )
+        if mismatches:
+            raise SystemExit(
+                "structured action residual flags do not match --init-checkpoint: "
+                + "; ".join(mismatches)
+                + ". Upgrade the checkpoint with the structured_action_value "
+                "upgrade or omit the flags to inherit its exact architecture."
+            )
+        return inherited_static, inherited_legal
+    if grow_checkpoint:
+        inherited_static, inherited_legal = _checkpoint_structured_action_residuals(
+            grow_checkpoint
+        )
+        return (
+            inherited_static if requested_static is None else requested_static,
+            inherited_legal if requested_legal is None else requested_legal,
+        )
+    return (
+        False if requested_static is None else requested_static,
+        False if requested_legal is None else requested_legal,
+    )
+
+
+def _structured_action_create_kwargs(
+    args: argparse.Namespace,
+) -> dict[str, bool]:
+    """Single construction boundary shared by the trainer and wiring tests."""
+
+    return {
+        "static_action_residual": bool(args.static_action_residual),
+        "legal_action_value_residual": bool(args.legal_action_value_residual),
+    }
+
+
 def _resolve_effective_meaningful_public_history(
     args: argparse.Namespace,
 ) -> tuple[bool, int, str]:
@@ -9552,6 +9673,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         _resolve_effective_public_card_count_features(args)
     )
     (
+        args.static_action_residual,
+        args.legal_action_value_residual,
+    ) = _resolve_effective_structured_action_residuals(args)
+    (
         args.meaningful_public_history,
         args.event_history_limit,
         args.meaningful_public_history_pooling,
@@ -9753,6 +9878,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.public_card_count_features = (
         _resolve_effective_public_card_count_features(args)
     )
+    (
+        args.static_action_residual,
+        args.legal_action_value_residual,
+    ) = _resolve_effective_structured_action_residuals(args)
     (
         args.meaningful_public_history,
         args.event_history_limit,
@@ -10295,6 +10424,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     public_card_count_features=bool(
                         args.public_card_count_features
                     ),
+                    **_structured_action_create_kwargs(args),
                     meaningful_public_history=bool(
                         args.meaningful_public_history
                     ),
@@ -25514,6 +25644,18 @@ def _checkpoint_config_mismatches(
                 f"checkpoint={checkpoint_card_counts} cli={requested_card_counts}; "
                 "use a function-preserving card_count checkpoint upgrade"
             )
+        for field in (
+            "static_action_residual",
+            "legal_action_value_residual",
+        ):
+            checkpoint_enabled = bool(getattr(config, field, False))
+            requested_enabled = bool(getattr(args, field, False))
+            if checkpoint_enabled != requested_enabled:
+                mismatches.append(
+                    f"{field} checkpoint={checkpoint_enabled} "
+                    f"cli={requested_enabled}; use the structured_action_value "
+                    "checkpoint upgrade"
+                )
         checkpoint_history = bool(
             getattr(config, "meaningful_public_history", False)
         )
