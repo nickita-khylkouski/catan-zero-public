@@ -35,10 +35,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from catan_zero.rl.meaningful_history import (  # noqa: E402
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT,
 )
 from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
     resolve_checkpoint_entity_feature_adapter,
 )
 from catan_zero.rl.entity_token_features import (  # noqa: E402
@@ -89,6 +92,7 @@ MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V
     "public_card_count_features+meaningful_public_history+"
     "actor_public_rule_state.v4"
 )
+MODULE_CURRENT_V5 = "entity_graph.current_v5_coherent_learner.v1"
 MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY = (
     "entity_graph.meaningful_public_history.ordered_attention.v2"
 )
@@ -433,6 +437,71 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
         },
         "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V4,
     },
+    MODULE_CURRENT_V5: {
+        "flags": {
+            "action_target_gather": True,
+            "static_action_residual": True,
+            "legal_action_value_residual": True,
+            "legal_action_value_set_statistics": True,
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT,
+            "meaningful_public_history_pooling": ORDERED_ATTENTION_V2,
+            "meaningful_public_history_target_gather": True,
+            "public_rule_state_features": True,
+            "public_rule_state_feature_schema": (
+                PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+            ),
+        },
+        "new_parameter_initialization": {
+            "target_gather_proj.0.bias": "zeros",
+            "target_gather_proj.0.weight": "ones",
+            "target_gather_proj.1.bias": "zeros",
+            "target_gather_proj.1.weight": "zeros",
+            "static_action_residual_proj.bias": "zeros",
+            "static_action_residual_proj.weight": "zeros",
+            "legal_action_value_residual_proj.weight": "zeros",
+            "legal_action_value_static_proj.weight": "zeros",
+            "legal_action_value_max_proj.weight": "zeros",
+            "legal_action_value_count_proj.weight": "zeros",
+            "legal_action_value_static_max_proj.weight": "zeros",
+            "public_card_count_residual.weight": "zeros",
+            "meaningful_history_residual_gate": "zeros",
+            "meaningful_history_ordered_gate": "zeros",
+            "meaningful_history_sequence.norm.bias": "zeros",
+            "meaningful_history_sequence.norm.weight": "ones",
+            "meaningful_history_sequence.position_embedding": "zeros",
+            "meaningful_history_sequence.query": "seeded_torch_default",
+            "meaningful_history_target_proj.0.bias": "zeros",
+            "meaningful_history_target_proj.0.weight": "ones",
+            "meaningful_history_target_proj.1.weight": "zeros",
+            "public_rule_state_residual.weight": "zeros",
+        },
+        "config_delta": {
+            "action_target_gather": True,
+            "static_action_residual": True,
+            "legal_action_value_residual": True,
+            "legal_action_value_set_statistics": True,
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT,
+            "meaningful_public_history_pooling": ORDERED_ATTENTION_V2,
+            "meaningful_public_history_target_gather": True,
+            "public_rule_state_features": True,
+            "public_rule_state_feature_schema": (
+                PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+            ),
+        },
+        "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V5,
+    },
     MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY: {
         "flags": {
             "meaningful_public_history": True,
@@ -666,7 +735,10 @@ def _reconstruct_seeded_parameters(
         seed=seed,
         device="cpu",
         entity_feature_adapter_version=(
-            RUST_ENTITY_ADAPTER_V4
+            RUST_ENTITY_ADAPTER_V5
+            if values.get("meaningful_public_history_schema")
+            == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+            else RUST_ENTITY_ADAPTER_V4
             if bool(values.get("public_rule_state_features", False))
             else base.entity_feature_adapter_version
         ),
@@ -840,7 +912,10 @@ def inspect_upgrade(
     ignored = {"model", "config", "upgrade_provenance"}
     if expected_adapter is not None:
         ignored.add("entity_feature_adapter")
-    unexpected_metadata = sorted(set(after) - set(before) - {"upgrade_provenance"})
+    allowed_added_metadata = {"upgrade_provenance"}
+    if expected_adapter is not None:
+        allowed_added_metadata.add("entity_feature_adapter")
+    unexpected_metadata = sorted(set(after) - set(before) - allowed_added_metadata)
     drift = [
         key
         for key in before

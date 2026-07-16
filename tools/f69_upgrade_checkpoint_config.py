@@ -41,13 +41,18 @@ from catan_zero.rl.entity_token_policy import (  # noqa: E402
     EntityGraphConfig,
     EntityGraphPolicy,
 )
-from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V4  # noqa: E402
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
+)
 from catan_zero.rl.entity_token_features import (  # noqa: E402
     PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
 )
 from catan_zero.rl.meaningful_history import (  # noqa: E402
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT,
 )
 from catan_zero.rl.ordered_history import ORDERED_ATTENTION_V2  # noqa: E402
 
@@ -87,6 +92,7 @@ NEW_PARAM_PREFIXES = (
     "meaningful_history_residual_gate",
     "meaningful_history_ordered_gate",
     "meaningful_history_sequence.",
+    "meaningful_history_target_proj.",
     "value_blocks.",
     "value_state_norm.",
     "public_rule_state_residual.",
@@ -178,6 +184,28 @@ def _parse_flags(raw: str) -> dict[str, object]:
             )
             overrides["event_history_limit"] = MEANINGFUL_PUBLIC_HISTORY_LIMIT
             overrides["meaningful_public_history_pooling"] = ORDERED_ATTENTION_V2
+        elif entry in (
+            "history_v2",
+            "meaningful_history_v2",
+            "meaningful_public_history_v2",
+        ):
+            overrides["meaningful_public_history"] = True
+            overrides["meaningful_public_history_schema"] = (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+            )
+            overrides["event_history_limit"] = MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT
+            overrides["meaningful_public_history_pooling"] = ORDERED_ATTENTION_V2
+        elif entry in (
+            "history_target_gather",
+            "meaningful_history_target_gather",
+        ):
+            overrides["meaningful_public_history_target_gather"] = True
+        elif entry in (
+            "legal_action_value_set_statistics",
+            "value_set_statistics",
+        ):
+            overrides["legal_action_value_residual"] = True
+            overrides["legal_action_value_set_statistics"] = True
         elif entry in (
             "public_rule_state",
             "public_rule_state_features",
@@ -386,7 +414,10 @@ def main() -> None:
         seed=int(args.seed),
         device=args.device,
         entity_feature_adapter_version=(
-            RUST_ENTITY_ADAPTER_V4
+            RUST_ENTITY_ADAPTER_V5
+            if overrides.get("meaningful_public_history_schema")
+            == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+            else RUST_ENTITY_ADAPTER_V4
             if bool(overrides.get("public_rule_state_features", False))
             else base.entity_feature_adapter_version
         ),
@@ -422,6 +453,8 @@ def main() -> None:
         mutated_keys=(
             ("model", "config", "entity_feature_adapter")
             if bool(overrides.get("public_rule_state_features", False))
+            or overrides.get("meaningful_public_history_schema")
+            == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
             else ("model", "config")
         ),
     )
