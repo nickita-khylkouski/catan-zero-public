@@ -106,6 +106,33 @@ def test_factory_keeps_forced_policy_rows_out_of_fresh_training(tmp_path: Path) 
     assert command[command.index("--forced-action-weight") + 1] == "0.0"
 
 
+def test_factory_trains_the_scalar_readout_deployed_by_search(tmp_path: Path) -> None:
+    result = _dry_run(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    train_argv = command[command.index("tools/train_bc.py") + 1 :]
+    resolved = train_bc.build_parser().parse_args(train_argv)
+
+    assert resolved.scalar_value_loss_readout == "deployed_tanh"
+    assert resolved.scalar_value_loss_scale == pytest.approx(1.0)
+
+
+def test_factory_can_replay_the_legacy_raw_scalar_readout(tmp_path: Path) -> None:
+    result = _dry_run(
+        tmp_path,
+        "--scalar-value-loss-readout",
+        "raw",
+        "--scalar-value-loss-scale",
+        "2.0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    assert command[command.index("--scalar-value-loss-readout") + 1] == "raw"
+    assert command[command.index("--scalar-value-loss-scale") + 1] == "2.0"
+
+
 def test_factory_phase_weights_match_production_prompt_vocabulary(tmp_path: Path) -> None:
     result = _dry_run(tmp_path)
 

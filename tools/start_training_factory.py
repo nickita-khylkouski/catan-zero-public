@@ -142,6 +142,22 @@ def main() -> None:
         ),
     )
     parser.add_argument("--value-loss-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--scalar-value-loss-readout",
+        choices=("raw", "deployed_tanh"),
+        default="deployed_tanh",
+        help=(
+            "Scalar value function optimized by BC. Fresh factory runs default to "
+            "the tanh readout deployed by scalar MCTS; use raw only to replay a "
+            "historical recipe."
+        ),
+    )
+    parser.add_argument(
+        "--scalar-value-loss-scale",
+        type=float,
+        default=1.0,
+        help="Scale inside the deployed tanh scalar value readout.",
+    )
     parser.add_argument("--final-vp-loss-weight", type=float, default=0.05)
     parser.add_argument(
         "--teacher-weights",
@@ -380,6 +396,10 @@ def main() -> None:
             str(args.loser_sample_weight),
             "--value-loss-weight",
             str(args.value_loss_weight),
+            "--scalar-value-loss-readout",
+            args.scalar_value_loss_readout,
+            "--scalar-value-loss-scale",
+            str(args.scalar_value_loss_scale),
             "--final-vp-loss-weight",
             str(args.final_vp_loss_weight),
             "--teacher-weights",
