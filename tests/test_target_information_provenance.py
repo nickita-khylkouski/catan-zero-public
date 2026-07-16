@@ -80,6 +80,19 @@ def test_public_teacher_regimes_cannot_be_mixed():
         )
 
 
+def test_legacy_rows_remain_usable_for_value_only_rehearsal():
+    data = _data(
+        [
+            TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+            TARGET_INFORMATION_REGIME_PUBLIC,
+        ]
+    )
+    data["policy_weight_multiplier"] = np.asarray([1.0, 0.0], dtype=np.float32)
+    report = _admit(data)
+    assert report["search_objective_active_rows"] == 1
+    assert report["mismatched_target_information_rows"] == 0
+
+
 @pytest.mark.parametrize(
     "regime", ["authoritative_hidden_state_search_v1", "unknown", ""]
 )

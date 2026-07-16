@@ -3,8 +3,9 @@
 
 This is a thin campaign layer over ``a1_one_dose_train``.  It does not invent
 another trainer.  Four 8xB200 arms independently reload the same exact f7
-function-preserving initializer with fresh Adam and differ only in the number
-of auxiliary policy-active rows sampled per rank and optimizer step.
+function-preserving initializer with fresh Adam and differ only in the explicit
+coefficient on an independently normalized auxiliary policy objective. The AUX
+batch size is fixed across arms and controls estimator variance only.
 
 The tool deliberately has two gates before optimizer launch:
 
@@ -52,7 +53,7 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools.fleet import a1_coherent_target_rd_executor as coherent_executor  # noqa: E402
 
 
-SCHEMA = "a1-b200-active-policy-exposure-campaign-v1"
+SCHEMA = "a1-b200-active-policy-exposure-campaign-v2"
 ADMISSION_SCHEMA = "a1-coherent-n128-corpus-admission-v1"
 FINGERPRINT_SCHEMA = "a1-b200-active-policy-fingerprint-v2"
 DOSE_TELEMETRY_SCHEMA = "a1-active-policy-dose-telemetry-v2"
@@ -85,7 +86,7 @@ TRAIN_DIAGNOSTIC_CADENCE = 16
 OBJECTIVE_GRADIENT_CADENCE = 64
 CAMPAIGN_LR = 6e-5
 CAMPAIGN_LR_WARMUP_STEPS = 16
-BASE_AUX_ACTIVE_BATCH_SIZE = 463
+POLICY_AUX_ACTIVE_BATCH_SIZE = 128
 ARM_MULTIPLIERS = {
     "P10": 0.10,
     "P25": 0.25,
@@ -95,9 +96,8 @@ ARM_MULTIPLIERS = {
 ARMS = {
     arm: {
         "active_policy_branch_multiplier": multiplier,
-        "policy_aux_active_batch_size": int(
-            math.floor(BASE_AUX_ACTIVE_BATCH_SIZE * multiplier + 0.5)
-        ),
+        "policy_aux_active_batch_size": POLICY_AUX_ACTIVE_BATCH_SIZE,
+        "policy_aux_loss_weight": float(multiplier),
     }
     for arm, multiplier in ARM_MULTIPLIERS.items()
 }
@@ -642,6 +642,7 @@ def _arm_overrides(arm: str, science_recipe: Mapping[str, Any]) -> dict[str, Any
         "policy_aux_active_batch_size": int(
             ARMS[arm]["policy_aux_active_batch_size"]
         ),
+        "policy_aux_loss_weight": float(ARMS[arm]["policy_aux_loss_weight"]),
     }
 
 
@@ -856,12 +857,12 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "base_row_draws": GLOBAL_BATCH_SIZE * MAX_STEPS,
         },
         "treatment": {
-            "field": "policy_aux_active_batch_size",
+            "field": "policy_aux_loss_weight",
             "interpretation": (
-                "auxiliary draws conditioned on authenticated positive-policy rows; "
-                "global policy/value losses remain unchanged"
+                "independently normalized AUX policy mean; batch size is fixed "
+                "and cannot redefine objective strength"
             ),
-            "base_aux_active_batch_size": BASE_AUX_ACTIVE_BATCH_SIZE,
+            "fixed_policy_aux_active_batch_size": POLICY_AUX_ACTIVE_BATCH_SIZE,
         },
         "canonical_learner": {
             "science_contract": str(current_science.CONTRACT_PATH),
@@ -1027,6 +1028,8 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
         != ",".join(map(str, INTERMEDIATE_STEPS))
         or int(_option(command, "--policy-aux-active-batch-size"))
         != int(ARMS[arm]["policy_aux_active_batch_size"])
+        or float(_option(command, "--policy-aux-loss-weight"))
+        != float(ARMS[arm]["policy_aux_loss_weight"])
         or int(_option(command, "--train-diagnostics-every-batches"))
         != TRAIN_DIAGNOSTIC_CADENCE
         or int(
@@ -1068,6 +1071,7 @@ def _dry_run_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, Any]:
         "policy_aux_active_batch_size": ARMS[arm][
             "policy_aux_active_batch_size"
         ],
+        "policy_aux_loss_weight": ARMS[arm]["policy_aux_loss_weight"],
         "max_steps": MAX_STEPS,
     }
     drift = {
@@ -1397,6 +1401,7 @@ def _verify_completed_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, An
     checkpoint = _regular_file(arm_root / "candidate.pt", where=f"arm {arm} checkpoint")
     outputs = receipt.get("outputs")
     expected_aux = int(ARMS[arm]["policy_aux_active_batch_size"])
+    expected_aux_weight = float(ARMS[arm]["policy_aux_loss_weight"])
     expected_aux_rows = expected_aux * WORLD_SIZE * MAX_STEPS
     requested = report.get("checkpoint_steps_requested")
     intermediate = report.get("intermediate_checkpoints")
@@ -1410,6 +1415,7 @@ def _verify_completed_arm(campaign: Mapping[str, Any], arm: str) -> dict[str, An
         or report.get("steps_completed") != MAX_STEPS
         or report.get("optimizer_restored") is not False
         or report.get("policy_aux_active_batch_size") != expected_aux
+        or report.get("policy_aux_loss_weight") != expected_aux_weight
         or report.get("policy_aux_active_rows") != expected_aux_rows
         or requested != list(INTERMEDIATE_STEPS)
         or not isinstance(intermediate, list)
@@ -1681,6 +1687,7 @@ def _fingerprint_arm(
         "policy_aux_active_batch_size": ARMS[arm][
             "policy_aux_active_batch_size"
         ],
+        "policy_aux_loss_weight": ARMS[arm]["policy_aux_loss_weight"],
         "dose_telemetry": completed["dose_telemetry"],
         "parent_checkpoint_sha256": _file_sha256(parent),
         "checkpoints": records,
@@ -1721,6 +1728,8 @@ def _select(
             != ARMS[arm]["active_policy_branch_multiplier"]
             or fingerprint.get("policy_aux_active_batch_size")
             != ARMS[arm]["policy_aux_active_batch_size"]
+            or fingerprint.get("policy_aux_loss_weight")
+            != ARMS[arm]["policy_aux_loss_weight"]
             or fingerprint.get("parent_checkpoint_sha256")
             != campaign["lineage_contract"]["upgraded_initializer_sha256"]
             or not isinstance(fingerprint.get("dose_telemetry"), dict)

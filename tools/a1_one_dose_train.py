@@ -246,6 +246,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "value_trunk_grad_scale",
         "policy_loss_weight",
         "policy_aux_active_batch_size",
+        "policy_aux_loss_weight",
         "soft_target_source",
         "soft_target_weight",
         "soft_target_temperature",
@@ -3292,6 +3293,13 @@ def bind_learner_ablation(
             "public_card_lr_mult requires the receipt-backed public-card "
             "function-preserving initializer"
         )
+    aux_batch_declared = "policy_aux_active_batch_size" in overrides
+    aux_weight_declared = "policy_aux_loss_weight" in overrides
+    if aux_batch_declared != aux_weight_declared:
+        raise ExecutorError(
+            "policy AUX ablations must declare policy_aux_active_batch_size and "
+            "policy_aux_loss_weight together; batch size is not an objective dose"
+        )
     bound = dict(verified["recipe"])
     effective = dict(bound)
     # Added after the original sealed A1 lock. Default 1.0 is the exact
@@ -3304,6 +3312,8 @@ def bind_learner_ablation(
     # derived recipe so enabling the existing CAT-60 path can never silently
     # mean equal when an operator intended sqrt (or vice versa).
     effective["per_game_value_weight_mode"] = "equal"
+    if aux_batch_declared:
+        effective["policy_aux_loss_weight"] = 1.0
     if "value_trunk_grad_scale" in overrides:
         effective["value_trunk_grad_scale"] = 1.0
     for key, value in overrides.items():
@@ -3341,6 +3351,7 @@ def bind_learner_ablation(
             if key
             in {
                 "value_trunk_grad_scale",
+                "policy_aux_loss_weight",
                 "public_card_lr_mult",
                 "trunk_lr_mult",
                 "policy_kl_target",
@@ -3370,6 +3381,7 @@ def bind_learner_ablation(
         "value_trunk_grad_scale": (0.0, 1.0, True),
         "policy_loss_weight": (0.0, None, True),
         "policy_aux_active_batch_size": (0.0, None, True),
+        "policy_aux_loss_weight": (0.0, 4.0, False),
         "soft_target_weight": (0.0, 1.0, True),
         "soft_target_temperature": (0.0, None, False),
         "soft_target_min_legal_coverage": (0.0, 1.0, True),
@@ -3489,6 +3501,10 @@ def bind_learner_ablation(
         drift["policy_aux_active_batch_size"] = {
             "contract": 0,
             "effective": effective["policy_aux_active_batch_size"],
+        }
+        drift["policy_aux_loss_weight"] = {
+            "contract": "disabled with policy_aux_active_batch_size=0",
+            "effective": effective["policy_aux_loss_weight"],
         }
     if effective.get("value_trunk_grad_scale", 1.0) != 1.0:
         drift["value_trunk_grad_scale"] = {
@@ -3776,6 +3792,9 @@ def bind_diagnostic_training_descriptor(
         policy_aux_batch = int(effective_recipe.get("policy_aux_active_batch_size", 0))
         if policy_aux_batch > 0:
             derived_overrides["policy_aux_active_batch_size"] = policy_aux_batch
+            derived_overrides["policy_aux_loss_weight"] = float(
+                effective_recipe["policy_aux_loss_weight"]
+            )
 
     derived = copy.deepcopy(base)
     derived["learner_recipe_overrides"] = derived_overrides
@@ -5590,6 +5609,12 @@ def _build_direct_train_command(
             [
                 "--policy-aux-active-batch-size",
                 str(recipe["policy_aux_active_batch_size"]),
+            ]
+        )
+        command.extend(
+            [
+                "--policy-aux-loss-weight",
+                str(recipe["policy_aux_loss_weight"]),
             ]
         )
     central_binding = verified.get("central_learner_binding")
@@ -9311,6 +9336,7 @@ def _verify_training_outputs(
         exposure = lineage_dose["objective_exposure"]
         expected_draws = {
             "policy_aux_active_batch_size": int(recipe["policy_aux_active_batch_size"]),
+            "policy_aux_loss_weight": float(recipe["policy_aux_loss_weight"]),
             "base_training_row_draws": int(exposure["base_sampled_rows"]),
             "policy_aux_training_row_draws": int(
                 exposure["policy_aux_active_sampled_rows"]

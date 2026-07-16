@@ -265,6 +265,7 @@ def _training_report(
         "policy_aux_active_batch_size": int(
             recipe.get("policy_aux_active_batch_size", 0)
         ),
+        "policy_aux_loss_weight": float(recipe.get("policy_aux_loss_weight", 1.0)),
     }
     payload = {
         "arch": "entity_graph",
@@ -380,6 +381,7 @@ def _training_report(
                 "policy_aux_active_batch_size": recipe[
                     "policy_aux_active_batch_size"
                 ],
+                "policy_aux_loss_weight": recipe["policy_aux_loss_weight"],
                 "training_row_draws": base_draws,
                 "base_training_row_draws": base_draws,
                 "policy_aux_training_row_draws": aux_draws,
@@ -1467,11 +1469,15 @@ def test_policy_aux_active_dose_is_typed_and_command_bound(
     derived = executor.bind_learner_ablation(
         verified,
         ablation_id="policy-aux-128",
-        overrides_json='{"policy_aux_active_batch_size":128}',
+        overrides_json=(
+            '{"policy_aux_active_batch_size":128,'
+            '"policy_aux_loss_weight":0.25}'
+        ),
         reviewed_code_tree_sha256=code_sha,
     )
 
     assert derived["recipe"]["policy_aux_active_batch_size"] == 128
+    assert derived["recipe"]["policy_aux_loss_weight"] == 0.25
     assert derived["learner_ablation"]["recipe_drift"][
         "policy_aux_active_batch_size"
     ] == {
@@ -1485,6 +1491,7 @@ def test_policy_aux_active_dose_is_typed_and_command_bound(
         report=tmp_path / "report.json",
     )
     assert _option(command, "--policy-aux-active-batch-size") == "128"
+    assert _option(command, "--policy-aux-loss-weight") == "0.25"
     parsed = executor.train_bc.build_parser().parse_args(command[2:])
     assert executor.train_bc.TrainConfig.from_namespace(
         parsed
@@ -2634,6 +2641,7 @@ def test_report_binding_seals_exact_base_value_and_policy_doses(
 ) -> None:
     verified = _verified(tmp_path)
     verified["recipe"]["policy_aux_active_batch_size"] = 128
+    verified["recipe"]["policy_aux_loss_weight"] = 0.25
     checkpoint = tmp_path / "candidate.pt"
     report = tmp_path / "report.json"
     report.write_text(json.dumps(_training_report(verified, checkpoint)))
@@ -2711,6 +2719,7 @@ def test_report_binding_seals_exact_ordinary_production_objective_dose(
 def test_exact_policy_dose_binding_refuses_counter_drift(tmp_path: Path) -> None:
     verified = _verified(tmp_path)
     verified["recipe"]["policy_aux_active_batch_size"] = 128
+    verified["recipe"]["policy_aux_loss_weight"] = 0.25
     checkpoint = tmp_path / "candidate.pt"
     payload = _training_report(verified, checkpoint)
     payload["policy_total_active_rows"] += 1

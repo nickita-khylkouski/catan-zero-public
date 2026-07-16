@@ -47,6 +47,7 @@ WORLD_SIZE = 8
 LOCAL_BATCH_SIZE = 512
 GLOBAL_BATCH_SIZE = WORLD_SIZE * LOCAL_BATCH_SIZE
 POLICY_AUX_ACTIVE_BATCH_SIZE = 64
+POLICY_AUX_LOSS_WEIGHT = 0.25
 MAX_STEPS = 32
 CHECKPOINT_STEPS = (1, 2, 4, 8, 12, 16, 24, 32)
 INTERMEDIATE_CHECKPOINT_STEPS = CHECKPOINT_STEPS[:-1]
@@ -129,6 +130,7 @@ def _recipe() -> dict[str, Any]:
         "lr": LR,
         "lr_warmup_steps": LR_WARMUP_STEPS,
         "policy_aux_active_batch_size": POLICY_AUX_ACTIVE_BATCH_SIZE,
+        "policy_aux_loss_weight": POLICY_AUX_LOSS_WEIGHT,
         "policy_loss_weight": 1.0,
         "soft_target_source": "policy",
         "soft_target_weight": 1.0,

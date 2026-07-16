@@ -1006,6 +1006,18 @@ def build_parser() -> argparse.ArgumentParser:
             "only. 0 (default) is a strict no-op."
         ),
     )
+    parser.add_argument(
+        "--policy-aux-loss-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Explicit coefficient for the independently normalized policy-AUX "
+            "objective: base_policy_mean + weight * aux_policy_mean. AUX batch "
+            "size controls estimator variance and coverage only; it no longer "
+            "silently changes the objective strength with row weights or DDP "
+            "world size. Used only when --policy-aux-active-batch-size > 0."
+        ),
+    )
     # EXP3 (value-reuse-discipline ablation, task #40): at a fixed policy recipe,
     # value-loss-weight 0.10 was strictly better than 0.25 under multi-epoch reuse
     # (same policy loss, lower value overfit). RUN-6 adopts 0.10 as the default.
@@ -4022,7 +4034,10 @@ def _preflight_flywheel_diagnostic_derivative(
             "lr_warmup_steps",
             "lr_schedule",
         }
-        optional_lr_dose_keys = {"policy_aux_active_batch_size"}
+        optional_lr_dose_keys = {
+            "policy_aux_active_batch_size",
+            "policy_aux_loss_weight",
+        }
         science_profile_keys = {public_card_key, surprise_key}
         allowed_additions = {
             typed_key,
@@ -4075,6 +4090,14 @@ def _preflight_flywheel_diagnostic_derivative(
                     lr_dose_valid
                     and type(policy_aux) is int
                     and 1 <= policy_aux <= 512
+                )
+                policy_aux_loss_weight = effective_overrides.get(
+                    "policy_aux_loss_weight"
+                )
+                lr_dose_valid = (
+                    lr_dose_valid
+                    and type(policy_aux_loss_weight) is float
+                    and 0.0 < policy_aux_loss_weight <= 4.0
                 )
         if (
             set(base_overrides) - set(effective_overrides)
@@ -5236,6 +5259,7 @@ def _validate_composite_learner_recipe_authorization(
         "per_game_value_weight": bool,
         "per_game_value_weight_mode": str,
         "policy_aux_active_batch_size": int,
+        "policy_aux_loss_weight": float,
         "policy_loss_weight": float,
         "policy_surprise_weight": float,
         "public_card_lr_mult": float,
@@ -7571,6 +7595,7 @@ def _effective_a1_learner_training_recipe(
     )
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         effective["policy_aux_active_batch_size"] = int(args.policy_aux_active_batch_size)
+        effective["policy_aux_loss_weight"] = float(args.policy_aux_loss_weight)
     # Additive provenance: old authenticated recipes remain byte-for-byte valid
     # when the backward-compatible flag is off, while future rank-offset runs
     # bind the trajectory-changing opt-in explicitly.
@@ -8446,6 +8471,7 @@ def _validate_a1_learner_training_recipe(
     authorized_extra_fields = {"per_game_value_weight_mode"}
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         authorized_extra_fields.add("policy_aux_active_batch_size")
+        authorized_extra_fields.add("policy_aux_loss_weight")
     if float(getattr(args, "value_trunk_grad_scale", 1.0)) != 1.0:
         authorized_extra_fields.add("value_trunk_grad_scale")
     if effective.get("forced_row_value_action_type_weights"):
@@ -8491,6 +8517,10 @@ def _validate_a1_learner_training_recipe(
         drift["policy_aux_active_batch_size"] = {
             "contract": 0,
             "effective": int(effective["policy_aux_active_batch_size"]),
+        }
+        drift["policy_aux_loss_weight"] = {
+            "contract": "disabled with policy_aux_active_batch_size=0",
+            "effective": float(effective["policy_aux_loss_weight"]),
         }
     if "value_trunk_grad_scale" in effective:
         drift["value_trunk_grad_scale"] = {
@@ -9678,6 +9708,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
     if int(args.policy_aux_active_batch_size) < 0:
         raise SystemExit("--policy-aux-active-batch-size must be >= 0")
+    if not math.isfinite(float(args.policy_aux_loss_weight)) or float(
+        args.policy_aux_loss_weight
+    ) <= 0.0:
+        raise SystemExit("--policy-aux-loss-weight must be finite and > 0")
     if int(args.policy_aux_active_batch_size) > 0:
         if args.arch not in {"xdim_graph", "entity_graph"}:
             raise SystemExit(
@@ -12262,6 +12296,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                             "policy_aux_data": policy_aux_data,
                             "policy_aux_batch": policy_aux_batch,
                             "policy_aux_sample_weights": batch_policy_weights,
+                            "policy_aux_loss_weight": float(
+                                args.policy_aux_loss_weight
+                            ),
                         }
                         if policy_aux_batch is not None
                         else {}
@@ -14150,6 +14187,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "soft_target_min_legal_coverage": args.soft_target_min_legal_coverage,
         "policy_loss_weight": args.policy_loss_weight,
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
+        "policy_aux_loss_weight": float(args.policy_aux_loss_weight),
         "policy_aux_active_rows": int(
             sum(int(metric.get("policy_aux_active_rows", 0)) for metric in metrics)
         ),
@@ -15314,6 +15352,7 @@ def _train_xdim_batch(
     policy_aux_data=None,
     policy_aux_batch: np.ndarray | None = None,
     policy_aux_sample_weights: np.ndarray | None = None,
+    policy_aux_loss_weight: float = 1.0,
     measure_objective_gradient_interference: bool = False,
     measure_aux_gradient_geometry_only: bool = False,
     value_trunk_grad_scale: float = 1.0,
@@ -15455,7 +15494,15 @@ def _train_xdim_batch(
             per_sample_loss, policy_weights
         )
         policy_base_loss_denominator = policy_loss_denominator
-        policy_aux_loss_sum, _ = _zero_loss_parts(policy.device)
+        policy_base_loss = _weighted_mean_from_parts(
+            policy_loss_sum, policy_base_loss_denominator
+        )
+        policy_aux_loss_sum, policy_aux_loss_denominator = _zero_loss_parts(
+            policy.device
+        )
+        policy_aux_loss = torch.tensor(
+            0.0, dtype=torch.float32, device=policy.device
+        )
         policy_aux_active_count = 0
         policy_aux_correct_count = 0
         policy_aux_top3_correct_count = 0
@@ -15524,7 +15571,8 @@ def _train_xdim_batch(
                 aux_per_sample = aux_hard
             aux_sum, aux_denominator = _weighted_loss_parts(aux_per_sample, aux_weights)
             policy_aux_loss_sum = aux_sum
-            policy_loss_sum = policy_loss_sum + aux_sum
+            policy_aux_loss_denominator = aux_denominator
+            policy_aux_loss = _weighted_mean_from_parts(aux_sum, aux_denominator)
             policy_aux_active_count = int(len(policy_aux_batch))
             aux_predictions = torch.argmax(aux_outputs["logits"], dim=-1)
             policy_aux_correct_count = int(
@@ -15575,12 +15623,12 @@ def _train_xdim_batch(
                     aux_logits_np,
                     field="teacher_name",
                 )
-        # Preserve the complete base-policy objective. The auxiliary stream is
-        # an additive dose measured relative to the base denominator, not a
-        # larger joint batch that dilutes base learning by B/(B+A). Equivalently
-        # this is base_mean + (aux_weight/base_weight) * aux_mean.
-        policy_loss = _weighted_mean_from_parts(
-            policy_loss_sum, policy_base_loss_denominator
+        # Batch size is a Monte-Carlo estimator/throughput knob, not a hidden
+        # science coefficient. Normalize the base and AUX measures independently
+        # so row weights and DDP world size cannot silently redefine AUX strength.
+        policy_loss = (
+            policy_base_loss
+            + float(policy_aux_loss_weight) * policy_aux_loss
         )
         value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
@@ -15879,13 +15927,10 @@ def _train_xdim_batch(
             )
             policy_aux_objective = None
             if policy_aux_batch is not None:
-                # Report the auxiliary contribution using the same base
-                # denominator as the real additive objective above.
-                policy_aux_objective = float(policy_loss_weight) * (
-                    _weighted_mean_from_parts(
-                        policy_aux_loss_sum,
-                        policy_base_loss_denominator,
-                    )
+                policy_aux_objective = (
+                    float(policy_loss_weight)
+                    * float(policy_aux_loss_weight)
+                    * policy_aux_loss
                 )
             value_objective = (
                 float(value_loss_weight) * value_loss
@@ -16164,14 +16209,21 @@ def _train_xdim_batch(
             else "scalar_mse"
         ),
         "scalar_value_mse_diagnostic": float(value_loss.item()),
-        "policy_loss_weighted_sum": float(policy_loss_sum.item()),
+        "policy_loss_weighted_sum": float(
+            (policy_loss.detach() * policy_base_loss_denominator).item()
+        ),
         "policy_loss_weight_sum": float(policy_loss_denominator.item()),
+        "policy_base_loss": float(policy_base_loss.item()),
+        "policy_base_loss_weighted_sum": float(policy_loss_sum.item()),
         "policy_base_loss_weight_sum": float(
             policy_base_loss_denominator.item()
         ),
-        "policy_aux_loss_weight_sum": float(aux_denominator.item())
+        "policy_aux_loss": float(policy_aux_loss.item()),
+        "policy_aux_loss_weighted_sum": float(policy_aux_loss_sum.item()),
+        "policy_aux_loss_weight_sum": float(policy_aux_loss_denominator.item())
         if policy_aux_batch is not None
         else 0.0,
+        "policy_aux_loss_coefficient": float(policy_aux_loss_weight),
         "value_loss_weighted_sum": float(value_loss_sum.item()),
         "value_loss_weight_sum": float(value_loss_denominator.item()),
         "final_vp_loss_weighted_sum": float(final_vp_loss_sum.item()),
@@ -19071,12 +19123,10 @@ def _validate_target_information_admission(
     """Fail closed before public-information training consumes search targets.
 
     Observation masking and search-state safety are independent contracts.  A
-    masked student may use realised outcomes and hard recorded actions from a
-    legacy corpus only when every search-derived objective is disabled for the
-    run.  The current trainer configures those objectives corpus-wide, so a
-    mixed corpus is admitted to them only when every row explicitly carries a
-    recognized public-search regime. Missing provenance is ``unknown`` and is
-    intentionally unsafe.
+    masked student may still use realised outcomes from legacy rows, but every
+    row that is active for a search-derived objective must bind the one exact
+    requested operator. Public PIMC and coherent-public search are both
+    information-safe yet are not interchangeable policy-improvement teachers.
     """
 
     n = int(len(data["action_taken"]))
@@ -19142,11 +19192,54 @@ def _validate_target_information_admission(
             "required_target_information_regime must name one exact supported "
             f"public search operator, got {required_regime!r}"
         )
-    mismatched_target_rows = n - int(counts.get(required_regime, 0))
+    policy_active = np.ones(n, dtype=np.bool_)
+    if "policy_weight_multiplier" in data:
+        policy_active = np.asarray(data["policy_weight_multiplier"]) > 0.0
+        if policy_active.shape != (n,):
+            raise SystemExit("policy_weight_multiplier shape drift during admission")
+    objective_active = np.zeros(n, dtype=np.bool_)
+    if any(
+        objective
+        in {
+            "soft_policy",
+            "q_target",
+            "policy_kl_anchor",
+            "policy_surprise_sampling",
+            "per_game_capped_policy_surprise_sampling",
+        }
+        for objective in objectives
+    ):
+        objective_active |= policy_active
+    if "root_value" in objectives:
+        if "root_value_mask" in data:
+            root_active = np.asarray(data["root_value_mask"], dtype=np.bool_)
+        else:
+            root_active = np.isfinite(np.asarray(data["root_value"]))
+        if root_active.shape != (n,):
+            raise SystemExit("root-value activity mask shape drift during admission")
+        objective_active |= root_active
+    active_indices = np.flatnonzero(objective_active)
+    if regime_column is None:
+        active_regime_counts = {
+            TARGET_INFORMATION_REGIME_UNKNOWN: int(active_indices.size)
+        }
+    else:
+        active_regimes = np.asarray(regime_column[active_indices]).astype(str)
+        active_regime_counts = {
+            str(value): int(count)
+            for value, count in zip(
+                *np.unique(active_regimes, return_counts=True), strict=True
+            )
+        }
+    mismatched_target_rows = int(active_indices.size) - int(
+        active_regime_counts.get(required_regime, 0)
+    )
     report: dict[str, object] = {
         "mask_hidden_info": bool(mask_hidden_info),
         "target_information_regime_counts": counts,
         "required_target_information_regime": required_regime,
+        "search_objective_active_rows": int(active_indices.size),
+        "search_objective_target_information_regime_counts": active_regime_counts,
         "mismatched_target_information_rows": mismatched_target_rows,
         "unsafe_or_unknown_rows": unsafe_count,
         "search_target_objectives": objectives,
@@ -19155,9 +19248,11 @@ def _validate_target_information_admission(
         raise SystemExit(
             "public-observation training refused mismatched search targets: "
             f"objectives={objectives}, required_target_information_regime="
-            f"{required_regime!r}, mismatched_rows={mismatched_target_rows}/{n}, "
+            f"{required_regime!r}, mismatched_objective_rows="
+            f"{mismatched_target_rows}/{int(active_indices.size)}, "
             f"unsafe_or_unknown_rows={unsafe_count}/{n}, "
-            f"target_information_regimes={counts}. Public PIMC and coherent-public "
+            f"objective_target_information_regimes={active_regime_counts}, "
+            f"corpus_target_information_regimes={counts}. Public PIMC and coherent-public "
             "single-tree targets are different policy-improvement operators and may "
             "not be silently combined or substituted. Reanalyse with the required "
             "operator, explicitly select the legacy regime for a sealed ablation, or "

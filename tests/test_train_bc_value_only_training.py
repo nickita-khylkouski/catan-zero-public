@@ -960,7 +960,7 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
     template = _make_entity_policy()
     initial = copy.deepcopy(template.model.state_dict())
 
-    def run(*, auxiliary: bool):
+    def run(*, auxiliary: bool, aux_weight_scale: float = 1.0):
         policy = _make_entity_policy()
         policy.model.load_state_dict(initial)
         policy.model.eval()  # make the duplicated-forward equality exact (no dropout)
@@ -992,7 +992,7 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
                 {
                     "policy_aux_data": data,
                     "policy_aux_batch": batch,
-                    "policy_aux_sample_weights": weights,
+                    "policy_aux_sample_weights": weights * aux_weight_scale,
                 }
                 if auxiliary
                 else {}
@@ -1002,6 +1002,7 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
 
     _control_policy, control = run(auxiliary=False)
     aux_policy, auxiliary = run(auxiliary=True)
+    _scaled_policy, scaled_auxiliary = run(auxiliary=True, aux_weight_scale=17.0)
     # Duplicating the same policy rows in the active-policy stream must add one
     # complete auxiliary dose without shrinking the original base objective.
     assert auxiliary["policy_loss"] == pytest.approx(
@@ -1018,6 +1019,14 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
     )
     assert auxiliary["policy_aux_loss_weight_sum"] == pytest.approx(
         control["policy_loss_weight_sum"], rel=1e-6
+    )
+    # Corpus-normalized row weights and world-size-dependent mass must not
+    # redefine the AUX coefficient. Only the explicit loss weight may do that.
+    assert scaled_auxiliary["policy_loss"] == pytest.approx(
+        auxiliary["policy_loss"], rel=1e-6
+    )
+    assert scaled_auxiliary["policy_aux_loss_weight_sum"] == pytest.approx(
+        17.0 * auxiliary["policy_aux_loss_weight_sum"], rel=1e-6
     )
     # Value telemetry/dose is base-only and value-head parameters receive no
     # gradient from the policy-only auxiliary forward.

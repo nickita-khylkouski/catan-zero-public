@@ -112,20 +112,24 @@ def test_active_policy_arms_change_only_auxiliary_exposure() -> None:
     assert {
         arm: values["policy_aux_active_batch_size"]
         for arm, values in campaign.ARMS.items()
-    } == {"P10": 46, "P25": 116, "P50": 232, "P100": 463}
+    } == {"P10": 128, "P25": 128, "P50": 128, "P100": 128}
+    assert {
+        arm: values["policy_aux_loss_weight"]
+        for arm, values in campaign.ARMS.items()
+    } == {"P10": 0.10, "P25": 0.25, "P50": 0.50, "P100": 1.00}
     recipes = {
         arm: campaign._arm_overrides(arm, science) for arm in campaign.ARMS
     }
     common = {
         key: value
         for key, value in recipes["P10"].items()
-        if key != "policy_aux_active_batch_size"
+        if key != "policy_aux_loss_weight"
     }
     assert all(
         {
             key: value
             for key, value in recipe.items()
-            if key != "policy_aux_active_batch_size"
+            if key != "policy_aux_loss_weight"
         }
         == common
         for recipe in recipes.values()
@@ -292,6 +296,9 @@ def test_selection_maximizes_teacher_gap_inside_explicit_drift_budgets(
             "policy_aux_active_batch_size": campaign.ARMS[arm][
                 "policy_aux_active_batch_size"
             ],
+            "policy_aux_loss_weight": campaign.ARMS[arm][
+                "policy_aux_loss_weight"
+            ],
             "parent_checkpoint_sha256": campaign_payload["lineage_contract"][
                 "upgraded_initializer_sha256"
             ],
@@ -386,6 +393,9 @@ def test_selection_can_choose_an_earlier_checkpoint_over_overdosed_terminals(
             "policy_aux_active_batch_size": campaign.ARMS[arm][
                 "policy_aux_active_batch_size"
             ],
+            "policy_aux_loss_weight": campaign.ARMS[arm][
+                "policy_aux_loss_weight"
+            ],
             "parent_checkpoint_sha256": campaign_payload["lineage_contract"][
                 "upgraded_initializer_sha256"
             ],
@@ -471,7 +481,11 @@ def test_explicit_diagnostic_checkpoint_schedule_excludes_terminal(
 
 
 def test_arm_dose_telemetry_seals_exposure_grad_clip_and_update_rms() -> None:
-    expected_aux = 46 * campaign.WORLD_SIZE * campaign.MAX_STEPS
+    expected_aux = (
+        campaign.POLICY_AUX_ACTIVE_BATCH_SIZE
+        * campaign.WORLD_SIZE
+        * campaign.MAX_STEPS
+    )
     report = {
         "policy_base_active_rows": 10_000,
         "policy_aux_active_rows": expected_aux,
