@@ -1907,6 +1907,7 @@ def test_reviewed_public_card_one_dose_renders_exact_eight_b200_command(
     assert arm["recipe"]["global_batch_size"] == 4096
     assert arm["recipe"]["resume_optimizer"] is False
     assert arm["recipe"]["public_card_lr_mult"] == pytest.approx(4.0)
+    assert arm["recipe"]["moe_balance_loss_weight"] == pytest.approx(0.01)
     assert arm["recipe"]["per_game_policy_surprise_weighting"] is True
     assert arm["learner_ablation"]["recipe_drift"]["public_card_lr_mult"] == {
         "contract": 1.0,
@@ -1929,6 +1930,7 @@ def test_reviewed_public_card_one_dose_renders_exact_eight_b200_command(
     assert _option(command, "--max-steps") == "128"
     assert _option(command, "--batch-size") == "512"
     assert _option(command, "--public-card-lr-mult") == "4.0"
+    assert _option(command, "--moe-balance-loss-weight") == "0.01"
     assert "--public-card-count-features" in command
     assert "--per-game-policy-surprise-weighting" in command
     assert "--no-resume-optimizer" in command
@@ -2136,6 +2138,60 @@ def test_generic_ablation_can_bind_trunk_lr_and_adaptive_parent_kl(
     assert _option(command, "--policy-kl-dual-lr") == "1.0"
     assert _option(command, "--policy-kl-max-weight") == "1.0"
     assert _option(command, "--policy-kl-anchor-direction") == "forward"
+
+
+def test_generic_ablation_preserves_explicit_parent_moe_balance_weight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    historical = _verified(tmp_path)
+    historical["reviewed_lock_file_sha256"] = historical["lock_file_sha256"]
+    code_binding = _reviewed_ablation_code_binding()
+    code_sha = code_binding["code_tree_sha256"]
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: code_binding,
+    )
+
+    historical_arm = executor.bind_learner_ablation(
+        historical,
+        ablation_id="historical-moe-default",
+        overrides_json='{"trunk_lr_mult":0.25}',
+        reviewed_code_tree_sha256=code_sha,
+    )
+    assert "moe_balance_loss_weight" not in historical_arm["bound_recipe"]
+    assert historical_arm["recipe"]["moe_balance_loss_weight"] == pytest.approx(0.01)
+    assert "moe_balance_loss_weight" not in historical_arm["learner_ablation"][
+        "recipe_drift"
+    ]
+    historical_command = executor.build_train_command(
+        historical_arm,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "historical.pt",
+        report=tmp_path / "historical.report.json",
+    )
+    assert _option(historical_command, "--moe-balance-loss-weight") == "0.01"
+
+    current = copy.deepcopy(historical)
+    current["recipe"]["moe_balance_loss_weight"] = 0.0
+    current_arm = executor.bind_learner_ablation(
+        current,
+        ablation_id="current-moe-zero",
+        overrides_json='{"trunk_lr_mult":0.25}',
+        reviewed_code_tree_sha256=code_sha,
+    )
+    assert current_arm["bound_recipe"]["moe_balance_loss_weight"] == pytest.approx(0.0)
+    assert current_arm["recipe"]["moe_balance_loss_weight"] == pytest.approx(0.0)
+    assert "moe_balance_loss_weight" not in current_arm["learner_ablation"][
+        "recipe_drift"
+    ]
+    current_command = executor.build_train_command(
+        current_arm,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "current.pt",
+        report=tmp_path / "current.report.json",
+    )
+    assert _option(current_command, "--moe-balance-loss-weight") == "0.0"
 
 
 def test_adaptive_parent_kl_ablation_requires_complete_controller(

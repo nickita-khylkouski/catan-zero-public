@@ -3364,6 +3364,11 @@ def bind_learner_ablation(
     effective["per_game_policy_surprise_weighting"] = False
     effective.setdefault("target_reliability_confidence_weighting", False)
     effective.setdefault("target_reliability_confidence_floor", 0.25)
+    # Generic ablations are validated against train_bc's complete current
+    # ablation recipe shape. Sparse MoE remains disabled by the sealed model
+    # topology, but its configured default is still part of that shape and
+    # must not appear only after argv parsing.
+    effective.setdefault("moe_balance_loss_weight", 0.01)
     # Historical A1 omitted this typed knob because per-game weighting was
     # locked off. Bind the then-current train_bc default explicitly in every
     # derived recipe so enabling the existing CAT-60 path can never silently
@@ -5578,6 +5583,14 @@ def _build_direct_train_command(
             str(recipe["value_uncertainty_loss_weight"]),
             "--aux-subgoal-loss-weight",
             str(recipe["aux_subgoal_loss_weight"]),
+            *(
+                [
+                    "--moe-balance-loss-weight",
+                    str(recipe["moe_balance_loss_weight"]),
+                ]
+                if "moe_balance_loss_weight" in recipe
+                else []
+            ),
             "--freeze-modules",
             str(recipe["freeze_modules"]),
             "--policy-surprise-weight",

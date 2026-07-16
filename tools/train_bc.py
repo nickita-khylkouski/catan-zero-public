@@ -10969,6 +10969,7 @@ def _validate_a1_learner_training_recipe(
         "target_reliability_confidence_weighting",
         "target_reliability_confidence_floor",
         "policy_aux_sampling_mode",
+        "moe_balance_loss_weight",
     ):
         if post_seal_field in effective:
             authorized_extra_fields.add(post_seal_field)
