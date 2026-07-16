@@ -1024,14 +1024,22 @@ def _load_parent(
                 "parent checkpoint public-award transition is not authenticated "
                 "by the training report"
             )
+        mixed_corpus_acknowledged = award_training.get(
+            "mixed_corpus_acknowledged", False
+        )
+        if not isinstance(mixed_corpus_acknowledged, bool):
+            raise SystemExit(
+                "training report public-award mixed_corpus_acknowledged must "
+                "be boolean"
+            )
         reconstructed_award_transition = (
             prepared["train_bc"]._configure_public_award_feature_training(
                 policy,
                 prepared["data"],
                 argparse.Namespace(
                     public_award_feature_contract=effective_award,
-                    allow_mixed_public_award_feature_contracts=bool(
-                        award_training.get("mixed_corpus_acknowledged", False)
+                    allow_mixed_public_award_feature_contracts=(
+                        mixed_corpus_acknowledged
                     ),
                 ),
             )

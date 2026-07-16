@@ -342,6 +342,136 @@ def _paths(tmp_path: Path, report: dict):
     return report_path, checkpoint, data, manifest
 
 
+def _parent_prepared(
+    module, tmp_path: Path, *, award_training: object
+) -> tuple[dict, Path, _FakeTrainBC]:
+    parent = tmp_path / "legacy-parent.pt"
+    parent.write_bytes(b"parent")
+    report = _report()
+    report["init_checkpoint_sha256"] = module._sha256(parent)  # noqa: SLF001
+    if award_training is not None:
+        report["public_award_feature_training"] = award_training
+    fake = _FakeTrainBC()
+    return (
+        {
+            "report": report,
+            "train_bc": fake,
+            "data": object(),
+            "device": "cpu",
+            "award_contract": "authoritative_v1",
+        },
+        parent,
+        fake,
+    )
+
+
+def _legacy_parent_policy() -> SimpleNamespace:
+    return SimpleNamespace(
+        config=SimpleNamespace(public_card_count_features=False),
+        public_award_feature_contract="legacy_zero_v0",
+    )
+
+
+def test_parent_reconstructs_authenticated_public_award_transition(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _module()
+    award_training = {
+        "initializer_contract": "legacy_zero_v0",
+        "effective_contract": "authoritative_v1",
+        "mixed_corpus_acknowledged": False,
+        "legacy_column_zero_initialized": True,
+    }
+    prepared, parent, fake = _parent_prepared(
+        module, tmp_path, award_training=award_training
+    )
+    policy = _legacy_parent_policy()
+
+    def configure(received_policy, data, args):
+        assert received_policy is policy
+        assert data is prepared["data"]
+        assert args.public_award_feature_contract == "authoritative_v1"
+        assert args.allow_mixed_public_award_feature_contracts is False
+        received_policy.public_award_feature_contract = "authoritative_v1"
+        return {
+            "initializer_contract": "legacy_zero_v0",
+            "effective_contract": "authoritative_v1",
+            "mixed_corpus_acknowledged": False,
+            "legacy_column_zero_initialized": True,
+        }
+
+    fake._configure_public_award_feature_training = configure
+    monkeypatch.setattr(module, "_load_policy", lambda *_args: policy)
+
+    loaded, binding, surface = module._load_parent(  # noqa: SLF001
+        prepared, parent, require_report_binding=True
+    )
+
+    assert loaded is policy
+    assert binding["sha256"] == prepared["report"]["init_checkpoint_sha256"]
+    assert binding["reconstructed_public_award_transition"] == {
+        "initializer_contract": "legacy_zero_v0",
+        "effective_contract": "authoritative_v1",
+        "mixed_corpus_acknowledged": False,
+        "legacy_column_zero_initialized": True,
+    }
+    assert surface == {
+        "public_award_feature_contract": "authoritative_v1",
+        "public_card_count_features": False,
+        "mask_hidden_info": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "award_training",
+    [
+        None,
+        {
+            "initializer_contract": "authoritative_v1",
+            "effective_contract": "authoritative_v1",
+            "mixed_corpus_acknowledged": False,
+            "legacy_column_zero_initialized": True,
+        },
+    ],
+)
+def test_parent_refuses_missing_or_mismatched_public_award_transition(
+    tmp_path: Path, monkeypatch, award_training: object
+) -> None:
+    module = _module()
+    prepared, parent, _fake = _parent_prepared(
+        module, tmp_path, award_training=award_training
+    )
+    monkeypatch.setattr(module, "_load_policy", lambda *_args: _legacy_parent_policy())
+
+    with pytest.raises(SystemExit, match="transition is not authenticated"):
+        module._load_parent(  # noqa: SLF001
+            prepared, parent, require_report_binding=True
+        )
+
+
+@pytest.mark.parametrize("malformed", ["false", 0, None])
+def test_parent_refuses_non_boolean_mixed_corpus_acknowledgement(
+    tmp_path: Path, monkeypatch, malformed: object
+) -> None:
+    module = _module()
+    prepared, parent, _fake = _parent_prepared(
+        module,
+        tmp_path,
+        award_training={
+            "initializer_contract": "legacy_zero_v0",
+            "effective_contract": "authoritative_v1",
+            "mixed_corpus_acknowledged": malformed,
+            "legacy_column_zero_initialized": True,
+        },
+    )
+    monkeypatch.setattr(module, "_load_policy", lambda *_args: _legacy_parent_policy())
+
+    with pytest.raises(SystemExit, match="mixed_corpus_acknowledged must be boolean"):
+        module._load_parent(  # noqa: SLF001
+            prepared, parent, require_report_binding=True
+        )
+
+
 def test_aux_enabled_report_reconstructs_exact_q_times_w_objective(
     tmp_path: Path, monkeypatch
 ) -> None:
