@@ -1,4 +1,5 @@
 """Focused contracts for the matched MSE-vs-HL-Gauss value tournament."""
+
 from __future__ import annotations
 
 import ast
@@ -11,17 +12,12 @@ import pytest
 
 from tools import train_bc
 from tools.train_bc import (
-    _hl_gauss_value_targets,
     _resolve_value_objective_weights,
     _train_xdim_batch,
     _value_training_metadata,
     _weighted_mean_loss,
     evaluate_bc_batches,
     main as train_main,
-)
-from tools.reanalyze_lite import (
-    materialize_search_root_values,
-    resolve_root_value_materialization,
 )
 from catan_zero.rl.pipeline_configs import TrainConfig, config_from_payload
 
@@ -56,7 +52,9 @@ def _args(
         (_args("hlgauss", categorical=0.4, scalar_aux=0.1), (0.1, 0.4)),
     ],
 )
-def test_resolve_value_objective_weights_matrix(args: SimpleNamespace, expected) -> None:
+def test_resolve_value_objective_weights_matrix(
+    args: SimpleNamespace, expected
+) -> None:
     assert _resolve_value_objective_weights(args) == pytest.approx(expected)
 
 
@@ -76,7 +74,9 @@ def test_resolve_value_objective_weights_matrix(args: SimpleNamespace, expected)
         _args("unknown"),
     ],
 )
-def test_resolve_value_objective_weights_rejects_contradictions(args: SimpleNamespace) -> None:
+def test_resolve_value_objective_weights_rejects_contradictions(
+    args: SimpleNamespace,
+) -> None:
     with pytest.raises(SystemExit):
         _resolve_value_objective_weights(args)
 
@@ -134,9 +134,7 @@ def test_fixed_population_denominator_preserves_importance_at_batch_one() -> Non
         torch.tensor([1.75]),
         fixed_weight_mean=1.0,
     )
-    self_normalized_low = _weighted_mean_loss(
-        torch.tensor([2.0]), torch.tensor([0.25])
-    )
+    self_normalized_low = _weighted_mean_loss(torch.tensor([2.0]), torch.tensor([0.25]))
     self_normalized_high = _weighted_mean_loss(
         torch.tensor([2.0]), torch.tensor([1.75])
     )
@@ -304,7 +302,9 @@ def _validation_fixture():
             self.model = TinyModel()
             self.categorical_bias = torch.zeros(6, dtype=torch.float32)
 
-        def forward_legal_np(self, obs, legal_action_ids, legal_action_context, *, return_q):
+        def forward_legal_np(
+            self, obs, legal_action_ids, legal_action_context, *, return_q
+        ):
             del obs, legal_action_context, return_q
             rows, width = legal_action_ids.shape
             # Tie outputs to a parameter so this behaves like a real model tensor,
@@ -591,14 +591,12 @@ def test_xdim_binary_win_bce_keeps_mse_as_a_separate_diagnostic() -> None:
     bounded = float(np.tanh(2.0))
     expected_mse = ((bounded - 1.0) ** 2 + (bounded + 1.0) ** 2) / 2.0
     assert metrics["value_loss"] == pytest.approx(expected_bce)
-    assert metrics["scalar_value_mse_diagnostic"] == pytest.approx(
-        expected_mse
-    )
+    assert metrics["scalar_value_mse_diagnostic"] == pytest.approx(expected_mse)
     assert metrics["primary_value_loss_kind"] == "binary_win_bce"
     assert metrics["loss"] == pytest.approx(expected_bce)
-    assert metrics["loss_denominators"][
-        "scalar_value_mse_diagnostic"
-    ] == pytest.approx(4.0)
+    assert metrics["loss_denominators"]["scalar_value_mse_diagnostic"] == pytest.approx(
+        4.0
+    )
 
 
 def test_xdim_validation_hlgauss_is_categorical_primary_not_double_weighted() -> None:
@@ -618,7 +616,9 @@ def test_xdim_validation_hlgauss_is_categorical_primary_not_double_weighted() ->
     assert metrics["loss_denominators"]["value_categorical_loss"] == pytest.approx(4.0)
 
 
-def test_hlgauss_weighted_telemetry_is_partition_invariant_and_splits_truncation() -> None:
+def test_hlgauss_weighted_telemetry_is_partition_invariant_and_splits_truncation() -> (
+    None
+):
     torch = pytest.importorskip("torch")
     policy, data = _validation_fixture()
     data["truncated"] = np.asarray([False, True, False, True], dtype=np.bool_)
@@ -656,9 +656,9 @@ def test_hlgauss_weighted_telemetry_is_partition_invariant_and_splits_truncation
     assert uneven["loss_denominators"]["value_categorical_loss"] == pytest.approx(
         expected_clean_mass + expected_truncated_mass
     )
-    assert uneven["loss_denominators"][
-        "value_categorical_clean_loss"
-    ] == pytest.approx(expected_clean_mass)
+    assert uneven["loss_denominators"]["value_categorical_clean_loss"] == pytest.approx(
+        expected_clean_mass
+    )
     assert uneven["loss_denominators"][
         "value_categorical_truncated_loss"
     ] == pytest.approx(expected_truncated_mass)
@@ -667,7 +667,9 @@ def test_hlgauss_weighted_telemetry_is_partition_invariant_and_splits_truncation
     )
 
 
-def test_xdim_validation_applies_same_root_value_lambda_convention_to_both_arms() -> None:
+def test_xdim_validation_applies_same_root_value_lambda_convention_to_both_arms() -> (
+    None
+):
     torch = pytest.importorskip("torch")
     policy, data = _validation_fixture()
     # lambda=0 means pure stored search value under the canonical
@@ -696,42 +698,42 @@ def test_xdim_validation_applies_same_root_value_lambda_convention_to_both_arms(
     assert cat_z["value_categorical_loss"] != pytest.approx(
         cat_search["value_categorical_loss"]
     )
-    assert mse_search["component_reconstructed_loss"] == pytest.approx(mse_search["loss"])
-    assert cat_search["component_reconstructed_loss"] == pytest.approx(cat_search["loss"])
-
-
-def test_reanalysis_feeds_identical_bounded_search_targets_to_mse_and_hlgauss() -> None:
-    torch = pytest.importorskip("torch")
-    policy, data = _validation_fixture()
-    raw = torch.tensor([4.0, -4.0, 0.25, -0.25], dtype=torch.float32)
-    spec = resolve_root_value_materialization(
-        value_readout="scalar", value_squash="tanh", value_scale=1.5
+    assert mse_search["component_reconstructed_loss"] == pytest.approx(
+        mse_search["loss"]
     )
-    bounded = materialize_search_root_values({"value": raw}, spec)
-    assert np.all((-1.0 <= bounded) & (bounded <= 1.0))
-    data["root_value"] = bounded
-    data["root_value_mask"] = np.ones(4, dtype=np.bool_)
-    policy.categorical_bias = torch.tensor(
-        [-2.0, -1.0, 0.0, 1.0, 2.0, -3.0], dtype=torch.float32
+    assert cat_search["component_reconstructed_loss"] == pytest.approx(
+        cat_search["loss"]
     )
 
-    mse = _evaluate(
-        policy, data, scalar_weight=1.0, categorical_weight=0.0, target_lambda=0.0
-    )
-    hl = _evaluate(
-        policy, data, scalar_weight=0.0, categorical_weight=1.0, target_lambda=0.0
-    )
 
-    assert mse["value_loss"] == pytest.approx(float(np.mean(bounded**2)))
-    expected_hl_targets = _hl_gauss_value_targets(
-        torch.as_tensor(bounded),
-        5,
-        truncated=torch.zeros(4, dtype=torch.bool),
-        add_truncation_class=True,
+def test_legacy_direct_forward_root_overlay_is_quarantined() -> None:
+    class _Corpus(dict):
+        meta = {
+            "columns": {
+                "root_value": {
+                    "materialization": {
+                        "schema": "catan_zero_root_value_materialization_v1"
+                    }
+                }
+            }
+        }
+
+    data = _Corpus(
+        action_taken=np.asarray([1]),
+        root_value=np.asarray([0.2], dtype=np.float32),
+        root_value_mask=np.asarray([True]),
     )
-    log_probs = torch.nn.functional.log_softmax(policy.categorical_bias, dim=-1)
-    expected_hl = float((-(expected_hl_targets * log_probs).sum(dim=-1)).mean())
-    assert hl["value_categorical_loss"] == pytest.approx(expected_hl)
+    with pytest.raises(SystemExit, match="legacy direct-forward"):
+        train_bc._audit_value_root_blend_corpus(  # noqa: SLF001
+            data,
+            np.asarray([1.0]),
+            regime={
+                "schema_version": "value-root-blend-regime-v1",
+                "mode": "global_compat",
+                "lambda": 0.0,
+                "phases": [],
+            },
+        )
 
 
 @pytest.mark.parametrize(

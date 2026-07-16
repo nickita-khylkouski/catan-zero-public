@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""CAT-63: banked-corpus reanalyze FLEET JOB -- run reanalyze-lite's value-only
-forward+column-rewrite over the entire 32.6M-row / 417GB banked corpus
+"""CAT-63: banked-corpus reanalyze FLEET JOB -- run reanalyze-lite's
+provenance-qualified per-action Q refresh over a large banked corpus
 (``runs/memmap_corpus_full``) in resumable, preemption-safe chunks sized for A100
 between-wave idle slots.
 
@@ -8,8 +8,10 @@ WHAT THIS IS (and is NOT)
 -------------------------
 This is the fleet-scale GRADUATION of reanalyze-lite v1 (CAT-34). It does NOT
 reimplement the forward-and-rewrite logic -- it imports ``reanalyze_lite`` and
-reuses ``batch_forward`` (the exact featurize+forward path), the ragged/per-state
-column rewriters, and the checkpoint/EMA resolution unchanged. This module adds
+reuses ``batch_forward`` (the exact featurize+forward path), the ragged per-action
+column rewriter, and the checkpoint/EMA resolution unchanged. Root values are
+intentionally unsupported because this direct forward is not the sealed search
+operator. This module adds
 ONLY fleet-job orchestration:
 
 * CHUNKING -- partition the corpus into contiguous row ranges along the EXISTING
@@ -67,7 +69,8 @@ HOST RUN (the real 417GB job -- see the completion note for the full resource pl
     # 1. plan (cheap: reads only row_offsets + meta)
     python tools/reanalyze_banked_corpus.py plan \
         --corpus runs/memmap_corpus_full --job-dir runs/reanalyze_job_full \
-        --checkpoint runs/champion.pt --v-component root_value --chunk-rows 500000
+        --checkpoint runs/champion.pt --v-component target_scores \
+        --q-head-provenance q_head_provenance.json --chunk-rows 500000
     # 2. run -- one invocation per idle GPU slot; safe to run many in parallel and to
     #    re-run after preemption (each grabs unclaimed/stale chunks)
     CUDA_VISIBLE_DEVICES=0 python tools/reanalyze_banked_corpus.py run \
@@ -79,6 +82,7 @@ HOST RUN (the real 417GB job -- see the completion note for the full resource pl
     python tools/reanalyze_banked_corpus.py merge --job-dir runs/reanalyze_job_full \
         --out runs/memmap_corpus_full_reanalyzed --mix-fraction 0.2
 """
+
 from __future__ import annotations
 
 import argparse
@@ -244,7 +248,9 @@ def validate_partition(chunks: list[dict], row_count: int, flat_count: int) -> N
     if chunks[0]["row_start"] != 0:
         raise SystemExit("first chunk does not start at row 0")
     if chunks[-1]["row_end"] != row_count:
-        raise SystemExit(f"last chunk ends at {chunks[-1]['row_end']} != row_count {row_count}")
+        raise SystemExit(
+            f"last chunk ends at {chunks[-1]['row_end']} != row_count {row_count}"
+        )
     rows = 0
     flat = 0
     for i, ch in enumerate(chunks):
@@ -299,30 +305,16 @@ def do_plan(
     mask_hidden_info: bool,
     force: bool,
     q_head_provenance: Path | dict | None = None,
-    value_readout: str = "scalar",
-    value_squash: str = "tanh",
-    value_scale: float = 1.0,
 ) -> dict:
-    if v_component not in rl.V_COMPONENTS:
-        raise SystemExit(f"unknown --v-component {v_component!r}; choices: {sorted(rl.V_COMPONENTS)}")
+    spec = rl.validate_v_component(v_component)
     meta = load_meta(corpus_dir)
     row_count = int(meta["row_count"])
     flat_count = int(meta["flat_count"])
     legal_width = int(meta["legal_width"])
-    spec = rl.V_COMPONENTS[v_component]
     verified_q_provenance = rl.validate_q_head_provenance(
         q_head_provenance,
         reanalyzer_meta=reanalyzer_meta,
         v_component=v_component,
-    )
-    root_value_provenance = (
-        rl.resolve_root_value_materialization(
-            value_readout=value_readout,
-            value_squash=value_squash,
-            value_scale=value_scale,
-        )
-        if v_component == "root_value"
-        else None
     )
     if spec["kind"] == "per_action" and v_component not in meta["columns"]:
         raise SystemExit(
@@ -344,18 +336,9 @@ def do_plan(
         "source_corpus": str(Path(corpus_dir).resolve()),
         "v_component": v_component,
         "column_kind": spec["kind"],
-        "forward_output": (
-            root_value_provenance["forward_output"]
-            if root_value_provenance is not None
-            else spec["forward_output"]
-        ),
+        "forward_output": (spec["forward_output"]),
         "q_head_provenance": verified_q_provenance,
-        "root_value_materialization": root_value_provenance,
-        "column_dtype": (
-            "<f4"
-            if spec["kind"] == "per_state"
-            else meta["columns"][v_component]["dtype"]
-        ),
+        "column_dtype": meta["columns"][v_component]["dtype"],
         "row_count": row_count,
         "flat_count": flat_count,
         "legal_width": legal_width,
@@ -372,7 +355,6 @@ def do_plan(
         "source_corpus",
         "v_component",
         "q_head_provenance",
-        "root_value_materialization",
         "chunk_rows",
         "row_count",
         "flat_count",
@@ -407,6 +389,7 @@ def do_plan(
             # `--force` actually "discards in-flight chunk state" as documented,
             # instead of leaving orphaned files from the old shape on disk forever.
             import shutil as _shutil
+
             _shutil.rmtree(_chunks_dir(job_dir), ignore_errors=True)
             _chunks_dir(job_dir).mkdir(parents=True, exist_ok=True)
 
@@ -469,8 +452,12 @@ def _try_claim(job_dir: Path, chunk_id: int, stale_sec: float) -> bool:
     A stale claim (older than ``stale_sec`` -- a preempted worker) is stolen."""
     claim_path = _claim_path(job_dir, chunk_id)
     payload = json.dumps(
-        {"host": socket.gethostname(), "pid": os.getpid(), "claimed_utc": _utc_now(),
-         "claimed_at": time.time()},
+        {
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "claimed_utc": _utc_now(),
+            "claimed_at": time.time(),
+        },
         sort_keys=True,
     ).encode("utf-8")
     try:
@@ -524,7 +511,6 @@ def process_chunk(
     reanalyzer_md5: str,
     device: str,
     progress_every: int,
-    root_value_materialization: dict | None = None,
 ) -> dict:
     """Forward + rewrite ONE chunk, write its piece + atomic done marker.
 
@@ -540,10 +526,14 @@ def process_chunk(
     started = time.perf_counter()
     global_idx = np.arange(row_start, row_end, dtype=np.int64)
     fwd = rl.batch_forward(
-        policy, parent_corpus, global_idx,
-        batch_size=batch_size, want_q=want_q, legal_width=legal_width,
+        policy,
+        parent_corpus,
+        global_idx,
+        batch_size=batch_size,
+        want_q=want_q,
+        legal_width=legal_width,
         progress_every=progress_every,
-        value_materialization=root_value_materialization,
+        value_materialization=None,
     )
 
     view = _ChunkView(parent_corpus, row_start, row_end)
@@ -555,40 +545,23 @@ def process_chunk(
     tmp_dir = _chunks_dir(job_dir) / f".tmp_chunk_{cid:06d}"
     if tmp_dir.exists():
         import shutil as _shutil
+
         _shutil.rmtree(tmp_dir)  # scrub a previous preempted attempt
     tmp_dir.mkdir(parents=True)
-    if spec["kind"] == "per_action":
-        rewrite = rl.rewrite_per_action_column(
-            view, tmp_dir, v_component, fwd["q_values"], legal_width=legal_width
-        )
-    else:
-        # per-state new-column materialisation edits corpus_meta.json in the dir; give
-        # it a copy so the reused code path is unchanged. The merged meta is rebuilt
-        # centrally at merge time, so this per-chunk copy is otherwise ignored.
-        (tmp_dir / "corpus_meta.json").write_text(
-            json.dumps(parent_corpus.meta, indent=2, sort_keys=True), encoding="utf-8"
-        )
-        rewrite = rl.rewrite_per_state_column(
-            view,
-            tmp_dir,
-            v_component,
-            fwd["value"],
-            column_provenance=root_value_materialization,
-        )
+    rewrite = rl.rewrite_per_action_column(
+        view, tmp_dir, v_component, fwd["q_values"], legal_width=legal_width
+    )
     produced = tmp_dir / f"{v_component}.dat"
 
     # Validate the piece length against the source's own flat layout: this is the
     # per-chunk half of the "no row lost or duplicated across chunk boundaries" proof.
-    itemsize = (
-        np.dtype("<f4").itemsize
-        if spec["kind"] == "per_state"
-        else np.dtype(view.meta["columns"][v_component]["dtype"]).itemsize
-    )
-    expected_entries = chunk["n_flat"] if spec["kind"] == "per_action" else chunk["n_rows"]
+    itemsize = np.dtype(view.meta["columns"][v_component]["dtype"]).itemsize
+    expected_entries = chunk["n_flat"]
     expected_bytes = expected_entries * itemsize
     got_bytes = produced.stat().st_size
     if got_bytes != expected_bytes:
         import shutil as _shutil
+
         _shutil.rmtree(tmp_dir, ignore_errors=True)
         raise SystemExit(
             f"chunk {cid}: piece is {got_bytes} bytes, expected {expected_bytes} "
@@ -599,6 +572,7 @@ def process_chunk(
     os.replace(produced, piece_path)
     _fsync_file(piece_path)
     import shutil as _shutil
+
     _shutil.rmtree(tmp_dir, ignore_errors=True)
     piece_sha = rl.sha256_file(piece_path)
 
@@ -614,7 +588,6 @@ def process_chunk(
         "piece_bytes": int(piece_path.stat().st_size),
         "piece_sha256": piece_sha,
         "reanalyzer_md5": reanalyzer_md5,
-        "root_value_materialization": root_value_materialization,
         "device": device,
         "host": socket.gethostname(),
         "elapsed_s": round(elapsed, 3),
@@ -623,9 +596,22 @@ def process_chunk(
     }
     _atomic_write_json(_done_path(job_dir, cid), marker)
     print(
-        json.dumps({"progress": "reanalyze_chunk_done", **{
-            k: marker[k] for k in ("chunk_id", "n_rows", "entries_rewritten", "elapsed_s", "rows_per_s")
-        }}, sort_keys=True),
+        json.dumps(
+            {
+                "progress": "reanalyze_chunk_done",
+                **{
+                    k: marker[k]
+                    for k in (
+                        "chunk_id",
+                        "n_rows",
+                        "entries_rewritten",
+                        "elapsed_s",
+                        "rows_per_s",
+                    )
+                },
+            },
+            sort_keys=True,
+        ),
         flush=True,
     )
     return marker
@@ -649,7 +635,7 @@ def do_run(
     reanalyzer_meta = manifest["reanalyzer"]
     reanalyzer_md5 = reanalyzer_meta["md5"]
     v_component = manifest["v_component"]
-    spec = rl.V_COMPONENTS[v_component]
+    spec = rl.validate_v_component(v_component)
     legal_width = int(manifest["legal_width"])
     # Re-validate at execution time as well as plan time. This makes pre-hardening
     # target_scores jobs (which have no provenance field) fail closed instead of
@@ -659,10 +645,11 @@ def do_run(
         reanalyzer_meta=reanalyzer_meta,
         v_component=v_component,
     )
-    root_value_materialization = rl.validate_root_value_materialization(
-        manifest.get("root_value_materialization"),
-        v_component=v_component,
-    )
+    if manifest.get("root_value_materialization") is not None:
+        raise SystemExit(
+            "legacy banked value-materialization plans are semantically invalid; "
+            "re-plan a true search reanalysis"
+        )
 
     # The manifest pins the checkpoint md5 at `plan` time; verify the checkpoint
     # file this invocation actually resolved to still matches it. Without this, a
@@ -686,17 +673,25 @@ def do_run(
 
     pending = [c for c in chunks if not chunk_is_done(job_dir, c, reanalyzer_md5)]
     if not pending:
-        print(json.dumps({"progress": "reanalyze_run_nothing_pending",
-                          "job_dir": str(job_dir)}, sort_keys=True), flush=True)
+        print(
+            json.dumps(
+                {"progress": "reanalyze_run_nothing_pending", "job_dir": str(job_dir)},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         return {"processed": [], "skipped_claimed": [], "pending_remaining": 0}
 
     # Load the corpus + policy ONCE per invocation (amortise eager-column
     # materialisation and checkpoint load across all chunks this worker does).
     import train_bc
+
     train_bc._MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(manifest["mask_hidden_info"])
     policy_type = reanalyzer_meta.get("policy_type") or "entity_graph"
     parent = MemmapCorpus(manifest["source_corpus"])
-    policy = rl.load_policy(Path(reanalyzer_path), device=device, policy_type=policy_type)
+    policy = rl.load_policy(
+        Path(reanalyzer_path), device=device, policy_type=policy_type
+    )
 
     processed: list[int] = []
     skipped: list[int] = []
@@ -713,10 +708,17 @@ def do_run(
             continue
         try:
             process_chunk(
-                parent, policy, chunk, job_dir=Path(job_dir), v_component=v_component,
-                spec=spec, legal_width=legal_width, batch_size=batch_size,
-                reanalyzer_md5=reanalyzer_md5, device=device, progress_every=progress_every,
-                root_value_materialization=root_value_materialization,
+                parent,
+                policy,
+                chunk,
+                job_dir=Path(job_dir),
+                v_component=v_component,
+                spec=spec,
+                legal_width=legal_width,
+                batch_size=batch_size,
+                reanalyzer_md5=reanalyzer_md5,
+                device=device,
+                progress_every=progress_every,
             )
             processed.append(cid)
         finally:
@@ -779,9 +781,14 @@ def do_status(*, job_dir: Path) -> dict:
         "rows_done": total_rows_done,
         "entries_rewritten": total_entries,
         "gpu_hours_consumed": round(gpu_hours, 3),
-        "gpu_hours_projected_total": round(projected_total_h, 3) if projected_total_h else None,
+        "gpu_hours_projected_total": round(projected_total_h, 3)
+        if projected_total_h
+        else None,
         "fleet_day_budget_h": manifest.get("fleet_day_hours", FLEET_DAY_HOURS),
-        "over_budget": bool(projected_total_h and projected_total_h > manifest.get("fleet_day_hours", FLEET_DAY_HOURS)),
+        "over_budget": bool(
+            projected_total_h
+            and projected_total_h > manifest.get("fleet_day_hours", FLEET_DAY_HOURS)
+        ),
         "pending_chunk_ids": pending[:50],
         "complete": len(pending) == 0,
     }
@@ -808,6 +815,7 @@ def _link_or_copy(src: Path, dst: Path, mode: str) -> str:
         except OSError:
             pass
     import shutil
+
     shutil.copy2(src, dst)
     return "copy"
 
@@ -824,22 +832,25 @@ def do_merge(
     manifest = read_manifest(job_dir)
     reanalyzer_md5 = manifest["reanalyzer"]["md5"]
     v_component = manifest["v_component"]
-    spec = rl.V_COMPONENTS[v_component]
+    spec = rl.validate_v_component(v_component)
     # Do not bless/merge pieces from a legacy unsafe q-values plan.
     rl.validate_q_head_provenance(
         manifest.get("q_head_provenance"),
         reanalyzer_meta=manifest["reanalyzer"],
         v_component=v_component,
     )
-    root_value_materialization = rl.validate_root_value_materialization(
-        manifest.get("root_value_materialization"),
-        v_component=v_component,
-    )
+    if manifest.get("root_value_materialization") is not None:
+        raise SystemExit(
+            "legacy banked value-materialization plans are semantically invalid; "
+            "re-plan a true search reanalysis"
+        )
     source = Path(manifest["source_corpus"])
     chunks = manifest["chunks"]
 
     # 1. Every chunk must be done (verified: marker + hash + checkpoint match).
-    not_done = [c["chunk_id"] for c in chunks if not chunk_is_done(job_dir, c, reanalyzer_md5)]
+    not_done = [
+        c["chunk_id"] for c in chunks if not chunk_is_done(job_dir, c, reanalyzer_md5)
+    ]
     if not_done:
         raise SystemExit(
             f"cannot merge: {len(not_done)} chunk(s) not done: {not_done[:20]}"
@@ -848,10 +859,12 @@ def do_merge(
 
     out_dir = Path(out_dir)
     if out_dir.exists():
-        raise SystemExit(f"output dir already exists (refusing to overwrite): {out_dir}")
+        raise SystemExit(
+            f"output dir already exists (refusing to overwrite): {out_dir}"
+        )
 
     dtype = np.dtype(manifest["column_dtype"])
-    expected_entries = manifest["flat_count"] if spec["kind"] == "per_action" else manifest["row_count"]
+    expected_entries = manifest["flat_count"]
 
     out_dir.mkdir(parents=True)
     rewritten_file = f"{v_component}.dat"
@@ -866,13 +879,8 @@ def do_merge(
             cid = chunk["chunk_id"]
             piece = _piece_path(job_dir, cid)
             marker = json.loads(_done_path(job_dir, cid).read_text())
-            if marker.get("root_value_materialization") != root_value_materialization:
-                raise SystemExit(
-                    f"chunk {cid}: value materialization provenance does not match "
-                    "the immutable job plan; refusing to merge mixed-semantics pieces"
-                )
             piece_entries = marker["piece_bytes"] // dtype.itemsize
-            expected_chunk = chunk["n_flat"] if spec["kind"] == "per_action" else chunk["n_rows"]
+            expected_chunk = chunk["n_flat"]
             if piece_entries != expected_chunk:
                 raise SystemExit(
                     f"chunk {cid}: piece has {piece_entries} entries, plan expects {expected_chunk}"
@@ -901,21 +909,17 @@ def do_merge(
         name = src_file.name
         if name == rewritten_file:
             continue  # replaced by the assembled column
-        if name in ("corpus_meta.json", "reanalyze_manifest.json", "reanalyze_merge_manifest.json"):
+        if name in (
+            "corpus_meta.json",
+            "reanalyze_manifest.json",
+            "reanalyze_merge_manifest.json",
+        ):
             continue  # written fresh below
         link_report[name] = _link_or_copy(src_file, out_dir / name, link_mode)
 
-    # 4. Fresh corpus_meta.json (copy of source's; add root_value schema if new).
+    # 4. Fresh corpus_meta.json.
     out_meta = load_meta(source)
     meta_changed = False
-    if spec["kind"] == "per_state":
-        schema = {"kind": "fixed", "dtype": "<f4", "inner_shape": []}
-        if root_value_materialization is not None:
-            schema["target_semantics"] = rl.ROOT_VALUE_TARGET_SEMANTICS
-            schema["materialization"] = root_value_materialization
-        if out_meta["columns"].get(v_component) != schema:
-            out_meta["columns"][v_component] = schema
-            meta_changed = True
     (out_dir / "corpus_meta.json").write_text(
         json.dumps(out_meta, indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -961,7 +965,6 @@ def do_merge(
         "column_kind": spec["kind"],
         "forward_output": manifest["forward_output"],
         "q_head_provenance": manifest.get("q_head_provenance"),
-        "root_value_materialization": root_value_materialization,
         "reanalyzer": manifest["reanalyzer"],
         "mask_hidden_info": manifest["mask_hidden_info"],
         "n_chunks": len(chunks),
@@ -971,7 +974,8 @@ def do_merge(
         "assembled_entries": total_entries,
         "expected_entries": expected_entries,
         "entries_rewritten": total_entries_rewritten,
-        "no_loss_no_dup_verified": total_entries == expected_entries and reloaded.row_count == src_row_count,
+        "no_loss_no_dup_verified": total_entries == expected_entries
+        and reloaded.row_count == src_row_count,
         "meta_changed": meta_changed,
         "link_mode": link_mode,
         "overlay_links": link_report,
@@ -1004,7 +1008,9 @@ def do_merge(
 # --------------------------------------------------------------------------- #
 # Mix plan
 # --------------------------------------------------------------------------- #
-def compute_mix_plan(reanalyzed_rows: int, window_size: int, mix_fraction: float) -> dict:
+def compute_mix_plan(
+    reanalyzed_rows: int, window_size: int, mix_fraction: float
+) -> dict:
     """How many rows of the reanalyzed banked corpus blend into a window of
     ``window_size`` at ``mix_fraction`` (roadmap B1 default ~0.2), plus the fresh
     remainder. Capped at what the reanalyzed corpus actually holds."""
@@ -1024,10 +1030,18 @@ def compute_mix_plan(reanalyzed_rows: int, window_size: int, mix_fraction: float
     }
 
 
-def do_mix(*, job_dir: Path | None, reanalyzed_rows: int | None, window_size: int, mix_fraction: float) -> dict:
+def do_mix(
+    *,
+    job_dir: Path | None,
+    reanalyzed_rows: int | None,
+    window_size: int,
+    mix_fraction: float,
+) -> dict:
     if reanalyzed_rows is None:
         if job_dir is None:
-            raise SystemExit("mix needs --window-size and either --job-dir or --reanalyzed-rows")
+            raise SystemExit(
+                "mix needs --window-size and either --job-dir or --reanalyzed-rows"
+            )
         reanalyzed_rows = int(read_manifest(job_dir)["row_count"])
     plan = compute_mix_plan(reanalyzed_rows, window_size, mix_fraction)
     print(json.dumps(plan, indent=2, sort_keys=True), flush=True)
@@ -1049,10 +1063,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--job-dir", required=True, type=Path)
     p.add_argument(
         "--v-component",
-        default=rl.DEFAULT_V_COMPONENT,
+        required=True,
         choices=sorted(rl.V_COMPONENTS),
-        help="column to rewrite (default: root_value); q-values columns require "
-        "--q-head-provenance",
+        help="q-value column to rewrite; requires --q-head-provenance. Root value "
+        "columns require true search reanalysis and are unsupported here.",
     )
     p.add_argument(
         "--q-head-provenance",
@@ -1061,59 +1075,71 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="required checkpoint-bound validation JSON for target_scores or "
         "afterstate_target",
     )
-    p.add_argument(
-        "--value-readout",
-        choices=("scalar", "categorical"),
-        default="scalar",
-        help="root_value readout; must match the search configuration",
-    )
-    p.add_argument(
-        "--value-squash",
-        choices=("tanh", "clip"),
-        default="tanh",
-        help="search squash recorded and applied during root_value materialization",
-    )
-    p.add_argument(
-        "--value-scale",
-        type=float,
-        default=1.0,
-        help="positive finite search value scale",
-    )
     p.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS)
-    p.add_argument("--reanalyzer-net", default="checkpoint", choices=("checkpoint", "ema"))
+    p.add_argument(
+        "--reanalyzer-net", default="checkpoint", choices=("checkpoint", "ema")
+    )
     p.add_argument("--checkpoint", type=Path, default=None)
     p.add_argument("--ema-checkpoints", nargs="+", type=Path, default=None)
     p.add_argument("--ema-decay", type=float, default=0.75)
     p.add_argument(
-        "--mask-hidden-info", dest="mask_hidden_info",
-        action=argparse.BooleanOptionalAction, default=None,
+        "--mask-hidden-info",
+        dest="mask_hidden_info",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="public-observation masking during forwards (default: inherit checkpoint flag)",
     )
-    p.add_argument("--force", action="store_true", help="replace an existing plan (discards chunk state)")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="replace an existing plan (discards chunk state)",
+    )
 
     # run
-    p = sub.add_parser("run", help="process pending chunks (resumable, preemption-safe)")
+    p = sub.add_parser(
+        "run", help="process pending chunks (resumable, preemption-safe)"
+    )
     p.add_argument("--job-dir", required=True, type=Path)
     p.add_argument("--device", default="cpu")
     p.add_argument("--batch-size", type=int, default=4096)
-    p.add_argument("--max-chunks", type=int, default=None, help="stop after N chunks (one idle slot)")
-    p.add_argument("--chunk-ids", type=int, nargs="+", default=None, help="only these chunk ids")
-    p.add_argument("--no-claim", dest="use_claim", action="store_false", default=True,
-                   help="disable O_EXCL claim files (single-worker mode)")
+    p.add_argument(
+        "--max-chunks",
+        type=int,
+        default=None,
+        help="stop after N chunks (one idle slot)",
+    )
+    p.add_argument(
+        "--chunk-ids", type=int, nargs="+", default=None, help="only these chunk ids"
+    )
+    p.add_argument(
+        "--no-claim",
+        dest="use_claim",
+        action="store_false",
+        default=True,
+        help="disable O_EXCL claim files (single-worker mode)",
+    )
     p.add_argument("--claim-stale-sec", type=float, default=DEFAULT_CLAIM_STALE_SEC)
     p.add_argument("--progress-every", type=int, default=0)
 
     # status
-    p = sub.add_parser("status", help="done/pending + GPU-hours vs the fleet-day budget")
+    p = sub.add_parser(
+        "status", help="done/pending + GPU-hours vs the fleet-day budget"
+    )
     p.add_argument("--job-dir", required=True, type=Path)
 
     # merge
     p = sub.add_parser("merge", help="assemble the versioned overlay corpus")
     p.add_argument("--job-dir", required=True, type=Path)
     p.add_argument("--out", required=True, type=Path)
-    p.add_argument("--link-mode", default="hardlink", choices=("hardlink", "symlink", "copy"))
-    p.add_argument("--mix-fraction", type=float, default=None,
-                   help="record a mix plan (fraction of the reanalyzed corpus into a window)")
+    p.add_argument(
+        "--link-mode", default="hardlink", choices=("hardlink", "symlink", "copy")
+    )
+    p.add_argument(
+        "--mix-fraction",
+        type=float,
+        default=None,
+        help="record a mix plan (fraction of the reanalyzed corpus into a window)",
+    )
 
     # mix
     p = sub.add_parser("mix", help="print the mix plan for a given window size")
@@ -1130,19 +1156,24 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "plan":
         reanalyzer_path, reanalyzer_meta = rl.resolve_reanalyzer_checkpoint(
-            mode=args.reanalyzer_net, checkpoint=args.checkpoint,
-            ema_checkpoints=args.ema_checkpoints, ema_decay=args.ema_decay,
+            mode=args.reanalyzer_net,
+            checkpoint=args.checkpoint,
+            ema_checkpoints=args.ema_checkpoints,
+            ema_decay=args.ema_decay,
             work_dir=Path(args.job_dir),
         )
-        mask = rl._resolve_mask_hidden_info(args.mask_hidden_info, reanalyzer_meta["mask_hidden_info"])
+        mask = rl._resolve_mask_hidden_info(
+            args.mask_hidden_info, reanalyzer_meta["mask_hidden_info"]
+        )
         do_plan(
-            corpus_dir=args.corpus, job_dir=args.job_dir, reanalyzer_meta=reanalyzer_meta,
-            v_component=args.v_component, chunk_rows=args.chunk_rows,
-            mask_hidden_info=mask, force=args.force,
+            corpus_dir=args.corpus,
+            job_dir=args.job_dir,
+            reanalyzer_meta=reanalyzer_meta,
+            v_component=args.v_component,
+            chunk_rows=args.chunk_rows,
+            mask_hidden_info=mask,
+            force=args.force,
             q_head_provenance=args.q_head_provenance,
-            value_readout=args.value_readout,
-            value_squash=args.value_squash,
-            value_scale=args.value_scale,
         )
         return
 
@@ -1153,16 +1184,23 @@ def main(argv: list[str] | None = None) -> None:
         # into the job dir; a plain checkpoint uses its recorded path).
         if rmeta["mode"] == "ema":
             reanalyzer_path, _ = rl.resolve_reanalyzer_checkpoint(
-                mode="ema", checkpoint=None,
+                mode="ema",
+                checkpoint=None,
                 ema_checkpoints=[Path(p) for p in rmeta["ema_source_checkpoints"]],
-                ema_decay=float(rmeta["ema_decay"]), work_dir=Path(args.job_dir),
+                ema_decay=float(rmeta["ema_decay"]),
+                work_dir=Path(args.job_dir),
             )
         else:
             reanalyzer_path = Path(rmeta["path"])
         do_run(
-            job_dir=args.job_dir, reanalyzer_path=reanalyzer_path, device=args.device,
-            batch_size=args.batch_size, max_chunks=args.max_chunks, chunk_ids=args.chunk_ids,
-            use_claim=args.use_claim, claim_stale_sec=args.claim_stale_sec,
+            job_dir=args.job_dir,
+            reanalyzer_path=reanalyzer_path,
+            device=args.device,
+            batch_size=args.batch_size,
+            max_chunks=args.max_chunks,
+            chunk_ids=args.chunk_ids,
+            use_claim=args.use_claim,
+            claim_stale_sec=args.claim_stale_sec,
             progress_every=args.progress_every,
         )
         return
@@ -1172,13 +1210,21 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "merge":
-        do_merge(job_dir=args.job_dir, out_dir=args.out, link_mode=args.link_mode,
-                 mix_fraction=args.mix_fraction)
+        do_merge(
+            job_dir=args.job_dir,
+            out_dir=args.out,
+            link_mode=args.link_mode,
+            mix_fraction=args.mix_fraction,
+        )
         return
 
     if args.command == "mix":
-        do_mix(job_dir=args.job_dir, reanalyzed_rows=args.reanalyzed_rows,
-               window_size=args.window_size, mix_fraction=args.mix_fraction)
+        do_mix(
+            job_dir=args.job_dir,
+            reanalyzed_rows=args.reanalyzed_rows,
+            window_size=args.window_size,
+            mix_fraction=args.mix_fraction,
+        )
         return
 
 

@@ -16,6 +16,7 @@ shards, no model, no GPU):
 * EMA reanalyzer resolution -- --reanalyzer-net ema averages checkpoints.
 * batch-forward assembly -- batching + q/value alignment (fake forward).
 """
+
 from __future__ import annotations
 
 import json
@@ -72,9 +73,15 @@ def _make_synthetic_corpus(corpus_dir: Path) -> None:
     np.cumsum(counts, out=offsets[1:])
     offsets.tofile(corpus_dir / "row_offsets.dat")
 
-    np.ascontiguousarray(legal_ids[prefix].astype(np.float32)).tofile(corpus_dir / "legal_action_ids.dat")
-    np.ascontiguousarray(scores[prefix].astype(np.float32)).tofile(corpus_dir / "target_scores.dat")
-    np.ascontiguousarray(scores_mask[prefix].astype(np.bool_)).tofile(corpus_dir / "target_scores_mask.dat")
+    np.ascontiguousarray(legal_ids[prefix].astype(np.float32)).tofile(
+        corpus_dir / "legal_action_ids.dat"
+    )
+    np.ascontiguousarray(scores[prefix].astype(np.float32)).tofile(
+        corpus_dir / "target_scores.dat"
+    )
+    np.ascontiguousarray(scores_mask[prefix].astype(np.bool_)).tofile(
+        corpus_dir / "target_scores_mask.dat"
+    )
 
     # A decoy scalar fixed column (must stay byte-identical through the rewrite).
     seat = np.arange(n, dtype=np.int64)
@@ -104,7 +111,9 @@ def _make_synthetic_corpus(corpus_dir: Path) -> None:
         },
         "stats": {},
     }
-    (corpus_dir / "corpus_meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+    (corpus_dir / "corpus_meta.json").write_text(
+        json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
 
 def _fresh_q_all() -> np.ndarray:
@@ -164,7 +173,9 @@ def test_per_action_rewrite_overwrites_only_finite_legal_entries(corpus_dir, tmp
 
     shutil.copytree(corpus_dir, out_dir)
     fresh = _fresh_q_all()
-    rewrite = rl.rewrite_per_action_column(corpus, out_dir, "target_scores", fresh, legal_width=_LEGAL_WIDTH)
+    rewrite = rl.rewrite_per_action_column(
+        corpus, out_dir, "target_scores", fresh, legal_width=_LEGAL_WIDTH
+    )
 
     # Row 0 had one in-prefix NaN (slot 2) -> only slots 0,1 rewritten.
     # Row 3 had a leading in-prefix NaN (slot 0) -> only slot 1 rewritten.
@@ -189,7 +200,9 @@ def test_source_corpus_untouched(corpus_dir, tmp_path, monkeypatch):
     before = rl.hash_corpus_dats(corpus_dir)
     before_meta = rl.sha256_file(corpus_dir / "corpus_meta.json")
 
-    _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, v_component="target_scores")
+    _run_full_with_fake_forward(
+        corpus_dir, tmp_path, monkeypatch, v_component="target_scores"
+    )
 
     after = rl.hash_corpus_dats(corpus_dir)
     after_meta = rl.sha256_file(corpus_dir / "corpus_meta.json")
@@ -198,7 +211,9 @@ def test_source_corpus_untouched(corpus_dir, tmp_path, monkeypatch):
 
 
 def test_full_run_manifest_and_integrity(corpus_dir, tmp_path, monkeypatch):
-    manifest = _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, v_component="target_scores")
+    manifest = _run_full_with_fake_forward(
+        corpus_dir, tmp_path, monkeypatch, v_component="target_scores"
+    )
     out_dir = Path(manifest["output_corpus"])
 
     # Manifest is present and self-consistent.
@@ -214,7 +229,10 @@ def test_full_run_manifest_and_integrity(corpus_dir, tmp_path, monkeypatch):
     assert manifest["source_corpus"]["dat_sha256"]  # per-file source hashes
     assert manifest["integrity"]["unchanged_columns_verified"] is True
     assert manifest["integrity"]["unexpectedly_changed_files"] == []
-    assert manifest["integrity"]["row_count_before"] == manifest["integrity"]["row_count_after"]
+    assert (
+        manifest["integrity"]["row_count_before"]
+        == manifest["integrity"]["row_count_after"]
+    )
     assert manifest["integrity"]["expected_changed_files"] == ["target_scores.dat"]
 
     # Stats carry a real mean shift + per-phase deltas.
@@ -225,7 +243,9 @@ def test_full_run_manifest_and_integrity(corpus_dir, tmp_path, monkeypatch):
 
 
 def test_backward_compat_load_through_memmap_corpus(corpus_dir, tmp_path, monkeypatch):
-    manifest = _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, v_component="target_scores")
+    manifest = _run_full_with_fake_forward(
+        corpus_dir, tmp_path, monkeypatch, v_component="target_scores"
+    )
     out_dir = Path(manifest["output_corpus"])
     reloaded = MemmapCorpus(out_dir)
     assert len(reloaded) == len(MemmapCorpus(corpus_dir))
@@ -240,31 +260,10 @@ def test_backward_compat_load_through_memmap_corpus(corpus_dir, tmp_path, monkey
             np.testing.assert_array_equal(a, b, err_msg=key)
 
 
-def test_root_value_materialisation(corpus_dir, tmp_path, monkeypatch):
-    manifest = _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, v_component="root_value")
-    out_dir = Path(manifest["output_corpus"])
-    assert manifest["meta_changed"] is True
-    assert manifest["forward_output"] == "value"
-    assert manifest["q_head_provenance"] is None
-    assert (out_dir / "root_value.dat").exists()
-
-    reloaded = MemmapCorpus(out_dir)
-    assert "root_value" in reloaded
-    got = np.asarray(reloaded["root_value"])
-    assert got.shape == (len(reloaded),)
-    # Fake forward returns value = row_index * 0.01; all rows written (no mask).
-    expected = (np.arange(len(reloaded)) * 0.01).astype(np.float32)
-    np.testing.assert_allclose(got, expected, rtol=0, atol=1e-6)
-    # corpus_meta.json gained a scalar fixed schema entry.
-    meta = json.loads((out_dir / "corpus_meta.json").read_text())
-    root_schema = meta["columns"]["root_value"]
-    assert {key: root_schema[key] for key in ("kind", "dtype", "inner_shape")} == {
-        "kind": "fixed",
-        "dtype": "<f4",
-        "inner_shape": [],
-    }
-    assert root_schema["target_semantics"] == rl.ROOT_VALUE_TARGET_SEMANTICS
-    assert root_schema["materialization"] == manifest["root_value_materialization"]
+@pytest.mark.parametrize("component", ["root_value", "root_prior_value"])
+def test_value_component_reanalysis_is_refused(component):
+    with pytest.raises(SystemExit, match="single stored-feature forward"):
+        rl.validate_v_component(component)
 
 
 def test_integrity_guard_detects_unexpected_change(corpus_dir, tmp_path, monkeypatch):
@@ -280,23 +279,28 @@ def test_integrity_guard_detects_unexpected_change(corpus_dir, tmp_path, monkeyp
 
     monkeypatch.setattr(rl, "rewrite_per_action_column", _sabotage)
     with pytest.raises(SystemExit, match="INTEGRITY FAILURE"):
-        _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, v_component="target_scores")
+        _run_full_with_fake_forward(
+            corpus_dir, tmp_path, monkeypatch, v_component="target_scores"
+        )
 
 
 def test_out_dir_refuses_to_overwrite(corpus_dir, tmp_path, monkeypatch):
     out = tmp_path / "existing"
     out.mkdir()
     with pytest.raises(SystemExit, match="already exists"):
-        _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, v_component="target_scores", out_dir=out)
+        _run_full_with_fake_forward(
+            corpus_dir, tmp_path, monkeypatch, v_component="target_scores", out_dir=out
+        )
 
 
 # --------------------------------------------------------------------------- #
 # Q-head safety boundary
 # --------------------------------------------------------------------------- #
-def test_cli_defaults_to_trained_value_head_root_value():
-    args = rl.build_arg_parser().parse_args(["--corpus", "corpus", "--checkpoint", "ckpt.pt"])
-    assert args.v_component == "root_value"
-    assert args.q_head_provenance is None
+def test_cli_requires_an_explicit_q_component():
+    with pytest.raises(SystemExit):
+        rl.build_arg_parser().parse_args(
+            ["--corpus", "corpus", "--checkpoint", "ckpt.pt"]
+        )
 
 
 def test_q_values_component_requires_explicit_provenance(tmp_path):
@@ -335,13 +339,11 @@ def test_programmatic_run_metadata_is_bound_to_actual_reanalyzer_bytes(tmp_path)
         checkpoint_a, {"md5": rl.md5_file(checkpoint_a)}
     ) == rl.md5_file(checkpoint_a)
     with pytest.raises(SystemExit, match="reanalyzer checkpoint md5 mismatch"):
-        rl.verify_reanalyzer_identity(
-            checkpoint_b, {"md5": rl.md5_file(checkpoint_a)}
-        )
+        rl.verify_reanalyzer_identity(checkpoint_b, {"md5": rl.md5_file(checkpoint_a)})
 
 
 def test_root_value_rejects_irrelevant_q_provenance(tmp_path):
-    with pytest.raises(SystemExit, match="only valid with a q_values component"):
+    with pytest.raises(SystemExit, match="single stored-feature forward"):
         rl.validate_q_head_provenance(
             {"schema": rl.Q_HEAD_PROVENANCE_SCHEMA},
             reanalyzer_meta={"md5": "a" * 32},
@@ -458,7 +460,9 @@ def test_batch_forward_assembles_value_and_q(corpus_dir, monkeypatch):
         def eval(self):
             return self
 
-    fake_policy = type("P", (), {"model": _FakeModel(), "policy_type": "entity_graph"})()
+    fake_policy = type(
+        "P", (), {"model": _FakeModel(), "policy_type": "entity_graph"}
+    )()
 
     def _fake_forward(policy, data, batch, legal_action_ids, *, return_q, **kwargs):
         w = legal_action_ids.shape[1]
@@ -484,11 +488,15 @@ def test_batch_forward_assembles_value_and_q(corpus_dir, monkeypatch):
 # --------------------------------------------------------------------------- #
 # Helper: full run with model + forward faked out
 # --------------------------------------------------------------------------- #
-def _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, *, v_component, out_dir=None):
+def _run_full_with_fake_forward(
+    corpus_dir, tmp_path, monkeypatch, *, v_component, out_dir=None
+):
     torch = pytest.importorskip("torch")
 
     ckpt = tmp_path / "champion.pt"
-    torch.save({"policy_type": "entity_graph", "mask_hidden_info": False, "model": {}}, ckpt)
+    torch.save(
+        {"policy_type": "entity_graph", "mask_hidden_info": False, "model": {}}, ckpt
+    )
 
     monkeypatch.setattr(rl, "load_policy", lambda *a, **k: object())
 
@@ -515,7 +523,11 @@ def _run_full_with_fake_forward(corpus_dir, tmp_path, monkeypatch, *, v_componen
     monkeypatch.setattr(rl, "batch_forward", _fake_batch_forward)
 
     reanalyzer_path, reanalyzer_meta = rl.resolve_reanalyzer_checkpoint(
-        mode="checkpoint", checkpoint=ckpt, ema_checkpoints=None, ema_decay=0.75, work_dir=tmp_path
+        mode="checkpoint",
+        checkpoint=ckpt,
+        ema_checkpoints=None,
+        ema_decay=0.75,
+        work_dir=tmp_path,
     )
     q_head_provenance = (
         _write_q_head_provenance(tmp_path, ckpt)

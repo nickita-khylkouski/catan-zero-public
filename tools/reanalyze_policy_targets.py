@@ -63,6 +63,10 @@ from reconstruct_state import (  # noqa: E402
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
     TARGET_INFORMATION_REGIME_PUBLIC,
 )
+from catan_zero.rl.target_reliability import (  # noqa: E402
+    TARGET_RELIABILITY_COLUMNS,
+    unaudited_target_reliability_fields,
+)
 from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig  # noqa: E402
 from catan_zero.search.native_gumbel_mcts import create_gumbel_search  # noqa: E402
 from catan_zero.search.neural_rust_mcts import (  # noqa: E402
@@ -72,9 +76,9 @@ from catan_zero.search.neural_rust_mcts import (  # noqa: E402
 )
 
 
-PLAN_SCHEMA = "a1-policy-target-reanalysis-plan-v1"
-CLAIM_SCHEMA = "a1-policy-target-reanalysis-claim-v1"
-MERGE_SCHEMA = "a1-policy-target-reanalysis-merged-v1"
+PLAN_SCHEMA = "a1-policy-target-reanalysis-plan-v2"
+CLAIM_SCHEMA = "a1-policy-target-reanalysis-claim-v2"
+MERGE_SCHEMA = "a1-policy-target-reanalysis-merged-v2"
 PAYLOAD_INVENTORY_SCHEMA = "reanalysis-payload-inventory-v1"
 COLORS = ("RED", "BLUE")
 REWRITTEN_COLUMNS = frozenset(
@@ -86,11 +90,21 @@ REWRITTEN_COLUMNS = frozenset(
         "target_scores_mask",
         "root_value",
         "root_value_mask",
+        "root_prior_value",
+        "root_prior_value_mask",
         "prior_policy",
+        "simulations_used",
+        "used_full_search",
+        "search_evidence_version",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+        "search_prior_policy_flat",
         "trajectory_producer_checkpoint_sha256",
         "target_reanalyzer_checkpoint_sha256",
         "target_reanalysis_search_config_sha256",
         "target_reanalysis_plan_sha256",
+        *TARGET_RELIABILITY_COLUMNS,
     }
 )
 SEARCH_PATCH_COLUMNS = frozenset(
@@ -101,7 +115,11 @@ SEARCH_PATCH_COLUMNS = frozenset(
         "target_scores_mask",
         "root_value",
         "root_value_mask",
+        "root_prior_value",
+        "root_prior_value_mask",
         "prior_policy",
+        "simulations_used",
+        "used_full_search",
     }
 )
 RECONSTRUCTION_COLUMNS = frozenset(
@@ -687,7 +705,9 @@ def _search_patch(search: Any, game: Any, feature: Mapping[str, Any]) -> dict[st
     if set(result.improved_policy) != set(legal_rust):
         raise ReanalysisError("search result does not cover the exact legal root")
     target = [float(result.improved_policy[action]) for action in legal_rust]
-    target_mask = [value > 0.0 for value in target]
+    # Coverage records that the teacher supplied a label for a legal action.
+    # An exact zero is a valid soft target, not missing supervision.
+    target_mask = [True] * len(target)
     raw_scores = [
         float(result.q_values.get(action, float("nan"))) for action in legal_rust
     ]
@@ -697,9 +717,15 @@ def _search_patch(search: Any, game: Any, feature: Mapping[str, Any]) -> dict[st
     # merge time; consumers must consult target_scores_mask.
     scores = [value if valid else 0.0 for value, valid in zip(raw_scores, score_mask)]
     priors = [float(result.priors[action]) for action in legal_rust]
-    if not result.used_full_search or not np.isfinite(result.root_value):
+    if (
+        not result.used_full_search
+        or not np.isfinite(result.root_value)
+        or not -1.0 <= float(result.root_value) <= 1.0
+        or not np.isfinite(result.root_prior_value)
+        or not -1.0 <= float(result.root_prior_value) <= 1.0
+    ):
         raise ReanalysisError(
-            "forced-full reanalysis returned no full-search root value"
+            "forced-full reanalysis returned invalid root search/prior value evidence"
         )
     if not np.isclose(sum(target), 1.0, atol=1e-5) or not np.isclose(
         sum(priors), 1.0, atol=1e-5
@@ -712,7 +738,11 @@ def _search_patch(search: Any, game: Any, feature: Mapping[str, Any]) -> dict[st
         "target_scores_mask": score_mask,
         "root_value": float(result.root_value),
         "root_value_mask": True,
+        "root_prior_value": float(result.root_prior_value),
+        "root_prior_value_mask": True,
         "prior_policy": priors,
+        "simulations_used": int(result.simulations_used),
+        "used_full_search": True,
     }
 
 
@@ -854,6 +884,11 @@ def _ensure_reanalysis_provenance_columns(
     arrays: dict[str, np.ndarray], plan: Mapping[str, Any]
 ) -> None:
     rows = _row_count(arrays)
+    arrays.setdefault("root_prior_value", np.full(rows, np.nan, dtype=np.float32))
+    arrays.setdefault("root_prior_value_mask", np.zeros(rows, dtype=np.bool_))
+    for key, scalar in unaudited_target_reliability_fields().items():
+        if key not in arrays:
+            arrays[key] = np.full(rows, scalar, dtype=np.asarray(scalar).dtype)
     original_teacher = np.asarray(arrays.get("teacher_name", np.full(rows, ""))).astype(
         "U64"
     )
@@ -883,6 +918,8 @@ def _stamp_reanalysis_provenance(
     ]
     arrays["target_reanalysis_search_config_sha256"][row] = plan["search_config_sha256"]
     arrays["target_reanalysis_plan_sha256"][row] = plan["plan_sha256"]
+    for key, scalar in unaudited_target_reliability_fields().items():
+        arrays[key][row] = scalar
 
 
 def _columns_sha256(arrays: Mapping[str, np.ndarray], keys: Iterable[str]) -> str:
@@ -1020,6 +1057,18 @@ def merge_claims(
         original = load_shard(Path(source["path"]))
         arrays = {key: value.copy() for key, value in original.items()}
         _ensure_reanalysis_provenance_columns(arrays, plan)
+        # Compact search evidence belongs to the exact checkpoint/search that
+        # produced it. Until this operator rebuilds that ragged bundle from the
+        # new SearchResult, remove it instead of pairing new targets with stale Q
+        # and visit evidence. The empirical quality gate then fails closed.
+        for key in (
+            "search_evidence_version",
+            "search_evidence_offsets",
+            "search_visit_counts_flat",
+            "search_completed_q_flat",
+            "search_prior_policy_flat",
+        ):
+            arrays.pop(key, None)
         before = {
             key: value.copy()
             for key, value in original.items()
@@ -1075,6 +1124,7 @@ def merge_claims(
         "search_config_sha256": plan["search_config_sha256"],
         "rewritten_columns": sorted(REWRITTEN_COLUMNS),
         "reanalyzed_rows": len(patches),
+        "search_evidence_invalidated": True,
         "shards": output_shards,
         "payload_inventory_schema": PAYLOAD_INVENTORY_SCHEMA,
         "payload_inventory": payload_inventory,

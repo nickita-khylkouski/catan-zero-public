@@ -10,7 +10,9 @@ from pathlib import Path
 
 import numpy as np
 
-SCHEMA = "a1-policy-target-reanalysis-merged-v1"
+from catan_zero.rl.target_reliability import TARGET_RELIABILITY_COLUMNS
+
+SCHEMA = "a1-policy-target-reanalysis-merged-v2"
 REWRITTEN = frozenset(
     {
         "teacher_name",
@@ -20,11 +22,21 @@ REWRITTEN = frozenset(
         "target_scores_mask",
         "root_value",
         "root_value_mask",
+        "root_prior_value",
+        "root_prior_value_mask",
         "prior_policy",
+        "simulations_used",
+        "used_full_search",
+        "search_evidence_version",
+        "search_evidence_offsets",
+        "search_visit_counts_flat",
+        "search_completed_q_flat",
+        "search_prior_policy_flat",
         "trajectory_producer_checkpoint_sha256",
         "target_reanalyzer_checkpoint_sha256",
         "target_reanalysis_search_config_sha256",
         "target_reanalysis_plan_sha256",
+        *TARGET_RELIABILITY_COLUMNS,
     }
 )
 
@@ -109,6 +121,10 @@ def validate_policy_target_reanalysis_manifest(
         raise SystemExit("policy-target reanalysis manifest authentication failed")
     if set(payload.get("rewritten_columns", [])) != REWRITTEN:
         raise SystemExit("policy-target reanalysis rewritten-column allowlist mismatch")
+    if payload.get("search_evidence_invalidated") is not True:
+        raise SystemExit(
+            "policy-target reanalysis did not invalidate stale search evidence"
+        )
     for role in ("trajectory_producer", "target_reanalyzer"):
         binding = payload.get(role)
         if not isinstance(binding, dict) or _file_sha(
@@ -146,6 +162,18 @@ def validate_policy_target_reanalysis_manifest(
             source_arrays = {key: raw[key] for key in raw.files}
         with np.load(output_path, allow_pickle=True) as raw:
             output_arrays = {key: raw[key] for key in raw.files}
+        stale_evidence = {
+            "search_evidence_version",
+            "search_evidence_offsets",
+            "search_visit_counts_flat",
+            "search_completed_q_flat",
+            "search_prior_policy_flat",
+        }.intersection(output_arrays)
+        if stale_evidence:
+            raise SystemExit(
+                "policy-target reanalysis retained stale search evidence: "
+                + ", ".join(sorted(stale_evidence))
+            )
         preserved = set(source_arrays) - REWRITTEN
         digest = _columns_sha(source_arrays, preserved)
         if (
@@ -158,7 +186,16 @@ def validate_policy_target_reanalysis_manifest(
             if (
                 str(output_arrays["teacher_name"][row]) != "policy_target_reanalysis"
                 or not bool(output_arrays["root_value_mask"][row])
-                or not bool(np.asarray(output_arrays["target_policy_mask"])[row].any())
+                or not bool(output_arrays["root_prior_value_mask"][row])
+                or not np.isfinite(float(output_arrays["root_value"][row]))
+                or not -1.0 <= float(output_arrays["root_value"][row]) <= 1.0
+                or not np.isfinite(float(output_arrays["root_prior_value"][row]))
+                or not -1.0 <= float(output_arrays["root_prior_value"][row]) <= 1.0
+                or not bool(
+                    np.asarray(output_arrays["target_policy_mask"])[row][
+                        np.asarray(output_arrays["legal_action_ids"])[row] >= 0
+                    ].all()
+                )
                 or str(output_arrays["trajectory_producer_checkpoint_sha256"][row])
                 != payload["trajectory_producer"]["checkpoint_sha256"]
                 or str(output_arrays["target_reanalyzer_checkpoint_sha256"][row])

@@ -29672,6 +29672,23 @@ def _audit_value_root_blend_corpus(
         ) == {"public_conservation_pimc_v1"}
     if lam == 1.0:
         return report
+    # reanalyze_lite <=1.2 mislabeled a single network forward as a
+    # post-search root backup. Quarantine those overlays by their durable
+    # materialization schema before any blended target can reach the optimizer.
+    components = getattr(data, "corpora", None) or (data,)
+    for component in components:
+        columns = getattr(component, "meta", {}).get("columns", {})
+        materialization = columns.get("root_value", {}).get("materialization", {})
+        if (
+            isinstance(materialization, dict)
+            and materialization.get("schema")
+            == "catan_zero_root_value_materialization_v1"
+        ):
+            raise SystemExit(
+                "requested root-value blend includes a legacy direct-forward "
+                "root_value overlay; regenerate targets with a true sealed search "
+                "reanalysis"
+            )
     if "root_value" not in data:
         raise SystemExit("requested root-value blend but corpus has no root_value column")
     root = np.asarray(data["root_value"][rows], dtype=np.float32).reshape(n)

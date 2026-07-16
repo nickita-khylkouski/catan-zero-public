@@ -1,32 +1,12 @@
 #!/usr/bin/env python3
-"""Reanalyze-lite v1: batch-forward a checkpoint over a stored window and rewrite
-the lambda-blend's value component into a COPY of the corpus.
+"""Reanalyze-lite v1.3: refresh provenance-qualified per-action Q targets.
 
 WHAT THIS FIXES (CAT-34)
 ------------------------
-The reanalyze value-target design (docs/REANALYZE_VALUE_TARGETS_DESIGN_20260704.md)
-blends the Monte-Carlo outcome ``z`` with a search-derived value component into the
-training value target::
-
-    v_target = lambda * z + (1 - lambda) * V_component
-
-The persisted ``V_component`` is the *generation-time* network's own estimate
-(``target_scores`` = ``result.q_values`` per legal action, produced while that
-same net was generating the game). Reusing a net's own archived value as its own
-regression target is a self-distillation amplifier -- the effective-rank-collapse
-failure mode Kumar et al. (2010.14498) describe, and the reason MuZero-Reanalyse
-pins the value-loss weight at 0.25. It is plausibly co-causal in the reported
-+69% drift incident.
-
-"Reanalyze-lite" is the cheap remedy that extracts more from data already paid
-for, with ZERO new games: batch-forward the CURRENT champion (or a lagged/EMA net)
-over the stored states and overwrite the value component with those fresh forward
-passes. This is a batch FORWARD pass, not a full re-search (that is the larger,
-separate "full selective reanalyze" graduation step, CAT-63) -- and it is a
-HYPOTHESIS TEST, not a guaranteed fix: a fresh search-consistent forward value may
-or may not beat the stale search-completed value. The selected scalar/categorical
-readout is materialized with search's exact scale, squash, and final clip; the
-retrain + gate (a separate step, run on the output of this tool) is what decides.
+This tool batch-forwards the current checkpoint over stored states and may rewrite
+``target_scores`` or ``afterstate_target`` only when the checkpoint carries
+explicit, validation-bound Q-head provenance. It is not a search reanalyzer and
+therefore refuses both root value columns.
 
 WHAT IT REUSES
 --------------
@@ -52,12 +32,16 @@ USAGE
 Spot-check first (no write; forward a sample, print before/after stats)::
 
     python tools/reanalyze_lite.py --corpus runs/memmap_corpus_window \
-        --checkpoint runs/champion.pt --sample 20000 --device cuda --batch-size 8192
+        --checkpoint runs/champion.pt --v-component target_scores \
+        --q-head-provenance q_head_provenance.json \
+        --sample 20000 --device cuda --batch-size 8192
 
 Full rewrite on a host GPU (inference only, verification/smoke scale)::
 
     python tools/reanalyze_lite.py --corpus runs/memmap_corpus_window \
-        --checkpoint runs/champion.pt --device cuda --batch-size 8192 \
+        --checkpoint runs/champion.pt --v-component target_scores \
+        --q-head-provenance q_head_provenance.json \
+        --device cuda --batch-size 8192 \
         --progress-every 50
     # -> runs/memmap_corpus_window_reanalyzed_<tag>/  (+ reanalyze_manifest.json)
 
@@ -65,21 +49,20 @@ Lagged/EMA reanalyzer (R8 fallback when drift telemetry is ambiguous)::
 
     python tools/reanalyze_lite.py --corpus runs/memmap_corpus_window \
         --reanalyzer-net ema --ema-checkpoints ckpt_gen1.pt ckpt_gen2a.pt \
-        --ema-decay 0.75 --device cuda
+        --ema-decay 0.75 --v-component target_scores \
+        --q-head-provenance q_head_provenance.json --device cuda
 
 Then retrain ONE dose champion-init on the rewritten corpus and gate it against a
 same-data control trained on the untouched corpus (both separate steps).
 
 SAFE DEFAULT
 ------------
-The default is ``--v-component root_value``. It materialises a fresh per-state
-``V(s)`` column from the configured trained value readout, using the same
-``value_scale`` / scalar ``value_squash`` / final ``[-1, 1]`` clip as search. The
-full contract is persisted in the column schema and manifest. This is the column
-consumed by ``train_bc --value-target-lambda``. Normal training uses
-``q_loss_weight=0`` and freezes the q branch, so silently replacing
-``target_scores`` from that branch would turn random/untrained outputs into
-training targets.
+There is deliberately no default component. A direct checkpoint forward is not
+necessarily the search root evaluator: wide roots can use symmetry averaging and
+information-set search can aggregate determinizations. Therefore this lite tool
+must never rewrite either ``root_value`` or ``root_prior_value``. Those paired
+columns may only be refreshed by a tool that actually reruns the sealed search
+operator.
 
 The per-action ``target_scores`` and ``afterstate_target`` modes remain available
 only for a checkpoint whose q head has explicit, validated provenance supplied by
@@ -87,6 +70,7 @@ only for a checkpoint whose q head has explicit, validated provenance supplied b
 that the q head was trained for root-to-move search-action values in ``[-1, 1]``
 and passed a named validation. See ``docs/REANALYZE_Q_HEAD_PROVENANCE.md``.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -108,160 +92,34 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 TOOL_NAME = "reanalyze_lite"
-TOOL_VERSION = "1.2"
-DEFAULT_V_COMPONENT = "root_value"
+TOOL_VERSION = "1.3"
 
 Q_HEAD_PROVENANCE_SCHEMA = "catan_zero_q_head_provenance_v1"
 Q_HEAD_TARGET_SEMANTICS = "root_to_move_search_action_value_v1"
-ROOT_VALUE_MATERIALIZATION_SCHEMA = "catan_zero_root_value_materialization_v1"
-ROOT_VALUE_TARGET_SEMANTICS = "root_to_move_search_backup_value_v1"
-ROOT_VALUE_RANGE = [-1.0, 1.0]
 
-# The three value-component columns the tool can refresh, and which forward-pass
-# output feeds each. Only ``target_scores`` is present in a standard memmap corpus
-# (build_memmap_corpus.LOADER_KEYS carries it but drops afterstate_target /
-# root_value, which live in gumbel_self_play.EXTRA_KEYS); the other two are
-# supported for corpora that carry them or when materialising a fresh per-state
-# ``root_value`` column for a future per-state value-target-lambda.
-#
-# * per_action columns (target_scores, afterstate_target) are ragged
+# The two q-value columns this tool can refresh. Both are ragged
 #   (N, legal_width), stored trimmed to each row's legal count; refreshed from the
 #   q_values head, overwriting only the entries that were finite (masked) before.
-# * per_state columns (root_value) are a scalar (N,) fixed column; refreshed from
-#   the configured search value readout after its exact scale/squash/final clip.
-#   If absent it is MATERIALISED (a new .dat + a provenance-bearing schema entry).
 V_COMPONENTS: dict[str, dict[str, str]] = {
     "target_scores": {"forward_output": "q_values", "kind": "per_action"},
     "afterstate_target": {"forward_output": "q_values", "kind": "per_action"},
-    "root_value": {"forward_output": "value", "kind": "per_state"},
 }
 
 
-def resolve_root_value_materialization(
-    *,
-    value_readout: str = "scalar",
-    value_squash: str = "tanh",
-    value_scale: float = 1.0,
-) -> dict:
-    """Return the canonical, search-equivalent root-value materialization spec.
-
-    This mirrors :class:`EntityGraphRustEvaluator` exactly: scalar search reads
-    ``outputs["value"]`` and applies ``tanh(raw * scale)`` (or the experimental
-    clip-only path); categorical search reads the already-calibrated
-    ``outputs["value_categorical"]``, bypasses scalar tanh, then both paths apply
-    the evaluator's final ``[-1, 1]`` clip.  Persisting this complete spec keeps a
-    corpus target tied to the readout actually used by search instead of merely
-    saying that it came from an unspecified "value head".
-    """
-    readout = str(value_readout)
-    squash = str(value_squash)
-    try:
-        scale = float(value_scale)
-    except (TypeError, ValueError) as exc:
-        raise SystemExit(f"--value-scale must be a finite positive float (got {value_scale!r})") from exc
-    if readout not in {"scalar", "categorical"}:
+def validate_v_component(v_component: str) -> dict[str, str]:
+    if v_component in {"root_value", "root_prior_value"}:
         raise SystemExit(
-            f"unknown --value-readout {readout!r}; expected 'scalar' or 'categorical'"
+            f"REFUSING --v-component {v_component}: a single stored-feature forward "
+            "does not reproduce the sealed root search evaluator. Use "
+            "reanalyze_policy_targets.py or the Stage-C search reanalyzer so "
+            "root_value and root_prior_value are refreshed atomically."
         )
-    if squash not in {"tanh", "clip"}:
+    spec = V_COMPONENTS.get(v_component)
+    if spec is None:
         raise SystemExit(
-            f"unknown --value-squash {squash!r}; expected 'tanh' or 'clip'"
+            f"unknown --v-component {v_component!r}; choices: {sorted(V_COMPONENTS)}"
         )
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise SystemExit(f"--value-scale must be finite and > 0 (got {value_scale!r})")
-    return {
-        "schema": ROOT_VALUE_MATERIALIZATION_SCHEMA,
-        "target_semantics": ROOT_VALUE_TARGET_SEMANTICS,
-        "value_readout": readout,
-        "forward_output": "value" if readout == "scalar" else "value_categorical",
-        "value_scale": scale,
-        "configured_value_squash": squash,
-        "applied_value_squash": squash if readout == "scalar" else "none",
-        "final_clip": True,
-        "value_range": list(ROOT_VALUE_RANGE),
-    }
-
-
-def validate_root_value_materialization(
-    provenance: dict | None,
-    *,
-    v_component: str,
-) -> dict | None:
-    """Validate a persisted materialization record, rejecting legacy ambiguity.
-
-    Per-action Q targets do not use this record.  ``root_value`` jobs must carry
-    the full canonical record at plan, run, and merge time; otherwise a pre-v1.2
-    banked job containing raw, unsquashed scalar outputs could be mistaken for
-    search-backup values.
-    """
-    if v_component != "root_value":
-        if provenance is not None:
-            raise SystemExit(
-                "root-value materialization provenance is only valid with "
-                "--v-component root_value"
-            )
-        return None
-    if not isinstance(provenance, dict):
-        raise SystemExit(
-            "root_value requires search-consistent value materialization provenance; "
-            "legacy/raw-forward jobs must be re-planned"
-        )
-    try:
-        canonical = resolve_root_value_materialization(
-            value_readout=provenance.get("value_readout"),
-            value_squash=provenance.get("configured_value_squash"),
-            value_scale=provenance.get("value_scale"),
-        )
-    except SystemExit as exc:
-        raise SystemExit(f"invalid root-value materialization provenance: {exc}") from exc
-    if provenance != canonical:
-        mismatched = sorted(
-            key
-            for key in set(provenance) | set(canonical)
-            if provenance.get(key) != canonical.get(key)
-        )
-        raise SystemExit(
-            "invalid root-value materialization provenance: non-canonical/mismatched "
-            f"field(s) {mismatched}"
-        )
-    return canonical
-
-
-def materialize_search_root_values(outputs: dict, provenance: dict) -> np.ndarray:
-    """Convert one forward batch into the exact bounded value search backs up."""
-    spec = validate_root_value_materialization(provenance, v_component="root_value")
-    assert spec is not None
-    key = spec["forward_output"]
-    if key not in outputs:
-        raise SystemExit(
-            f"value_readout={spec['value_readout']!r} requires forward output {key!r}; "
-            f"model emitted {sorted(outputs)} (refusing fallback to another head)"
-        )
-    tensor = outputs[key]
-    try:
-        raw = tensor.detach().float().reshape(-1).cpu().numpy().astype(np.float64)
-    except AttributeError as exc:
-        raise SystemExit(f"forward output {key!r} is not a tensor-like value") from exc
-    if not np.all(np.isfinite(raw)):
-        bad = int((~np.isfinite(raw)).sum())
-        raise SystemExit(f"forward output {key!r} contains {bad} non-finite value(s)")
-
-    scaled = raw * float(spec["value_scale"])
-    if spec["applied_value_squash"] == "tanh":
-        bounded = np.tanh(scaled)
-    elif spec["applied_value_squash"] in {"clip", "none"}:
-        bounded = scaled
-    else:  # Defensive even after canonical validation.
-        raise SystemExit(
-            f"unsupported applied value squash {spec['applied_value_squash']!r}"
-        )
-    # This is the final clip performed at every search call site, after squash.
-    bounded = np.clip(bounded, ROOT_VALUE_RANGE[0], ROOT_VALUE_RANGE[1])
-    if not np.all(np.isfinite(bounded)):
-        raise SystemExit("materialized root values contain non-finite value(s)")
-    if np.any(bounded < ROOT_VALUE_RANGE[0]) or np.any(bounded > ROOT_VALUE_RANGE[1]):
-        raise SystemExit("materialized root values escaped the declared [-1, 1] range")
-    return bounded.astype(np.float32, copy=False)
+    return spec
 
 
 def _is_hex_digest(value: object, length: int) -> bool:
@@ -282,23 +140,18 @@ def validate_q_head_provenance(
 ) -> dict | None:
     """Fail closed before any q-head output can become a corpus target.
 
-    ``root_value`` uses the value head and needs no q provenance. Per-action
-    components use ``q_values`` and therefore require an explicit record bound to
+    Supported components use ``q_values`` and therefore require an explicit record bound to
     the exact checkpoint. A path is normalized into a self-contained manifest
     record (including the provenance file hash); an already-normalized dict is
     accepted when re-validating a banked job manifest at ``run``/``merge`` time.
     """
-    spec = V_COMPONENTS.get(v_component)
-    if spec is None:
-        raise SystemExit(
-            f"unknown --v-component {v_component!r}; choices: {sorted(V_COMPONENTS)}"
-        )
+    spec = validate_v_component(v_component)
     needs_q = spec["forward_output"] == "q_values"
     if not needs_q:
         if provenance is not None:
             raise SystemExit(
                 "--q-head-provenance is only valid with a q_values component "
-                "(target_scores or afterstate_target); root_value uses the trained value head"
+                "(target_scores or afterstate_target)"
             )
         return None
 
@@ -306,8 +159,7 @@ def validate_q_head_provenance(
         raise SystemExit(
             f"REFUSING --v-component {v_component}: it rewrites corpus targets from "
             "q_values, but normal train_bc runs freeze an untrained q branch when "
-            "q_loss_weight=0. Use --v-component root_value (the safe default), or "
-            "supply --q-head-provenance for a q head trained and validated with the "
+            "q_loss_weight=0. Supply --q-head-provenance for a q head trained and validated with the "
             "required search-action-value semantics."
         )
 
@@ -369,7 +221,9 @@ def validate_q_head_provenance(
             errors.append("validation.passed must be true")
         evidence = validation.get("evidence")
         if not isinstance(evidence, str) or not evidence.strip():
-            errors.append("validation.evidence must be a non-empty run/report identifier")
+            errors.append(
+                "validation.evidence must be a non-empty run/report identifier"
+            )
 
     if errors:
         raise SystemExit("invalid q-head provenance: " + "; ".join(errors))
@@ -380,7 +234,9 @@ def validate_q_head_provenance(
         normalized["source_path"] = source_path
     if source_sha256 is not None:
         if not _is_hex_digest(source_sha256, 64):
-            raise SystemExit("invalid q-head provenance: source_sha256 must be 64 hex chars")
+            raise SystemExit(
+                "invalid q-head provenance: source_sha256 must be 64 hex chars"
+            )
         normalized["source_sha256"] = source_sha256.lower()
     return normalized
 
@@ -457,7 +313,9 @@ def resolve_reanalyzer_checkpoint(
 
     if mode == "ema":
         if not ema_checkpoints:
-            raise SystemExit("--reanalyzer-net ema requires --ema-checkpoints P1 P2 ...")
+            raise SystemExit(
+                "--reanalyzer-net ema requires --ema-checkpoints P1 P2 ..."
+            )
         from ema_average_checkpoints import (  # noqa: E402
             compute_ema_weights,
             ema_average_checkpoints,
@@ -469,7 +327,9 @@ def resolve_reanalyzer_checkpoint(
                 raise SystemExit(f"ema checkpoint not found: {p}")
         work_dir.mkdir(parents=True, exist_ok=True)
         averaged_path = work_dir / "reanalyzer_ema.pt"
-        ema_average_checkpoints(checkpoints=paths, decay=ema_decay, output=averaged_path)
+        ema_average_checkpoints(
+            checkpoints=paths, decay=ema_decay, output=averaged_path
+        )
         meta = {
             "mode": "ema",
             "ema_decay": float(ema_decay),
@@ -490,7 +350,9 @@ def load_policy(checkpoint_path: Path, *, device: str, policy_type: str):
     from catan_zero.rl.xdim_lite_policy import XDimLitePolicy
 
     if policy_type == "entity_graph":
-        return EntityGraphPolicy.load(checkpoint_path, device=device, strict_metadata=False)
+        return EntityGraphPolicy.load(
+            checkpoint_path, device=device, strict_metadata=False
+        )
     return XDimLitePolicy.load(checkpoint_path, device=device, strict_metadata=False)
 
 
@@ -536,16 +398,18 @@ def batch_forward(
                 legal_action_ids,
                 return_q=want_q,
             )
-            if value_materialization is None:
-                if "value" not in outputs:
-                    raise SystemExit(
-                        f"forward pass emitted no 'value' output; keys={sorted(outputs)}"
-                    )
-                value = outputs["value"].detach().float().reshape(-1).cpu().numpy()
-                if not np.all(np.isfinite(value)):
-                    raise SystemExit("forward output 'value' contains non-finite value(s)")
-            else:
-                value = materialize_search_root_values(outputs, value_materialization)
+            if value_materialization is not None:
+                raise SystemExit(
+                    "direct value materialization is disabled; rerun the sealed search "
+                    "operator to refresh root values"
+                )
+            if "value" not in outputs:
+                raise SystemExit(
+                    f"forward pass emitted no 'value' output; keys={sorted(outputs)}"
+                )
+            value = outputs["value"].detach().float().reshape(-1).cpu().numpy()
+            if not np.all(np.isfinite(value)):
+                raise SystemExit("forward output 'value' contains non-finite value(s)")
             if value.shape[0] != len(batch):
                 raise SystemExit(
                     f"value output has {value.shape[0]} entries for batch size {len(batch)}"
@@ -627,87 +491,9 @@ def rewrite_per_action_column(
         "entries_rewritten": int(change.sum()),
         "before": old_padded[change].astype(np.float64),
         "after": new_padded[change].astype(np.float64),
-        "row_index_per_entry": np.repeat(np.arange(old_padded.shape[0]), change.sum(axis=1)),
-    }
-
-
-def rewrite_per_state_column(
-    corpus,
-    dst_dir: Path,
-    name: str,
-    fresh_values: np.ndarray,
-    *,
-    write_mask: np.ndarray | None = None,
-    column_provenance: dict | None = None,
-) -> dict:
-    """Write/overwrite a per-state scalar column with fresh value-head V(s).
-
-    Materialises the column if the corpus does not already carry it (updates the
-    copy's corpus_meta.json with a scalar ``fixed`` schema entry). Rows outside
-    ``write_mask`` are left NaN (mixable-rows-only discipline; a corpus with no
-    full-search flag defaults to writing every row). ``column_provenance`` is
-    embedded in the column schema and values are rejected unless they satisfy its
-    declared finite ``[-1, 1]`` target contract. This catches callers that bypass
-    the canonical batch-forward materializer.
-    """
-    n = int(len(corpus))
-    fresh_values = np.asarray(fresh_values, dtype=np.float32).reshape(-1)
-    if fresh_values.shape[0] != n:
-        raise SystemExit(f"fresh_values length {fresh_values.shape[0]} != row_count {n}")
-    if write_mask is None:
-        write_mask = np.ones(n, dtype=bool)
-    write_mask = np.asarray(write_mask, dtype=bool).reshape(-1)
-    if write_mask.shape[0] != n:
-        raise SystemExit(f"write_mask length {write_mask.shape[0]} != row_count {n}")
-
-    canonical_provenance = None
-    if column_provenance is not None:
-        canonical_provenance = validate_root_value_materialization(
-            column_provenance, v_component=name
-        )
-        selected = fresh_values[write_mask]
-        if not np.all(np.isfinite(selected)):
-            raise SystemExit("refusing to write non-finite materialized root_value target(s)")
-        tolerance = 1.0e-6
-        if np.any(selected < ROOT_VALUE_RANGE[0] - tolerance) or np.any(
-            selected > ROOT_VALUE_RANGE[1] + tolerance
-        ):
-            lo = float(np.min(selected))
-            hi = float(np.max(selected))
-            raise SystemExit(
-                "refusing out-of-range materialized root_value target(s): "
-                f"observed [{lo}, {hi}], required [-1, 1]"
-            )
-
-    existed = name in corpus
-    old = np.asarray(corpus[name], dtype=np.float64).reshape(-1) if existed else None
-
-    col = np.full(n, np.nan, dtype=np.float32)
-    col[write_mask] = fresh_values[write_mask]
-    np.ascontiguousarray(col).tofile(dst_dir / f"{name}.dat")
-
-    meta_changed = False
-    if not existed or canonical_provenance is not None:
-        meta_path = dst_dir / "corpus_meta.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        schema = {"kind": "fixed", "dtype": "<f4", "inner_shape": []}
-        if canonical_provenance is not None:
-            schema["target_semantics"] = ROOT_VALUE_TARGET_SEMANTICS
-            schema["materialization"] = canonical_provenance
-        if meta["columns"].get(name) != schema:
-            meta["columns"][name] = schema
-            meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
-            meta_changed = True
-
-    changed = write_mask
-    return {
-        "changed_files": [f"{name}.dat"],
-        "meta_changed": meta_changed,
-        "rows_total": n,
-        "entries_rewritten": int(write_mask.sum()),
-        "before": (old[changed] if existed else np.empty(0, dtype=np.float64)),
-        "after": col[changed].astype(np.float64),
-        "row_index_per_entry": np.flatnonzero(changed),
+        "row_index_per_entry": np.repeat(
+            np.arange(old_padded.shape[0]), change.sum(axis=1)
+        ),
     }
 
 
@@ -813,44 +599,30 @@ def run_reanalyze(
     seed: int,
     progress_every: int,
     q_head_provenance: Path | dict | None = None,
-    value_readout: str = "scalar",
-    value_squash: str = "tanh",
-    value_scale: float = 1.0,
 ) -> dict:
     import train_bc
     from train_bc import MemmapCorpus
 
-    if v_component not in V_COMPONENTS:
-        raise SystemExit(f"unknown --v-component {v_component!r}; choices: {sorted(V_COMPONENTS)}")
+    spec = validate_v_component(v_component)
     verify_reanalyzer_identity(reanalyzer_path, reanalyzer_meta)
-    spec = V_COMPONENTS[v_component]
     verified_q_provenance = validate_q_head_provenance(
         q_head_provenance,
         reanalyzer_meta=reanalyzer_meta,
         v_component=v_component,
     )
-    root_value_provenance = (
-        resolve_root_value_materialization(
-            value_readout=value_readout,
-            value_squash=value_squash,
-            value_scale=value_scale,
-        )
-        if v_component == "root_value"
-        else None
-    )
-
     corpus = MemmapCorpus(corpus_dir)
     legal_width = corpus.legal_width
     n = len(corpus)
 
-    if spec["kind"] == "per_action" and v_component not in corpus:
+    if v_component not in corpus:
         raise SystemExit(
             f"corpus {corpus_dir} has no {v_component!r} column; present columns: "
             f"{sorted(corpus.keys())}"
         )
-
     policy_type = reanalyzer_meta["policy_type"] or "entity_graph"
-    effective_mask = _resolve_mask_hidden_info(mask_hidden_info, reanalyzer_meta["mask_hidden_info"])
+    effective_mask = _resolve_mask_hidden_info(
+        mask_hidden_info, reanalyzer_meta["mask_hidden_info"]
+    )
     # Load-time public-observation masking hook (train_bc global). Must match the
     # regime the reanalyzer net was trained under, or the forward is off-distribution.
     train_bc._MASK_HIDDEN_INFO_PLAYER_TOKENS = bool(effective_mask)
@@ -866,12 +638,22 @@ def run_reanalyze(
         take = min(int(sample), n)
         idx = np.sort(rng.choice(n, size=take, replace=False).astype(np.int64))
         fwd = batch_forward(
-            policy, corpus, idx, batch_size=batch_size, want_q=want_q,
-            legal_width=legal_width, progress_every=progress_every,
-            value_materialization=root_value_provenance,
+            policy,
+            corpus,
+            idx,
+            batch_size=batch_size,
+            want_q=want_q,
+            legal_width=legal_width,
+            progress_every=progress_every,
+            value_materialization=None,
         )
         report = _sample_report(
-            corpus, idx, fwd, v_component, spec, legal_width,
+            corpus,
+            idx,
+            fwd,
+            v_component,
+            spec,
+            legal_width,
             phases[idx] if phases is not None else None,
         )
         payload = {
@@ -880,13 +662,8 @@ def run_reanalyze(
             "sampled_rows": take,
             "row_count": n,
             "v_component": v_component,
-            "forward_output": (
-                root_value_provenance["forward_output"]
-                if root_value_provenance is not None
-                else spec["forward_output"]
-            ),
+            "forward_output": spec["forward_output"],
             "q_head_provenance": verified_q_provenance,
-            "root_value_materialization": root_value_provenance,
             "reanalyzer": reanalyzer_meta,
             "mask_hidden_info": bool(effective_mask),
             "device": device,
@@ -897,35 +674,36 @@ def run_reanalyze(
 
     # ---- Full mode: forward all rows, copy corpus, rewrite one column, manifest.
     if out_dir is None:
-        out_dir = corpus_dir.parent / f"{corpus_dir.name}_reanalyzed_{_checkpoint_tag(reanalyzer_meta)}"
+        out_dir = (
+            corpus_dir.parent
+            / f"{corpus_dir.name}_reanalyzed_{_checkpoint_tag(reanalyzer_meta)}"
+        )
     out_dir = Path(out_dir)
     if out_dir.exists():
-        raise SystemExit(f"output dir already exists (refusing to overwrite): {out_dir}")
+        raise SystemExit(
+            f"output dir already exists (refusing to overwrite): {out_dir}"
+        )
 
     src_hashes = hash_corpus_dats(corpus_dir)
     src_meta_hash = sha256_file(corpus_dir / "corpus_meta.json")
 
     all_idx = np.arange(n, dtype=np.int64)
     fwd = batch_forward(
-        policy, corpus, all_idx, batch_size=batch_size, want_q=want_q,
-        legal_width=legal_width, progress_every=progress_every,
-        value_materialization=root_value_provenance,
+        policy,
+        corpus,
+        all_idx,
+        batch_size=batch_size,
+        want_q=want_q,
+        legal_width=legal_width,
+        progress_every=progress_every,
+        value_materialization=None,
     )
 
     shutil.copytree(corpus_dir, out_dir)
 
-    if spec["kind"] == "per_action":
-        rewrite = rewrite_per_action_column(
-            corpus, out_dir, v_component, fwd["q_values"], legal_width=legal_width
-        )
-    else:
-        rewrite = rewrite_per_state_column(
-            corpus,
-            out_dir,
-            v_component,
-            fwd["value"],
-            column_provenance=root_value_provenance,
-        )
+    rewrite = rewrite_per_action_column(
+        corpus, out_dir, v_component, fwd["q_values"], legal_width=legal_width
+    )
 
     stats = compute_stats(rewrite, phases)
 
@@ -938,7 +716,6 @@ def run_reanalyze(
             continue
         if dst_hashes.get(name) != src_hash:
             unexpected.append(name)
-    # A newly materialised column (root_value.dat) is expected to be absent in src.
     new_files = sorted(set(dst_hashes) - set(src_hashes) - changed)
     integrity = {
         "unchanged_columns_verified": not unexpected,
@@ -968,13 +745,8 @@ def run_reanalyze(
         "output_corpus": str(out_dir),
         "reanalyzer": reanalyzer_meta,
         "v_component": v_component,
-        "forward_output": (
-            root_value_provenance["forward_output"]
-            if root_value_provenance is not None
-            else spec["forward_output"]
-        ),
+        "forward_output": spec["forward_output"],
         "q_head_provenance": verified_q_provenance,
-        "root_value_materialization": root_value_provenance,
         "mask_hidden_info": bool(effective_mask),
         "device": device,
         "batch_size": batch_size,
@@ -984,10 +756,8 @@ def run_reanalyze(
         "integrity": integrity,
         "stats": stats,
         "perspective_note": (
-            "Fresh value/q come from the same policy class whose archived estimate "
-            "they replace (root-to-move perspective), so no sign flip is applied. "
-            "target_scores <- q_values head; root_value follows the persisted "
-            "search readout/scale/squash/final-clip materialization contract."
+            "Fresh Q comes from the same root-to-move policy class whose archived "
+            "per-action estimate it replaces, so no sign flip is applied."
         ),
     }
     (out_dir / "reanalyze_manifest.json").write_text(
@@ -1054,7 +824,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--corpus", required=True, type=Path, help="memmap corpus dir (build_memmap_corpus.py output)")
+    parser.add_argument(
+        "--corpus",
+        required=True,
+        type=Path,
+        help="memmap corpus dir (build_memmap_corpus.py output)",
+    )
     parser.add_argument(
         "--out",
         type=Path,
@@ -1063,11 +838,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--v-component",
-        default=DEFAULT_V_COMPONENT,
+        required=True,
         choices=sorted(V_COMPONENTS),
-        help="which value-component column to rewrite (default: root_value, a fresh "
-        "per-state V(s) column from the trained value head). target_scores and "
-        "afterstate_target require --q-head-provenance.",
+        help="q-value component to rewrite; requires --q-head-provenance. Value "
+        "columns require a true search reanalysis and are intentionally unsupported.",
     )
     parser.add_argument(
         "--q-head-provenance",
@@ -1078,26 +852,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "root-to-move search-action-value semantics",
     )
     parser.add_argument(
-        "--value-readout",
-        choices=("scalar", "categorical"),
-        default="scalar",
-        help="root_value head to materialize. Must match the readout used by search; "
-        "categorical fails closed if the forward emits no value_categorical output.",
-    )
-    parser.add_argument(
-        "--value-squash",
-        choices=("tanh", "clip"),
-        default="tanh",
-        help="search value squash. Scalar applies it after --value-scale; categorical "
-        "records but bypasses it exactly like search, then final-clips to [-1,1].",
-    )
-    parser.add_argument(
-        "--value-scale",
-        type=float,
-        default=1.0,
-        help="positive finite search value scale applied before squash/final clipping",
-    )
-    parser.add_argument(
         "--reanalyzer-net",
         default="checkpoint",
         choices=("checkpoint", "ema"),
@@ -1105,7 +859,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "average of several (--ema-checkpoints). EMA is the R8 fallback when "
         "generation-vs-champion drift telemetry is ambiguous.",
     )
-    parser.add_argument("--checkpoint", type=Path, default=None, help="checkpoint for --reanalyzer-net checkpoint")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="checkpoint for --reanalyzer-net checkpoint",
+    )
     parser.add_argument(
         "--ema-checkpoints",
         nargs="+",
@@ -1113,9 +872,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="checkpoints (CHRONOLOGICAL: oldest->newest) for --reanalyzer-net ema",
     )
-    parser.add_argument("--ema-decay", type=float, default=0.75, help="EMA decay for --reanalyzer-net ema")
-    parser.add_argument("--device", default="cpu", help="torch device for the forward pass (cpu | cuda | cuda:0)")
-    parser.add_argument("--batch-size", type=int, default=4096, help="forward-pass batch size")
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.75,
+        help="EMA decay for --reanalyzer-net ema",
+    )
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        help="torch device for the forward pass (cpu | cuda | cuda:0)",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=4096, help="forward-pass batch size"
+    )
     parser.add_argument(
         "--mask-hidden-info",
         dest="mask_hidden_info",
@@ -1131,14 +901,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="spot-check mode: forward N random rows, print before/after v-component "
         "stats (mean shift, correlation, per-phase deltas), and DO NOT write.",
     )
-    parser.add_argument("--seed", type=int, default=0, help="RNG seed for --sample row selection")
-    parser.add_argument("--progress-every", type=int, default=0, help="log a progress line every N forward batches")
+    parser.add_argument(
+        "--seed", type=int, default=0, help="RNG seed for --sample row selection"
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=0,
+        help="log a progress line every N forward batches",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
-    work_dir = (args.out or (args.corpus.parent / f"{args.corpus.name}_reanalyzed")).parent
+    work_dir = (
+        args.out or (args.corpus.parent / f"{args.corpus.name}_reanalyzed")
+    ).parent
     reanalyzer_path, reanalyzer_meta = resolve_reanalyzer_checkpoint(
         mode=args.reanalyzer_net,
         checkpoint=args.checkpoint,
@@ -1159,9 +938,6 @@ def main(argv: list[str] | None = None) -> None:
         seed=args.seed,
         progress_every=args.progress_every,
         q_head_provenance=args.q_head_provenance,
-        value_readout=args.value_readout,
-        value_squash=args.value_squash,
-        value_scale=args.value_scale,
     )
 
 

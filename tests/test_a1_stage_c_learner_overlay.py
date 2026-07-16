@@ -65,8 +65,7 @@ def _broad_root_inventory(
 
 def _inventory_selected_rows(inventory: dict) -> int:
     return sum(
-        int(scope["selected_root_count"])
-        for scope in inventory["scopes"].values()
+        int(scope["selected_root_count"]) for scope in inventory["scopes"].values()
     )
 
 
@@ -112,11 +111,7 @@ def test_stage_c_root_breadth_verifier_recomputes_semantic_failures() -> None:
     inventory["passed"] = True
     inventory["failures"] = []
     inventory["inventory_sha256"] = overlay._value_sha256(  # noqa: SLF001
-        {
-            key: value
-            for key, value in inventory.items()
-            if key != "inventory_sha256"
-        }
+        {key: value for key, value in inventory.items() if key != "inventory_sha256"}
     )
 
     with pytest.raises(overlay.OverlayError, match="failed or drifted"):
@@ -126,7 +121,9 @@ def test_stage_c_root_breadth_verifier_recomputes_semantic_failures() -> None:
         )
 
 
-def test_policy_projection_disables_old_targets_and_maps_action_ids(tmp_path: Path) -> None:
+def test_policy_projection_disables_old_targets_and_maps_action_ids(
+    tmp_path: Path,
+) -> None:
     base = tmp_path / "base"
     derived = tmp_path / "derived"
     base.mkdir()
@@ -138,6 +135,13 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(tmp_path: Pa
     _write(base / "decision_index.dat", np.asarray([1, 2, 3], dtype=np.int64))
     _write(base / "legal_action_ids.dat", legal)
     _write(base / "value_target.dat", np.asarray([0.1, -0.2, 0.3], dtype=np.float32))
+    _write(base / "root_value.dat", np.asarray([0.1, 0.2, 0.3], dtype=np.float32))
+    _write(base / "root_value_mask.dat", np.ones(3, dtype=np.bool_))
+    _write(
+        base / "root_prior_value.dat",
+        np.asarray([-0.1, -0.2, -0.3], dtype=np.float32),
+    )
+    _write(base / "root_prior_value_mask.dat", np.ones(3, dtype=np.bool_))
     _write(base / "teacher_name.codes.dat", np.zeros(3, dtype=np.int32))
 
     meta = {
@@ -156,6 +160,18 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(tmp_path: Pa
                 "dtype": "float32",
                 "inner_shape": [],
             },
+            "root_value": {"kind": "fixed", "dtype": "float32", "inner_shape": []},
+            "root_value_mask": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
+            "root_prior_value": {
+                "kind": "fixed",
+                "dtype": "float32",
+                "inner_shape": [],
+            },
+            "root_prior_value_mask": {
+                "kind": "fixed",
+                "dtype": "bool",
+                "inner_shape": [],
+            },
             "policy_weight_multiplier": {
                 "kind": "fixed",
                 "dtype": "float32",
@@ -169,7 +185,18 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(tmp_path: Pa
             "teacher_name": {"kind": "string", "categories": ["historical"]},
         },
     }
-    overlay._hardlink_payloads(base, derived, meta["columns"])  # noqa: SLF001
+    paired = {
+        "root_value",
+        "root_value_mask",
+        "root_prior_value",
+        "root_prior_value_mask",
+    }
+    overlay._hardlink_payloads(  # noqa: SLF001
+        base,
+        derived,
+        meta["columns"],
+        rewritten_columns=set(overlay.REWRITTEN_COLUMNS) | paired,
+    )
     patch = {
         "row_index": np.asarray([1], dtype=np.int64),
         "game_seed": np.asarray([200], dtype=np.int64),
@@ -184,6 +211,10 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(tmp_path: Pa
         "prior_policy_flat": np.asarray([0.5, 0.2, 0.3], dtype=np.float32),
         "target_scores_flat": np.asarray([3.0, 1.0, 2.0], dtype=np.float32),
         "target_scores_mask_flat": np.asarray([True, True, True]),
+        "root_value": np.asarray([0.75], dtype=np.float32),
+        "root_value_mask": np.asarray([True]),
+        "root_prior_value": np.asarray([0.25], dtype=np.float32),
+        "root_prior_value_mask": np.asarray([True]),
     }
 
     evidence = overlay._project_policy_patch(  # noqa: SLF001
@@ -204,6 +235,8 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(tmp_path: Pa
     priors = np.fromfile(derived / "prior_policy.dat", dtype=np.float32)
     scores = np.fromfile(derived / "target_scores.dat", dtype=np.float32)
     teacher_codes = np.fromfile(derived / "teacher_name.codes.dat", dtype=np.int32)
+    root_values = np.fromfile(derived / "root_value.dat", dtype=np.float32)
+    root_priors = np.fromfile(derived / "root_prior_value.dat", dtype=np.float32)
     assert weights.tolist() == [0.0, 1.0, 0.0]
     assert not target_mask[:2].any() and not target_mask[5:].any()
     assert targets[2:5] == pytest.approx([0.0, 0.4, 0.6])
@@ -213,6 +246,9 @@ def test_policy_projection_disables_old_targets_and_maps_action_ids(tmp_path: Pa
     assert np.all(targets[:2] == 0.0) and np.all(targets[5:] == 0.0)
     assert np.isnan(scores[:2]).all() and np.isnan(scores[5:]).all()
     assert teacher_codes.tolist() == [0, 1, 0]
+    assert root_values.tolist() == pytest.approx([0.1, 0.75, 0.3])
+    assert root_priors.tolist() == pytest.approx([-0.1, 0.25, -0.3])
+    assert set(evidence["authoritative_search_fixed_columns"]) >= paired
     assert meta["columns"]["teacher_name"]["categories"] == [
         "historical",
         overlay.POLICY_TEACHER,
@@ -356,23 +392,17 @@ def test_clean_stage_c_recipe_commissions_new_adapters() -> None:
         "static_action_residual_proj",
     }
     assert campaign.EFFECTIVE_FEATURE_CONTRACT["static_action_residual"] is True
-    assert (
-        campaign.EFFECTIVE_FEATURE_CONTRACT["legal_action_value_residual"] is True
-    )
-    assert campaign.EFFECTIVE_FEATURE_CONTRACT[
-        "meaningful_public_history"
-    ] is True
+    assert campaign.EFFECTIVE_FEATURE_CONTRACT["legal_action_value_residual"] is True
+    assert campaign.EFFECTIVE_FEATURE_CONTRACT["meaningful_public_history"] is True
     assert (
         campaign.MINIMUM_FEATURE_SIGNAL_OBSERVATIONS
         * campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
         == campaign.MAX_STEPS
     )
-    assert train_bc.ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS[
-        "public_card_residual"
-    ] == ("public_card_count_residual",)
-    assert train_bc.ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS[
-        "meaningful_history_gate"
-    ] == (
+    assert train_bc.ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["public_card_residual"] == (
+        "public_card_count_residual",
+    )
+    assert train_bc.ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["meaningful_history_gate"] == (
         "meaningful_history_residual_gate",
         "meaningful_history_ordered_gate",
         "meaningful_history_sequence",

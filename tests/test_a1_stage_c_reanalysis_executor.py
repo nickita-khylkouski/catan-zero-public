@@ -314,6 +314,7 @@ def _generator_patch(
     monkeypatch,
     *,
     root_value: float = 0.2,
+    root_prior_value: float = 0.1,
     target: tuple[float, float] = (0.7, 0.3),
     prior: tuple[float, float] = (0.6, 0.4),
 ) -> dict[str, object]:
@@ -335,6 +336,7 @@ def _generator_patch(
         used_full_search=True,
         simulations_used=128,
         root_value=root_value,
+        root_prior_value=root_prior_value,
         q_values_root_perspective=True,
         selected_action=101,
     )
@@ -373,6 +375,22 @@ def test_search_patch_accepts_bounded_root_value_endpoints(
     patch = _generator_patch(monkeypatch, root_value=root_value)
 
     assert patch["root_value"] == root_value
+
+
+@pytest.mark.parametrize("root_prior_value", [-1.0, 1.0])
+def test_search_patch_accepts_bounded_root_prior_value_endpoints(
+    monkeypatch, root_prior_value: float
+) -> None:
+    patch = _generator_patch(monkeypatch, root_prior_value=root_prior_value)
+    assert patch["root_prior_value"] == root_prior_value
+
+
+@pytest.mark.parametrize("root_prior_value", [np.nan, np.inf, -1.01, 1.01])
+def test_search_patch_rejects_invalid_root_prior_value(
+    monkeypatch, root_prior_value: float
+) -> None:
+    with pytest.raises(executor.ExecutorError, match="incomplete or ambiguous"):
+        _generator_patch(monkeypatch, root_prior_value=root_prior_value)
 
 
 @pytest.mark.parametrize(
@@ -424,6 +442,8 @@ def _replacement_patch() -> tuple[dict[str, np.ndarray], dict[str, object]]:
         "selected_action_policy_id": 11,
         "root_value": 0.2,
         "root_value_mask": True,
+        "root_prior_value": 0.1,
+        "root_prior_value_mask": True,
         "simulations_used": 128,
         "used_full_search": True,
         "q_values_root_perspective": True,
@@ -488,6 +508,10 @@ def test_patch_verifier_accepts_bounded_root_value_endpoints(
         ("root_value", np.inf),
         ("root_value", -1.01),
         ("root_value", 1.01),
+        ("root_prior_value", np.nan),
+        ("root_prior_value", np.inf),
+        ("root_prior_value", -1.01),
+        ("root_prior_value", 1.01),
         ("target_policy_flat", np.asarray([-0.25, 1.25], dtype=np.float32)),
         ("target_policy_flat", np.asarray([np.nan, 1.0], dtype=np.float32)),
         ("target_policy_flat", np.asarray([np.inf, 0.0], dtype=np.float32)),
@@ -504,6 +528,32 @@ def test_patch_verifier_rejects_invalid_replacement_values(
 
     with pytest.raises(executor.ExecutorError, match="invalid search evidence"):
         executor._verify_patch_arrays(arrays, receipt=receipt)
+
+
+def test_v3_patch_requires_paired_root_prior_columns_and_mask() -> None:
+    arrays, receipt = _replacement_patch()
+    without_prior = dict(arrays)
+    without_prior.pop("root_prior_value")
+    without_prior.pop("root_prior_value_mask")
+    receipt_without = {**receipt, "patch_columns": sorted(without_prior)}
+    with pytest.raises(executor.ExecutorError, match="column contract drifted"):
+        executor._verify_patch_arrays(without_prior, receipt=receipt_without)
+
+    arrays["root_prior_value_mask"][0] = False
+    with pytest.raises(executor.ExecutorError, match="invalid search evidence"):
+        executor._verify_patch_arrays(arrays, receipt=receipt)
+
+
+def test_v2_patch_remains_readable_without_fabricated_root_prior() -> None:
+    arrays, receipt = _replacement_patch()
+    arrays.pop("root_prior_value")
+    arrays.pop("root_prior_value_mask")
+    receipt = {
+        **receipt,
+        "patch_schema_version": executor.PATCH_SCHEMA_V2,
+        "patch_columns": sorted(arrays),
+    }
+    executor._verify_patch_arrays(arrays, receipt=receipt)
 
 
 def test_stage_c_alignment_imports_before_executor_in_clean_process() -> None:

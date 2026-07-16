@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import numpy as np
 import pytest
 
@@ -29,6 +30,7 @@ def _write_source(
         "winner": np.asarray(["RED", "RED"]),
         "policy_weight_multiplier": np.asarray([1.0, 1.0], dtype=np.float32),
         "used_full_search": np.asarray([True, True]),
+        "simulations_used": np.asarray([16, 16], dtype=np.int32),
         "is_forced": np.asarray([False, False]),
         "target_information_regime": np.asarray([regime, regime]),
         "legal_action_ids": np.asarray([[10, 12, -1], [11, 13, -1]], dtype=np.int16),
@@ -43,6 +45,23 @@ def _write_source(
         "target_scores_mask": np.asarray([[True, True, False], [True, True, False]]),
         "root_value": np.asarray([0.2, 0.3], dtype=np.float32),
         "root_value_mask": np.asarray([True, True]),
+        "root_prior_value": np.asarray([0.1, 0.15], dtype=np.float32),
+        "root_prior_value_mask": np.asarray([True, True]),
+        "search_evidence_version": np.asarray(2, dtype=np.uint8),
+        "search_evidence_offsets": np.asarray([0, 2, 4], dtype=np.uint32),
+        "search_visit_counts_flat": np.asarray([8, 8, 8, 8], dtype=np.uint16),
+        "search_completed_q_flat": np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32),
+        "search_prior_policy_flat": np.asarray([0.5, 0.5, 0.5, 0.5], dtype=np.float32),
+        "target_reliability_version": np.asarray([1, 1], dtype=np.uint8),
+        "target_reliability_audited": np.asarray([True, True]),
+        "target_reliability_js_divergence": np.asarray([0.1, 0.1], dtype=np.float32),
+        "target_reliability_policy_top1_agreement": np.asarray([True, True]),
+        "target_reliability_q_top1_agreement": np.asarray([True, True]),
+        "target_reliability_q_margin_primary": np.asarray([0.2, 0.2], dtype=np.float32),
+        "target_reliability_q_margin_duplicate": np.asarray(
+            [0.2, 0.2], dtype=np.float32
+        ),
+        "target_reliability_confidence": np.asarray([0.5, 0.5], dtype=np.float32),
         "prior_policy": np.asarray(
             [[0.5, 0.5, 0.0], [0.5, 0.5, 0.0]], dtype=np.float16
         ),
@@ -100,12 +119,73 @@ def _patch(_search, _game, _feature):
         "target_scores_mask": [True, True],
         "root_value": 0.55,
         "root_value_mask": True,
+        "root_prior_value": 0.35,
+        "root_prior_value_mask": True,
         "prior_policy": [0.4, 0.6],
+        "simulations_used": 32,
+        "used_full_search": True,
     }
 
 
 def _bypass_reconstruction(**_kwargs):
     return object(), {"legal_policy_ids": (10, 12)}
+
+
+def test_search_patch_preserves_zero_mass_coverage_and_pairs_root_prior(
+    monkeypatch,
+) -> None:
+    game = SimpleNamespace(
+        playable_action_indices=lambda _colors, _map_kind: [101, 102]
+    )
+    result = SimpleNamespace(
+        improved_policy={101: 1.0, 102: 0.0},
+        q_values={101: 0.4, 102: 0.1},
+        priors={101: 0.6, 102: 0.4},
+        used_full_search=True,
+        root_value=0.3,
+        root_prior_value=0.2,
+        simulations_used=16,
+    )
+    monkeypatch.setattr(
+        target,
+        "rust_policy_action_ids",
+        lambda *_args, **_kwargs: (10, 12),
+    )
+    patch = target._search_patch(  # noqa: SLF001
+        SimpleNamespace(search=lambda _game, force_full: result),
+        game,
+        {"legal_policy_ids": (10, 12)},
+    )
+    assert patch["target_policy_mask"] == [True, True]
+    assert patch["root_value"] == pytest.approx(0.3)
+    assert patch["root_prior_value"] == pytest.approx(0.2)
+
+
+@pytest.mark.parametrize("root_prior_value", [np.nan, np.inf, -1.01, 1.01])
+def test_search_patch_rejects_invalid_root_prior(
+    monkeypatch, root_prior_value: float
+) -> None:
+    game = SimpleNamespace(playable_action_indices=lambda _colors, _map_kind: [101])
+    result = SimpleNamespace(
+        improved_policy={101: 1.0},
+        q_values={101: 0.4},
+        priors={101: 1.0},
+        used_full_search=True,
+        root_value=0.3,
+        root_prior_value=root_prior_value,
+        simulations_used=16,
+    )
+    monkeypatch.setattr(
+        target,
+        "rust_policy_action_ids",
+        lambda *_args, **_kwargs: (10,),
+    )
+    with pytest.raises(target.ReanalysisError, match="root search/prior"):
+        target._search_patch(  # noqa: SLF001
+            SimpleNamespace(search=lambda _game, force_full: result),
+            game,
+            {"legal_policy_ids": (10,)},
+        )
 
 
 def test_reconstruction_mismatch_stops_before_search(tmp_path: Path) -> None:
@@ -199,6 +279,14 @@ def test_merge_changes_only_search_target_columns(monkeypatch, tmp_path: Path) -
     assert np.allclose(rebuilt["target_policy"][:, :2], [[0.25, 0.75], [0.25, 0.75]])
     assert np.allclose(rebuilt["root_value"], 0.55)
     assert np.all(rebuilt["root_value_mask"])
+    assert np.allclose(rebuilt["root_prior_value"], 0.35)
+    assert np.all(rebuilt["root_prior_value_mask"])
+    assert not any(
+        key.startswith("search_") and key != "search_seed" for key in rebuilt
+    )
+    assert manifest["search_evidence_invalidated"] is True
+    assert not np.any(rebuilt["target_reliability_audited"])
+    assert np.allclose(rebuilt["target_reliability_confidence"], 1.0)
     assert set(rebuilt["teacher_name"].astype(str)) == {"policy_target_reanalysis"}
     assert manifest["payload_inventory_sha256"] == target._value_sha256(
         manifest["payload_inventory"]

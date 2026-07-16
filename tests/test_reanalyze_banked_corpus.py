@@ -19,6 +19,7 @@ Covers, on a tiny SYNTHETIC multi-chunk memmap corpus crafted directly on disk
 * claim files -- O_EXCL claim, fresh-claim refusal, stale-claim steal.
 * mix plan arithmetic.
 """
+
 from __future__ import annotations
 
 import json
@@ -76,9 +77,15 @@ def _make_corpus(corpus_dir: Path, n_rows: int) -> None:
     np.cumsum(counts, out=offsets[1:])
     offsets.tofile(corpus_dir / "row_offsets.dat")
 
-    np.ascontiguousarray(legal_ids[prefix].astype(np.float32)).tofile(corpus_dir / "legal_action_ids.dat")
-    np.ascontiguousarray(scores[prefix].astype(np.float32)).tofile(corpus_dir / "target_scores.dat")
-    np.ascontiguousarray(scores_mask[prefix].astype(np.bool_)).tofile(corpus_dir / "target_scores_mask.dat")
+    np.ascontiguousarray(legal_ids[prefix].astype(np.float32)).tofile(
+        corpus_dir / "legal_action_ids.dat"
+    )
+    np.ascontiguousarray(scores[prefix].astype(np.float32)).tofile(
+        corpus_dir / "target_scores.dat"
+    )
+    np.ascontiguousarray(scores_mask[prefix].astype(np.bool_)).tofile(
+        corpus_dir / "target_scores_mask.dat"
+    )
 
     seat = np.arange(n_rows, dtype=np.int64)
     np.ascontiguousarray(seat).tofile(corpus_dir / "seat.dat")
@@ -106,7 +113,9 @@ def _make_corpus(corpus_dir: Path, n_rows: int) -> None:
         },
         "stats": {},
     }
-    (corpus_dir / "corpus_meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+    (corpus_dir / "corpus_meta.json").write_text(
+        json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
 
 def _fresh_q_for_indices(indices: np.ndarray, legal_width: int, corpus) -> np.ndarray:
@@ -163,7 +172,9 @@ def fake_forward(monkeypatch):
 def _fake_ckpt(tmp_path: Path) -> Path:
     torch = pytest.importorskip("torch")
     ckpt = tmp_path / "champion.pt"
-    torch.save({"policy_type": "entity_graph", "mask_hidden_info": False, "model": {}}, ckpt)
+    torch.save(
+        {"policy_type": "entity_graph", "mask_hidden_info": False, "model": {}}, ckpt
+    )
     return ckpt
 
 
@@ -191,25 +202,42 @@ def _write_q_head_provenance(path: Path, checkpoint: Path) -> Path:
 
 def _plan(corpus_dir, job_dir, ckpt, *, v_component="target_scores", chunk_rows=3):
     _, meta = rl.resolve_reanalyzer_checkpoint(
-        mode="checkpoint", checkpoint=ckpt, ema_checkpoints=None, ema_decay=0.75, work_dir=job_dir
+        mode="checkpoint",
+        checkpoint=ckpt,
+        ema_checkpoints=None,
+        ema_decay=0.75,
+        work_dir=job_dir,
     )
     q_head_provenance = (
-        _write_q_head_provenance(job_dir.parent / f"{job_dir.name}_q_provenance.json", ckpt)
+        _write_q_head_provenance(
+            job_dir.parent / f"{job_dir.name}_q_provenance.json", ckpt
+        )
         if rl.V_COMPONENTS[v_component]["forward_output"] == "q_values"
         else None
     )
     return rbc.do_plan(
-        corpus_dir=corpus_dir, job_dir=job_dir, reanalyzer_meta=meta,
-        v_component=v_component, chunk_rows=chunk_rows, mask_hidden_info=False, force=False,
+        corpus_dir=corpus_dir,
+        job_dir=job_dir,
+        reanalyzer_meta=meta,
+        v_component=v_component,
+        chunk_rows=chunk_rows,
+        mask_hidden_info=False,
+        force=False,
         q_head_provenance=q_head_provenance,
     )
 
 
 def _run(job_dir, ckpt, *, max_chunks=None, use_claim=False):
     return rbc.do_run(
-        job_dir=job_dir, reanalyzer_path=ckpt, device="cpu", batch_size=2,
-        max_chunks=max_chunks, chunk_ids=None, use_claim=use_claim,
-        claim_stale_sec=rbc.DEFAULT_CLAIM_STALE_SEC, progress_every=0,
+        job_dir=job_dir,
+        reanalyzer_path=ckpt,
+        device="cpu",
+        batch_size=2,
+        max_chunks=max_chunks,
+        chunk_ids=None,
+        use_claim=use_claim,
+        claim_stale_sec=rbc.DEFAULT_CLAIM_STALE_SEC,
+        progress_every=0,
     )
 
 
@@ -243,23 +271,19 @@ def test_validate_partition_detects_gap(corpus_dir):
         rbc.validate_partition(chunks, meta["row_count"], meta["flat_count"])
 
 
-def test_plan_cli_defaults_to_root_value():
-    args = rbc.build_arg_parser().parse_args(
-        [
-            "plan",
-            "--corpus",
-            "corpus",
-            "--job-dir",
-            "job",
-            "--checkpoint",
-            "checkpoint.pt",
-        ]
-    )
-    assert args.v_component == "root_value"
-    assert args.q_head_provenance is None
-    assert args.value_readout == "scalar"
-    assert args.value_squash == "tanh"
-    assert args.value_scale == pytest.approx(1.0)
+def test_plan_cli_requires_explicit_q_component():
+    with pytest.raises(SystemExit):
+        rbc.build_arg_parser().parse_args(
+            [
+                "plan",
+                "--corpus",
+                "corpus",
+                "--job-dir",
+                "job",
+                "--checkpoint",
+                "checkpoint.pt",
+            ]
+        )
 
 
 def test_plan_refuses_q_values_without_provenance(corpus_dir, tmp_path):
@@ -312,17 +336,22 @@ def test_run_and_merge_refuse_legacy_root_plan_without_materialization_provenanc
     tmp_path,
     fake_forward,
 ):
-    ckpt = _fake_ckpt(tmp_path)
     job_dir = tmp_path / "root_job"
-    _plan(corpus_dir, job_dir, ckpt, v_component="root_value", chunk_rows=3)
+    job_dir.mkdir()
     manifest_path = job_dir / rbc._MANIFEST_NAME
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest.pop("root_value_materialization")
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "v_component": "root_value",
+                "reanalyzer": {"md5": "0" * 32},
+            }
+        ),
+        encoding="utf-8",
+    )
 
-    with pytest.raises(SystemExit, match="legacy/raw-forward"):
-        _run(job_dir, ckpt)
-    with pytest.raises(SystemExit, match="legacy/raw-forward"):
+    with pytest.raises(SystemExit, match="single stored-feature forward"):
+        _run(job_dir, _fake_ckpt(tmp_path))
+    with pytest.raises(SystemExit, match="single stored-feature forward"):
         rbc.do_merge(
             job_dir=job_dir,
             out_dir=tmp_path / "unsafe_root_overlay",
@@ -334,20 +363,34 @@ def test_run_and_merge_refuse_legacy_root_plan_without_materialization_provenanc
 # --------------------------------------------------------------------------- #
 # Value-only correctness: chunked+merged == single-shot reference
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("v_component", ["target_scores", "root_value"])
-def test_chunked_merge_matches_single_shot_reference(corpus_dir, tmp_path, fake_forward, v_component):
+def test_chunked_merge_matches_single_shot_reference(
+    corpus_dir, tmp_path, fake_forward
+):
     pytest.importorskip("torch")
     ckpt = _fake_ckpt(tmp_path)
+    v_component = "target_scores"
 
     # Reference: single-shot reanalyze_lite full run.
     _, meta = rl.resolve_reanalyzer_checkpoint(
-        mode="checkpoint", checkpoint=ckpt, ema_checkpoints=None, ema_decay=0.75, work_dir=tmp_path
+        mode="checkpoint",
+        checkpoint=ckpt,
+        ema_checkpoints=None,
+        ema_decay=0.75,
+        work_dir=tmp_path,
     )
     ref_out = tmp_path / "reference"
     rl.run_reanalyze(
-        corpus_dir=corpus_dir, out_dir=ref_out, reanalyzer_path=ckpt, reanalyzer_meta=meta,
-        v_component=v_component, device="cpu", batch_size=2, mask_hidden_info=False,
-        sample=None, seed=0, progress_every=0,
+        corpus_dir=corpus_dir,
+        out_dir=ref_out,
+        reanalyzer_path=ckpt,
+        reanalyzer_meta=meta,
+        v_component=v_component,
+        device="cpu",
+        batch_size=2,
+        mask_hidden_info=False,
+        sample=None,
+        seed=0,
+        progress_every=0,
         q_head_provenance=(
             _write_q_head_provenance(tmp_path / "reference_q_provenance.json", ckpt)
             if rl.V_COMPONENTS[v_component]["forward_output"] == "q_values"
@@ -370,18 +413,9 @@ def test_chunked_merge_matches_single_shot_reference(corpus_dir, tmp_path, fake_
     # And it loads back through MemmapCorpus identically.
     ref_col = np.asarray(MemmapCorpus(ref_out)[v_component])
     ovl_col = np.asarray(MemmapCorpus(overlay)[v_component])
-    np.testing.assert_array_equal(np.nan_to_num(ref_col, nan=-999.0), np.nan_to_num(ovl_col, nan=-999.0))
-    if v_component == "root_value":
-        plan_manifest = json.loads((job_dir / rbc._MANIFEST_NAME).read_text())
-        merge_manifest = json.loads(
-            (overlay / "reanalyze_merge_manifest.json").read_text()
-        )
-        corpus_meta = json.loads((overlay / "corpus_meta.json").read_text())
-        provenance = plan_manifest["root_value_materialization"]
-        assert provenance["value_readout"] == "scalar"
-        assert provenance["configured_value_squash"] == "tanh"
-        assert merge_manifest["root_value_materialization"] == provenance
-        assert corpus_meta["columns"]["root_value"]["materialization"] == provenance
+    np.testing.assert_array_equal(
+        np.nan_to_num(ref_col, nan=-999.0), np.nan_to_num(ovl_col, nan=-999.0)
+    )
 
 
 def test_merge_no_loss_no_dup_and_overlay_loads(corpus_dir, tmp_path, fake_forward):
@@ -391,7 +425,9 @@ def test_merge_no_loss_no_dup_and_overlay_loads(corpus_dir, tmp_path, fake_forwa
     _plan(corpus_dir, job_dir, ckpt, chunk_rows=3)
     _run(job_dir, ckpt)
     overlay = tmp_path / "overlay"
-    manifest = rbc.do_merge(job_dir=job_dir, out_dir=overlay, link_mode="copy", mix_fraction=0.2)
+    manifest = rbc.do_merge(
+        job_dir=job_dir, out_dir=overlay, link_mode="copy", mix_fraction=0.2
+    )
 
     assert manifest["no_loss_no_dup_verified"] is True
     assert manifest["row_count_before"] == manifest["row_count_after"] == 20
@@ -419,13 +455,20 @@ def test_merge_refuses_before_all_chunks_done(corpus_dir, tmp_path, fake_forward
     _plan(corpus_dir, job_dir, ckpt, chunk_rows=3)
     _run(job_dir, ckpt, max_chunks=2)  # only 2 of 7 chunks
     with pytest.raises(SystemExit, match="not done"):
-        rbc.do_merge(job_dir=job_dir, out_dir=tmp_path / "overlay", link_mode="copy", mix_fraction=None)
+        rbc.do_merge(
+            job_dir=job_dir,
+            out_dir=tmp_path / "overlay",
+            link_mode="copy",
+            mix_fraction=None,
+        )
 
 
 # --------------------------------------------------------------------------- #
 # Resumability / preemption safety
 # --------------------------------------------------------------------------- #
-def test_resume_completes_remaining_without_reprocessing(corpus_dir, tmp_path, fake_forward):
+def test_resume_completes_remaining_without_reprocessing(
+    corpus_dir, tmp_path, fake_forward
+):
     pytest.importorskip("torch")
     ckpt = _fake_ckpt(tmp_path)
     job_dir = tmp_path / "job"
@@ -436,7 +479,9 @@ def test_resume_completes_remaining_without_reprocessing(corpus_dir, tmp_path, f
     # First slot: process 2 chunks, then "preempt".
     fake_forward.clear()
     _run(job_dir, ckpt, max_chunks=2)
-    done_after_first = [c["chunk_id"] for c in manifest["chunks"] if rbc.chunk_is_done(job_dir, c, md5)]
+    done_after_first = [
+        c["chunk_id"] for c in manifest["chunks"] if rbc.chunk_is_done(job_dir, c, md5)
+    ]
     assert len(done_after_first) == 2
     first_ranges = list(fake_forward)
     assert len(first_ranges) == 2  # exactly 2 chunks forwarded
@@ -449,8 +494,12 @@ def test_resume_completes_remaining_without_reprocessing(corpus_dir, tmp_path, f
 
     # Simulate a crash MID-CHUNK on a not-yet-done chunk: a truncated piece, NO done
     # marker (the "never assume a chunk finishes" case).
-    victim = next(c for c in manifest["chunks"] if c["chunk_id"] not in done_after_first)
-    rbc._piece_path(job_dir, victim["chunk_id"]).write_bytes(b"\x00\x00\x00")  # partial garbage
+    victim = next(
+        c for c in manifest["chunks"] if c["chunk_id"] not in done_after_first
+    )
+    rbc._piece_path(job_dir, victim["chunk_id"]).write_bytes(
+        b"\x00\x00\x00"
+    )  # partial garbage
     assert not rbc.chunk_is_done(job_dir, victim, md5)
 
     # Resume: process the remainder.
@@ -458,7 +507,9 @@ def test_resume_completes_remaining_without_reprocessing(corpus_dir, tmp_path, f
     _run(job_dir, ckpt)
 
     # All chunks now done.
-    done_all = [c["chunk_id"] for c in manifest["chunks"] if rbc.chunk_is_done(job_dir, c, md5)]
+    done_all = [
+        c["chunk_id"] for c in manifest["chunks"] if rbc.chunk_is_done(job_dir, c, md5)
+    ]
     assert len(done_all) == n_chunks
 
     # The resume forwarded EXACTLY the previously-unfinished chunks (5), not the 2
@@ -472,24 +523,40 @@ def test_resume_completes_remaining_without_reprocessing(corpus_dir, tmp_path, f
 
     # Finished chunks' markers are UNTOUCHED (same completed_utc).
     for cid, ts in markers_before.items():
-        assert json.loads(rbc._done_path(job_dir, cid).read_text())["completed_utc"] == ts
+        assert (
+            json.loads(rbc._done_path(job_dir, cid).read_text())["completed_utc"] == ts
+        )
 
     # Merged result still matches the reference single-shot run byte-for-byte.
     _, meta2 = rl.resolve_reanalyzer_checkpoint(
-        mode="checkpoint", checkpoint=ckpt, ema_checkpoints=None, ema_decay=0.75, work_dir=tmp_path
+        mode="checkpoint",
+        checkpoint=ckpt,
+        ema_checkpoints=None,
+        ema_decay=0.75,
+        work_dir=tmp_path,
     )
     ref_out = tmp_path / "reference"
     rl.run_reanalyze(
-        corpus_dir=corpus_dir, out_dir=ref_out, reanalyzer_path=ckpt, reanalyzer_meta=meta2,
-        v_component="target_scores", device="cpu", batch_size=2, mask_hidden_info=False,
-        sample=None, seed=0, progress_every=0,
+        corpus_dir=corpus_dir,
+        out_dir=ref_out,
+        reanalyzer_path=ckpt,
+        reanalyzer_meta=meta2,
+        v_component="target_scores",
+        device="cpu",
+        batch_size=2,
+        mask_hidden_info=False,
+        sample=None,
+        seed=0,
+        progress_every=0,
         q_head_provenance=_write_q_head_provenance(
             tmp_path / "reference_q_provenance.json", ckpt
         ),
     )
     overlay = tmp_path / "overlay"
     rbc.do_merge(job_dir=job_dir, out_dir=overlay, link_mode="copy", mix_fraction=None)
-    assert (overlay / "target_scores.dat").read_bytes() == (ref_out / "target_scores.dat").read_bytes()
+    assert (overlay / "target_scores.dat").read_bytes() == (
+        ref_out / "target_scores.dat"
+    ).read_bytes()
 
 
 def test_corrupt_piece_after_done_is_detected(corpus_dir, tmp_path, fake_forward):
@@ -511,7 +578,9 @@ def test_corrupt_piece_after_done_is_detected(corpus_dir, tmp_path, fake_forward
     assert not rbc.chunk_is_done(job_dir, chunk0, md5)
 
 
-def test_done_marker_from_different_checkpoint_is_not_trusted(corpus_dir, tmp_path, fake_forward):
+def test_done_marker_from_different_checkpoint_is_not_trusted(
+    corpus_dir, tmp_path, fake_forward
+):
     pytest.importorskip("torch")
     ckpt = _fake_ckpt(tmp_path)
     job_dir = tmp_path / "job"
@@ -523,7 +592,9 @@ def test_done_marker_from_different_checkpoint_is_not_trusted(corpus_dir, tmp_pa
     assert not rbc.chunk_is_done(job_dir, chunk0, "deadbeef" * 4)
 
 
-def test_done_marker_with_stale_row_range_is_not_trusted(corpus_dir, tmp_path, fake_forward):
+def test_done_marker_with_stale_row_range_is_not_trusted(
+    corpus_dir, tmp_path, fake_forward
+):
     """A piece/marker left over from a discarded --force re-plan (different
     --chunk-rows) must never be silently reused just because its chunk_id number
     recurred: the row range it actually covers no longer matches this chunk_id's
@@ -546,7 +617,9 @@ def test_done_marker_with_stale_row_range_is_not_trusted(corpus_dir, tmp_path, f
     assert not rbc.chunk_is_done(job_dir, reshaped, md5)
 
 
-def test_force_replan_with_different_shape_purges_stale_chunks(corpus_dir, tmp_path, fake_forward):
+def test_force_replan_with_different_shape_purges_stale_chunks(
+    corpus_dir, tmp_path, fake_forward
+):
     """--force replacing a plan whose shape actually changed (different
     --chunk-rows) discards the old chunks/ state, as the docstring promises,
     instead of leaving orphaned pieces from the discarded configuration on disk."""
@@ -558,11 +631,20 @@ def test_force_replan_with_different_shape_purges_stale_chunks(corpus_dir, tmp_p
     assert any(rbc._chunks_dir(job_dir).glob("chunk_*.done.json"))
 
     _, meta = rl.resolve_reanalyzer_checkpoint(
-        mode="checkpoint", checkpoint=ckpt, ema_checkpoints=None, ema_decay=0.75, work_dir=job_dir
+        mode="checkpoint",
+        checkpoint=ckpt,
+        ema_checkpoints=None,
+        ema_decay=0.75,
+        work_dir=job_dir,
     )
     new_manifest = rbc.do_plan(
-        corpus_dir=corpus_dir, job_dir=job_dir, reanalyzer_meta=meta,
-        v_component="target_scores", chunk_rows=7, mask_hidden_info=False, force=True,
+        corpus_dir=corpus_dir,
+        job_dir=job_dir,
+        reanalyzer_meta=meta,
+        v_component="target_scores",
+        chunk_rows=7,
+        mask_hidden_info=False,
+        force=True,
         q_head_provenance=_write_q_head_provenance(
             tmp_path / "replan_q_provenance.json", ckpt
         ),
@@ -584,7 +666,15 @@ def test_run_detects_checkpoint_swapped_after_plan(corpus_dir, tmp_path, fake_fo
 
     # Swap the checkpoint file IN PLACE at the same path (different weights/content)
     # after planning -- the manifest's pinned md5 no longer matches reality.
-    torch.save({"policy_type": "entity_graph", "mask_hidden_info": False, "model": {}, "swapped": True}, ckpt)
+    torch.save(
+        {
+            "policy_type": "entity_graph",
+            "mask_hidden_info": False,
+            "model": {},
+            "swapped": True,
+        },
+        ckpt,
+    )
 
     with pytest.raises(SystemExit, match="swapped after planning"):
         _run(job_dir, ckpt)
@@ -613,7 +703,9 @@ def test_provenance_manifests(corpus_dir, tmp_path, fake_forward):
 
     _run(job_dir, ckpt)
     overlay = tmp_path / "overlay"
-    merge = rbc.do_merge(job_dir=job_dir, out_dir=overlay, link_mode="copy", mix_fraction=None)
+    merge = rbc.do_merge(
+        job_dir=job_dir, out_dir=overlay, link_mode="copy", mix_fraction=None
+    )
     on_disk = json.loads((overlay / "reanalyze_merge_manifest.json").read_text())
     assert on_disk == merge
     assert merge["reanalyzer"]["md5"] == manifest["reanalyzer"]["md5"]
@@ -653,12 +745,18 @@ def test_overlay_hardlinks_unchanged_columns(corpus_dir, tmp_path, fake_forward)
     _plan(corpus_dir, job_dir, ckpt, chunk_rows=3)
     _run(job_dir, ckpt)
     overlay = tmp_path / "overlay"
-    rbc.do_merge(job_dir=job_dir, out_dir=overlay, link_mode="hardlink", mix_fraction=None)
+    rbc.do_merge(
+        job_dir=job_dir, out_dir=overlay, link_mode="hardlink", mix_fraction=None
+    )
 
     # Unchanged column shares an inode with the source (hardlink).
-    assert (overlay / "seat.dat").stat().st_ino == (corpus_dir / "seat.dat").stat().st_ino
+    assert (overlay / "seat.dat").stat().st_ino == (
+        corpus_dir / "seat.dat"
+    ).stat().st_ino
     # Rewritten column is a DISTINCT file (source untouched).
-    assert (overlay / "target_scores.dat").stat().st_ino != (corpus_dir / "target_scores.dat").stat().st_ino
+    assert (overlay / "target_scores.dat").stat().st_ino != (
+        corpus_dir / "target_scores.dat"
+    ).stat().st_ino
 
 
 # --------------------------------------------------------------------------- #
@@ -694,14 +792,18 @@ def test_run_with_claims_skips_already_claimed(corpus_dir, tmp_path, fake_forwar
 # Mix plan
 # --------------------------------------------------------------------------- #
 def test_compute_mix_plan_basic():
-    plan = rbc.compute_mix_plan(reanalyzed_rows=1_000_000, window_size=100_000, mix_fraction=0.2)
+    plan = rbc.compute_mix_plan(
+        reanalyzed_rows=1_000_000, window_size=100_000, mix_fraction=0.2
+    )
     assert plan["banked_rows_to_draw"] == 20_000
     assert plan["fresh_rows"] == 80_000
     assert plan["capped"] is False
 
 
 def test_compute_mix_plan_capped_by_available():
-    plan = rbc.compute_mix_plan(reanalyzed_rows=5_000, window_size=100_000, mix_fraction=0.2)
+    plan = rbc.compute_mix_plan(
+        reanalyzed_rows=5_000, window_size=100_000, mix_fraction=0.2
+    )
     assert plan["banked_rows_to_draw"] == 5_000  # capped at what exists
     assert plan["fresh_rows"] == 95_000
     assert plan["capped"] is True

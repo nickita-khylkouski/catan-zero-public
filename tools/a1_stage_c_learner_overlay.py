@@ -49,9 +49,9 @@ from catan_zero.rl.target_reliability import (  # noqa: E402
 )
 
 
-EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v2"
-MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v2"
-ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v2"
+EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v3"
+MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v3"
+ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v3"
 SAMPLING_SCHEMA = "a1-stage-c-policy-sampling-distribution-v2"
 ROOT_BREADTH_SCHEMA = alignment.ROOT_BREADTH_SCHEMA
 POLICY_TEACHER = "stage_c_coherent_n128_reanalysis"
@@ -84,6 +84,8 @@ OPTIONAL_FIXED_PATCH_COLUMNS = {
     "used_full_search": "used_full_search",
     "root_value": "root_value",
     "root_value_mask": "root_value_mask",
+    "root_prior_value": "root_prior_value",
+    "root_prior_value_mask": "root_prior_value_mask",
     **{name: name for name in TARGET_RELIABILITY_COLUMNS},
 }
 
@@ -170,9 +172,7 @@ def _stage_c_root_breadth_inventory(
     """Bind realized policy-root breadth to the full train/validation populations."""
 
     corpus_games = np.asarray(corpus_game_seeds, dtype=np.int64)
-    validation_games = np.unique(
-        np.asarray(validation_game_seeds, dtype=np.int64)
-    )
+    validation_games = np.unique(np.asarray(validation_game_seeds, dtype=np.int64))
     selected_games = np.asarray(selected_game_seeds, dtype=np.int64)
     selected_decisions = np.asarray(selected_decision_indices, dtype=np.int64)
     selected_phase_values = np.asarray(selected_phases).astype(str, copy=False)
@@ -185,7 +185,9 @@ def _stage_c_root_breadth_inventory(
         raise OverlayError("Stage-C root-breadth arrays are not row-aligned")
     all_games = np.unique(corpus_games)
     if np.setdiff1d(validation_games, all_games).size:
-        raise OverlayError("Stage-C validation manifest names a game outside the corpus")
+        raise OverlayError(
+            "Stage-C validation manifest names a game outside the corpus"
+        )
     training_games = np.setdiff1d(all_games, validation_games)
     selected_validation = np.isin(selected_games, validation_games)
     scopes = {
@@ -217,14 +219,12 @@ def _stage_c_root_breadth_inventory(
 def _root_breadth_failures(scopes: Mapping[str, Mapping[str, Any]]) -> list[str]:
     failures: list[str] = []
     for scope_name, scope in scopes.items():
-        if (
-            float(scope["unique_game_fraction"])
-            < float(ROOT_BREADTH_CONTRACT["minimum_unique_game_fraction"])
+        if float(scope["unique_game_fraction"]) < float(
+            ROOT_BREADTH_CONTRACT["minimum_unique_game_fraction"]
         ):
             failures.append(f"{scope_name}:unique_game_fraction")
-        if (
-            int(scope["roots_per_represented_game"]["minimum"])
-            < int(ROOT_BREADTH_CONTRACT["minimum_roots_per_represented_game"])
+        if int(scope["roots_per_represented_game"]["minimum"]) < int(
+            ROOT_BREADTH_CONTRACT["minimum_roots_per_represented_game"]
         ):
             failures.append(f"{scope_name}:minimum_roots_per_represented_game")
         if scope["unknown_phases"]:
@@ -278,8 +278,7 @@ def _verify_stage_c_root_breadth_inventory(
             or root_count < 0
             or game_count < 0
             or game_count > population_count
-            or int(scope.get("missing_game_count", -1))
-            != population_count - game_count
+            or int(scope.get("missing_game_count", -1)) != population_count - game_count
             or not math.isclose(
                 float(scope.get("unique_game_fraction", math.nan)),
                 game_count / population_count,
@@ -308,9 +307,7 @@ def _verify_stage_c_root_breadth_inventory(
             or maximum < minimum
             or (game_count == 0 and (minimum != 0 or maximum != 0))
             or (game_count > 0 and (minimum == 0 or root_count < game_count * minimum))
-            or not math.isclose(
-                mean, expected_mean, rel_tol=0.0, abs_tol=1.0e-12
-            )
+            or not math.isclose(mean, expected_mean, rel_tol=0.0, abs_tol=1.0e-12)
             or sum(int(count) for count in phase_counts.values())
             + len(scope["unknown_phases"])
             != root_count
@@ -400,7 +397,9 @@ def _write_json_immutable(path: Path, value: Mapping[str, Any]) -> None:
         if destination.is_symlink() or not destination.is_file():
             raise OverlayError(f"immutable output is not a file: {destination}")
         if destination.read_text(encoding="utf-8") != rendered:
-            raise OverlayError(f"immutable output already exists with drift: {destination}")
+            raise OverlayError(
+                f"immutable output already exists with drift: {destination}"
+            )
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp.{os.getpid()}")
@@ -488,9 +487,7 @@ def _export_sampling_population(
     candidate_mask = _bound_array("reanalysis_candidate", np.bool_)
     policy_status = _bound_array("policy_status", np.uint8)
     candidate_rows = np.flatnonzero(candidate_mask).astype(np.int64)
-    legal_widths_all = np.asarray(
-        data["legal_action_ids"].row_counts(), dtype=np.int64
-    )
+    legal_widths_all = np.asarray(data["legal_action_ids"].row_counts(), dtype=np.int64)
     reliability_classes, _report = alignment._reliability_inventory(  # noqa: SLF001
         data, row_count=rows
     )
@@ -501,9 +498,9 @@ def _export_sampling_population(
     phases = np.asarray(data["phase"][candidate_rows]).astype(str)
     legal_widths = legal_widths_all[candidate_rows]
     surprise = alignment._policy_surprise(data, candidate_rows)  # noqa: SLF001
-    source_admission_path = Path(
-        str(plan["source_corpus_admission"]["path"])
-    ).resolve(strict=True)
+    source_admission_path = Path(str(plan["source_corpus_admission"]["path"])).resolve(
+        strict=True
+    )
     try:
         _admission_path, source_admission = active_campaign._load_admission(  # noqa: SLF001
             source_admission_path
@@ -530,9 +527,7 @@ def _export_sampling_population(
         "reliability_class": reliability_classes[candidate_rows],
         "policy_status": policy_status[candidate_rows],
         "population_game_seeds": np.asarray(data["game_seed"], dtype=np.int64),
-        "validation_game_seeds": np.asarray(
-            validation["game_seeds"], dtype=np.int64
-        ),
+        "validation_game_seeds": np.asarray(validation["game_seeds"], dtype=np.int64),
         "selection_seed": int(plan["subset"]["selection_seed"]),
         "max_rows_per_game": int(plan["subset"]["max_rows_per_game"]),
     }
@@ -545,19 +540,19 @@ def _export_sampling_population(
         **replay_kwargs,
         limit=int(plan["subset"]["requested_rows"]),
     )
-    if not np.array_equal(candidate_rows[replay_positions], selected_rows) or not np.array_equal(
+    if not np.array_equal(
+        candidate_rows[replay_positions], selected_rows
+    ) or not np.array_equal(
         replay_strata.astype(str), np.asarray(subset["stratum"]).astype(str)
     ):
         raise OverlayError("current code cannot replay the sealed Stage-C selection")
     population_counts = replay_selection["candidate_counts_by_stratum"]
     declared_selected = {
-        str(key): int(value)
-        for key, value in plan["subset"]["stratum_counts"].items()
+        str(key): int(value) for key, value in plan["subset"]["stratum_counts"].items()
     }
-    if (
-        replay_selected_counts != declared_selected
-        or replay_selection != plan["subset"].get("game_first_selection")
-    ):
+    if replay_selected_counts != declared_selected or replay_selection != plan[
+        "subset"
+    ].get("game_first_selection"):
         raise OverlayError("replayed selected stratum counts differ from the plan")
     subset_strata = {
         int(row): str(stratum)
@@ -607,10 +602,11 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
         raise OverlayError(f"Stage-C merge export refused: {error}") from error
 
     base_root = Path(str(eligibility["corpus"]["path"])).resolve(strict=True)
-    meta_path, meta = _load_json(base_root / "corpus_meta.json", where="base corpus metadata")
+    meta_path, meta = _load_json(
+        base_root / "corpus_meta.json", where="base corpus metadata"
+    )
     if (
-        _file_sha256(meta_path)
-        != eligibility["corpus"]["corpus_meta_file_sha256"]
+        _file_sha256(meta_path) != eligibility["corpus"]["corpus_meta_file_sha256"]
         or meta.get("payload_inventory_sha256")
         != eligibility["corpus"]["payload_inventory_sha256"]
     ):
@@ -628,6 +624,19 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
     with np.load(patch_path, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     stage_c._verify_patch_arrays(arrays, receipt=merge)  # noqa: SLF001
+    paired_root_columns = {
+        "root_value",
+        "root_value_mask",
+        "root_prior_value",
+        "root_prior_value_mask",
+    }
+    if merge.get(
+        "patch_schema_version"
+    ) != stage_c.PATCH_SCHEMA or not paired_root_columns <= set(arrays):
+        raise OverlayError(
+            "Stage-C learner export requires a v3 search patch with paired "
+            "root_value/root_prior_value evidence"
+        )
     sampling_population = _export_sampling_population(
         plan=plan,
         eligibility=eligibility,
@@ -687,19 +696,22 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
                 "root_value",
                 "root_value_mask",
             }
-            <= set(OPTIONAL_FIXED_PATCH_COLUMNS)
-            & set(arrays),
+            <= set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(arrays),
+            "root_prior_value_patch_consumed": {
+                "root_prior_value",
+                "root_prior_value_mask",
+            }
+            <= set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(arrays),
+            "paired_root_value_patch_consumed": paired_root_columns
+            <= set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(arrays),
             "completed_q_patch_consumed": False,
             "completed_q_evidence_sidecar_preserved": {
                 "completed_q_values_flat",
                 "completed_q_mask_flat",
             }
             <= set(arrays),
-            "target_reliability_patch_consumed": set(
-                TARGET_RELIABILITY_COLUMNS
-            )
-            <= set(OPTIONAL_FIXED_PATCH_COLUMNS)
-            & set(arrays),
+            "target_reliability_patch_consumed": set(TARGET_RELIABILITY_COLUMNS)
+            <= set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(arrays),
             "authoritative_search_fixed_columns": sorted(
                 set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(arrays)
             ),
@@ -724,6 +736,10 @@ def _load_export(
         or stated != _value_sha256(unsigned)
         or manifest.get("learner_projection", {}).get("rewritten_columns")
         != sorted(REWRITTEN_COLUMNS)
+        or manifest.get("learner_projection", {}).get(
+            "paired_root_value_patch_consumed"
+        )
+        is not True
     ):
         raise OverlayError("Stage-C learner export schema/digest/semantics drifted")
     patch_ref = manifest.get("patch")
@@ -758,8 +774,7 @@ def _load_export(
             stage_c.REBOUND_MERGE_RECEIPT_SCHEMA,
         }
         or merge.get("receipt_sha256") != merge_ref.get("receipt_sha256")
-        or merge.get("artifact", {}).get("file_sha256")
-        != patch_ref.get("file_sha256")
+        or merge.get("artifact", {}).get("file_sha256") != patch_ref.get("file_sha256")
     ):
         raise OverlayError("exported Stage-C merge binding drifted")
     with np.load(patch, allow_pickle=False) as source:
@@ -872,7 +887,9 @@ def _project_policy_patch(
     ):
         raise OverlayError("Stage-C patch row indices are invalid for base corpus")
 
-    base_seed = _fixed_memmap(base_root, "game_seed", columns["game_seed"], rows, mode="r")
+    base_seed = _fixed_memmap(
+        base_root, "game_seed", columns["game_seed"], rows, mode="r"
+    )
     base_decision = _fixed_memmap(
         base_root, "decision_index", columns["decision_index"], rows, mode="r"
     )
@@ -950,11 +967,11 @@ def _project_policy_patch(
             or np.unique(base_ids).size != base_ids.size
             or set(base_ids.tolist()) != set(patch_ids.tolist())
         ):
-            raise OverlayError(
-                f"Stage-C legal action set differs at corpus row {row}"
-            )
+            raise OverlayError(f"Stage-C legal action set differs at corpus row {row}")
         patch_position = {int(action): index for index, action in enumerate(patch_ids)}
-        gather = np.asarray([patch_position[int(action)] for action in base_ids], dtype=np.int64)
+        gather = np.asarray(
+            [patch_position[int(action)] for action in base_ids], dtype=np.int64
+        )
         for name, (patch_name, _fill) in POLICY_RAGGED_COLUMNS.items():
             source = np.asarray(patch[patch_name])[patch_start:patch_stop]
             outputs[name][base_start:base_stop] = source[gather]
@@ -974,9 +991,7 @@ def _project_policy_patch(
         target[...] = source
         values = np.asarray(patch[patch_name])
         if values.shape[0] != selected_rows.size:
-            raise OverlayError(
-                f"Stage-C {patch_name} is not aligned to selected rows"
-            )
+            raise OverlayError(f"Stage-C {patch_name} is not aligned to selected rows")
         target[selected_rows] = values
         target.flush()
         projected_search_columns.append(column_name)
@@ -1009,7 +1024,11 @@ def _project_policy_patch(
     target_mask = outputs["target_policy_mask"]
     selected_mass = np.asarray(
         [
-            float(np.asarray(target_policy[int(offsets[row]) : int(offsets[row + 1])]).sum())
+            float(
+                np.asarray(
+                    target_policy[int(offsets[row]) : int(offsets[row + 1])]
+                ).sum()
+            )
             for row in selected_rows
         ]
     )
@@ -1054,7 +1073,9 @@ def _updated_inventory(
         else:
             record = base_records.get(filename)
             if record is None:
-                raise OverlayError(f"new payload was not declared rewritten: {filename}")
+                raise OverlayError(
+                    f"new payload was not declared rewritten: {filename}"
+                )
             if path.stat().st_size != int(record["size_bytes"]):
                 raise OverlayError(f"hard-linked payload size drifted: {filename}")
             result.append(record)
@@ -1137,7 +1158,10 @@ def _selected_sampling_weights(
         for key, value in population["selected_counts_by_stratum"].items()
     }
     raw = np.asarray(
-        [candidate_counts[stratum] / selected_counts[stratum] for stratum, _, _ in descriptors],
+        [
+            candidate_counts[stratum] / selected_counts[stratum]
+            for stratum, _, _ in descriptors
+        ],
         dtype=np.float64,
     )
     validation = np.asarray(selected_validation, dtype=np.bool_)
@@ -1199,9 +1223,7 @@ def _selected_sampling_weights(
                 "min": float(weights[validation].min()),
                 "max": float(weights[validation].max()),
                 "mean": float(weights[validation].mean()),
-                "effective_sample_size": _effective_sample_size(
-                    weights[validation]
-                ),
+                "effective_sample_size": _effective_sample_size(weights[validation]),
             }
             if np.any(validation)
             else None
@@ -1294,9 +1316,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         base_data = train_bc.MemmapCorpus(base_root)
         root_breadth = _stage_c_root_breadth_inventory(
             corpus_game_seeds=np.asarray(base_data["game_seed"], dtype=np.int64),
-            validation_game_seeds=np.asarray(
-                validation["game_seeds"], dtype=np.int64
-            ),
+            validation_game_seeds=np.asarray(validation["game_seeds"], dtype=np.int64),
             selected_game_seeds=np.asarray(patch["game_seed"], dtype=np.int64),
             selected_decision_indices=np.asarray(
                 patch["decision_index"], dtype=np.int64
@@ -1314,6 +1334,19 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             arm=str(args.sampling_arm),
             production_weight_cap=float(args.production_weight_cap),
         )
+        paired_root_columns = {
+            "root_value",
+            "root_value_mask",
+            "root_prior_value",
+            "root_prior_value_mask",
+        }
+        if not paired_root_columns <= set(columns) or not paired_root_columns <= set(
+            patch
+        ):
+            raise OverlayError(
+                "Stage-C v3 materialization requires paired root value columns "
+                "in both the base corpus and target patch"
+            )
         optional_fixed = set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(columns) & set(patch)
         rewritten_columns = set(REWRITTEN_COLUMNS) | optional_fixed | {SAMPLING_COLUMN}
         _hardlink_payloads(
@@ -1336,10 +1369,11 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             len(selected_validation) - np.count_nonzero(selected_validation)
         )
         if projection["selected_training_policy_rows"] <= 0:
-            raise OverlayError("Stage-C overlay has no policy roots in the training split")
+            raise OverlayError(
+                "Stage-C overlay has no policy roots in the training split"
+            )
         rewritten_filenames = {
-            _column_payload_filename(name, columns[name])
-            for name in rewritten_columns
+            _column_payload_filename(name, columns[name]) for name in rewritten_columns
         }
         if None in rewritten_filenames:
             raise OverlayError("Stage-C rewritten column unexpectedly has no payload")
@@ -1373,12 +1407,15 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "nonselected_policy_weight": 0.0,
             "selected_policy_weight": 1.0,
             "base_value_rows_retained": True,
+            "paired_root_value_patch_consumed": True,
             "rewritten_columns": sorted(rewritten_columns),
             "sampling_distribution": sampling_report,
             "root_breadth": root_breadth,
         }
         meta_path = temporary / "corpus_meta.json"
-        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        meta_path.write_text(
+            json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
         final_meta = output / "corpus_meta.json"
         final_receipt = output / "stage_c_policy_overlay.receipt.json"
@@ -1415,7 +1452,9 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "target_reanalyzer_checkpoint": copy.deepcopy(
                 export["target_reanalyzer_checkpoint"]
             ),
-            "target_operator_contract": copy.deepcopy(export["target_operator_contract"]),
+            "target_operator_contract": copy.deepcopy(
+                export["target_operator_contract"]
+            ),
             "projection": projection,
             "sampling_distribution": sampling_report,
             "root_breadth": root_breadth,
@@ -1423,6 +1462,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "preserved_columns": sorted(set(columns) - rewritten_columns),
             "non_target_source_columns_mutated": False,
             "base_value_and_outcome_columns_retained": True,
+            "paired_root_value_patch_consumed": True,
         }
         receipt["receipt_sha256"] = _value_sha256(receipt)
         _write_json_immutable(temporary / final_receipt.name, receipt)
@@ -1444,9 +1484,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "policy_active_rows": int(projection["selected_rows"]),
                 "stage_c_reanalysis_only": True,
-                "root_breadth_inventory_sha256": root_breadth[
-                    "inventory_sha256"
-                ],
+                "root_breadth_inventory_sha256": root_breadth["inventory_sha256"],
                 "target_policy_target_identity_sha256": export[
                     "target_policy_target_identity_sha256"
                 ],
@@ -1454,6 +1492,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         )
         admission["stage_c_policy_overlay"] = {
             "schema_version": ADMISSION_OVERLAY_SCHEMA,
+            "paired_root_value_patch_consumed": True,
             "materialization_receipt": {
                 "path": str(final_receipt),
                 "file_sha256": _file_sha256(temporary / final_receipt.name),
@@ -1505,6 +1544,7 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         or overlay.get("schema_version") != ADMISSION_OVERLAY_SCHEMA
         or overlay.get("historical_policy_targets_active") is not False
         or overlay.get("base_value_rows_retained") is not True
+        or overlay.get("paired_root_value_patch_consumed") is not True
         or int(overlay.get("selected_policy_rows", 0)) <= 0
         or int(overlay.get("selected_training_policy_rows", 0)) <= 0
         or int(overlay.get("selected_validation_policy_rows", -1)) < 0
@@ -1541,6 +1581,7 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
         or receipt.get("target_policy_target_identity_sha256")
         != overlay.get("target_policy_target_identity_sha256")
         or receipt.get("root_breadth") != root_breadth
+        or receipt.get("paired_root_value_patch_consumed") is not True
         or admission.get("policy_distillation_contract", {}).get(
             "root_breadth_inventory_sha256"
         )
@@ -1551,13 +1592,15 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
     meta_path = corpus_root / "corpus_meta.json"
     _meta_path, meta = _load_json(meta_path, where="Stage-C overlay corpus metadata")
     if (
-        _file_sha256(meta_path)
-        != admission["corpus"]["corpus_meta_file_sha256"]
+        _file_sha256(meta_path) != admission["corpus"]["corpus_meta_file_sha256"]
         or corpus_root != receipt_path.parent
         or receipt["overlay_corpus"]["payload_inventory_sha256"]
         != admission["corpus"]["payload_inventory_sha256"]
-        or meta.get("stage_c_policy_overlay", {}).get("root_breadth")
-        != root_breadth
+        or meta.get("stage_c_policy_overlay", {}).get("root_breadth") != root_breadth
+        or meta.get("stage_c_policy_overlay", {}).get(
+            "paired_root_value_patch_consumed"
+        )
+        is not True
     ):
         raise OverlayError("Stage-C overlay admission differs from corpus bytes")
     return {

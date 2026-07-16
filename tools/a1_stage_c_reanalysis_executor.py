@@ -74,7 +74,8 @@ QUALIFICATION_PARTITION_RECEIPT_SCHEMA = (
 QUALIFICATION_PARTITION_SCHEMA = "a1-stage-c-sparse-reconstruction-partition-v1"
 EXECUTION_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-chunk-receipt-v1"
 PATCH_SCHEMA_V1 = "a1-stage-c-coherent-reanalysis-target-patch-v1"
-PATCH_SCHEMA = "a1-stage-c-coherent-reanalysis-target-patch-v2"
+PATCH_SCHEMA_V2 = "a1-stage-c-coherent-reanalysis-target-patch-v2"
+PATCH_SCHEMA = "a1-stage-c-coherent-reanalysis-target-patch-v3"
 REBOUND_MERGE_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-rebound-merge-receipt-v2"
 MERGE_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-merge-receipt-v1"
 ROW_SEED_SCHEMA = alignment.STAGE_C_ROW_SEED_SCHEMA
@@ -120,6 +121,8 @@ PATCH_ROW_COLUMNS = (
     "selected_action_policy_id",
     "root_value",
     "root_value_mask",
+    "root_prior_value",
+    "root_prior_value_mask",
     "simulations_used",
     "used_full_search",
     "q_values_root_perspective",
@@ -128,6 +131,21 @@ PATCH_ROW_COLUMNS = (
     "target_operator_contract_file_sha256",
     *TARGET_RELIABILITY_COLUMNS,
 )
+LEGACY_PATCH_ROW_COLUMNS = tuple(
+    name
+    for name in PATCH_ROW_COLUMNS
+    if name not in {"root_prior_value", "root_prior_value_mask"}
+)
+
+
+def _patch_row_columns(patch_schema: str) -> tuple[str, ...]:
+    if patch_schema in {PATCH_SCHEMA_V1, PATCH_SCHEMA_V2}:
+        return LEGACY_PATCH_ROW_COLUMNS
+    if patch_schema == PATCH_SCHEMA:
+        return PATCH_ROW_COLUMNS
+    raise ExecutorError("unsupported Stage-C patch schema")
+
+
 PATCH_RAGGED_COLUMNS = (
     "legal_action_ids_flat",
     "target_policy_flat",
@@ -1301,6 +1319,8 @@ def _search_patch(
         != _expected_forced_full_simulations(len(legal_rust), effective_config)
         or not math.isfinite(float(result.root_value))
         or not -1.0 <= float(result.root_value) <= 1.0
+        or not math.isfinite(float(result.root_prior_value))
+        or not -1.0 <= float(result.root_prior_value) <= 1.0
         or not bool(result.q_values_root_perspective)
         or not np.all(np.isfinite(target))
         or np.any(target < 0.0)
@@ -1331,6 +1351,8 @@ def _search_patch(
         "selected_action_policy_id": int(legal_policy_ids[selected_position]),
         "root_value": float(result.root_value),
         "root_value_mask": True,
+        "root_prior_value": float(result.root_prior_value),
+        "root_prior_value_mask": True,
         "simulations_used": int(result.simulations_used),
         "used_full_search": bool(result.used_full_search),
         "q_values_root_perspective": bool(result.q_values_root_perspective),
@@ -1346,7 +1368,9 @@ def _partition_positions(
     return np.flatnonzero((chunks % int(partitions)) == int(partition_index))
 
 
-def _patch_arrays(records: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray]:
+def _patch_arrays(
+    records: Sequence[Mapping[str, Any]], *, patch_schema: str = PATCH_SCHEMA
+) -> dict[str, np.ndarray]:
     offsets = [0]
     for record in records:
         offsets.append(offsets[-1] + len(record["legal_action_ids"]))
@@ -1391,6 +1415,13 @@ def _patch_arrays(records: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray]
         "q_values_root_perspective": np.ones(count, dtype=np.bool_),
         "legal_action_offsets": np.asarray(offsets, dtype=np.int64),
     }
+    if patch_schema == PATCH_SCHEMA:
+        arrays["root_prior_value"] = np.asarray(
+            [record["root_prior_value"] for record in records], dtype=np.float32
+        )
+        arrays["root_prior_value_mask"] = np.ones(count, dtype=np.bool_)
+    elif patch_schema not in {PATCH_SCHEMA_V1, PATCH_SCHEMA_V2}:
+        raise ExecutorError("unsupported Stage-C patch schema")
     string_fields = (
         "target_policy_target_identity_sha256",
         "target_reanalyzer_checkpoint_sha256",
@@ -1558,9 +1589,7 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
                     evaluator=evaluator,
                     reconstructed_game=game,
                     row_seed=duplicate_seed,
-                    expected_legal_policy_ids=_one_row(
-                        data["legal_action_ids"], row
-                    ),
+                    expected_legal_policy_ids=_one_row(data["legal_action_ids"], row),
                 )
                 primary_ids = np.asarray(patch["legal_action_ids"], dtype=np.int64)
                 duplicate_ids = np.asarray(
@@ -1694,12 +1723,9 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "contract": reliability_contract,
             "typed_neutral_sentinel_for_unaudited_rows": True,
-            "audited_rows": int(
-                np.count_nonzero(arrays["target_reliability_audited"])
-            ),
+            "audited_rows": int(np.count_nonzero(arrays["target_reliability_audited"])),
             "unaudited_rows": int(
-                len(records)
-                - np.count_nonzero(arrays["target_reliability_audited"])
+                len(records) - np.count_nonzero(arrays["target_reliability_audited"])
             ),
             "duplicate_selected_action_applied": False,
         },
@@ -1714,17 +1740,16 @@ def _verify_patch_arrays(
     arrays: Mapping[str, np.ndarray], *, receipt: Mapping[str, Any]
 ) -> None:
     patch_schema = str(receipt.get("patch_schema_version", ""))
-    if patch_schema not in {PATCH_SCHEMA_V1, PATCH_SCHEMA}:
-        raise ExecutorError("unsupported Stage-C patch schema")
+    row_columns = _patch_row_columns(patch_schema)
     expected = {
-        *PATCH_ROW_COLUMNS,
+        *row_columns,
         *PATCH_RAGGED_COLUMNS,
         "legal_action_offsets",
     }
     if set(arrays) != expected or sorted(arrays) != receipt.get("patch_columns"):
         raise ExecutorError("Stage-C patch column contract drifted")
     count = int(receipt["counts"]["rows"])
-    for name in PATCH_ROW_COLUMNS:
+    for name in row_columns:
         if np.asarray(arrays[name]).shape != (count,):
             raise ExecutorError(f"Stage-C patch row column {name} is misaligned")
     offsets = np.asarray(arrays["legal_action_offsets"], dtype=np.int64)
@@ -1806,7 +1831,7 @@ def _verify_patch_arrays(
     else:
         raise ExecutorError("unknown Stage-C reliability mode")
     effective_config = None
-    if patch_schema == PATCH_SCHEMA:
+    if patch_schema in {PATCH_SCHEMA_V2, PATCH_SCHEMA}:
         search = receipt.get("search")
         if not isinstance(search, Mapping) or not isinstance(
             search.get("effective_config_without_row_seed"), Mapping
@@ -1846,6 +1871,14 @@ def _verify_patch_arrays(
             or not bool(arrays["root_value_mask"][row])
             or not math.isfinite(float(arrays["root_value"][row]))
             or not -1.0 <= float(arrays["root_value"][row]) <= 1.0
+            or (
+                patch_schema == PATCH_SCHEMA
+                and (
+                    not bool(arrays["root_prior_value_mask"][row])
+                    or not math.isfinite(float(arrays["root_prior_value"][row]))
+                    or not -1.0 <= float(arrays["root_prior_value"][row]) <= 1.0
+                )
+            )
             or not bool(arrays["used_full_search"][row])
             or not bool(arrays["q_values_root_perspective"][row])
             or (
@@ -1867,7 +1900,7 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
     patch_schema = receipt.get("patch_schema_version")
     if (
         receipt.get("schema_version") != EXECUTION_RECEIPT_SCHEMA
-        or patch_schema not in {PATCH_SCHEMA_V1, PATCH_SCHEMA}
+        or patch_schema not in {PATCH_SCHEMA_V1, PATCH_SCHEMA_V2, PATCH_SCHEMA}
         or stated != _value_sha256(unsigned)
     ):
         raise ExecutorError("Stage-C execution receipt digest drifted")
@@ -1914,7 +1947,7 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
         or search.get("effective_config_sha256") != _value_sha256(effective)
     ):
         raise ExecutorError("Stage-C execution effective search config drifted")
-    if patch_schema == PATCH_SCHEMA and (
+    if patch_schema in {PATCH_SCHEMA_V2, PATCH_SCHEMA} and (
         search.get("target_execution") != alignment.STAGE_C_TARGET_EXECUTION
         or search.get("target_execution_sha256")
         != _value_sha256(alignment.STAGE_C_TARGET_EXECUTION)
@@ -1947,10 +1980,15 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
     }
 
 
-def _record_from_patch(arrays: Mapping[str, np.ndarray], row: int) -> dict[str, Any]:
+def _record_from_patch(
+    arrays: Mapping[str, np.ndarray], row: int, *, patch_schema: str
+) -> dict[str, Any]:
     offsets = np.asarray(arrays["legal_action_offsets"], dtype=np.int64)
     start, stop = int(offsets[row]), int(offsets[row + 1])
-    record = {name: np.asarray(arrays[name])[row].item() for name in PATCH_ROW_COLUMNS}
+    record = {
+        name: np.asarray(arrays[name])[row].item()
+        for name in _patch_row_columns(patch_schema)
+    }
     for output_name, record_name in (
         ("legal_action_ids_flat", "legal_action_ids"),
         ("target_policy_flat", "target_policy"),
@@ -1978,6 +2016,13 @@ def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
     if not executions:
         raise ExecutorError("Stage-C merge requires execution receipts")
     first = executions[0]
+    if any(
+        execution.get("patch_schema_version") != PATCH_SCHEMA
+        for execution in executions
+    ):
+        raise ExecutorError(
+            "new Stage-C merges require v3 execution patches with paired root values"
+        )
     plan_sha = first["stage_c_plan"]["plan_sha256"]
     qualification_sha = first["qualification_receipt"]["receipt_sha256"]
     target_sha = first["target_policy_target_identity_sha256"]
@@ -2007,7 +2052,7 @@ def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
     for execution in executions:
         arrays = execution["arrays"]
         for row in range(int(execution["counts"]["rows"])):
-            record = _record_from_patch(arrays, row)
+            record = _record_from_patch(arrays, row, patch_schema=PATCH_SCHEMA)
             ordinal = int(record["ready_ordinal"])
             if ordinal in records_by_ordinal:
                 raise ExecutorError(f"duplicate Stage-C row claim ordinal={ordinal}")
@@ -2186,7 +2231,7 @@ def _rebind_legacy_merge(args: argparse.Namespace) -> dict[str, Any]:
     source_receipt = args.receipt.expanduser().resolve(strict=True)
     receipt: dict[str, Any] = {
         "schema_version": REBOUND_MERGE_RECEIPT_SCHEMA,
-        "patch_schema_version": PATCH_SCHEMA,
+        "patch_schema_version": PATCH_SCHEMA_V2,
         "diagnostic_only": True,
         "promotion_eligible": False,
         "stage_c_plan": legacy["stage_c_plan"],
@@ -2245,9 +2290,9 @@ def _verify_rebound_merge_receipt(
 ) -> dict[str, Any]:
     unsigned = dict(receipt)
     stated = unsigned.pop("receipt_sha256", None)
-    if receipt.get("patch_schema_version") != PATCH_SCHEMA or stated != _value_sha256(
-        unsigned
-    ):
+    if receipt.get(
+        "patch_schema_version"
+    ) != PATCH_SCHEMA_V2 or stated != _value_sha256(unsigned):
         raise ExecutorError("Stage-C rebound merge digest drifted")
     source_ref = receipt.get("source_legacy_merge")
     if not isinstance(source_ref, Mapping):
@@ -2324,7 +2369,8 @@ def _verify_merge_receipt(path: Path) -> dict[str, Any]:
     stated = unsigned.pop("receipt_sha256", None)
     if (
         receipt.get("schema_version") != MERGE_RECEIPT_SCHEMA
-        or receipt.get("patch_schema_version") not in {PATCH_SCHEMA_V1, PATCH_SCHEMA}
+        or receipt.get("patch_schema_version")
+        not in {PATCH_SCHEMA_V1, PATCH_SCHEMA_V2, PATCH_SCHEMA}
         or stated != _value_sha256(unsigned)
     ):
         raise ExecutorError("Stage-C merge receipt digest drifted")
@@ -2394,14 +2440,21 @@ def _verify_merge_receipt(path: Path) -> dict[str, Any]:
     records: dict[int, dict[str, Any]] = {}
     for execution in executions:
         for row in range(int(execution["counts"]["rows"])):
-            record = _record_from_patch(execution["arrays"], row)
+            record = _record_from_patch(
+                execution["arrays"],
+                row,
+                patch_schema=str(receipt["patch_schema_version"]),
+            )
             ordinal = int(record["ready_ordinal"])
             if ordinal in records or not 0 <= ordinal < len(ready["row_index"]):
                 raise ExecutorError("Stage-C merge has duplicate/foreign ready ordinal")
             records[ordinal] = record
     if set(records) != set(range(len(ready["row_index"]))):
         raise ExecutorError("Stage-C merge execution DAG has incomplete row coverage")
-    rebuilt = _patch_arrays([records[index] for index in range(len(records))])
+    rebuilt = _patch_arrays(
+        [records[index] for index in range(len(records))],
+        patch_schema=str(receipt["patch_schema_version"]),
+    )
     if set(rebuilt) != set(arrays) or any(
         not _arrays_equal(rebuilt[name], arrays[name]) for name in arrays
     ):

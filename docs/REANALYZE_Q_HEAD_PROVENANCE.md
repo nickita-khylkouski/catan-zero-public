@@ -1,21 +1,26 @@
 # Reanalysis q-head safety
 
-`tools/reanalyze_lite.py` and `tools/reanalyze_banked_corpus.py` default to
-`--v-component root_value`. This is the controlled value-reanalysis probe: it
-forwards the configured trained value readout and materializes the per-state
-column consumed by `train_bc --value-target-lambda`. The default matches scalar
-search (`--value-readout scalar --value-scale 1 --value-squash tanh`). A
-categorical-search corpus must explicitly use `--value-readout categorical`.
-Categorical expectations bypass scalar tanh exactly as search does; both paths
-receive search's final `[-1,1]` clip.
+`tools/reanalyze_lite.py` and `tools/reanalyze_banked_corpus.py` do not support
+either root value column. They require an explicit q-value component.
 
-Every `root_value` output records a
-`catan_zero_root_value_materialization_v1` object in its reanalysis manifest and
-in `corpus_meta.json` next to the column schema. It binds the source output key,
-readout, scale, configured/applied squash, final clip, range, and root-to-move
-semantics. Banked jobs treat it as immutable plan shape and validate it again at
-run and merge. Legacy raw-forward jobs and mixed-provenance chunks fail closed and
-must be replanned.
+`root_value` is the post-search backed-up root value.
+`root_prior_value` is the pre-search evaluator baseline used by the same sealed
+search operator. A direct stored-feature forward cannot reproduce that operator:
+wide roots may use symmetry averaging, and information-set modes may aggregate
+determinizations. Relabeling such a forward as either root field corrupts the
+training or quality signal.
+
+Only true search reruns may refresh these fields. The policy-target reanalyzer
+updates both atomically but currently invalidates compact completed-Q/visit
+evidence, so its output intentionally cannot pass the empirical policy-quality
+gate. Stage-C v3 updates the paired root fields together with the full search
+patch and is the gate-capable route. Stage-C v1/v2 artifacts remain readable as
+diagnostics but cannot be exported into a new learner overlay.
+
+Legacy overlays carrying
+`catan_zero_root_value_materialization_v1` mislabeled a direct forward as a
+post-search backup. `train_bc` rejects them whenever
+`--value-target-lambda < 1`; regenerate those targets with a true search rerun.
 
 Do not use `target_scores` merely because that column already exists in an older
 corpus. Those modes forward the model's per-action `q_values`. Normal `train_bc`
