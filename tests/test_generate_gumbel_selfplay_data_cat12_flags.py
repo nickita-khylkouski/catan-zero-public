@@ -336,6 +336,7 @@ def test_strategic_clock_and_forced_trajectory_mode_thread_through(monkeypatch) 
         _worker_args(
             temperature_clock="nonforced_choice",
             coherent_public_belief_search=True,
+            boundary_value_particles=4,
             forced_root_target_mode="trajectory_only",
             meaningful_public_history=True,
             event_history_limit=32,
@@ -349,6 +350,7 @@ def test_strategic_clock_and_forced_trajectory_mode_thread_through(monkeypatch) 
     assert captured["config"].record_automatic_transitions is False
     assert captured["search_config"].coherent_public_belief_search is True
     assert captured["search_config"].information_set_search is False
+    assert captured["search_config"].boundary_value_particles == 4
     assert captured["search_config"].forced_root_target_mode == "trajectory_only"
 
 

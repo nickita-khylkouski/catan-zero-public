@@ -245,6 +245,16 @@ def test_learner_row_adapter_flag_is_typed_and_defaults_to_tied_contract() -> No
     )
 
 
+def test_boundary_value_particles_are_science_hashed() -> None:
+    legacy = GenerateConfig(games=0)
+    particles = GenerateConfig(games=0, boundary_value_particles=4)
+
+    assert legacy.boundary_value_particles == 1
+    assert particles.canonical_payload()["fields"]["boundary_value_particles"] == 4
+    assert particles.config_hash() != legacy.config_hash()
+    assert particles.full_config_hash() != legacy.full_config_hash()
+
+
 def test_merge_worker_summaries_authenticates_teacher_and_learner_adapters(
     tmp_path: Path,
 ) -> None:

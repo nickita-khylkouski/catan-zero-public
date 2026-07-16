@@ -1018,6 +1018,16 @@ def build_parser() -> argparse.ArgumentParser:
         "n128 use four particles and n16 use one.",
     )
     parser.add_argument(
+        "--boundary-value-particles",
+        type=int,
+        default=1,
+        help=(
+            "Number of observer-information particles averaged only at the "
+            "first opponent/new-turn continuation-value boundary in coherent "
+            "public search. K=1 preserves the historical operator."
+        ),
+    )
+    parser.add_argument(
         "--information-set-target-aggregation",
         choices=("mean_improved_policy", "aggregate_q_then_improve"),
         default="mean_improved_policy",
@@ -1292,6 +1302,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     _validate_science_args(args, parser)
     if int(args.determinization_particles) < 1:
         parser.error("--determinization-particles must be >= 1")
+    if int(args.boundary_value_particles) < 1:
+        parser.error("--boundary-value-particles must be >= 1")
+    if int(args.boundary_value_particles) > 1 and not bool(
+        args.coherent_public_belief_search
+    ):
+        parser.error(
+            "--boundary-value-particles > 1 requires "
+            "--coherent-public-belief-search"
+        )
     if int(args.determinization_min_simulations) < 1:
         parser.error("--determinization-min-simulations must be >= 1")
     if bool(args.information_set_search) or bool(args.coherent_public_belief_search):
@@ -1302,6 +1321,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             has_public_dev_materializer = hasattr(
                 catanatron_rs.Game, "apply_public_belief_development_draws"
             )
+            has_boundary_determinization = hasattr(
+                catanatron_rs.Game,
+                "determinize_from_observer_information",
+            )
             capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
             native_capabilities = (
                 set(capability_fn()) if callable(capability_fn) else set()
@@ -1309,6 +1332,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         except ImportError:
             has_determinization = False
             has_public_dev_materializer = False
+            has_boundary_determinization = False
             native_capabilities = set()
         if not has_determinization:
             parser.error(
@@ -1320,6 +1344,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 parser.error(
                     "--coherent-public-belief-search requires a catanatron_rs "
                     "wheel exposing Game.apply_public_belief_development_draws"
+                )
+            if (
+                int(args.boundary_value_particles) > 1
+                and not has_boundary_determinization
+            ):
+                parser.error(
+                    "--boundary-value-particles > 1 requires a wheel exposing "
+                    "Game.determinize_from_observer_information"
+                )
+            if (
+                int(args.boundary_value_particles) > 1
+                and bool(args.native_mcts_hot_loop)
+                and "boundary_value_particles" not in native_capabilities
+            ):
+                parser.error(
+                    "--boundary-value-particles > 1 with the native hot loop "
+                    "requires a wheel advertising boundary_value_particles"
                 )
             if bool(args.native_mcts_hot_loop) and (
                 "coherent_public_belief_search" not in native_capabilities
@@ -1613,6 +1654,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "coherent_public_belief_search": bool(
                     args.coherent_public_belief_search
                 ),
+                "boundary_value_particles": int(args.boundary_value_particles),
                 "forced_root_target_mode": str(args.forced_root_target_mode),
                 "determinization_particles": int(args.determinization_particles),
                 "determinization_min_simulations": int(
@@ -2306,6 +2348,9 @@ def _run_worker(
         coherent_public_belief_search=bool(
             worker_args.get("coherent_public_belief_search", False)
         ),
+        boundary_value_particles=int(
+            worker_args.get("boundary_value_particles", 1)
+        ),
         forced_root_target_mode=str(worker_args.get("forced_root_target_mode", "full")),
         determinization_particles=int(worker_args.get("determinization_particles", 1)),
         determinization_min_simulations=int(
@@ -2595,6 +2640,9 @@ def _merge_worker_summaries(
         "exact_budget_sh_min_n": int(getattr(args, "exact_budget_sh_min_n", 0)),
         "root_wave_batching": bool(getattr(args, "root_wave_batching", False)),
         "native_mcts_hot_loop": bool(getattr(args, "native_mcts_hot_loop", False)),
+        "boundary_value_particles": int(
+            getattr(args, "boundary_value_particles", 1)
+        ),
         "rust_featurize": bool(args.rust_featurize),
         "value_readout": str(getattr(args, "value_readout", "scalar")),
         "checkpoint": args.checkpoint,

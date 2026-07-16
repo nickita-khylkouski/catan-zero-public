@@ -73,6 +73,9 @@ def _mcts(*, particles: int = 4, n_full: int = 128) -> GumbelChanceMCTS:
     )
     mcts.evaluator = SimpleNamespace(config=SimpleNamespace(public_observation=True))
     mcts.rng = random.Random(mcts.config.seed)
+    mcts._gumbel_rng = mcts.rng
+    mcts._chance_rng = mcts.rng
+    mcts._belief_rng = mcts.rng
     mcts.attested_root_phases = []
 
     def fetch(_self, _game):
@@ -664,3 +667,158 @@ def test_actor_turn_boundary_stops_on_opponent_or_new_turn() -> None:
     )
     assert mcts._is_information_set_turn_boundary(opponent, depth=1)
     assert mcts._is_information_set_turn_boundary(later, depth=1)
+
+
+def test_boundary_particles_average_values_with_real_per_world_legal_sets() -> None:
+    class Particle:
+        def __init__(self, seed: int) -> None:
+            self.seed = int(seed)
+
+    class BoundaryGame:
+        def winning_color(self):
+            return None
+
+        def current_color(self):
+            return "BLUE"
+
+        def num_turns(self):
+            return 7
+
+        def determinize_from_observer_information(
+            self, observer: str, seed: int
+        ) -> Particle:
+            assert observer == "RED"
+            return Particle(seed)
+
+    class Evaluator:
+        config = SimpleNamespace(public_observation=True, emit_uncertainty=False)
+
+        def __init__(self) -> None:
+            self.requests: list[list[tuple[Particle, tuple[int, ...]]]] = []
+
+        def evaluate_many(self, requests, *, root_color, colors):
+            assert root_color == "RED"
+            assert colors == ("RED", "BLUE")
+            self.requests.append(list(requests))
+            return [
+                ({action: 1.0 / len(legal) for action in legal}, seed.seed / 10.0)
+                for seed, legal in requests
+            ]
+
+    evaluator = Evaluator()
+    mcts = _mcts()
+    mcts.config = replace(
+        mcts.config,
+        information_set_search=False,
+        coherent_public_belief_search=True,
+        boundary_value_particles=3,
+    )
+    mcts.evaluator = evaluator
+    mcts._boundary_value_particle_seeds = (1, 2, 3)
+
+    def fetch(_self, game):
+        legal = (11,) if game.seed == 1 else ((11, 12) if game.seed == 2 else (12, 13, 14))
+        return legal, {}, {}
+
+    mcts._fetch_legal_actions = MethodType(fetch, mcts)
+    node = _GNode(game=BoundaryGame(), root_color="RED")
+    mcts._information_set_root_turn = 7
+
+    first = mcts._simulate(node, depth=1)
+    second = mcts._simulate(node, depth=1)
+
+    assert first == pytest.approx(0.2)
+    assert second == first
+    assert node.expanded is True
+    assert node.actions == {}
+    assert [[legal for _game, legal in batch] for batch in evaluator.requests] == [
+        [(11,), (11, 12), (12, 13, 14)]
+    ]
+
+
+def test_boundary_particle_configuration_fails_closed_on_uncertainty() -> None:
+    with pytest.raises(ValueError, match="uncertainty backup weighting"):
+        GumbelChanceMCTS(
+            GumbelChanceMCTSConfig(
+                coherent_public_belief_search=True,
+                boundary_value_particles=2,
+                uncertainty_backup_weighting=True,
+            ),
+            SimpleNamespace(config=SimpleNamespace(public_observation=True)),
+        )
+
+
+def test_coherent_boundary_particle_seeds_are_hidden_truth_invariant() -> None:
+    class BoundaryAuthoritative(_AuthoritativeGame):
+        def determinize_from_observer_information(self, observer: str, seed: int):
+            return _SampledGame(seed, self.prompt)
+
+    def run(hidden_truth: str) -> tuple[int, ...]:
+        mcts = _mcts(n_full=128)
+        mcts.config = replace(
+            mcts.config,
+            information_set_search=False,
+            coherent_public_belief_search=True,
+            boundary_value_particles=4,
+        )
+        mcts.evaluator.config.emit_uncertainty = False
+        mcts.search(BoundaryAuthoritative(hidden_truth), force_full=True)
+        return tuple(mcts._boundary_value_particle_seeds)
+
+    assert run("KNIGHT") == run("VICTORY_POINT")
+
+
+def test_boundary_value_particles_k1_draws_no_additional_rng() -> None:
+    mcts = _mcts(n_full=128)
+    mcts.config = replace(
+        mcts.config,
+        information_set_search=False,
+        coherent_public_belief_search=True,
+        boundary_value_particles=1,
+    )
+    expected = random.Random(mcts.config.seed)
+    expected.getrandbits(64)  # Historical sanitized-root determinization draw.
+
+    mcts.search(_AuthoritativeGame("irrelevant"), force_full=True)
+
+    assert mcts._boundary_value_particle_seeds == ()
+    assert mcts._belief_rng.getstate() == expected.getstate()
+
+
+def test_boundary_value_particles_k1_uses_exact_legacy_boundary_expansion() -> None:
+    class BoundaryGame:
+        def winning_color(self):
+            return None
+
+        def current_color(self):
+            return "BLUE"
+
+        def num_turns(self):
+            return 7
+
+    mcts = _mcts()
+    mcts.config = replace(
+        mcts.config,
+        information_set_search=False,
+        coherent_public_belief_search=True,
+        boundary_value_particles=1,
+    )
+    mcts._information_set_root_turn = 7
+    node = _GNode(game=BoundaryGame(), root_color="RED")
+    calls: list[_GNode] = []
+
+    def legacy_expand(_self, received):
+        calls.append(received)
+        received.expanded = True
+        received.prior_value = 0.375
+        return 0.375
+
+    def forbidden_particles(_self, _received):
+        raise AssertionError("K=1 must not enter boundary-particle expansion")
+
+    mcts._expand = MethodType(legacy_expand, mcts)
+    mcts._expand_boundary_value_particles = MethodType(forbidden_particles, mcts)
+
+    assert mcts._simulate(node, depth=1) == pytest.approx(0.375)
+    assert mcts._simulate(node, depth=1) == pytest.approx(0.375)
+    assert calls == [node]

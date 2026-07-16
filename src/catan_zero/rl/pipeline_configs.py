@@ -566,6 +566,11 @@ class GenerateConfig(PipelineConfig):
     opponent_pool_manifest: str | None = None
     opponent_mix_manifest: str | None = None
     exploiter_fraction: float | None = None
+    # Append-only producer field: number of observer-information worlds
+    # averaged only at the first opponent/new-turn continuation-value
+    # boundary. K=1 is the exact historical coherent-public operator; larger
+    # values therefore require a distinct producer identity and config hash.
+    boundary_value_particles: int = 1
 
     @classmethod
     def from_namespace(cls, args: Any) -> "GenerateConfig":

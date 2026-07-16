@@ -132,6 +132,20 @@ pub trait Evaluator {
         }
         Ok(out)
     }
+
+    /// Evaluate a coherent-public opponent-turn boundary by integrating only
+    /// its continuation value across observer-information particles. The
+    /// concrete bridge owns determinization and per-particle legal-action
+    /// construction; priors are intentionally absent because traversal stops
+    /// at this boundary.
+    fn evaluate_boundary(
+        &mut self,
+        _game: &Game,
+        _root_color: Color,
+        _particle_seeds: &[u64],
+    ) -> Result<f64, String> {
+        Err("boundary value particles require an evaluator boundary callback".into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +212,9 @@ pub struct SearchConfig {
     /// conservation; development draws are materialized from the public
     /// posterior independently of the concrete hidden deck.
     pub coherent_public_belief_search: bool,
+    /// Pre-drawn common-random-number seeds for boundary-only public-belief
+    /// value integration. Empty is the exact historical K=1 path.
+    pub boundary_value_particle_seeds: Vec<u64>,
 }
 
 impl Default for SearchConfig {
@@ -242,6 +259,7 @@ impl Default for SearchConfig {
             uncertainty_backup_cap: 1.0,
             stop_at_root_turn_boundary: false,
             coherent_public_belief_search: false,
+            boundary_value_particle_seeds: Vec::new(),
         }
     }
 }
@@ -543,6 +561,25 @@ impl GumbelMctsEngine {
                 game.state.colors.len()
             ));
         }
+        if self.config.boundary_value_particle_seeds.len() == 1 {
+            return Err(
+                "boundary_value_particle_seeds must be empty (K=1 legacy) or contain at least two seeds"
+                    .into(),
+            );
+        }
+        if !self.config.boundary_value_particle_seeds.is_empty()
+            && !self.config.coherent_public_belief_search
+        {
+            return Err("boundary value particles require coherent public-belief search".into());
+        }
+        if !self.config.boundary_value_particle_seeds.is_empty()
+            && self.config.uncertainty_backup_weighting
+        {
+            return Err(
+                "boundary value particles cannot be combined with uncertainty backup weighting"
+                    .into(),
+            );
+        }
         if self.config.rescale_noise_floor_initial_road_only
             && self
                 .config
@@ -739,6 +776,28 @@ impl GumbelMctsEngine {
         self.finish_expand(arena, node_idx, legal_actions, priors, value, uncertainty)
     }
 
+    fn expand_boundary_value<E: Evaluator>(
+        &mut self,
+        arena: &mut Arena,
+        node_idx: usize,
+        evaluator: &mut E,
+    ) -> Result<f64, String> {
+        let node = arena.get(node_idx);
+        let value = evaluator.evaluate_boundary(
+            &node.game,
+            node.root_color,
+            &self.config.boundary_value_particle_seeds,
+        )?;
+        if !value.is_finite() {
+            return Err("boundary evaluator returned non-finite value".into());
+        }
+        let node = arena.get_mut(node_idx);
+        node.prior_value = value.clamp(-1.0, 1.0);
+        node.prior_uncertainty = 0.0;
+        node.expanded = true;
+        Ok(node.prior_value)
+    }
+
     fn finish_expand(
         &self,
         arena: &mut Arena,
@@ -891,7 +950,11 @@ impl GumbelMctsEngine {
         }
         if self.is_root_turn_boundary(arena, node_idx, depth) {
             if !arena.get(node_idx).expanded {
-                self.expand_node(arena, node_idx, evaluator)?;
+                if self.config.boundary_value_particle_seeds.len() > 1 {
+                    self.expand_boundary_value(arena, node_idx, evaluator)?;
+                } else {
+                    self.expand_node(arena, node_idx, evaluator)?;
+                }
             }
             let value = arena.get(node_idx).prior_value;
             let node = arena.get_mut(node_idx);
@@ -1965,6 +2028,8 @@ mod tests {
     struct CountingEvaluator {
         leaf_calls: usize,
         root_calls: usize,
+        boundary_calls: usize,
+        boundary_seeds: Vec<Vec<u64>>,
     }
 
     impl Evaluator for CountingEvaluator {
@@ -1992,6 +2057,17 @@ mod tests {
             self.root_calls += 1;
             self.evaluate(game, legal, root_color)
         }
+
+        fn evaluate_boundary(
+            &mut self,
+            _game: &Game,
+            _root_color: Color,
+            particle_seeds: &[u64],
+        ) -> Result<f64, String> {
+            self.boundary_calls += 1;
+            self.boundary_seeds.push(particle_seeds.to_vec());
+            Ok(0.375)
+        }
     }
 
     fn opening(seed: u64) -> Game {
@@ -1999,6 +2075,72 @@ mod tests {
             vec![Player::simple(Color::Red), Player::simple(Color::Blue)],
             Some(seed),
         )
+    }
+
+    #[test]
+    fn boundary_value_particles_call_once_and_cache_value_only_node() {
+        let game = opening(101);
+        let current = game.state.current_color();
+        let observer = game
+            .state
+            .colors
+            .iter()
+            .copied()
+            .find(|color| *color != current)
+            .unwrap();
+        let mut arena = Arena::new();
+        let node_idx = arena.alloc(Node::new(game.clone(), observer));
+        let mut engine = GumbelMctsEngine::new(SearchConfig {
+            coherent_public_belief_search: true,
+            boundary_value_particle_seeds: vec![11, 22, 33],
+            ..Default::default()
+        });
+        engine.root_turn = game.state.num_turns;
+        let mut evaluator = CountingEvaluator::default();
+
+        let first = engine
+            .simulate(&mut arena, node_idx, 1, None, &mut evaluator)
+            .unwrap();
+        let second = engine
+            .simulate(&mut arena, node_idx, 1, None, &mut evaluator)
+            .unwrap();
+
+        assert_eq!(first, 0.375);
+        assert_eq!(second, first);
+        assert_eq!(evaluator.boundary_calls, 1);
+        assert_eq!(evaluator.boundary_seeds, vec![vec![11, 22, 33]]);
+        let node = arena.get(node_idx);
+        assert!(node.expanded);
+        assert!(node.actions.is_empty());
+        assert!(node.playable_actions.is_empty());
+        assert_eq!(node.prior_value, 0.375);
+        assert_eq!(node.prior_uncertainty, 0.0);
+        assert_eq!(node.visits, 2);
+    }
+
+    #[test]
+    fn boundary_value_particles_reject_uncertainty_weighting() {
+        let error = GumbelMctsEngine::new(SearchConfig {
+            coherent_public_belief_search: true,
+            boundary_value_particle_seeds: vec![11, 22],
+            uncertainty_backup_weighting: true,
+            ..Default::default()
+        })
+        .search(&opening(103), &mut CountingEvaluator::default(), Some(true))
+        .unwrap_err();
+        assert!(error.contains("cannot be combined with uncertainty"));
+    }
+
+    #[test]
+    fn one_boundary_seed_is_rejected_instead_of_silently_using_k1() {
+        let error = GumbelMctsEngine::new(SearchConfig {
+            coherent_public_belief_search: true,
+            boundary_value_particle_seeds: vec![11],
+            ..Default::default()
+        })
+        .search(&opening(107), &mut CountingEvaluator::default(), Some(true))
+        .unwrap_err();
+        assert!(error.contains("empty (K=1 legacy) or contain at least two"));
     }
 
     #[test]
@@ -2082,7 +2224,7 @@ mod tests {
         {
             let hidden = game.state.player_state_mut(opponent);
             hidden.dev_cards[DevCard::RoadBuilding.idx()] = hidden_count;
-            hidden.owned_at_start[DevCard::RoadBuilding.idx()] = true;
+            hidden.owned_at_start[DevCard::RoadBuilding.idx()] = hidden_count;
         }
         game.state.development_listdeck = starting_devcard_bank();
         for _ in 0..hidden_count {

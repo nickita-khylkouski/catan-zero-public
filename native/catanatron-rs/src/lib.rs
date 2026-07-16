@@ -5675,6 +5675,31 @@ impl Game {
         if self.state.current_color() != observer {
             return Err("determinization observer must be the current player".into());
         }
+        let result = self.determinize_from_observer_information(observer, seed)?;
+        if result.playable_actions != self.playable_actions {
+            return Err("public-belief determinization changed root legal actions".into());
+        }
+        Ok(result)
+    }
+
+    /// Sample a complete hidden world from ``observer``'s information at an
+    /// arbitrary public decision boundary.
+    ///
+    /// Unlike [`Game::determinize_for_player`], the observer need not be the
+    /// side to act. This is the value-boundary primitive for coherent search:
+    /// it preserves the observer's branch-updated private hand while
+    /// resampling every other hidden hand and the development deck from public
+    /// conservation. The sampled current actor's legal actions are regenerated
+    /// from that sampled hand and deliberately are not compared with the
+    /// source world's hidden-dependent legal set.
+    pub fn determinize_from_observer_information(
+        &self,
+        observer: Color,
+        seed: u64,
+    ) -> Result<Game, String> {
+        if !self.state.color_to_index.contains_key(&observer) {
+            return Err("observer is not a player in this game".into());
+        }
 
         fn sample_freqdeck(
             pool: &mut FreqDeck,
@@ -5887,8 +5912,8 @@ impl Game {
             target.dev_cards = sampled;
             target.actual_victory_points =
                 target.victory_points + i16::from(sampled[DevCard::VictoryPoint.idx()]);
-            // Every opponent is between turns at a root owned by `observer`;
-            // when its next turn begins the engine refreshes this field anyway.
+            // At a boundary the sampled opponent may be the side to act. All
+            // cards already in hand at the start of that turn are playable.
             target.owned_at_start = sampled;
         }
 
@@ -5906,14 +5931,9 @@ impl Game {
         result.state.development_listdeck = sampled_deck;
         result.rng = SmallRng::seed_from_u64(seed ^ 0x1F05_E7A5_5EED_0001);
 
-        // Current-player legal actions are a function of public state and the
-        // observer's own preserved hand.  Regenerate defensively and reject any
-        // accidental drift at this correctness boundary.
-        let expected_actions = self.playable_actions.clone();
+        // The current actor can differ from the observer at a value boundary,
+        // so its legal set legitimately depends on its sampled private hand.
         result.playable_actions = generate_playable_actions(&result.state);
-        if result.playable_actions != expected_actions {
-            return Err("public-belief determinization changed root legal actions".into());
-        }
         Ok(result)
     }
 
@@ -8137,6 +8157,21 @@ pub mod python_bindings {
             let observer = parse_color(observer_color).map_err(py_err)?;
             self.game
                 .determinize_for_player(observer, seed)
+                .map(|game| PyGame { game })
+                .map_err(py_err)
+        }
+
+        /// Sample hidden state from an observer's information even when that
+        /// observer is not the side to act. Intended for coherent-search
+        /// opponent-turn value boundaries.
+        fn determinize_from_observer_information(
+            &self,
+            observer_color: &str,
+            seed: u64,
+        ) -> PyResult<PyGame> {
+            let observer = parse_color(observer_color).map_err(py_err)?;
+            self.game
+                .determinize_from_observer_information(observer, seed)
                 .map(|game| PyGame { game })
                 .map_err(py_err)
         }
@@ -15141,6 +15176,78 @@ mod public_belief_determinization_tests {
             assert_eq!(first_child.state.development_listdeck.len(), 22);
             assert_public_conservation(first_child);
         }
+    }
+
+    #[test]
+    fn observer_information_determinization_supports_non_current_observer() {
+        let mut first = Game::new(
+            vec![Player::simple(Color::Red), Player::simple(Color::Blue)],
+            Some(83),
+        );
+        let current = first.state.current_color();
+        let observer = first
+            .state
+            .colors
+            .iter()
+            .copied()
+            .find(|color| *color != current)
+            .unwrap();
+
+        first.state.player_state_mut(current).dev_cards[DevCard::Knight.idx()] = 1;
+        first.state.player_state_mut(current).owned_at_start[DevCard::Knight.idx()] = 1;
+        let knight_position = first
+            .state
+            .development_listdeck
+            .iter()
+            .position(|card| *card == DevCard::Knight)
+            .unwrap();
+        first.state.development_listdeck.remove(knight_position);
+
+        let mut second = first.clone();
+        second.state.player_state_mut(current).dev_cards = [0; 5];
+        second.state.player_state_mut(current).owned_at_start = [0; 5];
+        second.state.player_state_mut(current).dev_cards[DevCard::VictoryPoint.idx()] = 1;
+        second.state.player_state_mut(current).owned_at_start[DevCard::VictoryPoint.idx()] = 1;
+        second.state.player_state_mut(current).actual_victory_points =
+            second.state.player_state(current).victory_points + 1;
+        second.state.development_listdeck.push(DevCard::Knight);
+        let vp_position = second
+            .state
+            .development_listdeck
+            .iter()
+            .position(|card| *card == DevCard::VictoryPoint)
+            .unwrap();
+        second.state.development_listdeck.remove(vp_position);
+
+        let first_before = format!("{first:?}");
+        let second_before = format!("{second:?}");
+        let sampled_first = first
+            .determinize_from_observer_information(observer, 14_503)
+            .unwrap();
+        let sampled_second = second
+            .determinize_from_observer_information(observer, 14_503)
+            .unwrap();
+
+        assert_eq!(
+            game_to_json_value(&sampled_first),
+            game_to_json_value(&sampled_second),
+            "non-current observer particles must ignore authoritative hidden identities",
+        );
+        assert_eq!(format!("{first:?}"), first_before);
+        assert_eq!(format!("{second:?}"), second_before);
+        assert_eq!(
+            sampled_first.state.player_state(observer).dev_cards,
+            first.state.player_state(observer).dev_cards,
+        );
+        assert_eq!(
+            sampled_first.state.player_state(observer).resources,
+            first.state.player_state(observer).resources,
+        );
+        assert_public_conservation(&sampled_first);
+        assert_eq!(
+            sampled_first.playable_actions,
+            generate_playable_actions(&sampled_first.state),
+        );
     }
 
     #[test]

@@ -772,6 +772,14 @@ class GumbelChanceMCTSConfig:
     # remains on that path; independently replicated audit searches opt in.
     rng_stream_separation: bool = False
 
+    # Number of public-conservation hidden worlds used only for the first
+    # opponent/new-turn continuation value in coherent-public search. K=1 is
+    # the exact historical operator: one sanitized root world and its ordinary
+    # actor-centric boundary evaluation. K>1 keeps one coherent current-turn
+    # tree, but averages the boundary value across observer-preserving
+    # determinizations before backing it up. Opponent priors are never combined.
+    boundary_value_particles: int = 1
+
 
 @dataclass(frozen=True, slots=True)
 class SearchResult:
@@ -1026,7 +1034,31 @@ class GumbelChanceMCTS:
                 "coherent_public_belief_search already supplies public-belief "
                 "chance nodes; do not also enable belief_chance_spectra"
             )
+        if int(self.config.boundary_value_particles) < 1:
+            raise ValueError("boundary_value_particles must be >= 1")
+        if int(self.config.boundary_value_particles) > 1 and not bool(
+            self.config.coherent_public_belief_search
+        ):
+            raise ValueError(
+                "boundary_value_particles > 1 requires "
+                "coherent_public_belief_search=True"
+            )
+        if int(self.config.boundary_value_particles) > 1 and bool(
+            self.config.uncertainty_backup_weighting
+        ):
+            raise ValueError(
+                "boundary value particles cannot be combined with uncertainty "
+                "backup weighting until particle uncertainty aggregation has an "
+                "explicit contract"
+            )
         self.evaluator = evaluator or HeuristicRustEvaluator()
+        if int(self.config.boundary_value_particles) > 1 and bool(
+            getattr(getattr(self.evaluator, "config", None), "emit_uncertainty", False)
+        ):
+            raise ValueError(
+                "boundary value particles require an evaluator with "
+                "emit_uncertainty=False"
+            )
         self.rng = random.Random(self.config.seed)
         self._gumbel_rng = self.rng
         self._chance_rng = self.rng
@@ -1148,11 +1180,13 @@ class GumbelChanceMCTS:
         arbitrary hidden allocation in the sanitized root is never used as a
         chance-support restriction.
         """
-        required_methods = (
+        required_methods = [
             "determinize_for_player",
             "apply_public_belief_development_draws",
             "json_snapshot",
-        )
+        ]
+        if int(self.config.boundary_value_particles) > 1:
+            required_methods.append("determinize_from_observer_information")
         missing = [name for name in required_methods if not hasattr(game, name)]
         if missing:
             raise RuntimeError(
@@ -1201,6 +1235,15 @@ class GumbelChanceMCTS:
         if not sampled_legal:
             raise RuntimeError("no legal actions at coherent public-belief MCTS root")
         self._information_set_root_turn = int(sampled.num_turns())
+        particle_count = int(self.config.boundary_value_particles)
+        self._boundary_value_particle_seeds = (
+            tuple(
+                int(self._belief_rng.getrandbits(64))
+                for _ in range(particle_count)
+            )
+            if particle_count > 1
+            else ()
+        )
         return self._search_single_world(
             sampled,
             force_full=force_full,
@@ -2353,6 +2396,66 @@ class GumbelChanceMCTS:
             for index, child in stats.children.items()
         )
 
+    def _expand_boundary_value_particles(self, node: _GNode) -> float:
+        """Expand one turn-boundary node with a public-belief value mean.
+
+        The original root actor remains the observer. Every particle therefore
+        preserves exactly what that actor knows after the searched branch while
+        independently resampling the next actor's hidden development-card hand.
+        The next actor's real sampled legal set is supplied to the model because
+        value architectures may consume legal-action affordances. Priors are
+        intentionally discarded: the coherent operator stops at this boundary
+        and hidden-world legal supports are not policy-aligned.
+        """
+
+        seeds = tuple(
+            int(seed)
+            for seed in getattr(self, "_boundary_value_particle_seeds", ())
+        )
+        if len(seeds) <= 1:
+            raise RuntimeError(
+                "boundary particle expansion requires at least two pre-drawn seeds"
+            )
+        determinize = getattr(
+            node.game, "determinize_from_observer_information", None
+        )
+        if not callable(determinize):
+            raise RuntimeError(
+                "boundary value particles require a native game exposing "
+                "determinize_from_observer_information"
+            )
+        if not callable(getattr(self.evaluator, "evaluate_many", None)):
+            raise RuntimeError(
+                "boundary value particles require evaluator.evaluate_many"
+            )
+
+        requests: list[tuple[Any, tuple[int, ...]]] = []
+        for seed in seeds:
+            sampled = determinize(str(node.root_color), int(seed))
+            legal, _actions, _spectra = self._fetch_legal_actions(sampled)
+            if not legal:
+                raise RuntimeError(
+                    "boundary determinization produced no current-actor legal actions"
+                )
+            requests.append((sampled, tuple(int(action) for action in legal)))
+
+        evaluations = _evaluate_many_checked(
+            self.evaluator,
+            requests,
+            root_color=str(node.root_color),
+            colors=self.config.colors,
+        )
+        values = [float(_split_evaluation(result)[1]) for result in evaluations]
+        if not values or not all(math.isfinite(value) for value in values):
+            raise RuntimeError(
+                "boundary value particles produced non-finite value evidence"
+            )
+        value = float(sum(values) / len(values))
+        node.prior_value = float(max(min(value, 1.0), -1.0))
+        node.prior_uncertainty = 0.0
+        node.expanded = True
+        return node.prior_value
+
     def _prepare_simulation(
         self, node: _GNode, *, depth: int, forced_action: int | None = None
     ) -> float | _PendingSimulation:
@@ -2375,6 +2478,11 @@ class GumbelChanceMCTS:
         # was constructed independently of authoritative hidden truth.
         if self._is_information_set_turn_boundary(node, depth=depth):
             if not node.expanded:
+                if int(self.config.boundary_value_particles) > 1:
+                    value = self._expand_boundary_value_particles(node)
+                    node.visits += 1
+                    node.value_sum += value
+                    return value
                 return self._pending_expansion(node, record_leaf_visit=True)
             value = node.prior_value
             node.visits += 1
@@ -2504,7 +2612,11 @@ class GumbelChanceMCTS:
             return 1.0 if str(winner) == node.root_color else -1.0
         if self._is_information_set_turn_boundary(node, depth=depth):
             if not node.expanded:
-                value = self._expand(node)
+                value = (
+                    self._expand_boundary_value_particles(node)
+                    if int(self.config.boundary_value_particles) > 1
+                    else self._expand(node)
+                )
             else:
                 value = node.prior_value
             node.visits += 1

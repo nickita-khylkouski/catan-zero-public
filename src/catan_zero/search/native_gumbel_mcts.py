@@ -8,6 +8,7 @@ fallback as one source of truth while removing the per-simulation Python loop.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable
 
 from catan_zero.search.gumbel_chance_mcts import (
@@ -152,6 +153,14 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                     "coherent_public_belief_search requires a native wheel "
                     "advertising coherent_public_belief_search"
                 )
+            if (
+                int(self.config.boundary_value_particles) > 1
+                and "boundary_value_particles" not in capabilities
+            ):
+                unsupported.append(
+                    "boundary_value_particles requires a native wheel "
+                    "advertising boundary_value_particles"
+                )
         if (
             self.using_native_hot_loop
             and self.config.forced_root_target_mode == "trajectory_only"
@@ -258,6 +267,12 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 exact_budget_sh_min_n=0,
             )
             values.pop("n_full_wide", None)
+        particle_seeds = tuple(
+            int(seed)
+            for seed in getattr(self, "_boundary_value_particle_seeds", ())
+        )
+        if len(particle_seeds) > 1:
+            values["boundary_value_particle_seeds"] = list(particle_seeds)
         return values
 
     def _search_single_world(
@@ -361,7 +376,68 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                     native_game, tuple(legal), root_color=root_color, colors=colors
                 )
 
+        boundary_evaluator = None
+        if int(self.config.boundary_value_particles) > 1:
+
+            def boundary_evaluator(
+                native_game: Any,
+                root_color: str,
+                particle_seeds: list[int],
+            ) -> float:
+                if len(particle_seeds) < 2:
+                    raise RuntimeError(
+                        "native boundary evaluator requires at least two seeds"
+                    )
+                determinize = getattr(
+                    native_game, "determinize_from_observer_information", None
+                )
+                if not callable(determinize):
+                    raise RuntimeError(
+                        "native boundary evaluator requires "
+                        "determinize_from_observer_information"
+                    )
+                requests: list[tuple[Any, tuple[int, ...]]] = []
+                for seed in particle_seeds:
+                    sampled = determinize(str(root_color), int(seed))
+                    legal = tuple(
+                        int(action)
+                        for action in sampled.playable_action_indices(
+                            list(colors), self.config.map_kind
+                        )
+                    )
+                    if not legal:
+                        raise RuntimeError(
+                            "boundary determinization produced no legal actions"
+                        )
+                    requests.append((sampled, legal))
+                evaluations = list(
+                    self.evaluator.evaluate_many(
+                        requests,
+                        root_color=str(root_color),
+                        colors=colors,
+                    )
+                )
+                if len(evaluations) != len(requests):
+                    raise RuntimeError(
+                        "boundary evaluator batch cardinality mismatch"
+                    )
+                values = [float(result[1]) for result in evaluations]
+                if not values or not all(math.isfinite(value) for value in values):
+                    raise RuntimeError(
+                        "boundary evaluator produced non-finite values"
+                    )
+                return float(sum(values) / len(values))
+
         root_phase = self._resolve_d1_root_phase(game, attested_root_phase)
+        native_kwargs = {
+            "evaluator_many": evaluate_many,
+            "root_evaluator": root_evaluator,
+            "force_full": force_full,
+        }
+        # Preserve compatibility with pre-boundary-particle wheels on the K=1
+        # path: do not pass the newly added keyword unless it is load-bearing.
+        if boundary_evaluator is not None:
+            native_kwargs["boundary_evaluator"] = boundary_evaluator
         raw = catanatron_rs.gumbel_search(
             game,
             evaluate,
@@ -369,9 +445,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 n_simulations_override=n_simulations_override,
                 attested_root_phase=root_phase,
             ),
-            evaluator_many=evaluate_many,
-            root_evaluator=root_evaluator,
-            force_full=force_full,
+            **native_kwargs,
         )
         return SearchResult(
             selected_action=int(raw["selected_action"]),

@@ -383,6 +383,203 @@ def test_native_config_maps_coherent_public_belief_boundary() -> None:
     assert native["stop_at_root_turn_boundary"] is True
 
 
+def test_native_config_maps_boundary_particle_seeds_only_when_enabled() -> None:
+    legacy = object.__new__(NativeGumbelChanceMCTS)
+    legacy.config = GumbelChanceMCTSConfig(
+        coherent_public_belief_search=True,
+        boundary_value_particles=1,
+    )
+    legacy.rng = random.Random(7)
+    legacy._boundary_value_particle_seeds = ()
+    assert "boundary_value_particle_seeds" not in legacy._native_config()
+
+    particles = object.__new__(NativeGumbelChanceMCTS)
+    particles.config = GumbelChanceMCTSConfig(
+        coherent_public_belief_search=True,
+        boundary_value_particles=3,
+    )
+    particles.rng = random.Random(7)
+    particles._boundary_value_particle_seeds = (11, 22, 33)
+    assert particles._native_config()["boundary_value_particle_seeds"] == [
+        11,
+        22,
+        33,
+    ]
+
+
+def test_native_boundary_particles_require_advertised_capability(monkeypatch) -> None:
+    fake_module = SimpleNamespace(
+        gumbel_search=lambda *_args, **_kwargs: None,
+        gumbel_search_capabilities=lambda: ["coherent_public_belief_search"],
+    )
+    monkeypatch.setitem(sys.modules, "catanatron_rs", fake_module)
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(
+        coherent_public_belief_search=True,
+        boundary_value_particles=3,
+    )
+    search.using_native_hot_loop = True
+
+    with pytest.raises(ValueError, match="boundary_value_particles"):
+        search._validate_native_semantics()
+
+
+def test_native_boundary_callback_uses_real_particle_legal_sets(monkeypatch) -> None:
+    class _Particle:
+        def __init__(self, seed: int) -> None:
+            self.seed = int(seed)
+
+        def playable_action_indices(self, colors, map_kind):
+            assert tuple(colors) == ("RED", "BLUE")
+            assert map_kind is None
+            return list(range(1, self.seed + 1))
+
+    class _Game:
+        def playable_action_indices(self, colors, map_kind):
+            assert tuple(colors) == ("RED", "BLUE")
+            assert map_kind is None
+            return [3, 7]
+
+        def determinize_from_observer_information(self, observer, seed):
+            assert observer == "RED"
+            return _Particle(int(seed))
+
+    class _Evaluator:
+        config = SimpleNamespace(public_observation=True, emit_uncertainty=False)
+
+        def __init__(self) -> None:
+            self.legal_sets = []
+
+        def evaluate(self, game, legal, *, root_color, colors):
+            del game, root_color, colors
+            return ({int(action): 1.0 / len(legal) for action in legal}, 0.0)
+
+        def evaluate_many(self, requests, *, root_color, colors):
+            assert root_color == "RED"
+            assert tuple(colors) == ("RED", "BLUE")
+            self.legal_sets.append([legal for _game, legal in requests])
+            return [
+                ({int(action): 1.0 / len(legal) for action in legal}, game.seed / 10.0)
+                for game, legal in requests
+            ]
+
+    observed = {}
+
+    def fake_search(
+        game,
+        evaluator,
+        config,
+        *,
+        evaluator_many,
+        root_evaluator,
+        force_full,
+        boundary_evaluator,
+    ):
+        del evaluator, evaluator_many, root_evaluator
+        observed["force_full"] = force_full
+        observed["seeds"] = config["boundary_value_particle_seeds"]
+        observed["value"] = boundary_evaluator(game, "RED", observed["seeds"])
+        return {
+            "selected_action": 3,
+            "improved_policy": {3: 0.5, 7: 0.5},
+            "visit_counts": {3: 1, 7: 1},
+            "q_values": {3: 0.0, 7: 0.0},
+            "priors": {3: 0.5, 7: 0.5},
+            "root_value": observed["value"],
+            "used_full_search": True,
+            "simulations_used": 2,
+            "afterstate_values": {},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(gumbel_search=fake_search),
+    )
+    evaluator = _Evaluator()
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(
+        seed=7,
+        coherent_public_belief_search=True,
+        boundary_value_particles=3,
+    )
+    search.evaluator = evaluator
+    search.rng = random.Random(7)
+    search.using_native_hot_loop = True
+    search._boundary_value_particle_seeds = (1, 2, 3)
+    search._leaf_evaluation_observer = None
+
+    result = search._search_single_world(_Game(), force_full=True)
+
+    assert observed == {
+        "force_full": True,
+        "seeds": [1, 2, 3],
+        "value": pytest.approx(0.2),
+    }
+    assert evaluator.legal_sets == [[(1,), (1, 2), (1, 2, 3)]]
+    assert result.root_value == pytest.approx(0.2)
+
+
+def test_native_boundary_callback_rejects_batch_cardinality_mismatch(
+    monkeypatch,
+) -> None:
+    class _Particle:
+        def playable_action_indices(self, _colors, _map_kind):
+            return [1]
+
+    class _Game:
+        def playable_action_indices(self, _colors, _map_kind):
+            return [3, 7]
+
+        def determinize_from_observer_information(self, _observer, _seed):
+            return _Particle()
+
+    class _Evaluator:
+        config = SimpleNamespace(public_observation=True, emit_uncertainty=False)
+
+        def evaluate_many(self, requests, *, root_color, colors):
+            del root_color, colors
+            return [({1: 1.0}, 0.0)] * max(0, len(requests) - 1)
+
+        def evaluate(self, *_args, **_kwargs):
+            return ({3: 0.5, 7: 0.5}, 0.0)
+
+    def fake_search(
+        game,
+        _evaluator,
+        config,
+        *,
+        evaluator_many,
+        root_evaluator,
+        force_full,
+        boundary_evaluator,
+    ):
+        del evaluator_many, root_evaluator, force_full
+        boundary_evaluator(
+            game, "RED", config["boundary_value_particle_seeds"]
+        )
+        raise AssertionError("cardinality mismatch should fail before search returns")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(gumbel_search=fake_search),
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(
+        coherent_public_belief_search=True,
+        boundary_value_particles=2,
+    )
+    search.evaluator = _Evaluator()
+    search.rng = random.Random(7)
+    search.using_native_hot_loop = True
+    search._boundary_value_particle_seeds = (1, 2)
+    search._leaf_evaluation_observer = None
+
+    with pytest.raises(RuntimeError, match="cardinality mismatch"):
+        search._search_single_world(_Game(), force_full=True)
+
+
 def test_forced_trajectory_only_keeps_action_and_omits_discarded_targets() -> None:
     evaluator = _ForcedCountingEvaluator()
     trajectory = object.__new__(GumbelChanceMCTS)

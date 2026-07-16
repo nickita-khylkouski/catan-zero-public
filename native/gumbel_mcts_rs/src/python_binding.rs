@@ -19,6 +19,7 @@ struct PyEvaluator {
     eval_fn: Py<PyAny>,
     root_eval_fn: Option<Py<PyAny>>,
     eval_many_fn: Option<Py<PyAny>>,
+    boundary_eval_fn: Option<Py<PyAny>>,
 }
 
 impl Evaluator for PyEvaluator {
@@ -115,6 +116,32 @@ impl Evaluator for PyEvaluator {
             Ok(out)
         })
     }
+
+    fn evaluate_boundary(
+        &mut self,
+        game: &Game,
+        root_color: Color,
+        particle_seeds: &[u64],
+    ) -> Result<f64, String> {
+        let boundary_fn = self
+            .boundary_eval_fn
+            .as_ref()
+            .ok_or("boundary value particles require boundary_evaluator")?;
+        Python::attach(|py| {
+            let py_game = PyGame { game: game.clone() };
+            let py_obj = Py::new(py, py_game).map_err(|error| error.to_string())?;
+            boundary_fn
+                .bind(py)
+                .call1((
+                    py_obj,
+                    color_to_string(root_color),
+                    particle_seeds.to_vec(),
+                ))
+                .map_err(|error| error.to_string())?
+                .extract::<f64>()
+                .map_err(|error| error.to_string())
+        })
+    }
 }
 
 /// Convert Color to the string representation expected by the Python evaluator
@@ -181,7 +208,7 @@ fn string_to_map_kind(value: &str) -> Option<ctrs::MapKind> {
 // ---------------------------------------------------------------------------
 
 #[pyfunction]
-#[pyo3(signature = (game, evaluator, config_dict, evaluator_many=None, root_evaluator=None, force_full=None))]
+#[pyo3(signature = (game, evaluator, config_dict, evaluator_many=None, root_evaluator=None, force_full=None, boundary_evaluator=None))]
 fn gumbel_search(
     py: Python,
     game: &Bound<'_, PyAny>,
@@ -190,6 +217,7 @@ fn gumbel_search(
     evaluator_many: Option<Py<PyAny>>,
     root_evaluator: Option<Py<PyAny>>,
     force_full: Option<bool>,
+    boundary_evaluator: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyDict>> {
     let py_game = game.cast::<PyGame>()?;
     let native_game = py_game.borrow().game.clone();
@@ -336,6 +364,14 @@ fn gumbel_search(
     if let Some(v) = config_dict.get_item("coherent_public_belief_search")? {
         config.coherent_public_belief_search = v.extract()?;
     }
+    if let Some(v) = config_dict.get_item("boundary_value_particle_seeds")? {
+        config.boundary_value_particle_seeds = v.extract()?;
+        if config.boundary_value_particle_seeds.len() == 1 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "boundary_value_particle_seeds must be empty (K=1 legacy) or contain at least two seeds",
+            ));
+        }
+    }
     if let Some(v) = config_dict.get_item("colors")? {
         let colors: Vec<String> = v.extract()?;
         config.colors = colors
@@ -358,6 +394,7 @@ fn gumbel_search(
         eval_fn: evaluator,
         root_eval_fn: root_evaluator,
         eval_many_fn: evaluator_many,
+        boundary_eval_fn: boundary_evaluator,
     };
     if let Some(v) = config_dict.get_item("batch_size")? {
         let batch_size: usize = v.extract()?;
@@ -425,6 +462,7 @@ fn gumbel_search_capabilities() -> Vec<&'static str> {
         "public_award_feature_parity",
         "policy_temperature_semantics",
         "coherent_public_belief_search",
+        "boundary_value_particles",
         "forced_root_trajectory_only",
     ]
 }
