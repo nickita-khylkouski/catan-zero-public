@@ -90,7 +90,7 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 14
+CONFIG_SCHEMA_VERSION = 15
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -267,6 +267,10 @@ class TrainConfig(PipelineConfig):
     allow_missing_game_seed_validation_split: bool = False
     epochs: int = 2
     max_steps: int = 0
+    # Whether max_steps is an exact applied-update dose or only an upper bound.
+    # This changes the optimizer trajectory when the configured epoch ceiling
+    # would otherwise end first, so it must be sealed in the science identity.
+    exact_max_steps: bool = False
     batch_size: int = 65536
     optimizer: str = "adam"
     weight_decay: float = 0.0

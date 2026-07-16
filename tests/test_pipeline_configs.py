@@ -75,6 +75,15 @@ def test_policy_aux_active_batch_size_changes_typed_train_hash() -> None:
     assert config_from_payload(policy_aux.canonical_payload()) == policy_aux
 
 
+def test_exact_step_dose_changes_typed_train_hash() -> None:
+    epoch_bounded = TrainConfig(max_steps=128, exact_max_steps=False)
+    exact_dose = TrainConfig(max_steps=128, exact_max_steps=True)
+
+    assert exact_dose.config_hash() != epoch_bounded.config_hash()
+    assert exact_dose.canonical_payload()["fields"]["exact_max_steps"] is True
+    assert config_from_payload(exact_dose.canonical_payload()) == exact_dose
+
+
 def test_per_game_policy_surprise_changes_typed_train_hash() -> None:
     baseline = TrainConfig()
     exact_surprise = TrainConfig(per_game_policy_surprise_weighting=True)
