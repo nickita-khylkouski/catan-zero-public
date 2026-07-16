@@ -114,6 +114,16 @@ from catan_zero.rl.flywheel.composite_contract import (
 
 
 CHECKOUT_RUNTIME_BINDING_SCHEMA = "train-bc-checkout-runtime-v1"
+POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1 = (
+    "weighted_with_replacement_legacy_v1"
+)
+POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1 = (
+    "weighted_permutation_cycles_v1"
+)
+POLICY_AUX_SAMPLING_MODES = (
+    POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
+    POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1,
+)
 _VALUE_PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
 _VALUE_PLAYER_INDEX = {
     player: index for index, player in enumerate(_VALUE_PLAYER_NAMES)
@@ -1230,6 +1240,18 @@ def build_parser() -> argparse.ArgumentParser:
             "size controls estimator variance and coverage only; it no longer "
             "silently changes the objective strength with row weights or DDP "
             "world size. Used only when --policy-aux-active-batch-size > 0."
+        ),
+    )
+    parser.add_argument(
+        "--policy-aux-sampling-mode",
+        choices=POLICY_AUX_SAMPLING_MODES,
+        default=POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
+        help=(
+            "Policy-AUX source-row traversal. The legacy default draws weighted "
+            "rows with replacement. weighted_permutation_cycles_v1 draws one "
+            "deterministic weighted permutation of every positive-mass row "
+            "before starting the next cycle, preventing duplicate roots before "
+            "coverage exhaustion."
         ),
     )
     # EXP3 (value-reuse-discipline ablation, task #40): at a fixed policy recipe,
@@ -6053,6 +6075,7 @@ def _validate_composite_learner_recipe_authorization(
         "target_reliability_confidence_floor": float,
         "per_game_policy_weight": bool,
         "per_game_policy_weight_mode": str,
+        "policy_aux_sampling_mode": str,
         "per_game_value_weight": bool,
         "per_game_value_weight_mode": str,
         "value_player_outcome_balance_mode": str,
@@ -8454,6 +8477,18 @@ def _effective_a1_learner_training_recipe(
     generic_a1_ablation = bool(
         str(getattr(args, "a1_learner_ablation_id", "") or "")
     )
+    policy_aux_sampling_mode = str(
+        getattr(
+            args,
+            "policy_aux_sampling_mode",
+            POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
+        )
+    )
+    if (
+        policy_aux_sampling_mode
+        != POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1
+    ):
+        effective["policy_aux_sampling_mode"] = policy_aux_sampling_mode
     public_card_lr_mult = float(getattr(args, "public_card_lr_mult", 1.0))
     if public_card_lr_mult != 1.0 or generic_a1_ablation:
         effective["public_card_lr_mult"] = public_card_lr_mult
@@ -9815,6 +9850,8 @@ def _validate_a1_learner_training_recipe(
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         authorized_extra_fields.add("policy_aux_active_batch_size")
         authorized_extra_fields.add("policy_aux_loss_weight")
+        if "policy_aux_sampling_mode" in effective:
+            authorized_extra_fields.add("policy_aux_sampling_mode")
     if float(getattr(args, "value_trunk_grad_scale", 1.0)) != 1.0:
         authorized_extra_fields.add("value_trunk_grad_scale")
     if "policy_target_blend_semantics" in effective:
@@ -9829,6 +9866,7 @@ def _validate_a1_learner_training_recipe(
         "per_game_policy_surprise_weighting",
         "target_reliability_confidence_weighting",
         "target_reliability_confidence_floor",
+        "policy_aux_sampling_mode",
     ):
         if post_seal_field in effective:
             authorized_extra_fields.add(post_seal_field)
@@ -9869,6 +9907,17 @@ def _validate_a1_learner_training_recipe(
             "contract": "disabled with policy_aux_active_batch_size=0",
             "effective": float(effective["policy_aux_loss_weight"]),
         }
+        if (
+            effective.get(
+                "policy_aux_sampling_mode",
+                POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
+            )
+            != POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1
+        ):
+            drift["policy_aux_sampling_mode"] = {
+                "contract": POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
+                "effective": effective["policy_aux_sampling_mode"],
+            }
     if "value_trunk_grad_scale" in effective:
         drift["value_trunk_grad_scale"] = {
             "contract": 1.0,
@@ -11399,6 +11448,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(
                 "--policy-aux-active-batch-size requires positive --policy-loss-weight"
             )
+    elif (
+        str(args.policy_aux_sampling_mode)
+        != POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1
+    ):
+        raise SystemExit(
+            "--policy-aux-sampling-mode is inert unless "
+            "--policy-aux-active-batch-size is positive"
+        )
     if int(args.grad_accum_steps) > 1 and args.arch not in {"xdim_graph", "entity_graph"}:
         raise SystemExit(
             "--grad-accum-steps > 1 is only supported for --arch entity_graph/"
@@ -13615,12 +13672,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "schema_version": "train-policy-aux-sampling-v1",
                 "enabled": False,
                 "base_measure": "off",
+                "mode": str(args.policy_aux_sampling_mode),
             }
         else:
             assert policy_aux_preconditioning_weights is not None
+            positive_aux_weights = (
+                np.asarray(policy_aux_sampling_weights, dtype=np.float64) > 0.0
+            )
+            positive_aux_mass = np.asarray(
+                policy_aux_sampling_weights, dtype=np.float64
+            )[positive_aux_weights]
             policy_aux_sampling_report = {
                 "schema_version": "train-policy-aux-sampling-v1",
                 "enabled": True,
+                "mode": str(args.policy_aux_sampling_mode),
                 "base_measure": policy_aux_base_measure,
                 "exact_per_game_policy_surprise_weighting": (
                     exact_per_game_surprise
@@ -13652,7 +13717,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "content_sha256": _array_content_sha256(
                         policy_aux_sampling_weights
                     ),
+                    "eligible_positive_mass_rows": int(
+                        np.count_nonzero(positive_aux_weights)
+                    ),
+                    "effective_sample_size": float(
+                        positive_aux_mass.sum() ** 2
+                        / np.square(positive_aux_mass).sum()
+                    ),
                 },
+                "cycle_semantics": (
+                    "weighted_permutation_without_replacement_until_every_"
+                    "positive_mass_row_is_exhausted"
+                    if args.policy_aux_sampling_mode
+                    == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+                    else "legacy_weighted_draws_with_replacement"
+                ),
+                "epoch_cycles": [],
             }
             if policy_aux_validation_sampling_weights is not None:
                 policy_aux_sampling_report["validation_sampling_weights"] = {
@@ -14155,14 +14235,31 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         aux_order = None
         if policy_aux_sampling_weights is not None:
-            # Stateless per-epoch seed preserves exact resume behavior without
-            # perturbing or extending the historical persisted base RNG state.
-            policy_aux_rng = np.random.default_rng(
-                np.random.SeedSequence([sampler_seed, 0xA17C1E, int(epoch)])
-            )
+            # This stream is stateless with respect to the persisted base RNG.
+            # Legacy mode keeps its exact historical per-epoch seed. Cycle mode
+            # uses one run seed plus a deterministic global offset so a cycle
+            # can continue across epoch/resume boundaries without duplication.
             local_aux_draws = (
                 int(np.ceil(len(order) / max(1, int(args.batch_size))))
                 * int(args.policy_aux_active_batch_size)
+            )
+            weighted_cycle_mode = (
+                str(args.policy_aux_sampling_mode)
+                == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+            )
+            policy_aux_rng = np.random.default_rng(
+                np.random.SeedSequence(
+                    [sampler_seed, 0xA17C1E]
+                    if weighted_cycle_mode
+                    else [sampler_seed, 0xA17C1E, int(epoch)]
+                )
+            )
+            global_aux_draw_offset = (
+                int(epoch)
+                * int(local_aux_draws)
+                * int(ddp["world_size"])
+                if weighted_cycle_mode
+                else 0
             )
             aux_order = _policy_aux_epoch_order(
                 policy_aux_rng,
@@ -14170,7 +14267,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 policy_aux_sampling_weights,
                 local_draws=local_aux_draws,
                 ddp=ddp,
+                mode=str(args.policy_aux_sampling_mode),
+                global_draw_offset=global_aux_draw_offset,
             )
+            if int(ddp["rank"]) == 0:
+                policy_aux_sampling_report.setdefault("epoch_cycles", []).append(
+                    {
+                        "epoch": int(epoch) + 1,
+                        **_policy_aux_sampling_cycle_report(
+                            policy_aux_sampling_weights,
+                            local_draws=local_aux_draws,
+                            ddp=ddp,
+                            mode=str(args.policy_aux_sampling_mode),
+                            global_draw_offset=global_aux_draw_offset,
+                        ),
+                    }
+                )
         epoch_policy_component_dose: dict[str, float] = {}
         epoch_policy_component_phase_dose: dict[str, float] = {}
         epoch_value_component_dose: dict[str, float] = {}
@@ -16909,6 +17021,51 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         ),
     }
+    if (
+        policy_aux_sampling_weights is not None
+        and str(args.policy_aux_sampling_mode)
+        == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+        and metrics
+    ):
+        realized_reuse = metrics[-1].get("policy_aux_source_reuse")
+        eligible_rows = int(
+            np.count_nonzero(
+                np.asarray(policy_aux_sampling_weights, dtype=np.float64) > 0.0
+            )
+        )
+        if not isinstance(realized_reuse, dict):
+            raise RuntimeError(
+                "weighted policy AUX cycles completed without reuse evidence"
+            )
+        realized_draws = int(realized_reuse["draws"])
+        reuse_cap = int(math.ceil(realized_draws / eligible_rows))
+        if int(realized_reuse["max_source_row_reuse"]) > reuse_cap:
+            raise RuntimeError("weighted policy AUX sampler exceeded its reuse cap")
+        if (
+            not bool(args.ddp_shard_data)
+            and realized_draws >= eligible_rows
+            and int(realized_reuse["unique_source_rows"]) != eligible_rows
+        ):
+            raise RuntimeError(
+                "weighted policy AUX sampler failed complete eligible-row coverage"
+            )
+        if int(ddp["rank"]) == 0:
+            policy_aux_sampling_report["realized_reuse_contract"] = {
+                "schema_version": "policy-aux-cycle-realized-reuse-v1",
+                "draws": realized_draws,
+                "eligible_positive_mass_rows": eligible_rows,
+                "unique_source_rows": int(
+                    realized_reuse["unique_source_rows"]
+                ),
+                "observed_max_source_row_reuse": int(
+                    realized_reuse["max_source_row_reuse"]
+                ),
+                "maximum_source_row_reuse_by_construction": reuse_cap,
+                "complete_eligible_coverage_required": bool(
+                    not args.ddp_shard_data and realized_draws >= eligible_rows
+                ),
+                "contract_satisfied": True,
+            }
     report = {
         "checkout_runtime_binding": checkout_runtime_binding,
         "training_resume_recipe_identity": resume_recipe_identity,
@@ -17228,6 +17385,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
         "policy_aux_loss_weight": float(args.policy_aux_loss_weight),
+        "policy_aux_sampling_mode": str(args.policy_aux_sampling_mode),
         "policy_aux_active_rows": int(
             sum(int(metric.get("policy_aux_active_rows", 0)) for metric in metrics)
         ),
@@ -34455,6 +34613,8 @@ def _policy_aux_epoch_order(
     *,
     local_draws: int,
     ddp: dict[str, int | bool],
+    mode: str = POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1,
+    global_draw_offset: int = 0,
 ) -> np.ndarray:
     """Draw an exact per-rank dose from one deterministic global stream."""
     if int(local_draws) < 0:
@@ -34465,12 +34625,141 @@ def _policy_aux_epoch_order(
     total = float(weights.sum())
     if not math.isfinite(total) or total <= 0.0:
         raise ValueError("policy auxiliary sampling weights have no mass")
+    if np.any(~np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError(
+            "policy auxiliary sampling weights must be finite and non-negative"
+        )
     world = int(ddp["world_size"]) if ddp.get("enabled", False) else 1
     rank = int(ddp["rank"]) if ddp.get("enabled", False) else 0
-    global_order = rng.choice(
-        int(n), size=int(local_draws) * world, replace=True, p=weights / total
-    )
+    global_draws = int(local_draws) * world
+    offset = int(global_draw_offset)
+    if offset < 0:
+        raise ValueError("policy auxiliary global_draw_offset must be non-negative")
+    if mode == POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1:
+        if offset != 0:
+            raise ValueError(
+                "legacy policy auxiliary sampling does not accept a global offset"
+            )
+        global_order = rng.choice(
+            int(n), size=global_draws, replace=True, p=weights / total
+        )
+    elif mode == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1:
+        eligible = np.flatnonzero(weights > 0.0).astype(np.int64, copy=False)
+        eligible_weights = weights[eligible]
+        global_order = np.empty(global_draws, dtype=np.int64)
+        cycle_size = int(eligible.size)
+        first_cycle = offset // cycle_size
+        last_exclusive = offset + global_draws
+        final_cycle = (
+            (last_exclusive - 1) // cycle_size
+            if global_draws > 0
+            else first_cycle - 1
+        )
+        output_offset = 0
+        for cycle in range(final_cycle + 1):
+            # Gumbel-top-k generates a Plackett-Luce weighted permutation:
+            # higher-mass rows tend to occur earlier, but every positive-mass
+            # row appears exactly once before the next cycle begins.  Using
+            # log(weight)+Gumbel avoids the reciprocal overflow of an
+            # exponential race when an authenticated row has tiny positive
+            # mass.
+            priority = np.log(eligible_weights) + rng.gumbel(
+                size=eligible_weights.size
+            )
+            if cycle < first_cycle:
+                continue
+            cycle_start = cycle * cycle_size
+            slice_start = max(offset, cycle_start) - cycle_start
+            slice_stop = min(last_exclusive, cycle_start + cycle_size) - cycle_start
+            needed = int(slice_stop)
+            if needed == cycle_size:
+                selected = np.argsort(-priority, kind="stable")
+            else:
+                selected = np.argpartition(-priority, needed - 1)[:needed]
+                selected = selected[
+                    np.argsort(-priority[selected], kind="stable")
+                ]
+            part = eligible[selected[int(slice_start) : int(slice_stop)]]
+            global_order[output_offset : output_offset + part.size] = part
+            output_offset += int(part.size)
+        if output_offset != global_draws:
+            raise RuntimeError("weighted policy auxiliary cycle length drift")
+    else:
+        raise ValueError(f"unknown policy auxiliary sampling mode: {mode!r}")
     return np.asarray(global_order[rank::world], dtype=np.int64)
+
+
+def _policy_aux_sampling_cycle_report(
+    sample_weights: np.ndarray,
+    *,
+    local_draws: int,
+    ddp: Mapping[str, int | bool],
+    mode: str,
+    global_draw_offset: int = 0,
+) -> dict[str, object]:
+    """Describe exact global coverage/reuse guarantees for one epoch stream."""
+
+    weights = np.asarray(sample_weights, dtype=np.float64)
+    positive = weights > 0.0
+    eligible_rows = int(np.count_nonzero(positive))
+    mass = float(weights[positive].sum())
+    squared_mass = float(np.square(weights[positive]).sum())
+    world = int(ddp["world_size"]) if ddp.get("enabled", False) else 1
+    global_draws = int(local_draws) * world
+    offset = int(global_draw_offset)
+    end = offset + global_draws
+    start_cycle = offset // eligible_rows if eligible_rows else 0
+    end_cycle = (end - 1) // eligible_rows if eligible_rows and global_draws else -1
+    cycle_boundaries_crossed = (
+        end // eligible_rows - offset // eligible_rows if eligible_rows else 0
+    )
+    partial_cycle_draws_at_end = end % eligible_rows if eligible_rows else 0
+    weighted_cycles = mode == POLICY_AUX_SAMPLING_WEIGHTED_CYCLES_V1
+    return {
+        "schema_version": "policy-aux-sampling-cycle-v1",
+        "mode": str(mode),
+        "global_draws": global_draws,
+        "global_draw_offset": offset,
+        "global_draw_end": end,
+        "local_draws_per_rank": int(local_draws),
+        "world_size": world,
+        "eligible_positive_mass_rows": eligible_rows,
+        "sampling_weight_effective_sample_size": (
+            mass * mass / squared_mass if squared_mass > 0.0 else 0.0
+        ),
+        "start_cycle_index": int(start_cycle) if weighted_cycles else None,
+        "end_cycle_index": int(end_cycle) if weighted_cycles else None,
+        "complete_cycles_before_slice": (
+            int(offset // eligible_rows)
+            if weighted_cycles and eligible_rows
+            else None
+        ),
+        "complete_cycles_after_slice": (
+            int(end // eligible_rows)
+            if weighted_cycles and eligible_rows
+            else None
+        ),
+        "cycle_boundaries_crossed": (
+            int(cycle_boundaries_crossed) if weighted_cycles else None
+        ),
+        "partial_cycle_draws_at_end": (
+            int(partial_cycle_draws_at_end) if weighted_cycles else None
+        ),
+        "duplicates_before_cycle_exhaustion": (
+            False if weighted_cycles else "unconstrained"
+        ),
+        "maximum_source_row_reuse_by_construction": (
+            int(math.ceil(end / eligible_rows))
+            if weighted_cycles
+            else None
+        ),
+        "reuse_cap_semantics": (
+            "cumulative_ceil(global_draw_end/eligible_positive_mass_rows)"
+            if weighted_cycles
+            else "none_weighted_draws_with_replacement"
+        ),
+        "global_stream_rank_partition": "rank_stride",
+    }
 
 
 def _policy_aux_loss_weights_without_phase_multiplication(

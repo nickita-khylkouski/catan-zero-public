@@ -321,6 +321,7 @@ class TrainConfig(PipelineConfig):
     # Independently normalized AUX-policy objective coefficient. Batch size is
     # only a sampling/throughput knob and must not redefine objective strength.
     policy_aux_loss_weight: float = 1.0
+    policy_aux_sampling_mode: str = "weighted_with_replacement_legacy_v1"
     # RUN-6/EXP3: default aligned with train_bc --value-loss-weight (0.10, was 0.25).
     value_loss_weight: float = 0.10
     final_vp_loss_weight: float = 0.05
