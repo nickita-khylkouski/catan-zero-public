@@ -46,6 +46,17 @@ def _policy_history_options(policy: EntityGraphPolicy) -> tuple[bool, int]:
     return enabled, limit
 
 
+def _rust_batch_feature_path_available() -> bool:
+    """Return whether the installed native wheel exposes both batch builders."""
+    try:
+        import catanatron_rs  # type: ignore
+    except ImportError:
+        return False
+    return callable(
+        getattr(catanatron_rs, "build_entity_features_batch", None)
+    ) and callable(getattr(catanatron_rs, "build_action_context_batch", None))
+
+
 @dataclass(frozen=True, slots=True)
 class EntityGraphRustEvaluatorConfig:
     """Adapter options for using an EntityGraphPolicy inside RustMCTS.
@@ -516,6 +527,53 @@ class EntityGraphRustEvaluator:
         context = build_action_context_rust(game, topology=topology)
         return context[None, ...]
 
+    def _entity_context_batch_via_rust(
+        self,
+        games: list[Any],
+        *,
+        colors: tuple[str, ...],
+        policy_action_ids: list[tuple[int, ...]],
+        acting_color: str,
+        adapter: Any,
+    ) -> tuple[dict[str, np.ndarray], np.ndarray, list[int]]:
+        """Build one native feature batch for a search evaluation wave."""
+        from catan_zero.rl.action_context_features_rust import (
+            build_action_context_batch_rust,
+        )
+        from catan_zero.rl.entity_token_features_rust import (
+            build_entity_features_batch_rust,
+        )
+
+        topology = self._get_or_init_rust_topology(adapter, acting_color=acting_color)
+        entity, widths = build_entity_features_batch_rust(
+            games,
+            colors=colors,
+            policy_action_ids=policy_action_ids,
+            action_size=int(self.policy.action_size),
+            topology=topology,
+            public_observation=bool(self.config.public_observation),
+            public_card_count_features=bool(
+                getattr(
+                    getattr(self.policy, "config", None),
+                    "public_card_count_features",
+                    getattr(self.policy, "public_card_count_features", False),
+                )
+            ),
+            meaningful_public_history=_policy_history_options(self.policy)[0],
+            history_limit=_policy_history_options(self.policy)[1],
+            entity_feature_adapter_version=(self.config.entity_feature_adapter_version),
+        )
+        context, context_widths = build_action_context_batch_rust(
+            games, topology=topology
+        )
+        expected_widths = [len(ids) for ids in policy_action_ids]
+        if widths != expected_widths or context_widths != expected_widths:
+            raise RuntimeError(
+                "native batch featurizers returned legal widths that do not "
+                "match the evaluator requests"
+            )
+        return entity, context, widths
+
     def _apply_value_squash(self, raw_value: float) -> float:
         """Scale the raw value-head output and apply `config.value_squash`.
 
@@ -949,6 +1007,22 @@ class EntityGraphRustEvaluator:
         results: list[tuple[dict[int, float], float] | None] = [None] * len(requests)
         pending_indices: list[int] = []
         pending_batch_requests: list[_BatchedEvalRequest] = []
+        native_forward_batch: (
+            tuple[dict[str, np.ndarray], np.ndarray, np.ndarray] | None
+        ) = None
+        native_pending: list[
+            tuple[
+                int,
+                Any,
+                tuple[int, ...],
+                str,
+                tuple[int, ...],
+                tuple[str, str, tuple[str, ...], tuple[int, ...]] | None,
+            ]
+        ] = []
+        use_native_feature_batch = (
+            bool(self.config.rust_featurize) and _rust_batch_feature_path_available()
+        )
 
         for request_index, (game, legal_actions) in enumerate(requests):
             if not legal_actions:
@@ -1020,6 +1094,27 @@ class EntityGraphRustEvaluator:
                     meaningful_public_history=_policy_history_options(self.policy)[0],
                     entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 )
+            if use_native_feature_batch:
+                # Bootstrap the immutable BASE-map topology from only the
+                # first pending request. The actual entity/context arrays are
+                # built below in one native call each, rather than paying two
+                # Python↔Rust calls and two result-marshalling steps per leaf.
+                if self._rust_topology is None:
+                    assert resolved is not None
+                    self._get_or_init_rust_topology(
+                        resolved[1], acting_color=acting_color
+                    )
+                native_pending.append(
+                    (
+                        request_index,
+                        game,
+                        tuple(int(action) for action in legal_actions),
+                        acting_color,
+                        tuple(int(action) for action in policy_action_ids),
+                        cache_key,
+                    )
+                )
+                continue
             if bool(self.config.rust_featurize):
                 entity = self._entity_batch_via_rust(
                     game,
@@ -1076,10 +1171,57 @@ class EntityGraphRustEvaluator:
                 )
             )
 
-        if pending_batch_requests:
-            entity_batch, legal_ids, context = _merge_batched_eval_requests(
-                pending_batch_requests
+        if native_pending:
+            entity_batch, context_batch, widths = self._entity_context_batch_via_rust(
+                [item[1] for item in native_pending],
+                colors=tuple(str(color) for color in colors),
+                policy_action_ids=[item[4] for item in native_pending],
+                acting_color=native_pending[0][3],
+                adapter=None,
             )
+            max_width = max(widths, default=0)
+            legal_ids = np.full(
+                (len(native_pending), max_width), -1, dtype=np.int64
+            )
+            for batch_row, (
+                request_index,
+                _game,
+                legal_actions,
+                acting_color,
+                policy_action_ids,
+                cache_key,
+            ) in enumerate(native_pending):
+                width = widths[batch_row]
+                legal_ids[batch_row, :width] = policy_action_ids
+                pending_indices.append(request_index)
+                pending_batch_requests.append(
+                    _BatchedEvalRequest(
+                        # The native builders already returned one padded,
+                        # stacked batch. These per-row tensors are metadata
+                        # placeholders only; the forward below consumes
+                        # ``native_forward_batch`` directly and avoids
+                        # splitting/re-padding/re-stacking the same arrays.
+                        entity={},
+                        legal_action_ids=legal_ids[batch_row : batch_row + 1, :width],
+                        legal_action_context=context_batch[
+                            batch_row : batch_row + 1, :width
+                        ],
+                        legal_actions=legal_actions,
+                        acting_color=acting_color,
+                        root_color=str(root_color),
+                        colors=tuple(str(color) for color in colors),
+                        cache_key=cache_key,
+                    )
+                )
+            native_forward_batch = (entity_batch, legal_ids, context_batch)
+
+        if pending_batch_requests:
+            if native_forward_batch is None:
+                entity_batch, legal_ids, context = _merge_batched_eval_requests(
+                    pending_batch_requests
+                )
+            else:
+                entity_batch, legal_ids, context = native_forward_batch
             import torch
 
             with torch.no_grad():

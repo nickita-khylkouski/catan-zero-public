@@ -226,6 +226,15 @@ def _stub_native_features(evaluator, monkeypatch):
         "_context_batch_via_rust",
         lambda *_args, **_kwargs: np.zeros((1, 2, 1), dtype=np.float32),
     )
+    monkeypatch.setattr(
+        evaluator,
+        "_entity_context_batch_via_rust",
+        lambda games, *, policy_action_ids, **_kwargs: (
+            {"dummy": np.zeros((len(games), 1), dtype=np.float32)},
+            np.zeros((len(games), 2, 1), dtype=np.float32),
+            [len(ids) for ids in policy_action_ids],
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +399,55 @@ def test_evaluate_many_skips_adapter_after_rust_topology_is_warm():
         "evaluate_many() rebuilt the Python entity adapter after native topology "
         f"was warm: {counter.calls} call(s)"
     )
+
+
+def test_warm_rust_evaluate_many_uses_one_native_feature_batch(monkeypatch):
+    game = _StubGame()
+    legal = (10, 11)
+    actor = str(game.current_color())
+    evaluator = EntityGraphRustEvaluator(
+        _StubPolicy(),
+        config=EntityGraphRustEvaluatorConfig(cache_size=0, rust_featurize=True),
+    )
+    evaluator._rust_topology = object()
+    monkeypatch.setattr(
+        neural_rust_mcts,
+        "rust_policy_action_ids",
+        lambda _game, request_legal, **_kwargs: tuple(range(len(request_legal))),
+    )
+    monkeypatch.setattr(
+        neural_rust_mcts, "_rust_batch_feature_path_available", lambda: True
+    )
+    single_calls = 0
+
+    def _forbid_single(*_args, **_kwargs):
+        nonlocal single_calls
+        single_calls += 1
+        raise AssertionError("evaluate_many must not call single-item featurizers")
+
+    monkeypatch.setattr(evaluator, "_entity_batch_via_rust", _forbid_single)
+    monkeypatch.setattr(evaluator, "_context_batch_via_rust", _forbid_single)
+    batch_calls = 0
+
+    def _batch(_games, *, policy_action_ids, **_kwargs):
+        nonlocal batch_calls
+        batch_calls += 1
+        batch_size = len(policy_action_ids)
+        width = len(policy_action_ids[0])
+        return (
+            {"dummy": np.zeros((batch_size, 1), dtype=np.float32)},
+            np.zeros((batch_size, width, 1), dtype=np.float32),
+            [len(ids) for ids in policy_action_ids],
+        )
+
+    monkeypatch.setattr(evaluator, "_entity_context_batch_via_rust", _batch)
+    results = evaluator.evaluate_many(
+        [(game, legal), (game, legal)], root_color=actor, colors=COLORS
+    )
+
+    assert len(results) == 2
+    assert batch_calls == 1
+    assert single_calls == 0
 
 
 def test_batched_evaluator_skips_adapter_after_rust_topology_is_warm():
