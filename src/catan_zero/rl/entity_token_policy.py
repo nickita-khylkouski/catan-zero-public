@@ -18,6 +18,11 @@ from catan_zero.rl.action_features import (
     CONTEXT_ACTION_FEATURE_SIZE,
     build_action_context_feature_table,
 )
+from catan_zero.rl.checkpoint_runtime_semantics import (
+    ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+    assert_entity_graph_checkpoint_runtime_semantics,
+    current_entity_graph_forward_semantics,
+)
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     RUST_ENTITY_ADAPTER_V4,
@@ -2874,6 +2879,13 @@ class EntityGraphPolicy:
                 self.static_action_features.detach().cpu().numpy()
             ),
             "static_action_features": self.static_action_features.detach().cpu(),
+            # Tensor/config compatibility is insufficient: a checkout can load
+            # every tensor while executing a different forward implementation.
+            # Bind only the executable neural surface, excluding save/load and
+            # comments so provenance-only releases do not invalidate models.
+            ENTITY_GRAPH_FORWARD_SEMANTICS_KEY: (
+                current_entity_graph_forward_semantics(Path(__file__))
+            ),
             "model": self.model.state_dict(),
         }
         if durable_value_training is not None:
@@ -2896,6 +2908,7 @@ class EntityGraphPolicy:
         device: str | None = None,
         strict_metadata: bool = True,
         allow_missing_optional_parameters: bool = False,
+        enforce_runtime_semantics: bool = False,
     ) -> EntityGraphPolicy:
         """Load a complete inference checkpoint.
 
@@ -2916,10 +2929,22 @@ class EntityGraphPolicy:
         resolved = _resolve_device(device)
         _install_numpy_pickle_aliases()
         checkpoint = Path(path)
+        # Evaluation preflight must happen before CUDA allocation.  Ordinary
+        # warm-start/upgrader callers retain the historical resolved-device
+        # load unless they explicitly request the serving guard.
+        load_location = "cpu" if enforce_runtime_semantics else resolved
         try:
-            data = torch.load(checkpoint, map_location=resolved, weights_only=False)
+            data = torch.load(
+                checkpoint, map_location=load_location, weights_only=False
+            )
         except TypeError:
-            data = torch.load(checkpoint, map_location=resolved)
+            data = torch.load(checkpoint, map_location=load_location)
+        if enforce_runtime_semantics:
+            assert_entity_graph_checkpoint_runtime_semantics(
+                data,
+                checkpoint_path=checkpoint,
+                policy_source=Path(__file__),
+            )
         adapter_version, adapter_binding_source = (
             resolve_checkpoint_entity_feature_adapter(
                 data.get("entity_feature_adapter"),

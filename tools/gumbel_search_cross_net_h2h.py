@@ -59,6 +59,10 @@ from catan_zero.rl.config_cli import (  # noqa: E402
     apply_config_file,
     resolve_config,
 )
+from catan_zero.rl import entity_token_policy as _entity_token_policy  # noqa: E402
+from catan_zero.rl.checkpoint_runtime_semantics import (  # noqa: E402
+    assert_entity_graph_checkpoint_runtime_semantics,
+)
 from catan_zero.rl.entity_token_features_rust import (  # noqa: E402
     require_rust_feature_path,
 )
@@ -102,6 +106,35 @@ HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
 INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA = "a1-internal-h2h-engine-identity-v1"
 ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
 _UNSET = object()
+
+
+def _preflight_checkpoint_runtime_semantics(
+    candidate: str | Path,
+    baseline: str | Path,
+) -> dict[str, dict[str, object]]:
+    """Validate both model functions on CPU before workers or CUDA exist."""
+
+    import torch
+
+    results: dict[str, dict[str, object]] = {}
+    for role, raw_path in (("candidate", candidate), ("baseline", baseline)):
+        checkpoint = Path(raw_path).expanduser().resolve(strict=True)
+        try:
+            payload = torch.load(
+                checkpoint,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            payload = torch.load(checkpoint, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{role} checkpoint payload is not an object")
+        results[role] = assert_entity_graph_checkpoint_runtime_semantics(
+            payload,
+            checkpoint_path=checkpoint,
+            policy_source=Path(_entity_token_policy.__file__).resolve(strict=True),
+        )
+    return results
 
 
 def _native_runtime_extension_path() -> Path:
@@ -1950,6 +1983,15 @@ def main() -> None:
         argv=sys.argv[1:],
         expected_pipeline=EvalConfig.PIPELINE,
     )
+    try:
+        args.checkpoint_runtime_semantics = (
+            _preflight_checkpoint_runtime_semantics(
+                args.candidate,
+                args.baseline,
+            )
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.error(str(error))
     for role in ("candidate", "baseline"):
         threshold = getattr(args, f"{role}_raw_policy_above_width")
         if threshold is not None and int(threshold) < 0:
@@ -2413,6 +2455,9 @@ def _build_summary(
         "candidate_checkpoint_sha256": candidate_checkpoint_sha256,
         "baseline_checkpoint": args.baseline,
         "baseline_checkpoint_sha256": baseline_checkpoint_sha256,
+        "checkpoint_runtime_semantics": getattr(
+            args, "checkpoint_runtime_semantics", None
+        ),
         "map_kind": str(getattr(args, "map_kind", "BASE")),
         "gate_config": getattr(args, "gate_config", None),
         "n_full": int(args.n_full),

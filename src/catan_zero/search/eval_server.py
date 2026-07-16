@@ -940,7 +940,11 @@ def _server_main(
     if precision not in {"highest", "high", "medium"}:
         raise ValueError(f"invalid EvalServer matmul_precision={precision!r}")
     torch.set_float32_matmul_precision(precision)
-    policy = EntityGraphPolicy.load(checkpoint, device=config.device)
+    policy = EntityGraphPolicy.load(
+        checkpoint,
+        device=config.device,
+        enforce_runtime_semantics=True,
+    )
     adapter_contract = _require_implemented_entity_feature_adapter(
         policy_entity_feature_adapter_version(policy),
         context="EvalServer",
@@ -1682,7 +1686,9 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 
             local_policy = EntityGraphPolicy.load(
-                self._fallback_checkpoint, device=self._fallback_device
+                self._fallback_checkpoint,
+                device=self._fallback_device,
+                enforce_runtime_semantics=True,
             )
             expected_adapter = _require_implemented_entity_feature_adapter(
                 policy_entity_feature_adapter_version(self.policy),

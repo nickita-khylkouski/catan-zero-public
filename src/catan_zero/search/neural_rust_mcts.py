@@ -448,7 +448,14 @@ class EntityGraphRustEvaluator:
         device: str = "cpu",
         config: EntityGraphRustEvaluatorConfig | None = None,
     ) -> "EntityGraphRustEvaluator":
-        return cls(EntityGraphPolicy.load(checkpoint, device=device), config=config)
+        return cls(
+            EntityGraphPolicy.load(
+                checkpoint,
+                device=device,
+                enforce_runtime_semantics=True,
+            ),
+            config=config,
+        )
 
     @property
     def applied_prior_temperature(self) -> float:
@@ -1331,7 +1338,11 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
         max_wait_ms: float = 3.0,
     ) -> "BatchedEntityGraphRustEvaluator":
         return cls(
-            EntityGraphPolicy.load(checkpoint, device=device),
+            EntityGraphPolicy.load(
+                checkpoint,
+                device=device,
+                enforce_runtime_semantics=True,
+            ),
             config=config,
             max_batch_size=max_batch_size,
             max_wait_ms=max_wait_ms,
