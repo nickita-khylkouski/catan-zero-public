@@ -203,6 +203,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert "event_encoder" in required_modules
     assert "public_rule_state_residual" in required_modules
     assert "--ddp-shard-data" not in command
+    assert "--target-reliability-confidence-weighting" not in command
     marker = json.loads(command[command.index("--a1-scratch-authority-json") + 1])
     assert marker == authority
 

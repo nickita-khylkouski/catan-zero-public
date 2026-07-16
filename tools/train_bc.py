@@ -12463,7 +12463,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
                 surprise_weights[split_indices] = (
                     per_game_capped_policy_surprise_sampling_weights(
-                        np.asarray(data["game_seed"][split_indices]),
+                        _component_game_identities(data, split_indices),
                         surprise_kl,
                         np.asarray(policy_weights[split_indices]) > 0.0,
                     )
@@ -13091,7 +13091,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if exact_per_game_surprise:
             policy_surprise_sampling_report = (
                 per_game_policy_surprise_sampling_report(
-                    np.asarray(data["game_seed"][train_indices]),
+                    _component_game_identities(data, train_indices),
                     np.asarray(policy_surprise_weights_full[train_indices]),
                     np.asarray(policy_sample_weights[train_indices]) > 0.0,
                     enabled=True,
@@ -13446,7 +13446,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # cannot distinguish broad target coverage from repeatedly replaying a
     # small handful of roots.
     policy_aux_source_row_counts: Counter[int] = Counter()
-    policy_aux_seen_game_seeds: set[int] = set()
+    policy_aux_seen_game_identities: set[tuple[int, int]] = set()
     # C1 gradient accumulation. accum==1 (default) preserves the pre-C1 path
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
     # and steps, and global_step (== optimizer steps) advances once per batch.
@@ -13928,11 +13928,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                     int(row) for row in aux_source_rows_array
                 )
                 if "game_seed" in data:
-                    policy_aux_seen_game_seeds.update(
-                        int(seed)
-                        for seed in np.asarray(
-                            data["game_seed"][aux_source_rows_array],
-                            dtype=np.int64,
+                    policy_aux_seen_game_identities.update(
+                        (
+                            int(identity["component"]),
+                            int(identity["seed"]),
+                        )
+                        for identity in _component_game_identities(
+                            data, aux_source_rows_array
                         )
                     )
             if len(batch) == 0:
@@ -15062,7 +15064,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy_aux_source_reuse = (
             _policy_aux_source_reuse_summary(
                 policy_aux_source_row_counts,
-                game_seeds=policy_aux_seen_game_seeds,
+                game_identities=policy_aux_seen_game_identities,
                 ddp=ddp,
                 data_sharded=bool(args.ddp_shard_data),
             )
@@ -25410,8 +25412,27 @@ def policy_surprise_sampling_weights(
 _PER_GAME_POLICY_SURPRISE_CAP = 2.0
 
 
+def _component_game_identities(data, rows: np.ndarray) -> np.ndarray:
+    """Return game identities namespaced by composite component."""
+
+    indices = np.asarray(rows, dtype=np.int64)
+    seeds = np.asarray(data["game_seed"][indices], dtype=np.int64)
+    component_mapper = getattr(data, "component_indices_for_rows", None)
+    components = (
+        np.asarray(component_mapper(indices), dtype=np.int64)
+        if callable(component_mapper)
+        else np.zeros(indices.size, dtype=np.int64)
+    )
+    if components.shape != seeds.shape:
+        raise ValueError("component/game identity alignment drift")
+    return np.rec.fromarrays(
+        (components, seeds),
+        names=("component", "seed"),
+    )
+
+
 def per_game_capped_policy_surprise_sampling_weights(
-    game_seeds: np.ndarray,
+    game_identities: np.ndarray,
     kl_target_prior: np.ndarray,
     policy_active: np.ndarray,
 ) -> np.ndarray:
@@ -25429,22 +25450,24 @@ def per_game_capped_policy_surprise_sampling_weights(
     changing either the game or component sampling proportions.
     """
 
-    seeds = np.asarray(game_seeds)
+    identities = np.asarray(game_identities)
     surprise = np.asarray(kl_target_prior, dtype=np.float64)
     active = np.asarray(policy_active, dtype=np.bool_)
-    if seeds.ndim != 1 or surprise.ndim != 1 or active.ndim != 1:
+    if identities.ndim != 1 or surprise.ndim != 1 or active.ndim != 1:
         raise ValueError("per-game policy-surprise inputs must be one-dimensional")
-    if seeds.shape != surprise.shape or seeds.shape != active.shape:
+    if identities.shape != surprise.shape or identities.shape != active.shape:
         raise ValueError("per-game policy-surprise input shape drift")
     if not np.isfinite(surprise).all():
         raise ValueError("per-game policy-surprise KL contains non-finite values")
 
-    factors = np.ones(seeds.shape[0], dtype=np.float64)
+    factors = np.ones(identities.shape[0], dtype=np.float64)
     active_positions = np.flatnonzero(active)
     if active_positions.size == 0:
         return factors
 
-    _games, inverse = np.unique(seeds[active_positions], return_inverse=True)
+    _games, inverse = np.unique(
+        identities[active_positions], return_inverse=True
+    )
     active_counts = np.bincount(inverse).astype(np.float64, copy=False)
     clipped = np.clip(
         surprise[active_positions], 0.0, _PER_GAME_POLICY_SURPRISE_CAP
@@ -25470,7 +25493,7 @@ def per_game_capped_policy_surprise_sampling_weights(
 
 
 def per_game_policy_surprise_sampling_report(
-    game_seeds: np.ndarray,
+    game_identities: np.ndarray,
     sampling_factors: np.ndarray,
     policy_active: np.ndarray,
     *,
@@ -25479,16 +25502,18 @@ def per_game_policy_surprise_sampling_report(
 ) -> dict[str, object]:
     """Build the stable report schema for the exact within-game sampler."""
 
-    seeds = np.asarray(game_seeds)
+    identities = np.asarray(game_identities)
     factors = np.asarray(sampling_factors, dtype=np.float64)
     active = np.asarray(policy_active, dtype=np.bool_)
-    if seeds.shape != factors.shape or seeds.shape != active.shape:
+    if identities.shape != factors.shape or identities.shape != active.shape:
         raise ValueError("per-game policy-surprise report shape drift")
     active_positions = np.flatnonzero(active)
     max_active_mass_error = 0.0
     active_games = 0
     if active_positions.size:
-        _games, inverse = np.unique(seeds[active_positions], return_inverse=True)
+        _games, inverse = np.unique(
+            identities[active_positions], return_inverse=True
+        )
         expected = np.bincount(inverse).astype(np.float64, copy=False)
         realized = np.bincount(inverse, weights=factors[active_positions])
         max_active_mass_error = float(np.max(np.abs(realized - expected)))
@@ -25507,6 +25532,11 @@ def per_game_policy_surprise_sampling_report(
         "policy_active_rows": int(active_positions.size),
         "policy_inactive_rows": int(active.size - active_positions.size),
         "policy_active_games": active_games,
+        "game_identity_namespace": (
+            "component_id+game_seed"
+            if identities.dtype.names == ("component", "seed")
+            else "game_seed"
+        ),
         "max_per_game_active_mass_error": max_active_mass_error,
         "policy_inactive_factor_is_one": bool(
             np.all(factors[~active] == 1.0) if np.any(~active) else True
@@ -32406,8 +32436,8 @@ def _compose_stage_c_policy_surprise_sampling_weights(
     if not np.any(base > 0.0):
         raise ValueError("Stage-C policy-surprise base has no selected-root mass")
 
-    game_seeds = np.asarray(data["game_seed"][rows], dtype=np.int64)
-    _games, inverse = np.unique(game_seeds, return_inverse=True)
+    game_identities = _component_game_identities(data, rows)
+    _games, inverse = np.unique(game_identities, return_inverse=True)
     game_count = int(inverse.max()) + 1 if inverse.size else 0
     before = np.bincount(inverse, weights=base, minlength=game_count)
     combined = base * factors
@@ -32692,7 +32722,7 @@ def _policy_aux_loss_weights_without_phase_multiplication(
 def _policy_aux_source_reuse_summary(
     row_counts: Mapping[int, int],
     *,
-    game_seeds: set[int],
+    game_identities: set[tuple[int, int]],
     ddp: Mapping[str, int | bool],
     data_sharded: bool,
 ) -> dict[str, object]:
@@ -32701,7 +32731,10 @@ def _policy_aux_source_reuse_summary(
     local = {
         "rank": int(ddp.get("rank", 0)),
         "row_counts": {int(row): int(count) for row, count in row_counts.items()},
-        "game_seeds": sorted(int(seed) for seed in game_seeds),
+        "game_identities": sorted(
+            (int(component), int(seed))
+            for component, seed in game_identities
+        ),
     }
     gathered = [local]
     if bool(ddp.get("enabled", False)):
@@ -32710,7 +32743,7 @@ def _policy_aux_source_reuse_summary(
         gathered = [None for _ in range(int(ddp["world_size"]))]
         dist.all_gather_object(gathered, local)
     merged: Counter[object] = Counter()
-    merged_games: set[int] = set()
+    merged_games: set[tuple[int, int]] = set()
     for record in gathered:
         if not isinstance(record, dict):
             raise RuntimeError("policy AUX reuse gather returned malformed rank data")
@@ -32718,7 +32751,10 @@ def _policy_aux_source_reuse_summary(
         for row, count in dict(record["row_counts"]).items():
             identity: object = (rank, int(row)) if data_sharded else int(row)
             merged[identity] += int(count)
-        merged_games.update(int(seed) for seed in record["game_seeds"])
+        merged_games.update(
+            (int(component), int(seed))
+            for component, seed in record["game_identities"]
+        )
     counts = np.asarray(tuple(merged.values()), dtype=np.int64)
     draws = int(counts.sum()) if counts.size else 0
     unique_rows = int(counts.size)
@@ -32727,6 +32763,7 @@ def _policy_aux_source_reuse_summary(
         "draws": draws,
         "unique_source_rows": unique_rows,
         "unique_source_games": len(merged_games),
+        "game_identity_namespace": "component_id+game_seed",
         "draws_per_unique_row": (
             float(draws / unique_rows) if unique_rows else 0.0
         ),

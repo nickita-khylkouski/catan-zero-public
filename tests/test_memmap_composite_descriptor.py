@@ -873,13 +873,14 @@ def test_policy_aux_phase_allocation_rejects_invalid_loss_multiplier() -> None:
 def test_policy_aux_source_reuse_reports_actual_root_and_game_coverage() -> None:
     report = train_bc._policy_aux_source_reuse_summary(
         {11: 3, 12: 1},
-        game_seeds={101, 102},
+        game_identities={(0, 101), (1, 102)},
         ddp={"enabled": False, "world_size": 1, "rank": 0},
         data_sharded=False,
     )
     assert report["draws"] == 4
     assert report["unique_source_rows"] == 2
     assert report["unique_source_games"] == 2
+    assert report["game_identity_namespace"] == "component_id+game_seed"
     assert report["draws_per_unique_row"] == pytest.approx(2.0)
     assert report["max_source_row_reuse"] == 3
     assert report["source_row_reuse_p50"] == pytest.approx(2.0)

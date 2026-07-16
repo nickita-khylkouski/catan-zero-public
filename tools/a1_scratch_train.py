@@ -462,7 +462,6 @@ def build_train_command(
             "--per-game-policy-weight",
             "--per-game-policy-weight-mode",
             str(recipe.get("per_game_policy_weight_mode", "equal")),
-            "--target-reliability-confidence-weighting",
             "--no-per-game-policy-surprise-weighting",
             "--checkpoint",
             str(checkpoint),

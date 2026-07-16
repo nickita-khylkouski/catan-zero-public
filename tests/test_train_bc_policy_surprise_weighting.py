@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from tools.train_bc import (
+    _component_game_identities,
     _compose_per_game_policy_surprise_sampling_weights,
     _epoch_order,
     compute_policy_surprise_kl,
@@ -162,6 +163,29 @@ class _CompositeData:
 
     def component_indices_for_rows(self, indices):
         return self._components[np.asarray(indices, dtype=np.int64)]
+
+
+class _CollidingSeedComposite(dict):
+    def __init__(self) -> None:
+        super().__init__(
+            game_seed=np.asarray([7, 7, 7, 7], dtype=np.int64),
+        )
+        self._components = np.asarray([0, 0, 1, 1], dtype=np.int64)
+
+    def component_indices_for_rows(self, indices):
+        return self._components[np.asarray(indices, dtype=np.int64)]
+
+
+def test_per_game_surprise_namespaces_same_seed_by_component():
+    data = _CollidingSeedComposite()
+    rows = np.arange(4, dtype=np.int64)
+    identities = _component_game_identities(data, rows)
+    factors = per_game_capped_policy_surprise_sampling_weights(
+        identities,
+        np.asarray([0.0, 2.0, 0.0, 0.0], dtype=np.float32),
+        np.ones(4, dtype=np.bool_),
+    )
+    assert factors.tolist() == pytest.approx([0.5, 1.5, 1.0, 1.0])
 
 
 def test_per_game_surprise_composes_without_changing_component_proportions():
