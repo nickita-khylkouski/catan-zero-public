@@ -385,13 +385,56 @@ def test_planned_receipt_is_semantically_authenticated(tmp_path: Path) -> None:
     assert stated == scratch._value_sha256(unsigned)  # noqa: SLF001
 
 
-def test_completed_outputs_bind_terminal_report_and_epoch_frontier(
+def test_scratch_python_authority_preserves_venv_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "python-real"
+    target.write_bytes(b"python")
+    target.chmod(0o755)
+    lexical = tmp_path / "python"
+    lexical.symlink_to(target.name)
+
+    authority = scratch._executable_ref(lexical, where="learner Python")  # noqa: SLF001
+
+    assert authority["path"] == str(lexical)
+    assert authority["target_path"] == str(target.resolve())
+    assert authority["file_sha256"] == scratch._file_sha256(target)  # noqa: SLF001
+
+
+def test_completed_outputs_bind_terminal_report_and_both_frontiers(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "model.pt"
     report = tmp_path / "report.json"
+    checkpoint_steps = (8, 16)
     checkpoint.write_bytes(b"terminal")
-    report.write_text('{"epochs":3}\n', encoding="utf-8")
+    intermediate = []
+    for step, step_path in zip(
+        checkpoint_steps,
+        scratch._step_outputs(checkpoint, checkpoint_steps),  # noqa: SLF001
+        strict=True,
+    ):
+        step_path.write_bytes(f"step-{step}".encode())
+        intermediate.append(
+            {
+                "schema_version": "train-bc-intermediate-checkpoint-v1",
+                "optimizer_step": step,
+                "checkpoint": str(step_path),
+                "checkpoint_sha256": scratch._file_sha256(step_path),  # noqa: SLF001
+                "size_bytes": step_path.stat().st_size,
+                "same_training_trajectory": True,
+                "optimizer_sidecar": None,
+            }
+        )
+    report.write_text(
+        json.dumps(
+            {
+                "epochs": 3,
+                "checkpoint_steps_requested": list(checkpoint_steps),
+                "intermediate_checkpoints": intermediate,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     for epoch, epoch_path in enumerate(
         scratch._epoch_outputs(checkpoint, 3), start=1  # noqa: SLF001
     ):
@@ -405,13 +448,152 @@ def test_completed_outputs_bind_terminal_report_and_epoch_frontier(
         checkpoint=checkpoint,
         report=report,
         epochs=3,
+        checkpoint_steps=checkpoint_steps,
     )
 
     assert outputs["terminal_checkpoint"]["path"] == str(checkpoint.resolve())
     assert [row["epoch"] for row in outputs["epoch_frontier"]] == [1, 2, 3]
+    assert [
+        row["optimizer_step"] for row in outputs["optimizer_step_frontier"]
+    ] == [8, 16]
     assert outputs["epoch_frontier_sha256"] == scratch._value_sha256(  # noqa: SLF001
         outputs["epoch_frontier"]
     )
+    assert outputs["optimizer_step_frontier_sha256"] == scratch._value_sha256(  # noqa: SLF001
+        outputs["optimizer_step_frontier"]
+    )
+
+
+def test_go_consumes_immutable_plan_at_separate_execution_path(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "scratch.plan.json"
+    expected = {
+        "schema_version": scratch.PLAN_SCHEMA,
+        "created_unix_ns": 10,
+        "status": "planned",
+        "command": ["python", "train"],
+    }
+    scratch._write_receipt(plan_path, expected)  # noqa: SLF001
+
+    payload, reference = scratch._load_matching_plan_receipt(  # noqa: SLF001
+        plan_path,
+        expected={**expected, "created_unix_ns": 99},
+    )
+
+    assert payload["receipt_sha256"] == reference["receipt_sha256"]
+    assert reference["path"] == str(plan_path.resolve())
+    assert scratch._execution_receipt_path(plan_path) == (  # noqa: SLF001
+        tmp_path / "scratch.plan.execution.json"
+    )
+
+
+def test_run_plan_then_go_does_not_collide_with_plan_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python = tmp_path / "python"
+    python.write_bytes(b"python")
+    python.chmod(0o755)
+    lock = tmp_path / "lock.json"
+    lock.write_text("{}\n")
+    data = tmp_path / "data.json"
+    data.write_text("{}\n")
+    build = tmp_path / "build.json"
+    build.write_text("{}\n")
+    recipe = {
+        **current_science.learner_training_recipe(),
+        "epochs": 1,
+        "checkpoint_steps": "8",
+    }
+    topology = {
+        **current_science.learner_execution_topology(),
+        "go_authorized": True,
+        "optimization_schedule_status": "commissioned_scratch_update_horizon_v1",
+    }
+    verified = {
+        "lock_path": lock,
+        "data_path": data,
+        "recipe": recipe,
+        "logical_recipe": recipe,
+        "initialization": current_science.learner_initialization(),
+        "model_construction": current_science.learner_model_construction(),
+        "execution_topology": topology,
+        "composite_build_receipt": {
+            "path": str(build.resolve()),
+            "file_sha256": scratch._file_sha256(build),  # noqa: SLF001
+            "receipt_sha256": "sha256:" + "1" * 64,
+        },
+        "descriptor_fingerprint": "sha256:" + "2" * 64,
+        "source_authority_semantic_sha256": "sha256:" + "3" * 64,
+        "validation_split_receipt_sha256": "sha256:" + "4" * 64,
+        "trainer_authority": {"trainer": "test"},
+    }
+    monkeypatch.setattr(scratch, "verify_inputs", lambda **_kwargs: verified)
+    monkeypatch.setattr(
+        scratch,
+        "_scratch_plan_authority",
+        lambda _verified: {"authority": "test"},
+    )
+    monkeypatch.setattr(
+        scratch,
+        "_code_authority",
+        lambda: {"records": [], "records_sha256": "sha256:" + "5" * 64},
+    )
+    monkeypatch.setattr(
+        scratch,
+        "build_train_command",
+        lambda *_args, **_kwargs: ["python", "train", "--save-each-epoch"],
+    )
+    args = SimpleNamespace(
+        lock=lock,
+        data=data,
+        composite_build_receipt=build,
+        checkpoint=tmp_path / "model.pt",
+        report=tmp_path / "report.json",
+        receipt=tmp_path / "plan.json",
+        execution_receipt=None,
+        python=python,
+        go=False,
+    )
+
+    scratch.run(args)
+    plan_bytes = args.receipt.read_bytes()
+
+    args.go = True
+
+    def runner(*_args, **_kwargs):
+        args.checkpoint.write_bytes(b"terminal")
+        epoch = scratch._epoch_outputs(args.checkpoint, 1)[0]  # noqa: SLF001
+        epoch.write_bytes(b"epoch")
+        Path(str(epoch) + ".optimizer.pt").write_bytes(b"optimizer")
+        Path(str(epoch) + ".training-progress.json").write_text("{}\n")
+        step = scratch._step_outputs(args.checkpoint, (8,))[0]  # noqa: SLF001
+        step.write_bytes(b"step-8")
+        args.report.write_text(
+            json.dumps(
+                {
+                    "epochs": 1,
+                    "checkpoint_steps_requested": [8],
+                    "intermediate_checkpoints": [
+                        {
+                            "optimizer_step": 8,
+                            "checkpoint": str(step),
+                            "checkpoint_sha256": scratch._file_sha256(step),  # noqa: SLF001
+                            "same_training_trajectory": True,
+                            "optimizer_sidecar": None,
+                        }
+                    ],
+                }
+            )
+            + "\n"
+        )
+        return SimpleNamespace(returncode=0)
+
+    completed = scratch.run(args, runner=runner)
+
+    assert args.receipt.read_bytes() == plan_bytes
+    assert completed["plan_receipt"]["path"] == str(args.receipt.resolve())
+    assert scratch._execution_receipt_path(args.receipt).is_file()  # noqa: SLF001
 
 
 def _runtime_args() -> SimpleNamespace:
@@ -512,6 +694,7 @@ def test_scratch_plan_has_explicit_execution_switch(tmp_path: Path) -> None:
     ]
     parsed = scratch.parse_args(argv)
     assert parsed.go is False
+    assert parsed.execution_receipt is None
     assert scratch.parse_args([*argv, "--go"]).go is True
 
 

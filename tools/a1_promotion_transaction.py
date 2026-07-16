@@ -67,11 +67,13 @@ ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v2"
 PREVIOUS_ADJUDICATION_SCHEMA = "a1-promotion-adjudication-v1"
 BRANCH_CHALLENGE_ADJUDICATION_SCHEMA = "a1-branch-challenge-adjudication-v1"
 CHECKPOINT_SELECTION_SCHEMA = "a1-same-trajectory-checkpoint-selection-v3"
-SCRATCH_CHECKPOINT_SELECTION_SCHEMA = "a1-scratch-epoch-checkpoint-selection-v1"
+SCRATCH_CHECKPOINT_SELECTION_SCHEMA = (
+    "a1-scratch-optimizer-step-checkpoint-selection-v2"
+)
 SCRATCH_CHECKPOINT_SELECTION_RULE = {
-    "schema_version": "a1-scratch-epoch-selection-rule-v1",
+    "schema_version": "a1-scratch-optimizer-step-selection-rule-v2",
     "objective": "maximum_matched_candidate_half_points",
-    "tie_break": "lowest_epoch_on_exact_tie",
+    "tie_break": "lowest_optimizer_step_on_exact_tie",
     "training_loss_used": False,
 }
 MATCHED_QUICK_SCREEN_SCHEMA = "a1-matched-quick-screen-v3"
@@ -2419,19 +2421,27 @@ def _same_trajectory_training_parent_sha256(
     return parent_sha256
 
 
-def _select_scratch_epoch(half_points_by_epoch: Mapping[int, int]) -> int:
-    if not half_points_by_epoch:
-        raise PromotionError("scratch checkpoint selection has no epoch scores")
-    expected = set(range(1, len(half_points_by_epoch) + 1))
-    if set(half_points_by_epoch) != expected:
-        raise PromotionError("scratch checkpoint selection epoch set is not contiguous")
+def _select_scratch_optimizer_step(
+    half_points_by_step: Mapping[int, int],
+) -> int:
+    if not half_points_by_step:
+        raise PromotionError("scratch checkpoint selection has no optimizer-step scores")
     if any(
-        isinstance(score, bool) or not isinstance(score, int) or score < 0
-        for score in half_points_by_epoch.values()
+        isinstance(step, bool)
+        or not isinstance(step, int)
+        or step <= 0
+        or isinstance(score, bool)
+        or not isinstance(score, int)
+        or score < 0
+        for step, score in half_points_by_step.items()
     ):
-        raise PromotionError("scratch checkpoint scores must be non-negative integers")
-    best = max(half_points_by_epoch.values())
-    return min(epoch for epoch, score in half_points_by_epoch.items() if score == best)
+        raise PromotionError(
+            "scratch optimizer steps must be positive and scores non-negative integers"
+        )
+    best = max(half_points_by_step.values())
+    return min(
+        step for step, score in half_points_by_step.items() if score == best
+    )
 
 
 def _verify_scratch_checkpoint_selection(
@@ -2453,10 +2463,10 @@ def _verify_scratch_checkpoint_selection(
             "schema_version",
             "training_receipt",
             "training_report",
-            "epoch_frontier_sha256",
-            "eligible_epochs",
+            "optimizer_step_frontier_sha256",
+            "eligible_optimizer_steps",
             "evaluation_reports",
-            "selected_epoch",
+            "selected_optimizer_step",
             "selected_checkpoint",
             "selection_rule",
             "matched_common_random_numbers",
@@ -2500,39 +2510,51 @@ def _verify_scratch_checkpoint_selection(
         "sha256": _sha256(training_report_path),
     }:
         raise PromotionError("scratch selection binds a different training report")
-    if value["epoch_frontier_sha256"] != scratch_receipt["epoch_frontier_sha256"]:
-        raise PromotionError("scratch selection binds a different epoch frontier")
-    frontier = scratch_receipt["epoch_frontier"]
-    epochs = [record["epoch"] for record in frontier]
-    if value["eligible_epochs"] != epochs:
-        raise PromotionError("scratch selection eligible epochs differ from frontier")
+    if (
+        value["optimizer_step_frontier_sha256"]
+        != scratch_receipt["optimizer_step_frontier_sha256"]
+    ):
+        raise PromotionError(
+            "scratch selection binds a different optimizer-step frontier"
+        )
+    frontier = scratch_receipt["optimizer_step_frontier"]
+    steps = [record["optimizer_step"] for record in frontier]
+    if value["eligible_optimizer_steps"] != steps:
+        raise PromotionError(
+            "scratch selection eligible optimizer steps differ from frontier"
+        )
 
     raw_reports = value["evaluation_reports"]
     if not isinstance(raw_reports, list) or len(raw_reports) != len(frontier):
-        raise PromotionError("scratch selection must evaluate every epoch frontier")
+        raise PromotionError(
+            "scratch selection must evaluate every optimizer-step frontier"
+        )
     baseline_ref: dict[str, str] | None = None
     ordered_keys: list[dict[str, Any]] | None = None
     search_configuration: dict[str, Any] | None = None
     half_points: dict[int, int] = {}
     verified_reports: list[dict[str, Any]] = []
-    for expected_epoch, raw_report, frontier_record in zip(
-        epochs, raw_reports, frontier, strict=True
+    for expected_step, raw_report, frontier_record in zip(
+        steps, raw_reports, frontier, strict=True
     ):
         record = _require_exact_keys(
             raw_report,
-            {"epoch", "evaluation_report"},
-            where=f"scratch checkpoint selection evaluation epoch {expected_epoch}",
+            {"optimizer_step", "evaluation_report"},
+            where=(
+                "scratch checkpoint selection evaluation optimizer step "
+                f"{expected_step}"
+            ),
         )
-        if record["epoch"] != expected_epoch:
+        if record["optimizer_step"] != expected_step:
             raise PromotionError("scratch selection evaluation order drifted")
         report_path, report_file_ref = _validate_file_ref(
             record["evaluation_report"],
             base=path.parent,
-            where=f"scratch epoch-{expected_epoch} evaluation report",
+            where=f"scratch optimizer-step-{expected_step} evaluation report",
         )
         report = _verify_matched_quick_screen_report(
             report_path,
-            where=f"scratch epoch-{expected_epoch} evaluation report",
+            where=f"scratch optimizer-step-{expected_step} evaluation report",
         )
         expected_checkpoint = {
             "path": frontier_record["checkpoint"]["path"],
@@ -2540,7 +2562,7 @@ def _verify_scratch_checkpoint_selection(
         }
         if report["candidate_checkpoint"] != expected_checkpoint:
             raise PromotionError(
-                f"scratch epoch-{expected_epoch} report binds wrong checkpoint"
+                f"scratch optimizer-step-{expected_step} report binds wrong checkpoint"
             )
         if baseline_ref is None:
             baseline_ref = report["baseline_checkpoint"]
@@ -2552,12 +2574,12 @@ def _verify_scratch_checkpoint_selection(
             or report["search_configuration"] != search_configuration
         ):
             raise PromotionError(
-                "scratch epoch reports do not share baseline/games/search"
+                "scratch optimizer-step reports do not share baseline/games/search"
             )
-        half_points[expected_epoch] = report["candidate_half_points"]
+        half_points[expected_step] = report["candidate_half_points"]
         verified_reports.append(
             {
-                "epoch": expected_epoch,
+                "optimizer_step": expected_step,
                 "evaluation_report": {
                     **report_file_ref,
                     "path": str(report_path),
@@ -2565,10 +2587,14 @@ def _verify_scratch_checkpoint_selection(
                 "candidate_half_points": report["candidate_half_points"],
             }
         )
-    selected_epoch = _select_scratch_epoch(half_points)
-    if value["selected_epoch"] != selected_epoch:
-        raise PromotionError("scratch selected epoch differs from playing-strength result")
-    selected_record = frontier[selected_epoch - 1]
+    selected_step = _select_scratch_optimizer_step(half_points)
+    if value["selected_optimizer_step"] != selected_step:
+        raise PromotionError(
+            "scratch selected optimizer step differs from playing-strength result"
+        )
+    selected_record = next(
+        record for record in frontier if record["optimizer_step"] == selected_step
+    )
     selected_ref = _require_exact_keys(
         value["selected_checkpoint"],
         {"path", "sha256"},
@@ -2583,13 +2609,15 @@ def _verify_scratch_checkpoint_selection(
         or candidate_path != Path(expected_selected_ref["path"])
         or candidate_sha256 != expected_selected_ref["sha256"]
     ):
-        raise PromotionError("adjudicated candidate differs from selected scratch epoch")
+        raise PromotionError(
+            "adjudicated candidate differs from selected scratch optimizer step"
+        )
     assert baseline_ref is not None
     return {
         "path": str(path),
         "sha256": expected_file_sha256,
         "selection_sha256": declared,
-        "selected_epoch": selected_epoch,
+        "selected_optimizer_step": selected_step,
         "selected_checkpoint": selected_ref,
         "evaluation_baseline": baseline_ref,
         "evaluation_reports": verified_reports,
@@ -2888,6 +2916,7 @@ def _verify_completed_scratch_training_receipt(
             "started_unix_ns",
             "finished_unix_ns",
             "returncode",
+            "plan_receipt",
             "outputs",
             "receipt_sha256",
         },
@@ -2921,6 +2950,57 @@ def _verify_completed_scratch_training_receipt(
         <= value["finished_unix_ns"]
     ):
         raise PromotionError("scratch training receipt timestamps are not monotonic")
+    plan_ref = _require_exact_keys(
+        value["plan_receipt"],
+        {"path", "file_sha256", "receipt_sha256"},
+        where="scratch training receipt.plan_receipt",
+    )
+    plan_path = _canonical_existing_file(
+        _absolute(plan_ref["path"], base=path.parent),
+        where="scratch plan receipt",
+    )
+    if _sha256(plan_path) != _validate_sha256(
+        plan_ref["file_sha256"],
+        where="scratch training receipt.plan_receipt.file_sha256",
+    ):
+        raise PromotionError("scratch plan receipt bytes drifted")
+    plan_payload = _load_json(plan_path)
+    plan_unsigned = dict(plan_payload)
+    plan_declared = _validate_sha256(
+        plan_unsigned.pop("receipt_sha256", None),
+        where="scratch training receipt.plan_receipt.receipt_sha256",
+    )
+    if (
+        plan_declared != plan_ref["receipt_sha256"]
+        or plan_declared != _digest_value(plan_unsigned)
+        or plan_payload.get("schema_version") != scratch_train.PLAN_SCHEMA
+        or plan_payload.get("status") != "planned"
+    ):
+        raise PromotionError("scratch execution does not bind an authenticated plan")
+    if plan_payload.get("created_unix_ns") != value["created_unix_ns"]:
+        raise PromotionError("scratch execution changed its plan creation identity")
+    for field in (
+        "go_authorized",
+        "optimization_schedule_authorized",
+        "contract",
+        "science_contract",
+        "initialization",
+        "model_construction",
+        "execution_topology",
+        "logical_recipe",
+        "effective_recipe",
+        "composite",
+        "plan_authority",
+        "python",
+        "trainer_authority",
+        "launcher_authority",
+        "command",
+        "command_sha256",
+    ):
+        if plan_payload.get(field) != value[field]:
+            raise PromotionError(
+                f"scratch execution differs from its sealed plan at {field!r}"
+            )
 
     receipt_contract_path, receipt_contract_ref = _verify_scratch_file_ref(
         value["contract"],
@@ -2982,6 +3062,8 @@ def _verify_completed_scratch_training_receipt(
             "training_report",
             "epoch_frontier",
             "epoch_frontier_sha256",
+            "optimizer_step_frontier",
+            "optimizer_step_frontier_sha256",
         },
         where="scratch training receipt.outputs",
     )
@@ -3034,6 +3116,63 @@ def _verify_completed_scratch_training_receipt(
         )
     if len(frontier) != int(value["logical_recipe"].get("epochs", -1)):
         raise PromotionError("scratch epoch frontier length differs from sealed recipe")
+    raw_step_frontier = outputs["optimizer_step_frontier"]
+    if not isinstance(raw_step_frontier, list) or not raw_step_frontier:
+        raise PromotionError("scratch receipt has no optimizer-step frontier")
+    if (
+        outputs["optimizer_step_frontier_sha256"]
+        != _digest_value(raw_step_frontier)
+    ):
+        raise PromotionError("scratch optimizer-step frontier digest mismatch")
+    try:
+        expected_steps = [
+            int(token)
+            for token in str(
+                value["effective_recipe"].get("checkpoint_steps", "")
+            ).split(",")
+            if token.strip()
+        ]
+    except ValueError as error:
+        raise PromotionError(
+            "scratch effective checkpoint schedule is malformed"
+        ) from error
+    if len(raw_step_frontier) != len(expected_steps):
+        raise PromotionError(
+            "scratch optimizer-step frontier differs from sealed checkpoint schedule"
+        )
+    optimizer_step_frontier: list[dict[str, Any]] = []
+    for expected_step, raw_record in zip(
+        expected_steps, raw_step_frontier, strict=True
+    ):
+        record = _require_exact_keys(
+            raw_record,
+            {
+                "optimizer_step",
+                "checkpoint",
+                "same_training_trajectory",
+                "optimizer_sidecar_intentionally_omitted",
+            },
+            where=f"scratch optimizer-step frontier[{expected_step}]",
+        )
+        if (
+            record["optimizer_step"] != expected_step
+            or record["same_training_trajectory"] is not True
+            or record["optimizer_sidecar_intentionally_omitted"] is not True
+        ):
+            raise PromotionError("scratch optimizer-step frontier semantics drifted")
+        checkpoint_path, checkpoint_ref = _verify_scratch_file_ref(
+            record["checkpoint"],
+            base=path.parent,
+            where=f"scratch optimizer-step-{expected_step} checkpoint",
+        )
+        optimizer_step_frontier.append(
+            {
+                "optimizer_step": expected_step,
+                "checkpoint": {**checkpoint_ref, "path": str(checkpoint_path)},
+                "same_training_trajectory": True,
+                "optimizer_sidecar_intentionally_omitted": True,
+            }
+        )
     report = _load_json(report_path)
     if (
         report.get("epochs") != len(frontier)
@@ -3041,6 +3180,42 @@ def _verify_completed_scratch_training_receipt(
         or _sha256(terminal_path) != terminal_ref["file_sha256"]
     ):
         raise PromotionError("scratch terminal report/output binding drifted")
+    if report.get("checkpoint_steps_requested") != expected_steps:
+        raise PromotionError("scratch report optimizer-step request drifted")
+    report_intermediate = report.get("intermediate_checkpoints")
+    if not isinstance(report_intermediate, list) or len(report_intermediate) != len(
+        optimizer_step_frontier
+    ):
+        raise PromotionError("scratch report intermediate checkpoint frontier drifted")
+    report_by_step: dict[int, Mapping[str, Any]] = {}
+    for raw_record in report_intermediate:
+        if not isinstance(raw_record, dict):
+            raise PromotionError("scratch report intermediate checkpoint is malformed")
+        step = raw_record.get("optimizer_step")
+        if isinstance(step, bool) or not isinstance(step, int) or step in report_by_step:
+            raise PromotionError("scratch report intermediate checkpoint step drifted")
+        report_by_step[step] = raw_record
+    for frontier_record in optimizer_step_frontier:
+        step = frontier_record["optimizer_step"]
+        report_record = report_by_step.get(step)
+        if report_record is None:
+            raise PromotionError(
+                f"scratch report omitted optimizer-step checkpoint {step}"
+            )
+        if (
+            _absolute(
+                report_record.get("checkpoint"),
+                base=report_path.parent,
+            )
+            != Path(frontier_record["checkpoint"]["path"])
+            or report_record.get("checkpoint_sha256")
+            != frontier_record["checkpoint"]["file_sha256"]
+            or report_record.get("same_training_trajectory") is not True
+            or report_record.get("optimizer_sidecar") is not None
+        ):
+            raise PromotionError(
+                f"scratch report optimizer-step-{step} binding drifted"
+            )
     validation_manifest = _canonical_existing_file(
         _absolute(
             report.get("input_validation_game_seed_manifest"),
@@ -3081,6 +3256,10 @@ def _verify_completed_scratch_training_receipt(
         "training_report": {**report_ref, "path": str(report_path)},
         "epoch_frontier": frontier,
         "epoch_frontier_sha256": outputs["epoch_frontier_sha256"],
+        "optimizer_step_frontier": optimizer_step_frontier,
+        "optimizer_step_frontier_sha256": outputs[
+            "optimizer_step_frontier_sha256"
+        ],
         "validation_outputs": {
             "validation_seed_manifest": str(validation_manifest),
             "validation_seed_manifest_sha256": validation_manifest_sha256,
@@ -3132,7 +3311,8 @@ def _verify_one_dose_training_receipt(
     if raw_schema == scratch_train.EXECUTION_SCHEMA:
         if not checkpoint_selection_requested:
             raise PromotionError(
-                "completed scratch training requires playing-strength epoch selection"
+                "completed scratch training requires playing-strength "
+                "optimizer-step selection"
             )
         if legacy_snapshot is not None:
             raise PromotionError("legacy snapshots cannot authorize scratch training")
@@ -10403,16 +10583,16 @@ def create_same_trajectory_checkpoint_selection(
     }
 
 
-def create_scratch_epoch_checkpoint_selection(
+def create_scratch_optimizer_step_checkpoint_selection(
     *,
     contract_lock: Path,
     training_receipt_path: Path,
     training_report_path: Path,
-    epoch_report_paths: Mapping[int, Path],
-    selected_epoch: int | None = None,
+    optimizer_step_report_paths: Mapping[int, Path],
+    selected_optimizer_step: int | None = None,
     output_path: Path,
 ) -> dict[str, Any]:
-    """Select a fresh-model epoch solely by matched playing-strength evidence."""
+    """Select a same-trajectory scratch checkpoint by playing strength."""
 
     contract_lock = _canonical_existing_file(
         contract_lock, where="scratch selection contract lock"
@@ -10440,40 +10620,55 @@ def create_scratch_epoch_checkpoint_selection(
         "file_sha256": _sha256(training_report_path),
     }:
         raise PromotionError("scratch selection training report differs from receipt")
-    epochs = [record["epoch"] for record in receipt["epoch_frontier"]]
-    if set(epoch_report_paths) != set(epochs):
-        raise PromotionError("scratch selection requires one report for every epoch")
-    reports = {
-        epoch: _verify_matched_quick_screen_report(
-            epoch_report_paths[epoch],
-            where=f"scratch selection epoch-{epoch} report",
+    steps = [
+        record["optimizer_step"] for record in receipt["optimizer_step_frontier"]
+    ]
+    if set(optimizer_step_report_paths) != set(steps):
+        raise PromotionError(
+            "scratch selection requires one report for every optimizer step"
         )
-        for epoch in epochs
+    reports = {
+        step: _verify_matched_quick_screen_report(
+            optimizer_step_report_paths[step],
+            where=f"scratch selection optimizer-step-{step} report",
+        )
+        for step in steps
     }
-    first = reports[epochs[0]]
+    first = reports[steps[0]]
     half_points: dict[int, int] = {}
-    for epoch, frontier_record in zip(epochs, receipt["epoch_frontier"], strict=True):
-        report = reports[epoch]
+    for step, frontier_record in zip(
+        steps, receipt["optimizer_step_frontier"], strict=True
+    ):
+        report = reports[step]
         if report["candidate_checkpoint"] != {
             "path": frontier_record["checkpoint"]["path"],
             "sha256": frontier_record["checkpoint"]["file_sha256"],
         }:
-            raise PromotionError(f"scratch epoch-{epoch} report checkpoint drift")
+            raise PromotionError(
+                f"scratch optimizer-step-{step} report checkpoint drift"
+            )
         if (
             report["baseline_checkpoint"] != first["baseline_checkpoint"]
             or report["ordered_game_keys"] != first["ordered_game_keys"]
             or report["search_configuration"] != first["search_configuration"]
         ):
             raise PromotionError(
-                "scratch epoch reports do not share baseline/games/search"
+                "scratch optimizer-step reports do not share baseline/games/search"
             )
-        half_points[epoch] = report["candidate_half_points"]
-    derived_epoch = _select_scratch_epoch(half_points)
-    if selected_epoch is not None and selected_epoch != derived_epoch:
+        half_points[step] = report["candidate_half_points"]
+    derived_step = _select_scratch_optimizer_step(half_points)
+    if (
+        selected_optimizer_step is not None
+        and selected_optimizer_step != derived_step
+    ):
         raise PromotionError(
-            "caller-selected scratch epoch differs from playing-strength result"
+            "caller-selected scratch optimizer step differs from playing-strength result"
         )
-    selected_record = receipt["epoch_frontier"][derived_epoch - 1]
+    selected_record = next(
+        record
+        for record in receipt["optimizer_step_frontier"]
+        if record["optimizer_step"] == derived_step
+    )
     payload = {
         "schema_version": SCRATCH_CHECKPOINT_SELECTION_SCHEMA,
         "training_receipt": {
@@ -10485,19 +10680,21 @@ def create_scratch_epoch_checkpoint_selection(
             "path": str(training_report_path),
             "sha256": _sha256(training_report_path),
         },
-        "epoch_frontier_sha256": receipt["epoch_frontier_sha256"],
-        "eligible_epochs": epochs,
+        "optimizer_step_frontier_sha256": receipt[
+            "optimizer_step_frontier_sha256"
+        ],
+        "eligible_optimizer_steps": steps,
         "evaluation_reports": [
             {
-                "epoch": epoch,
+                "optimizer_step": step,
                 "evaluation_report": {
-                    "path": reports[epoch]["path"],
-                    "sha256": reports[epoch]["sha256"],
+                    "path": reports[step]["path"],
+                    "sha256": reports[step]["sha256"],
                 },
             }
-            for epoch in epochs
+            for step in steps
         ],
-        "selected_epoch": derived_epoch,
+        "selected_optimizer_step": derived_step,
         "selected_checkpoint": {
             "path": selected_record["checkpoint"]["path"],
             "sha256": selected_record["checkpoint"]["file_sha256"],
@@ -10525,17 +10722,21 @@ def create_scratch_epoch_checkpoint_selection(
     }
 
 
-def _parse_epoch_report(raw: str) -> tuple[int, Path]:
-    epoch_text, separator, path_text = raw.partition("=")
+def _parse_optimizer_step_report(raw: str) -> tuple[int, Path]:
+    step_text, separator, path_text = raw.partition("=")
     if not separator:
-        raise argparse.ArgumentTypeError("expected EPOCH=PATH")
+        raise argparse.ArgumentTypeError("expected OPTIMIZER_STEP=PATH")
     try:
-        epoch = int(epoch_text)
+        step = int(step_text)
     except ValueError as error:
-        raise argparse.ArgumentTypeError("epoch must be an integer") from error
-    if epoch <= 0 or not path_text:
-        raise argparse.ArgumentTypeError("expected positive EPOCH=PATH")
-    return epoch, Path(path_text)
+        raise argparse.ArgumentTypeError(
+            "optimizer step must be an integer"
+        ) from error
+    if step <= 0 or not path_text:
+        raise argparse.ArgumentTypeError(
+            "expected positive OPTIMIZER_STEP=PATH"
+        )
+    return step, Path(path_text)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -10598,21 +10799,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     select.add_argument("--output", required=True, type=Path)
     scratch_select = subparsers.add_parser(
-        "select-scratch-epoch",
-        help="select a completed native-scratch epoch by matched playing strength",
+        "select-scratch-checkpoint",
+        help=(
+            "select a completed native-scratch optimizer-step checkpoint by "
+            "matched playing strength"
+        ),
     )
     scratch_select.add_argument("--contract-lock", required=True, type=Path)
     scratch_select.add_argument("--training-receipt", required=True, type=Path)
     scratch_select.add_argument("--training-report", required=True, type=Path)
     scratch_select.add_argument(
-        "--epoch-report",
+        "--optimizer-step-report",
         required=True,
         action="append",
-        type=_parse_epoch_report,
-        help="repeat EPOCH=PATH once for every sealed epoch-frontier checkpoint",
+        type=_parse_optimizer_step_report,
+        help=(
+            "repeat OPTIMIZER_STEP=PATH once for every sealed optimizer-step "
+            "frontier checkpoint"
+        ),
     )
     scratch_select.add_argument(
-        "--selected-epoch",
+        "--selected-optimizer-step",
         type=int,
         help="optional assertion; the playing-strength result remains authoritative",
     )
@@ -10668,15 +10875,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_path=args.output,
             )
         else:
-            epoch_report_paths = dict(args.epoch_report)
-            if len(epoch_report_paths) != len(args.epoch_report):
-                raise PromotionError("duplicate --epoch-report epoch")
-            result = create_scratch_epoch_checkpoint_selection(
+            optimizer_step_report_paths = dict(args.optimizer_step_report)
+            if len(optimizer_step_report_paths) != len(
+                args.optimizer_step_report
+            ):
+                raise PromotionError("duplicate --optimizer-step-report step")
+            result = create_scratch_optimizer_step_checkpoint_selection(
                 contract_lock=args.contract_lock,
                 training_receipt_path=args.training_receipt,
                 training_report_path=args.training_report,
-                epoch_report_paths=epoch_report_paths,
-                selected_epoch=args.selected_epoch,
+                optimizer_step_report_paths=optimizer_step_report_paths,
+                selected_optimizer_step=args.selected_optimizer_step,
                 output_path=args.output,
             )
     except PromotionError as error:

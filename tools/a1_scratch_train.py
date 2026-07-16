@@ -32,7 +32,7 @@ from tools import train_bc  # noqa: E402
 
 
 PLAN_SCHEMA = "a1-coherent-scratch-training-receipt-v1"
-EXECUTION_SCHEMA = "a1-coherent-scratch-training-execution-v1"
+EXECUTION_SCHEMA = "a1-coherent-scratch-training-execution-v2"
 CHILD_AUTHORITY_SCHEMA = "a1-coherent-scratch-plan-authority-v2"
 CODE_SURFACE = (
     "tools/a1_scratch_train.py",
@@ -83,6 +83,28 @@ def _ref(path: Path, *, where: str) -> dict[str, str]:
     return {"path": str(resolved), "file_sha256": _file_sha256(resolved)}
 
 
+def _executable_ref(path: Path, *, where: str) -> dict[str, str]:
+    """Bind a venv-safe lexical executable and the bytes it resolves to."""
+
+    lexical = Path(os.path.abspath(os.fspath(path.expanduser())))
+    try:
+        target = lexical.resolve(strict=True)
+    except OSError as error:
+        raise ScratchTrainError(f"cannot resolve {where}: {error}") from error
+    if (
+        not lexical.is_file()
+        or not target.is_file()
+        or not os.access(lexical, os.X_OK)
+        or not os.access(target, os.X_OK)
+    ):
+        raise ScratchTrainError(f"{where} must be executable: {lexical}")
+    return {
+        "path": str(lexical),
+        "target_path": str(target),
+        "file_sha256": _file_sha256(target),
+    }
+
+
 def _write_receipt(path: Path, payload: Mapping[str, Any]) -> None:
     if path.exists() or path.is_symlink():
         raise ScratchTrainError(f"refusing non-fresh receipt path: {path}")
@@ -98,6 +120,47 @@ def _write_receipt(path: Path, payload: Mapping[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _execution_receipt_path(plan_receipt: Path) -> Path:
+    suffix = plan_receipt.suffix
+    if suffix:
+        name = f"{plan_receipt.stem}.execution{suffix}"
+    else:
+        name = f"{plan_receipt.name}.execution.json"
+    return plan_receipt.with_name(name)
+
+
+def _load_matching_plan_receipt(
+    path: Path, *, expected: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    plan_path = _regular_file(path, where="scratch plan receipt")
+    try:
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ScratchTrainError(f"scratch plan receipt is unreadable: {error}") from error
+    if not isinstance(payload, dict):
+        raise ScratchTrainError("scratch plan receipt must be a JSON object")
+    unsigned = dict(payload)
+    declared = unsigned.pop("receipt_sha256", None)
+    if declared != _value_sha256(unsigned):
+        raise ScratchTrainError("scratch plan receipt semantic digest mismatch")
+    if unsigned.get("schema_version") != PLAN_SCHEMA or unsigned.get("status") != "planned":
+        raise ScratchTrainError("scratch execution requires a completed plan-only receipt")
+    if set(unsigned) != set(expected):
+        raise ScratchTrainError("scratch plan receipt fields differ from current plan")
+    for key, value in expected.items():
+        if key == "created_unix_ns":
+            continue
+        if unsigned[key] != value:
+            raise ScratchTrainError(
+                f"scratch plan receipt differs from current plan at {key!r}"
+            )
+    return payload, {
+        "path": str(plan_path),
+        "file_sha256": _file_sha256(plan_path),
+        "receipt_sha256": str(declared),
+    }
 
 
 def _science_authority(lock: Mapping[str, Any]) -> dict[str, Any]:
@@ -680,6 +743,31 @@ def _epoch_outputs(checkpoint: Path, epochs: int) -> list[Path]:
     ]
 
 
+def _checkpoint_steps(recipe: Mapping[str, Any]) -> tuple[int, ...]:
+    raw = str(recipe.get("checkpoint_steps", "") or "").strip()
+    if not raw:
+        return ()
+    try:
+        values = tuple(int(token.strip()) for token in raw.split(","))
+    except ValueError as error:
+        raise ScratchTrainError("scratch checkpoint_steps is malformed") from error
+    if (
+        any(step <= 0 for step in values)
+        or tuple(sorted(set(values))) != values
+    ):
+        raise ScratchTrainError(
+            "scratch checkpoint_steps must be unique, positive, and increasing"
+        )
+    return values
+
+
+def _step_outputs(checkpoint: Path, steps: Sequence[int]) -> list[Path]:
+    return [
+        train_bc._step_checkpoint_path(str(checkpoint), int(step))  # noqa: SLF001
+        for step in steps
+    ]
+
+
 def _require_fresh_epoch_outputs(checkpoint: Path, epochs: int) -> None:
     collisions: list[str] = []
     for epoch_path in _epoch_outputs(checkpoint, epochs):
@@ -696,11 +784,25 @@ def _require_fresh_epoch_outputs(checkpoint: Path, epochs: int) -> None:
         )
 
 
+def _require_fresh_step_outputs(checkpoint: Path, steps: Sequence[int]) -> None:
+    collisions = [
+        str(path)
+        for path in _step_outputs(checkpoint, steps)
+        if path.exists() or path.is_symlink()
+    ]
+    if collisions:
+        raise ScratchTrainError(
+            "scratch optimizer-step frontier output already exists: "
+            + ", ".join(collisions)
+        )
+
+
 def _completed_outputs(
     *,
     checkpoint: Path,
     report: Path,
     epochs: int,
+    checkpoint_steps: Sequence[int],
 ) -> dict[str, Any]:
     terminal = _ref(checkpoint, where="terminal scratch checkpoint")
     report_ref = _ref(report, where="scratch training report")
@@ -730,11 +832,61 @@ def _completed_outputs(
         raise ScratchTrainError(f"scratch training report is unreadable: {error}") from error
     if int(report_payload.get("epochs", -1)) != int(epochs):
         raise ScratchTrainError("scratch report completed epoch count drift")
+    if report_payload.get("checkpoint_steps_requested") != list(checkpoint_steps):
+        raise ScratchTrainError("scratch report optimizer-step request drift")
+    raw_intermediate = report_payload.get("intermediate_checkpoints")
+    if not isinstance(raw_intermediate, list):
+        raise ScratchTrainError("scratch report has no intermediate checkpoint frontier")
+    by_step: dict[int, Mapping[str, Any]] = {}
+    for raw_record in raw_intermediate:
+        if not isinstance(raw_record, dict):
+            raise ScratchTrainError("scratch intermediate checkpoint record is malformed")
+        step = raw_record.get("optimizer_step")
+        if isinstance(step, bool) or not isinstance(step, int) or step in by_step:
+            raise ScratchTrainError("scratch intermediate checkpoint step is malformed")
+        by_step[step] = raw_record
+    optimizer_step_records: list[dict[str, Any]] = []
+    for step, step_path in zip(
+        checkpoint_steps,
+        _step_outputs(checkpoint, checkpoint_steps),
+        strict=True,
+    ):
+        raw_record = by_step.get(int(step))
+        if raw_record is None:
+            raise ScratchTrainError(
+                f"scratch report omitted requested optimizer-step checkpoint {step}"
+            )
+        checkpoint_ref = _ref(
+            step_path, where=f"scratch optimizer-step-{step} checkpoint"
+        )
+        if (
+            Path(str(raw_record.get("checkpoint", ""))).expanduser().resolve(
+                strict=False
+            )
+            != step_path.expanduser().resolve(strict=False)
+            or raw_record.get("checkpoint_sha256")
+            != checkpoint_ref["file_sha256"]
+            or raw_record.get("same_training_trajectory") is not True
+            or raw_record.get("optimizer_sidecar") is not None
+        ):
+            raise ScratchTrainError(
+                f"scratch optimizer-step-{step} checkpoint report binding drift"
+            )
+        optimizer_step_records.append(
+            {
+                "optimizer_step": int(step),
+                "checkpoint": checkpoint_ref,
+                "same_training_trajectory": True,
+                "optimizer_sidecar_intentionally_omitted": True,
+            }
+        )
     return {
         "terminal_checkpoint": terminal,
         "training_report": report_ref,
         "epoch_frontier": epoch_records,
         "epoch_frontier_sha256": _value_sha256(epoch_records),
+        "optimizer_step_frontier": optimizer_step_records,
+        "optimizer_step_frontier_sha256": _value_sha256(optimizer_step_records),
     }
 
 
@@ -743,11 +895,19 @@ def run(
     *,
     runner: Any = subprocess.run,
 ) -> dict[str, Any]:
-    python = _regular_file(args.python, where="learner Python")
+    python_authority = _executable_ref(args.python, where="learner Python")
+    python = Path(python_authority["path"])
     checkpoint = args.checkpoint.expanduser().absolute()
     report = args.report.expanduser().absolute()
-    receipt = args.receipt.expanduser().absolute()
-    _fresh_outputs(checkpoint, report, receipt)
+    plan_receipt = args.receipt.expanduser().absolute()
+    execution_receipt_arg = getattr(args, "execution_receipt", None)
+    execution_receipt = (
+        _execution_receipt_path(plan_receipt)
+        if execution_receipt_arg is None
+        else execution_receipt_arg.expanduser().absolute()
+    )
+    output_receipt = execution_receipt if bool(args.go) else plan_receipt
+    _fresh_outputs(checkpoint, report, output_receipt)
     verified = verify_inputs(
         lock_path=args.lock,
         data_path=args.data,
@@ -766,7 +926,9 @@ def run(
     epochs = int(verified["recipe"]["epochs"])
     if "--save-each-epoch" not in command:
         raise ScratchTrainError("scratch command lost its checkpoint frontier")
+    checkpoint_steps = _checkpoint_steps(verified["recipe"])
     _require_fresh_epoch_outputs(checkpoint, epochs)
+    _require_fresh_step_outputs(checkpoint, checkpoint_steps)
     base = {
         "schema_version": PLAN_SCHEMA,
         "created_unix_ns": time.time_ns(),
@@ -798,15 +960,23 @@ def run(
             ],
         },
         "plan_authority": plan_authority,
-        "python": _ref(python, where="learner Python"),
+        "python": python_authority,
         "trainer_authority": verified["trainer_authority"],
         "launcher_authority": _code_authority(),
         "command": command,
         "command_sha256": _value_sha256(command),
     }
     if not bool(args.go):
-        _write_receipt(receipt, base)
+        _write_receipt(plan_receipt, base)
         return base
+    plan_payload, plan_ref = _load_matching_plan_receipt(
+        plan_receipt, expected=base
+    )
+    base = {
+        key: value
+        for key, value in plan_payload.items()
+        if key != "receipt_sha256"
+    }
     if not optimization_schedule_authorized:
         raise ScratchTrainError(
             "--go requires a commissioned scratch optimizer schedule"
@@ -829,16 +999,18 @@ def run(
             "started_unix_ns": started,
             "finished_unix_ns": time.time_ns(),
             "returncode": returncode,
+            "plan_receipt": plan_ref,
         }
-        _write_receipt(receipt, failed)
+        _write_receipt(execution_receipt, failed)
         raise ScratchTrainError(
             f"scratch learner exited with return code {returncode}; "
-            f"failure receipt={receipt}"
+            f"failure receipt={execution_receipt}"
         )
     outputs = _completed_outputs(
         checkpoint=checkpoint,
         report=report,
         epochs=epochs,
+        checkpoint_steps=checkpoint_steps,
     )
     completed = {
         **base,
@@ -851,9 +1023,10 @@ def run(
         "started_unix_ns": started,
         "finished_unix_ns": time.time_ns(),
         "returncode": 0,
+        "plan_receipt": plan_ref,
         "outputs": outputs,
     }
-    _write_receipt(receipt, completed)
+    _write_receipt(execution_receipt, completed)
     return completed
 
 
@@ -865,6 +1038,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
+    parser.add_argument(
+        "--execution-receipt",
+        type=Path,
+        help=(
+            "Fresh execution receipt path used only with --go. Defaults to an "
+            "immutable sibling of --receipt; --receipt itself is always the "
+            "pre-existing authenticated plan."
+        ),
+    )
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument(
         "--go",

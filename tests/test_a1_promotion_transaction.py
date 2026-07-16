@@ -2750,7 +2750,7 @@ def test_completed_scratch_receipt_dispatches_to_separate_verifier(
         promotion,
         "_verify_scratch_checkpoint_selection",
         lambda *_args, **_kwargs: {
-            "selected_epoch": 2,
+            "selected_optimizer_step": 16,
             "evaluation_baseline": {
                 "path": str(tmp_path / "champion.pt"),
                 "sha256": "sha256:" + "4" * 64,
@@ -2782,7 +2782,7 @@ def test_completed_scratch_receipt_dispatches_to_separate_verifier(
     )
 
     assert verified["initialization_mode"] == "from_scratch"
-    assert verified["checkpoint_selection"]["selected_epoch"] == 2
+    assert verified["checkpoint_selection"]["selected_optimizer_step"] == 16
 
 
 def test_completed_scratch_receipt_requires_playing_strength_selection(
@@ -2795,7 +2795,7 @@ def test_completed_scratch_receipt_requires_playing_strength_selection(
 
     with pytest.raises(
         promotion.PromotionError,
-        match="requires playing-strength epoch selection",
+        match="requires playing-strength optimizer-step selection",
     ):
         promotion._verify_one_dose_training_receipt(  # noqa: SLF001
             receipt,
@@ -2808,7 +2808,7 @@ def test_completed_scratch_receipt_requires_playing_strength_selection(
         )
 
 
-def test_completed_scratch_receipt_authenticates_epoch_frontier(
+def test_completed_scratch_receipt_authenticates_optimizer_step_frontier(
     tmp_path: Path,
 ) -> None:
     from tools import a1_scratch_train as scratch_train
@@ -2824,9 +2824,39 @@ def test_completed_scratch_receipt_authenticates_epoch_frontier(
     terminal = tmp_path / "model.pt"
     terminal.write_bytes(b"terminal")
     report = tmp_path / "report.json"
+    step_frontier = []
+    report_intermediate = []
+    for step in (8, 16):
+        checkpoint = tmp_path / f"model.step{step}.pt"
+        checkpoint.write_bytes(f"step-{step}".encode())
+        checkpoint_ref = {
+            "path": str(checkpoint),
+            "file_sha256": promotion._sha256(checkpoint),
+        }
+        step_frontier.append(
+            {
+                "optimizer_step": step,
+                "checkpoint": checkpoint_ref,
+                "same_training_trajectory": True,
+                "optimizer_sidecar_intentionally_omitted": True,
+            }
+        )
+        report_intermediate.append(
+            {
+                "schema_version": "train-bc-intermediate-checkpoint-v1",
+                "optimizer_step": step,
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": checkpoint_ref["file_sha256"],
+                "size_bytes": checkpoint.stat().st_size,
+                "same_training_trajectory": True,
+                "optimizer_sidecar": None,
+            }
+        )
     report_payload = {
         "epochs": 2,
         "checkpoint": str(terminal),
+        "checkpoint_steps_requested": [8, 16],
+        "intermediate_checkpoints": report_intermediate,
         "input_validation_game_seed_manifest": str(validation_manifest),
         "input_validation_game_seed_manifest_sha256": promotion._sha256(
             validation_manifest
@@ -2871,7 +2901,7 @@ def test_completed_scratch_receipt_authenticates_epoch_frontier(
         "go_authorized": True,
         "optimization_schedule_status": "commissioned_scratch_update_horizon_v1",
     }
-    recipe = {"epochs": 2}
+    recipe = {"epochs": 2, "checkpoint_steps": "8,16"}
     contract = {
         "science": {
             "learner_initialization": initialization,
@@ -2890,6 +2920,7 @@ def test_completed_scratch_receipt_authenticates_epoch_frontier(
         str(report),
         "--save-each-epoch",
     ]
+    plan_path = tmp_path / "plan.json"
     receipt = {
         "schema_version": scratch_train.EXECUTION_SCHEMA,
         "created_unix_ns": 1,
@@ -2940,7 +2971,49 @@ def test_completed_scratch_receipt_authenticates_epoch_frontier(
             },
             "epoch_frontier": frontier,
             "epoch_frontier_sha256": promotion._digest_value(frontier),
+            "optimizer_step_frontier": step_frontier,
+            "optimizer_step_frontier_sha256": promotion._digest_value(
+                step_frontier
+            ),
         },
+    }
+    plan_payload = {
+        "schema_version": scratch_train.PLAN_SCHEMA,
+        "created_unix_ns": receipt["created_unix_ns"],
+        "status": "planned",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "go_authorized": receipt["go_authorized"],
+        "optimization_schedule_authorized": receipt[
+            "optimization_schedule_authorized"
+        ],
+        "maximum_result": "none_plan_only",
+        **{
+            field: receipt[field]
+            for field in (
+                "contract",
+                "science_contract",
+                "initialization",
+                "model_construction",
+                "execution_topology",
+                "logical_recipe",
+                "effective_recipe",
+                "composite",
+                "plan_authority",
+                "python",
+                "trainer_authority",
+                "launcher_authority",
+                "command",
+                "command_sha256",
+            )
+        },
+    }
+    plan_payload["receipt_sha256"] = promotion._digest_value(plan_payload)
+    _write_json(plan_path, plan_payload)
+    receipt["plan_receipt"] = {
+        "path": str(plan_path),
+        "file_sha256": promotion._sha256(plan_path),
+        "receipt_sha256": plan_payload["receipt_sha256"],
     }
     receipt["receipt_sha256"] = promotion._digest_value(receipt)
     receipt_path = tmp_path / "receipt.json"
@@ -2953,21 +3026,28 @@ def test_completed_scratch_receipt_authenticates_epoch_frontier(
     )
 
     assert [row["epoch"] for row in verified["epoch_frontier"]] == [1, 2]
+    assert [
+        row["optimizer_step"] for row in verified["optimizer_step_frontier"]
+    ] == [8, 16]
     assert verified["report_checkpoint"]["sha256"] == promotion._sha256(terminal)
     assert verified["validation_outputs"]["validation_game_seed_count"] == 32
 
 
-def test_scratch_epoch_selector_uses_strength_and_earliest_exact_tie() -> None:
-    assert promotion._select_scratch_epoch({1: 10, 2: 14, 3: 12}) == 2  # noqa: SLF001
-    assert promotion._select_scratch_epoch({1: 14, 2: 14, 3: 12}) == 1  # noqa: SLF001
+def test_scratch_step_selector_uses_strength_and_earliest_exact_tie() -> None:
+    assert promotion._select_scratch_optimizer_step(  # noqa: SLF001
+        {8: 10, 16: 14, 32: 12}
+    ) == 16
+    assert promotion._select_scratch_optimizer_step(  # noqa: SLF001
+        {8: 14, 16: 14, 32: 12}
+    ) == 8
 
 
-def test_scratch_selector_rejects_noncontiguous_frontier() -> None:
-    with pytest.raises(promotion.PromotionError, match="not contiguous"):
-        promotion._select_scratch_epoch({1: 10, 3: 20})  # noqa: SLF001
+def test_scratch_selector_rejects_invalid_step() -> None:
+    with pytest.raises(promotion.PromotionError, match="must be positive"):
+        promotion._select_scratch_optimizer_step({0: 10, 16: 20})  # noqa: SLF001
 
 
-def test_scratch_selection_replays_every_epoch_and_ignores_training_loss(
+def test_scratch_selection_replays_every_optimizer_step_and_ignores_training_loss(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     receipt_path = tmp_path / "scratch-receipt.json"
@@ -2976,26 +3056,27 @@ def test_scratch_selection_replays_every_epoch_and_ignores_training_loss(
     report_path.write_text("{}\n")
     baseline = tmp_path / "champion.pt"
     baseline.write_bytes(b"champion")
-    epoch_paths: list[Path] = []
+    checkpoint_paths: list[Path] = []
     frontier = []
     evaluation_paths: dict[int, Path] = {}
-    points = {1: 20, 2: 28, 3: 24}
-    for epoch in (1, 2, 3):
-        checkpoint = tmp_path / f"epoch-{epoch}.pt"
-        checkpoint.write_bytes(f"epoch-{epoch}".encode())
-        epoch_paths.append(checkpoint)
+    steps = (8, 16, 32)
+    points = {8: 20, 16: 28, 32: 24}
+    for step in steps:
+        checkpoint = tmp_path / f"step-{step}.pt"
+        checkpoint.write_bytes(f"step-{step}".encode())
+        checkpoint_paths.append(checkpoint)
         frontier.append(
             {
-                "epoch": epoch,
+                "optimizer_step": step,
                 "checkpoint": {
                     "path": str(checkpoint),
                     "file_sha256": promotion._sha256(checkpoint),
                 },
             }
         )
-        evaluation = tmp_path / f"eval-{epoch}.json"
+        evaluation = tmp_path / f"eval-{step}.json"
         evaluation.write_text("{}\n")
-        evaluation_paths[epoch] = evaluation
+        evaluation_paths[step] = evaluation
 
     common_keys = [
         {"game_seed": seed, "orientation": orientation}
@@ -3006,8 +3087,8 @@ def test_scratch_selection_replays_every_epoch_and_ignores_training_loss(
 
     def verify_report(path: Path, *, where: str) -> dict:
         del where
-        epoch = int(path.stem.split("-")[-1])
-        checkpoint = epoch_paths[epoch - 1]
+        step = int(path.stem.split("-")[-1])
+        checkpoint = checkpoint_paths[steps.index(step)]
         return {
             "path": str(path),
             "sha256": promotion._sha256(path),
@@ -3015,7 +3096,7 @@ def test_scratch_selection_replays_every_epoch_and_ignores_training_loss(
             "baseline_checkpoint": _checkpoint_ref(baseline),
             "ordered_game_keys": common_keys,
             "search_configuration": common_search,
-            "candidate_half_points": points[epoch],
+            "candidate_half_points": points[step],
         }
 
     monkeypatch.setattr(
@@ -3024,8 +3105,8 @@ def test_scratch_selection_replays_every_epoch_and_ignores_training_loss(
     scratch_receipt = {
         "sha256": promotion._sha256(receipt_path),
         "receipt_sha256": "sha256:" + "1" * 64,
-        "epoch_frontier_sha256": "sha256:" + "2" * 64,
-        "epoch_frontier": frontier,
+        "optimizer_step_frontier_sha256": "sha256:" + "2" * 64,
+        "optimizer_step_frontier": frontier,
     }
     selection = {
         "schema_version": promotion.SCRATCH_CHECKPOINT_SELECTION_SCHEMA,
@@ -3035,17 +3116,19 @@ def test_scratch_selection_replays_every_epoch_and_ignores_training_loss(
             "receipt_sha256": scratch_receipt["receipt_sha256"],
         },
         "training_report": _checkpoint_ref(report_path),
-        "epoch_frontier_sha256": scratch_receipt["epoch_frontier_sha256"],
-        "eligible_epochs": [1, 2, 3],
+        "optimizer_step_frontier_sha256": scratch_receipt[
+            "optimizer_step_frontier_sha256"
+        ],
+        "eligible_optimizer_steps": list(steps),
         "evaluation_reports": [
             {
-                "epoch": epoch,
-                "evaluation_report": _checkpoint_ref(evaluation_paths[epoch]),
+                "optimizer_step": step,
+                "evaluation_report": _checkpoint_ref(evaluation_paths[step]),
             }
-            for epoch in (1, 2, 3)
+            for step in steps
         ],
-        "selected_epoch": 2,
-        "selected_checkpoint": _checkpoint_ref(epoch_paths[1]),
+        "selected_optimizer_step": 16,
+        "selected_checkpoint": _checkpoint_ref(checkpoint_paths[1]),
         "selection_rule": promotion.SCRATCH_CHECKPOINT_SELECTION_RULE,
         "matched_common_random_numbers": True,
         "full_gate_requires_disjoint_cohort": True,
@@ -3060,11 +3143,11 @@ def test_scratch_selection_replays_every_epoch_and_ignores_training_loss(
         training_receipt_path=receipt_path,
         scratch_receipt=scratch_receipt,
         training_report_path=report_path,
-        candidate_path=epoch_paths[1],
-        candidate_sha256=promotion._sha256(epoch_paths[1]),
+        candidate_path=checkpoint_paths[1],
+        candidate_sha256=promotion._sha256(checkpoint_paths[1]),
     )
 
-    assert verified["selected_epoch"] == 2
+    assert verified["selected_optimizer_step"] == 16
     assert verified["evaluation_baseline"] == _checkpoint_ref(baseline)
     assert promotion.SCRATCH_CHECKPOINT_SELECTION_RULE["training_loss_used"] is False
 
