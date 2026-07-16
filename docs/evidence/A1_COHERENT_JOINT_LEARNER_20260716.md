@@ -108,11 +108,19 @@ D6 averaging at width 20, and zero truncations.
 | split FULL step 12 | 32 | 18-14 | 56.25% |
 | split FULL step 48 | 32 | 19-13 | 59.38% |
 | split D128/FREEZE step 128 | 32 | 19-13 | 59.38% |
+| **split FULL step 48 confirmation** | **128** | **82-46** | **64.06%** |
 
 The screens establish a real learning signal and reject the claim that the
 coherent n128 corpus is intrinsically unlearnable. They are not by themselves
-promotion evidence. A separate 64-pair confirmation of split FULL step 48 is
-the next binding result.
+promotion evidence.
+
+The independent 64-pair confirmation is stored at
+`/tmp/a1-coherent-joint-split1-8arm-20260716/h2h/split1_full48_vs_f7_64pairs.json`.
+It completed all 64 pairs with zero truncations. Its production
+`[-10,+15]` pentanomial SPRT crossed the H1 boundary:
+`LLR=3.0708 > 2.9444`. The stricter `[0,+15]` superiority test remains
+`continue`; this result commissions the learner recipe but does not itself
+perform a champion promotion.
 
 ## Current interpretation
 
@@ -126,4 +134,6 @@ the next binding result.
 - Long unrestricted training can improve teacher KL while damaging value
   quality. Selection must combine target closure, value quality, functional
   drift, and matched gameplay.
-
+- The commissioned parent-update treatment is the split-value FULL arm at
+  exactly 48 updates, with fresh optimizer state and no candidate chaining.
+  The separate fresh-scratch recipe is not modified by this warm-start result.
