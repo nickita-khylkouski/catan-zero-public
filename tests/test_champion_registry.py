@@ -180,6 +180,88 @@ def test_registry_promotion_counter_drives_confirmation_flag(tmp_path: Path) -> 
     assert reg.promotion_count("public_champion") == 0
 
 
+def test_registry_rejects_stale_promotion_count_that_would_skip_third_gate(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "registry.json"
+    reg = ChampionRegistry(path)
+    reg.record_promotion("generator_champion")
+    reg.record_promotion("generator_champion")
+    reg.save()
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["promotion_counts"]["generator_champion"] = 1
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="disagree with promotion_recorded"):
+        ChampionRegistry.load(path)
+
+
+def test_registry_reconstructs_missing_promotion_count_from_journal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "registry.json"
+    reg = ChampionRegistry(path)
+    reg.record_promotion("generator_champion")
+    reg.record_promotion("generator_champion")
+    reg.save()
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    del raw["promotion_counts"]
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    recovered = ChampionRegistry.load(path)
+    assert recovered.promotion_count("generator_champion") == 2
+    next_count = recovered.record_promotion("generator_champion")
+    assert next_count == 3
+    assert requires_nth_confirmation(next_count, every=3) is True
+
+
+def test_registry_rejects_inflated_promotion_count(tmp_path: Path) -> None:
+    path = tmp_path / "registry.json"
+    reg = ChampionRegistry(path)
+    reg.record_promotion("generator_champion")
+    reg.save()
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["promotion_counts"]["generator_champion"] = 4
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="disagree with promotion_recorded"):
+        ChampionRegistry.load(path)
+
+
+def test_registry_rejects_explicit_null_promotion_count_cache(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "registry.json"
+    path.write_text(
+        json.dumps(
+            {
+                "roles": {},
+                "opponent_pool": [],
+                "transitions": [],
+                "promotion_counts": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="promotion_counts must be a JSON object"):
+        ChampionRegistry.load(path)
+
+
+@pytest.mark.parametrize("role", ["", None])
+def test_record_promotion_rejects_role_that_cannot_reload(
+    tmp_path: Path,
+    role: object,
+) -> None:
+    reg = ChampionRegistry(tmp_path / "registry.json")
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        reg.record_promotion(role)  # type: ignore[arg-type]
+
+
 # =============================================================================
 # Bucket veto
 # =============================================================================

@@ -140,7 +140,38 @@ class ChampionRegistry:
         self._roles = {name: RolePointer(**entry) for name, entry in raw.get("roles", {}).items()}
         self._pool = [PoolEntry(**entry) for entry in raw.get("opponent_pool", [])]
         self._transitions = [Transition(**entry) for entry in raw.get("transitions", [])]
-        self._promotion_counts = {str(k): int(v) for k, v in raw.get("promotion_counts", {}).items()}
+        journal_counts: dict[str, int] = {}
+        for transition in self._transitions:
+            if transition.kind != "promotion_recorded":
+                continue
+            if not isinstance(transition.role, str) or not transition.role:
+                raise ValueError(
+                    "promotion_recorded transition must name a non-empty role"
+                )
+            journal_counts[transition.role] = journal_counts.get(transition.role, 0) + 1
+
+        if "promotion_counts" not in raw:
+            # Backward-compatible recovery for a journaled registry written
+            # before the denormalized counter cache existed.
+            self._promotion_counts = journal_counts
+            return
+        persisted_counts_raw = raw["promotion_counts"]
+        if not isinstance(persisted_counts_raw, dict):
+            raise ValueError("promotion_counts must be a JSON object")
+        persisted_counts: dict[str, int] = {}
+        for role, value in persisted_counts_raw.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"promotion_counts[{role!r}] must be a non-negative integer"
+                )
+            if value:
+                persisted_counts[str(role)] = value
+        if persisted_counts != journal_counts:
+            raise ValueError(
+                "promotion_counts disagree with promotion_recorded transition "
+                f"history: persisted={persisted_counts}, journal={journal_counts}"
+            )
+        self._promotion_counts = journal_counts
 
     def save(self) -> None:
         state = {
@@ -276,6 +307,8 @@ class ChampionRegistry:
         """Increment and return the promotion count for ``role``. Combine with
         ``requires_nth_confirmation`` to route every 3rd promotion through the
         heavier 200-game/n=64 bucketed confirmation (Master Plan Sec 4.1, R8)."""
+        if not isinstance(role, str) or not role:
+            raise ValueError("promotion role must be a non-empty string")
         count = self._promotion_counts.get(role, 0) + 1
         self._promotion_counts[role] = count
         self._transitions.append(
