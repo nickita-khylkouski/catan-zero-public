@@ -41,7 +41,11 @@ evaluation transaction.
 The doctor requires the exact Python, PyTorch/CUDA, dependency, NVIDIA driver,
 sealed native-wheel archive, and native capability identities in
 `configs/runtime/a1_production_runtime.json`. It also requires a clean Git
-worktree and re-hashes the job and every input immediately before launch.
+worktree and re-hashes the job and every input immediately before launch. The
+contract also checks every visible accelerator model: generation and evaluation
+require H100s, while the currently commissioned learner recipes require B200s.
+An eight-H100 host therefore cannot authorize a B200 learner merely because its
+device count and software runtime match.
 
 Generation may specify `gpu` to bind the child process through
 `CUDA_VISIBLE_DEVICES`; one generator job owns one physical GPU. Training is

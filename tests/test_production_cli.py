@@ -104,14 +104,16 @@ def test_all_canonical_config_and_guard_identities_are_exact() -> None:
         validate_pipeline_contract(ROOT, "generate"),
         validate_pipeline_contract(ROOT, "evaluate"),
         validate_pipeline_contract(ROOT, "train", "a1-current-35m-b200"),
-        validate_pipeline_contract(
-            ROOT, "train", "a1-parent-update-35m-b200"
-        ),
+        validate_pipeline_contract(ROOT, "train", "a1-parent-update-35m-b200"),
     ]
     for identity in identities:
         payload = json.loads(Path(identity["config"]).read_text(encoding="utf-8"))
         assert identity["config_sha256"] == canonical_json_sha256(payload)
     assert identities[0]["guard_sha256"] == contracts.GENERATION_GUARD_SHA256
+    assert identities[0]["required_accelerator_model"] == "NVIDIA H100"
+    assert identities[1]["required_accelerator_model"] == "NVIDIA H100"
+    assert identities[2]["required_accelerator_model"] == "NVIDIA B200"
+    assert identities[3]["required_accelerator_model"] == "NVIDIA B200"
 
 
 def test_guard_identity_drift_is_rejected(
@@ -127,7 +129,9 @@ def test_guard_identity_drift_is_rejected(
         validate_pipeline_contract(ROOT, "generate")
 
 
-def test_generate_plan_has_one_canonical_command_and_bound_inputs(tmp_path: Path) -> None:
+def test_generate_plan_has_one_canonical_command_and_bound_inputs(
+    tmp_path: Path,
+) -> None:
     job_path = _write_job(tmp_path)
     plan = cli.build_plan(job_path)
 
@@ -204,7 +208,9 @@ def test_plan_artifact_drift_is_detected(tmp_path: Path) -> None:
     plan = cli.build_plan(_write_job(tmp_path))
     Path(plan["inputs"]["checkpoint"]["path"]).write_bytes(b"replaced")
 
-    assert any("input checkpoint drift" in error for error in cli._verify_plan_artifacts(plan))  # noqa: SLF001
+    assert any(
+        "input checkpoint drift" in error for error in cli._verify_plan_artifacts(plan)
+    )  # noqa: SLF001
 
 
 def test_doctor_accepts_only_exact_runtime_and_clean_repository(
@@ -212,9 +218,13 @@ def test_doctor_accepts_only_exact_runtime_and_clean_repository(
 ) -> None:
     plan = cli.build_plan(_write_job(tmp_path))
     runtime = json.loads(
-        (ROOT / "configs/runtime/a1_production_runtime.json").read_text(encoding="utf-8")
+        (ROOT / "configs/runtime/a1_production_runtime.json").read_text(
+            encoding="utf-8"
+        )
     )
-    monkeypatch.setattr(cli.platform, "python_version", lambda: runtime["python_version"])
+    monkeypatch.setattr(
+        cli.platform, "python_version", lambda: runtime["python_version"]
+    )
     monkeypatch.setattr(
         cli,
         "_package_version",
@@ -231,7 +241,11 @@ def test_doctor_accepts_only_exact_runtime_and_clean_repository(
     )
     fake_torch = SimpleNamespace(
         version=SimpleNamespace(cuda=runtime["torch_cuda_version"]),
-        cuda=SimpleNamespace(is_available=lambda: True, device_count=lambda: 8),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 8,
+            get_device_name=lambda _index: "NVIDIA H100 80GB HBM3",
+        ),
     )
     monkeypatch.setitem(cli.sys.modules, "torch", fake_torch)
     monkeypatch.setattr(
@@ -261,18 +275,96 @@ def test_doctor_accepts_only_exact_runtime_and_clean_repository(
     assert result["errors"] == []
 
 
+def test_doctor_refuses_b200_training_recipe_on_h100(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = cli.build_plan(
+        _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
+    )
+    runtime = json.loads(
+        (ROOT / "configs/runtime/a1_production_runtime.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    monkeypatch.setattr(
+        cli.platform, "python_version", lambda: runtime["python_version"]
+    )
+    monkeypatch.setattr(
+        cli,
+        "_package_version",
+        lambda distribution: {
+            "catanatron-rs": runtime["catanatron_rs_version"],
+            "numpy": runtime["numpy_version"],
+            "networkx": runtime["networkx_version"],
+            "gymnasium": runtime["gymnasium_version"],
+            "zstandard": runtime["zstandard_version"],
+            "scipy": runtime["scipy_version"],
+            "whr": runtime["whr_version"],
+            "torch": runtime["torch_version"],
+        }[distribution],
+    )
+    fake_torch = SimpleNamespace(
+        version=SimpleNamespace(cuda=runtime["torch_cuda_version"]),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 8,
+            get_device_name=lambda _index: "NVIDIA H100 80GB HBM3",
+        ),
+    )
+    monkeypatch.setitem(cli.sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        cli,
+        "_nvidia_driver_identity",
+        lambda: {"versions": [runtime["nvidia_driver_version"]], "error": None},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_native_runtime_identity",
+        lambda: {
+            "wheel_sha256": runtime["catanatron_rs_wheel_sha256"],
+            "capabilities": sorted(NATIVE_REQUIRED_CAPABILITIES),
+        },
+    )
+    clean_repository = {
+        "commit": plan["repository"]["commit"],
+        "tracked_changes": [],
+        "clean": True,
+    }
+    plan["repository"] = clean_repository
+    monkeypatch.setattr(cli, "_git_identity", lambda _root: clean_repository)
+
+    result = cli.doctor(plan)
+
+    assert result["ok"] is False
+    assert (
+        result["runtime_actual"]["cuda_device_names"] == ["NVIDIA H100 80GB HBM3"] * 8
+    )
+    assert any(
+        "production placement requires only NVIDIA B200" in error
+        for error in result["errors"]
+    )
+
+
 def test_doctor_refuses_blocked_training_even_with_exact_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plan = cli.build_plan(_write_job(tmp_path, "train"))
     monkeypatch.setattr(cli, "_package_version", lambda _name: None)
-    monkeypatch.setattr(cli, "_nvidia_driver_identity", lambda: {"versions": [], "error": "test"})
-    monkeypatch.setattr(cli, "_native_runtime_identity", lambda: {"wheel_sha256": None, "capabilities": []})
+    monkeypatch.setattr(
+        cli, "_nvidia_driver_identity", lambda: {"versions": [], "error": "test"}
+    )
+    monkeypatch.setattr(
+        cli,
+        "_native_runtime_identity",
+        lambda: {"wheel_sha256": None, "capabilities": []},
+    )
 
     result = cli.doctor(plan)
 
     assert result["ok"] is False
-    assert "pipeline is blocked: scratch_optimizer_schedule_unresolved" in result["errors"]
+    assert (
+        "pipeline is blocked: scratch_optimizer_schedule_unresolved" in result["errors"]
+    )
     assert any("authenticated plan receipt" in error for error in result["errors"])
 
 
@@ -350,7 +442,9 @@ def test_prepare_runs_only_authenticated_scratch_planning(
 def test_cli_surface_is_five_commands_with_one_job_argument() -> None:
     parser = cli.build_parser()
     subparser_action = next(
-        action for action in parser._actions if action.dest == "command"  # noqa: SLF001
+        action
+        for action in parser._actions
+        if action.dest == "command"  # noqa: SLF001
     )
 
     assert set(subparser_action.choices) == {

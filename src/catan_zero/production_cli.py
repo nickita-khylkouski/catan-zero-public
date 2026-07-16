@@ -139,7 +139,9 @@ def load_job(path: Path) -> dict[str, Any]:
     job["_source"] = str(source)
 
     if pipeline == "generate":
-        job["checkpoint"] = str(_absolute_path(job.get("checkpoint"), field="checkpoint"))
+        job["checkpoint"] = str(
+            _absolute_path(job.get("checkpoint"), field="checkpoint")
+        )
         _positive_integer(job.get("games"), field="games")
         _positive_integer(job.get("base_seed"), field="base_seed", allow_zero=True)
         if not isinstance(job.get("claim_label"), str) or not job["claim_label"]:
@@ -185,9 +187,7 @@ def load_job(path: Path) -> dict[str, Any]:
                     f"forbidden={forbidden}"
                 )
             job["init_checkpoint"] = str(
-                _absolute_path(
-                    job.get("init_checkpoint"), field="init_checkpoint"
-                )
+                _absolute_path(job.get("init_checkpoint"), field="init_checkpoint")
             )
         else:
             raise ProductionCLIError(
@@ -204,7 +204,11 @@ def load_job(path: Path) -> dict[str, Any]:
             )
         for field in ("pairs", "workers"):
             _positive_integer(job.get(field), field=field)
-        _positive_integer(job.get("threads_per_worker", 0), field="threads_per_worker", allow_zero=True)
+        _positive_integer(
+            job.get("threads_per_worker", 0),
+            field="threads_per_worker",
+            allow_zero=True,
+        )
         _positive_integer(job.get("base_seed"), field="base_seed", allow_zero=True)
         devices = job.get("devices")
         if (
@@ -384,9 +388,7 @@ def _command_environment(job: dict[str, Any]) -> dict[str, str]:
     return {}
 
 
-def _prepare_command(
-    job: dict[str, Any], contract: dict[str, Any]
-) -> list[str] | None:
+def _prepare_command(job: dict[str, Any], contract: dict[str, Any]) -> list[str] | None:
     if job["pipeline"] != "train" or job["recipe"] != "a1-current-35m-b200":
         return None
     return _command(job, contract)[:-1]
@@ -409,9 +411,13 @@ def _git_identity(root: Path) -> dict[str, Any]:
             text=True,
         ).stdout.splitlines()
     except (OSError, subprocess.CalledProcessError) as error:
-        raise ProductionCLIError(f"cannot attest repository identity: {error}") from error
+        raise ProductionCLIError(
+            f"cannot attest repository identity: {error}"
+        ) from error
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise ProductionCLIError(f"repository HEAD is not a full commit identity: {commit!r}")
+        raise ProductionCLIError(
+            f"repository HEAD is not a full commit identity: {commit!r}"
+        )
     return {"commit": commit, "tracked_changes": status, "clean": not status}
 
 
@@ -478,7 +484,9 @@ def _native_runtime_identity() -> dict[str, Any]:
         capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
         if callable(capability_fn):
             result["capabilities"] = sorted(set(map(str, capability_fn())))
-    except Exception as error:  # The doctor reports every unavailable identity together.
+    except (
+        Exception
+    ) as error:  # The doctor reports every unavailable identity together.
         result["error"] = str(error)
     return result
 
@@ -496,7 +504,9 @@ def _nvidia_driver_identity() -> dict[str, Any]:
             text=True,
             timeout=15,
         )
-        versions = sorted({line.strip() for line in completed.stdout.splitlines() if line.strip()})
+        versions = sorted(
+            {line.strip() for line in completed.stdout.splitlines() if line.strip()}
+        )
         return {"versions": versions, "error": None}
     except (OSError, subprocess.SubprocessError) as error:
         return {"versions": [], "error": str(error)}
@@ -565,11 +575,21 @@ def doctor(plan: dict[str, Any]) -> dict[str, Any]:
         actual["torch_cuda_version"] = str(torch.version.cuda or "")
         actual["cuda_available"] = bool(torch.cuda.is_available())
         actual["cuda_device_count"] = int(torch.cuda.device_count())
+        try:
+            actual["cuda_device_names"] = [
+                str(torch.cuda.get_device_name(index))
+                for index in range(actual["cuda_device_count"])
+            ]
+        except Exception as error:  # The doctor must refuse instead of crashing.
+            actual["cuda_device_names"] = []
+            actual["cuda_device_name_error"] = str(error)
+            errors.append(f"cannot identify visible CUDA devices: {error}")
     except ImportError:
         actual.update(
             torch_cuda_version=None,
             cuda_available=False,
             cuda_device_count=0,
+            cuda_device_names=[],
         )
     if actual["torch_cuda_version"] != runtime.get("torch_cuda_version"):
         errors.append(
@@ -601,6 +621,17 @@ def doctor(plan: dict[str, Any]) -> dict[str, Any]:
         errors.append(f"native runtime lacks capabilities: {missing_capabilities}")
     if plan["job"]["pipeline"] == "train" and actual["cuda_device_count"] != 8:
         errors.append("canonical training requires exactly 8 visible CUDA devices")
+    required_accelerator = plan["contract"].get("required_accelerator_model")
+    mismatched_devices = [
+        name
+        for name in actual["cuda_device_names"]
+        if isinstance(required_accelerator, str) and required_accelerator not in name
+    ]
+    if required_accelerator and (not actual["cuda_device_names"] or mismatched_devices):
+        errors.append(
+            "production placement requires only "
+            f"{required_accelerator} devices; actual={actual['cuda_device_names']}"
+        )
     if (
         plan["job"]["pipeline"] == "train"
         and plan["job"]["recipe"] == "a1-current-35m-b200"
@@ -665,7 +696,9 @@ def _write_json_atomic(path: Path, value: object) -> None:
 def execute(plan: dict[str, Any]) -> int:
     check = doctor(plan)
     if not check["ok"]:
-        raise ProductionCLIError("production doctor refused run: " + "; ".join(check["errors"]))
+        raise ProductionCLIError(
+            "production doctor refused run: " + "; ".join(check["errors"])
+        )
     receipt_path = Path(plan["run_receipt"])
     prior_receipt: dict[str, Any] | None = None
     if receipt_path.exists():
@@ -712,9 +745,7 @@ def execute(plan: dict[str, Any]) -> int:
     _write_json_atomic(receipt_path, receipt)
     try:
         run_dir = Path(plan["job"]["run_dir"])
-        run_dir.mkdir(
-            parents=True, exist_ok=bool(plan["job"].get("resume", False))
-        )
+        run_dir.mkdir(parents=True, exist_ok=bool(plan["job"].get("resume", False)))
         environment = os.environ.copy()
         environment.update(plan["environment"])
         completed = subprocess.run(
@@ -757,9 +788,7 @@ def prepare_training(plan: dict[str, Any]) -> int:
     if repository["commit"] != plan["repository"]["commit"]:
         errors.append("repository HEAD changed after planning")
     if errors:
-        raise ProductionCLIError(
-            "training preparation refused: " + "; ".join(errors)
-        )
+        raise ProductionCLIError("training preparation refused: " + "; ".join(errors))
     environment = os.environ.copy()
     environment.update(plan["environment"])
     try:

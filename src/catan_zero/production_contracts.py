@@ -45,9 +45,16 @@ TRAIN_LAUNCHERS = {
     "a1-current-35m-b200": "tools/a1_scratch_train.py",
     "a1-parent-update-35m-b200": "tools/train.py",
 }
+PIPELINE_ACCELERATOR_MODELS = {
+    "generate": "NVIDIA H100",
+    "evaluate": "NVIDIA H100",
+}
+TRAIN_ACCELERATOR_MODELS = {
+    "a1-current-35m-b200": "NVIDIA B200",
+    "a1-parent-update-35m-b200": "NVIDIA B200",
+}
 GENERATION_GUARD = (
-    "configs/guards/"
-    "a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
+    "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
 )
 GENERATION_GUARD_SHA256 = (
     "9d86aba856305cb98fef3d8a318d1e5fc82abfe011d7f93bb4bc1cd7be3fc4c1"
@@ -85,9 +92,7 @@ def _recipe_entry(pipeline: str, recipe: str | None) -> dict[str, str]:
         raise ProductionContractError(f"pipeline {pipeline!r} has no recipe")
     try:
         matches = [
-            entry
-            for entry in production_recipes(pipeline)
-            if entry["name"] == selected
+            entry for entry in production_recipes(pipeline) if entry["name"] == selected
         ]
     except ProductionRecipeError as error:
         raise ProductionContractError(str(error)) from error
@@ -111,6 +116,7 @@ def validate_pipeline_contract(
             "launcher": None,
             "guard": None,
             "guard_sha256": None,
+            "required_accelerator_model": None,
         }
     if pipeline not in DEFAULT_RECIPES:
         raise ProductionContractError(f"unknown production pipeline {pipeline!r}")
@@ -157,6 +163,11 @@ def validate_pipeline_contract(
         "config_sha256": entry["canonical_sha256"],
         "guard": None if guard_path is None else str(guard_path),
         "guard_sha256": guard_sha256,
+        "required_accelerator_model": (
+            TRAIN_ACCELERATOR_MODELS[entry["name"]]
+            if pipeline == "train"
+            else PIPELINE_ACCELERATOR_MODELS[pipeline]
+        ),
     }
 
 
@@ -178,8 +189,7 @@ def pipeline_readiness(
                 "authority_sha256": identity["config_sha256"],
             }
         science_path = (
-            repo
-            / "configs/operations/a1-next-wave-coherent-public-v3/"
+            repo / "configs/operations/a1-next-wave-coherent-public-v3/"
             "science.contract.json"
         ).resolve()
         science = _read_json_object(science_path, label="current science contract")
@@ -211,12 +221,13 @@ def pipeline_readiness(
             "authorized": False,
             "reason": "negative_exact_initializer_canary_and_no_canonical_ppo_recipe",
             "authority": str(
-                (repo / "docs/reviews/CATAN_ZERO_DIFFERENTIAL_REVIEW_2026-07-16.md").resolve()
+                (
+                    repo / "docs/reviews/CATAN_ZERO_DIFFERENTIAL_REVIEW_2026-07-16.md"
+                ).resolve()
             ),
             "authority_sha256": hashlib.sha256(
                 (
-                    repo
-                    / "docs/reviews/CATAN_ZERO_DIFFERENTIAL_REVIEW_2026-07-16.md"
+                    repo / "docs/reviews/CATAN_ZERO_DIFFERENTIAL_REVIEW_2026-07-16.md"
                 ).read_bytes()
             ).hexdigest(),
         }
@@ -233,8 +244,7 @@ def pipeline_readiness(
 
 def production_status(repo: Path) -> dict[str, Any]:
     pipelines = {
-        name: pipeline_readiness(repo, name)
-        for name in ("generate", "evaluate", "ppo")
+        name: pipeline_readiness(repo, name) for name in ("generate", "evaluate", "ppo")
     }
     train_recipes = {
         entry["name"]: pipeline_readiness(repo, "train", entry["name"])
@@ -245,9 +255,7 @@ def production_status(repo: Path) -> dict[str, Any]:
         "status": "ready"
         if any(value["authorized"] for value in train_recipes.values())
         else "blocked",
-        "authorized": any(
-            value["authorized"] for value in train_recipes.values()
-        ),
+        "authorized": any(value["authorized"] for value in train_recipes.values()),
         "reason": "recipe_specific_authorization",
         "authority": str((repo / CATALOG_RELATIVE_PATH).resolve()),
         "authority_sha256": canonical_json_sha256(
