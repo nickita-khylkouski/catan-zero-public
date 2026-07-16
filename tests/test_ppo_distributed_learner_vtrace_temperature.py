@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from catan_zero.rl.self_play import StepSample
 from catan_zero.rl.torch_ppo import (
@@ -92,3 +94,66 @@ def test_recompute_target_logp_defaults_to_unscaled_temperature() -> None:
     )
 
     np.testing.assert_allclose(default_logp, explicit_logp, atol=1e-9)
+
+
+def test_entity_recompute_uses_actor_saturation_at_temperature_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch
+
+    from catan_zero.rl import torch_ppo
+
+    samples = [
+        StepSample(
+            observation=np.zeros(1, dtype=np.float32),
+            valid_actions=(4, 5),
+            action=4,
+            player="BLUE",
+            entity_features={},
+        ),
+        StepSample(
+            observation=np.zeros(1, dtype=np.float32),
+            valid_actions=(4, 5, 6),
+            action=5,
+            player="BLUE",
+            entity_features={},
+        ),
+    ]
+    policy = SimpleNamespace(
+        device=torch.device("cpu"),
+        forward_legal_np=lambda *_args, **_kwargs: None,
+    )
+    raw_logits = torch.as_tensor(
+        [[-200.0, -200.0, -1.0e9], [-200.0, -200.0, -200.0]],
+        dtype=torch.float32,
+    )
+
+    def fake_outputs(_policy, batch_samples, *, return_q):
+        assert return_q is False
+        count = len(batch_samples)
+        return {
+            "logits": raw_logits[:count],
+            "value": torch.zeros(count, dtype=torch.float32),
+        }
+
+    monkeypatch.setattr(torch_ppo, "_entity_graph_outputs", fake_outputs)
+    target_logp, _ = _recompute_target_logp_and_values_batched(
+        policy,
+        [SimpleNamespace(samples=samples)],
+        forward_chunk=8192,
+        behavior_temperature=1.0,
+    )
+
+    expected_logits = torch_ppo._behavior_policy_logits(  # noqa: SLF001
+        raw_logits,
+        1.0,
+        valid_mask=torch.as_tensor(
+            [[True, True, False], [True, True, True]]
+        ),
+    )
+    expected = (
+        torch.distributions.Categorical(logits=expected_logits)
+        .log_prob(torch.as_tensor([0, 1]))
+        .numpy()
+    )
+    np.testing.assert_allclose(target_logp, expected, atol=1e-6)

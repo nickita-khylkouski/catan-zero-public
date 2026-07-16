@@ -666,20 +666,20 @@ def _recompute_target_logp_and_values_batched(
     the per-sample action-context tensor, run ``policy.forward`` to get full-action logits +
     value, mask to the legal set, take ``Categorical(logits).log_prob(action)``.
 
-    FIX A1 (V-trace temperature mismatch): the actor's stored ``old_log_probs`` (the V-trace
-    behavior distribution) are computed from logits scaled by ``behavior_temperature`` — see
-    ``ppo_update``'s ``behavior_logits = logits / behavior_temperature`` (both the entity-graph
-    and flat/candidate paths). If this recompute used raw (T=1) logits instead, every V-trace
-    importance ratio would be systematically wrong whenever ``behavior_temperature != 1.0``,
-    independent of real policy drift. We therefore apply the IDENTICAL scale-and-clamp here
-    before building the ``Categorical`` used for the target log-prob.
+    FIX A1 (V-trace behavior-distribution mismatch): entity actors always temperature-scale
+    and clamp legal logits, including at T=1.  The current-policy recompute must use that exact
+    transform and preserve the mixed-width padding mask or V-trace sees policy drift where none
+    exists.  The legacy flat path retains its historical T=1 no-op and applies its established
+    scale-and-clamp only when a non-unit behavior temperature is requested.
     """
     import torch
 
     # Reuse the exact batching helpers ppo_update uses so the recomputed numbers line up with
     # the actor's stored log-probs (same normalization, same masking, same context handling).
     from catan_zero.rl.torch_ppo import (
+        _behavior_policy_logits,
         _entity_action_column,
+        _entity_behavior_valid_mask,
         _entity_graph_outputs,
         _action_context_features_tensor,
         _masked_logits,
@@ -736,7 +736,16 @@ def _recompute_target_logp_and_values_batched(
                 chunk_valid = valid_actions[start:end]
                 logits, values = policy.forward(obs_t, context_t)
                 logits = _masked_logits(logits, chunk_valid, policy.action_size)
-            if behavior_temperature != 1.0:
+            if entity_mode:
+                logits = _behavior_policy_logits(
+                    logits,
+                    behavior_temperature,
+                    valid_mask=_entity_behavior_valid_mask(
+                        samples[start:end],
+                        logits,
+                    ),
+                )
+            elif behavior_temperature != 1.0:
                 logits = torch.clamp(
                     logits / behavior_temperature,
                     min=-50.0,

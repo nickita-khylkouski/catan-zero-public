@@ -58,7 +58,10 @@ from catan_zero.rl.ordered_history import (
     SUPPORTED_HISTORY_POOLING,
     build_ordered_history_pool,
 )
-from catan_zero.rl.torch_ppo import build_action_feature_table
+from catan_zero.rl.torch_ppo import (
+    _behavior_policy_logits,
+    build_action_feature_table,
+)
 from catan_zero.rl.xdim_lite_policy import (
     _array_sha256,
     _install_numpy_pickle_aliases,
@@ -2694,6 +2697,9 @@ class EntityGraphPolicy:
         import torch
 
         del rng
+        # Direct sampler callers must get the same deterministic distribution
+        # as collect_ppo_episode and the learner's likelihood recomputation.
+        self.model.eval()
         valid_actions = tuple(int(action) for action in info["valid_actions"])
         if not valid_actions:
             raise ValueError("entity_graph policy received no valid actions")
@@ -2709,8 +2715,7 @@ class EntityGraphPolicy:
             if q_values is None:
                 q_values = outputs["value"].reshape(1, 1).expand(1, len(valid_actions))
             legal_q_values = q_values.squeeze(0)
-            behavior_logits = logits / max(float(action_temperature), 1.0e-6)
-            behavior_logits = torch.clamp(behavior_logits, min=-50.0, max=50.0)
+            behavior_logits = _behavior_policy_logits(logits, action_temperature)
             dist = torch.distributions.Categorical(logits=behavior_logits)
             column_t = dist.sample() if training else torch.argmax(logits, dim=-1)
             column = int(column_t.item())

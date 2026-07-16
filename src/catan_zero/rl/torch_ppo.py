@@ -40,6 +40,26 @@ def _resolve_device(device: str | None):
     return resolved
 
 
+def _behavior_policy_logits(logits, temperature: float, *, valid_mask=None):
+    """Return the exact bounded distribution surface shared by actor and learner."""
+
+    import torch
+
+    behavior_logits = torch.clamp(
+        logits / max(float(temperature), 1.0e-6),
+        min=-50.0,
+        max=50.0,
+    )
+    if valid_mask is not None:
+        if tuple(valid_mask.shape) != tuple(logits.shape):
+            raise ValueError(
+                "behavior-logit valid mask shape differs from logits: "
+                f"{tuple(valid_mask.shape)} != {tuple(logits.shape)}"
+            )
+        behavior_logits = behavior_logits.masked_fill(~valid_mask, -1.0e9)
+    return behavior_logits
+
+
 @dataclass(slots=True)
 class PPOTrajectory:
     samples: list[StepSample]
@@ -416,8 +436,6 @@ class TorchPPOPolicy:
         return logits, self.critic(features).squeeze(-1)
 
     def q_values(self, observations, action_context_features=None):
-        import torch
-
         features = self.model(observations)
         if _is_candidate_architecture(self.architecture):
             assert self.q_state is not None
@@ -735,6 +753,31 @@ def create_ppo_policy(
         env.close()
 
 
+def _set_policy_inference_mode(policy: Any) -> None:
+    """Put every known policy module in the deterministic actor serving mode."""
+
+    seen: set[int] = set()
+    for name in (
+        "model",
+        "actor",
+        "critic",
+        "q_head",
+        "q_state",
+        "q_action_encoder",
+        "q_action_bias",
+        "action_encoder",
+        "action_id_embedding",
+        "action_bias",
+    ):
+        module = getattr(policy, name, None)
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        eval_method = getattr(module, "eval", None)
+        if callable(eval_method):
+            eval_method()
+
+
 def collect_ppo_episode(
     policy: TorchPPOPolicy,
     opponents: dict[str, Policy],
@@ -751,6 +794,7 @@ def collect_ppo_episode(
     value_shaping_opponent_penalty: float = 0.05,
     action_temperature: float = 1.0,
 ) -> PPOTrajectory:
+    _set_policy_inference_mode(policy)
     env = ColonistMultiAgentEnv(config)
     samples: list[StepSample] = []
     old_log_probs: list[float] = []
@@ -1549,15 +1593,14 @@ def _ppo_update_entity_graph(
     advantage_normalization: str = "global",
     advantage_group_weights: Any | None = None,
 ) -> dict[str, float]:
-    import torch
-    from torch import nn
-
-    # FIX A12: EntityGraphPolicy.load() ends with model.eval(), and nothing in the PPO learner
-    # ever calls .train() -- so every Dropout(0.05) layer was inert during PPO updates while
-    # active during BC on the identical checkpoint. try/finally guarantees eval() is restored
-    # on every exit path (including the early empty-samples return and any exception raised
-    # mid-update), since rollout/inference callers must always see the policy in eval mode.
-    policy.model.train()
+    # PPO ratios are only meaningful when the learner recomputes the exact
+    # behavior distribution recorded by actors. Actors serve EntityGraphPolicy
+    # in eval mode, so enabling dropout here creates false ratios/clipping even
+    # before an optimizer step. eval() does not disable autograd: gradients and
+    # optimizer updates remain active while stochastic/stateful inference layers
+    # follow the actor contract. The finally block preserves that postcondition
+    # on empty/error exits too.
+    policy.model.eval()
     try:
         return _ppo_update_entity_graph_body(
             policy,
@@ -1765,13 +1808,12 @@ def _ppo_update_entity_graph_body(
             )
             logits = outputs["logits"]
             values = outputs["value"]
-            behavior_logits = logits
-            if behavior_temperature != 1.0:
-                behavior_logits = torch.clamp(
-                    logits / behavior_temperature,
-                    min=-50.0,
-                    max=50.0,
-                )
+            valid_mask = _entity_behavior_valid_mask(batch_samples, logits)
+            behavior_logits = _behavior_policy_logits(
+                logits,
+                behavior_temperature,
+                valid_mask=valid_mask,
+            )
             dist = torch.distributions.Categorical(logits=behavior_logits)
             log_probs = dist.log_prob(batch_actions)
             ratio = torch.exp(log_probs - batch_old_log_probs)
@@ -1826,13 +1868,11 @@ def _ppo_update_entity_graph_body(
             if ema_policy is not None and ema_policy_kl_coef > 0.0:
                 with torch.no_grad():
                     ema_outputs = _entity_graph_outputs(ema_policy, batch_samples, return_q=False)
-                    ema_logits = ema_outputs["logits"]
-                    if behavior_temperature != 1.0:
-                        ema_logits = torch.clamp(
-                            ema_logits / behavior_temperature,
-                            min=-50.0,
-                            max=50.0,
-                        )
+                    ema_logits = _behavior_policy_logits(
+                        ema_outputs["logits"],
+                        behavior_temperature,
+                        valid_mask=valid_mask,
+                    )
                     ema_policy_t = torch.softmax(ema_logits, dim=-1)
                 # Match the KL anchor to the same temperature-scaled distribution used by
                 # PPO ratios. Otherwise temp-controlled actors can drift in behavior space
@@ -1912,6 +1952,18 @@ def _entity_action_column(sample: StepSample) -> int:
         raise ValueError(
             f"sample action {sample.action} is not in valid_actions={sample.valid_actions}"
         ) from error
+
+
+def _entity_behavior_valid_mask(samples: list[StepSample], logits):
+    import torch
+
+    width = int(logits.shape[-1])
+    counts = torch.as_tensor(
+        [len(sample.valid_actions) for sample in samples],
+        dtype=torch.long,
+        device=logits.device,
+    )
+    return torch.arange(width, device=logits.device).unsqueeze(0) < counts.unsqueeze(1)
 
 
 def _entity_graph_outputs(policy: Any, samples: list[StepSample], *, return_q: bool = False):
@@ -2474,7 +2526,6 @@ def evaluate_teacher_agreement(
     obs_t = torch.as_tensor(observations, dtype=torch.float32, device=policy.device)
     context_t = _action_context_features_tensor(samples, policy)
     actions_t = torch.as_tensor(actions, dtype=torch.long, device=policy.device)
-    targets_t = _target_policy_tensor(samples, policy.action_size, policy.device)
     with torch.no_grad():
         logits, _ = policy.forward(obs_t, context_t)
         masked = _masked_logits(logits, valid_actions, policy.action_size)
