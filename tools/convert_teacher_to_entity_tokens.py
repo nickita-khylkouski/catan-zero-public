@@ -13,6 +13,9 @@ from typing import Any
 import numpy as np
 
 from catan_zero.deduction_tracker import DEDUCTION_FEATURE_SIZE, DeductionTracker
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+)
 from catan_zero.rl.entity_token_features import (
     ENTITY_TOKEN_SCHEMA_VERSION,
     build_entity_token_features,
@@ -160,6 +163,7 @@ def main() -> None:
         "graph_history_features": bool(args.graph_history_features),
         "emit_deduction_features": bool(args.emit_deduction_features),
         "schema": ENTITY_TOKEN_SCHEMA_VERSION,
+        "entity_feature_adapter_version": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
         "partition_count": int(args.partition_count),
         "partition_index": int(args.partition_index),
         "loaded_rows": 0,
@@ -411,7 +415,13 @@ def _convert_seed(
                 )
                 break
             for duplicate_row in rows:
-                writer.add(duplicate_row, features)
+                writer.add(
+                    {
+                        **duplicate_row,
+                        "adapter_version": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+                    },
+                    features,
+                )
             _, _, terminated, truncated, info = env.step(action)
             converted_rows += len(rows)
             decision += 1

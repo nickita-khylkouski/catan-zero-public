@@ -7,6 +7,9 @@ from typing import Any
 import numpy as np
 
 from catan_zero.deduction_tracker import DEDUCTION_FEATURE_SIZE, true_state_label
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+)
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
 from tools.convert_teacher_to_entity_tokens import (
     DEDUCTION_FEATURES_KEY,
@@ -85,6 +88,25 @@ def test_emit_deduction_features_off_by_default_omits_key(tmp_path):
     writer = EntityShardWriter(tmp_path, shard_size=10_000, fmt="npz")
     _convert_seed(seed, by_decision, config, writer, emit_deduction_features=False)
     assert all(DEDUCTION_FEATURES_KEY not in row for row in writer.rows)
+
+
+def test_conversion_binds_current_entity_adapter_semantics(tmp_path):
+    config = ColonistMultiAgentConfig(players=2, vps_to_win=10)
+    seed = 777004
+    by_decision = _play_and_record(seed, config, max_steps=8)
+
+    writer = EntityShardWriter(tmp_path, shard_size=10_000, fmt="npz")
+    _convert_seed(seed, by_decision, config, writer, emit_deduction_features=False)
+
+    assert writer.rows
+    assert {
+        str(row["adapter_version"]) for row in writer.rows
+    } == {CURRENT_RUST_ENTITY_ADAPTER_VERSION}
+    writer.close()
+    loaded = np.load(writer.paths[0])
+    assert set(map(str, loaded["adapter_version"])) == {
+        CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    }
 
 
 def test_emit_deduction_features_tracks_ground_truth_across_replay(tmp_path):

@@ -134,6 +134,34 @@ def test_factory_uses_public_equal_game_training_contract(tmp_path: Path) -> Non
     assert resolved.lr_warmup_steps == 16
 
 
+def test_factory_converts_teacher_rows_before_entity_training(tmp_path: Path) -> None:
+    result = _dry_run(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    manifest = _manifest(tmp_path)
+    converter_index = next(
+        index
+        for index, command in enumerate(manifest["commands"])
+        if "tools/convert_teacher_to_entity_tokens.py" in command
+    )
+    train_index = next(
+        index
+        for index, command in enumerate(manifest["commands"])
+        if "tools/train_bc.py" in command
+    )
+    converter = manifest["commands"][converter_index]
+    command = manifest["commands"][train_index]
+
+    assert converter_index < train_index
+    assert converter[converter.index("--data") + 1] == str(tmp_path / "teacher_data")
+    assert converter[converter.index("--out") + 1] == str(
+        tmp_path / "teacher_data_entity"
+    )
+    assert command[command.index("--data") + 1] == str(
+        tmp_path / "teacher_data_entity"
+    )
+
+
 def test_factory_can_replay_the_legacy_raw_scalar_readout(tmp_path: Path) -> None:
     result = _dry_run(
         tmp_path,

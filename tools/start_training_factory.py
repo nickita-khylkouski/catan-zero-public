@@ -252,6 +252,8 @@ def main() -> None:
     run_dir = Path(args.run_dir)
     raw_data_dir = run_dir / "teacher_data_raw"
     data_dir = run_dir / "teacher_data"
+    entity_data_dir = run_dir / "teacher_data_entity"
+    training_data_dir = entity_data_dir if args.arch == "entity_graph" else data_dir
     teacher_quality_report = run_dir / "teacher_data_quality.json"
     bc_checkpoint = run_dir / f"bc_{args.arch}.pt"
     bc_report = run_dir / f"bc_{args.arch}.json"
@@ -355,6 +357,25 @@ def main() -> None:
                 else "--strict-35m-teacher",
             ]
         )
+    if args.arch == "entity_graph":
+        commands.append(
+            [
+                args.python,
+                "tools/convert_teacher_to_entity_tokens.py",
+                "--data",
+                str(data_dir),
+                "--out",
+                str(entity_data_dir),
+                "--track",
+                args.track,
+                "--vps-to-win",
+                str(args.vps_to_win),
+                "--format",
+                "npz_zst",
+                "--shard-size",
+                "50000",
+            ]
+        )
     bc_launcher = [args.python]
     if world_size > 1:
         bc_launcher = [
@@ -372,7 +393,7 @@ def main() -> None:
             "--arch",
             args.arch,
             "--data",
-            str(data_dir),
+            str(training_data_dir),
             "--track",
             args.track,
             "--vps-to-win",
