@@ -186,7 +186,7 @@ def test_routing_validation_fails_closed_on_unsupported_paths() -> None:
             _args(arch="xdim_graph", value_trunk_grad_scale=0.0),
             scalar_weight=0.25,
         )
-    with pytest.raises(SystemExit, match="active scalar-MSE"):
+    with pytest.raises(SystemExit, match="active value-family"):
         train_bc._value_trunk_gradient_routing(
             _args(value_trunk_grad_scale=0.0), scalar_weight=0.0
         )
@@ -203,6 +203,7 @@ def test_routing_validation_fails_closed_on_unsupported_paths() -> None:
     )
     assert pooled["value_attention_pool_enabled"] is True
     assert pooled["all_scalar_value_shared_inputs_scaled"] is True
+    assert pooled["all_value_family_shared_inputs_scaled"] is True
     assert pooled["shared_input_paths"] == [
         "cls_state",
         "attention_pool_state",
@@ -250,6 +251,21 @@ def test_checkpoint_metadata_carries_exact_gradient_routing_contract(tmp_path) -
     loaded = EntityGraphPolicy.load(checkpoint, device="cpu")
     assert loaded.value_training["value_gradient_routing"] == routing
 
+
+def test_categorical_value_objective_can_use_trunk_gradient_protection() -> None:
+    routing = train_bc._value_trunk_gradient_routing(
+        _args(value_head_type="hlgauss", value_trunk_grad_scale=0.1),
+        scalar_weight=0.0,
+        categorical_weight=0.25,
+    )
+
+    assert routing["active"] is True
+    assert routing["scope"] == "value_family_readouts_all_shared_inputs"
+    assert routing["active_value_objectives"] == {
+        "scalar_mse": 0.0,
+        "categorical_ce": 0.25,
+        "final_vp": 0.0,
+    }
 
 def test_train_config_hash_binds_value_trunk_gradient_scale() -> None:
     from catan_zero.rl.pipeline_configs import TrainConfig

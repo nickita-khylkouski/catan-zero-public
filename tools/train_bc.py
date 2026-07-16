@@ -1958,9 +1958,11 @@ def _value_trunk_gradient_routing(
     args,
     *,
     scalar_weight: float,
+    categorical_weight: float = 0.0,
+    final_vp_weight: float | None = None,
     model=None,
 ) -> dict[str, object]:
-    """Validate and describe scalar-value gradient routing at the trunk boundary.
+    """Validate and describe value-family gradient routing at the trunk boundary.
 
     This is deliberately narrower than ``--trunk-lr-mult``.  The latter scales
     the optimizer update produced by *all* objectives in trunk parameters.  This
@@ -1977,18 +1979,20 @@ def _value_trunk_gradient_routing(
         raise SystemExit(
             "--value-trunk-grad-scale != 1 requires --arch entity_graph"
         )
-    if active and float(scalar_weight) <= 0.0:
+    resolved_final_vp_weight = float(
+        getattr(args, "final_vp_loss_weight", 0.0)
+        if final_vp_weight is None
+        else final_vp_weight
+    )
+    active_value_objectives = {
+        "scalar_mse": float(scalar_weight),
+        "categorical_ce": float(categorical_weight),
+        "final_vp": resolved_final_vp_weight,
+    }
+    if active and not any(weight > 0.0 for weight in active_value_objectives.values()):
         raise SystemExit(
-            "--value-trunk-grad-scale != 1 requires an active scalar-MSE value "
-            "objective; it cannot affect a categorical-only or value-disabled run"
-        )
-    if active and str(getattr(args, "value_head_type", "mse")) not in {
-        "mse",
-        "scalar",
-    }:
-        raise SystemExit(
-            "--value-trunk-grad-scale != 1 is sealed only for scalar-MSE value "
-            "training"
+            "--value-trunk-grad-scale != 1 requires at least one active value-family "
+            "objective (scalar MSE, categorical CE, or final-VP)"
         )
     value_attention_pool = bool(
         model is not None and getattr(model, "value_attention_pool", False)
@@ -2007,9 +2011,11 @@ def _value_trunk_gradient_routing(
         "shared_state_upstream_gradient_scale": scale,
         "scope": "value_family_readouts_all_shared_inputs",
         "legacy_scope_alias": "scalar_value_head_state_input_only",
+        "active_value_objectives": active_value_objectives,
         "shared_input_paths": shared_input_paths,
         "value_attention_pool_enabled": value_attention_pool,
         "all_scalar_value_shared_inputs_scaled": True,
+        "all_value_family_shared_inputs_scaled": True,
         "final_vp_shared_state_scaled": True,
         "categorical_value_shared_state_scaled": True,
         "policy_gradient_unchanged": True,
@@ -2063,7 +2069,10 @@ def _value_training_metadata(
     value_gradient_routing = getattr(args, "value_gradient_routing", None)
     if value_gradient_routing is None:
         value_gradient_routing = _value_trunk_gradient_routing(
-            args, scalar_weight=scalar_weight
+            args,
+            scalar_weight=scalar_weight,
+            categorical_weight=categorical_weight,
+            final_vp_weight=float(getattr(args, "final_vp_loss_weight", 0.0)),
         )
     metadata = {
         "schema_version": "value-training-v1",
@@ -10310,7 +10319,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         resolved_categorical_value_weight,
     ) = _resolve_value_objective_weights(args)
     args.value_gradient_routing = _value_trunk_gradient_routing(
-        args, scalar_weight=resolved_scalar_value_weight
+        args,
+        scalar_weight=resolved_scalar_value_weight,
+        categorical_weight=resolved_categorical_value_weight,
+        final_vp_weight=float(args.final_vp_loss_weight),
     )
     value_root_blend_regime = _resolve_value_root_blend_regime(args)
     _rank0_print(
@@ -10506,6 +10518,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.value_gradient_routing = _value_trunk_gradient_routing(
             args,
             scalar_weight=resolved_scalar_value_weight,
+            categorical_weight=resolved_categorical_value_weight,
+            final_vp_weight=float(args.final_vp_loss_weight),
             model=policy.model,
         )
         _rank0_print(
@@ -17294,7 +17308,12 @@ def evaluate_bc_batches(
         )
         return {
             "samples": int(total_count),
-            "loss": loss_eval,
+            # The configured objective is a sum of independently normalized
+            # terms. Averaging each batch's already-normalized total silently
+            # changes that objective when policy/value eligibility differs by
+            # batch. Use the globally reconstructed objective for every corpus;
+            # retain the historical batch statistic under its honest name.
+            "loss": component_reconstructed_loss,
             "raw_batch_mean_loss": loss_eval,
             "component_reconstructed_loss": component_reconstructed_loss,
             "policy_loss": policy_loss_eval,

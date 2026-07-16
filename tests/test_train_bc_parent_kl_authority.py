@@ -140,10 +140,11 @@ def test_value_trunk_routing_attests_all_attention_pool_shared_inputs() -> None:
         model=SimpleNamespace(value_attention_pool=True),
     )
 
-    assert routing["scope"] == "scalar_value_readout_all_shared_inputs"
+    assert routing["scope"] == "value_family_readouts_all_shared_inputs"
     assert routing["shared_input_paths"] == [
         "cls_state",
         "attention_pool_state",
         "attention_pool_tokens",
     ]
     assert routing["all_scalar_value_shared_inputs_scaled"] is True
+    assert routing["all_value_family_shared_inputs_scaled"] is True
