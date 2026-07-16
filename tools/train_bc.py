@@ -35577,12 +35577,25 @@ def _derived_array_cache_key(payload: dict[str, object]) -> tuple[str, dict[str,
     code or numerical-runtime change cannot silently reuse an older result.
     """
 
-    identity = {
+    raw_identity = {
         "schema_version": _TRAINING_PRECOMPUTE_CACHE_SCHEMA,
         "implementation_sha256": _sha256_existing_file(__file__),
         "numpy_version": str(np.__version__),
         "inputs": payload,
     }
+    # The manifest is JSON, so its decoded identity contains lists even when a
+    # caller supplied tuples (notably explicit validation seed ranges). Keep
+    # the in-memory comparison object in that same canonical JSON domain;
+    # otherwise a valid freshly-written cache immediately refuses itself as
+    # "identity drift".
+    identity = json.loads(
+        json.dumps(
+            raw_identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+    )
     digest = _canonical_json_sha256(identity).removeprefix("sha256:")
     return digest, identity
 

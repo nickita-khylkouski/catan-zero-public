@@ -37,6 +37,29 @@ def test_derived_array_cache_round_trip_is_exact_read_only_mmap(tmp_path):
         assert np.array_equal(loaded[name], expected)
 
 
+def test_derived_array_cache_canonicalizes_tuple_inputs_for_json_round_trip(
+    tmp_path,
+):
+    _key, identity = train_bc._derived_array_cache_key(
+        {
+            "validation_game_seed_ranges": [(10, 19), (30, 39)],
+            "nested": {"tuple": ("a", 2)},
+        }
+    )
+    assert identity["inputs"]["validation_game_seed_ranges"] == [
+        [10, 19],
+        [30, 39],
+    ]
+    directory = train_bc._write_derived_array_cache(
+        tmp_path,
+        identity,
+        {"train_indices": np.arange(3, dtype=np.int64)},
+    )
+    assert directory.is_dir()
+    loaded = train_bc._load_derived_array_cache(tmp_path, identity)
+    np.testing.assert_array_equal(loaded["train_indices"], [0, 1, 2])
+
+
 def test_derived_array_cache_fails_closed_on_payload_tamper(tmp_path):
     identity = _identity()
     directory = train_bc._write_derived_array_cache(
@@ -95,4 +118,3 @@ def test_uniform_epoch_cap_is_ignored_to_preserve_permutation_semantics():
     )
     assert len(requested_cap) == 100
     assert np.array_equal(requested_cap, uncapped)
-
