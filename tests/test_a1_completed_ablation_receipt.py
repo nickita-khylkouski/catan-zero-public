@@ -824,6 +824,35 @@ def test_stage_c_accepts_earlier_mid_epoch_value_safe_checkpoint() -> None:
     assert selected["step"] == 16
 
 
+def test_stage_c_teacher_closure_is_diagnostic_not_an_admission_gate() -> None:
+    records = [
+        {
+            "step": 16,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
+            "feature_learning_signal_authenticated": True,
+            "parent_kl": 0.002,
+            "trunk_relative_l2": 0.001,
+            "fresh_parent_teacher_gap_absolute_closure": -0.02,
+            "fresh_parent_teacher_gap_relative_closure": -0.03,
+            "value_quality_gate": {"passed": True},
+        },
+        {
+            "step": 24,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
+            "feature_learning_signal_authenticated": True,
+            "parent_kl": 0.02,
+            "trunk_relative_l2": 0.002,
+            "fresh_parent_teacher_gap_absolute_closure": 0.05,
+            "fresh_parent_teacher_gap_relative_closure": 0.06,
+            "value_quality_gate": {"passed": True},
+        },
+    ]
+
+    selected = campaign._select_fingerprint_winner(records)  # noqa: SLF001
+    assert selected is not None
+    assert selected["step"] == 16
+
+
 def test_stage_c_value_gate_replays_b200_parent_comparison() -> None:
     def functional(candidate_value: float) -> dict:
         parent_value = 0.6638134101444333

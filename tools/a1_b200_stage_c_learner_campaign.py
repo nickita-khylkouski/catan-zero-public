@@ -1685,11 +1685,13 @@ def _select_fingerprint_winner(
     *,
     expected_objective: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Nominate the smallest trusted update with positive teacher uptake.
+    """Nominate the smallest representation- and value-safe update.
 
     B200 traces showed that larger teacher-gap closure was anti-correlated with
-    paired playing strength. Closure therefore admits a checkpoint but never
-    ranks it; paired H2H remains the only strength authority.
+    paired playing strength. Closure is therefore diagnostic only: requiring it
+    to be positive lets a noisy teacher decide which checkpoints are allowed to
+    reach the paired H2H screen, even though that screen is the actual strength
+    authority.
     """
 
     expected = (
@@ -1710,8 +1712,6 @@ def _select_fingerprint_winner(
         if row.get("feature_learning_signal_authenticated") is True
         and float(row["parent_kl"]) <= MAX_PARENT_KL
         and float(row["trunk_relative_l2"]) <= MAX_TRUNK_RELATIVE_L2
-        and float(row["fresh_parent_teacher_gap_relative_closure"]) > 0.0
-        and float(row["fresh_parent_teacher_gap_absolute_closure"]) > 0.0
         and row.get("value_quality_gate", {}).get(
             "selection_admitted",
             row.get("value_quality_gate", {}).get("passed"),
