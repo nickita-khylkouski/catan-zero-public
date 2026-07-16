@@ -25,6 +25,7 @@ reanalyzer or conditioning on hidden truth.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import math
@@ -55,12 +56,29 @@ from catan_zero.rl.target_reliability import (  # noqa: E402
     target_reliability_confidence,
 )
 from catan_zero.search.rng_streams import SEARCH_RNG_STREAM_SCHEMA  # noqa: E402
+from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
+    GumbelChanceMCTSConfig,
+)
+from catan_zero.search.neural_rust_mcts import (  # noqa: E402
+    EntityGraphRustEvaluatorConfig,
+)
 
 
 PLAN_SCHEMA = "a1-stage-c-teacher-alignment-plan-v1"
 OVERLAY_SCHEMA = "a1-stage-c-target-eligibility-overlay-v1"
 SUBSET_SCHEMA = "a1-stage-c-reanalysis-subset-v1"
 COHERENT_REGIME = "public_belief_single_tree_v1"
+OPERATOR_IDENTITY_SCHEMA_V1 = "a1-operator-bound-policy-target-identity-v1"
+OPERATOR_IDENTITY_SCHEMA_V2 = "a1-operator-bound-policy-target-identity-v2"
+STAGE_C_ROW_SEED_SCHEMA = "a1-stage-c-coherent-reanalysis-root-seed-v1"
+STAGE_C_TARGET_EXECUTION = {
+    "schema_version": "a1-stage-c-target-execution-v1",
+    "mode": "forced_full_root_reanalysis",
+    "force_full_override": True,
+    "effective_simulations": 128,
+    "budget_source": "force_full_overrides_playout_cap_and_wide_root_gates",
+    "row_seed_schema": STAGE_C_ROW_SEED_SCHEMA,
+}
 POLICY_STATUS = {
     "inactive_no_stored_policy": 0,
     "eligible_exact_operator": 1,
@@ -253,11 +271,67 @@ def _semantic_field_bundle(
     return {name: fields[name] if name in fields else operator[name] for name in names}
 
 
+def _json_normalized(value: object) -> Any:
+    """Return the exact JSON-domain representation used by sealed receipts."""
+
+    return json.loads(_canonical_bytes(value))
+
+
+def _complete_effective_search_config(fields: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve every Gumbel field that can affect a root target.
+
+    The typed generation schema intentionally omits defaults.  Hashing only its
+    present keys allowed a newly added/defaulted search knob to change targets
+    without changing target identity.  Resolve the live dataclass here and bind
+    every field except ``seed``.  The seed is the sole exclusion: it identifies
+    a stochastic replicate, not the scientific operator, and Stage C binds its
+    deterministic per-row derivation separately in ``target_execution``.
+
+    Execution/fleet layout is outside this dataclass.  Performance toggles that
+    can alter evaluation order (including root-wave batching and batch API use)
+    are deliberately retained rather than assumed numerically invisible.
+    """
+
+    allowed = {field.name for field in dataclasses.fields(GumbelChanceMCTSConfig)}
+    kwargs = {name: value for name, value in fields.items() if name in allowed}
+    if "colors" in kwargs:
+        kwargs["colors"] = tuple(str(value) for value in kwargs["colors"])
+    try:
+        resolved = dataclasses.asdict(GumbelChanceMCTSConfig(**kwargs))
+    except (TypeError, ValueError) as error:
+        raise AlignmentError(
+            f"cannot resolve effective Gumbel config: {error}"
+        ) from error
+    resolved.pop("seed")
+    return _json_normalized(resolved)
+
+
+def _complete_effective_evaluator_config(
+    fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve target-changing evaluator fields and document the cache exclusion."""
+
+    kwargs = {
+        "value_scale": float(fields.get("value_scale", 1.0)),
+        "prior_temperature": float(fields.get("prior_temperature", 1.0)),
+        "value_readout": str(fields.get("value_readout", "scalar")),
+        "public_observation": bool(fields.get("public_observation", False)),
+        "rust_featurize": bool(fields.get("rust_featurize", False)),
+    }
+    resolved = dataclasses.asdict(EntityGraphRustEvaluatorConfig(**kwargs))
+    # Cache capacity changes storage/layout only.  Every other resolved field
+    # affects features, values, priors, or emitted uncertainty and stays bound.
+    resolved.pop("cache_size")
+    return _json_normalized(resolved)
+
+
 def _operator_identity(
     contract_path: Path,
     checkpoint: Path,
     *,
     require_current_target: bool = False,
+    identity_schema: str = OPERATOR_IDENTITY_SCHEMA_V2,
+    target_execution: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the scientific identity of policy targets, excluding fleet layout."""
 
@@ -326,8 +400,15 @@ def _operator_identity(
         or semantics["public_observation"] is not True
     ):
         raise AlignmentError("target operator is not current coherent-public n128")
+    if identity_schema not in {
+        OPERATOR_IDENTITY_SCHEMA_V1,
+        OPERATOR_IDENTITY_SCHEMA_V2,
+    }:
+        raise AlignmentError(
+            f"unsupported policy-target identity schema {identity_schema!r}"
+        )
     value: dict[str, Any] = {
-        "schema_version": "a1-operator-bound-policy-target-identity-v1",
+        "schema_version": identity_schema,
         "producer_checkpoint": {
             "path": str(checkpoint),
             "sha256": _file_sha256(checkpoint),
@@ -365,22 +446,60 @@ def _operator_identity(
             "operator_semantic_sha256": _value_sha256(operator),
         },
     }
+    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V2:
+        execution = (
+            dict(target_execution)
+            if target_execution is not None
+            else {
+                "schema_version": "a1-generation-target-execution-v1",
+                "mode": "sealed_generation_schedule",
+                "force_full_override": None,
+                "effective_simulations": None,
+                "budget_source": "per_row_playout_cap_randomization",
+                "row_seed_schema": None,
+            }
+        )
+        if target_execution is not None and execution != STAGE_C_TARGET_EXECUTION:
+            raise AlignmentError("Stage-C target execution override drifted")
+        value["effective_gumbel_config"] = _complete_effective_search_config(fields)
+        value["effective_evaluator_config"] = _complete_effective_evaluator_config(
+            fields
+        )
+        value["target_execution"] = _json_normalized(execution)
+        value["identity_exclusions"] = {
+            "gumbel.seed": (
+                "per-row stochastic replicate; Stage-C binds the deterministic "
+                "row-seed schema in target_execution"
+            ),
+            "evaluator.cache_size": "execution layout only; no model output semantics",
+            "fleet_and_worker_layout": (
+                "authenticated as provenance by contracts/receipts, not a root-target "
+                "operator input"
+            ),
+        }
     # The scientific identity deliberately excludes contract path, seed lanes,
     # and fleet placement. Those authenticate provenance but do not change a
     # root target. It includes the producer network and every search semantic.
-    scientific = {
-        key: value[key]
-        for key in (
-            "producer_checkpoint",
-            "target_information_regime",
-            "operator_contract_semantics",
-            "search",
-            "belief",
-            "chance",
-            "symmetry",
-            "target_semantics",
+    scientific_keys = [
+        "producer_checkpoint",
+        "target_information_regime",
+        "operator_contract_semantics",
+        "search",
+        "belief",
+        "chance",
+        "symmetry",
+        "target_semantics",
+    ]
+    if identity_schema == OPERATOR_IDENTITY_SCHEMA_V2:
+        scientific_keys.extend(
+            (
+                "effective_gumbel_config",
+                "effective_evaluator_config",
+                "target_execution",
+                "identity_exclusions",
+            )
         )
-    }
+    scientific = {key: value[key] for key in scientific_keys}
     scientific["producer_checkpoint"] = {
         "sha256": value["producer_checkpoint"]["sha256"]
     }
@@ -701,6 +820,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         args.target_operator_contract,
         args.target_checkpoint,
         require_current_target=True,
+        target_execution=STAGE_C_TARGET_EXECUTION,
     )
     if (
         source_identity["producer_checkpoint"]["sha256"]
@@ -945,10 +1065,18 @@ def _verify_plan(path: Path) -> dict[str, Any]:
         checkpoint = identity.get("producer_checkpoint")
         if not isinstance(authority, Mapping) or not isinstance(checkpoint, Mapping):
             raise AlignmentError(f"Stage-C {identity_key} authority is malformed")
+        schema = identity.get("schema_version")
         replayed = _operator_identity(
             Path(str(authority["path"])),
             Path(str(checkpoint["path"])),
             require_current_target=(identity_key == "target_policy_target_identity"),
+            identity_schema=str(schema),
+            target_execution=(
+                identity.get("target_execution")
+                if schema == OPERATOR_IDENTITY_SCHEMA_V2
+                and identity_key == "target_policy_target_identity"
+                else None
+            ),
         )
         if replayed != identity:
             raise AlignmentError(f"Stage-C {identity_key} no longer replays")

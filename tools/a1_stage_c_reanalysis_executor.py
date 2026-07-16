@@ -45,6 +45,10 @@ from catan_zero.rl.target_reliability import (  # noqa: E402
     TARGET_RELIABILITY_SCHEMA,
     unaudited_target_reliability_fields,
 )
+from catan_zero.rl.gumbel_self_play import (  # noqa: E402
+    SEARCH_EVIDENCE_SCHEMA,
+    SEARCH_EVIDENCE_VERSION,
+)
 from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
     GumbelChanceMCTSConfig,
 )
@@ -65,9 +69,11 @@ QUALIFICATION_PARTITION_RECEIPT_SCHEMA = (
 )
 QUALIFICATION_PARTITION_SCHEMA = "a1-stage-c-sparse-reconstruction-partition-v1"
 EXECUTION_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-chunk-receipt-v1"
-PATCH_SCHEMA = "a1-stage-c-coherent-reanalysis-target-patch-v1"
+PATCH_SCHEMA_V1 = "a1-stage-c-coherent-reanalysis-target-patch-v1"
+PATCH_SCHEMA = "a1-stage-c-coherent-reanalysis-target-patch-v2"
+REBOUND_MERGE_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-rebound-merge-receipt-v2"
 MERGE_RECEIPT_SCHEMA = "a1-stage-c-coherent-reanalysis-merge-receipt-v1"
-ROW_SEED_SCHEMA = "a1-stage-c-coherent-reanalysis-root-seed-v1"
+ROW_SEED_SCHEMA = alignment.STAGE_C_ROW_SEED_SCHEMA
 STATUS = {
     "unclassified": 0,
     "reconstructable_public_roundtrip": 1,
@@ -121,6 +127,18 @@ PATCH_RAGGED_COLUMNS = (
     "completed_q_values_flat",
     "completed_q_mask_flat",
     "prior_policy_flat",
+)
+RUNTIME_SOURCE_PATHS = frozenset(
+    {
+        "tools/a1_stage_c_reanalysis_executor.py",
+        "tools/reconstruct_state.py",
+        "tools/a1_stage_c_teacher_alignment.py",
+        "src/catan_zero/rl/gumbel_self_play.py",
+        "src/catan_zero/rl/target_reliability.py",
+        "src/catan_zero/search/gumbel_chance_mcts.py",
+        "src/catan_zero/search/native_gumbel_mcts.py",
+        "src/catan_zero/search/neural_rust_mcts.py",
+    }
 )
 
 
@@ -191,6 +209,92 @@ def _runtime_attestation() -> dict[str, Any]:
     }
     value["runtime_sha256"] = _value_sha256(value)
     return value
+
+
+def _git_blob_sha256(commit: str, path: str) -> str:
+    """Hash one historical source blob without consulting the worktree."""
+
+    if Path(path).is_absolute() or ".." in Path(path).parts:
+        raise ExecutorError(f"unsafe historical runtime source path: {path!r}")
+    try:
+        blob = subprocess.run(
+            ["git", "show", f"{commit}:{path}"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ExecutorError(
+            f"cannot resolve sealed historical source {commit}:{path}"
+        ) from error
+    return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+def _verify_runtime_attestation(
+    runtime: Mapping[str, Any], *, require_current: bool
+) -> None:
+    """Verify a current producer or a portable authenticated historical one.
+
+    Historical verification is read-only: source bytes are read from the
+    recorded git commit rather than the current checkout, while the recorded
+    native extension must still exist byte-for-byte.  This lets a newer export
+    tool consume a sealed old DAG without pretending that old code is current.
+    New search execution calls this with ``require_current=True``.
+    """
+
+    unsigned = dict(runtime)
+    stated = unsigned.pop("runtime_sha256", None)
+    if runtime.get(
+        "schema_version"
+    ) != "a1-stage-c-reconstruction-runtime-v1" or stated != _value_sha256(unsigned):
+        raise ExecutorError("Stage-C reconstruction runtime digest drifted")
+    if require_current:
+        if dict(runtime) != _runtime_attestation():
+            raise ExecutorError("Stage-C runtime is not the current executable runtime")
+        return
+
+    commit = str(runtime.get("repo_commit", ""))
+    if len(commit) != 40 or any(
+        character not in "0123456789abcdef" for character in commit
+    ):
+        raise ExecutorError("Stage-C historical runtime commit is malformed")
+    try:
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ExecutorError(
+            "Stage-C historical runtime commit is unavailable or not an ancestor"
+        ) from error
+    sources = runtime.get("sources")
+    if not isinstance(sources, list):
+        raise ExecutorError("Stage-C historical runtime sources are malformed")
+    by_path = {
+        str(source.get("path")): source
+        for source in sources
+        if isinstance(source, Mapping)
+    }
+    if set(by_path) != RUNTIME_SOURCE_PATHS or len(by_path) != len(sources):
+        raise ExecutorError("Stage-C historical runtime source inventory drifted")
+    for path, source in by_path.items():
+        if source.get("file_sha256") != _git_blob_sha256(commit, path):
+            raise ExecutorError(f"Stage-C historical source bytes drifted: {path}")
+    native = runtime.get("native_runtime")
+    if not isinstance(native, Mapping):
+        raise ExecutorError("Stage-C reconstruction native runtime is malformed")
+    native_path = Path(str(native.get("path", ""))).resolve(strict=True)
+    if native.get("file_sha256") != alignment._file_sha256(native_path):  # noqa: SLF001
+        raise ExecutorError("Stage-C reconstruction native extension drifted")
+    capabilities = native.get("capabilities")
+    if (
+        not isinstance(capabilities, list)
+        or not REQUIRED_COHERENT_CAPABILITIES.issubset(map(str, capabilities))
+        or not isinstance(native.get("distribution_version"), str)
+    ):
+        raise ExecutorError("Stage-C historical native runtime identity is incomplete")
 
 
 def _sequence_rows(
@@ -894,7 +998,9 @@ def _merge_qualification_partitions(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
-def _verify_receipt(path: Path) -> dict[str, Any]:
+def _verify_receipt(
+    path: Path, *, require_current_runtime: bool = False
+) -> dict[str, Any]:
     receipt_path, receipt = alignment._load_json(  # noqa: SLF001
         path, where="Stage-C reconstruction receipt"
     )
@@ -917,20 +1023,7 @@ def _verify_receipt(path: Path) -> dict[str, Any]:
     runtime = receipt.get("runtime")
     if not isinstance(runtime, Mapping):
         raise ExecutorError("Stage-C reconstruction receipt lost its runtime")
-    runtime_unsigned = dict(runtime)
-    runtime_stated = runtime_unsigned.pop("runtime_sha256", None)
-    if runtime_stated != _value_sha256(runtime_unsigned):
-        raise ExecutorError("Stage-C reconstruction runtime digest drifted")
-    for source in runtime.get("sources", ()):
-        source_path = REPO_ROOT / str(source["path"])
-        if source.get("file_sha256") != alignment._file_sha256(source_path):  # noqa: SLF001
-            raise ExecutorError("Stage-C reconstruction source bytes drifted")
-    native = runtime.get("native_runtime")
-    if not isinstance(native, Mapping):
-        raise ExecutorError("Stage-C reconstruction native runtime is malformed")
-    native_path = Path(str(native["path"])).resolve(strict=True)
-    if native.get("file_sha256") != alignment._file_sha256(native_path):  # noqa: SLF001
-        raise ExecutorError("Stage-C reconstruction native extension drifted")
+    _verify_runtime_attestation(runtime, require_current=require_current_runtime)
     for artifact in receipt["artifacts"].values():
         artifact_path = Path(str(artifact["path"])).resolve(strict=True)
         if (
@@ -1035,6 +1128,12 @@ def _effective_search_config(
     if "colors" in kwargs:
         kwargs["colors"] = tuple(str(value) for value in kwargs["colors"])
     config = GumbelChanceMCTSConfig(**kwargs)
+    effective = alignment._complete_effective_search_config(fields)  # noqa: SLF001
+    if (
+        target.get("schema_version") == alignment.OPERATOR_IDENTITY_SCHEMA_V2
+        and target.get("effective_gumbel_config") != effective
+    ):
+        raise ExecutorError("Stage-C effective Gumbel identity drifted")
     if (
         int(config.n_full) != 128
         or not bool(config.coherent_public_belief_search)
@@ -1059,6 +1158,13 @@ def _effective_search_config(
 
 def _evaluator_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
     fields = _sealed_typed_fields(plan)
+    target = plan["target_policy_target_identity"]
+    if (
+        target.get("schema_version") == alignment.OPERATOR_IDENTITY_SCHEMA_V2
+        and target.get("effective_evaluator_config")
+        != alignment._complete_effective_evaluator_config(fields)  # noqa: SLF001
+    ):
+        raise ExecutorError("Stage-C effective evaluator identity drifted")
     if fields.get("public_observation") is not True:
         raise ExecutorError("sealed target evaluator is not public-observation safe")
     if fields.get("rust_featurize") is not True:
@@ -1148,9 +1254,12 @@ def _search_patch(
         [float(result.completed_q_values.get(action, np.nan)) for action in legal_rust],
         dtype=np.float32,
     )
+    execution = plan["target_policy_target_identity"].get("target_execution")
+    if execution != alignment.STAGE_C_TARGET_EXECUTION:
+        raise ExecutorError("Stage-C forced-full target execution identity drifted")
     if (
         not bool(result.used_full_search)
-        or int(result.simulations_used) <= 0
+        or int(result.simulations_used) != int(execution["effective_simulations"])
         or not math.isfinite(float(result.root_value))
         or not bool(result.q_values_root_perspective)
         or not np.all(np.isfinite(completed))
@@ -1167,7 +1276,9 @@ def _search_patch(
     return {
         "legal_action_ids": legal_policy_ids,
         "target_policy": target,
-        "target_policy_mask": target > 0.0,
+        # Coverage means the teacher supplied a value for this legal action;
+        # an exact zero is still a valid soft-target label, never missing data.
+        "target_policy_mask": np.ones(target.shape, dtype=np.bool_),
         "target_scores": raw_q,
         "target_scores_mask": np.isfinite(raw_q),
         "completed_q_values": completed,
@@ -1177,8 +1288,8 @@ def _search_patch(
         "root_value": float(result.root_value),
         "root_value_mask": True,
         "simulations_used": int(result.simulations_used),
-        "used_full_search": True,
-        "q_values_root_perspective": True,
+        "used_full_search": bool(result.used_full_search),
+        "q_values_root_perspective": bool(result.q_values_root_perspective),
     }
 
 
@@ -1266,7 +1377,7 @@ def _patch_arrays(records: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray]
 
 
 def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
-    qualification = _verify_receipt(args.receipt)
+    qualification = _verify_receipt(args.receipt, require_current_runtime=True)
     plan = alignment._verify_plan(  # noqa: SLF001
         Path(str(qualification["stage_c_plan"]["path"]))
     )
@@ -1305,6 +1416,13 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
             int(position)
         )
     target = plan["target_policy_target_identity"]
+    if (
+        target.get("schema_version") != alignment.OPERATOR_IDENTITY_SCHEMA_V2
+        or target.get("target_execution") != alignment.STAGE_C_TARGET_EXECUTION
+    ):
+        raise ExecutorError(
+            "new Stage-C execution requires the complete forced-full v2 target identity"
+        )
     checkpoint_sha = str(target["producer_checkpoint"]["sha256"])
     operator_contract_sha = str(target["authority"]["contract"]["file_sha256"])
     records: list[dict[str, Any]] = []
@@ -1380,8 +1498,7 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
         alignment._npz_bytes(arrays),  # noqa: SLF001
     )
     qualification_path = Path(str(qualification["path"]))
-    effective = dataclasses.asdict(_effective_search_config(plan, row_seed=0))
-    effective.pop("seed", None)
+    effective = target["effective_gumbel_config"]
     receipt: dict[str, Any] = {
         "schema_version": EXECUTION_RECEIPT_SCHEMA,
         "patch_schema_version": PATCH_SCHEMA,
@@ -1406,6 +1523,18 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
             "row_seed_schema": ROW_SEED_SCHEMA,
             "effective_config_without_row_seed": effective,
             "effective_config_sha256": _value_sha256(effective),
+            "target_execution": target["target_execution"],
+            "target_execution_sha256": _value_sha256(target["target_execution"]),
+            "row_search_evidence": {
+                "schema": SEARCH_EVIDENCE_SCHEMA,
+                "version": SEARCH_EVIDENCE_VERSION,
+                "simulations": "simulations_used",
+                "full_search": "used_full_search",
+                "completed_q": "completed_q_values_flat",
+                "completed_q_coverage": "completed_q_mask_flat",
+                "raw_visited_q": "target_scores_flat_with_target_scores_mask_flat",
+                "target_coverage": "target_policy_mask_flat_all_legal_actions",
+            },
         },
         "evaluator": {
             "type": "EntityGraphRustEvaluator",
@@ -1440,6 +1569,9 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
 def _verify_patch_arrays(
     arrays: Mapping[str, np.ndarray], *, receipt: Mapping[str, Any]
 ) -> None:
+    patch_schema = str(receipt.get("patch_schema_version", ""))
+    if patch_schema not in {PATCH_SCHEMA_V1, PATCH_SCHEMA}:
+        raise ExecutorError("unsupported Stage-C patch schema")
     expected = {
         *PATCH_ROW_COLUMNS,
         *PATCH_RAGGED_COLUMNS,
@@ -1497,16 +1629,19 @@ def _verify_patch_arrays(
         scores = np.asarray(arrays["target_scores_flat"])[start:stop]
         score_mask = np.asarray(arrays["target_scores_mask_flat"])[start:stop]
         completed = np.asarray(arrays["completed_q_values_flat"])[start:stop]
+        target_coverage = np.asarray(arrays["target_policy_mask_flat"])[start:stop]
+        coverage_valid = (
+            np.array_equal(target_coverage, target > 0.0)
+            if patch_schema == PATCH_SCHEMA_V1
+            else bool(np.all(target_coverage))
+        )
         if (
             np.any(legal < 0)
             or np.unique(legal).size != legal.size
             or int(arrays["selected_action_policy_id"][row]) not in set(legal.tolist())
             or not np.all(np.isfinite(target))
             or np.any(target < 0.0)
-            or not np.array_equal(
-                np.asarray(arrays["target_policy_mask_flat"])[start:stop],
-                target > 0.0,
-            )
+            or not coverage_valid
             or not np.array_equal(score_mask, np.isfinite(scores))
             or not np.all(np.asarray(arrays["completed_q_mask_flat"])[start:stop])
             or not np.isclose(float(target.sum()), 1.0, atol=1.0e-5)
@@ -1517,7 +1652,12 @@ def _verify_patch_arrays(
             or not bool(arrays["root_value_mask"][row])
             or not bool(arrays["used_full_search"][row])
             or not bool(arrays["q_values_root_perspective"][row])
-            or int(arrays["simulations_used"][row]) <= 0
+            or (
+                int(arrays["simulations_used"][row]) <= 0
+                if patch_schema == PATCH_SCHEMA_V1
+                else int(arrays["simulations_used"][row])
+                != int(alignment.STAGE_C_TARGET_EXECUTION["effective_simulations"])
+            )
         ):
             raise ExecutorError("Stage-C patch contains invalid search evidence")
 
@@ -1528,9 +1668,10 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
     )
     unsigned = dict(receipt)
     stated = unsigned.pop("receipt_sha256", None)
+    patch_schema = receipt.get("patch_schema_version")
     if (
         receipt.get("schema_version") != EXECUTION_RECEIPT_SCHEMA
-        or receipt.get("patch_schema_version") != PATCH_SCHEMA
+        or patch_schema not in {PATCH_SCHEMA_V1, PATCH_SCHEMA}
         or stated != _value_sha256(unsigned)
     ):
         raise ExecutorError("Stage-C execution receipt digest drifted")
@@ -1561,8 +1702,29 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
     ):
         raise ExecutorError("Stage-C target checkpoint drifted")
     runtime = receipt.get("runtime")
-    if not isinstance(runtime, Mapping) or runtime != _runtime_attestation():
-        raise ExecutorError("Stage-C execution runtime drifted")
+    if not isinstance(runtime, Mapping):
+        raise ExecutorError("Stage-C execution runtime is malformed")
+    _verify_runtime_attestation(runtime, require_current=False)
+    search = receipt.get("search")
+    if not isinstance(search, Mapping):
+        raise ExecutorError("Stage-C execution search evidence is malformed")
+    effective = dataclasses.asdict(_effective_search_config(plan, row_seed=0))
+    effective.pop("seed", None)
+    effective = alignment._json_normalized(effective)  # noqa: SLF001
+    if (
+        search.get("force_full") is not True
+        or search.get("nominal_n_full") != 128
+        or search.get("effective_config_without_row_seed") != effective
+        or search.get("effective_config_sha256") != _value_sha256(effective)
+    ):
+        raise ExecutorError("Stage-C execution effective search config drifted")
+    if patch_schema == PATCH_SCHEMA and (
+        search.get("target_execution") != alignment.STAGE_C_TARGET_EXECUTION
+        or search.get("target_execution_sha256")
+        != _value_sha256(alignment.STAGE_C_TARGET_EXECUTION)
+        or search.get("row_search_evidence", {}).get("schema") != SEARCH_EVIDENCE_SCHEMA
+    ):
+        raise ExecutorError("Stage-C v2 execution target evidence drifted")
     artifact = receipt["artifact"]
     patch_path = Path(str(artifact["path"])).resolve(strict=True)
     if (
@@ -1709,15 +1871,238 @@ def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
     return receipt
 
 
+def _new_target_identity_from_legacy_merge(
+    legacy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Derive the forced-full v2 identity from one fully verified v1 DAG."""
+
+    plan = alignment._verify_plan(  # noqa: SLF001
+        Path(str(legacy["stage_c_plan"]["path"]))
+    )
+    old_target = plan["target_policy_target_identity"]
+    if (
+        legacy.get("schema_version") != MERGE_RECEIPT_SCHEMA
+        or legacy.get("patch_schema_version") != PATCH_SCHEMA_V1
+        or old_target.get("schema_version") != alignment.OPERATOR_IDENTITY_SCHEMA_V1
+        or legacy.get("target_policy_target_identity_sha256")
+        != old_target.get("identity_sha256")
+    ):
+        raise ExecutorError("rebind accepts only a complete legacy Stage-C v1 merge")
+    contract = old_target["authority"]["contract"]
+    checkpoint = old_target["producer_checkpoint"]
+    rebound = alignment._operator_identity(  # noqa: SLF001
+        Path(str(contract["path"])),
+        Path(str(checkpoint["path"])),
+        require_current_target=True,
+        identity_schema=alignment.OPERATOR_IDENTITY_SCHEMA_V2,
+        target_execution=alignment.STAGE_C_TARGET_EXECUTION,
+    )
+    if rebound["identity_sha256"] == old_target["identity_sha256"]:
+        raise ExecutorError("forced-full v2 target identity did not separate from v1")
+    effective = rebound["effective_gumbel_config"]
+    search = legacy.get("search")
+    if (
+        not isinstance(search, Mapping)
+        or search.get("force_full") is not True
+        or search.get("nominal_n_full") != 128
+        or search.get("row_seed_schema") != ROW_SEED_SCHEMA
+        or search.get("effective_config_without_row_seed") != effective
+        or search.get("effective_config_sha256") != _value_sha256(effective)
+        or effective.get("policy_target_min_visits") != 0
+    ):
+        raise ExecutorError("legacy merge lacks an unambiguous forced-full config")
+    return rebound
+
+
+def _rebound_search_receipt(
+    legacy_search: Mapping[str, Any], target: Mapping[str, Any]
+) -> dict[str, Any]:
+    search = dict(legacy_search)
+    search.update(
+        {
+            "target_execution": target["target_execution"],
+            "target_execution_sha256": _value_sha256(target["target_execution"]),
+            "row_search_evidence": {
+                "schema": SEARCH_EVIDENCE_SCHEMA,
+                "version": SEARCH_EVIDENCE_VERSION,
+                "simulations": "simulations_used",
+                "full_search": "used_full_search",
+                "completed_q": "completed_q_values_flat",
+                "completed_q_coverage": "completed_q_mask_flat",
+                "raw_visited_q": "target_scores_flat_with_target_scores_mask_flat",
+                "target_coverage": "target_policy_mask_flat_all_legal_actions",
+                "visit_counts": "not_present_in_v1_patch_not_required_by_overlay",
+            },
+        }
+    )
+    return search
+
+
+def _rebind_legacy_merge(args: argparse.Namespace) -> dict[str, Any]:
+    legacy = _verify_merge_receipt(args.receipt)
+    target = _new_target_identity_from_legacy_merge(legacy)
+    source_patch = Path(str(legacy["artifact"]["path"])).resolve(strict=True)
+    with np.load(source_patch, allow_pickle=False) as source:
+        arrays = {name: np.asarray(source[name]).copy() for name in source.files}
+    if (
+        not np.all(arrays["used_full_search"])
+        or not np.all(
+            arrays["simulations_used"]
+            == int(alignment.STAGE_C_TARGET_EXECUTION["effective_simulations"])
+        )
+        or not np.all(arrays["completed_q_mask_flat"])
+    ):
+        raise ExecutorError("legacy patch lacks exact forced-full per-row evidence")
+    arrays["target_policy_mask_flat"] = np.ones(
+        arrays["target_policy_flat"].shape, dtype=np.bool_
+    )
+    arrays["target_policy_target_identity_sha256"] = np.full(
+        arrays["row_index"].shape,
+        target["identity_sha256"],
+        dtype="<U71",
+    )
+    output = args.output.expanduser().resolve(strict=False)
+    alignment._write_immutable(  # noqa: SLF001
+        output,
+        alignment._npz_bytes(arrays),  # noqa: SLF001
+    )
+    source_receipt = args.receipt.expanduser().resolve(strict=True)
+    receipt: dict[str, Any] = {
+        "schema_version": REBOUND_MERGE_RECEIPT_SCHEMA,
+        "patch_schema_version": PATCH_SCHEMA,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "stage_c_plan": legacy["stage_c_plan"],
+        "qualification_receipt": legacy["qualification_receipt"],
+        "source_legacy_merge": {
+            "path": str(source_receipt),
+            "file_sha256": alignment._file_sha256(source_receipt),  # noqa: SLF001
+            "receipt_sha256": legacy["receipt_sha256"],
+            "patch_file_sha256": legacy["artifact"]["file_sha256"],
+            "old_target_policy_target_identity_sha256": legacy[
+                "target_policy_target_identity_sha256"
+            ],
+        },
+        "target_policy_target_identity": target,
+        "target_policy_target_identity_sha256": target["identity_sha256"],
+        "target_reanalyzer_checkpoint": target["producer_checkpoint"],
+        "target_operator_contract": target["authority"]["contract"],
+        "search": _rebound_search_receipt(legacy["search"], target),
+        "evaluator": legacy["evaluator"],
+        "runtime": legacy["runtime"],
+        "counts": dict(legacy["counts"]),
+        "coverage": {
+            **dict(legacy["coverage"]),
+            "target_policy_mask_semantics": "all_legal_actions_have_teacher_labels",
+        },
+        "migration": {
+            "mode": "authenticated_semantic_rebind_without_search_rerun",
+            "allowed_mutations": [
+                "target_policy_mask_flat",
+                "target_policy_target_identity_sha256",
+            ],
+            "search_outputs_recomputed": False,
+            "reason": (
+                "v1 omitted force_full and resolved default search fields from "
+                "target identity; the sealed execution DAG proves both"
+            ),
+        },
+        "non_target_source_columns_mutated": False,
+        "source_corpus_rewritten": False,
+        "patch_columns": sorted(arrays),
+        "artifact": alignment._artifact_ref(output),  # noqa: SLF001
+    }
+    receipt["receipt_sha256"] = _value_sha256(receipt)
+    _verify_patch_arrays(arrays, receipt=receipt)
+    return receipt
+
+
+def _arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:
+    if left.dtype.kind in "fc" or right.dtype.kind in "fc":
+        return bool(np.array_equal(left, right, equal_nan=True))
+    return bool(np.array_equal(left, right))
+
+
+def _verify_rebound_merge_receipt(
+    receipt_path: Path, receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    unsigned = dict(receipt)
+    stated = unsigned.pop("receipt_sha256", None)
+    if receipt.get("patch_schema_version") != PATCH_SCHEMA or stated != _value_sha256(
+        unsigned
+    ):
+        raise ExecutorError("Stage-C rebound merge digest drifted")
+    source_ref = receipt.get("source_legacy_merge")
+    if not isinstance(source_ref, Mapping):
+        raise ExecutorError("Stage-C rebound merge lost its legacy authority")
+    source_path = Path(str(source_ref["path"])).resolve(strict=True)
+    legacy = _verify_merge_receipt(source_path)
+    if (
+        legacy.get("schema_version") != MERGE_RECEIPT_SCHEMA
+        or legacy.get("patch_schema_version") != PATCH_SCHEMA_V1
+        or source_ref.get("file_sha256") != alignment._file_sha256(source_path)  # noqa: SLF001
+        or source_ref.get("receipt_sha256") != legacy["receipt_sha256"]
+        or source_ref.get("patch_file_sha256") != legacy["artifact"]["file_sha256"]
+        or source_ref.get("old_target_policy_target_identity_sha256")
+        != legacy["target_policy_target_identity_sha256"]
+    ):
+        raise ExecutorError("Stage-C rebound legacy merge binding drifted")
+    target = _new_target_identity_from_legacy_merge(legacy)
+    if (
+        receipt.get("target_policy_target_identity") != target
+        or receipt.get("target_policy_target_identity_sha256")
+        != target["identity_sha256"]
+        or receipt.get("target_reanalyzer_checkpoint") != target["producer_checkpoint"]
+        or receipt.get("target_operator_contract") != target["authority"]["contract"]
+        or receipt.get("search") != _rebound_search_receipt(legacy["search"], target)
+        or receipt.get("runtime") != legacy["runtime"]
+        or receipt.get("counts") != legacy["counts"]
+    ):
+        raise ExecutorError("Stage-C rebound semantic identity drifted")
+    artifact = receipt.get("artifact")
+    if not isinstance(artifact, Mapping):
+        raise ExecutorError("Stage-C rebound patch artifact is malformed")
+    output = Path(str(artifact["path"])).resolve(strict=True)
+    if (
+        artifact.get("file_sha256") != alignment._file_sha256(output)  # noqa: SLF001
+        or artifact.get("size_bytes") != output.stat().st_size
+    ):
+        raise ExecutorError("Stage-C rebound patch bytes drifted")
+    with np.load(output, allow_pickle=False) as source:
+        arrays = {name: np.asarray(source[name]) for name in source.files}
+    _verify_patch_arrays(arrays, receipt=receipt)
+    legacy_path = Path(str(legacy["artifact"]["path"])).resolve(strict=True)
+    with np.load(legacy_path, allow_pickle=False) as source:
+        old_arrays = {name: np.asarray(source[name]) for name in source.files}
+    mutable = {
+        "target_policy_mask_flat",
+        "target_policy_target_identity_sha256",
+    }
+    if set(arrays) != set(old_arrays) or any(
+        not _arrays_equal(arrays[name], old_arrays[name])
+        for name in arrays
+        if name not in mutable
+    ):
+        raise ExecutorError("Stage-C rebound modified search outputs or row identity")
+    if not np.all(arrays["target_policy_mask_flat"]) or not np.all(
+        arrays["target_policy_target_identity_sha256"].astype(str)
+        == target["identity_sha256"]
+    ):
+        raise ExecutorError("Stage-C rebound mask or target identity is incomplete")
+    return {"path": str(receipt_path), **dict(receipt)}
+
+
 def _verify_merge_receipt(path: Path) -> dict[str, Any]:
     receipt_path, receipt = alignment._load_json(  # noqa: SLF001
         path, where="Stage-C merge receipt"
     )
+    if receipt.get("schema_version") == REBOUND_MERGE_RECEIPT_SCHEMA:
+        return _verify_rebound_merge_receipt(receipt_path, receipt)
     unsigned = dict(receipt)
     stated = unsigned.pop("receipt_sha256", None)
     if (
         receipt.get("schema_version") != MERGE_RECEIPT_SCHEMA
-        or receipt.get("patch_schema_version") != PATCH_SCHEMA
+        or receipt.get("patch_schema_version") not in {PATCH_SCHEMA_V1, PATCH_SCHEMA}
         or stated != _value_sha256(unsigned)
     ):
         raise ExecutorError("Stage-C merge receipt digest drifted")
@@ -1743,7 +2128,50 @@ def _verify_merge_receipt(path: Path) -> dict[str, Any]:
     with np.load(output, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     _verify_patch_arrays(arrays, receipt=receipt)
-    if int(receipt["counts"]["rows"]) != len(arrays["row_index"]):
+    if not executions:
+        raise ExecutorError("Stage-C merge contains no execution receipts")
+    first = executions[0]
+    partitions = int(first["partition"]["partitions"])
+    if (
+        sorted(int(item["partition"]["partition_index"]) for item in executions)
+        != list(range(partitions))
+        or any(
+            int(item["partition"]["partitions"]) != partitions for item in executions
+        )
+        or receipt.get("stage_c_plan") != first["stage_c_plan"]
+        or receipt.get("qualification_receipt") != first["qualification_receipt"]
+        or receipt.get("target_policy_target_identity_sha256")
+        != first["target_policy_target_identity_sha256"]
+        or receipt.get("target_reanalyzer_checkpoint")
+        != first["target_reanalyzer_checkpoint"]
+        or receipt.get("target_operator_contract") != first["target_operator_contract"]
+        or receipt.get("search") != first["search"]
+        or receipt.get("evaluator") != first["evaluator"]
+        or receipt.get("runtime") != first["runtime"]
+    ):
+        raise ExecutorError("Stage-C merge execution authority drifted")
+    ready = _load_ready_subset(first["qualification"])
+    records: dict[int, dict[str, Any]] = {}
+    for execution in executions:
+        for row in range(int(execution["counts"]["rows"])):
+            record = _record_from_patch(execution["arrays"], row)
+            ordinal = int(record["ready_ordinal"])
+            if ordinal in records or not 0 <= ordinal < len(ready["row_index"]):
+                raise ExecutorError("Stage-C merge has duplicate/foreign ready ordinal")
+            records[ordinal] = record
+    if set(records) != set(range(len(ready["row_index"]))):
+        raise ExecutorError("Stage-C merge execution DAG has incomplete row coverage")
+    rebuilt = _patch_arrays([records[index] for index in range(len(records))])
+    if set(rebuilt) != set(arrays) or any(
+        not _arrays_equal(rebuilt[name], arrays[name]) for name in arrays
+    ):
+        raise ExecutorError("Stage-C merged patch differs from its execution DAG")
+    if (
+        int(receipt["counts"]["rows"]) != len(arrays["row_index"])
+        or int(receipt["counts"]["partitions"]) != partitions
+        or int(receipt["counts"]["legal_actions"])
+        != int(arrays["legal_action_offsets"][-1])
+    ):
         raise ExecutorError("Stage-C merged row count drifted")
     return {"path": str(receipt_path), **receipt}
 
@@ -1794,6 +2222,13 @@ def build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--write", required=True, type=Path)
     verify_merge = commands.add_parser("verify-merge")
     verify_merge.add_argument("--receipt", required=True, type=Path)
+    rebind = commands.add_parser(
+        "rebind-legacy-merge",
+        help="rebind one authenticated v1 full-search DAG to the complete v2 identity",
+    )
+    rebind.add_argument("--receipt", required=True, type=Path)
+    rebind.add_argument("--output", required=True, type=Path)
+    rebind.add_argument("--write", required=True, type=Path)
     return parser
 
 
@@ -1823,6 +2258,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         elif args.command == "merge":
             result = _merge_executions(args)
+            alignment._write_json_immutable(args.write, result)  # noqa: SLF001
+        elif args.command == "rebind-legacy-merge":
+            result = _rebind_legacy_merge(args)
             alignment._write_json_immutable(args.write, result)  # noqa: SLF001
         else:
             result = _verify_merge_receipt(args.receipt)

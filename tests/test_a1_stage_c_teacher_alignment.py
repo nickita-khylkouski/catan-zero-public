@@ -30,6 +30,36 @@ def test_semantic_bundle_uses_only_explicit_sealed_operator_fallback() -> None:
         )
 
 
+def test_complete_effective_search_config_binds_resolved_defaults() -> None:
+    effective = alignment._complete_effective_search_config(  # noqa: SLF001
+        {"n_full": 128, "c_scale": 0.1}
+    )
+
+    assert "seed" not in effective
+    assert effective["n_full"] == 128
+    assert effective["policy_target_min_visits"] == 0
+    assert effective["max_root_candidates"] == 16
+    assert effective["rng_stream_separation"] is False
+    assert set(effective) == {
+        field.name
+        for field in __import__("dataclasses").fields(alignment.GumbelChanceMCTSConfig)
+        if field.name != "seed"
+    }
+
+
+def test_stage_c_execution_identity_is_forced_full_and_seed_schema_bound() -> None:
+    execution = alignment.STAGE_C_TARGET_EXECUTION
+
+    assert execution == {
+        "schema_version": "a1-stage-c-target-execution-v1",
+        "mode": "forced_full_root_reanalysis",
+        "force_full_override": True,
+        "effective_simulations": 128,
+        "budget_source": "force_full_overrides_playout_cap_and_wide_root_gates",
+        "row_seed_schema": alignment.STAGE_C_ROW_SEED_SCHEMA,
+    }
+
+
 def test_operator_mismatch_quarantines_only_stored_policy() -> None:
     active = np.asarray([False, True, True, False], dtype=np.bool_)
 

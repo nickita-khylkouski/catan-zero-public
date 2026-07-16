@@ -313,7 +313,7 @@ def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
         "q_values_root_perspective": True,
         **provenance,
         "legal_action_ids": np.asarray([11, 13], dtype=np.int32),
-        "target_policy": np.asarray([0.7, 0.3], dtype=np.float32),
+        "target_policy": np.asarray([1.0, 0.0], dtype=np.float32),
         "target_policy_mask": np.asarray([True, True]),
         "target_scores": np.asarray([0.4, np.nan], dtype=np.float32),
         "target_scores_mask": np.asarray([True, False]),
@@ -323,6 +323,7 @@ def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
     }
     arrays = executor._patch_arrays([record])
     receipt = {
+        "patch_schema_version": executor.PATCH_SCHEMA,
         "patch_columns": sorted(arrays),
         "counts": {"rows": 1, "legal_actions": 2},
         "target_policy_target_identity_sha256": provenance[
@@ -340,3 +341,43 @@ def test_ragged_target_patch_is_complete_and_uses_neutral_reliability() -> None:
     assert arrays["legal_action_offsets"].tolist() == [0, 2]
     assert arrays["target_reliability_audited"].tolist() == [False]
     assert arrays["target_reliability_confidence"].tolist() == [1.0]
+    assert arrays["target_policy_mask_flat"].tolist() == [True, True]
+
+
+def test_portable_runtime_verifies_historical_git_blobs_not_current_tree(
+    monkeypatch, tmp_path
+) -> None:
+    native = tmp_path / "native.so"
+    native.write_bytes(b"sealed native")
+    commit = "a" * 40
+    sources = [
+        {"path": path, "file_sha256": f"sha256:{index:064x}"}
+        for index, path in enumerate(sorted(executor.RUNTIME_SOURCE_PATHS), 1)
+    ]
+    runtime = {
+        "schema_version": "a1-stage-c-reconstruction-runtime-v1",
+        "repo_commit": commit,
+        "sources": sources,
+        "native_runtime": {
+            "path": str(native),
+            "file_sha256": executor.alignment._file_sha256(native),
+            "distribution_version": "0.1.10",
+            "capabilities": sorted(executor.REQUIRED_COHERENT_CAPABILITIES),
+        },
+    }
+    runtime["runtime_sha256"] = executor._value_sha256(runtime)
+    expected = {item["path"]: item["file_sha256"] for item in sources}
+    monkeypatch.setattr(
+        executor,
+        "_git_blob_sha256",
+        lambda resolved_commit, path: (
+            expected[path] if resolved_commit == commit else "wrong"
+        ),
+    )
+    monkeypatch.setattr(
+        executor.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0),
+    )
+
+    executor._verify_runtime_attestation(runtime, require_current=False)
