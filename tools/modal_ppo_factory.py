@@ -79,6 +79,185 @@ DEFAULT_LAG_STALL_SLEEP = 10.0
 # 75 containers — poll the published version at most this often (overridable via --policy-poll-secs).
 DEFAULT_POLICY_POLL_SECS = 15.0
 
+_RUN_MANIFEST_JSON_KEY = "run_manifest_json"
+_RUN_MANIFEST_SHA256_KEY = "run_manifest_sha256"
+
+
+def _actor_manifest_science(manifest: Any) -> dict[str, Any]:
+    """Return every actor-science field owned by a v2 run manifest."""
+    identity = manifest.spec.identity
+    actor = manifest.spec.actor
+    return {
+        "architecture": identity.architecture,
+        "track": identity.track,
+        "vps_to_win": identity.vps_to_win,
+        "max_decisions": actor.max_decisions,
+        "games_per_shard": actor.games_per_shard,
+        "gamma": actor.gamma,
+        "gae_lambda": actor.gae_lambda,
+        "action_temperature": actor.action_temperature,
+        "value_shaping_coef": actor.value_shaping_coef,
+        "value_shaping_scale": actor.value_shaping_scale,
+        "value_shaping_opponent_penalty": actor.value_shaping_opponent_penalty,
+        "seed": actor.seed,
+        "opponent_mode": actor.opponent_mode,
+        # The manifest order is behaviorally significant. Never sort it.
+        "opponents": ",".join(actor.opponents),
+        "pfsp_mode": actor.pfsp_mode,
+    }
+
+
+def _actor_container_manifest_science(
+    manifest: Any, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Account for the launcher's deterministic per-container seed partition."""
+    science = _actor_manifest_science(manifest)
+    worker_id = str(payload.get("worker_id", ""))
+    prefix = "actor_"
+    suffix = worker_id.removeprefix(prefix)
+    if worker_id.startswith(prefix) and suffix.isdigit():
+        science["seed"] += int(suffix) * max(1, int(payload["games_per_worker"]))
+    return science
+
+
+def _learner_manifest_science(manifest: Any) -> dict[str, Any]:
+    """Return the legacy learner fields exposed by the Modal entrypoints."""
+    identity = manifest.spec.identity
+    actor = manifest.spec.actor
+    learner = manifest.spec.learner
+    return {
+        "architecture": identity.architecture,
+        "max_steps": learner.max_steps,
+        "shards_per_step": learner.shards_per_step,
+        "max_staleness": learner.max_staleness,
+        "lr": learner.lr,
+        "clip_ratio": learner.clip_ratio,
+        "value_coef": learner.value_coef,
+        "entropy_coef": learner.entropy_coef,
+        "ppo_epochs": learner.ppo_epochs,
+        "minibatch_size": learner.minibatch_size,
+        "behavior_temperature": actor.action_temperature,
+        "gamma": actor.gamma,
+        "gae_lambda": actor.gae_lambda,
+        "vtrace_clip_rho": learner.vtrace_clip_rho,
+        "vtrace_clip_pg_rho": learner.vtrace_clip_pg_rho,
+        "advantage_normalization": learner.advantage_normalization,
+        "vtrace_forward_chunk": learner.vtrace_forward_chunk,
+        "use_vtrace": learner.use_vtrace,
+    }
+
+
+def _reject_manifest_science_conflicts(
+    payload: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    conflicts = {
+        key: (payload[key], expected_value)
+        for key, expected_value in expected.items()
+        if key in payload and payload[key] != expected_value
+    }
+    if conflicts:
+        details = ", ".join(
+            f"{key}={actual!r} (manifest {wanted!r})"
+            for key, (actual, wanted) in sorted(conflicts.items())
+        )
+        raise ValueError(f"run manifest conflicts with legacy science: {details}")
+
+
+def _verify_manifest_initializer(
+    manifest: Any,
+    init_checkpoint: str,
+    *,
+    required: bool,
+) -> None:
+    """Hash initializer bytes when visible; containers require them to exist."""
+    from catan_zero.rl import ppo_distributed as ppd
+
+    path = Path(init_checkpoint)
+    if not path.is_file():
+        if required:
+            raise RuntimeError(f"cannot hash init checkpoint: file not found: {path}")
+        return
+    actual = f"sha256:{ppd.checkpoint_sha256(path)}"
+    expected = manifest.spec.identity.initializer_sha256
+    if actual != expected:
+        raise ValueError(
+            "init checkpoint SHA-256 does not match run manifest identity: "
+            f"expected={expected} actual={actual}"
+        )
+
+
+def _bound_manifest_from_payload(
+    payload: dict[str, Any],
+    *,
+    init_checkpoint: str,
+    require_initializer: bool,
+) -> Any | None:
+    """Reconstruct and authenticate an optional canonical manifest envelope."""
+    from catan_zero.rl.ppo_run_manifest import PPORunManifest
+
+    raw = payload.get(_RUN_MANIFEST_JSON_KEY)
+    claimed_sha256 = payload.get(_RUN_MANIFEST_SHA256_KEY)
+    if raw is None and claimed_sha256 is None:
+        return None
+    if type(raw) is not str or type(claimed_sha256) is not str:
+        raise ValueError("run manifest payload requires canonical JSON and SHA-256")
+    manifest = PPORunManifest.from_json(raw)
+    if manifest.status != "bound":
+        raise ValueError("run manifest must have status='bound'; templates cannot run")
+    actual_sha256 = manifest.sha256()
+    if claimed_sha256 != actual_sha256:
+        raise ValueError(
+            "run manifest SHA-256 mismatch: "
+            f"expected={claimed_sha256} actual={actual_sha256}"
+        )
+    if raw != manifest.canonical_json():
+        raise ValueError("run manifest payload must use canonical JSON")
+    _verify_manifest_initializer(
+        manifest, init_checkpoint, required=require_initializer
+    )
+    return manifest
+
+
+def _manifest_envelope_from_path(
+    run_manifest: str,
+    *,
+    init_checkpoint: str,
+) -> tuple[Any, dict[str, str]]:
+    """Load a local manifest once and prepare its authenticated Modal payload."""
+    from catan_zero.rl.ppo_run_manifest import load_manifest
+
+    manifest = load_manifest(run_manifest)
+    if manifest.status != "bound":
+        raise ValueError("run manifest must have status='bound'; templates cannot run")
+    _verify_manifest_initializer(manifest, init_checkpoint, required=False)
+    return manifest, {
+        _RUN_MANIFEST_JSON_KEY: manifest.canonical_json(),
+        _RUN_MANIFEST_SHA256_KEY: manifest.sha256(),
+    }
+
+
+def _add_learner_manifest(
+    payload: dict[str, Any],
+    run_manifest: str | None,
+) -> dict[str, Any]:
+    if run_manifest is None:
+        return payload
+    manifest, envelope = _manifest_envelope_from_path(
+        run_manifest, init_checkpoint=str(payload["init_checkpoint"])
+    )
+    science = _learner_manifest_science(manifest)
+    _reject_manifest_science_conflicts(payload, science)
+    payload.update(science)
+    payload.update(envelope)
+    return payload
+
+
+def _run_manifest_chunk_fields(payload: dict[str, Any]) -> dict[str, str]:
+    """Propagate authenticated v2 identity to every child-process chunk."""
+    value = payload.get(_RUN_MANIFEST_SHA256_KEY)
+    return {} if value is None else {_RUN_MANIFEST_SHA256_KEY: str(value)}
+
+
 # The actor fleet needs torch + catanatron on top of the teacher-factory image.
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -402,7 +581,12 @@ def _run_actor_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
 
             if games_in_buffer >= games_per_shard:
                 path = ppd.write_trajectory_shard(
-                    root, worker_id, shard_index, buffer, policy_version=policy_version
+                    root,
+                    worker_id,
+                    shard_index,
+                    buffer,
+                    policy_version=policy_version,
+                    run_manifest_sha256=chunk.get(_RUN_MANIFEST_SHA256_KEY),
                 )
                 shard_paths.append(str(path))
                 samples_written += samples_in_buffer
@@ -413,7 +597,12 @@ def _run_actor_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
 
     if buffer:
         path = ppd.write_trajectory_shard(
-            root, worker_id, shard_index, buffer, policy_version=policy_version
+            root,
+            worker_id,
+            shard_index,
+            buffer,
+            policy_version=policy_version,
+            run_manifest_sha256=chunk.get(_RUN_MANIFEST_SHA256_KEY),
         )
         shard_paths.append(str(path))
         samples_written += samples_in_buffer
@@ -500,8 +689,29 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
     root = ppd.run_root(VOLUME_ROOT, run_name)
-    ppd.ensure_run_dirs(root)
-    volume.reload()  # see any weights/league the learner has already published
+    has_manifest_payload = any(
+        key in payload for key in (_RUN_MANIFEST_JSON_KEY, _RUN_MANIFEST_SHA256_KEY)
+    )
+    if has_manifest_payload:
+        volume.reload()  # make initializer and any existing binding visible first
+        manifest = _bound_manifest_from_payload(
+            payload,
+            init_checkpoint=str(payload["init_checkpoint"]),
+            require_initializer=True,
+        )
+        assert manifest is not None
+        _reject_manifest_science_conflicts(
+            payload, _actor_container_manifest_science(manifest, payload)
+        )
+        # Bind before any runtime read/write. This preserves the v2 pristine-root guard.
+        ppd.bind_run_manifest(root, manifest)
+        ppd.ensure_run_dirs(root)
+        # Publish the immutable identity before any actor can poll or emit data.
+        volume.commit()
+    else:
+        manifest = None
+        ppd.ensure_run_dirs(root)
+        volume.reload()  # preserve the historical legacy ordering
 
     # ---- cold-start gating (FIX H3): block-poll until the learner has published a real version
     #      so the first wave doesn't produce version-0 BC shards the learner will drop as stale. ----
@@ -540,14 +750,15 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
     # version observed above. The actor verifies the same initializer and
     # behavior distribution before producing any shard; a timeout fallback may
     # create it, but can never overwrite a conflicting learner contract.
-    ppd.bind_run_contract(
-        root,
-        init_checkpoint=payload["init_checkpoint"],
-        architecture=architecture,
-        gamma=rollout_contract["gamma"],
-        gae_lambda=rollout_contract["gae_lambda"],
-        behavior_temperature=rollout_contract["action_temperature"],
-    )
+    if manifest is None:
+        ppd.bind_run_contract(
+            root,
+            init_checkpoint=payload["init_checkpoint"],
+            architecture=architecture,
+            gamma=rollout_contract["gamma"],
+            gae_lambda=rollout_contract["gae_lambda"],
+            behavior_temperature=rollout_contract["action_temperature"],
+        )
 
     # ---- per-process shard namespaces: each of the cpu_workers processes owns a disjoint
     #      worker_id so their shard files never collide on disk. ----
@@ -651,6 +862,7 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
                         "opponents": payload.get("opponents", DEFAULT_OPPONENTS),
                         "pfsp_mode": payload.get("pfsp_mode", "pfsp"),
                         "opponent_cache_size": opponent_cache_size,
+                        **_run_manifest_chunk_fields(payload),
                         **rollout_contract,
                         "value_shaping_coef": payload.get("value_shaping_coef", 0.0),
                         "value_shaping_scale": payload.get("value_shaping_scale", 100.0),
@@ -762,34 +974,67 @@ def ppo_learner(config_payload: dict[str, Any]) -> dict[str, Any]:
     architecture = str(config_payload.get("architecture", "entity_graph"))
     device = str(config_payload.get("device", "cuda"))
 
-    # Make sure the run dirs exist before the learner scans them (matches actor-side bootstrap).
-    from catan_zero.rl import ppo_distributed as ppd
+    has_manifest_payload = any(
+        key in config_payload
+        for key in (_RUN_MANIFEST_JSON_KEY, _RUN_MANIFEST_SHA256_KEY)
+    )
+    if has_manifest_payload:
+        volume.reload()
+        manifest = _bound_manifest_from_payload(
+            config_payload,
+            init_checkpoint=init_checkpoint,
+            require_initializer=True,
+        )
+        assert manifest is not None
+        _reject_manifest_science_conflicts(
+            config_payload, _learner_manifest_science(manifest)
+        )
+        # The learner's v2 binder requires a pristine run root. Keep the input
+        # manifest in /tmp; train() will bind its canonical contents into the root.
+        manifest_path = Path("/tmp") / (
+            "catan_zero_ppo_" + manifest.sha256().removeprefix("sha256:") + ".json"
+        )
+        manifest_path.write_text(manifest.canonical_json(), encoding="utf-8")
+        config, _args = learner.resolve_config(
+            [
+                "--run-manifest",
+                str(manifest_path),
+                "--run-base",
+                run_base,
+                "--run-name",
+                run_name,
+                "--init-checkpoint",
+                init_checkpoint,
+                "--device",
+                device,
+            ]
+        )
+    else:
+        # Preserve the historical construction path byte-for-byte in legacy mode.
+        from catan_zero.rl import ppo_distributed as ppd
 
-    ppd.ensure_run_dirs(ppd.run_root(run_base, run_name))
-    volume.reload()
+        manifest = None
+        ppd.ensure_run_dirs(ppd.run_root(run_base, run_name))
+        volume.reload()
+        LearnerConfig = getattr(learner, "LearnerConfig")
+        known_fields = set(getattr(LearnerConfig, "__dataclass_fields__", {}).keys())
+        cfg_kwargs: dict[str, Any] = {
+            "run_base": run_base,
+            "run_name": run_name,
+            "init_checkpoint": init_checkpoint,
+            "architecture": architecture,
+            "device": device,
+        }
+        for key, value in config_payload.items():
+            if key in known_fields and key not in cfg_kwargs:
+                cfg_kwargs[key] = value
+        cfg_kwargs = {
+            k: v for k, v in cfg_kwargs.items() if not known_fields or k in known_fields
+        }
+        config = LearnerConfig(**cfg_kwargs)
 
-    # Build the learner config. Prefer the module's LearnerConfig dataclass; only pass keys it
-    # actually declares so we tolerate the parallel edits to its field set.
-    LearnerConfig = getattr(learner, "LearnerConfig")
-    known_fields = set(getattr(LearnerConfig, "__dataclass_fields__", {}).keys())
-    cfg_kwargs: dict[str, Any] = {
-        "run_base": run_base,
-        "run_name": run_name,
-        "init_checkpoint": init_checkpoint,
-        "architecture": architecture,
-        "device": device,
-    }
-    # Overlay any extra learner knobs the caller passed (lr, shards_per_step, max_steps, ...).
-    for key, value in config_payload.items():
-        if key in known_fields and key not in cfg_kwargs:
-            cfg_kwargs[key] = value
-    cfg_kwargs = {k: v for k, v in cfg_kwargs.items() if not known_fields or k in known_fields}
-    config = LearnerConfig(**cfg_kwargs)
-
-    # The learner reloads the Modal volume before each shard scan via ``volume_reload_fn`` and
-    # PERSISTS freshly-published weights with ``volume_commit_fn`` (FIX H2-wiring) so actors can
-    # see each new policy version. The learner agent threads both hooks through ``train``; we pass
-    # both and fall back defensively if either param isn't wired yet. Reference callables defensively.
+    # The checked-out learner contract requires both volume hooks. Invoke it once and let any
+    # runtime TypeError propagate: retrying after a partial update can duplicate training work.
     reload_fn = volume.reload
     commit_fn = volume.commit
     train_fn = getattr(learner, "train", None)
@@ -797,28 +1042,25 @@ def ppo_learner(config_payload: dict[str, Any]) -> dict[str, Any]:
 
     started = time.perf_counter()
     if callable(train_fn):
-        try:
-            # Preferred: both hooks present.
-            train_fn(  # type: ignore[call-arg]
-                config, volume_reload_fn=reload_fn, volume_commit_fn=commit_fn
-            )
-        except TypeError:
-            # ``volume_commit_fn`` not added yet (parallel edit in flight): try reload-only.
-            try:
-                train_fn(config, volume_reload_fn=reload_fn)  # type: ignore[call-arg]
-            except TypeError:
-                # Neither hook wired yet: fall back to the plain signature.
-                train_fn(config)
-    elif callable(main_fn):
-        main_fn(
-            [
-                "--run-base", run_base,
-                "--run-name", run_name,
-                "--init-checkpoint", init_checkpoint,
-                "--architecture", architecture,
-                "--device", device,
-            ]
+        train_fn(  # type: ignore[call-arg]
+            config, volume_reload_fn=reload_fn, volume_commit_fn=commit_fn
         )
+    elif callable(main_fn):
+        argv = [
+            "--run-base",
+            run_base,
+            "--run-name",
+            run_name,
+            "--init-checkpoint",
+            init_checkpoint,
+            "--device",
+            device,
+        ]
+        if manifest is not None:
+            argv[0:0] = ["--run-manifest", str(manifest_path)]
+        else:
+            argv.extend(["--architecture", architecture])
+        main_fn(argv)
     else:  # pragma: no cover - defensive
         raise RuntimeError("ppo_distributed_learner exposes neither train() nor main()")
 
@@ -865,8 +1107,51 @@ def _payloads(
     value_shaping_scale: float,
     value_shaping_opponent_penalty: float,
     action_temperature: float,
+    run_manifest: str | None = None,
 ) -> list[dict[str, Any]]:
     from catan_zero.rl.ppo_policy_factory import validate_canonical_ppo_actor_contract
+
+    manifest_envelope: dict[str, str] = {}
+    if run_manifest is not None:
+        manifest, manifest_envelope = _manifest_envelope_from_path(
+            run_manifest, init_checkpoint=init_checkpoint
+        )
+        supplied_science = {
+            "architecture": architecture,
+            "track": track,
+            "vps_to_win": vps_to_win,
+            "max_decisions": max_decisions,
+            "games_per_shard": games_per_shard,
+            "gamma": gamma,
+            "gae_lambda": gae_lambda,
+            "action_temperature": action_temperature,
+            "value_shaping_coef": value_shaping_coef,
+            "value_shaping_scale": value_shaping_scale,
+            "value_shaping_opponent_penalty": value_shaping_opponent_penalty,
+            "seed": seed,
+            "opponent_mode": opponent_mode,
+            "opponents": opponents,
+            "pfsp_mode": pfsp_mode,
+        }
+        manifest_science = _actor_manifest_science(manifest)
+        _reject_manifest_science_conflicts(supplied_science, manifest_science)
+        architecture = manifest_science["architecture"]
+        track = manifest_science["track"]
+        vps_to_win = manifest_science["vps_to_win"]
+        max_decisions = manifest_science["max_decisions"]
+        games_per_shard = manifest_science["games_per_shard"]
+        gamma = manifest_science["gamma"]
+        gae_lambda = manifest_science["gae_lambda"]
+        action_temperature = manifest_science["action_temperature"]
+        value_shaping_coef = manifest_science["value_shaping_coef"]
+        value_shaping_scale = manifest_science["value_shaping_scale"]
+        value_shaping_opponent_penalty = manifest_science[
+            "value_shaping_opponent_penalty"
+        ]
+        seed = manifest_science["seed"]
+        opponent_mode = manifest_science["opponent_mode"]
+        opponents = manifest_science["opponents"]
+        pfsp_mode = manifest_science["pfsp_mode"]
 
     validate_canonical_ppo_actor_contract(
         architecture=architecture,
@@ -906,6 +1191,7 @@ def _payloads(
             "value_shaping_scale": value_shaping_scale,
             "value_shaping_opponent_penalty": value_shaping_opponent_penalty,
             "action_temperature": action_temperature,
+            **manifest_envelope,
         }
         for index in range(containers)
     ]
@@ -943,6 +1229,7 @@ def _launch(
     value_shaping_scale: float,
     value_shaping_opponent_penalty: float,
     action_temperature: float,
+    run_manifest: str | None = None,
 ) -> None:
     started = time.perf_counter()
     run_id = f"{run_name}-{uuid.uuid4().hex[:12]}"
@@ -977,6 +1264,7 @@ def _launch(
         value_shaping_scale=value_shaping_scale,
         value_shaping_opponent_penalty=value_shaping_opponent_penalty,
         action_temperature=action_temperature,
+        run_manifest=run_manifest,
     )
     print(
         json.dumps(
@@ -1231,6 +1519,65 @@ def launch_ppo_actors(
 
 
 @app.local_entrypoint()
+def launch_ppo_actors_from_manifest(
+    run_manifest: str,
+    run_name: str = "ppo_2p10_manifest_v2",
+    init_checkpoint: str = "/data/bc_warmstart/current.pt",
+    containers: int = 75,
+    games_per_container: int = 256,
+    cpu_workers: int = 8,
+    commit_every_shards: int = 4,
+    commit_min_secs: float = 30.0,
+    opponent_cache_size: int = DEFAULT_OPPONENT_CACHE_SIZE,
+    cold_start_timeout_secs: float = DEFAULT_COLD_START_TIMEOUT_SECS,
+    policy_poll_secs: float = DEFAULT_POLICY_POLL_SECS,
+    max_actor_lag: int = DEFAULT_MAX_ACTOR_LAG,
+    lag_stall_rounds: int = DEFAULT_LAG_STALL_ROUNDS,
+    lag_stall_sleep: float = DEFAULT_LAG_STALL_SLEEP,
+    device: str = "cpu",
+) -> None:
+    """Launch actors with runtime wiring only; the manifest owns all science."""
+    manifest, _envelope = _manifest_envelope_from_path(
+        run_manifest, init_checkpoint=init_checkpoint
+    )
+    science = _actor_manifest_science(manifest)
+    _launch(
+        run_name=run_name,
+        init_checkpoint=init_checkpoint,
+        containers=containers,
+        games_per_container=games_per_container,
+        cpu_workers=cpu_workers,
+        games_per_shard=science["games_per_shard"],
+        commit_every_shards=commit_every_shards,
+        commit_min_secs=commit_min_secs,
+        opponent_cache_size=opponent_cache_size,
+        # Quantization changes policy numerics and is not part of the v2 manifest identity.
+        quantize_rollout=False,
+        cold_start_timeout_secs=cold_start_timeout_secs,
+        policy_poll_secs=policy_poll_secs,
+        max_actor_lag=max_actor_lag,
+        lag_stall_rounds=lag_stall_rounds,
+        lag_stall_sleep=lag_stall_sleep,
+        seed=science["seed"],
+        architecture=science["architecture"],
+        device=device,
+        track=science["track"],
+        vps_to_win=science["vps_to_win"],
+        max_decisions=science["max_decisions"],
+        opponent_mode=science["opponent_mode"],
+        opponents=science["opponents"],
+        pfsp_mode=science["pfsp_mode"],
+        gamma=science["gamma"],
+        gae_lambda=science["gae_lambda"],
+        value_shaping_coef=science["value_shaping_coef"],
+        value_shaping_scale=science["value_shaping_scale"],
+        value_shaping_opponent_penalty=science["value_shaping_opponent_penalty"],
+        action_temperature=science["action_temperature"],
+        run_manifest=run_manifest,
+    )
+
+
+@app.local_entrypoint()
 def launch_learner(
     run_name: str = "ppo_2p10_actors_600cpu_v1",
     init_checkpoint: str = "/data/bc_warmstart/current.pt",
@@ -1331,6 +1678,74 @@ def launch_learner(
         ),
         flush=True,
     )
+
+
+@app.local_entrypoint()
+def launch_learner_from_manifest(
+    run_manifest: str,
+    run_name: str = "ppo_2p10_manifest_v2",
+    init_checkpoint: str = "/data/bc_warmstart/current.pt",
+    run_base: str = str(VOLUME_ROOT),
+    device: str = "cuda",
+    blocking: bool = False,
+) -> None:
+    """Launch the fixed-A100 learner with runtime wiring only."""
+    payload = _add_learner_manifest(
+        {
+            "run_name": run_name,
+            "init_checkpoint": init_checkpoint,
+            "run_base": run_base,
+            "device": device,
+        },
+        run_manifest,
+    )
+    science = _learner_manifest_science(
+        _bound_manifest_from_payload(
+            payload,
+            init_checkpoint=init_checkpoint,
+            require_initializer=False,
+        )
+    )
+    print(
+        json.dumps(
+            {
+                "progress": "modal_ppo_manifest_learner_launch",
+                "run_name": run_name,
+                "run_base": run_base,
+                "gpu": "A100",
+                "device": device,
+                "run_manifest_sha256": payload[_RUN_MANIFEST_SHA256_KEY],
+                "max_steps": science["max_steps"],
+                "lr": science["lr"],
+                "minibatch_size": science["minibatch_size"],
+                "blocking": blocking,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    if blocking:
+        result = ppo_learner.remote(payload)
+        print(
+            json.dumps(
+                {"progress": "modal_ppo_manifest_learner_done", "result": result},
+                default=str,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    else:
+        handle = ppo_learner.spawn(payload)
+        print(
+            json.dumps(
+                {
+                    "progress": "modal_ppo_manifest_learner_spawned",
+                    "object_id": getattr(handle, "object_id", None),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
 
 @app.local_entrypoint()
