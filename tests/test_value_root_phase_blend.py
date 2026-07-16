@@ -44,6 +44,34 @@ def _data() -> dict[str, np.ndarray]:
     }
 
 
+def _lower_level_test_regime(
+    *, phases=("DISCARD", "MOVE_ROBBER", "PLAY_TURN"), global_compat=False
+) -> dict[str, object]:
+    return {
+        "schema_version": "value-root-blend-regime-v1",
+        "mode": "global_compat" if global_compat else "phase_gated",
+        "lambda": 0.5,
+        "phases": list(phases),
+    }
+
+
+@pytest.mark.parametrize(
+    ("phases", "compat"),
+    [
+        ("DISCARD,MOVE_ROBBER,PLAY_TURN", False),
+        ("", False),
+        ("", True),
+    ],
+)
+def test_nonunit_lambda_is_unconditionally_disabled_without_target_authority(
+    phases: str, compat: bool
+) -> None:
+    with pytest.raises(
+        SystemExit, match="authenticated root-target admission is not implemented"
+    ):
+        _resolve_value_root_blend_regime(_args(phases=phases, compat=compat))
+
+
 def test_mature_phase_mask_excludes_opening_and_invalid_roots() -> None:
     data = _data()
     batch = np.arange(6, dtype=np.int64)
@@ -64,7 +92,7 @@ def test_mature_phase_audit_records_realized_operator_and_public_provenance() ->
     report = _audit_value_root_blend_corpus(
         _data(),
         np.asarray([1, 1, 2, 3, 4, 5], dtype=np.float32),
-        regime=_resolve_value_root_blend_regime(_args()),
+        regime=_lower_level_test_regime(),
     )
 
     assert report["mode"] == "phase_gated"
@@ -87,7 +115,7 @@ def test_requested_blend_with_zero_realized_rows_fails_closed() -> None:
         _audit_value_root_blend_corpus(
             data,
             np.ones(6, dtype=np.float32),
-            regime=_resolve_value_root_blend_regime(_args()),
+            regime=_lower_level_test_regime(),
         )
 
 
@@ -96,7 +124,7 @@ def test_requested_blend_with_zero_training_mass_fails_closed() -> None:
         _audit_value_root_blend_corpus(
             _data(),
             np.zeros(6, dtype=np.float32),
-            regime=_resolve_value_root_blend_regime(_args()),
+            regime=_lower_level_test_regime(),
         )
 
 
@@ -108,19 +136,22 @@ def test_masked_invalid_root_values_fail_closed(root: float) -> None:
         _audit_value_root_blend_corpus(
             data,
             np.ones(6, dtype=np.float32),
-            regime=_resolve_value_root_blend_regime(_args()),
+            regime=_lower_level_test_regime(),
         )
 
 
-def test_nonunit_lambda_requires_explicit_scope_and_unknown_phase_is_rejected() -> None:
-    with pytest.raises(SystemExit, match="explicit target-information scope"):
+def test_nonunit_lambda_is_disabled_even_without_scope() -> None:
+    with pytest.raises(SystemExit, match="authenticated root-target admission"):
         _resolve_value_root_blend_regime(_args(phases=""))
+
+
+def test_unknown_phase_is_rejected() -> None:
     with pytest.raises(SystemExit, match="unknown --value-root-blend-phases"):
         _resolve_value_root_blend_regime(_args(phases="MAGIC"))
 
 
-def test_global_behavior_exists_only_as_explicit_compatibility() -> None:
-    regime = _resolve_value_root_blend_regime(_args(phases="", compat=True))
+def test_lower_level_global_audit_remains_testable_but_is_not_cli_admitted() -> None:
+    regime = _lower_level_test_regime(phases=(), global_compat=True)
     assert regime["mode"] == "global_compat"
     report = _audit_value_root_blend_corpus(
         _data(), np.ones(6, dtype=np.float32), regime=regime
@@ -137,13 +168,13 @@ def test_lambda_one_remains_disabled_exact_noop_without_root_column() -> None:
     assert report["blended_rows"] == 0
 
 
-def test_checkpoint_value_metadata_carries_realized_blend_audit() -> None:
-    args = _args()
+def test_checkpoint_value_metadata_carries_disabled_blend_audit() -> None:
+    args = _args(lam=1.0, phases="")
     args.value_head_type = "mse"
     args.hlgauss_scalar_aux_loss_weight = 0.0
     args.value_hlgauss_sigma_ratio = 0.75
     args.truncated_vp_margin_value_weight = 0.0
-    args.value_root_blend_audit = {"eligible_rows": 3, "blended_weighted_mass": 9.0}
+    args.value_root_blend_audit = {"eligible_rows": 0, "blended_weighted_mass": 0.0}
     metadata = _value_training_metadata(
         args,
         scalar_weight=0.25,
@@ -155,5 +186,5 @@ def test_checkpoint_value_metadata_carries_realized_blend_audit() -> None:
         categorical_training_weight_sum=0.0,
     )
 
-    assert metadata["value_root_blend_regime"]["mode"] == "phase_gated"
-    assert metadata["value_root_blend_audit"]["eligible_rows"] == 3
+    assert metadata["value_root_blend_regime"]["mode"] == "disabled"
+    assert metadata["value_root_blend_audit"]["eligible_rows"] == 0

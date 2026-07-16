@@ -1543,26 +1543,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help=(
-            "MuZero/ReZero-style value-target blend (CAT-39, arXiv:2404.16364): value target "
-            "= lambda*z + (1-lambda)*V_search on rows carrying a stored search root value "
-            "(the `root_value` / `root_value_mask` shard columns). 1.0 (default) is a pure "
-            "no-op (pure realised-outcome z). Non-unit values require an explicit phase "
-            "scope (or the named global-compatibility mode) and fail closed when no eligible "
-            "root rows exist. The "
-            "blend is applied in DISTRIBUTION space for the HL-Gauss head (project z and "
-            "V_search each to a categorical distribution, then mix) and in scalar space for "
-            "the MSE control arm -- the two are consistent because HL-Gauss preserves the "
-            "expectation and blending is linear."
+            "Reserved MuZero/ReZero-style value-target blend. Only 1.0 (pure "
+            "realised-outcome z) is currently admitted. Non-unit values fail "
+            "closed until root targets have authenticated producer, operator, "
+            "payload, and per-row-mask authority."
         ),
     )
     parser.add_argument(
         "--value-root-blend-phases",
         default="",
         help=(
-            "Comma-separated authoritative game phases eligible for the search-root "
-            "value blend. Example: DISCARD,MOVE_ROBBER,PLAY_TURN. When lambda < 1, "
-            "either this option or --value-root-blend-global-compat is required. "
-            "Opening placement/road rows remain pure outcome targets unless named."
+            "Reserved comma-separated phase scope for a future authenticated "
+            "search-root value blend. Non-empty values do not enable the blend "
+            "while --value-target-lambda is restricted to 1.0."
         ),
     )
     parser.add_argument(
@@ -1570,8 +1563,9 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Explicit compatibility mode for the historical behavior that blends every "
-            "valid root-value row. Mutually exclusive with --value-root-blend-phases."
+            "Reserved historical global root-blend scope. It remains mutually "
+            "exclusive with --value-root-blend-phases and cannot enable a "
+            "non-unit blend without authenticated target admission."
         ),
     )
     parser.add_argument(
@@ -29584,11 +29578,11 @@ def _parse_value_root_blend_phases(value: str | tuple[str, ...]) -> tuple[str, .
 
 
 def _resolve_value_root_blend_regime(args) -> dict[str, object]:
-    """Resolve the root-value target operator, requiring explicit scope.
+    """Keep root-target blending disabled until its authority is authenticated.
 
-    ``lambda=1`` stays an exact no-op. A non-unit lambda may either target named
-    phases or request the historical global operator explicitly; it can never
-    silently fall back to global blending.
+    ``lambda=1`` stays an exact no-op. Lower-level blend helpers remain in place
+    for eventual authenticated admission and focused operator tests, but neither
+    a phase name nor the legacy global flag is target provenance.
     """
 
     lam = float(getattr(args, "value_target_lambda", 1.0))
@@ -29601,11 +29595,12 @@ def _resolve_value_root_blend_regime(args) -> dict[str, object]:
             "--value-root-blend-phases and --value-root-blend-global-compat are "
             "mutually exclusive"
         )
-    if lam != 1.0 and not phases and not global_compat:
+    if lam != 1.0:
         raise SystemExit(
-            "--value-target-lambda < 1 requires an explicit target-information "
-            "scope: use --value-root-blend-phases or the historical "
-            "--value-root-blend-global-compat"
+            "--value-target-lambda < 1 is disabled because authenticated "
+            "root-target admission is not implemented; use "
+            "--value-target-lambda 1.0 until every active target is bound to "
+            "an authenticated producer, operator, payload, and per-row mask"
         )
     return {
         "schema_version": "value-root-blend-regime-v1",

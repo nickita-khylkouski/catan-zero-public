@@ -19,8 +19,10 @@ diagnostics but cannot be exported into a new learner overlay.
 
 Legacy overlays carrying
 `catan_zero_root_value_materialization_v1` mislabeled a direct forward as a
-post-search backup. `train_bc` rejects them whenever
-`--value-target-lambda < 1`; regenerate those targets with a true search rerun.
+post-search backup. `train_bc` now rejects every `--value-target-lambda < 1`,
+including metadata-free overlays, until authenticated target authority binds
+the producer, operator, payload, and exact eligible-row mask. A true search
+rerun is necessary but is not by itself sufficient for learner admission.
 
 Do not use `target_scores` merely because that column already exists in an older
 corpus. Those modes forward the model's per-action `q_values`. Normal `train_bc`
