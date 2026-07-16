@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from catan_zero.rl.ppo_policy_factory import (
@@ -73,6 +75,28 @@ def test_w7_defaults_are_canonical() -> None:
     assert config.clip_ratio == 0.1
     assert 0.005 <= config.target_kl <= 0.01
     assert 2 <= config.ppo_epochs <= 4
+
+
+def test_explicit_cli_value_equal_to_default_wins_over_config(tmp_path) -> None:
+    config_path = tmp_path / "ppo.json"
+    config_path.write_text(json.dumps({"ppo": {"lr": 9.0e-4}}), encoding="utf-8")
+
+    from_file, _ = resolve_config(
+        ["--config", str(config_path), "--init-checkpoint", "parent.pt"]
+    )
+    explicit_default, _ = resolve_config(
+        [
+            "--config",
+            str(config_path),
+            "--init-checkpoint",
+            "parent.pt",
+            "--lr",
+            "0.0002",
+        ]
+    )
+
+    assert from_file.lr == pytest.approx(9.0e-4)
+    assert explicit_default.lr == pytest.approx(2.0e-4)
 
 
 @pytest.mark.parametrize(

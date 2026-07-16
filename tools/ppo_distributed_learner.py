@@ -48,6 +48,7 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from catan_zero.rl import ppo_distributed as dist  # noqa: E402
+from catan_zero.rl.config_cli import _explicit_cli_dests  # noqa: E402
 from catan_zero.rl.league import League  # noqa: E402
 from catan_zero.rl.ppo_policy_factory import (  # noqa: E402
     CANONICAL_PPO_ARCHITECTURE,
@@ -390,15 +391,17 @@ def load_config_file(path: str | os.PathLike) -> dict[str, Any]:
 def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argparse.Namespace]:
     """Build a LearnerConfig: argparse defaults < config file < explicit CLI flags."""
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(effective_argv)
 
-    # Which dest names did the user set explicitly (vs left at default)? Anything matching the
-    # parser default is treated as "unset" so config-file values can override it.
-    defaults = {action.dest: action.default for action in parser._actions}
+    # Presence in argv, rather than inequality with the parser default, is the
+    # only reliable way to distinguish omission from an explicit value that
+    # happens to equal the default.
+    explicit_dests = _explicit_cli_dests(parser, effective_argv)
     explicit = {
         dest: getattr(args, dest)
-        for dest, default in defaults.items()
-        if dest not in ("help", "config") and getattr(args, dest, default) != default
+        for dest in explicit_dests
+        if dest not in ("help", "config")
     }
 
     cfg_kwargs: dict[str, Any] = {
