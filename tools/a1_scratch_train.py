@@ -308,6 +308,7 @@ def build_train_command(
         ("--attention-heads", "attention_heads"),
         ("--graph-dropout", "graph_dropout"),
         ("--entity-state-trunk", "entity_state_trunk"),
+        ("--value-tower-split-layers", "value_tower_split_layers"),
         ("--entity-feature-adapter-version", "entity_feature_adapter_version"),
         ("--meaningful-public-history-pooling", "meaningful_public_history_pooling"),
         ("--event-history-limit", "event_history_limit"),

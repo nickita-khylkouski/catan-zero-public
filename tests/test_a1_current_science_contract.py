@@ -23,7 +23,9 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     assert model["graph_tokens"] is None
     assert model["public_card_count_residual_bias"] is False
     assert model["public_rule_state_features"] is True
+    assert model["value_tower_split_layers"] == 1
     assert model["actor_public_rule_state"].startswith("dev_used_")
+    assert recipe["value_trunk_grad_scale"] == 0.0
     execution = current_science.learner_execution_topology()
     assert execution == current_science.PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
     assert execution["go_authorized"] is False

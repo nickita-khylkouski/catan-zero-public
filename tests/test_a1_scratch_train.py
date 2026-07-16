@@ -174,6 +174,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--no-resume-optimizer") == 1
     assert command.count("--no-public-card-count-residual-bias") == 1
     assert command.count("--public-rule-state-features") == 1
+    assert command[command.index("--value-tower-split-layers") + 1] == "1"
     assert command.count("--meaningful-public-history-target-gather") == 1
     assert command.count("--entity-feature-adapter-version") == 1
     assert command.count("--fused-optimizer") == 1
@@ -284,6 +285,7 @@ def _runtime_args() -> SimpleNamespace:
         entity_state_trunk=model["entity_state_trunk"],
         static_action_residual=model["static_action_residual"],
         legal_action_value_residual=model["legal_action_value_residual"],
+        value_tower_split_layers=model["value_tower_split_layers"],
         public_card_count_features=model["public_card_count_features"],
         public_card_count_residual_bias=model["public_card_count_residual_bias"],
         public_rule_state_features=model["public_rule_state_features"],

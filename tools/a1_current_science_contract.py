@@ -48,13 +48,13 @@ CURRENT_LEARNER_ENTITY_ADAPTER = (
 )
 CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
     "structured_action_value,card_count_v2,meaningful_history,"
-    "history_target_gather,public_rule_state"
+    "history_target_gather,public_rule_state,value_tower_split1"
 )
 CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
     "entity_graph.static_action_residual+legal_action_value_residual+"
     "public_card_count_features+meaningful_public_history+"
     "meaningful_history_target_gather+"
-    "actor_public_rule_state.v5"
+    "actor_public_rule_state.v5+value_tower_split1"
 )
 CURRENT_MEANINGFUL_HISTORY_POOLING = "ordered_attention_v2"
 PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
@@ -77,10 +77,10 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "fused_optimizer": True,
     "amp": "bf16",
     "value_lr_mult": 1.0,
-    # Policy/value gradients are frequently opposed in the shared trunk. Keep
-    # the value head fully trainable while halving only its shared-trunk
-    # contribution.
-    "value_trunk_grad_scale": 0.5,
+    # Adam can cancel a constant raw-gradient scale through its first/second
+    # moments. The private value suffix learns at full strength while this exact
+    # stop-gradient protects the shared policy prefix.
+    "value_trunk_grad_scale": 0.0,
     # Reporting is part of production admission even though it does not alter
     # the optimizer trajectory. The full scratch dose must prove every
     # commissioned v5 path received gradient and an actual update.
@@ -122,7 +122,9 @@ PRODUCTION_LEARNER_INITIALIZATION_CONTRACT = {
 }
 PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "arch": "entity_graph",
-    "hidden_size": 640,
+    # One private value block adds real capacity; width 632 keeps the complete
+    # split model just below the enforced 40M checkpoint ceiling.
+    "hidden_size": 632,
     "graph_tokens": None,
     "graph_layers": 6,
     "attention_heads": 8,
@@ -130,6 +132,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "entity_state_trunk": "transformer",
     "static_action_residual": True,
     "legal_action_value_residual": True,
+    "value_tower_split_layers": 1,
     "public_card_count_features": True,
     "public_card_count_residual_bias": False,
     "public_rule_state_features": True,

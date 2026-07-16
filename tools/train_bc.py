@@ -8676,6 +8676,8 @@ def _validate_a1_scratch_runtime_projection(
         != model["static_action_residual"],
         "legal_action_value_residual": bool(args.legal_action_value_residual)
         != model["legal_action_value_residual"],
+        "value_tower_split_layers": int(args.value_tower_split_layers)
+        != model["value_tower_split_layers"],
         "public_card_count_features": bool(args.public_card_count_features)
         != model["public_card_count_features"],
         "public_card_count_residual_bias": bool(
