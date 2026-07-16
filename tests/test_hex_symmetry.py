@@ -255,12 +255,28 @@ def test_event_action_zero_relabels_when_masked_present(sym, real_entity):
     entity = {key: np.array(value, copy=True) for key, value in real_entity.items()}
     entity["event_tokens"][0, -1, 35] = 0.0  # exact action id 0
     entity["event_mask"][0, -1] = True
+    entity["event_target_ids"][0, -1, 0] = 0
     g = next(index for index in range(N_SYMMETRIES) if sym.pi_act[index, 0] != 0)
     out = sym.permute_entity_batch(entity, g, relabel_events=True)
     assert out["event_tokens"][0, -1, 35] == pytest.approx(
         sym.pi_act[g, 0] / 607.0,
         abs=5e-4,
     )
+
+
+def test_targetless_event_action_zero_stays_zero_for_every_symmetry(
+    sym, real_entity
+):
+    entity = {key: np.array(value, copy=True) for key, value in real_entity.items()}
+    row = entity["event_tokens"].shape[1] - 1
+    entity["event_tokens"][0, row, 35] = 0.0
+    entity["event_mask"][0, row] = True
+    entity["event_target_ids"][0, row] = -1
+
+    for g in range(N_SYMMETRIES):
+        out = sym.permute_entity_batch(entity, g, relabel_events=True)
+        assert out["event_tokens"][0, row, 35] == 0.0
+        assert np.array_equal(out["event_target_ids"][0, row], [-1, -1, -1, -1])
 
 
 def test_event_spatial_targets_relabel_with_the_same_symmetry(sym, real_entity):

@@ -261,7 +261,34 @@ class HexSymmetry:
                 raise ValueError(
                     f"event_mask shape {present.shape} != event action ids {ids.shape}"
                 )
-            spatial = present & (ids >= 0) & (ids < self.pi_act.shape[1])
+            # Slot 35 historically used 0 both for the valid spatial action id
+            # zero and for "producer did not encode an action id".  Occupancy
+            # alone therefore cannot prove that zero is an action identity.
+            # Require the event's explicit public board target before applying
+            # a D6 action permutation; targetless native history must remain
+            # targetless instead of acquiring a fabricated rotated action id.
+            event_targets = entity.get("event_target_ids")
+            if event_targets is None:
+                has_spatial_target = np.zeros_like(present)
+            else:
+                event_targets = np.asarray(event_targets)
+                if (
+                    event_targets.ndim != 3
+                    or event_targets.shape[:2] != present.shape
+                    or event_targets.shape[2] < 3
+                ):
+                    raise ValueError(
+                        "event_target_ids must be [B,E,>=3] and align with "
+                        f"event_mask: targets={event_targets.shape} "
+                        f"mask={present.shape}"
+                    )
+                has_spatial_target = np.any(event_targets[:, :, :3] >= 0, axis=-1)
+            spatial = (
+                present
+                & has_spatial_target
+                & (ids >= 0)
+                & (ids < self.pi_act.shape[1])
+            )
             ids_c = np.where(spatial, ids, 0)
             mapped_spatial = self.pi_act[g_arr[:, None], ids_c]
             new_ids = np.where(spatial, mapped_spatial, ids)
@@ -275,8 +302,8 @@ class HexSymmetry:
             # edge and therefore describes a different history.  Event targets
             # use the same four-column convention as legal-action targets:
             # (hex, vertex, edge, player).  Player identity is not spatial.
-            if "event_target_ids" in entity:
-                event_targets = np.asarray(entity["event_target_ids"]).copy()
+            if event_targets is not None:
+                event_targets = np.asarray(event_targets).copy()
                 event_targets[:, :, 0] = self._remap_values(
                     event_targets[:, :, 0], fwd_hex
                 )
