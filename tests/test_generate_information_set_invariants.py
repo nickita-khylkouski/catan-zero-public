@@ -48,7 +48,7 @@ def _args(**overrides: object) -> SimpleNamespace:
         ),
         (
             {"belief_chance_spectra": True},
-            "--information-set-search cannot be combined with --belief-chance-spectra",
+            "public-state search cannot be combined with --belief-chance-spectra",
         ),
     ],
 )
