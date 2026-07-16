@@ -19,6 +19,13 @@ one-dose/iteration executor must refuse this v3 production learner; the later
 full retrain must create a native v3 model rather than relabeling or resuming a
 v2 checkpoint.
 
+The same authority now binds the fresh model construction and physical
+execution separately from the logical 4096-row dose. The model enables both
+structured-action residual paths, public-card counts, and meaningful public
+history at construction time. Execution is exactly 8 B200 ranks × 512 rows ×
+one accumulation step; no launcher may reinterpret the logical `1 × 4096`
+recipe as an arbitrary topology.
+
 Generate through the sealed pre-wave control plane. For a direct lane command:
 
 ```bash

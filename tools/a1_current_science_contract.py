@@ -77,6 +77,37 @@ PRODUCTION_LEARNER_INITIALIZATION_CONTRACT = {
     "checkpoint": None,
     "optimizer_state": "fresh",
 }
+PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
+    "arch": "entity_graph",
+    "hidden_size": 640,
+    "graph_layers": 6,
+    "attention_heads": 8,
+    "graph_dropout": 0.05,
+    "entity_state_trunk": "transformer",
+    "static_action_residual": True,
+    "legal_action_value_residual": True,
+    "public_card_count_features": True,
+    "meaningful_public_history": True,
+    "meaningful_public_history_pooling": "masked_mean_v1",
+    "event_history_limit": 32,
+    "mask_hidden_info": True,
+    "entity_feature_adapter_version": (
+        "rust_entity_adapter_v3_structured_action_resources"
+    ),
+    "require_35m_model": True,
+}
+PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT = {
+    "schema_version": "a1-scratch-training-topology-v1",
+    "launcher": "torch.distributed.run",
+    "name": "b200-8gpu-ddp",
+    "world_size": 8,
+    "physical_gpus": list(range(8)),
+    "local_batch_size": 512,
+    "grad_accum_steps": 1,
+    "global_batch_size": 4096,
+    "ddp_shard_data": False,
+    "training_rng_rank_offset": True,
+}
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
     {"policy_aux_active_batch_size", "policy_aux_loss_weight"}
 )
@@ -163,6 +194,8 @@ def _load() -> dict[str, Any]:
         "initialization",
         "architecture_upgrade_flags",
         "architecture_upgrade_module",
+        "model_construction",
+        "execution_topology",
         "topology",
         "training_recipe",
     } or not isinstance(learner_value["training_recipe"], dict):
@@ -172,7 +205,30 @@ def _load() -> dict[str, Any]:
             "current coherent learner initialization must be native from-scratch "
             "v3 with fresh optimizer state"
         )
+    if (
+        learner_value.get("model_construction")
+        != PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT
+    ):
+        raise ScienceContractError("current scratch model construction drifted")
+    if (
+        learner_value.get("execution_topology")
+        != PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
+        or learner_value.get("topology")
+        != PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT["name"]
+    ):
+        raise ScienceContractError("current scratch execution topology drifted")
     recipe = learner_value["training_recipe"]
+    execution = learner_value["execution_topology"]
+    if (
+        execution["world_size"]
+        * execution["local_batch_size"]
+        * execution["grad_accum_steps"]
+        != execution["global_batch_size"]
+        or execution["global_batch_size"] != recipe.get("global_batch_size")
+    ):
+        raise ScienceContractError(
+            "current scratch execution topology changes the logical global dose"
+        )
     if (
         recipe.get("policy_target_blend_semantics")
         != POLICY_TARGET_BLEND_FALLBACK_V2
@@ -266,6 +322,14 @@ def learner_training_recipe() -> dict[str, Any]:
 
 def learner_initialization() -> dict[str, Any]:
     return copy.deepcopy(_load()["learner"]["initialization"])
+
+
+def learner_model_construction() -> dict[str, Any]:
+    return copy.deepcopy(_load()["learner"]["model_construction"])
+
+
+def learner_execution_topology() -> dict[str, Any]:
+    return copy.deepcopy(_load()["learner"]["execution_topology"])
 
 
 def target_information_regime() -> str:

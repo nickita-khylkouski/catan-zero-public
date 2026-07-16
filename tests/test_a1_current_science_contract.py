@@ -15,6 +15,18 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         current_science.learner_initialization()
         == current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
     )
+    assert (
+        current_science.learner_model_construction()
+        == current_science.PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT
+    )
+    execution = current_science.learner_execution_topology()
+    assert execution == current_science.PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
+    assert (
+        execution["world_size"]
+        * execution["local_batch_size"]
+        * execution["grad_accum_steps"]
+        == recipe["global_batch_size"]
+    )
     for key, expected in current_science.PRODUCTION_LEARNER_SIGNAL_CONTRACT.items():
         assert recipe[key] == expected
     for (
@@ -51,6 +63,32 @@ def test_current_contract_rejects_non_scratch_v3_initialization(
         current_science.ScienceContractError,
         match="native from-scratch v3",
     ):
+        current_science.load()
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "bad_value"),
+    (
+        ("model_construction", "static_action_residual", False),
+        ("model_construction", "entity_feature_adapter_version", "legacy"),
+        ("execution_topology", "world_size", 4),
+        ("execution_topology", "local_batch_size", 1024),
+    ),
+)
+def test_current_contract_rejects_scratch_construction_or_topology_drift(
+    tmp_path,
+    monkeypatch,
+    section: str,
+    field: str,
+    bad_value,
+) -> None:
+    contract = copy.deepcopy(current_science.load())
+    contract["learner"][section][field] = bad_value
+    path = tmp_path / "science.contract.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
+
+    with pytest.raises(current_science.ScienceContractError, match="scratch"):
         current_science.load()
 
 
