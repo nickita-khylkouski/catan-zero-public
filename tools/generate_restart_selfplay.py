@@ -49,6 +49,8 @@ import numpy as np
 
 from catan_zero.rl.gumbel_self_play import (
     GumbelShardWriter,
+    TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _apply_selected_action,
     _game_outcome_fields,
     action_size_for_evaluator,
@@ -112,6 +114,7 @@ class RestartSelfPlayConfig:
     meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
     event_history_limit: int = 64
     entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_V5
+    target_information_regime: str = TARGET_INFORMATION_REGIME_AUTHORITATIVE
 
 
 class RestartShardWriter(GumbelShardWriter):
@@ -208,6 +211,7 @@ def play_restart_game_from_state(
         meaningful_public_history_schema=config.meaningful_public_history_schema,
         event_history_limit=config.event_history_limit,
         entity_feature_adapter_version=config.entity_feature_adapter_version,
+        target_information_regime=config.target_information_regime,
     )
     while cont_index < config.max_continuation_decisions:
         if game.winning_color() is not None:
@@ -571,6 +575,11 @@ def main() -> None:
         entity_feature_adapter_version=str(
             args.learner_entity_feature_adapter_version
         ),
+        target_information_regime=(
+            TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+            if args.checkpoint and bool(args.public_observation)
+            else TARGET_INFORMATION_REGIME_AUTHORITATIVE
+        ),
     )
 
     counts = plan_start_mix(
@@ -635,6 +644,9 @@ def main() -> None:
                 event_history_limit=int(args.event_history_limit),
                 entity_feature_adapter_version=str(
                     args.learner_entity_feature_adapter_version
+                ),
+                target_information_regime=str(
+                    config.target_information_regime
                 ),
             ),
             game_seed=game_seed,

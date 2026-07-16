@@ -111,18 +111,27 @@ def test_opening_panel_contains_no_private_gnode_bypass() -> None:
     assert "._run_root_search(" not in source
 
 
-def test_public_opening_panel_requires_information_set_search() -> None:
+def test_public_opening_panel_requires_an_explicit_public_search_operator() -> None:
     args = SimpleNamespace(
         public_observation=True,
         information_set_search=False,
+        coherent_public_belief_search=False,
         determinization_particles=4,
         determinization_min_simulations=32,
     )
-    with pytest.raises(ValueError, match="information-set-search together"):
+    with pytest.raises(ValueError, match="exactly one public search operator"):
         _validate_information_recipe(args)
 
     args.information_set_search = True
     _validate_information_recipe(args)
+
+    args.information_set_search = False
+    args.coherent_public_belief_search = True
+    _validate_information_recipe(args)
+
+    args.information_set_search = True
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _validate_information_recipe(args)
 
 
 def test_build_panel_reconstruct_is_deterministic():

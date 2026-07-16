@@ -423,6 +423,9 @@ def _build_config(args: Any) -> GumbelChanceMCTSConfig:
         variance_aware_q=bool(args.variance_aware_q),
         variance_aware_k=float(args.variance_aware_k),
         information_set_search=bool(args.information_set_search),
+        coherent_public_belief_search=bool(
+            args.coherent_public_belief_search
+        ),
         determinization_particles=int(args.determinization_particles),
         determinization_min_simulations=int(
             args.determinization_min_simulations
@@ -431,9 +434,19 @@ def _build_config(args: Any) -> GumbelChanceMCTSConfig:
 
 
 def _validate_information_recipe(args: Any) -> None:
-    if bool(args.public_observation) != bool(args.information_set_search):
+    public = bool(args.public_observation)
+    information_set = bool(args.information_set_search)
+    coherent = bool(getattr(args, "coherent_public_belief_search", False))
+    if information_set and coherent:
         raise ValueError(
-            "eval requires --public-observation and --information-set-search together"
+            "--information-set-search and --coherent-public-belief-search are "
+            "mutually exclusive"
+        )
+    if public != (information_set or coherent):
+        raise ValueError(
+            "eval requires --public-observation with exactly one public search "
+            "operator: --information-set-search or "
+            "--coherent-public-belief-search"
         )
     if int(args.determinization_particles) < 1:
         raise ValueError("--determinization-particles must be >= 1")
@@ -472,6 +485,16 @@ def main() -> None:
         help=(
             "Search public-belief determinizations. Required with "
             "--public-observation; masked features alone are insufficient."
+        ),
+    )
+    p_eval.add_argument(
+        "--coherent-public-belief-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the adopted single-tree coherent public-belief operator. "
+            "Requires --public-observation and cannot be combined with "
+            "--information-set-search."
         ),
     )
     p_eval.add_argument("--determinization-particles", type=int, default=4)
@@ -587,6 +610,9 @@ def main() -> None:
         "oracle_rollouts": int(args.oracle_rollouts),
         "public_observation": bool(args.public_observation),
         "information_set_search": bool(args.information_set_search),
+        "coherent_public_belief_search": bool(
+            args.coherent_public_belief_search
+        ),
         "determinization_particles": int(args.determinization_particles),
         "determinization_min_simulations": int(
             args.determinization_min_simulations
@@ -604,6 +630,9 @@ def main() -> None:
             "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
             "lazy_interior_chance": bool(args.lazy_interior_chance),
             "information_set_search": bool(args.information_set_search),
+            "coherent_public_belief_search": bool(
+                args.coherent_public_belief_search
+            ),
             "determinization_particles": int(args.determinization_particles),
             "determinization_min_simulations": int(
                 args.determinization_min_simulations

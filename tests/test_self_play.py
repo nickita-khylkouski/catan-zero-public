@@ -121,20 +121,22 @@ def test_opening_evaluator_records_initial_placement_states() -> None:
         {"heuristic": teacher},
         games=1,
         seed=1729,
+        players=2,
         vps_to_win=3,
-        max_opening_decisions=8,
-        sample_records=8,
+        max_opening_decisions=4,
+        sample_records=4,
     )
 
-    assert report["opening_states"] == 8
-    assert report["prompt_counts"]["BUILD_INITIAL_SETTLEMENT"] == 4
-    assert report["prompt_counts"]["BUILD_INITIAL_ROAD"] == 4
+    assert report["players"] == 2
+    assert report["opening_states"] == 4
+    assert report["prompt_counts"]["BUILD_INITIAL_SETTLEMENT"] == 2
+    assert report["prompt_counts"]["BUILD_INITIAL_ROAD"] == 2
     assert report["invalid_candidate_actions"] == 0
     agreement_rate = report["teacher_metrics"]["heuristic"]["agreement_rate"]
     assert 0.0 <= agreement_rate <= 1.0
     by_prompt = report["teacher_metrics_by_prompt"]["heuristic"]
-    assert by_prompt["BUILD_INITIAL_SETTLEMENT"]["states"] == 4
-    assert by_prompt["BUILD_INITIAL_ROAD"]["states"] == 4
+    assert by_prompt["BUILD_INITIAL_SETTLEMENT"]["states"] == 2
+    assert by_prompt["BUILD_INITIAL_ROAD"]["states"] == 2
     assert report["sample_records"]
     assert all(record["candidate_label"] for record in report["sample_records"])
 

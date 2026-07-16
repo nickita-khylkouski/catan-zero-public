@@ -27,6 +27,10 @@ from catan_zero.rl.raw_selfplay import (
     RawSelfPlayConfig,
     run_raw_selfplay_worker_games,
 )
+from catan_zero.rl.gumbel_self_play import (
+    TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+)
 from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
 from catan_zero.rl.meaningful_history import MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
 from catan_zero.search.gumbel_chance_mcts import HeuristicRustEvaluator
@@ -269,6 +273,11 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
                 "learner_entity_feature_adapter_version",
                 RawSelfPlayConfig().entity_feature_adapter_version,
             )
+        ),
+        target_information_regime=(
+            TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+            if checkpoint and bool(worker_args.get("public_observation", False))
+            else TARGET_INFORMATION_REGIME_AUTHORITATIVE
         ),
     )
     summary = run_raw_selfplay_worker_games(

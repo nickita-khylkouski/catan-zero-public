@@ -14,6 +14,8 @@ if str(ROOT) not in sys.path:
 
 from catan_zero.rl import ColonistMultiAgentEnv, make_env_config
 from catan_zero.rl.action_features import build_action_context_feature_table
+from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+from catan_zero.rl.policy_pool import load_checkpoint_policy
 from catan_zero.rl.self_play import Policy
 from catan_zero.rl.torch_ppo import TorchPPOPolicy, _masked_logits, _normalize_observation
 from tools.evaluate_self_play import _make_policy
@@ -37,6 +39,7 @@ def main() -> None:
             "linear",
             "mlp",
             "ppo",
+            "checkpoint",
         ),
         default="ppo",
     )
@@ -58,6 +61,7 @@ def main() -> None:
         help="Opening teachers used for agreement and rank diagnostics.",
     )
     parser.add_argument("--games", type=int, default=32)
+    parser.add_argument("--players", type=int, choices=(2, 3, 4), default=2)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--vps-to-win", type=int, default=10)
     parser.add_argument("--max-opening-decisions", type=int, default=16)
@@ -71,15 +75,19 @@ def main() -> None:
     parser.add_argument("--output")
     args = parser.parse_args()
 
-    candidate = _make_policy(
-        args.candidate,
-        args.checkpoint,
-        candidate_limit=args.candidate_limit,
-        presearch_candidate_limit=args.presearch_candidate_limit,
-        rollout_decisions=args.rollout_decisions,
-        rollout_samples=args.rollout_samples,
-        root_value_weight=args.root_value_weight,
-        opponent_penalty=args.opponent_penalty,
+    candidate = (
+        load_checkpoint_policy(args.checkpoint)
+        if args.candidate == "checkpoint" and args.checkpoint
+        else _make_policy(
+            args.candidate,
+            args.checkpoint,
+            candidate_limit=args.candidate_limit,
+            presearch_candidate_limit=args.presearch_candidate_limit,
+            rollout_decisions=args.rollout_decisions,
+            rollout_samples=args.rollout_samples,
+            root_value_weight=args.root_value_weight,
+            opponent_penalty=args.opponent_penalty,
+        )
     )
     teachers = {
         name: _make_policy(
@@ -114,6 +122,7 @@ def main() -> None:
         teachers,
         driver=driver,
         games=args.games,
+        players=args.players,
         seed=args.seed,
         vps_to_win=args.vps_to_win,
         max_opening_decisions=args.max_opening_decisions,
@@ -133,6 +142,7 @@ def evaluate_openings(
     driver: Policy | None = None,
     games: int,
     seed: int,
+    players: int = 2,
     vps_to_win: int = 10,
     max_opening_decisions: int = 16,
     sample_records: int = 24,
@@ -156,7 +166,7 @@ def evaluate_openings(
     candidate_teacher_best_probs: list[float] = []
     invalid_actions = 0
     env_config = make_env_config(
-        players=4,
+        players=players,
         vps_to_win=vps_to_win,
         use_graph_history_features=(
             _needs_graph_history(candidate)
@@ -261,6 +271,7 @@ def evaluate_openings(
     opening_states = sum(prompt_counts.values())
     return {
         "games": games,
+        "players": players,
         "seed": seed,
         "candidate": getattr(candidate, "name", type(candidate).__name__),
         "driver": getattr(driver, "name", type(driver).__name__),
@@ -383,6 +394,12 @@ def _policy_action_probs(
     valid_actions = tuple(int(action) for action in info["valid_actions"])
     if not valid_actions:
         return None
+    if isinstance(policy, EntityGraphPolicy):
+        probs = policy.action_probs(env, info, valid_actions)
+        return {
+            int(action): float(probability)
+            for action, probability in zip(valid_actions, probs)
+        }
     if hasattr(policy, "action_probs"):
         probs = policy.action_probs(observation, valid_actions)  # type: ignore[attr-defined]
         return {

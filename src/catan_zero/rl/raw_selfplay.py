@@ -54,7 +54,7 @@ from catan_zero.rl.gumbel_self_play import (
     COLORS,
     PLAYER_NAMES,
     GumbelShardWriter,
-    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+    TARGET_INFORMATION_REGIME_AUTHORITATIVE,
     _apply_selected_action,
     _build_public_learner_features,
     _game_outcome_fields,
@@ -114,7 +114,13 @@ class RawSelfPlayConfig:
     )
     event_history_limit: int = 64
     entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION
-    target_information_regime: str = TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+    # Fail closed because the driver accepts an arbitrary RustEvaluator.  A
+    # caller may claim the public-coherent regime only after it has established
+    # that the behavior evaluator itself sees public information exclusively.
+    # The stock heuristic evaluator reads exact hidden resources/dev cards/VP,
+    # so treating the generic/default path as public would contaminate the
+    # public value objective even though these rows carry zero policy weight.
+    target_information_regime: str = TARGET_INFORMATION_REGIME_AUTHORITATIVE
 
 
 @dataclass(slots=True)
