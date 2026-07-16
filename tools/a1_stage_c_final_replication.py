@@ -292,6 +292,7 @@ def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
     campaign_unsigned = dict(campaign)
     campaign_stated = campaign_unsigned.pop("campaign_sha256", None)
     selection = campaign.get("selection_contract")
+    recipe = campaign.get("recipe")
     if (
         campaign.get("schema_version") != CAMPAIGN_SCHEMA
         or campaign_stated != value_sha256(campaign_unsigned)
@@ -310,6 +311,11 @@ def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
         }
         or campaign.get("feature_learning_signal_contract")
         != _expected_feature_learning_contract()
+        or not isinstance(recipe, dict)
+        or recipe.get("policy_aux_active_batch_size")
+        != stage_c_campaign.POLICY_AUX_ACTIVE_BATCH_SIZE
+        or recipe.get("policy_aux_loss_weight")
+        != stage_c_campaign.POLICY_AUX_LOSS_WEIGHT
         or not isinstance(selection, dict)
         or selection.get("requires_checkpoint_local_feature_learning_signal")
         is not True
@@ -319,6 +325,25 @@ def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
         or payload.get("value_quality_gate") != selection.get("value_quality_gate")
     ):
         raise FinalReplicationError("Stage-C strategic campaign semantics drifted")
+    try:
+        policy_teacher_gap_objective = (
+            stage_c_campaign._expected_policy_teacher_gap_objective(recipe)  # noqa: SLF001
+        )
+    except stage_c_campaign.CampaignError as error:
+        raise FinalReplicationError(
+            "Stage-C strategic campaign semantics drifted"
+        ) from error
+    if (
+        payload.get("policy_teacher_gap_objective")
+        != policy_teacher_gap_objective
+        or any(
+            not isinstance(item, dict)
+            or item.get("policy_teacher_gap_objective")
+            != policy_teacher_gap_objective
+            for item in payload.get("checkpoints", [])
+        )
+    ):
+        raise FinalReplicationError("fresh-parent fingerprint semantics drifted")
     payload["_verified_campaign"] = campaign
     payload["_verified_campaign_path"] = str(campaign_path)
     return resolved, payload
@@ -420,6 +445,13 @@ def _checkpoint_record(
     *,
     require_fingerprint_eligible: bool = True,
 ) -> dict[str, Any]:
+    policy_teacher_gap_objective = fingerprint.get(
+        "policy_teacher_gap_objective"
+    )
+    if not isinstance(policy_teacher_gap_objective, dict):
+        raise FinalReplicationError(
+            "fresh-parent fingerprint policy objective is malformed"
+        )
     matches = [
         item
         for item in fingerprint.get("checkpoints", [])
@@ -435,6 +467,10 @@ def _checkpoint_record(
             f"selected step {step} is not one eligible fresh-parent checkpoint"
         )
     record = copy.deepcopy(matches[0])
+    if record.get("policy_teacher_gap_objective") != policy_teacher_gap_objective:
+        raise FinalReplicationError(
+            f"step {step} policy teacher-gap objective differs from campaign recipe"
+        )
     checkpoint = _regular_file(
         Path(str(record.get("checkpoint", ""))), where=f"step {step} checkpoint"
     )

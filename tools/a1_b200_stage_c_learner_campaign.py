@@ -48,6 +48,7 @@ from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v6"
 EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v1"
 FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
+POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA = "posthoc-policy-teacher-gap-objective-v1"
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
 TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v1"
 SEPARATE_PARENT_GAP_SCHEMA = "posthoc-separate-parent-teacher-gap-v1"
@@ -500,6 +501,57 @@ def _recipe() -> dict[str, Any]:
         # type (unspecified types also retain the 1.0 default).
         "forced_row_value_action_type_weights": "END_TURN=1,ROLL=1",
     }
+
+
+def _expected_policy_teacher_gap_objective(
+    recipe: Mapping[str, Any],
+) -> dict[str, Any]:
+    raw_active_batch_size = recipe.get("policy_aux_active_batch_size")
+    raw_coefficient = recipe.get("policy_aux_loss_weight")
+    try:
+        coefficient = float(raw_coefficient)
+    except (TypeError, ValueError) as error:
+        raise CampaignError("Stage-C policy AUX recipe is malformed") from error
+    if (
+        isinstance(raw_active_batch_size, bool)
+        or not isinstance(raw_active_batch_size, int)
+        or raw_active_batch_size < 0
+        or isinstance(raw_coefficient, bool)
+        or not math.isfinite(coefficient)
+        or coefficient < 0.0
+    ):
+        raise CampaignError("Stage-C policy AUX recipe is malformed")
+    active_batch_size = raw_active_batch_size
+    enabled = active_batch_size > 0
+    return {
+        "schema_version": POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA,
+        "selection_authority": True,
+        "objective_matched": True,
+        "formula": (
+            "base_plus_coefficient_times_aux_policy_teacher_kl"
+            if enabled
+            else "base_policy_teacher_kl"
+        ),
+        "policy_aux_enabled": enabled,
+        "policy_aux_active_batch_size": active_batch_size,
+        "policy_aux_loss_weight": coefficient,
+        "policy_aux_measure": (
+            "conditioned_sampling_x_policy_weight" if enabled else "disabled"
+        ),
+    }
+
+
+def _require_policy_teacher_gap_objective(
+    value: object,
+    *,
+    expected: Mapping[str, Any],
+    where: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or value != dict(expected):
+        raise CampaignError(
+            f"{where} policy teacher-gap objective differs from Stage-C recipe"
+        )
+    return copy.deepcopy(value)
 
 
 def _one_dose_command(plan: Mapping[str, Any]) -> list[str]:
@@ -1446,6 +1498,8 @@ def _authenticate_cached_functional_evidence(
 
 def _select_fingerprint_winner(
     records: Sequence[Mapping[str, Any]],
+    *,
+    expected_objective: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Nominate the smallest trusted update with positive teacher uptake.
 
@@ -1453,6 +1507,18 @@ def _select_fingerprint_winner(
     paired playing strength. Closure therefore admits a checkpoint but never
     ranks it; paired H2H remains the only strength authority.
     """
+
+    expected = (
+        _expected_policy_teacher_gap_objective(_recipe())
+        if expected_objective is None
+        else dict(expected_objective)
+    )
+    for row in records:
+        _require_policy_teacher_gap_objective(
+            row.get("policy_teacher_gap_objective"),
+            expected=expected,
+            where=f"step {row.get('step', '?')} fingerprint",
+        )
 
     eligible = [
         row
@@ -1840,6 +1906,9 @@ def _fingerprint(
         != _file_sha256(parent)
     ):
         raise CampaignError("separate parent functional used the wrong checkpoint")
+    policy_teacher_gap_objective = _expected_policy_teacher_gap_objective(
+        plan["recipe"]
+    )
     records = []
     commands = []
     terminal_checkpoint = Path(
@@ -1915,6 +1984,13 @@ def _fingerprint(
                 )
         functional = _load_json(functional_path, where=f"step {step} functional")[1]
         drift = _load_json(drift_path, where=f"step {step} drift")[1]
+        functional_policy_teacher_gap_objective = (
+            _require_policy_teacher_gap_objective(
+                functional.get("policy_teacher_gap_objective"),
+                expected=policy_teacher_gap_objective,
+                where=f"checkpoint {step} functional report",
+            )
+        )
         functional_parent = functional.get("inputs", {}).get("parent_checkpoint")
         if not isinstance(functional_parent, dict) or functional_parent.get(
             "sha256"
@@ -1972,6 +2048,9 @@ def _fingerprint(
                 "fresh_parent_evidence_schema_version": fresh_gap[
                     "evidence_schema_version"
                 ],
+                "policy_teacher_gap_objective": (
+                    functional_policy_teacher_gap_objective
+                ),
                 "legacy_stored_generation_prior_teacher_gap_closure": legacy_closure,
                 "stored_generation_prior_selection_authority": False,
                 "trunk_relative_l2": trunk,
@@ -1997,7 +2076,10 @@ def _fingerprint(
             "validation_holdout": validation_binding,
             "commands": commands,
         }
-    winner = _select_fingerprint_winner(records)
+    winner = _select_fingerprint_winner(
+        records,
+        expected_objective=policy_teacher_gap_objective,
+    )
     payload: dict[str, Any] = {
         "schema_version": FINGERPRINT_SCHEMA,
         "campaign": {
@@ -2030,6 +2112,7 @@ def _fingerprint(
             "kl_and_trunk_drift_budgets"
         ),
         "teacher_gap_closure_ranking_authority": False,
+        "policy_teacher_gap_objective": policy_teacher_gap_objective,
         "value_quality_gate": copy.deepcopy(
             plan["selection_contract"]["value_quality_gate"]
         ),

@@ -183,6 +183,30 @@ def _paths(tmp_path: Path, report: dict):
     return report_path, checkpoint, data, manifest
 
 
+def test_aux_enabled_report_fails_before_loading_probe_runtime(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _module()
+    report = _report()
+    report["policy_aux_active_batch_size"] = 64
+    report["policy_aux_loss_weight"] = 0.25
+    report_path, checkpoint, data, manifest = _paths(tmp_path, report)
+    monkeypatch.setattr(
+        module,
+        "_load_train_bc",
+        lambda: pytest.fail("AUX objective must fail before loading train_bc"),
+    )
+
+    with pytest.raises(SystemExit, match="AUX-enabled policy objective"):
+        module.run_probe(
+            report_path=report_path,
+            checkpoint_path=checkpoint,
+            data_path=data,
+            validation_manifest_path=manifest,
+            device="cpu",
+        )
+
+
 def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     tmp_path, monkeypatch
 ):
@@ -211,6 +235,16 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
         batch_size=64,
     )
 
+    assert result["policy_teacher_gap_objective"] == {
+        "schema_version": module.POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA,
+        "selection_authority": True,
+        "objective_matched": True,
+        "formula": "base_policy_teacher_kl",
+        "policy_aux_enabled": False,
+        "policy_aux_active_batch_size": 0,
+        "policy_aux_loss_weight": 0.0,
+        "policy_aux_measure": "disabled",
+    }
     assert fake._MASK_HIDDEN_INFO_PLAYER_TOKENS is True
     assert fake.calls["corpus"] == data
     assert fake.calls["policy_weights"] == {

@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parents[1]
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
 VALUE_QUALITY_SCHEMA = "posthoc-objective-matched-value-quality-v1"
 PAIRED_PARENT_VALUE_SCHEMA = "posthoc-paired-parent-value-quality-v1"
+POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA = "posthoc-policy-teacher-gap-objective-v1"
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
@@ -60,6 +61,41 @@ def _required(report: dict[str, Any], key: str) -> Any:
             f"training report lacks {key!r}; exact posthoc recipe reconstruction refused"
         )
     return report[key]
+
+
+def _policy_teacher_gap_objective(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind the policy objective that the teacher-gap probe actually scores."""
+
+    raw_batch_size = report.get("policy_aux_active_batch_size", 0)
+    raw_coefficient = report.get("policy_aux_loss_weight", 0.0)
+    if (
+        isinstance(raw_batch_size, bool)
+        or not isinstance(raw_batch_size, int)
+        or raw_batch_size < 0
+    ):
+        raise SystemExit("training report policy_aux_active_batch_size is malformed")
+    try:
+        coefficient = float(raw_coefficient)
+    except (TypeError, ValueError) as error:
+        raise SystemExit("training report policy_aux_loss_weight is malformed") from error
+    if not math.isfinite(coefficient) or coefficient < 0.0:
+        raise SystemExit("training report policy_aux_loss_weight is malformed")
+    if raw_batch_size > 0:
+        raise SystemExit(
+            "posthoc teacher-gap probe cannot score an AUX-enabled policy objective: "
+            "training used independently normalized base + coefficient*AUX(q*w), "
+            "but objective-matched AUX teacher-gap scoring is not implemented"
+        )
+    return {
+        "schema_version": POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA,
+        "selection_authority": True,
+        "objective_matched": True,
+        "formula": "base_policy_teacher_kl",
+        "policy_aux_enabled": False,
+        "policy_aux_active_batch_size": 0,
+        "policy_aux_loss_weight": 0.0,
+        "policy_aux_measure": "disabled",
+    }
 
 
 def _functional_drift_batch(
@@ -377,6 +413,7 @@ def _prepare_probe(
         raise SystemExit("training report must contain a JSON object")
     if report.get("data_format") != "memmap":
         raise SystemExit("posthoc teacher-gap probe requires a memmap training report")
+    policy_teacher_gap_objective = _policy_teacher_gap_objective(report)
 
     train_bc = _load_train_bc()
     actual_fingerprint = train_bc._training_data_fingerprint(data_path, "memmap")
@@ -550,6 +587,7 @@ def _prepare_probe(
     scope_identity = _scope_identity(data, report)
     objective_reconstruction = {
         "schema_version": "posthoc-objective-reconstruction-v1",
+        "policy_teacher_gap_objective": policy_teacher_gap_objective,
         "component_scopes": scope_identity,
         "target_reliability_confidence_weighting": bool(
             report.get("target_reliability_confidence_weighting", False)
@@ -602,6 +640,7 @@ def _prepare_probe(
         "batch_size": eval_batch_size,
         "award_contract": award_contract,
         "objective_reconstruction": objective_reconstruction,
+        "policy_teacher_gap_objective": policy_teacher_gap_objective,
         "scalar_value_loss_readout": scalar_readout,
         "scalar_value_loss_scale": scalar_scale,
         "shared_holdout": {
@@ -962,6 +1001,9 @@ def _evaluate_candidate(
             )
         },
         "metrics": metrics,
+        "policy_teacher_gap_objective": dict(
+            prepared["policy_teacher_gap_objective"]
+        ),
     }
     if parent_policy is not None:
         assert (
@@ -1051,6 +1093,9 @@ def run_probe(
         "validation_rows": int(shared["validation_rows"]),
         "validation_game_seed_set_sha256": shared["validation_game_seed_set_sha256"],
         "shared_holdout": shared,
+        "policy_teacher_gap_objective": candidate[
+            "policy_teacher_gap_objective"
+        ],
         "teacher_gap": candidate["teacher_gap"],
         "value_quality": candidate["value_quality"],
         "teacher_gap_semantics": candidate["teacher_gap_semantics"],
@@ -1184,6 +1229,9 @@ def run_batch_probe(
         "batch_size": int(prepared["batch_size"]),
         "checkpoint_order": labels,
         "shared_holdout": shared_holdout,
+        "policy_teacher_gap_objective": dict(
+            prepared["policy_teacher_gap_objective"]
+        ),
         "checkpoints": results,
     }
     comparison = _step64_128_comparison(results)

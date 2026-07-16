@@ -44,6 +44,7 @@ def _campaign(tmp_path: Path, *, parent_sha: str) -> tuple[Path, dict]:
             "policy_loss_weight": 1.0,
             "value_loss_weight": 0.25,
             "policy_aux_active_batch_size": 64,
+            "policy_aux_loss_weight": 0.25,
             "soft_target_source": "policy",
             "soft_target_weight": 1.0,
             "soft_target_min_legal_coverage": 1.0,
@@ -72,6 +73,11 @@ def _fingerprint(
     tmp_path: Path, *, parent_sha: str, steps: tuple[int, ...]
 ) -> tuple[Path, dict]:
     campaign_path, campaign = _campaign(tmp_path, parent_sha=parent_sha)
+    policy_teacher_gap_objective = (
+        final.stage_c_campaign._expected_policy_teacher_gap_objective(  # noqa: SLF001
+            campaign["recipe"]
+        )
+    )
     records = []
     checkpoints = {}
     for step in steps:
@@ -141,6 +147,7 @@ def _fingerprint(
         records.append(
             {
                 "step": step,
+                "policy_teacher_gap_objective": policy_teacher_gap_objective,
                 "eligible": step != 16,
                 "feature_learning_signal_authenticated": feature_authenticated,
                 "feature_learning_signal": feature_signal,
@@ -186,6 +193,7 @@ def _fingerprint(
         },
         "stored_generation_prior_used_as_selection_authority": False,
         "optimizer_batch_kl_used_as_trust_authority": False,
+        "policy_teacher_gap_objective": policy_teacher_gap_objective,
         "value_quality_gate": final._expected_value_gate_contract(),  # noqa: SLF001
         "separate_exact_parent_evidence": {"selection_authority": True},
     }
@@ -522,9 +530,34 @@ def test_fingerprint_refuses_eligible_checkpoint_without_feature_signal(
         final._fingerprint(bad_path)  # noqa: SLF001
 
 
+def test_fingerprint_refuses_base_only_teacher_gap_for_aux_campaign(
+    tmp_path: Path,
+) -> None:
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(16,)
+    )
+    base_recipe = copy.deepcopy(
+        json.loads(Path(fingerprint["campaign"]["path"]).read_text())["recipe"]
+    )
+    base_recipe["policy_aux_active_batch_size"] = 0
+    base_recipe["policy_aux_loss_weight"] = 0.0
+    fingerprint["policy_teacher_gap_objective"] = (
+        final.stage_c_campaign._expected_policy_teacher_gap_objective(  # noqa: SLF001
+            base_recipe
+        )
+    )
+    fingerprint.pop("fingerprint_sha256")
+    _write_sealed(fingerprint_path, fingerprint, "fingerprint_sha256")
+
+    with pytest.raises(
+        final.FinalReplicationError, match="fingerprint semantics drifted"
+    ):
+        final._fingerprint(fingerprint_path)  # noqa: SLF001
+
+
 @pytest.mark.parametrize(
     "mutation",
-    ("schema", "feature_contract", "value_gate"),
+    ("schema", "feature_contract", "value_gate", "policy_aux_objective"),
 )
 def test_fingerprint_refuses_campaign_contract_drift(
     tmp_path: Path,
@@ -540,6 +573,8 @@ def test_fingerprint_refuses_campaign_contract_drift(
         campaign["schema_version"] = "a1-b200-stage-c-aligned-learner-campaign-v5"
     elif mutation == "feature_contract":
         campaign["feature_learning_signal_contract"].pop("required_modules")
+    elif mutation == "policy_aux_objective":
+        campaign["recipe"]["policy_aux_loss_weight"] = 0.0
     else:
         campaign["selection_contract"]["value_quality_gate"][
             "max_absolute_regression"

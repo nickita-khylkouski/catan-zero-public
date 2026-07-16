@@ -14,6 +14,12 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _policy_teacher_gap_objective() -> dict[str, object]:
+    return campaign._expected_policy_teacher_gap_objective(  # noqa: SLF001
+        campaign._recipe()  # noqa: SLF001
+    )
+
+
 def _feature_observability(*, observed_steps: int) -> dict[str, object]:
     module_row = {
         "mean_pre_clip_grad_norm": 0.4,
@@ -566,6 +572,7 @@ def test_stage_c_fingerprint_binds_report_emitted_holdout(
     }
     plan = {
         "output_root": str(output_root),
+        "recipe": campaign._recipe(),  # noqa: SLF001
         "inputs": {
             "python": "/usr/bin/python3",
             "data": str(data),
@@ -653,6 +660,7 @@ def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -
     records = [
         {
             "step": 8,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
             "feature_learning_signal_authenticated": False,
             "parent_kl": 0.01,
             "trunk_relative_l2": 0.01,
@@ -665,6 +673,7 @@ def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -
         },
         {
             "step": 16,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
             "feature_learning_signal_authenticated": True,
             "parent_kl": 0.02,
             "trunk_relative_l2": 0.02,
@@ -685,6 +694,31 @@ def test_stage_c_selector_ignores_misleading_stored_generation_prior_closure() -
     assert selected["fresh_parent_teacher_gap_relative_closure"] == pytest.approx(0.25)
 
 
+def test_stage_c_selector_rejects_base_only_gap_for_aux_recipe() -> None:
+    base_recipe = campaign._recipe()  # noqa: SLF001
+    base_recipe["policy_aux_active_batch_size"] = 0
+    base_recipe["policy_aux_loss_weight"] = 0.0
+    records = [
+        {
+            "step": 16,
+            "policy_teacher_gap_objective": (
+                campaign._expected_policy_teacher_gap_objective(  # noqa: SLF001
+                    base_recipe
+                )
+            ),
+            "feature_learning_signal_authenticated": True,
+            "parent_kl": 0.01,
+            "trunk_relative_l2": 0.01,
+            "fresh_parent_teacher_gap_absolute_closure": 0.04,
+            "fresh_parent_teacher_gap_relative_closure": 0.25,
+            "value_quality_gate": {"passed": True},
+        }
+    ]
+
+    with pytest.raises(campaign.CampaignError, match="differs from Stage-C recipe"):
+        campaign._select_fingerprint_winner(records)  # noqa: SLF001
+
+
 def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> None:
     report = _completed_feature_signal_report()
     early = campaign._checkpoint_feature_learning_signal(  # noqa: SLF001
@@ -696,6 +730,7 @@ def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> N
     records = [
         {
             "step": 8,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
             "feature_learning_signal_authenticated": early["authenticated"],
             "parent_kl": 0.001,
             "trunk_relative_l2": 0.001,
@@ -705,6 +740,7 @@ def test_stage_c_selector_rejects_early_checkpoint_without_feature_signal() -> N
         },
         {
             "step": 16,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
             "feature_learning_signal_authenticated": commissioned[
                 "authenticated"
             ],
@@ -732,6 +768,7 @@ def test_stage_c_rejects_policy_improvement_when_value_regresses() -> None:
     records = [
         {
             "step": 16,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
             "feature_learning_signal_authenticated": True,
             "parent_kl": 0.002,
             "trunk_relative_l2": 0.001,
@@ -741,6 +778,7 @@ def test_stage_c_rejects_policy_improvement_when_value_regresses() -> None:
         },
         {
             "step": 24,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
             "feature_learning_signal_authenticated": True,
             "parent_kl": 0.02,
             "trunk_relative_l2": 0.002,
@@ -757,6 +795,7 @@ def test_stage_c_accepts_earlier_mid_epoch_value_safe_checkpoint() -> None:
     records = [
         {
             "step": 16,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
             "feature_learning_signal_authenticated": True,
             "parent_kl": 0.002,
             "trunk_relative_l2": 0.001,
@@ -766,6 +805,7 @@ def test_stage_c_accepts_earlier_mid_epoch_value_safe_checkpoint() -> None:
         },
         {
             "step": 24,
+            "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
             "feature_learning_signal_authenticated": True,
             "parent_kl": 0.02,
             "trunk_relative_l2": 0.002,
@@ -839,6 +879,7 @@ def test_stage_c_value_gate_replays_b200_parent_comparison() -> None:
         [
             {
                 "step": 4,
+                "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
                 "feature_learning_signal_authenticated": False,
                 "parent_kl": 0.0022811808808186323,
                 "trunk_relative_l2": 0.0006498816281192034,
@@ -848,6 +889,7 @@ def test_stage_c_value_gate_replays_b200_parent_comparison() -> None:
             },
             {
                 "step": 32,
+                "policy_teacher_gap_objective": _policy_teacher_gap_objective(),
                 "feature_learning_signal_authenticated": True,
                 "parent_kl": 0.1130148750044209,
                 "trunk_relative_l2": 0.010375720545963748,
