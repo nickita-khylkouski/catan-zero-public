@@ -102,6 +102,15 @@ def main() -> None:
     parser.add_argument("--graph-tokens", type=int, default=32)
     parser.add_argument("--graph-layers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=16,
+        help=(
+            "Linear optimizer warmup for fresh BC. The default matches the current "
+            "short-dose learner contract instead of exposing a full-rate first update."
+        ),
+    )
     parser.add_argument("--soft-target-temperature", type=float, default=0.7)
     parser.add_argument("--soft-target-weight", type=float, default=1.0)
     parser.add_argument(
@@ -380,6 +389,8 @@ def main() -> None:
             str(args.hidden_size),
             "--lr",
             str(args.lr),
+            "--lr-warmup-steps",
+            str(args.lr_warmup_steps),
             "--soft-target-temperature",
             str(args.soft_target_temperature),
             "--soft-target-weight",
@@ -408,7 +419,13 @@ def main() -> None:
         + (
             ["--graph-tokens", str(args.graph_tokens), "--graph-layers", str(args.graph_layers)]
             if args.arch == "xdim_graph"
-            else ["--graph-layers", str(args.graph_layers)]
+            else [
+                "--graph-layers",
+                str(args.graph_layers),
+                "--mask-hidden-info",
+                "--per-game-policy-weight",
+                "--per-game-value-weight",
+            ]
             if args.arch == "entity_graph"
             else []
         )
