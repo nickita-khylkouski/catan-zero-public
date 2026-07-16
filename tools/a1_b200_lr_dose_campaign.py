@@ -33,10 +33,10 @@ GLOBAL_BATCH_SIZE = 4096
 SHORT_STEPS = 128
 LONG_STEPS = 256
 SCIENCE_CONTRACT_RELATIVE = Path(
-    "configs/operations/a1-next-wave-coherent-public-v1/science.contract.json"
+    "configs/operations/a1-next-wave-coherent-public-v2/science.contract.json"
 )
 EXISTING_CORPUS_SCIENCE_FIELDS = {
-    "forced_row_value_action_type_weights": "END_TURN=0.1,ROLL=0.25",
+    "forced_row_value_action_type_weights": "END_TURN=1.0,ROLL=1.0",
     "per_game_policy_surprise_weighting": True,
     "public_card_lr_mult": 4.0,
 }

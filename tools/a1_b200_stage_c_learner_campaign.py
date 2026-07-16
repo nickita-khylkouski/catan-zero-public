@@ -67,7 +67,13 @@ MAX_PARENT_KL = 0.03
 MAX_TRUNK_RELATIVE_L2 = 0.03
 ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
 TRAINABLE_ADAPTER_MODULES = frozenset(
-    {"meaningful_history_residual_gate", "public_card_count_residual"}
+    {
+        "legal_action_value_residual_proj",
+        "legal_action_value_static_proj",
+        "meaningful_history_residual_gate",
+        "public_card_count_residual",
+        "static_action_residual_proj",
+    }
 )
 FEATURE_SIGNAL_MODULES = frozenset({*TRAINABLE_ADAPTER_MODULES, "event_encoder"})
 TRAIN_DIAGNOSTIC_CADENCE_BATCHES = 16
@@ -82,6 +88,8 @@ POSITIVE_OPTIMIZER_SIGNAL_FIELDS = (
 )
 EFFECTIVE_FEATURE_CONTRACT = {
     "entity_feature_adapter_version": CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    "static_action_residual": True,
+    "legal_action_value_residual": True,
     "public_card_count_features": True,
     "meaningful_public_history": True,
     "meaningful_public_history_schema": (MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION),

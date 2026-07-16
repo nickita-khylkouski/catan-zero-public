@@ -112,6 +112,36 @@ def test_training_strata_reports_realized_policy_active_dose() -> None:
     ] == 1
 
 
+def test_training_strata_reports_rare_action_exposure_and_explicit_zeroes() -> None:
+    legal_tokens = np.zeros(
+        (2, 2, 2 + len(train_bc.ACTION_TYPES)), dtype=np.float16
+    )
+    yop = train_bc.ACTION_TYPES.index("PLAY_YEAR_OF_PLENTY")
+    monopoly = train_bc.ACTION_TYPES.index("PLAY_MONOPOLY")
+    legal_tokens[0, 1, 2 + yop] = 1.0
+    legal_tokens[1, 0, 2 + monopoly] = 1.0
+    data = {
+        "legal_action_ids": np.asarray([[100, 101], [102, 103]], dtype=np.int16),
+        "legal_action_tokens": legal_tokens,
+        "action_taken": np.asarray([101, 102], dtype=np.int16),
+        "phase": np.asarray(["main", "main"]),
+    }
+
+    dose = train_bc._training_strata_dose_for_batch(
+        data,
+        np.arange(2, dtype=np.int64),
+        policy_weights=np.asarray([1.0, 2.0], dtype=np.float32),
+        value_weights=np.ones(2, dtype=np.float32),
+        value_active_mask=np.asarray([True, True]),
+    )
+    action_types = dose["action_type"]
+
+    assert action_types["PLAY_YEAR_OF_PLENTY"]["policy_active_rows"] == 1
+    assert action_types["PLAY_MONOPOLY"]["policy_weight_sum"] == pytest.approx(2.0)
+    assert action_types["BUILD_ROAD"]["sampled_rows"] == 0
+    assert set(train_bc.ACTION_TYPES).issubset(action_types)
+
+
 def test_normalization_preserves_decision_class_and_labels_legacy(tmp_path: Path) -> None:
     base = {
         "obs": np.zeros((2, 806), dtype=np.float16),
@@ -150,6 +180,7 @@ def test_completed_campaign_report_requires_real_policy_and_module_dose(
             }
         }
         for name in (
+            "action_type",
             "draw_stream",
             "full_vs_fast",
             "simulation_budget",
@@ -239,7 +270,7 @@ def test_lr_dose_profile_is_carried_by_and_replayed_from_descriptor(
             composite_builder.LEARNER_RECIPE_OVERRIDES
         ),
         "policy_distillation_component_ids": list(
-            one_dose.ALL_POST_WAVE_COMPONENT_IDS
+            one_dose.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
         ),
         "value_training_component_ids": list(
             one_dose.ALL_POST_WAVE_COMPONENT_IDS
@@ -255,6 +286,7 @@ def test_lr_dose_profile_is_carried_by_and_replayed_from_descriptor(
         "lr_warmup_steps": 16,
         "lr_schedule": "flat",
         "policy_aux_active_batch_size": 463,
+        "policy_aux_loss_weight": 0.25,
     }
     verified = {
         "data_kind": "production_composite_v2",

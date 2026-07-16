@@ -61,6 +61,7 @@ from catan_zero.rl.entity_token_policy import (
     _validate_public_award_feature_contract,
 )
 from catan_zero.rl.entity_token_features import (
+    ACTION_TYPES,
     DEDUCTION_FEATURES_KEY,
     EDGE_FEATURE_SIZE,
     EVENT_FEATURE_SIZE,
@@ -25892,6 +25893,45 @@ def _training_source_labels(data: object, rows: np.ndarray) -> np.ndarray:
     )
 
 
+def _training_action_type_labels(data: object, rows: np.ndarray) -> np.ndarray:
+    """Recover the selected action type from the serialized legal-action token.
+
+    The current entity adapter stores an exact action-type one-hot in slots
+    ``2:2+len(ACTION_TYPES)`` for every legal action.  Reading the selected
+    legal row avoids reconstructing a player-count-specific flat ActionCatalog
+    and makes rare-action dose evidence valid under both 2p and larger tracks.
+    Legacy/non-entity corpora remain explicitly ``unrecorded``.
+    """
+
+    indices = np.asarray(rows, dtype=np.int64)
+    fallback = np.full(len(indices), "unrecorded", dtype="<U32")
+    if "legal_action_tokens" not in data or len(indices) == 0:
+        return fallback
+    legal_ids = np.asarray(data["legal_action_ids"][indices])
+    action_ids = np.asarray(data["action_taken"][indices], dtype=np.int64)
+    tokens = np.asarray(data["legal_action_tokens"][indices])
+    expected_width = 2 + len(ACTION_TYPES)
+    if (
+        legal_ids.ndim != 2
+        or tokens.ndim != 3
+        or legal_ids.shape != tokens.shape[:2]
+        or tokens.shape[2] < expected_width
+    ):
+        raise RuntimeError("training action-type attribution is malformed")
+    selected_columns = _target_columns(legal_ids, action_ids)
+    selected = np.asarray(
+        tokens[np.arange(len(indices)), selected_columns, 2:expected_width],
+        dtype=np.float32,
+    )
+    finite = np.isfinite(selected).all(axis=1)
+    positive = selected > 0.5
+    one_hot = finite & (positive.sum(axis=1) == 1)
+    if np.any(one_hot):
+        encoded = np.argmax(selected[one_hot], axis=1)
+        fallback[one_hot] = np.asarray(ACTION_TYPES, dtype="<U32")[encoded]
+    return fallback
+
+
 def _training_strata_dose_for_batch(
     data: object,
     rows: np.ndarray,
@@ -25951,6 +25991,7 @@ def _training_strata_dose_for_batch(
         else np.full(len(rows), "legacy_unknown", dtype="<U14")
     )
     sources = _training_source_labels(data, rows)
+    action_types = _training_action_type_labels(data, rows)
     dimensions = {
         "draw_stream": np.full(len(rows), str(draw_stream)),
         "full_vs_fast": full_labels,
@@ -25963,12 +26004,18 @@ def _training_strata_dose_for_batch(
         ),
         "phase": phases,
         "fresh_vs_replay": sources,
+        "action_type": action_types,
     }
     policy_active = policy > 0.0
     result: dict[str, dict[str, dict[str, float]]] = {}
     for dimension, labels in dimensions.items():
         groups: dict[str, dict[str, float]] = {}
-        for label in np.unique(labels):
+        dimension_labels = (
+            tuple(ACTION_TYPES) + ("unrecorded",)
+            if dimension == "action_type"
+            else tuple(str(label) for label in np.unique(labels))
+        )
+        for label in dimension_labels:
             mask = labels == label
             active_value = mask & value_active
             groups[str(label)] = {

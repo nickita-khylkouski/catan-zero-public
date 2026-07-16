@@ -228,14 +228,24 @@ def test_clean_stage_c_recipe_commissions_new_adapters() -> None:
     assert recipe["value_trunk_grad_scale"] == pytest.approx(0.1)
     assert recipe["soft_target_min_legal_coverage"] == pytest.approx(1.0)
     assert campaign.TRAINABLE_ADAPTER_MODULES == {
+        "legal_action_value_residual_proj",
+        "legal_action_value_static_proj",
         "meaningful_history_residual_gate",
         "public_card_count_residual",
+        "static_action_residual_proj",
     }
     assert campaign.FEATURE_SIGNAL_MODULES == {
         "event_encoder",
+        "legal_action_value_residual_proj",
+        "legal_action_value_static_proj",
         "meaningful_history_residual_gate",
         "public_card_count_residual",
+        "static_action_residual_proj",
     }
+    assert campaign.EFFECTIVE_FEATURE_CONTRACT["static_action_residual"] is True
+    assert (
+        campaign.EFFECTIVE_FEATURE_CONTRACT["legal_action_value_residual"] is True
+    )
     assert campaign.EFFECTIVE_FEATURE_CONTRACT[
         "meaningful_public_history"
     ] is True
