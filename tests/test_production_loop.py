@@ -276,6 +276,94 @@ def test_promotion_cannot_substitute_training_report_for_execution_receipt(
         load_config(config_path, state_dir=tmp_path / "state")
 
 
+def test_commissioned_parent_update_and_candidate_pack_are_connected(
+    tmp_path: Path,
+) -> None:
+    repository, config_path, _final, payload = _fixture(tmp_path)
+    pack_tool = repository / "tools" / "a1_candidate_promotion_pack.py"
+    pack_tool.write_text(WRITER, encoding="utf-8")
+    config = repository / "configs" / "training" / "parent-update.json"
+    config.parent.mkdir(parents=True)
+    config.write_text("{}", encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Loop Test",
+            "-c",
+            "user.email=loop@example.invalid",
+            "commit",
+            "-qm",
+            "candidate pack",
+        ),
+        check=True,
+    )
+    payload["repository_commit"] = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    stages = payload["stages"]
+    assert isinstance(stages, dict)
+    train = stages["train"]
+    evaluate = stages["evaluate"]
+    promote = stages["promote"]
+    assert isinstance(train, dict) and isinstance(evaluate, dict)
+    assert isinstance(promote, dict)
+    train_command = train["command"]
+    assert isinstance(train_command, list)
+    train_command.extend(("--canonical-parent-update-config", str(config)))
+    train["inputs"].append(str(config))  # type: ignore[union-attr]
+    training_receipt = train_command[train_command.index("--receipt") + 1]
+    training_report = train_command[train_command.index("--report") + 1]
+    candidate = train_command[train_command.index("--checkpoint") + 1]
+    adjudication = tmp_path / "evaluation-pack" / "adjudication.json"
+    exclusions = tmp_path / "evaluation-pack" / "exclusions.json"
+    pack_receipt = tmp_path / "evaluation-pack" / "receipt.json"
+    evaluate["command"] = [
+        sys.executable,
+        str(pack_tool),
+        "--candidate",
+        candidate,
+        "--training-receipt",
+        training_receipt,
+        "--training-report",
+        training_report,
+        "--out",
+        str(adjudication),
+        "--cohort-exclusions-out",
+        str(exclusions),
+        "--receipt",
+        str(pack_receipt),
+    ]
+    evaluate["inputs"] = [candidate, training_receipt, training_report]
+    evaluate["outputs"] = [str(adjudication), str(exclusions), str(pack_receipt)]
+    promote_command = promote["command"]
+    assert isinstance(promote_command, list)
+    promote_command[promote_command.index("--adjudication") + 1] = str(adjudication)
+    promote["inputs"] = [str(adjudication), training_receipt]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_config(config_path, state_dir=tmp_path / "state")
+
+    train_bindings = loaded["stages"]["train"]["artifact_bindings"]
+    assert any(
+        binding["kind"] == "canonical_parent_update_config"
+        and binding["path"] == str(config.resolve())
+        for binding in train_bindings
+    )
+    eval_bindings = loaded["stages"]["evaluate"]["artifact_bindings"]
+    assert {binding["kind"] for binding in eval_bindings} >= {
+        "candidate_checkpoint",
+        "training_execution_receipt",
+        "training_report",
+        "evaluation_adjudication",
+        "cohort_exclusions",
+        "evaluation_pack_receipt",
+    }
+
+
 def test_exact_repo_relative_tool_and_untracked_cleanliness(tmp_path: Path) -> None:
     repository, config_path, _final, payload = _fixture(tmp_path)
     collision = repository / "other" / "train.py"

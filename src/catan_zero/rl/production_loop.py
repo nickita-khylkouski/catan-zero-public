@@ -40,7 +40,9 @@ STAGE_TOOLS = {
     "train": frozenset(
         ("tools/a1_one_dose_train.py", "tools/a1_scratch_train.py")
     ),
-    "evaluate": frozenset(("tools/evaluate.py",)),
+    "evaluate": frozenset(
+        ("tools/evaluate.py", "tools/a1_candidate_promotion_pack.py")
+    ),
     "promote": frozenset(("tools/a1_promotion_transaction.py",)),
 }
 PLACEHOLDERS = frozenset(("repo", "state_dir", "python"))
@@ -63,7 +65,6 @@ STAGE_ARTIFACT_BINDINGS: Mapping[str, tuple[tuple[str, str, str, bool], ...]] = 
     ),
     "evaluate": (
         ("candidate_checkpoint", "input", "--candidate", True),
-        ("evaluation_adjudication", "output", "--out", False),
     ),
     "promote": (
         ("evaluation_adjudication", "input", "--adjudication", True),
@@ -633,6 +634,22 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
                         "path": upgrade_receipt,
                     }
                 )
+            if "--canonical-parent-update-config" in command:
+                parent_update_config = _flag_path(
+                    command, "--canonical-parent-update-config", stage=name
+                )
+                if parent_update_config not in inputs:
+                    raise ProductionLoopError(
+                        "--canonical-parent-update-config must be a declared train input"
+                    )
+                artifact_bindings.append(
+                    {
+                        "kind": "canonical_parent_update_config",
+                        "direction": "input",
+                        "flag": "--canonical-parent-update-config",
+                        "path": parent_update_config,
+                    }
+                )
         if name == "train" and tool_name == "tools/a1_scratch_train.py":
             execution_receipt = _flag_path(
                 command, "--execution-receipt", stage=name
@@ -662,6 +679,70 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
                     },
                 )
             )
+        if name == "evaluate":
+            adjudication = _flag_path(command, "--out", stage=name)
+            if adjudication not in outputs:
+                raise ProductionLoopError(
+                    "evaluation --out must be a declared adjudication output"
+                )
+            artifact_bindings.append(
+                {
+                    "kind": "evaluation_adjudication",
+                    "direction": "output",
+                    "flag": "--out",
+                    "path": adjudication,
+                }
+            )
+            if tool_name == "tools/a1_candidate_promotion_pack.py":
+                training_receipt = _flag_path(
+                    command, "--training-receipt", stage=name
+                )
+                training_report = _flag_path(command, "--training-report", stage=name)
+                exclusions = _flag_path(
+                    command, "--cohort-exclusions-out", stage=name
+                )
+                pack_receipt = _flag_path(command, "--receipt", stage=name)
+                if not {training_receipt, training_report}.issubset(inputs):
+                    raise ProductionLoopError(
+                        "candidate promotion pack must consume the declared training "
+                        "receipt and report"
+                    )
+                if not {training_receipt, training_report}.issubset(previous_outputs):
+                    raise ProductionLoopError(
+                        "candidate promotion pack must consume the immediate train outputs"
+                    )
+                if not {exclusions, pack_receipt}.issubset(outputs):
+                    raise ProductionLoopError(
+                        "candidate promotion pack must declare exclusions and receipt outputs"
+                    )
+                artifact_bindings.extend(
+                    (
+                        {
+                            "kind": "training_execution_receipt",
+                            "direction": "input",
+                            "flag": "--training-receipt",
+                            "path": training_receipt,
+                        },
+                        {
+                            "kind": "training_report",
+                            "direction": "input",
+                            "flag": "--training-report",
+                            "path": training_report,
+                        },
+                        {
+                            "kind": "cohort_exclusions",
+                            "direction": "output",
+                            "flag": "--cohort-exclusions-out",
+                            "path": exclusions,
+                        },
+                        {
+                            "kind": "evaluation_pack_receipt",
+                            "direction": "output",
+                            "flag": "--receipt",
+                            "path": pack_receipt,
+                        },
+                    )
+                )
         timeout = stage["timeout_seconds"]
         if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
             raise ProductionLoopError(

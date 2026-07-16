@@ -72,7 +72,7 @@ evaluation configs. The coordinator does not reinterpret those settings.
 | audit | `tools/a1_pre_wave_contract.py audit` |
 | composite | `tools/a1_build_post_wave_composite.py` |
 | train | issued `a1_one_dose_train.py --go`, `a1_scratch_train.py --go` |
-| evaluate | `tools/evaluate.py` |
+| evaluate | `tools/evaluate.py`, `tools/a1_candidate_promotion_pack.py` |
 | promote | `tools/a1_promotion_transaction.py promote --go` |
 
 `tools/fleet/fleet_launch.sh` is intentionally absent. It is a historical
@@ -81,13 +81,39 @@ search/history combinations. A new production turn cannot invoke it through
 the coordinator. Issued historical receipts remain replayable through their
 original tools; this exclusion applies to new work.
 
-The current scratch learner is still scientifically uncommissioned until its
-optimizer horizon is selected. The coordinator makes a commissioned turn
-repeatable; it does not manufacture authorization for an unresolved recipe.
+The commissioned parent update is
+`configs/training/a1_parent_update_35m_b200.schema1.json`: exact f7 parent,
+direct current-v5+split1 function-preserving initializer, fresh AdamW,
+48 steps, and 8x64=512 global batch. New parent-update turns must pass it to
+`a1_one_dose_train.py` with `--canonical-parent-update-config`; the loop binds
+that file as an immutable train input. Generic learner overrides remain
+diagnostic-only.
 
-`tools/evaluate.py` emits the matched internal H2H source report. It does not
-by itself emit `a1-promotion-adjudication-v2`: mechanism calibration, external
-panel, high-regret, bucket-veto, cohort-exclusion, and adjudication artifacts
-must still be produced by the typed promotion-artifact transaction. A loop
-configuration must not alias the raw H2H `--out` path to promotion's
-`--adjudication`.
+`tools/evaluate.py` emits a matched internal H2H source report; it is not a
+promotion adjudication. After the existing matched evaluators have emitted
+candidate/champion calibration, internal H2H, external-panel, and high-regret
+reports, run `tools/a1_candidate_promotion_pack.py`. It derives and replays all
+five required evidence kinds, bucket veto, prior-cohort exclusions, and the
+final `a1-promotion-adjudication-v2`. In a canonical loop it is the evaluate
+stage entry point and its exact `--out` becomes promotion's `--adjudication`;
+its training receipt and report must be the immediate train-stage outputs.
+
+```bash
+python tools/a1_candidate_promotion_pack.py \
+  --contract-lock "$LOCK" \
+  --training-receipt "$TRAIN_RECEIPT" \
+  --training-report "$TRAIN_REPORT" \
+  --registry "$REGISTRY" --current-pointer "$CURRENT" \
+  --candidate "$CANDIDATE" --candidate-version "$CANDIDATE_VERSION" \
+  --champion "$CHAMPION" --champion-version "$CHAMPION_VERSION" \
+  --candidate-calibration "$CANDIDATE_CALIBRATION" \
+  --champion-calibration "$CHAMPION_CALIBRATION" \
+  --internal-h2h "$INTERNAL_H2H" \
+  --candidate-panel "$CANDIDATE_PANEL" \
+  --champion-panel "$CHAMPION_PANEL" \
+  --high-regret-report "$HIGH_REGRET" \
+  --prior-cohort "dose-screen:internal_h2h=$DOSE_SCREEN" \
+  --out "$EVAL_DIR/adjudication.json" \
+  --cohort-exclusions-out "$EVAL_DIR/cohort-exclusions.json" \
+  --receipt "$EVAL_DIR/pack.receipt.json"
+```
