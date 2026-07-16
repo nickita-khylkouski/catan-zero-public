@@ -37,6 +37,7 @@ from catan_zero.rl.gumbel_self_play import (
     TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _apply_selected_action,
     _full_search_simulation_accounting,
+    _generation_resume_semantics_sha256,
     _is_n128_reliability_result,
     _search_execution_contract,
     _target_information_regime_for_search,
@@ -968,6 +969,55 @@ def test_search_execution_contract_attests_effective_particle_budget_semantics()
         "forced_root_target_mode": "trajectory_only",
         "native_mcts_hot_loop": True,
     }
+
+
+def test_search_execution_contract_attests_nonunit_temperature_ownership():
+    temperature_contract = {
+        "schema_version": "gumbel-prior-temperature-application-v2",
+        "effective_logit_temperature": 2.0,
+        "semantics": "single_application_v2",
+    }
+
+    contract = _search_execution_contract(
+        SimpleNamespace(information_set_search=False, exact_budget_sh=False),
+        native_mcts_hot_loop=True,
+        prior_temperature_application=temperature_contract,
+    )
+
+    assert contract["prior_temperature_application"] == temperature_contract
+
+
+def test_nonunit_temperature_v2_invalidates_legacy_resume_identity():
+    search_config = GumbelChanceMCTSConfig(prior_temperature=2.0)
+    common = {
+        "caller_contract_sha256": None,
+        "worker_seed": 7,
+        "config": GumbelSelfPlayConfig(),
+        "search_config": search_config,
+        "preserve_search_evidence": True,
+        "native_mcts_hot_loop": True,
+        "target_information_regime": TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+        "opponent_pool": None,
+        "opponent_mix": None,
+        "public_award_feature_provenance": None,
+    }
+    legacy_double_application_identity = _generation_resume_semantics_sha256(
+        **common
+    )
+    fixed_single_application_identity = _generation_resume_semantics_sha256(
+        **common,
+        prior_temperature_application={
+            "schema_version": "gumbel-prior-temperature-application-v2",
+            "configured_search_prior_temperature": 2.0,
+            "evaluator_applied_prior_temperature": 2.0,
+            "effective_search_prior_temperature": 1.0,
+            "effective_logit_temperature": 2.0,
+            "application_count": 1,
+            "semantics": "single_application_v2",
+        },
+    )
+
+    assert fixed_single_application_identity != legacy_double_application_identity
 
 
 def test_run_worker_games_isolates_one_bad_game_from_the_worker(tmp_path, monkeypatch):

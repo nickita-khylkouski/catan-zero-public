@@ -219,6 +219,15 @@ def test_native_particle_override_preserves_exact_per_particle_dose() -> None:
     assert "n_full_wide" not in native
 
 
+def test_native_config_does_not_retemper_pretempered_evaluator_priors() -> None:
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(prior_temperature=2.0)
+    search.evaluator = SimpleNamespace(applied_prior_temperature=2.0)
+    search.rng = random.Random(7)
+
+    assert search._native_config()["prior_temperature"] == pytest.approx(1.0)
+
+
 def test_native_particle_root_callback_replays_immutable_precomputed_d6(
     monkeypatch,
 ) -> None:

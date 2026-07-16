@@ -47,6 +47,10 @@ class _StubEvaluator:
     `ActionCatalog`, which is pure Python (no Rust engine needed)."""
 
 
+class _PretemperedStubEvaluator(_StubEvaluator):
+    applied_prior_temperature = 2.0
+
+
 def _fake_decision(game_seed: int, decision_index: int) -> gsp.DecisionRecord:
     row = {
         "obs": np.zeros((4,), dtype=np.float16),
@@ -1152,6 +1156,63 @@ def test_generation_semantic_drift_replays_from_zero(tmp_path, monkeypatch, drif
 
     assert seen == [0, 1]
     assert summary["resumed_from_offset"] == 0
+
+
+def test_legacy_double_temperature_progress_replays_from_zero(
+    tmp_path, monkeypatch
+):
+    out_dir = tmp_path / "worker_000"
+    seen: list[int] = []
+
+    def _stub(
+        _mcts, _evaluator, *, config, game_seed, game_index, **_kwargs
+    ):
+        seen.append(game_index)
+        return _fake_game_record(game_seed, game_index, config.colors)
+
+    monkeypatch.setattr(gsp, "play_one_game", _stub)
+    monkeypatch.setattr(gcm, "_require_rust_module", lambda: None)
+    selfplay_config = _stub_config()
+    search_config = GumbelChanceMCTSConfig(seed=9, prior_temperature=2.0)
+    kwargs = {
+        "out_dir": out_dir,
+        "games": 1,
+        "game_index_start": 0,
+        "base_seed": 42_000,
+        "worker_seed": 9,
+        "config": selfplay_config,
+        "search_config": search_config,
+        "evaluator": _PretemperedStubEvaluator(),
+        "shard_size": SHARD_SIZE,
+        "fmt": "npz",
+        "run_id": "run-temperature-contract-drift",
+        "resume": True,
+        "resume_semantics_sha256": RESUME_SEMANTICS_SHA256,
+    }
+    first = gsp.run_worker_games(**kwargs)
+    progress_path = out_dir / gsp.PROGRESS_FILENAME
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    legacy_identity = gsp._generation_resume_semantics_sha256(
+        caller_contract_sha256=RESUME_SEMANTICS_SHA256,
+        worker_seed=9,
+        config=selfplay_config,
+        search_config=search_config,
+        preserve_search_evidence=False,
+        native_mcts_hot_loop=False,
+        target_information_regime=gsp.TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+        opponent_pool=None,
+        opponent_mix=None,
+        public_award_feature_provenance=None,
+    )
+    assert first["generation_resume_semantics_sha256"] != legacy_identity
+    progress["generation_semantics_sha256"] = legacy_identity
+    progress_path.write_text(json.dumps(progress), encoding="utf-8")
+
+    seen.clear()
+    resumed = gsp.run_worker_games(**kwargs)
+
+    assert seen == [0]
+    assert resumed["resumed_from_offset"] == 0
 
 
 def test_resume_requires_full_caller_semantics_digest(tmp_path):

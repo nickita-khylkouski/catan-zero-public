@@ -236,6 +236,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             # identically seeded search objects but distinct within one run.
             seed=self.rng.getrandbits(64),
         )
+        values["prior_temperature"] = self._effective_prior_temperature()
         values["rescale_noise_floor_initial_road_only"] = bool(
             config.rescale_noise_floor_initial_road_only
         )

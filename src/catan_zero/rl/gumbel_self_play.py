@@ -1124,7 +1124,10 @@ def _target_information_regime_for_search(
 
 
 def _search_execution_contract(
-    search_config: Any, *, native_mcts_hot_loop: bool
+    search_config: Any,
+    *,
+    native_mcts_hot_loop: bool,
+    prior_temperature_application: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Describe effective budget semantics that are not visible in the dataclass.
 
@@ -1141,7 +1144,7 @@ def _search_execution_contract(
 
     information_set = bool(getattr(search_config, "information_set_search", False))
     coherent = bool(getattr(search_config, "coherent_public_belief_search", False))
-    return {
+    contract = {
         "budget_scope": (
             "total_before_determinization_division"
             if information_set
@@ -1160,6 +1163,11 @@ def _search_execution_contract(
         ),
         "native_mcts_hot_loop": bool(native_mcts_hot_loop),
     }
+    if prior_temperature_application is not None:
+        contract["prior_temperature_application"] = dict(
+            prior_temperature_application
+        )
+    return contract
 
 
 def _search_evidence_recalibration_scope(search_config: Any) -> str:
@@ -2479,6 +2487,20 @@ def _game_search_seed(*, worker_seed: int, game_index: int) -> int:
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
 
+def _validate_resume_semantics_sha256(value: str | None) -> None:
+    if value is not None and (
+        not value.startswith("sha256:")
+        or len(value) != 71
+        or any(
+            character not in "0123456789abcdef"
+            for character in value.removeprefix("sha256:")
+        )
+    ):
+        raise ValueError(
+            "resume_semantics_sha256 must be a lowercase sha256:<64 hex> digest"
+        )
+
+
 def _generation_resume_semantics_sha256(
     *,
     caller_contract_sha256: str | None,
@@ -2491,20 +2513,11 @@ def _generation_resume_semantics_sha256(
     opponent_pool: OpponentPoolRuntime | None,
     opponent_mix: MixRuntime | None,
     public_award_feature_provenance: Mapping[str, Any] | None,
+    prior_temperature_application: Mapping[str, Any] | None = None,
 ) -> str:
     """Bind every in-function science knob plus caller-authenticated model bytes."""
 
-    if caller_contract_sha256 is not None and (
-        not caller_contract_sha256.startswith("sha256:")
-        or len(caller_contract_sha256) != 71
-        or any(
-            character not in "0123456789abcdef"
-            for character in caller_contract_sha256.removeprefix("sha256:")
-        )
-    ):
-        raise ValueError(
-            "resume_semantics_sha256 must be a lowercase sha256:<64 hex> digest"
-        )
+    _validate_resume_semantics_sha256(caller_contract_sha256)
     if opponent_pool is not None:
         archive_records: list[dict[str, Any]] = []
         for item in opponent_pool.archive:
@@ -2553,6 +2566,10 @@ def _generation_resume_semantics_sha256(
             else dict(public_award_feature_provenance)
         ),
     }
+    if prior_temperature_application is not None:
+        semantics["prior_temperature_application"] = dict(
+            prior_temperature_application
+        )
     encoded = json.dumps(
         semantics,
         sort_keys=True,
@@ -2672,6 +2689,10 @@ def run_worker_games(
             "resume=True requires resume_semantics_sha256 binding immutable "
             "producer/opponent bytes and the caller's generation contract"
         )
+    # Reject malformed caller authority before native search construction. This
+    # keeps validation deterministic and fail-fast even when the Rust module is
+    # unavailable or incompatible.
+    _validate_resume_semantics_sha256(resume_semantics_sha256)
     search_evidence_scope = (
         _search_evidence_recalibration_scope(search_config)
         if preserve_search_evidence
@@ -2702,6 +2723,22 @@ def run_worker_games(
             engine_supports_public_belief_development_draws
         ),
     )
+    mcts = create_gumbel_search(
+        search_config,
+        evaluator,
+        native_hot_loop=bool(native_mcts_hot_loop),
+    )
+    prior_temperature_application = mcts.prior_temperature_application_contract()
+    if math.isclose(
+        float(prior_temperature_application["effective_logit_temperature"]),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        # Preserve byte-identical T=1 resume/manifests. Only non-unit runs
+        # changed meaning across the single-application repair and therefore
+        # require an explicit v2 identity that rejects legacy T² shards.
+        prior_temperature_application = None
     generation_semantics_sha256 = _generation_resume_semantics_sha256(
         caller_contract_sha256=resume_semantics_sha256,
         worker_seed=int(worker_seed),
@@ -2713,11 +2750,7 @@ def run_worker_games(
         opponent_pool=opponent_pool,
         opponent_mix=opponent_mix,
         public_award_feature_provenance=public_award_feature_provenance,
-    )
-    mcts = create_gumbel_search(
-        search_config,
-        evaluator,
-        native_hot_loop=bool(native_mcts_hot_loop),
+        prior_temperature_application=prior_temperature_application,
     )
     target_reliability_mcts: GumbelChanceMCTS | None = None
     target_reliability_manifest = target_reliability_contract(
@@ -3238,7 +3271,9 @@ def run_worker_games(
         "selfplay_config": dataclasses.asdict(config),
         "search_config": dataclasses.asdict(search_config),
         "search_execution_contract": _search_execution_contract(
-            search_config, native_mcts_hot_loop=bool(native_mcts_hot_loop)
+            search_config,
+            native_mcts_hot_loop=bool(native_mcts_hot_loop),
+            prior_temperature_application=prior_temperature_application,
         ),
         "decision_taxonomy_schema": DECISION_TAXONOMY_SCHEMA_VERSION,
         "search_budget_contract": {

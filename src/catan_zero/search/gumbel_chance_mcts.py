@@ -460,8 +460,11 @@ class GumbelChanceMCTSConfig:
     # improved_policy as a *training target*, not for the SH winner as a move.
     temperature: float = 0.0
     play_sh_winner: bool = False
-    # Softens (>1) or sharpens (<1) the evaluator's prior before it enters the
-    # search as logits: logits = log(prior) / prior_temperature.
+    # Semantic model-prior temperature. Neural evaluators apply it while
+    # converting raw logits to probabilities; evaluators that return raw
+    # priors leave it for search to apply as log(prior) / prior_temperature.
+    # GumbelChanceMCTS detects the evaluator-owned transform so the value is
+    # applied exactly once.
     prior_temperature: float = 1.0
     # Playout-cap randomization (Wu, "Accelerating Self-Play Learning in Go"):
     # only full-search moves should emit policy targets downstream.
@@ -976,6 +979,11 @@ class GumbelChanceMCTS:
         if not math.isfinite(float(self.config.temperature)):
             raise ValueError("temperature must be finite")
         if (
+            not math.isfinite(float(self.config.prior_temperature))
+            or float(self.config.prior_temperature) <= 0.0
+        ):
+            raise ValueError("prior_temperature must be finite and positive")
+        if (
             self.config.sigma_reference_visits is not None
             and int(self.config.sigma_reference_visits) < 0
         ):
@@ -1083,6 +1091,74 @@ class GumbelChanceMCTS:
         self._belief_materialization_seed = int(self.config.seed)
         self.seed_search_rngs(int(self.config.seed))
         _require_rust_module()
+
+    def _effective_prior_temperature(self) -> float:
+        """Return the temperature Gumbel search still needs to apply.
+
+        Neural evaluators return probabilities after softmaxing logits at
+        their configured prior temperature. Generation historically passed
+        that same value to both evaluator and search, producing an unintended
+        ``softmax(logits / T**2)`` operator. Evaluators that expose
+        ``applied_prior_temperature`` own that transform; search accepts either
+        its neutral default or the same semantic value, and refuses two
+        conflicting non-unit values.
+        """
+
+        search_temperature = float(self.config.prior_temperature)
+        if not math.isfinite(search_temperature) or search_temperature <= 0.0:
+            raise ValueError("prior_temperature must be finite and positive")
+        evaluator = getattr(self, "evaluator", None)
+        applied_raw = getattr(evaluator, "applied_prior_temperature", None)
+        if applied_raw is None:
+            return search_temperature
+        applied_temperature = float(applied_raw)
+        if not math.isfinite(applied_temperature) or applied_temperature <= 0.0:
+            raise ValueError(
+                "evaluator applied_prior_temperature must be finite and positive"
+            )
+        if math.isclose(applied_temperature, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+            return search_temperature
+        if (
+            math.isclose(search_temperature, 1.0, rel_tol=0.0, abs_tol=1.0e-12)
+            or math.isclose(
+                search_temperature,
+                applied_temperature,
+                rel_tol=0.0,
+                abs_tol=1.0e-12,
+            )
+        ):
+            return 1.0
+        raise ValueError(
+            "conflicting prior_temperature transforms: "
+            f"evaluator already applied {applied_temperature}, "
+            f"search requested {search_temperature}"
+        )
+
+    def prior_temperature_application_contract(self) -> dict[str, float | str | int]:
+        """Describe the effective single-application prior operator."""
+
+        configured_search = float(self.config.prior_temperature)
+        evaluator = getattr(self, "evaluator", None)
+        applied_raw = getattr(evaluator, "applied_prior_temperature", None)
+        evaluator_applied = 1.0 if applied_raw is None else float(applied_raw)
+        effective_search = self._effective_prior_temperature()
+        effective_logit_temperature = evaluator_applied * effective_search
+        return {
+            "schema_version": "gumbel-prior-temperature-application-v2",
+            "configured_search_prior_temperature": configured_search,
+            "evaluator_applied_prior_temperature": evaluator_applied,
+            "effective_search_prior_temperature": effective_search,
+            "effective_logit_temperature": effective_logit_temperature,
+            "application_count": int(
+                not math.isclose(
+                    effective_logit_temperature,
+                    1.0,
+                    rel_tol=0.0,
+                    abs_tol=1.0e-12,
+                )
+            ),
+            "semantics": "single_application_v2",
+        }
 
     def seed_search_rngs(self, seed: int) -> None:
         """Reset search RNG state under the configured stream contract.
@@ -1751,7 +1827,7 @@ class GumbelChanceMCTS:
             },
             action_logits={
                 action: math.log(max(float(aggregate_priors[action]), 1.0e-8))
-                / max(float(self.config.prior_temperature), 1.0e-6)
+                / self._effective_prior_temperature()
                 for action in legal_actions
             },
             expanded=True,
@@ -3392,7 +3468,7 @@ class GumbelChanceMCTS:
                 int(action): _GAction(prior=float(priors[int(action)]))
                 for action in legal_actions
             }
-            prior_temperature = max(float(self.config.prior_temperature), 1.0e-6)
+            prior_temperature = self._effective_prior_temperature()
             node.action_logits = {
                 int(action): math.log(max(float(priors[int(action)]), 1.0e-8))
                 / prior_temperature

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import queue
 import threading
 import time
@@ -448,6 +449,20 @@ class EntityGraphRustEvaluator:
         config: EntityGraphRustEvaluatorConfig | None = None,
     ) -> "EntityGraphRustEvaluator":
         return cls(EntityGraphPolicy.load(checkpoint, device=device), config=config)
+
+    @property
+    def applied_prior_temperature(self) -> float:
+        """Temperature already applied while converting logits to priors.
+
+        Search implementations can use this protocol marker to avoid treating
+        the returned probabilities as raw priors and applying the same
+        temperature a second time.
+        """
+
+        temperature = float(self.config.prior_temperature)
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("prior_temperature must be finite and positive")
+        return temperature
 
     def _entity_batch_via_rust(
         self,

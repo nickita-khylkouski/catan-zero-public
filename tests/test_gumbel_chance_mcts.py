@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
@@ -698,6 +699,10 @@ class _DistinctPriorEvaluator:
         return {action: value / total for action, value in raw.items()}, 0.0
 
 
+class _PretemperedDistinctPriorEvaluator(_DistinctPriorEvaluator):
+    applied_prior_temperature = 2.0
+
+
 def test_prior_temperature_scales_action_logits_and_sharpens_policy():
     # Regression test: prior_temperature was a dead config knob (defined but
     # never applied). It must now scale action_logits as log(prior)/temperature
@@ -729,6 +734,39 @@ def test_prior_temperature_scales_action_logits_and_sharpens_policy():
     assert policy_sharp != policy_soft
     # Lower prior_temperature sharpens (more concentrated) the distribution.
     assert max(policy_sharp.values()) >= max(policy_soft.values())
+
+
+def test_prior_temperature_is_not_applied_twice_to_pretempered_evaluator() -> None:
+    catanatron_rs = _rust()
+    game = _advance_to_multi_action_state(catanatron_rs, seed=7, min_legal=3)
+    evaluator = _PretemperedDistinctPriorEvaluator()
+    search = GumbelChanceMCTS(
+        GumbelChanceMCTSConfig(seed=0, prior_temperature=2.0),
+        evaluator,
+    )
+    node = _GNode(game=game.copy(), root_color=str(game.current_color()))
+
+    search._expand(node)
+
+    priors, _value = evaluator.evaluate(
+        game,
+        tuple(node.actions),
+        root_color=str(game.current_color()),
+        colors=search.config.colors,
+    )
+    assert node.action_logits == pytest.approx(
+        {action: math.log(max(prior, 1.0e-8)) for action, prior in priors.items()}
+    )
+
+
+def test_prior_temperature_rejects_conflicting_evaluator_and_search_values() -> None:
+    evaluator = _PretemperedDistinctPriorEvaluator()
+    search = object.__new__(GumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(seed=0, prior_temperature=3.0)
+    search.evaluator = evaluator
+
+    with pytest.raises(ValueError, match="prior_temperature"):
+        search._effective_prior_temperature()
 
 
 def test_improved_policy_uses_mixed_value_for_unvisited_actions_not_zero():
