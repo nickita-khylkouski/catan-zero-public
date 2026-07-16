@@ -149,6 +149,7 @@ class LearnerConfig:
     league_snapshot_interval: int = 200
     league_promote_winrate: float = 0.7
     run_manifest_sha256: str | None = None
+    run_manifest_path: str | None = None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -569,6 +570,7 @@ def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argpar
                 f"actual={actual_initializer_sha256}"
             )
         cfg_kwargs.update(_manifest_config_values(manifest))
+        cfg_kwargs["run_manifest_path"] = str(args.run_manifest)
     elif args.config:
         file_cfg = load_config_file(args.config)
         for key, value in file_cfg.items():
@@ -1524,6 +1526,28 @@ def _commit_recovery_update(
     return published, checkpoint_path, optimizer_path
 
 
+def _bind_configured_run_identity(
+    root: str | os.PathLike, config: LearnerConfig
+) -> dict[str, Any]:
+    """Bind either the exact v2 manifest or the untouched historical v1 contract."""
+    if config.run_manifest_path is not None:
+        try:
+            manifest = load_manifest(config.run_manifest_path)
+        except (OSError, ManifestError) as error:
+            raise RuntimeError(f"cannot reload bound PPO run manifest: {error}") from error
+        if manifest.status != "bound" or manifest.sha256() != config.run_manifest_sha256:
+            raise RuntimeError("bound PPO run manifest changed after configuration resolution")
+        return dist.bind_run_manifest(root, manifest)
+    return dist.bind_run_contract(
+        root,
+        init_checkpoint=config.init_checkpoint,
+        architecture=config.architecture,
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda,
+        behavior_temperature=config.behavior_temperature,
+    )
+
+
 # --------------------------------------------------------------------------- train loop
 def train(
     config: LearnerConfig,
@@ -1560,14 +1584,7 @@ def train(
     dist.ensure_run_dirs(root)
 
     _validate_w7_config(config)
-    run_contract = dist.bind_run_contract(
-        root,
-        init_checkpoint=config.init_checkpoint,
-        architecture=config.architecture,
-        gamma=config.gamma,
-        gae_lambda=config.gae_lambda,
-        behavior_temperature=config.behavior_temperature,
-    )
+    run_contract = _bind_configured_run_identity(root, config)
     print({"event": "run_contract", **run_contract}, flush=True)
 
     # 1. TRAINABLE policy + separate FROZEN anchor.  A cold start loads both
@@ -1684,6 +1701,7 @@ def train(
                     root,
                     min_policy_version=min_version,
                     max_policy_version=max_version,
+                    expected_run_manifest_sha256=config.run_manifest_sha256,
                 )
             except Exception as exc:
                 print({"event": "sweep_drop_policy_window_error", "error": repr(exc)}, flush=True)
@@ -1698,12 +1716,15 @@ def train(
             stable_secs=config.stable_secs,
             with_envelope=True,
             volume_reload_fn=volume_reload_fn,
+            expected_run_manifest_sha256=config.run_manifest_sha256,
         )
         try:
             shard_items = list(
                 dist.iter_unconsumed_shards(root, newest_first=True, **iter_kwargs)  # type: ignore[call-arg]
             )
         except TypeError:
+            if config.run_manifest_sha256 is not None:
+                raise
             shard_items = list(dist.iter_unconsumed_shards(root, **iter_kwargs))
         if not shard_items:
             time.sleep(config.poll_secs)

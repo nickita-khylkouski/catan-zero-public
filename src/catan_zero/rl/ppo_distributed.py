@@ -647,6 +647,7 @@ def sweep_drop_outside_policy_window(
     *,
     min_policy_version: int,
     max_policy_version: int,
+    expected_run_manifest_sha256: str | None = None,
 ) -> int:
     """Consume every shard outside an inclusive accepted policy-version window."""
     base = trajectories_dir(root)
@@ -661,7 +662,10 @@ def sweep_drop_outside_policy_window(
             if _consumed_marker(root, shard).exists():
                 continue
             try:
-                envelope = read_trajectory_shard(shard)
+                envelope = read_trajectory_shard(
+                    shard,
+                    expected_run_manifest_sha256=expected_run_manifest_sha256,
+                )
             except (pickle.UnpicklingError, EOFError, OSError):
                 continue
             version = int(envelope.get("policy_version", 0))
