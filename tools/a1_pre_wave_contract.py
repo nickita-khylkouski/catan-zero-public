@@ -9579,11 +9579,11 @@ def _selected_target_activation_chunk(
     """Authenticate the exact selected-row policy/value gradient switches.
 
     This is intentionally shared by post-wave audit and composite materialization.
-    Full non-forced rows train policy at weight 1. Valid fast-search rows may
-    use the bounded confidence formula emitted by ``gumbel_self_play``; legacy
-    shards remain compatible with zero-weight fast rows. Every selected row
-    trains value. Merely checking non-negative multiplier mass would allow an
-    apparently valid wave to train a materially different objective.
+    Full non-forced rows train policy at weight 1. Fast-search and forced rows
+    carry zero policy authority in the exact-n128 teacher contract. Every
+    selected row trains value. Merely checking non-negative multiplier mass
+    would allow an apparently valid wave to train a materially different
+    objective.
     """
 
     required = {
@@ -9712,68 +9712,11 @@ def _selected_target_activation_chunk(
 
     positive_fast = fast_non_forced & (selected_policy > 0.0)
     if np.any(positive_fast):
-        if selected_simulations is None:
-            raise ContractError(
-                f"{where}: positive fast-search policy weights require "
-                "simulations_used provenance"
-            )
-        expected_fast = np.asarray(
-            np.minimum(
-                FAST_SEARCH_POLICY_WEIGHT_MAX,
-                selected_simulations.astype(np.float64)
-                / float(FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS),
-            ),
-            dtype=np.float32,
-        ).astype(np.float64)
-        invalid_fast = positive_fast & (
-            (selected_simulations <= 0) | (selected_policy != expected_fast)
+        raise ContractError(
+            f"{where}: fast-search rows must have zero policy authority in the "
+            f"exact-n128 teacher contract; observed "
+            f"{int(np.count_nonzero(positive_fast))} positive rows"
         )
-        if np.any(invalid_fast):
-            raise ContractError(
-                f"{where}: fast-search policy weight disagrees with bounded "
-                f"simulation confidence on {int(np.count_nonzero(invalid_fast))} "
-                "selected rows"
-            )
-        if not {"target_policy", "target_policy_mask"} <= set(payload.files):
-            raise ContractError(
-                f"{where}: positive fast-search policy weights require target "
-                "distribution provenance"
-            )
-        raw_target_policy = np.asarray(payload["target_policy"])
-        raw_target_mask = np.asarray(payload["target_policy_mask"])
-        if (
-            raw_target_policy.ndim != 2
-            or raw_target_policy.shape[0] != seeds.shape[0]
-            or raw_target_mask.shape != raw_target_policy.shape
-            or raw_target_mask.dtype.kind != "b"
-        ):
-            raise ContractError(
-                f"{where}: fast-search target distribution provenance is malformed"
-            )
-        fast_targets = np.asarray(raw_target_policy[mask], dtype=np.float64)[
-            positive_fast
-        ]
-        fast_target_masks = np.asarray(raw_target_mask[mask], dtype=np.bool_)[
-            positive_fast
-        ]
-        active_values = np.where(fast_target_masks, fast_targets, 0.0)
-        invalid_target = (
-            ~np.all(np.isfinite(active_values), axis=1)
-            | np.any(active_values < 0.0, axis=1)
-            | ~np.any(fast_target_masks, axis=1)
-            | ~np.isclose(
-                active_values.sum(axis=1, dtype=np.float64),
-                1.0,
-                rtol=1.0e-5,
-                atol=1.0e-5,
-            )
-        )
-        if np.any(invalid_target):
-            raise ContractError(
-                f"{where}: fast-search policy weight has invalid target "
-                f"distribution on {int(np.count_nonzero(invalid_target))} "
-                "selected rows"
-            )
     if np.any(~np.isfinite(selected_value)) or np.any(selected_value != 1.0):
         raise ContractError(
             f"{where}: value_weight_multiplier must be finite and exactly 1"

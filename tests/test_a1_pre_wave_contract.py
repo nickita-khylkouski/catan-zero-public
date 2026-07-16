@@ -3252,7 +3252,7 @@ def test_selected_target_activation_rejects_gradient_switch_drift(
             )
 
 
-def test_selected_target_activation_authenticates_bounded_fast_policy_weights(
+def test_selected_target_activation_authenticates_exact_n128_fast_policy_zero(
     tmp_path: Path,
 ) -> None:
     arrays = {
@@ -3262,7 +3262,7 @@ def test_selected_target_activation_authenticates_bounded_fast_policy_weights(
         "used_full_search": np.asarray([True, True, False, False]),
         "simulations_used": np.asarray([64, 0, 16, 8], dtype=np.int32),
         "policy_weight_multiplier": np.asarray(
-            [1.0, 0.0, 0.125, 0.0625], dtype=np.float32
+            [1.0, 0.0, 0.0, 0.0], dtype=np.float32
         ),
         "value_weight_multiplier": np.ones(4, dtype=np.float32),
         "target_policy": np.asarray(
@@ -3284,10 +3284,10 @@ def test_selected_target_activation_authenticates_bounded_fast_policy_weights(
             where="fixture",
         )
 
-    assert chunk["schema_version"] == contract.TARGET_ACTIVATION_CHUNK_SCHEMA_V2
+    assert chunk["schema_version"] == contract.TARGET_ACTIVATION_CHUNK_SCHEMA
     assert chunk["counts"]["full_search_non_forced_rows"] == 1
     assert chunk["counts"]["fast_search_non_forced_rows"] == 2
-    assert chunk["counts"]["policy_active_rows"] == 3
+    assert chunk["counts"]["policy_active_rows"] == 1
     wrapped = {
         **chunk,
         "job_id": "gpu0__current_producer",
@@ -3301,19 +3301,15 @@ def test_selected_target_activation_authenticates_bounded_fast_policy_weights(
         categories=("current_producer",),
         sealed_p_full=0.25,
     )
-    assert report["schema_version"] == contract.TARGET_ACTIVATION_SCHEMA_V2
-    assert report["fast_search_policy_confidence"] == {
-        "max_weight": 0.25,
-        "reference_simulations": 128,
-        "legacy_zero_weight_compatible": True,
-    }
+    assert report["schema_version"] == contract.TARGET_ACTIVATION_SCHEMA
+    assert "fast_search_policy_confidence" not in report
 
 
 @pytest.mark.parametrize(
     ("include_simulations", "fast_weight", "error"),
     (
-        (False, 0.25, "require simulations_used provenance"),
-        (True, 0.5, "bounded simulation confidence"),
+        (False, 0.25, "zero policy authority"),
+        (True, 0.5, "zero policy authority"),
     ),
 )
 def test_selected_target_activation_rejects_unauthenticated_fast_policy_weights(

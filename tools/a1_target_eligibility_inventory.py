@@ -26,10 +26,6 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 from catan_zero.rl.action_mask import ActionCatalog
-from catan_zero.rl.gumbel_self_play import (
-    FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS,
-    FAST_SEARCH_POLICY_WEIGHT_MAX,
-)
 
 
 SCHEMA = "a1-target-eligibility-inventory-v1"
@@ -665,31 +661,8 @@ def inspect_memmap(
         )
         positive_fast = fast_non_forced & (policy_values > 0.0)
         fast_policy_active_rows = int(np.count_nonzero(positive_fast))
-        if "simulations_used" in columns:
-            simulations = np.asarray(
-                _column(root, meta, "simulations_used").reshape(-1),
-                dtype=np.int64,
-            )
-            expected_fast = np.asarray(
-                np.minimum(
-                    FAST_SEARCH_POLICY_WEIGHT_MAX,
-                    simulations.astype(np.float64)
-                    / float(FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS),
-                ),
-                dtype=np.float32,
-            ).astype(np.float64)
-            mismatch |= positive_fast & (
-                (simulations <= 0) | (policy_values != expected_fast)
-            )
-            activation_evidence = (
-                "full_forced_plus_bounded_fast_simulation_confidence"
-                "_with_legacy_fast_zero"
-            )
-        else:
-            mismatch |= positive_fast
-            activation_evidence = (
-                "full_forced_with_legacy_fast_zero_no_simulation_provenance"
-            )
+        mismatch |= positive_fast
+        activation_evidence = "exact_n128_full_only_with_fast_policy_zero"
         activation_mismatch: int | None = int(np.count_nonzero(mismatch))
     else:
         activation_mismatch = None

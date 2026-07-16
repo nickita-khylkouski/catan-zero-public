@@ -115,7 +115,7 @@ def test_missing_opponent_decisions_blocks_full_reanalysis(tmp_path: Path) -> No
     assert "noncontiguous_or_incomplete_action_trajectory" in replay["blockers"]
 
 
-def test_inventory_accepts_authenticated_bounded_fast_policy_activity(
+def test_inventory_rejects_former_bounded_fast_policy_activity(
     tmp_path: Path,
 ) -> None:
     root = _write_corpus(
@@ -133,11 +133,11 @@ def test_inventory_accepts_authenticated_bounded_fast_policy_activity(
 
     assert result["policy_active_rows"] == 2
     assert result["fast_search_policy_active_rows"] == 1
-    assert result["policy_active_rule_mismatch_rows"] == 0
-    assert result["policy_targets_eligible_for_requested_learner"] is True
-    assert "bounded_fast_simulation_confidence" in result[
-        "policy_activation_evidence"
-    ]
+    assert result["policy_active_rule_mismatch_rows"] == 1
+    assert result["policy_targets_eligible_for_requested_learner"] is False
+    assert result["policy_activation_evidence"] == (
+        "exact_n128_full_only_with_fast_policy_zero"
+    )
 
 
 def test_inventory_rejects_fast_policy_activity_without_matching_provenance(
