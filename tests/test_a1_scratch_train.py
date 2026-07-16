@@ -235,6 +235,10 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--fused-optimizer") == 1
     assert command.count("--symmetry-augment") == 1
     assert command.count("--symmetry-augment-events") == 1
+    assert command[command.index("--value-target-lambda") + 1] == "1.0"
+    assert command[command.index("--value-root-blend-phases") + 1] == ""
+    assert command.count("--no-value-root-blend-global-compat") == 1
+    assert command[command.index("--q-loss-weight") + 1] == "0.0"
     assert command.count("--required-target-information-regime") == 1
     assert command.count("--save-each-epoch") == 1
     assert command[command.index("--train-diagnostics-every-batches") + 1] == "16"
@@ -268,6 +272,14 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
         ]
         == "0.0"
     )
+    trainer_index = command.index(str(verified["trainer_authority"]["path"]))
+    parsed = train_bc.build_parser().parse_args(command[trainer_index + 1 :])
+    effective = train_bc._effective_a1_scratch_training_recipe(  # noqa: SLF001
+        parsed,
+        {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+        verified["recipe"],
+    )
+    assert effective == verified["recipe"]
     marker = json.loads(command[command.index("--a1-scratch-authority-json") + 1])
     assert marker == authority
 
@@ -611,7 +623,21 @@ def test_run_plan_then_go_does_not_collide_with_plan_receipt(
 def _runtime_args() -> SimpleNamespace:
     model = current_science.learner_model_construction()
     topology = current_science.learner_execution_topology()
-    return SimpleNamespace(
+    parser_defaults = vars(
+        train_bc.build_parser().parse_args(
+            ["--data", "fixture", "--checkpoint", "fixture.pt", "--report", "report.json"]
+        )
+    )
+    parser_defaults.update(
+        {
+            key: value
+            for key, value in current_science.learner_training_recipe().items()
+            if key not in {"world_size", "global_batch_size"}
+            and key in parser_defaults
+        }
+    )
+    parser_defaults.update(
+        dict(
         init_checkpoint="",
         grow_from_checkpoint="",
         resume_optimizer=False,
@@ -648,7 +674,9 @@ def _runtime_args() -> SimpleNamespace:
         grad_accum_steps=topology["grad_accum_steps"],
         ddp_shard_data=topology["ddp_shard_data"],
         training_rng_rank_offset=topology["training_rng_rank_offset"],
+        )
     )
+    return SimpleNamespace(**parser_defaults)
 
 
 def test_scratch_runtime_projection_accepts_every_current_field() -> None:

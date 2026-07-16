@@ -357,6 +357,15 @@ def _effective_recipe_from_command(command: Sequence[str]) -> dict[str, object]:
         args,
         {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": True},
     )
+    expected = train_bc._a1_scratch_topology_expected_effective_recipe(  # noqa: SLF001
+        source_recipe=current_science.learner_training_recipe(),
+        source_model=current_science.learner_model_construction(),
+        source_topology=current_science.learner_execution_topology(),
+        max_steps=int(args.max_steps),
+    )
+    train_bc._bind_late_a1_recipe_fields(  # noqa: SLF001
+        effective, args, expected
+    )
     if str(args.a1_learner_ablation_id or ""):
         effective["per_game_value_weight_mode"] = str(args.per_game_value_weight_mode)
         if str(args.value_player_outcome_balance_mode) != "none":

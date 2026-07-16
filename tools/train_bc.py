@@ -1552,7 +1552,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--value-root-blend-global-compat",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help=(
             "Explicit compatibility mode for the historical behavior that blends every "
             "valid root-value row. Mutually exclusive with --value-root-blend-phases."
@@ -9141,6 +9142,54 @@ def _effective_a1_learner_training_recipe(
     return effective
 
 
+def _bind_late_a1_recipe_fields(
+    effective: dict[str, object],
+    args: argparse.Namespace,
+    expected: Mapping[str, object],
+) -> None:
+    """Project post-v1 fields only when the immutable authority binds them."""
+
+    late_bound_values = {
+        "checkpoint_steps": str(getattr(args, "checkpoint_steps", "") or ""),
+        "max_grad_norm": float(getattr(args, "max_grad_norm", 1.0)),
+        "post_policy_dose_value_trunk_grad_scale": float(
+            getattr(args, "post_policy_dose_value_trunk_grad_scale", 1.0)
+        ),
+        "value_player_outcome_balance_mode": str(
+            getattr(args, "value_player_outcome_balance_mode", "none")
+        ),
+        "value_root_blend_phases": str(
+            getattr(args, "value_root_blend_phases", "") or ""
+        ),
+        "value_root_blend_global_compat": bool(
+            getattr(args, "value_root_blend_global_compat", False)
+        ),
+    }
+    for key, value in late_bound_values.items():
+        if key in expected:
+            effective[key] = value
+
+
+def _effective_a1_scratch_training_recipe(
+    args: argparse.Namespace,
+    ddp: dict[str, int | bool],
+    expected: Mapping[str, object],
+) -> dict[str, object]:
+    """Reconstruct scratch recipe fields after model projection is checked."""
+
+    effective = _effective_a1_learner_training_recipe(args, ddp)
+    _bind_late_a1_recipe_fields(effective, args, expected)
+    for field in (
+        "static_action_residual",
+        "legal_action_value_residual",
+        "legal_action_value_set_statistics",
+        "value_tower_split_layers",
+        "public_rule_state_features",
+    ):
+        effective.pop(field, None)
+    return effective
+
+
 def _validate_a1_decisive_training_semantics(
     args: argparse.Namespace,
     ddp: dict[str, int | bool],
@@ -10055,6 +10104,9 @@ def _validate_a1_scratch_diagnostic_authority(
                         "enabled": True,
                     },
                 )
+                _bind_late_a1_recipe_fields(
+                    actual_effective, args, expected_effective
+                )
                 actual_effective["per_game_value_weight_mode"] = str(
                     args.per_game_value_weight_mode
                 )
@@ -10361,6 +10413,30 @@ def _validate_production_composite_scratch_binding(
         binding["science"]["learner_execution_topology"],
         diagnostic_authority=diagnostic,
     )
+    expected_recipe = dict(binding["science"]["learner_training_recipe"])
+    expected_topology = binding["science"]["learner_execution_topology"]
+    expected_recipe.update(
+        {
+            "world_size": int(expected_topology["world_size"]),
+            "batch_size": int(expected_topology["local_batch_size"]),
+            "grad_accum_steps": int(expected_topology["grad_accum_steps"]),
+            "global_batch_size": int(expected_topology["global_batch_size"]),
+        }
+    )
+    effective_recipe = _effective_a1_scratch_training_recipe(
+        args, ddp, expected_recipe
+    )
+    if effective_recipe != expected_recipe:
+        differing = sorted(
+            key
+            for key in set(effective_recipe) | set(expected_recipe)
+            if effective_recipe.get(key) != expected_recipe.get(key)
+        )
+        raise SystemExit(
+            "A1 scratch command differs from its sealed learner recipe: "
+            f"{differing}"
+        )
+    binding["effective_learner_training_recipe"] = effective_recipe
     if isinstance(diagnostic, Mapping):
         binding["diagnostic_accelerator_inventory"] = (
             _require_a1_scratch_topology_h100_runtime(diagnostic, ddp)
@@ -10463,19 +10539,7 @@ def _validate_a1_learner_training_recipe(
     # These fields postdate the historical effective-recipe tuple. Replay them
     # only when the immutable authority explicitly binds them, preserving old
     # recipe shapes while making current scratch commands exact.
-    late_bound_values = {
-        "checkpoint_steps": str(getattr(args, "checkpoint_steps", "") or ""),
-        "max_grad_norm": float(getattr(args, "max_grad_norm", 1.0)),
-        "post_policy_dose_value_trunk_grad_scale": float(
-            getattr(args, "post_policy_dose_value_trunk_grad_scale", 1.0)
-        ),
-        "value_player_outcome_balance_mode": str(
-            getattr(args, "value_player_outcome_balance_mode", "none")
-        ),
-    }
-    for key, value in late_bound_values.items():
-        if key in expected:
-            effective[key] = value
+    _bind_late_a1_recipe_fields(effective, args, expected)
     # Static parent-KL direction was added to newer sealed recipes after the
     # original effective-recipe field tuple. It is trajectory-relevant when
     # anchoring is active, so replay it whenever the immutable authority binds

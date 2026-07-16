@@ -280,3 +280,28 @@ def test_current_contract_rejects_unsafe_target_quality_learner_drift(
         match="weighting|surprise",
     ):
         current_science.load()
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    (
+        ("q_loss_weight", 0.25),
+        ("value_target_lambda", 0.75),
+        ("value_root_blend_phases", "PLAY_TURN"),
+        ("value_root_blend_global_compat", True),
+    ),
+)
+def test_current_contract_rejects_unqualified_search_value_targets(
+    tmp_path, monkeypatch, field: str, bad_value
+) -> None:
+    contract = copy.deepcopy(current_science.load())
+    contract["learner"]["training_recipe"][field] = bad_value
+    path = tmp_path / "science.contract.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
+
+    with pytest.raises(
+        current_science.ScienceContractError,
+        match="target-quality contract drifted",
+    ):
+        current_science.load()

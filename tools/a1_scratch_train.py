@@ -621,6 +621,7 @@ def build_train_command(
         ("scalar_value_loss_readout", "--scalar-value-loss-readout"),
         ("scalar_value_loss_scale", "--scalar-value-loss-scale"),
         ("value_target_lambda", "--value-target-lambda"),
+        ("value_root_blend_phases", "--value-root-blend-phases"),
         ("value_categorical_loss_weight", "--value-categorical-loss-weight"),
         ("hlgauss_scalar_aux_loss_weight", "--hlgauss-scalar-aux-loss-weight"),
         ("final_vp_loss_weight", "--final-vp-loss-weight"),
@@ -670,6 +671,11 @@ def build_train_command(
             "mse",
             "--value-categorical-bins",
             "0",
+            (
+                "--value-root-blend-global-compat"
+                if recipe["value_root_blend_global_compat"]
+                else "--no-value-root-blend-global-compat"
+            ),
             "--policy-kl-anchor-direction",
             str(recipe.get("policy_kl_anchor_direction", "forward")),
             "--mask-hidden-info",

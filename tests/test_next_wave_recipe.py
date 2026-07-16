@@ -297,6 +297,10 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert recipe["soft_target_weight"] == 1.0
     assert recipe["soft_target_temperature"] == 1.0
     assert recipe["soft_target_min_legal_coverage"] == 1.0
+    assert recipe["q_loss_weight"] == 0.0
+    assert recipe["value_target_lambda"] == 1.0
+    assert recipe["value_root_blend_phases"] == ""
+    assert recipe["value_root_blend_global_compat"] is False
     assert recipe["train_diagnostics_every_batches"] == 16
     assert recipe["objective_gradient_interference_every_batches"] == 16
     assert recipe["minimum_feature_learning_signal_observations"] == 2
@@ -320,10 +324,10 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert "final_vp_head" in recipe["require_feature_learning_signal_modules"]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:7ed5fbebb8d2a42c64a775f6d3d1b2051bc112195d627b6130cbe25d0c64c29f"
+        "sha256:59702b9735eda81e45170cd4d45ca342d5d08bb761bfa5c967d24c0960563a02"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:d458c989d72b9c20bb42adbe0bea3b4b7dca557acfba0bd0001147d8303e1a0b"
+        "sha256:22d081f54e5ec6693ff40d7b87ada5374f56eff45add34827cd10aff15d44c2e"
     )
 
 
@@ -347,6 +351,8 @@ def test_canonical_short_dose_reconstructs_byte_exactly_in_trainer() -> None:
         "max_grad_norm",
         "post_policy_dose_value_trunk_grad_scale",
         "value_player_outcome_balance_mode",
+        "value_root_blend_phases",
+        "value_root_blend_global_compat",
     }
     assert effective == {
         key: value for key, value in recipe.items() if key not in late_bound_fields

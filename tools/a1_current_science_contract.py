@@ -232,6 +232,15 @@ PRODUCTION_TARGET_QUALITY_LEARNER_CONTRACT = {
     # Raw search disagreement is not target correctness. Production may only
     # prioritize it again after the reliability audit has qualified a recipe.
     "policy_surprise_weight": 0.0,
+    # The archived Stage-C audits show that direct root/completed-Q regression
+    # is worse than the raw value baseline and usually below the measured
+    # search-noise floor. Keep those scalar/Q objectives diagnostic-only. The
+    # policy target remains search-derived and needs its own provenance-bound
+    # quality admission before this currently blocked recipe is authorized.
+    "q_loss_weight": 0.0,
+    "value_target_lambda": 1.0,
+    "value_root_blend_phases": "",
+    "value_root_blend_global_compat": False,
 }
 PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT = {
     # A stable root hash selects this audit slice without consuming gameplay or

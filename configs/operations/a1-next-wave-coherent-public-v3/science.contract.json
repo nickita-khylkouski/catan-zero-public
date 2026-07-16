@@ -182,6 +182,8 @@
       "scalar_value_loss_readout": "deployed_tanh",
       "scalar_value_loss_scale": 1.0,
       "value_target_lambda": 1.0,
+      "value_root_blend_phases": "",
+      "value_root_blend_global_compat": false,
       "value_categorical_loss_weight": 0.0,
       "hlgauss_scalar_aux_loss_weight": 0.0,
       "final_vp_loss_weight": 0.05,
