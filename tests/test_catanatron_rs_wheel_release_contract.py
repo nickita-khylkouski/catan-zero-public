@@ -15,7 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILDER = REPO_ROOT / "tools" / "build_catanatron_rs_wheel.sh"
 CHECKSUM_INVENTORY = "native/catanatron-rs/WHEEL_SHA256SUMS"
-RECEIPT_NAME = "catanatron_rs-0.1.11-build-receipt.json"
+RECEIPT_NAME = "catanatron_rs-0.1.12-build-receipt.json"
 RECEIPT_SCHEMA = "catanatron-rs-wheel-build-receipt-v2"
 
 
@@ -89,8 +89,8 @@ def test_all_cargo_resolution_is_locked() -> None:
     assert "native/gumbel_mcts_rs/Cargo.lock" in _script()
 
 
-def test_native_mcts_wheel_has_one_unique_0111_package_identity() -> None:
-    expected = "0.1.11"
+def test_native_mcts_wheel_has_one_unique_0112_package_identity() -> None:
+    expected = "0.1.12"
     manifests = (
         REPO_ROOT / "native/catanatron-rs/Cargo.toml",
         REPO_ROOT / "native/catanatron-rs/python/Cargo.toml",
@@ -102,8 +102,8 @@ def test_native_mcts_wheel_has_one_unique_0111_package_identity() -> None:
         assert match.group(1) == expected
 
     script = _script()
-    assert "catanatron_rs-0.1.11-cp311-cp311-manylinux_2_34_x86_64.whl" in script
-    assert "catanatron_rs-0.1.11-build-receipt.json" in script
+    assert "catanatron_rs-0.1.12-cp311-cp311-manylinux_2_34_x86_64.whl" in script
+    assert "catanatron_rs-0.1.12-build-receipt.json" in script
     assert "catanatron_rs-0.1.4-cp311" not in script
 
     gumbel_manifest = REPO_ROOT / "native/gumbel_mcts_rs/Cargo.toml"
@@ -147,8 +147,8 @@ def test_source_identity_is_bound_only_after_compilation() -> None:
     assert 'CATAN_RS_SOURCE_COMMIT="$SOURCE_COMMIT"' not in staged_environment
     assert 'CATAN_RS_SOURCE_TREE="$SOURCE_TREE"' not in staged_environment
     assert (
-        'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.11-'
-        'feature-abi-wheel-v1"' in script
+        'SEALED_COMPILE_IDENTITY="catanatron-rs-0.1.12-'
+        'dense-native-search-wheel-v1"' in script
     )
     assert 'payload["source_commit"] = sys.argv[2]' in script
     assert 'payload["source_tree"] = sys.argv[3]' in script
@@ -194,7 +194,7 @@ def test_builder_smokes_the_compiled_capability_contract_before_hashing() -> Non
     digest = script.index('WHEEL_SHA256="$(sha256sum "$WHEEL_PATH"')
 
     assert smoke < digest
-    assert 'version("catanatron-rs") == "0.1.11"' in script
+    assert 'version("catanatron-rs") == "0.1.12"' in script
     assert "public_card_deductions_json" in script
     assert "public_card_deductions_2p_v1" in script
     assert "gumbel_search_capabilities" in script
@@ -228,6 +228,12 @@ def test_builder_runs_semantic_tests_for_advertised_corrected_capabilities() -> 
     forced_root = script.index(
         "forced_trajectory_only_selects_without_evaluator_or_fake_values"
     )
+    full_gumbel = (
+        'cargo test \\\n'
+        '  --locked \\\n'
+        '  --manifest-path "$ROOT/native/gumbel_mcts_rs/Cargo.toml" \\\n'
+        "  --lib\n"
+    )
 
     assert public_award < build
     assert public_belief < build
@@ -236,6 +242,7 @@ def test_builder_runs_semantic_tests_for_advertised_corrected_capabilities() -> 
     assert temperature < build
     assert coherent_belief < build
     assert forced_root < build
+    assert full_gumbel in script
     assert "--features python" in script[public_award - 180 : public_award]
     assert "temperature \\\n  --lib" in script[temperature : build]
 
