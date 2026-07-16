@@ -207,16 +207,16 @@ fn gumbel_search(
     if let Some(v) = config_dict.get_item("c_scale")? {
         config.c_scale = v.extract()?;
     }
-    if let Some(v) = config_dict.get_item("sigma_reference_visits")? {
-        if !v.is_none() {
-            let visits: i32 = v.extract()?;
-            if visits < 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "sigma_reference_visits must be non-negative",
-                ));
-            }
-            config.sigma_reference_visits = Some(visits);
+    if let Some(v) = config_dict.get_item("sigma_reference_visits")?
+        && !v.is_none()
+    {
+        let visits: i32 = v.extract()?;
+        if visits < 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "sigma_reference_visits must be non-negative",
+            ));
         }
+        config.sigma_reference_visits = Some(visits);
     }
     if let Some(v) = config_dict.get_item("temperature")? {
         config.temperature = v.extract()?;
@@ -290,16 +290,16 @@ fn gumbel_search(
     if let Some(v) = config_dict.get_item("rescale_noise_floor_initial_road_only")? {
         config.rescale_noise_floor_initial_road_only = v.extract()?;
     }
-    if let Some(v) = config_dict.get_item("attested_root_phase")? {
-        if !v.is_none() {
-            let phase: String = v.extract()?;
-            if phase.is_empty() {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "attested_root_phase must be a non-empty string",
-                ));
-            }
-            config.attested_root_phase = Some(phase);
+    if let Some(v) = config_dict.get_item("attested_root_phase")?
+        && !v.is_none()
+    {
+        let phase: String = v.extract()?;
+        if phase.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "attested_root_phase must be a non-empty string",
+            ));
         }
+        config.attested_root_phase = Some(phase);
     }
     if config.rescale_noise_floor_initial_road_only && config.attested_root_phase.is_none() {
         return Err(pyo3::exceptions::PyValueError::new_err(

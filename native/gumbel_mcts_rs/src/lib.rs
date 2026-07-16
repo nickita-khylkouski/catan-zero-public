@@ -472,7 +472,7 @@ impl GumbelMctsEngine {
         assert!(
             config
                 .sigma_reference_visits
-                .map_or(true, |visits| visits >= 0),
+                .is_none_or(|visits| visits >= 0),
             "sigma_reference_visits must be non-negative"
         );
         let action_space = ActionSpace::new(&config.colors, config.map_kind);
@@ -516,7 +516,7 @@ impl GumbelMctsEngine {
                 .config
                 .attested_root_phase
                 .as_deref()
-                .map_or(true, str::is_empty)
+                .is_none_or(str::is_empty)
         {
             return Err(
                 "initial-road-only D1 requires a non-empty authoritative root-phase attestation"
@@ -1164,15 +1164,15 @@ impl GumbelMctsEngine {
         }
         for color in &game.state.colors {
             let player = game.state.player_state(*color);
-            for index in 0..5 {
-                public_unknown[index] = public_unknown[index]
+            for (index, count) in public_unknown.iter_mut().enumerate() {
+                *count = count
                     .checked_sub(player.played_dev_cards[index])
                     .ok_or("public played development cards exceed base deck")?;
             }
         }
         let observer = game.state.player_state(root_color);
-        for index in 0..5 {
-            public_unknown[index] = public_unknown[index]
+        for (index, count) in public_unknown.iter_mut().enumerate() {
+            *count = count
                 .checked_sub(observer.dev_cards[index])
                 .ok_or("observer development cards exceed public remaining deck")?;
         }
