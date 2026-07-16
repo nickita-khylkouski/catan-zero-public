@@ -2238,6 +2238,9 @@ def _run_worker(
         meaningful_public_history=bool(
             worker_args.get("meaningful_public_history", False)
         ),
+        meaningful_public_history_schema=(
+            _requested_history_options(worker_args)[2]
+        ),
         learner_entity_feature_adapter_version=worker_args.get(
             "learner_entity_feature_adapter_version"
         ),

@@ -49,11 +49,12 @@ import numpy as np
 
 from catan_zero.rl.gumbel_self_play import (
     GumbelShardWriter,
-    PLAYER_NAMES,
     _apply_selected_action,
     _game_outcome_fields,
     action_size_for_evaluator,
 )
+from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
+from catan_zero.rl.meaningful_history import MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
 from catan_zero.rl.raw_selfplay import (
     COLORS,
     RawSelfPlayConfig,
@@ -61,10 +62,9 @@ from catan_zero.rl.raw_selfplay import (
     _select_action,
     play_one_raw_selfplay_game,
 )
-from catan_zero.search.rust_mcts import RustEvaluator, _require_rust_module
+from catan_zero.search.rust_mcts import RustEvaluator
 
 from reconstruct_state import (
-    CHANCE_RNG_SALT,
     gather_game_action_sequence,
     reconstruct_state,
 )
@@ -108,6 +108,10 @@ class RestartSelfPlayConfig:
     restart_temperature_decisions: int = 20
     temperature: float = 1.0
     correct_rust_chance_spectra: bool = True
+    meaningful_public_history: bool = True
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+    event_history_limit: int = 64
+    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_V5
 
 
 class RestartShardWriter(GumbelShardWriter):
@@ -200,6 +204,10 @@ def play_restart_game_from_state(
         temperature_decisions=config.restart_temperature_decisions,
         temperature=config.temperature,
         correct_rust_chance_spectra=config.correct_rust_chance_spectra,
+        meaningful_public_history=config.meaningful_public_history,
+        meaningful_public_history_schema=config.meaningful_public_history_schema,
+        event_history_limit=config.event_history_limit,
+        entity_feature_adapter_version=config.entity_feature_adapter_version,
     )
     while cont_index < config.max_continuation_decisions:
         if game.winning_color() is not None:
@@ -229,6 +237,15 @@ def play_restart_game_from_state(
             game_seed=archived_game_seed,
             decision_index=cont_index,
             obs_width=config.obs_width,
+            meaningful_public_history=bool(config.meaningful_public_history),
+            meaningful_public_history_schema=str(
+                config.meaningful_public_history_schema
+            ),
+            event_history_limit=int(config.event_history_limit),
+            entity_feature_adapter_version=str(
+                config.entity_feature_adapter_version
+            ),
+            target_information_regime=str(temp_config.target_information_regime),
         )
         # Tag provenance + start mode. teacher_name distinguishes this corpus.
         row["teacher_name"] = TEACHER_NAME
@@ -466,14 +483,24 @@ def main() -> None:
     parser.add_argument(
         "--public-observation",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Mask hidden opponent info at the model input (f72/#76), threaded into "
             "EntityGraphRustEvaluatorConfig.public_observation. REQUIRED when the "
             "--checkpoint is a masked/public-observation-trained net (e.g. "
             "champion_v0); otherwise neural_rust_mcts's regime assert refuses it. "
-            "Default OFF (matches an omniscient-trained checkpoint)."
+            "Default ON. Persisted rows are always public-masked."
         ),
+    )
+    parser.add_argument(
+        "--meaningful-public-history",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--event-history-limit", type=int, default=64)
+    parser.add_argument(
+        "--learner-entity-feature-adapter-version",
+        default=RUST_ENTITY_ADAPTER_V5,
     )
     parser.add_argument(
         "--correct-rust-chance-spectra",
@@ -533,6 +560,17 @@ def main() -> None:
         restart_temperature_decisions=int(args.restart_temperature_decisions),
         temperature=float(args.temperature),
         correct_rust_chance_spectra=bool(args.correct_rust_chance_spectra),
+        meaningful_public_history=bool(args.meaningful_public_history),
+        meaningful_public_history_schema=(
+            MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+            if str(args.learner_entity_feature_adapter_version)
+            == RUST_ENTITY_ADAPTER_V5
+            else RawSelfPlayConfig().meaningful_public_history_schema
+        ),
+        event_history_limit=int(args.event_history_limit),
+        entity_feature_adapter_version=str(
+            args.learner_entity_feature_adapter_version
+        ),
     )
 
     counts = plan_start_mix(
@@ -587,6 +625,17 @@ def main() -> None:
                 temperature_decisions=int(args.restart_temperature_decisions),
                 temperature=float(args.temperature),
                 correct_rust_chance_spectra=bool(args.correct_rust_chance_spectra),
+                meaningful_public_history=bool(args.meaningful_public_history),
+                meaningful_public_history_schema=(
+                    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+                    if str(args.learner_entity_feature_adapter_version)
+                    == RUST_ENTITY_ADAPTER_V5
+                    else RawSelfPlayConfig().meaningful_public_history_schema
+                ),
+                event_history_limit=int(args.event_history_limit),
+                entity_feature_adapter_version=str(
+                    args.learner_entity_feature_adapter_version
+                ),
             ),
             game_seed=game_seed,
             game_index=game_seed,

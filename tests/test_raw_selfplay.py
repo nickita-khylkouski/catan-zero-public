@@ -16,6 +16,9 @@ from catan_zero.rl.raw_selfplay import (
     play_one_raw_selfplay_game,
     run_raw_selfplay_worker_games,
 )
+from catan_zero.rl.gumbel_self_play import (
+    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+)
 from catan_zero.search.gumbel_chance_mcts import HeuristicRustEvaluator
 from catan_zero.search.rust_mcts import _require_rust_module
 
@@ -115,6 +118,14 @@ def test_teacher_name_is_raw_selfplay():
     assert record.decisions
     for decision in record.decisions:
         assert decision.row["teacher_name"] == TEACHER_NAME
+        assert (
+            decision.row["target_information_regime"]
+            == TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+        )
+        assert (
+            decision.row["adapter_version"]
+            == config.entity_feature_adapter_version
+        )
 
 
 # ---------------------------------------------------------------------------

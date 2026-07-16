@@ -98,9 +98,13 @@ from catan_zero.search import gumbel_chance_mcts as _gumbel_chance_mcts
 from catan_zero.search.native_gumbel_mcts import create_gumbel_search
 from catan_zero.search.neural_rust_mcts import (
     RUST_ENTITY_ADAPTER_VERSION,
+    _resolve_entity_adapter,
     rust_action_context_batch,
     rust_game_to_entity_batch,
     rust_policy_action_ids,
+)
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
 
 __all__ = [
@@ -329,6 +333,9 @@ class GumbelSelfPlayConfig:
     # strategic public taxonomy and retain at most the latest 32 events.
     # Defaults preserve legacy shard shape/contents.
     meaningful_public_history: bool = False
+    meaningful_public_history_schema: str = (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    )
     event_history_limit: int = 64
     # The search evaluator remains checkpoint-bound to its own feature adapter.
     # Fresh learner rows may explicitly use a newer, versioned adapter because
@@ -738,6 +745,100 @@ def _game_outcome_fields(
     }
 
 
+def _build_public_learner_features(
+    game: Any,
+    legal_rust: tuple[int, ...],
+    *,
+    colors: tuple[str, ...],
+    action_size: int,
+    actor: str,
+    snapshot: dict[str, Any] | None = None,
+    action_by_id: dict[int, Any] | None = None,
+    meaningful_public_history: bool = False,
+    meaningful_public_history_schema: str = (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    ),
+    event_history_limit: int = 64,
+    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
+) -> tuple[
+    tuple[int, ...],
+    dict[str, np.ndarray],
+    np.ndarray,
+    dict[str, Any],
+    dict[int, Any],
+]:
+    """Build the one canonical public-only learner input surface.
+
+    Search, raw-policy, restart, and future frontier-value producers must use
+    this path.  The authoritative game object may contain exact hidden truth,
+    but persisted learner tensors never may.  Resolving once also avoids the
+    historical duplicate snapshot/player-state/action-map work between entity
+    tokens and legal-action context.
+    """
+
+    if snapshot is None:
+        snapshot = json.loads(game.json_snapshot())
+    if action_by_id is None:
+        action_ids = [
+            int(action)
+            for action in game.playable_action_indices(list(colors), None)
+        ]
+        raw_actions = json.loads(game.playable_actions_json())
+        action_by_id = dict(zip(action_ids, raw_actions))
+    mapped = rust_policy_action_ids(
+        game,
+        legal_rust,
+        colors=colors,
+        action_size=action_size,
+        action_by_id=action_by_id,
+    )
+    resolved = _resolve_entity_adapter(
+        game,
+        legal_rust,
+        colors=colors,
+        action_size=action_size,
+        policy_action_ids=mapped,
+        snapshot=snapshot,
+        action_by_id=action_by_id,
+        public_observation=True,
+        perspective=str(actor),
+        meaningful_public_history=meaningful_public_history,
+        meaningful_public_history_schema=meaningful_public_history_schema,
+        entity_feature_adapter_version=entity_feature_adapter_version,
+    )
+    entity = rust_game_to_entity_batch(
+        game,
+        legal_rust,
+        actor=actor,
+        colors=colors,
+        action_size=action_size,
+        policy_action_ids=mapped,
+        meaningful_public_history=meaningful_public_history,
+        meaningful_public_history_schema=meaningful_public_history_schema,
+        history_limit=event_history_limit,
+        entity_feature_adapter_version=entity_feature_adapter_version,
+        resolved=resolved,
+    )
+    context = rust_action_context_batch(
+        game,
+        legal_rust,
+        actor=actor,
+        colors=colors,
+        action_size=action_size,
+        policy_action_ids=mapped,
+        public_observation=True,
+        entity_feature_adapter_version=entity_feature_adapter_version,
+        resolved=resolved,
+    )[0]
+    return (
+        mapped,
+        {key: value[0] for key, value in entity.items()},
+        context,
+        snapshot,
+        action_by_id,
+    )
+
+
 def _build_decision_row(
     game: Any,
     *,
@@ -755,6 +856,9 @@ def _build_decision_row(
     action_by_id: dict[int, Any] | None = None,
     target_information_regime: str = TARGET_INFORMATION_REGIME_AUTHORITATIVE,
     meaningful_public_history: bool = False,
+    meaningful_public_history_schema: str = (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    ),
     event_history_limit: int = 64,
     decision_class: str = "normal_choice",
     entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
@@ -774,56 +878,19 @@ def _build_decision_row(
     # no neural work. Both must receive zero policy weight.
     is_forced = len(legal_rust) <= 1
     acting_color = str(game.current_color())
-    mapped = rust_policy_action_ids(
-        game, legal_rust, colors=colors, action_size=action_size
-    )
-    # Fetch the snapshot + rust-action-id -> raw-json mapping ONCE and thread
-    # them into both batch calls below (they'd otherwise each independently
-    # re-fetch json_snapshot/playable_action_indices/playable_actions_json on
-    # the same, unchanged game state -- see `_resolve_entity_adapter`'s
-    # docstring in neural_rust_mcts.py).
-    if snapshot is None:
-        snapshot = json.loads(game.json_snapshot())
-    if action_by_id is None:
-        action_ids = [
-            int(action) for action in game.playable_action_indices(list(colors), None)
-        ]
-        raw_actions = json.loads(game.playable_actions_json())
-        action_by_id = {
-            action_id: raw for action_id, raw in zip(action_ids, raw_actions)
-        }
-    entity = rust_game_to_entity_batch(
+    mapped, features, context, snapshot, action_by_id = _build_public_learner_features(
         game,
         legal_rust,
-        actor=acting_color,
         colors=colors,
         action_size=action_size,
-        policy_action_ids=mapped,
+        actor=acting_color,
         snapshot=snapshot,
         action_by_id=action_by_id,
-        # Persist the same public-information view used by online MCTS.  The
-        # training loader may mask again as a defence in depth, but shards
-        # must be safe and self-describing on their own: a consumer that does
-        # not happen to pass ``--mask-hidden-info`` must never see opponents'
-        # resource composition, hidden development cards, or actual VP.
-        public_observation=True,
         meaningful_public_history=meaningful_public_history,
-        history_limit=event_history_limit,
+        meaningful_public_history_schema=meaningful_public_history_schema,
+        event_history_limit=event_history_limit,
         entity_feature_adapter_version=entity_feature_adapter_version,
     )
-    features = {key: value[0] for key, value in entity.items()}
-    context = rust_action_context_batch(
-        game,
-        legal_rust,
-        actor=acting_color,
-        colors=colors,
-        action_size=action_size,
-        policy_action_ids=mapped,
-        snapshot=snapshot,
-        action_by_id=action_by_id,
-        public_observation=True,
-        entity_feature_adapter_version=entity_feature_adapter_version,
-    )[0]
 
     # F4: fp32, not fp16. improved_policy assigns real (non-zero, non-one-hot)
     # mass to every legal action via completion, so fp16's ~1e-3 relative
@@ -1453,6 +1520,9 @@ def play_one_game(
                 snapshot=snapshot,
                 action_by_id=action_by_id,
                 meaningful_public_history=bool(config.meaningful_public_history),
+                meaningful_public_history_schema=str(
+                    config.meaningful_public_history_schema
+                ),
                 event_history_limit=int(config.event_history_limit),
                 decision_class=decision_class,
                 entity_feature_adapter_version=(

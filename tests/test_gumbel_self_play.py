@@ -20,7 +20,9 @@ from catan_zero.rl.aux_subgoal_targets import (
 from catan_zero.rl.entity_feature_adapter import (
     RUST_ENTITY_ADAPTER_V2,
     RUST_ENTITY_ADAPTER_V3,
+    RUST_ENTITY_ADAPTER_V5,
 )
+from catan_zero.rl.meaningful_history import MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
 from catan_zero.rl.flywheel.opponent_mix import (
     MixCategory,
     MixCheckpointRef,
@@ -434,10 +436,14 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
             return SimpleNamespace(selected_action=100, simulations_used=4)
 
     recorded_adapter_versions: list[str] = []
+    recorded_history_schemas: list[str] = []
 
     def fake_build(game, **kwargs):
         recorded_adapter_versions.append(
             str(kwargs["entity_feature_adapter_version"])
+        )
+        recorded_history_schemas.append(
+            str(kwargs["meaningful_public_history_schema"])
         )
         return {
             "player": str(game.current_color()),
@@ -467,7 +473,9 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
         ),
         config=GumbelSelfPlayConfig(
             max_decisions=3,
-            learner_entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V3,
+            meaningful_public_history=True,
+            meaningful_public_history_schema=MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+            learner_entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
         ),
         game_seed=123,
         game_index=0,
@@ -475,7 +483,8 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
     )
 
     assert record.terminal is True
-    assert recorded_adapter_versions == [RUST_ENTITY_ADAPTER_V3] * 3
+    assert recorded_adapter_versions == [RUST_ENTITY_ADAPTER_V5] * 3
+    assert recorded_history_schemas == [MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2] * 3
     assert record.forced_decisions == 3
     assert len(record.decisions) == 3
     for decision in record.decisions:

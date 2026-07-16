@@ -41,7 +41,6 @@ fields (identical convention to the searched driver), which
 from __future__ import annotations
 
 import dataclasses
-import json
 import random
 import time
 from dataclasses import dataclass
@@ -55,16 +54,18 @@ from catan_zero.rl.gumbel_self_play import (
     COLORS,
     PLAYER_NAMES,
     GumbelShardWriter,
+    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _apply_selected_action,
+    _build_public_learner_features,
     _game_outcome_fields,
     _write_json_atomic,
     action_size_for_evaluator,
 )
 from catan_zero.search.neural_rust_mcts import (
     RUST_ENTITY_ADAPTER_VERSION,
-    rust_action_context_batch,
-    rust_game_to_entity_batch,
-    rust_policy_action_ids,
+)
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
 from catan_zero.search.rust_mcts import RustEvaluator, _require_rust_module
 
@@ -107,6 +108,13 @@ class RawSelfPlayConfig:
     # game's own chance resolution needs the same verified-bug correction
     # (A19/A20) as the searched driver to keep recorded trajectories valid.
     correct_rust_chance_spectra: bool = True
+    meaningful_public_history: bool = False
+    meaningful_public_history_schema: str = (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    )
+    event_history_limit: int = 64
+    entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION
+    target_information_regime: str = TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
 
 
 @dataclass(slots=True)
@@ -197,37 +205,26 @@ def _build_raw_decision_row(
     game_seed: int,
     decision_index: int,
     obs_width: int,
+    meaningful_public_history: bool,
+    meaningful_public_history_schema: str,
+    event_history_limit: int,
+    entity_feature_adapter_version: str,
+    target_information_regime: str,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     legal_rust = tuple(sorted(priors.keys()))
     is_forced = len(legal_rust) <= 1
     acting_color = str(game.current_color())
-    mapped = rust_policy_action_ids(game, legal_rust, colors=colors, action_size=action_size)
-
-    snapshot = json.loads(game.json_snapshot())
-    action_ids = [int(action) for action in game.playable_action_indices(list(colors), None)]
-    raw_actions = json.loads(game.playable_actions_json())
-    action_by_id = {action_id: raw for action_id, raw in zip(action_ids, raw_actions)}
-    entity = rust_game_to_entity_batch(
+    mapped, features, context, snapshot, _action_by_id = _build_public_learner_features(
         game,
         legal_rust,
-        actor=acting_color,
         colors=colors,
         action_size=action_size,
-        policy_action_ids=mapped,
-        snapshot=snapshot,
-        action_by_id=action_by_id,
+        actor=acting_color,
+        meaningful_public_history=meaningful_public_history,
+        meaningful_public_history_schema=meaningful_public_history_schema,
+        event_history_limit=event_history_limit,
+        entity_feature_adapter_version=entity_feature_adapter_version,
     )
-    features = {key: value[0] for key, value in entity.items()}
-    context = rust_action_context_batch(
-        game,
-        legal_rust,
-        actor=acting_color,
-        colors=colors,
-        action_size=action_size,
-        policy_action_ids=mapped,
-        snapshot=snapshot,
-        action_by_id=action_by_id,
-    )[0]
 
     # target_policy IS the evaluator's raw prior distribution -- there is no
     # search to "improve" it in this driver, so target==prior by construction
@@ -259,9 +256,10 @@ def _build_raw_decision_row(
         "target_policy_mask": target_policy_mask,
         "target_scores_mask": target_scores_mask,
         "target_score_source": TARGET_SCORE_SOURCE,
+        "target_information_regime": target_information_regime,
         "game_seed": np.int64(game_seed),
         "teacher_name": TEACHER_NAME,
-        "adapter_version": RUST_ENTITY_ADAPTER_VERSION,
+        "adapter_version": entity_feature_adapter_version,
         "player": acting_color,
         # Must index PLAYER_NAMES order, not `colors` order -- see the
         # identical convention/warning in gumbel_self_play.py's
@@ -355,6 +353,15 @@ def play_one_raw_selfplay_game(
             game_seed=game_seed,
             decision_index=decision_index,
             obs_width=config.obs_width,
+            meaningful_public_history=bool(config.meaningful_public_history),
+            meaningful_public_history_schema=str(
+                config.meaningful_public_history_schema
+            ),
+            event_history_limit=int(config.event_history_limit),
+            entity_feature_adapter_version=str(
+                config.entity_feature_adapter_version
+            ),
+            target_information_regime=str(config.target_information_regime),
         )
         decisions.append(RawDecisionRecord(row=row, features=features))
 
@@ -468,7 +475,8 @@ def run_raw_selfplay_worker_games(
         "worker_seed": int(worker_seed),
         "base_seed": int(base_seed),
         "game_index_start": int(game_index_start),
-        "adapter_version": RUST_ENTITY_ADAPTER_VERSION,
+        "adapter_version": config.entity_feature_adapter_version,
+        "target_information_regime": config.target_information_regime,
         # Full config provenance (982d344 pattern): what the worker actually
         # constructed, for post-hoc audit via audit_gumbel_pilot_shards.py's
         # check_config_provenance.

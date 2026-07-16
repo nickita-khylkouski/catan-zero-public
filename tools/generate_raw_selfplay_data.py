@@ -27,6 +27,8 @@ from catan_zero.rl.raw_selfplay import (
     RawSelfPlayConfig,
     run_raw_selfplay_worker_games,
 )
+from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
+from catan_zero.rl.meaningful_history import MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
 from catan_zero.search.gumbel_chance_mcts import HeuristicRustEvaluator
 from catan_zero.search.neural_rust_mcts import (
     BatchedEntityGraphRustEvaluator,
@@ -72,13 +74,19 @@ def main() -> None:
     parser.add_argument(
         "--public-observation",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Public-observation featurization (hidden-info leak fix, f72): mask each "
-        "opponent's hand composition, unplayed dev-card identities, and actual VP from "
-        "the recorded model input (keep public counts/VP + the actor's own hand). "
-        "Threads to EntityGraphRustEvaluatorConfig.public_observation. Default off; use "
-        "for a public-only value-repair corpus (equivalently, train_bc --mask-hidden-info "
-        "on the existing corpus).",
+        default=True,
+        help="Use the same public observation available to the learner for behavior "
+        "selection. Persisted rows are always public-masked regardless.",
+    )
+    parser.add_argument(
+        "--meaningful-public-history",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--event-history-limit", type=int, default=64)
+    parser.add_argument(
+        "--learner-entity-feature-adapter-version",
+        default=RUST_ENTITY_ADAPTER_V5,
     )
     parser.add_argument(
         "--belief-chance-spectra",
@@ -150,6 +158,17 @@ def main() -> None:
                 "score_actions": bool(args.score_actions),
                 "correct_rust_chance_spectra": bool(args.correct_rust_chance_spectra),
                 "public_observation": bool(args.public_observation),
+                "meaningful_public_history": bool(args.meaningful_public_history),
+                "meaningful_public_history_schema": (
+                    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+                    if str(args.learner_entity_feature_adapter_version)
+                    == RUST_ENTITY_ADAPTER_V5
+                    else RawSelfPlayConfig().meaningful_public_history_schema
+                ),
+                "event_history_limit": int(args.event_history_limit),
+                "learner_entity_feature_adapter_version": str(
+                    args.learner_entity_feature_adapter_version
+                ),
             }
         )
         game_index_start += worker_games
@@ -235,6 +254,22 @@ def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
         temperature_decisions=int(worker_args["temperature_decisions"]),
         temperature=float(worker_args["temperature"]),
         correct_rust_chance_spectra=bool(worker_args["correct_rust_chance_spectra"]),
+        meaningful_public_history=bool(
+            worker_args.get("meaningful_public_history", False)
+        ),
+        meaningful_public_history_schema=str(
+            worker_args.get(
+                "meaningful_public_history_schema",
+                RawSelfPlayConfig().meaningful_public_history_schema,
+            )
+        ),
+        event_history_limit=int(worker_args.get("event_history_limit", 64)),
+        entity_feature_adapter_version=str(
+            worker_args.get(
+                "learner_entity_feature_adapter_version",
+                RawSelfPlayConfig().entity_feature_adapter_version,
+            )
+        ),
     )
     summary = run_raw_selfplay_worker_games(
         out_dir=Path(worker_args["out_dir"]),
