@@ -28,14 +28,11 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     assert recipe["value_trunk_grad_scale"] == 0.0
     execution = current_science.learner_execution_topology()
     assert execution == current_science.PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
-    assert execution["go_authorized"] is True
-    assert (
-        execution["optimization_schedule_status"]
-        == "commissioned_scratch_update_horizon_v1"
-    )
+    assert execution["go_authorized"] is False
+    assert execution["optimization_schedule_status"] == "unresolved"
     assert (
         execution["reviewed_optimizer_schedule_role"]
-        == "from_scratch_representation_learning_v1"
+        == "candidate_horizon_pending_optimizer_and_value_routing_evidence_v1"
     )
     assert (
         execution["world_size"]

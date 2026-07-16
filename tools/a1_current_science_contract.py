@@ -175,10 +175,14 @@ PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT = {
     "global_batch_size": 512,
     "ddp_shard_data": False,
     "training_rng_rank_offset": True,
-    "optimization_schedule_status": "commissioned_scratch_update_horizon_v1",
-    "go_authorized": True,
+    # The smaller batch creates a plausible update horizon, but it does not
+    # resolve the untested AdamW/decay/cosine bundle or exact-zero shared value
+    # gradient. Keep execution fail-closed until matched scratch evidence
+    # adjudicates those choices.
+    "optimization_schedule_status": "unresolved",
+    "go_authorized": False,
     "reviewed_optimizer_schedule_role": (
-        "from_scratch_representation_learning_v1"
+        "candidate_horizon_pending_optimizer_and_value_routing_evidence_v1"
     ),
 }
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(

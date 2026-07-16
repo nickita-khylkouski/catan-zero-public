@@ -921,12 +921,19 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert recipe["per_game_policy_weight_mode"] == "equal"
     assert recipe["training_rng_rank_offset"] is True
     assert recipe["lr"] == 6e-5
-    assert recipe["lr_warmup_steps"] == 100
+    assert recipe["lr_warmup_steps"] == 250
     assert recipe["lr_schedule"] == "cosine"
     assert recipe["symmetry_augment"] is True
     assert recipe["value_phase_weights"] == "none"
     assert recipe["per_game_value_weight"] is True
     assert recipe == contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE
+    assert payload["science"]["learner_execution_topology"]["go_authorized"] is False
+    assert (
+        payload["science"]["learner_execution_topology"][
+            "optimization_schedule_status"
+        ]
+        == "unresolved"
+    )
     assert "$.promotion_handoff.path" in unresolved
     assert payload["science"]["search"]["n_full_wide"] is None
     assert payload["science"]["search"]["n_full_wide_threshold"] is None

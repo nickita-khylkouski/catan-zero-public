@@ -94,9 +94,9 @@
       "global_batch_size": 512,
       "ddp_shard_data": false,
       "training_rng_rank_offset": true,
-      "optimization_schedule_status": "commissioned_scratch_update_horizon_v1",
-      "go_authorized": true,
-      "reviewed_optimizer_schedule_role": "from_scratch_representation_learning_v1"
+      "optimization_schedule_status": "unresolved",
+      "go_authorized": false,
+      "reviewed_optimizer_schedule_role": "candidate_horizon_pending_optimizer_and_value_routing_evidence_v1"
     },
     "learner_training_recipe": {
       "track": "2p_no_trade",

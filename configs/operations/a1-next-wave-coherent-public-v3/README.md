@@ -36,12 +36,16 @@ global batch of 512 as an arbitrary topology.
 
 `tools/a1_scratch_train.py` authenticates the admitted post-wave composite and
 renders the exact native-v5, bias-free 35M command plus a digest-bound planning
-receipt. The current candidate recipe is epoch-bound (`epochs=3`,
-`max_steps=0`) with fresh AdamW, 250-step warmup, cosine decay, BF16, and the
-sealed symmetry/history relabeling flags. The commissioned global batch of 512
-provides roughly eight times as many optimizer updates as the rejected
-fine-tune-sized global batch of 4096. Execution remains receipt- and
-contract-gated.
+receipt. It is intentionally plan-only today. The current candidate recipe is
+epoch-bound (`epochs=3`, `max_steps=0`) with fresh AdamW, 250-step warmup,
+cosine decay, BF16, and the sealed symmetry/history relabeling flags. The
+candidate global batch of 512 provides roughly eight times as many optimizer
+updates as the rejected fine-tune-sized global batch of 4096, but the execution
+topology still records `optimization_schedule_status=unresolved` and
+`go_authorized=false`. Until a complete scratch-optimizer schedule authority is
+reviewed—including the exact-zero shared value-gradient choice—the planner
+exposes no execution switch and `train_bc` rejects its child marker before data
+loading; every planning receipt is diagnostic-only and non-promotion-eligible.
 
 Generate through the sealed pre-wave control plane. For a direct lane command:
 
