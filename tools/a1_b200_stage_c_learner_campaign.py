@@ -46,7 +46,7 @@ from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 
 
 SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v6"
-EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v1"
+EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v2"
 FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
 POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA = "posthoc-policy-teacher-gap-objective-v1"
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
@@ -102,10 +102,120 @@ VALUE_GATE_POLICIES = frozenset(
     {VALUE_GATE_POLICY, "diagnostic_record_only_allow_regression"}
 )
 MAX_VALUE_MSE_REGRESSION = 0.0
+POLICY_AUX_COVERAGE_TAIL_PROBABILITY = 1.0e-9
 
 
 class CampaignError(RuntimeError):
     """The Stage-C aligned learner campaign is invalid."""
+
+
+def _uniform_unique_coverage_contract(
+    *,
+    population: int,
+    draws: int,
+    tail_probability: float = POLICY_AUX_COVERAGE_TAIL_PROBABILITY,
+) -> dict[str, float | int | str]:
+    """Return a rigorous lower bound for unique roots under uniform draws.
+
+    The number of distinct roots is 1-Lipschitz in every independent draw.
+    McDiarmid's inequality therefore gives a distribution-free lower-tail
+    bound around the exact occupancy expectation without relying on a normal
+    approximation.
+    """
+
+    roots = int(population)
+    dose = int(draws)
+    alpha = float(tail_probability)
+    if roots <= 0 or dose < 0:
+        raise CampaignError("policy-AUX coverage population/draws are invalid")
+    if not math.isfinite(alpha) or not 0.0 < alpha < 1.0:
+        raise CampaignError("policy-AUX coverage tail probability is invalid")
+    if dose == 0:
+        expectation = 0.0
+        deviation = 0.0
+    else:
+        unseen_probability = math.exp(
+            float(dose) * math.log1p(-1.0 / float(roots))
+        ) if roots > 1 else 0.0
+        expectation = float(roots) * (1.0 - unseen_probability)
+        deviation = math.sqrt(
+            0.5 * float(dose) * math.log(1.0 / alpha)
+        )
+    lower = max(0, math.floor(expectation - deviation))
+    return {
+        "schema_version": "uniform-policy-aux-unique-coverage-v1",
+        "population": roots,
+        "draws": dose,
+        "expected_unique_roots": expectation,
+        "lower_bound_unique_roots": int(lower),
+        "lower_tail_probability_bound": alpha,
+        "bound": "mcdiarmid_bounded_differences",
+    }
+
+
+def _verify_strategic_balanced_sampling_surface(
+    sampling: Mapping[str, Any], *, selected_training_roots: int
+) -> None:
+    """Authenticate that STRATEGIC_BALANCED really is uniform over roots."""
+
+    summary = sampling.get("final_training_weights")
+    roots = int(selected_training_roots)
+    if (
+        roots <= 0
+        or not isinstance(summary, Mapping)
+        or float(summary.get("min", math.nan)) != 1.0
+        or float(summary.get("max", math.nan)) != 1.0
+        or float(summary.get("mean", math.nan)) != 1.0
+        or not math.isclose(
+            float(summary.get("effective_sample_size", math.nan)),
+            float(roots),
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        )
+    ):
+        raise CampaignError(
+            "STRATEGIC_BALANCED sampling is not uniform over selected training roots"
+        )
+
+
+def _verify_realized_policy_aux_coverage(
+    *,
+    arm: str,
+    selected_training_roots: int,
+    auxiliary_draws: int,
+    unique_source_rows: int,
+) -> dict[str, Any]:
+    """Refuse a learner whose realized auxiliary sampler collapsed."""
+
+    roots = int(selected_training_roots)
+    draws = int(auxiliary_draws)
+    unique = int(unique_source_rows)
+    if roots <= 0 or draws <= 0 or unique <= 0 or unique > min(roots, draws):
+        raise CampaignError("completed learner unique-root exposure drifted")
+    if arm != "STRATEGIC_BALANCED":
+        return {
+            "schema_version": "policy-aux-realized-coverage-v1",
+            "arm": str(arm),
+            "exact_uniform_lower_bound_available": False,
+            "gate_passed": True,
+        }
+    contract = _uniform_unique_coverage_contract(
+        population=roots,
+        draws=draws,
+    )
+    if unique < int(contract["lower_bound_unique_roots"]):
+        raise CampaignError(
+            "completed learner policy-AUX sampler collapsed: "
+            f"unique={unique} lower_bound={contract['lower_bound_unique_roots']} "
+            f"draws={draws} population={roots}"
+        )
+    return {
+        **contract,
+        "arm": str(arm),
+        "exact_uniform_lower_bound_available": True,
+        "realized_unique_roots": unique,
+        "gate_passed": True,
+    }
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -680,6 +790,11 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
     )
     if selected_roots_total <= 0 or selected_training_roots <= 0:
         raise CampaignError("Stage-C overlay has no policy roots")
+    if arm == "STRATEGIC_BALANCED":
+        _verify_strategic_balanced_sampling_surface(
+            sampling,
+            selected_training_roots=selected_training_roots,
+        )
     trajectory = []
     for step in CHECKPOINT_STEPS:
         aux_draws = POLICY_AUX_ACTIVE_BATCH_SIZE * WORLD_SIZE * step
@@ -994,10 +1109,14 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
     selected_roots = int(
         plan["policy_target_contract"]["selected_unique_training_roots"]
     )
+    coverage_evidence = _verify_realized_policy_aux_coverage(
+        arm=str(plan["arm"]),
+        selected_training_roots=selected_roots,
+        auxiliary_draws=aux_draws,
+        unique_source_rows=unique_rows,
+    )
     if (
         aux_draws != expected_aux_draws
-        or unique_rows <= 0
-        or unique_rows > selected_roots
         or not math.isclose(
             float(report.get("policy_aux_reuse_factor", math.nan)),
             aux_draws / unique_rows,
@@ -1033,6 +1152,7 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
             "unique_auxiliary_source_rows": unique_rows,
             "unique_root_coverage_fraction": unique_rows / selected_roots,
             "auxiliary_reuse_factor": aux_draws / unique_rows,
+            "realized_coverage_authority": coverage_evidence,
             "base_policy_active_draws": int(report.get("policy_base_active_rows", 0)),
             "root_breadth": copy.deepcopy(
                 plan["policy_target_contract"]["root_breadth"]
