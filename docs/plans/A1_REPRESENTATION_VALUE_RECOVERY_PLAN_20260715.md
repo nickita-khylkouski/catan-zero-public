@@ -147,6 +147,12 @@ Compare independent arms:
 - shared trunk LR `0.10`;
 - split final policy/value tower.
 
+The commissioned scratch baseline uses the split final value tower with
+`value_trunk_grad_scale=0.25`. A zero shared-value gradient is not a valid
+scratch baseline: most retained rows are value-only, so zero would leave the
+new encoders and shared blocks trained almost entirely by the much smaller
+policy-active subset.
+
 Keep terminal outcomes as the main value target. Record phase-sliced value
 calibration, value/policy gradient norms, gradient cosine by layer, parent
 policy KL, and functional drift at least every eight steps.

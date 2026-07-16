@@ -81,10 +81,13 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "fused_optimizer": True,
     "amp": "bf16",
     "value_lr_mult": 1.0,
-    # Adam can cancel a constant raw-gradient scale through its first/second
-    # moments. The private value suffix learns at full strength while this exact
-    # stop-gradient protects the shared policy prefix.
-    "value_trunk_grad_scale": 0.0,
+    # Adam can cancel a constant parameter-group LR interpretation through its
+    # first/second moments, so this is an explicit autograd-boundary scale. The
+    # private final value block protects the policy readout, while a
+    # measured 0.25 boundary gradient still lets terminal outcomes train the
+    # shared token/history representation from scratch.  A zero boundary made
+    # every value-only row useless to the 5 shared blocks and input encoders.
+    "value_trunk_grad_scale": 0.25,
     # Reporting is part of production admission even though it does not alter
     # the optimizer trajectory. The full scratch dose must prove every
     # commissioned v5 path received gradient and an actual update.

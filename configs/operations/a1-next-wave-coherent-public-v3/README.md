@@ -17,6 +17,10 @@ v1/v2 artifacts remain immutable and diagnostically replayable.
 The production learner starts natively from scratch with adapter v5,
 `public_rule_state` and meaningful-history target gather enabled, no learner
 checkpoint, and fresh optimizer state.
+Its final value block is private, while terminal-value gradients enter the
+shared encoders and first five blocks at 0.25 strength. This retains the
+measured interference reduction without making the roughly 87.6% value-only
+rows unable to teach the new representation.
 The search teacher remains the deployed adapter-v2 checkpoint; only stored
 learner features advance. The function-preserving v4 checkpoint upgrader
 remains available for isolated compatibility experiments, but it is not the
