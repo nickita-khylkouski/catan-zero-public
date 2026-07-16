@@ -932,6 +932,22 @@ def test_production_one_dose_emits_same_trajectory_dose_snapshots(
     ) == (64, 96)
 
 
+def test_coherent_one_dose_renders_deployed_scalar_value_objective(
+    tmp_path: Path,
+) -> None:
+    verified = _production_trainer_verified(tmp_path)
+    verified["recipe"] = dict(contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE)
+    command = executor._build_direct_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    assert _option(command, "--scalar-value-loss-readout") == "deployed_tanh"
+    assert _option(command, "--scalar-value-loss-scale") == "1.0"
+
+
 def test_intermediate_checkpoint_steps_fail_closed() -> None:
     assert executor.train_bc._parse_checkpoint_steps(
         "64,96", max_steps=128

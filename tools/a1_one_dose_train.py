@@ -1740,6 +1740,14 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
         raise ExecutorError(
             "sealed A1 topology/optimizer invariants are not one-B200 fresh Adam"
         )
+    if current_science.is_coherent_search(search) and (
+        recipe.get("scalar_value_loss_readout") != "deployed_tanh"
+        or recipe.get("scalar_value_loss_scale")
+        != (science.get("evaluator") or {}).get("value_scale")
+    ):
+        raise ExecutorError(
+            "coherent scalar learner must optimize the deployed tanh search readout"
+        )
     return recipe, objective
 
 
@@ -3644,7 +3652,11 @@ def bind_learner_ablation(
             # material fraction of the dose. Each observation reuses the real
             # forward graph and never mutates Parameter.grad or optimizer state.
             "objective_gradient_interference_every_batches": (
-                64 if diagnostic_dose_curve else 0
+                (
+                    min(64, max(1, int(effective["max_steps"]) // 2))
+                    if diagnostic_dose_curve
+                    else 0
+                )
             ),
             "optimizer_trajectory_unchanged": True,
         },
@@ -5404,6 +5416,10 @@ def _build_direct_train_command(
             str(recipe["soft_target_min_legal_coverage"]),
             "--value-loss-weight",
             str(recipe["value_loss_weight"]),
+            "--scalar-value-loss-readout",
+            str(recipe.get("scalar_value_loss_readout", "raw")),
+            "--scalar-value-loss-scale",
+            str(recipe.get("scalar_value_loss_scale", 1.0)),
             "--value-target-lambda",
             str(recipe["value_target_lambda"]),
             "--value-head-type",
@@ -9178,6 +9194,20 @@ def _verify_training_outputs(
         "steps_completed": expected_steps,
         "total_training_steps": expected_steps,
     }
+    if "scalar_value_loss_readout" in recipe:
+        expected["scalar_value_loss_contract"] = {
+            "schema_version": "scalar-value-loss-readout-v1",
+            "readout": str(recipe["scalar_value_loss_readout"]),
+            "scale": float(recipe["scalar_value_loss_scale"]),
+            "formula": (
+                "raw"
+                if recipe["scalar_value_loss_readout"] == "raw"
+                else "tanh(raw * scale)"
+            ),
+            "matches_scalar_mcts_when_value_squash_tanh": (
+                recipe["scalar_value_loss_readout"] == "deployed_tanh"
+            ),
+        }
     if isinstance(learner_ablation, dict):
         # These post-seal optimizer axes are required evidence for diagnostic
         # arms, while legacy production reports retain their historical shape.

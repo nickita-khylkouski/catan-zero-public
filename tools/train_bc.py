@@ -7515,14 +7515,28 @@ def _validate_a1_learner_objective(
     if objective.get("value_readout") != expected_readout:
         raise SystemExit("A1 learner readout differs from the immutable contract")
     expected_scalar_loss_readout = str(
-        objective.get("scalar_value_loss_readout", "raw")
+        objective.get(
+            "scalar_value_loss_readout",
+            (
+                bound.get("learner_training_recipe", {})
+                if isinstance(bound.get("learner_training_recipe"), dict)
+                else {}
+            ).get("scalar_value_loss_readout", "raw"),
+        )
     )
     if str(getattr(args, "scalar_value_loss_readout", "raw")) != expected_scalar_loss_readout:
         raise SystemExit(
             "A1 scalar value loss readout differs from the immutable contract"
         )
     expected_scalar_loss_scale = float(
-        objective.get("scalar_value_loss_scale", 1.0)
+        objective.get(
+            "scalar_value_loss_scale",
+            (
+                bound.get("learner_training_recipe", {})
+                if isinstance(bound.get("learner_training_recipe"), dict)
+                else {}
+            ).get("scalar_value_loss_scale", 1.0),
+        )
     )
     if not math.isclose(
         float(getattr(args, "scalar_value_loss_scale", 1.0)),
@@ -7715,6 +7729,17 @@ def _effective_a1_learner_training_recipe(
         effective["policy_target_blend_semantics"] = (
             policy_target_blend_semantics
         )
+    scalar_value_loss_readout = str(
+        getattr(args, "scalar_value_loss_readout", "raw")
+    )
+    scalar_value_loss_scale = float(
+        getattr(args, "scalar_value_loss_scale", 1.0)
+    )
+    if scalar_value_loss_readout != "raw" or scalar_value_loss_scale != 1.0:
+        # Historical scalar recipes optimize the raw head and omit these
+        # additive fields. New recipes bind the exact deployed search operator.
+        effective["scalar_value_loss_readout"] = scalar_value_loss_readout
+        effective["scalar_value_loss_scale"] = scalar_value_loss_scale
     forced_type_weights = _parse_forced_row_value_action_type_weights(
         str(getattr(args, "forced_row_value_action_type_weights", "") or "")
     )

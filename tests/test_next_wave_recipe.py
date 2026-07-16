@@ -212,12 +212,16 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
     assert recipe["lr_warmup_steps"] == 16
     assert recipe["lr_warmup_steps"] <= recipe["max_steps"] // 8
     assert recipe["per_game_value_weight"] is True
+    assert recipe["scalar_value_loss_readout"] == "deployed_tanh"
+    assert recipe["scalar_value_loss_scale"] == payload["operator"]["evaluator"][
+        "value_scale"
+    ]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:5eb7191e856c65109e5ffc6e87d9683faa340831b5b2e22532f0a23d6207bcc0"
+        "sha256:f9d75162a6fabd171c43abad51446972bc3af1552cbde9f9d68a7515eda040d3"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:14f62e86a2a5802714ad8d7d30647dba169c333b611776d8c7bf4447b98734a8"
+        "sha256:671baad1d6314e0c9b36cda25d0b74a24af7c5f8c09a37e5b5cc5afaeb9223bc"
     )
 
 

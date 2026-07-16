@@ -112,6 +112,8 @@
       "soft_target_temperature": 0.7,
       "soft_target_min_legal_coverage": 0.5,
       "value_loss_weight": 0.25,
+      "scalar_value_loss_readout": "deployed_tanh",
+      "scalar_value_loss_scale": 1.0,
       "value_target_lambda": 1.0,
       "value_categorical_loss_weight": 0.0,
       "hlgauss_scalar_aux_loss_weight": 0.0,

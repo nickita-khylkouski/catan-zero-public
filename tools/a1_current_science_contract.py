@@ -121,6 +121,20 @@ def _load() -> dict[str, Any]:
             "current coherent learner must bind pure authenticated policy CE "
             "with hard-action fallback only"
         )
+    evaluator_value = operator["evaluator"]
+    if (
+        evaluator_value.get("value_readout") == "scalar"
+        and evaluator_value.get("value_squash") == "tanh"
+        and (
+            recipe.get("scalar_value_loss_readout") != "deployed_tanh"
+            or recipe.get("scalar_value_loss_scale")
+            != evaluator_value.get("value_scale")
+        )
+    ):
+        raise ScienceContractError(
+            "current scalar learner must optimize the exact deployed tanh "
+            "search readout and scale"
+        )
     return value
 
 
