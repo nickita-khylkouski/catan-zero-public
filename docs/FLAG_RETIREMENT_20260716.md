@@ -6,7 +6,7 @@ longer assembled from dozens of command-line switches.
 ## Canonical command surfaces
 
 - `tools/generate.py`: 9 options
-- `tools/evaluate.py`: 9 options
+- `tools/evaluate.py`: 10 options
 - `tools/train.py`: config-first learner entrypoint
 
 The older executors remain executable for authenticated historical replay,
@@ -60,9 +60,14 @@ python tools/evaluate.py \
   --config configs/eval/coherent_public_n128.schema18.json \
   --candidate candidate.pt --champion champion.pt \
   --out evaluation.json --pairs 400 --workers 32 \
+  --threads-per-worker 6 \
   --devices cuda:0,cuda:1,cuda:2,cuda:3 \
   --base-seed 2026071600
 ```
+
+`--threads-per-worker` is execution placement rather than evaluation science.
+Set it explicitly when multiple evaluator invocations share one host; `0`
+retains the executor's single-run automatic allocation.
 
 ## Fixed config-order defect
 

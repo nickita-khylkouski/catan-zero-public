@@ -101,3 +101,36 @@ def test_canonical_evaluation_uses_the_production_promotion_gate() -> None:
 
     assert payload["fields"]["elo0"] == -10.0
     assert payload["fields"]["elo1"] == 15.0
+
+
+@pytest.mark.parametrize("threads_per_worker", (0, 6))
+def test_canonical_evaluation_forwards_cpu_placement(
+    threads_per_worker: int,
+) -> None:
+    parser = evaluate.build_parser()
+    args = parser.parse_args(
+        [
+            "--config",
+            "eval.json",
+            "--candidate",
+            "candidate.pt",
+            "--champion",
+            "champion.pt",
+            "--out",
+            "report.json",
+            "--pairs",
+            "16",
+            "--workers",
+            "8",
+            "--devices",
+            "cuda:0,cuda:1",
+            "--threads-per-worker",
+            str(threads_per_worker),
+            "--base-seed",
+            "1",
+        ]
+    )
+
+    forwarded = evaluate._executor_argv(args)  # noqa: SLF001
+    index = forwarded.index("--threads-per-worker")
+    assert forwarded[index + 1] == str(threads_per_worker)
