@@ -151,7 +151,13 @@ def _namespace(
             "device": device,
             "host_lock_file": str(output / "train.lock"),
             "allow_concurrent_bc": True,
-            "base_sampler": "coverage_importance_v1",
+            # This is one authenticated coherent-n128 corpus, not a composite
+            # with component sampling ratios.  The coverage sampler is only
+            # defined for such composites and cannot normalize the adaptive
+            # parent-KL objective.  With no component weights, the canonical
+            # weighted-replacement mode falls back to the ordinary unweighted
+            # base traversal used by this compact diagnostic.
+            "base_sampler": "weighted_replacement_v1",
             "checkpoint_steps": CHECKPOINT_STEPS,
             "entity_feature_adapter_version": (
                 "rust_entity_adapter_v5_meaningful_history_v2"
