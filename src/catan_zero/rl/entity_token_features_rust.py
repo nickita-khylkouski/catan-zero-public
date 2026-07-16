@@ -46,7 +46,13 @@ from catan_zero.deduction_tracker import (
 )
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+    RUST_ENTITY_ADAPTER_V5,
     require_known_entity_feature_adapter,
+)
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    meaningful_public_history_limit,
 )
 from catan_zero.rl.entity_token_features import (
     EDGE_FEATURE_SIZE,
@@ -259,6 +265,7 @@ def build_entity_features_rust(
     public_card_count_features: bool = False,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
     entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 ) -> dict[str, np.ndarray]:
     """Rust-backed equivalent of `build_entity_token_features`'s output dict
@@ -280,6 +287,22 @@ def build_entity_features_rust(
     adapter_version = require_known_entity_feature_adapter(
         entity_feature_adapter_version
     )
+    if meaningful_public_history:
+        maximum_history_limit = meaningful_public_history_limit(
+            meaningful_public_history_schema
+        )
+        if not 1 <= int(history_limit) <= maximum_history_limit:
+            raise ValueError(
+                "meaningful public-history limit outside schema contract: "
+                f"{history_limit} not in [1, {maximum_history_limit}]"
+            )
+        if (
+            meaningful_public_history_schema == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+        ) != (adapter_version == RUST_ENTITY_ADAPTER_V5):
+            raise ValueError(
+                "meaningful public-history v2 and entity adapter v5 must be "
+                "enabled together"
+            )
     raw = catanatron_rs.build_entity_features_flat(
         rust_game,
         list(colors),
@@ -321,6 +344,7 @@ def build_entity_features_batch_rust(
     parallel: bool = False,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
     entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 ) -> tuple[dict[str, np.ndarray], list[int]]:
     """Batched companion to `build_entity_features_rust`: one call builds
@@ -359,6 +383,7 @@ def build_entity_features_batch_rust(
             public_card_count_features=public_card_count_features,
             meaningful_public_history=meaningful_public_history,
             history_limit=history_limit,
+            meaningful_public_history_schema=meaningful_public_history_schema,
             entity_feature_adapter_version=entity_feature_adapter_version,
         )
         return {key: value[None, ...] for key, value in single.items()}, [
@@ -370,6 +395,22 @@ def build_entity_features_batch_rust(
     adapter_version = require_known_entity_feature_adapter(
         entity_feature_adapter_version
     )
+    if meaningful_public_history:
+        maximum_history_limit = meaningful_public_history_limit(
+            meaningful_public_history_schema
+        )
+        if not 1 <= int(history_limit) <= maximum_history_limit:
+            raise ValueError(
+                "meaningful public-history limit outside schema contract: "
+                f"{history_limit} not in [1, {maximum_history_limit}]"
+            )
+        if (
+            meaningful_public_history_schema == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+        ) != (adapter_version == RUST_ENTITY_ADAPTER_V5):
+            raise ValueError(
+                "meaningful public-history v2 and entity adapter v5 must be "
+                "enabled together"
+            )
     raw = catanatron_rs.build_entity_features_batch(
         list(rust_games),
         list(colors),

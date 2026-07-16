@@ -40,6 +40,20 @@ ADAPTIVE_FIELDS = (
     "wide_roots_always_full",
 )
 POLICY_TARGET_BLEND_FALLBACK_V2 = "policy_target_fallback_v2"
+CURRENT_TEACHER_ENTITY_ADAPTER = (
+    "rust_entity_adapter_v2_land_topology_ports_maritime"
+)
+CURRENT_LEARNER_ENTITY_ADAPTER = (
+    "rust_entity_adapter_v4_actor_public_rule_state"
+)
+CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
+    "structured_action_value,card_count_v2,meaningful_history,public_rule_state"
+)
+CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
+    "entity_graph.static_action_residual+legal_action_value_residual+"
+    "public_card_count_features+meaningful_public_history+"
+    "actor_public_rule_state.v4"
+)
 PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # These fields retain the reviewed 4096-row logical dose identity. The
     # checkpoint-initialized one-dose executor is not an execution projection
@@ -72,7 +86,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
 PRODUCTION_LEARNER_INITIALIZATION_CONTRACT = {
     "mode": "from_scratch",
     "entity_feature_adapter_version": (
-        "rust_entity_adapter_v3_structured_action_resources"
+        "rust_entity_adapter_v4_actor_public_rule_state"
     ),
     "checkpoint": None,
     "optimizer_state": "fresh",
@@ -87,12 +101,14 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "static_action_residual": True,
     "legal_action_value_residual": True,
     "public_card_count_features": True,
+    "public_rule_state_features": True,
+    "public_rule_state_feature_schema": "actor_public_rule_state_2p_v1",
     "meaningful_public_history": True,
     "meaningful_public_history_pooling": "masked_mean_v1",
     "event_history_limit": 32,
     "mask_hidden_info": True,
     "entity_feature_adapter_version": (
-        "rust_entity_adapter_v3_structured_action_resources"
+        "rust_entity_adapter_v4_actor_public_rule_state"
     ),
     "require_35m_model": True,
 }
@@ -203,7 +219,7 @@ def _load() -> dict[str, Any]:
     if learner_value.get("initialization") != PRODUCTION_LEARNER_INITIALIZATION_CONTRACT:
         raise ScienceContractError(
             "current coherent learner initialization must be native from-scratch "
-            "v3 with fresh optimizer state"
+            "v4 with fresh optimizer state"
         )
     if (
         learner_value.get("model_construction")
@@ -228,6 +244,15 @@ def _load() -> dict[str, Any]:
     ):
         raise ScienceContractError(
             "current scratch execution topology changes the logical global dose"
+        )
+    if (
+        learner_value.get("architecture_upgrade_flags")
+        != CURRENT_ARCHITECTURE_UPGRADE_FLAGS
+        or learner_value.get("architecture_upgrade_module")
+        != CURRENT_ARCHITECTURE_UPGRADE_MODULE
+    ):
+        raise ScienceContractError(
+            "current coherent learner architecture upgrade authority drifted"
         )
     if (
         recipe.get("policy_target_blend_semantics")
@@ -268,6 +293,15 @@ def _load() -> dict[str, Any]:
             f"{target_quality_learner_drift}"
         )
     generation_value = value["generation"]
+    if (
+        generation_value.get("teacher_entity_feature_adapter_version")
+        != CURRENT_TEACHER_ENTITY_ADAPTER
+        or generation_value.get("learner_entity_feature_adapter_version")
+        != CURRENT_LEARNER_ENTITY_ADAPTER
+    ):
+        raise ScienceContractError(
+            "current coherent generation teacher/learner adapter authority drifted"
+        )
     target_quality_generation_drift = {
         key: {"expected": expected, "actual": generation_value.get(key)}
         for key, expected in PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT.items()
@@ -469,6 +503,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
         **PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT,
         "exact_budget_sh": search_value.get("exact_budget_sh"),
         "exact_budget_sh_min_n": search_value.get("exact_budget_sh_min_n"),
+        "learner_entity_feature_adapter_version": CURRENT_LEARNER_ENTITY_ADAPTER,
     }
     generator_drift = {
         key: {"expected": expected, "actual": fields.get(key)}
@@ -506,6 +541,9 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
         ],
         "--exact-budget-sh": expected_generator["exact_budget_sh"],
         "--exact-budget-sh-min-n": expected_generator["exact_budget_sh_min_n"],
+        "--learner-entity-feature-adapter-version": (
+            expected_generator["learner_entity_feature_adapter_version"]
+        ),
     }
     guard_drift = {
         flag: {

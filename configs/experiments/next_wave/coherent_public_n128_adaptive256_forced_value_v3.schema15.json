@@ -51,7 +51,7 @@
     "late_temperature": 0.1,
     "late_temperature_decisions": 100,
     "lazy_interior_chance": true,
-    "learner_entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+    "learner_entity_feature_adapter_version": "rust_entity_adapter_v4_actor_public_rule_state",
     "max_decisions": 600,
     "max_depth": 80,
     "meaningful_public_history": true,

@@ -11,6 +11,8 @@ from catan_zero.rl.entity_token_features import (
 )
 from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+    MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT,
     is_meaningful_public_event,
     meaningful_public_events,
     public_events_from_native_action_records,
@@ -91,6 +93,20 @@ def test_filter_runs_before_exact_32_event_cap():
         for event in selected
     )
     assert selected == tuple(events[54::3])
+
+
+def test_v2_is_explicit_and_retains_64_strategic_events():
+    events = [_event("BUILD_ROAD") for _ in range(80)]
+
+    assert len(meaningful_public_events(events, limit=64)) == 32
+    selected = meaningful_public_events(
+        events,
+        limit=80,
+        schema=MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+    )
+
+    assert len(selected) == MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT
+    assert selected == tuple(events[-MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT:])
 
 
 def test_existing_event_encoder_uses_32_meaningful_rows_without_schema_growth():
@@ -213,3 +229,49 @@ def test_native_record_translation_redacts_every_hidden_card_identity():
         meaningful_public_history=True,
     )
     assert np.all(targets == -1)
+
+
+def test_native_v2_binds_public_turn_and_spatial_player_targets():
+    records = [
+        {
+            "action": ["RED", "BUILD_SETTLEMENT", 12],
+            "result": None,
+        },
+        {
+            "action": ["BLUE", "MOVE_ROBBER", [[0, 0, 0], "RED"]],
+            "result": "ORE",
+        },
+    ]
+    events = public_events_from_native_action_records(
+        records,
+        [3, 2],
+        [[7, 1], [8, 0]],
+        schema=MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+    )
+
+    assert [event["turn_key"] for event in events] == [(7, 1), (8, 0)]
+    assert "ORE" not in repr(events)
+    targets = _event_target_ids(
+        {"event_log": events},
+        {
+            "coordinate_to_hex": {(0, 0, 0): 8},
+            "edge_to_id": {},
+        },
+        history_limit=64,
+        meaningful_public_history=True,
+        meaningful_public_history_schema=MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+    )
+    assert targets[-2].tolist() == [-1, 12, -1, -1]
+    assert targets[-1].tolist() == [8, -1, -1, 1]
+    tokens = _event_tokens(
+        {"event_log": events},
+        {
+            "coordinate_to_hex": {(0, 0, 0): 8},
+            "edge_to_id": {},
+        },
+        history_limit=64,
+        meaningful_public_history=True,
+        meaningful_public_history_schema=MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+    )
+    assert tokens[-2, 15] == np.float16(7 / 512)
+    assert tokens[-2, 16] == np.float16(1 / 4)

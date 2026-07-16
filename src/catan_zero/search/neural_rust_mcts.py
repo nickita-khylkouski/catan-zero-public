@@ -25,7 +25,8 @@ from catan_zero.rl.entity_feature_adapter import (
 from catan_zero.rl.entity_token_features import build_entity_token_features
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
 from catan_zero.rl.meaningful_history import (
-    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    meaningful_public_history_limit,
     public_events_from_native_action_records,
 )
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
@@ -37,13 +38,21 @@ from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMulti
 RUST_ENTITY_ADAPTER_VERSION = CURRENT_RUST_ENTITY_ADAPTER_VERSION
 
 
-def _policy_history_options(policy: EntityGraphPolicy) -> tuple[bool, int]:
+def _policy_history_options(policy: EntityGraphPolicy) -> tuple[bool, int, str]:
     config = getattr(policy, "config", None)
     enabled = bool(getattr(config, "meaningful_public_history", False))
+    schema = str(
+        getattr(
+            config,
+            "meaningful_public_history_schema",
+            MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+        )
+        or MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    )
     limit = int(getattr(config, "event_history_limit", 64) or 0)
     if enabled:
-        limit = min(limit, MEANINGFUL_PUBLIC_HISTORY_LIMIT)
-    return enabled, limit
+        limit = min(limit, meaningful_public_history_limit(schema))
+    return enabled, limit, schema
 
 
 def _rust_batch_feature_path_available() -> bool:
@@ -458,6 +467,9 @@ class EntityGraphRustEvaluator:
         )
 
         topology = self._get_or_init_rust_topology(adapter, acting_color=acting_color)
+        history_enabled, history_limit, history_schema = _policy_history_options(
+            self.policy
+        )
         entity = build_entity_features_rust(
             game,
             colors=tuple(str(color) for color in colors),
@@ -472,8 +484,9 @@ class EntityGraphRustEvaluator:
                     getattr(self.policy, "public_card_count_features", False),
                 )
             ),
-            meaningful_public_history=_policy_history_options(self.policy)[0],
-            history_limit=_policy_history_options(self.policy)[1],
+            meaningful_public_history=history_enabled,
+            history_limit=history_limit,
+            meaningful_public_history_schema=history_schema,
             entity_feature_adapter_version=(
                 self.config.entity_feature_adapter_version
             ),
@@ -545,6 +558,9 @@ class EntityGraphRustEvaluator:
         )
 
         topology = self._get_or_init_rust_topology(adapter, acting_color=acting_color)
+        history_enabled, history_limit, history_schema = _policy_history_options(
+            self.policy
+        )
         entity, widths = build_entity_features_batch_rust(
             games,
             colors=colors,
@@ -559,8 +575,9 @@ class EntityGraphRustEvaluator:
                     getattr(self.policy, "public_card_count_features", False),
                 )
             ),
-            meaningful_public_history=_policy_history_options(self.policy)[0],
-            history_limit=_policy_history_options(self.policy)[1],
+            meaningful_public_history=history_enabled,
+            history_limit=history_limit,
+            meaningful_public_history_schema=history_schema,
             entity_feature_adapter_version=(self.config.entity_feature_adapter_version),
         )
         context, context_widths = build_action_context_batch_rust(
@@ -751,6 +768,9 @@ class EntityGraphRustEvaluator:
                 public_observation=bool(self.config.public_observation),
                 perspective=acting_color,
                 meaningful_public_history=_policy_history_options(self.policy)[0],
+                meaningful_public_history_schema=_policy_history_options(
+                    self.policy
+                )[2],
                 entity_feature_adapter_version=self.config.entity_feature_adapter_version,
             )
         if bool(self.config.rust_featurize):
@@ -772,6 +792,9 @@ class EntityGraphRustEvaluator:
                 public_observation=bool(self.config.public_observation),
                 meaningful_public_history=_policy_history_options(self.policy)[0],
                 history_limit=_policy_history_options(self.policy)[1],
+                meaningful_public_history_schema=_policy_history_options(
+                    self.policy
+                )[2],
                 entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 resolved=resolved,
             )
@@ -879,6 +902,9 @@ class EntityGraphRustEvaluator:
                 public_observation=bool(self.config.public_observation),
                 perspective=acting_color,
                 meaningful_public_history=_policy_history_options(self.policy)[0],
+                meaningful_public_history_schema=_policy_history_options(
+                    self.policy
+                )[2],
                 entity_feature_adapter_version=self.config.entity_feature_adapter_version,
             )
         else:
@@ -920,6 +946,9 @@ class EntityGraphRustEvaluator:
                 public_observation=bool(self.config.public_observation),
                 meaningful_public_history=_policy_history_options(self.policy)[0],
                 history_limit=_policy_history_options(self.policy)[1],
+                meaningful_public_history_schema=_policy_history_options(
+                    self.policy
+                )[2],
                 entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 resolved=resolved,
             )
@@ -1092,6 +1121,9 @@ class EntityGraphRustEvaluator:
                     public_observation=bool(self.config.public_observation),
                     perspective=acting_color,
                     meaningful_public_history=_policy_history_options(self.policy)[0],
+                    meaningful_public_history_schema=_policy_history_options(
+                        self.policy
+                    )[2],
                     entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 )
             if use_native_feature_batch:
@@ -1134,6 +1166,9 @@ class EntityGraphRustEvaluator:
                     public_observation=bool(self.config.public_observation),
                     meaningful_public_history=_policy_history_options(self.policy)[0],
                     history_limit=_policy_history_options(self.policy)[1],
+                    meaningful_public_history_schema=_policy_history_options(
+                        self.policy
+                    )[2],
                     entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                     resolved=resolved,
                 )
@@ -1397,6 +1432,9 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 public_observation=bool(self.config.public_observation),
                 perspective=acting_color,
                 meaningful_public_history=_policy_history_options(self.policy)[0],
+                meaningful_public_history_schema=_policy_history_options(
+                    self.policy
+                )[2],
                 entity_feature_adapter_version=self.config.entity_feature_adapter_version,
             )
         if bool(self.config.rust_featurize):
@@ -1418,6 +1456,9 @@ class BatchedEntityGraphRustEvaluator(EntityGraphRustEvaluator):
                 public_observation=bool(self.config.public_observation),
                 meaningful_public_history=_policy_history_options(self.policy)[0],
                 history_limit=_policy_history_options(self.policy)[1],
+                meaningful_public_history_schema=_policy_history_options(
+                    self.policy
+                )[2],
                 entity_feature_adapter_version=self.config.entity_feature_adapter_version,
                 resolved=resolved,
             )
@@ -1664,6 +1705,7 @@ def _resolve_entity_adapter(
     public_observation: bool = False,
     perspective: str | None = None,
     meaningful_public_history: bool = False,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
     entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
 ) -> tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]]:
     """Shared preamble for `rust_game_to_entity_batch`/`rust_action_context_batch`:
@@ -1710,6 +1752,7 @@ def _resolve_entity_adapter(
         public_observation=public_observation,
         perspective=perspective,
         meaningful_public_history=meaningful_public_history,
+        meaningful_public_history_schema=meaningful_public_history_schema,
     )
     adapter = _RustEntityFeatureEnv(payload, action_size=action_size)
     return payload, adapter, structured
@@ -1728,6 +1771,7 @@ def rust_game_to_entity_batch(
     public_observation: bool = False,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
     entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
     resolved: tuple[dict[str, Any], "_RustEntityFeatureEnv", list[dict[str, Any]]]
     | None = None,
@@ -1754,6 +1798,7 @@ def rust_game_to_entity_batch(
             public_observation=public_observation,
             perspective=str(actor),
             meaningful_public_history=meaningful_public_history,
+            meaningful_public_history_schema=meaningful_public_history_schema,
             entity_feature_adapter_version=entity_feature_adapter_version,
         )
     entity = build_entity_token_features(
@@ -1761,11 +1806,17 @@ def rust_game_to_entity_batch(
         actor=actor,
         include_event_log=True,
         history_limit=(
-            min(int(history_limit), MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+            min(
+                int(history_limit),
+                meaningful_public_history_limit(
+                    meaningful_public_history_schema
+                ),
+            )
             if meaningful_public_history
             else int(history_limit)
         ),
         meaningful_public_history=meaningful_public_history,
+        meaningful_public_history_schema=meaningful_public_history_schema,
         entity_feature_adapter_version=entity_feature_adapter_version,
     )
     return {
@@ -1989,6 +2040,7 @@ def _entity_payload_from_rust_snapshot(
     public_observation: bool = False,
     perspective: str | None = None,
     meaningful_public_history: bool = False,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 ) -> dict[str, Any]:
     colors = tuple(str(color) for color in snapshot.get("colors", ()))
     robber = tuple(snapshot.get("robber_coordinate") or ())
@@ -2072,6 +2124,8 @@ def _entity_payload_from_rust_snapshot(
             public_events_from_native_action_records(
                 snapshot.get("action_records", ()),
                 snapshot.get("action_public_legal_counts", ()),
+                snapshot.get("action_public_turn_keys", ()),
+                schema=meaningful_public_history_schema,
             )
             if meaningful_public_history
             else []

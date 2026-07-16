@@ -84,7 +84,7 @@
           "--target-reliability-audit-seed": 20260716,
           "--record-automatic-transitions": true,
           "--meaningful-public-history": true,
-          "--learner-entity-feature-adapter-version": "rust_entity_adapter_v3_structured_action_resources",
+          "--learner-entity-feature-adapter-version": "rust_entity_adapter_v4_actor_public_rule_state",
           "--event-history-limit": 32,
           "--rust-featurize": true,
           "--eval-cache-size": 0,

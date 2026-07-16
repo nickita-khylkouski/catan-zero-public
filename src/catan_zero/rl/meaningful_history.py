@@ -12,8 +12,30 @@ from collections.abc import Iterable
 from typing import Any
 
 
-MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION = "meaningful_public_history_2p_no_trade_v1"
+MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V1 = "meaningful_public_history_2p_no_trade_v1"
+MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2 = "meaningful_public_history_2p_no_trade_v2"
+# Compatibility alias: every existing checkpoint/config that imports the
+# unqualified name remains pinned to v1 until an explicit v2 commissioning.
+MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V1
 MEANINGFUL_PUBLIC_HISTORY_LIMIT = 32
+MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT = 64
+SUPPORTED_MEANINGFUL_PUBLIC_HISTORY_SCHEMAS = frozenset(
+    {MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V1, MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2}
+)
+
+
+def meaningful_public_history_limit(schema: object) -> int:
+    """Return the append-only event cap bound to one history schema."""
+
+    resolved = str(schema or "")
+    if resolved == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V1:
+        return MEANINGFUL_PUBLIC_HISTORY_LIMIT
+    if resolved == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2:
+        return MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT
+    raise ValueError(
+        f"unsupported meaningful public-history schema {resolved!r}; expected one of "
+        f"{sorted(SUPPORTED_MEANINGFUL_PUBLIC_HISTORY_SCHEMAS)}"
+    )
 
 # These actions expose strategic public information even when their private
 # result is redacted.  In particular, repeated DISCARD_RESOURCE events encode
@@ -111,6 +133,7 @@ def meaningful_public_events(
     events: Iterable[Any],
     *,
     limit: int = MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 ) -> tuple[dict[str, Any], ...]:
     """Return the most recent bounded meaningful public events.
 
@@ -120,7 +143,7 @@ def meaningful_public_events(
 
     if isinstance(limit, bool) or int(limit) < 0:
         raise ValueError("meaningful public history limit must be >= 0")
-    bounded = min(int(limit), MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+    bounded = min(int(limit), meaningful_public_history_limit(schema))
     if bounded == 0:
         return ()
     filtered = tuple(event for event in events if is_meaningful_public_event(event))
@@ -130,6 +153,9 @@ def meaningful_public_events(
 def public_events_from_native_action_records(
     records: Iterable[Any],
     public_legal_action_counts: Iterable[Any] = (),
+    public_turn_keys: Iterable[Any] = (),
+    *,
+    schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 ) -> tuple[dict[str, Any], ...]:
     """Translate native ``json_snapshot.action_records`` without secrets.
 
@@ -139,7 +165,10 @@ def public_events_from_native_action_records(
     event can cross into a model-input payload.
     """
 
+    history_cap = meaningful_public_history_limit(schema)
+    del history_cap  # Schema validation is intentional even before truncation.
     public_counts = tuple(public_legal_action_counts)
+    turn_keys = tuple(public_turn_keys)
     events: list[dict[str, Any]] = []
     for record_index, record in enumerate(records):
         if not isinstance(record, dict):
@@ -167,11 +196,27 @@ def public_events_from_native_action_records(
                     public_width = int(candidate)
             except (TypeError, ValueError):
                 public_width = None
+        turn_key: tuple[int, int] | None = None
+        if schema == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2 and record_index < len(
+            turn_keys
+        ):
+            candidate = turn_keys[record_index]
+            if isinstance(candidate, (list, tuple)) and len(candidate) >= 2:
+                try:
+                    first = int(candidate[0])
+                    second = int(candidate[1])
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    # Native unknown sentinels and malformed/negative values
+                    # fail closed to the historical all-zero token surface.
+                    if 0 <= first < 2**31 and 0 <= second < 2**15:
+                        turn_key = (first, second)
         events.append(
             {
                 "event_id": len(events) + 1,
                 "event_type": "board_action",
-                "turn_key": None,
+                "turn_key": turn_key,
                 "actor": actor,
                 "payload": {
                     "action_index": None,

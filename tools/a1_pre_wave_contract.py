@@ -57,6 +57,7 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     ENTITY_FEATURE_ADAPTER_SPECS,
     RUST_ENTITY_ADAPTER_V2,
     RUST_ENTITY_ADAPTER_V3,
+    RUST_ENTITY_ADAPTER_V4,
     require_known_entity_feature_adapter,
 )
 from catan_zero.rl.entity_token_features import ACTION_TYPES  # noqa: E402
@@ -2580,9 +2581,10 @@ def _validate_generation(generation: dict[str, Any]) -> None:
         teacher_adapter = require_known_entity_feature_adapter(
             generation["teacher_entity_feature_adapter_version"]
         )
-        if learner_adapter != CURRENT_RUST_ENTITY_ADAPTER_VERSION:
+        if learner_adapter != RUST_ENTITY_ADAPTER_V4:
             raise ContractError(
-                "current generation learner rows must use the current entity adapter"
+                "current generation learner rows must use the reviewed v4 actor "
+                "public-rule-state adapter"
             )
         if teacher_adapter != RUST_ENTITY_ADAPTER_V2:
             raise ContractError(
@@ -9483,12 +9485,12 @@ def _authenticated_empty_event_authority() -> dict[str, Any]:
     }
 
 
-def _meaningful_public_event_authority() -> dict[str, Any]:
+def _meaningful_public_event_authority(
+    adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+) -> dict[str, Any]:
     """Return the source-bound opt-in history authority for fresh v1.6 rows."""
 
-    adapter_version = require_known_entity_feature_adapter(
-        CURRENT_RUST_ENTITY_ADAPTER_VERSION
-    )
+    adapter_version = require_known_entity_feature_adapter(adapter_version)
     native = information_surface.native_meaningful_public_history_capability()
     if (
         native.get("available") is not True
@@ -9693,6 +9695,7 @@ def _require_shard_feature_semantics(
     where: str,
     meaningful_public_history: bool = False,
     event_history_limit: int = 64,
+    expected_adapter_version: str | None = None,
 ) -> dict[str, Any]:
     """Authenticate adapter identity and the sealed event-history semantic.
 
@@ -9702,7 +9705,9 @@ def _require_shard_feature_semantics(
     """
 
     authority = (
-        _meaningful_public_event_authority()
+        _meaningful_public_event_authority(
+            expected_adapter_version or CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        )
         if meaningful_public_history
         else _authenticated_empty_event_authority()
     )
@@ -9730,7 +9735,7 @@ def _require_shard_feature_semantics(
             action_catalog=action_catalog,
             where=where,
         )
-        if expected_adapter == RUST_ENTITY_ADAPTER_V3
+        if expected_adapter in {RUST_ENTITY_ADAPTER_V3, RUST_ENTITY_ADAPTER_V4}
         else None
     )
 
@@ -10505,8 +10510,14 @@ def audit_outputs(
         lock["generation"].get("meaningful_public_history", False)
     )
     event_history_limit = int(lock["generation"].get("event_history_limit", 64))
+    expected_learner_adapter = str(
+        lock["generation"].get(
+            "learner_entity_feature_adapter_version",
+            CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        )
+    )
     event_authority = (
-        _meaningful_public_event_authority()
+        _meaningful_public_event_authority(expected_learner_adapter)
         if meaningful_public_history
         else _authenticated_empty_event_authority()
     )
@@ -10879,6 +10890,7 @@ def audit_outputs(
                         where=f"{job['job_id']}:{canonical_shard.name}",
                         meaningful_public_history=meaningful_public_history,
                         event_history_limit=event_history_limit,
+                        expected_adapter_version=expected_learner_adapter,
                     )
                     feature_semantic_rows += int(feature_semantics["row_count"])
                     adapter_version_counts.update(

@@ -35,10 +35,18 @@ RUST_ENTITY_ADAPTER_V3 = (
 RUST_ENTITY_ADAPTER_V4 = (
     "rust_entity_adapter_v4_actor_public_rule_state"
 )
+RUST_ENTITY_ADAPTER_V5 = (
+    "rust_entity_adapter_v5_meaningful_history_v2"
+)
 LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION = RUST_ENTITY_ADAPTER_V2
 CURRENT_RUST_ENTITY_ADAPTER_VERSION = RUST_ENTITY_ADAPTER_V3
 IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS = frozenset(
-    {RUST_ENTITY_ADAPTER_V2, RUST_ENTITY_ADAPTER_V3, RUST_ENTITY_ADAPTER_V4}
+    {
+        RUST_ENTITY_ADAPTER_V2,
+        RUST_ENTITY_ADAPTER_V3,
+        RUST_ENTITY_ADAPTER_V4,
+        RUST_ENTITY_ADAPTER_V5,
+    }
 )
 
 
@@ -99,6 +107,25 @@ ENTITY_FEATURE_ADAPTER_SPECS: Mapping[str, EntityFeatureAdapterSpec] = (
                 context_trade_totals="legacy_maritime_list_cardinality",
                 topology="base_layout_static_lookup",
                 event_history="meaningful_public_history_v1_when_enabled",
+                structured_action_resources=(
+                    "yop_bundle_and_discard_monopoly_singular_identity"
+                ),
+                actor_public_rule_state=(
+                    "dev_used_road_building_free_roads_discard_remainder_"
+                    "playable_dev_counts"
+                ),
+            ),
+            RUST_ENTITY_ADAPTER_V5: EntityFeatureAdapterSpec(
+                version=RUST_ENTITY_ADAPTER_V5,
+                player_has_longest_road="authoritative_public_state",
+                trade_action_type_one_hot="legacy_case_sensitive_miss",
+                trade_prompt_one_hot="legacy_prompt_name_miss",
+                trade_panel="offers_remaining_zero_current_offer_none",
+                context_trade_totals="legacy_maritime_list_cardinality",
+                topology="base_layout_static_lookup",
+                event_history=(
+                    "meaningful_public_history_v2_public_turn_keys_64_when_enabled"
+                ),
                 structured_action_resources=(
                     "yop_bundle_and_discard_monopoly_singular_identity"
                 ),

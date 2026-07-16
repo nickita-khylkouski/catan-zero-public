@@ -276,6 +276,59 @@ def _canonical_v3_checkpoints(
     return source, output
 
 
+def _canonical_v4_checkpoints(
+    tmp_path: Path, *, seed: int = 97
+) -> tuple[Path, Path]:
+    from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE
+    from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V4
+    from catan_zero.rl.entity_token_features import LEGAL_ACTION_FEATURE_SIZE
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+
+    source = tmp_path / "champion-canonical-v4-source.pt"
+    output = tmp_path / "champion-canonical-v4.pt"
+    config = EntityGraphConfig(
+        action_size=16,
+        static_action_feature_size=45,
+        context_action_feature_size=CONTEXT_ACTION_FEATURE_SIZE,
+        legal_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        dropout=0.0,
+    )
+    static = np.zeros((config.action_size, config.static_action_feature_size))
+    base = EntityGraphPolicy(config, static, seed=13, device="cpu")
+    base.save(source, mask_hidden_info=True)
+    spec = upgrade.ALLOWLIST[
+        upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4
+    ]
+    treatment = EntityGraphPolicy(
+        dataclasses.replace(config, **spec["config_delta"]),
+        static,
+        seed=seed,
+        device="cpu",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V4,
+    )
+    missing, unexpected = treatment.model.load_state_dict(
+        base.model.state_dict(), strict=False
+    )
+    assert not unexpected
+    assert set(missing) == set(spec["new_parameter_initialization"])
+    treatment.save(output, mask_hidden_info=True)
+    raw = torch.load(output, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": upgrade._sha(source).removeprefix("sha256:"),  # noqa: SLF001
+        "flags": dict(spec["flags"]),
+        "initialization_seed": seed,
+        "trained_value_readouts_added": [],
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+    }
+    torch.save(raw, output)
+    return source, output
+
+
 def _aux_checkpoints(tmp_path: Path, *, seed: int = 79) -> tuple[Path, Path]:
     """Build the exact shared auxiliary initializer for both matched arms."""
 
@@ -425,6 +478,34 @@ def test_canonical_v3_receipt_replays_exact_combined_initializer(
     assert verified["receipt_sha256"] == issued["receipt_sha256"]
     assert verified["forward_max_diff"] == 0.0
     assert verified["shared_parameters_bit_identical"] is True
+
+
+def test_canonical_v4_receipt_replays_actor_rule_state_adapter_transition(
+    tmp_path: Path,
+) -> None:
+    source, initializer = _canonical_v4_checkpoints(tmp_path)
+    receipt = tmp_path / "canonical-v4.receipt.json"
+    issued = upgrade.issue_receipt(
+        source,
+        initializer,
+        receipt,
+        module=(
+            upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4
+        ),
+    )
+    verified = upgrade.verify_receipt(receipt)
+    spec = upgrade.ALLOWLIST[
+        upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4
+    ]
+
+    assert verified["receipt_sha256"] == issued["receipt_sha256"]
+    assert verified["forward_max_diff"] == 0.0
+    assert verified["shared_parameters_bit_identical"] is True
+    assert verified["flags"] == spec["flags"]
+    assert verified["entity_feature_adapter_version"] == (
+        "rust_entity_adapter_v4_actor_public_rule_state"
+    )
+    assert "public_rule_state_residual.weight" in verified["new_parameters"]
 
 
 def test_bias_free_public_card_v2_upgrade_has_only_zero_weight_delta(

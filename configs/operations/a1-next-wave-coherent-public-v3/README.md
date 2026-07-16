@@ -6,18 +6,24 @@ explicitly separates the pinned
 legacy teacher feature contract from the fresh learner-row contract:
 
 - teacher/search evaluator: `rust_entity_adapter_v2_land_topology_ports_maritime`
-- stored learner rows: `rust_entity_adapter_v3_structured_action_resources`
+- stored learner rows: `rust_entity_adapter_v4_actor_public_rule_state`
 
 Search priors, values, and selected actions remain checkpoint-bound. Only the
 post-search learner tensors advance, restoring Year of Plenty and Monopoly
-resource identity for the from-scratch v3 learner. Historical v1/v2 artifacts
-remain immutable and diagnostically replayable.
+resource identity plus the current actor's development-card playability, Road
+Building continuation, remaining free roads, and discard remainder. Historical
+v1/v2 artifacts remain immutable and diagnostically replayable.
 
-The science contract binds that initialization mechanically: no learner
-checkpoint and fresh optimizer state. The checkpoint-initialized legacy
-one-dose/iteration executor must refuse this v3 production learner; the later
-full retrain must create a native v3 model rather than relabeling or resuming a
-v2 checkpoint.
+The production learner starts natively from scratch with adapter v4,
+`public_rule_state` enabled, no learner checkpoint, and fresh optimizer state.
+The search teacher remains the deployed adapter-v2 checkpoint; only stored
+learner features advance. The function-preserving v4 checkpoint upgrader
+remains available for isolated compatibility experiments, but it is not the
+production initialization path.
+
+The checkpoint-initialized legacy one-dose/iteration executor must refuse this
+production learner. The full retrain must construct a native v4 model rather
+than relabeling or resuming a v2/v3 checkpoint.
 
 The same authority now binds the fresh model construction and physical
 execution separately from the logical 4096-row dose. The model enables both
@@ -54,13 +60,13 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
   --record-automatic-transitions \
   --meaningful-public-history --event-history-limit 32 \
   --learner-entity-feature-adapter-version \
-    rust_entity_adapter_v3_structured_action_resources \
+    rust_entity_adapter_v4_actor_public_rule_state \
   --rust-featurize --eval-cache-size 0 \
   --dump-config "$OUT/config.json" --config-purpose a1-next-wave-coherent-public-v3
 ```
 
 Post-wave admission must prove every worker used teacher v2 and emitted learner
-rows v3, with the legacy `adapter_version` row column equal to the learner
+rows v4, with the legacy `adapter_version` row column equal to the learner
 identity. Forced rows retain `policy_weight_multiplier=0` and
 `value_weight_multiplier=1`; training continues to use equal per-game value mass.
 

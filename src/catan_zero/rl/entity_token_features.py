@@ -13,10 +13,12 @@ from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     RUST_ENTITY_ADAPTER_V3,
     RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
     require_known_entity_feature_adapter,
 )
 from catan_zero.rl.meaningful_history import (
-    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    meaningful_public_history_limit,
     meaningful_public_events,
 )
 
@@ -309,6 +311,7 @@ def build_entity_token_features(
     include_event_log: bool = True,
     history_limit: int = 64,
     meaningful_public_history: bool = False,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
     entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 ) -> dict[str, np.ndarray]:
     """Build typed Catan entity-token tensors from the public env payload.
@@ -324,7 +327,10 @@ def build_entity_token_features(
     payload = env.observation_payload(actor_name, include_event_log=include_event_log)
     topology = _topology(payload)
     effective_history_limit = (
-        min(int(history_limit), MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+        min(
+            int(history_limit),
+            meaningful_public_history_limit(meaningful_public_history_schema),
+        )
         if meaningful_public_history
         else int(history_limit)
     )
@@ -335,7 +341,8 @@ def build_entity_token_features(
         env,
         payload,
         actor_name,
-        encode_actor_public_rule_state=adapter_version == RUST_ENTITY_ADAPTER_V4,
+        encode_actor_public_rule_state=adapter_version
+        in {RUST_ENTITY_ADAPTER_V4, RUST_ENTITY_ADAPTER_V5},
     )
     return {
         "schema": np.asarray(ENTITY_TOKEN_SCHEMA_VERSION),
@@ -359,7 +366,12 @@ def build_entity_token_features(
             payload,
             topology,
             encode_structured_action_resources=(
-                adapter_version in {RUST_ENTITY_ADAPTER_V3, RUST_ENTITY_ADAPTER_V4}
+                adapter_version
+                in {
+                    RUST_ENTITY_ADAPTER_V3,
+                    RUST_ENTITY_ADAPTER_V4,
+                    RUST_ENTITY_ADAPTER_V5,
+                }
             ),
         ),
         "legal_action_target_ids": _legal_action_target_ids(payload, topology),
@@ -368,12 +380,14 @@ def build_entity_token_features(
             topology,
             history_limit=effective_history_limit,
             meaningful_public_history=meaningful_public_history,
+            meaningful_public_history_schema=meaningful_public_history_schema,
         ),
         "event_target_ids": _event_target_ids(
             payload,
             topology,
             history_limit=effective_history_limit,
             meaningful_public_history=meaningful_public_history,
+            meaningful_public_history_schema=meaningful_public_history_schema,
         ),
         "hex_mask": np.ones(19, dtype=np.bool_),
         "vertex_mask": np.ones(54, dtype=np.bool_),
@@ -388,6 +402,7 @@ def build_entity_token_features(
             payload,
             history_limit=effective_history_limit,
             meaningful_public_history=meaningful_public_history,
+            meaningful_public_history_schema=meaningful_public_history_schema,
         ),
     }
 
@@ -815,11 +830,13 @@ def _event_tokens(
     *,
     history_limit: int,
     meaningful_public_history: bool = False,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 ) -> np.ndarray:
     events = _selected_history_events(
         payload,
         history_limit=history_limit,
         meaningful_public_history=meaningful_public_history,
+        meaningful_public_history_schema=meaningful_public_history_schema,
     )
     tokens = np.zeros((history_limit, EVENT_FEATURE_SIZE), dtype=np.float16)
     offset = history_limit - len(events)
@@ -869,11 +886,13 @@ def _event_target_ids(
     *,
     history_limit: int,
     meaningful_public_history: bool = False,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 ) -> np.ndarray:
     events = _selected_history_events(
         payload,
         history_limit=history_limit,
         meaningful_public_history=meaningful_public_history,
+        meaningful_public_history_schema=meaningful_public_history_schema,
     )
     targets = np.full((history_limit, 4), -1, dtype=np.int16)
     offset = history_limit - len(events)
@@ -887,12 +906,14 @@ def _event_mask(
     *,
     history_limit: int,
     meaningful_public_history: bool = False,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 ) -> np.ndarray:
     count = len(
         _selected_history_events(
             payload,
             history_limit=history_limit,
             meaningful_public_history=meaningful_public_history,
+            meaningful_public_history_schema=meaningful_public_history_schema,
         )
     )
     mask = np.zeros(history_limit, dtype=np.bool_)
@@ -906,10 +927,15 @@ def _selected_history_events(
     *,
     history_limit: int,
     meaningful_public_history: bool,
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 ) -> tuple[dict[str, Any], ...]:
     events = tuple(payload.get("event_log", ()))
     if meaningful_public_history:
-        return meaningful_public_events(events, limit=history_limit)
+        return meaningful_public_events(
+            events,
+            limit=history_limit,
+            schema=meaningful_public_history_schema,
+        )
     if history_limit <= 0:
         return ()
     return tuple(event for event in events[-history_limit:] if isinstance(event, dict))

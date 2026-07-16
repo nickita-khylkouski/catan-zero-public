@@ -106,7 +106,7 @@ def test_next_wave_typed_generation_config_is_exact_schema_15_recipe() -> None:
     assert cfg.event_history_limit == 32
     assert cfg.record_automatic_transitions is True
     assert cfg.learner_entity_feature_adapter_version == (
-        "rust_entity_adapter_v3_structured_action_resources"
+        "rust_entity_adapter_v4_actor_public_rule_state"
     )
     assert cfg.temperature_clock == "nonforced_choice"
     assert (cfg.temperature_decisions, cfg.late_temperature_decisions) == (40, 100)
@@ -269,7 +269,7 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
         "sha256:223e73ae29d743c035cb59ecfae983d5f36c0e8443dccb8a61534c14731748e1"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:c0c9da3478bbf93acf34c9215b58a4bb39fd8975bbea074ed7bf76c5d8d1f05f"
+        "sha256:ccf629f15591783c8c037918eaedd297f9fc50f4d0c074f74d9abb8e474162f2"
     )
 
 
@@ -299,6 +299,8 @@ def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:
     assert "--record-automatic-transitions" in text
     assert "--meaningful-public-history" in text
     assert "--event-history-limit 32" in text
+    assert "public_rule_state" in text
+    assert "rust_entity_adapter_v4_actor_public_rule_state" in text
     assert "complete forced-transition retention" in text
     assert "policy_weight_multiplier=0" in text
     assert "value_weight_multiplier=1" in text

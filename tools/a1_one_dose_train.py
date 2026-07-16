@@ -3301,6 +3301,7 @@ def bind_learner_ablation(
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
             architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
+            architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4,
             architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY,
             architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY_FROM_V1,
         }
@@ -3325,6 +3326,7 @@ def bind_learner_ablation(
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
             architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
+            architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4,
         }
         if (
             not isinstance(upgrade, dict)
@@ -5390,6 +5392,7 @@ def _build_direct_train_command(
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
         architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
+        architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4,
     }:
         # Make the reviewed architecture delta visible in argv as well as the
         # initializer receipt. train_bc independently verifies that this flag
@@ -5400,17 +5403,26 @@ def _build_direct_train_command(
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
         architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
+        architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4,
         architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY,
         architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY_FROM_V1,
     }:
         command.extend(["--meaningful-public-history", "--event-history-limit", "32"])
     if (
         upgrade_module
-        == architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3
+        in {
+            architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
+            architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4,
+        }
     ):
         command.extend(
             ["--static-action-residual", "--legal-action-value-residual"]
         )
+    if (
+        upgrade_module
+        == architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4
+    ):
+        command.append("--public-rule-state-features")
     if upgrade_module in {
         architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY,
         architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY_FROM_V1,

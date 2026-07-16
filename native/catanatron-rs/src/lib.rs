@@ -2692,6 +2692,11 @@ pub struct State {
     /// must never be used to suppress an event. In particular, regular
     /// PLAY_TURN and DISCARD widths depend on hidden cards and stay zero.
     pub action_public_legal_counts: Vec<u16>,
+    /// Public pre-action `(num_turns, current_turn_index)` aligned with
+    /// `action_records`. `None` is reserved for legacy/directly injected
+    /// records whose execution context was not captured. Unlike regular-turn
+    /// legal width, these counters never depend on private cards.
+    pub action_public_turn_keys: Vec<Option<(usize, usize)>>,
     pub num_turns: usize,
     pub current_player_index: usize,
     pub current_turn_index: usize,
@@ -2749,6 +2754,7 @@ impl State {
             buildings_by_color,
             action_records: Vec::new(),
             action_public_legal_counts: Vec::new(),
+            action_public_turn_keys: Vec::new(),
             num_turns: 0,
             current_player_index: 0,
             current_turn_index: 0,
@@ -3585,6 +3591,7 @@ fn apply_action_inner(
     record_action: bool,
     known_valid: bool,
 ) -> Result<ActionRecord, String> {
+    let public_turn_key = (state.num_turns, state.current_turn_index);
     let record = match action.action_type {
         ActionType::EndTurn => apply_end_turn(state, action),
         ActionType::BuildSettlement => apply_build_settlement(state, action, known_valid),
@@ -3616,8 +3623,15 @@ fn apply_action_inner(
         state
             .action_public_legal_counts
             .resize(state.action_records.len(), 0);
+        state
+            .action_public_turn_keys
+            .truncate(state.action_records.len());
+        state
+            .action_public_turn_keys
+            .resize(state.action_records.len(), None);
         state.action_records.push(record.clone());
         state.action_public_legal_counts.push(0);
+        state.action_public_turn_keys.push(Some(public_turn_key));
     }
     Ok(record)
 }
@@ -6920,6 +6934,9 @@ pub fn game_to_json_value(game: &Game) -> Value {
         // Non-zero entries are aligned with action_records and derive only
         // from public board/prompt state.
         "action_public_legal_counts": game.state.action_public_legal_counts,
+        // Entries are aligned with action_records and capture the public
+        // pre-action turn identity. Null is a fail-closed legacy sentinel.
+        "action_public_turn_keys": game.state.action_public_turn_keys,
         "player_state": game
             .state
             .player_state
@@ -9063,6 +9080,7 @@ pub mod python_bindings {
     const ENTITY_ADAPTER_V2: &str = "rust_entity_adapter_v2_land_topology_ports_maritime";
     const ENTITY_ADAPTER_V3: &str = "rust_entity_adapter_v3_structured_action_resources";
     const ENTITY_ADAPTER_V4: &str = "rust_entity_adapter_v4_actor_public_rule_state";
+    const ENTITY_ADAPTER_V5: &str = "rust_entity_adapter_v5_meaningful_history_v2";
     const ENTITY_PLAYERS_ORDER: [&str; 4] = ["BLUE", "RED", "ORANGE", "WHITE"];
     const ENTITY_PROMPTS: [&str; 8] = [
         "BUILD_INITIAL_SETTLEMENT",
@@ -9098,9 +9116,9 @@ pub mod python_bindings {
     fn entity_adapter_encodes_action_resources(version: &str) -> PyResult<bool> {
         match version {
             ENTITY_ADAPTER_V2 => Ok(false),
-            ENTITY_ADAPTER_V3 | ENTITY_ADAPTER_V4 => Ok(true),
+            ENTITY_ADAPTER_V3 | ENTITY_ADAPTER_V4 | ENTITY_ADAPTER_V5 => Ok(true),
             _ => Err(PyValueError::new_err(format!(
-                "unknown entity feature adapter version {version:?}; expected {ENTITY_ADAPTER_V2:?}, {ENTITY_ADAPTER_V3:?}, or {ENTITY_ADAPTER_V4:?}"
+                "unknown entity feature adapter version {version:?}; expected {ENTITY_ADAPTER_V2:?}, {ENTITY_ADAPTER_V3:?}, {ENTITY_ADAPTER_V4:?}, or {ENTITY_ADAPTER_V5:?}"
             ))),
         }
     }
@@ -9228,6 +9246,7 @@ pub mod python_bindings {
         requested_event_history_limit: usize,
         encode_structured_action_resources: bool,
         encode_actor_public_rule_state: bool,
+        encode_meaningful_history_v2: bool,
     ) -> PyResult<EntityFeatureArrays> {
         let state = &game.state;
         let actions = &game.playable_actions;
@@ -9245,7 +9264,7 @@ pub mod python_bindings {
                 "event_history_limit must be <= {ENTITY_EVENT_HISTORY_LIMIT}, got {requested_event_history_limit}"
             )));
         }
-        let event_history_limit = if meaningful_public_history {
+        let event_history_limit = if meaningful_public_history && !encode_meaningful_history_v2 {
             requested_event_history_limit.min(ENTITY_MEANINGFUL_PUBLIC_HISTORY_LIMIT)
         } else {
             requested_event_history_limit
@@ -9487,8 +9506,8 @@ pub mod python_bindings {
             .into_iter()
             .enumerate()
             {
-                let playable = actor_state.dev_cards[card.idx()]
-                    .min(actor_state.owned_at_start[card.idx()]);
+                let playable =
+                    actor_state.dev_cards[card.idx()].min(actor_state.owned_at_start[card.idx()]);
                 global_tokens[12 + offset] = entity_scale(playable as i64, 5.0);
             }
         }
@@ -9625,15 +9644,14 @@ pub mod python_bindings {
                             .unwrap_or(0)
                             != 1
                 })
-                .map(|(_, record)| record)
+                .map(|(record_index, record)| (record_index, record))
                 .collect::<Vec<_>>();
-            let retained = meaningful
-                .len()
-                .min(event_history_limit)
-                .min(ENTITY_MEANINGFUL_PUBLIC_HISTORY_LIMIT);
+            // `event_history_limit` is already schema-bounded above: v1 caps
+            // at 32 while adapter-v5/v2 may retain the full 64-row surface.
+            let retained = meaningful.len().min(event_history_limit);
             let source_start = meaningful.len().saturating_sub(retained);
             let row_start = event_history_limit - retained;
-            for (index, record) in meaningful[source_start..].iter().enumerate() {
+            for (index, (record_index, record)) in meaningful[source_start..].iter().enumerate() {
                 let row = row_start + index;
                 let base = row * ENTITY_EVENT_FEATURE_SIZE;
                 event_mask[row] = true;
@@ -9644,6 +9662,13 @@ pub mod python_bindings {
                 event_tokens[base + 3] = 1.0;
                 if let Some(actor_index) = entity_player_index(color_name(record.action.color)) {
                     event_tokens[base + 10 + actor_index] = 1.0;
+                }
+                if encode_meaningful_history_v2
+                    && let Some(Some((turn_number, turn_index))) =
+                        state.action_public_turn_keys.get(*record_index)
+                {
+                    event_tokens[base + 15] = entity_scale(*turn_number as i64, 512.0);
+                    event_tokens[base + 16] = entity_scale(*turn_index as i64, 4.0);
                 }
                 let type_name = action_type_name(record.action.action_type);
                 if let Some(type_index) = ENTITY_ACTION_TYPES
@@ -9868,8 +9893,11 @@ pub mod python_bindings {
         let colors = parse_colors_list(&colors)?;
         let encode_structured_action_resources =
             entity_adapter_encodes_action_resources(entity_feature_adapter_version)?;
-        let encode_actor_public_rule_state =
-            entity_feature_adapter_version == ENTITY_ADAPTER_V4;
+        let encode_actor_public_rule_state = matches!(
+            entity_feature_adapter_version,
+            ENTITY_ADAPTER_V4 | ENTITY_ADAPTER_V5
+        );
+        let encode_meaningful_history_v2 = entity_feature_adapter_version == ENTITY_ADAPTER_V5;
         let arrays = build_entity_feature_arrays(
             &game.game,
             &colors,
@@ -9881,6 +9909,7 @@ pub mod python_bindings {
             event_history_limit,
             encode_structured_action_resources,
             encode_actor_public_rule_state,
+            encode_meaningful_history_v2,
         )?;
         entity_feature_arrays_to_pydict(py, arrays)
     }
@@ -9967,8 +9996,11 @@ pub mod python_bindings {
         let colors = parse_colors_list(&colors)?;
         let encode_structured_action_resources =
             entity_adapter_encodes_action_resources(entity_feature_adapter_version)?;
-        let encode_actor_public_rule_state =
-            entity_feature_adapter_version == ENTITY_ADAPTER_V4;
+        let encode_actor_public_rule_state = matches!(
+            entity_feature_adapter_version,
+            ENTITY_ADAPTER_V4 | ENTITY_ADAPTER_V5
+        );
+        let encode_meaningful_history_v2 = entity_feature_adapter_version == ENTITY_ADAPTER_V5;
         let batch_size = games.len();
 
         // Borrow every game's inner `Game` up front (needs the GIL) so the
@@ -9992,6 +10024,7 @@ pub mod python_bindings {
                         event_history_limit,
                         encode_structured_action_resources,
                         encode_actor_public_rule_state,
+                        encode_meaningful_history_v2,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -10011,6 +10044,7 @@ pub mod python_bindings {
                         event_history_limit,
                         encode_structured_action_resources,
                         encode_actor_public_rule_state,
+                        encode_meaningful_history_v2,
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()?
@@ -10028,7 +10062,7 @@ pub mod python_bindings {
             .first()
             .map(|arrays| arrays.event_history_limit)
             .unwrap_or_else(|| {
-                if meaningful_public_history {
+                if meaningful_public_history && !encode_meaningful_history_v2 {
                     event_history_limit.min(ENTITY_MEANINGFUL_PUBLIC_HISTORY_LIMIT)
                 } else {
                     event_history_limit
@@ -10586,6 +10620,7 @@ pub mod python_bindings {
                 ENTITY_EVENT_HISTORY_LIMIT,
                 false,
                 false,
+                false,
             )
             .unwrap();
             let actor_base =
@@ -10636,6 +10671,7 @@ pub mod python_bindings {
                 ENTITY_EVENT_HISTORY_LIMIT,
                 true,
                 false,
+                false,
             )
             .unwrap();
             let v4 = build_entity_feature_arrays(
@@ -10649,6 +10685,7 @@ pub mod python_bindings {
                 ENTITY_EVENT_HISTORY_LIMIT,
                 true,
                 true,
+                false,
             )
             .unwrap();
 
@@ -10724,6 +10761,7 @@ pub mod python_bindings {
                 ENTITY_EVENT_HISTORY_LIMIT,
                 true,
                 false,
+                false,
             )
             .unwrap();
             assert_eq!(enabled.event_history_limit, 32);
@@ -10757,11 +10795,89 @@ pub mod python_bindings {
                 ENTITY_EVENT_HISTORY_LIMIT,
                 false,
                 false,
+                false,
             )
             .unwrap();
             assert_eq!(legacy.event_history_limit, 64);
             assert!(legacy.event_mask.iter().all(|value| !value));
             assert!(legacy.event_tokens.iter().all(|value| *value == 0.0));
+        }
+
+        #[test]
+        fn meaningful_public_history_v2_keeps_64_rows_and_public_turn_keys() {
+            let mut py_game =
+                PyGame::simple(Some(vec!["RED".to_string(), "BLUE".to_string()]), Some(35))
+                    .unwrap();
+            let actor = py_game.game.state.current_color();
+            py_game.game.state.action_records.clear();
+            py_game.game.state.action_public_legal_counts.clear();
+            py_game.game.state.action_public_turn_keys.clear();
+            for index in 0..70 {
+                py_game.game.state.action_records.push(ActionRecord {
+                    action: Action::new(actor, ActionType::BuildRoad, ActionValue::Edge((0, 1))),
+                    result: ActionValue::None,
+                });
+                py_game.game.state.action_public_legal_counts.push(3);
+                py_game
+                    .game
+                    .state
+                    .action_public_turn_keys
+                    .push(Some((100 + index, index % 2)));
+            }
+
+            let mut topology = PyEntityTopology {
+                hex_vertex_ids: vec![vec![-1; 6]; 19],
+                hex_edge_ids: vec![vec![-1; 6]; 19],
+                edge_vertex_ids: vec![vec![-1; 2]; 72],
+                port_base_nodes: vec![vec![-1; 2]; 16],
+            };
+            topology.edge_vertex_ids[19] = vec![0, 1];
+            let colors = py_game.game.state.colors.clone();
+            let policy_action_ids = vec![0; py_game.game.playable_actions.len()];
+
+            let v1 = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &policy_action_ids,
+                400,
+                &topology,
+                true,
+                true,
+                ENTITY_EVENT_HISTORY_LIMIT,
+                true,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(v1.event_history_limit, 32);
+            assert!(
+                v1.event_tokens
+                    .chunks_exact(ENTITY_EVENT_FEATURE_SIZE)
+                    .all(|row| row[15] == 0.0 && row[16] == 0.0)
+            );
+
+            let v2 = build_entity_feature_arrays(
+                &py_game.game,
+                &colors,
+                &policy_action_ids,
+                400,
+                &topology,
+                true,
+                true,
+                ENTITY_EVENT_HISTORY_LIMIT,
+                true,
+                true,
+                true,
+            )
+            .unwrap();
+            assert_eq!(v2.event_history_limit, 64);
+            assert_eq!(v2.event_mask.iter().filter(|&&value| value).count(), 64);
+            // 70 meaningful rows retain records 6..69. Turn keys are the
+            // public pre-action counters aligned to those exact records.
+            assert_eq!(v2.event_tokens[15], 106.0 / 512.0);
+            let last = 63 * ENTITY_EVENT_FEATURE_SIZE;
+            assert_eq!(v2.event_tokens[last + 15], 169.0 / 512.0);
+            assert_eq!(v2.event_tokens[last + 16], 1.0 / 4.0);
         }
 
         #[test]
@@ -10844,6 +10960,7 @@ pub mod python_bindings {
                 ENTITY_EVENT_HISTORY_LIMIT,
                 false,
                 false,
+                false,
             )
             .unwrap();
             let v3 = build_entity_feature_arrays(
@@ -10856,6 +10973,7 @@ pub mod python_bindings {
                 false,
                 ENTITY_EVENT_HISTORY_LIMIT,
                 true,
+                false,
                 false,
             )
             .unwrap();
@@ -10908,6 +11026,37 @@ pub mod python_bindings {
                 vec![0],
                 "even a sole regular-turn action is private-dependent metadata",
             );
+        }
+
+        #[test]
+        fn public_turn_key_sidecar_records_pre_action_context() {
+            let players = vec![Player::simple(Color::Red), Player::simple(Color::Blue)];
+            let mut game = Game::new(players, Some(93));
+            game.state.current_prompt = ActionPrompt::PlayTurn;
+            game.state.is_initial_build_phase = false;
+            game.state.num_turns = 7;
+            game.state.current_turn_index = 1;
+            game.state.current_player_index = 1;
+            let actor = game.state.current_color();
+            game.state.player_state_mut(actor).has_rolled = true;
+            game.playable_actions = generate_playable_actions(&game.state);
+            let end_turn = game
+                .playable_actions
+                .iter()
+                .find(|action| action.action_type == ActionType::EndTurn)
+                .unwrap()
+                .clone();
+
+            game.execute(end_turn, true, None).unwrap();
+
+            assert_eq!(game.state.action_public_turn_keys, vec![Some((7, 1))]);
+            assert_ne!(
+                (game.state.num_turns, game.state.current_turn_index),
+                (7, 1),
+                "the test must exercise a transition that mutates turn state",
+            );
+            let snapshot = game_to_json_value(&game);
+            assert_eq!(snapshot["action_public_turn_keys"], json!([[7, 1]]));
         }
 
         #[test]
@@ -14775,8 +14924,7 @@ mod public_belief_determinization_tests {
                 "sampled hidden victory points must repair actual VP",
             );
             assert_eq!(
-                player.owned_at_start,
-                player.dev_cards,
+                player.owned_at_start, player.dev_cards,
                 "sampled opponent playability metadata must match its hand",
             );
         }

@@ -285,9 +285,18 @@ def _synthetic_event_log(
         action_index = _reencode_action_index(env, action)
         action_value = _jsonable(action.value)
         result = _jsonable(record.result)
-        if native_type == "DISCARD_RESOURCE":
+        if native_type == "BUY_DEVELOPMENT_CARD":
+            action_value = "hidden_development_card"
+            result = "hidden_development_card"
+            action_index = None
+        elif native_type == "DISCARD_RESOURCE":
             action_value = "hidden_resource"
             result = "hidden_resource"
+        elif native_type == "MOVE_ROBBER" and result is not None:
+            # The robber destination and chosen victim are public and remain
+            # in action_value. The stolen resource identity is authoritative
+            # hidden truth and must not cross into the model event payload.
+            result = "hidden_stolen_resource"
         events.append(
             {
                 "event_id": len(events),

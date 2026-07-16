@@ -72,6 +72,46 @@ def test_synthetic_discard_history_never_reemits_hidden_resource_id() -> None:
     assert event["payload"]["action"]["value"] == "hidden_resource"
     assert event["payload"]["result"] == "hidden_resource"
 
+
+@pytest.mark.parametrize(
+    ("action_type", "value", "result", "hidden", "public_value"),
+    [
+        (
+            "BUY_DEVELOPMENT_CARD",
+            "VICTORY_POINT",
+            "VICTORY_POINT",
+            "VICTORY_POINT",
+            "hidden_development_card",
+        ),
+        (
+            "MOVE_ROBBER",
+            [[0, 0, 0], "BLUE"],
+            "ORE",
+            "ORE",
+            [[0, 0, 0], "BLUE"],
+        ),
+    ],
+)
+def test_synthetic_history_redacts_authoritative_hidden_results(
+    action_type, value, result, hidden, public_value
+) -> None:
+    action = SimpleNamespace(
+        action_type=SimpleNamespace(name=action_type),
+        color=SimpleNamespace(name="RED"),
+        value=value,
+    )
+    env = SimpleNamespace(action_catalog=SimpleNamespace(try_encode=lambda _action: 123))
+    game = SimpleNamespace(
+        state=SimpleNamespace(
+            action_records=[SimpleNamespace(action=action, result=result)]
+        )
+    )
+
+    event = _synthetic_event_log(env, game, history_limit=64)[-1]
+
+    assert hidden not in repr(event)
+    assert event["payload"]["action"]["value"] == public_value
+
 # entity_token_features._event_tokens slots 15/16 encode a per-event
 # `turn_key` ordinal that `_synthetic_event_log` deliberately does not
 # reconstruct (see its docstring). Zeroed out before comparison below.

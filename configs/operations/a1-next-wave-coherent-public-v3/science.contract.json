@@ -74,7 +74,7 @@
     "meaningful_public_history": true,
     "event_history_limit": 32,
     "teacher_entity_feature_adapter_version": "rust_entity_adapter_v2_land_topology_ports_maritime",
-    "learner_entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+    "learner_entity_feature_adapter_version": "rust_entity_adapter_v4_actor_public_rule_state",
     "workers_per_gpu": 16,
     "shard_size": 512,
     "format": "npz",
@@ -87,12 +87,12 @@
   "learner": {
     "initialization": {
       "mode": "from_scratch",
-      "entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+      "entity_feature_adapter_version": "rust_entity_adapter_v4_actor_public_rule_state",
       "checkpoint": null,
       "optimizer_state": "fresh"
     },
-    "architecture_upgrade_flags": "structured_action_value,card_count_v2,meaningful_history",
-    "architecture_upgrade_module": "entity_graph.static_action_residual+legal_action_value_residual+public_card_count_features+meaningful_public_history.v3",
+    "architecture_upgrade_flags": "structured_action_value,card_count_v2,meaningful_history,public_rule_state",
+    "architecture_upgrade_module": "entity_graph.static_action_residual+legal_action_value_residual+public_card_count_features+meaningful_public_history+actor_public_rule_state.v4",
     "model_construction": {
       "arch": "entity_graph",
       "hidden_size": 640,
@@ -103,11 +103,13 @@
       "static_action_residual": true,
       "legal_action_value_residual": true,
       "public_card_count_features": true,
+      "public_rule_state_features": true,
+      "public_rule_state_feature_schema": "actor_public_rule_state_2p_v1",
       "meaningful_public_history": true,
       "meaningful_public_history_pooling": "masked_mean_v1",
       "event_history_limit": 32,
       "mask_hidden_info": true,
-      "entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+      "entity_feature_adapter_version": "rust_entity_adapter_v4_actor_public_rule_state",
       "require_35m_model": true
     },
     "execution_topology": {

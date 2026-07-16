@@ -50,7 +50,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         ("optimizer_state", "resume"),
     ),
 )
-def test_current_contract_rejects_non_scratch_v3_initialization(
+def test_current_contract_rejects_non_scratch_v4_initialization(
     tmp_path, monkeypatch, field: str, bad_value
 ) -> None:
     contract = copy.deepcopy(current_science.load())
@@ -61,7 +61,7 @@ def test_current_contract_rejects_non_scratch_v3_initialization(
 
     with pytest.raises(
         current_science.ScienceContractError,
-        match="native from-scratch v3",
+        match="native from-scratch v4",
     ):
         current_science.load()
 
@@ -94,6 +94,19 @@ def test_current_contract_rejects_scratch_construction_or_topology_drift(
 
 def test_current_target_quality_generation_is_bound_to_config_and_guard() -> None:
     generation = current_science.generation()
+    learner = current_science.learner()
+    assert generation["teacher_entity_feature_adapter_version"] == (
+        current_science.CURRENT_TEACHER_ENTITY_ADAPTER
+    )
+    assert generation["learner_entity_feature_adapter_version"] == (
+        current_science.CURRENT_LEARNER_ENTITY_ADAPTER
+    )
+    assert learner["architecture_upgrade_flags"] == (
+        current_science.CURRENT_ARCHITECTURE_UPGRADE_FLAGS
+    )
+    assert learner["architecture_upgrade_module"] == (
+        current_science.CURRENT_ARCHITECTURE_UPGRADE_MODULE
+    )
     for (
         key,
         expected,
@@ -119,6 +132,9 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     assert lint["expected_values"]["--exact-budget-sh-min-n"] == 0
     assert lint["expected_values"]["--target-reliability-audit-fraction"] == 0.05
     assert lint["expected_values"]["--target-reliability-audit-seed"] == 20260716
+    assert lint["expected_values"][
+        "--learner-entity-feature-adapter-version"
+    ] == current_science.CURRENT_LEARNER_ENTITY_ADAPTER
 
 
 @pytest.mark.parametrize(

@@ -21,6 +21,7 @@ from catan_zero.rl.action_features import (
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     RUST_ENTITY_ADAPTER_V4,
+    RUST_ENTITY_ADAPTER_V5,
     checkpoint_entity_feature_adapter_metadata,
     require_known_entity_feature_adapter,
     resolve_checkpoint_entity_feature_adapter,
@@ -41,8 +42,10 @@ from catan_zero.rl.entity_token_features import (
 )
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
 from catan_zero.rl.meaningful_history import (
-    MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+    SUPPORTED_MEANINGFUL_PUBLIC_HISTORY_SCHEMAS,
+    meaningful_public_history_limit,
 )
 from catan_zero.rl.ordered_history import (
     MASKED_MEAN_V1,
@@ -592,6 +595,15 @@ class EntityGraphNet:
                     getattr(cfg, "meaningful_public_history", False)
                 )
                 if self.meaningful_public_history_enabled:
+                    self.meaningful_public_history_normalization = (
+                        meaningful_public_history_limit(
+                            getattr(
+                                cfg,
+                                "meaningful_public_history_schema",
+                                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+                            )
+                        )
+                    )
                     self.meaningful_public_history_pooling = str(
                         getattr(
                             cfg,
@@ -617,7 +629,7 @@ class EntityGraphNet:
                     )
                     if self.meaningful_public_history_pooling == ORDERED_ATTENTION_V2:
                         self.meaningful_history_sequence = build_ordered_history_pool(
-                            h, MEANINGFUL_PUBLIC_HISTORY_LIMIT
+                            h, self.meaningful_public_history_normalization
                         )
                         # Add the order-aware path without replacing the v1
                         # masked-mean path. A separate zero gate preserves a
@@ -1241,7 +1253,9 @@ class EntityGraphNet:
                     history_weight = event_mask.to(event_piece.dtype).unsqueeze(-1)
                     pooled_history = (
                         event_piece * history_weight
-                    ).sum(dim=1) / float(MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+                    ).sum(dim=1) / float(
+                        self.meaningful_public_history_normalization
+                    )
                     history_delta = (
                         pooled_history * self.meaningful_history_residual_gate
                     )
@@ -1921,17 +1935,18 @@ class EntityGraphPolicy:
             history_schema = str(
                 getattr(config, "meaningful_public_history_schema", "") or ""
             )
-            if history_schema != MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION:
+            if history_schema not in SUPPORTED_MEANINGFUL_PUBLIC_HISTORY_SCHEMAS:
                 raise ValueError(
                     "unsupported meaningful public-history schema: "
-                    f"{history_schema!r} != "
-                    f"{MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION!r}"
+                    f"{history_schema!r}; expected one of "
+                    f"{sorted(SUPPORTED_MEANINGFUL_PUBLIC_HISTORY_SCHEMAS)}"
                 )
             history_limit = int(getattr(config, "event_history_limit", 0) or 0)
-            if not 1 <= history_limit <= MEANINGFUL_PUBLIC_HISTORY_LIMIT:
+            maximum_history_limit = meaningful_public_history_limit(history_schema)
+            if not 1 <= history_limit <= maximum_history_limit:
                 raise ValueError(
                     "meaningful public history requires event_history_limit in "
-                    f"[1, {MEANINGFUL_PUBLIC_HISTORY_LIMIT}], got {history_limit}"
+                    f"[1, {maximum_history_limit}], got {history_limit}"
                 )
         self.architecture = self.policy_type
         # f72 safety net (task #76): whether this policy's weights were trained
@@ -1942,12 +1957,28 @@ class EntityGraphPolicy:
         self.entity_feature_adapter_version = require_known_entity_feature_adapter(
             entity_feature_adapter_version
         )
+        if bool(getattr(config, "meaningful_public_history", False)):
+            uses_history_v2 = (
+                str(getattr(config, "meaningful_public_history_schema", ""))
+                == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+            )
+            uses_adapter_v5 = (
+                self.entity_feature_adapter_version == RUST_ENTITY_ADAPTER_V5
+            )
+            if uses_history_v2 != uses_adapter_v5:
+                raise ValueError(
+                    "meaningful public-history v2 and entity adapter v5 must be "
+                    "enabled together; got schema "
+                    f"{getattr(config, 'meaningful_public_history_schema', None)!r} "
+                    f"and adapter {self.entity_feature_adapter_version!r}"
+                )
         if (
             bool(getattr(config, "public_rule_state_features", False))
-            and self.entity_feature_adapter_version != RUST_ENTITY_ADAPTER_V4
+            and self.entity_feature_adapter_version
+            not in {RUST_ENTITY_ADAPTER_V4, RUST_ENTITY_ADAPTER_V5}
         ):
             raise ValueError(
-                "public_rule_state_features requires entity adapter v4; got "
+                "public_rule_state_features requires entity adapter v4 or v5; got "
                 f"{self.entity_feature_adapter_version!r}"
             )
         self.entity_feature_adapter_binding_source = "new_policy_runtime_binding"
@@ -2087,7 +2118,12 @@ class EntityGraphPolicy:
                     meaningful_public_history_schema
                 ),
                 event_history_limit=(
-                    min(int(event_history_limit), MEANINGFUL_PUBLIC_HISTORY_LIMIT)
+                    min(
+                        int(event_history_limit),
+                        meaningful_public_history_limit(
+                            meaningful_public_history_schema
+                        ),
+                    )
                     if meaningful_public_history
                     else int(event_history_limit)
                 ),
@@ -2349,6 +2385,13 @@ class EntityGraphPolicy:
             history_limit=int(getattr(self.config, "event_history_limit", 64)),
             meaningful_public_history=bool(
                 getattr(self.config, "meaningful_public_history", False)
+            ),
+            meaningful_public_history_schema=str(
+                getattr(
+                    self.config,
+                    "meaningful_public_history_schema",
+                    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+                )
             ),
             entity_feature_adapter_version=self.entity_feature_adapter_version,
         )

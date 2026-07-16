@@ -54,7 +54,7 @@
     "science_schema_version": "a1-pre-wave-science-v2",
     "learner_initialization": {
       "mode": "from_scratch",
-      "entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+      "entity_feature_adapter_version": "rust_entity_adapter_v4_actor_public_rule_state",
       "checkpoint": null,
       "optimizer_state": "fresh"
     },
@@ -68,11 +68,13 @@
       "static_action_residual": true,
       "legal_action_value_residual": true,
       "public_card_count_features": true,
+      "public_rule_state_features": true,
+      "public_rule_state_feature_schema": "actor_public_rule_state_2p_v1",
       "meaningful_public_history": true,
       "meaningful_public_history_pooling": "masked_mean_v1",
       "event_history_limit": 32,
       "mask_hidden_info": true,
-      "entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+      "entity_feature_adapter_version": "rust_entity_adapter_v4_actor_public_rule_state",
       "require_35m_model": true
     },
     "learner_execution_topology": {
@@ -188,7 +190,7 @@
     "meaningful_public_history": true,
     "event_history_limit": 32,
     "teacher_entity_feature_adapter_version": "rust_entity_adapter_v2_land_topology_ports_maritime",
-    "learner_entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+    "learner_entity_feature_adapter_version": "rust_entity_adapter_v4_actor_public_rule_state",
     "workers_per_gpu": 16,
     "shard_size": 512,
     "format": "npz",
@@ -257,6 +259,7 @@
       "../../src/catan_zero/rl/decision_taxonomy.py",
       "../../src/catan_zero/rl/flywheel/opponent_mix.py",
       "../../src/catan_zero/rl/entity_token_policy.py",
+      "../../src/catan_zero/rl/entity_feature_adapter.py",
       "../../src/catan_zero/rl/entity_token_features.py",
       "../../src/catan_zero/rl/meaningful_history.py",
       "../../src/catan_zero/rl/hex_symmetry.py",
@@ -284,6 +287,7 @@
       "../../tools/build_memmap_corpus.py",
       "../../src/catan_zero/rl/config_cli.py",
       "../../src/catan_zero/rl/entity_token_policy.py",
+      "../../src/catan_zero/rl/entity_feature_adapter.py",
       "../../src/catan_zero/rl/entity_token_features.py",
       "../../src/catan_zero/rl/meaningful_history.py",
       "../../src/catan_zero/rl/pipeline_configs.py",

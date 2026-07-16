@@ -37,6 +37,13 @@ from catan_zero.rl.meaningful_history import (  # noqa: E402
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    RUST_ENTITY_ADAPTER_V4,
+    resolve_checkpoint_entity_feature_adapter,
+)
+from catan_zero.rl.entity_token_features import (  # noqa: E402
+    PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
+)
 from catan_zero.rl.ordered_history import (  # noqa: E402
     MASKED_MEAN_V1,
     ORDERED_ATTENTION_V2,
@@ -76,6 +83,11 @@ MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2 = (
 MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3 = (
     "entity_graph.static_action_residual+legal_action_value_residual+"
     "public_card_count_features+meaningful_public_history.v3"
+)
+MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4 = (
+    "entity_graph.static_action_residual+legal_action_value_residual+"
+    "public_card_count_features+meaningful_public_history+"
+    "actor_public_rule_state.v4"
 )
 MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY = (
     "entity_graph.meaningful_public_history.ordered_attention.v2"
@@ -379,6 +391,48 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
         },
     },
+    MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4: {
+        "flags": {
+            "static_action_residual": True,
+            "legal_action_value_residual": True,
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+            "public_rule_state_features": True,
+            "public_rule_state_feature_schema": (
+                PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+            ),
+        },
+        "new_parameter_initialization": {
+            "legal_action_value_residual_proj.weight": "zeros",
+            "legal_action_value_static_proj.weight": "zeros",
+            "static_action_residual_proj.bias": "zeros",
+            "static_action_residual_proj.weight": "zeros",
+            "public_card_count_residual.weight": "zeros",
+            "meaningful_history_residual_gate": "zeros",
+            "public_rule_state_residual.weight": "zeros",
+        },
+        "config_delta": {
+            "static_action_residual": True,
+            "legal_action_value_residual": True,
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+            "public_rule_state_features": True,
+            "public_rule_state_feature_schema": (
+                PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+            ),
+        },
+        "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V4,
+    },
     MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY: {
         "flags": {
             "meaningful_public_history": True,
@@ -611,6 +665,11 @@ def _reconstruct_seeded_parameters(
         base.static_action_features.detach().cpu().numpy(),
         seed=seed,
         device="cpu",
+        entity_feature_adapter_version=(
+            RUST_ENTITY_ADAPTER_V4
+            if bool(values.get("public_rule_state_features", False))
+            else base.entity_feature_adapter_version
+        ),
     )
     missing, unexpected = upgraded.model.load_state_dict(
         base.model.state_dict(), strict=False
@@ -709,6 +768,17 @@ def inspect_upgrade(
     ]
     if changed:
         raise UpgradeError(f"shared checkpoint parameters changed: {changed[:8]}")
+    expected_adapter = spec.get("entity_feature_adapter_version")
+    if expected_adapter is not None:
+        after_adapter, _source = resolve_checkpoint_entity_feature_adapter(
+            after.get("entity_feature_adapter"),
+            metadata_present="entity_feature_adapter" in after,
+        )
+        if after_adapter != expected_adapter:
+            raise UpgradeError(
+                "upgraded checkpoint entity adapter drift: "
+                f"{after_adapter!r} != {expected_adapter!r}"
+            )
     seeded_names = {
         name
         for name, kind in spec["new_parameter_initialization"].items()
@@ -768,6 +838,8 @@ def inspect_upgrade(
         raise UpgradeError("effective checkpoint config delta is not allowlisted")
 
     ignored = {"model", "config", "upgrade_provenance"}
+    if expected_adapter is not None:
+        ignored.add("entity_feature_adapter")
     unexpected_metadata = sorted(set(after) - set(before) - {"upgrade_provenance"})
     drift = [
         key
@@ -803,6 +875,8 @@ def inspect_upgrade(
         evidence["seeded_parameter_sha256"] = {
             name: _tensor_sha256(after_model[name]) for name in sorted(seeded_names)
         }
+    if expected_adapter is not None:
+        evidence["entity_feature_adapter_version"] = str(expected_adapter)
     return evidence
 
 
