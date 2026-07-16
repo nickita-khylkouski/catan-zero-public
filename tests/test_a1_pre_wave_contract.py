@@ -3131,10 +3131,14 @@ def test_post_wave_feature_semantics_require_exact_existing_contracts(
 ) -> None:
     shard = tmp_path / "semantic.npz"
     rows = 2
+    action_catalog = contract.ActionCatalog(("BLUE", "RED"))
     arrays = {
         "adapter_version": np.full(
             rows, contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
         ),
+        "legal_action_ids": np.zeros((rows, 1), dtype=np.int16),
+        "legal_action_mask": np.ones((rows, 1), dtype=bool),
+        "legal_action_tokens": np.zeros((rows, 1, 50), dtype=np.float16),
         "event_tokens": np.zeros((rows, 2, 1), dtype=np.float16),
         "event_mask": np.zeros((rows, 2), dtype=bool),
         "event_target_ids": np.full((rows, 2, 4), -1, dtype=np.int16),
@@ -3142,7 +3146,7 @@ def test_post_wave_feature_semantics_require_exact_existing_contracts(
     np.savez(shard, **arrays)
     with np.load(shard, allow_pickle=False) as payload:
         report = contract._require_shard_feature_semantics(  # noqa: SLF001
-            payload, rows=rows, where="fixture"
+            payload, rows=rows, action_catalog=action_catalog, where="fixture"
         )
     assert report["entity_feature_adapter_version"] == (
         contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION
@@ -3153,6 +3157,15 @@ def test_post_wave_feature_semantics_require_exact_existing_contracts(
     assert empty_scan["row_count"] == 2
     assert empty_scan["padded_event_width"] == 2
     assert empty_scan["nonzero_event_mask_count"] == 0
+    assert report["structured_action_resources"] == {
+        "schema": "training-v3-structured-action-resource-scan-v1",
+        "row_count": 2,
+        "active_legal_action_count": 2,
+        "structured_resource_action_count": 0,
+        "structured_resource_action_type_counts": {},
+        "year_of_plenty_pick_counts": {},
+        "scan_sha256": report["structured_action_resources"]["scan_sha256"],
+    }
 
     expected_award = contract._expected_public_award_feature_provenance(  # noqa: SLF001
         rust_featurize=True
@@ -3185,10 +3198,14 @@ def test_post_wave_feature_semantics_reject_drift(
     replacement: np.ndarray,
     error: str,
 ) -> None:
+    action_catalog = contract.ActionCatalog(("BLUE", "RED"))
     arrays = {
         "adapter_version": np.full(
             2, contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
         ),
+        "legal_action_ids": np.zeros((2, 1), dtype=np.int16),
+        "legal_action_mask": np.ones((2, 1), dtype=bool),
+        "legal_action_tokens": np.zeros((2, 1, 50), dtype=np.float16),
         "event_tokens": np.zeros((2, 2, 1), dtype=np.float16),
         "event_mask": np.zeros((2, 2), dtype=bool),
         "event_target_ids": np.full((2, 2, 4), -1, dtype=np.int16),
@@ -3199,7 +3216,121 @@ def test_post_wave_feature_semantics_reject_drift(
     with np.load(shard, allow_pickle=False) as payload:
         with pytest.raises(contract.ContractError, match=error):
             contract._require_shard_feature_semantics(  # noqa: SLF001
-                payload, rows=2, where="fixture"
+                payload,
+                rows=2,
+                action_catalog=action_catalog,
+                where="fixture",
+            )
+
+
+def test_post_wave_feature_semantics_reject_v2_bytes_mislabeled_as_v3(
+    tmp_path: Path,
+) -> None:
+    action_catalog = contract.ActionCatalog(("BLUE", "RED"))
+    legal_ids = np.asarray([[185, 305, 312, 311, 330]], dtype=np.int16)
+    legal_tokens = np.zeros((1, legal_ids.shape[1], 50), dtype=np.float16)
+    resource_slots = np.asarray(
+        [
+            [0.5, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0, 0.0, 0.5],
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=np.float16,
+    )
+    legal_tokens[0, :, 31:36] = resource_slots
+    for column, action_id in enumerate(legal_ids[0]):
+        action_type = action_catalog.descriptor(int(action_id)).action_type
+        legal_tokens[0, column, 2 + contract.ACTION_TYPES.index(action_type)] = 1.0
+        legal_tokens[0, column, 30] = 1.0
+    arrays = {
+        "adapter_version": np.full(
+            1, contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
+        ),
+        "legal_action_ids": legal_ids,
+        "legal_action_mask": np.ones(legal_ids.shape, dtype=bool),
+        "legal_action_tokens": legal_tokens,
+        "event_tokens": np.zeros((1, 2, 1), dtype=np.float16),
+        "event_mask": np.zeros((1, 2), dtype=bool),
+        "event_target_ids": np.full((1, 2, 4), -1, dtype=np.int16),
+    }
+    shard = tmp_path / "mislabeled-v3.npz"
+    np.savez(shard, **arrays)
+
+    with np.load(shard, allow_pickle=False) as payload:
+        report = contract._require_shard_feature_semantics(  # noqa: SLF001
+            payload,
+            rows=1,
+            action_catalog=action_catalog,
+            where="fixture",
+        )
+    assert report["structured_action_resources"][
+        "structured_resource_action_type_counts"
+    ] == {
+        "DISCARD_RESOURCE": 1,
+        "PLAY_MONOPOLY": 1,
+        "PLAY_YEAR_OF_PLENTY": 3,
+    }
+    assert report["structured_action_resources"]["year_of_plenty_pick_counts"] == {
+        "pair": 2,
+        "singleton": 1,
+    }
+
+    arrays["legal_action_tokens"] = legal_tokens.astype(np.float32)
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(
+            contract.ContractError,
+            match="must be exact finite float16 bytes",
+        ):
+            contract._require_shard_feature_semantics(  # noqa: SLF001
+                payload,
+                rows=1,
+                action_catalog=action_catalog,
+                where="fixture",
+            )
+
+    arrays["legal_action_tokens"] = legal_tokens.copy()
+    arrays["legal_action_tokens"][0, 0, 30] = 0.0
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match="target-kind bytes drift"):
+            contract._require_shard_feature_semantics(  # noqa: SLF001
+                payload,
+                rows=1,
+                action_catalog=action_catalog,
+                where="fixture",
+            )
+
+    arrays["legal_action_tokens"] = legal_tokens.copy()
+    action_type = action_catalog.descriptor(int(legal_ids[0, 0])).action_type
+    arrays["legal_action_tokens"][
+        0, 0, 2 + contract.ACTION_TYPES.index(action_type)
+    ] = 0.0
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match="action-type bytes drift"):
+            contract._require_shard_feature_semantics(  # noqa: SLF001
+                payload,
+                rows=1,
+                action_catalog=action_catalog,
+                where="fixture",
+            )
+
+    arrays["legal_action_tokens"] = legal_tokens.copy()
+    arrays["legal_action_tokens"][0, 0, 31:36] = 0.0
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(
+            contract.ContractError,
+            match="resource bytes disagree with legal_action_ids",
+        ):
+            contract._require_shard_feature_semantics(  # noqa: SLF001
+                payload,
+                rows=1,
+                action_catalog=action_catalog,
+                where="fixture",
             )
 
 
@@ -3518,6 +3649,9 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
             "action_taken": action_ids,
             "legal_action_ids": action_ids[:, np.newaxis],
             "legal_action_mask": np.ones((row_count, 1), dtype=bool),
+            "legal_action_tokens": np.zeros(
+                (row_count, 1, 50), dtype=np.float16
+            ),
             "terminated": np.ones(row_count, dtype=bool),
             "truncated": np.zeros(row_count, dtype=bool),
             "is_forced": forced_mask,
@@ -3752,6 +3886,12 @@ def test_post_wave_audit_accepts_exact_complete_category_corpus(
     assert feature_semantics["entity_feature_adapter"]["row_counts"] == {
         contract.CURRENT_RUST_ENTITY_ADAPTER_VERSION: expected_rows
     }
+    assert feature_semantics["structured_action_resources"][
+        "active_legal_action_count"
+    ] == expected_rows
+    assert feature_semantics["structured_action_resources"][
+        "structured_resource_action_count"
+    ] == 0
     assert feature_semantics["event_history"]["authenticated_empty"] is True
     assert feature_semantics["event_history"]["row_count"] == expected_rows
     assert feature_semantics["event_history"]["history_width_row_counts"] == {

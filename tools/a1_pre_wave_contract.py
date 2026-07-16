@@ -56,8 +56,10 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ENTITY_FEATURE_ADAPTER_SPECS,
     RUST_ENTITY_ADAPTER_V2,
+    RUST_ENTITY_ADAPTER_V3,
     require_known_entity_feature_adapter,
 )
+from catan_zero.rl.entity_token_features import ACTION_TYPES  # noqa: E402
 from catan_zero.rl.decision_taxonomy import (  # noqa: E402
     DECISION_TAXONOMY_SCHEMA_VERSION,
     MANDATORY_CHOICE,
@@ -9414,10 +9416,187 @@ def _meaningful_public_event_authority() -> dict[str, Any]:
     }
 
 
+_STRUCTURED_ACTION_RESOURCE_NAMES = ("wood", "brick", "sheep", "wheat", "ore")
+_STRUCTURED_ACTION_RESOURCE_TYPES = {
+    "DISCARD_RESOURCE",
+    "PLAY_MONOPOLY",
+    "PLAY_YEAR_OF_PLENTY",
+}
+
+
+def _resource_name(value: object) -> str:
+    return str(getattr(value, "name", value)).lower()
+
+
+def _expected_structured_action_resource_slots(
+    action_catalog: ActionCatalog,
+    legal_action_ids: np.ndarray,
+    legal_action_mask: np.ndarray,
+) -> tuple[np.ndarray, Counter[str], Counter[str]]:
+    """Decode the v3 resource slots from the authenticated flat action catalog."""
+
+    expected = np.zeros((*legal_action_ids.shape, 5), dtype=np.float16)
+    action_type_counts: Counter[str] = Counter()
+    yop_pick_counts: Counter[str] = Counter()
+    for row, column in np.argwhere(legal_action_mask):
+        action_id = int(legal_action_ids[row, column])
+        if action_id < 0 or action_id >= action_catalog.size:
+            raise ContractError(
+                "legal_action_ids contains an active id outside the sealed "
+                f"action catalog: {action_id}"
+            )
+        descriptor = action_catalog.descriptor(action_id)
+        if descriptor.action_type not in _STRUCTURED_ACTION_RESOURCE_TYPES:
+            continue
+        action_type_counts[descriptor.action_type] += 1
+        raw_values = (
+            descriptor.value
+            if isinstance(descriptor.value, (tuple, list))
+            else (descriptor.value,)
+        )
+        if descriptor.action_type == "PLAY_YEAR_OF_PLENTY":
+            yop_pick_counts[
+                "singleton" if len(raw_values) == 1 else "pair"
+            ] += 1
+        for value in raw_values:
+            resource = _resource_name(value)
+            if resource not in _STRUCTURED_ACTION_RESOURCE_NAMES:
+                raise ContractError(
+                    "sealed action catalog has an unknown structured-action "
+                    f"resource {resource!r} for id {action_id}"
+                )
+            index = _STRUCTURED_ACTION_RESOURCE_NAMES.index(resource)
+            expected[row, column, index] = min(
+                float(expected[row, column, index]) + 0.5,
+                1.0,
+            )
+    return expected, action_type_counts, yop_pick_counts
+
+
+def _require_v3_structured_action_resource_semantics(
+    payload: Any,
+    *,
+    rows: int,
+    action_catalog: ActionCatalog,
+    where: str,
+) -> dict[str, Any]:
+    """Prove v3-labeled bytes encode the resource identity implied by action IDs."""
+
+    required = {"legal_action_ids", "legal_action_mask", "legal_action_tokens"}
+    missing = sorted(required.difference(payload.files))
+    if missing:
+        raise ContractError(
+            f"{where}: missing v3 structured-action columns {missing}"
+        )
+    legal_ids = np.asarray(payload["legal_action_ids"])
+    legal_mask = np.asarray(payload["legal_action_mask"])
+    legal_tokens = np.asarray(payload["legal_action_tokens"])
+    if (
+        legal_ids.ndim != 2
+        or legal_ids.shape[0] != rows
+        or legal_mask.shape != legal_ids.shape
+        or legal_tokens.ndim != 3
+        or legal_tokens.shape[:2] != legal_ids.shape
+        or legal_tokens.shape[2] < 36
+    ):
+        raise ContractError(
+            f"{where}: v3 structured-action tensors are not shape-aligned"
+        )
+    if legal_ids.dtype.kind not in "iu" or legal_mask.dtype.kind != "b":
+        raise ContractError(
+            f"{where}: v3 structured-action id/mask dtypes violate the entity schema"
+        )
+    if legal_tokens.dtype != np.dtype(np.float16) or np.any(~np.isfinite(legal_tokens)):
+        raise ContractError(
+            f"{where}: legal_action_tokens must be exact finite float16 bytes"
+        )
+    if np.any(legal_mask & (legal_ids < 0)):
+        raise ContractError(f"{where}: active legal-action slots contain padding ids")
+
+    expected, action_type_counts, yop_pick_counts = (
+        _expected_structured_action_resource_slots(
+            action_catalog,
+            legal_ids,
+            legal_mask,
+        )
+    )
+    resource_positions = np.isin(
+        legal_ids,
+        np.asarray(
+            [
+                action_id
+                for action_id in range(action_catalog.size)
+                if action_catalog.descriptor(action_id).action_type
+                in _STRUCTURED_ACTION_RESOURCE_TYPES
+            ],
+            dtype=legal_ids.dtype,
+        ),
+    ) & legal_mask
+    observed = legal_tokens[..., 31:36]
+    if not np.array_equal(
+        observed[legal_mask].view(np.uint16),
+        expected[legal_mask].view(np.uint16),
+    ):
+        mismatch = np.argwhere(
+            legal_mask & np.any(observed.view(np.uint16) != expected.view(np.uint16), axis=2)
+        )
+        first = mismatch[0].tolist() if mismatch.size else None
+        raise ContractError(
+            f"{where}: v3 structured-action resource bytes disagree with "
+            f"legal_action_ids; first_mismatch={first}"
+        )
+
+    if np.any(resource_positions):
+        expected_target_kind = np.zeros(
+            (int(np.count_nonzero(resource_positions)), 6),
+            dtype=np.float16,
+        )
+        expected_target_kind[:, 5] = 1.0
+        observed_target_kind = legal_tokens[..., 25:31][resource_positions]
+        if not np.array_equal(
+            observed_target_kind.view(np.uint16),
+            expected_target_kind.view(np.uint16),
+        ):
+            raise ContractError(
+                f"{where}: v3 structured-action resource target-kind bytes drift"
+            )
+        observed_types = legal_tokens[..., 2 : 2 + len(ACTION_TYPES)][
+            resource_positions
+        ]
+        expected_types = np.zeros_like(observed_types)
+        for output_row, (row, column) in enumerate(
+            np.argwhere(resource_positions)
+        ):
+            action_type = action_catalog.descriptor(
+                int(legal_ids[row, column])
+            ).action_type
+            expected_types[output_row, ACTION_TYPES.index(action_type)] = 1.0
+        if not np.array_equal(
+            observed_types.view(np.uint16),
+            expected_types.view(np.uint16),
+        ):
+            raise ContractError(
+                f"{where}: v3 structured-action action-type bytes drift"
+            )
+    scan = {
+        "schema": "training-v3-structured-action-resource-scan-v1",
+        "row_count": rows,
+        "active_legal_action_count": int(np.count_nonzero(legal_mask)),
+        "structured_resource_action_count": int(sum(action_type_counts.values())),
+        "structured_resource_action_type_counts": dict(
+            sorted(action_type_counts.items())
+        ),
+        "year_of_plenty_pick_counts": dict(sorted(yop_pick_counts.items())),
+    }
+    scan["scan_sha256"] = _digest_value(scan)
+    return scan
+
+
 def _require_shard_feature_semantics(
     payload: Any,
     *,
     rows: int,
+    action_catalog: ActionCatalog,
     where: str,
     meaningful_public_history: bool = False,
     event_history_limit: int = 64,
@@ -9451,6 +9630,16 @@ def _require_shard_feature_semantics(
             f"{where}: adapter_version drift; observed={sorted(observed_adapters)} "
             f"expected={[expected_adapter]}"
         )
+    structured_action_resource_scan = (
+        _require_v3_structured_action_resource_semantics(
+            payload,
+            rows=rows,
+            action_catalog=action_catalog,
+            where=where,
+        )
+        if expected_adapter == RUST_ENTITY_ADAPTER_V3
+        else None
+    )
 
     event_mask = np.asarray(payload["event_mask"])
     if (
@@ -9500,6 +9689,7 @@ def _require_shard_feature_semantics(
         return {
             "row_count": rows,
             "entity_feature_adapter_version": expected_adapter,
+            "structured_action_resources": structured_action_resource_scan,
             "event_history": {
                 "authenticated_empty": False,
                 "semantic": MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
@@ -9518,6 +9708,7 @@ def _require_shard_feature_semantics(
     return {
         "row_count": rows,
         "entity_feature_adapter_version": expected_adapter,
+        "structured_action_resources": structured_action_resource_scan,
         "event_history": {
             "authenticated_empty": True,
             "empty_event_mask_scan": empty_scan,
@@ -10190,6 +10381,9 @@ def audit_outputs(
     }
     feature_semantic_rows = 0
     adapter_version_counts: Counter[str] = Counter()
+    structured_resource_action_type_counts: Counter[str] = Counter()
+    year_of_plenty_pick_counts: Counter[str] = Counter()
+    active_legal_action_count = 0
     event_history_width_counts: Counter[int] = Counter()
     event_history_nonzero_mask_count = 0
     public_award_generation_manifests = 0
@@ -10588,6 +10782,7 @@ def audit_outputs(
                     feature_semantics = _require_shard_feature_semantics(
                         payload,
                         rows=int(game_seeds.size),
+                        action_catalog=action_catalog,
                         where=f"{job['job_id']}:{canonical_shard.name}",
                         meaningful_public_history=meaningful_public_history,
                         event_history_limit=event_history_limit,
@@ -10597,6 +10792,19 @@ def audit_outputs(
                         [str(feature_semantics["entity_feature_adapter_version"])]
                         * int(feature_semantics["row_count"])
                     )
+                    resource_scan = feature_semantics["structured_action_resources"]
+                    if resource_scan is not None:
+                        active_legal_action_count += int(
+                            resource_scan["active_legal_action_count"]
+                        )
+                        structured_resource_action_type_counts.update(
+                            resource_scan[
+                                "structured_resource_action_type_counts"
+                            ]
+                        )
+                        year_of_plenty_pick_counts.update(
+                            resource_scan["year_of_plenty_pick_counts"]
+                        )
                     event_scan = feature_semantics["event_history"][
                         (
                             "event_mask_scan"
@@ -11087,6 +11295,23 @@ def audit_outputs(
         "nonzero_event_mask_count": event_history_nonzero_mask_count,
     }
     aggregate_event_scan["scan_sha256"] = _digest_value(aggregate_event_scan)
+    aggregate_structured_resource_scan = {
+        "schema": "training-v3-structured-action-resource-aggregate-v1",
+        "row_count": feature_semantic_rows,
+        "active_legal_action_count": active_legal_action_count,
+        "structured_resource_action_count": int(
+            sum(structured_resource_action_type_counts.values())
+        ),
+        "structured_resource_action_type_counts": dict(
+            sorted(structured_resource_action_type_counts.items())
+        ),
+        "year_of_plenty_pick_counts": dict(
+            sorted(year_of_plenty_pick_counts.items())
+        ),
+    }
+    aggregate_structured_resource_scan["scan_sha256"] = _digest_value(
+        aggregate_structured_resource_scan
+    )
     feature_semantics_report: dict[str, Any] = {
         "public_award_feature_provenance": {
             "expected": expected_public_award_provenance,
@@ -11102,6 +11327,7 @@ def audit_outputs(
             ),
             "row_counts": dict(adapter_version_counts),
         },
+        "structured_action_resources": aggregate_structured_resource_scan,
         "event_history": {
             **event_authority,
             "authenticated_empty": not meaningful_public_history,
