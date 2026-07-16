@@ -26402,10 +26402,12 @@ def teacher_data_quality(
     soft_target_min_legal_coverage: float = 0.5,
 ) -> dict:
     n = int(len(data["action_taken"]))
-    legal_counts = np.sum(data["legal_action_ids"] >= 0, axis=1)
+    legal_action_ids = data["legal_action_ids"]
+    legal_counts = _legal_action_counts(legal_action_ids)
+    legal = np.asarray(legal_action_ids)
     target_policy = np.asarray(data.get("target_policy", np.zeros((n, 0))), dtype=np.float32)
     target_scores = np.asarray(data.get("target_scores", np.full((n, 0), np.nan)), dtype=np.float32)
-    legal_mask = data["legal_action_ids"] >= 0
+    legal_mask = legal >= 0
     target_policy_mask = np.asarray(
         data.get("target_policy_mask", np.where(np.isfinite(target_policy), target_policy, 0.0) > 0.0),
         dtype=np.bool_,
@@ -26464,12 +26466,12 @@ def teacher_data_quality(
         effective_soft_distillation = _has_distillation_distribution(
             soft_payload[0],
             soft_payload[1],
-            legal_action_ids=data["legal_action_ids"],
+            legal_action_ids=legal,
             min_legal_coverage=soft_target_min_legal_coverage,
         )
     unflagged_actual_vp_rows = _unflagged_vp_rows(data, "final_actual_vps", "has_final_actual_vps")
     unflagged_public_vp_rows = _unflagged_vp_rows(data, "final_public_vps", "has_final_public_vps")
-    matches = data["legal_action_ids"] == data["action_taken"][:, None]
+    matches = legal == data["action_taken"][:, None]
     selected_action_has_score = np.any(matches & finite_scores, axis=1)
     soft_scores = np.any(finite_scores, axis=1)
     soft_policy = np.any(positive_policy, axis=1)

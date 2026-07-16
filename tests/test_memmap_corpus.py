@@ -135,6 +135,7 @@ def test_opponent_provenance_survives_mixed_npz_and_memmap_paths(tmp_path):
     quality = teacher_data_quality(in_memory)
     assert quality["opponent_provenance_rows"] == 2
     assert quality["opponent_tag_counts"] == {"recent_history": 2}
+    assert teacher_data_quality(memmap) == quality
     assert teacher_provenance_quality(memmap, chunk_rows=1)["opponent_provenance_fraction"] == 0.5
 
 
@@ -196,6 +197,11 @@ def test_conversion_round_trip_full_column_equality(corpus_pair):
         else:
             # assert_array_equal treats NaN==NaN as equal (target_scores has NaN pads).
             np.testing.assert_array_equal(actual, expected, err_msg=key)
+
+
+def test_teacher_data_quality_accepts_streaming_memmap(corpus_pair):
+    in_memory, memmap = corpus_pair
+    assert teacher_data_quality(memmap) == teacher_data_quality(in_memory)
 
 
 def test_batch_content_equality_on_identical_indices(corpus_pair):
