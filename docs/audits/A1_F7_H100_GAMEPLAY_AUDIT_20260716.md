@@ -81,8 +81,9 @@ time. Scaling deep behavioral panels requires:
 
 ## Current scratch contract correction
 
-The current contract is width 624 with `action_target_gather=true` and
-`value_trunk_grad_scale=0.25`. The largest remaining representation gap is
+The current contract is width 640 with `action_target_gather=true` and
+`value_trunk_grad_scale=0.25` after `ad7f303`. The largest remaining
+representation gap is
 topology: vertex construction discards topology, edge tokens omit endpoints,
 and the plain Transformer consumes no adjacency. Local gather does not by
 itself represent road connectivity, cutoffs, or Longest Road plans.

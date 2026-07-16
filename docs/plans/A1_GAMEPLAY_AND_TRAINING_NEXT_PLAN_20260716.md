@@ -41,7 +41,7 @@ This is most damaging for:
 - robber placement;
 - the two linked Road Building choices.
 
-### 2. Inefficient attention widths are an H100 risk; current width 624 is unmeasured
+### 2. The scratch contract now preserves the efficient width-640 attention path
 
 An exact synthetic training-step comparison used the current six-layer,
 one-private-value-block construction, BF16, batch 256, and the real audit-shard
@@ -64,11 +64,10 @@ width 640 and either:
 - remove/compress a dormant readout such as the Q head, which is frozen and
   unused when `q_loss_weight=0`.
 
-The commissioned contract currently uses width 624, not 632. The 632 result is
-strong evidence that nonstandard head dimensions can be expensive, but it does
-not directly certify the 624 configuration. Measure exact 624-versus-640
-training steps before changing the contract; do not extrapolate the 632 number
-as if 624 had already been benchmarked.
+Commit `ad7f303` moved the commissioned contract to width 640, so the inefficient
+632-width result is now historical evidence rather than an open contract bug.
+Keep width 640 fixed while testing topology so architecture and kernel-path
+effects are not confounded.
 
 ### 3. Fresh-scratch value routing is selected in prose but not commissioned by evidence
 
@@ -184,10 +183,9 @@ gates.
 
 Run matched fresh-init architecture arms:
 
-1. `C624`: exact current width-624, gather, V25 contract.
-2. `C640`: width 640 with otherwise identical gather and V25 settings.
-3. `T640`: `C640` plus topology residual/relational consumption.
-4. `E640`: edge-policy head only after `T640` identifies remaining policy
+1. `C640`: exact current width-640, gather, V25 contract.
+2. `T640`: `C640` plus topology residual/relational consumption.
+3. `E640`: edge-policy head only after `T640` identifies remaining policy
    aliasing.
 
 Keep a no-gather permutation probe as a causal test fixture, not as the claimed
@@ -377,7 +375,7 @@ The large retrain may start only when all are true:
    opening and Road Building failures plus paired counterfactuals.
 2. Add a separate non-promotable bounded H100 scratch runner; do not weaken the
    B200 production authority or `go_authorized=false` gate.
-3. Run matched `C624`/`C640`/`T640` 128--256-step canaries on identical rows and
+3. Run matched `C640`/`T640` 128--256-step canaries on identical rows and
    initialization, including the action-target permutation probe.
 4. Materialize the evaluator-query/turn-boundary value holdout and run
    V0/V25/V100 with matched optimizer exposure.
