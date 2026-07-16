@@ -11266,6 +11266,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     intermediate_checkpoints: list[dict[str, object]] = []
     checkpoint_dose_snapshots: list[dict[str, object]] = []
     saved_checkpoint_steps: set[int] = set()
+    # Exact cumulative source-row coverage for the auxiliary active-policy
+    # stream.  Short Stage-C doses sample with replacement; draw count alone
+    # cannot distinguish broad target coverage from repeatedly replaying a
+    # small handful of roots.
+    policy_aux_seen_global_rows: set[int] = set()
     # C1 gradient accumulation. accum==1 (default) preserves the pre-C1 path
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
     # and steps, and global_step (== optimizer steps) advances once per batch.
@@ -11703,6 +11708,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     policy_aux_batch,
                     aux_source_rows,
                 ) = _batch_tuple
+                policy_aux_seen_global_rows.update(
+                    int(row) for row in np.asarray(aux_source_rows, dtype=np.int64)
+                )
             if len(batch) == 0:
                 continue
             # C1 grad-accum bookkeeping. At accum==1 do_zero_grad and do_step are
@@ -12144,6 +12152,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     },
                     ddp,
                 )
+                checkpoint_aux_unique_rows = (
+                    _reduce_unique_row_count(
+                        policy_aux_seen_global_rows,
+                        total_rows=n,
+                        ddp=ddp,
+                    )
+                    if int(args.policy_aux_active_batch_size) > 0
+                    else 0
+                )
                 checkpoint_denominator_inputs = {
                     name: value
                     for name, value in epoch_extra_denominators.items()
@@ -12178,6 +12195,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ),
                     "policy_aux_active_rows": int(
                         round(checkpoint_counts["policy_aux_active_rows"])
+                    ),
+                    "policy_aux_unique_source_rows": int(
+                        checkpoint_aux_unique_rows
                     ),
                     "policy_base_effective_weight_sum": checkpoint_counts[
                         "policy_base_effective_weight_sum"
@@ -12581,6 +12601,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_loss": policy_loss_epoch,
                 "policy_base_active_rows": int(active_count_total),
                 "policy_aux_active_rows": int(aux_active_count_total),
+                "policy_aux_unique_source_rows": (
+                    _reduce_unique_row_count(
+                        policy_aux_seen_global_rows,
+                        total_rows=n,
+                        ddp=ddp,
+                    )
+                    if int(args.policy_aux_active_batch_size) > 0
+                    else 0
+                ),
                 "policy_total_active_rows": int(
                     active_count_total + aux_active_count_total
                 ),
@@ -13343,6 +13372,28 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
         "policy_aux_active_rows": int(
             sum(int(metric.get("policy_aux_active_rows", 0)) for metric in metrics)
+        ),
+        "policy_aux_unique_source_rows": max(
+            (
+                int(metric.get("policy_aux_unique_source_rows", 0))
+                for metric in metrics
+            ),
+            default=0,
+        ),
+        "policy_aux_reuse_factor": (
+            sum(int(metric.get("policy_aux_active_rows", 0)) for metric in metrics)
+            / max(
+                (
+                    int(metric.get("policy_aux_unique_source_rows", 0))
+                    for metric in metrics
+                ),
+                default=1,
+            )
+            if any(
+                int(metric.get("policy_aux_unique_source_rows", 0)) > 0
+                for metric in metrics
+            )
+            else None
         ),
         "policy_base_active_rows": int(
             sum(int(metric.get("policy_base_active_rows", 0)) for metric in metrics)
@@ -26481,8 +26532,23 @@ def _checkpoint_dose_telemetry(
             )
         ),
     }
+    policy_aux_unique_source_rows = max(
+        (
+            int(metric.get("policy_aux_unique_source_rows", 0))
+            for metric in metrics
+        ),
+        default=0,
+    )
     active_rows["policy_total"] = (
         active_rows["policy_base"] + active_rows["policy_aux"]
+    )
+    active_rows["policy_aux_unique_source_rows"] = (
+        policy_aux_unique_source_rows
+    )
+    active_rows["policy_aux_reuse_factor"] = (
+        active_rows["policy_aux"] / policy_aux_unique_source_rows
+        if policy_aux_unique_source_rows > 0
+        else None
     )
     policy_effective = {
         "base": float(
@@ -26612,6 +26678,37 @@ def _reduce_named_sums(
     )
     dist.all_reduce(values, op=dist.ReduceOp.SUM)
     return {name: float(values[index].item()) for index, name in enumerate(names)}
+
+
+def _reduce_unique_row_count(
+    rows: set[int],
+    *,
+    total_rows: int,
+    ddp: dict[str, int | bool],
+) -> int:
+    """Return the exact global union size for a small sampled row set."""
+
+    if total_rows < 0 or any(row < 0 or row >= total_rows for row in rows):
+        raise ValueError("sampled source row lies outside the corpus")
+    if not ddp["enabled"]:
+        return len(rows)
+    import torch
+    import torch.distributed as dist
+
+    observed = torch.zeros(
+        int(total_rows),
+        dtype=torch.uint8,
+        device=f"cuda:{int(ddp['local_rank'])}",
+    )
+    if rows:
+        indices = torch.as_tensor(
+            sorted(rows),
+            dtype=torch.int64,
+            device=observed.device,
+        )
+        observed[indices] = 1
+    dist.all_reduce(observed, op=dist.ReduceOp.MAX)
+    return int(observed.sum().item())
 
 
 def _reduce_sparse_named_sums(
