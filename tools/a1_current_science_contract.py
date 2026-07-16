@@ -47,7 +47,12 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "batch_size": 4096,
     "global_batch_size": 4096,
     "grad_accum_steps": 1,
-    "max_steps": 128,
+    # The coherent active-policy frontier peaked before the historical
+    # 128-step dose: step 32 scored 56.25% vs f7 and 51.17% vs v5, while the
+    # terminal step-128 checkpoint fell to 51.95% and 45.31%.  The denser
+    # coherent sampler therefore uses the observed short-dose optimum instead
+    # of inheriting the old corpus's optimizer-step count.
+    "max_steps": 32,
     "resume_optimizer": False,
     "lr": 6e-5,
     "lr_warmup_steps": 16,

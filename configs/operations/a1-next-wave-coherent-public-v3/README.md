@@ -66,3 +66,10 @@ only 34.16% of policy objective mass to ordinary `PLAY_TURN` decisions and
 66.49% `PLAY_TURN` mass, matching the 66.08% strategic-turn share of the
 historically successful selected-dose corpus while retaining supervision for
 every mandatory multi-action prompt.
+
+The coherent learner is capped at 32 optimizer steps. This is not the
+historical corpus's 128-step dose copied forward: on the matched coherent
+frontier, step 32 scored 56.25% against f7 and 51.17% against v5, while the
+step-128 checkpoint fell to 51.95% and 45.31%. The denser current sampler
+changes what one optimizer step means, so continuing to 128 erased the useful
+early update.

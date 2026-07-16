@@ -7917,6 +7917,19 @@ def _effective_a1_learner_training_recipe(
     target_reliability_confidence_weighting = bool(
         getattr(args, "target_reliability_confidence_weighting", False)
     )
+    # The current production reliability contract deliberately binds surprise
+    # weighting OFF. Preserve that negative decision in the effective recipe
+    # whenever reliability weighting identifies the new contract; otherwise a
+    # launched coherent run cannot reconstruct its sealed recipe even though
+    # the CLI is correct. Historical recipes still omit both default-off fields.
+    if (
+        per_game_policy_surprise_weighting
+        or target_reliability_confidence_weighting
+        or generic_a1_ablation
+    ):
+        effective["per_game_policy_surprise_weighting"] = (
+            per_game_policy_surprise_weighting
+        )
     target_reliability_confidence_floor = float(
         getattr(args, "target_reliability_confidence_floor", 0.25)
     )

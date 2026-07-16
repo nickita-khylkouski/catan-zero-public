@@ -969,6 +969,8 @@ def test_coherent_one_dose_renders_deployed_scalar_value_objective(
 
     assert _option(command, "--scalar-value-loss-readout") == "deployed_tanh"
     assert _option(command, "--scalar-value-loss-scale") == "1.0"
+    assert _option(command, "--max-steps") == "32"
+    assert "--checkpoint-steps" not in command
 
 
 def test_intermediate_checkpoint_steps_fail_closed() -> None:

@@ -1,0 +1,41 @@
+{
+  "schema_version": "a1-coherent-dose-frontier-evidence-v1",
+  "source_host": "ubuntu@149.118.65.110",
+  "source_results": "/home/ubuntu/experimental_nonpromotable/coherent-n128-active-policy-20260715-r1/eval-126afe1/stage-a-no-selection-frontier/results.summary.json",
+  "source_matrix": "/home/ubuntu/experimental_nonpromotable/coherent-n128-active-policy-20260715-r1/eval-126afe1/stage-a-no-selection-frontier/matrix.json",
+  "operator": "coherent_public/base_n128_d6",
+  "common_random_numbers": true,
+  "seat_swapped": true,
+  "games_per_matchup": 256,
+  "frontier": [
+    {
+      "step": 32,
+      "parent_kl": 0.07918167827500365,
+      "trunk_relative_l2": 0.01196729464479322,
+      "teacher_gap_closure": 0.003907404815376325,
+      "win_rate_vs_f7": 0.5625,
+      "win_rate_vs_v5": 0.51171875
+    },
+    {
+      "step": 64,
+      "parent_kl": 0.10015563289947571,
+      "trunk_relative_l2": 0.018163787583341633,
+      "teacher_gap_closure": 0.019997466377896678,
+      "win_rate_vs_f7": 0.5625,
+      "win_rate_vs_v5": 0.4921875
+    },
+    {
+      "step": 128,
+      "parent_kl": 0.11761147054650001,
+      "trunk_relative_l2": 0.02845926992276177,
+      "teacher_gap_closure": 0.04453910098588454,
+      "win_rate_vs_f7": 0.51953125,
+      "win_rate_vs_v5": 0.453125
+    }
+  ],
+  "root_cause": "the coherent active sampler redefined optimizer-step exposure, but production inherited the historical 128-step dose; offline teacher-gap closure kept improving while actual playing strength peaked much earlier and then regressed",
+  "production_decision": {
+    "max_steps": 32,
+    "reason": "earliest evaluated coherent checkpoint with the strongest matched broad playing result"
+  }
+}
