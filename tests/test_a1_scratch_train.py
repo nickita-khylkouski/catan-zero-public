@@ -219,6 +219,66 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert marker == authority
 
 
+def test_scratch_topology_binder_preserves_512_global_batch(tmp_path: Path) -> None:
+    logical = current_science.learner_training_recipe()
+    verified = {"recipe": copy.deepcopy(logical)}
+
+    bound = scratch._bind_scratch_training_topology(  # noqa: SLF001
+        verified,
+        logical_recipe=logical,
+        topology=current_science.learner_execution_topology(),
+    )
+
+    assert bound["bound_recipe"] == logical
+    assert bound["recipe"]["world_size"] == 8
+    assert bound["recipe"]["batch_size"] == 64
+    assert bound["recipe"]["grad_accum_steps"] == 1
+    assert bound["recipe"]["global_batch_size"] == 512
+    assert bound["training_topology"]["dose_preserving"] is True
+
+
+def test_scratch_topology_binder_preserves_authenticated_recipe_overrides() -> None:
+    logical = current_science.learner_training_recipe()
+    effective = copy.deepcopy(logical)
+    effective["soft_target_temperature"] = 0.7
+
+    bound = scratch._bind_scratch_training_topology(  # noqa: SLF001
+        {
+            "bound_recipe": copy.deepcopy(logical),
+            "recipe": effective,
+        },
+        logical_recipe=logical,
+        topology=current_science.learner_execution_topology(),
+    )
+
+    assert bound["bound_recipe"] == logical
+    assert bound["recipe"]["soft_target_temperature"] == 0.7
+    assert bound["recipe"]["batch_size"] == 64
+    assert bound["recipe"]["global_batch_size"] == 512
+
+
+def test_scratch_topology_binder_does_not_require_legacy_4096_batch(
+    tmp_path: Path,
+) -> None:
+    logical = current_science.learner_training_recipe()
+    assert logical["global_batch_size"] == 512
+    with pytest.raises(
+        scratch.one_dose.ExecutorError,
+        match="exact legacy 4096-global dose",
+    ):
+        scratch.one_dose.bind_training_topology(
+            {"recipe": copy.deepcopy(logical)},
+            topology=scratch.one_dose.B200_8GPU_DDP_TOPOLOGY,
+            gpu=0,
+        )
+
+    scratch._bind_scratch_training_topology(  # noqa: SLF001
+        {"recipe": copy.deepcopy(logical)},
+        logical_recipe=logical,
+        topology=current_science.learner_execution_topology(),
+    )
+
+
 def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     model = current_science.learner_model_construction()
     args = SimpleNamespace(

@@ -261,10 +261,10 @@ def verify_inputs(
             validation_path=None,
             build_receipt_path=composite_build_receipt,
         )
-        verified = one_dose.bind_training_topology(
+        verified = _bind_scratch_training_topology(
             verified,
-            topology=str(science["execution_topology"]["name"]),
-            gpu=0,
+            logical_recipe=science["logical_recipe"],
+            topology=science["execution_topology"],
         )
     except (
         contract.ContractError,
@@ -278,6 +278,92 @@ def verify_inputs(
     if adapters != {science["initialization"]["entity_feature_adapter_version"]}:
         raise ScratchTrainError("composite adapter semantics differ from scratch model")
     return {**verified, **science}
+
+
+def _bind_scratch_training_topology(
+    verified: Mapping[str, Any],
+    *,
+    logical_recipe: Mapping[str, Any],
+    topology: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the logical scratch batch onto its dedicated 8-rank topology.
+
+    ``one_dose.bind_training_topology`` is intentionally sealed to the
+    historical 4096-global checkpoint-initialized dose.  Reusing it here made
+    the native scratch executor reject its own 512-global science contract
+    before it could even emit a plan.  Scratch owns a separate topology
+    contract, so bind it directly and prove that the projection preserves the
+    logical global batch.
+    """
+
+    bound = dict(verified.get("bound_recipe", verified.get("recipe", logical_recipe)))
+    expected = dict(logical_recipe)
+    if bound != expected:
+        raise ScratchTrainError(
+            "verified composite learner recipe differs from current scratch science"
+        )
+    required_topology = current_science.learner_execution_topology()
+    if dict(topology) != required_topology:
+        raise ScratchTrainError("scratch execution topology differs from current science")
+    if (
+        str(topology.get("name")) != "b200-8gpu-ddp"
+        or str(topology.get("launcher")) != "torch.distributed.run"
+        or list(topology.get("physical_gpus", ())) != list(range(8))
+    ):
+        raise ScratchTrainError("scratch execution topology is not exact 8-GPU B200 DDP")
+    effective = dict(verified.get("recipe", bound))
+    topology_fields = (
+        "world_size",
+        "batch_size",
+        "grad_accum_steps",
+        "global_batch_size",
+    )
+    topology_drift = {
+        field: {"logical": bound.get(field), "effective": effective.get(field)}
+        for field in topology_fields
+        if effective.get(field) != bound.get(field)
+    }
+    if topology_drift:
+        raise ScratchTrainError(
+            "authenticated composite override changes scratch topology/dose fields: "
+            f"{topology_drift}"
+        )
+    effective.update(
+        {
+            "world_size": int(topology["world_size"]),
+            "batch_size": int(topology["local_batch_size"]),
+            "grad_accum_steps": int(topology["grad_accum_steps"]),
+            "global_batch_size": int(topology["global_batch_size"]),
+        }
+    )
+    realized_global_batch = (
+        int(effective["world_size"])
+        * int(effective["batch_size"])
+        * int(effective["grad_accum_steps"])
+    )
+    if (
+        realized_global_batch != int(bound["global_batch_size"])
+        or realized_global_batch != int(topology["global_batch_size"])
+    ):
+        raise ScratchTrainError("scratch topology changes the logical global batch")
+    result = dict(verified)
+    result.update(
+        {
+            "bound_recipe": bound,
+            "recipe": effective,
+            "training_topology": {
+                "schema_version": str(topology["schema_version"]),
+                "name": str(topology["name"]),
+                "world_size": int(topology["world_size"]),
+                "physical_gpus": list(topology["physical_gpus"]),
+                "local_batch_size": int(topology["local_batch_size"]),
+                "grad_accum_steps": int(topology["grad_accum_steps"]),
+                "global_batch_size": realized_global_batch,
+                "dose_preserving": True,
+            },
+        }
+    )
+    return result
 
 
 def _add(command: list[str], flag: str, value: object) -> None:
