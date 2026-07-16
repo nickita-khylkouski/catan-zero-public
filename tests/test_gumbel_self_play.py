@@ -29,6 +29,7 @@ from catan_zero.rl.gumbel_self_play import (
     TARGET_INFORMATION_REGIME_PUBLIC,
     TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _apply_selected_action,
+    _fast_search_policy_confidence_weight,
     _full_search_simulation_accounting,
     _is_n128_reliability_result,
     _search_execution_contract,
@@ -445,13 +446,12 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
 
 
 # ---------------------------------------------------------------------------
-# Fast-search rows must not carry policy weight (KataGo playout-cap
-# randomization: fast searches only advance the game / contribute a value
-# target, never a policy target).
+# Real fast-search rows carry a conservative policy confidence weight.
+# Forced/raw-prior/no-search rows remain policy-inactive.
 # ---------------------------------------------------------------------------
 
 
-def test_fast_search_rows_have_zero_policy_weight_but_full_value_weight():
+def test_fast_search_rows_have_bounded_policy_weight_and_full_value_weight():
     _rust()
     self_play_config, search_config = _fast_config(max_decisions=5, p_full=0.0)
     evaluator = HeuristicRustEvaluator(score_actions=False)
@@ -469,10 +469,112 @@ def test_fast_search_rows_have_zero_policy_weight_but_full_value_weight():
     assert record.decisions, "expected at least one non-forced decision to be recorded"
     for decision in record.decisions:
         assert decision.row["used_full_search"] is False
-        assert float(decision.row["policy_weight_multiplier"]) == pytest.approx(0.0)
+        if decision.row["is_forced"]:
+            assert float(decision.row["policy_weight_multiplier"]) == pytest.approx(0.0)
+        else:
+            assert 0.0 < float(decision.row["policy_weight_multiplier"]) <= 0.25
         assert float(decision.row["value_weight_multiplier"]) == pytest.approx(1.0)
         assert not bool(decision.row["root_value_mask"])
         assert np.isnan(decision.row["root_value"])
+
+
+def test_fast_search_policy_confidence_accepts_valid_search_evidence():
+    result = SimpleNamespace(
+        improved_policy={10: 0.75, 11: 0.25},
+        visit_counts={10: 12, 11: 4},
+        simulations_used=16,
+    )
+
+    weight = _fast_search_policy_confidence_weight(
+        result,
+        legal_actions=(10, 11),
+        target_policy=np.asarray([0.75, 0.25], dtype=np.float32),
+        is_forced=False,
+    )
+
+    assert weight == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize(
+    ("result", "legal_actions", "target_policy", "is_forced"),
+    (
+        (
+            SimpleNamespace(
+                improved_policy={10: 0.75, 11: 0.25},
+                visit_counts={10: 12, 11: 4},
+                simulations_used=16,
+            ),
+            (10, 11),
+            np.asarray([0.75, 0.25], dtype=np.float32),
+            True,
+        ),
+        (
+            SimpleNamespace(
+                improved_policy={10: 0.75, 11: 0.25},
+                visit_counts={},
+                simulations_used=0,
+            ),
+            (10, 11),
+            np.asarray([0.75, 0.25], dtype=np.float32),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                improved_policy={10: 0.75, 11: 0.25},
+                visit_counts={10: 11, 11: 4},
+                simulations_used=16,
+            ),
+            (10, 11),
+            np.asarray([0.75, 0.25], dtype=np.float32),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                improved_policy={10: 0.75, 11: float("nan")},
+                visit_counts={10: 12, 11: 4},
+                simulations_used=16,
+            ),
+            (10, 11),
+            np.asarray([0.75, np.nan], dtype=np.float32),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                improved_policy={10: 0.0, 11: 0.0},
+                visit_counts={10: 12, 11: 4},
+                simulations_used=16,
+            ),
+            (10, 11),
+            np.asarray([0.0, 0.0], dtype=np.float32),
+            False,
+        ),
+        (
+            SimpleNamespace(
+                improved_policy={10: 1.0},
+                visit_counts={10: 16},
+                simulations_used=16,
+            ),
+            (10,),
+            np.asarray([1.0], dtype=np.float32),
+            False,
+        ),
+    ),
+)
+def test_fast_search_policy_confidence_suppresses_invalid_or_degenerate_evidence(
+    result,
+    legal_actions,
+    target_policy,
+    is_forced,
+):
+    assert (
+        _fast_search_policy_confidence_weight(
+            result,
+            legal_actions=legal_actions,
+            target_policy=target_policy,
+            is_forced=is_forced,
+        )
+        == 0.0
+    )
 
 
 def test_full_search_rows_have_nonzero_policy_weight():

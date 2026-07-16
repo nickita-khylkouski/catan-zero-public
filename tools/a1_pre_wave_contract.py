@@ -61,6 +61,8 @@ from catan_zero.rl.decision_taxonomy import (  # noqa: E402
     MANDATORY_CHOICE,
 )
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
+    FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS,
+    FAST_SEARCH_POLICY_WEIGHT_MAX,
     GumbelSelfPlayConfig,
     PLAYER_NAMES,
     TARGET_INFORMATION_REGIME_PUBLIC,
@@ -116,6 +118,8 @@ DUAL_ARM_AUDIT_SCHEMA = "a1-dual-arm-post-wave-audit-v1"
 DUAL_ARM_SELECTED_GAMES_SCHEMA = "a1-dual-arm-selected-training-games-v1"
 TARGET_ACTIVATION_SCHEMA = "a1-selected-target-activation-v1"
 TARGET_ACTIVATION_CHUNK_SCHEMA = "a1-selected-target-activation-chunk-v1"
+TARGET_ACTIVATION_SCHEMA_V2 = "a1-selected-target-activation-v2"
+TARGET_ACTIVATION_CHUNK_SCHEMA_V2 = "a1-selected-target-activation-chunk-v2"
 # A two-sided Hoeffding bound is used because the full/fast decision is a
 # Bernoulli draw for every non-forced root.  The bound is family-wise across
 # source categories and deliberately has no fitted/tunable tolerance.
@@ -9495,11 +9499,13 @@ _ADAPTIVE_TARGET_ACTIVATION_COUNT_KEYS = _TARGET_ACTIVATION_COUNT_KEYS + (
 
 def _sha256_labeled_arrays(
     arrays: Sequence[tuple[str, np.ndarray]],
+    *,
+    schema_version: str = TARGET_ACTIVATION_CHUNK_SCHEMA,
 ) -> str:
     """Hash typed row evidence without constructing a multi-million-row JSON list."""
 
     digest = hashlib.sha256()
-    digest.update((TARGET_ACTIVATION_CHUNK_SCHEMA + "\0").encode("ascii"))
+    digest.update((schema_version + "\0").encode("ascii"))
     for label, raw in arrays:
         value = np.ascontiguousarray(raw)
         label_bytes = label.encode("ascii")
@@ -9526,10 +9532,11 @@ def _selected_target_activation_chunk(
     """Authenticate the exact selected-row policy/value gradient switches.
 
     This is intentionally shared by post-wave audit and composite materialization.
-    The producer contract is binary: only non-forced FULL rows train policy and
-    every selected row trains value.  Merely checking non-negative multiplier
-    mass would allow an apparently valid wave to train a materially different
-    objective.
+    Full non-forced rows train policy at weight 1. Valid fast-search rows may
+    use the bounded confidence formula emitted by ``gumbel_self_play``; legacy
+    shards remain compatible with zero-weight fast rows. Every selected row
+    trains value. Merely checking non-negative multiplier mass would allow an
+    apparently valid wave to train a materially different objective.
     """
 
     required = {
@@ -9582,7 +9589,21 @@ def _selected_target_activation_chunk(
     used_full = np.asarray(raw_full[mask], dtype=np.bool_)
     selected_policy = np.asarray(policy[mask], dtype=np.float64)
     selected_value = np.asarray(value[mask], dtype=np.float64)
-    expected_policy = np.asarray(used_full & ~forced, dtype=np.uint8)
+    full_non_forced = np.asarray(used_full & ~forced, dtype=np.bool_)
+    fast_non_forced = np.asarray(~used_full & ~forced, dtype=np.bool_)
+    selected_simulations: np.ndarray | None = None
+    if "simulations_used" in payload.files:
+        raw_simulations = np.asarray(payload["simulations_used"])
+        if (
+            raw_simulations.shape != seeds.shape
+            or raw_simulations.dtype.kind not in "iu"
+        ):
+            raise ContractError(
+                f"{where}: simulations_used must be row-aligned integer"
+            )
+        selected_simulations = np.asarray(raw_simulations[mask], dtype=np.int64)
+        if np.any(selected_simulations < 0):
+            raise ContractError(f"{where}: simulations_used must be non-negative")
     legal_width: np.ndarray | None = None
     wide_non_forced: np.ndarray | None = None
     mandatory_non_forced: np.ndarray | None = None
@@ -9628,21 +9649,84 @@ def _selected_target_activation_chunk(
             )
 
     if np.any(~np.isfinite(selected_policy)) or np.any(
-        (selected_policy != 0.0) & (selected_policy != 1.0)
+        (selected_policy < 0.0) | (selected_policy > 1.0)
     ):
         raise ContractError(
-            f"{where}: policy_weight_multiplier must be finite and exactly binary"
+            f"{where}: policy_weight_multiplier must be finite and in [0,1]"
         )
-    if not np.array_equal(selected_policy, expected_policy.astype(np.float64)):
-        mismatches = int(
-            np.count_nonzero(
-                selected_policy != expected_policy.astype(np.float64)
+    forced_mismatches = forced & (selected_policy != 0.0)
+    full_mismatches = full_non_forced & (selected_policy != 1.0)
+    if np.any(forced_mismatches) or np.any(full_mismatches):
+        mismatches = int(np.count_nonzero(forced_mismatches | full_mismatches))
+        raise ContractError(
+            f"{where}: policy_weight_multiplier disagrees with forced/full "
+            f"activation on {mismatches} selected rows"
+        )
+
+    positive_fast = fast_non_forced & (selected_policy > 0.0)
+    if np.any(positive_fast):
+        if selected_simulations is None:
+            raise ContractError(
+                f"{where}: positive fast-search policy weights require "
+                "simulations_used provenance"
+            )
+        expected_fast = np.asarray(
+            np.minimum(
+                FAST_SEARCH_POLICY_WEIGHT_MAX,
+                selected_simulations.astype(np.float64)
+                / float(FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS),
+            ),
+            dtype=np.float32,
+        ).astype(np.float64)
+        invalid_fast = positive_fast & (
+            (selected_simulations <= 0) | (selected_policy != expected_fast)
+        )
+        if np.any(invalid_fast):
+            raise ContractError(
+                f"{where}: fast-search policy weight disagrees with bounded "
+                f"simulation confidence on {int(np.count_nonzero(invalid_fast))} "
+                "selected rows"
+            )
+        if not {"target_policy", "target_policy_mask"} <= set(payload.files):
+            raise ContractError(
+                f"{where}: positive fast-search policy weights require target "
+                "distribution provenance"
+            )
+        raw_target_policy = np.asarray(payload["target_policy"])
+        raw_target_mask = np.asarray(payload["target_policy_mask"])
+        if (
+            raw_target_policy.ndim != 2
+            or raw_target_policy.shape[0] != seeds.shape[0]
+            or raw_target_mask.shape != raw_target_policy.shape
+            or raw_target_mask.dtype.kind != "b"
+        ):
+            raise ContractError(
+                f"{where}: fast-search target distribution provenance is malformed"
+            )
+        fast_targets = np.asarray(raw_target_policy[mask], dtype=np.float64)[
+            positive_fast
+        ]
+        fast_target_masks = np.asarray(raw_target_mask[mask], dtype=np.bool_)[
+            positive_fast
+        ]
+        active_values = np.where(fast_target_masks, fast_targets, 0.0)
+        invalid_target = (
+            ~np.all(np.isfinite(active_values), axis=1)
+            | np.any(active_values < 0.0, axis=1)
+            | ~np.any(fast_target_masks, axis=1)
+            | ~np.isclose(
+                active_values.sum(axis=1, dtype=np.float64),
+                1.0,
+                rtol=1.0e-5,
+                atol=1.0e-5,
             )
         )
-        raise ContractError(
-            f"{where}: policy_weight_multiplier disagrees with "
-            f"used_full_search && !is_forced on {mismatches} selected rows"
-        )
+        if np.any(invalid_target):
+            raise ContractError(
+                f"{where}: fast-search policy weight has invalid target "
+                f"distribution on {int(np.count_nonzero(invalid_target))} "
+                "selected rows"
+            )
     if np.any(~np.isfinite(selected_value)) or np.any(selected_value != 1.0):
         raise ContractError(
             f"{where}: value_weight_multiplier must be finite and exactly 1"
@@ -9650,15 +9734,16 @@ def _selected_target_activation_chunk(
 
     rows = int(selected_seeds.size)
     forced_rows = int(np.count_nonzero(forced))
-    full_rows = int(np.count_nonzero(expected_policy))
+    full_rows = int(np.count_nonzero(full_non_forced))
+    policy_active_rows = int(np.count_nonzero(selected_policy > 0.0))
     counts = {
         "rows": rows,
         "forced_rows": forced_rows,
         "non_forced_rows": rows - forced_rows,
         "full_search_non_forced_rows": full_rows,
         "fast_search_non_forced_rows": rows - forced_rows - full_rows,
-        "policy_active_rows": full_rows,
-        "policy_inactive_rows": rows - full_rows,
+        "policy_active_rows": policy_active_rows,
+        "policy_inactive_rows": rows - policy_active_rows,
         "value_active_rows": rows,
     }
     if wide_non_forced is not None and mandatory_non_forced is not None:
@@ -9685,14 +9770,26 @@ def _selected_target_activation_chunk(
                 ),
             }
         )
+    legacy_expected_policy = full_non_forced.astype(np.uint8)
     activation_arrays: list[tuple[str, np.ndarray]] = [
         ("game_seed", selected_seeds),
         ("decision_index", selected_decision),
         ("is_forced", forced.astype(np.uint8)),
         ("used_full_search", used_full.astype(np.uint8)),
-        ("policy_weight_multiplier", expected_policy),
+        ("policy_weight_multiplier", legacy_expected_policy),
         ("value_weight_multiplier", np.ones(rows, dtype=np.uint8)),
     ]
+    chunk_schema = TARGET_ACTIVATION_CHUNK_SCHEMA
+    if np.any(positive_fast):
+        chunk_schema = TARGET_ACTIVATION_CHUNK_SCHEMA_V2
+        activation_arrays[4] = (
+            "policy_weight_multiplier",
+            selected_policy.astype("<f4", copy=False),
+        )
+        assert selected_simulations is not None
+        activation_arrays.append(
+            ("simulations_used", selected_simulations.astype("<i8", copy=False))
+        )
     if (
         legal_width is not None
         and wide_non_forced is not None
@@ -9709,10 +9806,11 @@ def _selected_target_activation_chunk(
             )
         )
     row_activation_sha256 = _sha256_labeled_arrays(
-        activation_arrays
+        activation_arrays,
+        schema_version=chunk_schema,
     )
     chunk: dict[str, Any] = {
-        "schema_version": TARGET_ACTIVATION_CHUNK_SCHEMA,
+        "schema_version": chunk_schema,
         "counts": counts,
         "counts_sha256": _digest_value(counts),
         "row_activation_sha256": row_activation_sha256,
@@ -9737,7 +9835,11 @@ def _normalize_target_activation_chunk(raw: object) -> dict[str, Any]:
         raise ContractError("target-activation chunk fields differ from schema")
     counts = chunk.get("counts")
     if (
-        chunk.get("schema_version") != TARGET_ACTIVATION_CHUNK_SCHEMA
+        chunk.get("schema_version")
+        not in {
+            TARGET_ACTIVATION_CHUNK_SCHEMA,
+            TARGET_ACTIVATION_CHUNK_SCHEMA_V2,
+        }
         or not isinstance(chunk.get("job_id"), str)
         or not chunk["job_id"]
         or not isinstance(chunk.get("source_sha256"), str)
@@ -9817,6 +9919,7 @@ def _build_target_activation_report(
     }
     category_reports: dict[str, Any] = {}
     all_passed = True
+    saw_v2_chunk = False
     for category in expected_categories:
         chunks = [
             _normalize_target_activation_chunk(chunk)
@@ -9828,6 +9931,25 @@ def _build_target_activation_report(
                 raise ContractError(
                     f"target-activation chunk mode drift for {category}"
                 )
+            chunk_fast_active = (
+                int(chunk["counts"]["policy_active_rows"])
+                - int(chunk["counts"]["full_search_non_forced_rows"])
+            )
+            if (
+                chunk["schema_version"] == TARGET_ACTIVATION_CHUNK_SCHEMA
+                and chunk_fast_active != 0
+            ):
+                raise ContractError(
+                    f"legacy target-activation chunk carries fast policy activity "
+                    f"for {category}"
+                )
+            if chunk["schema_version"] == TARGET_ACTIVATION_CHUNK_SCHEMA_V2:
+                saw_v2_chunk = True
+                if chunk_fast_active <= 0:
+                    raise ContractError(
+                        f"v2 target-activation chunk lacks fast policy activity "
+                        f"for {category}"
+                    )
             for key in count_keys:
                 counts[key] += int(chunk["counts"][key])
         if (
@@ -9836,7 +9958,8 @@ def _build_target_activation_report(
             + counts["fast_search_non_forced_rows"]
             != counts["non_forced_rows"]
             or counts["policy_active_rows"]
-            != counts["full_search_non_forced_rows"]
+            < counts["full_search_non_forced_rows"]
+            or counts["policy_active_rows"] > counts["non_forced_rows"]
             or counts["policy_active_rows"] + counts["policy_inactive_rows"]
             != counts["rows"]
             or counts["value_active_rows"] != counts["rows"]
@@ -9893,8 +10016,21 @@ def _build_target_activation_report(
         deviation = abs(float(observed) - expected)
         passed = bool(n > 0 and deviation <= float(allowed))
         all_passed = all_passed and passed
+        fast_search_policy_active_rows = (
+            counts["policy_active_rows"]
+            - counts["full_search_non_forced_rows"]
+        )
         category_report: dict[str, Any] = {
             "counts": counts,
+            **(
+                {
+                    "fast_search_policy_active_rows": (
+                        fast_search_policy_active_rows
+                    )
+                }
+                if fast_search_policy_active_rows
+                else {}
+            ),
             "counts_sha256": _digest_value(counts),
             "chunks": chunks,
             "chunks_sha256": _digest_value(chunks),
@@ -9908,10 +10044,36 @@ def _build_target_activation_report(
         }
         category_report["activation_sha256"] = _digest_value(category_report)
         category_reports[category] = category_report
+    fast_policy_active = any(
+        int(report.get("fast_search_policy_active_rows", 0)) > 0
+        for report in category_reports.values()
+    )
+    if fast_policy_active != saw_v2_chunk:
+        raise ContractError("target-activation fast-policy schema/count drift")
     report: dict[str, Any] = {
-        "schema_version": TARGET_ACTIVATION_SCHEMA,
+        "schema_version": (
+            TARGET_ACTIVATION_SCHEMA_V2
+            if fast_policy_active
+            else TARGET_ACTIVATION_SCHEMA
+        ),
         "policy_activation_rule": (
-            "policy_weight_multiplier == int(used_full_search and not is_forced)"
+            "full non-forced rows == 1; forced rows == 0; fast non-forced rows "
+            "are legacy 0 or min(0.25, simulations_used/64)"
+            if fast_policy_active
+            else "policy_weight_multiplier == int(used_full_search and not is_forced)"
+        ),
+        **(
+            {
+                "fast_search_policy_confidence": {
+                    "max_weight": FAST_SEARCH_POLICY_WEIGHT_MAX,
+                    "reference_simulations": (
+                        FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS
+                    ),
+                    "legacy_zero_weight_compatible": True,
+                }
+            }
+            if fast_policy_active
+            else {}
         ),
         "value_activation_rule": "value_weight_multiplier == 1.0",
         "sealed_p_full": 0.25,
@@ -10606,7 +10768,7 @@ def audit_outputs(
                             wide_full_threshold=wide_full_threshold,
                         )
                         activation_chunk = {
-                            "schema_version": TARGET_ACTIVATION_CHUNK_SCHEMA,
+                            "schema_version": activation["schema_version"],
                             "job_id": str(job["job_id"]),
                             "source_sha256": job_data_shard_records[shard]["sha256"],
                             "counts": activation["counts"],

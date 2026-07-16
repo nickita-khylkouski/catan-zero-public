@@ -25,6 +25,11 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
+from catan_zero.rl.gumbel_self_play import (
+    FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS,
+    FAST_SEARCH_POLICY_WEIGHT_MAX,
+)
+
 
 SCHEMA = "a1-target-eligibility-inventory-v1"
 RD_CONTRACT_SCHEMA = "a1-coherent-target-rd-contract-v1"
@@ -480,17 +485,53 @@ def inspect_memmap(
         )
 
     policy = _column(root, meta, "policy_weight_multiplier").reshape(-1)
-    policy_active = np.asarray(policy) > 0.0
+    policy_values = np.asarray(policy, dtype=np.float64)
+    policy_active = policy_values > 0.0
+    fast_policy_active_rows: int | None = None
     if {"used_full_search", "is_forced"} <= columns:
-        used_full = _column(root, meta, "used_full_search").reshape(-1)
-        forced = _column(root, meta, "is_forced").reshape(-1)
-        expected_active = np.asarray(used_full, dtype=np.bool_) & ~np.asarray(
-            forced, dtype=np.bool_
+        used_full = np.asarray(
+            _column(root, meta, "used_full_search").reshape(-1), dtype=np.bool_
         )
-        activation_mismatch: int | None = int(
-            np.count_nonzero(policy_active != expected_active)
+        forced = np.asarray(
+            _column(root, meta, "is_forced").reshape(-1), dtype=np.bool_
         )
-        activation_evidence = "used_full_search_and_not_is_forced"
+        full_non_forced = used_full & ~forced
+        fast_non_forced = ~used_full & ~forced
+        mismatch = (
+            ~np.isfinite(policy_values)
+            | (policy_values < 0.0)
+            | (policy_values > 1.0)
+            | (forced & (policy_values != 0.0))
+            | (full_non_forced & (policy_values != 1.0))
+        )
+        positive_fast = fast_non_forced & (policy_values > 0.0)
+        fast_policy_active_rows = int(np.count_nonzero(positive_fast))
+        if "simulations_used" in columns:
+            simulations = np.asarray(
+                _column(root, meta, "simulations_used").reshape(-1),
+                dtype=np.int64,
+            )
+            expected_fast = np.asarray(
+                np.minimum(
+                    FAST_SEARCH_POLICY_WEIGHT_MAX,
+                    simulations.astype(np.float64)
+                    / float(FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS),
+                ),
+                dtype=np.float32,
+            ).astype(np.float64)
+            mismatch |= positive_fast & (
+                (simulations <= 0) | (policy_values != expected_fast)
+            )
+            activation_evidence = (
+                "full_forced_plus_bounded_fast_simulation_confidence"
+                "_with_legacy_fast_zero"
+            )
+        else:
+            mismatch |= positive_fast
+            activation_evidence = (
+                "full_forced_with_legacy_fast_zero_no_simulation_provenance"
+            )
+        activation_mismatch: int | None = int(np.count_nonzero(mismatch))
     else:
         activation_mismatch = None
         activation_evidence = "policy_weight_multiplier_only_legacy_payload"
@@ -522,12 +563,16 @@ def inspect_memmap(
             regime: _operator_family(regime) for regime in regime_counts
         },
         "policy_active_rows": int(np.count_nonzero(policy_active)),
+        "fast_search_policy_active_rows": fast_policy_active_rows,
         "policy_active_target_regime_rows": active_regime_counts,
         "policy_active_rule_mismatch_rows": activation_mismatch,
         "policy_activation_evidence": activation_evidence,
         "required_target_information_regime": required_regime,
         "incompatible_policy_active_rows": int(incompatible_active),
-        "policy_targets_eligible_for_requested_learner": incompatible_active == 0,
+        "policy_targets_eligible_for_requested_learner": (
+            incompatible_active == 0
+            and activation_mismatch in (None, 0)
+        ),
         "search_evidence_columns": sorted(
             name
             for name in columns
@@ -695,6 +740,12 @@ def inspect_composite(
         for item in components
         if item["policy_distillation_active"]
     )
+    activation_invalid = [
+        item["label"]
+        for item in components
+        if item["policy_distillation_active"]
+        and item["policy_active_rule_mismatch_rows"] not in (None, 0)
+    ]
     reanalysis_blocked = [
         item["label"]
         for item in components
@@ -712,7 +763,10 @@ def inspect_composite(
         "components": components,
         "policy_active_rows": active_rows,
         "incompatible_policy_active_rows": incompatible,
-        "policy_targets_eligible_for_requested_learner": incompatible == 0,
+        "policy_activation_invalid_components": activation_invalid,
+        "policy_targets_eligible_for_requested_learner": (
+            incompatible == 0 and not activation_invalid
+        ),
         "old_targets_remain_policy_active": incompatible > 0,
         "full_composite_root_reanalysis_eligible": not reanalysis_blocked,
         "root_reanalysis_blocked_components": reanalysis_blocked,
@@ -919,6 +973,17 @@ def build_inventory(
     if composite_result is not None:
         active += int(composite_result["policy_active_rows"])
         incompatible += int(composite_result["incompatible_policy_active_rows"])
+    activation_invalid = [
+        item["label"]
+        for item in direct
+        if item["policy_active_rule_mismatch_rows"] not in (None, 0)
+    ]
+    if composite_result is not None:
+        activation_invalid.extend(
+            f"composite:{label}"
+            for label in composite_result["policy_activation_invalid_components"]
+        )
+    targets_eligible = incompatible == 0 and not activation_invalid
     value: dict[str, Any] = {
         "schema_version": SCHEMA,
         "required_target_information_regime": required_regime,
@@ -928,11 +993,12 @@ def build_inventory(
         "aggregate": {
             "policy_active_rows": active,
             "incompatible_policy_active_rows": incompatible,
-            "policy_targets_eligible_for_requested_learner": incompatible == 0,
+            "policy_activation_invalid_components": activation_invalid,
+            "policy_targets_eligible_for_requested_learner": targets_eligible,
             "old_targets_remain_policy_active": incompatible > 0,
             "decision": (
                 "eligible_existing_targets"
-                if incompatible == 0
+                if targets_eligible
                 else "generate_new_coherent_targets"
             ),
         },

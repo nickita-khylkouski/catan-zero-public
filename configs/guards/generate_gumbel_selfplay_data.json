@@ -9,7 +9,7 @@
     },
     "synchronizer": {
       "path": "tools/a1_pre_wave_contract.py",
-      "sha256": "sha256:ece2887f0e4156332dd596f5667ea0737efb5145b7bc7fa590f245674ca83b68"
+      "sha256": "sha256:06cd3dedbebf16ef48976eff4dc9536ec2b39573d610d93c2bb418cd43d47ae1"
     }
   },
   "guards": [

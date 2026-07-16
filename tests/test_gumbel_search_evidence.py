@@ -175,8 +175,14 @@ def test_optional_arrays_are_the_only_default_schema_difference() -> None:
         np.testing.assert_array_equal(enabled[key], historical_value)
 
 
-def test_decision_row_preserves_completed_q_and_visits_in_legal_order(
+@pytest.mark.parametrize(
+    ("used_full_search", "expected_policy_weight"),
+    ((True, 1.0), (False, 4.0 / 64.0)),
+)
+def test_decision_row_preserves_active_search_evidence_in_legal_order(
     monkeypatch: pytest.MonkeyPatch,
+    used_full_search: bool,
+    expected_policy_weight: float,
 ) -> None:
     class _Game:
         def current_color(self):
@@ -215,7 +221,7 @@ def test_decision_row_preserves_completed_q_and_visits_in_legal_order(
             q_values={10: 0.2, 11: -0.1},
             priors={10: 0.6, 11: 0.4},
             root_value=0.1,
-            used_full_search=True,
+            used_full_search=used_full_search,
             simulations_used=4,
             completed_q_values={10: 0.2, 11: 0.05},
         ),
@@ -226,5 +232,8 @@ def test_decision_row_preserves_completed_q_and_visits_in_legal_order(
         obs_width=1,
     )
 
+    assert float(row["policy_weight_multiplier"]) == pytest.approx(
+        expected_policy_weight
+    )
     assert row["_search_visit_counts"].tolist() == [3, 1]
     assert row["_search_completed_q"].tolist() == pytest.approx([0.2, 0.05])

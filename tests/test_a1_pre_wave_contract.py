@@ -3209,12 +3209,12 @@ def test_post_wave_feature_semantics_reject_drift(
         (
             "policy_weight_multiplier",
             np.asarray([1.0, 0.5, 0.0, 0.0], dtype=np.float32),
-            "exactly binary",
+            "forced/full activation",
         ),
         (
             "policy_weight_multiplier",
             np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            "disagrees with used_full_search",
+            "forced/full activation",
         ),
         (
             "value_weight_multiplier",
@@ -3250,6 +3250,129 @@ def test_selected_target_activation_rejects_gradient_switch_drift(
                 selected_mask=np.ones(4, dtype=bool),
                 where="fixture",
             )
+
+
+def test_selected_target_activation_authenticates_bounded_fast_policy_weights(
+    tmp_path: Path,
+) -> None:
+    arrays = {
+        "game_seed": np.asarray([10, 10, 11, 11], dtype=np.int64),
+        "decision_index": np.asarray([0, 1, 0, 1], dtype=np.int32),
+        "is_forced": np.asarray([False, True, False, False]),
+        "used_full_search": np.asarray([True, True, False, False]),
+        "simulations_used": np.asarray([64, 0, 16, 8], dtype=np.int32),
+        "policy_weight_multiplier": np.asarray(
+            [1.0, 0.0, 0.25, 0.125], dtype=np.float32
+        ),
+        "value_weight_multiplier": np.ones(4, dtype=np.float32),
+        "target_policy": np.asarray(
+            [[0.7, 0.3], [1.0, 0.0], [0.6, 0.4], [0.8, 0.2]],
+            dtype=np.float32,
+        ),
+        "target_policy_mask": np.asarray(
+            [[True, True], [True, False], [True, True], [True, True]],
+            dtype=bool,
+        ),
+    }
+    shard = tmp_path / "target-activation-fast.npz"
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        chunk = contract._selected_target_activation_chunk(  # noqa: SLF001
+            payload,
+            game_seeds=arrays["game_seed"],
+            selected_mask=np.ones(4, dtype=bool),
+            where="fixture",
+        )
+
+    assert chunk["schema_version"] == contract.TARGET_ACTIVATION_CHUNK_SCHEMA_V2
+    assert chunk["counts"]["full_search_non_forced_rows"] == 1
+    assert chunk["counts"]["fast_search_non_forced_rows"] == 2
+    assert chunk["counts"]["policy_active_rows"] == 3
+    wrapped = {
+        **chunk,
+        "job_id": "gpu0__current_producer",
+        "source_sha256": "sha256:" + "a" * 64,
+    }
+    wrapped["chunk_sha256"] = contract._digest_value(  # noqa: SLF001
+        {key: value for key, value in wrapped.items() if key != "chunk_sha256"}
+    )
+    report = contract._build_target_activation_report(  # noqa: SLF001
+        {"current_producer": [wrapped]},
+        categories=("current_producer",),
+        sealed_p_full=0.25,
+    )
+    assert report["schema_version"] == contract.TARGET_ACTIVATION_SCHEMA_V2
+    assert report["fast_search_policy_confidence"] == {
+        "max_weight": 0.25,
+        "reference_simulations": 64,
+        "legacy_zero_weight_compatible": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("include_simulations", "fast_weight", "error"),
+    (
+        (False, 0.25, "require simulations_used provenance"),
+        (True, 0.5, "bounded simulation confidence"),
+    ),
+)
+def test_selected_target_activation_rejects_unauthenticated_fast_policy_weights(
+    tmp_path: Path,
+    include_simulations: bool,
+    fast_weight: float,
+    error: str,
+) -> None:
+    arrays = {
+        "game_seed": np.asarray([10, 11], dtype=np.int64),
+        "decision_index": np.asarray([0, 0], dtype=np.int32),
+        "is_forced": np.asarray([False, False]),
+        "used_full_search": np.asarray([True, False]),
+        "policy_weight_multiplier": np.asarray(
+            [1.0, fast_weight], dtype=np.float32
+        ),
+        "value_weight_multiplier": np.ones(2, dtype=np.float32),
+    }
+    if include_simulations:
+        arrays["simulations_used"] = np.asarray([64, 16], dtype=np.int32)
+    shard = tmp_path / "target-activation-fast-invalid.npz"
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        with pytest.raises(contract.ContractError, match=error):
+            contract._selected_target_activation_chunk(  # noqa: SLF001
+                payload,
+                game_seeds=arrays["game_seed"],
+                selected_mask=np.ones(2, dtype=bool),
+                where="fixture",
+            )
+
+
+def test_legacy_target_activation_digest_and_schema_remain_byte_identical(
+    tmp_path: Path,
+) -> None:
+    arrays = {
+        "game_seed": np.asarray([10, 10, 11, 11], dtype=np.int64),
+        "decision_index": np.asarray([0, 1, 0, 1], dtype=np.int32),
+        "is_forced": np.asarray([False, True, False, False]),
+        "used_full_search": np.asarray([True, True, False, False]),
+        "policy_weight_multiplier": np.asarray(
+            [1.0, 0.0, 0.0, 0.0], dtype=np.float32
+        ),
+        "value_weight_multiplier": np.ones(4, dtype=np.float32),
+    }
+    shard = tmp_path / "target-activation-legacy.npz"
+    np.savez(shard, **arrays)
+    with np.load(shard, allow_pickle=False) as payload:
+        chunk = contract._selected_target_activation_chunk(  # noqa: SLF001
+            payload,
+            game_seeds=arrays["game_seed"],
+            selected_mask=np.ones(4, dtype=bool),
+            where="fixture",
+        )
+
+    assert chunk["schema_version"] == contract.TARGET_ACTIVATION_CHUNK_SCHEMA
+    assert chunk["row_activation_sha256"] == (
+        "sha256:91b509a5e8d8dd65db488ffa06bfe8ac530704fbcabab4b531114cd93654584d"
+    )
 
 
 def test_target_activation_rate_contract_rejects_full_search_regression(
