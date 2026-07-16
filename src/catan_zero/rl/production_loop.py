@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import time
 from typing import Any, Iterator, Mapping, Sequence
@@ -32,18 +33,48 @@ STAGES = (
     "promote",
 )
 STAGE_TOOLS = {
-    "generate": frozenset(("generate.py", "a1_production_executor.py")),
-    "harvest": frozenset(("a1_harvest_transaction.py",)),
-    "audit": frozenset(("a1_pre_wave_contract.py",)),
-    "composite": frozenset(
-        ("a1_build_post_wave_composite.py", "build_memmap_corpus.py")
+    "generate": frozenset(("tools/fleet/a1_production_executor.py",)),
+    "harvest": frozenset(("tools/fleet/a1_harvest_transaction.py",)),
+    "audit": frozenset(("tools/a1_pre_wave_contract.py",)),
+    "composite": frozenset(("tools/a1_build_post_wave_composite.py",)),
+    "train": frozenset(
+        ("tools/train.py", "tools/a1_one_dose_train.py", "tools/a1_scratch_train.py")
     ),
-    "train": frozenset(("train.py", "a1_one_dose_train.py", "a1_scratch_train.py")),
-    "evaluate": frozenset(("evaluate.py", "a1_h100_eval_fleet.py")),
-    "promote": frozenset(("a1_promotion_transaction.py",)),
+    "evaluate": frozenset(("tools/evaluate.py",)),
+    "promote": frozenset(("tools/a1_promotion_transaction.py",)),
 }
 PLACEHOLDERS = frozenset(("repo", "state_dir", "python"))
 
+# These are the semantic edges that make a turn one RL transaction.  A path
+# merely appearing in ``inputs``/``outputs`` is not evidence that the stage
+# tool actually consumed or produced it.  Each binding below must occur once
+# as the value of its typed CLI flag.  The three predecessor-bound inputs are
+# the load-bearing learning loop: composite -> learner data, learner -> eval
+# candidate, and eval -> promotion adjudication.
+STAGE_ARTIFACT_BINDINGS: Mapping[str, tuple[tuple[str, str, str, bool], ...]] = {
+    "generate": (("generation_receipt", "output", "--receipt", False),),
+    "audit": (
+        ("harvest_relocation", "input", "--harvest-relocation", True),
+        ("audit_receipt", "output", "--out", False),
+    ),
+    "composite": (
+        ("audit_receipt", "input", "--post-wave-audit", True),
+        ("training_data", "output", "--out", False),
+    ),
+    "train": (
+        ("training_data", "input", "--data", True),
+        ("candidate_checkpoint", "output", "--checkpoint", False),
+    ),
+    "evaluate": (
+        ("candidate_checkpoint", "input", "--candidate", True),
+        ("evaluation_adjudication", "output", "--out", False),
+    ),
+    "promote": (
+        ("evaluation_adjudication", "input", "--adjudication", True),
+        ("training_execution_receipt", "input", "--training-receipt", False),
+        ("promotion_receipt", "output", "--receipt", False),
+    ),
+}
 
 class ProductionLoopError(RuntimeError):
     """The loop is malformed, stale, or cannot advance safely."""
@@ -77,8 +108,47 @@ def _file_ref(path: Path, *, where: str) -> dict[str, Any]:
     stat = resolved.stat()
     return {
         "path": str(resolved),
+        "kind": "file",
         "sha256": _file_sha256(resolved),
         "size_bytes": stat.st_size,
+    }
+
+
+def _artifact_ref(path: Path, *, where: str) -> dict[str, Any]:
+    """Content-address one immutable file or directory artifact."""
+
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError as error:
+        raise ProductionLoopError(f"cannot resolve {where}: {error}") from error
+    if resolved.is_file():
+        return _file_ref(resolved, where=where)
+    if not resolved.is_dir():
+        raise ProductionLoopError(f"{where} must be a regular file or directory")
+    records: list[dict[str, Any]] = []
+    total_size = 0
+    for child in sorted(resolved.rglob("*")):
+        if child.is_symlink():
+            raise ProductionLoopError(f"{where} contains a symlink: {child}")
+        if child.is_dir():
+            continue
+        if not child.is_file():
+            raise ProductionLoopError(f"{where} contains a non-regular file: {child}")
+        size = child.stat().st_size
+        total_size += size
+        records.append(
+            {
+                "path": child.relative_to(resolved).as_posix(),
+                "sha256": _file_sha256(child),
+                "size_bytes": size,
+            }
+        )
+    return {
+        "path": str(resolved),
+        "kind": "directory",
+        "sha256": _value_sha256(records),
+        "size_bytes": total_size,
+        "file_count": len(records),
     }
 
 
@@ -101,12 +171,200 @@ def _expand(value: str, values: Mapping[str, str]) -> str:
     return result
 
 
-def _command_tool(command: Sequence[str]) -> str:
+def _command_tool(command: Sequence[str], *, repo: Path) -> str:
     if len(command) < 2:
         raise ProductionLoopError("stage command must invoke Python and one tool")
-    # The first token is the bound Python interpreter.  Keeping the internal
-    # executor behind it makes virtualenv identity explicit and replayable.
-    return Path(command[1]).name
+    try:
+        tool = Path(command[1]).expanduser().resolve(strict=True)
+        return tool.relative_to(repo).as_posix()
+    except (OSError, ValueError) as error:
+        raise ProductionLoopError(
+            "stage tool must be an exact checked-in repository path"
+        ) from error
+
+
+def _normalize_artifact_path(value: str) -> str:
+    return str(Path(value).expanduser().resolve(strict=False))
+
+
+def _flag_path(command: Sequence[str], flag: str, *, stage: str) -> str:
+    positions = [index for index, value in enumerate(command) if value == flag]
+    if len(positions) != 1:
+        raise ProductionLoopError(
+            f"stage {stage!r} must bind {flag} exactly once, found {len(positions)}"
+        )
+    index = positions[0]
+    if index + 1 >= len(command) or command[index + 1].startswith("--"):
+        raise ProductionLoopError(f"stage {stage!r} has no path value for {flag}")
+    return _normalize_artifact_path(command[index + 1])
+
+
+def _bind_stage_artifacts(
+    *,
+    name: str,
+    command: Sequence[str],
+    inputs: Sequence[str],
+    outputs: Sequence[str],
+    predecessor_outputs: set[str],
+) -> list[dict[str, str]]:
+    bindings: list[dict[str, str]] = []
+    if name == "harvest":
+        executor_receipt = _flag_path(command, "--executor-receipt", stage=name)
+        if executor_receipt not in inputs or executor_receipt not in predecessor_outputs:
+            raise ProductionLoopError(
+                "harvest must consume the immediate generation --receipt through "
+                "--executor-receipt"
+            )
+        destination = Path(_flag_path(command, "--destination", stage=name))
+        relocation = _normalize_artifact_path(str(destination / "relocation_map.json"))
+        if relocation not in outputs:
+            raise ProductionLoopError(
+                "harvest output must declare DESTINATION/relocation_map.json"
+            )
+        bindings.extend(
+            (
+                {
+                    "kind": "generation_receipt",
+                    "direction": "input",
+                    "flag": "--executor-receipt",
+                    "path": executor_receipt,
+                },
+                {
+                    "kind": "harvest_relocation",
+                    "direction": "output",
+                    "flag": "--destination/relocation_map.json",
+                    "path": relocation,
+                },
+            )
+        )
+    for kind, direction, flag, requires_predecessor in STAGE_ARTIFACT_BINDINGS.get(
+        name, ()
+    ):
+        path = _flag_path(command, flag, stage=name)
+        declared = set(inputs if direction == "input" else outputs)
+        if path not in declared:
+            raise ProductionLoopError(
+                f"stage {name!r} {kind} bound by {flag} is not declared as an "
+                f"{direction}: {path}"
+            )
+        if requires_predecessor and path not in predecessor_outputs:
+            raise ProductionLoopError(
+                f"stage {name!r} {kind} must be the exact immediate predecessor "
+                f"output passed through {flag}: {path}"
+            )
+        bindings.append(
+            {"kind": kind, "direction": direction, "flag": flag, "path": path}
+        )
+    argv_paths = {
+        _normalize_artifact_path(value)
+        for value in command[2:]
+        if value and not value.startswith("--")
+    }
+    semantically_bound = {binding["path"] for binding in bindings}
+    unbound = [
+        path
+        for path in (*inputs, *outputs)
+        if path not in argv_paths and path not in semantically_bound
+    ]
+    if unbound:
+        raise ProductionLoopError(
+            f"stage {name!r} declares artifacts absent from its argv: {unbound}"
+        )
+    return bindings
+
+
+def _repository_guard(config: Mapping[str, Any], *, stage: str) -> None:
+    repo = Path(str(config["repository"]))
+    expected = str(config["repository_commit"])
+    actual = _git(repo, "rev-parse", "HEAD")
+    if actual != expected:
+        raise ProductionLoopError(
+            f"stage {stage!r} repository revision drift: expected={expected} "
+            f"actual={actual}"
+        )
+    if _git(repo, "status", "--porcelain", "--untracked-files=all"):
+        raise ProductionLoopError(
+            f"stage {stage!r} repository is not clean, including untracked files"
+        )
+    stage_config = config["stages"][stage]
+    current_tool = _file_ref(
+        Path(stage_config["command"][1]), where=f"{stage} stage tool"
+    )
+    if current_tool != stage_config.get("tool"):
+        raise ProductionLoopError(f"stage {stage!r} tool bytes drifted")
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Contain a timed-out local stage and all descendants in its session."""
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+    # The session leader may exit on SIGTERM while a descendant ignores it.
+    # Probe and kill the group even after ``wait`` returns for the leader.
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    if process.poll() is None:
+        process.wait()
+
+
+def _run_local_stage(
+    command: Sequence[str],
+    *,
+    cwd: str,
+    log: Any,
+    timeout_seconds: int,
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(process)
+        raise
+    except BaseException:
+        _terminate_process_group(process)
+        raise
+    return subprocess.CompletedProcess(command, returncode)
+
+
+def _remote_cancellation_command(
+    command: Sequence[str], *, repo: Path
+) -> list[str] | None:
+    """Return only an entrypoint's explicit receipt-bound cancellation contract."""
+
+    if _command_tool(command, repo=repo) != "tools/fleet/a1_production_executor.py":
+        return None
+    result = list(command)
+    try:
+        operation = result.index("run", 2)
+    except ValueError as error:
+        raise ProductionLoopError(
+            "production executor command lost its run operation"
+        ) from error
+    result[operation] = "stop"
+    while "--resume" in result:
+        result.remove("--resume")
+    if "--go" not in result:
+        result.append("--go")
+    return result
 
 
 def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
@@ -149,8 +407,10 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
     require_clean = payload["require_clean_repository"]
     if require_clean is not True:
         raise ProductionLoopError("production loops require a clean repository")
-    if _git(repo, "status", "--porcelain", "--untracked-files=no"):
-        raise ProductionLoopError("production loop repository has tracked modifications")
+    if _git(repo, "status", "--porcelain", "--untracked-files=all"):
+        raise ProductionLoopError(
+            "production loop repository must be clean, including untracked files"
+        )
     python = Path(str(payload["python"])).expanduser().resolve(strict=True)
     if not python.is_file() or not os.access(python, os.X_OK):
         raise ProductionLoopError("python must be an executable file")
@@ -166,6 +426,7 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
         "python": str(python),
     }
     normalized_stages: dict[str, Any] = {}
+    previous_outputs: set[str] = set()
     for name in STAGES:
         stage = stages[name]
         if not isinstance(stage, dict) or set(stage) != {
@@ -190,35 +451,38 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
                 f"stage {name!r} must use the config-bound Python interpreter"
             )
         tool = Path(command[1]).expanduser().resolve(strict=True)
-        try:
-            tool.relative_to(repo)
-        except ValueError as error:
-            raise ProductionLoopError(
-                f"stage {name!r} tool escapes the bound repository"
-            ) from error
         command[1] = str(tool)
-        if _command_tool(command) not in STAGE_TOOLS[name]:
+        tool_name = _command_tool(command, repo=repo)
+        if tool_name not in STAGE_TOOLS[name]:
             raise ProductionLoopError(
-                f"stage {name!r} cannot invoke {_command_tool(command)!r}; "
+                f"stage {name!r} cannot invoke {tool_name!r}; "
                 f"choose from {sorted(STAGE_TOOLS[name])}"
             )
         if name == "audit" and "audit" not in command[2:]:
             raise ProductionLoopError("audit stage must select the audit subcommand")
         if name == "promote" and "promote" not in command[2:]:
             raise ProductionLoopError("promote stage must select the promote subcommand")
-        tool_name = _command_tool(command)
-        if tool_name == "a1_production_executor.py" and not {
+        if tool_name == "tools/fleet/a1_production_executor.py" and not {
             "run",
             "--go",
         }.issubset(command[2:]):
             raise ProductionLoopError(
                 "fleet generation must select the executor run transaction with --go"
             )
-        if tool_name == "a1_one_dose_train.py" and "--go" not in command[2:]:
+        if tool_name == "tools/a1_one_dose_train.py" and "--go" not in command[2:]:
             raise ProductionLoopError(
                 "one-dose training stage must execute rather than emit another dry-run"
             )
-        if tool_name == "a1_promotion_transaction.py" and "--go" not in command[2:]:
+        if tool_name == "tools/a1_scratch_train.py":
+            if "--go" not in command[2:]:
+                raise ProductionLoopError(
+                    "scratch training stage must execute with --go"
+                )
+            if "--execution-receipt" not in command[2:]:
+                raise ProductionLoopError(
+                    "scratch training stage must bind a fresh --execution-receipt"
+                )
+        if tool_name == "tools/a1_promotion_transaction.py" and "--go" not in command[2:]:
             raise ProductionLoopError(
                 "promotion stage must commit the verified transaction with --go"
             )
@@ -232,8 +496,46 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
             or not all(isinstance(v, str) for v in outputs)
         ):
             raise ProductionLoopError(f"stage {name!r} must bind output receipt files")
-        inputs = [_expand(item, values) for item in inputs]
-        outputs = [_expand(item, values) for item in outputs]
+        inputs = [_normalize_artifact_path(_expand(item, values)) for item in inputs]
+        outputs = [_normalize_artifact_path(_expand(item, values)) for item in outputs]
+        if len(inputs) != len(set(inputs)) or len(outputs) != len(set(outputs)):
+            raise ProductionLoopError(f"stage {name!r} repeats artifact paths")
+        artifact_bindings = _bind_stage_artifacts(
+            name=name,
+            command=command,
+            inputs=inputs,
+            outputs=outputs,
+            predecessor_outputs=previous_outputs,
+        )
+        if name == "train" and tool_name == "tools/a1_scratch_train.py":
+            execution_receipt = _flag_path(
+                command, "--execution-receipt", stage=name
+            )
+            if execution_receipt not in outputs:
+                raise ProductionLoopError(
+                    "scratch --execution-receipt must be a declared train output"
+                )
+            plan_receipt = _flag_path(command, "--receipt", stage=name)
+            if plan_receipt not in inputs:
+                raise ProductionLoopError(
+                    "scratch --receipt plan authority must be a declared train input"
+                )
+            artifact_bindings.extend(
+                (
+                    {
+                        "kind": "scratch_plan_receipt",
+                        "direction": "input",
+                        "flag": "--receipt",
+                        "path": plan_receipt,
+                    },
+                    {
+                        "kind": "training_execution_receipt",
+                        "direction": "output",
+                        "flag": "--execution-receipt",
+                        "path": execution_receipt,
+                    },
+                )
+            )
         timeout = stage["timeout_seconds"]
         if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
             raise ProductionLoopError(
@@ -244,7 +546,10 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
             "inputs": inputs,
             "outputs": outputs,
             "timeout_seconds": timeout,
+            "tool": _file_ref(tool, where=f"{name} stage tool"),
+            "artifact_bindings": artifact_bindings,
         }
+        previous_outputs = set(outputs)
     normalized = dict(payload)
     normalized["repository"] = str(repo)
     normalized["python"] = str(python)
@@ -252,9 +557,9 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
     normalized["config_path"] = str(source)
     normalized["config_sha256"] = _value_sha256(payload)
     # Prove this is one connected turn, not seven unrelated commands sharing a
-    # JSON file.  Each downstream transaction must consume an immutable output
-    # from an earlier transaction; the fixed runtime order remains STAGES.
-    prior_outputs: set[str] = set()
+    # JSON file. Every stage consumes its immediate predecessor, while typed
+    # bindings above prove the critical data/checkpoint/adjudication edges.
+    previous_outputs = set()
     all_outputs: set[str] = set()
     for index, name in enumerate(STAGES):
         stage = normalized_stages[name]
@@ -263,13 +568,22 @@ def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
             raise ProductionLoopError(
                 f"stage {name!r} reuses output identities: {sorted(duplicate_outputs)}"
             )
-        if index and not prior_outputs.intersection(stage["inputs"]):
+        if index and not previous_outputs.intersection(stage["inputs"]):
             raise ProductionLoopError(
-                f"stage {name!r} is disconnected: it must consume at least one "
-                "receipt produced by an earlier stage"
+                f"stage {name!r} is disconnected: it must consume an output "
+                "from its immediate predecessor"
             )
-        prior_outputs.update(stage["outputs"])
+        previous_outputs = set(stage["outputs"])
         all_outputs.update(stage["outputs"])
+    training_receipt = next(
+        binding["path"]
+        for binding in normalized_stages["promote"]["artifact_bindings"]
+        if binding["kind"] == "training_execution_receipt"
+    )
+    if training_receipt not in normalized_stages["train"]["outputs"]:
+        raise ProductionLoopError(
+            "promotion --training-receipt must be an exact train-stage output"
+        )
     return normalized
 
 
@@ -334,9 +648,13 @@ def _load_state(path: Path, config: Mapping[str, Any]) -> dict[str, Any]:
         stage = config["stages"][name]
         if receipt.get("command_sha256") != _value_sha256(stage["command"]):
             raise ProductionLoopError(f"completed stage {name!r} command drifted")
-        current_inputs = [_file_ref(Path(item), where=f"{name} input") for item in stage["inputs"]]
+        current_inputs = [
+            _artifact_ref(Path(item), where=f"{name} input")
+            for item in stage["inputs"]
+        ]
         current_outputs = [
-            _file_ref(Path(item), where=f"{name} output") for item in stage["outputs"]
+            _artifact_ref(Path(item), where=f"{name} output")
+            for item in stage["outputs"]
         ]
         if current_inputs != receipt.get("inputs") or current_outputs != receipt.get("outputs"):
             raise ProductionLoopError(f"completed stage {name!r} artifact bytes drifted")
@@ -371,8 +689,10 @@ def execute(config: Mapping[str, Any], *, state_dir: Path) -> dict[str, Any]:
         state = _load_state(state_path, config)
         for name in STAGES[len(state["completed_stages"]) :]:
             stage = config["stages"][name]
+            _repository_guard(config, stage=name)
             inputs = [
-                _file_ref(Path(item), where=f"{name} input") for item in stage["inputs"]
+                _artifact_ref(Path(item), where=f"{name} input")
+                for item in stage["inputs"]
             ]
             for output in stage["outputs"]:
                 if Path(output).expanduser().exists():
@@ -388,16 +708,38 @@ def execute(config: Mapping[str, Any], *, state_dir: Path) -> dict[str, Any]:
             started_ns = time.time_ns()
             with log_path.open("xb") as log:
                 try:
-                    completed = subprocess.run(
+                    completed = _run_local_stage(
                         stage["command"],
                         cwd=config["repository"],
-                        stdin=subprocess.DEVNULL,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        timeout=stage["timeout_seconds"],
-                        check=False,
+                        log=log,
+                        timeout_seconds=stage["timeout_seconds"],
                     )
-                except (OSError, subprocess.TimeoutExpired) as error:
+                except subprocess.TimeoutExpired as error:
+                    cancellation = _remote_cancellation_command(
+                        stage["command"], repo=Path(config["repository"])
+                    )
+                    if cancellation is not None:
+                        try:
+                            stopped = _run_local_stage(
+                                cancellation,
+                                cwd=config["repository"],
+                                log=log,
+                                timeout_seconds=min(stage["timeout_seconds"], 120),
+                            )
+                        except (OSError, subprocess.TimeoutExpired) as cancel_error:
+                            raise ProductionLoopError(
+                                f"stage {name!r} timed out and its exact remote "
+                                f"cancellation failed; see {log_path}: {cancel_error}"
+                            ) from cancel_error
+                        if stopped.returncode != 0:
+                            raise ProductionLoopError(
+                                f"stage {name!r} timed out and its exact remote "
+                                f"cancellation exited {stopped.returncode}; see {log_path}"
+                            )
+                    raise ProductionLoopError(
+                        f"stage {name!r} could not complete; see {log_path}: {error}"
+                    ) from error
+                except OSError as error:
                     raise ProductionLoopError(
                         f"stage {name!r} could not complete; see {log_path}: {error}"
                     ) from error
@@ -405,8 +747,33 @@ def execute(config: Mapping[str, Any], *, state_dir: Path) -> dict[str, Any]:
                 raise ProductionLoopError(
                     f"stage {name!r} exited {completed.returncode}; see {log_path}"
                 )
+            _repository_guard(config, stage=name)
+            if (
+                name == "train"
+                and _command_tool(stage["command"], repo=Path(config["repository"]))
+                == "tools/a1_scratch_train.py"
+            ):
+                execution_path = Path(
+                    _flag_path(stage["command"], "--execution-receipt", stage=name)
+                )
+                try:
+                    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                    raise ProductionLoopError(
+                        "scratch stage did not emit a readable execution receipt"
+                    ) from error
+                if not isinstance(execution, dict) or not (
+                    execution.get("schema_version")
+                    == "a1-coherent-scratch-training-execution-v2"
+                    and execution.get("status") == "completed"
+                    and execution.get("go") is True
+                ):
+                    raise ProductionLoopError(
+                        "scratch stage execution receipt is not a completed --go run"
+                    )
             outputs = [
-                _file_ref(Path(item), where=f"{name} output") for item in stage["outputs"]
+                _artifact_ref(Path(item), where=f"{name} output")
+                for item in stage["outputs"]
             ]
             receipt = {
                 "stage": name,
@@ -414,6 +781,7 @@ def execute(config: Mapping[str, Any], *, state_dir: Path) -> dict[str, Any]:
                 "command_sha256": _value_sha256(stage["command"]),
                 "inputs": inputs,
                 "outputs": outputs,
+                "artifact_bindings": stage.get("artifact_bindings", []),
                 "log": _file_ref(log_path, where=f"{name} log"),
                 "started_unix_ns": started_ns,
                 "completed_unix_ns": time.time_ns(),

@@ -1116,6 +1116,7 @@ def harvest(
     render_path: Path,
     destination: Path,
     *,
+    executor_receipt: Path | None = None,
     ssh_command: Sequence[str] = ("ssh",),
     fetch_workers: int = 1,
 ) -> dict[str, Any]:
@@ -1131,6 +1132,25 @@ def harvest(
             raise HarvestError(f"cannot resolve immutable {label} input: {error}") from error
         if canonical != path:
             raise HarvestError(f"immutable {label} input path must not traverse symlinks")
+    if executor_receipt is not None:
+        receipt_path = executor_receipt.expanduser().absolute()
+        try:
+            canonical_receipt = receipt_path.resolve(strict=True)
+        except OSError as error:
+            raise HarvestError(f"cannot resolve executor receipt: {error}") from error
+        if canonical_receipt != receipt_path or not receipt_path.is_file():
+            raise HarvestError("executor receipt path must be a canonical regular file")
+        receipt = _load_json(receipt_path)
+        lock = _load_json(lock_path)
+        rendered = _load_json(render_path)
+        if (
+            receipt.get("status") != "launched"
+            or receipt.get("contract_sha256") != lock.get("contract_sha256")
+            or receipt.get("render_sha256") != rendered.get("render_sha256")
+        ):
+            raise HarvestError(
+                "executor receipt is not the launched transaction for this lock/render"
+            )
     try:
         destination_parent = destination.parent.resolve(strict=True)
     except OSError as error:
@@ -1245,6 +1265,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--render", required=True, type=Path)
+    parser.add_argument(
+        "--executor-receipt",
+        type=Path,
+        help=(
+            "exact launched a1_production_executor receipt; required by the "
+            "canonical production loop"
+        ),
+    )
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument(
         "--ssh-command",
@@ -1263,6 +1291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.lock,
             args.render,
             args.destination,
+            executor_receipt=args.executor_receipt,
             ssh_command=(args.ssh_command,),
             fetch_workers=args.fetch_workers,
         )

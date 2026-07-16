@@ -33,16 +33,27 @@ evaluation configs. The coordinator does not reinterpret those settings.
 
 ## Required properties
 
-- The repository commit is exact and the tracked checkout is clean.
-- The Python interpreter is exact and every command invokes a stage-allowlisted
-  tool inside that checkout.
+- The repository commit is exact and the checkout is clean, including
+  untracked files. Revision and tool bytes are revalidated before and after
+  every stage.
+- The Python interpreter is exact and every command invokes an exact
+  repo-relative, stage-allowlisted tool (matching a basename is insufficient).
 - Commands are argument arrays, never shell strings.
-- Each stage consumes at least one immutable receipt from an earlier stage.
-- Stage outputs must be fresh files. Successful outputs, inputs, commands, and
+- Each stage consumes an immutable output from its immediate predecessor.
+- Typed CLI bindings prove that the composite is the learner's actual
+  `--data`, the learner checkpoint is the evaluator's actual `--candidate`,
+  and the evaluation receipt is promotion's actual `--adjudication`.
+- Stage outputs must be fresh file or directory artifacts. Successful outputs, inputs, commands, and
   logs are content-addressed in `state.json`.
 - Restarting the same turn replays hashes and resumes after the last committed
   stage. Drift fails closed instead of repeating a generation, learner, or
   promotion side effect.
+- Scratch training must use `--go` and emit a separate completed
+  `--execution-receipt`; a successful plan-only invocation cannot advance the
+  loop.
+- Local stages run in isolated process groups, so a timeout kills descendants.
+  Detached fleet tools are admitted only when they expose an exact
+  receipt-bound cancellation transaction.
 - Promotion is always last and must invoke the existing typed promotion
   transaction with `promote --go`.
 
@@ -50,12 +61,12 @@ evaluation configs. The coordinator does not reinterpret those settings.
 
 | Stage | Allowed entry points |
 |---|---|
-| generate | `tools/generate.py`, `tools/fleet/a1_production_executor.py run --go` |
+| generate | `tools/fleet/a1_production_executor.py run --go` |
 | harvest | `tools/fleet/a1_harvest_transaction.py` |
 | audit | `tools/a1_pre_wave_contract.py audit` |
-| composite | `tools/a1_build_post_wave_composite.py`, `tools/build_memmap_corpus.py` |
+| composite | `tools/a1_build_post_wave_composite.py` |
 | train | `tools/train.py`, issued `a1_one_dose_train.py --go`, `a1_scratch_train.py` |
-| evaluate | `tools/evaluate.py`, `tools/fleet/a1_h100_eval_fleet.py` |
+| evaluate | `tools/evaluate.py` |
 | promote | `tools/a1_promotion_transaction.py promote --go` |
 
 `tools/fleet/fleet_launch.sh` is intentionally absent. It is a historical
