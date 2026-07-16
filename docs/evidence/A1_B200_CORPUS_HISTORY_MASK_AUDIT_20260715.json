@@ -1,0 +1,30 @@
+{
+  "schema": "a1-corpus-history-mask-audit-v1",
+  "date": "2026-07-15",
+  "corpus": {
+    "role": "a1_fresh_mixed_12000games",
+    "row_count": 2927924,
+    "corpus_meta_relative_path": "runs/memmap_a1_fresh_mixed_12000games/corpus_meta.json",
+    "payload_inventory_sha256": "sha256:46d8fe266d04353e2545a0b3b278774dad621366059b876ecba5e8084b87a3cf"
+  },
+  "event_mask": {
+    "filename": "event_mask.dat",
+    "size_bytes": 187387136,
+    "sha256": "sha256:63b2cbc25ef91e2a87d01e56039b7c410ad23e055614e19cef9f4cbaeda351c7",
+    "transfer_sha256_matches_authenticated_payload_inventory": true,
+    "comparison": "exact byte comparison against an equal-length zero stream",
+    "all_zero": true,
+    "nonzero_count": 0
+  },
+  "finding": {
+    "event_history_trainable": false,
+    "existing_policy_and_value_rows_remain_usable": true,
+    "history_or_belief_training_from_this_memmap": false,
+    "required_remedy": "re-featurize replayable raw states or generate fresh rows with a versioned nonempty public-history contract"
+  },
+  "execution": {
+    "remote_gpu_workload_started": false,
+    "remote_operation": "copy event_mask.dat only",
+    "analysis_location": "local CPU"
+  }
+}
