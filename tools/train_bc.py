@@ -10942,11 +10942,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
     exact_per_game_surprise = bool(args.per_game_policy_surprise_weighting)
     legacy_policy_surprise = float(args.policy_surprise_weight) > 0.0
-    epoch_sample_weights = (
+    policy_surprise_aux_preconditioning = (
         policy_surprise_weights_full[train_indices]
         if exact_per_game_surprise or legacy_policy_surprise
         else None
     )
+    # The base order feeds both policy and value objectives. Policy-surprise is
+    # therefore never allowed to alter it: doing so silently changes the value
+    # state distribution in what is supposed to be a policy-only treatment.
+    # Surprise is applied only to the independently sampled active-policy
+    # auxiliary stream below. Authenticated component/game sampling remains a
+    # legitimate shared base measure because it defines the corpus itself.
+    epoch_sample_weights = None
     component_game_sampling = derived.get("component_game_sampling")
     if component_game_sampling is not None:
         if legacy_policy_surprise:
@@ -10957,7 +10964,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "preservation defines the joint measure"
             )
         if exact_per_game_surprise:
-            epoch_sample_weights = (
+            policy_surprise_aux_preconditioning = (
                 _compose_per_game_policy_surprise_sampling_weights(
                     data,
                     train_indices,
@@ -10965,8 +10972,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                     component_game_sampling,
                 )
             )
-        else:
-            epoch_sample_weights = component_game_sampling
+        epoch_sample_weights = component_game_sampling
+    training_policy_sample_weights = policy_sample_weights
+    if (
+        exact_per_game_surprise or legacy_policy_surprise
+    ) and int(args.policy_aux_active_batch_size) <= 0:
+        # Backward-compatible policy-only fallback for recipes without the
+        # isolated auxiliary stream. Keep the shared row order unchanged so
+        # value sees the same state distribution; express surprise only as a
+        # policy loss weight on training rows. Validation retains the original
+        # corpus weights and therefore remains comparable across treatments.
+        training_policy_sample_weights = np.asarray(
+            policy_sample_weights, dtype=np.float32
+        ).copy()
+        training_policy_sample_weights[train_indices] *= np.asarray(
+            policy_surprise_weights_full[train_indices], dtype=np.float32
+        )
     policy_aux_sampling_weights = None
     policy_aux_preconditioning_weights = None
     policy_aux_base_measure = "off"
@@ -10997,8 +11018,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             else None
         )
         policy_aux_preconditioning_weights = (
-            epoch_sample_weights
-            if exact_per_game_surprise
+            policy_surprise_aux_preconditioning
+            if exact_per_game_surprise or legacy_policy_surprise
             else stage_c_base[0]
             if stage_c_base is not None
             else (
@@ -11067,6 +11088,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "mode": "off",
                 "enabled": False,
             }
+        policy_surprise_sampling_report["application_surface"] = (
+            "isolated_policy_aux_sampler"
+            if int(args.policy_aux_active_batch_size) > 0
+            else "base_policy_loss_weights_only"
+            if exact_per_game_surprise or legacy_policy_surprise
+            else "off"
+        )
+        policy_surprise_sampling_report["shared_base_value_order_unchanged"] = True
         if policy_aux_sampling_weights is None:
             policy_aux_sampling_report = {
                 "schema_version": "train-policy-aux-sampling-v1",
@@ -11197,7 +11226,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     None,
                     data,
                     physical_batch,
-                    policy_sample_weights,
+                    training_policy_sample_weights,
                     value_sample_weights,
                     args.soft_target_temperature,
                     args.soft_target_weight,
@@ -11603,7 +11632,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             component_ids = tuple(data.component_ids)
             base_rows = train_indices[np.asarray(order, dtype=np.int64)]
             base_rows = base_rows[
-                np.asarray(policy_sample_weights[base_rows], dtype=np.float32) > 0.0
+                np.asarray(training_policy_sample_weights[base_rows], dtype=np.float32)
+                > 0.0
             ]
             base_components = data.component_indices_for_rows(base_rows)
             aux_components = (
@@ -11762,7 +11792,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             order,
             train_indices,
             int(args.batch_size),
-            policy_sample_weights,
+            training_policy_sample_weights,
             value_sample_weights,
             num_workers=int(args.data_loader_workers),
             prefetch=int(args.data_loader_prefetch),
@@ -11933,7 +11963,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     _training_strata_dose_for_batch(
                         data,
                         source_global_rows,
-                        policy_weights=np.asarray(policy_sample_weights)[
+                        policy_weights=np.asarray(training_policy_sample_weights)[
                             source_global_rows
                         ],
                         value_weights=np.asarray(value_sample_weights)[
@@ -11952,7 +11982,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         _training_strata_dose_for_batch(
                             data,
                             np.asarray(aux_source_rows, dtype=np.int64),
-                            policy_weights=np.asarray(policy_sample_weights)[
+                            policy_weights=np.asarray(training_policy_sample_weights)[
                                 aux_source_rows
                             ],
                             value_weights=np.zeros(
