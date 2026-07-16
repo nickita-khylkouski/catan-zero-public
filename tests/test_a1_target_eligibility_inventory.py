@@ -203,3 +203,77 @@ def test_sealed_rd_contract_and_nullable_override_guard() -> None:
     )
     assert guarded.passed is False
     assert guarded.details["forbidden_flags"] == ["--nullable"]
+
+
+def test_policy_operator_inventory_rejects_mixed_search_teachers() -> None:
+    groups = [
+        {
+            "scope": "fresh",
+            "category": "n128",
+            "operator_sha256": "sha256:" + "1" * 64,
+        },
+        {
+            "scope": "fresh",
+            "category": "n256",
+            "operator_sha256": "sha256:" + "2" * 64,
+        },
+    ]
+
+    result = inventory._policy_operator_identity_inventory(  # noqa: SLF001
+        groups=groups,
+        policy_distillation_component_ids={"n128", "n256"},
+        policy_active_component_ids={"n128", "n256"},
+    )
+
+    assert result["mixed_policy_target_operators"] is True
+    assert result["policy_operator_uniform"] is False
+    assert result["realized_operator_sha256"] == [
+        "sha256:" + "1" * 64,
+        "sha256:" + "2" * 64,
+    ]
+
+
+def test_manifest_operator_identity_includes_checkpoint_and_cli_search_fields(
+    tmp_path: Path,
+) -> None:
+    records = []
+    for index, (checkpoint, n_full) in enumerate(
+        (("sha256:" + "a" * 64, 128), ("sha256:" + "b" * 64, 256))
+    ):
+        path = tmp_path / f"manifest-{index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "producer_checkpoint_sha256": checkpoint,
+                    "target_information_regime": inventory.COHERENT_REGIME,
+                    "cli_args": {
+                        "n_full": n_full,
+                        "n_fast": 16,
+                        "p_full": 0.25,
+                        "c_scale": 0.03,
+                        "coherent_public_belief_search": True,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        records.append(
+            {
+                "category": f"arm-{index}",
+                "artifact": {
+                    "path": str(path),
+                    "file_sha256": inventory._file_sha256(path),  # noqa: SLF001
+                },
+            }
+        )
+
+    groups = inventory._manifest_operator_groups(  # noqa: SLF001
+        {"fresh_generation_manifests": records}
+    )
+
+    assert len(groups) == 2
+    assert {group["operator"]["n_full"] for group in groups} == {128, 256}
+    assert {
+        group["operator"]["producer_checkpoint_sha256"] for group in groups
+    } == {"sha256:" + "a" * 64, "sha256:" + "b" * 64}
+    assert len({group["operator_sha256"] for group in groups}) == 2

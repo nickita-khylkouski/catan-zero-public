@@ -86,7 +86,9 @@ SEARCH_EVIDENCE_COLUMNS = frozenset(
     }
 )
 OPERATOR_FIELDS = (
+    "producer_checkpoint_sha256",
     "target_information_regime",
+    "public_observation",
     "information_set_search",
     "coherent_public_belief_search",
     "determinization_particles",
@@ -98,6 +100,16 @@ OPERATOR_FIELDS = (
     "n_full_wide_threshold",
     "wide_roots_always_full",
     "c_scale",
+    "correct_rust_chance_spectra",
+    "lazy_interior_chance",
+    "exact_budget_sh",
+    "exact_budget_sh_min_n",
+    "root_wave_batching",
+    "native_mcts_hot_loop",
+    "rust_featurize",
+    "value_readout",
+    "value_scale",
+    "prior_temperature",
     "sigma_eval",
     "symmetry_averaged_eval",
     "symmetry_averaged_eval_threshold",
@@ -586,6 +598,9 @@ def inspect_memmap(
 
 def _nested_operator(mapping: Mapping[str, Any]) -> dict[str, Any]:
     candidates: list[Mapping[str, Any]] = [mapping]
+    cli_args = mapping.get("cli_args")
+    if isinstance(cli_args, Mapping):
+        candidates.append(cli_args)
     science = mapping.get("science")
     if isinstance(science, Mapping):
         for key in ("effective_search_config", "search_operator", "search"):
@@ -696,6 +711,66 @@ def _manifest_operator_groups(source_authority: Mapping[str, Any]) -> list[dict[
     return [grouped[key] for key in sorted(grouped)]
 
 
+def _policy_operator_identity_inventory(
+    *,
+    groups: Iterable[Mapping[str, Any]],
+    policy_distillation_component_ids: set[str],
+    policy_active_component_ids: set[str],
+) -> dict[str, Any]:
+    """Make manifest operator fingerprints decision-bearing.
+
+    Information regime is only one field of a policy target's identity.  In
+    particular, n128 and n256 targets from the same coherent-public search
+    family are different teachers, as are targets produced by different
+    checkpoints.  The old inventory reported those manifest fingerprints but
+    still admitted the composite based on regime alone.
+
+    Fresh manifest categories map directly to fresh composite component IDs.
+    The historical replay component is an aggregate, so when it is explicitly
+    policy-active all historical manifest groups are in scope.
+    """
+
+    relevant: list[dict[str, Any]] = []
+    covered_components: set[str] = set()
+    for raw in groups:
+        scope = str(raw.get("scope", ""))
+        category = str(raw.get("category", ""))
+        if scope == "fresh" and category in policy_distillation_component_ids:
+            relevant.append(dict(raw))
+            covered_components.add(category)
+        elif (
+            scope == "historical_replay"
+            and "historical_replay" in policy_distillation_component_ids
+        ):
+            relevant.append(dict(raw))
+            covered_components.add("historical_replay")
+
+    expected_components = (
+        policy_distillation_component_ids & policy_active_component_ids
+    )
+    missing = sorted(expected_components - covered_components)
+    identities = sorted(
+        {
+            str(item["operator_sha256"])
+            for item in relevant
+            if isinstance(item.get("operator_sha256"), str)
+        }
+    )
+    mixed = len(identities) > 1
+    return {
+        "schema_version": "policy-target-manifest-identity-inventory-v1",
+        "policy_active_component_ids": sorted(expected_components),
+        "manifest_covered_component_ids": sorted(covered_components),
+        "missing_manifest_identity_component_ids": missing,
+        "realized_operator_sha256": identities,
+        "mixed_policy_target_operators": mixed,
+        # Missing legacy provenance remains visible but is not newly made a
+        # hard error here; train_bc's explicit accepted-identity mode is the
+        # fail-closed boundary for exact-identity campaigns.
+        "policy_operator_uniform": not mixed,
+    }
+
+
 def inspect_composite(
     *, descriptor_path: Path, required_regime: str
 ) -> dict[str, Any]:
@@ -752,6 +827,16 @@ def inspect_composite(
         if item["policy_distillation_active"]
         and not item["exact_root_reanalysis"]["full_corpus_replayable"]
     ]
+    manifest_groups = _manifest_operator_groups(source_authority)
+    policy_identity = _policy_operator_identity_inventory(
+        groups=manifest_groups,
+        policy_distillation_component_ids=distillation,
+        policy_active_component_ids={
+            str(item["label"])
+            for item in components
+            if int(item["policy_active_rows"]) > 0
+        },
+    )
     return {
         "descriptor": {
             "path": str(path),
@@ -765,9 +850,12 @@ def inspect_composite(
         "incompatible_policy_active_rows": incompatible,
         "policy_activation_invalid_components": activation_invalid,
         "policy_targets_eligible_for_requested_learner": (
-            incompatible == 0 and not activation_invalid
+            incompatible == 0
+            and not activation_invalid
+            and policy_identity["policy_operator_uniform"]
         ),
         "old_targets_remain_policy_active": incompatible > 0,
+        "policy_target_manifest_identity": policy_identity,
         "full_composite_root_reanalysis_eligible": not reanalysis_blocked,
         "root_reanalysis_blocked_components": reanalysis_blocked,
         "source_authority": {
@@ -776,9 +864,7 @@ def inspect_composite(
             "schema_version": source_authority.get("schema_version"),
         },
         "operator_authorities": _operator_authorities(source_authority),
-        "generation_manifest_operator_groups": _manifest_operator_groups(
-            source_authority
-        ),
+        "generation_manifest_operator_groups": manifest_groups,
     }
 
 
