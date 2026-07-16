@@ -2578,7 +2578,7 @@ def test_only_independent_final_replication_can_enter_full_gate(
         experiment["experiment_id"],
         recovery_gate_authority_path=_recovery_gate_path(tmp_path, final),
     )
-    assert gate["candidate_checkpoint_sha256"] == _sha("f")
+    assert gate["candidate_checkpoint_sha256"] == good_result["checkpoint_sha256"]
     assert gate["auto_promotion"] is False
 
 
