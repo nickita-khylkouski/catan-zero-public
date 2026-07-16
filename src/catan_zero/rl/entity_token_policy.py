@@ -994,6 +994,14 @@ class EntityGraphNet:
                         nn.LayerNorm(h),
                         nn.Linear(h, h),
                     )
+                    self.register_buffer(
+                        "action_target_local_identity_table",
+                        self._build_action_target_local_identity_table(
+                            width=h,
+                            device=self.type_embedding.device,
+                        ),
+                        persistent=False,
+                    )
                     if not self.uses_relational_topology:
                         nn.init.zeros_(self.target_gather_proj[1].weight)
                         nn.init.zeros_(self.target_gather_proj[1].bias)
@@ -1448,8 +1456,25 @@ class EntityGraphNet:
                 if self.action_target_gather or self.edge_policy_head:
                     pooled_targets = self._gather_target_tokens(tokens, batch)
                 if self.action_target_gather:
+                    # The incumbent Transformer has no within-type positional
+                    # identity.  Consequently, several empty opening-road edge
+                    # tokens can be representation-identical even though their
+                    # action targets are different.  Gathering only the token
+                    # then leaves those actions causally indistinguishable.
+                    #
+                    # Add a fixed, parameter-free encoding of the *remapped*
+                    # local target id before the zero-output projection.  This
+                    # preserves exact warm-start parity (the projection's final
+                    # Linear is zero), introduces no new checkpoint parameters,
+                    # and follows D6 correctly because symmetry code relabels
+                    # legal_action_target_ids before this function runs.
+                    target_identity = self._action_target_local_identity(
+                        batch["legal_action_target_ids"],
+                        width=int(pooled_targets.shape[-1]),
+                        dtype=pooled_targets.dtype,
+                    )
                     encoded_actions = encoded_actions + self.target_gather_proj(
-                        pooled_targets
+                        pooled_targets + target_identity
                     )
                 if self.action_cross_attention_layers > 0:
                     for cross_block in self.action_cross_blocks:
@@ -1966,6 +1991,97 @@ class EntityGraphNet:
                     batch,
                     target_key="legal_action_target_ids",
                 )
+
+            @staticmethod
+            def _build_action_target_local_identity_table(
+                *,
+                width: int,
+                device,
+            ):
+                """Precompute typed local-id sinusoids once per model."""
+                if width <= 0:
+                    raise ValueError("target identity width must be positive")
+                namespace_widths = torch.tensor(
+                    (19, 54, 72, 4),
+                    dtype=torch.long,
+                    device=device,
+                )
+                max_namespace_width = int(namespace_widths.max().item())
+                local_ids = torch.arange(
+                    max_namespace_width,
+                    dtype=torch.float32,
+                    device=device,
+                ).view(1, -1)
+                normalized = local_ids / (namespace_widths - 1).clamp(min=1).view(
+                    -1, 1
+                )
+                band_count = (int(width) + 1) // 2
+                bands = torch.arange(
+                    1,
+                    band_count + 1,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                angles = normalized.unsqueeze(-1) * (math.pi * bands)
+                encoded = torch.zeros(
+                    4,
+                    max_namespace_width,
+                    int(width),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                encoded[..., 0::2] = torch.sin(angles)[..., : encoded[..., 0::2].shape[-1]]
+                if int(width) > 1:
+                    encoded[..., 1::2] = torch.cos(angles)[
+                        ..., : encoded[..., 1::2].shape[-1]
+                    ]
+                valid_rows = (
+                    torch.arange(max_namespace_width, device=device).view(1, -1)
+                    < namespace_widths.view(-1, 1)
+                )
+                return encoded * valid_rows.unsqueeze(-1)
+
+            def _action_target_local_identity(
+                self,
+                target_ids,
+                *,
+                width: int,
+                dtype,
+            ):
+                """Pool fixed typed local-id identity for each action target.
+
+                ``target_ids`` follows the same four local namespaces as
+                ``_gather_entity_target_tokens``.  Invalid ``-1`` slots
+                contribute exactly zero.  The lookup table is non-persistent
+                and parameter-free, so checkpoint keys and the commissioned
+                trainable surface remain unchanged.
+                """
+
+                import torch
+
+                if int(width) != int(
+                    self.action_target_local_identity_table.shape[-1]
+                ):
+                    raise ValueError(
+                        "target identity width differs from the model buffer"
+                    )
+                ids = target_ids.long()
+                valid = ids >= 0
+                clipped = ids.clamp(
+                    min=0,
+                    max=int(
+                        self.action_target_local_identity_table.shape[1] - 1
+                    ),
+                )
+                columns = torch.arange(4, device=ids.device).view(1, 1, 4)
+                encoded = self.action_target_local_identity_table[
+                    columns, clipped
+                ]
+                encoded = encoded * valid.unsqueeze(-1)
+                pooled = encoded.sum(dim=2) / valid.sum(dim=2).clamp(min=1).unsqueeze(
+                    -1
+                )
+                return pooled.to(dtype=dtype)
 
             def _value_pool(self, state, tokens, padding_mask):
                 """Learned probe token cross-attends over all output tokens.
