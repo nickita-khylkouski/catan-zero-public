@@ -71,6 +71,7 @@ from catan_zero.rl.entity_token_features import (
     public_card_count_features_from_entity_tokens,
 )
 from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     checkpoint_entity_feature_adapter_metadata,
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
@@ -20726,6 +20727,17 @@ def validate_teacher_data_schema(policy, data: dict, data_quality: dict, env_con
         if getattr(policy, "policy_type", "") == "entity_graph"
         else ""
     )
+    if (
+        checkpoint_adapter_version == CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        and not nonempty_adapters
+        and len(actions) >= 1000
+    ):
+        problems.append(
+            "missing adapter_version for a production-sized teacher dataset while "
+            f"the checkpoint uses current entity adapter {checkpoint_adapter_version!r}; "
+            "regenerate current-adapter rows or curate/backfill authenticated adapter "
+            "provenance instead of training current semantics on legacy-unknown features"
+        )
     if (
         checkpoint_adapter_version
         and nonempty_adapters
