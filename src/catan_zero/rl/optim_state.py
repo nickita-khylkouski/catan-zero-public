@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -105,6 +106,7 @@ def save_training_progress(
     rank_torch_rng_states: list[dict[str, Any]],
     scalar_training_weight_sum: float,
     categorical_training_weight_sum: float,
+    policy_objective_lr_area: float = 0.0,
     policy_kl_controller_state: dict[str, Any] | None = None,
     ddp: dict | None,
 ) -> Path | None:
@@ -144,6 +146,7 @@ def save_training_progress(
         "rank_torch_rng_states": rank_torch_rng_states,
         "scalar_training_weight_sum": float(scalar_training_weight_sum),
         "categorical_training_weight_sum": float(categorical_training_weight_sum),
+        "policy_objective_lr_area": float(policy_objective_lr_area),
     }
     if policy_kl_controller_state is not None:
         if not isinstance(policy_kl_controller_state, dict):
@@ -204,6 +207,16 @@ def load_training_progress(
         value = payload.get(field)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise TrainingProgressError(f"invalid training progress field {field}")
+    policy_objective_lr_area = payload.get("policy_objective_lr_area", 0.0)
+    if (
+        isinstance(policy_objective_lr_area, bool)
+        or not isinstance(policy_objective_lr_area, (int, float))
+        or not math.isfinite(float(policy_objective_lr_area))
+        or float(policy_objective_lr_area) < 0.0
+    ):
+        raise TrainingProgressError(
+            "invalid training progress field policy_objective_lr_area"
+        )
     if not isinstance(payload.get("rng_state"), dict):
         raise TrainingProgressError("training progress lacks numpy RNG state")
     if "policy_kl_controller_state" in payload and not isinstance(

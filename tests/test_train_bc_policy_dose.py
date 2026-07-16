@@ -35,6 +35,42 @@ def test_zero_policy_dose_preserves_historical_constant_weight() -> None:
     ) == pytest.approx(0.75)
 
 
+def test_policy_dose_requires_matching_global_batch_topology() -> None:
+    assert train_bc._validate_policy_dose_topology(  # noqa: SLF001
+        target_lr_area=0.01,
+        reference_global_batch_size=512,
+        local_batch_size=64,
+        grad_accum_steps=1,
+        world_size=8,
+    ) == 512
+    with pytest.raises(SystemExit, match="cannot cross optimizer topology"):
+        train_bc._validate_policy_dose_topology(  # noqa: SLF001
+            target_lr_area=0.01,
+            reference_global_batch_size=4096,
+            local_batch_size=64,
+            grad_accum_steps=1,
+            world_size=8,
+        )
+
+
+def test_positive_policy_dose_requires_explicit_reference_topology() -> None:
+    with pytest.raises(SystemExit, match="requires.*reference-global-batch-size"):
+        train_bc._validate_policy_dose_topology(  # noqa: SLF001
+            target_lr_area=0.01,
+            reference_global_batch_size=0,
+            local_batch_size=64,
+            grad_accum_steps=1,
+            world_size=8,
+        )
+
+
+def test_uncapped_training_can_request_an_early_checkpoint_frontier() -> None:
+    assert train_bc._parse_checkpoint_steps(  # noqa: SLF001
+        "8,16,32,64,128",
+        max_steps=0,
+    ) == (8, 16, 32, 64, 128)
+
+
 def test_policy_only_gradient_suppression_keeps_shared_value_paths() -> None:
     torch = pytest.importorskip("torch")
 

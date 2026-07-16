@@ -353,6 +353,7 @@ def build_train_command(
         ("seed", "--seed"),
         ("epochs", "--epochs"),
         ("max_steps", "--max-steps"),
+        ("checkpoint_steps", "--checkpoint-steps"),
         ("base_sampler", "--base-sampler"),
         ("batch_size", "--batch-size"),
         ("grad_accum_steps", "--grad-accum-steps"),
@@ -361,6 +362,7 @@ def build_train_command(
         ("lr_warmup_steps", "--lr-warmup-steps"),
         ("lr_schedule", "--lr-schedule"),
         ("weight_decay", "--weight-decay"),
+        ("max_grad_norm", "--max-grad-norm"),
         ("value_lr_mult", "--value-lr-mult"),
         ("action_module_lr_mult", "--action-module-lr-mult"),
         ("public_card_lr_mult", "--public-card-lr-mult"),
@@ -381,6 +383,10 @@ def build_train_command(
         ),
         ("policy_loss_weight", "--policy-loss-weight"),
         ("policy_dose_lr_area", "--policy-dose-lr-area"),
+        (
+            "policy_dose_reference_global_batch_size",
+            "--policy-dose-reference-global-batch-size",
+        ),
         ("soft_target_source", "--soft-target-source"),
         ("soft_target_weight", "--soft-target-weight"),
         ("policy_target_blend_semantics", "--policy-target-blend-semantics"),
@@ -417,6 +423,7 @@ def build_train_command(
         "public_card_lr_mult": 1.0,
         "target_reliability_confidence_floor": 0.25,
         "policy_dose_lr_area": 0.0,
+        "policy_dose_reference_global_batch_size": 0,
     }
     for key, flag in scalar_fields:
         if key in optional_scalar_defaults:

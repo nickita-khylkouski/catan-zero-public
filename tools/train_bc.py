@@ -1185,6 +1185,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--policy-dose-reference-global-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Global optimizer batch whose policy LR-area evidence is being reused. "
+            "Required when --policy-dose-lr-area is positive and must exactly equal "
+            "batch-size * grad-accum-steps * world-size. This prevents silently "
+            "transferring a dose frontier across incompatible optimizer topology."
+        ),
+    )
+    parser.add_argument(
         "--policy-aux-active-batch-size",
         type=int,
         default=0,
@@ -1886,7 +1897,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated optimizer steps at which to emit model-only "
             "checkpoints from the same training trajectory (for example 64,96). "
-            "The terminal --checkpoint is still written normally."
+            "The terminal --checkpoint is still written normally. With uncapped "
+            "epoch training, every requested step must be reached before the run "
+            "ends or the trainer fails closed."
         ),
     )
     parser.add_argument(
@@ -2537,6 +2550,46 @@ def _policy_weight_for_lr_area(
     if learning_rate == 0.0:
         return coefficient
     return min(coefficient, remaining / learning_rate)
+
+
+def _validate_policy_dose_topology(
+    *,
+    target_lr_area: float,
+    reference_global_batch_size: int,
+    local_batch_size: int,
+    grad_accum_steps: int,
+    world_size: int,
+) -> int:
+    """Bind an LR-area dose to the optimizer topology that produced its evidence."""
+
+    target = float(target_lr_area)
+    reference = int(reference_global_batch_size)
+    global_batch_size = (
+        int(local_batch_size) * int(grad_accum_steps) * int(world_size)
+    )
+    if not math.isfinite(target) or target < 0.0:
+        raise SystemExit("--policy-dose-lr-area must be finite and >= 0")
+    if global_batch_size <= 0:
+        raise SystemExit("policy dose requires a positive global optimizer batch")
+    if target == 0.0:
+        if reference != 0:
+            raise SystemExit(
+                "--policy-dose-reference-global-batch-size is inert unless "
+                "--policy-dose-lr-area is positive"
+            )
+        return global_batch_size
+    if reference <= 0:
+        raise SystemExit(
+            "positive --policy-dose-lr-area requires "
+            "--policy-dose-reference-global-batch-size"
+        )
+    if reference != global_batch_size:
+        raise SystemExit(
+            "policy LR-area evidence cannot cross optimizer topology: "
+            f"reference_global_batch={reference} "
+            f"current_global_batch={global_batch_size}"
+        )
+    return global_batch_size
 
 
 def _optimizer_lr_dose_attestation(
@@ -10855,10 +10908,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.policy_loss_weight = _validate_policy_loss_weight(
         args.policy_loss_weight
     )
-    if not math.isfinite(float(args.policy_dose_lr_area)) or float(
-        args.policy_dose_lr_area
-    ) < 0.0:
-        raise SystemExit("--policy-dose-lr-area must be finite and >= 0")
     if float(args.policy_dose_lr_area) > 0.0:
         policy_group_multipliers = {
             "--trunk-lr-mult": float(args.trunk_lr_mult),
@@ -10895,6 +10944,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "keep shared-trunk dropout streams rank-distinct/reproducible"
             )
     ddp = _distributed_state()
+    _validate_policy_dose_topology(
+        target_lr_area=float(args.policy_dose_lr_area),
+        reference_global_batch_size=int(
+            args.policy_dose_reference_global_batch_size
+        ),
+        local_batch_size=int(args.batch_size),
+        grad_accum_steps=int(args.grad_accum_steps),
+        world_size=int(ddp["world_size"]),
+    )
     # Authenticate diagnostic batch/topology drift before the expensive A1
     # memmap preflight.  The same authorization is replayed again when the
     # audited corpus recipe is bound below.
@@ -13612,12 +13670,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         start_epoch,
         cumulative_scalar_training_weight,
         cumulative_categorical_training_weight,
+        policy_objective_lr_area,
     ) = _restore_training_progress_state(
         resume_progress,
         epochs=effective_epoch_limit,
         rng=rng,
         symmetry_rng=symmetry_rng,
         ddp=ddp,
+        require_policy_objective_lr_area=(
+            float(args.policy_dose_lr_area) > 0.0
+        ),
     )
     _validate_resumed_max_step_boundary(
         resumed=resume_progress is not None,
@@ -13652,7 +13714,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     optimizer_lr_applied_updates = 0
     optimizer_schedule_multiplier_sum = 0.0
     optimizer_lr_area_by_group = [0.0 for _ in optimizer.param_groups]
-    policy_objective_lr_area = 0.0
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
     intermediate_checkpoints: list[dict[str, object]] = []
     checkpoint_dose_snapshots: list[dict[str, object]] = []
@@ -15936,6 +15997,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 categorical_training_weight_sum=(
                     cumulative_categorical_training_weight
                 ),
+                policy_objective_lr_area=policy_objective_lr_area,
                 policy_kl_controller_state=(
                     None
                     if policy_kl_controller is None
@@ -16113,6 +16175,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         symmetry_rng=symmetry_rng,
         scalar_training_weight_sum=cumulative_scalar_training_weight,
         categorical_training_weight_sum=cumulative_categorical_training_weight,
+        policy_objective_lr_area=policy_objective_lr_area,
         policy_kl_controller_state=(
             None
             if policy_kl_controller is None
@@ -16572,6 +16635,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "soft_target_min_legal_coverage": args.soft_target_min_legal_coverage,
         "policy_loss_weight": args.policy_loss_weight,
         "policy_dose_lr_area": float(args.policy_dose_lr_area),
+        "policy_dose_reference_global_batch_size": int(
+            args.policy_dose_reference_global_batch_size
+        ),
         "policy_objective_lr_area": float(policy_objective_lr_area),
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
         "policy_aux_loss_weight": float(args.policy_aux_loss_weight),
@@ -32334,9 +32400,7 @@ def _parse_checkpoint_steps(raw: str, *, max_steps: int) -> tuple[int, ...]:
         raise SystemExit(
             "--checkpoint-steps must be unique positive integers in increasing order"
         )
-    if int(max_steps) <= 0:
-        raise SystemExit("--checkpoint-steps requires a positive --max-steps")
-    if any(step >= int(max_steps) for step in steps):
+    if int(max_steps) > 0 and any(step >= int(max_steps) for step in steps):
         raise SystemExit(
             "--checkpoint-steps must be strictly below --max-steps; the terminal "
             "checkpoint already represents --max-steps"
@@ -34779,10 +34843,11 @@ def _restore_training_progress_state(
     rng,
     symmetry_rng,
     ddp: dict[str, int | bool],
-) -> tuple[int, int, float, float]:
+    require_policy_objective_lr_area: bool = False,
+) -> tuple[int, int, float, float, float]:
     """Restore schedule/dose counters and sampler RNG from validated progress."""
     if progress is None:
-        return 0, 0, 0.0, 0.0
+        return 0, 0, 0.0, 0.0, 0.0
     global_step = int(progress["optimizer_step"])
     completed_epochs = int(progress["completed_epochs"])
     if completed_epochs > int(epochs):
@@ -34823,6 +34888,18 @@ def _restore_training_progress_state(
         raise SystemExit(
             "training progress has symmetry RNG state but current recipe disables it"
         )
+    if require_policy_objective_lr_area and "policy_objective_lr_area" not in progress:
+        raise SystemExit(
+            "resumed policy-dose run lacks consumed policy LR-area progress"
+        )
+    policy_objective_lr_area = float(
+        progress.get("policy_objective_lr_area", 0.0)
+    )
+    if (
+        not math.isfinite(policy_objective_lr_area)
+        or policy_objective_lr_area < 0.0
+    ):
+        raise SystemExit("resumed checkpoint has invalid policy LR-area progress")
     rank_rng_states = progress.get("rank_torch_rng_states")
     if not isinstance(rank_rng_states, list) or len(rank_rng_states) != int(
         ddp["world_size"]
@@ -34844,6 +34921,7 @@ def _restore_training_progress_state(
         completed_epochs,
         float(progress["scalar_training_weight_sum"]),
         float(progress["categorical_training_weight_sum"]),
+        policy_objective_lr_area,
     )
 
 
@@ -34892,6 +34970,7 @@ def _save_training_progress_sidecar(
     symmetry_rng,
     scalar_training_weight_sum: float,
     categorical_training_weight_sum: float,
+    policy_objective_lr_area: float,
     policy_kl_controller_state: dict[str, object] | None = None,
     ddp: dict,
 ) -> None:
@@ -34972,6 +35051,7 @@ def _save_training_progress_sidecar(
             categorical_training_weight_sum=float(
                 categorical_training_weight_sum
             ),
+            policy_objective_lr_area=float(policy_objective_lr_area),
             policy_kl_controller_state=policy_kl_controller_state,
             ddp=ddp,
         )

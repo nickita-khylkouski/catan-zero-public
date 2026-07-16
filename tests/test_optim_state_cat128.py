@@ -236,7 +236,7 @@ def test_train_bc_restores_schedule_counter_epoch_and_sampler_rng():
         symmetry_rng=None,
         ddp=_DDP_SINGLE,
     )
-    assert restored == (713, 2, 123.5, 44.0)
+    assert restored == (713, 2, 123.5, 44.0, 0.0)
     assert np.array_equal(resumed_rng.random(4), expected_next)
 
 
@@ -278,6 +278,62 @@ def test_train_bc_restores_rank_local_numpy_sampler_rng() -> None:
     )
 
     assert np.array_equal(resumed_rng.random(4), rank1_expected)
+
+
+def test_train_bc_restores_consumed_policy_lr_area() -> None:
+    tb = _load_train_bc()
+    np = __import__("numpy")
+    rng = np.random.default_rng(12)
+    progress = {
+        "optimizer_step": 7,
+        "completed_epochs": 1,
+        "rng_state": rng.bit_generator.state,
+        "symmetry_rng_state": None,
+        "rank_torch_rng_states": [
+            {"rank": 0, "cpu": torch.get_rng_state().tolist(), "cuda": None}
+        ],
+        "scalar_training_weight_sum": 0.0,
+        "categorical_training_weight_sum": 0.0,
+        "policy_objective_lr_area": 0.0125,
+    }
+
+    restored = tb._restore_training_progress_state(
+        progress,
+        epochs=2,
+        rng=np.random.default_rng(999),
+        symmetry_rng=None,
+        ddp=_DDP_SINGLE,
+        require_policy_objective_lr_area=True,
+    )
+
+    assert restored[-1] == pytest.approx(0.0125)
+
+
+def test_policy_dose_resume_without_consumed_area_fails_closed() -> None:
+    tb = _load_train_bc()
+    np = __import__("numpy")
+    rng = np.random.default_rng(12)
+    progress = {
+        "optimizer_step": 7,
+        "completed_epochs": 1,
+        "rng_state": rng.bit_generator.state,
+        "symmetry_rng_state": None,
+        "rank_torch_rng_states": [
+            {"rank": 0, "cpu": torch.get_rng_state().tolist(), "cuda": None}
+        ],
+        "scalar_training_weight_sum": 0.0,
+        "categorical_training_weight_sum": 0.0,
+    }
+
+    with pytest.raises(SystemExit, match="lacks consumed policy LR-area"):
+        tb._restore_training_progress_state(
+            progress,
+            epochs=2,
+            rng=np.random.default_rng(999),
+            symmetry_rng=None,
+            ddp=_DDP_SINGLE,
+            require_policy_objective_lr_area=True,
+        )
 
 
 def test_legacy_sharded_ddp_resume_without_rank_sampler_state_fails() -> None:
