@@ -440,6 +440,7 @@ def test_stage_c_run_adopts_authenticated_completed_receipt_without_subprocess(
     }
     plan = {
         "campaign_sha256": "sha256:" + "2" * 64,
+        "arm": "PRODUCTION_WEIGHTED",
         "policy_target_contract": {
             "selected_unique_training_roots": 256,
             "selected_unique_roots_total": 300,
