@@ -15727,9 +15727,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         validation_metrics = _evaluate_validation_indices(validation_indices)
         validation_metrics["measure"] = "raw_row_concat"
         validation_metrics["objective_matched"] = False
+        validation_metrics["training_value_player_outcome_balance_mode"] = str(
+            args.value_player_outcome_balance_mode
+        )
+        validation_metrics["validation_value_player_outcome_balance_mode"] = (
+            "none"
+        )
         validation_metrics["warning"] = (
             "compatibility metric: raw held-out rows do not follow the "
-            "authenticated component->game->row training measure"
+            "authenticated component->game->row training measure, and validation "
+            "uses natural outcomes rather than fitting training-only outcome balance"
         )
         metrics[-1]["validation"] = validation_metrics
         if is_memmap_composite and tuple(
@@ -15745,14 +15752,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 epoch=epoch + 1,
                 optimizer_step=global_step,
             )
-            metrics[-1]["validation_objective_matched"] = (
-                evaluate_composite_validation_measure(
-                    data,
-                    validation_indices,
-                    _evaluate_validation_indices,
-                    evaluation_identity=evaluation_identity,
-                )
+            composite_validation = evaluate_composite_validation_measure(
+                data,
+                validation_indices,
+                _evaluate_validation_indices,
+                evaluation_identity=evaluation_identity,
+                training_value_player_outcome_balance_mode=str(
+                    args.value_player_outcome_balance_mode
+                ),
+                validation_value_player_outcome_balance_mode="none",
             )
+            validation_key = (
+                "validation_objective_matched"
+                if composite_validation["objective_matched"] is True
+                else "validation_natural_composite"
+            )
+            metrics[-1][validation_key] = composite_validation
         if policy_aux_validation_sampling_weights is not None:
             # AUX training draws rows from q (the conditioned sampler) and then
             # applies the ordinary policy loss weight w inside that draw.  Its
@@ -15867,7 +15882,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "policy_kl_anchor_loss", 0.0
                     )
                 )
-            base_wrapper = metrics[-1].get("validation_objective_matched")
+            base_validation_key = (
+                "validation_objective_matched"
+                if "validation_objective_matched" in metrics[-1]
+                else "validation_natural_composite"
+            )
+            base_wrapper = metrics[-1].get(base_validation_key)
             base_objective_metrics = (
                 base_wrapper["metrics"]
                 if isinstance(base_wrapper, dict)
@@ -15895,7 +15915,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         f"{objective_wrapper.get('measure', 'weighted_held_out_base')}"
                         "+conditioned_policy_aux"
                     ),
-                    "objective_matched": True,
+                    "objective_matched": bool(
+                        objective_wrapper.get("objective_matched", False)
+                    ),
                     "metrics": combined_validation,
                     "policy_aux": {
                         "measure": "held_out_conditioned_policy_aux",
@@ -15912,7 +15934,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     },
                 }
             )
-            metrics[-1]["validation_objective_matched"] = (
+            metrics[-1][base_validation_key] = (
                 _reseal_objective_matched_validation_wrapper(objective_wrapper)
             )
         _rank0_print(
@@ -19376,6 +19398,12 @@ def _validated_objective_matched_validation_wrapper(
 
     matched = epoch_metrics.get("validation_objective_matched")
     if not isinstance(matched, dict):
+        natural = epoch_metrics.get("validation_natural_composite")
+        if isinstance(natural, dict):
+            raise ValueError(
+                "natural composite validation does not match the learner objective; "
+                "objective-matched selection is unavailable"
+            )
         if require_matched:
             raise ValueError(
                 "authenticated composite adjudication requires objective-matched "
@@ -19415,6 +19443,43 @@ def _validated_objective_matched_validation_wrapper(
         if require_matched or matched:
             raise ValueError("objective-matched validation wrapper is malformed")
         return None
+    objective_match = matched.get("objective_match")
+    if objective_match is not None:
+        expected_match_fields = {
+            "component_game_row_sampling_matched",
+            "training_value_player_outcome_balance_mode",
+            "validation_value_player_outcome_balance_mode",
+            "value_player_outcome_balance_matched",
+            "validation_outcome_measure",
+        }
+        if (
+            not isinstance(objective_match, dict)
+            or set(objective_match) != expected_match_fields
+            or objective_match.get("component_game_row_sampling_matched") is not True
+            or objective_match.get("training_value_player_outcome_balance_mode")
+            not in {"none", "sampler_balanced_v1"}
+            or objective_match.get("validation_value_player_outcome_balance_mode")
+            not in {"none", "sampler_balanced_v1"}
+        ):
+            raise ValueError("objective-matched validation contract is malformed")
+        declared_outcome_match = (
+            objective_match["training_value_player_outcome_balance_mode"]
+            == objective_match["validation_value_player_outcome_balance_mode"]
+        )
+        expected_validation_measure = (
+            "natural_holdout_v1"
+            if objective_match["validation_value_player_outcome_balance_mode"]
+            == "none"
+            else objective_match["validation_value_player_outcome_balance_mode"]
+        )
+        if (
+            objective_match.get("value_player_outcome_balance_matched")
+            is not declared_outcome_match
+            or objective_match.get("validation_outcome_measure")
+            != expected_validation_measure
+            or matched.get("objective_matched") is not declared_outcome_match
+        ):
+            raise ValueError("objective-matched validation contract is inconsistent")
     ratio_values = np.asarray(list(ratios.values()), dtype=np.float64)
     if (
         ratio_values.shape != (len(ratios),)
@@ -19505,6 +19570,15 @@ def _validated_objective_matched_validation_wrapper(
         or provenance_sha256 != _canonical_json_sha256(provenance)
     ):
         raise ValueError("objective-matched validation provenance is malformed")
+    if objective_match is not None and (
+        provenance.get("training_value_player_outcome_balance_mode")
+        != objective_match["training_value_player_outcome_balance_mode"]
+        or provenance.get("validation_value_player_outcome_balance_mode")
+        != objective_match["validation_value_player_outcome_balance_mode"]
+        or provenance.get("value_player_outcome_balance_matched")
+        is not objective_match["value_player_outcome_balance_matched"]
+    ):
+        raise ValueError("objective-matched validation provenance is inconsistent")
     source_authority = provenance.get("source_authority_semantic_sha256")
     if source_authority is not None and not _is_sha256(source_authority):
         raise ValueError("objective-matched source authority is malformed")
@@ -20139,6 +20213,8 @@ def evaluate_composite_validation_measure(
     evaluate_indices,
     *,
     evaluation_identity: Mapping[str, object],
+    training_value_player_outcome_balance_mode: str = "none",
+    validation_value_player_outcome_balance_mode: str = "none",
 ) -> dict[str, object]:
     """Evaluate a composite under its authenticated training distribution.
 
@@ -20150,7 +20226,29 @@ def evaluate_composite_validation_measure(
     ratios. ``evaluate_indices`` performs all DDP reductions, and every rank
     traverses this deterministic component/game order, so collectives remain
     aligned even when a game has fewer rows than ranks.
+
+    Outcome balancing is a separate part of the learner objective. In
+    particular, ``sampler_balanced_v1`` is fitted on the training partition and
+    is intentionally not fitted on validation labels. Report that distinction
+    explicitly instead of calling a natural-outcome holdout objective-matched.
     """
+    allowed_outcome_balance_modes = {"none", "sampler_balanced_v1"}
+    training_outcome_balance_mode = str(
+        training_value_player_outcome_balance_mode
+    )
+    validation_outcome_balance_mode = str(
+        validation_value_player_outcome_balance_mode
+    )
+    if (
+        training_outcome_balance_mode not in allowed_outcome_balance_modes
+        or validation_outcome_balance_mode not in allowed_outcome_balance_modes
+    ):
+        raise SystemExit(
+            "composite validation received an unknown value outcome-balance mode"
+        )
+    outcome_balance_matched = (
+        training_outcome_balance_mode == validation_outcome_balance_mode
+    )
     ratios = np.asarray(
         getattr(data, "component_game_sampling_ratios", tuple()), dtype=np.float64
     )
@@ -20288,6 +20386,13 @@ def evaluate_composite_validation_measure(
             np.unique(seeds)
         ),
         "component_coverage_sha256": _canonical_json_sha256(coverage),
+        "training_value_player_outcome_balance_mode": (
+            training_outcome_balance_mode
+        ),
+        "validation_value_player_outcome_balance_mode": (
+            validation_outcome_balance_mode
+        ),
+        "value_player_outcome_balance_matched": outcome_balance_matched,
         "evaluation_schema_version": evaluation_identity["schema_version"],
         **{
             key: evaluation_identity[key]
@@ -20298,7 +20403,22 @@ def evaluate_composite_validation_measure(
     result: dict[str, object] = {
         "schema_version": COMPOSITE_VALIDATION_MEASURE_SCHEMA,
         "measure": COMPOSITE_VALIDATION_MEASURE,
-        "objective_matched": True,
+        "objective_matched": outcome_balance_matched,
+        "objective_match": {
+            "component_game_row_sampling_matched": True,
+            "training_value_player_outcome_balance_mode": (
+                training_outcome_balance_mode
+            ),
+            "validation_value_player_outcome_balance_mode": (
+                validation_outcome_balance_mode
+            ),
+            "value_player_outcome_balance_matched": outcome_balance_matched,
+            "validation_outcome_measure": (
+                "natural_holdout_v1"
+                if validation_outcome_balance_mode == "none"
+                else validation_outcome_balance_mode
+            ),
+        },
         "samples": int(indices.size),
         "games": int(
             sum(int(report["games"]) for report in component_reports.values())

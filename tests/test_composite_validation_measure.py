@@ -170,6 +170,57 @@ def test_objective_matched_validation_is_component_then_game_then_row() -> None:
     assert calls == [(0,), (1, 2, 3), (4, 5)]
 
 
+def test_natural_outcome_validation_is_not_labeled_sampler_balanced() -> None:
+    data = _Composite()
+    # Natural holdout mass is deliberately outcome-skewed: the high-loss
+    # positive game contributes three rows, while the negative game contributes
+    # one. Component/game aggregation remains authenticated, but the validation
+    # outcome weights do not match sampler_balanced_v1 fitted on training.
+    per_row_loss = np.asarray([1.0, 9.0, 9.0, 9.0, 4.0, 4.0])
+
+    def evaluate(indices: np.ndarray) -> dict:
+        value = float(per_row_loss[indices].mean())
+        return {
+            "samples": int(len(indices)),
+            "loss": value,
+            "value_loss": value,
+            "loss_denominators": {"value_loss": float(len(indices))},
+            "objective_coefficients": {"value_loss": 1.0},
+        }
+
+    report = evaluate_composite_validation_measure(
+        data,
+        np.arange(6, dtype=np.int64),
+        evaluate,
+        evaluation_identity=_evaluation_identity(),
+        training_value_player_outcome_balance_mode="sampler_balanced_v1",
+        validation_value_player_outcome_balance_mode="none",
+    )
+
+    assert report["metrics"]["value_loss"] == pytest.approx(4.75)
+    assert report["objective_matched"] is False
+    assert report["objective_match"] == {
+        "component_game_row_sampling_matched": True,
+        "training_value_player_outcome_balance_mode": "sampler_balanced_v1",
+        "validation_value_player_outcome_balance_mode": "none",
+        "value_player_outcome_balance_matched": False,
+        "validation_outcome_measure": "natural_holdout_v1",
+    }
+    assert report["provenance"][
+        "value_player_outcome_balance_matched"
+    ] is False
+    epoch = {"validation_natural_composite": report}
+    with pytest.raises(ValueError, match="natural composite validation"):
+        objective_matched_validation_metrics(
+            epoch
+        )
+    report["objective_matched"] = True
+    with pytest.raises(ValueError, match="contract is inconsistent"):
+        objective_matched_validation_metrics(
+            {"validation_objective_matched": report}
+        )
+
+
 def test_objective_matched_validation_rejects_missing_component_holdout() -> None:
     data = _Composite()
 

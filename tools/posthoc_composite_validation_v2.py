@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Read-only exact-v2 validation for an existing composite-trained checkpoint.
+"""Read-only natural-holdout validation for a composite-trained checkpoint.
 
 This tool performs no optimizer construction, backward pass, checkpoint save, or
-training-report mutation. It replays the completed run's exact learner objective
-on its locked whole-game holdout, using ``composite-validation-measure-v2``.
-Every input byte identity and the evaluation checkout/runtime identity are bound
-into the output so old v1 validation can be replaced without rewriting history.
+training-report mutation. It replays the completed run's policy/value losses on
+its locked whole-game holdout under the authenticated component -> game -> row
+measure. Training-only value outcome balancing remains training-only: validation
+labels are not used to refit it, and the output explicitly records that this is
+not the exact learner objective when those modes differ.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ if str(REPO / "src") not in sys.path:
 
 from tools import train_bc  # noqa: E402
 
-SCHEMA = "posthoc-composite-validation-v2/v1"
+SCHEMA = "posthoc-composite-validation-v2/v2"
 
 
 def _sha256(path: Path) -> str:
@@ -52,7 +53,7 @@ def _json_object(path: Path, label: str) -> dict[str, Any]:
 def _required(report: dict[str, Any], key: str) -> Any:
     if key not in report:
         raise SystemExit(
-            f"training report lacks {key!r}; exact posthoc recipe reconstruction refused"
+            f"training report lacks {key!r}; posthoc recipe reconstruction refused"
         )
     return report[key]
 
@@ -73,7 +74,7 @@ def _load_policy(arch: str, checkpoint: Path, device: str):
 
         cls = XDimGraphPolicy if arch == "xdim_graph" else XDimLitePolicy
         return cls.load(checkpoint, device=device)
-    raise SystemExit(f"exact composite validation does not support arch={arch!r}")
+    raise SystemExit(f"composite validation does not support arch={arch!r}")
 
 
 def _git_commit() -> str:
@@ -210,7 +211,7 @@ def run_rescore(
     before = {name: _sha256(path) for name, path in paths.items()}
     report = _json_object(paths["training_report"], "training report")
     if report.get("data_format") != "memmap":
-        raise SystemExit("exact v2 posthoc validation requires data_format=memmap")
+        raise SystemExit("posthoc composite validation requires data_format=memmap")
     reported_checkpoint = report.get("checkpoint")
     if isinstance(reported_checkpoint, str) and Path(reported_checkpoint).is_absolute():
         if Path(reported_checkpoint).resolve(strict=False) != paths["checkpoint"]:
@@ -220,7 +221,7 @@ def run_rescore(
 
     authenticated = train_bc._preflight_memmap_composite_descriptor(paths["descriptor"])
     if authenticated.get("schema_version") != "memmap_composite_v2":
-        raise SystemExit("exact v2 posthoc validation requires memmap_composite_v2")
+        raise SystemExit("posthoc composite validation requires memmap_composite_v2")
     fingerprint = train_bc._training_data_fingerprint(paths["descriptor"], "memmap")
     if fingerprint != str(_required(report, "data_fingerprint")):
         raise SystemExit("composite descriptor fingerprint differs from training report")
@@ -343,7 +344,7 @@ def run_rescore(
         )
 
     runtime_binding = train_bc._assert_checkout_runtime_binding()
-    exact = train_bc.evaluate_composite_validation_measure(
+    natural = train_bc.evaluate_composite_validation_measure(
         data,
         validation_indices,
         evaluate,
@@ -355,9 +356,13 @@ def run_rescore(
             epoch=int(report.get("epochs", 0)),
             optimizer_step=int(report.get("steps_completed", 0)),
         ),
+        training_value_player_outcome_balance_mode=str(
+            report.get("value_player_outcome_balance_mode", "none")
+        ),
+        validation_value_player_outcome_balance_mode="none",
     )
-    if exact.get("schema_version") != "composite-validation-measure-v2":
-        raise RuntimeError("trainer did not emit exact composite validation v2")
+    if natural.get("schema_version") != "composite-validation-measure-v2":
+        raise RuntimeError("trainer did not emit composite validation v2")
     after = {name: _sha256(path) for name, path in paths.items()}
     if after != before:
         raise RuntimeError("posthoc validation input bytes changed during evaluation")
@@ -392,7 +397,7 @@ def run_rescore(
             "readout": scalar_readout,
             "scale": scalar_scale,
         },
-        "exact_validation": exact,
+        "natural_validation": natural,
     }
 
 

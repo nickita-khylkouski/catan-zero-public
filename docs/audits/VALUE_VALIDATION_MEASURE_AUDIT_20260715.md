@@ -1,5 +1,16 @@
 # Value validation-measure audit (2026-07-15)
 
+## 2026-07-16 correction
+
+The component -> game -> row aggregation described below matches the composite
+sampler, but it does not match the complete learner objective when
+`value_player_outcome_balance_mode=sampler_balanced_v1`: that transform is fit
+on training rows only, while validation intentionally retains natural outcomes.
+New reports therefore emit this aggregate as `validation_natural_composite`
+with `objective_matched=false`. Objective-matched consumers fail closed instead
+of treating it as promotion evidence. Historical numbers below are retained as
+evidence about row-mix correction, not as proof of full objective matching.
+
 ## Verdict
 
 Composite training already emitted an authenticated validation aggregate under

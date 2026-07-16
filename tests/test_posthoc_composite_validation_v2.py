@@ -80,6 +80,7 @@ def _report(seed_sha: str) -> dict:
         "forced_row_value_action_type_weights": {"END_TURN": 0.1, "ROLL": 0.25},
         "per_game_value_weight": False,
         "per_game_value_weight_mode": "equal",
+        "value_player_outcome_balance_mode": "sampler_balanced_v1",
         "mask_hidden_info": True,
         "soft_target_temperature": 0.7,
         "soft_target_weight": 0.9,
@@ -154,7 +155,9 @@ def test_forced_row_value_recipe_preserves_legacy_disabled_reports(
     assert catalog is None
 
 
-def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch) -> None:
+def test_run_rescore_is_read_only_and_emits_natural_v2(
+    tmp_path: Path, monkeypatch
+) -> None:
     data = _Composite()
     seeds = np.asarray([11, 12, 21], dtype=np.int64)
     seed_sha = posthoc.train_bc._game_seed_set_sha256(seeds)
@@ -277,7 +280,17 @@ def test_run_rescore_is_read_only_and_emits_exact_v2(tmp_path: Path, monkeypatch
     assert result["checkpoint_mutated"] is False
     assert result["evaluation_repo_commit"] == "abc123"
     assert result["evaluation_tool_sha256"].startswith("sha256:")
-    assert result["exact_validation"]["schema_version"] == "composite-validation-measure-v2"
+    assert result["schema_version"] == "posthoc-composite-validation-v2/v2"
+    natural = result["natural_validation"]
+    assert natural["schema_version"] == "composite-validation-measure-v2"
+    assert natural["objective_matched"] is False
+    assert natural["objective_match"] == {
+        "component_game_row_sampling_matched": True,
+        "training_value_player_outcome_balance_mode": "sampler_balanced_v1",
+        "validation_value_player_outcome_balance_mode": "none",
+        "value_player_outcome_balance_matched": False,
+        "validation_outcome_measure": "natural_holdout_v1",
+    }
     assert before == {
         path: posthoc._sha256(path)
         for path in (report_path, checkpoint, descriptor, manifest)
