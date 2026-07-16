@@ -54,7 +54,32 @@ def main() -> None:
         ),
     )
     parser.add_argument("--bc-epochs", type=int, default=2)
-    parser.add_argument("--bc-batch-size", type=int, default=4096)
+    parser.add_argument(
+        "--bc-global-batch-size",
+        type=int,
+        default=4096,
+        help=(
+            "Effective BC optimizer batch across every DDP rank and gradient-"
+            "accumulation micro-batch. The factory derives train_bc.py's rank-local "
+            "--batch-size from this value and refuses non-divisible topologies."
+        ),
+    )
+    parser.add_argument(
+        "--bc-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Explicit rank-local BC micro-batch override for backwards-compatible "
+            "replays. Prefer --bc-global-batch-size for new runs; when set, the "
+            "manifest records the resulting effective global batch."
+        ),
+    )
+    parser.add_argument(
+        "--bc-grad-accum-steps",
+        type=int,
+        default=1,
+        help="BC micro-batches accumulated per optimizer step on each rank.",
+    )
     parser.add_argument(
         "--bc-amp",
         choices=("none", "bf16"),
@@ -130,6 +155,29 @@ def main() -> None:
         help="Write/print the pipeline manifest without running commands.",
     )
     args = parser.parse_args()
+    world_size = int(args.torchrun_nproc_per_node)
+    grad_accum_steps = int(args.bc_grad_accum_steps)
+    if world_size < 1:
+        raise SystemExit("--torchrun-nproc-per-node must be >= 1")
+    if grad_accum_steps < 1:
+        raise SystemExit("--bc-grad-accum-steps must be >= 1")
+    topology_divisor = world_size * grad_accum_steps
+    if args.bc_batch_size is None:
+        global_batch_size = int(args.bc_global_batch_size)
+        if global_batch_size < 1:
+            raise SystemExit("--bc-global-batch-size must be >= 1")
+        if global_batch_size % topology_divisor:
+            raise SystemExit(
+                "--bc-global-batch-size must be divisible by "
+                "--torchrun-nproc-per-node * --bc-grad-accum-steps: "
+                f"{global_batch_size} % ({world_size} * {grad_accum_steps}) != 0"
+            )
+        local_batch_size = global_batch_size // topology_divisor
+    else:
+        local_batch_size = int(args.bc_batch_size)
+        if local_batch_size < 1:
+            raise SystemExit("--bc-batch-size must be >= 1")
+        global_batch_size = local_batch_size * topology_divisor
     if (
         float(args.loser_sample_weight) < 1.0
         and not args.acknowledge_diagnostic_outcome_conditioned_policy_distillation
@@ -254,13 +302,13 @@ def main() -> None:
             ]
         )
     bc_launcher = [args.python]
-    if int(args.torchrun_nproc_per_node) > 1:
+    if world_size > 1:
         bc_launcher = [
             args.python,
             "-m",
             "torch.distributed.run",
             "--standalone",
-            f"--nproc_per_node={int(args.torchrun_nproc_per_node)}",
+            f"--nproc_per_node={world_size}",
         ]
     commands.extend(
         [
@@ -278,7 +326,9 @@ def main() -> None:
             "--epochs",
             str(args.bc_epochs),
             "--batch-size",
-            str(args.bc_batch_size),
+            str(local_batch_size),
+            "--grad-accum-steps",
+            str(grad_accum_steps),
             "--amp",
             args.bc_amp,
             "--hidden-size",
@@ -402,7 +452,22 @@ def main() -> None:
         )
         commands.append([args.python, "tools/train_selfplay_gpu.py", "--config", str(ppo_config)])
 
-    manifest = {"run_dir": str(run_dir), "commands": commands, "allow_ppo": bool(args.allow_ppo)}
+    manifest = {
+        "run_dir": str(run_dir),
+        "commands": commands,
+        "allow_ppo": bool(args.allow_ppo),
+        "bc_training_topology": {
+            "world_size": world_size,
+            "rank_local_batch_size": local_batch_size,
+            "grad_accum_steps": grad_accum_steps,
+            "effective_global_batch_size": global_batch_size,
+            "batch_size_source": (
+                "explicit_rank_local_override"
+                if args.bc_batch_size is not None
+                else "derived_from_global_batch"
+            ),
+        },
+    }
     write_json(run_dir / "pipeline_manifest.json", manifest)
     if args.dry_run:
         print(json.dumps(manifest, indent=2, sort_keys=True), flush=True)
