@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://catan-zero.local/schemas/production-job-v1.json",
+  "title": "CatanZero production job",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "pipeline", "run_id", "run_dir", "checkpoint", "games", "base_seed", "claim_label"],
+      "properties": {
+        "schema_version": {"const": "catan-zero-production-job-v1"},
+        "pipeline": {"const": "generate"},
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "run_dir": {"$ref": "#/$defs/absolute_path"},
+        "checkpoint": {"$ref": "#/$defs/absolute_path"},
+        "games": {"type": "integer", "minimum": 1},
+        "base_seed": {"type": "integer", "minimum": 0},
+        "claim_label": {"type": "string", "minLength": 1},
+        "workers": {"type": "integer", "minimum": 1},
+        "gpu": {"type": "integer", "minimum": 0},
+        "resume": {"type": "boolean", "default": false}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "pipeline", "run_id", "run_dir", "recipe", "data", "lock", "composite_build_receipt", "plan_receipt"],
+      "properties": {
+        "schema_version": {"const": "catan-zero-production-job-v1"},
+        "pipeline": {"const": "train"},
+        "recipe": {"const": "a1-current-35m-b200"},
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "run_dir": {"$ref": "#/$defs/absolute_path"},
+        "data": {"$ref": "#/$defs/absolute_path"},
+        "lock": {"$ref": "#/$defs/absolute_path"},
+        "composite_build_receipt": {"$ref": "#/$defs/absolute_path"},
+        "plan_receipt": {"$ref": "#/$defs/absolute_path"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "pipeline", "run_id", "run_dir", "recipe", "data", "init_checkpoint"],
+      "properties": {
+        "schema_version": {"const": "catan-zero-production-job-v1"},
+        "pipeline": {"const": "train"},
+        "recipe": {"const": "a1-parent-update-35m-b200"},
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "run_dir": {"$ref": "#/$defs/absolute_path"},
+        "data": {"$ref": "#/$defs/absolute_path"},
+        "init_checkpoint": {"$ref": "#/$defs/absolute_path"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "pipeline", "run_id", "run_dir", "candidate", "champion", "pairs", "workers", "devices", "base_seed"],
+      "properties": {
+        "schema_version": {"const": "catan-zero-production-job-v1"},
+        "pipeline": {"const": "evaluate"},
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "run_dir": {"$ref": "#/$defs/absolute_path"},
+        "candidate": {"$ref": "#/$defs/absolute_path"},
+        "champion": {"$ref": "#/$defs/absolute_path"},
+        "pairs": {"type": "integer", "minimum": 1},
+        "workers": {"type": "integer", "minimum": 1},
+        "devices": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+        "threads_per_worker": {"type": "integer", "minimum": 0, "default": 0},
+        "base_seed": {"type": "integer", "minimum": 0},
+        "held_out_suite": {"$ref": "#/$defs/absolute_path"}
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "pipeline", "run_id", "run_dir"],
+      "properties": {
+        "schema_version": {"const": "catan-zero-production-job-v1"},
+        "pipeline": {"const": "ppo"},
+        "run_id": {"$ref": "#/$defs/run_id"},
+        "run_dir": {"$ref": "#/$defs/absolute_path"}
+      }
+    }
+  ],
+  "$defs": {
+    "run_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,95}$"},
+    "absolute_path": {"type": "string", "pattern": "^/", "minLength": 2}
+  }
+}

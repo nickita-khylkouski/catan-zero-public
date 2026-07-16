@@ -16,6 +16,9 @@ dependencies = [
     "scipy>=1.11",
 ]
 
+[project.scripts]
+catan-zero = "catan_zero.production_cli:main"
+
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "whr>=2.2", "scipy>=1.11"]
 rl = ["torch>=2.0"]

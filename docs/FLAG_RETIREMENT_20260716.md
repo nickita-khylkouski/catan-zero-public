@@ -5,6 +5,8 @@ longer assembled from dozens of command-line switches.
 
 ## Canonical command surfaces
 
+- `catan-zero`: five commands (`status`, `plan`, `prepare`, `doctor`, `run`),
+  with one typed job file instead of pipeline flags
 - `tools/generate.py`: 9 options
 - `tools/evaluate.py`: 10 options
 - `tools/train.py`: 8-option config-first learner adapter; the checked-in fresh-scratch
@@ -29,6 +31,9 @@ still reconstructs retired PIMC and truncated-history behavior from shell
 flags. New multi-host generation enters through the sealed A1 executor selected
 by `tools/loop.py`; the old shell launcher exists only for historical evidence
 and explicitly bounded diagnostics.
+
+The three compact Python launchers are implementation boundaries under
+`catan-zero`, not separate operator workflows. See `docs/PRODUCTION_CLI.md`.
 
 ## Retired generation experiments
 

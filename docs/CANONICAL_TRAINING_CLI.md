@@ -99,11 +99,11 @@ existing data-bound scratch authority. The compact adapter explicitly refuses
 the checked-in scratch recipe so an unresolved schedule cannot be mistaken for
 an authorized run.
 
-`tools/train_bc.py` remains temporarily importable as an internal compatibility
+`tools/train_bc.py` remains temporarily executable as an internal compatibility
 engine because sealed historical receipts and the authenticated scratch/one-dose
 executors bind its script path, functions, and bytes. It remains executable only
-for those issued authorities; it is not a supported interface for new
-hand-authored runs. Once sealed replay and those executors are routed through an
+for those issued authorities; new operator jobs go through `catan-zero`. Once
+sealed replay and those executors are routed through an
 explicit legacy adapter, the parser implementation can be deleted from the
 engine entirely.
 

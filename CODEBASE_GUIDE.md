@@ -14,7 +14,7 @@
 | API Style | Config-first production pipeline; compact launch CLIs and in-process environment/search contracts |
 | Database | Filesystem artifacts: NPZ shards, memmap corpora, JSON/JSONL registries |
 | Auth | SSH fleet config outside the repository; no application auth layer |
-| Where to start | `src/catan_zero/search` for MCTS, `src/catan_zero/rl` for simulation/training, `tools/` for pipelines |
+| Where to start | `tools/loop.py` for a full turn and `catan-zero status` for stage readiness; `src/catan_zero/search` for MCTS and `src/catan_zero/rl` for simulation/training |
 | RL fleet operations | Read `RL_AGENT_HANDOFF.md` before changing fleet state or consuming data |
 
 ---
@@ -135,7 +135,7 @@ tools/loop.py + one sealed turn config
 
 ### `/tools`
 - **Owns:** Generation, training, evaluation, curation, profiling, gates, and experiment orchestration.
-- **Entry point:** Use the compact production launchers `generate.py`, `train.py`, and `evaluate.py`.
+- **Entry point:** Use `tools/loop.py` for a full turn. Use `catan-zero` for an individually attested stage; it resolves typed jobs through the compact launchers.
 - **Key files:**
   - `generate.py` — nine-option config-first generation launcher.
   - `train.py` — eight-option config-first learner launcher.

@@ -163,3 +163,45 @@ def require_production_recipe(
             f"actual_sha256={actual}"
         )
     return str(entry["name"])
+
+
+def production_recipes(entrypoint: str) -> tuple[dict[str, str], ...]:
+    """Return every authenticated recipe for one compact entrypoint.
+
+    Operator layers use this instead of copying catalog paths or digests into a
+    second registry. Every returned entry has already replayed the same
+    checked-in path and semantic-hash checks as the compact launcher.
+    """
+
+    if entrypoint not in SUPPORTED_ENTRYPOINTS:
+        raise ProductionRecipeError(f"unsupported production entrypoint {entrypoint!r}")
+    root = _repository_root()
+    entries = _load_catalog(root)[entrypoint]
+    if not isinstance(entries, list):
+        raise ProductionRecipeError(
+            f"production recipe catalog {entrypoint!r} must be a list"
+        )
+    authenticated: list[dict[str, str]] = []
+    for value in entries:
+        if not isinstance(value, dict) or not isinstance(value.get("path"), str):
+            raise ProductionRecipeError(
+                f"production recipe catalog has malformed {entrypoint} entry"
+            )
+        path = root / value["path"]
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ProductionRecipeError(
+                f"cannot load cataloged {entrypoint} recipe {path}: {error}"
+            ) from error
+        name = require_production_recipe(
+            entrypoint=entrypoint, path=path, payload=payload
+        )
+        authenticated.append(
+            {
+                "name": name,
+                "path": str(path.resolve()),
+                "canonical_sha256": canonical_json_sha256(payload),
+            }
+        )
+    return tuple(authenticated)

@@ -7,6 +7,7 @@ import pytest
 
 from catan_zero.rl.production_recipe_catalog import (
     ProductionRecipeError,
+    production_recipes,
     require_production_recipe,
 )
 
@@ -54,6 +55,17 @@ def test_checked_in_parent_update_recipe_is_authenticated() -> None:
         require_production_recipe(entrypoint="train", path=path, payload=payload)
         == expected_name
     )
+
+
+def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None:
+    train = production_recipes("train")
+
+    assert [entry["name"] for entry in train] == [
+        "a1-current-35m-b200",
+        "a1-parent-update-35m-b200",
+    ]
+    assert all(Path(entry["path"]).is_absolute() for entry in train)
+    assert all(len(entry["canonical_sha256"]) == 64 for entry in train)
 
 
 def test_unlisted_copy_cannot_enter_production(tmp_path: Path) -> None:

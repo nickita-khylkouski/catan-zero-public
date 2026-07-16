@@ -27,6 +27,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools import a1_pre_wave_contract as contract  # noqa: E402
 from tools import production_runtime_contract as runtime_contract  # noqa: E402
+from catan_zero.production_contracts import NATIVE_REQUIRED_CAPABILITIES  # noqa: E402
 
 HOST_SCHEMA = "a1-production-hosts-v1"
 RECEIPT_SCHEMA = "a1-production-executor-receipt-v1"
@@ -50,17 +51,6 @@ NATIVE_WHEEL_NAME = PRODUCTION_RUNTIME["catanatron_rs_wheel_filename"]
 NATIVE_WHEEL_INVENTORY = _REPO_ROOT / "native/catanatron-rs/WHEEL_SHA256SUMS"
 VENDORED_CATANATRON_SENTINEL = (
     "vendor/catanatron/catanatron/catanatron/models/map.py"
-)
-NATIVE_REQUIRED_CAPABILITIES = frozenset(
-    {
-        "sigma_reference_visits",
-        "belief_target_evidence",
-        "initial_road_d1_scope",
-        "public_award_feature_parity",
-        "policy_temperature_semantics",
-        "coherent_public_belief_search",
-        "forced_root_trajectory_only",
-    }
 )
 HISTORICAL_DB1_REPO_ROOT = Path("/home/ubuntu/catan-db1c8b1-campaign")
 HISTORICAL_DB1_CAMPAIGN_PATH = (

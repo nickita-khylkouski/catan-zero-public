@@ -44,6 +44,7 @@ if str(_REPO_ROOT) not in sys.path:
 from tools import a1_evaluation_pool as evaluation_pool  # noqa: E402
 from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import production_runtime_contract as runtime_contract  # noqa: E402
+from catan_zero.production_contracts import NATIVE_REQUIRED_CAPABILITIES  # noqa: E402
 from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
 from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE  # noqa: E402
@@ -89,17 +90,6 @@ DEFAULT_WORKERS_PER_GPU = 16
 PRODUCTION_RUNTIME = runtime_contract.load_runtime_contract()
 NATIVE_WHEEL_VERSION = PRODUCTION_RUNTIME["catanatron_rs_version"]
 NATIVE_WHEEL_NAME = PRODUCTION_RUNTIME["catanatron_rs_wheel_filename"]
-NATIVE_REQUIRED_CAPABILITIES = frozenset(
-    {
-        "sigma_reference_visits",
-        "belief_target_evidence",
-        "initial_road_d1_scope",
-        "public_award_feature_parity",
-        "policy_temperature_semantics",
-        "coherent_public_belief_search",
-        "forced_root_trajectory_only",
-    }
-)
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SAFE_ADDRESS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$")
 
