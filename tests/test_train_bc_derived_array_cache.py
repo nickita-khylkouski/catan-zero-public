@@ -168,6 +168,34 @@ def test_coverage_rejects_unsupported_objective_before_cache_build() -> None:
         )
 
 
+def test_policy_signal_floor_cannot_be_inert_under_weighted_sampler() -> None:
+    args = SimpleNamespace(
+        **TrainConfig().field_values(),
+        base_sampler=train_bc.BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1,
+        minimum_policy_effective_rows_per_global_batch=32.0,
+    )
+
+    with pytest.raises(SystemExit, match="requires --base-sampler"):
+        train_bc._validate_coverage_sampler_configuration(  # noqa: SLF001
+            args,
+            categorical_value_loss_weight=0.0,
+        )
+
+
+def test_policy_signal_floor_requires_enabled_policy_objective() -> None:
+    args = SimpleNamespace(
+        **TrainConfig(policy_loss_weight=0.0).field_values(),
+        base_sampler=train_bc.BASE_SAMPLER_COVERAGE_IMPORTANCE_V1,
+        minimum_policy_effective_rows_per_global_batch=32.0,
+    )
+
+    with pytest.raises(SystemExit, match="positive --policy-loss-weight"):
+        train_bc._validate_coverage_sampler_configuration(  # noqa: SLF001
+            args,
+            categorical_value_loss_weight=0.0,
+        )
+
+
 def test_weighted_epoch_cap_is_exact_historical_prefix():
     n = 10_000
     weights = np.linspace(0.1, 2.0, n, dtype=np.float64)

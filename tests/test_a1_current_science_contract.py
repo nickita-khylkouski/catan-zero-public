@@ -56,6 +56,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     assert not current_science.DIAGNOSTIC_POLICY_AUX_FIELDS & set(recipe)
     assert recipe["phase_weights"] == "PLAY_TURN=4.0"
     assert recipe["base_sampler"] == "coverage_importance_v1"
+    assert recipe["minimum_policy_effective_rows_per_global_batch"] == 32.0
     assert recipe["moe_balance_loss_weight"] == 0.0
     assert recipe["soft_target_source"] == "policy"
     assert recipe["soft_target_weight"] == 1.0

@@ -1109,6 +1109,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--minimum-policy-effective-rows-per-global-batch",
+        type=float,
+        default=0.0,
+        help=(
+            "Coverage-sampler corpus admission floor. Before the first "
+            "optimizer step, estimate policy effective sample size over the "
+            "authenticated training split and scale its fraction to one "
+            "synchronous global optimizer batch "
+            "(batch_size * world_size * grad_accum_steps). A positive floor "
+            "fails closed when sparse or concentrated policy weights provide "
+            "less effective supervision than commissioned. 0 preserves "
+            "historical and diagnostic recipes."
+        ),
+    )
+    parser.add_argument(
         "--training-rng-rank-offset",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -9081,6 +9096,13 @@ def _effective_a1_learner_training_recipe(
         != BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1
     ):
         effective["base_sampler"] = str(args.base_sampler)
+    policy_signal_floor = float(
+        getattr(args, "minimum_policy_effective_rows_per_global_batch", 0.0)
+    )
+    if policy_signal_floor > 0.0:
+        effective["minimum_policy_effective_rows_per_global_batch"] = (
+            policy_signal_floor
+        )
     moe_balance_loss_weight = float(
         getattr(args, "moe_balance_loss_weight", 0.01)
     )
@@ -14586,6 +14608,7 @@ def main(
             policy_surprise_weights_full[train_indices], dtype=np.float32
         )
     coverage_loss_normalizers: dict[str, float] | None = None
+    coverage_policy_signal_admission: dict[str, object] | None = None
     base_sampler = str(args.base_sampler)
     if base_sampler == BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1:
         epoch_sample_weights = component_game_sampling
@@ -14627,6 +14650,22 @@ def main(
             vps_to_win=int(args.vps_to_win),
             public_information_only=bool(args.mask_hidden_info),
         )
+        coverage_policy_signal_admission = _rank0_authoritative_call(
+            ddp,
+            "coverage policy signal admission",
+            lambda: _coverage_policy_signal_admission(
+                train_indices,
+                policy_sample_weights=training_policy_sample_weights,
+                global_batch_size=(
+                    int(args.batch_size)
+                    * (int(ddp["world_size"]) if bool(ddp["enabled"]) else 1)
+                    * int(args.grad_accum_steps)
+                ),
+                minimum_effective_rows_per_global_batch=float(
+                    args.minimum_policy_effective_rows_per_global_batch
+                ),
+            ),
+        )
         if (
             float(resolved_scalar_value_weight) > 0.0
             and coverage_loss_normalizers["value_effective_weight_mean"] <= 0.0
@@ -14652,6 +14691,7 @@ def main(
             "importance_max": float(importance.max()),
             "importance_content_sha256": _array_content_sha256(importance),
             "fixed_loss_normalizers": dict(coverage_loss_normalizers),
+            "policy_signal_admission": dict(coverage_policy_signal_admission),
             "validation_measure_unchanged": True,
             "objective_active_scope": coverage_objective_scope_report,
             "objective_active_schedule": (
@@ -36978,8 +37018,29 @@ def _validate_coverage_sampler_configuration(
 ) -> None:
     """Reject unsupported coverage recipes before any derived cache is written."""
 
+    policy_signal_floor = float(
+        getattr(args, "minimum_policy_effective_rows_per_global_batch", 0.0)
+    )
+    if not math.isfinite(policy_signal_floor) or policy_signal_floor < 0.0:
+        raise SystemExit(
+            "--minimum-policy-effective-rows-per-global-batch must be finite "
+            "and non-negative"
+        )
     if str(args.base_sampler) != BASE_SAMPLER_COVERAGE_IMPORTANCE_V1:
+        if policy_signal_floor > 0.0:
+            raise SystemExit(
+                "--minimum-policy-effective-rows-per-global-batch requires "
+                "--base-sampler coverage_importance_v1"
+            )
         return
+    if (
+        policy_signal_floor > 0.0
+        and float(getattr(args, "policy_loss_weight", 0.0)) <= 0.0
+    ):
+        raise SystemExit(
+            "--minimum-policy-effective-rows-per-global-batch requires a "
+            "positive --policy-loss-weight"
+        )
     if int(args.policy_aux_active_batch_size) > 0:
         raise SystemExit(
             "coverage_importance_v1 is currently sealed for the direct base "
@@ -37127,6 +37188,128 @@ def _coverage_fixed_loss_normalizers(
     if normalizers["policy_effective_weight_mean"] <= 0.0:
         raise SystemExit("coverage policy objective has zero population weight")
     return normalizers
+
+
+def _coverage_policy_signal_admission(
+    train_indices: np.ndarray,
+    *,
+    policy_sample_weights: np.ndarray,
+    global_batch_size: int,
+    minimum_effective_rows_per_global_batch: float,
+    chunk_rows: int = 262_144,
+) -> dict[str, object]:
+    """Measure corpus-level policy dose before a coverage run can optimize.
+
+    Counting only nonzero policy rows misses the failure mode where importance
+    weighting concentrates nearly all policy mass onto a still smaller set.
+    Kish effective sample size, ``sum(w)^2 / sum(w^2)``, captures both sparsity
+    and concentration. Scaling its corpus fraction by the synchronous global
+    batch size gives the expected effective policy rows in one optimizer
+    update. This is an admission statistic, not a claim that every shuffled
+    batch realizes exactly that count.
+
+    The canonical floor is deliberately recipe-bound. It rejects the audited
+    failed corpus (0.85% active and roughly 0.71% ESS: about 4.36 active and
+    3.65 effective rows at global batch 512) while leaving legacy/diagnostic
+    recipes unchanged unless they explicitly commission a positive floor.
+    """
+
+    rows = np.asarray(train_indices, dtype=np.int64)
+    weights = np.asarray(policy_sample_weights)
+    batch_size = int(global_batch_size)
+    minimum = float(minimum_effective_rows_per_global_batch)
+    if rows.ndim != 1 or rows.size == 0:
+        raise ValueError("coverage policy admission requires training rows")
+    if (
+        weights.ndim != 1
+        or np.any(rows < 0)
+        or np.any(rows >= weights.size)
+    ):
+        raise ValueError("coverage policy admission weight alignment drift")
+    if batch_size <= 0:
+        raise ValueError("coverage policy admission requires positive global batch")
+    if (
+        not math.isfinite(minimum)
+        or minimum < 0.0
+        or minimum > float(batch_size)
+    ):
+        raise ValueError(
+            "minimum policy effective rows must be finite and within the "
+            "global batch"
+        )
+
+    active_rows = 0
+    weight_sum = 0.0
+    weight_square_sum = 0.0
+    block_rows = max(1, int(chunk_rows))
+    for start in range(0, rows.size, block_rows):
+        scoped = np.asarray(
+            weights[rows[start : start + block_rows]], dtype=np.float64
+        )
+        if not np.isfinite(scoped).all() or np.any(scoped < 0.0):
+            raise ValueError(
+                "coverage policy admission weights must be finite and non-negative"
+            )
+        active_rows += int(np.count_nonzero(scoped > 0.0))
+        weight_sum += float(np.sum(scoped, dtype=np.float64))
+        weight_square_sum += float(np.dot(scoped, scoped))
+    if active_rows <= 0 or weight_sum <= 0.0 or weight_square_sum <= 0.0:
+        if minimum > 0.0:
+            raise SystemExit("coverage policy objective has zero population weight")
+        return {
+            "schema_version": "coverage-policy-signal-admission-v1",
+            "training_row_count": int(rows.size),
+            "policy_active_row_count": 0,
+            "policy_active_row_fraction": 0.0,
+            "policy_effective_sample_size_rows": 0.0,
+            "policy_effective_sample_fraction": 0.0,
+            "policy_effective_weight_sum": 0.0,
+            "policy_effective_weight_square_sum": 0.0,
+            "effective_global_batch_size": batch_size,
+            "expected_policy_active_rows_per_global_batch": 0.0,
+            "expected_policy_effective_rows_per_global_batch": 0.0,
+            "minimum_policy_effective_rows_per_global_batch": minimum,
+            "admission_enforced": False,
+            "admitted": True,
+            "signal_present": False,
+            "estimator": "kish_ess_fraction_x_synchronous_global_batch_v1",
+        }
+
+    effective_rows = (weight_sum * weight_sum) / weight_square_sum
+    row_count = int(rows.size)
+    active_fraction = float(active_rows) / float(row_count)
+    effective_fraction = float(effective_rows) / float(row_count)
+    expected_active = float(batch_size) * active_fraction
+    expected_effective = float(batch_size) * effective_fraction
+    report: dict[str, object] = {
+        "schema_version": "coverage-policy-signal-admission-v1",
+        "training_row_count": row_count,
+        "policy_active_row_count": active_rows,
+        "policy_active_row_fraction": active_fraction,
+        "policy_effective_sample_size_rows": float(effective_rows),
+        "policy_effective_sample_fraction": effective_fraction,
+        "policy_effective_weight_sum": weight_sum,
+        "policy_effective_weight_square_sum": weight_square_sum,
+        "effective_global_batch_size": batch_size,
+        "expected_policy_active_rows_per_global_batch": expected_active,
+        "expected_policy_effective_rows_per_global_batch": expected_effective,
+        "minimum_policy_effective_rows_per_global_batch": minimum,
+        "admission_enforced": minimum > 0.0,
+        "admitted": expected_effective >= minimum,
+        "signal_present": True,
+        "estimator": "kish_ess_fraction_x_synchronous_global_batch_v1",
+    }
+    if minimum > 0.0 and expected_effective < minimum:
+        raise SystemExit(
+            "coverage policy signal admission refused sparse/concentrated "
+            "supervision before the first optimizer step: "
+            f"active_rows={active_rows}/{row_count} "
+            f"expected_active_per_global_batch={expected_active:.6g} "
+            f"effective_sample_size={effective_rows:.6g} "
+            f"expected_effective_per_global_batch={expected_effective:.6g} "
+            f"required={minimum:.6g} global_batch={batch_size}"
+        )
+    return report
 
 
 def _compose_per_game_policy_surprise_sampling_weights(
@@ -39426,6 +39609,9 @@ def _training_resume_recipe_identity(
         ),
         "base_sampler": str(
             getattr(args, "base_sampler", BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1)
+        ),
+        "minimum_policy_effective_rows_per_global_batch": float(
+            getattr(args, "minimum_policy_effective_rows_per_global_batch", 0.0)
         ),
         "entity_feature_adapter_version": resume_entity_adapter,
         "public_rule_state_features": bool(

@@ -31,6 +31,12 @@ def test_canonical_coverage_recipe_can_reach_composite_training() -> None:
 
     fields = _fields()
     assert _payload()["engine_settings"]["base_sampler"] == "coverage_importance_v1"
+    assert (
+        _payload()["engine_settings"][
+            "minimum_policy_effective_rows_per_global_batch"
+        ]
+        == 32.0
+    )
     assert fields["data_format"] == "memmap"
     assert fields["validation_max_samples"] == 0
 

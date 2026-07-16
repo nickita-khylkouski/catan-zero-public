@@ -8,6 +8,7 @@ from tools.train_bc import (
     _compose_per_game_policy_surprise_sampling_weights,
     _coverage_fixed_loss_normalizers,
     _coverage_importance_weights,
+    _coverage_policy_signal_admission,
     _epoch_order,
     compute_policy_surprise_kl,
     per_game_capped_policy_surprise_sampling_weights,
@@ -295,6 +296,129 @@ def test_coverage_normalizers_match_effective_policy_and_value_masks() -> None:
     assert normalizers["policy_effective_weight_mean"] == pytest.approx(1.0)
     assert normalizers["value_effective_weight_mean"] == pytest.approx(1.25 / 3.0)
     assert normalizers["final_vp_effective_weight_mean"] == pytest.approx(1.0 / 3.0)
+
+
+def test_coverage_policy_admission_rejects_audited_sparse_signal() -> None:
+    rows = np.arange(959_142, dtype=np.int64)
+    weights = np.zeros(rows.size, dtype=np.float64)
+    weights[:8_178] = 1.0
+    # One heavier synthetic row exactly reproduces the audited 6,835.96 ESS
+    # without copying any private corpus payload into the repository.
+    weights[0] = 41.268579058650666
+
+    report = _coverage_policy_signal_admission(
+        rows,
+        policy_sample_weights=weights,
+        global_batch_size=512,
+        minimum_effective_rows_per_global_batch=0.0,
+    )
+
+    assert report["policy_active_row_count"] == 8_178
+    assert report["policy_effective_sample_size_rows"] == pytest.approx(6_835.96)
+    assert report["expected_policy_active_rows_per_global_batch"] == pytest.approx(
+        4.36550, rel=1e-5
+    )
+    assert report["expected_policy_effective_rows_per_global_batch"] == pytest.approx(
+        3.64911, rel=1e-5
+    )
+
+    with pytest.raises(SystemExit, match="refused sparse/concentrated"):
+        _coverage_policy_signal_admission(
+            rows,
+            policy_sample_weights=weights,
+            global_batch_size=512,
+            minimum_effective_rows_per_global_batch=32.0,
+        )
+
+
+def test_coverage_policy_admission_accepts_commissioned_signal_margin() -> None:
+    rows = np.arange(4_096, dtype=np.int64)
+    weights = np.zeros(rows.size, dtype=np.float32)
+    weights[:1_024] = 1.0
+
+    report = _coverage_policy_signal_admission(
+        rows,
+        policy_sample_weights=weights,
+        global_batch_size=512,
+        minimum_effective_rows_per_global_batch=32.0,
+    )
+
+    assert report["policy_active_row_fraction"] == pytest.approx(0.25)
+    assert report["policy_effective_sample_fraction"] == pytest.approx(0.25)
+    assert report["expected_policy_effective_rows_per_global_batch"] == pytest.approx(
+        128.0
+    )
+    assert report["admitted"] is True
+
+
+def test_coverage_policy_admission_detects_weight_concentration() -> None:
+    rows = np.arange(1_024, dtype=np.int64)
+    weights = np.ones(rows.size, dtype=np.float64)
+    weights[0] = 1_024.0
+
+    with pytest.raises(SystemExit, match="effective_sample_size"):
+        _coverage_policy_signal_admission(
+            rows,
+            policy_sample_weights=weights,
+            global_batch_size=512,
+            minimum_effective_rows_per_global_batch=32.0,
+        )
+
+
+def test_coverage_policy_admission_uses_synchronous_ddp_batch_geometry() -> None:
+    rows = np.arange(1_000, dtype=np.int64)
+    weights = np.zeros(rows.size, dtype=np.float32)
+    weights[:100] = 1.0
+
+    report = _coverage_policy_signal_admission(
+        rows,
+        policy_sample_weights=weights,
+        global_batch_size=64 * 8 * 2,
+        minimum_effective_rows_per_global_batch=32.0,
+    )
+
+    assert report["effective_global_batch_size"] == 1_024
+    assert report["expected_policy_active_rows_per_global_batch"] == pytest.approx(
+        102.4
+    )
+    assert report["expected_policy_effective_rows_per_global_batch"] == pytest.approx(
+        102.4
+    )
+
+
+def test_coverage_policy_admission_is_global_topology_equivalent() -> None:
+    rows = np.arange(1_000, dtype=np.int64)
+    weights = np.zeros(rows.size, dtype=np.float32)
+    weights[:100] = 1.0
+
+    reports = [
+        _coverage_policy_signal_admission(
+            rows,
+            policy_sample_weights=weights,
+            global_batch_size=local * world * accumulation,
+            minimum_effective_rows_per_global_batch=32.0,
+        )
+        for local, world, accumulation in ((512, 1, 1), (64, 8, 1), (64, 4, 2))
+    ]
+
+    assert [
+        report["expected_policy_effective_rows_per_global_batch"]
+        for report in reports
+    ] == pytest.approx([51.2, 51.2, 51.2])
+
+
+def test_zero_floor_reports_absent_policy_signal_without_new_refusal() -> None:
+    report = _coverage_policy_signal_admission(
+        np.arange(32, dtype=np.int64),
+        policy_sample_weights=np.zeros(32, dtype=np.float32),
+        global_batch_size=32,
+        minimum_effective_rows_per_global_batch=0.0,
+    )
+
+    assert report["admission_enforced"] is False
+    assert report["admitted"] is True
+    assert report["signal_present"] is False
+    assert report["expected_policy_effective_rows_per_global_batch"] == 0.0
 
 
 def test_coverage_permutation_visits_every_row_once() -> None:

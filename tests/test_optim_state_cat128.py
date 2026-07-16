@@ -512,6 +512,7 @@ def _resume_identity_args(**overrides):
         "scalar_value_loss_scale": 1.0,
         "value_player_outcome_balance_mode": "none",
         "base_sampler": "weighted_replacement_v1",
+        "minimum_policy_effective_rows_per_global_batch": 0.0,
         "entity_feature_adapter_version": None,
         "public_rule_state_features": False,
         "value_tower_split_layers": 0,
@@ -540,6 +541,7 @@ def _resume_identity_args(**overrides):
         ("scalar_value_loss_scale", 0.75),
         ("value_player_outcome_balance_mode", "sampler_balanced_v1"),
         ("base_sampler", "coverage_importance_v1"),
+        ("minimum_policy_effective_rows_per_global_batch", 32.0),
         (
             "entity_feature_adapter_version",
             "rust_entity_adapter_v5_meaningful_history_v2",

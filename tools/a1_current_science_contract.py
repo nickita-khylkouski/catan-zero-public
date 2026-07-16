@@ -79,6 +79,12 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # never the training loss.
     "checkpoint_steps": "8,16,32,64,128,256,512,1024",
     "base_sampler": "coverage_importance_v1",
+    # The failed Stage-C corpus exposed only 3.649 Kish-effective policy rows
+    # per global-512 update. The exact fresh-corpus preflight (after holdout,
+    # phase/per-game weights, forced-row exclusion, and coverage importance)
+    # measures 41.002. Require 32: 8.77x above the failed regime with a 28%
+    # measured margin on the commissioned corpus.
+    "minimum_policy_effective_rows_per_global_batch": 32.0,
     # The commissioned scratch model has no routed experts.  The generic
     # trainer default is intentionally useful for MoE experiments, but leaving
     # it implicit here makes coverage_importance_v1 reject the production
