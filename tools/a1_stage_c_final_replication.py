@@ -37,6 +37,7 @@ for root in (REPO_ROOT, REPO_ROOT / "tools"):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
+from tools import a1_b200_stage_c_learner_campaign as stage_c_campaign  # noqa: E402
 from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
 from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 from tools import a1_stage_c_reanalysis_executor as reanalysis  # noqa: E402
@@ -49,6 +50,7 @@ ROOT_MANIFEST_SCHEMA = "a1-stage-c-independent-root-manifest-v1"
 FINAL_CORPUS_ADMISSION_SCHEMA = "a1-stage-c-final-corpus-admission-v1"
 FINAL_AUTHORITY_SCHEMA = "a1-stage-c-final-matched-replication-authority-v2"
 FRESH_FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
+CAMPAIGN_SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v6"
 EXPECTED_ARM = "STRATEGIC_BALANCED"
 EXPECTED_ROOTS = 8_192
 EXPECTED_PARTITIONS = 64
@@ -202,6 +204,48 @@ def _sealed(path: Path, *, schema: str, digest_field: str, where: str) -> dict[s
     return payload
 
 
+def _expected_feature_learning_contract() -> dict[str, Any]:
+    return {
+        "effective_architecture": dict(stage_c_campaign.EFFECTIVE_FEATURE_CONTRACT),
+        "module_optimizer_observability_schema": (
+            "module-optimizer-observability-v1"
+        ),
+        "norm_scope": "global_replicated",
+        "diagnostic_cadence_batches": (
+            stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+        ),
+        "minimum_observed_steps": (
+            stage_c_campaign.MINIMUM_FEATURE_SIGNAL_OBSERVATIONS
+        ),
+        "required_modules": sorted(stage_c_campaign.FEATURE_SIGNAL_MODULES),
+        "required_positive_fields": list(
+            stage_c_campaign.POSITIVE_OPTIMIZER_SIGNAL_FIELDS
+        ),
+    }
+
+
+def _expected_value_gate_contract() -> dict[str, Any]:
+    return {
+        "policy": stage_c_campaign.VALUE_GATE_POLICY,
+        "metric": "primary_value_loss",
+        "metric_kind": "scalar_mse",
+        "parent_baseline": "fresh_exact_report_bound_parent_forward",
+        "max_absolute_regression": 0.0,
+        "phase_slices_required": [],
+        "phase_slice_reason": (
+            "current posthoc evidence has no objective-matched per-phase "
+            "value sufficient statistics"
+        ),
+    }
+
+
+def _path_matches(value: object, expected: Path) -> bool:
+    try:
+        return Path(str(value)).resolve(strict=True) == expected
+    except OSError:
+        return False
+
+
 def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
     resolved, payload = _load_json(path, where="fresh-parent fingerprint")
     unsigned = dict(payload)
@@ -249,8 +293,10 @@ def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
     _campaign_path, campaign = _load_json(campaign_path, where="Stage-C campaign")
     campaign_unsigned = dict(campaign)
     campaign_stated = campaign_unsigned.pop("campaign_sha256", None)
+    selection = campaign.get("selection_contract")
     if (
-        campaign_stated != value_sha256(campaign_unsigned)
+        campaign.get("schema_version") != CAMPAIGN_SCHEMA
+        or campaign_stated != value_sha256(campaign_unsigned)
         or campaign_stated != campaign_ref.get("campaign_sha256")
         or campaign.get("arm") != EXPECTED_ARM
         or campaign.get("diagnostic_only") is not True
@@ -264,11 +310,124 @@ def _fingerprint(path: Path) -> tuple[Path, dict[str, Any]]:
             "local_batch_size": 512,
             "global_batch_size": 4096,
         }
+        or campaign.get("feature_learning_signal_contract")
+        != _expected_feature_learning_contract()
+        or not isinstance(selection, dict)
+        or selection.get("requires_checkpoint_local_feature_learning_signal")
+        is not True
+        or selection.get("earliest_feature_signal_step")
+        != stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+        or selection.get("value_quality_gate") != _expected_value_gate_contract()
+        or payload.get("value_quality_gate") != selection.get("value_quality_gate")
     ):
         raise FinalReplicationError("Stage-C strategic campaign semantics drifted")
     payload["_verified_campaign"] = campaign
     payload["_verified_campaign_path"] = str(campaign_path)
     return resolved, payload
+
+
+def _completed_report(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
+    completed = fingerprint.get("completed_dose")
+    report_ref = completed.get("report") if isinstance(completed, dict) else None
+    if not isinstance(report_ref, dict):
+        raise FinalReplicationError("fresh-parent fingerprint lost completed report")
+    report_path = _regular_file(
+        Path(str(report_ref.get("path", ""))), where="completed Stage-C report"
+    )
+    if file_sha256(report_path) != report_ref.get("file_sha256"):
+        raise FinalReplicationError("completed Stage-C report bytes drifted")
+    return _load_json(report_path, where="completed Stage-C report")[1]
+
+
+def _authenticate_checkpoint_evidence(
+    fingerprint: Mapping[str, Any],
+    record: Mapping[str, Any],
+    *,
+    step: int,
+    checkpoint: Path,
+) -> None:
+    digest = file_sha256(checkpoint)
+    binding = record.get("checkpoint_report_binding")
+    if (
+        not isinstance(binding, dict)
+        or binding.get("schema_version")
+        != "stage-c-checkpoint-report-binding-v1"
+        or binding.get("optimizer_step") != step
+        or not _path_matches(binding.get("checkpoint"), checkpoint)
+        or binding.get("checkpoint_sha256") != digest
+    ):
+        raise FinalReplicationError(
+            f"step {step} checkpoint report binding is malformed"
+        )
+    report = _completed_report(fingerprint)
+    if step == stage_c_campaign.MAX_STEPS:
+        completed = fingerprint["completed_dose"]["terminal_checkpoint"]
+        if (
+            binding.get("source") != "receipt_bound_terminal_checkpoint"
+            or not _path_matches(report.get("checkpoint"), checkpoint)
+            or not _path_matches(completed.get("path"), checkpoint)
+            or completed.get("file_sha256") != digest
+        ):
+            raise FinalReplicationError(
+                f"step {step} terminal checkpoint report binding drifted"
+            )
+    else:
+        matches = [
+            item
+            for item in report.get("intermediate_checkpoints", [])
+            if isinstance(item, dict) and item.get("optimizer_step") == step
+        ]
+        if (
+            binding.get("source") != "authenticated_intermediate_checkpoint"
+            or len(matches) != 1
+            or matches[0].get("schema_version")
+            != "train-bc-intermediate-checkpoint-v1"
+            or matches[0].get("same_training_trajectory") is not True
+            or not _path_matches(matches[0].get("checkpoint"), checkpoint)
+            or matches[0].get("checkpoint_sha256") != digest
+            or matches[0].get("size_bytes") != checkpoint.stat().st_size
+        ):
+            raise FinalReplicationError(
+                f"step {step} intermediate checkpoint report binding drifted"
+            )
+
+    signal = record.get("feature_learning_signal")
+    if not isinstance(signal, dict) or signal.get("optimizer_step") != step:
+        raise FinalReplicationError(
+            f"step {step} checkpoint-local feature evidence is missing"
+        )
+    authenticated = signal.get("authenticated") is True
+    if record.get("feature_learning_signal_authenticated") is not authenticated:
+        raise FinalReplicationError(
+            f"step {step} checkpoint-local feature evidence contradicts summary"
+        )
+    if not authenticated:
+        if (
+            step >= stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+            or signal.get("reason")
+            != "awaiting_feature_optimizer_observation_cadence"
+        ):
+            raise FinalReplicationError(
+                f"step {step} unauthenticated feature evidence is inconsistent"
+            )
+        return
+    try:
+        stage_c_campaign._verify_feature_optimizer_observability(  # noqa: SLF001
+            signal,
+            minimum_observations=1,
+            where=f"final replication checkpoint {step}",
+        )
+    except stage_c_campaign.CampaignError as error:
+        raise FinalReplicationError(
+            f"step {step} checkpoint-local feature evidence is invalid"
+        ) from error
+    if signal.get("feature_paths") != {
+        "public_card": {"enabled": True, "status": "observed"},
+        "meaningful_history": {"enabled": True, "status": "observed"},
+    }:
+        raise FinalReplicationError(
+            f"step {step} checkpoint-local feature paths are invalid"
+        )
 
 
 def _checkpoint_record(
@@ -297,6 +456,12 @@ def _checkpoint_record(
     )
     if file_sha256(checkpoint) != record.get("checkpoint_sha256"):
         raise FinalReplicationError(f"step {step} checkpoint bytes drifted")
+    _authenticate_checkpoint_evidence(
+        fingerprint,
+        record,
+        step=step,
+        checkpoint=checkpoint,
+    )
     return record
 
 

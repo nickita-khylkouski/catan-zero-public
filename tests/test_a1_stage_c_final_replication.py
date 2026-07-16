@@ -21,7 +21,7 @@ def _write_sealed(path: Path, value: dict, field: str) -> dict:
 
 def _campaign(tmp_path: Path, *, parent_sha: str) -> tuple[Path, dict]:
     value = {
-        "schema_version": "a1-b200-stage-c-aligned-learner-campaign-v1",
+        "schema_version": final.CAMPAIGN_SCHEMA,
         "arm": final.EXPECTED_ARM,
         "diagnostic_only": True,
         "promotion_eligible": False,
@@ -53,6 +53,16 @@ def _campaign(tmp_path: Path, *, parent_sha: str) -> tuple[Path, dict]:
             "policy_kl_anchor_weight": 0.0,
             "forced_row_value_action_type_weights": "END_TURN=1,ROLL=1",
         },
+        "selection_contract": {
+            "requires_checkpoint_local_feature_learning_signal": True,
+            "earliest_feature_signal_step": (
+                final.stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+            ),
+            "value_quality_gate": final._expected_value_gate_contract(),  # noqa: SLF001
+        },
+        "feature_learning_signal_contract": (
+            final._expected_feature_learning_contract()  # noqa: SLF001
+        ),
     }
     path = tmp_path / "campaign.json"
     return path, _write_sealed(path, value, "campaign_sha256")
@@ -63,17 +73,87 @@ def _fingerprint(
 ) -> tuple[Path, dict]:
     campaign_path, campaign = _campaign(tmp_path, parent_sha=parent_sha)
     records = []
+    checkpoints = {}
     for step in steps:
         checkpoint = tmp_path / f"candidate_step{step:04d}.pt"
         checkpoint.write_bytes(f"candidate-{step}".encode())
+        checkpoints[step] = checkpoint
+    terminal = checkpoints.get(final.stage_c_campaign.MAX_STEPS)
+    if terminal is None:
+        terminal = tmp_path / "candidate.pt"
+        terminal.write_bytes(b"terminal-candidate")
+    report_path = tmp_path / "train.report.json"
+    report = {
+        "checkpoint": str(terminal),
+        "intermediate_checkpoints": [
+            {
+                "schema_version": "train-bc-intermediate-checkpoint-v1",
+                "optimizer_step": step,
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": final.file_sha256(checkpoint),
+                "size_bytes": checkpoint.stat().st_size,
+                "same_training_trajectory": True,
+                "optimizer_sidecar": None,
+            }
+            for step, checkpoint in checkpoints.items()
+            if step != final.stage_c_campaign.MAX_STEPS
+        ],
+    }
+    report_path.write_text(json.dumps(report, sort_keys=True))
+    for step, checkpoint in checkpoints.items():
+        feature_authenticated = True
+        feature_signal = (
+            {
+                "authenticated": True,
+                "schema_version": "module-optimizer-observability-v1",
+                "observed_steps": 1,
+                "cadence_batches": (
+                    final.stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+                ),
+                "norm_scope": "global_replicated",
+                "modules": {
+                    module: {
+                        "mean_pre_clip_grad_norm": 0.4,
+                        "max_pre_clip_grad_norm": 0.6,
+                        "mean_parameter_delta_norm": 0.02,
+                        "mean_parameter_update_rms": 0.001,
+                        "parameter_count": 8,
+                    }
+                    for module in final.stage_c_campaign.FEATURE_SIGNAL_MODULES
+                },
+                "optimizer_step": step,
+                "feature_paths": {
+                    "public_card": {"enabled": True, "status": "observed"},
+                    "meaningful_history": {"enabled": True, "status": "observed"},
+                },
+            }
+            if feature_authenticated
+            else {
+                "authenticated": False,
+                "reason": "awaiting_feature_optimizer_observation_cadence",
+                "optimizer_step": step,
+            }
+        )
         records.append(
             {
                 "step": step,
                 "eligible": step != 16,
-                "feature_learning_signal_authenticated": step != 16,
-                "value_quality_gate": {"passed": step != 16},
+                "feature_learning_signal_authenticated": feature_authenticated,
+                "feature_learning_signal": feature_signal,
+                "value_quality_gate": {"passed": True},
                 "checkpoint": str(checkpoint),
                 "checkpoint_sha256": final.file_sha256(checkpoint),
+                "checkpoint_report_binding": {
+                    "schema_version": "stage-c-checkpoint-report-binding-v1",
+                    "optimizer_step": step,
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_sha256": final.file_sha256(checkpoint),
+                    "source": (
+                        "receipt_bound_terminal_checkpoint"
+                        if step == final.stage_c_campaign.MAX_STEPS
+                        else "authenticated_intermediate_checkpoint"
+                    ),
+                },
             }
         )
     value = {
@@ -83,13 +163,20 @@ def _fingerprint(
             "campaign_sha256": campaign["campaign_sha256"],
         },
         "checkpoints": records,
-        "completed_dose": {"feature_learning_signal_authenticated": True},
+        "completed_dose": {
+            "feature_learning_signal_authenticated": True,
+            "report": {
+                "path": str(report_path),
+                "file_sha256": final.file_sha256(report_path),
+            },
+            "terminal_checkpoint": {
+                "path": str(terminal),
+                "file_sha256": final.file_sha256(terminal),
+            },
+        },
         "stored_generation_prior_used_as_selection_authority": False,
         "optimizer_batch_kl_used_as_trust_authority": False,
-        "value_quality_gate": {
-            "policy": "require_non_regression",
-            "max_absolute_regression": 0.0,
-        },
+        "value_quality_gate": final._expected_value_gate_contract(),  # noqa: SLF001
         "separate_exact_parent_evidence": {"selection_authority": True},
     }
     path = tmp_path / "fingerprint.json"
@@ -409,8 +496,9 @@ def test_fingerprint_refuses_eligible_checkpoint_without_feature_signal(
     tmp_path: Path,
 ) -> None:
     fingerprint_path, fingerprint = _fingerprint(
-        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(8,)
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(16,)
     )
+    fingerprint["checkpoints"][0]["eligible"] = True
     fingerprint["checkpoints"][0][
         "feature_learning_signal_authenticated"
     ] = False
@@ -422,6 +510,75 @@ def test_fingerprint_refuses_eligible_checkpoint_without_feature_signal(
         final.FinalReplicationError, match="fingerprint semantics drifted"
     ):
         final._fingerprint(bad_path)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("schema", "feature_contract", "value_gate"),
+)
+def test_fingerprint_refuses_campaign_contract_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(16,)
+    )
+    campaign_path = Path(fingerprint["campaign"]["path"])
+    campaign = json.loads(campaign_path.read_text())
+    campaign.pop("campaign_sha256")
+    if mutation == "schema":
+        campaign["schema_version"] = "a1-b200-stage-c-aligned-learner-campaign-v5"
+    elif mutation == "feature_contract":
+        campaign["feature_learning_signal_contract"].pop("required_modules")
+    else:
+        campaign["selection_contract"]["value_quality_gate"][
+            "max_absolute_regression"
+        ] = 0.01
+    campaign = _write_sealed(campaign_path, campaign, "campaign_sha256")
+    fingerprint["campaign"] = {
+        **final._artifact(campaign_path),  # noqa: SLF001
+        "campaign_sha256": campaign["campaign_sha256"],
+    }
+    fingerprint.pop("fingerprint_sha256")
+    _write_sealed(fingerprint_path, fingerprint, "fingerprint_sha256")
+
+    with pytest.raises(
+        final.FinalReplicationError, match="campaign semantics drifted"
+    ):
+        final._fingerprint(fingerprint_path)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing_report_binding", "contradictory_feature_evidence"),
+)
+def test_checkpoint_record_refuses_unbound_local_evidence(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(16,)
+    )
+    record = fingerprint["checkpoints"][0]
+    if mutation == "missing_report_binding":
+        record.pop("checkpoint_report_binding")
+    else:
+        record["feature_learning_signal"]["modules"][
+            next(iter(final.stage_c_campaign.FEATURE_SIGNAL_MODULES))
+        ]["mean_parameter_update_rms"] = 0.0
+    fingerprint.pop("fingerprint_sha256")
+    _write_sealed(fingerprint_path, fingerprint, "fingerprint_sha256")
+    _path, verified = final._fingerprint(fingerprint_path)  # noqa: SLF001
+
+    with pytest.raises(
+        final.FinalReplicationError,
+        match="checkpoint report binding|feature evidence",
+    ):
+        final._checkpoint_record(  # noqa: SLF001
+            verified,
+            16,
+            require_fingerprint_eligible=False,
+        )
 
 
 def test_root_manifest_refuses_diagnostic_or_eval_overlap(
