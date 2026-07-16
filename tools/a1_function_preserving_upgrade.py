@@ -94,6 +94,13 @@ MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V
 )
 MODULE_CURRENT_V5 = "entity_graph.current_v5_coherent_learner.v1"
 MODULE_VALUE_TOWER_SPLIT_1 = "entity_graph.value_tower_split.1_from_6layer.v1"
+MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1 = (
+    "entity_graph.action_target_gather+static_action_residual+"
+    "legal_action_value_residual+legal_action_value_set_statistics+"
+    "public_card_count_features+meaningful_public_history+"
+    "meaningful_history_target_gather+actor_public_rule_state.v5+"
+    "value_tower_split1"
+)
 MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY = (
     "entity_graph.meaningful_public_history.ordered_attention.v2"
 )
@@ -608,6 +615,34 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
         },
         "config_delta": {"action_cross_attention_layers": 1},
     },
+}
+
+# The live f7 incumbent predates both the current-v5 learner surface and the
+# commissioned split value suffix.  Issuing two independent receipts leaves a
+# gap because the promotion contract accepts one exact parent-to-initializer
+# edge.  This reviewed composite is the same deterministic construction done
+# in one pass: every current-v5 addition is zero-output, and the private value
+# suffix is cloned exactly from the incumbent's final policy block/state norm.
+# Keeping this as one allowlisted edge lets the ordinary one-dose receipt bind
+# exact incumbent bytes directly to the final initializer without checkpoint
+# chaining or a second provenance vocabulary.
+ALLOWLIST[MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1] = {
+    "flags": {
+        **ALLOWLIST[MODULE_CURRENT_V5]["flags"],
+        **ALLOWLIST[MODULE_VALUE_TOWER_SPLIT_1]["flags"],
+    },
+    "source_config_requirements": dict(
+        ALLOWLIST[MODULE_VALUE_TOWER_SPLIT_1]["source_config_requirements"]
+    ),
+    "new_parameter_initialization": {
+        **ALLOWLIST[MODULE_CURRENT_V5]["new_parameter_initialization"],
+        **ALLOWLIST[MODULE_VALUE_TOWER_SPLIT_1]["new_parameter_initialization"],
+    },
+    "config_delta": {
+        **ALLOWLIST[MODULE_CURRENT_V5]["config_delta"],
+        **ALLOWLIST[MODULE_VALUE_TOWER_SPLIT_1]["config_delta"],
+    },
+    "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V5,
 }
 
 

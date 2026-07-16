@@ -38,7 +38,7 @@ STAGE_TOOLS = {
     "audit": frozenset(("tools/a1_pre_wave_contract.py",)),
     "composite": frozenset(("tools/a1_build_post_wave_composite.py",)),
     "train": frozenset(
-        ("tools/train.py", "tools/a1_one_dose_train.py", "tools/a1_scratch_train.py")
+        ("tools/a1_one_dose_train.py", "tools/a1_scratch_train.py")
     ),
     "evaluate": frozenset(("tools/evaluate.py",)),
     "promote": frozenset(("tools/a1_promotion_transaction.py",)),

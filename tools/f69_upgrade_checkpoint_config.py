@@ -125,7 +125,34 @@ def _build_upgraded_config(
 def _parse_flags(raw: str) -> dict[str, object]:
     overrides: dict[str, object] = {}
     for entry in (piece.strip() for piece in raw.split(",") if piece.strip()):
-        if entry in ("gather", "action_target_gather"):
+        if entry in ("current_v5_split1", "current-v5-split1"):
+            # Canonical direct legacy-incumbent -> commissioned parent
+            # topology. Keep this one token so operators cannot accidentally
+            # omit a zero-output module or request the historical default
+            # value split of two layers.
+            overrides.update(
+                {
+                    "action_target_gather": True,
+                    "static_action_residual": True,
+                    "legal_action_value_residual": True,
+                    "legal_action_value_set_statistics": True,
+                    "public_card_count_features": True,
+                    "public_card_count_residual_bias": False,
+                    "meaningful_public_history": True,
+                    "meaningful_public_history_schema": (
+                        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+                    ),
+                    "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT,
+                    "meaningful_public_history_pooling": ORDERED_ATTENTION_V2,
+                    "meaningful_public_history_target_gather": True,
+                    "public_rule_state_features": True,
+                    "public_rule_state_feature_schema": (
+                        PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+                    ),
+                    "value_tower_split_layers": 1,
+                }
+            )
+        elif entry in ("gather", "action_target_gather"):
             overrides["action_target_gather"] = True
         elif entry in ("value", "value_attention_pool"):
             overrides["value_attention_pool"] = True
@@ -203,6 +230,7 @@ def _parse_flags(raw: str) -> dict[str, object]:
         elif entry in (
             "legal_action_value_set_statistics",
             "value_set_statistics",
+            "legal_set_statistics",
         ):
             overrides["legal_action_value_residual"] = True
             overrides["legal_action_value_set_statistics"] = True
@@ -224,6 +252,8 @@ def _parse_flags(raw: str) -> dict[str, object]:
             # still holds on those keys.
             n = entry.split(":", 1)[1] if ":" in entry else "33"
             overrides["value_categorical_bins"] = int(n)
+        elif entry == "value_tower_split1":
+            overrides["value_tower_split_layers"] = 1
         elif entry.startswith(("value_split", "value_tower")):
             n = entry.split(":", 1)[1] if ":" in entry else "2"
             overrides["value_tower_split_layers"] = int(n)

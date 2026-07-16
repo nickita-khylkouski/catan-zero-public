@@ -648,6 +648,33 @@ def test_value_tower_split_receipt_binds_exact_six_layer_source(tmp_path: Path) 
     )
 
 
+def test_current_v5_split1_is_one_direct_reviewed_upgrade_edge() -> None:
+    composite = upgrade.ALLOWLIST[
+        upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1
+    ]
+    current = upgrade.ALLOWLIST[upgrade.MODULE_CURRENT_V5]
+    split = upgrade.ALLOWLIST[upgrade.MODULE_VALUE_TOWER_SPLIT_1]
+
+    assert composite["flags"] == {**current["flags"], **split["flags"]}
+    assert composite["config_delta"] == {
+        **current["config_delta"],
+        **split["config_delta"],
+    }
+    assert composite["new_parameter_initialization"] == {
+        **current["new_parameter_initialization"],
+        **split["new_parameter_initialization"],
+    }
+    assert composite["source_config_requirements"] == split[
+        "source_config_requirements"
+    ]
+    assert upgrade_tool._parse_flags("current_v5_split1") == composite["flags"]  # noqa: SLF001
+    assert upgrade_tool._parse_flags(  # noqa: SLF001
+        "gather,static,legal_action_value_residual,value_set_statistics,"
+        "card_count_v2,history_v2,history_target_gather,public_rule_state,"
+        "value_split:1"
+    ) == composite["flags"]
+
+
 @pytest.mark.parametrize(
     "source_overrides",
     [

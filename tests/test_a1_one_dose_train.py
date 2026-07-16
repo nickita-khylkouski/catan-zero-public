@@ -4683,3 +4683,33 @@ def test_cli_is_dry_run_by_default() -> None:
         ]
     )
     assert args.go is False
+
+
+def test_direct_composite_parent_upgrade_renders_complete_topology() -> None:
+    command = ["python", "train_bc.py"]
+    executor._append_current_parent_topology_cli(  # noqa: SLF001
+        command,
+        executor.architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+    )
+
+    assert command == [
+        "python",
+        "train_bc.py",
+        "--action-target-gather",
+        "--static-action-residual",
+        "--legal-action-value-residual",
+        "--legal-action-value-set-statistics",
+        "--public-card-count-features",
+        "--no-public-card-count-residual-bias",
+        "--meaningful-public-history",
+        "--event-history-limit",
+        "64",
+        "--meaningful-public-history-pooling",
+        "ordered_attention_v2",
+        "--meaningful-public-history-target-gather",
+        "--public-rule-state-features",
+        "--entity-feature-adapter-version",
+        "rust_entity_adapter_v5_meaningful_history_v2",
+        "--value-tower-split-layers",
+        "1",
+    ]

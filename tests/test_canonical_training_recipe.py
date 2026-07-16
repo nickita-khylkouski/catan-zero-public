@@ -29,6 +29,8 @@ def _public_args(*, init_checkpoint: str = "") -> argparse.Namespace:
         checkpoint="/tmp/candidate.pt",
         report="/tmp/train.json",
         init_checkpoint=init_checkpoint,
+        parent_checkpoint="",
+        architecture_upgrade_receipt="",
         device="auto",
         host_lock_file="/tmp/catan-test.lock",
         allow_concurrent_bc=False,
@@ -183,6 +185,54 @@ def test_parent_update_requires_exact_parent_and_uses_corpus_target_identity() -
     train_bc._validate_coverage_sampler_configuration(
         resolved, categorical_value_loss_weight=0.0
     )
+
+
+def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "f7.pt"
+    initializer = tmp_path / "f7-current-v5-split1.pt"
+    receipt = tmp_path / "upgrade.json"
+    parent.write_bytes(b"legacy-parent")
+    initializer.write_bytes(b"current-v5-split1")
+    receipt.write_text("{}", encoding="utf-8")
+    args = _public_args(init_checkpoint=str(initializer))
+    args.parent_checkpoint = str(parent)
+
+    with pytest.raises(SystemExit, match="upgrade-receipt is required"):
+        train._parent_initializer_binding(args)
+
+    from tools import a1_function_preserving_upgrade as upgrade
+
+    parent_ref = train._checkpoint_ref(str(parent), where="parent")
+    initializer_ref = train._checkpoint_ref(str(initializer), where="initializer")
+    receipt_ref = {
+        "path": str(receipt.resolve()),
+        "sha256": "sha256:" + "a" * 64,
+    }
+    monkeypatch.setattr(
+        upgrade,
+        "verify_receipt",
+        lambda _path: {
+            "module": upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+            "source": parent_ref,
+            "upgraded_initializer": initializer_ref,
+            "receipt": receipt_ref,
+        },
+    )
+    args.architecture_upgrade_receipt = str(receipt)
+    binding = train._parent_initializer_binding(args)
+
+    assert binding["parent"] == parent_ref
+    assert binding["initializer"] == initializer_ref
+    assert binding["function_preserving_upgrade"] == {
+        "schema_version": "a1-lineage-function-preserving-upgrade-v1",
+        "module": upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+        "receipt": receipt_ref["path"],
+        "receipt_sha256": receipt_ref["sha256"],
+        "source_checkpoint_sha256": parent_ref["sha256"],
+        "upgraded_initializer_sha256": initializer_ref["sha256"],
+    }
 
 
 def test_parent_update_rejects_growth_or_optimizer_resume() -> None:

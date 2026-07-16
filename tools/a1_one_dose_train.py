@@ -5415,6 +5415,36 @@ def bind_stage_c_final_replication(
     return result
 
 
+def _append_current_parent_topology_cli(
+    command: list[str], upgrade_module: str | None
+) -> None:
+    """Expose the reviewed legacy-parent topology edge in trainer argv."""
+
+    if upgrade_module != architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1:
+        return
+    command.extend(
+        [
+            "--action-target-gather",
+            "--static-action-residual",
+            "--legal-action-value-residual",
+            "--legal-action-value-set-statistics",
+            "--public-card-count-features",
+            "--no-public-card-count-residual-bias",
+            "--meaningful-public-history",
+            "--event-history-limit",
+            "64",
+            "--meaningful-public-history-pooling",
+            "ordered_attention_v2",
+            "--meaningful-public-history-target-gather",
+            "--public-rule-state-features",
+            "--entity-feature-adapter-version",
+            "rust_entity_adapter_v5_meaningful_history_v2",
+            "--value-tower-split-layers",
+            "1",
+        ]
+    )
+
+
 def _build_direct_train_command(
     verified: dict[str, Any],
     *,
@@ -5497,6 +5527,17 @@ def _build_direct_train_command(
         command.append("--aux-subgoal-heads")
         command.append("--aux-settlement-pointer-head")
     upgrade_module = verified.get("function_preserving_upgrade", {}).get("module")
+    if (
+        upgrade_module
+        == architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1
+    ):
+        # This is the one reviewed legacy-incumbent -> production parent
+        # topology edge.  Keep every checkpoint-owned switch visible in the
+        # sealed trainer argv as well as in the replayed receipt.  In
+        # particular, history-v2 owns cap 64 (the older generic history
+        # upgrades below own cap 32), and the private value suffix must not be
+        # inferred from an unrelated recipe default.
+        _append_current_parent_topology_cli(command, upgrade_module)
     if upgrade_module in {
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,

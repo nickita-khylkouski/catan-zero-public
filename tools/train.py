@@ -11,10 +11,13 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import hashlib
 import json
+import os
 import sys
+import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _REPO_SRC = _REPO_ROOT / "src"
@@ -81,7 +84,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--init-checkpoint",
         default="",
-        help="Optional parent checkpoint; omitted means the recipe's initialization.",
+        help=(
+            "Exact learner initializer. For a legacy incumbent this is the "
+            "function-preserving upgraded checkpoint, not the incumbent bytes."
+        ),
+    )
+    parser.add_argument(
+        "--parent-checkpoint",
+        default="",
+        help=(
+            "Exact incumbent checkpoint being updated. Parent-update runs must "
+            "bind this separately from the architecture initializer."
+        ),
+    )
+    parser.add_argument(
+        "--architecture-upgrade-receipt",
+        default="",
+        help=(
+            "Reviewed zero-diff receipt connecting --parent-checkpoint to "
+            "--init-checkpoint. Required when their bytes differ."
+        ),
     )
     parser.add_argument("--device", default="auto")
     parser.add_argument(
@@ -341,6 +363,156 @@ def _engine_namespace(
     return args
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+
+def _checkpoint_ref(raw: str, *, where: str) -> dict[str, str]:
+    try:
+        path = Path(raw).expanduser().resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(f"cannot resolve {where}: {error}") from error
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"{where} must be a regular non-symlink file: {path}")
+    return {"path": str(path), "sha256": _sha256(path)}
+
+
+def _parent_initializer_binding(
+    public_args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Replay the exact incumbent -> initializer edge before optimizer launch."""
+
+    if not public_args.parent_checkpoint:
+        raise SystemExit(
+            "parent_fresh_optimizer requires --parent-checkpoint separately from "
+            "--init-checkpoint"
+        )
+    if not public_args.init_checkpoint:
+        raise SystemExit("parent_fresh_optimizer requires --init-checkpoint")
+    parent = _checkpoint_ref(public_args.parent_checkpoint, where="learner parent")
+    initializer = _checkpoint_ref(
+        public_args.init_checkpoint, where="learner initializer"
+    )
+    receipt_raw = str(public_args.architecture_upgrade_receipt or "")
+    if parent["sha256"] == initializer["sha256"]:
+        if receipt_raw:
+            raise SystemExit(
+                "exact-parent initialization must not claim an architecture receipt"
+            )
+        return {
+            "schema_version": "a1-canonical-parent-initializer-v1",
+            "mode": "exact_parent",
+            "parent": parent,
+            "initializer": initializer,
+            "function_preserving_upgrade": None,
+        }
+    if not receipt_raw:
+        raise SystemExit(
+            "initializer bytes differ from the incumbent; "
+            "--architecture-upgrade-receipt is required"
+        )
+    from tools import a1_function_preserving_upgrade as upgrade
+
+    try:
+        replayed = upgrade.verify_receipt(Path(receipt_raw))
+    except (OSError, upgrade.UpgradeError) as error:
+        raise SystemExit(f"architecture upgrade receipt refused: {error}") from error
+    if (
+        replayed.get("module")
+        != upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1
+        or replayed.get("source") != parent
+        or replayed.get("upgraded_initializer") != initializer
+    ):
+        raise SystemExit(
+            "architecture receipt must connect the exact incumbent directly to "
+            "the commissioned current-v5+split1 initializer"
+        )
+    receipt = replayed["receipt"]
+    lineage_binding = {
+        "schema_version": "a1-lineage-function-preserving-upgrade-v1",
+        "module": replayed["module"],
+        "receipt": receipt["path"],
+        "receipt_sha256": receipt["sha256"],
+        "source_checkpoint_sha256": parent["sha256"],
+        "upgraded_initializer_sha256": initializer["sha256"],
+    }
+    return {
+        "schema_version": "a1-canonical-parent-initializer-v1",
+        "mode": "function_preserving_upgrade",
+        "parent": parent,
+        "initializer": initializer,
+        "function_preserving_upgrade": lineage_binding,
+    }
+
+
+def _bind_parent_report(
+    report_path: str | Path,
+    *,
+    initialization: Mapping[str, Any],
+) -> None:
+    """Stamp diagnostic canonical runs with exact lineage, never eligibility.
+
+    Promotion requires the sealed receipt emitted by ``a1_one_dose_train.py``;
+    this report binding makes standalone commissioning scientifically legible
+    without creating a second promotion receipt format.
+    """
+
+    from tools import a1_lineage_dose as lineage
+
+    path = Path(report_path).expanduser().resolve(strict=True)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"cannot bind canonical parent report: {error}") from error
+    if not isinstance(payload, dict):
+        raise SystemExit("canonical parent report must be a JSON object")
+    steps = payload.get("steps_completed")
+    sampled_rows = payload.get("base_training_row_draws")
+    if (
+        isinstance(steps, bool)
+        or not isinstance(steps, int)
+        or steps <= 0
+        or isinstance(sampled_rows, bool)
+        or not isinstance(sampled_rows, int)
+        or sampled_rows <= 0
+    ):
+        raise SystemExit(
+            "canonical parent report lacks exact optimizer-step/base-draw counters"
+        )
+    try:
+        dose = lineage.direct_lineage_dose(
+            declared_producer_sha256=initialization["parent"]["sha256"],
+            init_checkpoint_sha256=initialization["initializer"]["sha256"],
+            current_sampled_rows=sampled_rows,
+            current_optimizer_steps=steps,
+            function_preserving_upgrade=initialization[
+                "function_preserving_upgrade"
+            ],
+        )
+    except lineage.LineageDoseError as error:
+        raise SystemExit(f"canonical parent lineage refused: {error}") from error
+    payload["a1_lineage_dose"] = dose
+    payload["a1_parent_update_initialization"] = dict(initialization)
+    payload["promotion_eligible"] = False
+    payload["promotion_block_reason"] = (
+        "requires_sealed_a1_one_dose_execution_receipt"
+    )
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     public_args = build_parser().parse_args(argv)
     config, engine_settings = _load_recipe(public_args.config)
@@ -352,6 +524,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--report, and --receipt to create the authenticated plan; rerun "
             "that same command with --go only after the plan is commissioned."
         )
+    initialization = _parent_initializer_binding(public_args)
     engine_args = _engine_namespace(
         config=config,
         engine_settings=engine_settings,
@@ -360,6 +533,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     from tools import train_bc
 
     train_bc.main(engine_args)
+    # Under torchrun every rank executes this wrapper. train_bc owns report
+    # emission on rank zero, so only rank zero may seal the post-run binding.
+    if int(os.environ.get("RANK", "0")) == 0:
+        _bind_parent_report(public_args.report, initialization=initialization)
 
 
 if __name__ == "__main__":

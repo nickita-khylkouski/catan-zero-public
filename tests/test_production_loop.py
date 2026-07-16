@@ -50,7 +50,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
         "harvest": fleet_dir / "a1_harvest_transaction.py",
         "audit": tools_dir / "a1_pre_wave_contract.py",
         "composite": tools_dir / "a1_build_post_wave_composite.py",
-        "train": tools_dir / "train.py",
+        "train": tools_dir / "a1_one_dose_train.py",
         "evaluate": tools_dir / "evaluate.py",
         "promote": tools_dir / "a1_promotion_transaction.py",
     }
@@ -118,6 +118,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
         elif name == "train":
             training_receipt = tmp_path / "training-receipt.json"
             command += [
+                "--go",
                 "--data",
                 str(previous),
                 "--checkpoint",
@@ -193,7 +194,7 @@ def test_loop_binds_and_executes_exact_artifact_chain(tmp_path: Path) -> None:
         "a1_harvest_transaction.py",
         "a1_pre_wave_contract.py",
         "a1_build_post_wave_composite.py",
-        "train.py",
+        "a1_one_dose_train.py",
         "evaluate.py",
         "a1_promotion_transaction.py",
     ]
@@ -248,10 +249,44 @@ def test_exact_repo_relative_tool_and_untracked_cleanliness(tmp_path: Path) -> N
     with pytest.raises(ProductionLoopError, match="cannot invoke 'other/train.py'"):
         load_config(config_path, state_dir=tmp_path / "state")
 
-    stages["train"]["command"][1] = str(repository / "tools" / "train.py")  # type: ignore[index]
+    stages["train"]["command"][1] = str(  # type: ignore[index]
+        repository / "tools" / "a1_one_dose_train.py"
+    )
     config_path.write_text(json.dumps(payload), encoding="utf-8")
     (repository / "untracked.txt").write_text("drift", encoding="utf-8")
     with pytest.raises(ProductionLoopError, match="including untracked files"):
+        load_config(config_path, state_dir=tmp_path / "state")
+
+
+def test_bare_config_launcher_is_not_a_production_training_receipt(tmp_path: Path) -> None:
+    repository, config_path, _final, payload = _fixture(tmp_path)
+    bare = repository / "tools" / "train.py"
+    bare.write_text(WRITER, encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Loop Test",
+            "-c",
+            "user.email=loop@example.invalid",
+            "commit",
+            "-qm",
+            "bare-train",
+        ),
+        check=True,
+    )
+    payload["repository_commit"] = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    stages = payload["stages"]
+    assert isinstance(stages, dict) and isinstance(stages["train"], dict)
+    stages["train"]["command"][1] = str(bare)  # type: ignore[index]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ProductionLoopError, match="cannot invoke 'tools/train.py'"):
         load_config(config_path, state_dir=tmp_path / "state")
 
 

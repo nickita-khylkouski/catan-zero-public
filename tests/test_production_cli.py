@@ -46,7 +46,15 @@ def _write_job(tmp_path: Path, pipeline: str = "generate", **updates: object) ->
         data.write_text("{}", encoding="utf-8")
         payload.update(data=str(data), recipe=recipe)
         if recipe == "a1-parent-update-35m-b200":
-            payload.update(init_checkpoint=str(checkpoint))
+            parent = tmp_path / "parent.pt"
+            parent.write_bytes(b"parent-v1")
+            upgrade = tmp_path / "architecture-upgrade.receipt.json"
+            upgrade.write_text("{}", encoding="utf-8")
+            payload.update(
+                init_checkpoint=str(checkpoint),
+                parent_checkpoint=str(parent),
+                architecture_upgrade_receipt=str(upgrade),
+            )
         else:
             lock = tmp_path / "reviewed-lock.json"
             lock.write_text("{}", encoding="utf-8")
@@ -183,8 +191,28 @@ def test_commissioned_parent_update_uses_exact_recipe_and_parent(
     )
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]
+    assert "--parent-checkpoint" in plan["command"]
+    assert "--architecture-upgrade-receipt" in plan["command"]
     assert "--nproc-per-node=8" in plan["command"]
     assert plan["prepare_command"] is None
+
+
+def test_parent_update_requires_receipt_only_for_changed_initializer(
+    tmp_path: Path,
+) -> None:
+    changed = _write_job(
+        tmp_path, "train", recipe="a1-parent-update-35m-b200"
+    )
+    payload = json.loads(changed.read_text(encoding="utf-8"))
+    payload.pop("architecture_upgrade_receipt")
+    changed.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(cli.ProductionCLIError, match="receipt is required"):
+        cli.build_plan(changed)
+
+    payload["init_checkpoint"] = payload["parent_checkpoint"]
+    changed.write_text(json.dumps(payload), encoding="utf-8")
+    plan = cli.build_plan(changed)
+    assert "--architecture-upgrade-receipt" not in plan["command"]
 
 
 def test_production_job_rejects_unknown_keys_and_relative_paths(tmp_path: Path) -> None:

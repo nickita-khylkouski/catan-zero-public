@@ -46,6 +46,8 @@ _PIPELINE_KEYS = {
         "data",
         "recipe",
         "init_checkpoint",
+        "parent_checkpoint",
+        "architecture_upgrade_receipt",
         "lock",
         "composite_build_receipt",
         "plan_receipt",
@@ -158,11 +160,19 @@ def load_job(path: Path) -> dict[str, Any]:
         if recipe == "a1-current-35m-b200":
             required = {"lock", "composite_build_receipt", "plan_receipt"}
             missing = sorted(key for key in required if key not in job)
-            if missing or "init_checkpoint" in job:
+            forbidden = sorted(
+                key
+                for key in (
+                    "init_checkpoint",
+                    "parent_checkpoint",
+                    "architecture_upgrade_receipt",
+                )
+                if key in job
+            )
+            if missing or forbidden:
                 raise ProductionCLIError(
                     "scratch training job field drift: "
-                    f"missing={missing} forbidden_init_checkpoint="
-                    f"{'init_checkpoint' in job}"
+                    f"missing={missing} forbidden={forbidden}"
                 )
             job["lock"] = str(_absolute_path(job.get("lock"), field="lock"))
             job["composite_build_receipt"] = str(
@@ -180,15 +190,32 @@ def load_job(path: Path) -> dict[str, Any]:
                 for key in ("lock", "composite_build_receipt", "plan_receipt")
                 if key in job
             )
-            if "init_checkpoint" not in job or forbidden:
+            required = {
+                "init_checkpoint",
+                "parent_checkpoint",
+            }
+            missing = sorted(required - set(job))
+            if missing or forbidden:
                 raise ProductionCLIError(
                     "parent-update training job field drift: "
-                    f"missing_init_checkpoint={'init_checkpoint' not in job} "
+                    f"missing={missing} "
                     f"forbidden={forbidden}"
                 )
             job["init_checkpoint"] = str(
                 _absolute_path(job.get("init_checkpoint"), field="init_checkpoint")
             )
+            job["parent_checkpoint"] = str(
+                _absolute_path(
+                    job.get("parent_checkpoint"), field="parent_checkpoint"
+                )
+            )
+            if "architecture_upgrade_receipt" in job:
+                job["architecture_upgrade_receipt"] = str(
+                    _absolute_path(
+                        job.get("architecture_upgrade_receipt"),
+                        field="architecture_upgrade_receipt",
+                    )
+                )
         else:
             raise ProductionCLIError(
                 "training recipe must be 'a1-current-35m-b200' or "
@@ -269,6 +296,11 @@ def _input_paths(job: dict[str, Any]) -> dict[str, Path]:
         paths = {"data": Path(job["data"])}
         if job["recipe"] == "a1-parent-update-35m-b200":
             paths["init_checkpoint"] = Path(job["init_checkpoint"])
+            paths["parent_checkpoint"] = Path(job["parent_checkpoint"])
+            if "architecture_upgrade_receipt" in job:
+                paths["architecture_upgrade_receipt"] = Path(
+                    job["architecture_upgrade_receipt"]
+                )
             return paths
         paths.update(
             lock=Path(job["lock"]),
@@ -316,7 +348,7 @@ def _command(job: dict[str, Any], contract: dict[str, Any]) -> list[str]:
         return command
     if pipeline == "train":
         if job["recipe"] == "a1-parent-update-35m-b200":
-            return [
+            command = [
                 sys.executable,
                 "-m",
                 "torch.distributed.run",
@@ -329,11 +361,21 @@ def _command(job: dict[str, Any], contract: dict[str, Any]) -> list[str]:
                 str(job["data"]),
                 "--init-checkpoint",
                 str(job["init_checkpoint"]),
+                "--parent-checkpoint",
+                str(job["parent_checkpoint"]),
                 "--checkpoint",
                 str(run_dir / "candidate.pt"),
                 "--report",
                 str(run_dir / "train.report.json"),
             ]
+            if "architecture_upgrade_receipt" in job:
+                command.extend(
+                    [
+                        "--architecture-upgrade-receipt",
+                        str(job["architecture_upgrade_receipt"]),
+                    ]
+                )
+            return command
         return [
             sys.executable,
             str(contract["launcher"]),
@@ -432,6 +474,19 @@ def build_plan(job_path: Path) -> dict[str, Any]:
         name: {"path": str(path), "sha256": _file_sha256(path)}
         for name, path in _input_paths(job).items()
     }
+    if pipeline == "train" and recipe == "a1-parent-update-35m-b200":
+        parent_sha = inputs["parent_checkpoint"]["sha256"]
+        initializer_sha = inputs["init_checkpoint"]["sha256"]
+        has_receipt = "architecture_upgrade_receipt" in inputs
+        if parent_sha != initializer_sha and not has_receipt:
+            raise ProductionCLIError(
+                "parent-update initializer differs from the exact incumbent; "
+                "architecture_upgrade_receipt is required"
+            )
+        if parent_sha == initializer_sha and has_receipt:
+            raise ProductionCLIError(
+                "exact-parent update must not claim architecture_upgrade_receipt"
+            )
     public_job = {key: value for key, value in job.items() if not key.startswith("_")}
     value: dict[str, Any] = {
         "schema_version": PLAN_SCHEMA,

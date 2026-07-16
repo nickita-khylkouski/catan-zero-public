@@ -370,6 +370,7 @@ def build_turn(
         if replayed["module"] in {
             upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
             upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
+            upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
         }:
             initializer_binding["architecture_profile"] = (
                 V16_COMBINED_ARCHITECTURE_PROFILE
