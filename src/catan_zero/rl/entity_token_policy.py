@@ -32,6 +32,7 @@ from catan_zero.rl.entity_token_features import (
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
     build_entity_token_features,
+    mask_player_tokens_public,
 )
 from catan_zero.rl.multiagent_env import ColonistMultiAgentConfig, ColonistMultiAgentEnv
 from catan_zero.rl.meaningful_history import (
@@ -2171,6 +2172,11 @@ class EntityGraphPolicy:
                 getattr(self.config, "meaningful_public_history", False)
             ),
         )
+        if self.trained_with_masked_hidden_info:
+            entity = dict(entity)
+            entity["player_tokens"] = mask_player_tokens_public(
+                entity["player_tokens"]
+            )
         if int(entity["legal_action_tokens"].shape[0]) != len(valid_actions):
             raise ValueError(
                 "entity legal-action token count does not match valid actions: "

@@ -14,8 +14,18 @@ _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
-from catan_zero.search.neural_rust_mcts import (
+from catan_zero.rl import entity_token_policy  # noqa: E402
+from catan_zero.rl.entity_token_features import (  # noqa: E402
+    LEGAL_ACTION_FEATURE_SIZE,
+    PLAYER_ACTOR_FLAG_SLOT,
+    PLAYER_FEATURE_SIZE,
+    PUBLIC_MASK_PLAYER_SLOTS,
+)
+from catan_zero.rl.entity_token_policy import (  # noqa: E402
+    EntityGraphConfig,
+    EntityGraphPolicy,
+)
+from catan_zero.search.neural_rust_mcts import (  # noqa: E402
     EntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
 )
@@ -69,6 +79,61 @@ def test_save_defaults_mask_hidden_info_to_false_when_omitted(tmp_path):
     policy.save(path)  # no mask_hidden_info kwarg at all
     loaded = EntityGraphPolicy.load(path, device="cpu")
     assert loaded.trained_with_masked_hidden_info is False
+
+
+def test_direct_policy_evaluation_honors_checkpoint_public_mask(monkeypatch):
+    policy = _tiny_policy()
+    policy.trained_with_masked_hidden_info = True
+    player_tokens = np.ones((4, PLAYER_FEATURE_SIZE), dtype=np.float32)
+    player_tokens[:, PLAYER_ACTOR_FLAG_SLOT] = 0.0
+    player_tokens[0, PLAYER_ACTOR_FLAG_SLOT] = 1.0
+    original_player_tokens = player_tokens.copy()
+    entity = {
+        "schema": "entity_tokens_v1",
+        "player_tokens": player_tokens,
+        "legal_action_tokens": np.zeros(
+            (2, LEGAL_ACTION_FEATURE_SIZE), dtype=np.float32
+        ),
+    }
+    captured = {}
+
+    monkeypatch.setattr(
+        entity_token_policy,
+        "build_entity_token_features",
+        lambda *_args, **_kwargs: entity,
+    )
+    monkeypatch.setattr(
+        entity_token_policy,
+        "build_action_context_feature_table",
+        lambda *_args, **_kwargs: np.zeros(
+            (ACTION_SIZE, policy.config.context_action_feature_size),
+            dtype=np.float32,
+        ),
+    )
+
+    def _forward(entity_batch, *_args, **_kwargs):
+        captured.update(entity_batch)
+        import torch
+
+        return {
+            "logits": torch.zeros((1, 2), dtype=torch.float32),
+            "value": torch.zeros(1, dtype=torch.float32),
+        }
+
+    monkeypatch.setattr(policy, "forward_legal_np", _forward)
+    fake_env = type("_Env", (), {"current_player_name": lambda self: "RED"})()
+
+    _outputs, observed, _context = policy._legal_outputs_from_env(  # noqa: SLF001
+        fake_env,
+        {"current_player": "RED"},
+        (0, 1),
+    )
+
+    for slot in PUBLIC_MASK_PLAYER_SLOTS:
+        assert np.all(observed["player_tokens"][1:, slot] == 0.0)
+        assert np.all(captured["player_tokens"][0, 1:, slot] == 0.0)
+        assert observed["player_tokens"][0, slot] == 1.0
+    assert np.array_equal(entity["player_tokens"], original_player_tokens)
 
 
 def test_legacy_checkpoint_missing_the_field_loads_as_not_masked(tmp_path):
