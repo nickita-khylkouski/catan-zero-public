@@ -22,7 +22,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     model = current_science.learner_model_construction()
     assert model["graph_tokens"] is None
     assert model["hidden_size"] == 640
-    assert model["max_35m_params"] == 42_000_000
+    assert model["max_parameter_count"] == 42_000_000
     assert model["public_card_count_residual_bias"] is False
     assert model["public_rule_state_features"] is True
     assert model["value_tower_split_layers"] == 1
@@ -119,6 +119,7 @@ def test_current_contract_rejects_non_scratch_v5_initialization(
     (
         ("model_construction", "static_action_residual", False),
         ("model_construction", "action_target_gather", False),
+        ("model_construction", "max_parameter_count", 40_000_000),
         ("model_construction", "entity_feature_adapter_version", "legacy"),
         ("execution_topology", "world_size", 4),
         ("execution_topology", "local_batch_size", 1024),

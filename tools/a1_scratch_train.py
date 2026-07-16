@@ -460,9 +460,11 @@ def build_train_command(
         ("--entity-feature-adapter-version", "entity_feature_adapter_version"),
         ("--meaningful-public-history-pooling", "meaningful_public_history_pooling"),
         ("--event-history-limit", "event_history_limit"),
-        ("--max-35m-params", "max_35m_params"),
     ):
         _add(command, flag, model[key])
+    # Keep train_bc's backward-compatible CLI name while the sealed science
+    # contract uses a model-class-neutral parameter ceiling.
+    _add(command, "--max-35m-params", model["max_parameter_count"])
     command.extend(
         [
             "--action-target-gather",

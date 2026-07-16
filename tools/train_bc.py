@@ -9196,7 +9196,7 @@ def _validate_a1_scratch_runtime_projection(
         "require_35m_model": bool(args.require_35m_model)
         != model["require_35m_model"],
         "max_35m_params": int(args.max_35m_params)
-        != model["max_35m_params"],
+        != model["max_parameter_count"],
         "topology_world_size": int(ddp.get("world_size", 0))
         != topology["world_size"],
         "topology_local_batch": int(args.batch_size)
@@ -9434,6 +9434,12 @@ def _validate_production_composite_scratch_binding(
         raise SystemExit("A1 scratch authority requires production composite v2")
     binding = _validate_a1_scratch_plan_binding(
         authority, data_path=str(args.data), composite_meta=composite_meta
+    )
+    _validate_a1_scratch_runtime_projection(
+        args,
+        ddp,
+        binding["science"]["learner_model_construction"],
+        binding["science"]["learner_execution_topology"],
     )
     _require_a1_scratch_execution_schedule(
         binding["science"]["learner_execution_topology"]

@@ -296,7 +296,7 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
         "sha256:3cf1a74225d562b48584796dd9148662893f0efb3c281e137cd5eeeb1c12876e"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:490c32b0e843d6b38306fca186c31ada5efd16252b39a72377211334e457534f"
+        "sha256:ce29f5aefea0c664908d7829e9bd27e6ee65254cd2a54b650f9dd9a94dd2fcd2"
     )
 
 

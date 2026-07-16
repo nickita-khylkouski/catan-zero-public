@@ -63,8 +63,12 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
 )
 from catan_zero.rl.entity_token_features import ACTION_TYPES  # noqa: E402
 from catan_zero.rl.decision_taxonomy import (  # noqa: E402
+    AUTOMATIC_TRANSITION,
     DECISION_TAXONOMY_SCHEMA_VERSION,
     MANDATORY_CHOICE,
+    MANDATORY_SEQUENCE_CONTINUATION,
+    NORMAL_CHOICE,
+    WIDE_CHOICE,
 )
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
     FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS,
@@ -10067,6 +10071,22 @@ def _selected_target_activation_chunk(
                 f"{where}: decision taxonomy is not row-aligned/current"
             )
         decision_class = np.asarray(raw_decision_class[mask]).astype(str)
+        known_decision_classes = {
+            AUTOMATIC_TRANSITION,
+            MANDATORY_CHOICE,
+            MANDATORY_SEQUENCE_CONTINUATION,
+            NORMAL_CHOICE,
+            WIDE_CHOICE,
+        }
+        unknown_decision_classes = sorted(
+            set(decision_class.tolist()) - known_decision_classes
+        )
+        if unknown_decision_classes:
+            raise ContractError(
+                f"{where}: decision_class contains values outside "
+                f"{DECISION_TAXONOMY_SCHEMA_VERSION}: "
+                f"{unknown_decision_classes[:16]}"
+            )
         mandatory_non_forced = np.asarray(
             (~forced) & (decision_class == MANDATORY_CHOICE), dtype=np.bool_
         )

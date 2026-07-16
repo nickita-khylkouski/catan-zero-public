@@ -190,7 +190,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
         "rust_entity_adapter_v5_meaningful_history_v2"
     ),
     "require_35m_model": True,
-    "max_35m_params": 42_000_000,
+    "max_parameter_count": 42_000_000,
 }
 PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT = {
     "schema_version": "a1-scratch-training-topology-v1",

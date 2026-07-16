@@ -120,7 +120,7 @@
       "mask_hidden_info": true,
       "entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
       "require_35m_model": true,
-      "max_35m_params": 42000000
+      "max_parameter_count": 42000000
     },
     "execution_topology": {
       "schema_version": "a1-scratch-training-topology-v1",

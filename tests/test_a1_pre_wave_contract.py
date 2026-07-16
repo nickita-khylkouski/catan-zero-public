@@ -3620,7 +3620,7 @@ def test_adaptive_target_activation_excludes_mandatory_full_roots_from_pfull(
     used_full[:250] = True
     used_full[randomized_rows:] = True
     decision_class = np.full(rows, "normal_choice", dtype="U32")
-    decision_class[randomized_rows:] = "mandatory_choice"
+    decision_class[randomized_rows:] = contract.MANDATORY_CHOICE
     arrays = {
         "game_seed": np.arange(rows, dtype=np.int64),
         "decision_index": np.zeros(rows, dtype=np.int32),
@@ -3665,6 +3665,38 @@ def test_adaptive_target_activation_excludes_mandatory_full_roots_from_pfull(
     assert report["passed"] is True
     assert counts["randomized_non_forced_rows"] == randomized_rows
     assert counts["mandatory_full_search_non_forced_rows"] == mandatory_rows
+
+
+def test_adaptive_target_activation_rejects_unknown_current_taxonomy_class(
+    tmp_path: Path,
+) -> None:
+    arrays = {
+        "game_seed": np.asarray([1], dtype=np.int64),
+        "decision_index": np.asarray([0], dtype=np.int32),
+        "is_forced": np.asarray([False]),
+        "used_full_search": np.asarray([True]),
+        "policy_weight_multiplier": np.asarray([1.0], dtype=np.float32),
+        "value_weight_multiplier": np.asarray([1.0], dtype=np.float32),
+        "target_policy_mask": np.ones((1, 2), dtype=bool),
+        "decision_class": np.asarray(["mandatory_choice"], dtype="U32"),
+        "decision_taxonomy_schema": np.asarray(
+            [contract.DECISION_TAXONOMY_SCHEMA_VERSION], dtype="U64"
+        ),
+    }
+    shard = tmp_path / "unknown-decision-class.npz"
+    np.savez(shard, **arrays)
+
+    with np.load(shard, allow_pickle=False) as payload, pytest.raises(
+        contract.ContractError,
+        match="decision_class contains values outside",
+    ):
+        contract._selected_target_activation_chunk(  # noqa: SLF001
+            payload,
+            game_seeds=arrays["game_seed"],
+            selected_mask=np.asarray([True]),
+            where="fixture",
+            wide_full_threshold=20,
+        )
 
 
 def test_single_read_registry_evidence_rejects_in_place_mutation(

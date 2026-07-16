@@ -218,6 +218,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--meaningful-public-history-target-gather") == 1
     assert command.count("--entity-feature-adapter-version") == 1
     assert command[command.index("--hidden-size") + 1] == "640"
+    assert command.count("--max-35m-params") == 1
     assert command[command.index("--max-35m-params") + 1] == "42000000"
     assert command.count("--fused-optimizer") == 1
     assert command.count("--symmetry-augment") == 1
@@ -447,7 +448,7 @@ def _runtime_args() -> SimpleNamespace:
         event_history_limit=model["event_history_limit"],
         mask_hidden_info=model["mask_hidden_info"],
         require_35m_model=model["require_35m_model"],
-        max_35m_params=model["max_35m_params"],
+        max_35m_params=model["max_parameter_count"],
         batch_size=topology["local_batch_size"],
         grad_accum_steps=topology["grad_accum_steps"],
         ddp_shard_data=topology["ddp_shard_data"],
@@ -635,6 +636,25 @@ def test_production_composite_dispatch_retains_late_schedule_refusal(
     args.data = str(verified["data_path"])
     args.a1_scratch_authority_json = json.dumps(authority)
     with pytest.raises(SystemExit, match="schedule is unresolved"):
+        train_bc._validate_production_composite_scratch_binding(  # noqa: SLF001
+            args,
+            {"world_size": 8},
+            meta,
+        )
+
+
+def test_production_composite_dispatch_rejects_runtime_model_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    verified, meta, authority = _authority_fixture(tmp_path)
+    args = _runtime_args()
+    args.data = str(verified["data_path"])
+    args.a1_scratch_authority_json = json.dumps(authority)
+    args.max_35m_params = 40_000_000
+    monkeypatch.setattr(
+        train_bc, "_require_a1_scratch_execution_schedule", lambda _topology: None
+    )
+    with pytest.raises(SystemExit, match="scratch runtime projection drift"):
         train_bc._validate_production_composite_scratch_binding(  # noqa: SLF001
             args,
             {"world_size": 8},
