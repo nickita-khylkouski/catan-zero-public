@@ -816,7 +816,17 @@ def test_boundary_value_particles_do_not_perturb_shared_search_rng() -> None:
             force_full=None,
             attested_root_phase=None,
         ):
-            return force_full, attested_root_phase
+            del attested_root_phase
+            return SearchResult(
+                selected_action=11,
+                improved_policy={11: 1.0},
+                visit_counts={11: 1},
+                q_values={11: 0.0},
+                priors={11: 1.0},
+                root_value=0.0,
+                used_full_search=bool(force_full),
+                simulations_used=1,
+            )
 
         mcts._search_single_world = MethodType(stop_before_traversal, mcts)
         mcts.seed_search_rngs(918273)
@@ -854,7 +864,17 @@ def test_boundary_value_particle_samples_are_matched_prefixes_at_each_root() -> 
             force_full=None,
             attested_root_phase=None,
         ):
-            return force_full, attested_root_phase
+            del attested_root_phase
+            return SearchResult(
+                selected_action=11,
+                improved_policy={11: 1.0},
+                visit_counts={11: 1},
+                q_values={11: 0.0},
+                priors={11: 1.0},
+                root_value=0.0,
+                used_full_search=bool(force_full),
+                simulations_used=1,
+            )
 
         mcts._search_single_world = MethodType(stop_before_traversal, mcts)
         mcts.seed_search_rngs(192837)
