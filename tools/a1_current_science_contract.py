@@ -88,6 +88,10 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # shared token/history representation from scratch.  A zero boundary made
     # every value-only row useless to the 5 shared blocks and input encoders.
     "value_trunk_grad_scale": 0.25,
+    # Dormant while policy_dose_lr_area is unresolved/zero. Once a positive
+    # policy frontier is sealed, terminal value learning continues only through
+    # the private value tower/readouts instead of drifting the policy trunk.
+    "post_policy_dose_value_trunk_grad_scale": 0.0,
     # Reporting is part of production admission even though it does not alter
     # the optimizer trajectory. The full scratch dose must prove every
     # commissioned v5 path received gradient and an actual update.

@@ -387,6 +387,10 @@ def build_train_command(
             "policy_dose_reference_global_batch_size",
             "--policy-dose-reference-global-batch-size",
         ),
+        (
+            "post_policy_dose_value_trunk_grad_scale",
+            "--post-policy-dose-value-trunk-grad-scale",
+        ),
         ("soft_target_source", "--soft-target-source"),
         ("soft_target_weight", "--soft-target-weight"),
         ("policy_target_blend_semantics", "--policy-target-blend-semantics"),
@@ -424,6 +428,7 @@ def build_train_command(
         "target_reliability_confidence_floor": 0.25,
         "policy_dose_lr_area": 0.0,
         "policy_dose_reference_global_batch_size": 0,
+        "post_policy_dose_value_trunk_grad_scale": 1.0,
     }
     for key, flag in scalar_fields:
         if key in optional_scalar_defaults:

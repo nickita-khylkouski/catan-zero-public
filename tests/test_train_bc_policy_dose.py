@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -34,6 +35,44 @@ def test_zero_policy_dose_preserves_historical_constant_weight() -> None:
         consumed_lr_area=0.0,
         target_lr_area=0.0,
     ) == pytest.approx(0.75)
+
+
+def test_post_policy_value_routing_is_dormant_until_positive_dose_exhausts() -> None:
+    dormant = train_bc._post_policy_dose_value_trunk_routing(  # noqa: SLF001
+        base_scale=0.25,
+        post_scale=0.0,
+        target_lr_area=0.0,
+        realized_policy_loss_weight=0.0,
+    )
+    active = train_bc._post_policy_dose_value_trunk_routing(  # noqa: SLF001
+        base_scale=0.25,
+        post_scale=0.0,
+        target_lr_area=0.01,
+        realized_policy_loss_weight=1.0,
+    )
+    exhausted = train_bc._post_policy_dose_value_trunk_routing(  # noqa: SLF001
+        base_scale=0.25,
+        post_scale=0.0,
+        target_lr_area=0.01,
+        realized_policy_loss_weight=0.0,
+    )
+
+    assert dormant["phase"] == "dormant_no_positive_policy_dose"
+    assert dormant["effective_value_trunk_grad_scale"] == pytest.approx(0.25)
+    assert active["effective_value_trunk_grad_scale"] == pytest.approx(0.25)
+    assert exhausted["phase"] == "post_policy_dose"
+    assert exhausted["effective_value_trunk_grad_scale"] == 0.0
+    assert exhausted["shared_policy_representation_frozen"] is True
+
+
+def test_post_policy_value_routing_rejects_invalid_scale() -> None:
+    with pytest.raises(SystemExit, match="post-policy-dose.*\\[0, 1\\]"):
+        train_bc._post_policy_dose_value_trunk_routing(  # noqa: SLF001
+            base_scale=0.25,
+            post_scale=1.1,
+            target_lr_area=0.01,
+            realized_policy_loss_weight=0.0,
+        )
 
 
 def test_policy_objective_fraction_preserves_fractional_boundary() -> None:
@@ -119,6 +158,84 @@ def test_policy_only_gradient_suppression_keeps_shared_value_paths() -> None:
     assert all(parameter.grad is not None for parameter in model.value_head.parameters())
     assert all(parameter not in optimizer.state for parameter in model.action_bias.parameters())
     assert model.logit_scale not in optimizer.state
+
+
+def test_post_policy_freeze_clears_shared_adamw_state_but_keeps_value_tower() -> None:
+    torch = pytest.importorskip("torch")
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.hex_encoder = torch.nn.Linear(3, 3)
+            self.action_encoder = torch.nn.Linear(3, 3)
+            self.action_bias = torch.nn.Linear(3, 1)
+            self.value_blocks = torch.nn.ModuleList([torch.nn.Linear(3, 3)])
+            self.value_head = torch.nn.Linear(3, 1)
+
+    model = Model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1, weight_decay=0.01)
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    shared_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.hex_encoder.named_parameters()
+    }
+    value_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.value_head.named_parameters()
+    }
+
+    suppressed = train_bc._suppress_shared_policy_representation_gradients(  # noqa: SLF001
+        SimpleNamespace(model=model),
+        optimizer,
+    )
+    optimizer.step()
+
+    assert any(name.startswith("hex_encoder.") for name in suppressed)
+    assert all(
+        parameter.grad is None for parameter in model.hex_encoder.parameters()
+    )
+    assert all(
+        parameter.grad is None for parameter in model.action_encoder.parameters()
+    )
+    assert all(
+        parameter.grad is not None for parameter in model.value_blocks.parameters()
+    )
+    assert all(
+        parameter.grad is not None for parameter in model.value_head.parameters()
+    )
+    assert all(
+        parameter not in optimizer.state
+        for parameter in model.hex_encoder.parameters()
+    )
+    assert all(
+        parameter in optimizer.state for parameter in model.value_head.parameters()
+    )
+    assert all(
+        torch.equal(parameter, shared_before[name])
+        for name, parameter in model.hex_encoder.named_parameters()
+    )
+    assert any(
+        not torch.equal(parameter, value_before[name])
+        for name, parameter in model.value_head.named_parameters()
+    )
+
+
+def test_train_config_hash_binds_policy_dose_and_post_value_route() -> None:
+    from catan_zero.rl.pipeline_configs import TrainConfig
+
+    baseline = TrainConfig()
+    treatment = replace(
+        baseline,
+        policy_dose_lr_area=0.01,
+        policy_dose_reference_global_batch_size=512,
+        post_policy_dose_value_trunk_grad_scale=0.0,
+    )
+    assert baseline.full_config_hash() != treatment.full_config_hash()
 
 
 def test_policy_signal_attestation_uses_scheduled_objective_mass() -> None:

@@ -58,6 +58,9 @@ def test_weight_decay_and_optimizer_defaults_are_safe() -> None:
     assert parser.get_default("action_module_lr_mult") == pytest.approx(1.0)
     assert parser.get_default("trunk_lr_mult") == pytest.approx(1.0)
     assert parser.get_default("value_trunk_grad_scale") == pytest.approx(1.0)
+    assert parser.get_default(
+        "post_policy_dose_value_trunk_grad_scale"
+    ) == pytest.approx(1.0)
     assert parser.get_default("objective_gradient_interference_every_batches") == 0
     assert parser.get_default("sampler_seed") is None
 

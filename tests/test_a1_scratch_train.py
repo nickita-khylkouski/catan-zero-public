@@ -209,6 +209,12 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert "public_rule_state_residual" in required_modules
     assert "--ddp-shard-data" not in command
     assert "--target-reliability-confidence-weighting" not in command
+    assert (
+        command[
+            command.index("--post-policy-dose-value-trunk-grad-scale") + 1
+        ]
+        == "0.0"
+    )
     marker = json.loads(command[command.index("--a1-scratch-authority-json") + 1])
     assert marker == authority
 

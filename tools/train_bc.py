@@ -1197,6 +1197,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--post-policy-dose-value-trunk-grad-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "EntityGraph value-family gradient scale at the shared policy "
+            "representation after a positive --policy-dose-lr-area is exhausted. "
+            "The default 1 preserves historical behavior. 0 keeps training the "
+            "private value tower/readouts while freezing the shared policy "
+            "representation (including AdamW/momentum state). This setting is "
+            "dormant when --policy-dose-lr-area is 0."
+        ),
+    )
+    parser.add_argument(
         "--policy-aux-active-batch-size",
         type=int,
         default=0,
@@ -2689,6 +2702,49 @@ def _validate_policy_dose_topology(
             f"current_global_batch={global_batch_size}"
         )
     return global_batch_size
+
+
+def _post_policy_dose_value_trunk_routing(
+    *,
+    base_scale: float,
+    post_scale: float,
+    target_lr_area: float,
+    realized_policy_loss_weight: float,
+) -> dict[str, object]:
+    """Resolve the per-batch value boundary without redefining a zero-dose run."""
+
+    base = float(base_scale)
+    post = float(post_scale)
+    target = float(target_lr_area)
+    policy_weight = float(realized_policy_loss_weight)
+    for name, value in (
+        ("--value-trunk-grad-scale", base),
+        ("--post-policy-dose-value-trunk-grad-scale", post),
+    ):
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise SystemExit(f"{name} must be finite and in [0, 1]")
+    if not math.isfinite(target) or target < 0.0:
+        raise SystemExit("--policy-dose-lr-area must be finite and >= 0")
+    if target == 0.0:
+        phase = "dormant_no_positive_policy_dose"
+        effective = base
+    elif policy_weight > 0.0:
+        phase = "pre_or_boundary_policy_dose"
+        effective = base
+    else:
+        phase = "post_policy_dose"
+        effective = post
+    return {
+        "schema_version": "post-policy-dose-value-routing-v1",
+        "phase": phase,
+        "effective_value_trunk_grad_scale": effective,
+        "base_value_trunk_grad_scale": base,
+        "post_policy_dose_value_trunk_grad_scale": post,
+        "positive_policy_dose_enabled": target > 0.0,
+        "shared_policy_representation_frozen": (
+            phase == "post_policy_dose" and effective == 0.0
+        ),
+    }
 
 
 def _optimizer_lr_dose_attestation(
@@ -11070,6 +11126,35 @@ def main(argv: Sequence[str] | None = None) -> None:
         grad_accum_steps=int(args.grad_accum_steps),
         world_size=int(ddp["world_size"]),
     )
+    post_policy_dose_routing = _post_policy_dose_value_trunk_routing(
+        base_scale=float(args.value_trunk_grad_scale),
+        post_scale=float(args.post_policy_dose_value_trunk_grad_scale),
+        target_lr_area=float(args.policy_dose_lr_area),
+        realized_policy_loss_weight=float(args.policy_loss_weight),
+    )
+    if (
+        bool(post_policy_dose_routing["positive_policy_dose_enabled"])
+        and float(args.post_policy_dose_value_trunk_grad_scale)
+        != float(args.value_trunk_grad_scale)
+        and str(args.arch) != "entity_graph"
+    ):
+        raise SystemExit(
+            "--post-policy-dose-value-trunk-grad-scale requires "
+            "--arch entity_graph when a positive policy dose is enabled"
+        )
+    if (
+        bool(post_policy_dose_routing["positive_policy_dose_enabled"])
+        and float(args.post_policy_dose_value_trunk_grad_scale) == 0.0
+        and (
+            float(args.policy_kl_anchor_weight) != 0.0
+            or args.policy_kl_target is not None
+        )
+    ):
+        raise SystemExit(
+            "post-policy exact shared-representation freeze requires the "
+            "policy-KL anchor/controller to be disabled"
+        )
+    args.post_policy_dose_value_routing_contract = post_policy_dose_routing
     # Authenticate diagnostic batch/topology drift before the expensive A1
     # memmap preflight.  The same authorization is replayed again when the
     # audited corpus recipe is bound below.
@@ -12149,6 +12234,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             final_vp_weight=float(args.final_vp_loss_weight),
             model=policy.model,
         )
+        args.value_gradient_routing["post_policy_dose"] = {
+            **dict(args.post_policy_dose_value_routing_contract),
+            "value_tower_split_layers": int(
+                getattr(policy.model, "value_tower_split_layers", 0) or 0
+            ),
+            "private_value_tower_remains_trainable": bool(
+                int(getattr(policy.model, "value_tower_split_layers", 0) or 0)
+                > 0
+            ),
+            "optimizer_state_freeze_at_zero_scale": True,
+        }
         _rank0_print(
             json.dumps(
                 {
@@ -13809,6 +13905,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         global_step=global_step,
         max_steps=int(args.max_steps),
     )
+    policy_dose_cutoff_optimizer_step = (
+        int(global_step)
+        if float(args.policy_dose_lr_area) > 0.0
+        and float(policy_objective_lr_area)
+        >= float(args.policy_dose_lr_area)
+        else None
+    )
     policy_kl_controller = _adaptive_policy_kl_controller(
         args, resume_progress=resume_progress
     )
@@ -14196,6 +14299,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_policy_objective_equivalent_effective_weight = 0.0
         epoch_policy_objective_optimizer_updates = 0
         epoch_policy_objective_equivalent_optimizer_updates = 0.0
+        epoch_pre_policy_dose_value_routing_batches = 0
+        epoch_post_policy_dose_value_routing_batches = 0
+        epoch_pre_policy_dose_value_routing_updates = 0
+        epoch_post_policy_dose_value_routing_updates = 0
+        epoch_post_policy_dose_shared_freeze_updates = 0
         epoch_value_active_count = 0.0
         epoch_anchor_eligible_count = 0.0
         epoch_policy_kl_weighted_objective_sum = 0.0
@@ -14406,9 +14514,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 batch_policy_loss_weight,
                 float(args.policy_loss_weight),
             )
+            batch_post_policy_routing = _post_policy_dose_value_trunk_routing(
+                base_scale=float(args.value_trunk_grad_scale),
+                post_scale=float(
+                    args.post_policy_dose_value_trunk_grad_scale
+                ),
+                target_lr_area=float(args.policy_dose_lr_area),
+                realized_policy_loss_weight=batch_policy_loss_weight,
+            )
+            batch_value_trunk_grad_scale = float(
+                batch_post_policy_routing[
+                    "effective_value_trunk_grad_scale"
+                ]
+            )
             if train_fn is _train_xdim_batch:
                 train_fn_extra_kwargs["policy_kl_anchor_weight"] = (
                     batch_policy_kl_coefficient
+                )
+                train_fn_extra_kwargs["value_trunk_grad_scale"] = (
+                    batch_value_trunk_grad_scale
                 )
             # DDP documents that no_sync() must wrap the forward pass as well as
             # backward().  Applying it only inside _train_xdim_batch after the
@@ -14428,7 +14552,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         batch_number=batch_number,
                         baseline_observed=objective_gradient_baseline_observed,
                         accum_do_step=accum_do_step,
-                    )
+                    ) and batch_policy_objective_fraction > 0.0
                     symmetry_kwargs = {
                         "symmetry": symmetry,
                         "symmetry_rng": symmetry_rng,
@@ -14616,12 +14740,31 @@ def main(argv: Sequence[str] | None = None) -> None:
             optimizer_step_applied = bool(
                 batch_metrics.get("optimizer_step_applied", accum_do_step)
             )
+            if batch_post_policy_routing["phase"] == "post_policy_dose":
+                epoch_post_policy_dose_value_routing_batches += 1
+                if optimizer_step_applied:
+                    epoch_post_policy_dose_value_routing_updates += 1
+                    if batch_post_policy_routing[
+                        "shared_policy_representation_frozen"
+                    ]:
+                        epoch_post_policy_dose_shared_freeze_updates += 1
+            else:
+                epoch_pre_policy_dose_value_routing_batches += 1
+                if optimizer_step_applied:
+                    epoch_pre_policy_dose_value_routing_updates += 1
             if optimizer_step_applied:
                 optimizer_lr_applied_updates += 1
                 optimizer_schedule_multiplier_sum += float(applied_lr_multiplier)
                 policy_objective_lr_area += (
                     float(batch_policy_loss_weight) * scheduled_base_lr
                 )
+                if (
+                    policy_dose_cutoff_optimizer_step is None
+                    and float(args.policy_dose_lr_area) > 0.0
+                    and policy_objective_lr_area
+                    >= float(args.policy_dose_lr_area)
+                ):
+                    policy_dose_cutoff_optimizer_step = int(global_step) + 1
                 for group_index, group in enumerate(optimizer.param_groups):
                     optimizer_lr_area_by_group[group_index] += float(group["lr"])
             if optimizer_observability is not None:
@@ -15728,6 +15871,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_objective_equivalent_optimizer_updates": float(
                     epoch_policy_objective_equivalent_optimizer_updates
                 ),
+                "post_policy_dose_value_routing": {
+                    "schema_version": "post-policy-dose-value-routing-epoch-v1",
+                    "pre_or_dormant_local_microbatches_per_rank": int(
+                        epoch_pre_policy_dose_value_routing_batches
+                    ),
+                    "post_policy_dose_local_microbatches_per_rank": int(
+                        epoch_post_policy_dose_value_routing_batches
+                    ),
+                    "pre_or_dormant_optimizer_updates": int(
+                        epoch_pre_policy_dose_value_routing_updates
+                    ),
+                    "post_policy_dose_optimizer_updates": int(
+                        epoch_post_policy_dose_value_routing_updates
+                    ),
+                    "post_policy_dose_shared_freeze_updates": int(
+                        epoch_post_policy_dose_shared_freeze_updates
+                    ),
+                },
                 "value_active_rows": int(value_active_count_total),
                 "policy_kl_anchor_eligible_rows": int(
                     anchor_eligible_count_total
@@ -16683,6 +16844,71 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "complete_training_split_coverage": True,
             }
         )
+    post_policy_dose_value_routing = {
+        "schema_version": "post-policy-dose-value-routing-report-v1",
+        "configured_base_value_trunk_grad_scale": float(
+            args.value_trunk_grad_scale
+        ),
+        "configured_post_policy_dose_value_trunk_grad_scale": float(
+            args.post_policy_dose_value_trunk_grad_scale
+        ),
+        "positive_policy_dose_enabled": float(args.policy_dose_lr_area) > 0.0,
+        "policy_dose_cutoff_optimizer_step": (
+            None
+            if policy_dose_cutoff_optimizer_step is None
+            else int(policy_dose_cutoff_optimizer_step)
+        ),
+        "pre_or_dormant_local_microbatches_per_rank": int(
+            sum(
+                int(
+                    (metric.get("post_policy_dose_value_routing") or {}).get(
+                        "pre_or_dormant_local_microbatches_per_rank", 0
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "post_policy_dose_local_microbatches_per_rank": int(
+            sum(
+                int(
+                    (metric.get("post_policy_dose_value_routing") or {}).get(
+                        "post_policy_dose_local_microbatches_per_rank", 0
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "pre_or_dormant_optimizer_updates": int(
+            sum(
+                int(
+                    (metric.get("post_policy_dose_value_routing") or {}).get(
+                        "pre_or_dormant_optimizer_updates", 0
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "post_policy_dose_optimizer_updates": int(
+            sum(
+                int(
+                    (metric.get("post_policy_dose_value_routing") or {}).get(
+                        "post_policy_dose_optimizer_updates", 0
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "post_policy_dose_shared_freeze_updates": int(
+            sum(
+                int(
+                    (metric.get("post_policy_dose_value_routing") or {}).get(
+                        "post_policy_dose_shared_freeze_updates", 0
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+    }
     report = {
         "checkout_runtime_binding": checkout_runtime_binding,
         "training_resume_recipe_identity": resume_recipe_identity,
@@ -16994,6 +17220,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.policy_dose_reference_global_batch_size
         ),
         "policy_objective_lr_area": float(policy_objective_lr_area),
+        "post_policy_dose_value_trunk_grad_scale": float(
+            args.post_policy_dose_value_trunk_grad_scale
+        ),
+        "post_policy_dose_value_routing": (
+            post_policy_dose_value_routing
+        ),
         "policy_aux_active_batch_size": int(args.policy_aux_active_batch_size),
         "policy_aux_loss_weight": float(args.policy_aux_loss_weight),
         "policy_aux_active_rows": int(
@@ -19160,6 +19392,7 @@ def _train_xdim_batch(
     backward_loss = loss / float(grad_accum_steps) if int(grad_accum_steps) > 1 else loss
     backward_loss.backward()
     policy_only_gradients_suppressed: tuple[str, ...] = ()
+    shared_policy_representation_gradients_suppressed: tuple[str, ...] = ()
     if (
         float(policy_loss_weight) == 0.0
         and float(policy_kl_anchor_weight) == 0.0
@@ -19167,6 +19400,12 @@ def _train_xdim_batch(
         policy_only_gradients_suppressed = (
             _suppress_inactive_policy_only_gradients(policy, optimizer)
         )
+        if float(value_trunk_grad_scale) == 0.0:
+            shared_policy_representation_gradients_suppressed = (
+                _suppress_shared_policy_representation_gradients(
+                    policy, optimizer
+                )
+            )
     optimizer_observability = None
     optimizer_step_applied = False
     if accum_do_step:
@@ -19499,6 +19738,9 @@ def _train_xdim_batch(
         ),
         "policy_only_gradients_suppressed": list(
             policy_only_gradients_suppressed
+        ),
+        "shared_policy_representation_gradients_suppressed": list(
+            shared_policy_representation_gradients_suppressed
         ),
         "optimizer_step_applied": bool(optimizer_step_applied),
     }
@@ -29170,6 +29412,43 @@ def _suppress_inactive_policy_only_gradients(
                 (f"state_norm.{name}", parameter)
                 for name, parameter in state_norm.named_parameters()
             )
+    suppressed: list[str] = []
+    for name, parameter in parameters:
+        if parameter.grad is not None:
+            parameter.grad = None
+            suppressed.append(name)
+        if optimizer is not None:
+            optimizer.state.pop(parameter, None)
+    return tuple(sorted(suppressed))
+
+
+def _suppress_shared_policy_representation_gradients(
+    policy,
+    optimizer=None,
+) -> tuple[str, ...]:
+    """Freeze every non-value EntityGraph surface, including AdamW state."""
+
+    model = policy.model
+    module = getattr(model, "module", model)
+    frozen_roots = {
+        module_name
+        for group_name in ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS
+        for module_name in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS[group_name]
+    }
+    parameters: list[tuple[str, object]] = []
+    seen: set[int] = set()
+    for name, parameter in module.named_parameters():
+        normalized = str(name)
+        for prefix in ("module.", "_fsdp_wrapped_module."):
+            while normalized.startswith(prefix):
+                normalized = normalized[len(prefix) :]
+        if normalized.split(".", 1)[0] not in frozen_roots:
+            continue
+        identity = id(parameter)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        parameters.append((normalized, parameter))
     suppressed: list[str] = []
     for name, parameter in parameters:
         if parameter.grad is not None:

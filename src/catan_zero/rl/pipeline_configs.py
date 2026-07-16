@@ -310,6 +310,9 @@ class TrainConfig(PipelineConfig):
     soft_target_min_legal_coverage: float = 0.5
     # Value-head weights -- the group the "flag-flips" work verifies.
     policy_loss_weight: float = 1.0
+    policy_dose_lr_area: float = 0.0
+    policy_dose_reference_global_batch_size: int = 0
+    post_policy_dose_value_trunk_grad_scale: float = 1.0
     # Additional policy-active rows drawn per local optimizer step.  This is a
     # science-critical sampling knob: it changes the effective policy batch
     # without changing the base/value row dose, so it must participate in the

@@ -158,6 +158,7 @@
       "fused_optimizer": true,
       "value_lr_mult": 1.0,
       "value_trunk_grad_scale": 0.25,
+      "post_policy_dose_value_trunk_grad_scale": 0.0,
       "train_diagnostics_every_batches": 16,
       "objective_gradient_interference_every_batches": 16,
       "require_feature_learning_signal_modules": "event_encoder,legal_action_value_residual_proj,legal_action_value_static_proj,meaningful_history_residual_gate,meaningful_history_ordered_gate,meaningful_history_sequence,meaningful_history_target_proj,public_card_count_residual,public_rule_state_residual,static_action_residual_proj,value_blocks,value_head,value_state_norm,final_vp_head",
