@@ -109,6 +109,8 @@ D6 averaging at width 20, and zero truncations.
 | split FULL step 48 | 32 | 19-13 | 59.38% |
 | split D128/FREEZE step 128 | 32 | 19-13 | 59.38% |
 | **split FULL step 48 confirmation** | **128** | **82-46** | **64.06%** |
+| split FULL step 48 replication | 128 | 69-59 | 53.91% |
+| **strictly pooled split FULL step 48** | **256** | **151-105** | **58.98%** |
 
 The screens establish a real learning signal and reject the claim that the
 coherent n128 corpus is intrinsically unlearnable. They are not by themselves
@@ -121,6 +123,16 @@ It completed all 64 pairs with zero truncations. Its production
 `LLR=3.0708 > 2.9444`. The stricter `[0,+15]` superiority test remains
 `continue`; this result commissions the learner recipe but does not itself
 perform a champion promotion.
+
+The second disjoint 64-pair cohort also favored the candidate. The repository's
+strict evaluation pool authenticated identical checkpoint bytes, exact f7,
+matching effective search, non-overlapping seed intervals, and all 128 complete
+pairs. The pooled artifact is
+`/tmp/a1-coherent-joint-split1-8arm-20260716/h2h/split1_full48_vs_f7_pooled128pairs.json`
+with SHA
+`sha256:6fc12764eb3ab45e7c4f88caefd4db58d014ed63788bc294952eaacb766ecd9b`.
+Its production pentanomial verdict is H1 (`LLR=3.3860`); the stricter
+superiority test remains `continue` (`LLR=1.8591`).
 
 ## Current interpretation
 
@@ -137,3 +149,8 @@ perform a champion promotion.
 - The commissioned parent-update treatment is the split-value FULL arm at
   exactly 48 updates, with fresh optimizer state and no candidate chaining.
   The separate fresh-scratch recipe is not modified by this warm-start result.
+
+The selected checkpoint and evidence bundle are durably staged at
+`/home/ubuntu/catan-zero-artifacts/rl-system-repair-20260716/split1-full48`.
+The checkpoint SHA is
+`sha256:bd8adcba9bcb9f6d9d25ce4b05e545d6b1134354758fefd30bbf49cab4ab68be`.
