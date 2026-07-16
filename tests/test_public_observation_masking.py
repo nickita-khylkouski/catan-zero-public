@@ -298,7 +298,21 @@ def test_belief_robber_weights_do_not_condition_on_hidden_held_type_set():
     expected = PublicBelief.from_snapshot(
         snapshot, perspective=actor
     ).robber_steal_probabilities(str(action_json[2][1]))
-    actual = {RESOURCES[index]: weight for index, weight, _child in belief}
+    colors = [str(color) for color in snapshot["colors"]]
+    victim_index = colors.index(str(action_json[2][1]))
+    before = snapshot["player_state"][victim_index]["resources"]
+    actual: dict[str, float] = {}
+    for _index, weight, child in belief:
+        after = json.loads(child.json_snapshot())["player_state"][victim_index][
+            "resources"
+        ]
+        stolen = [
+            resource
+            for resource in RESOURCES
+            if int(before.get(resource, 0)) - int(after.get(resource, 0)) == 1
+        ]
+        assert len(stolen) == 1
+        actual[stolen[0]] = actual.get(stolen[0], 0.0) + float(weight)
     assert actual == pytest.approx(
         {resource: weight for resource, weight in expected.items() if weight > 0.0}
     )
