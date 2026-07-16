@@ -19,6 +19,7 @@ evaluator, which sanitizes the root before any neural evaluation or expansion.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import hashlib
 import importlib.metadata
@@ -43,6 +44,10 @@ from tools import train_bc  # noqa: E402
 from catan_zero.rl.target_reliability import (  # noqa: E402
     TARGET_RELIABILITY_COLUMNS,
     TARGET_RELIABILITY_SCHEMA,
+    duplicate_search_reliability_fields,
+    target_reliability_contract,
+    target_reliability_root_seed,
+    target_reliability_root_selected,
     unaudited_target_reliability_fields,
 )
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
@@ -1404,8 +1409,23 @@ def _patch_arrays(records: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray]
     neutral = unaudited_target_reliability_fields()
     for name in TARGET_RELIABILITY_COLUMNS:
         scalar = np.asarray(neutral[name])
-        arrays[name] = np.full(count, scalar.item(), dtype=scalar.dtype)
+        arrays[name] = np.asarray(
+            [record.get(name, scalar.item()) for record in records],
+            dtype=scalar.dtype,
+        )
     return arrays
+
+
+def _neutral_reliability_receipt(row_count: int) -> dict[str, Any]:
+    return {
+        "schema_version": TARGET_RELIABILITY_SCHEMA,
+        "mode": "primary_search_only_unaudited_v1",
+        "contract": None,
+        "typed_neutral_sentinel_for_unaudited_rows": True,
+        "audited_rows": 0,
+        "unaudited_rows": int(row_count),
+        "duplicate_selected_action_applied": False,
+    }
 
 
 def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
@@ -1457,6 +1477,10 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
         )
     checkpoint_sha = str(target["producer_checkpoint"]["sha256"])
     operator_contract_sha = str(target["authority"]["contract"]["file_sha256"])
+    reliability_contract = target_reliability_contract(
+        audit_fraction=float(args.target_reliability_audit_fraction),
+        audit_seed=int(args.target_reliability_audit_seed),
+    )
     records: list[dict[str, Any]] = []
     for game_seed, game_positions in sorted(ordinals_by_game.items()):
         sequence, game_rows = sequences[game_seed]
@@ -1506,6 +1530,73 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
                 row_seed=seed,
                 expected_legal_policy_ids=_one_row(data["legal_action_ids"], row),
             )
+            reliability = unaudited_target_reliability_fields()
+            if target_reliability_root_selected(
+                game_seed=game_seed,
+                decision_index=decision,
+                audit_seed=int(args.target_reliability_audit_seed),
+                audit_fraction=float(args.target_reliability_audit_fraction),
+            ):
+                duplicate_seed = target_reliability_root_seed(
+                    game_seed=game_seed,
+                    decision_index=decision,
+                    audit_seed=int(args.target_reliability_audit_seed),
+                )
+                if duplicate_seed == seed:
+                    raise ExecutorError(
+                        "duplicate-search reliability seed collided with primary search"
+                    )
+                duplicate = _search_patch(
+                    plan=plan,
+                    evaluator=evaluator,
+                    reconstructed_game=game,
+                    row_seed=duplicate_seed,
+                    expected_legal_policy_ids=_one_row(
+                        data["legal_action_ids"], row
+                    ),
+                )
+                primary_ids = np.asarray(patch["legal_action_ids"], dtype=np.int64)
+                duplicate_ids = np.asarray(
+                    duplicate["legal_action_ids"], dtype=np.int64
+                )
+                if not np.array_equal(primary_ids, duplicate_ids):
+                    raise ExecutorError(
+                        "duplicate search changed the authenticated action support"
+                    )
+                reliability = duplicate_search_reliability_fields(
+                    primary_policy={
+                        int(action): float(value)
+                        for action, value in zip(
+                            primary_ids,
+                            patch["target_policy"],
+                            strict=True,
+                        )
+                    },
+                    duplicate_policy={
+                        int(action): float(value)
+                        for action, value in zip(
+                            duplicate_ids,
+                            duplicate["target_policy"],
+                            strict=True,
+                        )
+                    },
+                    primary_completed_q={
+                        int(action): float(value)
+                        for action, value in zip(
+                            primary_ids,
+                            patch["completed_q_values"],
+                            strict=True,
+                        )
+                    },
+                    duplicate_completed_q={
+                        int(action): float(value)
+                        for action, value in zip(
+                            duplicate_ids,
+                            duplicate["completed_q_values"],
+                            strict=True,
+                        )
+                    },
+                )
             records.append(
                 {
                     "ready_ordinal": int(subset["ready_ordinal"][position]),
@@ -1520,6 +1611,7 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
                     "target_reanalyzer_checkpoint_sha256": checkpoint_sha,
                     "target_operator_contract_file_sha256": operator_contract_sha,
                     **patch,
+                    **reliability,
                 }
             )
     records.sort(key=lambda value: int(value["ready_ordinal"]))
@@ -1588,8 +1680,21 @@ def _execute_partition(args: argparse.Namespace) -> dict[str, Any]:
         },
         "reliability": {
             "schema_version": TARGET_RELIABILITY_SCHEMA,
-            "mode": "primary_search_only_unaudited_v1",
-            "typed_neutral_sentinel": True,
+            "mode": (
+                "primary_plus_independent_duplicate_search_v1"
+                if reliability_contract is not None
+                else "primary_search_only_unaudited_v1"
+            ),
+            "contract": reliability_contract,
+            "typed_neutral_sentinel_for_unaudited_rows": True,
+            "audited_rows": int(
+                np.count_nonzero(arrays["target_reliability_audited"])
+            ),
+            "unaudited_rows": int(
+                len(records)
+                - np.count_nonzero(arrays["target_reliability_audited"])
+            ),
+            "duplicate_selected_action_applied": False,
         },
         "patch_columns": sorted(arrays),
         "artifact": alignment._artifact_ref(patch_path),  # noqa: SLF001
@@ -1643,16 +1748,56 @@ def _verify_patch_arrays(
     ):
         if not np.all(np.asarray(arrays[name]).astype(str) == expected_value):
             raise ExecutorError(f"Stage-C patch {name} provenance drifted")
-    neutral = unaudited_target_reliability_fields()
-    for name in TARGET_RELIABILITY_COLUMNS:
-        values = np.asarray(arrays[name])
-        expected_value = np.asarray(neutral[name]).item()
-        if isinstance(expected_value, float) and math.isnan(expected_value):
-            valid = np.all(np.isnan(values))
-        else:
-            valid = np.all(values == expected_value)
-        if not valid:
-            raise ExecutorError("Stage-C patch reliability sentinel drifted")
+    reliability = receipt.get("reliability")
+    if not isinstance(reliability, Mapping):
+        reliability = _neutral_reliability_receipt(count)
+    _classes, reliability_inventory = alignment._reliability_inventory(  # noqa: SLF001
+        arrays, row_count=count
+    )
+    audited = np.asarray(arrays["target_reliability_audited"], dtype=np.bool_)
+    audited_rows = int(np.count_nonzero(audited))
+    if (
+        reliability.get("schema_version") != TARGET_RELIABILITY_SCHEMA
+        or reliability.get("audited_rows") != audited_rows
+        or reliability.get("unaudited_rows") != count - audited_rows
+        or reliability.get("duplicate_selected_action_applied") is not False
+        or reliability_inventory.get("audited_rows") != audited_rows
+    ):
+        raise ExecutorError("Stage-C patch reliability accounting drifted")
+    mode = str(reliability.get("mode"))
+    if mode == "primary_search_only_unaudited_v1":
+        if reliability.get("contract") is not None or audited_rows != 0:
+            raise ExecutorError("unaudited Stage-C patch carries duplicate evidence")
+    elif mode == "primary_plus_independent_duplicate_search_v1":
+        contract = reliability.get("contract")
+        if not isinstance(contract, Mapping):
+            raise ExecutorError("duplicate-search Stage-C patch lost its contract")
+        expected_contract = target_reliability_contract(
+            audit_fraction=float(contract.get("audit_fraction", -1.0)),
+            audit_seed=int(contract.get("audit_seed", -1)),
+        )
+        if contract != expected_contract:
+            raise ExecutorError("duplicate-search reliability contract drifted")
+        expected_audited = np.asarray(
+            [
+                target_reliability_root_selected(
+                    game_seed=int(game_seed),
+                    decision_index=int(decision),
+                    audit_seed=int(contract["audit_seed"]),
+                    audit_fraction=float(contract["audit_fraction"]),
+                )
+                for game_seed, decision in zip(
+                    arrays["game_seed"], arrays["decision_index"], strict=True
+                )
+            ],
+            dtype=np.bool_,
+        )
+        if not np.array_equal(audited, expected_audited):
+            raise ExecutorError(
+                "duplicate-search audited roots differ from sealed selector"
+            )
+    else:
+        raise ExecutorError("unknown Stage-C reliability mode")
     effective_config = None
     if patch_schema == PATCH_SCHEMA:
         search = receipt.get("search")
@@ -1775,6 +1920,11 @@ def _verify_execution_receipt(path: Path) -> dict[str, Any]:
     with np.load(patch_path, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     _verify_patch_arrays(arrays, receipt=receipt)
+    if not isinstance(receipt.get("reliability"), Mapping):
+        receipt = copy.deepcopy(receipt)
+        receipt["reliability"] = _neutral_reliability_receipt(
+            int(receipt["counts"]["rows"])
+        )
     return {
         "path": str(receipt_path),
         "file_sha256": alignment._file_sha256(receipt_path),  # noqa: SLF001
@@ -1803,6 +1953,14 @@ def _record_from_patch(arrays: Mapping[str, np.ndarray], row: int) -> dict[str, 
     return record
 
 
+def _reliability_identity(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        key: copy.deepcopy(item)
+        for key, item in value.items()
+        if key not in {"audited_rows", "unaudited_rows"}
+    }
+
+
 def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
     executions = [_verify_execution_receipt(path) for path in args.receipt]
     if not executions:
@@ -1815,6 +1973,8 @@ def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
         execution["stage_c_plan"]["plan_sha256"] != plan_sha
         or execution["qualification_receipt"]["receipt_sha256"] != qualification_sha
         or execution["target_policy_target_identity_sha256"] != target_sha
+        or _reliability_identity(execution["reliability"])
+        != _reliability_identity(first["reliability"])
         for execution in executions[1:]
     ):
         raise ExecutorError("Stage-C merge received foreign execution receipts")
@@ -1877,6 +2037,13 @@ def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
             executions, key=lambda item: int(item["partition"]["partition_index"])
         )
     ]
+    merged_reliability = copy.deepcopy(first["reliability"])
+    merged_reliability["audited_rows"] = sum(
+        int(execution["reliability"]["audited_rows"]) for execution in executions
+    )
+    merged_reliability["unaudited_rows"] = sum(
+        int(execution["reliability"]["unaudited_rows"]) for execution in executions
+    )
     receipt: dict[str, Any] = {
         "schema_version": MERGE_RECEIPT_SCHEMA,
         "patch_schema_version": PATCH_SCHEMA,
@@ -1888,6 +2055,7 @@ def _merge_executions(args: argparse.Namespace) -> dict[str, Any]:
         "target_reanalyzer_checkpoint": first["target_reanalyzer_checkpoint"],
         "target_operator_contract": first["target_operator_contract"],
         "search": first["search"],
+        "reliability": merged_reliability,
         "evaluator": first["evaluator"],
         "runtime": first["runtime"],
         "execution_receipts": receipt_refs,
@@ -2108,6 +2276,11 @@ def _verify_rebound_merge_receipt(
     with np.load(output, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     _verify_patch_arrays(arrays, receipt=receipt)
+    if not isinstance(receipt.get("reliability"), Mapping):
+        receipt = copy.deepcopy(receipt)
+        receipt["reliability"] = _neutral_reliability_receipt(
+            int(receipt["counts"]["rows"])
+        )
     legacy_path = Path(str(legacy["artifact"]["path"])).resolve(strict=True)
     with np.load(legacy_path, allow_pickle=False) as source:
         old_arrays = {name: np.asarray(source[name]) for name in source.files}
@@ -2165,10 +2338,22 @@ def _verify_merge_receipt(path: Path) -> dict[str, Any]:
     with np.load(output, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     _verify_patch_arrays(arrays, receipt=receipt)
+    if not isinstance(receipt.get("reliability"), Mapping):
+        receipt = copy.deepcopy(receipt)
+        receipt["reliability"] = _neutral_reliability_receipt(
+            int(receipt["counts"]["rows"])
+        )
     if not executions:
         raise ExecutorError("Stage-C merge contains no execution receipts")
     first = executions[0]
     partitions = int(first["partition"]["partitions"])
+    expected_reliability = copy.deepcopy(first["reliability"])
+    expected_reliability["audited_rows"] = sum(
+        int(execution["reliability"]["audited_rows"]) for execution in executions
+    )
+    expected_reliability["unaudited_rows"] = sum(
+        int(execution["reliability"]["unaudited_rows"]) for execution in executions
+    )
     if (
         sorted(int(item["partition"]["partition_index"]) for item in executions)
         != list(range(partitions))
@@ -2183,6 +2368,12 @@ def _verify_merge_receipt(path: Path) -> dict[str, Any]:
         != first["target_reanalyzer_checkpoint"]
         or receipt.get("target_operator_contract") != first["target_operator_contract"]
         or receipt.get("search") != first["search"]
+        or any(
+            _reliability_identity(execution["reliability"])
+            != _reliability_identity(first["reliability"])
+            for execution in executions[1:]
+        )
+        or receipt.get("reliability") != expected_reliability
         or receipt.get("evaluator") != first["evaluator"]
         or receipt.get("runtime") != first["runtime"]
     ):
@@ -2247,6 +2438,21 @@ def build_parser() -> argparse.ArgumentParser:
     execute.add_argument("--partition-index", required=True, type=int)
     execute.add_argument("--partitions", required=True, type=int)
     execute.add_argument("--device", default="cuda")
+    execute.add_argument(
+        "--target-reliability-audit-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Deterministic fraction of roots receiving an independent duplicate "
+            "coherent-n128 search. FINAL reliability-gated value training uses 1.0."
+        ),
+    )
+    execute.add_argument(
+        "--target-reliability-audit-seed",
+        type=int,
+        default=0,
+        help="Independent selector/RNG-domain seed for duplicate-search evidence.",
+    )
     execute.add_argument("--patch", required=True, type=Path)
     execute.add_argument("--write", required=True, type=Path)
     verify_execute = commands.add_parser("verify-execution")

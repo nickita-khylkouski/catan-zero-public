@@ -44,6 +44,9 @@ from tools import a1_b200_active_policy_campaign as active_campaign  # noqa: E40
 from tools import a1_stage_c_reanalysis_executor as stage_c  # noqa: E402
 from tools import a1_stage_c_teacher_alignment as alignment  # noqa: E402
 from tools import train_bc  # noqa: E402
+from catan_zero.rl.target_reliability import (  # noqa: E402
+    TARGET_RELIABILITY_COLUMNS,
+)
 
 
 EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v1"
@@ -77,6 +80,7 @@ OPTIONAL_FIXED_PATCH_COLUMNS = {
     "used_full_search": "used_full_search",
     "root_value": "root_value",
     "root_value_mask": "root_value_mask",
+    **{name: name for name in TARGET_RELIABILITY_COLUMNS},
 }
 
 
@@ -393,8 +397,23 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
             "nonselected_policy_weight": 0.0,
             "selected_policy_weight": 1.0,
             "base_value_rows_retained": True,
-            "root_value_patch_consumed": False,
+            "root_value_patch_consumed": {
+                "root_value",
+                "root_value_mask",
+            }
+            <= set(OPTIONAL_FIXED_PATCH_COLUMNS)
+            & set(arrays),
             "completed_q_patch_consumed": False,
+            "completed_q_evidence_sidecar_preserved": {
+                "completed_q_values_flat",
+                "completed_q_mask_flat",
+            }
+            <= set(arrays),
+            "target_reliability_patch_consumed": set(
+                TARGET_RELIABILITY_COLUMNS
+            )
+            <= set(OPTIONAL_FIXED_PATCH_COLUMNS)
+            & set(arrays),
             "authoritative_search_fixed_columns": sorted(
                 set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(arrays)
             ),

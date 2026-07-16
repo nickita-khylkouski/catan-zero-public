@@ -1,0 +1,640 @@
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from tools import a1_one_dose_train as one_dose
+from tools import a1_pre_wave_contract as contract
+from tools import a1_stage_c_final_replication as final
+
+
+def _write_sealed(path: Path, value: dict, field: str) -> dict:
+    payload = copy.deepcopy(value)
+    payload[field] = final.value_sha256(payload)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return payload
+
+
+def _campaign(tmp_path: Path, *, parent_sha: str) -> tuple[Path, dict]:
+    value = {
+        "schema_version": "a1-b200-stage-c-aligned-learner-campaign-v1",
+        "arm": final.EXPECTED_ARM,
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "lineage": {
+            "fresh_adam": True,
+            "candidate_chaining": False,
+            "learner_parent_sha256": parent_sha,
+        },
+        "topology": {
+            "name": "b200-8gpu-ddp",
+            "world_size": 8,
+            "local_batch_size": 512,
+            "global_batch_size": 4096,
+        },
+        "recipe": {
+            "epochs": 1,
+            "max_steps": 32,
+            "lr": 6.0e-5,
+            "lr_warmup_steps": 16,
+            "policy_loss_weight": 1.0,
+            "value_loss_weight": 0.25,
+            "policy_aux_active_batch_size": 64,
+            "soft_target_source": "policy",
+            "soft_target_weight": 1.0,
+            "soft_target_min_legal_coverage": 1.0,
+            "public_card_lr_mult": 1.0,
+            "value_trunk_grad_scale": 0.1,
+            "per_game_policy_surprise_weighting": False,
+            "policy_kl_anchor_weight": 0.0,
+            "forced_row_value_action_type_weights": "END_TURN=1,ROLL=1",
+        },
+    }
+    path = tmp_path / "campaign.json"
+    return path, _write_sealed(path, value, "campaign_sha256")
+
+
+def _fingerprint(
+    tmp_path: Path, *, parent_sha: str, steps: tuple[int, ...]
+) -> tuple[Path, dict]:
+    campaign_path, campaign = _campaign(tmp_path, parent_sha=parent_sha)
+    records = []
+    for step in steps:
+        checkpoint = tmp_path / f"candidate_step{step:04d}.pt"
+        checkpoint.write_bytes(f"candidate-{step}".encode())
+        records.append(
+            {
+                "step": step,
+                "eligible": step != 16,
+                "checkpoint": str(checkpoint),
+                "checkpoint_sha256": final.file_sha256(checkpoint),
+            }
+        )
+    value = {
+        "schema_version": final.FRESH_FINGERPRINT_SCHEMA,
+        "campaign": {
+            **final._artifact(campaign_path),  # noqa: SLF001
+            "campaign_sha256": campaign["campaign_sha256"],
+        },
+        "checkpoints": records,
+        "stored_generation_prior_used_as_selection_authority": False,
+        "optimizer_batch_kl_used_as_trust_authority": False,
+        "separate_exact_parent_evidence": {"selection_authority": True},
+    }
+    path = tmp_path / "fingerprint.json"
+    return path, _write_sealed(path, value, "fingerprint_sha256")
+
+
+def _panel(
+    path: Path,
+    *,
+    checkpoint: Path,
+    baseline_sha: str,
+    win_rate: float,
+    decision: str,
+) -> Path:
+    candidate_sha = final.file_sha256(checkpoint)
+    candidate_wins = round(win_rate * final.EXPECTED_GAMES)
+    report = {
+        "fleet_merge": {
+            "schema_version": final.EXPECTED_POOL_SCHEMA,
+            "candidate": {"sha256": candidate_sha},
+            "effective_search_config_sha256": "sha256:" + "e" * 64,
+        },
+        "engine_identity": {
+            "schema_version": final.EXPECTED_ENGINE_SCHEMA,
+            "repo_commit": "deadbeef",
+        },
+        "effective_search_config": {"n_full": 128},
+        "candidate_checkpoint_sha256": candidate_sha,
+        "baseline_checkpoint_sha256": baseline_sha,
+        "comparison_contract": final.EXPECTED_COMPARISON,
+        "coherent_public_belief_search": True,
+        "public_observation": True,
+        "correct_rust_chance_spectra": True,
+        "native_mcts_hot_loop": True,
+        "forced_root_target_mode": "trajectory_only",
+        "candidate_n_full": 128,
+        "baseline_n_full": 128,
+        "candidate_gameplay_policy_aggregation": "mean_improved_policy",
+        "baseline_gameplay_policy_aggregation": "mean_improved_policy",
+        "errors": [],
+        "games_truncated": 0,
+        "games_played": final.EXPECTED_GAMES,
+        "games_with_winner": final.EXPECTED_GAMES,
+        "complete_pairs": final.EXPECTED_PAIRS,
+        "pairs_requested": final.EXPECTED_PAIRS,
+        "pairs_truncated_excluded": 0,
+        "candidate_wins": candidate_wins,
+        "baseline_wins": final.EXPECTED_GAMES - candidate_wins,
+        "candidate_win_rate": win_rate,
+        "verdict": decision,
+        "pentanomial_sprt": {"decision": decision},
+        "search_rng_contract": {"stream_key": "role,pair,orientation"},
+        "games": [
+            {"game_seed": 9_000_000 + pair}
+            for pair in range(final.EXPECTED_PAIRS)
+            for _orientation in range(2)
+        ],
+    }
+    path.write_text(json.dumps(report))
+    return path
+
+
+def _cohort(seeds: list[int], wins: list[int], *, decision: str) -> dict:
+    assert len(seeds) == len(wins)
+    pairs = len(seeds)
+    candidate_wins = sum(wins)
+    rate = candidate_wins / (2 * pairs)
+    ll_pairs = sum(value == 0 for value in wins)
+    split_pairs = sum(value == 1 for value in wins)
+    ww_pairs = sum(value == 2 for value in wins)
+    sprt = {
+        "decision": decision,
+        "pairs": pairs,
+        "mean_pair_score": rate,
+        "ll_pairs": ll_pairs,
+        "split_pairs": split_pairs,
+        "ww_pairs": ww_pairs,
+    }
+    return {
+        "pairs": pairs,
+        "games": 2 * pairs,
+        "candidate_wins": candidate_wins,
+        "baseline_wins": 2 * pairs - candidate_wins,
+        "candidate_win_rate": rate,
+        "pair_outcomes": [
+            {"seed": seed, "candidate_wins": won, "pair_score": won / 2.0}
+            for seed, won in zip(seeds, wins, strict=True)
+        ],
+        "pair_diagnostics": {
+            "incomplete_pairs": 0,
+            "ll_pairs": ll_pairs,
+            "split_pairs": split_pairs,
+            "ww_pairs": ww_pairs,
+        },
+        "sprt_minus10_plus15": copy.deepcopy(sprt),
+        "superiority_sprt_0_plus15": copy.deepcopy(sprt),
+    }
+
+
+def _tiebreak(
+    tmp_path: Path, *, fingerprint: dict, incumbent: Path
+) -> tuple[Path, str]:
+    incumbent_sha = final.file_sha256(incumbent)
+    records = {int(item["step"]): item for item in fingerprint["checkpoints"]}
+    engine = {
+        "schema_version": final.EXPECTED_ENGINE_SCHEMA,
+        "repo_commit": "e" * 40,
+        "evaluator_sha256": "sha256:" + "1" * 64,
+        "native_runtime_sha256": "sha256:" + "2" * 64,
+        "native_wheel_sha256": "sha256:" + "3" * 64,
+    }
+    role_config = {
+        role: {
+            "c_scale": 0.1,
+            "gameplay_policy_aggregation": "mean_improved_policy",
+        }
+        for role in ("candidate", "champion")
+    }
+    science_sha = "sha256:" + "4" * 64
+    effective_sha = "sha256:" + "5" * 64
+    sources = {}
+
+    def write_source(name: str, value: dict) -> None:
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(value, sort_keys=True))
+        sources[name] = {"path": str(path), "sha256": final.file_sha256(path)}
+
+    for step in (8, 16):
+        plan = {
+            "schema_version": "a1-h100-eval-fleet-plan-v2",
+            "operator_mode": "coherent_public",
+            "science_config_hash": science_sha,
+            "repo_commit": "e" * 40,
+            "internal_engine_identity": engine,
+            "role_search_config": role_config,
+            "candidate": {"sha256": records[step]["checkpoint_sha256"]},
+            "champion": {"sha256": incumbent_sha},
+        }
+        write_source(f"step{step}_plan", plan)
+        write_source(f"step{step}_replacement_plan", plan)
+        report = {
+            "candidate_checkpoint_sha256": records[step]["checkpoint_sha256"],
+            "baseline_checkpoint_sha256": incumbent_sha,
+            "comparison_contract": final.EXPECTED_COMPARISON,
+            "coherent_public_belief_search": True,
+            "public_observation": True,
+            "correct_rust_chance_spectra": True,
+            "native_mcts_hot_loop": True,
+            "candidate_n_full": 128,
+            "baseline_n_full": 128,
+            "candidate_gameplay_policy_aggregation": "mean_improved_policy",
+            "baseline_gameplay_policy_aggregation": "mean_improved_policy",
+            "errors": [],
+            "games_truncated": 0,
+            "pairs_truncated_excluded": 0,
+            "games_played": 256,
+            "complete_pairs": 128,
+            "engine_identity": engine,
+            "fleet_merge": {"effective_search_config_sha256": effective_sha},
+        }
+        write_source(f"step{step}_prior", report)
+        replacement = {**report, "games_played": 8, "complete_pairs": 4}
+        write_source(f"step{step}_replacement", replacement)
+        if step == 8:
+            fresh = {**report, "games_played": 512, "complete_pairs": 256}
+            write_source("step8_fresh", fresh)
+
+    prior_seeds = list(range(6_198_724_000, 6_198_724_128))
+    fresh_seeds = [
+        seed
+        for seed in range(6_198_726_000, 6_198_726_256)
+        if seed != 6_198_726_246
+    ] + [6_198_728_000]
+    step8_prior = [2] + [1] * 127
+    step16_prior = [1] * 128
+    step8_fresh = [1] * 222 + [0] * 34
+    step16_fresh = [1] * 234 + [0] * 22
+
+    def arm(step: int, prior: list[int], fresh: list[int]) -> dict:
+        return {
+            "checkpoint": {
+                "path": records[step]["checkpoint"],
+                "sha256": records[step]["checkpoint_sha256"],
+            },
+            "prior_128": _cohort(prior_seeds, prior, decision="continue"),
+            "tie_break_256": _cohort(fresh_seeds, fresh, decision="H0"),
+            "combined_384": _cohort(
+                prior_seeds + fresh_seeds, prior + fresh, decision="H0"
+            ),
+        }
+
+    arms = {
+        "strategic_step8": arm(8, step8_prior, step8_fresh),
+        "strategic_step16": arm(16, step16_prior, step16_fresh),
+    }
+
+    def matched(name: str) -> dict:
+        left = {
+            item["seed"]: item["pair_score"]
+            for item in arms["strategic_step8"][name]["pair_outcomes"]
+        }
+        right = {
+            item["seed"]: item["pair_score"]
+            for item in arms["strategic_step16"][name]["pair_outcomes"]
+        }
+        deltas = [
+            {"seed": seed, "delta": right[seed] - left[seed]}
+            for seed in sorted(left)
+        ]
+        return {
+            "pairs": len(deltas),
+            "per_seed_delta": deltas,
+            "step16_better_pairs": sum(item["delta"] > 0 for item in deltas),
+            "step8_better_pairs": sum(item["delta"] < 0 for item in deltas),
+            "same_pairs": sum(item["delta"] == 0 for item in deltas),
+            "step16_minus_step8_mean_pair_score": sum(
+                item["delta"] for item in deltas
+            )
+            / len(deltas),
+        }
+
+    lanes = [
+        {
+            "alias": f"host{index // 4}",
+            "gpu": index % 4,
+            "pairs_requested": 8,
+            "complete_pairs": 7 if index == 31 else 8,
+            "games_truncated": 1 if index == 31 else 0,
+            "path": f"/remote/lane-{index}.json",
+            "sha256": f"sha256:{index + 10:064x}",
+        }
+        for index in range(32)
+    ]
+    value = {
+        "schema_version": final.TIEBREAK_SCHEMA,
+        "diagnostic_non_promotable": True,
+        "operator_mode": "coherent_public",
+        "repo_commit": "e" * 40,
+        "science_config_hash": science_sha,
+        "internal_engine_identity": engine,
+        "role_search_config": role_config,
+        "baseline": {
+            "source": str(incumbent),
+            "remote": str(incumbent),
+            "sha256": incumbent_sha,
+        },
+        "arms": arms,
+        "cohort": {
+            "combined_pairs": 384,
+            "final_tiebreak_pairs": 256,
+            "common_seed_set_sha256": "sha256:" + "6" * 64,
+            "prior_interval": [6_198_724_000, 6_198_724_128],
+            "fresh_original_interval": [6_198_726_000, 6_198_726_256],
+            "deterministic_truncated_seed": 6_198_726_246,
+            "truncated_orientation": "candidate_red",
+            "truncation_decisions": 600,
+            "shared_replacement_block": [6_198_728_000, 6_198_728_004],
+            "selected_replacement_seed": 6_198_728_000,
+            "replacement_selection_rule": (
+                "lowest seed in predeclared shared block; selected without "
+                "inspecting outcomes"
+            ),
+        },
+        "matched_comparison": {
+            "tie_break_256": matched("tie_break_256"),
+            "combined_384": matched("combined_384"),
+        },
+        "selection_result": {
+            "winner": "strategic_step16",
+            "reason": "matched recovery only; no strength qualification",
+        },
+        "sources": sources,
+        "step16_fresh_lane_reports": lanes,
+    }
+    path = tmp_path / "tiebreak.json"
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    return path, incumbent_sha
+
+
+def test_external_adjudication_selects_balanced_step16_and_replays(
+    tmp_path: Path,
+) -> None:
+    f7 = "sha256:" + "7" * 64
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha=f7, steps=(8, 16)
+    )
+    incumbent = tmp_path / "v5.pt"
+    incumbent.write_bytes(b"authoritative-v5")
+    tiebreak_path, incumbent_sha = _tiebreak(
+        tmp_path, fingerprint=fingerprint, incumbent=incumbent
+    )
+    step16 = next(item for item in fingerprint["checkpoints"] if item["step"] == 16)
+    f7_report = _panel(
+        tmp_path / "step16-f7.json",
+        checkpoint=Path(step16["checkpoint"]),
+        baseline_sha=f7,
+        win_rate=149 / 256,
+        decision="H1",
+    )
+    adjudication = final.build_adjudication(
+        fingerprint_path=fingerprint_path,
+        tiebreak_adjudication_path=tiebreak_path,
+        selected_f7_report_path=f7_report,
+    )
+    assert adjudication["selected"]["step"] == 16
+    assert adjudication["incumbent_checkpoint_sha256"] == incumbent_sha
+    assert adjudication["diagnostic_strength_qualification"] is False
+    assert adjudication["all_f7_start_finalists_failed_current_parent_h0"] is True
+    assert adjudication["selected"]["combined_matched_lift_over_step8"] == 11 / 768
+    assert adjudication["selected_checkpoint_is_initializer"] is False
+    path = tmp_path / "adjudication.json"
+    final._write_json_immutable(path, adjudication)  # noqa: SLF001
+    assert final.verify_adjudication(path) == adjudication
+
+
+def test_root_manifest_refuses_diagnostic_or_eval_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    production_plan = tmp_path / "production-plan.json"
+    production_plan.write_text("{}")
+    subset = tmp_path / "production-roots.npz"
+    identities = np.asarray(
+        [f"sha256:{index:064x}" for index in range(final.EXPECTED_ROOTS)]
+    )
+    game_seeds = np.arange(100_000, 100_000 + final.EXPECTED_ROOTS, dtype=np.int64)
+    row_indices = np.arange(final.EXPECTED_ROOTS, dtype=np.int64)
+    decision_indices = np.arange(final.EXPECTED_ROOTS, dtype=np.int64) + 10
+    np.savez(
+        subset,
+        identity_sha256=identities,
+        game_seed=game_seeds,
+        row_index=row_indices,
+        decision_index=decision_indices,
+    )
+    ready = [
+        {
+            "row_index": int(row_indices[index]),
+            "game_seed": int(game_seeds[index]),
+            "decision_index": int(decision_indices[index]),
+            "identity_sha256": str(identities[index]),
+        }
+        for index in range(final.EXPECTED_ROOTS)
+    ]
+    prep_value = {
+        "schema_version": final.PREP_INVENTORY_SCHEMA,
+        "authority": {"is_authority": False, "may_launch_search": False},
+        "fully_reconstructable_ready_roots": ready,
+        "proof": {
+            "satisfied": True,
+            "independent_from_all_declared_eval_pair_seeds": True,
+            "independent_from_diagnostic_selected_rows": True,
+            "independent_from_learner_holdout_games": True,
+            "required_fully_reconstructable_strategic_roots": final.EXPECTED_ROOTS,
+            "observed_fully_reconstructable_strategic_roots": final.EXPECTED_ROOTS,
+            "first_8192_ready_root_key_set_sha256": final.value_sha256(ready),
+        },
+    }
+    prep = tmp_path / "prep.json"
+    _write_sealed(prep, prep_value, "inventory_sha256")
+    plan = {
+        "plan_sha256": "sha256:" + "p" * 64,
+        "subset": {
+            "artifact": {"path": str(subset)},
+            "selected_rows": final.EXPECTED_ROOTS,
+            "requested_rows": final.EXPECTED_ROOTS,
+            "chunks": final.EXPECTED_PARTITIONS,
+            "selection_seed": 42,
+        },
+        "execution": {"executor_semantics": final.EXPECTED_EXECUTOR},
+        "target_policy_target_identity": {
+            "target_information_regime": final.EXPECTED_OPERATOR,
+            "search_operator": {"n_full": 128},
+        },
+    }
+    monkeypatch.setattr(final.alignment, "_verify_plan", lambda _path: plan)
+    forbidden = tmp_path / "diagnostic-roots.npz"
+    np.savez(
+        forbidden,
+        identity_sha256=np.asarray(["sha256:" + "f" * 64]),
+        game_seed=np.asarray([200_000], dtype=np.int64),
+    )
+    eval_report = tmp_path / "eval.json"
+    eval_report.write_text(
+        json.dumps(
+            {
+                "games": [
+                    {"game_seed": 300_000 + pair}
+                    for pair in range(final.EXPECTED_PAIRS)
+                    for _orientation in range(2)
+                ]
+            }
+        )
+    )
+    manifest = final.build_root_manifest(
+        production_plan_path=production_plan,
+        prep_inventory_path=prep,
+        forbidden_subset_paths=[forbidden],
+        forbidden_eval_paths=[eval_report],
+    )
+    assert manifest["root_count"] == final.EXPECTED_ROOTS
+    assert manifest["diagnostic_root_overlap_count"] == 0
+
+    np.savez(
+        forbidden,
+        identity_sha256=np.asarray([identities[0]]),
+        game_seed=np.asarray([game_seeds[0]], dtype=np.int64),
+    )
+    with pytest.raises(final.FinalReplicationError, match="overlaps"):
+        final.build_root_manifest(
+            production_plan_path=production_plan,
+            prep_inventory_path=prep,
+            forbidden_subset_paths=[forbidden],
+            forbidden_eval_paths=[eval_report],
+        )
+
+
+def test_one_dose_final_binder_reloads_current_v5_not_diagnostic_f7(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current = {"path": str(tmp_path / "v5.pt"), "sha256": "sha256:" + "5" * 64}
+    Path(current["path"]).write_bytes(b"v5")
+    current["sha256"] = one_dose._file_sha256(Path(current["path"]))
+    initializer = {
+        "path": str(tmp_path / "v5-upgraded.pt"),
+        "sha256": "sha256:" + "6" * 64,
+    }
+    Path(initializer["path"]).write_bytes(b"v5 upgraded")
+    initializer["sha256"] = one_dose._file_sha256(Path(initializer["path"]))
+    admission_path = tmp_path / "final-admission.json"
+    admission_path.write_text("{}")
+    lock_path = tmp_path / "lock.json"
+    lock_path.write_text("{}")
+    authority_path = tmp_path / "authority.json"
+    authority_path.write_text("{}")
+    base_recipe = dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE)
+    selected_recipe = {
+        "epochs": 1,
+        "max_steps": 32,
+        "lr": 6.0e-5,
+        "lr_warmup_steps": 16,
+        "policy_loss_weight": 1.0,
+        "value_loss_weight": 0.25,
+        "policy_aux_active_batch_size": 64,
+        "soft_target_source": "policy",
+        "soft_target_weight": 1.0,
+        "soft_target_min_legal_coverage": 1.0,
+        "public_card_lr_mult": 1.0,
+        "trunk_lr_mult": 1.0,
+        "value_lr_mult": 0.3,
+        "value_trunk_grad_scale": 0.1,
+        "per_game_policy_surprise_weighting": False,
+        "policy_kl_anchor_weight": 0.0,
+        "forced_row_value_action_type_weights": "END_TURN=1,ROLL=1",
+        "sampler_seed": 777,
+    }
+    authority = {
+        "authority_sha256": "sha256:" + "a" * 64,
+        "final_corpus_admission": {
+            "path": str(admission_path),
+            "file_sha256": one_dose._file_sha256(admission_path),
+            "admission_sha256": "sha256:" + "c" * 64,
+        },
+        "initializer": {
+            "exact_parent": current,
+            "upgraded_initializer": initializer,
+            "upgrade_receipt_sha256": "sha256:" + "u" * 64,
+            "fresh_adam": True,
+            "resume_optimizer": False,
+            "candidate_chaining": False,
+        },
+        "training": {
+            "matched_arms": {
+                final.FINAL_CONTROL_ARM: {
+                    "role": "exact_v5_terminal_value_control",
+                    "recipe": selected_recipe,
+                    "recipe_sha256": one_dose._value_sha256(selected_recipe),
+                    "value_target": "terminal_outcome_only",
+                }
+            },
+            "max_optimizer_steps": 32,
+            "checkpoint_steps": [8, 12, 16, 32],
+        },
+        "reviewed_code": {
+            "lock": {
+                "path": str(lock_path),
+                "file_sha256": one_dose._file_sha256(lock_path),
+            },
+            "code_tree_sha256": "sha256:" + "d" * 64,
+        },
+        "diagnostic_selection": {
+            "selected_step": 16,
+            "selected_diagnostic_checkpoint_sha256": "sha256:" + "f" * 64,
+        },
+        "external_adjudication": {"adjudication_sha256": "sha256:" + "e" * 64},
+    }
+    monkeypatch.setattr(
+        one_dose.stage_c_final, "verify_final_authority", lambda _path: authority
+    )
+    monkeypatch.setattr(
+        one_dose,
+        "_current_ablation_code_binding",
+        lambda _lock: {"code_tree_sha256": "sha256:" + "d" * 64},
+    )
+    verified = {
+        "lock": {},
+        "lock_path": lock_path,
+        "lock_file_sha256": one_dose._file_sha256(lock_path),
+        "reviewed_lock_file_sha256": one_dose._file_sha256(lock_path),
+        "recipe": base_recipe,
+        "producer": current,
+        "function_preserving_upgrade": {
+            "source": current,
+            "upgraded_initializer": initializer,
+            "receipt_sha256": "sha256:" + "u" * 64,
+        },
+        "stage_c_final_corpus_admission": {
+            "admission_sha256": "sha256:" + "c" * 64,
+            "root_manifest": {"root_manifest_sha256": "sha256:" + "r" * 64},
+            "search_value_evidence": {
+                "naive_root_blend_authorized": False,
+                "terminal_target_remains_authoritative": True,
+            },
+        },
+        "coherent_direct_corpus_binding": {
+            "corpus_admission": {"path": str(admission_path)}
+        },
+    }
+    bound = one_dose.bind_stage_c_final_replication(
+        verified,
+        authority_path=authority_path,
+        arm_name=final.FINAL_CONTROL_ARM,
+        reviewed_code_tree_sha256="sha256:" + "d" * 64,
+    )
+    assert bound["recipe"]["max_steps"] == 32
+    assert (
+        bound["stage_c_final_replication_binding"][
+            "initializer_checkpoint_sha256"
+        ]
+        == initializer["sha256"]
+    )
+    assert (
+        bound["stage_c_final_replication_binding"][
+            "selected_diagnostic_checkpoint_loaded"
+        ]
+        is False
+    )
+    bad = copy.deepcopy(verified)
+    bad["producer"] = {"path": "/f7.pt", "sha256": "sha256:" + "7" * 64}
+    with pytest.raises(one_dose.ExecutorError, match="initializer drifted"):
+        one_dose.bind_stage_c_final_replication(
+            bad,
+            authority_path=authority_path,
+            arm_name=final.FINAL_CONTROL_ARM,
+            reviewed_code_tree_sha256="sha256:" + "d" * 64,
+        )
