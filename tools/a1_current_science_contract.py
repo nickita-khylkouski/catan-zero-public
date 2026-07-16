@@ -31,7 +31,7 @@ GENERATOR_GUARD_PATH = (
     REPO_ROOT
     / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
 )
-SCHEMA_VERSION = "a1-current-science-contract-v1"
+SCHEMA_VERSION = "a1-current-science-contract-v2"
 TEACHER_REPORT_SCHEMA = "teacher-operator-causal-report-v1"
 ADOPTION_RECEIPT_SCHEMA = "a1-teacher-operator-adoption-v1"
 ADAPTIVE_FIELDS = (
@@ -41,8 +41,10 @@ ADAPTIVE_FIELDS = (
 )
 POLICY_TARGET_BLEND_FALLBACK_V2 = "policy_target_fallback_v2"
 PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
-    # The science recipe is sealed in its legacy single-process representation;
-    # a1_one_dose_train overlays 8x512 while preserving the 4096-row global dose.
+    # These fields retain the reviewed 4096-row logical dose identity. The
+    # checkpoint-initialized one-dose executor is not an execution projection
+    # for the native scratch learner; a scratch launcher must separately bind
+    # its realized distributed topology before production use.
     "world_size": 1,
     "batch_size": 4096,
     "global_batch_size": 4096,
@@ -66,6 +68,14 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # normalization, keeping mandatory prompts supervised without letting
     # them dominate the strategic policy update.
     "phase_weights": "PLAY_TURN=4.0",
+}
+PRODUCTION_LEARNER_INITIALIZATION_CONTRACT = {
+    "mode": "from_scratch",
+    "entity_feature_adapter_version": (
+        "rust_entity_adapter_v3_structured_action_resources"
+    ),
+    "checkpoint": None,
+    "optimizer_state": "fresh",
 }
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
     {"policy_aux_active_batch_size", "policy_aux_loss_weight"}
@@ -150,12 +160,18 @@ def _load() -> dict[str, Any]:
             raise ScienceContractError("adopted teacher operator evidence drifted")
     learner_value = value["learner"]
     if set(learner_value) != {
+        "initialization",
         "architecture_upgrade_flags",
         "architecture_upgrade_module",
         "topology",
         "training_recipe",
     } or not isinstance(learner_value["training_recipe"], dict):
         raise ScienceContractError("current learner contract shape drifted")
+    if learner_value.get("initialization") != PRODUCTION_LEARNER_INITIALIZATION_CONTRACT:
+        raise ScienceContractError(
+            "current coherent learner initialization must be native from-scratch "
+            "v3 with fresh optimizer state"
+        )
     recipe = learner_value["training_recipe"]
     if (
         recipe.get("policy_target_blend_semantics")
@@ -246,6 +262,10 @@ def learner() -> dict[str, Any]:
 
 def learner_training_recipe() -> dict[str, Any]:
     return copy.deepcopy(_load()["learner"]["training_recipe"])
+
+
+def learner_initialization() -> dict[str, Any]:
+    return copy.deepcopy(_load()["learner"]["initialization"])
 
 
 def target_information_regime() -> str:

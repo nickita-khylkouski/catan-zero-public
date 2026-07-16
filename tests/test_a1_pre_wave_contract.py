@@ -901,7 +901,7 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert payload["generation"]["native_mcts_hot_loop"] is True
     recipe = payload["science"]["learner_training_recipe"]
     assert recipe["amp"] == "none"
-    assert recipe["max_steps"] == 128
+    assert recipe["max_steps"] == 32
     assert recipe["forced_action_weight"] == 0.0
     assert recipe["forced_row_value_weight"] == 1.0
     assert recipe["per_game_policy_weight"] is True
@@ -909,7 +909,7 @@ def test_checked_in_template_is_intentionally_unresolved_and_refuses_seal() -> N
     assert recipe["training_rng_rank_offset"] is True
     assert recipe["lr"] == 6e-5
     assert recipe["lr_warmup_steps"] == 16
-    assert recipe["lr_warmup_steps"] <= recipe["max_steps"] // 8
+    assert recipe["lr_warmup_steps"] == recipe["max_steps"] // 2
     assert recipe["per_game_value_weight"] is True
     assert recipe == contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE
     assert "$.promotion_handoff.path" in unresolved

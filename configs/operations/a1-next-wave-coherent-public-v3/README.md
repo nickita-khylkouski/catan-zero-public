@@ -13,6 +13,12 @@ post-search learner tensors advance, restoring Year of Plenty and Monopoly
 resource identity for the from-scratch v3 learner. Historical v1/v2 artifacts
 remain immutable and diagnostically replayable.
 
+The science contract binds that initialization mechanically: no learner
+checkpoint and fresh optimizer state. The checkpoint-initialized legacy
+one-dose/iteration executor must refuse this v3 production learner; the later
+full retrain must create a native v3 model rather than relabeling or resuming a
+v2 checkpoint.
+
 Generate through the sealed pre-wave control plane. For a direct lane command:
 
 ```bash

@@ -1715,6 +1715,13 @@ def _require_a1_science(lock: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
             )
         except current_science.ScienceContractError as error:
             raise ExecutorError(str(error)) from error
+        initialization = current_science.learner_initialization()
+        if initialization["mode"] == "from_scratch":
+            raise ExecutorError(
+                "current coherent-public v3 learner is contract-bound to native "
+                "from-scratch initialization; the checkpoint-initialized one-dose "
+                "executor cannot launch it"
+            )
     recipe = science.get("learner_training_recipe")
     if recipe not in (
         a1_contract.EXPECTED_LEARNER_TRAINING_RECIPE,

@@ -1,5 +1,5 @@
 {
-  "schema_version": "a1-current-science-contract-v1",
+  "schema_version": "a1-current-science-contract-v2",
   "contract_id": "a1-next-wave-coherent-public-v3",
   "operator_selection": {
     "status": "adopted_teacher_campaign",
@@ -85,6 +85,12 @@
     "target_reliability_audit_seed": 20260716
   },
   "learner": {
+    "initialization": {
+      "mode": "from_scratch",
+      "entity_feature_adapter_version": "rust_entity_adapter_v3_structured_action_resources",
+      "checkpoint": null,
+      "optimizer_state": "fresh"
+    },
     "architecture_upgrade_flags": "structured_action_value,card_count_v2,meaningful_history",
     "architecture_upgrade_module": "entity_graph.static_action_residual+legal_action_value_residual+public_card_count_features+meaningful_public_history.v3",
     "topology": "b200-8gpu-ddp",

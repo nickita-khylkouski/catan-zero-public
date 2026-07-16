@@ -816,27 +816,30 @@ def test_current_a1_requires_global_n128_and_exact_scalar_dose() -> None:
         executor._require_a1_science(_lock(n_full=256))
 
 
-def test_current_coherent_a1_accepts_full_value_learning_rate() -> None:
-    lock = {
-        "science": {
-            "search_operator": executor.current_science.search(),
-            "evaluator": executor.current_science.evaluator(),
-            "learner_training_recipe": (
-                executor.current_science.learner_training_recipe()
-            ),
-            "learner_value_objective": _objective(),
-        },
-        "generation": executor.current_science.generation(),
-        "post_wave_acceptance": {
-            "require_target_information_regime": (
-                executor.current_science.target_information_regime()
-            )
-        },
-    }
+def test_current_coherent_scratch_refuses_shared_one_dose_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        executor.current_science,
+        "is_coherent_search",
+        lambda _search: True,
+    )
+    monkeypatch.setattr(
+        executor.current_science,
+        "require_current_operator",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        executor.current_science,
+        "learner_initialization",
+        lambda: dict(executor.current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT),
+    )
 
-    recipe, _ = executor._require_a1_science(lock)
-
-    assert recipe["value_lr_mult"] == 1.0
+    with pytest.raises(
+        executor.ExecutorError,
+        match="contract-bound to native from-scratch initialization",
+    ):
+        executor._require_a1_science(_lock())
 
 
 def test_command_is_direct_one_b200_fresh_unfused_adam(tmp_path: Path) -> None:

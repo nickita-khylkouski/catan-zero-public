@@ -9,6 +9,7 @@ import pytest
 
 from tools import a1_iteration_orchestrator as iteration
 from tools import a1_pre_wave_contract as contract
+from catan_zero.rl.optim_state import save_training_progress
 
 
 def _write(path: Path, value: str = "x") -> Path:
@@ -313,6 +314,25 @@ def _initialize_next_fake(
     return state_path, state, verified
 
 
+def test_current_v3_scratch_refuses_checkpoint_one_dose_orchestrator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        iteration.current_science,
+        "is_coherent_search",
+        lambda _search: True,
+    )
+    learner = iteration.current_science.learner()
+    learner["topology"] = iteration.one_dose.LEGACY_SINGLE_GPU_TOPOLOGY
+    monkeypatch.setattr(iteration.current_science, "learner", lambda: learner)
+
+    with pytest.raises(
+        iteration.IterationError,
+        match="contract-bound to native from-scratch initialization",
+    ):
+        _initialize_next_fake(tmp_path, monkeypatch)
+
+
 def test_initialize_next_claims_fresh_corpus_once_and_rejects_cross_turn_reuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -609,6 +629,18 @@ def _remove_option(command: list[str], flag: str) -> list[str]:
 
 def _training_report(verified: dict, checkpoint: Path) -> dict:
     recipe = verified["recipe"]
+    resume_identity = {
+        "schema_version": "train-bc-resume-recipe-v1",
+        "normalized_train_config_sha256": "sha256:" + "9" * 64,
+        "grad_accum_steps": int(recipe["grad_accum_steps"]),
+        "world_size": int(recipe["world_size"]),
+        "ddp_shard_data": False,
+        "fsdp": False,
+        "policy_aux_active_batch_size": int(
+            recipe.get("policy_aux_active_batch_size", 0)
+        ),
+        "policy_aux_loss_weight": float(recipe.get("policy_aux_loss_weight", 1.0)),
+    }
     return {
         "arch": "entity_graph",
         **iteration.one_dose.SEALED_A1_MODEL_REPORT,
@@ -671,6 +703,10 @@ def _training_report(verified: dict, checkpoint: Path) -> dict:
         ),
         "steps_completed": 1,
         "total_training_steps": 1,
+        "training_resume_recipe_identity": resume_identity,
+        "training_resume_recipe_identity_sha256": (
+            iteration.one_dose._value_sha256(resume_identity)
+        ),
         "require_35m_model": True,
         "parameter_count": 35_000_000,
         "value_training": {
@@ -703,6 +739,32 @@ def _training_report(verified: dict, checkpoint: Path) -> dict:
             }
         ],
     }
+
+
+def _write_training_progress(checkpoint: Path, report_payload: dict) -> None:
+    identity = report_payload["training_resume_recipe_identity"]
+    world_size = int(identity["world_size"])
+    numpy_states = [
+        {"bit_generator": "PCG64", "state": {"state": rank, "inc": rank + 1}}
+        for rank in range(world_size)
+    ]
+    torch_states = [
+        {"rank": rank, "cpu": [rank], "cuda": None}
+        for rank in range(world_size)
+    ]
+    assert save_training_progress(
+        checkpoint,
+        optimizer_step=1,
+        completed_epochs=1,
+        recipe_identity=identity,
+        rng_state=numpy_states[0],
+        rank_numpy_rng_states=numpy_states,
+        symmetry_rng_state=None,
+        rank_torch_rng_states=torch_states,
+        scalar_training_weight_sum=1.0,
+        categorical_training_weight_sum=0.0,
+        ddp={"rank": 0},
+    ) is not None
 
 
 def _completed_retry(tmp_path: Path) -> tuple[dict, dict[str, Path]]:
@@ -786,7 +848,9 @@ def _completed_retry(tmp_path: Path) -> tuple[dict, dict[str, Path]]:
         _write(checkpoint, "candidate")
         _write(Path(str(checkpoint) + ".optimizer.pt"), "optimizer")
         report.parent.mkdir(parents=True, exist_ok=True)
-        report.write_text(json.dumps(_training_report(verified, checkpoint)))
+        report_payload = _training_report(verified, checkpoint)
+        report.write_text(json.dumps(report_payload))
+        _write_training_progress(checkpoint, report_payload)
         return subprocess.CompletedProcess(command, 0)
 
     iteration.one_dose.execute(

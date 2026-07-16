@@ -11,6 +11,10 @@ from tools import a1_current_science_contract as current_science
 def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     recipe = current_science.learner_training_recipe()
 
+    assert (
+        current_science.learner_initialization()
+        == current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
+    )
     for key, expected in current_science.PRODUCTION_LEARNER_SIGNAL_CONTRACT.items():
         assert recipe[key] == expected
     for (
@@ -20,6 +24,34 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         assert recipe[key] == expected
     assert not current_science.DIAGNOSTIC_POLICY_AUX_FIELDS & set(recipe)
     assert recipe["phase_weights"] == "PLAY_TURN=4.0"
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    (
+        ("mode", "checkpoint"),
+        (
+            "entity_feature_adapter_version",
+            "rust_entity_adapter_v2_land_topology_ports_maritime",
+        ),
+        ("checkpoint", "/tmp/legacy.pt"),
+        ("optimizer_state", "resume"),
+    ),
+)
+def test_current_contract_rejects_non_scratch_v3_initialization(
+    tmp_path, monkeypatch, field: str, bad_value
+) -> None:
+    contract = copy.deepcopy(current_science.load())
+    contract["learner"]["initialization"][field] = bad_value
+    path = tmp_path / "science.contract.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
+
+    with pytest.raises(
+        current_science.ScienceContractError,
+        match="native from-scratch v3",
+    ):
+        current_science.load()
 
 
 def test_current_target_quality_generation_is_bound_to_config_and_guard() -> None:

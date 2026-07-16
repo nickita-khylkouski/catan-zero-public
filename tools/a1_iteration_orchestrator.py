@@ -601,13 +601,22 @@ def initialize_next(
         )
         if current_science.is_coherent_search(search):
             learner_contract = current_science.learner()
-            if (
-                topology != learner_contract["topology"]
-                or architecture_upgrade_receipt is None
-            ):
+            initialization = learner_contract["initialization"]
+            if topology != learner_contract["topology"]:
                 raise IterationError(
                     "current coherent-public turn must use the contract-bound "
-                    "8xB200 topology and architecture receipt"
+                    "8xB200 topology"
+                )
+            if initialization["mode"] == "from_scratch":
+                raise IterationError(
+                    "current coherent-public v3 learner is contract-bound to native "
+                    "from-scratch initialization; the checkpoint-initialized one-dose "
+                    "iteration orchestrator cannot launch it"
+                )
+            if architecture_upgrade_receipt is None:
+                raise IterationError(
+                    "checkpoint-initialized coherent-public turn requires its "
+                    "architecture receipt"
                 )
             if any(ablation_values):
                 raise IterationError(
