@@ -88,7 +88,12 @@ def _verified(tmp_path: Path) -> dict:
         "lock_path": lock_path,
         "lock_file_sha256": executor._file_sha256(lock_path),
         "contract_sha256": _SHA,
-        "recipe": dict(contract.EXPECTED_LEARNER_TRAINING_RECIPE),
+        "recipe": {
+            **contract.EXPECTED_LEARNER_TRAINING_RECIPE,
+            "policy_target_blend_semantics": (
+                executor.train_bc.POLICY_TARGET_BLEND_LEGACY_V1
+            ),
+        },
         "objective": _objective(),
         "producer": lock["checkpoints"][0],
         "data_path": data,
@@ -1039,6 +1044,44 @@ def test_coherent_one_dose_renders_deployed_scalar_value_objective(
     assert _option(command, "--max-steps") == "0"
     assert "--exact-max-steps" not in command
     assert "--checkpoint-steps" not in command
+
+
+def test_one_dose_refuses_missing_policy_target_blend_semantics(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"].pop("policy_target_blend_semantics")
+
+    with pytest.raises(
+        executor.ExecutorError,
+        match="refusing to silently revive sampled-action interpolation",
+    ):
+        executor._build_direct_train_command(
+            verified,
+            python=Path(sys.executable),
+            checkpoint=tmp_path / "candidate.pt",
+            report=tmp_path / "report.json",
+        )
+
+
+def test_one_dose_passes_explicit_policy_target_blend_semantics(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"]["policy_target_blend_semantics"] = (
+        executor.train_bc.POLICY_TARGET_BLEND_FALLBACK_V2
+    )
+
+    command = executor._build_direct_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    assert _option(command, "--policy-target-blend-semantics") == (
+        executor.train_bc.POLICY_TARGET_BLEND_FALLBACK_V2
+    )
 
 
 def test_intermediate_checkpoint_steps_fail_closed() -> None:

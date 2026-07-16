@@ -5346,6 +5346,18 @@ def _build_direct_train_command(
     """
 
     recipe = verified["recipe"]
+    if "policy_target_blend_semantics" not in recipe:
+        raise ExecutorError(
+            "learner recipe is missing policy_target_blend_semantics; refusing "
+            "to silently revive sampled-action interpolation"
+        )
+    policy_target_blend_semantics = recipe["policy_target_blend_semantics"]
+    if policy_target_blend_semantics not in train_bc.POLICY_TARGET_BLEND_SEMANTICS:
+        raise ExecutorError(
+            "learner recipe policy_target_blend_semantics must be one of "
+            f"{sorted(train_bc.POLICY_TARGET_BLEND_SEMANTICS)}, got "
+            f"{policy_target_blend_semantics!r}"
+        )
     initializer = verified.get("architecture_initializer", verified["producer"])
     trainer_path = _REPO_ROOT / "tools" / "train_bc.py"
     if verified.get("data_kind") == "production_composite_v2":
@@ -5505,12 +5517,7 @@ def _build_direct_train_command(
             "--soft-target-weight",
             str(recipe["soft_target_weight"]),
             "--policy-target-blend-semantics",
-            str(
-                recipe.get(
-                    "policy_target_blend_semantics",
-                    train_bc.POLICY_TARGET_BLEND_LEGACY_V1,
-                )
-            ),
+            str(policy_target_blend_semantics),
             "--soft-target-temperature",
             str(recipe["soft_target_temperature"]),
             "--soft-target-min-legal-coverage",
