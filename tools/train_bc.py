@@ -1185,6 +1185,28 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--scalar-value-loss-readout",
+        choices=("raw", "deployed_tanh"),
+        default="raw",
+        help=(
+            "Function of the scalar value head optimized against outcome targets. "
+            "'raw' preserves historical checkpoints. 'deployed_tanh' trains the "
+            "exact bounded readout consumed by scalar MCTS: tanh(raw * "
+            "--scalar-value-loss-scale). New from-scratch scalar learners should "
+            "use deployed_tanh so checkpoint selection and search optimize the same "
+            "operator."
+        ),
+    )
+    parser.add_argument(
+        "--scalar-value-loss-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Scale inside the deployed scalar loss readout. Must match the search "
+            "operator's --value-scale when --scalar-value-loss-readout=deployed_tanh."
+        ),
+    )
+    parser.add_argument(
         "--value-categorical-bins",
         type=int,
         default=None,
@@ -1978,6 +2000,39 @@ def _resolve_value_objective_weights(args) -> tuple[float, float]:
     raise SystemExit(f"unknown --value-head-type={mode!r}")
 
 
+def _scalar_value_loss_contract(args) -> dict[str, object]:
+    mode = str(getattr(args, "scalar_value_loss_readout", "raw"))
+    scale = float(getattr(args, "scalar_value_loss_scale", 1.0))
+    if mode not in {"raw", "deployed_tanh"}:
+        raise SystemExit(f"unknown scalar value loss readout: {mode!r}")
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise SystemExit("--scalar-value-loss-scale must be finite and > 0")
+    return {
+        "schema_version": "scalar-value-loss-readout-v1",
+        "readout": mode,
+        "scale": scale,
+        "formula": "raw" if mode == "raw" else "tanh(raw * scale)",
+        "matches_scalar_mcts_when_value_squash_tanh": mode == "deployed_tanh",
+    }
+
+
+def _scalar_value_loss_prediction(raw_value, *, readout: str, scale: float):
+    """Return the scalar function whose error the optimizer should minimize."""
+
+    mode = str(readout)
+    if mode == "raw":
+        return raw_value
+    if mode == "deployed_tanh":
+        import torch
+
+        if not math.isfinite(float(scale)) or float(scale) <= 0.0:
+            raise ValueError("deployed scalar value scale must be finite and > 0")
+        # Compute the squash in float32 even under bf16 autocast. Search applies
+        # the same function after converting the network output to a host float.
+        return torch.tanh(raw_value.float() * float(scale))
+    raise ValueError(f"unknown scalar value loss readout: {mode!r}")
+
+
 def _value_trunk_gradient_routing(
     args,
     *,
@@ -2114,6 +2169,9 @@ def _value_training_metadata(
         "value_target_lambda": float(getattr(args, "value_target_lambda", 1.0)),
         "value_root_blend_regime": _resolve_value_root_blend_regime(args),
         "value_root_blend_audit": getattr(args, "value_root_blend_audit", None),
+        "scalar_value_loss_contract": getattr(
+            args, "scalar_value_loss_contract", _scalar_value_loss_contract(args)
+        ),
         "value_gradient_routing": value_gradient_routing,
         "truncated_vp_margin_value_weight": float(
             getattr(args, "truncated_vp_margin_value_weight", 0.0)
@@ -7456,6 +7514,25 @@ def _validate_a1_learner_objective(
     expected_readout = "scalar" if mode == "mse" else "categorical"
     if objective.get("value_readout") != expected_readout:
         raise SystemExit("A1 learner readout differs from the immutable contract")
+    expected_scalar_loss_readout = str(
+        objective.get("scalar_value_loss_readout", "raw")
+    )
+    if str(getattr(args, "scalar_value_loss_readout", "raw")) != expected_scalar_loss_readout:
+        raise SystemExit(
+            "A1 scalar value loss readout differs from the immutable contract"
+        )
+    expected_scalar_loss_scale = float(
+        objective.get("scalar_value_loss_scale", 1.0)
+    )
+    if not math.isclose(
+        float(getattr(args, "scalar_value_loss_scale", 1.0)),
+        expected_scalar_loss_scale,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        raise SystemExit(
+            "A1 scalar value loss scale differs from the immutable contract"
+        )
     if mode == "mse":
         if int(getattr(args, "value_categorical_bins", 0)) != 0:
             raise SystemExit("A1 scalar learner cannot construct categorical bins")
@@ -10421,6 +10498,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         resolved_scalar_value_weight,
         resolved_categorical_value_weight,
     ) = _resolve_value_objective_weights(args)
+    args.scalar_value_loss_contract = _scalar_value_loss_contract(args)
     args.value_gradient_routing = _value_trunk_gradient_routing(
         args,
         scalar_weight=resolved_scalar_value_weight,
@@ -10439,6 +10517,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "hlgauss_scalar_aux_loss_weight": float(
                     args.hlgauss_scalar_aux_loss_weight
                 ),
+                "scalar_value_loss_contract": args.scalar_value_loss_contract,
             },
             sort_keys=True,
         ),
@@ -11881,6 +11960,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.advantage_weight_cap,
                     args.advantage_weight_floor,
                     args.amp,
+                    scalar_value_loss_readout=str(
+                        args.scalar_value_loss_readout
+                    ),
+                    scalar_value_loss_scale=float(args.scalar_value_loss_scale),
                     max_grad_norm=float(args.max_grad_norm),
                     diagnostics=False,
                     truncated_vp_margin_value_weight=float(
@@ -12596,6 +12679,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.advantage_weight_cap,
                     args.advantage_weight_floor,
                     args.amp,
+                    scalar_value_loss_readout=str(
+                        args.scalar_value_loss_readout
+                    ),
+                    scalar_value_loss_scale=float(args.scalar_value_loss_scale),
                     max_grad_norm=float(args.max_grad_norm),
                     diagnostics=(
                         int(args.train_diagnostics_every_batches) > 0
@@ -13883,6 +13970,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 data_loader_workers=int(args.data_loader_workers),
                 data_loader_prefetch=int(args.data_loader_prefetch),
+                scalar_value_loss_readout=str(args.scalar_value_loss_readout),
+                scalar_value_loss_scale=float(args.scalar_value_loss_scale),
             )
 
         validation_metrics = _evaluate_validation_indices(validation_indices)
@@ -13938,6 +14027,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 data_sharded=bool(args.ddp_shard_data),
                 data_loader_workers=int(args.data_loader_workers),
                 data_loader_prefetch=int(args.data_loader_prefetch),
+                scalar_value_loss_readout=str(args.scalar_value_loss_readout),
+                scalar_value_loss_scale=float(args.scalar_value_loss_scale),
             )
             base_wrapper = metrics[-1].get("validation_objective_matched")
             base_objective_metrics = (
@@ -14656,6 +14747,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "value_trunk_grad_scale": args.value_trunk_grad_scale,
         "value_gradient_routing": args.value_gradient_routing,
         "resolved_scalar_value_loss_weight": resolved_scalar_value_weight,
+        "scalar_value_loss_contract": args.scalar_value_loss_contract,
         "truncated_vp_margin_value_weight": float(args.truncated_vp_margin_value_weight),
         "final_vp_loss_weight": args.final_vp_loss_weight,
         "q_loss_weight": args.q_loss_weight,
@@ -14923,6 +15015,8 @@ def _train_candidate_batch(
     max_grad_norm: float = 1.0,
     diagnostics: bool = True,
     truncated_vp_margin_value_weight: float = 0.0,
+    scalar_value_loss_readout: str = "raw",
+    scalar_value_loss_scale: float = 1.0,
 ) -> dict:
     del q_skip_teacher_prefixes, amp
     del advantage_policy_weighting, advantage_temperature, advantage_weight_cap, advantage_weight_floor
@@ -14938,7 +15032,12 @@ def _train_candidate_batch(
     context_t = torch.as_tensor(context, dtype=torch.float32, device=policy.device)
     actions = torch.as_tensor(data["action_taken"][batch].astype(np.int64), device=policy.device)
     valid = _valid_lists(data["legal_action_ids"][batch])
-    logits, values = policy.forward(obs, context_t)
+    logits, raw_values = policy.forward(obs, context_t)
+    values = _scalar_value_loss_prediction(
+        raw_values,
+        readout=scalar_value_loss_readout,
+        scale=scalar_value_loss_scale,
+    )
     masked = _torch_ppo_masked_logits(logits, valid, policy.action_size)
     policy_weights = torch.as_tensor(
         policy_sample_weights[batch],
@@ -15764,6 +15863,8 @@ def _train_xdim_batch(
     measure_objective_gradient_interference: bool = False,
     measure_aux_gradient_geometry_only: bool = False,
     value_trunk_grad_scale: float = 1.0,
+    scalar_value_loss_readout: str = "raw",
+    scalar_value_loss_scale: float = 1.0,
 ) -> dict:
     import torch
     from torch import nn
@@ -15889,9 +15990,19 @@ def _train_xdim_batch(
             )
         # Advantage reweighting stays on the policy-safe (unfilled) outcome/has_outcome --
         # FIX F3 is scoped to the value head only, must not leak into POLICY weighting.
+        advantage_outputs = outputs
+        if "value" in outputs and scalar_value_loss_readout != "raw":
+            advantage_outputs = {
+                **outputs,
+                "value": _scalar_value_loss_prediction(
+                    outputs["value"],
+                    readout=scalar_value_loss_readout,
+                    scale=scalar_value_loss_scale,
+                ),
+            }
         policy_weights, advantage_stats = _advantage_reweighted_policy_weights(
             policy_weights,
-            outputs,
+            advantage_outputs,
             outcome_targets,
             has_outcome,
             advantage_policy_weighting,
@@ -16047,8 +16158,13 @@ def _train_xdim_batch(
             len(batch), dtype=torch.bool, device=policy.device
         )
         if value_outcome_targets is not None and "value" in outputs:
+            scalar_value_prediction = _scalar_value_loss_prediction(
+                outputs["value"],
+                readout=scalar_value_loss_readout,
+                scale=scalar_value_loss_scale,
+            )
             value_error = nn.functional.mse_loss(
-                outputs["value"], value_outcome_targets, reduction="none"
+                scalar_value_prediction, value_outcome_targets, reduction="none"
             )
             value_loss = _weighted_mean_loss(
                 value_error,
@@ -16126,7 +16242,14 @@ def _train_xdim_batch(
             and value_outcome_targets is not None
             and "value" in outputs
         ):
-            uncertainty_target = (value_outcome_targets - outputs["value"].detach()) ** 2
+            uncertainty_value = _scalar_value_loss_prediction(
+                outputs["value"],
+                readout=scalar_value_loss_readout,
+                scale=scalar_value_loss_scale,
+            )
+            uncertainty_target = (
+                value_outcome_targets - uncertainty_value.detach()
+            ) ** 2
             uncertainty_error = nn.functional.smooth_l1_loss(
                 outputs["value_uncertainty"], uncertainty_target, reduction="none"
             )
@@ -17370,6 +17493,8 @@ def evaluate_bc_batches(
     value_root_blend_global_compat: bool = False,
     data_loader_workers: int = 0,
     data_loader_prefetch: int = 2,
+    scalar_value_loss_readout: str = "raw",
+    scalar_value_loss_scale: float = 1.0,
 ) -> dict:
     if len(indices) == 0:
         return {}
@@ -17510,6 +17635,8 @@ def evaluate_bc_batches(
                 amp,
                 policy_target_blend_semantics=policy_target_blend_semantics,
                 truncated_vp_margin_value_weight=truncated_vp_margin_value_weight,
+                scalar_value_loss_readout=scalar_value_loss_readout,
+                scalar_value_loss_scale=scalar_value_loss_scale,
                 **eval_fn_extra_kwargs,
             )
             loss_sum += float(batch_metrics["loss"]) * len(batch)
@@ -17876,6 +18003,8 @@ def _eval_candidate_batch(
     *,
     policy_target_blend_semantics: str = POLICY_TARGET_BLEND_LEGACY_V1,
     truncated_vp_margin_value_weight: float = 0.0,
+    scalar_value_loss_readout: str = "raw",
+    scalar_value_loss_scale: float = 1.0,
 ) -> dict:
     del final_vp_loss_weight, q_loss_weight, amp
     del q_skip_teacher_prefixes
@@ -17893,7 +18022,12 @@ def _eval_candidate_batch(
         context_t = torch.as_tensor(context, dtype=torch.float32, device=policy.device)
         actions = torch.as_tensor(data["action_taken"][batch].astype(np.int64), device=policy.device)
         valid = _valid_lists(data["legal_action_ids"][batch])
-        logits, values = policy.forward(obs, context_t)
+        logits, raw_values = policy.forward(obs, context_t)
+        values = _scalar_value_loss_prediction(
+            raw_values,
+            readout=scalar_value_loss_readout,
+            scale=scalar_value_loss_scale,
+        )
         masked = _torch_ppo_masked_logits(logits, valid, policy.action_size)
         policy_weights = torch.as_tensor(
             policy_sample_weights[batch],
@@ -18041,6 +18175,8 @@ def _eval_xdim_batch(
     value_target_lambda: float = 1.0,
     value_root_blend_phases: tuple[str, ...] = (),
     value_root_blend_global_compat: bool = False,
+    scalar_value_loss_readout: str = "raw",
+    scalar_value_loss_scale: float = 1.0,
 ) -> dict:
     import torch
     from torch import nn
@@ -18149,9 +18285,19 @@ def _eval_xdim_batch(
                 )
             # Advantage reweighting stays on the policy-safe (unfilled) outcome/has_outcome --
             # FIX F3 is scoped to the value head only, must not leak into POLICY weighting.
+            advantage_outputs = outputs
+            if "value" in outputs and scalar_value_loss_readout != "raw":
+                advantage_outputs = {
+                    **outputs,
+                    "value": _scalar_value_loss_prediction(
+                        outputs["value"],
+                        readout=scalar_value_loss_readout,
+                        scale=scalar_value_loss_scale,
+                    ),
+                }
             policy_weights, advantage_stats = _advantage_reweighted_policy_weights(
                 policy_weights,
-                outputs,
+                advantage_outputs,
                 outcome_targets,
                 has_outcome,
                 advantage_policy_weighting,
@@ -18165,8 +18311,13 @@ def _eval_xdim_batch(
             final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             if value_outcome_targets is not None and "value" in outputs:
+                scalar_value_prediction = _scalar_value_loss_prediction(
+                    outputs["value"],
+                    readout=scalar_value_loss_readout,
+                    scale=scalar_value_loss_scale,
+                )
                 value_error = nn.functional.mse_loss(
-                    outputs["value"], value_outcome_targets, reduction="none"
+                    scalar_value_prediction, value_outcome_targets, reduction="none"
                 )
                 value_loss_sum, value_loss_denominator = _weighted_loss_parts(
                     value_error,
@@ -18230,8 +18381,13 @@ def _eval_xdim_batch(
                 and value_outcome_targets is not None
                 and "value" in outputs
             ):
+                uncertainty_value = _scalar_value_loss_prediction(
+                    outputs["value"],
+                    readout=scalar_value_loss_readout,
+                    scale=scalar_value_loss_scale,
+                )
                 uncertainty_target = (
-                    value_outcome_targets - outputs["value"].detach()
+                    value_outcome_targets - uncertainty_value.detach()
                 ) ** 2
                 uncertainty_error = nn.functional.smooth_l1_loss(
                     outputs["value_uncertainty"],

@@ -253,6 +253,7 @@ def test_report_records_requested_and_resolved_value_objective_weights() -> None
         "value_head_type",
         "value_loss_weight",
         "resolved_scalar_value_loss_weight",
+        "scalar_value_loss_contract",
         "value_categorical_loss_weight",
         "resolved_categorical_value_loss_weight",
         "hlgauss_scalar_aux_loss_weight",
@@ -320,6 +321,8 @@ def _evaluate(
     truncation_weight: float = 0.25,
     data_loader_workers: int = 0,
     data_loader_prefetch: int = 2,
+    scalar_value_loss_readout: str = "raw",
+    scalar_value_loss_scale: float = 1.0,
 ) -> dict:
     n = len(data["action_taken"])
     if value_weights is None:
@@ -355,6 +358,8 @@ def _evaluate(
         value_root_blend_global_compat=(target_lambda != 1.0),
         data_loader_workers=data_loader_workers,
         data_loader_prefetch=data_loader_prefetch,
+        scalar_value_loss_readout=scalar_value_loss_readout,
+        scalar_value_loss_scale=scalar_value_loss_scale,
     )
 
 
@@ -404,6 +409,35 @@ def test_xdim_validation_default_mse_objective_and_telemetry() -> None:
     assert metrics["loss"] == pytest.approx(0.25)
     assert metrics["component_reconstructed_loss"] == pytest.approx(metrics["loss"])
     assert policy.model.training is True  # validation restores the caller's mode
+
+
+def test_xdim_validation_can_score_the_deployed_scalar_search_readout() -> None:
+    torch = pytest.importorskip("torch")
+    policy, data = _validation_fixture()
+    with torch.no_grad():
+        policy.model.marker.fill_(2.0)
+
+    raw = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        scalar_value_loss_readout="raw",
+    )
+    deployed = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        scalar_value_loss_readout="deployed_tanh",
+        scalar_value_loss_scale=1.0,
+    )
+
+    bounded = float(np.tanh(2.0))
+    expected = ((bounded - 1.0) ** 2 + (bounded + 1.0) ** 2) / 2.0
+    assert raw["value_loss"] == pytest.approx(5.0)
+    assert deployed["value_loss"] == pytest.approx(expected)
+    assert deployed["loss"] == pytest.approx(expected)
 
 
 def test_xdim_validation_hlgauss_is_categorical_primary_not_double_weighted() -> None:
@@ -591,3 +625,49 @@ def test_xdim_train_and_validation_compute_the_same_value_objective(
     assert validated["value_categorical_loss"] == pytest.approx(
         trained["value_categorical_loss"]
     )
+
+
+def test_xdim_train_and_validation_share_deployed_tanh_value_semantics() -> None:
+    torch = pytest.importorskip("torch")
+    policy, data = _validation_fixture()
+    with torch.no_grad():
+        policy.model.marker.fill_(2.0)
+    optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
+    batch = np.arange(len(data["action_taken"]), dtype=np.int64)
+    weights = np.ones(len(batch), dtype=np.float32)
+
+    trained = _train_xdim_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        weights,
+        weights,
+        1.0,
+        0.0,
+        "policy",
+        0.5,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        (),
+        10,
+        "none",
+        1.0,
+        5.0,
+        0.0,
+        diagnostics=False,
+        scalar_value_loss_readout="deployed_tanh",
+        scalar_value_loss_scale=1.0,
+    )
+    validated = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        scalar_value_loss_readout="deployed_tanh",
+    )
+
+    assert trained["value_loss"] == pytest.approx(validated["value_loss"])
+    assert trained["loss"] == pytest.approx(validated["loss"])
