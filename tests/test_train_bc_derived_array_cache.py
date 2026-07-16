@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from catan_zero.rl.pipeline_configs import TrainConfig
 from tools import train_bc
 
 
@@ -90,6 +92,80 @@ def test_derived_array_cache_fails_closed_on_inventory_tamper(tmp_path):
 
     with pytest.raises(SystemExit, match="shape/dtype drift"):
         train_bc._load_derived_array_cache(tmp_path, identity)
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    (
+        ("policy_loss_weight", 0.0),
+        ("final_vp_loss_weight", 0.0),
+        ("q_loss_weight", 0.25),
+        ("policy_kl_anchor_weight", 0.25),
+        ("value_uncertainty_loss_weight", 0.25),
+        ("aux_subgoal_loss_weight", 0.25),
+        ("belief_resource_loss_weight", 0.25),
+        ("moe_routed_experts", 4),
+    ),
+)
+def test_derived_array_cache_binds_coverage_scope_objectives(
+    field: str,
+    changed: float | int,
+) -> None:
+    baseline = SimpleNamespace(
+        **TrainConfig().field_values(),
+        base_sampler=train_bc.BASE_SAMPLER_COVERAGE_IMPORTANCE_V1,
+    )
+    treatment = SimpleNamespace(**vars(baseline))
+    setattr(treatment, field, changed)
+
+    baseline_fields = train_bc._derived_training_scope_cache_fields(  # noqa: SLF001
+        baseline,
+        resolved_scalar_value_loss_weight=0.1,
+        resolved_categorical_value_loss_weight=0.0,
+    )
+    treatment_fields = train_bc._derived_training_scope_cache_fields(  # noqa: SLF001
+        treatment,
+        resolved_scalar_value_loss_weight=0.1,
+        resolved_categorical_value_loss_weight=0.0,
+    )
+
+    assert train_bc._derived_array_cache_key(baseline_fields)[0] != (  # noqa: SLF001
+        train_bc._derived_array_cache_key(treatment_fields)[0]  # noqa: SLF001
+    )
+
+
+def test_derived_array_cache_binds_resolved_value_objectives() -> None:
+    args = SimpleNamespace(
+        **TrainConfig().field_values(),
+        base_sampler=train_bc.BASE_SAMPLER_COVERAGE_IMPORTANCE_V1,
+    )
+    identities = []
+    for scalar_weight, categorical_weight in (
+        (0.1, 0.0),
+        (0.2, 0.0),
+        (0.1, 0.25),
+    ):
+        fields = train_bc._derived_training_scope_cache_fields(  # noqa: SLF001
+            args,
+            resolved_scalar_value_loss_weight=scalar_weight,
+            resolved_categorical_value_loss_weight=categorical_weight,
+        )
+        identities.append(train_bc._derived_array_cache_key(fields)[0])  # noqa: SLF001
+
+    assert len(set(identities)) == len(identities)
+
+
+def test_coverage_rejects_unsupported_objective_before_cache_build() -> None:
+    args = SimpleNamespace(
+        **TrainConfig(q_loss_weight=0.25).field_values(),
+        base_sampler=train_bc.BASE_SAMPLER_COVERAGE_IMPORTANCE_V1,
+    )
+
+    with pytest.raises(SystemExit, match="q_loss_weight"):
+        train_bc._validate_coverage_sampler_configuration(  # noqa: SLF001
+            args,
+            categorical_value_loss_weight=0.0,
+        )
 
 
 def test_weighted_epoch_cap_is_exact_historical_prefix():

@@ -13940,6 +13940,11 @@ def main(
         else None
     )
 
+    _validate_coverage_sampler_configuration(
+        args,
+        categorical_value_loss_weight=float(resolved_categorical_value_weight),
+    )
+
     def _build_derived_training_arrays() -> dict[str, np.ndarray]:
         """Build deterministic O(rows) learner arrays once per host."""
 
@@ -14228,12 +14233,15 @@ def main(
                     data, "value_training_component_indices", tuple()
                 )
             ],
-            "base_sampler": str(args.base_sampler),
-            "policy_loss_weight": float(args.policy_loss_weight),
-            "resolved_scalar_value_loss_weight": float(
-                resolved_scalar_value_weight
+            **_derived_training_scope_cache_fields(
+                args,
+                resolved_scalar_value_loss_weight=float(
+                    resolved_scalar_value_weight
+                ),
+                resolved_categorical_value_loss_weight=float(
+                    resolved_categorical_value_weight
+                ),
             ),
-            "final_vp_loss_weight": float(args.final_vp_loss_weight),
         }
         if forced_row_value_action_type_weight_map:
             # Preserve historical cache identities at the disabled default.
@@ -14571,23 +14579,6 @@ def main(
             raise SystemExit(
                 "coverage_importance_v1 requires authenticated component-game "
                 "sampling probabilities"
-            )
-        if int(args.policy_aux_active_batch_size) > 0:
-            raise SystemExit(
-                "coverage_importance_v1 is currently sealed for the direct base "
-                "learner only; policy AUX sampling needs a separate coverage "
-                "contract"
-            )
-        enabled_unsupported = _coverage_unsupported_objectives(
-            args,
-            categorical_value_loss_weight=float(
-                resolved_categorical_value_weight
-            ),
-        )
-        if enabled_unsupported:
-            raise SystemExit(
-                "coverage_importance_v1 fixed-measure normalization does not yet "
-                "bind these objectives: " + ",".join(enabled_unsupported)
             )
         importance = _coverage_importance_weights(component_game_sampling)
         training_policy_sample_weights = np.asarray(
@@ -36946,6 +36937,63 @@ def _coverage_unsupported_objectives(
         != 0.0,
     }
     return tuple(sorted(key for key, enabled in unsupported.items() if enabled))
+
+
+def _validate_coverage_sampler_configuration(
+    args, *, categorical_value_loss_weight: float
+) -> None:
+    """Reject unsupported coverage recipes before any derived cache is written."""
+
+    if str(args.base_sampler) != BASE_SAMPLER_COVERAGE_IMPORTANCE_V1:
+        return
+    if int(args.policy_aux_active_batch_size) > 0:
+        raise SystemExit(
+            "coverage_importance_v1 is currently sealed for the direct base "
+            "learner only; policy AUX sampling needs a separate coverage contract"
+        )
+    enabled_unsupported = _coverage_unsupported_objectives(
+        args,
+        categorical_value_loss_weight=float(categorical_value_loss_weight),
+    )
+    if enabled_unsupported:
+        raise SystemExit(
+            "coverage_importance_v1 fixed-measure normalization does not yet "
+            "bind these objectives: " + ",".join(enabled_unsupported)
+        )
+
+
+def _derived_training_scope_cache_fields(
+    args,
+    *,
+    resolved_scalar_value_loss_weight: float,
+    resolved_categorical_value_loss_weight: float,
+) -> dict[str, object]:
+    """Bind every objective that can change cached coverage component scope."""
+
+    return {
+        "base_sampler": str(args.base_sampler),
+        "policy_loss_weight": float(args.policy_loss_weight),
+        "resolved_scalar_value_loss_weight": float(
+            resolved_scalar_value_loss_weight
+        ),
+        "final_vp_loss_weight": float(args.final_vp_loss_weight),
+        "resolved_categorical_value_loss_weight": float(
+            resolved_categorical_value_loss_weight
+        ),
+        "q_loss_weight": float(args.q_loss_weight),
+        "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight),
+        "value_uncertainty_loss_weight": float(
+            args.value_uncertainty_loss_weight
+        ),
+        "aux_subgoal_loss_weight": float(args.aux_subgoal_loss_weight),
+        "belief_resource_loss_weight": float(args.belief_resource_loss_weight),
+        "effective_moe_balance_loss_weight": (
+            _effective_moe_balance_loss_weight(
+                routed_experts=int(args.moe_routed_experts),
+                configured_weight=float(args.moe_balance_loss_weight),
+            )
+        ),
+    }
 
 
 def _coverage_fixed_loss_normalizers(
