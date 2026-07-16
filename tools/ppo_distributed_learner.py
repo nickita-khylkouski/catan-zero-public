@@ -33,6 +33,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -60,6 +61,9 @@ from catan_zero.rl.ppo_policy_factory import (  # noqa: E402
 )
 from catan_zero.rl.torch_ppo import make_ppo_optimizer, ppo_update  # noqa: E402
 from catan_zero.rl.vtrace import vtrace_from_log_probs  # noqa: E402
+
+
+LEARNER_CHECKPOINT_SCHEMA = "ppo-distributed-learner-checkpoint-v1"
 
 
 # --------------------------------------------------------------------------- config / CLI
@@ -1052,6 +1056,235 @@ def _opt_path_for(ckpt_path: Path) -> Path:
     return ckpt_path.with_name(ckpt_path.name[:-len(".pt")] + ".opt.pt")
 
 
+def _capture_rng_state() -> dict[str, Any]:
+    """Capture every process-global RNG used by PPO minibatch/update code."""
+    import torch
+
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": cuda_states,
+        "torch_cuda_device_count": torch.cuda.device_count(),
+    }
+
+
+def _restore_rng_state(state: Any) -> None:
+    """Restore a validated checkpoint RNG bundle or fail closed."""
+    import torch
+
+    if not isinstance(state, dict):
+        raise RuntimeError("refusing PPO resume: RNG state is missing or malformed")
+    required = {
+        "python",
+        "numpy",
+        "torch_cpu",
+        "torch_cuda",
+        "torch_cuda_device_count",
+    }
+    if not required.issubset(state):
+        raise RuntimeError("refusing PPO resume: RNG state is incomplete")
+    saved_cuda_count = state["torch_cuda_device_count"]
+    cuda_states = state["torch_cuda"]
+    if not isinstance(saved_cuda_count, int) or not isinstance(cuda_states, list):
+        raise RuntimeError("refusing PPO resume: CUDA RNG state is malformed")
+    current_cuda_count = torch.cuda.device_count()
+    if saved_cuda_count != current_cuda_count or len(cuda_states) != current_cuda_count:
+        raise RuntimeError(
+            "refusing PPO resume: CUDA device count does not match checkpoint RNG state"
+        )
+    try:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch_cpu"].cpu())
+        if cuda_states:
+            torch.cuda.set_rng_state_all([cuda_state.cpu() for cuda_state in cuda_states])
+    except Exception as error:
+        raise RuntimeError(
+            f"refusing PPO resume: cannot restore checkpoint RNG state: {error}"
+        ) from error
+
+
+def _relative_shard_frontier(
+    root: str | os.PathLike,
+    shards: Iterable[str | os.PathLike],
+) -> list[str]:
+    """Bind consumed inputs to paths below this run's trajectories directory."""
+    base = dist.trajectories_dir(root).resolve()
+    frontier: list[str] = []
+    for shard in shards:
+        try:
+            relative = Path(shard).resolve().relative_to(base)
+        except (OSError, ValueError) as error:
+            raise ValueError(f"shard is outside trajectories directory: {shard}") from error
+        if not relative.parts or ".." in relative.parts:
+            raise ValueError(f"unsafe shard frontier path: {shard}")
+        frontier.append(relative.as_posix())
+    return frontier
+
+
+def _validate_consumed_frontier(frontier: Any) -> list[str]:
+    if not isinstance(frontier, list) or not all(isinstance(item, str) for item in frontier):
+        raise RuntimeError("refusing PPO resume: consumed-shard frontier is malformed")
+    for item in frontier:
+        path = Path(item)
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            raise RuntimeError("refusing PPO resume: unsafe consumed-shard frontier path")
+    return frontier
+
+
+def _finalize_consumed_frontier(
+    root: str | os.PathLike,
+    frontier: Iterable[str],
+) -> None:
+    """Idempotently finish the shard deletions committed by a recovery checkpoint."""
+    base = dist.trajectories_dir(root).resolve()
+    for relative_text in _validate_consumed_frontier(list(frontier)):
+        shard = (base / relative_text).resolve()
+        try:
+            shard.relative_to(base)
+        except ValueError as error:
+            raise RuntimeError(
+                "refusing PPO resume: unsafe consumed-shard frontier path"
+            ) from error
+        dist.mark_consumed(root, shard)
+        marker = dist.consumed_dir(root) / relative_text.replace("/", "__")
+        if shard.exists() and not marker.exists():
+            raise RuntimeError(f"failed to finalize consumed PPO shard: {shard}")
+
+
+def _save_checkpoint_set(
+    *,
+    policy: Any,
+    optimizer: Any,
+    root: str | os.PathLike,
+    step: int,
+    consumed_shards: Iterable[str | os.PathLike] = (),
+) -> tuple[Path, Path]:
+    """Atomically expose a model and its exact learner-state sidecar as one generation."""
+    import torch
+
+    completed_step = int(step)
+    if completed_step <= 0:
+        raise ValueError("PPO checkpoint step must be positive")
+    checkpoint_dir = dist.checkpoints_dir(root)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"step_{completed_step}.pt"
+    optimizer_path = _opt_path_for(checkpoint_path)
+    if checkpoint_path.exists():
+        raise FileExistsError(f"refusing to overwrite PPO checkpoint: {checkpoint_path}")
+    # An optimizer-only file is unreachable because resume discovery keys off the model.
+    # It can only be an interrupted attempt at this same step, so clear it before retrying.
+    if optimizer_path.exists():
+        optimizer_path.unlink()
+
+    frontier = _relative_shard_frontier(root, consumed_shards)
+    rng_state = _capture_rng_state()
+    unique = f"{os.getpid()}.{time.time_ns()}"
+    checkpoint_tmp = checkpoint_path.with_name(f".{checkpoint_path.name}.{unique}.tmp")
+    optimizer_tmp = optimizer_path.with_name(f".{optimizer_path.name}.{unique}.tmp")
+    try:
+        policy.save(str(checkpoint_tmp))
+        if not checkpoint_tmp.is_file() or checkpoint_tmp.stat().st_size <= 0:
+            raise RuntimeError("PPO policy did not write a non-empty checkpoint")
+        checkpoint_sha256 = dist.checkpoint_sha256(checkpoint_tmp)
+        torch.save(
+            {
+                "schema": LEARNER_CHECKPOINT_SCHEMA,
+                "step": completed_step,
+                "checkpoint_sha256": checkpoint_sha256,
+                "optimizer_state": optimizer.state_dict(),
+                "rng_state": rng_state,
+                "consumed_shards": frontier,
+            },
+            optimizer_tmp,
+        )
+        if not optimizer_tmp.is_file() or optimizer_tmp.stat().st_size <= 0:
+            raise RuntimeError("PPO optimizer did not write a non-empty sidecar")
+        # The model is the discovery/commit point. An interrupted new-step write
+        # leaves at most an ignored optimizer-only sidecar.
+        os.replace(optimizer_tmp, optimizer_path)
+        os.replace(checkpoint_tmp, checkpoint_path)
+    finally:
+        checkpoint_tmp.unlink(missing_ok=True)
+        optimizer_tmp.unlink(missing_ok=True)
+    return checkpoint_path, optimizer_path
+
+
+def _restore_optimizer_checkpoint(
+    *,
+    optimizer: Any,
+    checkpoint_path: Path,
+    step: int,
+    map_location: str,
+) -> dict[str, Any]:
+    """Restore the optimizer paired with ``checkpoint_path`` or refuse resume."""
+    import torch
+
+    optimizer_path = _opt_path_for(checkpoint_path)
+    if not optimizer_path.is_file():
+        raise RuntimeError(
+            "refusing PPO resume: discovered model checkpoint has no optimizer "
+            f"sidecar: {checkpoint_path} -> {optimizer_path}"
+        )
+    try:
+        payload = torch.load(
+            str(optimizer_path), map_location=map_location, weights_only=False
+        )
+    except TypeError:  # torch<2.1 compatibility
+        payload = torch.load(str(optimizer_path), map_location=map_location)
+    except Exception as error:
+        raise RuntimeError(
+            f"refusing PPO resume: cannot load optimizer sidecar {optimizer_path}: {error}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("refusing PPO resume: optimizer sidecar is not a mapping")
+    if payload.get("schema") != LEARNER_CHECKPOINT_SCHEMA:
+        raise RuntimeError(
+            "refusing PPO resume: optimizer sidecar schema is missing or unsupported"
+        )
+    if payload.get("step") != int(step):
+        raise RuntimeError(
+            "refusing PPO resume: optimizer sidecar step does not match model checkpoint"
+        )
+    if payload.get("checkpoint_sha256") != dist.checkpoint_sha256(checkpoint_path):
+        raise RuntimeError(
+            "refusing PPO resume: optimizer sidecar binds different model bytes"
+        )
+    optimizer_state = payload.get("optimizer_state")
+    if not isinstance(optimizer_state, dict):
+        raise RuntimeError(
+            "refusing PPO resume: optimizer state is missing or malformed"
+        )
+    _validate_consumed_frontier(payload.get("consumed_shards"))
+    rng_state = payload.get("rng_state")
+    if not isinstance(rng_state, dict):
+        raise RuntimeError("refusing PPO resume: RNG state is missing or malformed")
+    try:
+        optimizer.load_state_dict(optimizer_state)
+    except Exception as error:
+        raise RuntimeError(
+            f"refusing PPO resume: optimizer state is incompatible: {error}"
+        ) from error
+    return payload
+
+
+def _checkpoint_schedule(
+    config: LearnerConfig, *, completed_step: int
+) -> tuple[bool, bool]:
+    """Return periodic-evaluation and bounded-terminal reasons for a recovered step."""
+    step = int(completed_step)
+    if step <= 0:
+        raise ValueError("completed PPO step must be positive")
+    periodic = (
+        int(config.checkpoint_every) > 0
+        and step % int(config.checkpoint_every) == 0
+    )
+    terminal = int(config.max_steps) > 0 and step >= int(config.max_steps)
+    return periodic, terminal
+
+
 def find_resume_checkpoint(root: str | os.PathLike) -> tuple[int, Path] | None:
     """Highest ``step_{N}.pt`` to resume the TRAINABLE policy from (FIX C1). None if none exist."""
     ckpts = _list_checkpoints(root)
@@ -1141,6 +1374,43 @@ def _maybe_commit(volume_commit_fn: Any | None) -> None:
         pass
 
 
+def _commit_or_raise(volume_commit_fn: Any | None, *, operation: str) -> None:
+    """Make a learner transaction visible or stop before its dependent mutation."""
+    if volume_commit_fn is None:
+        return
+    try:
+        volume_commit_fn()
+    except Exception as error:
+        raise RuntimeError(f"PPO volume commit failed after {operation}") from error
+
+
+def _commit_recovery_update(
+    *,
+    policy: Any,
+    optimizer: Any,
+    root: str | os.PathLike,
+    completed_step: int,
+    shard_paths: Iterable[str | os.PathLike],
+    volume_commit_fn: Any | None,
+) -> tuple[Any, Path, Path]:
+    """Durably checkpoint, publish, then finalize one applied PPO update."""
+    shards = list(shard_paths)
+    frontier = _relative_shard_frontier(root, shards)
+    checkpoint_path, optimizer_path = _save_checkpoint_set(
+        policy=policy,
+        optimizer=optimizer,
+        root=root,
+        step=completed_step,
+        consumed_shards=shards,
+    )
+    _commit_or_raise(volume_commit_fn, operation="recovery checkpoint")
+    published = dist.publish_weights(root, policy.save, step=completed_step)
+    _commit_or_raise(volume_commit_fn, operation="weight publication")
+    _finalize_consumed_frontier(root, frontier)
+    _commit_or_raise(volume_commit_fn, operation="shard frontier finalization")
+    return published, checkpoint_path, optimizer_path
+
+
 # --------------------------------------------------------------------------- train loop
 def train(
     config: LearnerConfig,
@@ -1203,17 +1473,13 @@ def train(
             learning_rate=config.lr,
             trunk_lr_mult=config.trunk_lr_mult,
         )
-        opt_path = _opt_path_for(resume_path)
-        if opt_path.exists():
-            try:
-                optimizer.load_state_dict(torch.load(str(opt_path), map_location=device))
-                opt_restored = True
-            except Exception as exc:  # corrupt sidecar: keep the fresh optimizer, log it
-                print({"event": "resume_opt_load_error", "path": str(opt_path), "error": repr(exc)},
-                      flush=True)
-                opt_restored = False
-        else:
-            opt_restored = False
+        resume_payload = _restore_optimizer_checkpoint(
+            optimizer=optimizer,
+            checkpoint_path=resume_path,
+            step=resume_step,
+            map_location=device,
+        )
+        opt_restored = True
         # current_version comes from version.json (do NOT reset to 0/1 — actors track it).
         published_meta = dist.read_version(root)
         current_version = published_meta.version if published_meta is not None else resume_step
@@ -1243,6 +1509,7 @@ def train(
         )
         step = 0
         current_version = 0
+        resume_payload = None
 
     # 2. League: register the live policy as `main`. On a fresh run publish step-0 weights so actors
     # can start; on resume the version line already exists and we keep ``current_version``.
@@ -1270,11 +1537,15 @@ def train(
         _maybe_commit(volume_commit_fn)
         print({"event": "published", "version": current_version, "step": step}, flush=True)
     else:
-        # On resume, re-publish the resumed weights so actors definitely have the trainable policy
-        # (current.pt may be stale BC if the prior container died right after a checkpoint). FIX H2.
+        # The recovery checkpoint commits this input frontier before publishing or
+        # deleting it. Finish that deletion idempotently, then republish the exact
+        # recovered model. Restore RNG last so setup I/O cannot perturb the next update.
+        _finalize_consumed_frontier(root, resume_payload["consumed_shards"])
+        _commit_or_raise(volume_commit_fn, operation="resume frontier finalization")
         published = dist.publish_weights(root, policy.save, step=step)
         current_version = published.version
-        _maybe_commit(volume_commit_fn)
+        _commit_or_raise(volume_commit_fn, operation="resume weight publication")
+        _restore_rng_state(resume_payload["rng_state"])
         print({"event": "republished_on_resume", "version": current_version, "step": step}, flush=True)
 
     baseline_ids: dict[str, str] = {}
@@ -1392,11 +1663,33 @@ def train(
             advantage_group_weights=config.advantage_group_weights,
         )
 
-        # 3f. publish new weights, mark shards consumed
-        published = dist.publish_weights(root, policy.save, step=step + 1)
+        # 3f. Every applied update is a recovery point. Commit model + optimizer
+        # + RNG + exact input frontier before actors can observe the update or
+        # those inputs can be deleted.
+        completed_step = step + 1
+        periodic_evaluation, terminal_step = _checkpoint_schedule(
+            config, completed_step=completed_step
+        )
+        published, checkpoint_path, optimizer_path = _commit_recovery_update(
+            policy=policy,
+            optimizer=optimizer,
+            root=root,
+            completed_step=completed_step,
+            shard_paths=shard_paths,
+            volume_commit_fn=volume_commit_fn,
+        )
+        print(
+            {
+                "event": "checkpoint",
+                "step": completed_step,
+                "path": str(checkpoint_path),
+                "optimizer_path": str(optimizer_path),
+                "terminal": terminal_step,
+            },
+            flush=True,
+        )
+
         current_version = published.version
-        for shard in shard_paths:
-            dist.mark_consumed(root, shard)
 
         # 3g. log
         mean_return = _mean_return(trajectories)
@@ -1419,17 +1712,21 @@ def train(
         }
         print(log, flush=True)
 
-        # 3h. periodic checkpoint + eval + league update
-        if config.checkpoint_every > 0 and (step + 1) % config.checkpoint_every == 0:
+        # 3h. Evaluation is periodic and strictly after the recovery transaction.
+        if periodic_evaluation:
             _checkpoint_eval_league(
                 policy=policy,
+                optimizer=optimizer,
                 league=league,
                 main_id=main_id,
                 baseline_ids=baseline_ids,
                 root=root,
-                step=step + 1,
+                step=completed_step,
                 config=config,
+                checkpoint_path=checkpoint_path,
             )
+        prune_checkpoints(root, league, config)
+        _maybe_commit(volume_commit_fn)
 
         step += 1
 
@@ -1439,16 +1736,39 @@ def train(
 def _checkpoint_eval_league(
     *,
     policy: Any,
+    optimizer: Any,
     league: League,
     main_id: str,
     baseline_ids: dict[str, str],
     root: Path,
     step: int,
     config: LearnerConfig,
+    checkpoint_path: Path | None = None,
+    consumed_shards: Iterable[str | os.PathLike] = (),
+    run_evaluation: bool = True,
 ) -> None:
-    ckpt_path = dist.checkpoints_dir(root) / f"step_{step}.pt"
-    policy.save(str(ckpt_path))
-    print({"event": "checkpoint", "step": step, "path": str(ckpt_path)}, flush=True)
+    if checkpoint_path is None:
+        ckpt_path, optimizer_path = _save_checkpoint_set(
+            policy=policy,
+            optimizer=optimizer,
+            root=root,
+            step=step,
+            consumed_shards=consumed_shards,
+        )
+        print(
+            {
+                "event": "checkpoint",
+                "step": step,
+                "path": str(ckpt_path),
+                "optimizer_path": str(optimizer_path),
+            },
+            flush=True,
+        )
+    else:
+        ckpt_path = checkpoint_path
+
+    if not run_evaluation:
+        return
 
     out_path = dist.eval_dir(root) / f"scoreboard_step_{step}.json"
     report = run_scoreboard_eval(str(ckpt_path), str(out_path), config)
