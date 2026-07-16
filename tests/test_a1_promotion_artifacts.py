@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import stat
@@ -11,6 +12,11 @@ import numpy as np
 from tools import a1_promotion_artifacts as artifacts
 from tools import a1_promotion_transaction as promotion
 from tools.champion_registry import ChampionRegistry
+from tools.regret_common import (
+    H2H_SEARCH_RNG_CONTRACT,
+    derive_promotion_bucket_labels,
+    h2h_search_seed,
+)
 
 
 def _json(path: Path, value: dict) -> None:
@@ -29,6 +35,70 @@ def _checkpoints(tmp_path: Path) -> tuple[Path, Path]:
 
 def _ref(path: Path) -> dict[str, str]:
     return {"path": str(path.resolve()), "sha256": promotion._sha256(path)}
+
+
+def _bucket_game(
+    pair_id: int,
+    orientation: str,
+    *,
+    candidate_won: bool,
+    phase: str = "BUILD_ROAD",
+    max_legal_count: int = 12,
+    blowout: bool = False,
+) -> dict:
+    candidate_color, baseline_color = (
+        ("RED", "BLUE") if orientation == "candidate_red" else ("BLUE", "RED")
+    )
+    game_seed = 50_000 + pair_id
+    winner = candidate_color if candidate_won else baseline_color
+    loser = baseline_color if candidate_won else candidate_color
+    actual = {winner: 10, loser: 4 if blowout else 8}
+    game = {
+        "pair_id": pair_id,
+        "game_seed": game_seed,
+        "orientation": orientation,
+        "search_seeds_by_role": {
+            "candidate": h2h_search_seed(
+                game_seed=game_seed, seat_color=candidate_color
+            ),
+            "baseline": h2h_search_seed(
+                game_seed=game_seed, seat_color=baseline_color
+            ),
+        },
+        "candidate_color": candidate_color,
+        "baseline_color": baseline_color,
+        "candidate_won": candidate_won,
+        "winner": winner,
+        "terminated": True,
+        "truncated": False,
+        "final_public_vps": dict(actual),
+        "final_actual_vps": actual,
+        "archived_phase": phase,
+        "phases_seen": [phase],
+        "max_legal_count": max_legal_count,
+    }
+    game["buckets"] = derive_promotion_bucket_labels(game)
+    return game
+
+
+def _set_bucket_game_outcome(game: dict, candidate_won: bool) -> None:
+    candidate = game["candidate_color"]
+    baseline = game["baseline_color"]
+    winner = candidate if candidate_won else baseline
+    loser = baseline if candidate_won else candidate
+    margin = (
+        4
+        if "blowout" in game["buckets"]
+        else 8
+    )
+    actual = {winner: 10, loser: margin}
+    game.update(
+        candidate_won=candidate_won,
+        winner=winner,
+        final_public_vps=dict(actual),
+        final_actual_vps=actual,
+    )
+    game["buckets"] = derive_promotion_bucket_labels(game)
 
 
 def test_cohort_exclusions_are_derived_from_candidate_bound_game_seeds(
@@ -174,19 +244,28 @@ def _high_regret_report(
     }
     suite_payload["suite_sha256"] = promotion._digest_value(suite_payload)
     _json(suite, suite_payload)
-    games = [
-        {
-            "pair_id": pair,
-            "orientation": orientation,
-            "candidate_won": True,
-            "truncated": False,
-            "archived_game_seed": 50_000 + pair,
-            "archived_decision_index": pair % 20,
-            "buckets": ["phase:BUILD", "close"],
-        }
-        for pair in range(pairs)
-        for orientation in ("candidate_first", "candidate_second")
-    ]
+    games = []
+    phases = (
+        "BUILD_INITIAL_SETTLEMENT",
+        "MOVE_ROBBER",
+        "ROLL",
+        "BUILD_ROAD",
+    )
+    for pair in range(pairs):
+        for orientation in ("candidate_red", "candidate_blue"):
+            game = _bucket_game(
+                pair,
+                orientation,
+                candidate_won=True,
+                phase=phases[pair % len(phases)],
+                max_legal_count=54 if pair < 20 else 12,
+                blowout=pair % 2 == 0,
+            )
+            game.update(
+                archived_game_seed=50_000 + pair,
+                archived_decision_index=pair % 20,
+            )
+            games.append(game)
     normalized = [{**game, "search_won": game["candidate_won"]} for game in games]
     scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
     pentanomial = promotion.evaluate_pentanomial_sprt(
@@ -232,6 +311,7 @@ def _high_regret_report(
             "chance_stream": "random.Random(game_seed ^ 0xA17E)",
             "replay_contract": artifacts.REPLAY_CONTRACT,
         },
+        "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
         "errors": [],
         "games": games,
         "pentanomial_sprt": pentanomial,
@@ -256,10 +336,11 @@ def _set_high_regret_pair_counts(
     }
     for game in value["games"]:
         first, second = outcomes_by_pair[int(game["pair_id"])]
-        game["candidate_won"] = (
+        _set_bucket_game_outcome(
+            game,
             first
             if game["orientation"] in {"candidate_first", "candidate_red"}
-            else second
+            else second,
         )
     normalized = [
         {**game, "search_won": game["candidate_won"]} for game in value["games"]
@@ -290,6 +371,8 @@ def _truncate_high_regret_pair(value: dict, pair_id: int = 0) -> None:
 
 def _use_color_orientations(value: dict) -> None:
     for game in value["games"]:
+        if game["orientation"] in {"candidate_red", "candidate_blue"}:
+            continue
         if game["orientation"] == "candidate_first":
             game["orientation"] = "candidate_red"
             game["candidate_color"] = "RED"
@@ -318,6 +401,41 @@ def test_high_regret_builder_derives_source_from_passing_report(tmp_path: Path) 
         == _high_regret_report(tmp_path, candidate, champion)["suite_manifest"]
     )
     assert value["pair_diagnostics"]["ww_pairs"] == 200
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda value: value.update(search_rng_contract={}),
+            "corrected per-game/seat",
+        ),
+        (
+            lambda value: value["games"][0]["search_seeds_by_role"].__setitem__(
+                "candidate",
+                value["games"][0]["search_seeds_by_role"]["candidate"] + 1,
+            ),
+            "role/seat binding",
+        ),
+    ],
+)
+def test_high_regret_builder_requires_schedule_invariant_search_rng(
+    tmp_path: Path,
+    mutation,
+    message: str,
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion)
+    mutation(raw)
+    report = tmp_path / "invalid-search-rng.report.json"
+    _json(report, raw)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match=message):
+        artifacts.build_high_regret_source(
+            report_path=report,
+            candidate=candidate,
+            champion=champion,
+        )
 
 
 def test_high_regret_and_bucket_builders_accept_continue_as_nonregression(
@@ -681,12 +799,55 @@ def test_bucket_report_is_extracted_from_retained_high_regret_games(
 
     assert value["schema_version"] == artifacts.BUCKET_GAME_REPORT_SCHEMA
     assert len(value["games"]) == 400
-    assert value["games"][0] == {
-        "pair_id": 0,
-        "orientation": "candidate_first",
-        "candidate_won": True,
-        "buckets": ["close", "phase:BUILD"],
-    }
+    first = value["games"][0]
+    assert first["pair_id"] == 0
+    assert first["orientation"] == "candidate_red"
+    assert first["candidate_color"] == "RED"
+    assert first["baseline_color"] == "BLUE"
+    assert first["final_actual_vps"] == {"RED": 10, "BLUE": 4}
+    assert first["buckets"] == ["41+", "blowout", "opening", "phase:opening"]
+
+
+def test_bucket_report_rejects_forged_close_label_for_blowout(
+    tmp_path: Path,
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion)
+    game = raw["games"][0]
+    assert "blowout" in game["buckets"]
+    game["buckets"] = sorted(
+        "close" if label == "blowout" else label
+        for label in game["buckets"]
+    )
+    report = tmp_path / "forged-margin-label.report.json"
+    _json(report, raw)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match="labels do not replay"):
+        artifacts.build_bucket_game_report(
+            report_path=report,
+            candidate=candidate,
+            champion=champion,
+        )
+
+
+def test_bucket_report_preserves_hidden_public_vp_below_actual(
+    tmp_path: Path,
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _high_regret_report(tmp_path, candidate, champion)
+    game = raw["games"][0]
+    game["final_public_vps"][game["candidate_color"]] = 8
+    report = tmp_path / "hidden-vp.report.json"
+    _json(report, raw)
+
+    value = artifacts.build_bucket_game_report(
+        report_path=report,
+        candidate=candidate,
+        champion=champion,
+    )
+
+    assert value["games"][0]["final_public_vps"]["RED"] == 8
+    assert value["games"][0]["final_actual_vps"]["RED"] == 10
 
 
 def test_bucket_report_excludes_both_orientations_of_truncated_pair(
@@ -844,30 +1005,61 @@ def test_high_regret_builder_refuses_non_evidence(
 
 
 def _bucket_report(candidate: Path, champion: Path) -> dict:
+    games = [
+        _bucket_game(
+            index,
+            "candidate_red",
+            candidate_won=index < 6,
+            phase="BUILD_INITIAL_SETTLEMENT",
+        )
+        for index in range(8)
+    ] + [
+        _bucket_game(
+            100 + index,
+            "candidate_blue",
+            candidate_won=index < 9,
+            max_legal_count=54,
+        )
+        for index in range(10)
+    ]
+    source_report = candidate.parent / "bucket-source-high-regret.json"
+    _json(
+        source_report,
+        {
+            "schema_version": artifacts.HIGH_REGRET_REPORT_SCHEMA,
+            "suite": "held_out_high_regret",
+            "held_out": True,
+            "suite_manifest": {"path": "unused", "sha256": "sha256:" + "0" * 64},
+            "candidate": _ref(candidate),
+            "champion": _ref(champion),
+            "evaluation_config": {},
+            "errors": [],
+            "games": copy.deepcopy(games),
+            "pentanomial_sprt": {},
+            "pair_diagnostics": {},
+            "planned_engine_identity": {},
+            "engine_identity": {},
+            "archived_state_reconstruction": {},
+            "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
+        },
+    )
     return {
         "schema_version": artifacts.BUCKET_GAME_REPORT_SCHEMA,
         "candidate": _ref(candidate),
         "champion": _ref(champion),
         "errors": [],
-        "games": [
-            {
-                "pair_id": index,
-                "orientation": "candidate_first",
-                "candidate_won": index < 6,
-                "buckets": ["opening"],
-            }
-            for index in range(8)
-        ]
-        + [
-            {
-                "pair_id": 100 + index,
-                "orientation": "candidate_second",
-                "candidate_won": index < 9,
-                "buckets": ["41+"],
-            }
-            for index in range(10)
-        ],
+        "source_report": _ref(source_report),
+        "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
+        "games": games,
     }
+
+
+def _sync_bucket_source(raw: dict) -> None:
+    source_path = Path(raw["source_report"]["path"])
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["games"] = copy.deepcopy(raw["games"])
+    _json(source_path, source)
+    raw["source_report"] = _ref(source_path)
 
 
 def test_bucket_builder_computes_pass_from_counts(tmp_path: Path) -> None:
@@ -892,21 +1084,23 @@ def test_bucket_builder_preserves_fail_and_insufficient_data(tmp_path: Path) -> 
     candidate, champion = _checkpoints(tmp_path)
     raw = _bucket_report(candidate, champion)
     raw["games"] = [
-        {
-            "pair_id": index,
-            "orientation": "candidate_first",
-            "candidate_won": index < 2,
-            "buckets": ["opening"],
-        }
+        _bucket_game(
+            index,
+            "candidate_red",
+            candidate_won=index < 2,
+            phase="BUILD_INITIAL_SETTLEMENT",
+            blowout=True,
+        )
         for index in range(8)
     ] + [
-        {
-            "pair_id": 9,
-            "orientation": "candidate_first",
-            "candidate_won": True,
-            "buckets": ["rare"],
-        }
+        _bucket_game(
+            9,
+            "candidate_red",
+            candidate_won=True,
+            phase="BUILD_ROAD",
+        )
     ]
+    _sync_bucket_source(raw)
     report = tmp_path / "bucket-games.json"
     _json(report, raw)
 
@@ -915,9 +1109,9 @@ def test_bucket_builder_preserves_fail_and_insufficient_data(tmp_path: Path) -> 
     )
 
     assert value["veto"] is True
-    assert value["veto_buckets"] == ["opening"]
     assert value["per_bucket"]["opening"]["status"] == "fail"
-    assert value["per_bucket"]["rare"]["status"] == "insufficient_data"
+    assert value["per_bucket"]["close"]["status"] == "insufficient_data"
+    assert "opening" in value["veto_buckets"]
 
 
 def test_bucket_builder_uses_fixed_five_percent_regression_limit(
@@ -926,15 +1120,20 @@ def test_bucket_builder_uses_fixed_five_percent_regression_limit(
     candidate, champion = _checkpoints(tmp_path)
     raw = _bucket_report(candidate, champion)
     raw["games"] = [
-        {
-            "pair_id": index,
-            "orientation": "candidate_first",
-            "candidate_won": (index - offset) < wins,
-            "buckets": [label],
-        }
-        for label, wins, offset in (("at_limit", 9, 0), ("over_limit", 8, 100))
+        _bucket_game(
+            index,
+            "candidate_red",
+            candidate_won=(index - offset) < wins,
+            phase=phase,
+            blowout=True,
+        )
+        for phase, wins, offset in (
+            ("BUILD_INITIAL_SETTLEMENT", 9, 0),
+            ("BUILD_ROAD", 8, 100),
+        )
         for index in range(offset, offset + 20)
     ]
+    _sync_bucket_source(raw)
     report = tmp_path / "bucket-games.json"
     _json(report, raw)
 
@@ -942,20 +1141,50 @@ def test_bucket_builder_uses_fixed_five_percent_regression_limit(
         report_path=report, candidate=candidate, champion=champion
     )
 
-    assert value["per_bucket"]["at_limit"]["status"] == "pass"
-    assert value["per_bucket"]["over_limit"]["status"] == "fail"
-    assert value["veto_buckets"] == ["over_limit"]
+    assert value["per_bucket"]["phase:opening"]["status"] == "pass"
+    assert value["per_bucket"]["phase:build_trade"]["status"] == "fail"
+    assert "phase:build_trade" in value["veto_buckets"]
 
 
 def test_bucket_builder_refuses_duplicate_games(tmp_path: Path) -> None:
     candidate, champion = _checkpoints(tmp_path)
     raw = _bucket_report(candidate, champion)
     raw["games"].append(dict(raw["games"][0]))
+    _sync_bucket_source(raw)
     report = tmp_path / "bucket-games.json"
     _json(report, raw)
     with pytest.raises(artifacts.ArtifactBuildError, match="duplicate games"):
         artifacts.build_bucket_veto_source(
             report_path=report, candidate=candidate, champion=champion
+        )
+
+
+def test_bucket_builder_rejects_legacy_scoreless_report(tmp_path: Path) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _bucket_report(candidate, champion)
+    raw["schema_version"] = "a1-bucket-game-report-v1"
+    for game in raw["games"]:
+        for field in (
+            "candidate_color",
+            "baseline_color",
+            "winner",
+            "terminated",
+            "truncated",
+            "final_public_vps",
+            "final_actual_vps",
+            "archived_phase",
+            "phases_seen",
+            "max_legal_count",
+        ):
+            game.pop(field)
+    report = tmp_path / "legacy-bucket-games.json"
+    _json(report, raw)
+
+    with pytest.raises(artifacts.ArtifactBuildError, match="schema must be"):
+        artifacts.build_bucket_veto_source(
+            report_path=report,
+            candidate=candidate,
+            champion=champion,
         )
 
 

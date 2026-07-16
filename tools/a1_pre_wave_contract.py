@@ -88,6 +88,7 @@ from catan_zero.rl.meaningful_history import (  # noqa: E402
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
 )
+from tools.regret_common import validate_h2h_search_rng_report  # noqa: E402
 from catan_zero.rl.pipeline_configs import GenerateConfig  # noqa: E402
 from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
 from tools import audit_entity_graph_information_surface as information_surface  # noqa: E402
@@ -3571,7 +3572,7 @@ def _validate_held_out_hard_negative_evidence(
         kind="hard_negative_held_out_suite",
     )
     report = _load_json(Path(str(artifact["path"])))
-    if report.get("schema_version") != "a1-held-out-high-regret-report-v1":
+    if report.get("schema_version") != "a1-held-out-high-regret-report-v2":
         raise ContractError("held-out hard-negative report schema is unsupported")
     if report.get("held_out") is not True or report.get("suite") != "held_out_high_regret":
         raise ContractError("held-out hard-negative report is not an isolated suite")
@@ -3678,6 +3679,14 @@ def _validate_held_out_hard_negative_evidence(
     games = report.get("games")
     if not isinstance(games, list):
         raise ContractError("held-out hard-negative report games are malformed")
+    try:
+        validate_h2h_search_rng_report(
+            report.get("search_rng_contract"), games
+        )
+    except ValueError as error:
+        raise ContractError(
+            f"held-out hard-negative search RNG evidence does not replay: {error}"
+        ) from error
     by_pair: dict[int, list[dict[str, Any]]] = {}
     for index, game in enumerate(games):
         if not isinstance(game, dict):

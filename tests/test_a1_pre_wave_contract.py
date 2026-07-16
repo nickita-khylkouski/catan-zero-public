@@ -21,6 +21,10 @@ from tools import generate_gumbel_selfplay_data as generator
 from tools import legacy_scalar_readout_attestation as legacy_scalar
 from tools import search_operator_binding as operator_binding
 from tools.fleet import a1_production_executor as production_executor
+from tools.regret_common import (
+    H2H_SEARCH_RNG_CONTRACT,
+    h2h_search_seed,
+)
 
 
 def test_current_boundary_value_particles_survive_contract_projection() -> None:
@@ -4283,6 +4287,14 @@ def _rich_hard_negative_fixture(tmp_path: Path) -> dict[str, object]:
                     "error": None,
                     "game_seed": 200,
                     "orientation": "candidate_red",
+                    "search_seeds_by_role": {
+                        "candidate": h2h_search_seed(
+                            game_seed=200, seat_color="RED"
+                        ),
+                        "baseline": h2h_search_seed(
+                            game_seed=200, seat_color="BLUE"
+                        ),
+                    },
                     "pair_id": 0,
                     "terminated": True,
                     "truncated": False,
@@ -4294,6 +4306,14 @@ def _rich_hard_negative_fixture(tmp_path: Path) -> dict[str, object]:
                     "error": None,
                     "game_seed": 200,
                     "orientation": "candidate_blue",
+                    "search_seeds_by_role": {
+                        "candidate": h2h_search_seed(
+                            game_seed=200, seat_color="BLUE"
+                        ),
+                        "baseline": h2h_search_seed(
+                            game_seed=200, seat_color="RED"
+                        ),
+                    },
                     "pair_id": 0,
                     "terminated": True,
                     "truncated": False,
@@ -4303,7 +4323,8 @@ def _rich_hard_negative_fixture(tmp_path: Path) -> dict[str, object]:
             "pair_diagnostics": pair_diagnostics,
             "pentanomial_sprt": pentanomial,
             "planned_engine_identity": engine_identity,
-            "schema_version": "a1-held-out-high-regret-report-v1",
+            "schema_version": "a1-held-out-high-regret-report-v2",
+            "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
             "suite": "held_out_high_regret",
             "suite_manifest": _identity(suite),
         },

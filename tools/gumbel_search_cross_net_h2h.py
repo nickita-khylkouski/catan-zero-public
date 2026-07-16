@@ -91,12 +91,16 @@ from tools.high_regret_suite_contract import (  # noqa: E402
     validate_replay_metadata,
     validate_replay_trajectories,
 )
+from tools.regret_common import (  # noqa: E402
+    H2H_SEARCH_RNG_CONTRACT,
+    derive_promotion_bucket_labels,
+    promotion_phase_bucket,
+)
 
 
 HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
 INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA = "a1-internal-h2h-engine-identity-v1"
 ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
-H2H_SEARCH_RNG_DERIVATION = "sha256(game_seed,seat_color)-u64-v1"
 _UNSET = object()
 
 
@@ -254,17 +258,6 @@ from sprt_gate import (  # noqa: E402
 COLORS: tuple[str, ...] = ("RED", "BLUE")
 
 
-def _promotion_phase_bucket(phases: set[str]) -> str:
-    upper = " ".join(phases).upper()
-    if "BUILD_INITIAL_SETTLEMENT" in upper or "BUILD_INITIAL_ROAD" in upper:
-        return "opening"
-    if "ROBBER" in upper or "KNIGHT" in upper or "DEVELOPMENT_CARD" in upper:
-        return "robber_dev"
-    if "DISCARD" in upper or "ROLL" in upper:
-        return "chance"
-    return "build_trade"
-
-
 def _checkpoint_sha256(path: str | Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -416,7 +409,7 @@ def _load_held_out_high_regret_suite(
         )
     actual_strata = {
         f"phase:{stratum}": sum(
-            _promotion_phase_bucket({str(state.get("phase", ""))}) == stratum
+            promotion_phase_bucket({str(state.get("phase", ""))}) == stratum
             for state in bound_states
         )
         for stratum in ("opening", "robber_dev", "chance", "build_trade")
@@ -699,20 +692,15 @@ def play_one_h2h_game(
     start_phase = str(archived_phase or "")
     if start_phase:
         phases_seen.add(start_phase)
-    phase_bucket = _promotion_phase_bucket(
-        {start_phase} if start_phase else phases_seen
-    )
-    buckets = [f"phase:{phase_bucket}"]
-    phase_upper = " ".join(phases_seen).upper()
-    if "BUILD_INITIAL_SETTLEMENT" in phase_upper or "BUILD_INITIAL_ROAD" in phase_upper:
-        buckets.append("opening")
-    if max_legal_count >= 41:
-        buckets.append("41+")
-    vp_margin = abs(
-        final_actual_vps.get(candidate_color, 0)
-        - final_actual_vps.get(baseline_color, 0)
-    )
-    buckets.append("blowout" if vp_margin >= 3 else "close")
+    bucket_facts = {
+        "candidate_color": candidate_color,
+        "baseline_color": baseline_color,
+        "final_actual_vps": final_actual_vps,
+        "archived_phase": start_phase,
+        "phases_seen": sorted(phases_seen),
+        "max_legal_count": max_legal_count,
+    }
+    buckets = derive_promotion_bucket_labels(bucket_facts)
 
     return {
         "game_seed": int(game_seed),
@@ -726,8 +714,9 @@ def play_one_h2h_game(
         "final_vps": final_vps,
         "final_public_vps": final_vps,
         "final_actual_vps": final_actual_vps,
+        "archived_phase": start_phase,
         "candidate_won": candidate_won,
-        "buckets": sorted(set(buckets)),
+        "buckets": buckets,
         "max_legal_count": max_legal_count,
         "phases_seen": sorted(phases_seen),
         "archived_game_seed": archived_game_seed,
@@ -1920,7 +1909,7 @@ def main() -> None:
         help=(
             "Evaluate every archived state in an immutable "
             "a1-held-out-high-regret-suite-v4 manifest instead of fresh starts; "
-            "emits a1-held-out-high-regret-report-v1 for promotion replay."
+            "emits a1-held-out-high-regret-report-v2 for promotion replay."
         ),
     )
     parser.add_argument("--engine-repo-commit", default=None)
@@ -2331,7 +2320,7 @@ def main() -> None:
         summary["engine_identity"] = ordinary_engine
     if high_regret_suite_path is not None:
         summary = {
-            "schema_version": "a1-held-out-high-regret-report-v1",
+            "schema_version": "a1-held-out-high-regret-report-v2",
             "suite": "held_out_high_regret",
             "held_out": True,
             "suite_manifest": {
@@ -2349,6 +2338,7 @@ def main() -> None:
             "evaluation_config": eval_config.canonical_payload()["fields"],
             "errors": summary["errors"],
             "games": summary["games"],
+            "search_rng_contract": summary["search_rng_contract"],
             "pentanomial_sprt": summary["pentanomial_sprt"],
             "pair_diagnostics": summary["pair_diagnostics"],
             "planned_engine_identity": high_regret_planned_engine,
@@ -2482,12 +2472,7 @@ def _build_summary(
                 )
             )
         ),
-        "search_rng_contract": {
-            "derivation": H2H_SEARCH_RNG_DERIVATION,
-            "reset_scope": "each_game_orientation",
-            "stream_key": ["game_seed", "seat_color"],
-            "worker_schedule_independent": True,
-        },
+        "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
         "c_visit": float(args.c_visit),
         "rescale_noise_floor_c": float(getattr(args, "rescale_noise_floor_c", 0.0)),
         "sigma_eval": float(getattr(args, "sigma_eval", 0.79)),

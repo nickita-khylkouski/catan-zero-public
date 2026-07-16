@@ -35,11 +35,18 @@ from tools.high_regret_suite_contract import (  # noqa: E402
     load_source_validation_binding,
     scope_inventory_sha256,
 )
+from tools.regret_common import (  # noqa: E402
+    H2H_SEARCH_RNG_CONTRACT,
+    PROMOTION_BUCKET_GAME_FIELDS,
+    project_promotion_bucket_game,
+    validate_h2h_search_rng_report,
+    validate_promotion_bucket_game,
+)
 
 
-HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
+HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v2"
 HIGH_REGRET_SUITE_SCHEMA = SUITE_SCHEMA
-BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
+BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v2"
 
 
 class ArtifactBuildError(RuntimeError):
@@ -281,6 +288,7 @@ def build_high_regret_source(
             "planned_engine_identity",
             "engine_identity",
             "archived_state_reconstruction",
+            "search_rng_contract",
         },
         where="high-regret report",
     )
@@ -309,6 +317,14 @@ def build_high_regret_source(
     _complete_games, normalized_games, truncated_pairs = _validated_high_regret_games(
         raw["games"], where="high-regret report.games"
     )
+    try:
+        validate_h2h_search_rng_report(
+            raw["search_rng_contract"], raw["games"]
+        )
+    except ValueError as error:
+        raise ArtifactBuildError(
+            f"high-regret report search RNG evidence does not replay: {error}"
+        ) from error
     pair_scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized_games)
     pentanomial = promotion.evaluate_pentanomial_sprt(
         pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
@@ -340,6 +356,7 @@ def build_high_regret_source(
         "suite_manifest": suite_ref,
         "pentanomial_sprt": pentanomial,
         "pair_diagnostics": diagnostics,
+        "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
     }
 
 
@@ -760,6 +777,7 @@ def build_bucket_game_report(
             "planned_engine_identity",
             "engine_identity",
             "archived_state_reconstruction",
+            "search_rng_contract",
         },
         where="high-regret evaluation report",
     )
@@ -779,6 +797,14 @@ def build_bucket_game_report(
     games, normalized_games, truncated_pairs = _validated_high_regret_games(
         raw["games"], where="report.games"
     )
+    try:
+        validate_h2h_search_rng_report(
+            raw["search_rng_contract"], raw["games"]
+        )
+    except ValueError as error:
+        raise ArtifactBuildError(
+            f"bucket extraction search RNG evidence does not replay: {error}"
+        ) from error
     pair_scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized_games)
     pentanomial = promotion.evaluate_pentanomial_sprt(
         pair_scores, elo0=-10.0, elo1=15.0, alpha=0.05, beta=0.05
@@ -795,37 +821,22 @@ def build_bucket_game_report(
         )
     projected: list[dict[str, Any]] = []
     for index, game in enumerate(games):
-        identity = _paired_game_identity(game, index=index, where="report.games")
-        outcome = game.get("candidate_won")
-        labels = game.get("buckets")
-        if (
-            not isinstance(labels, list)
-            or not labels
-            or not all(isinstance(label, str) and label for label in labels)
-            or len(labels) != len(set(labels))
-        ):
-            raise ArtifactBuildError(f"report.games[{index}] has invalid bucket labels")
-        projected.append(
-            {
-                "pair_id": identity[0],
-                "orientation": identity[1],
-                "candidate_won": outcome,
-                "buckets": sorted(labels),
-                **(
-                    {
-                        "candidate_color": game["candidate_color"],
-                        "baseline_color": game["baseline_color"],
-                    }
-                    if identity[1] in _COLOR_ORIENTATION
-                    else {}
-                ),
-            }
-        )
+        try:
+            projected_game = project_promotion_bucket_game(game)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ArtifactBuildError(
+                f"report.games[{index}] bucket evidence does not replay: {error}"
+            ) from error
+        projected.append(projected_game)
     return {
         "schema_version": BUCKET_GAME_REPORT_SCHEMA,
         "candidate": candidate_ref,
         "champion": champion_ref,
         "errors": [],
+        "source_report": _file_ref(
+            report_path, where="bucket source high-regret report"
+        ),
+        "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
         "games": projected,
     }
 
@@ -837,7 +848,15 @@ def build_bucket_veto_source(
     report_path = report_path.expanduser().resolve()
     raw = _exact(
         _load_json(report_path),
-        {"schema_version", "candidate", "champion", "errors", "games"},
+        {
+            "schema_version",
+            "candidate",
+            "champion",
+            "errors",
+            "source_report",
+            "search_rng_contract",
+            "games",
+        },
         where="bucket game report",
     )
     if raw["schema_version"] != BUCKET_GAME_REPORT_SCHEMA:
@@ -852,32 +871,103 @@ def build_bucket_veto_source(
     )
     if raw["errors"] != []:
         raise ArtifactBuildError("bucket game report contains evaluation errors")
+    source_report_path, source_report_ref = _bound_file_ref(
+        raw["source_report"],
+        base=report_path.parent,
+        where="bucket game report.source_report",
+    )
+    source_report = _exact(
+        _load_json(source_report_path),
+        {
+            "schema_version",
+            "suite",
+            "held_out",
+            "suite_manifest",
+            "candidate",
+            "champion",
+            "evaluation_config",
+            "errors",
+            "games",
+            "pentanomial_sprt",
+            "pair_diagnostics",
+            "planned_engine_identity",
+            "engine_identity",
+            "archived_state_reconstruction",
+            "search_rng_contract",
+        },
+        where="bucket game report.source_report payload",
+    )
+    if (
+        source_report["schema_version"] != HIGH_REGRET_REPORT_SCHEMA
+        or source_report["suite"] != "held_out_high_regret"
+        or source_report["held_out"] is not True
+        or source_report["errors"] != []
+    ):
+        raise ArtifactBuildError(
+            "bucket game source is not a clean held-out high-regret report"
+        )
+    _verify_checkpoint_ref(
+        source_report["candidate"],
+        expected=candidate,
+        where="bucket game report.source_report.candidate",
+    )
+    _verify_checkpoint_ref(
+        source_report["champion"],
+        expected=champion,
+        where="bucket game report.source_report.champion",
+    )
+    try:
+        validate_h2h_search_rng_report(
+            source_report["search_rng_contract"], source_report["games"]
+        )
+        incomplete_pairs = {
+            game.get("pair_id")
+            for game in source_report["games"]
+            if isinstance(game, dict) and game.get("truncated") is True
+        }
+        source_projection = [
+            project_promotion_bucket_game(game)
+            for game in source_report["games"]
+            if isinstance(game, dict) and game.get("pair_id") not in incomplete_pairs
+        ]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ArtifactBuildError(
+            f"bucket game source cannot reproduce bucket evidence: {error}"
+        ) from error
+    if raw["source_report"] != source_report_ref or raw["games"] != source_projection:
+        raise ArtifactBuildError(
+            "bucket game report is not the exact projection of its source "
+            "high-regret report"
+        )
     games = raw["games"]
     if not isinstance(games, list) or not games:
         raise ArtifactBuildError("bucket game report.games must be a non-empty list")
+    try:
+        validate_h2h_search_rng_report(raw["search_rng_contract"], games)
+    except ValueError as error:
+        raise ArtifactBuildError(
+            f"bucket game report search RNG evidence does not replay: {error}"
+        ) from error
     identities: set[tuple[int, str]] = set()
     counts: dict[str, list[int]] = {}
     for index, game in enumerate(games):
+        game = _exact(
+            game,
+            set(PROMOTION_BUCKET_GAME_FIELDS),
+            where=f"bucket game report.games[{index}]",
+        )
         identity = _paired_game_identity(
             game, index=index, where="bucket game report.games"
         )
         outcome = game.get("candidate_won")
-        labels = game.get("buckets")
         if identity in identities:
             raise ArtifactBuildError("bucket game report contains duplicate games")
-        if not isinstance(outcome, bool):
+        try:
+            labels = validate_promotion_bucket_game(game)
+        except ValueError as error:
             raise ArtifactBuildError(
-                f"bucket game report.games[{index}].candidate_won must be boolean"
-            )
-        if (
-            not isinstance(labels, list)
-            or not labels
-            or not all(isinstance(label, str) and label for label in labels)
-            or len(set(labels)) != len(labels)
-        ):
-            raise ArtifactBuildError(
-                f"bucket game report.games[{index}].buckets is invalid"
-            )
+                f"bucket game report.games[{index}] does not replay: {error}"
+            ) from error
         identities.add(identity)
         for label in labels:
             bucket_counts = counts.setdefault(label, [0, 0])

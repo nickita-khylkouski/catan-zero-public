@@ -197,10 +197,18 @@ two panels must have identical opponent, map/search config, requested pair
 counts, and exact `(pair_id, game_seed, orientation)` cohort.
 Calibration likewise uses an exact fixed `0.02` maximum global-RMSE
 regression; envelopes cannot select either tolerance. High-regret evidence must use
-`a1-high-regret-comparison-v1` and prove a passing held-out paired result.
-Bucket evidence must use `a1-bucket-veto-v1`; every included bucket must be a
-real pass with at least eight games. `insufficient_data` is a promotion refusal,
-not a silent non-veto.
+`a1-high-regret-comparison-v2` and prove a passing held-out paired result. Its
+v2 raw report and every retained game bind the corrected
+`(game_seed, seat_color)` search-RNG stream, so pre-fix worker-history-dependent
+evidence and a copied top-level attestation are both rejected.
+Bucket evidence must use `a1-bucket-veto-v2`; every included bucket must be a
+real pass with at least eight games. Its referenced game report retains actual
+and public VP maps, role-to-color identity, terminal outcome, phase history,
+and maximum legal width. The artifact builder and transaction verifier both
+recompute every bucket label from those facts; caller-supplied `close`,
+`blowout`, phase, opening, or `41+` labels are not trusted. Scoreless v1 bucket
+evidence cannot authorize a new promotion. `insufficient_data` is a promotion
+refusal, not a silent non-veto.
 
 ## Build the evidence graph
 
@@ -254,13 +262,16 @@ python tools/a1_promotion_artifacts.py bucket-veto \
   --out /immutable/bucket-veto.source.json
 ```
 
-The high-regret input is `a1-held-out-high-regret-report-v1` and must bind the
+The high-regret input is `a1-held-out-high-regret-report-v2` and must bind the
 exact checkpoint bytes, `suite=held_out_high_regret`, `held_out=true`, a
 no errors, immutable held-out-suite provenance, and raw paired games whose
-pentanomial statistics replay to `H1`. The bucket input is
-`a1-bucket-game-report-v1`; the builder computes status, sample size, win rate,
-and veto directly from unique bucket-labelled games rather than accepting
-caller-authored result fields.
+pentanomial statistics and role-to-seat search seeds replay exactly. The bucket input is
+`a1-bucket-game-report-v2`; the builder computes status, sample size, win rate,
+and veto directly from unique games and independently replays every bucket
+label from retained score and state facts rather than accepting caller-authored
+result fields. It also hash-binds its originating high-regret report, and the
+final transaction requires an exact game projection from the same high-regret
+report independently verified by that adjudication.
 
 Wrap each verified source and then build the final adjudication. `--source` and
 `--evidence` are repeatable `ROLE=PATH` / `KIND=PATH` arguments:

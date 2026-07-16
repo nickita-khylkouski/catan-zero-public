@@ -60,6 +60,14 @@ from tools.high_regret_suite_contract import (  # noqa: E402
     validate_replay_metadata,
     validate_replay_trajectories,
 )
+from tools.regret_common import (  # noqa: E402
+    H2H_SEARCH_RNG_CONTRACT,
+    PROMOTION_BUCKET_GAME_FIELDS,
+    h2h_search_seed,
+    project_promotion_bucket_game,
+    validate_h2h_search_rng_report,
+    validate_promotion_bucket_game,
+)
 from tools.sprt_gate import evaluate_pentanomial_sprt, pair_scores_from_h2h_games  # noqa: E402
 
 
@@ -129,9 +137,9 @@ COHORT_EXCLUSIONS_SCHEMA = "a1-promotion-cohort-exclusions-v1"
 # transaction.
 EVIDENCE_SCHEMA = "a1-promotion-evidence-v2"
 LEGACY_EVIDENCE_SCHEMA = "a1-promotion-evidence-v1"
-HIGH_REGRET_SCHEMA = "a1-high-regret-comparison-v1"
-BUCKET_VETO_SCHEMA = "a1-bucket-veto-v1"
-HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v1"
+HIGH_REGRET_SCHEMA = "a1-high-regret-comparison-v2"
+BUCKET_VETO_SCHEMA = "a1-bucket-veto-v2"
+HIGH_REGRET_REPORT_SCHEMA = "a1-held-out-high-regret-report-v2"
 HIGH_REGRET_ENGINE_IDENTITY_SCHEMA = "a1-high-regret-engine-identity-v1"
 INTERNAL_H2H_ENGINE_IDENTITY_SCHEMA = "a1-internal-h2h-engine-identity-v1"
 INTERNAL_H2H_ANCESTOR_NON_ENGINE_ALLOWLIST = frozenset(
@@ -147,15 +155,10 @@ INTERNAL_H2H_ANCESTOR_NON_ENGINE_ALLOWLIST = frozenset(
 )
 ARCHIVED_STATE_RECONSTRUCTION_SCHEMA = "a1-archived-state-reconstruction-v1"
 HIGH_REGRET_SUITE_SCHEMA = SUITE_SCHEMA
-BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v1"
+BUCKET_GAME_REPORT_SCHEMA = "a1-bucket-game-report-v2"
 FLEET_EVALUATION_POOL_SCHEMA = "a1-fleet-evaluation-pool-v1"
-INTERNAL_H2H_SEARCH_RNG_DERIVATION = "sha256(game_seed,seat_color)-u64-v1"
-INTERNAL_H2H_SEARCH_RNG_CONTRACT = {
-    "derivation": INTERNAL_H2H_SEARCH_RNG_DERIVATION,
-    "reset_scope": "each_game_orientation",
-    "stream_key": ["game_seed", "seat_color"],
-    "worker_schedule_independent": True,
-}
+INTERNAL_H2H_SEARCH_RNG_DERIVATION = H2H_SEARCH_RNG_CONTRACT["derivation"]
+INTERNAL_H2H_SEARCH_RNG_CONTRACT = H2H_SEARCH_RNG_CONTRACT
 LEGACY_INCUMBENT_PROVENANCE_SCHEMA = "a1-legacy-incumbent-provenance-v1"
 LEGACY_CONTRACT_ATTESTATION_SCHEMA = "a1-markerless-v2-promotion-attestation-v1"
 # One immutable pre-promotion contract was sealed before promotion_handoff
@@ -6902,13 +6905,10 @@ def _sealed_evaluation_semantics(contract: dict[str, Any]) -> dict[str, Any]:
 def _internal_h2h_search_seed(*, game_seed: int, seat_color: str) -> int:
     """Replay the evaluator's schedule-independent per-seat search seed."""
 
-    color = str(seat_color).upper()
-    if color not in {"RED", "BLUE"}:
-        raise PromotionError(f"unsupported internal H2H seat color: {seat_color!r}")
-    payload = f"gumbel-search-cross-net-h2h-v1:{int(game_seed)}:{color}".encode(
-        "ascii"
-    )
-    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+    try:
+        return h2h_search_seed(game_seed=game_seed, seat_color=seat_color)
+    except ValueError as error:
+        raise PromotionError(str(error)) from error
 
 
 def _verify_internal_h2h_rng_contract(
@@ -6923,36 +6923,12 @@ def _verify_internal_h2h_rng_contract(
     the top-level attestation cannot launder an old report.
     """
 
-    if payload.get("search_rng_contract") != INTERNAL_H2H_SEARCH_RNG_CONTRACT:
-        raise PromotionError(
-            f"{where} does not bind the corrected per-game/seat search RNG contract"
+    try:
+        validate_h2h_search_rng_report(
+            payload.get("search_rng_contract"), payload.get("games")
         )
-    games = payload.get("games")
-    if not isinstance(games, list) or not games:
-        raise PromotionError(f"{where} has no games for search RNG verification")
-    for index, game in enumerate(games):
-        if not isinstance(game, dict):
-            raise PromotionError(f"{where}.games[{index}] is not an object")
-        seed = game.get("game_seed")
-        orientation = game.get("orientation")
-        if isinstance(seed, bool) or not isinstance(seed, int):
-            raise PromotionError(f"{where}.games[{index}] has invalid game_seed")
-        if orientation == "candidate_red":
-            role_colors = {"candidate": "RED", "baseline": "BLUE"}
-        elif orientation == "candidate_blue":
-            role_colors = {"candidate": "BLUE", "baseline": "RED"}
-        else:
-            raise PromotionError(
-                f"{where}.games[{index}] does not use the corrected color-swap encoding"
-            )
-        expected = {
-            role: _internal_h2h_search_seed(game_seed=seed, seat_color=color)
-            for role, color in role_colors.items()
-        }
-        if game.get("search_seeds_by_role") != expected:
-            raise PromotionError(
-                f"{where}.games[{index}] search RNG role/seat binding does not replay"
-            )
+    except ValueError as error:
+        raise PromotionError(f"{where} {error}") from error
 
 
 def _verify_internal_h2h_source(
@@ -7726,7 +7702,7 @@ def _verify_high_regret_source(
     sealed_semantics: dict[str, Any],
     candidate_search_config: dict[str, Any],
     champion_search_config: dict[str, Any],
-) -> None:
+) -> dict[str, Any]:
     expected_keys = {
         "schema_version",
         "suite",
@@ -7741,6 +7717,7 @@ def _verify_high_regret_source(
         "suite_manifest",
         "pentanomial_sprt",
         "pair_diagnostics",
+        "search_rng_contract",
     }
     value = _require_exact_keys(payload, expected_keys, where=where)
     if (
@@ -7792,6 +7769,7 @@ def _verify_high_regret_source(
             "planned_engine_identity",
             "engine_identity",
             "archived_state_reconstruction",
+            "search_rng_contract",
         },
         where=f"{where}.report payload",
     )
@@ -7802,6 +7780,18 @@ def _verify_high_regret_source(
         or report["errors"] != []
     ):
         raise PromotionError(f"{where}.report is not a clean held-out high-regret run")
+    if value["search_rng_contract"] != H2H_SEARCH_RNG_CONTRACT:
+        raise PromotionError(f"{where} high-regret search RNG contract drifted")
+    try:
+        validate_h2h_search_rng_report(
+            report["search_rng_contract"], report["games"]
+        )
+    except ValueError as error:
+        raise PromotionError(
+            f"{where}.report search RNG evidence does not replay: {error}"
+        ) from error
+    if report["search_rng_contract"] != value["search_rng_contract"]:
+        raise PromotionError(f"{where} and its report bind different search RNG contracts")
     _verify_bound_checkpoint(
         report["candidate"],
         expected_path=candidate,
@@ -8246,6 +8236,7 @@ def _verify_high_regret_source(
         or replayed["decision"] not in NON_REGRESSION_VETO_PASSING_DECISIONS
     ):
         raise PromotionError(f"{where} high-regret paired statistics do not replay")
+    return _report_ref
 
 
 def _verify_bucket_veto_source(
@@ -8256,7 +8247,7 @@ def _verify_bucket_veto_source(
     champion: Path,
     champion_sha256: str,
     where: str,
-) -> None:
+) -> dict[str, Any]:
     expected_keys = {
         "schema_version",
         "candidate",
@@ -8290,7 +8281,15 @@ def _verify_bucket_veto_source(
     )
     report = _require_exact_keys(
         _load_json(report_path),
-        {"schema_version", "candidate", "champion", "errors", "games"},
+        {
+            "schema_version",
+            "candidate",
+            "champion",
+            "errors",
+            "source_report",
+            "search_rng_contract",
+            "games",
+        },
         where=f"{where}.report payload",
     )
     if report["schema_version"] != BUCKET_GAME_REPORT_SCHEMA or report["errors"] != []:
@@ -8309,16 +8308,104 @@ def _verify_bucket_veto_source(
         where=f"{where}.report.champion",
         base=report_path.parent,
     )
+    source_report_path, source_report_ref = _validate_file_ref(
+        report["source_report"],
+        base=report_path.parent,
+        where=f"{where}.report.source_report",
+    )
+    source_report = _require_exact_keys(
+        _load_json(source_report_path),
+        {
+            "schema_version",
+            "suite",
+            "held_out",
+            "suite_manifest",
+            "candidate",
+            "champion",
+            "errors",
+            "games",
+            "pentanomial_sprt",
+            "pair_diagnostics",
+            "evaluation_config",
+            "planned_engine_identity",
+            "engine_identity",
+            "archived_state_reconstruction",
+            "search_rng_contract",
+        },
+        where=f"{where}.report.source_report payload",
+    )
+    if (
+        source_report["schema_version"] != HIGH_REGRET_REPORT_SCHEMA
+        or source_report["suite"] != "held_out_high_regret"
+        or source_report["held_out"] is not True
+        or source_report["errors"] != []
+    ):
+        raise PromotionError(
+            f"{where}.report.source_report is not a clean held-out high-regret run"
+        )
+    _verify_bound_checkpoint(
+        source_report["candidate"],
+        expected_path=candidate,
+        expected_sha256=candidate_sha256,
+        where=f"{where}.report.source_report.candidate",
+        base=source_report_path.parent,
+    )
+    _verify_bound_checkpoint(
+        source_report["champion"],
+        expected_path=champion,
+        expected_sha256=champion_sha256,
+        where=f"{where}.report.source_report.champion",
+        base=source_report_path.parent,
+    )
+    try:
+        validate_h2h_search_rng_report(
+            source_report["search_rng_contract"], source_report["games"]
+        )
+    except ValueError as error:
+        raise PromotionError(
+            f"{where}.report.source_report search RNG evidence does not replay: "
+            f"{error}"
+        ) from error
+    incomplete_pairs = {
+        game.get("pair_id")
+        for game in source_report["games"]
+        if isinstance(game, dict) and game.get("truncated") is True
+    }
+    try:
+        source_projection = [
+            project_promotion_bucket_game(game)
+            for game in source_report["games"]
+            if isinstance(game, dict) and game.get("pair_id") not in incomplete_pairs
+        ]
+    except (KeyError, TypeError, ValueError) as error:
+        raise PromotionError(
+            f"{where}.report.source_report cannot reproduce bucket evidence: {error}"
+        ) from error
     raw_games = report["games"]
     if not isinstance(raw_games, list) or not raw_games:
         raise PromotionError(f"{where}.report has no bucket-labelled games")
+    if raw_games != source_projection:
+        raise PromotionError(
+            f"{where}.report is not the exact projection of its source "
+            "high-regret report"
+        )
+    try:
+        validate_h2h_search_rng_report(
+            report["search_rng_contract"], raw_games
+        )
+    except ValueError as error:
+        raise PromotionError(
+            f"{where}.report search RNG evidence does not replay: {error}"
+        ) from error
     counts: dict[str, list[int]] = {}
     identities: set[tuple[int, str]] = set()
     orientations_by_pair: dict[int, set[str]] = {}
     orientation_encoding: str | None = None
     for index, game in enumerate(raw_games):
-        if not isinstance(game, dict):
-            raise PromotionError(f"{where}.report.games[{index}] is malformed")
+        if not isinstance(game, dict) or set(game) != PROMOTION_BUCKET_GAME_FIELDS:
+            raise PromotionError(
+                f"{where}.report.games[{index}] has incomplete bucket evidence"
+            )
         pair_id = game.get("pair_id")
         orientation = game.get("orientation")
         if (
@@ -8360,18 +8447,16 @@ def _verify_bucket_veto_source(
                     f"{where}.report.games[{index}] legacy orientation/color mismatch"
                 )
         outcome = game.get("candidate_won")
-        labels = game.get("buckets")
         if identity in identities or not isinstance(outcome, bool):
             raise PromotionError(
                 f"{where}.report.games[{index}] is duplicate or incomplete"
             )
-        if (
-            not isinstance(labels, list)
-            or not labels
-            or not all(isinstance(label, str) and label for label in labels)
-            or len(set(labels)) != len(labels)
-        ):
-            raise PromotionError(f"{where}.report.games[{index}] has invalid buckets")
+        try:
+            labels = validate_promotion_bucket_game(game)
+        except ValueError as error:
+            raise PromotionError(
+                f"{where}.report.games[{index}] bucket evidence does not replay: {error}"
+            ) from error
         identities.add(identity)
         orientations_by_pair.setdefault(pair_id, set()).add(orientation)
         for label in labels:
@@ -8434,6 +8519,7 @@ def _verify_bucket_veto_source(
             raise PromotionError(
                 f"{where} bucket {name!r} regresses by more than the fixed 5% limit"
             )
+    return source_report_ref
 
 
 def _verify_promotion_evidence(
@@ -8446,6 +8532,7 @@ def _verify_promotion_evidence(
     champion: dict[str, Any],
     promotion_mode: str = "promotion_parent",
     candidate_parent: dict[str, Any] | None = None,
+    verified_source_reports: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     contract_sha256 = contract["contract_sha256"]
     sealed_semantics = _sealed_evaluation_semantics(contract)
@@ -8770,7 +8857,7 @@ def _verify_promotion_evidence(
     elif kind == "high_regret":
         if set(source_by_role) != {"high_regret"} or result:
             raise PromotionError("high-regret source roles/result mismatch")
-        _verify_high_regret_source(
+        report_ref = _verify_high_regret_source(
             source_by_role["high_regret"][1],
             candidate=candidate_path,
             candidate_sha256=candidate["sha256"],
@@ -8781,12 +8868,14 @@ def _verify_promotion_evidence(
             candidate_search_config=candidate["search_config"],
             champion_search_config=champion["search_config"],
         )
+        if verified_source_reports is not None:
+            verified_source_reports["high_regret"] = report_ref
         if value["verdict"] != "pass":
             raise PromotionError("high-regret envelope verdict is not pass")
     elif kind == "bucket_veto":
         if set(source_by_role) != {"bucket_veto"} or result:
             raise PromotionError("bucket-veto source roles/result mismatch")
-        _verify_bucket_veto_source(
+        source_report_ref = _verify_bucket_veto_source(
             source_by_role["bucket_veto"][1],
             candidate=candidate_path,
             candidate_sha256=candidate["sha256"],
@@ -8794,6 +8883,8 @@ def _verify_promotion_evidence(
             champion_sha256=champion["sha256"],
             where="bucket-veto result",
         )
+        if verified_source_reports is not None:
+            verified_source_reports["bucket_veto"] = source_report_ref
         if value["verdict"] != "pass":
             raise PromotionError("bucket-veto envelope verdict is not pass")
     else:  # pragma: no cover - caller constrains the set.
@@ -9778,8 +9869,19 @@ def _verify_adjudication(
     if not isinstance(evidence, list):
         raise PromotionError("adjudication.evidence must be a list")
     evidence_by_kind: dict[str, dict[str, Any]] = {}
+    verified_source_reports: dict[str, dict[str, Any]] = {}
     final_cohort_intervals: list[dict[str, Any]] = list(nth_confirmation_intervals)
-    for index, record in enumerate(evidence):
+    ordered_evidence = sorted(
+        enumerate(evidence),
+        key=lambda item: (
+            {"high_regret": 0, "bucket_veto": 1}.get(
+                item[1].get("kind") if isinstance(item[1], dict) else None,
+                0,
+            ),
+            item[0],
+        ),
+    )
+    for index, record in ordered_evidence:
         item = _require_exact_keys(
             record, {"kind", "path", "sha256"}, where=f"evidence[{index}]"
         )
@@ -9804,6 +9906,7 @@ def _verify_adjudication(
             candidate_parent=(
                 None if branch_lineage is None else branch_lineage["initializer"]
             ),
+            verified_source_reports=verified_source_reports,
         )
         if (production_composite or scratch_execution) and kind == "mechanism_calibration":
             training_outputs = (
@@ -9847,6 +9950,15 @@ def _verify_adjudication(
         raise PromotionError(
             f"adjudication evidence kinds differ: missing={sorted(missing_evidence)} "
             f"unexpected={sorted(unexpected_evidence)}"
+        )
+    if (
+        set(verified_source_reports) != {"high_regret", "bucket_veto"}
+        or verified_source_reports["bucket_veto"]
+        != verified_source_reports["high_regret"]
+    ):
+        raise PromotionError(
+            "bucket-veto evidence is not derived from the exact high-regret "
+            "report used by this adjudication"
         )
 
     return {

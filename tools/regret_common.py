@@ -26,12 +26,13 @@ Value-scale convention (must match `tools/train_bc.py`'s `_value_targets` and
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
-import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 import numpy as np
 
@@ -77,6 +78,217 @@ DEFAULT_PHASE_BONUS: dict[str, float] = {
     "BUY_DEVELOPMENT_CARD": 0.3,
     "ROLL": 0.15,
 }
+
+PROMOTION_BUCKET_GAME_FIELDS = frozenset(
+    {
+        "pair_id",
+        "game_seed",
+        "orientation",
+        "search_seeds_by_role",
+        "candidate_color",
+        "baseline_color",
+        "candidate_won",
+        "winner",
+        "terminated",
+        "truncated",
+        "final_public_vps",
+        "final_actual_vps",
+        "archived_phase",
+        "phases_seen",
+        "max_legal_count",
+        "buckets",
+    }
+)
+H2H_SEARCH_RNG_DERIVATION = "sha256(game_seed,seat_color)-u64-v1"
+H2H_SEARCH_RNG_CONTRACT = {
+    "derivation": H2H_SEARCH_RNG_DERIVATION,
+    "reset_scope": "each_game_orientation",
+    "stream_key": ["game_seed", "seat_color"],
+    "worker_schedule_independent": True,
+}
+
+
+def h2h_search_seed(*, game_seed: int, seat_color: str) -> int:
+    color = str(seat_color).upper()
+    if color not in {"RED", "BLUE"}:
+        raise ValueError(f"unsupported H2H seat color: {seat_color!r}")
+    payload = f"gumbel-search-cross-net-h2h-v1:{int(game_seed)}:{color}".encode(
+        "ascii"
+    )
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def validate_h2h_search_rng_game(game: Mapping[str, Any]) -> None:
+    """Replay one color-swapped game's schedule-independent role RNG seeds."""
+
+    game_seed = game.get("game_seed")
+    orientation = game.get("orientation")
+    if isinstance(game_seed, bool) or not isinstance(game_seed, int):
+        raise ValueError("H2H game has invalid game_seed")
+    if orientation == "candidate_red":
+        role_colors = {"candidate": "RED", "baseline": "BLUE"}
+    elif orientation == "candidate_blue":
+        role_colors = {"candidate": "BLUE", "baseline": "RED"}
+    else:
+        raise ValueError("H2H game must use corrected candidate_red/blue orientation")
+    expected = {
+        role: h2h_search_seed(game_seed=game_seed, seat_color=color)
+        for role, color in role_colors.items()
+    }
+    if game.get("search_seeds_by_role") != expected:
+        raise ValueError("H2H game search RNG role/seat binding does not replay")
+
+
+def validate_h2h_search_rng_report(
+    contract: Any, games: Any
+) -> None:
+    if contract != H2H_SEARCH_RNG_CONTRACT:
+        raise ValueError(
+            "report does not bind corrected per-game/seat search RNG contract"
+        )
+    if not isinstance(games, list) or not games:
+        raise ValueError("report has no games for search RNG verification")
+    for game in games:
+        if not isinstance(game, dict):
+            raise ValueError("report contains malformed H2H game")
+        validate_h2h_search_rng_game(game)
+
+
+def promotion_phase_bucket(phases: set[str]) -> str:
+    upper = " ".join(phases).upper()
+    if "BUILD_INITIAL_SETTLEMENT" in upper or "BUILD_INITIAL_ROAD" in upper:
+        return "opening"
+    if "ROBBER" in upper or "KNIGHT" in upper or "DEVELOPMENT_CARD" in upper:
+        return "robber_dev"
+    if "DISCARD" in upper or "ROLL" in upper:
+        return "chance"
+    return "build_trade"
+
+
+def derive_promotion_bucket_labels(game: Mapping[str, Any]) -> list[str]:
+    """Derive every promotion bucket from retained game facts.
+
+    Bucket labels are gate inputs, not descriptive metadata.  Keeping this
+    derivation shared by the evaluator, artifact builder, and promotion
+    verifier prevents a supplied label list from laundering games between
+    mandatory veto slices.
+    """
+
+    candidate = game.get("candidate_color")
+    baseline = game.get("baseline_color")
+    if (
+        not isinstance(candidate, str)
+        or not candidate
+        or not isinstance(baseline, str)
+        or not baseline
+        or candidate == baseline
+    ):
+        raise ValueError("bucket game has invalid candidate/baseline colors")
+    actual = game.get("final_actual_vps")
+    if not isinstance(actual, dict) or set(actual) != {candidate, baseline}:
+        raise ValueError("bucket game final_actual_vps does not bind both colors")
+    for color, score in actual.items():
+        if isinstance(score, bool) or not isinstance(score, int) or score < 0:
+            raise ValueError(
+                f"bucket game final_actual_vps[{color!r}] must be non-negative integer"
+            )
+    phases = game.get("phases_seen")
+    if (
+        not isinstance(phases, list)
+        or not all(isinstance(phase, str) and phase for phase in phases)
+        or len(set(phases)) != len(phases)
+    ):
+        raise ValueError("bucket game phases_seen must be unique non-empty strings")
+    archived_phase = game.get("archived_phase")
+    if not isinstance(archived_phase, str):
+        raise ValueError("bucket game archived_phase must be a string")
+    max_legal_count = game.get("max_legal_count")
+    if (
+        isinstance(max_legal_count, bool)
+        or not isinstance(max_legal_count, int)
+        or max_legal_count < 0
+    ):
+        raise ValueError("bucket game max_legal_count must be non-negative integer")
+
+    phase_source = {archived_phase} if archived_phase else set(phases)
+    labels = [f"phase:{promotion_phase_bucket(phase_source)}"]
+    phase_upper = " ".join({*phases, archived_phase}).upper()
+    if "BUILD_INITIAL_SETTLEMENT" in phase_upper or "BUILD_INITIAL_ROAD" in phase_upper:
+        labels.append("opening")
+    if max_legal_count >= 41:
+        labels.append("41+")
+    margin = abs(int(actual[candidate]) - int(actual[baseline]))
+    labels.append("blowout" if margin >= 3 else "close")
+    return sorted(labels)
+
+
+def validate_promotion_bucket_game(game: Mapping[str, Any]) -> list[str]:
+    """Validate outcome/score consistency and replay the exact bucket labels."""
+
+    if set(game) != PROMOTION_BUCKET_GAME_FIELDS:
+        raise ValueError(
+            "bucket game fields differ: "
+            f"missing={sorted(PROMOTION_BUCKET_GAME_FIELDS - set(game))} "
+            f"unexpected={sorted(set(game) - PROMOTION_BUCKET_GAME_FIELDS)}"
+        )
+    if game.get("terminated") is not True or game.get("truncated") is not False:
+        raise ValueError("bucket game must be a clean terminal outcome")
+    validate_h2h_search_rng_game(game)
+    candidate = str(game["candidate_color"])
+    baseline = str(game["baseline_color"])
+    winner = game.get("winner")
+    if winner not in {candidate, baseline}:
+        raise ValueError("bucket game winner does not bind a participating color")
+    candidate_won = game.get("candidate_won")
+    if not isinstance(candidate_won, bool) or candidate_won is not (
+        winner == candidate
+    ):
+        raise ValueError("bucket game candidate_won disagrees with winner/color")
+    actual = game.get("final_actual_vps")
+    public = game.get("final_public_vps")
+    if not isinstance(public, dict) or set(public) != {candidate, baseline}:
+        raise ValueError("bucket game final_public_vps does not bind both colors")
+    if not isinstance(actual, dict):
+        raise ValueError("bucket game final_actual_vps must be an object")
+    for color, score in public.items():
+        if isinstance(score, bool) or not isinstance(score, int) or score < 0:
+            raise ValueError(
+                f"bucket game final_public_vps[{color!r}] must be non-negative integer"
+            )
+        actual_score = actual.get(color)
+        if (
+            isinstance(actual_score, bool)
+            or not isinstance(actual_score, int)
+            or score > actual_score
+        ):
+            raise ValueError(
+                f"bucket game public VP exceeds or lacks actual VP for {color!r}"
+            )
+    if actual.get(winner, -1) < 10:
+        raise ValueError("bucket game winner has fewer than ten actual VP")
+    expected = derive_promotion_bucket_labels(game)
+    labels = game.get("buckets")
+    if labels != expected:
+        raise ValueError(
+            f"bucket game labels do not replay: supplied={labels!r} expected={expected!r}"
+        )
+    return expected
+
+
+def project_promotion_bucket_game(game: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one evaluator game into the exact promotion bucket schema."""
+
+    missing = PROMOTION_BUCKET_GAME_FIELDS - set(game)
+    if missing:
+        raise ValueError(
+            f"source game lacks promotion bucket facts: {sorted(missing)}"
+        )
+    projected = {
+        field: copy.deepcopy(game[field])
+        for field in PROMOTION_BUCKET_GAME_FIELDS
+    }
+    validate_promotion_bucket_game(projected)
+    return projected
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,7 +487,6 @@ def phase_bonus_values(shard: dict[str, np.ndarray], table: dict[str, float]) ->
     n = int(np.asarray(shard["action_taken"]).shape[0])
     phases = _as_str_array(shard.get("phase", np.full(n, "")), n)
     keys = sorted(table.keys(), key=len, reverse=True)
-    out = np.zeros(n, dtype=np.float32)
     uniq, inverse = np.unique(phases, return_inverse=True)
     lut = np.zeros(len(uniq), dtype=np.float32)
     for idx, phase in enumerate(uniq):

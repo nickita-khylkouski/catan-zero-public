@@ -23,6 +23,12 @@ from tools import a1_production_l1_rerun as production_l1
 from tools import a1_production_gather_retrain as production_gather
 from tools.champion_registry import ChampionRegistry
 from tools.high_regret_suite_contract import REPLAY_CONTRACT, scope_inventory_sha256
+from tools.regret_common import (
+    H2H_SEARCH_RNG_CONTRACT,
+    derive_promotion_bucket_labels,
+    h2h_search_seed,
+    project_promotion_bucket_game,
+)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -1393,19 +1399,56 @@ def _fixture(
         high_regret_suite_payload
     )
     _write_json(high_regret_suite, high_regret_suite_payload)
-    high_regret_games = [
-        {
-            "pair_id": pair,
-            "orientation": orientation,
-            "candidate_won": True,
-            "truncated": False,
-            "archived_game_seed": 7_000_000 + pair,
-            "archived_decision_index": 0,
-            "buckets": ["phase:BUILD", "close"],
-        }
-        for pair in range(240)
-        for orientation in ("candidate_first", "candidate_second")
-    ]
+    high_regret_games = []
+    high_regret_phases = (
+        "BUILD_INITIAL_SETTLEMENT",
+        "MOVE_ROBBER",
+        "ROLL",
+        "BUILD_ROAD",
+    )
+    for pair in range(240):
+        game_seed = 7_000_000 + pair
+        phase = high_regret_phases[pair % len(high_regret_phases)]
+        for orientation in ("candidate_red", "candidate_blue"):
+            candidate_color, baseline_color = (
+                ("RED", "BLUE")
+                if orientation == "candidate_red"
+                else ("BLUE", "RED")
+            )
+            actual = {
+                candidate_color: 10,
+                baseline_color: 4 if pair % 2 == 0 else 8,
+            }
+            game = {
+                "pair_id": pair,
+                "game_seed": game_seed,
+                "orientation": orientation,
+                "search_seeds_by_role": {
+                    "candidate": h2h_search_seed(
+                        game_seed=game_seed,
+                        seat_color=candidate_color,
+                    ),
+                    "baseline": h2h_search_seed(
+                        game_seed=game_seed,
+                        seat_color=baseline_color,
+                    ),
+                },
+                "candidate_color": candidate_color,
+                "baseline_color": baseline_color,
+                "candidate_won": True,
+                "winner": candidate_color,
+                "terminated": True,
+                "truncated": False,
+                "final_public_vps": dict(actual),
+                "final_actual_vps": actual,
+                "archived_phase": phase,
+                "phases_seen": [phase],
+                "max_legal_count": 54 if pair % 10 == 0 else 12,
+                "archived_game_seed": game_seed,
+                "archived_decision_index": 0,
+            }
+            game["buckets"] = derive_promotion_bucket_labels(game)
+            high_regret_games.append(game)
     normalized_high_regret_games = [
         {**game, "search_won": game["candidate_won"]} for game in high_regret_games
     ]
@@ -1465,6 +1508,7 @@ def _fixture(
                 "chance_stream": "random.Random(game_seed ^ 0xA17E)",
                 "replay_contract": REPLAY_CONTRACT,
             },
+            "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
             "errors": [],
             "games": high_regret_games,
             "pentanomial_sprt": high_pentanomial,
@@ -1488,28 +1532,11 @@ def _fixture(
             "suite_manifest": _checkpoint_ref(high_regret_suite),
             "pentanomial_sprt": high_pentanomial,
             "pair_diagnostics": high_pair_diagnostics,
+            "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
         },
     )
-    phase_buckets = ("opening", "robber_dev", "chance", "build_trade")
-
-    def fixture_buckets(pair: int) -> list[str]:
-        phase = phase_buckets[pair % len(phase_buckets)]
-        labels = [f"phase:{phase}", "blowout" if pair % 2 == 0 else "close"]
-        if phase == "opening":
-            labels.append("opening")
-        if pair < 50:
-            labels.append("41+")
-        return sorted(labels)
-
     bucket_games = [
-        {
-            "pair_id": pair,
-            "orientation": orientation,
-            "candidate_won": True,
-            "buckets": fixture_buckets(pair),
-        }
-        for pair in range(100)
-        for orientation in ("candidate_first", "candidate_second")
+        project_promotion_bucket_game(game) for game in high_regret_games
     ]
     bucket_report = tmp_path / "bucket_veto.report.json"
     _write_json(
@@ -1519,6 +1546,8 @@ def _fixture(
             "candidate": _checkpoint_ref(candidate),
             "champion": _checkpoint_ref(champion),
             "errors": [],
+            "source_report": _checkpoint_ref(high_regret_report),
+            "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
             "games": bucket_games,
         },
     )
@@ -1532,20 +1561,20 @@ def _fixture(
             "veto": False,
             "veto_buckets": [],
             "per_bucket": {
-                "41+": {"status": "pass", "n": 100, "winrate": 1.0},
-                "blowout": {"status": "pass", "n": 100, "winrate": 1.0},
-                "close": {"status": "pass", "n": 100, "winrate": 1.0},
-                "opening": {"status": "pass", "n": 50, "winrate": 1.0},
+                "41+": {"status": "pass", "n": 48, "winrate": 1.0},
+                "blowout": {"status": "pass", "n": 240, "winrate": 1.0},
+                "close": {"status": "pass", "n": 240, "winrate": 1.0},
+                "opening": {"status": "pass", "n": 120, "winrate": 1.0},
                 "phase:build_trade": {
                     "status": "pass",
-                    "n": 50,
+                    "n": 120,
                     "winrate": 1.0,
                 },
-                "phase:chance": {"status": "pass", "n": 50, "winrate": 1.0},
-                "phase:opening": {"status": "pass", "n": 50, "winrate": 1.0},
+                "phase:chance": {"status": "pass", "n": 120, "winrate": 1.0},
+                "phase:opening": {"status": "pass", "n": 120, "winrate": 1.0},
                 "phase:robber_dev": {
                     "status": "pass",
-                    "n": 50,
+                    "n": 120,
                     "winrate": 1.0,
                 },
             },
@@ -4537,6 +4566,122 @@ def test_bucket_cannot_launder_regression_with_pass_status(tmp_path: Path) -> No
         _execute(fixture, go=False)
 
 
+def test_bucket_verifier_recomputes_close_vs_blowout_from_actual_vp(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def forge_close_label(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        game = next(
+            game for game in report["games"] if "blowout" in game["buckets"]
+        )
+        assert (
+            abs(
+                game["final_actual_vps"][game["candidate_color"]]
+                - game["final_actual_vps"][game["baseline_color"]]
+            )
+            >= 3
+        )
+        game["buckets"] = sorted(
+            "close" if label == "blowout" else label
+            for label in game["buckets"]
+        )
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture,
+        kind="bucket_veto",
+        role="bucket_veto",
+        mutate=forge_close_label,
+    )
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="not the exact projection|labels do not replay",
+    ):
+        _execute(fixture, go=False)
+
+
+@pytest.mark.parametrize("mutation", ("score", "phase_width", "outcome"))
+def test_bucket_verifier_rejects_compound_fact_and_label_rewrites(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def rewrite_facts_and_labels(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if mutation == "score":
+            game = next(
+                game for game in report["games"] if "blowout" in game["buckets"]
+            )
+            game["final_actual_vps"][game["baseline_color"]] = 8
+            game["final_public_vps"][game["baseline_color"]] = 8
+        elif mutation == "phase_width":
+            game = next(
+                game
+                for game in report["games"]
+                if "opening" in game["buckets"] and "41+" in game["buckets"]
+            )
+            game["archived_phase"] = "BUILD_ROAD"
+            game["phases_seen"] = ["BUILD_ROAD"]
+            game["max_legal_count"] = 12
+        else:
+            game = report["games"][0]
+            candidate = game["candidate_color"]
+            baseline = game["baseline_color"]
+            game["candidate_won"] = False
+            game["winner"] = baseline
+            game["final_actual_vps"] = {candidate: 8, baseline: 10}
+            game["final_public_vps"] = dict(game["final_actual_vps"])
+        game["buckets"] = derive_promotion_bucket_labels(game)
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture,
+        kind="bucket_veto",
+        role="bucket_veto",
+        mutate=rewrite_facts_and_labels,
+    )
+
+    with pytest.raises(promotion.PromotionError, match="not the exact projection"):
+        _execute(fixture, go=False)
+
+
+def test_bucket_veto_must_use_adjudicated_high_regret_report(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def bind_duplicate_report(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        high_report_path = Path(report["source_report"]["path"])
+        duplicate = tmp_path / "different-high-regret-report.json"
+        duplicate.write_bytes(high_report_path.read_bytes())
+        report["source_report"] = _checkpoint_ref(duplicate)
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture,
+        kind="bucket_veto",
+        role="bucket_veto",
+        mutate=bind_duplicate_report,
+    )
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="exact high-regret report used by this adjudication",
+    ):
+        _execute(fixture, go=False)
+
+
 def _calibration_non_regression_policy() -> dict:
     return {
         "value_readout": "scalar",
@@ -5159,11 +5304,22 @@ def _set_high_regret_source_counts(
     }
     for game in report["games"]:
         first, second = outcomes[int(game["pair_id"])]
-        game["candidate_won"] = (
+        candidate_won = (
             first
             if game["orientation"] in {"candidate_first", "candidate_red"}
             else second
         )
+        game["candidate_won"] = candidate_won
+        candidate_color = game["candidate_color"]
+        baseline_color = game["baseline_color"]
+        blowout = "blowout" in game["buckets"]
+        game["winner"] = candidate_color if candidate_won else baseline_color
+        game["final_actual_vps"] = {
+            candidate_color: 10 if candidate_won else (4 if blowout else 8),
+            baseline_color: (4 if blowout else 8) if candidate_won else 10,
+        }
+        game["final_public_vps"] = dict(game["final_actual_vps"])
+        game["buckets"] = derive_promotion_bucket_labels(game)
     normalized = [
         {**game, "search_won": game["candidate_won"]}
         for game in report["games"]
@@ -5181,6 +5337,52 @@ def _set_high_regret_source_counts(
     source["report"]["sha256"] = promotion._sha256(report_path)
 
 
+def _refresh_bucket_evidence_from_high_regret(fixture: dict) -> None:
+    adjudication = json.loads(fixture["adjudication"].read_text(encoding="utf-8"))
+    bucket_ref = next(
+        item
+        for item in adjudication["evidence"]
+        if item["kind"] == "bucket_veto"
+    )
+    bucket_evidence_path = Path(bucket_ref["path"])
+    envelope = json.loads(bucket_evidence_path.read_text(encoding="utf-8"))
+    source_ref = next(
+        item for item in envelope["sources"] if item["role"] == "bucket_veto"
+    )
+    source_path = Path(source_ref["path"])
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    bucket_report_path = Path(source["report"]["path"])
+    bucket_report = json.loads(bucket_report_path.read_text(encoding="utf-8"))
+    high_report_path = Path(bucket_report["source_report"]["path"])
+    high_report = json.loads(high_report_path.read_text(encoding="utf-8"))
+    incomplete_pairs = {
+        game["pair_id"]
+        for game in high_report["games"]
+        if game.get("truncated") is True
+    }
+    bucket_report["source_report"] = _checkpoint_ref(high_report_path)
+    bucket_report["games"] = [
+        project_promotion_bucket_game(game)
+        for game in high_report["games"]
+        if game["pair_id"] not in incomplete_pairs
+    ]
+    _write_json(bucket_report_path, bucket_report)
+    refreshed_source = artifacts.build_bucket_veto_source(
+        report_path=bucket_report_path,
+        candidate=fixture["candidate"],
+        champion=fixture["champion"],
+    )
+    _write_json(source_path, refreshed_source)
+    source_ref["sha256"] = promotion._sha256(source_path)
+    envelope.pop("evidence_sha256")
+    envelope["evidence_sha256"] = promotion._digest_value(envelope)
+    _write_json(bucket_evidence_path, envelope)
+    bucket_ref["sha256"] = promotion._sha256(bucket_evidence_path)
+    adjudication.pop("adjudication_sha256")
+    adjudication["adjudication_sha256"] = promotion._digest_value(adjudication)
+    _write_json(fixture["adjudication"], adjudication)
+
+
 def test_transaction_accepts_high_regret_continue_as_nonregression(
     tmp_path: Path,
 ) -> None:
@@ -5195,6 +5397,7 @@ def test_transaction_accepts_high_regret_continue_as_nonregression(
     _mutate_evidence_source(
         fixture, kind="high_regret", role="high_regret", mutate=mutate
     )
+    _refresh_bucket_evidence_from_high_regret(fixture)
 
     assert _execute(fixture, go=False)["status"] == "dry_run"
 
@@ -5232,6 +5435,29 @@ def test_high_regret_rust_featurize_requires_native_runtime_binding(
         fixture, kind="high_regret", role="high_regret", mutate=mutate
     )
     with pytest.raises(promotion.PromotionError, match="bound native MCTS runtime"):
+        _execute(fixture, go=False)
+
+
+def test_high_regret_verifier_replays_role_to_seat_search_rng(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def drift_search_seed(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text())
+        report["games"][0]["search_seeds_by_role"]["candidate"] += 1
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture,
+        kind="high_regret",
+        role="high_regret",
+        mutate=drift_search_seed,
+    )
+
+    with pytest.raises(promotion.PromotionError, match="role/seat binding"):
         _execute(fixture, go=False)
 
 
@@ -5322,7 +5548,7 @@ def _install_truncated_high_regret_pair(fixture: dict) -> None:
                 row["orientation"] = "candidate_red"
                 row["candidate_color"] = "RED"
                 row["baseline_color"] = "BLUE"
-            else:
+            elif row["orientation"] == "candidate_second":
                 row["orientation"] = "candidate_blue"
                 row["candidate_color"] = "BLUE"
                 row["baseline_color"] = "RED"
@@ -5354,6 +5580,7 @@ def _install_truncated_high_regret_pair(fixture: dict) -> None:
     _mutate_evidence_source(
         fixture, kind="high_regret", role="high_regret", mutate=mutate
     )
+    _refresh_bucket_evidence_from_high_regret(fixture)
 
 
 def test_transaction_independently_accepts_legitimate_truncated_high_regret_pair(
@@ -5578,7 +5805,7 @@ def test_transaction_rejects_mixed_high_regret_orientation_encodings(
         fixture, kind="high_regret", role="high_regret", mutate=mutate
     )
 
-    with pytest.raises(promotion.PromotionError, match="mixes orientation encodings"):
+    with pytest.raises(promotion.PromotionError, match="candidate_red/blue"):
         _execute(fixture, go=False)
 
 
@@ -5643,7 +5870,10 @@ def test_transaction_rejects_incomplete_bucket_pair(tmp_path: Path) -> None:
         fixture, kind="bucket_veto", role="bucket_veto", mutate=mutate
     )
 
-    with pytest.raises(promotion.PromotionError, match="incomplete bucket pair"):
+    with pytest.raises(
+        promotion.PromotionError,
+        match="not the exact projection|incomplete bucket pair",
+    ):
         _execute(fixture, go=False)
 
 

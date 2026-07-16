@@ -27,6 +27,10 @@ from tools import a1_promotion_transaction as promotion  # noqa: E402
 from tools.gumbel_search_cross_net_h2h import (  # noqa: E402
     _load_held_out_high_regret_suite,
 )
+from tools.regret_common import (  # noqa: E402
+    H2H_SEARCH_RNG_CONTRACT,
+    validate_h2h_search_rng_report,
+)
 
 
 MANIFEST_SCHEMA = "a1-distributed-high-regret-shards-v1"
@@ -337,11 +341,12 @@ def merge_reports(
     seen_games: set[tuple[int, str]] = set()
     all_games: list[dict[str, Any]] = []
     common_config: dict[str, Any] | None = None
+    common_provenance: dict[str, Any] | None = None
     encoding: str | None = None
     for report_arg in reports:
         report_path = _regular(report_arg, where="fragment report")
         report = _load(report_path, where="fragment report")
-        required = {"schema_version", "suite", "held_out", "suite_manifest", "candidate", "champion", "evaluation_config", "errors", "games", "pentanomial_sprt", "pair_diagnostics"}
+        required = {"schema_version", "suite", "held_out", "suite_manifest", "candidate", "champion", "evaluation_config", "planned_engine_identity", "engine_identity", "archived_state_reconstruction", "errors", "games", "search_rng_contract", "pentanomial_sprt", "pair_diagnostics"}
         if set(report) != required or report.get("schema_version") != artifacts.HIGH_REGRET_REPORT_SCHEMA or report.get("suite") != "held_out_high_regret" or report.get("held_out") is not True:
             raise DistributedHighRegretError("fragment report schema/identity drift")
         if report.get("errors") != []:
@@ -364,9 +369,29 @@ def merge_reports(
             common_config = config
         elif _canonical(config) != _canonical(common_config):
             raise DistributedHighRegretError("fragment evaluation config drift")
+        provenance = {
+            key: report[key]
+            for key in (
+                "planned_engine_identity",
+                "engine_identity",
+                "archived_state_reconstruction",
+            )
+        }
+        if common_provenance is None:
+            common_provenance = provenance
+        elif _canonical(provenance) != _canonical(common_provenance):
+            raise DistributedHighRegretError("fragment engine/replay provenance drift")
         games = report.get("games")
         if not isinstance(games, list) or not games:
             raise DistributedHighRegretError("fragment report has no games")
+        try:
+            validate_h2h_search_rng_report(
+                report.get("search_rng_contract"), games
+            )
+        except ValueError as error:
+            raise DistributedHighRegretError(
+                f"fragment report search RNG evidence does not replay: {error}"
+            ) from error
         if any(
             not isinstance(game, dict)
             or game.get("truncated") is not False
@@ -424,7 +449,9 @@ def merge_reports(
         "candidate": candidate_ref,
         "champion": champion_ref,
         "evaluation_config": final_config,
+        **dict(common_provenance or {}),
         "errors": [],
+        "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
         "games": all_games,
         "pentanomial_sprt": pentanomial,
         "pair_diagnostics": diagnostics,

@@ -10,6 +10,10 @@ import numpy as np
 from tools import a1_distributed_high_regret as distributed
 from tools import a1_promotion_artifacts as artifacts
 from tools import a1_promotion_transaction as promotion
+from tools.regret_common import (
+    H2H_SEARCH_RNG_CONTRACT,
+    h2h_search_seed,
+)
 
 
 def _write(path: Path, value: dict) -> None:
@@ -114,19 +118,39 @@ def fake_loader(monkeypatch: pytest.MonkeyPatch):
 
 def _report(fragment: Path, candidate: Path, champion: Path) -> dict:
     suite = json.loads(fragment.read_text())
-    games = [
-        {
-            "pair_id": state["pair_id"],
-            "orientation": orientation,
-            "candidate_won": True,
-            "truncated": False,
-            "archived_game_seed": state["game_seed"],
-            "archived_decision_index": state["decision_index"],
-            "buckets": ["phase:test"],
-        }
-        for state in suite["states"]
-        for orientation in ("candidate_first", "candidate_second")
-    ]
+    games = []
+    for state in suite["states"]:
+        for orientation in ("candidate_red", "candidate_blue"):
+            candidate_color, baseline_color = (
+                ("RED", "BLUE")
+                if orientation == "candidate_red"
+                else ("BLUE", "RED")
+            )
+            game_seed = state["game_seed"]
+            games.append(
+                {
+                    "pair_id": state["pair_id"],
+                    "game_seed": game_seed,
+                    "orientation": orientation,
+                    "search_seeds_by_role": {
+                        "candidate": h2h_search_seed(
+                            game_seed=game_seed,
+                            seat_color=candidate_color,
+                        ),
+                        "baseline": h2h_search_seed(
+                            game_seed=game_seed,
+                            seat_color=baseline_color,
+                        ),
+                    },
+                    "candidate_color": candidate_color,
+                    "baseline_color": baseline_color,
+                    "candidate_won": True,
+                    "truncated": False,
+                    "archived_game_seed": state["game_seed"],
+                    "archived_decision_index": state["decision_index"],
+                    "buckets": ["phase:test"],
+                }
+            )
     normalized = [{**game, "search_won": True} for game in games]
     scores, diagnostics = promotion.pair_scores_from_h2h_games(normalized)
     pentanomial = promotion.evaluate_pentanomial_sprt(
@@ -158,7 +182,31 @@ def _report(fragment: Path, candidate: Path, champion: Path) -> dict:
             "p_full": 1.0,
             "force_full_every_decision": True,
         },
+        "planned_engine_identity": {
+            "schema_version": promotion.HIGH_REGRET_ENGINE_IDENTITY_SCHEMA,
+            "repo_commit": "a" * 40,
+            "native_wheel_sha256": "sha256:" + "b" * 64,
+            "evaluator_sha256": "sha256:" + "c" * 64,
+            "replay_sha256": "sha256:" + "d" * 64,
+        },
+        "engine_identity": {
+            "schema_version": promotion.HIGH_REGRET_ENGINE_IDENTITY_SCHEMA,
+            "repo_commit": "a" * 40,
+            "native_wheel_sha256": "sha256:" + "b" * 64,
+            "evaluator_sha256": "sha256:" + "c" * 64,
+            "replay_sha256": "sha256:" + "d" * 64,
+            "native_runtime_sha256": "sha256:" + "e" * 64,
+        },
+        "archived_state_reconstruction": {
+            "schema_version": promotion.ARCHIVED_STATE_RECONSTRUCTION_SCHEMA,
+            "constructor": "catanatron_rs.Game.simple",
+            "map_kind": "BASE",
+            "action_prefix": "[0,target_decision)",
+            "chance_stream": "random.Random(game_seed ^ 0xA17E)",
+            "replay_contract": promotion.REPLAY_CONTRACT,
+        },
         "errors": [],
+        "search_rng_contract": H2H_SEARCH_RNG_CONTRACT,
         "games": games,
         "pentanomial_sprt": pentanomial,
         "pair_diagnostics": diagnostics,
@@ -234,6 +282,7 @@ def test_merge_recomputes_original_suite_report(tmp_path: Path, fake_loader) -> 
         ("error", "evaluation errors"),
         ("truncated", "truncated"),
         ("archived", "archived-state identity drift"),
+        ("search_rng", "role/seat binding"),
         ("statistics", "statistics do not replay"),
     ],
 )
@@ -255,6 +304,8 @@ def test_merge_rejects_report_tampering(
         value["games"][0]["candidate_won"] = None
     elif tamper == "archived":
         value["games"][0]["archived_game_seed"] += 1
+    elif tamper == "search_rng":
+        value["games"][0]["search_seeds_by_role"]["candidate"] += 1
     else:
         value["pair_diagnostics"]["ww_pairs"] -= 1
     _write(reports[0], value)
