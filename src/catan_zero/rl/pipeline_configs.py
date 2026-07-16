@@ -209,7 +209,7 @@ class TrainConfig(PipelineConfig):
     init_checkpoint_sha256: str = ""
     grow_from_checkpoint: str = ""
     grow_from_checkpoint_sha256: str = ""
-    resume_optimizer: bool = True
+    resume_optimizer: bool = False
     data_format: str = "npz"
     # Distributed execution can change the optimizer trajectory.  Keep these in
     # the typed identity in addition to train_bc's resume-only topology fields so
@@ -356,7 +356,7 @@ class TrainConfig(PipelineConfig):
     # loses the game. Outcome-conditioned downweighting is diagnostic-only.
     loser_sample_weight: float = 1.0
     vp_margin_weight: float = 0.0
-    forced_action_weight: float = 0.1
+    forced_action_weight: float = 0.0
     per_game_policy_weight: bool = False
     per_game_policy_weight_mode: str = "equal"
     # Explicit, versioned policy-target reliability objective.  The learner

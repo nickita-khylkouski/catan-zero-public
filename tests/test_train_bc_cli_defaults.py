@@ -50,18 +50,21 @@ def test_lr_schedule_default_is_flat_no_behavior_change() -> None:
     }
 
 
-def test_weight_decay_and_optimizer_defaults_unchanged() -> None:
-    """FIX 1 must not change the DEFAULT config (adam, weight_decay=0.0) -- only make a
-    nonzero --weight-decay with --optimizer adam fail loud instead of silently no-op."""
+def test_weight_decay_and_optimizer_defaults_are_safe() -> None:
     parser = _capture_parser()
     assert parser.get_default("optimizer") == "adam"
     assert parser.get_default("weight_decay") == pytest.approx(0.0)
-    assert parser.get_default("resume_optimizer") is True
+    assert parser.get_default("resume_optimizer") is False
     assert parser.get_default("action_module_lr_mult") == pytest.approx(1.0)
     assert parser.get_default("trunk_lr_mult") == pytest.approx(1.0)
     assert parser.get_default("value_trunk_grad_scale") == pytest.approx(1.0)
     assert parser.get_default("objective_gradient_interference_every_batches") == 0
     assert parser.get_default("sampler_seed") is None
+
+
+def test_forced_policy_rows_default_to_zero_weight() -> None:
+    parser = _capture_parser()
+    assert parser.get_default("forced_action_weight") == pytest.approx(0.0)
 
 
 def test_policy_surprise_weight_defaults_off() -> None:

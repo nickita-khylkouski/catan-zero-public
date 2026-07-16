@@ -1440,8 +1440,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--forced-action-weight",
         type=float,
-        default=0.1,
-        help="Multiplier for samples with exactly one legal action.",
+        default=0.0,
+        help=(
+            "Policy-loss multiplier for samples with exactly one legal action. "
+            "Defaults to 0: mechanical transitions contain no action-selection "
+            "information and must not consume strategic policy gradient."
+        ),
     )
     parser.add_argument(
         "--per-game-policy-weight",
@@ -1634,14 +1638,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume-optimizer",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "Restore a committed <init-checkpoint>.optimizer.pt + training-progress "
+            "Explicitly restore a committed <init-checkpoint>.optimizer.pt + training-progress "
             "checkpoint set when its model hashes and recipe/schedule identity match. "
             "A partial, legacy, or mismatched set fails closed instead of silently "
-            "restarting the LR/dose at step zero. Disable with --no-resume-optimizer "
-            "for an explicit fresh-Adam warm start (including matched experiments). "
-            "The resolved choice and restored step are recorded in the report."
+            "restarting the LR/dose at step zero. Default is fresh Adam so a new "
+            "candidate cannot silently inherit moments/step clocks from its parent. "
+            "Use --resume-optimizer only for an exact interrupted-run continuation."
         ),
     )
     parser.add_argument("--checkpoint", required=True)
