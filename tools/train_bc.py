@@ -6970,21 +6970,46 @@ def _preflight_a1_memmap_metadata(
     return payload
 
 
-def _single_node_ddp_preflight_enabled(ddp: dict[str, int | bool]) -> bool:
-    """Return whether all ranks are workers on this one shared-filesystem node.
+def _single_node_ddp_shared_storage_enabled(
+    ddp: dict[str, int | bool],
+) -> bool:
+    """Return whether DDP topology proves all ranks share this node's storage.
 
     ``LOCAL_WORLD_SIZE`` is deliberately required.  If a non-torchrun launcher
-    does not provide enough topology information, every rank retains the
-    historical independent verification instead of assuming shared storage.
-    Multi-node launches likewise keep per-rank verification because equal path
-    strings do not prove that the underlying files are equal across nodes.
+    does not provide enough topology information, callers must retain per-rank
+    verification/computation instead of assuming shared storage.  Multi-node
+    launches likewise cannot treat equal path strings as proof that underlying
+    files are equal across nodes.
     """
 
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0") or 0)
+    raw_local_world_size = os.environ.get("LOCAL_WORLD_SIZE", "")
+    try:
+        local_world_size = int(raw_local_world_size or 0)
+    except ValueError:
+        return False
+    world_size = int(ddp.get("world_size", 1))
     return (
         bool(ddp.get("enabled", False))
+        and world_size > 1
         and local_world_size > 1
-        and int(ddp.get("world_size", 1)) == local_world_size
+        and world_size == local_world_size
+    )
+
+
+def _single_node_ddp_preflight_enabled(ddp: dict[str, int | bool]) -> bool:
+    """Backward-compatible name for the shared-storage topology contract."""
+
+    return _single_node_ddp_shared_storage_enabled(ddp)
+
+
+def _derived_array_cache_enabled(
+    ddp: dict[str, int | bool], *, data_format: str
+) -> bool:
+    """Only share node-local derived arrays under proven single-node DDP."""
+
+    return (
+        data_format == "memmap"
+        and _single_node_ddp_shared_storage_enabled(ddp)
     )
 
 
@@ -14156,11 +14181,8 @@ def main(
             result["component_game_sampling"] = component_weights
         return result
 
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", ddp["world_size"]))
-    cache_enabled = (
-        bool(ddp["enabled"])
-        and args.data_format == "memmap"
-        and int(ddp["world_size"]) == local_world_size
+    cache_enabled = _derived_array_cache_enabled(
+        ddp, data_format=str(args.data_format)
     )
     if cache_enabled:
         cache_payload = {
@@ -36220,14 +36242,10 @@ def _rank0_authoritative_call(
     remaining ranks hung rather than failing the job coherently.
     """
 
-    world_size = int(ddp.get("world_size", 1))
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
-    distributed = bool(ddp.get("enabled", False)) and world_size > 1
     # On multi-node jobs each host may have its own corpus staging/filesystem.
     # A global rank-0 result cannot attest those independent local mappings, so
     # retain the historical per-rank check outside a single-node torchrun.
-    single_node = distributed and world_size == local_world_size
-    if not single_node:
+    if not _single_node_ddp_shared_storage_enabled(ddp):
         return operation()
 
     rank = int(ddp.get("rank", 0))

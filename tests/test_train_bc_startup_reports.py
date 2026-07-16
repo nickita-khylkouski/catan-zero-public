@@ -195,6 +195,7 @@ def test_target_information_admission_counts_dictionary_column_without_decode() 
 
 
 def test_rank0_authoritative_call_broadcasts_success(monkeypatch) -> None:
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
     calls = []
 
     def broadcast(payload, src):
@@ -213,6 +214,7 @@ def test_rank0_authoritative_call_broadcasts_success(monkeypatch) -> None:
 
 
 def test_rank0_authoritative_call_broadcasts_refusal(monkeypatch) -> None:
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
     import torch.distributed as dist
 
     monkeypatch.setattr(dist, "broadcast_object_list", lambda payload, src: None)
