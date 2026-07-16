@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from catan_zero.deduction_tracker import DEDUCTION_FEATURE_SIZE, true_state_label
+from catan_zero.deduction_tracker import DEDUCTION_FEATURE_SIZE
 from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 )
@@ -111,10 +111,15 @@ def test_conversion_binds_current_entity_adapter_semantics(tmp_path):
 
 def test_emit_deduction_features_tracks_ground_truth_across_replay(tmp_path):
     """Re-derive the tracker independently (via the public API, not the CLI
-    plumbing) and confirm the per-row feature table's exactness flag (slot
-    16 for each opponent) agrees with omniscient ground truth at least once
-    -- a light end-to-end sanity check that the wiring in `_convert_seed`
-    produces the same values as directly driving `DeductionTracker`."""
+    plumbing) and confirm the compact public-card feature table agrees with
+    ground truth, including at least one nonzero opponent resource vector --
+    a light end-to-end sanity check that the wiring in `_convert_seed`
+    produces the same values as directly driving `DeductionTracker`.
+
+    The current 11-slot schema no longer stores the old exactness flag:
+    two-player resource composition is exact by conservation, so slots 0:5
+    directly contain normalized exact resource counts.
+    """
     config = ColonistMultiAgentConfig(players=2, vps_to_win=10)
     seed = 777003
     by_decision = _play_and_record(seed, config, max_steps=200)
@@ -128,16 +133,15 @@ def test_emit_deduction_features_tracks_ground_truth_across_replay(tmp_path):
     _convert_seed(seed, by_decision, config, writer, emit_deduction_features=True)
 
     # Independently replay the same seed/policy to get omniscient ground
-    # truth at each decision boundary, and confirm the shipped exactness
-    # flag is never asserted true when the true hand doesn't actually match
-    # what an independently-built tracker would say.
+    # truth at each decision boundary, and confirm the shipped resource vector
+    # is non-vacuous at least once.
     from catan_zero.deduction_tracker import DeductionTracker
 
     env = ColonistMultiAgentEnv(config)
     _, info = env.reset(seed=seed)
     trackers: dict[str, DeductionTracker] = {}
     cursors: dict[str, int] = {}
-    exact_flag_true_count = 0
+    nonzero_resource_vector_count = 0
     for decision, rows in sorted(by_decision.items()):
         row = rows[0]
         player = row["player"]
@@ -154,10 +158,10 @@ def test_emit_deduction_features_tracks_ground_truth_across_replay(tmp_path):
             idx = env.player_names.index(opponent)
             expected = tracker.feature_vector_for(opponent, env.observation_payload(player, include_event_log=False))
             np.testing.assert_allclose(shipped[idx], expected, atol=1e-6)
-            if shipped[idx][16] == 1.0:
-                exact_flag_true_count += 1
+            if np.any(shipped[idx][:5] > 0.0):
+                nonzero_resource_vector_count += 1
         _, _, terminated, truncated, info = env.step(int(row["action_taken"]))
         if terminated or truncated:
             break
     env.close()
-    assert exact_flag_true_count > 0
+    assert nonzero_resource_vector_count > 0
