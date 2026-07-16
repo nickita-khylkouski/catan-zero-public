@@ -1245,7 +1245,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated --arch entity_graph module groups to freeze "
             "(requires_grad=False): trunk,action_encoder,policy_head,value_heads,"
-            "target_gather,edge_policy,action_cross. "
+            "target_gather,edge_policy,action_cross,public_card_residual,"
+            "meaningful_history_gate. "
             "The value_heads group includes scalar/categorical/final-VP/uncertainty "
             "readouts and optional value-attention-pool parameters. The three "
             "action-local groups allow causal adapter ablations without retraining "
@@ -10117,6 +10118,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ddp,
             )
         freeze_module_groups = set(_parse_prefixes(args.freeze_modules))
+        stage_c_overlay_meta = (
+            data.meta.get("stage_c_policy_overlay")
+            if isinstance(getattr(data, "meta", None), dict)
+            else None
+        )
+        stage_c_clean_adapter_freeze = bool(
+            isinstance(stage_c_overlay_meta, dict)
+            and stage_c_overlay_meta.get("schema_version")
+            == "a1-stage-c-policy-overlay-admission-binding-v1"
+            and stage_c_overlay_meta.get("sampling_distribution", {}).get(
+                "schema_version"
+            )
+            == "a1-stage-c-policy-sampling-distribution-v1"
+        )
+        if stage_c_clean_adapter_freeze:
+            freeze_module_groups |= {
+                "public_card_residual",
+                "meaningful_history_gate",
+            }
         if bool(args.train_value_only):
             freeze_module_groups |= ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS
         if freeze_module_groups:
@@ -10128,12 +10148,49 @@ def main(argv: Sequence[str] | None = None) -> None:
             touched = _set_entity_graph_modules_trainable(
                 policy.model, freeze_module_groups, trainable=False
             )
+            touched_names = set(touched)
+            required_stage_c_adapters = {
+                "public_card_count_residual",
+                "meaningful_history_residual_gate",
+            }
+            if stage_c_clean_adapter_freeze and not (
+                required_stage_c_adapters <= touched_names
+            ):
+                raise SystemExit(
+                    "clean Stage-C learner is missing a required frozen adapter: "
+                    f"{sorted(required_stage_c_adapters - touched_names)}"
+                )
+            unwrapped_for_freeze = getattr(policy.model, "module", policy.model)
+            frozen_parameters = {
+                name: parameter
+                for name, parameter in unwrapped_for_freeze.named_parameters()
+                if name in touched_names
+                or any(name.startswith(f"{prefix}.") for prefix in touched_names)
+            }
+            if not frozen_parameters or any(
+                parameter.requires_grad for parameter in frozen_parameters.values()
+            ):
+                raise SystemExit(
+                    "explicit module freeze did not exclude its complete parameter surface"
+                )
+            explicit_freeze = {
+                "frozen_groups": sorted(freeze_module_groups),
+                "frozen_submodules": sorted(set(touched)),
+                "optimizer_excluded_parameter_tensors": len(frozen_parameters),
+                "optimizer_excluded_parameters": int(
+                    sum(parameter.numel() for parameter in frozen_parameters.values())
+                ),
+                "all_require_grad_false": True,
+            }
+            training_information_surface = {
+                **(training_information_surface or {}),
+                "explicit_module_freeze": explicit_freeze,
+            }
             _rank0_print(
                 json.dumps(
                     {
                         "progress": "freeze_modules",
-                        "frozen_groups": sorted(freeze_module_groups),
-                        "frozen_submodules": touched,
+                        **explicit_freeze,
                     },
                     sort_keys=True,
                 ),
@@ -10912,9 +10969,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy auxiliary sampling requires authenticated composite base "
                 "weights or a coherent direct-corpus binding"
             )
+        stage_c_base = (
+            _stage_c_policy_aux_base_measure(data, train_indices)
+            if coherent_direct_policy_aux
+            else None
+        )
         policy_aux_preconditioning_weights = (
             epoch_sample_weights
             if exact_per_game_surprise
+            else stage_c_base[0]
+            if stage_c_base is not None
             else (
                 np.ones(len(train_indices), dtype=np.float64)
                 if coherent_direct_policy_aux
@@ -10926,6 +10990,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy_aux_base_measure = (
             "coherent_direct_x_exact_per_game_policy_surprise"
             if coherent_direct_policy_aux and exact_per_game_surprise
+            else stage_c_base[1]
+            if stage_c_base is not None
             else "coherent_direct_uniform_row"
             if coherent_direct_policy_aux
             else "authenticated_component_x_exact_per_game_policy_surprise"
@@ -13735,6 +13801,12 @@ def _train_candidate_batch(
         soft_target_source,
         soft_target_min_legal_coverage,
     )
+    _require_stage_c_soft_targets(
+        data,
+        batch,
+        has_soft,
+        source=soft_target_source,
+    )
     if soft_targets is not None:
         log_probs = _support_log_softmax(masked, soft_support)
         soft_loss = -(soft_targets * log_probs).sum(dim=-1)
@@ -14512,6 +14584,12 @@ def _train_xdim_batch(
             soft_target_source,
             soft_target_min_legal_coverage,
         )
+        _require_stage_c_soft_targets(
+            data,
+            batch,
+            has_soft,
+            source=soft_target_source,
+        )
         if soft_targets is not None:
             log_probs = _support_log_softmax(outputs["logits"], soft_support)
             soft_loss = -(soft_targets * log_probs).sum(dim=-1)
@@ -14640,6 +14718,12 @@ def _train_xdim_batch(
                 soft_target_temperature,
                 soft_target_source,
                 soft_target_min_legal_coverage,
+            )
+            _require_stage_c_soft_targets(
+                policy_aux_data,
+                policy_aux_batch,
+                aux_has_soft,
+                source=soft_target_source,
             )
             if aux_soft is not None:
                 aux_log_probs = _support_log_softmax(aux_outputs["logits"], aux_support)
@@ -20109,7 +20193,14 @@ def _soft_target_array(
         support[~has_policy & has_scores] = score_support[~has_policy & has_scores]
     if not np.any(np.sum(target, axis=1) > 0.0):
         return None
-    support &= target > 0.0
+    # Support is provenance, not ``target > 0``.  In particular, an exact-zero
+    # probability on a legal action is still part of a complete search target:
+    # it proves that the teacher considered that action and assigned it no
+    # mass.  Collapsing support to positive entries made a valid one-hot search
+    # target look like an unusable sparse target and silently routed the row to
+    # the historical hard ``action_taken`` label.
+    support &= np.asarray(data["legal_action_ids"][batch]) >= 0
+    target = np.where(support, target, 0.0)
     return target.astype(np.float32, copy=False), support.astype(np.bool_, copy=False)
 
 
@@ -20120,24 +20211,62 @@ def _has_distillation_distribution(
     legal_action_ids: np.ndarray | None = None,
     min_legal_coverage: float = 0.0,
 ) -> np.ndarray:
-    """Rows with only one supported target should train as hard labels.
+    """Return rows carrying a usable, sufficiently complete distribution.
 
-    A one-hot "soft" target makes KL over the supported set equal zero because
-    the supported softmax contains only the chosen action. Treating those rows
-    as hard labels preserves the full cross-entropy gradient.
+    The loss denominator is the complete legal-action softmax, so a one-hot
+    target with authenticated all-legal support is a valid distillation label
+    (and is mathematically equivalent to hard CE on that selected action).
+    Exact-zero probabilities therefore remain support rather than forcing a
+    fallback to ``action_taken``.
     """
 
     target = np.asarray(target, dtype=np.float32)
     support = np.asarray(support, dtype=np.bool_)
-    positive = support & (target > 0.0)
-    has_distribution = np.sum(positive, axis=1) > 1
+    has_distribution = np.sum(
+        np.where(support & np.isfinite(target) & (target > 0.0), target, 0.0),
+        axis=1,
+    ) > 0.0
     min_coverage = float(np.clip(min_legal_coverage, 0.0, 1.0))
     if min_coverage <= 0.0 or legal_action_ids is None:
         return has_distribution
     legal = np.asarray(legal_action_ids)
     legal_counts = np.maximum(np.sum(legal >= 0, axis=1), 1)
-    coverage = np.sum(positive, axis=1) / legal_counts
+    coverage = np.sum(support & (legal >= 0), axis=1) / legal_counts
     return has_distribution & (coverage >= min_coverage)
+
+
+def _require_stage_c_soft_targets(
+    data,
+    batch: np.ndarray,
+    has_soft,
+    *,
+    source: str,
+) -> None:
+    """Fail closed for active Stage-C rows instead of using stale hard actions."""
+
+    if source != "policy" or "teacher_name" not in data:
+        return
+    teachers = np.asarray(data["teacher_name"][batch]).astype(str)
+    stage_c = teachers == "stage_c_coherent_n128_reanalysis"
+    if "policy_weight_multiplier" in data:
+        stage_c &= (
+            np.asarray(data["policy_weight_multiplier"][batch], dtype=np.float32)
+            > 0.0
+        )
+    if not np.any(stage_c):
+        return
+    usable = (
+        np.zeros(len(batch), dtype=np.bool_)
+        if has_soft is None
+        else np.asarray(has_soft.detach().cpu(), dtype=np.bool_)
+    )
+    rejected = np.flatnonzero(stage_c & ~usable)
+    if rejected.size:
+        source_rows = np.asarray(batch, dtype=np.int64)[rejected]
+        raise ValueError(
+            "active Stage-C coherent target is unusable; refusing historical "
+            f"action_taken fallback for corpus rows {source_rows[:16].tolist()}"
+        )
 
 
 def _scores_to_policy(
@@ -24368,6 +24497,12 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "topology_residual_adapter",
     ),
     "action_encoder": ("action_encoder",),
+    # Granular commissioning freezes for the function-preserving v2 input
+    # adapters.  They also belong to ``trunk`` for legacy all-trunk freezes,
+    # but clean target-alignment learners must be able to exclude only these
+    # new zero-initialized paths while continuing to update the mature trunk.
+    "public_card_residual": ("public_card_count_residual",),
+    "meaningful_history_gate": ("meaningful_history_residual_gate",),
     "policy_head": ("action_bias", "logit_scale"),
     # Keep optional action-local adapters independently freezable.  Grouping
     # them together would make a gather+edge ablation silently update the
@@ -25687,6 +25822,49 @@ def _conditioned_policy_aux_sampling_weights(
         raise ValueError("policy auxiliary measure has no active mass")
     conditioned /= total
     return conditioned
+
+
+def _stage_c_policy_aux_base_measure(
+    data,
+    train_indices: np.ndarray,
+) -> tuple[np.ndarray, str] | None:
+    """Load the authenticated Stage-C selected-root sampling distribution."""
+
+    meta = getattr(data, "meta", None)
+    overlay = meta.get("stage_c_policy_overlay") if isinstance(meta, dict) else None
+    sampling = overlay.get("sampling_distribution") if isinstance(overlay, dict) else None
+    if sampling is None:
+        return None
+    if (
+        not isinstance(sampling, dict)
+        or sampling.get("schema_version")
+        != "a1-stage-c-policy-sampling-distribution-v1"
+        or sampling.get("column") != "stage_c_policy_sampling_weight"
+        or sampling.get("arm")
+        not in {"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"}
+        or "stage_c_policy_sampling_weight" not in data
+    ):
+        raise SystemExit("Stage-C policy sampling contract is malformed")
+    indices = np.asarray(train_indices, dtype=np.int64)
+    weights = np.asarray(
+        data["stage_c_policy_sampling_weight"][indices], dtype=np.float64
+    )
+    active = np.asarray(data["policy_weight_multiplier"][indices], dtype=np.float64) > 0.0
+    if (
+        weights.shape != indices.shape
+        or not np.isfinite(weights).all()
+        or np.any(weights < 0.0)
+        or np.any(weights[~active] != 0.0)
+        or np.any(weights[active] <= 0.0)
+    ):
+        raise SystemExit("Stage-C policy sampling weights violate active-row scope")
+    active_mean = float(np.mean(weights[active])) if np.any(active) else 0.0
+    if not math.isclose(active_mean, 1.0, rel_tol=0.0, abs_tol=2.0e-6):
+        raise SystemExit(
+            "Stage-C policy sampling weights lost unit selected-training mean: "
+            f"{active_mean}"
+        )
+    return weights, f"stage_c_{str(sampling['arm']).lower()}"
 
 
 def _apply_authenticated_policy_aux_phase_allocation(

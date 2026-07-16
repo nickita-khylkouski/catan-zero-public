@@ -24,6 +24,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -48,7 +49,11 @@ from tools import train_bc  # noqa: E402
 EXPORT_SCHEMA = "a1-stage-c-learner-overlay-export-v1"
 MATERIALIZATION_SCHEMA = "a1-stage-c-policy-overlay-materialization-v1"
 ADMISSION_OVERLAY_SCHEMA = "a1-stage-c-policy-overlay-admission-binding-v1"
+SAMPLING_SCHEMA = "a1-stage-c-policy-sampling-distribution-v1"
 POLICY_TEACHER = "stage_c_coherent_n128_reanalysis"
+SAMPLING_COLUMN = "stage_c_policy_sampling_weight"
+SAMPLING_ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
+DEFAULT_PRODUCTION_WEIGHT_CAP = 4.0
 REWRITTEN_COLUMNS = frozenset(
     {
         "policy_weight_multiplier",
@@ -66,6 +71,12 @@ POLICY_RAGGED_COLUMNS = {
     "target_policy_mask": ("target_policy_mask_flat", False),
     "target_scores": ("target_scores_flat", np.nan),
     "target_scores_mask": ("target_scores_mask_flat", False),
+}
+OPTIONAL_FIXED_PATCH_COLUMNS = {
+    "simulations_used": "simulations_used",
+    "used_full_search": "used_full_search",
+    "root_value": "root_value",
+    "root_value_mask": "root_value_mask",
 }
 
 
@@ -164,6 +175,134 @@ def _copy_immutable(source: Path, destination: Path) -> None:
             pass
 
 
+def _export_sampling_population(
+    *,
+    plan: Mapping[str, Any],
+    eligibility: Mapping[str, Any],
+    base_root: Path,
+    patch: Mapping[str, np.ndarray],
+    output: Path,
+) -> dict[str, Any]:
+    """Replay the sealed selector and bind admitted/selected stratum counts."""
+
+    subset_ref = plan.get("subset", {}).get("artifact")
+    if not isinstance(subset_ref, dict):
+        raise OverlayError("Stage-C plan lost its selected-subset artifact")
+    subset_source = Path(str(subset_ref.get("path", ""))).resolve(strict=True)
+    if _file_sha256(subset_source) != subset_ref.get("file_sha256"):
+        raise OverlayError("Stage-C selected-subset artifact drifted")
+    subset_path = output / "source_selected_reanalysis_rows.npz"
+    _copy_immutable(subset_source, subset_path)
+    with np.load(subset_path, allow_pickle=False) as source:
+        subset = {name: np.asarray(source[name]) for name in source.files}
+    required = {"row_index", "stratum", "phase", "legal_width"}
+    if not required <= set(subset):
+        raise OverlayError("Stage-C subset lacks sampling strata")
+    selected_rows = np.asarray(subset["row_index"], dtype=np.int64)
+    patch_rows = np.asarray(patch["row_index"], dtype=np.int64)
+    if not set(patch_rows.tolist()) <= set(selected_rows.tolist()):
+        raise OverlayError("Stage-C patch contains a row outside the sealed subset")
+
+    data = train_bc.MemmapCorpus(base_root)
+    rows = len(data)
+    artifacts = eligibility.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise OverlayError("Stage-C eligibility artifacts are missing")
+
+    def _bound_array(name: str, dtype) -> np.ndarray:
+        ref = artifacts.get(name)
+        if not isinstance(ref, dict):
+            raise OverlayError(f"Stage-C eligibility lost {name}")
+        path = Path(str(ref.get("path", ""))).resolve(strict=True)
+        if _file_sha256(path) != ref.get("file_sha256"):
+            raise OverlayError(f"Stage-C eligibility {name} drifted")
+        value = np.fromfile(path, dtype=dtype)
+        if value.shape != (rows,):
+            raise OverlayError(f"Stage-C eligibility {name} row count drifted")
+        return value
+
+    candidate_mask = _bound_array("reanalysis_candidate", np.bool_)
+    policy_status = _bound_array("policy_status", np.uint8)
+    candidate_rows = np.flatnonzero(candidate_mask).astype(np.int64)
+    legal_widths_all = np.asarray(
+        data["legal_action_ids"].row_counts(), dtype=np.int64
+    )
+    reliability_classes, _report = alignment._reliability_inventory(  # noqa: SLF001
+        data, row_count=rows
+    )
+    game_seeds = np.asarray(data["game_seed"][candidate_rows], dtype=np.int64)
+    decision_indices = np.asarray(
+        data["decision_index"][candidate_rows], dtype=np.int64
+    )
+    phases = np.asarray(data["phase"][candidate_rows]).astype(str)
+    legal_widths = legal_widths_all[candidate_rows]
+    surprise = alignment._policy_surprise(data, candidate_rows)  # noqa: SLF001
+    replay_kwargs = {
+        "rows": candidate_rows,
+        "game_seeds": game_seeds,
+        "decision_indices": decision_indices,
+        "phases": phases,
+        "legal_widths": legal_widths,
+        "surprise": surprise,
+        "reliability_class": reliability_classes[candidate_rows],
+        "policy_status": policy_status[candidate_rows],
+        "selection_seed": int(plan["subset"]["selection_seed"]),
+        "max_rows_per_game": int(plan["subset"]["max_rows_per_game"]),
+    }
+    replay_positions, replay_strata, replay_selected_counts = (
+        alignment._select_stratified(  # noqa: SLF001
+            **replay_kwargs,
+            limit=int(plan["subset"]["requested_rows"]),
+        )
+    )
+    if not np.array_equal(candidate_rows[replay_positions], selected_rows) or not np.array_equal(
+        replay_strata.astype(str), np.asarray(subset["stratum"]).astype(str)
+    ):
+        raise OverlayError("current code cannot replay the sealed Stage-C selection")
+    _all_positions, _all_strata, population_counts = alignment._select_stratified(  # noqa: SLF001
+        **replay_kwargs,
+        limit=len(candidate_rows),
+    )
+    declared_selected = {
+        str(key): int(value)
+        for key, value in plan["subset"]["stratum_counts"].items()
+    }
+    if replay_selected_counts != declared_selected:
+        raise OverlayError("replayed selected stratum counts differ from the plan")
+    subset_strata = {
+        int(row): str(stratum)
+        for row, stratum in zip(
+            selected_rows.tolist(),
+            np.asarray(subset["stratum"]).astype(str).tolist(),
+            strict=True,
+        )
+    }
+    materialized_selected: dict[str, int] = {}
+    for row in patch_rows.tolist():
+        stratum = subset_strata[int(row)]
+        materialized_selected[stratum] = materialized_selected.get(stratum, 0) + 1
+    if any(
+        int(population_counts.get(key, 0)) < count
+        for key, count in materialized_selected.items()
+    ):
+        raise OverlayError("Stage-C selected count exceeds admitted population")
+    return {
+        "schema_version": SAMPLING_SCHEMA,
+        "selected_subset": _artifact(subset_path),
+        "population_definition": "post_max_rows_per_game_admitted_population",
+        "candidate_rows_before_game_cap": int(candidate_rows.size),
+        "admitted_rows_after_game_cap": int(sum(population_counts.values())),
+        "planned_selected_rows": int(selected_rows.size),
+        "selected_rows": int(patch_rows.size),
+        "selection_seed": int(plan["subset"]["selection_seed"]),
+        "max_rows_per_game": int(plan["subset"]["max_rows_per_game"]),
+        "candidate_counts_by_stratum": dict(sorted(population_counts.items())),
+        "planned_selected_counts_by_stratum": dict(sorted(declared_selected.items())),
+        "selected_counts_by_stratum": dict(sorted(materialized_selected.items())),
+        "inverse_inclusion_formula": "candidate_count / selected_count",
+    }
+
+
 def _export(args: argparse.Namespace) -> dict[str, Any]:
     try:
         merge = stage_c._verify_merge_receipt(args.merge_receipt)  # noqa: SLF001
@@ -199,6 +338,13 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
     with np.load(patch_path, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     stage_c._verify_patch_arrays(arrays, receipt=merge)  # noqa: SLF001
+    sampling_population = _export_sampling_population(
+        plan=plan,
+        eligibility=eligibility,
+        base_root=base_root,
+        patch=arrays,
+        output=output,
+    )
     identities = [
         {
             "row_index": int(row),
@@ -241,6 +387,7 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
         "patch": _artifact(patch_path),
         "counts": copy.deepcopy(merge["counts"]),
         "row_identity_sha256": _value_sha256(identities),
+        "sampling_population": sampling_population,
         "learner_projection": {
             "policy_rows": "exact_stage_c_reanalysed_rows_only",
             "nonselected_policy_weight": 0.0,
@@ -248,6 +395,9 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
             "base_value_rows_retained": True,
             "root_value_patch_consumed": False,
             "completed_q_patch_consumed": False,
+            "authoritative_search_fixed_columns": sorted(
+                set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(arrays)
+            ),
             "rewritten_columns": sorted(REWRITTEN_COLUMNS),
         },
     }
@@ -256,7 +406,9 @@ def _export(args: argparse.Namespace) -> dict[str, Any]:
     return manifest
 
 
-def _load_export(path: Path) -> tuple[Path, dict[str, Any], dict[str, np.ndarray]]:
+def _load_export(
+    path: Path,
+) -> tuple[Path, dict[str, Any], dict[str, np.ndarray], dict[str, np.ndarray]]:
     manifest_path, manifest = _load_json(path, where="Stage-C learner export")
     unsigned = dict(manifest)
     stated = unsigned.pop("export_sha256", None)
@@ -271,13 +423,20 @@ def _load_export(path: Path) -> tuple[Path, dict[str, Any], dict[str, np.ndarray
         raise OverlayError("Stage-C learner export schema/digest/semantics drifted")
     patch_ref = manifest.get("patch")
     merge_ref = manifest.get("source_merge_receipt")
-    if not isinstance(patch_ref, dict) or not isinstance(merge_ref, dict):
+    subset_ref = manifest.get("sampling_population", {}).get("selected_subset")
+    if (
+        not isinstance(patch_ref, dict)
+        or not isinstance(merge_ref, dict)
+        or not isinstance(subset_ref, dict)
+    ):
         raise OverlayError("Stage-C learner export artifact bindings are malformed")
     patch = manifest_path.parent / Path(str(patch_ref.get("path", ""))).name
     merge_path = manifest_path.parent / Path(str(merge_ref.get("path", ""))).name
+    subset_path = manifest_path.parent / Path(str(subset_ref.get("path", ""))).name
     for artifact_path, reference, where in (
         (patch, patch_ref, "target patch"),
         (merge_path, merge_ref, "merge receipt"),
+        (subset_path, subset_ref, "selected subset"),
     ):
         if (
             artifact_path.is_symlink()
@@ -288,7 +447,11 @@ def _load_export(path: Path) -> tuple[Path, dict[str, Any], dict[str, np.ndarray
             raise OverlayError(f"Stage-C exported {where} bytes drifted")
     _merge_path, merge = _load_json(merge_path, where="exported Stage-C merge receipt")
     if (
-        merge.get("schema_version") != stage_c.MERGE_RECEIPT_SCHEMA
+        merge.get("schema_version")
+        not in {
+            stage_c.MERGE_RECEIPT_SCHEMA,
+            stage_c.REBOUND_MERGE_RECEIPT_SCHEMA,
+        }
         or merge.get("receipt_sha256") != merge_ref.get("receipt_sha256")
         or merge.get("artifact", {}).get("file_sha256")
         != patch_ref.get("file_sha256")
@@ -297,7 +460,9 @@ def _load_export(path: Path) -> tuple[Path, dict[str, Any], dict[str, np.ndarray
     with np.load(patch, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name]) for name in source.files}
     stage_c._verify_patch_arrays(arrays, receipt=merge)  # noqa: SLF001
-    return manifest_path, manifest, arrays
+    with np.load(subset_path, allow_pickle=False) as source:
+        subset = {name: np.asarray(source[name]) for name in source.files}
+    return manifest_path, manifest, arrays, subset
 
 
 def _column_payload_filename(name: str, schema: Mapping[str, Any]) -> str | None:
@@ -319,11 +484,13 @@ def _hardlink_payloads(
     base_root: Path,
     output_root: Path,
     columns: Mapping[str, Mapping[str, Any]],
+    *,
+    rewritten_columns: frozenset[str] | set[str] = REWRITTEN_COLUMNS,
 ) -> set[str]:
     linked: set[str] = {"row_offsets.dat"}
     for name, schema in columns.items():
         filename = _column_payload_filename(name, schema)
-        if filename is not None and name not in REWRITTEN_COLUMNS:
+        if filename is not None and name not in rewritten_columns:
             linked.add(filename)
     for filename in sorted(linked):
         source = base_root / filename
@@ -370,6 +537,7 @@ def _project_policy_patch(
     output_root: Path,
     meta: dict[str, Any],
     patch: Mapping[str, np.ndarray],
+    selected_sampling_weights: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Write the seven policy-only payloads and return projection evidence."""
 
@@ -433,6 +601,29 @@ def _project_policy_patch(
     policy_weight[selected_rows] = 1
     policy_weight.flush()
 
+    if SAMPLING_COLUMN in columns:
+        sampling_weight = _fixed_memmap(
+            output_root,
+            SAMPLING_COLUMN,
+            columns[SAMPLING_COLUMN],
+            rows,
+            mode="w+",
+        )
+        sampling_weight[...] = 0
+        selected_weight = (
+            np.ones(selected_rows.size, dtype=np.float32)
+            if selected_sampling_weights is None
+            else np.asarray(selected_sampling_weights, dtype=np.float32)
+        )
+        if (
+            selected_weight.shape != selected_rows.shape
+            or not np.isfinite(selected_weight).all()
+            or np.any(selected_weight <= 0.0)
+        ):
+            raise OverlayError("Stage-C selected sampling weights are invalid")
+        sampling_weight[selected_rows] = selected_weight
+        sampling_weight.flush()
+
     outputs: dict[str, np.memmap] = {}
     for name, (_patch_name, fill) in POLICY_RAGGED_COLUMNS.items():
         output = _ragged_flat_memmap(
@@ -464,6 +655,26 @@ def _project_policy_patch(
             outputs[name][base_start:base_stop] = source[gather]
     for output in outputs.values():
         output.flush()
+
+    projected_search_columns: list[str] = []
+    for column_name, patch_name in OPTIONAL_FIXED_PATCH_COLUMNS.items():
+        if column_name not in columns or patch_name not in patch:
+            continue
+        source = _fixed_memmap(
+            base_root, column_name, columns[column_name], rows, mode="r"
+        )
+        target = _fixed_memmap(
+            output_root, column_name, columns[column_name], rows, mode="w+"
+        )
+        target[...] = source
+        values = np.asarray(patch[patch_name])
+        if values.shape[0] != selected_rows.size:
+            raise OverlayError(
+                f"Stage-C {patch_name} is not aligned to selected rows"
+            )
+        target[selected_rows] = values
+        target.flush()
+        projected_search_columns.append(column_name)
 
     teacher_schema = columns["teacher_name"]
     if teacher_schema.get("kind") != "string":
@@ -511,12 +722,14 @@ def _project_policy_patch(
         "selected_policy_mass_min": float(selected_mass.min()),
         "selected_policy_mass_max": float(selected_mass.max()),
         "base_value_rows_retained": rows,
+        "authoritative_search_fixed_columns": projected_search_columns,
     }
 
 
 def _updated_inventory(
     *,
     base_meta: Mapping[str, Any],
+    output_meta: Mapping[str, Any],
     output_root: Path,
     rewritten_filenames: set[str],
 ) -> list[dict[str, Any]]:
@@ -524,8 +737,9 @@ def _updated_inventory(
         str(record["filename"]): dict(record)
         for record in base_meta.get("payload_inventory", ())
     }
-    expected = train_bc._expected_memmap_payload_filenames(base_meta)  # noqa: SLF001
-    if set(base_records) != expected:
+    base_expected = train_bc._expected_memmap_payload_filenames(base_meta)  # noqa: SLF001
+    expected = train_bc._expected_memmap_payload_filenames(output_meta)  # noqa: SLF001
+    if set(base_records) != base_expected:
         raise OverlayError("base payload inventory differs from its column schema")
     result = []
     for filename in sorted(expected):
@@ -533,15 +747,152 @@ def _updated_inventory(
         if filename in rewritten_filenames:
             result.append(_sha_record(path))
         else:
-            record = base_records[filename]
+            record = base_records.get(filename)
+            if record is None:
+                raise OverlayError(f"new payload was not declared rewritten: {filename}")
             if path.stat().st_size != int(record["size_bytes"]):
                 raise OverlayError(f"hard-linked payload size drifted: {filename}")
             result.append(record)
     return result
 
 
+def _unit_mean_capped_weights(raw: np.ndarray, *, cap: float) -> np.ndarray:
+    values = np.asarray(raw, dtype=np.float64)
+    if (
+        values.ndim != 1
+        or values.size == 0
+        or not np.isfinite(values).all()
+        or np.any(values <= 0.0)
+        or not math.isfinite(float(cap))
+        or float(cap) < 1.0
+    ):
+        raise OverlayError("production sampling weights/cap are invalid")
+    # Find the unique scale with mean(min(cap, scale * raw)) == 1.  This keeps
+    # both the declared cap and unit mean exact; cap-then-renormalize can exceed
+    # its own advertised ceiling.
+    low, high = 0.0, 1.0 / float(np.mean(values))
+    while float(np.mean(np.minimum(float(cap), high * values))) < 1.0:
+        high *= 2.0
+    for _ in range(96):
+        middle = (low + high) / 2.0
+        if float(np.mean(np.minimum(float(cap), middle * values))) < 1.0:
+            low = middle
+        else:
+            high = middle
+    result = np.minimum(float(cap), high * values)
+    if not math.isclose(float(np.mean(result)), 1.0, rel_tol=0.0, abs_tol=1.0e-12):
+        raise OverlayError("capped production weights failed unit normalization")
+    return result
+
+
+def _effective_sample_size(weights: np.ndarray) -> float:
+    values = np.asarray(weights, dtype=np.float64)
+    return float(values.sum() ** 2 / np.square(values).sum())
+
+
+def _selected_sampling_weights(
+    *,
+    export: Mapping[str, Any],
+    subset: Mapping[str, np.ndarray],
+    patch: Mapping[str, np.ndarray],
+    selected_validation: np.ndarray,
+    arm: str,
+    production_weight_cap: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if arm not in SAMPLING_ARMS:
+        raise OverlayError(f"unknown Stage-C sampling arm {arm!r}")
+    patch_rows = np.asarray(patch["row_index"], dtype=np.int64)
+    subset_rows = np.asarray(subset["row_index"], dtype=np.int64)
+    subset_strata = np.asarray(subset["stratum"]).astype(str)
+    subset_phases = np.asarray(subset["phase"]).astype(str)
+    subset_widths = np.asarray(subset["legal_width"], dtype=np.int64)
+    lookup = {
+        int(row): (str(stratum), str(phase), int(width))
+        for row, stratum, phase, width in zip(
+            subset_rows.tolist(),
+            subset_strata.tolist(),
+            subset_phases.tolist(),
+            subset_widths.tolist(),
+            strict=True,
+        )
+    }
+    try:
+        descriptors = [lookup[int(row)] for row in patch_rows.tolist()]
+    except KeyError as error:
+        raise OverlayError("Stage-C patch row lost its sealed stratum") from error
+    population = export.get("sampling_population")
+    if not isinstance(population, dict):
+        raise OverlayError("Stage-C export has no sampling population")
+    candidate_counts = {
+        str(key): int(value)
+        for key, value in population["candidate_counts_by_stratum"].items()
+    }
+    selected_counts = {
+        str(key): int(value)
+        for key, value in population["selected_counts_by_stratum"].items()
+    }
+    raw = np.asarray(
+        [candidate_counts[stratum] / selected_counts[stratum] for stratum, _, _ in descriptors],
+        dtype=np.float64,
+    )
+    validation = np.asarray(selected_validation, dtype=np.bool_)
+    if validation.shape != raw.shape or np.all(validation):
+        raise OverlayError("Stage-C selected training split is empty or misaligned")
+    train = ~validation
+    weights = np.ones(raw.size, dtype=np.float64)
+    if arm == "PRODUCTION_WEIGHTED":
+        weights[train] = _unit_mean_capped_weights(
+            raw[train], cap=float(production_weight_cap)
+        )
+        # Validation rows are not sampled by the optimizer.  Keep them positive
+        # for corpus-scope invariants without letting them alter train scaling.
+        weights[validation] = 1.0
+
+    def _mass_by(values: Sequence[str]) -> dict[str, float]:
+        labels = np.asarray(values).astype(str)
+        return {
+            str(label): float(weights[train & (labels == label)].sum())
+            for label in sorted(set(labels[train].tolist()))
+        }
+
+    phases = np.asarray([phase for _, phase, _ in descriptors]).astype(str)
+    width_buckets = np.asarray(
+        [alignment._width_bucket(width) for _, _, width in descriptors]  # noqa: SLF001
+    ).astype(str)
+    train_weights = weights[train]
+    report = {
+        "schema_version": SAMPLING_SCHEMA,
+        "arm": arm,
+        "column": SAMPLING_COLUMN,
+        "selected_rows": int(raw.size),
+        "selected_training_rows": int(np.count_nonzero(train)),
+        "selected_validation_rows": int(np.count_nonzero(validation)),
+        "inverse_inclusion_formula": "candidate_count / selected_count",
+        "normalization_scope": "selected_training_roots_only",
+        "production_weight_cap": (
+            float(production_weight_cap) if arm == "PRODUCTION_WEIGHTED" else None
+        ),
+        "raw_inverse_inclusion": {
+            "min": float(raw[train].min()),
+            "max": float(raw[train].max()),
+            "mean": float(raw[train].mean()),
+            "effective_sample_size": _effective_sample_size(raw[train]),
+        },
+        "final_training_weights": {
+            "min": float(train_weights.min()),
+            "max": float(train_weights.max()),
+            "mean": float(train_weights.mean()),
+            "effective_sample_size": _effective_sample_size(train_weights),
+        },
+        "training_mass_by_phase": _mass_by(phases),
+        "training_mass_by_legal_width_bucket": _mass_by(width_buckets),
+    }
+    report["sampling_sha256"] = _value_sha256(report)
+    return weights.astype(np.float32), report
+
+
 def _materialize(args: argparse.Namespace) -> dict[str, Any]:
-    export_path, export, patch = _load_export(args.export_manifest)
+    export_path, export, patch, subset = _load_export(args.export_manifest)
     try:
         base_admission_path, base_admission = active_campaign._load_admission(  # noqa: SLF001
             args.base_admission
@@ -574,13 +925,11 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
         columns = meta.get("columns")
         if not isinstance(columns, dict):
             raise OverlayError("base corpus column schema is malformed")
-        _hardlink_payloads(base_root, temporary, columns)
-        projection = _project_policy_patch(
-            base_root=base_root,
-            output_root=temporary,
-            meta=meta,
-            patch=patch,
-        )
+        columns[SAMPLING_COLUMN] = {
+            "kind": "fixed",
+            "dtype": "float32",
+            "inner_shape": [],
+        }
         validation_ref = base_admission["corpus"]["validation_manifest"]
         try:
             validation = train_bc._load_validation_game_seed_manifest_for_training(  # noqa: SLF001
@@ -598,6 +947,29 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             np.asarray(patch["game_seed"], dtype=np.int64),
             np.asarray(validation["game_seeds"], dtype=np.int64),
         )
+        selected_sampling_weights, sampling_report = _selected_sampling_weights(
+            export=export,
+            subset=subset,
+            patch=patch,
+            selected_validation=selected_validation,
+            arm=str(args.sampling_arm),
+            production_weight_cap=float(args.production_weight_cap),
+        )
+        optional_fixed = set(OPTIONAL_FIXED_PATCH_COLUMNS) & set(columns) & set(patch)
+        rewritten_columns = set(REWRITTEN_COLUMNS) | optional_fixed | {SAMPLING_COLUMN}
+        _hardlink_payloads(
+            base_root,
+            temporary,
+            columns,
+            rewritten_columns=rewritten_columns,
+        )
+        projection = _project_policy_patch(
+            base_root=base_root,
+            output_root=temporary,
+            meta=meta,
+            patch=patch,
+            selected_sampling_weights=selected_sampling_weights,
+        )
         projection["selected_validation_policy_rows"] = int(
             np.count_nonzero(selected_validation)
         )
@@ -608,12 +980,13 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             raise OverlayError("Stage-C overlay has no policy roots in the training split")
         rewritten_filenames = {
             _column_payload_filename(name, columns[name])
-            for name in REWRITTEN_COLUMNS
+            for name in rewritten_columns
         }
         if None in rewritten_filenames:
             raise OverlayError("Stage-C rewritten column unexpectedly has no payload")
         inventory = _updated_inventory(
             base_meta=base_meta,
+            output_meta=meta,
             output_root=temporary,
             rewritten_filenames={str(value) for value in rewritten_filenames},
         )
@@ -641,7 +1014,8 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             "nonselected_policy_weight": 0.0,
             "selected_policy_weight": 1.0,
             "base_value_rows_retained": True,
-            "rewritten_columns": sorted(REWRITTEN_COLUMNS),
+            "rewritten_columns": sorted(rewritten_columns),
+            "sampling_distribution": sampling_report,
         }
         meta_path = temporary / "corpus_meta.json"
         meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -683,8 +1057,9 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "target_operator_contract": copy.deepcopy(export["target_operator_contract"]),
             "projection": projection,
-            "rewritten_columns": sorted(REWRITTEN_COLUMNS),
-            "preserved_columns": sorted(set(columns) - REWRITTEN_COLUMNS),
+            "sampling_distribution": sampling_report,
+            "rewritten_columns": sorted(rewritten_columns),
+            "preserved_columns": sorted(set(columns) - rewritten_columns),
             "non_target_source_columns_mutated": False,
             "base_value_and_outcome_columns_retained": True,
         }
@@ -733,6 +1108,7 @@ def _materialize(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "base_value_rows_retained": True,
             "historical_policy_targets_active": False,
+            "sampling_distribution": sampling_report,
         }
         admission["admission_sha256"] = _value_sha256(admission)
         _write_json_immutable(temporary / "overlay.admission.json", admission)
@@ -774,6 +1150,9 @@ def verify_overlay_admission(path: Path) -> dict[str, Any]:
             "stage_c_reanalysis_only"
         )
         is not True
+        or overlay.get("sampling_distribution", {}).get("schema_version")
+        != SAMPLING_SCHEMA
+        or overlay.get("sampling_distribution", {}).get("arm") not in SAMPLING_ARMS
     ):
         raise OverlayError("Stage-C overlay admission digest/semantics drifted")
     receipt_ref = overlay.get("materialization_receipt")
@@ -822,6 +1201,14 @@ def build_parser() -> argparse.ArgumentParser:
     materialize.add_argument("--base-corpus", required=True, type=Path)
     materialize.add_argument("--base-admission", required=True, type=Path)
     materialize.add_argument("--output-root", required=True, type=Path)
+    materialize.add_argument(
+        "--sampling-arm", required=True, choices=sorted(SAMPLING_ARMS)
+    )
+    materialize.add_argument(
+        "--production-weight-cap",
+        type=float,
+        default=DEFAULT_PRODUCTION_WEIGHT_CAP,
+    )
     verify = commands.add_parser("verify")
     verify.add_argument("--admission", required=True, type=Path)
     return parser

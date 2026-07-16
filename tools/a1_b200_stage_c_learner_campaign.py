@@ -16,6 +16,7 @@ being replayed almost half an epoch on every optimizer step.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -36,7 +37,7 @@ from tools import a1_one_dose_train as one_dose  # noqa: E402
 from tools import a1_stage_c_learner_overlay as overlay  # noqa: E402
 
 
-SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v1"
+SCHEMA = "a1-b200-stage-c-aligned-learner-campaign-v2"
 EXECUTION_SCHEMA = "a1-b200-stage-c-aligned-learner-execution-v1"
 FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v1"
 WORLD_SIZE = 8
@@ -50,7 +51,8 @@ LR = 6.0e-5
 LR_WARMUP_STEPS = 16
 MAX_PARENT_KL = 0.03
 MAX_TRUNK_RELATIVE_L2 = 0.03
-ARM = "COHERENT_ONLY"
+ARMS = frozenset({"PRODUCTION_WEIGHTED", "STRATEGIC_BALANCED"})
+FROZEN_ADAPTER_GROUPS = "meaningful_history_gate,public_card_residual"
 
 
 class CampaignError(RuntimeError):
@@ -125,7 +127,9 @@ def _recipe() -> dict[str, Any]:
         "policy_loss_weight": 1.0,
         "soft_target_source": "policy",
         "soft_target_weight": 1.0,
+        "soft_target_min_legal_coverage": 1.0,
         "value_loss_weight": 0.25,
+        "value_trunk_grad_scale": 0.1,
         "policy_kl_anchor_weight": 0.0,
         "public_card_lr_mult": 1.0,
         "per_game_policy_surprise_weighting": False,
@@ -170,7 +174,7 @@ def _one_dose_command(plan: Mapping[str, Any]) -> list[str]:
         "--ddp-canary-receipt",
         str(inputs["ddp_canary_receipt"]),
         "--ablation-id",
-        "stage-c-coherent-only",
+        f"stage-c-{str(plan['arm']).lower().replace('_', '-')}",
         "--recipe-overrides-json",
         _canonical_bytes(plan["recipe"]).decode("ascii"),
         "--ablation-code-tree-sha256",
@@ -192,6 +196,15 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
     except (overlay.OverlayError, stage_a.CampaignError) as error:
         raise CampaignError(f"Stage-C overlay admission refused: {error}") from error
     corpus = admission["corpus"]
+    arm = str(args.arm)
+    sampling = overlay_evidence["receipt"].get("sampling_distribution")
+    if (
+        arm not in ARMS
+        or not isinstance(sampling, dict)
+        or sampling.get("schema_version") != overlay.SAMPLING_SCHEMA
+        or sampling.get("arm") != arm
+    ):
+        raise CampaignError("campaign arm differs from overlay sampling distribution")
     data = Path(str(corpus["data_path"])).resolve(strict=True)
     validation = Path(str(corpus["validation_manifest"]["path"])).resolve(strict=True)
     lock = args.lock.expanduser().resolve(strict=True)
@@ -269,6 +282,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema_version": SCHEMA,
         "purpose": "distil_exact_current_coherent_n128_stage_c_targets",
+        "arm": arm,
         "diagnostic_only": True,
         "promotion_eligible": False,
         "lineage": {
@@ -288,6 +302,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "nonselected_policy_weight": 0.0,
             "base_value_rows_retained": True,
             "surprise_weighting": False,
+            "sampling_distribution": copy.deepcopy(sampling),
         },
         "topology": {
             "name": "b200-8gpu-ddp",
@@ -309,6 +324,12 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "requires_positive_teacher_gap_closure": True,
             "objective": "best_external_play_among_posthoc_in_budget_checkpoints",
             "playing_strength_evaluation_required": True,
+        },
+        "optimizer_surface_contract": {
+            "shared_trunk_trainable": True,
+            "value_trunk_grad_scale": 0.1,
+            "frozen_adapter_groups": sorted(FROZEN_ADAPTER_GROUPS.split(",")),
+            "frozen_adapters_optimizer_excluded": True,
         },
         "inputs": {
             "python": str(python),
@@ -374,6 +395,15 @@ def _verify_inputs(plan: Mapping[str, Any]) -> None:
         if path.is_symlink() or _file_sha256(path) != inputs[sha_key]:
             raise CampaignError(f"campaign input bytes changed: {path_key}")
     overlay.verify_overlay_admission(Path(str(inputs["overlay_admission"])))
+    recipe = plan.get("recipe", {})
+    if (
+        plan.get("arm") not in ARMS
+        or float(recipe.get("value_trunk_grad_scale", -1.0)) != 0.1
+        or float(recipe.get("soft_target_min_legal_coverage", -1.0)) != 1.0
+        or float(recipe.get("policy_kl_anchor_weight", -1.0)) != 0.0
+        or bool(recipe.get("per_game_policy_surprise_weighting", True))
+    ):
+        raise CampaignError("Stage-C clean learner semantics drifted")
     if plan.get("command_sha256") != _value_sha256(_one_dose_command(plan)):
         raise CampaignError("Stage-C learner command drifted from campaign")
 
@@ -395,6 +425,20 @@ def _run(plan: Mapping[str, Any], *, go: bool) -> dict[str, Any]:
         raise CampaignError(f"completed Stage-C learner receipt refused: {error}") from error
     report_path = Path(str(plan["expected_artifacts"]["report"])).resolve(strict=True)
     report = _load_json(report_path, where="completed Stage-C learner report")[1]
+    freeze = report.get("training_information_surface", {}).get(
+        "explicit_module_freeze"
+    )
+    if (
+        float(report.get("value_trunk_grad_scale", -1.0)) != 0.1
+        or not isinstance(freeze, dict)
+        or freeze.get("frozen_groups")
+        != sorted(FROZEN_ADAPTER_GROUPS.split(","))
+        or set(freeze.get("frozen_submodules", ()))
+        != {"meaningful_history_residual_gate", "public_card_count_residual"}
+        or freeze.get("all_require_grad_false") is not True
+        or int(freeze.get("optimizer_excluded_parameter_tensors", 0)) <= 0
+    ):
+        raise CampaignError("completed learner did not exclude both new adapters")
     aux_draws = int(report.get("policy_aux_active_rows", -1))
     unique_rows = int(report.get("policy_aux_unique_source_rows", -1))
     expected_aux_draws = POLICY_AUX_ACTIVE_BATCH_SIZE * WORLD_SIZE * MAX_STEPS
@@ -595,6 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     plan = commands.add_parser("plan")
+    plan.add_argument("--arm", required=True, choices=sorted(ARMS))
     plan.add_argument("--overlay-admission", required=True, type=Path)
     plan.add_argument("--lock", required=True, type=Path)
     plan.add_argument("--architecture-upgrade-receipt", required=True, type=Path)
