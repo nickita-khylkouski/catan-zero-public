@@ -990,14 +990,16 @@ def test_policy_aux_batch_combines_parts_and_adds_no_value_gradient(tmp_path) ->
 
     _control_policy, control = run(auxiliary=False)
     aux_policy, auxiliary = run(auxiliary=True)
-    # Duplicating the same policy rows must double numerator and denominator,
-    # not sum two independently-normalized means.
-    assert auxiliary["policy_loss"] == pytest.approx(control["policy_loss"], rel=1e-6)
+    # Duplicating the same policy rows in the active-policy stream must add one
+    # complete auxiliary dose without shrinking the original base objective.
+    assert auxiliary["policy_loss"] == pytest.approx(
+        2.0 * control["policy_loss"], rel=1e-6
+    )
     assert auxiliary["policy_loss_weighted_sum"] == pytest.approx(
         2.0 * control["policy_loss_weighted_sum"], rel=1e-6
     )
     assert auxiliary["policy_loss_weight_sum"] == pytest.approx(
-        2.0 * control["policy_loss_weight_sum"], rel=1e-6
+        control["policy_loss_weight_sum"], rel=1e-6
     )
     assert auxiliary["policy_base_loss_weight_sum"] == pytest.approx(
         control["policy_loss_weight_sum"], rel=1e-6

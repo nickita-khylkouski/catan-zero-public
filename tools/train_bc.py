@@ -14791,10 +14791,13 @@ def _train_xdim_batch(
             aux_sum, aux_denominator = _weighted_loss_parts(aux_per_sample, aux_weights)
             policy_aux_loss_sum = aux_sum
             policy_loss_sum = policy_loss_sum + aux_sum
-            policy_loss_denominator = policy_loss_denominator + aux_denominator
             policy_aux_active_count = int(len(policy_aux_batch))
+        # Preserve the complete base-policy objective. The auxiliary stream is
+        # an additive dose measured relative to the base denominator, not a
+        # larger joint batch that dilutes base learning by B/(B+A). Equivalently
+        # this is base_mean + (aux_weight/base_weight) * aux_mean.
         policy_loss = _weighted_mean_from_parts(
-            policy_loss_sum, policy_loss_denominator
+            policy_loss_sum, policy_base_loss_denominator
         )
         value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
         final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
@@ -15093,15 +15096,12 @@ def _train_xdim_batch(
             )
             policy_aux_objective = None
             if policy_aux_batch is not None:
-                # The auxiliary active-policy branch is normalized jointly with
-                # the base branch.  Its effective objective contribution must
-                # therefore use the *combined* denominator, not an independent
-                # auxiliary mean.  This is reporting-only and reuses the exact
-                # forward graph consumed by the real optimizer update.
+                # Report the auxiliary contribution using the same base
+                # denominator as the real additive objective above.
                 policy_aux_objective = float(policy_loss_weight) * (
                     _weighted_mean_from_parts(
                         policy_aux_loss_sum,
-                        policy_loss_denominator,
+                        policy_base_loss_denominator,
                     )
                 )
             value_objective = (
