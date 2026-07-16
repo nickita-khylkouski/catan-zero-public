@@ -142,6 +142,33 @@ def test_science_trace_fails_closed_on_malformed_matched_validation() -> None:
         probe._report_trace(report, "primary_value_loss")
 
 
+def test_science_trace_rejects_partially_matched_epochs() -> None:
+    report = {
+        "metrics": [
+            {
+                "validation": {"primary_value_loss": 0.1},
+                "validation_objective_matched": {
+                    "schema_version": "composite-validation-measure-v2",
+                    "objective_matched": True,
+                    "metrics": {"primary_value_loss": 0.9},
+                },
+            },
+            {"validation": {"primary_value_loss": 0.2}},
+            {
+                "validation": {"primary_value_loss": 0.3},
+                "validation_objective_matched": {
+                    "schema_version": "composite-validation-measure-v2",
+                    "objective_matched": True,
+                    "metrics": {"primary_value_loss": 0.7},
+                },
+            },
+        ]
+    }
+
+    with pytest.raises(probe.ContractError, match="mixes objective-matched and raw"):
+        probe._report_trace(report, "primary_value_loss")
+
+
 def test_checked_in_manifest_resolves_and_both_full_commands_parse() -> None:
     manifest = json.loads(
         (_REPO / "configs/experiments/a0_gen2b_hlgauss.json").read_text(

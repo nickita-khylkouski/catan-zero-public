@@ -1120,10 +1120,25 @@ def _decision_validation_metrics(metric: Mapping[str, Any]) -> Mapping[str, Any]
 
 
 def _report_trace(report: Mapping[str, Any], field: str) -> list[float]:
+    metrics = report.get("metrics", [])
+    if not isinstance(metrics, list):
+        raise ContractError("completed report has malformed epoch metrics")
+    matched_validation_present = any(
+        isinstance(metric, Mapping)
+        and "validation_objective_matched" in metric
+        for metric in metrics
+    )
     result: list[float] = []
-    for metric in report.get("metrics", []):
+    for metric in metrics:
         if not isinstance(metric, Mapping):
             raise ContractError("completed report has a malformed epoch metric")
+        if (
+            matched_validation_present
+            and "validation_objective_matched" not in metric
+        ):
+            raise ContractError(
+                "completed report mixes objective-matched and raw validation epochs"
+            )
         validation = _decision_validation_metrics(metric)
         if field not in validation:
             raise ContractError(f"completed report lacks decision validation.{field}")
