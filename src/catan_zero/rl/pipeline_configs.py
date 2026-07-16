@@ -227,6 +227,7 @@ class TrainConfig(PipelineConfig):
     # it to a concrete bool before the immutable TrainConfig is recorded.
     public_card_count_features: bool | None = None
     public_card_count_feature_schema: str = "public_card_state_v2"
+    public_card_count_residual_bias: bool | None = None
     # Structured action/value residuals are checkpoint-owned architecture.
     # Main resolves the inherit sentinel to concrete bools before hashing.
     static_action_residual: bool | None = None

@@ -96,6 +96,7 @@
     "model_construction": {
       "arch": "entity_graph",
       "hidden_size": 640,
+      "graph_tokens": null,
       "graph_layers": 6,
       "attention_heads": 8,
       "graph_dropout": 0.05,
@@ -103,8 +104,10 @@
       "static_action_residual": true,
       "legal_action_value_residual": true,
       "public_card_count_features": true,
+      "public_card_count_residual_bias": false,
       "public_rule_state_features": true,
       "public_rule_state_feature_schema": "actor_public_rule_state_2p_v1",
+      "actor_public_rule_state": "dev_used_road_building_free_roads_discard_remainder_playable_dev_counts",
       "meaningful_public_history": true,
       "meaningful_public_history_pooling": "masked_mean_v1",
       "event_history_limit": 32,
@@ -122,7 +125,10 @@
       "grad_accum_steps": 1,
       "global_batch_size": 4096,
       "ddp_shard_data": false,
-      "training_rng_rank_offset": true
+      "training_rng_rank_offset": true,
+      "optimization_schedule_status": "unresolved",
+      "go_authorized": false,
+      "reviewed_optimizer_schedule_role": "checkpoint_initialized_diagnostic_canary_only"
     },
     "topology": "b200-8gpu-ddp",
     "training_recipe": {

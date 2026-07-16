@@ -19,8 +19,19 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         current_science.learner_model_construction()
         == current_science.PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT
     )
+    model = current_science.learner_model_construction()
+    assert model["graph_tokens"] is None
+    assert model["public_card_count_residual_bias"] is False
+    assert model["public_rule_state_features"] is True
+    assert model["actor_public_rule_state"].startswith("dev_used_")
     execution = current_science.learner_execution_topology()
     assert execution == current_science.PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT
+    assert execution["go_authorized"] is False
+    assert execution["optimization_schedule_status"] == "unresolved"
+    assert (
+        execution["reviewed_optimizer_schedule_role"]
+        == "checkpoint_initialized_diagnostic_canary_only"
+    )
     assert (
         execution["world_size"]
         * execution["local_batch_size"]

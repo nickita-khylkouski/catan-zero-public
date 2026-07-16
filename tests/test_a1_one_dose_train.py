@@ -1326,6 +1326,18 @@ def test_production_trainer_byte_drift_is_rejected_before_claim(
     assert not receipt.exists()
 
 
+def test_production_trainer_authority_binds_current_science_import() -> None:
+    authority = executor._current_production_trainer_authority()
+    records = {
+        record["relative_path"]: record for record in authority["code_surface"]
+    }
+    science_path = "tools/a1_current_science_contract.py"
+    assert science_path in executor.PRODUCTION_TRAINER_CODE_SURFACE
+    assert records[science_path]["path"] == str(
+        Path(executor.current_science.__file__).resolve(strict=True)
+    )
+
+
 def test_production_failure_receipt_binds_current_trainer_authority(
     tmp_path: Path,
 ) -> None:

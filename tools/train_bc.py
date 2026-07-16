@@ -45,6 +45,7 @@ from catan_zero.rl.aux_subgoal_targets import (
     AUX_TARGET_KEYS,
 )
 from catan_zero.rl.pipeline_configs import TrainConfig
+from tools import a1_current_science_contract as current_science
 from catan_zero.rl.torch_ppo import build_action_feature_table, create_ppo_policy
 from catan_zero.rl.xdim_lite_policy import (
     XDimGraphPolicy,
@@ -499,6 +500,18 @@ def build_parser() -> argparse.ArgumentParser:
             "public entity columns, and stored deduction_features are recomputed "
             "rather than trusted. Requires --mask-hidden-info. With an init/grow "
             "checkpoint the omitted default inherits its saved architecture flag."
+        ),
+    )
+    parser.add_argument(
+        "--public-card-count-residual-bias",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Checkpoint-owned topology of the public-card residual projection. "
+            "card_count_v2 requires the bias-free form so an all-zero public-card "
+            "row remains an exact zero contribution after training. Omitted "
+            "inherits an init/grow checkpoint and defaults to the historical "
+            "biased form for an ordinary fresh model."
         ),
     )
     parser.add_argument(
@@ -1726,6 +1739,9 @@ def build_parser() -> argparse.ArgumentParser:
     # the effective recipe and rejects any mismatch or empty/no-op ablation.
     parser.add_argument("--a1-learner-ablation-id", default="", help=argparse.SUPPRESS)
     parser.add_argument(
+        "--a1-scratch-authority-json", default="", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
         "--a1-effective-learner-recipe-json", default="", help=argparse.SUPPRESS
     )
     parser.add_argument(
@@ -2635,6 +2651,23 @@ def _checkpoint_public_card_count_features(checkpoint_path: str) -> bool:
         )
     config = config_attr_view(checkpoint["config"])
     return bool(getattr(config, "public_card_count_features", False))
+
+
+def _checkpoint_public_card_count_residual_bias(checkpoint_path: str) -> bool:
+    """Read the checkpoint-owned card-count residual topology."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --public-card-count-residual-bias"
+        )
+    config = config_attr_view(checkpoint["config"])
+    return bool(getattr(config, "public_card_count_residual_bias", True))
 
 
 def _checkpoint_public_rule_state_features(checkpoint_path: str) -> bool:
@@ -8490,6 +8523,324 @@ def _validate_a1_aux_regularization_binding(
     return binding
 
 
+def _validate_a1_scratch_runtime_projection(
+    args: argparse.Namespace,
+    ddp: Mapping[str, int | bool],
+    model: Mapping[str, object],
+    topology: Mapping[str, object],
+) -> None:
+    """Fail closed unless argv constructs every field of sealed scratch science."""
+
+    runtime_adapter = (
+        RUST_ENTITY_ADAPTER_V4
+        if bool(args.public_rule_state_features)
+        else CURRENT_RUST_ENTITY_ADAPTER_VERSION
+    )
+    drift = {
+        "fresh_initialization": bool(
+            args.init_checkpoint or args.grow_from_checkpoint or args.resume_optimizer
+        ),
+        "arch": str(args.arch) != model["arch"],
+        "hidden_size": int(args.hidden_size) != model["hidden_size"],
+        "graph_tokens": model["graph_tokens"] is not None,
+        "graph_layers": int(args.graph_layers) != model["graph_layers"],
+        "attention_heads": int(args.attention_heads) != model["attention_heads"],
+        "graph_dropout": float(args.graph_dropout) != model["graph_dropout"],
+        "entity_state_trunk": str(args.entity_state_trunk)
+        != model["entity_state_trunk"],
+        "static_action_residual": bool(args.static_action_residual)
+        != model["static_action_residual"],
+        "legal_action_value_residual": bool(args.legal_action_value_residual)
+        != model["legal_action_value_residual"],
+        "public_card_count_features": bool(args.public_card_count_features)
+        != model["public_card_count_features"],
+        "public_card_count_residual_bias": bool(
+            args.public_card_count_residual_bias
+        )
+        != model["public_card_count_residual_bias"],
+        "public_rule_state_features": bool(args.public_rule_state_features)
+        != model["public_rule_state_features"],
+        "public_rule_state_feature_schema": (
+            PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION
+            != model["public_rule_state_feature_schema"]
+        ),
+        "entity_feature_adapter_version": runtime_adapter
+        != model["entity_feature_adapter_version"],
+        "meaningful_public_history": bool(args.meaningful_public_history)
+        != model["meaningful_public_history"],
+        "meaningful_public_history_pooling": str(
+            args.meaningful_public_history_pooling
+        )
+        != model["meaningful_public_history_pooling"],
+        "event_history_limit": int(args.event_history_limit)
+        != model["event_history_limit"],
+        "mask_hidden_info": bool(args.mask_hidden_info)
+        != model["mask_hidden_info"],
+        "require_35m_model": bool(args.require_35m_model)
+        != model["require_35m_model"],
+        "topology_world_size": int(ddp.get("world_size", 0))
+        != topology["world_size"],
+        "topology_local_batch": int(args.batch_size)
+        != topology["local_batch_size"],
+        "topology_grad_accum": int(args.grad_accum_steps)
+        != topology["grad_accum_steps"],
+        "topology_global_batch": (
+            int(ddp.get("world_size", 0))
+            * int(args.batch_size)
+            * int(args.grad_accum_steps)
+            != topology["global_batch_size"]
+        ),
+        "ddp_shard_data": bool(args.ddp_shard_data)
+        != topology["ddp_shard_data"],
+        "training_rng_rank_offset": bool(args.training_rng_rank_offset)
+        != topology["training_rng_rank_offset"],
+    }
+    failed = sorted(key for key, value in drift.items() if value)
+    if failed:
+        raise SystemExit(
+            f"A1 native scratch runtime projection drift: {failed}"
+        )
+
+
+def _require_a1_scratch_execution_schedule(
+    topology: Mapping[str, object],
+) -> None:
+    """Prevent copied argv from inheriting an unreviewed scratch optimizer."""
+
+    if (
+        topology.get("optimization_schedule_status") != "reviewed"
+        or topology.get("go_authorized") is not True
+        or topology.get("reviewed_optimizer_schedule_role")
+        != "production_scratch"
+    ):
+        raise SystemExit(
+            "A1 native scratch optimization schedule is unresolved; the sealed "
+            "lr/warmup/32-step recipe is checkpoint-initialized diagnostic "
+            "evidence and cannot execute"
+        )
+
+
+def _preflight_a1_scratch_execution_authority(raw: str) -> None:
+    """Reject every scratch plan marker immediately after CLI/config parse."""
+
+    if not raw:
+        return
+    try:
+        authority = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid A1 scratch authority JSON: {error}") from error
+    if (
+        not isinstance(authority, dict)
+        or authority.get("schema_version")
+        != "a1-coherent-scratch-plan-authority-v2"
+    ):
+        raise SystemExit("A1 scratch plan authority fields/schema drift")
+    raise SystemExit(
+        "A1 native scratch optimization schedule is unresolved; scratch "
+        "authority is planning-only and cannot execute"
+    )
+
+
+_A1_SCRATCH_SCIENCE_BINDING_FIELDS = {
+    "science_schema_version",
+    "search_operator",
+    "search_operator_sha256",
+    "evaluator",
+    "evaluator_sha256",
+    "learner_value_objective",
+    "learner_value_objective_sha256",
+    "learner_training_recipe",
+    "learner_training_recipe_sha256",
+    "learner_initialization",
+    "learner_initialization_sha256",
+    "learner_model_construction",
+    "learner_model_construction_sha256",
+    "learner_execution_topology",
+    "learner_execution_topology_sha256",
+}
+
+
+def _validate_a1_scratch_plan_binding(
+    authority: Mapping[str, object],
+    *,
+    data_path: str,
+    composite_meta: Mapping[str, object],
+) -> dict[str, object]:
+    """Replay exact descriptor, staged-lock, and build-receipt plan identity."""
+
+    expected_fields = {
+        "schema_version",
+        "staged_contract",
+        "science",
+        "descriptor",
+        "source_authority",
+        "source_authority_semantic_sha256",
+        "build_receipt",
+    }
+    if (
+        set(authority) != expected_fields
+        or authority.get("schema_version")
+        != "a1-coherent-scratch-plan-authority-v2"
+    ):
+        raise SystemExit("A1 scratch plan authority fields/schema drift")
+    descriptor = authority["descriptor"]
+    source_ref = authority["source_authority"]
+    build_ref = authority["build_receipt"]
+    staged_ref = authority["staged_contract"]
+    source_authority = composite_meta.get("source_authority")
+    if (
+        not isinstance(descriptor, dict)
+        or descriptor
+        != {
+            "path": str(Path(data_path).expanduser().resolve(strict=True)),
+            "file_sha256": composite_meta.get("descriptor_file_sha256"),
+            "fingerprint": composite_meta.get("descriptor_fingerprint"),
+            "payload_inventory_sha256": composite_meta.get(
+                "payload_inventory_sha256"
+            ),
+        }
+        or source_ref != composite_meta.get("source_authority_ref")
+        or authority["source_authority_semantic_sha256"]
+        != composite_meta.get("source_authority_semantic_sha256")
+        or not isinstance(source_authority, dict)
+        or staged_ref != source_authority.get("current_contract")
+        or not isinstance(build_ref, dict)
+        or set(build_ref) != {"path", "file_sha256", "receipt_sha256"}
+    ):
+        raise SystemExit("A1 scratch descriptor/source authority binding drift")
+    try:
+        staged_path = Path(str(staged_ref["path"])).expanduser().resolve(strict=True)
+        staged_lock = json.loads(staged_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError) as error:
+        raise SystemExit(f"cannot replay staged A1 scratch lock: {error}") from error
+    staged_unhashed = dict(staged_lock)
+    staged_semantic = staged_unhashed.pop("contract_sha256", None)
+    if (
+        str(staged_path) != staged_ref.get("path")
+        or _sha256_existing_file(staged_path) != staged_ref.get("file_sha256")
+        or staged_semantic != _canonical_json_sha256(staged_unhashed)
+        or staged_semantic != staged_ref.get("contract_sha256")
+    ):
+        raise SystemExit("A1 scratch staged contract identity drift")
+    science = staged_lock.get("science")
+    declared_science = authority["science"]
+    if not isinstance(science, dict) or not isinstance(declared_science, dict):
+        raise SystemExit("A1 scratch staged science authority is malformed")
+    if (
+        set(declared_science) != _A1_SCRATCH_SCIENCE_BINDING_FIELDS
+        or not _A1_SCRATCH_SCIENCE_BINDING_FIELDS.issubset(science)
+        or declared_science
+        != {
+            key: science[key]
+            for key in _A1_SCRATCH_SCIENCE_BINDING_FIELDS
+        }
+    ):
+        raise SystemExit("A1 scratch authority self-asserts different science")
+    digest_pairs = (
+        ("search_operator", "search_operator_sha256"),
+        ("evaluator", "evaluator_sha256"),
+        ("learner_value_objective", "learner_value_objective_sha256"),
+        ("learner_training_recipe", "learner_training_recipe_sha256"),
+        ("learner_initialization", "learner_initialization_sha256"),
+        ("learner_model_construction", "learner_model_construction_sha256"),
+        ("learner_execution_topology", "learner_execution_topology_sha256"),
+    )
+    if any(
+        science.get(digest_key) != _canonical_json_sha256(science.get(value_key))
+        for value_key, digest_key in digest_pairs
+    ):
+        raise SystemExit("A1 scratch staged science declared digest drift")
+    if (
+        science.get("learner_initialization")
+        != current_science.learner_initialization()
+        or science.get("learner_model_construction")
+        != current_science.learner_model_construction()
+        or science.get("learner_execution_topology")
+        != current_science.learner_execution_topology()
+        or science.get("learner_training_recipe")
+        != current_science.learner_training_recipe()
+    ):
+        raise SystemExit("A1 scratch staged science is runtime-incompatible")
+    try:
+        build_path = Path(str(build_ref["path"])).expanduser().resolve(strict=True)
+        build = json.loads(build_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError) as error:
+        raise SystemExit(f"cannot replay A1 composite build receipt: {error}") from error
+    build_unhashed = dict(build)
+    build_semantic = build_unhashed.pop("receipt_sha256", None)
+    if (
+        str(build_path) != build_ref["path"]
+        or _sha256_existing_file(build_path) != build_ref["file_sha256"]
+        or build_semantic != _canonical_json_sha256(build_unhashed)
+        or build_semantic != build_ref["receipt_sha256"]
+        or build.get("descriptor", {}).get("path") != descriptor["path"]
+        or build.get("descriptor", {}).get("file_sha256")
+        != descriptor["file_sha256"]
+        or build.get("descriptor", {}).get("fingerprint")
+        != descriptor["fingerprint"]
+        or build.get("source_authority") != source_ref
+        or build.get("contract", {}).get("file_sha256")
+        != staged_ref["file_sha256"]
+        or build.get("contract", {}).get("contract_sha256")
+        != staged_ref["contract_sha256"]
+    ):
+        raise SystemExit("A1 scratch composite build-receipt binding drift")
+    return {
+        "staged_contract": dict(staged_ref),
+        "science": dict(declared_science),
+        "descriptor": dict(descriptor),
+        "source_authority": dict(source_ref),
+        "build_receipt": dict(build_ref),
+    }
+
+
+def _validate_production_composite_scratch_binding(
+    args: argparse.Namespace,
+    ddp: dict[str, int | bool],
+    composite_meta: Mapping[str, object],
+) -> dict[str, object]:
+    """Dispatch current production composites through scratch recipe validation."""
+
+    raw = str(getattr(args, "a1_scratch_authority_json", "") or "")
+    try:
+        authority = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid A1 scratch authority JSON: {error}") from error
+    if composite_meta.get("schema_version") != "memmap_composite_v2":
+        raise SystemExit("A1 scratch authority requires production composite v2")
+    binding = _validate_a1_scratch_plan_binding(
+        authority, data_path=str(args.data), composite_meta=composite_meta
+    )
+    _require_a1_scratch_execution_schedule(
+        binding["science"]["learner_execution_topology"]
+    )
+    return binding
+
+
+def _require_scratch_marker_for_fresh_production_composite(
+    args: argparse.Namespace,
+    composite_meta: Mapping[str, object] | None,
+) -> None:
+    """Block generic fresh entity-graph training on promotion data."""
+
+    if not (
+        isinstance(composite_meta, Mapping)
+        and composite_meta.get("schema_version") == "memmap_composite_v2"
+        and composite_meta.get("promotion_eligible") is True
+        and str(args.arch) == "entity_graph"
+        and not str(getattr(args, "init_checkpoint", "") or "")
+        and not str(getattr(args, "grow_from_checkpoint", "") or "")
+    ):
+        return
+    marker = str(getattr(args, "a1_scratch_authority_json", "") or "")
+    if not marker:
+        raise SystemExit(
+            "fresh entity_graph training on a promotion-eligible production "
+            "composite requires the sealed A1 scratch plan marker"
+        )
+    _preflight_a1_scratch_execution_authority(marker)
+
+
 def _validate_a1_learner_training_recipe(
     args: argparse.Namespace,
     ddp: dict[str, int | bool],
@@ -8514,12 +8865,16 @@ def _validate_a1_learner_training_recipe(
             "central learner projection and executor-authority path/SHA must be "
             "supplied together"
         )
-    if not central_binding_raw and bound.get("coherent_direct_corpus") is not True and (
+    if (
+        not central_binding_raw
+        and bound.get("coherent_direct_corpus") is not True
+        and (
         bool(getattr(args, "per_game_policy_weight", False))
         or str(
         getattr(args, "per_game_policy_weight_mode", "equal")
         )
         != "equal"
+        )
     ):
         raise SystemExit(
             "A1 single-contract learner does not bind per-game policy weighting; "
@@ -9329,6 +9684,36 @@ def _resolve_effective_public_card_count_features(
     return False if requested is None else requested
 
 
+def _resolve_effective_public_card_count_residual_bias(
+    args: argparse.Namespace,
+) -> bool:
+    """Resolve the v1/v2 public-card projection topology without guessing."""
+
+    requested_raw = getattr(args, "public_card_count_residual_bias", None)
+    requested = None if requested_raw is None else bool(requested_raw)
+    if str(args.arch) != "entity_graph":
+        if requested is not None:
+            raise SystemExit(
+                "--public-card-count-residual-bias is supported only for "
+                "--arch entity_graph"
+            )
+        return True
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_public_card_count_residual_bias(init_checkpoint)
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "--public-card-count-residual-bias does not match "
+                f"--init-checkpoint: checkpoint={inherited} cli={requested}"
+            )
+        return inherited
+    if grow_checkpoint:
+        inherited = _checkpoint_public_card_count_residual_bias(grow_checkpoint)
+        return inherited if requested is None else requested
+    return True if requested is None else requested
+
+
 def _resolve_effective_public_rule_state_features(
     args: argparse.Namespace,
 ) -> bool:
@@ -9461,6 +9846,18 @@ def _structured_action_create_kwargs(
     return {
         "static_action_residual": bool(args.static_action_residual),
         "legal_action_value_residual": bool(args.legal_action_value_residual),
+    }
+
+
+def _public_card_count_create_kwargs(
+    args: argparse.Namespace,
+) -> dict[str, bool]:
+    """Bind fresh card-count v1/v2 projection topology at model creation."""
+
+    return {
+        "public_card_count_residual_bias": bool(
+            args.public_card_count_residual_bias
+        )
     }
 
 
@@ -10164,6 +10561,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         argv=raw_argv,
         expected_pipeline=TrainConfig.PIPELINE,
     )
+    _preflight_a1_scratch_execution_authority(
+        str(getattr(args, "a1_scratch_authority_json", "") or "")
+    )
     effective_epoch_limit = _effective_training_epoch_limit(
         configured_epochs=int(args.epochs),
         max_steps=int(args.max_steps),
@@ -10247,6 +10647,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.public_card_count_features = (
         _resolve_effective_public_card_count_features(args)
     )
+    args.public_card_count_residual_bias = (
+        _resolve_effective_public_card_count_residual_bias(args)
+    )
     args.public_rule_state_features = (
         _resolve_effective_public_rule_state_features(args)
     )
@@ -10284,6 +10687,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             if not isinstance(value, dict):
                 raise SystemExit("coherent memmap corpus_meta.json is not an object")
             a1_preflight_meta = value
+    _require_scratch_marker_for_fresh_production_composite(
+        args, a1_preflight_meta
+    )
 
     validation_game_seed_ranges = _parse_game_seed_ranges(
         args.validation_game_seed_ranges
@@ -10458,6 +10864,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.value_categorical_bins = _resolve_effective_value_categorical_bins(args)
     args.public_card_count_features = (
         _resolve_effective_public_card_count_features(args)
+    )
+    args.public_card_count_residual_bias = (
+        _resolve_effective_public_card_count_residual_bias(args)
     )
     args.public_rule_state_features = (
         _resolve_effective_public_rule_state_features(args)
@@ -10759,7 +11168,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         central_raw = str(
             getattr(args, "a1_central_learner_binding_json", "") or ""
         )
-        if central_raw:
+        scratch_raw = str(
+            getattr(args, "a1_scratch_authority_json", "") or ""
+        )
+        if scratch_raw and central_raw:
+            raise SystemExit(
+                "A1 scratch and central learner authorities are mutually exclusive"
+            )
+        if scratch_raw:
+            a1_training_binding = _validate_production_composite_scratch_binding(
+                args, ddp, a1_preflight_meta
+            )
+        elif central_raw:
             try:
                 unverified_central = json.loads(central_raw)
             except json.JSONDecodeError as error:
@@ -11117,6 +11537,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     public_card_count_features=bool(
                         args.public_card_count_features
                     ),
+                    **_public_card_count_create_kwargs(args),
                     public_rule_state_features=bool(
                         args.public_rule_state_features
                     ),
@@ -29749,6 +30170,22 @@ def _checkpoint_config_mismatches(
                 "public_card_count_features "
                 f"checkpoint={checkpoint_card_counts} cli={requested_card_counts}; "
                 "use a function-preserving card_count checkpoint upgrade"
+            )
+        checkpoint_card_bias = bool(
+            getattr(config, "public_card_count_residual_bias", True)
+        )
+        requested_card_bias_raw = getattr(
+            args, "public_card_count_residual_bias", None
+        )
+        requested_card_bias = (
+            checkpoint_card_bias
+            if requested_card_bias_raw is None
+            else bool(requested_card_bias_raw)
+        )
+        if checkpoint_card_bias != requested_card_bias:
+            mismatches.append(
+                "public_card_count_residual_bias "
+                f"checkpoint={checkpoint_card_bias} cli={requested_card_bias}"
             )
         checkpoint_rule_state = bool(
             getattr(config, "public_rule_state_features", False)

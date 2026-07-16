@@ -78,6 +78,7 @@ PRODUCTION_TRAINER_CODE_SURFACE = tuple(
         train_bc.A1_REQUIRED_LEARNER_CODE_SUFFIXES
         | {
             "tools/a1_one_dose_train.py",
+            "tools/a1_current_science_contract.py",
             "tools/a1_build_post_wave_composite.py",
             "tools/audit_entity_graph_information_surface.py",
             "tools/mixed_memmap_corpus.py",
@@ -422,6 +423,14 @@ def _current_production_trainer_authority() -> dict[str, Any]:
     if imported != expected:
         raise ExecutorError(
             "production trainer import does not come from the current executor checkout"
+        )
+    expected_science = (
+        _REPO_ROOT / "tools" / "a1_current_science_contract.py"
+    ).resolve(strict=True)
+    imported_science = Path(current_science.__file__).resolve(strict=True)
+    if imported_science != expected_science:
+        raise ExecutorError(
+            "current science import does not come from the current executor checkout"
         )
     trainer, trainer_sha256 = _stable_canonical_regular_file(
         expected, where="current production trainer"

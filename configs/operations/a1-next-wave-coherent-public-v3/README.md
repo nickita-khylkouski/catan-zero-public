@@ -32,6 +32,16 @@ history at construction time. Execution is exactly 8 B200 ranks × 512 rows ×
 one accumulation step; no launcher may reinterpret the logical `1 × 4096`
 recipe as an arbitrary topology.
 
+`tools/a1_scratch_train.py` authenticates the admitted post-wave composite and
+renders the exact native-v4, bias-free 35M command plus a digest-bound planning
+receipt. It is intentionally plan-only today: the observed 32-step optimum came
+from checkpoint-initialized dose evidence and covers less than one percent of
+the full scratch corpus. Its LR, warmup, and flat schedule were likewise
+reviewed only for that warm start. Until a complete scratch-optimizer schedule
+authority is reviewed, the planner exposes no execution switch and `train_bc`
+rejects its child marker before data loading; every planning receipt is
+diagnostic-only and non-promotion-eligible.
+
 Generate through the sealed pre-wave control plane. For a direct lane command:
 
 ```bash

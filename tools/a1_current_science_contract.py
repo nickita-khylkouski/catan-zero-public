@@ -94,6 +94,7 @@ PRODUCTION_LEARNER_INITIALIZATION_CONTRACT = {
 PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "arch": "entity_graph",
     "hidden_size": 640,
+    "graph_tokens": None,
     "graph_layers": 6,
     "attention_heads": 8,
     "graph_dropout": 0.05,
@@ -101,8 +102,12 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "static_action_residual": True,
     "legal_action_value_residual": True,
     "public_card_count_features": True,
+    "public_card_count_residual_bias": False,
     "public_rule_state_features": True,
     "public_rule_state_feature_schema": "actor_public_rule_state_2p_v1",
+    "actor_public_rule_state": (
+        "dev_used_road_building_free_roads_discard_remainder_playable_dev_counts"
+    ),
     "meaningful_public_history": True,
     "meaningful_public_history_pooling": "masked_mean_v1",
     "event_history_limit": 32,
@@ -123,6 +128,11 @@ PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT = {
     "global_batch_size": 4096,
     "ddp_shard_data": False,
     "training_rng_rank_offset": True,
+    "optimization_schedule_status": "unresolved",
+    "go_authorized": False,
+    "reviewed_optimizer_schedule_role": (
+        "checkpoint_initialized_diagnostic_canary_only"
+    ),
 }
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
     {"policy_aux_active_batch_size", "policy_aux_loss_weight"}
