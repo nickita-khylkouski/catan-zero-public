@@ -77,9 +77,11 @@ EFFECTIVE_COMPONENT_RATIOS = {
 # target at T=1.0.  ``soft_target_temperature=0.7`` is deliberately inert for
 # stored-policy targets, so bind the source temperatures in the descriptor
 # instead of relying on that easy-to-misread global score-target flag.
-# Historical replay is retained for value/state evidence only. Its old search
-# policy is not an interchangeable teacher for a new operator; temperature
-# scaling cannot repair that identity mismatch.
+# Historical replay is retained as authenticated state evidence for explicit
+# reanalysis and other replay-aware consumers.  Neither its old search policy
+# nor its terminal outcome is an interchangeable target for the current
+# producer: both were generated under a different continuation policy.
+# Temperature scaling cannot repair either identity mismatch.
 STORED_POLICY_COMPONENT_TEMPERATURES = {
     "current_producer": 1.0,
     "recent_history": 1.0,
@@ -87,9 +89,11 @@ STORED_POLICY_COMPONENT_TEMPERATURES = {
     HISTORICAL_REPLAY_CATEGORY: 0.52,
 }
 
-# The production baseline distils policy only from fresh, same-operator n128
-# components. Replay remains available to value/reanalysis; any replay KL is a
-# separate treatment and must never become stale search-policy CE.
+# The production baseline trains policy and value only from fresh,
+# same-operator n128 components.  Replay remains physically present and
+# authenticated for reanalysis/state-coverage treatments; any replay policy
+# anchor or value objective is a separate treatment and must never silently
+# become stale policy CE or off-policy terminal-return supervision.
 HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT = 0.0
 _CURRENT_LEARNER_RECIPE = current_science.learner_training_recipe()
 _CURRENT_PER_GAME_VALUE_WEIGHT = _CURRENT_LEARNER_RECIPE.get(
@@ -1751,7 +1755,6 @@ def _build_descriptor(
             f"strict-future v{AUX_SUBGOAL_TARGET_VERSION}; missing={missing}"
         )
     fresh_component_ids = list(FRESH_SOURCE_GAME_RATIOS)
-    all_component_ids = [*fresh_component_ids, HISTORICAL_REPLAY_CATEGORY]
     replay_contract = {
         "schema_version": "flywheel-replay-composite-v2",
         "current_checkpoint_version": int(current_version),
@@ -1795,7 +1798,14 @@ def _build_descriptor(
             STORED_POLICY_COMPONENT_TEMPERATURES
         ),
         "entity_feature_adapter_component_versions": adapter_versions,
-        "value_training_component_ids": all_component_ids,
+        # Terminal outcomes estimate the return of the behavior/continuation
+        # policy that generated each trajectory.  Historical replay came from
+        # an older policy lineage, so including it here would train the current
+        # scratch value head on a different Bellman operator than the one used
+        # by the fresh coherent-search actor.  Keep replay in ``components``
+        # and ``flywheel_replay_contract`` for explicit reanalysis, but make
+        # fresh on-policy outcomes the production value baseline.
+        "value_training_component_ids": fresh_component_ids,
         "aux_subgoal_component_ids": aux_subgoal_component_ids,
         "flywheel_replay_contract": replay_contract,
         "source_authority_manifest": source_authority["path"],

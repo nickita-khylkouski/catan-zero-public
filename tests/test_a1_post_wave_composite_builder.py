@@ -814,7 +814,7 @@ def test_filter_wave_shards_rejects_selected_seed_in_wrong_job(tmp_path: Path) -
         )
 
 
-def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
+def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
     tmp_path: Path,
 ) -> None:
     components = []
@@ -924,6 +924,17 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
         "hard_negative",
     ]
     assert descriptor["value_training_component_ids"] == [
+        "current_producer",
+        "recent_history",
+        "hard_negative",
+    ]
+    # Replay remains authenticated and sampled in the composite for explicit
+    # reanalysis/state-evidence consumers; it is not silently used as an
+    # off-policy terminal-return label for the current scratch value head.
+    assert replay["replay_component_ids"] == ["historical_replay"]
+    assert [
+        component["component_id"] for component in descriptor["components"]
+    ] == [
         "current_producer",
         "recent_history",
         "hard_negative",

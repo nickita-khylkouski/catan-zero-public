@@ -2464,7 +2464,7 @@ def _verify_production_composite_inputs(
         or learner_overrides != composite_builder.LEARNER_RECIPE_OVERRIDES
         or meta.get("policy_kl_anchor_component_ids") != []
         or meta.get("policy_distillation_component_ids") != expected_ids[:3]
-        or meta.get("value_training_component_ids") != expected_ids
+        or meta.get("value_training_component_ids") != expected_ids[:3]
         or not isinstance(meta.get("entity_feature_adapter_component_versions"), dict)
         or set(meta["entity_feature_adapter_component_versions"]) != set(expected_ids)
         or len(set(meta["entity_feature_adapter_component_versions"].values())) != 1
@@ -3800,9 +3800,10 @@ def bind_diagnostic_training_descriptor(
     ``train_bc`` authenticates several argv values through the composite
     descriptor. A recipe ablation therefore cannot merely change argv: the
     descriptor must carry the same reviewed delta. This helper derives that
-    input without mutating the published production descriptor. It also owns
-    the fresh-policy-only treatment, whose value scope deliberately remains
-    all-component.
+    input without mutating the published production descriptor.  The
+    production policy and value scopes are both fresh-only; historical replay
+    remains present for explicit reanalysis/state-evidence treatments rather
+    than silently contributing stale policy or off-policy return targets.
     """
 
     if verified.get("data_kind") != "production_composite_v2":
@@ -3837,7 +3838,7 @@ def bind_diagnostic_training_descriptor(
         or tuple(base.get("policy_distillation_component_ids", ()))
         != FRESH_POLICY_DISTILLATION_COMPONENT_IDS
         or tuple(base.get("value_training_component_ids", ()))
-        != ALL_POST_WAVE_COMPONENT_IDS
+        != FRESH_VALUE_TRAINING_COMPONENT_IDS
     ):
         raise ExecutorError("base production descriptor identity/scope drifted")
 
@@ -9644,7 +9645,7 @@ def _verify_training_outputs(
             "value_training_component_ids": (
                 verified.get("diagnostic_training_descriptor_authority", {}).get(
                     "value_training_component_ids",
-                    list(ALL_POST_WAVE_COMPONENT_IDS),
+                    list(FRESH_VALUE_TRAINING_COMPONENT_IDS),
                 )
             ),
             "value_training_scope_explicit": True,
