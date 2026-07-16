@@ -1267,6 +1267,12 @@ def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
     data["teacher_name"] = np.asarray(["candidate_teacher"] * 6, dtype=object)
     data["policy_weight_multiplier"] = np.ones(6, dtype=np.float32)
     data["policy_weight_multiplier"][-1] = 0.0
+    winner = str(np.asarray(data["player"]).astype(str)[0])
+    data["winner"] = np.asarray([winner] * 6, dtype=object)
+    if "terminated" in data:
+        data["terminated"] = np.ones(6, dtype=np.bool_)
+    if "truncated" in data:
+        data["truncated"] = np.zeros(6, dtype=np.bool_)
     forced_action = int(data["action_taken"][0])
     data["legal_action_ids"][0] = -1
     data["legal_action_ids"][0, 0] = forced_action
@@ -1300,6 +1306,8 @@ def test_candidate_main_builds_base_only_policy_report_with_unforced_phases(
             "4",
             "--validation-fraction",
             "0",
+            "--host-lock-file",
+            str(tmp_path / "train.lock"),
             "--train-diagnostics-every-batches",
             "1",
             "--skip-guards",
@@ -1374,6 +1382,8 @@ def test_exact_max_steps_continues_past_configured_epoch_limit(
             "4",
             "--validation-fraction",
             "0",
+            "--host-lock-file",
+            str(tmp_path / "train.lock"),
             "--skip-guards",
         ]
     )

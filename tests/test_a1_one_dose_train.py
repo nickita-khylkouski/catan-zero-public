@@ -2757,12 +2757,13 @@ def test_central_p1_binds_exact_current_parent_sampler_and_mixed_transition(
     args.init_checkpoint_sha256 = executor._file_sha256(
         Path(args.init_checkpoint)
     )
+    immutable_recipe = bound["central_learner_binding"][
+        "immutable_contract_recipe"
+    ]
     train_bound = {
-        "learner_training_recipe": dict(
-            executor.a1_contract.EXPECTED_LEARNER_TRAINING_RECIPE
-        ),
+        "learner_training_recipe": dict(immutable_recipe),
         "learner_training_recipe_sha256": executor._value_sha256(
-            executor.a1_contract.EXPECTED_LEARNER_TRAINING_RECIPE
+            immutable_recipe
         ),
     }
     effective = executor.train_bc._validate_a1_learner_training_recipe(

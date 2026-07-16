@@ -121,6 +121,47 @@ def test_explicit_ranges_refuse_row_level_validation_cap():
         )
 
 
+def test_explicit_ranges_reject_absent_game_band() -> None:
+    data = _make_data(np.repeat(np.arange(10, dtype=np.int64), 2))
+
+    with pytest.raises(SystemExit, match="absent from the corpus"):
+        split_train_validation_indices(
+            data,
+            validation_fraction=0.05,
+            validation_seed=17,
+            validation_max_samples=0,
+            validation_game_seed_ranges=[(20, 22)],
+        )
+
+
+def test_explicit_ranges_reject_partially_present_game_band() -> None:
+    data = _make_data(
+        np.repeat(np.asarray([0, 1, 2, 5, 7, 8], dtype=np.int64), 2)
+    )
+
+    with pytest.raises(SystemExit, match="partial from the corpus"):
+        split_train_validation_indices(
+            data,
+            validation_fraction=0.05,
+            validation_seed=17,
+            validation_max_samples=0,
+            validation_game_seed_ranges=[(5, 8)],
+        )
+
+
+def test_explicit_ranges_reject_entire_corpus_holdout() -> None:
+    data = _make_data(np.repeat(np.arange(4, dtype=np.int64), 2))
+
+    with pytest.raises(SystemExit, match="select the entire corpus"):
+        split_train_validation_indices(
+            data,
+            validation_fraction=0.05,
+            validation_seed=17,
+            validation_max_samples=0,
+            validation_game_seed_ranges=[(0, 3)],
+        )
+
+
 def test_random_game_split_caps_by_complete_games() -> None:
     game_seeds = np.repeat(np.arange(100, dtype=np.int64), 10)
     data = _make_data(game_seeds)

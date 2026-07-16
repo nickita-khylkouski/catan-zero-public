@@ -1876,6 +1876,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--a1-scratch-authority-json", default="", help=argparse.SUPPRESS
     )
     parser.add_argument(
+        "--a1-scratch-diagnostic-authority-json",
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--a1-effective-learner-recipe-json", default="", help=argparse.SUPPRESS
     )
     parser.add_argument(
@@ -8527,13 +8532,12 @@ def _effective_a1_learner_training_recipe(
             POLICY_TARGET_BLEND_LEGACY_V1,
         )
     )
-    if policy_target_blend_semantics != POLICY_TARGET_BLEND_LEGACY_V1:
-        # Historical A1 locks predate this versioned loss contract and retain
-        # their exact recipe shape when replayed with the explicit legacy CLI
-        # semantic. New pure-policy recipes bind the non-legacy semantic.
-        effective["policy_target_blend_semantics"] = (
-            policy_target_blend_semantics
-        )
+    # Always report the actual loss operator.  Historical authorities that
+    # predate this field are normalized below by
+    # _validate_a1_learner_training_recipe only when they request the exact
+    # legacy default.  Current authorities must bind it explicitly so command
+    # construction and recipe replay cannot disagree.
+    effective["policy_target_blend_semantics"] = policy_target_blend_semantics
     scalar_value_loss_readout = str(
         getattr(args, "scalar_value_loss_readout", "raw")
     )
@@ -8599,13 +8603,21 @@ def _effective_a1_learner_training_recipe(
     )
     if belief_resource_loss_weight > 0.0:
         effective["belief_resource_loss_weight"] = belief_resource_loss_weight
+    generic_a1_ablation = bool(
+        str(getattr(args, "a1_learner_ablation_id", "") or "")
+    )
+    value_routing_ablation = str(
+        getattr(args, "a1_learner_ablation_id", "") or ""
+    ).startswith("scratch-value-routing-")
     # Additive diagnostic axis. Historical contracts predate it and retain an
-    # identical recipe shape at the default; a non-unit intervention must be
-    # explicitly authorized as learner-ablation drift.
+    # identical recipe shape at the default. Generic ablations must record even
+    # the unit value, however: a current authority whose baseline is 0.25 needs
+    # an unambiguous, shape-complete V100 treatment rather than silently
+    # omitting the only causal axis.
     value_trunk_grad_scale = float(
         getattr(args, "value_trunk_grad_scale", 1.0)
     )
-    if value_trunk_grad_scale != 1.0:
+    if value_trunk_grad_scale != 1.0 or value_routing_ablation:
         effective["value_trunk_grad_scale"] = value_trunk_grad_scale
     # These axes were added after the historical A1 seal. Keep ordinary old
     # recipes byte-for-byte unchanged at their exact legacy defaults. Generic
@@ -8614,9 +8626,6 @@ def _effective_a1_learner_training_recipe(
     # here for every such ablation as well, so train_bc compares one canonical
     # recipe shape instead of rejecting a valid intervention merely because
     # the immutable parent recipe predates the fields.
-    generic_a1_ablation = bool(
-        str(getattr(args, "a1_learner_ablation_id", "") or "")
-    )
     policy_aux_sampling_mode = str(
         getattr(
             args,
@@ -9221,25 +9230,165 @@ def _validate_a1_scratch_runtime_projection(
         )
 
 
+_A1_SCRATCH_DIAGNOSTIC_AUTHORITY_FIELDS = {
+    "schema_version",
+    "campaign_id",
+    "arm_id",
+    "diagnostic_only",
+    "promotion_eligible",
+    "exact_max_steps",
+    "max_steps",
+    "epochs",
+    "checkpoint_steps",
+    "value_trunk_grad_scale",
+    "source_recipe_sha256",
+    "source_execution_topology_sha256",
+    "code_tree_sha256",
+}
+_A1_SCRATCH_VALUE_ROUTING_ARMS = {
+    "V0": 0.0,
+    "V25": 0.25,
+    "V100": 1.0,
+}
+
+
+def _validate_a1_scratch_diagnostic_authority(
+    raw: str,
+    *,
+    args: argparse.Namespace | None = None,
+    science: Mapping[str, object] | None = None,
+) -> dict[str, object] | None:
+    """Validate one bounded, non-promotable scratch diagnostic override."""
+
+    if not raw:
+        return None
+    try:
+        authority = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(
+            f"invalid A1 scratch diagnostic authority JSON: {error}"
+        ) from error
+    if (
+        not isinstance(authority, dict)
+        or set(authority) != _A1_SCRATCH_DIAGNOSTIC_AUTHORITY_FIELDS
+        or authority.get("schema_version")
+        != "a1-scratch-bounded-diagnostic-authority-v1"
+        or authority.get("campaign_id")
+        != "scratch-value-routing-v0-v25-v100"
+        or authority.get("diagnostic_only") is not True
+        or authority.get("promotion_eligible") is not False
+        or authority.get("exact_max_steps") is not True
+    ):
+        raise SystemExit("A1 scratch diagnostic authority fields/schema drift")
+    arm_id = str(authority.get("arm_id", ""))
+    expected_scale = _A1_SCRATCH_VALUE_ROUTING_ARMS.get(arm_id)
+    max_steps = authority.get("max_steps")
+    epochs = authority.get("epochs")
+    checkpoint_steps = authority.get("checkpoint_steps")
+    scale = authority.get("value_trunk_grad_scale")
+    if (
+        expected_scale is None
+        or isinstance(max_steps, bool)
+        or not isinstance(max_steps, int)
+        or not 1 <= max_steps <= 256
+        or isinstance(epochs, bool)
+        or not isinstance(epochs, int)
+        or epochs != 1
+        or not isinstance(checkpoint_steps, list)
+        or any(isinstance(step, bool) or not isinstance(step, int) for step in checkpoint_steps)
+        or checkpoint_steps != sorted(set(checkpoint_steps))
+        or any(step <= 0 or step >= max_steps for step in checkpoint_steps)
+        or isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or float(scale) != expected_scale
+        or any(
+            not _is_sha256(authority.get(field))
+            for field in (
+                "source_recipe_sha256",
+                "source_execution_topology_sha256",
+                "code_tree_sha256",
+            )
+        )
+    ):
+        raise SystemExit("A1 scratch diagnostic authority value drift")
+    if args is not None:
+        try:
+            parsed_steps = list(
+                _parse_checkpoint_steps(
+                    str(getattr(args, "checkpoint_steps", "") or ""),
+                    max_steps=int(args.max_steps),
+                )
+            )
+        except (AttributeError, TypeError, ValueError) as error:
+            raise SystemExit(
+                "A1 scratch diagnostic runtime fields are malformed"
+            ) from error
+        expected_ablation_id = f"scratch-value-routing-{arm_id.lower()}"
+        if (
+            int(args.max_steps) != max_steps
+            or bool(args.exact_max_steps) is not True
+            or int(args.epochs) != epochs
+            or parsed_steps != checkpoint_steps
+            or float(args.value_trunk_grad_scale) != expected_scale
+            or str(args.a1_learner_ablation_id or "") != expected_ablation_id
+            or str(args.a1_ablation_code_tree_sha256 or "")
+            != authority["code_tree_sha256"]
+        ):
+            raise SystemExit("A1 scratch diagnostic command/authority drift")
+    if science is not None:
+        source_recipe = science.get("learner_training_recipe")
+        source_topology = science.get("learner_execution_topology")
+        if (
+            not isinstance(source_recipe, dict)
+            or not isinstance(source_topology, dict)
+            or authority["source_recipe_sha256"]
+            != _canonical_json_sha256(source_recipe)
+            or authority["source_execution_topology_sha256"]
+            != _canonical_json_sha256(source_topology)
+        ):
+            raise SystemExit("A1 scratch diagnostic source authority drift")
+    return authority
+
+
 def _require_a1_scratch_execution_schedule(
     topology: Mapping[str, object],
+    *,
+    diagnostic_authority: Mapping[str, object] | None = None,
 ) -> None:
     """Require the exact commissioned from-scratch optimizer horizon."""
 
     if (
         topology.get("optimization_schedule_status")
-        != "commissioned_scratch_update_horizon_v1"
-        or topology.get("go_authorized") is not True
-        or topology.get("reviewed_optimizer_schedule_role")
-        != "from_scratch_representation_learning_v1"
+        == "commissioned_scratch_update_horizon_v1"
+        and topology.get("go_authorized") is True
+        and topology.get("reviewed_optimizer_schedule_role")
+        == "from_scratch_representation_learning_v1"
     ):
-        raise SystemExit(
-            "A1 native scratch optimization schedule is unresolved; the sealed "
-            "launcher may execute only the commissioned from-scratch update horizon"
-        )
+        return
+    if (
+        isinstance(diagnostic_authority, Mapping)
+        and diagnostic_authority.get("diagnostic_only") is True
+        and diagnostic_authority.get("promotion_eligible") is False
+        and diagnostic_authority.get("exact_max_steps") is True
+        and isinstance(diagnostic_authority.get("max_steps"), int)
+        and 1 <= int(diagnostic_authority["max_steps"]) <= 256
+        and diagnostic_authority.get("source_execution_topology_sha256")
+        == _canonical_json_sha256(topology)
+    ):
+        return
+    raise SystemExit(
+        "A1 native scratch optimization schedule is unresolved; the sealed "
+        "launcher may execute only the commissioned from-scratch update horizon "
+        "or an authenticated bounded non-promotion diagnostic"
+    )
 
 
-def _preflight_a1_scratch_execution_authority(raw: str) -> None:
+def _preflight_a1_scratch_execution_authority(
+    raw: str,
+    diagnostic_raw: str = "",
+    *,
+    args: argparse.Namespace | None = None,
+) -> None:
     """Authenticate the scratch marker before any corpus/model allocation."""
 
     if not raw:
@@ -9262,7 +9411,18 @@ def _preflight_a1_scratch_execution_authority(raw: str) -> None:
     )
     if not isinstance(topology, dict):
         raise SystemExit("A1 scratch authority has no execution topology")
-    _require_a1_scratch_execution_schedule(topology)
+    diagnostic = _validate_a1_scratch_diagnostic_authority(
+        diagnostic_raw,
+        args=args,
+        science=science,
+    )
+    if diagnostic is None:
+        _require_a1_scratch_execution_schedule(topology)
+    else:
+        _require_a1_scratch_execution_schedule(
+            topology,
+            diagnostic_authority=diagnostic,
+        )
 
 
 _A1_SCRATCH_SCIENCE_BINDING_FIELDS = {
@@ -9441,9 +9601,22 @@ def _validate_production_composite_scratch_binding(
         binding["science"]["learner_model_construction"],
         binding["science"]["learner_execution_topology"],
     )
-    _require_a1_scratch_execution_schedule(
-        binding["science"]["learner_execution_topology"]
+    diagnostic = _validate_a1_scratch_diagnostic_authority(
+        str(
+            getattr(args, "a1_scratch_diagnostic_authority_json", "")
+            or ""
+        ),
+        args=args,
+        science=binding["science"],
     )
+    topology = binding["science"]["learner_execution_topology"]
+    if diagnostic is None:
+        _require_a1_scratch_execution_schedule(topology)
+    else:
+        _require_a1_scratch_execution_schedule(
+            topology,
+            diagnostic_authority=diagnostic,
+        )
     return binding
 
 
@@ -9468,7 +9641,14 @@ def _require_scratch_marker_for_fresh_production_composite(
             "fresh entity_graph training on a promotion-eligible production "
             "composite requires the sealed A1 scratch plan marker"
         )
-    _preflight_a1_scratch_execution_authority(marker)
+    _preflight_a1_scratch_execution_authority(
+        marker,
+        str(
+            getattr(args, "a1_scratch_diagnostic_authority_json", "")
+            or ""
+        ),
+        args=args,
+    )
 
 
 def _validate_a1_learner_training_recipe(
@@ -9515,6 +9695,15 @@ def _validate_a1_learner_training_recipe(
         raise SystemExit("A1 contract has no typed learner training recipe")
     immutable_expected = expected
     effective = _effective_a1_learner_training_recipe(args, ddp)
+    if (
+        "policy_target_blend_semantics" not in expected
+        and effective.get("policy_target_blend_semantics")
+        == POLICY_TARGET_BLEND_LEGACY_V1
+    ):
+        # Issued historical locks predate the typed loss-operator field.  They
+        # may replay only the exact legacy behavior; any newer semantic remains
+        # an unauthorized extra field and fails below.
+        effective.pop("policy_target_blend_semantics")
     # These fields postdate the historical effective-recipe tuple. Replay them
     # only when the immutable authority explicitly binds them, preserving old
     # recipe shapes while making current scratch commands exact.
@@ -10022,8 +10211,8 @@ def _validate_a1_learner_training_recipe(
         authorized_extra_fields.add("policy_aux_loss_weight")
         if "policy_aux_sampling_mode" in effective:
             authorized_extra_fields.add("policy_aux_sampling_mode")
-    if float(getattr(args, "value_trunk_grad_scale", 1.0)) != 1.0:
-        authorized_extra_fields.add("value_trunk_grad_scale")
+        if "value_trunk_grad_scale" in effective:
+            authorized_extra_fields.add("value_trunk_grad_scale")
     if "policy_target_blend_semantics" in effective:
         authorized_extra_fields.add("policy_target_blend_semantics")
     if effective.get("forced_row_value_action_type_weights"):
@@ -10090,7 +10279,7 @@ def _validate_a1_learner_training_recipe(
             }
     if "value_trunk_grad_scale" in effective:
         drift["value_trunk_grad_scale"] = {
-            "contract": 1.0,
+            "contract": float(expected.get("value_trunk_grad_scale", 1.0)),
             "effective": float(effective["value_trunk_grad_scale"]),
         }
     if "forced_row_value_action_type_weights" in effective:
@@ -11345,7 +11534,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         expected_pipeline=TrainConfig.PIPELINE,
     )
     _preflight_a1_scratch_execution_authority(
-        str(getattr(args, "a1_scratch_authority_json", "") or "")
+        str(getattr(args, "a1_scratch_authority_json", "") or ""),
+        str(
+            getattr(args, "a1_scratch_diagnostic_authority_json", "")
+            or ""
+        ),
+        args=args,
     )
     effective_epoch_limit = _effective_training_epoch_limit(
         configured_epochs=int(args.epochs),
@@ -14507,6 +14701,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ddp,
             )
         aux_order = None
+        weighted_cycle_mode = False
         if policy_aux_sampling_weights is not None:
             # This stream is stateless with respect to the persisted base RNG.
             # Legacy mode keeps its exact historical per-epoch seed. Cycle mode
@@ -17388,7 +17583,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     value_independent_evidence = _value_independent_evidence_report(
         data,
         train_indices,
-        value_sample_weights,
+        training_value_sample_weights,
     )
     coverage_completed = bool(
         base_sampler == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1
@@ -32786,12 +32981,36 @@ def split_train_validation_indices(
                 "explicit validation game-seed ranges require "
                 "validation_max_samples=0; a row cap would split held-out games"
             )
-        seeds = np.asarray(data.get("game_seed", np.arange(n, dtype=np.int64)), dtype=np.int64)
+        seeds = np.asarray(data["game_seed"], dtype=np.int64)
+        present_seeds = np.unique(seeds)
+        for start, end in validation_game_seed_ranges:
+            matched = present_seeds[
+                (present_seeds >= int(start)) & (present_seeds <= int(end))
+            ]
+            expected_games = int(end) - int(start) + 1
+            if matched.size != expected_games:
+                missing_games = expected_games - int(matched.size)
+                coverage = "absent" if matched.size == 0 else "partial"
+                raise SystemExit(
+                    "explicit validation game-seed range is "
+                    f"{coverage} from the corpus: range=[{start}, {end}] "
+                    f"expected_games={expected_games} "
+                    f"present_games={int(matched.size)} "
+                    f"missing_games={missing_games}"
+                )
         validation_mask = np.zeros(n, dtype=bool)
         for start, end in validation_game_seed_ranges:
             validation_mask |= (seeds >= start) & (seeds <= end)
         validation = all_indices[validation_mask]
         train = all_indices[~validation_mask]
+        if len(validation) == 0:
+            raise SystemExit(
+                "explicit validation game-seed ranges select no validation rows"
+            )
+        if len(train) == 0:
+            raise SystemExit(
+                "explicit validation game-seed ranges select the entire corpus"
+            )
         return {
             "train": train.astype(np.int64, copy=False),
             "validation": validation.astype(np.int64, copy=False),
@@ -36751,14 +36970,14 @@ def _value_independent_evidence_report(
     if np.any(rows >= len(weights)):
         raise ValueError("value evidence rows exceed the weight array")
 
-    game_seeds = np.asarray(data["game_seed"][rows], dtype=np.int64).reshape(-1)
+    game_identities = _component_game_identities(data, rows)
     winners = np.asarray(data["winner"][rows]).astype(str, copy=False).reshape(-1)
     truncated = _batch_array_or_fill(
         data, "truncated", rows, False, dtype=np.bool_
     )
     row_weights = weights[rows]
     if (
-        game_seeds.shape != rows.shape
+        game_identities.shape != rows.shape
         or winners.shape != rows.shape
         or truncated.shape != rows.shape
         or row_weights.shape != rows.shape
@@ -36776,15 +36995,15 @@ def _value_independent_evidence_report(
             "positive_value_weight_rows": int(np.count_nonzero(row_weights > 0.0)),
         }
 
-    clean_seeds = game_seeds[clean]
+    clean_identities = game_identities[clean]
     clean_winners = winners[clean]
     clean_weights = row_weights[clean]
-    unique_seeds, first, inverse = np.unique(
-        clean_seeds, return_index=True, return_inverse=True
+    unique_games, first, inverse = np.unique(
+        clean_identities, return_index=True, return_inverse=True
     )
-    game_rows = np.bincount(inverse, minlength=len(unique_seeds)).astype(np.int64)
+    game_rows = np.bincount(inverse, minlength=len(unique_games)).astype(np.int64)
     game_mass = np.bincount(
-        inverse, weights=clean_weights, minlength=len(unique_seeds)
+        inverse, weights=clean_weights, minlength=len(unique_games)
     ).astype(np.float64)
     winner_mismatch = clean_winners != clean_winners[first[inverse]]
     contradictory_games = int(
@@ -36792,7 +37011,7 @@ def _value_independent_evidence_report(
             np.bincount(
                 inverse,
                 weights=winner_mismatch.astype(np.int64),
-                minlength=len(unique_seeds),
+                minlength=len(unique_games),
             )
             > 0
         )
@@ -36805,7 +37024,7 @@ def _value_independent_evidence_report(
         else 0.0
     )
     clean_rows = int(np.count_nonzero(clean))
-    games = int(len(unique_seeds))
+    games = int(len(unique_games))
     return {
         "schema_version": "value-independent-evidence-v1",
         "status": "ok" if contradictory_games == 0 else "contradictory_game_outcomes",

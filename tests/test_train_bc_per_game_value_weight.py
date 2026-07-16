@@ -65,6 +65,30 @@ def test_value_evidence_surfaces_contradictory_outcomes_within_game() -> None:
     assert report["contradictory_terminal_outcome_games"] == 1
 
 
+def test_value_evidence_namespaces_reused_seeds_by_component() -> None:
+    class _Composite(dict):
+        @staticmethod
+        def component_indices_for_rows(rows):
+            indices = np.asarray(rows, dtype=np.int64)
+            return np.where(indices < 2, 0, 1)
+
+    data = _Composite(
+        game_seed=np.asarray([7, 7, 7, 7], dtype=np.int64),
+        winner=np.asarray(["RED", "RED", "BLUE", "BLUE"]),
+        truncated=np.asarray([False, False, False, False]),
+    )
+    report = _value_independent_evidence_report(
+        data,
+        np.arange(4, dtype=np.int64),
+        np.asarray([0.5, 0.5, 1.0, 1.0], dtype=np.float32),
+    )
+
+    assert report["status"] == "ok"
+    assert report["independent_terminal_games"] == 2
+    assert report["contradictory_terminal_outcome_games"] == 0
+    assert report["game_weight_effective_sample_size"] == pytest.approx(1.8)
+
+
 def test_per_game_value_weight_equalizes_total_mass_across_game_lengths() -> None:
     """CAT-60 core property: a 5-row game and a 1-row game must contribute the SAME total
     value-loss mass once --per-game-value-weight is on, addressing '16k games = 16k
