@@ -59,6 +59,11 @@ from catan_zero.rl.ppo_policy_factory import (  # noqa: E402
     validate_canonical_ppo_actor_contract,
     validate_canonical_ppo_staleness_contract,
 )
+from catan_zero.rl.ppo_run_manifest import (  # noqa: E402
+    ManifestError,
+    PPORunManifest,
+    load_manifest,
+)
 from catan_zero.rl.torch_ppo import make_ppo_optimizer, ppo_update  # noqa: E402
 from catan_zero.rl.vtrace import vtrace_from_log_probs  # noqa: E402
 
@@ -143,6 +148,7 @@ class LearnerConfig:
     eval_timeout_secs: float = 1200.0
     league_snapshot_interval: int = 200
     league_promote_winrate: float = 0.7
+    run_manifest_sha256: str | None = None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -153,6 +159,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", default=None,
                    help="JSON or YAML config (e.g. configs/selfplay/ppo_2p_v1.yaml). "
                         "Keys overlay the defaults below; explicit CLI flags still win.")
+    p.add_argument(
+        "--run-manifest",
+        default=None,
+        help=(
+            "Bound canonical_entity_ppo_run_v2 manifest. In manifest mode it is "
+            "the sole science authority and legacy science flags are rejected."
+        ),
+    )
 
     g = p.add_argument_group("run wiring")
     g.add_argument("--run-base", default="runs/distributed",
@@ -392,6 +406,71 @@ def load_config_file(path: str | os.PathLike) -> dict[str, Any]:
     return _flatten_config(raw)
 
 
+def _manifest_config_values(manifest: PPORunManifest) -> dict[str, Any]:
+    """Translate every v2 field consumed by this learner without default fallbacks."""
+    spec = manifest.spec
+    actor = spec.actor
+    learner = spec.learner
+    checkpoint = spec.checkpoint
+    evaluation = spec.evaluation
+    league = spec.league
+    return {
+        "architecture": spec.identity.architecture,
+        "gamma": actor.gamma,
+        "gae_lambda": actor.gae_lambda,
+        "behavior_temperature": actor.action_temperature,
+        "shards_per_step": learner.shards_per_step,
+        "max_staleness": learner.max_staleness,
+        "max_steps": learner.max_steps,
+        "resume": learner.resume,
+        "lr": learner.lr,
+        "trunk_lr_mult": learner.trunk_lr_mult,
+        "clip_ratio": learner.clip_ratio,
+        "value_coef": learner.value_coef,
+        "value_clip_range": learner.value_clip_range,
+        "entropy_coef": learner.entropy_coef,
+        "ppo_epochs": learner.ppo_epochs,
+        "minibatch_size": learner.minibatch_size,
+        "target_kl": learner.target_kl,
+        "top_advantage_fraction": learner.top_advantage_fraction,
+        "min_advantage_samples": learner.min_advantage_samples,
+        "advantage_normalization": learner.advantage_normalization,
+        "advantage_group_weights": ",".join(learner.advantage_group_weights),
+        "kl_to_bc_init": learner.kl_to_bc_init,
+        "kl_to_bc_final": learner.kl_to_bc_final,
+        "kl_to_bc_anneal_steps": learner.kl_to_bc_anneal_steps,
+        "use_vtrace": learner.use_vtrace,
+        "vtrace_clip_rho": learner.vtrace_clip_rho,
+        "vtrace_clip_pg_rho": learner.vtrace_clip_pg_rho,
+        "vtrace_use_current_values": learner.vtrace_use_current_values,
+        "vtrace_forward_chunk": learner.vtrace_forward_chunk,
+        "checkpoint_every": checkpoint.every_steps,
+        "keep_last_checkpoints": checkpoint.keep_last,
+        "checkpoint_milestone_every": checkpoint.milestone_every,
+        "eval_games": evaluation.dev_games,
+        "eval_tracks": ",".join(evaluation.tracks),
+        "eval_opponents": ",".join(evaluation.opponents),
+        "eval_workers": evaluation.workers,
+        "eval_max_decisions": evaluation.max_decisions,
+        "eval_timeout_secs": evaluation.timeout_secs,
+        "eval_device": evaluation.device,
+        "league_snapshot_interval": league.snapshot_interval,
+        "league_promote_winrate": league.promote_winrate,
+        "run_manifest_sha256": manifest.sha256(),
+    }
+
+
+_MANIFEST_RUNTIME_DESTS = {
+    "run_manifest",
+    "run_base",
+    "run_name",
+    "init_checkpoint",
+    "device",
+    "poll_secs",
+    "stable_secs",
+}
+
+
 def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argparse.Namespace]:
     """Build a LearnerConfig: argparse defaults < config file < explicit CLI flags."""
     parser = build_arg_parser()
@@ -458,7 +537,39 @@ def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argpar
         "league_promote_winrate": args.league_promote_winrate,
     }
 
-    if args.config:
+    if args.run_manifest:
+        conflicts = sorted(explicit_dests - _MANIFEST_RUNTIME_DESTS)
+        if conflicts:
+            parser.error(
+                "--run-manifest cannot be combined with legacy science/config "
+                f"flags: {', '.join(conflicts)}"
+            )
+        if not args.init_checkpoint:
+            parser.error(
+                "--init-checkpoint is required with --run-manifest so its bytes "
+                "can be verified"
+            )
+        try:
+            manifest = load_manifest(args.run_manifest)
+        except (OSError, ManifestError) as error:
+            parser.error(f"invalid --run-manifest: {error}")
+        if manifest.status != "bound":
+            parser.error("--run-manifest must have status='bound'; templates cannot run")
+        try:
+            actual_initializer_sha256 = (
+                f"sha256:{dist.checkpoint_sha256(args.init_checkpoint)}"
+            )
+        except OSError as error:
+            parser.error(f"cannot hash --init-checkpoint: {error}")
+        expected_initializer_sha256 = manifest.spec.identity.initializer_sha256
+        if actual_initializer_sha256 != expected_initializer_sha256:
+            parser.error(
+                "--init-checkpoint SHA-256 does not match run manifest identity: "
+                f"expected={expected_initializer_sha256} "
+                f"actual={actual_initializer_sha256}"
+            )
+        cfg_kwargs.update(_manifest_config_values(manifest))
+    elif args.config:
         file_cfg = load_config_file(args.config)
         for key, value in file_cfg.items():
             if key in cfg_kwargs:
