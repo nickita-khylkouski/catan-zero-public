@@ -271,6 +271,8 @@ TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
 
 CHECKPOINT_DOSE_TELEMETRY_SCHEMA = "train-bc-checkpoint-dose-telemetry-v1"
 CHECKPOINT_DOSE_TRAJECTORY_SCHEMA = "train-bc-checkpoint-dose-trajectory-v1"
+BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1 = "weighted_replacement_v1"
+BASE_SAMPLER_COVERAGE_IMPORTANCE_V1 = "coverage_importance_v1"
 
 MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
 MEMMAP_PAYLOAD_AUTH_CACHE_SCHEMA = "memmap-payload-auth-cache-v1"
@@ -1032,6 +1034,21 @@ def build_parser() -> argparse.ArgumentParser:
             "draws, and stochastic symmetry/data transforms. The legacy default "
             "inherits --seed exactly. Central experiments must set this explicitly "
             "so model/dropout RNG and sample identity cannot be accidentally coupled."
+        ),
+    )
+    parser.add_argument(
+        "--base-sampler",
+        choices=(
+            BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1,
+            BASE_SAMPLER_COVERAGE_IMPORTANCE_V1,
+        ),
+        default=BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1,
+        help=(
+            "Base-corpus traversal. weighted_replacement_v1 preserves the "
+            "historical authenticated component->game->row draw stream. "
+            "coverage_importance_v1 visits every training row once per epoch "
+            "and transfers that authenticated measure into policy/value loss "
+            "weights with self-normalized importance factors."
         ),
     )
     parser.add_argument(
@@ -8228,6 +8245,11 @@ def _effective_a1_learner_training_recipe(
     # bind the trajectory-changing opt-in explicitly.
     if bool(getattr(args, "training_rng_rank_offset", False)):
         effective["training_rng_rank_offset"] = True
+    if (
+        str(getattr(args, "base_sampler", BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1))
+        != BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1
+    ):
+        effective["base_sampler"] = str(args.base_sampler)
     train_diagnostic_cadence = int(
         getattr(args, "train_diagnostics_every_batches", 0)
     )
@@ -12905,8 +12927,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     component_game_sampling,
                 )
             )
-        epoch_sample_weights = component_game_sampling
     training_policy_sample_weights = policy_sample_weights
+    training_value_sample_weights = value_sample_weights
     if (
         exact_per_game_surprise or legacy_policy_surprise
     ) and int(args.policy_aux_active_batch_size) <= 0:
@@ -12921,6 +12943,60 @@ def main(argv: Sequence[str] | None = None) -> None:
         training_policy_sample_weights[train_indices] *= np.asarray(
             policy_surprise_weights_full[train_indices], dtype=np.float32
         )
+    base_sampler = str(args.base_sampler)
+    if base_sampler == BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1:
+        epoch_sample_weights = component_game_sampling
+        base_sampler_report = {
+            "schema_version": "train-base-sampler-v1",
+            "mode": BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1,
+            "traversal": "weighted_rows_with_replacement",
+            "objective_measure": "authenticated_component_game_row_sampling",
+            "complete_row_coverage_per_epoch": False,
+            "importance_weighting": False,
+        }
+    elif base_sampler == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1:
+        if component_game_sampling is None:
+            raise SystemExit(
+                "coverage_importance_v1 requires authenticated component-game "
+                "sampling probabilities"
+            )
+        if int(args.policy_aux_active_batch_size) > 0:
+            raise SystemExit(
+                "coverage_importance_v1 is currently sealed for the direct base "
+                "learner only; policy AUX sampling needs a separate coverage "
+                "contract"
+            )
+        importance = _coverage_importance_weights(component_game_sampling)
+        training_policy_sample_weights = np.asarray(
+            training_policy_sample_weights, dtype=np.float32
+        ).copy()
+        training_value_sample_weights = np.asarray(
+            value_sample_weights, dtype=np.float32
+        ).copy()
+        training_policy_sample_weights[train_indices] *= importance.astype(
+            np.float32
+        )
+        training_value_sample_weights[train_indices] *= importance.astype(
+            np.float32
+        )
+        epoch_sample_weights = None
+        base_sampler_report = {
+            "schema_version": "train-base-sampler-v1",
+            "mode": BASE_SAMPLER_COVERAGE_IMPORTANCE_V1,
+            "traversal": "seeded_global_permutation",
+            "objective_measure": "authenticated_component_game_row_sampling",
+            "complete_row_coverage_per_epoch": True,
+            "importance_weighting": True,
+            "importance_estimator": "self_normalized_minibatch_v1",
+            "importance_formula": "train_row_count * authenticated_row_probability",
+            "importance_mean": float(importance.mean()),
+            "importance_min": float(importance.min()),
+            "importance_max": float(importance.max()),
+            "importance_content_sha256": _array_content_sha256(importance),
+            "validation_measure_unchanged": True,
+        }
+    else:
+        raise SystemExit(f"unsupported --base-sampler {base_sampler!r}")
     policy_aux_sampling_weights = None
     policy_aux_validation_sampling_weights = None
     policy_aux_preconditioning_weights = None
@@ -13216,6 +13292,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_surprise_weight_quality": policy_surprise_weight_report,
                 "policy_surprise_sampling": policy_surprise_sampling_report,
                 "policy_aux_sampling": policy_aux_sampling_report,
+                "base_sampler": base_sampler_report,
             },
             sort_keys=True,
         ),
@@ -13276,7 +13353,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     data,
                     physical_batch,
                     training_policy_sample_weights,
-                    value_sample_weights,
+                    training_value_sample_weights,
                     args.soft_target_temperature,
                     args.soft_target_weight,
                     args.soft_target_source,
@@ -13882,7 +13959,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             train_indices,
             int(args.batch_size),
             training_policy_sample_weights,
-            value_sample_weights,
+            training_value_sample_weights,
             num_workers=int(args.data_loader_workers),
             prefetch=int(args.data_loader_prefetch),
             policy_aux_rows=(
@@ -14092,7 +14169,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         policy_weights=np.asarray(training_policy_sample_weights)[
                             source_global_rows
                         ],
-                        value_weights=np.asarray(value_sample_weights)[
+                        value_weights=np.asarray(training_value_sample_weights)[
                             source_global_rows
                         ],
                         value_active_mask=value_active_row_mask,
@@ -16218,6 +16295,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "policy_surprise_weight_quality": policy_surprise_weight_report,
         "policy_surprise_sampling": policy_surprise_sampling_report,
         "policy_aux_sampling": policy_aux_sampling_report,
+        "base_sampler": base_sampler_report,
         "first_batch_profile": first_batch_profile,
         # Backward-compatible headline: ``parameter_count`` remains the TOTAL
         # serialized/checkpoint-compatible architecture size. Never interpret
@@ -32335,6 +32413,39 @@ def _composite_game_sampling_weights(
     if not math.isclose(float(weights.sum()), 1.0, rel_tol=0.0, abs_tol=1e-9):
         raise SystemExit("authenticated component game sampling mass drift")
     return weights
+
+
+def _coverage_importance_weights(
+    sampling_probabilities: np.ndarray,
+) -> np.ndarray:
+    """Transfer a target row measure onto a uniform full-coverage traversal.
+
+    If the authenticated sampler assigns row ``i`` probability ``p_i`` and a
+    permutation visits every row with probability ``q_i = 1/N``, the exact
+    full-epoch weighted aggregate recovers the population objective with factor
+    ``p_i / q_i = N*p_i``. The trainer reports its existing self-normalized
+    minibatch estimator explicitly rather than calling each minibatch exact.
+    """
+
+    probabilities = np.asarray(sampling_probabilities, dtype=np.float64)
+    if (
+        probabilities.ndim != 1
+        or probabilities.size == 0
+        or not np.isfinite(probabilities).all()
+        or np.any(probabilities <= 0.0)
+        or not math.isclose(
+            float(probabilities.sum()), 1.0, rel_tol=0.0, abs_tol=1.0e-9
+        )
+    ):
+        raise ValueError(
+            "coverage importance requires a positive normalized row measure"
+        )
+    factors = probabilities * float(probabilities.size)
+    if not math.isclose(
+        float(factors.mean()), 1.0, rel_tol=0.0, abs_tol=1.0e-9
+    ):
+        raise RuntimeError("coverage importance mean drift")
+    return factors
 
 
 def _compose_per_game_policy_surprise_sampling_weights(

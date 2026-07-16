@@ -68,6 +68,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "grad_accum_steps": 1,
     "epochs": 3,
     "max_steps": 0,
+    "base_sampler": "coverage_importance_v1",
     "resume_optimizer": False,
     "optimizer": "adamw",
     "lr": 6e-5,

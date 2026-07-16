@@ -149,6 +149,31 @@ For authenticated component/game mixtures, implement per-component draw quotas
 plus shuffled game/root cycles. This preserves the mixture without allowing a
 few roots to dominate merely because the requested dose is short.
 
+### Current scratch coverage correction
+
+The authenticated current scratch split contains 15,968,808 rows. Its target
+component measure is 64/12/4/20, while raw row shares are
+73.18/7.10/2.30/17.42. The historical weighted replacement sampler therefore
+cannot be replaced by a naive unweighted permutation without silently changing
+the training objective.
+
+Under the historical replacement sampler, expected aggregate unique-row
+coverage is only 60.85% after one nominal epoch and 92.46% after three. Roughly
+1,204,068 training rows remain unseen despite 47.9 million draw events.
+
+The current scratch recipe now binds `coverage_importance_v1`:
+
+- traverse one seeded global permutation, giving every training row exposure
+  once per epoch before deterministic DDP padding;
+- retain the authenticated component→game→row probability `p_i`;
+- multiply train-only policy and value weights by `N * p_i`;
+- keep validation on its natural holdout measure;
+- report the self-normalized minibatch importance estimator explicitly.
+
+This removes the million-row blind spot without reverting source exposure to
+raw row proportions. The production schedule remains blocked pending current-v5
+data and optimizer commissioning.
+
 ## Finding 4 — phase allocation and phase loss weights can multiply each other
 
 The authenticated AUX phase allocator sets exact **sampling** shares at:

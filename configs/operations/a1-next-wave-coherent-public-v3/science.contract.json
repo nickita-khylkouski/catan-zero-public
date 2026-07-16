@@ -142,6 +142,7 @@
       "seed": 1,
       "epochs": 3,
       "max_steps": 0,
+      "base_sampler": "coverage_importance_v1",
       "batch_size": 4096,
       "grad_accum_steps": 1,
       "world_size": 1,

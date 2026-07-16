@@ -6,6 +6,7 @@ import pytest
 from tools.train_bc import (
     _component_game_identities,
     _compose_per_game_policy_surprise_sampling_weights,
+    _coverage_importance_weights,
     _epoch_order,
     compute_policy_surprise_kl,
     per_game_capped_policy_surprise_sampling_weights,
@@ -249,6 +250,55 @@ def test_epoch_order_default_matches_plain_permutation():
     expected = rng_b.permutation(10)
 
     assert order.tolist() == expected.tolist()
+
+
+def test_coverage_importance_preserves_weighted_population_objective() -> None:
+    probabilities = np.asarray([0.05, 0.15, 0.30, 0.50], dtype=np.float64)
+    losses = np.asarray([8.0, 4.0, 2.0, 1.0], dtype=np.float64)
+
+    importance = _coverage_importance_weights(probabilities)
+    weighted_target = float(np.sum(probabilities * losses))
+    permutation_objective = float(np.sum(importance * losses) / importance.sum())
+
+    assert importance.mean() == pytest.approx(1.0)
+    assert permutation_objective == pytest.approx(weighted_target)
+
+
+def test_coverage_permutation_visits_every_row_once() -> None:
+    order = _epoch_order(
+        np.random.default_rng(7),
+        100,
+        8,
+        _ddp_disabled(),
+        sample_weights=None,
+    )
+
+    assert len(order) == 100
+    assert len(np.unique(order)) == 100
+
+
+def test_coverage_ddp_rank_strides_cover_every_global_row() -> None:
+    n = 101
+    world_size = 8
+    local_orders = [
+        _epoch_order(
+            np.random.default_rng(11),
+            n,
+            4,
+            {
+                "enabled": True,
+                "world_size": world_size,
+                "rank": rank,
+                "local_rank": rank,
+            },
+            sample_weights=None,
+        )
+        for rank in range(world_size)
+    ]
+    realized = np.concatenate(local_orders)
+
+    assert set(realized.tolist()) == set(range(n))
+    assert len(realized) % (world_size * 4) == 0
 
 
 def test_epoch_order_weighted_sampling_shifts_frequency_toward_high_weight_rows():

@@ -350,6 +350,7 @@ def build_train_command(
         ("seed", "--seed"),
         ("epochs", "--epochs"),
         ("max_steps", "--max-steps"),
+        ("base_sampler", "--base-sampler"),
         ("batch_size", "--batch-size"),
         ("grad_accum_steps", "--grad-accum-steps"),
         ("optimizer", "--optimizer"),
