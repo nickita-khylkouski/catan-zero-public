@@ -366,3 +366,29 @@ def test_coherent_public_belief_accepts_one_full_budget_tree() -> None:
         ]
     )
     cli._validate_science_args(args, parser)
+
+
+def test_target_reliability_audit_preserves_adopted_legacy_n128_budget() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "--out-dir",
+            "/tmp/coherent-n128-reliability",
+            "--n-full",
+            "128",
+            "--public-observation",
+            "--coherent-public-belief-search",
+            "--no-information-set-search",
+            "--no-exact-budget-sh",
+            "--exact-budget-sh-min-n",
+            "0",
+            "--target-reliability-audit-fraction",
+            "0.05",
+            "--target-reliability-audit-seed",
+            "20260716",
+        ]
+    )
+
+    cli._validate_science_args(args, parser)
+    assert args.exact_budget_sh is False
+    assert args.target_reliability_audit_fraction == pytest.approx(0.05)

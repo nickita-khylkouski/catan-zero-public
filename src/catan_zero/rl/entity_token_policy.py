@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 import math
 import operator
@@ -367,6 +368,15 @@ class EntityGraphConfig:
     # order-aware attention pool while retaining the exact same input schema.
     # Appended last for positional legacy-pickle compatibility.
     meaningful_public_history_pooling: str = MASKED_MEAN_V1
+    # Function-preserving late policy/value tower split. The incumbent final N
+    # Transformer blocks remain the policy suffix; the value path receives a
+    # deep copy of those exact blocks plus the final state norm. At activation
+    # the two paths are numerically identical, while subsequent value gradients
+    # cannot overwrite the policy suffix. ``value_trunk_grad_scale`` applies at
+    # the shared-prefix boundary, so the private value tower still learns at
+    # full strength. Default 0 preserves every legacy checkpoint and forward.
+    # Appended last for positional legacy-pickle compatibility.
+    value_tower_split_layers: int = 0
 
 
 class EntityGraphNet:
@@ -687,6 +697,33 @@ class EntityGraphNet:
                             for _ in range(layer_count)
                         )
                 self.state_norm = nn.LayerNorm(h)
+                self.value_tower_split_layers = int(
+                    getattr(cfg, "value_tower_split_layers", 0) or 0
+                )
+                if self.value_tower_split_layers < 0:
+                    raise ValueError("value_tower_split_layers must be >= 0")
+                if self.value_tower_split_layers > len(self.blocks):
+                    raise ValueError(
+                        "value_tower_split_layers cannot exceed state_layers: "
+                        f"{self.value_tower_split_layers} > {len(self.blocks)}"
+                    )
+                if self.value_tower_split_layers:
+                    if self.state_trunk != "transformer":
+                        raise ValueError(
+                            "value_tower_split_layers currently supports only the "
+                            "incumbent transformer state trunk"
+                        )
+                    if self.latent_deliberation_steps:
+                        raise ValueError(
+                            "value_tower_split_layers cannot be combined with "
+                            "latent_deliberation_steps"
+                        )
+                    self.value_blocks = nn.ModuleList(
+                        copy.deepcopy(
+                            list(self.blocks[-self.value_tower_split_layers :])
+                        )
+                    )
+                    self.value_state_norm = copy.deepcopy(self.state_norm)
                 if self.latent_deliberation_steps > 0:
                     self.deliberation_slots = nn.Parameter(
                         torch.empty(1, self.latent_deliberation_slots, h)
@@ -1036,6 +1073,28 @@ class EntityGraphNet:
                     "nominal_active_per_token": int(total - inactive),
                 }
 
+            def initialize_value_tower_from_policy(self) -> None:
+                """Clone the loaded incumbent suffix into an enabled value tower.
+
+                A config-only upgrade of a legacy checkpoint has no
+                ``value_blocks.*`` tensors. Loading the mature policy blocks
+                first and then calling this method gives the value branch the
+                exact incumbent function instead of a fresh/random suffix.
+                """
+
+                if self.value_tower_split_layers <= 0:
+                    return
+                policy_suffix = self.blocks[-self.value_tower_split_layers :]
+                if len(policy_suffix) != len(self.value_blocks):
+                    raise RuntimeError("value tower suffix length mismatch")
+                for value_block, policy_block in zip(
+                    self.value_blocks, policy_suffix, strict=True
+                ):
+                    value_block.load_state_dict(policy_block.state_dict(), strict=True)
+                self.value_state_norm.load_state_dict(
+                    self.state_norm.state_dict(), strict=True
+                )
+
             def encode_state(
                 self,
                 batch: dict[str, Any],
@@ -1044,10 +1103,11 @@ class EntityGraphNet:
             ):
                 """Run the typed-token transformer trunk.
 
-                The returned tuple is intentionally tensor-only and stable:
-                ``(tokens, padding_mask, state)``.  That makes this boundary
-                suitable for a future static-shape CUDA graph without adding
-                wrapper objects or changing the checkpoint parameter set.
+                The legacy/default tuple remains
+                ``(tokens, padding_mask, state)``. An enabled late value split
+                appends ``(shared_prefix_tokens, history_delta)`` so action
+                scoring can apply value-gradient routing at the true shared
+                boundary before executing the private value suffix.
                 """
                 if event_token_limit is not None:
                     if isinstance(event_token_limit, bool):
@@ -1084,6 +1144,7 @@ class EntityGraphNet:
                     tokens = self.topology_residual_adapter(
                         tokens, relation_ids, key_padding_mask=padding_mask
                     )
+                value_tower_input = None
                 if self.uses_relational_topology:
                     from catan_zero.rl.relational_trunks import build_relation_ids
 
@@ -1114,7 +1175,17 @@ class EntityGraphNet:
                         else:
                             tokens = block_output
                 else:
-                    for block in self.blocks:
+                    split_index = (
+                        len(self.blocks) - self.value_tower_split_layers
+                        if self.value_tower_split_layers
+                        else len(self.blocks)
+                    )
+                    for index, block in enumerate(self.blocks):
+                        if (
+                            self.value_tower_split_layers
+                            and index == split_index
+                        ):
+                            value_tower_input = tokens
                         tokens = block(tokens, key_padding_mask=padding_mask)
                 state = self.state_norm(tokens[:, 0])
                 if self.latent_deliberation_steps > 0:
@@ -1129,6 +1200,7 @@ class EntityGraphNet:
                     state = self.deliberation_fusion(
                         torch.nn.functional.gelu(self.deliberation_fusion_norm(fused))
                     )
+                history_delta = None
                 if self.meaningful_public_history_enabled:
                     # Event rows stay masked from the mature trunk. Their
                     # bounded pooled representation enters only through this
@@ -1139,9 +1211,8 @@ class EntityGraphNet:
                     pooled_history = (
                         event_piece * history_weight
                     ).sum(dim=1) / float(MEANINGFUL_PUBLIC_HISTORY_LIMIT)
-                    state = (
-                        state
-                        + pooled_history * self.meaningful_history_residual_gate
+                    history_delta = (
+                        pooled_history * self.meaningful_history_residual_gate
                     )
                     if (
                         self.meaningful_public_history_pooling
@@ -1150,10 +1221,12 @@ class EntityGraphNet:
                         ordered_history = self.meaningful_history_sequence(
                             event_piece, event_mask
                         )
-                        state = (
-                            state
-                            + ordered_history * self.meaningful_history_ordered_gate
+                        history_delta = (
+                            history_delta
+                            + ordered_history
+                            * self.meaningful_history_ordered_gate
                         )
+                    state = state + history_delta
                 if self.moe_enabled:
                     return (
                         tokens,
@@ -1162,6 +1235,18 @@ class EntityGraphNet:
                         torch.stack(moe_balance).mean(),
                         torch.stack(moe_load),
                         torch.stack(moe_importance),
+                    )
+                if self.value_tower_split_layers:
+                    if value_tower_input is None:
+                        raise RuntimeError("value tower split boundary was not captured")
+                    if history_delta is None:
+                        history_delta = torch.zeros_like(state)
+                    return (
+                        tokens,
+                        padding_mask,
+                        state,
+                        value_tower_input,
+                        history_delta,
                     )
                 return tokens, padding_mask, state
 
@@ -1261,7 +1346,36 @@ class EntityGraphNet:
                         "value_trunk_grad_scale must be finite and in [0, 1], got "
                         f"{value_trunk_grad_scale}"
                     )
-                if value_trunk_grad_scale == 1.0:
+                if self.value_tower_split_layers:
+                    value_tower_input = encoded_state[3]
+                    history_delta = encoded_state[4]
+                    if value_trunk_grad_scale == 0.0:
+                        value_tokens = value_tower_input.detach()
+                    elif value_trunk_grad_scale == 1.0:
+                        value_tokens = value_tower_input
+                    else:
+                        value_tokens = (
+                            value_tower_input.detach()
+                            + value_trunk_grad_scale
+                            * (value_tower_input - value_tower_input.detach())
+                        )
+                    for block in self.value_blocks:
+                        value_tokens = block(
+                            value_tokens, key_padding_mask=padding_mask
+                        )
+                    if value_trunk_grad_scale == 0.0:
+                        history_delta = history_delta.detach()
+                    elif value_trunk_grad_scale != 1.0:
+                        history_delta = (
+                            history_delta.detach()
+                            + value_trunk_grad_scale
+                            * (history_delta - history_delta.detach())
+                        )
+                    value_state = (
+                        self.value_state_norm(value_tokens[:, 0])
+                        + history_delta
+                    )
+                elif value_trunk_grad_scale == 1.0:
                     value_state = state
                     value_tokens = tokens
                 elif value_trunk_grad_scale == 0.0:
@@ -1357,7 +1471,7 @@ class EntityGraphNet:
                     # target in train_bc.py separately detaches `value`, so
                     # both the target and the head input are stop-gradiented.)
                     outputs["value_uncertainty"] = torch.nn.functional.softplus(
-                        self.value_uncertainty_head(state.detach()).squeeze(-1)
+                        self.value_uncertainty_head(value_state.detach()).squeeze(-1)
                     )
                 if (
                     self.value_categorical_head is not None
@@ -1430,7 +1544,7 @@ class EntityGraphNet:
                         player_states
                     )
                 if return_q:
-                    state_expanded = state.unsqueeze(1).expand_as(encoded_actions)
+                    state_expanded = value_state.unsqueeze(1).expand_as(encoded_actions)
                     q_features = torch.cat(
                         (
                             state_expanded,
@@ -1870,6 +1984,7 @@ class EntityGraphPolicy:
         ),
         event_history_limit: int = 64,
         meaningful_public_history_pooling: str = MASKED_MEAN_V1,
+        value_tower_split_layers: int = 0,
         entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
@@ -1924,6 +2039,7 @@ class EntityGraphPolicy:
                 meaningful_public_history_pooling=str(
                     meaningful_public_history_pooling or MASKED_MEAN_V1
                 ),
+                value_tower_split_layers=int(value_tower_split_layers),
             )
             return cls(
                 config,
@@ -2523,10 +2639,33 @@ class EntityGraphPolicy:
         policy.trained_value_readouts = tuple(validated_readouts)
         policy._value_training_provenance_errors = tuple(provenance_errors)
         missing, unexpected = policy.model.load_state_dict(data["model"], strict=False)
+        cloned_value_tower = False
+        if int(getattr(config, "value_tower_split_layers", 0) or 0) > 0:
+            value_tower_prefixes = ("value_blocks.", "value_state_norm.")
+            value_tower_missing = [
+                key for key in missing if key.startswith(value_tower_prefixes)
+            ]
+            expected_value_tower = [
+                key
+                for key in policy.model.state_dict()
+                if key.startswith(value_tower_prefixes)
+            ]
+            if value_tower_missing:
+                if set(value_tower_missing) != set(expected_value_tower):
+                    raise RuntimeError(
+                        "entity_graph checkpoint has a partial value-tower state: "
+                        f"missing={value_tower_missing[:8]}"
+                    )
+                policy.model.initialize_value_tower_from_policy()
+                missing = [
+                    key for key in missing if not key.startswith(value_tower_prefixes)
+                ]
+                cloned_value_tower = True
         # Preserve load provenance for opt-in consumers that must distinguish a
         # genuinely trained optional head from a config-only warm-start upgrade.
         # The default scalar evaluator ignores this metadata entirely.
         policy._checkpoint_missing_state_keys = tuple(str(key) for key in missing)
+        policy._checkpoint_value_tower_cloned_from_policy = cloned_value_tower
         # q_head predates durable architecture metadata and remains an explicit
         # legacy exception; production search does not request it. Every module
         # controlled by a config flag is strict for ordinary loads. The larger

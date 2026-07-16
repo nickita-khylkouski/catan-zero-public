@@ -21,6 +21,7 @@ def _make_entity_policy(
     action_local: bool = False,
     edge_policy_head: bool = False,
     value_attention_pool: bool = False,
+    value_tower_split_layers: int = 0,
     public_card_count_features: bool = False,
     public_card_count_residual_bias: bool = True,
 ):
@@ -39,6 +40,7 @@ def _make_entity_policy(
         or action_local
         or edge_policy_head
         or value_attention_pool
+        or value_tower_split_layers
         or public_card_count_features
     ):
         config = replace(
@@ -48,6 +50,7 @@ def _make_entity_policy(
             action_cross_attention_layers=2 if action_local else 0,
             edge_policy_head=bool(edge_policy_head),
             value_attention_pool=bool(value_attention_pool),
+            value_tower_split_layers=int(value_tower_split_layers),
             public_card_count_features=bool(public_card_count_features),
             public_card_count_residual_bias=bool(public_card_count_residual_bias),
         )
@@ -77,6 +80,8 @@ class _Args:
 
 def test_value_head_module_attrs_covers_all_value_adjacent_heads() -> None:
     assert set(VALUE_HEAD_MODULE_ATTRS) == {
+        "value_blocks",
+        "value_state_norm",
         "value_head",
         "legal_action_value_residual_proj",
         "legal_action_value_static_proj",
@@ -157,6 +162,20 @@ def test_value_multiplier_covers_optional_value_attention_pool() -> None:
             else (submodule,)
         )
         assert {id(parameter) for parameter in parameters} <= value_ids
+
+
+def test_value_multiplier_covers_private_value_tower() -> None:
+    policy = _make_entity_policy(value_tower_split_layers=1)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=0.3
+    )
+    value_ids = {id(parameter) for parameter in groups[1]["params"]}
+    assert {
+        id(parameter) for parameter in policy.model.value_blocks.parameters()
+    } <= value_ids
+    assert {
+        id(parameter) for parameter in policy.model.value_state_norm.parameters()
+    } <= value_ids
 
 
 def test_categorical_primary_can_freeze_scalar_diagnostic_without_freezing_cat_head() -> (

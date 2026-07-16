@@ -240,7 +240,7 @@ def target_reliability_contract(
     return {
         "schema_version": TARGET_RELIABILITY_SCHEMA,
         "version": TARGET_RELIABILITY_VERSION,
-        "eligible_roots": "recorded_policy_active_coherent_exact_n128",
+        "eligible_roots": "recorded_policy_active_coherent_full_search_nominal_n128",
         "audit_fraction": fraction,
         "audit_seed": int(audit_seed),
         "selector_schema": TARGET_RELIABILITY_SELECTOR_SCHEMA,

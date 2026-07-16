@@ -34,7 +34,10 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
   --determinization-particles 1 --determinization-min-simulations 32 \
   --correct-rust-chance-spectra --lazy-interior-chance \
   --symmetry-averaged-eval --symmetry-averaged-eval-threshold 20 \
+  --no-exact-budget-sh --exact-budget-sh-min-n 0 \
   --native-mcts-hot-loop --forced-root-target-mode trajectory_only \
+  --target-reliability-audit-fraction 0.05 \
+  --target-reliability-audit-seed 20260716 \
   --record-automatic-transitions \
   --meaningful-public-history --event-history-limit 32 \
   --learner-entity-feature-adapter-version \
@@ -47,3 +50,11 @@ Post-wave admission must prove every worker used teacher v2 and emitted learner
 rows v3, with the legacy `adapter_version` row column equal to the learner
 identity. Forced rows retain `policy_weight_multiplier=0` and
 `value_weight_multiplier=1`; training continues to use equal per-game value mass.
+
+The five-percent reliability slice is selected by a stable hash of audit seed,
+game seed, and decision index. Its duplicate search uses independent
+Gumbel/chance/belief streams and never selects the live move. The learner binds
+`--target-reliability-confidence-weighting` with a `0.25` floor and leaves both
+global and per-game surprise sampling disabled. This prevents raw
+search-vs-parent disagreement from amplifying unstable labels before duplicate
+search has measured their reliability.

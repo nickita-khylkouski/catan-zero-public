@@ -425,11 +425,6 @@ def _validate_science_args(
             parser.error(
                 "--target-reliability-audit-fraction is contracted for --n-full 128"
             )
-        if not bool(args.exact_budget_sh) or int(args.exact_budget_sh_min_n) > 128:
-            parser.error(
-                "--target-reliability-audit-fraction requires exact-budget n128 "
-                "(--exact-budget-sh with --exact-budget-sh-min-n <= 128)"
-            )
     n_full_wide = getattr(args, "n_full_wide", None)
     if information_set and n_full_wide is not None:
         base_budgets = information_set_particle_budgets(
@@ -1060,7 +1055,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "Deterministic fraction of recorded policy-active exact-n128 roots "
+            "Deterministic fraction of recorded policy-active full-search roots "
+            "whose nominal budget is n128 "
             "that receive a second coherent search with independently separated "
             "Gumbel/chance/belief RNG streams. The duplicate only writes typed "
             "reliability evidence and never drives the live move. 0 disables all "

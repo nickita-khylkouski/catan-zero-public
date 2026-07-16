@@ -128,6 +128,68 @@ def test_forward_is_exact_composition_of_state_and_action_apis():
     assert encoded_state[0].shape[0] == batch["hex_tokens"].shape[0]
 
 
+def test_late_value_tower_clone_is_function_preserving_at_activation():
+    base = EntityGraphNet(_config(state_layers=3)).eval()
+    split = EntityGraphNet(
+        _config(state_layers=3, value_tower_split_layers=2)
+    ).eval()
+    missing, unexpected = split.load_state_dict(base.state_dict(), strict=False)
+    assert not unexpected
+    assert missing
+    assert all(
+        key.startswith(("value_blocks.", "value_state_norm."))
+        for key in missing
+    )
+    split.initialize_value_tower_from_policy()
+    batch = _batch()
+
+    with torch.no_grad():
+        base_outputs = base(batch, return_q=True)
+        split_outputs = split(batch, return_q=True)
+
+    _assert_outputs_equal(base_outputs, split_outputs, exact=True)
+    assert len(split.encode_state(batch)) == 5
+
+
+def test_late_value_tower_isolates_policy_and_value_suffix_gradients():
+    model = EntityGraphNet(
+        _config(state_layers=2, value_tower_split_layers=1)
+    ).train()
+    batch = _batch(batch_size=3, action_width=5)
+
+    model.zero_grad(set_to_none=True)
+    model(batch)["value"].square().mean().backward()
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
+        for parameter in model.value_blocks.parameters()
+    )
+    assert all(parameter.grad is None for parameter in model.blocks[-1].parameters())
+
+    model.zero_grad(set_to_none=True)
+    model(batch)["logits"].square().mean().backward()
+    assert all(parameter.grad is None for parameter in model.value_blocks.parameters())
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
+        for parameter in model.blocks[-1].parameters()
+    )
+
+
+def test_split_value_gradient_scale_zero_stops_shared_prefix_not_private_tower():
+    model = EntityGraphNet(
+        _config(state_layers=2, value_tower_split_layers=1)
+    ).train()
+    batch = _batch(batch_size=3, action_width=5)
+
+    model.zero_grad(set_to_none=True)
+    model(batch, value_trunk_grad_scale=0.0)["value"].square().mean().backward()
+
+    assert all(parameter.grad is None for parameter in model.blocks[0].parameters())
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
+        for parameter in model.value_blocks.parameters()
+    )
+
+
 def test_policy_value_only_output_selection_is_bit_identical_and_skips_final_vp():
     model = EntityGraphNet(_config()).eval()
     batch = _batch()

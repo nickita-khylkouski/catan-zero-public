@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Flip the f69 action-attention flags ON in an entity_graph checkpoint's
-config, warm-starting all shared weights and zero-initialising the new params,
-and re-save it as a new checkpoint.
+config, warm-starting all shared weights and constructing the new params with
+their function-preserving initializer (zero-output adapters or an exact policy
+suffix clone for the late value tower), and re-save it as a new checkpoint.
 
 This is the *mechanical enabler* for the v3b finetune: `tools/train_bc.py` has
 no CLI argument for the new EntityGraphConfig flags, and its `--init-checkpoint`
@@ -13,7 +14,7 @@ upgraded module, and loads these weights strictly (the new zero-init params are
 already present in this checkpoint, so nothing is missing).
 
 The output is behaviourally identical to the input at init (every upgrade path
-is zero-initialised on its output), which this script asserts on a real
+is zero-output or exact-cloned), which this script asserts on a real
 placement root before writing -- see `docs/f69_v3b_finetune_launch.md`.
 """
 
@@ -79,6 +80,8 @@ NEW_PARAM_PREFIXES = (
     "meaningful_history_residual_gate",
     "meaningful_history_ordered_gate",
     "meaningful_history_sequence.",
+    "value_blocks.",
+    "value_state_norm.",
 )
 
 
@@ -176,6 +179,9 @@ def _parse_flags(raw: str) -> dict[str, object]:
             # still holds on those keys.
             n = entry.split(":", 1)[1] if ":" in entry else "33"
             overrides["value_categorical_bins"] = int(n)
+        elif entry.startswith(("value_split", "value_tower")):
+            n = entry.split(":", 1)[1] if ":" in entry else "2"
+            overrides["value_tower_split_layers"] = int(n)
         else:
             raise SystemExit(f"unknown upgrade flag: {entry!r}")
     return overrides
@@ -308,6 +314,14 @@ def _record_upgrade_provenance(
         "forward_identical_at_init": (
             forward_max_diff == 0.0 if forward_max_diff is not None else False
         ),
+        "value_tower_initialization": (
+            {
+                "method": "exact_policy_suffix_clone",
+                "split_layers": int(flags["value_tower_split_layers"]),
+            }
+            if int(flags.get("value_tower_split_layers", 0) or 0) > 0
+            else None
+        ),
     }
     tmp = output.with_name(f".{output.name}.upgrade.tmp.{os.getpid()}")
     try:
@@ -357,6 +371,8 @@ def main() -> None:
     missing, unexpected = upgraded.model.load_state_dict(
         base.model.state_dict(), strict=False
     )
+    if int(getattr(upgraded_config, "value_tower_split_layers", 0) or 0) > 0:
+        upgraded.model.initialize_value_tower_from_policy()
     disallowed = [
         k for k in missing if not k.startswith(NEW_PARAM_PREFIXES + ("q_head.",))
     ]

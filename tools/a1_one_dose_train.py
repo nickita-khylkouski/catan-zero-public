@@ -262,6 +262,8 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "policy_kl_max_weight",
         "policy_surprise_weight",
         "per_game_policy_surprise_weighting",
+        "target_reliability_confidence_weighting",
+        "target_reliability_confidence_floor",
         "advantage_policy_weighting",
         "per_game_policy_weight",
         "per_game_policy_weight_mode",
@@ -3319,6 +3321,8 @@ def bind_learner_ablation(
     # request a different value below.
     effective["public_card_lr_mult"] = 1.0
     effective["per_game_policy_surprise_weighting"] = False
+    effective.setdefault("target_reliability_confidence_weighting", False)
+    effective.setdefault("target_reliability_confidence_floor", 0.25)
     # Historical A1 omitted this typed knob because per-game weighting was
     # locked off. Bind the then-current train_bc default explicitly in every
     # derived recipe so enabling the existing CAT-60 path can never silently
@@ -3369,9 +3373,14 @@ def bind_learner_ablation(
                 "policy_kl_target",
                 "policy_kl_dual_lr",
                 "policy_kl_max_weight",
+                "target_reliability_confidence_floor",
             }
             else bool
-            if key == "per_game_policy_surprise_weighting"
+            if key
+            in {
+                "per_game_policy_surprise_weighting",
+                "target_reliability_confidence_weighting",
+            }
             else str
             if key
             in {"policy_kl_anchor_direction", "policy_target_blend_semantics"}
@@ -3406,6 +3415,7 @@ def bind_learner_ablation(
         "policy_kl_dual_lr": (0.0, None, False),
         "policy_kl_max_weight": (0.0, None, False),
         "policy_surprise_weight": (0.0, None, True),
+        "target_reliability_confidence_floor": (0.0, 1.0, True),
         "vp_margin_weight": (0.0, None, True),
         "truncated_vp_margin_value_weight": (0.0, None, True),
         "forced_action_weight": (0.0, None, True),
@@ -3547,6 +3557,26 @@ def bind_learner_ablation(
         drift["per_game_policy_surprise_weighting"] = {
             "contract": False,
             "effective": True,
+        }
+    if effective.get("target_reliability_confidence_weighting", False) != bool(
+        bound.get("target_reliability_confidence_weighting", False)
+    ):
+        drift["target_reliability_confidence_weighting"] = {
+            "contract": bool(
+                bound.get("target_reliability_confidence_weighting", False)
+            ),
+            "effective": bool(
+                effective["target_reliability_confidence_weighting"]
+            ),
+        }
+    if float(effective.get("target_reliability_confidence_floor", 0.25)) != float(
+        bound.get("target_reliability_confidence_floor", 0.25)
+    ):
+        drift["target_reliability_confidence_floor"] = {
+            "contract": float(
+                bound.get("target_reliability_confidence_floor", 0.25)
+            ),
+            "effective": float(effective["target_reliability_confidence_floor"]),
         }
     if effective.get("forced_row_value_action_type_weights", ""):
         drift["forced_row_value_action_type_weights"] = {
@@ -5447,6 +5477,8 @@ def _build_direct_train_command(
             str(recipe["freeze_modules"]),
             "--policy-surprise-weight",
             str(recipe["policy_surprise_weight"]),
+            "--target-reliability-confidence-floor",
+            str(recipe.get("target_reliability_confidence_floor", 0.25)),
             "--advantage-policy-weighting",
             str(recipe["advantage_policy_weighting"]),
             "--vp-margin-weight",
@@ -5501,6 +5533,10 @@ def _build_direct_train_command(
         )
     if bool(recipe.get("per_game_policy_surprise_weighting", False)):
         command.append("--per-game-policy-surprise-weighting")
+    if bool(recipe.get("target_reliability_confidence_weighting", False)):
+        command.append("--target-reliability-confidence-weighting")
+    else:
+        command.append("--no-target-reliability-confidence-weighting")
     if recipe.get("forced_row_value_action_type_weights"):
         command.extend(
             [

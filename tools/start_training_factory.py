@@ -199,6 +199,22 @@ def main() -> None:
         default="policy_target_fallback_v2",
     )
     parser.add_argument(
+        "--target-reliability-confidence-weighting",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Weight authenticated search-policy rows by their versioned "
+            "duplicate-search confidence. Leave disabled for classical teacher "
+            "data that has no reliability columns."
+        ),
+    )
+    parser.add_argument(
+        "--target-reliability-confidence-floor",
+        type=float,
+        default=0.25,
+        help="Minimum policy multiplier for audited rows when weighting is enabled.",
+    )
+    parser.add_argument(
         "--forced-action-weight",
         type=float,
         default=0.0,
@@ -293,6 +309,8 @@ def main() -> None:
         raise SystemExit(
             "policy_target_fallback_v2 requires --soft-target-weight 0.0 or 1.0"
         )
+    if not 0.0 <= float(args.target_reliability_confidence_floor) <= 1.0:
+        raise SystemExit("--target-reliability-confidence-floor must be in [0, 1]")
     world_size = int(args.torchrun_nproc_per_node)
     grad_accum_steps = int(args.bc_grad_accum_steps)
     if world_size < 1:
@@ -541,6 +559,8 @@ def main() -> None:
             str(args.soft_target_weight),
             "--policy-target-blend-semantics",
             args.policy_target_blend_semantics,
+            "--target-reliability-confidence-floor",
+            str(args.target_reliability_confidence_floor),
             "--forced-action-weight",
             str(args.forced_action_weight),
             "--phase-weights",
@@ -562,6 +582,11 @@ def main() -> None:
             "--teacher-weights",
             args.teacher_weights,
         ]
+        + (
+            ["--target-reliability-confidence-weighting"]
+            if args.target_reliability_confidence_weighting
+            else ["--no-target-reliability-confidence-weighting"]
+        )
         + (
             ["--graph-tokens", str(args.graph_tokens), "--graph-layers", str(args.graph_layers)]
             if args.arch == "xdim_graph"
@@ -704,6 +729,12 @@ def main() -> None:
                 args.arch == "entity_graph" and args.mask_hidden_info
             ),
             "soft_target_weight": float(args.soft_target_weight),
+            "target_reliability_confidence_weighting": bool(
+                args.target_reliability_confidence_weighting
+            ),
+            "target_reliability_confidence_floor": float(
+                args.target_reliability_confidence_floor
+            ),
         },
         "bc_training_topology": {
             "world_size": world_size,

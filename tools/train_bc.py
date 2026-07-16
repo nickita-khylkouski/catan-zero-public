@@ -504,6 +504,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--value-tower-split-layers",
+        type=int,
+        default=None,
+        help=(
+            "Clone the final N entity-Transformer blocks into a private value "
+            "tower. 0 disables it. This is checkpoint-owned: omitted inherits "
+            "an init/grow checkpoint; enabling on an incumbent requires the "
+            "function-preserving value_split:N checkpoint upgrade."
+        ),
+    )
+    parser.add_argument(
         "--meaningful-public-history",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -2104,7 +2115,16 @@ def _value_trunk_gradient_routing(
     value_attention_pool = bool(
         model is not None and getattr(model, "value_attention_pool", False)
     )
-    shared_input_paths = ["cls_state"]
+    value_tower_split_layers = int(
+        getattr(model, "value_tower_split_layers", 0) or 0
+        if model is not None
+        else 0
+    )
+    shared_input_paths = (
+        ["value_tower_shared_prefix_tokens"]
+        if value_tower_split_layers > 0
+        else ["cls_state"]
+    )
     if value_attention_pool:
         shared_input_paths.extend(
             ["attention_pool_state", "attention_pool_tokens"]
@@ -2121,6 +2141,8 @@ def _value_trunk_gradient_routing(
         "active_value_objectives": active_value_objectives,
         "shared_input_paths": shared_input_paths,
         "value_attention_pool_enabled": value_attention_pool,
+        "value_tower_split_layers": value_tower_split_layers,
+        "private_value_tower_parameter_gradient_scale": 1.0,
         "all_scalar_value_shared_inputs_scaled": True,
         "all_value_family_shared_inputs_scaled": True,
         "final_vp_shared_state_scaled": True,
@@ -2592,6 +2614,28 @@ def _checkpoint_structured_action_residuals(
         bool(getattr(config, "static_action_residual", False)),
         bool(getattr(config, "legal_action_value_residual", False)),
     )
+
+
+def _checkpoint_value_tower_split_layers(checkpoint_path: str) -> int:
+    """Read the checkpoint-owned late policy/value split depth."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --value-tower-split-layers"
+        )
+    config = config_attr_view(checkpoint["config"])
+    layers = int(getattr(config, "value_tower_split_layers", 0) or 0)
+    if layers < 0:
+        raise SystemExit(
+            f"{checkpoint_path} records invalid value_tower_split_layers={layers}"
+        )
+    return layers
 
 
 def _checkpoint_meaningful_public_history(
@@ -5458,6 +5502,8 @@ def _validate_composite_learner_recipe_authorization(
         "lr_warmup_steps": int,
         "max_steps": int,
         "per_game_policy_surprise_weighting": bool,
+        "target_reliability_confidence_weighting": bool,
+        "target_reliability_confidence_floor": float,
         "per_game_policy_weight": bool,
         "per_game_policy_weight_mode": str,
         "per_game_value_weight": bool,
@@ -7816,6 +7862,10 @@ def _effective_a1_learner_training_recipe(
         effective["legal_action_value_residual"] = bool(
             args.legal_action_value_residual
         )
+    if int(getattr(args, "value_tower_split_layers", 0) or 0) > 0:
+        effective["value_tower_split_layers"] = int(
+            args.value_tower_split_layers
+        )
     # Additive opt-in objective: historical sealed recipes and old Namespace
     # fixtures predate this field and must remain byte-for-byte exact when it is
     # absent/off. A nonzero value is trajectory-changing and therefore enters
@@ -7852,6 +7902,19 @@ def _effective_a1_learner_training_recipe(
     if per_game_policy_surprise_weighting or generic_a1_ablation:
         effective["per_game_policy_surprise_weighting"] = (
             per_game_policy_surprise_weighting
+        )
+    target_reliability_confidence_weighting = bool(
+        getattr(args, "target_reliability_confidence_weighting", False)
+    )
+    target_reliability_confidence_floor = float(
+        getattr(args, "target_reliability_confidence_floor", 0.25)
+    )
+    if target_reliability_confidence_weighting or generic_a1_ablation:
+        effective["target_reliability_confidence_weighting"] = (
+            target_reliability_confidence_weighting
+        )
+        effective["target_reliability_confidence_floor"] = (
+            target_reliability_confidence_floor
         )
     if getattr(args, "policy_kl_target", None) is not None:
         # The fixed anchor's historical recipe shape remains untouched.  An
@@ -8793,6 +8856,8 @@ def _validate_a1_learner_training_recipe(
     for post_seal_field in (
         "public_card_lr_mult",
         "per_game_policy_surprise_weighting",
+        "target_reliability_confidence_weighting",
+        "target_reliability_confidence_floor",
     ):
         if post_seal_field in effective:
             authorized_extra_fields.add(post_seal_field)
@@ -8852,6 +8917,16 @@ def _validate_a1_learner_training_recipe(
         drift["per_game_policy_surprise_weighting"] = {
             "contract": False,
             "effective": True,
+        }
+    if bool(effective.get("target_reliability_confidence_weighting", False)):
+        drift["target_reliability_confidence_weighting"] = {
+            "contract": False,
+            "effective": True,
+        }
+    if float(effective.get("target_reliability_confidence_floor", 0.25)) != 0.25:
+        drift["target_reliability_confidence_floor"] = {
+            "contract": 0.25,
+            "effective": float(effective["target_reliability_confidence_floor"]),
         }
     if getattr(args, "policy_kl_target", None) is not None:
         # Reconstruct the exact parent marker, including the fields whose
@@ -9135,6 +9210,40 @@ def _resolve_effective_structured_action_residuals(
         False if requested_static is None else requested_static,
         False if requested_legal is None else requested_legal,
     )
+
+
+def _resolve_effective_value_tower_split_layers(
+    args: argparse.Namespace,
+) -> int:
+    """Resolve fresh/resume/grow late value-tower architecture exactly."""
+
+    requested_raw = getattr(args, "value_tower_split_layers", None)
+    requested = None if requested_raw is None else int(requested_raw)
+    if requested is not None and requested < 0:
+        raise SystemExit("--value-tower-split-layers must be >= 0")
+    if str(args.arch) != "entity_graph":
+        if requested not in (None, 0):
+            raise SystemExit(
+                "--value-tower-split-layers is supported only for "
+                "--arch entity_graph"
+            )
+        return 0
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_value_tower_split_layers(init_checkpoint)
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "--value-tower-split-layers does not match --init-checkpoint: "
+                f"checkpoint={inherited} cli={requested}. Upgrade the checkpoint "
+                "with --flags value_split:N or omit the flag to inherit it."
+            )
+        return inherited
+    if grow_checkpoint:
+        inherited = _checkpoint_value_tower_split_layers(grow_checkpoint)
+        return inherited if requested is None else requested
+    return 0 if requested is None else requested
 
 
 def _structured_action_create_kwargs(
@@ -9935,6 +10044,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.static_action_residual,
         args.legal_action_value_residual,
     ) = _resolve_effective_structured_action_residuals(args)
+    args.value_tower_split_layers = (
+        _resolve_effective_value_tower_split_layers(args)
+    )
     (
         args.meaningful_public_history,
         args.event_history_limit,
@@ -10141,6 +10253,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.static_action_residual,
         args.legal_action_value_residual,
     ) = _resolve_effective_structured_action_residuals(args)
+    args.value_tower_split_layers = (
+        _resolve_effective_value_tower_split_layers(args)
+    )
     (
         args.meaningful_public_history,
         args.event_history_limit,
@@ -10713,6 +10828,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         args.public_card_count_features
                     ),
                     **_structured_action_create_kwargs(args),
+                    value_tower_split_layers=int(
+                        args.value_tower_split_layers
+                    ),
                     meaningful_public_history=bool(
                         args.meaningful_public_history
                     ),
@@ -27929,6 +28047,19 @@ def _checkpoint_config_mismatches(
                     f"cli={requested_enabled}; use the structured_action_value "
                     "checkpoint upgrade"
                 )
+        checkpoint_value_split = int(
+            getattr(config, "value_tower_split_layers", 0) or 0
+        )
+        requested_value_split = int(
+            getattr(args, "value_tower_split_layers", 0) or 0
+        )
+        if checkpoint_value_split != requested_value_split:
+            mismatches.append(
+                "value_tower_split_layers "
+                f"checkpoint={checkpoint_value_split} "
+                f"cli={requested_value_split}; use the value_split:N "
+                "checkpoint upgrade"
+            )
         checkpoint_history = bool(
             getattr(config, "meaningful_public_history", False)
         )
@@ -28220,6 +28351,8 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     "action_cross": ("action_cross_blocks",),
     "static_action_residual": ("static_action_residual_proj",),
     "value_heads": (
+        "value_blocks",
+        "value_state_norm",
         "value_head",
         "legal_action_value_residual_proj",
         "legal_action_value_static_proj",
@@ -28301,6 +28434,7 @@ def _effective_entity_graph_architecture_report(
             "topology_residual_adapter": False,
             "static_action_residual": False,
             "legal_action_value_residual": False,
+            "value_tower_split_layers": 0,
             "public_card_count_features": False,
             "public_card_count_residual_bias": False,
             "meaningful_public_history": False,
@@ -28339,6 +28473,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "legal_action_value_residual": bool(
             getattr(config, "legal_action_value_residual", False)
+        ),
+        "value_tower_split_layers": int(
+            getattr(config, "value_tower_split_layers", 0) or 0
         ),
         "public_card_count_features": bool(
             getattr(config, "public_card_count_features", False)
@@ -28573,6 +28710,8 @@ def _apply_lr_schedule(
 # linear head while its fresh value probe/attention layers train at trunk LR.
 # Missing attributes are harmless for XDimLite/XDimGraph.
 VALUE_HEAD_MODULE_ATTRS: tuple[str, ...] = (
+    "value_blocks",
+    "value_state_norm",
     "value_head",
     "legal_action_value_residual_proj",
     "legal_action_value_static_proj",

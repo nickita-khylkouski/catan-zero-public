@@ -150,6 +150,8 @@ def test_factory_converts_entity_tokens_and_masks_hidden_inputs(tmp_path: Path) 
         "graph_history_features": True,
         "mask_hidden_info": True,
         "soft_target_weight": 0.0,
+        "target_reliability_confidence_weighting": False,
+        "target_reliability_confidence_floor": 0.25,
     }
 
 
@@ -249,6 +251,29 @@ def test_factory_forwards_explicit_trust_and_value_controls(tmp_path: Path) -> N
     assert resolved.policy_kl_target == pytest.approx(0.03)
     assert resolved.policy_kl_dual_lr == pytest.approx(0.5)
     assert resolved.policy_kl_max_weight == pytest.approx(0.8)
+
+
+def test_factory_forwards_target_reliability_weighting(tmp_path: Path) -> None:
+    result = _dry_run(
+        tmp_path,
+        "--target-reliability-confidence-weighting",
+        "--target-reliability-confidence-floor",
+        "0.4",
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = _manifest(tmp_path)
+    command = _train_command(manifest)
+    train_argv = command[command.index("tools/train_bc.py") + 1 :]
+    resolved = train_bc.build_parser().parse_args(train_argv)
+    assert resolved.target_reliability_confidence_weighting is True
+    assert resolved.target_reliability_confidence_floor == pytest.approx(0.4)
+    assert manifest["bc_training_data"][
+        "target_reliability_confidence_weighting"
+    ] is True
+    assert manifest["bc_training_data"][
+        "target_reliability_confidence_floor"
+    ] == pytest.approx(0.4)
 
 
 def test_production_factory_refuses_unbounded_epoch_only_training(

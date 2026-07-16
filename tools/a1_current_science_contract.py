@@ -58,6 +58,21 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
     {"policy_aux_active_batch_size", "policy_aux_loss_weight"}
 )
+PRODUCTION_TARGET_QUALITY_LEARNER_CONTRACT = {
+    # Raw search disagreement is not target correctness. Production may only
+    # prioritize it again after the reliability audit has qualified a recipe.
+    "policy_surprise_weight": 0.0,
+    "per_game_policy_surprise_weighting": False,
+    "target_reliability_confidence_weighting": True,
+    "target_reliability_confidence_floor": 0.25,
+}
+PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT = {
+    # A stable root hash selects this audit slice without consuming gameplay or
+    # primary-search RNG. Five percent is enough to calibrate target stability
+    # without turning the duplicate reference search into the dominant cost.
+    "target_reliability_audit_fraction": 0.05,
+    "target_reliability_audit_seed": 20260716,
+}
 
 
 class ScienceContractError(ValueError):
@@ -158,6 +173,27 @@ def _load() -> dict[str, Any]:
             "current coherent base learner must not bind diagnostic active-policy "
             f"AUX fields: {leaked_aux_fields}"
         )
+    target_quality_learner_drift = {
+        key: {"expected": expected, "actual": recipe.get(key)}
+        for key, expected in PRODUCTION_TARGET_QUALITY_LEARNER_CONTRACT.items()
+        if recipe.get(key) != expected
+    }
+    if target_quality_learner_drift:
+        raise ScienceContractError(
+            "current coherent learner target-quality contract drifted: "
+            f"{target_quality_learner_drift}"
+        )
+    generation_value = value["generation"]
+    target_quality_generation_drift = {
+        key: {"expected": expected, "actual": generation_value.get(key)}
+        for key, expected in PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT.items()
+        if generation_value.get(key) != expected
+    }
+    if target_quality_generation_drift:
+        raise ScienceContractError(
+            "current coherent generation target-quality contract drifted: "
+            f"{target_quality_generation_drift}"
+        )
     evaluator_value = operator["evaluator"]
     if (
         evaluator_value.get("value_readout") == "scalar"
@@ -172,6 +208,7 @@ def _load() -> dict[str, Any]:
             "current scalar learner must optimize the exact deployed tanh "
             "search readout and scale"
         )
+    _validate_target_quality_artifacts(value)
     return value
 
 
@@ -321,6 +358,73 @@ def _read_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ScienceContractError(f"{path} must contain a JSON object")
     return value
+
+
+def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
+    """Bind the generator recipe and guard to the target-quality authority."""
+
+    generator = _read_object(GENERATOR_CONFIG_PATH)
+    fields = generator.get("fields")
+    if not isinstance(fields, dict):
+        raise ScienceContractError("coherent generator config fields are missing")
+    generation = contract["generation"]
+    search_value = contract["operator"]["search"]
+    expected_generator = {
+        **PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT,
+        "exact_budget_sh": search_value.get("exact_budget_sh"),
+        "exact_budget_sh_min_n": search_value.get("exact_budget_sh_min_n"),
+    }
+    generator_drift = {
+        key: {"expected": expected, "actual": fields.get(key)}
+        for key, expected in expected_generator.items()
+        if fields.get(key) != expected
+    }
+    if generator_drift:
+        raise ScienceContractError(
+            "current coherent generator target-quality config drifted: "
+            f"{generator_drift}"
+        )
+    for key, expected in PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT.items():
+        if generation.get(key) != expected:
+            raise ScienceContractError(
+                f"current generation.{key} differs from generator config"
+            )
+
+    guard = _read_object(GENERATOR_GUARD_PATH)
+    try:
+        lint_args = next(
+            item["args"]
+            for item in guard["guards"]
+            if item.get("name") == "cli_flag_lint"
+        )
+        critical = set(lint_args["critical_flags"])
+        expected_values = lint_args["expected_values"]
+    except (KeyError, StopIteration, TypeError) as error:
+        raise ScienceContractError("coherent generator guard shape drifted") from error
+    guarded = {
+        "--target-reliability-audit-fraction": expected_generator[
+            "target_reliability_audit_fraction"
+        ],
+        "--target-reliability-audit-seed": expected_generator[
+            "target_reliability_audit_seed"
+        ],
+        "--exact-budget-sh": expected_generator["exact_budget_sh"],
+        "--exact-budget-sh-min-n": expected_generator["exact_budget_sh_min_n"],
+    }
+    guard_drift = {
+        flag: {
+            "critical": flag in critical,
+            "expected": expected,
+            "actual": expected_values.get(flag),
+        }
+        for flag, expected in guarded.items()
+        if flag not in critical or expected_values.get(flag) != expected
+    }
+    if guard_drift:
+        raise ScienceContractError(
+            "current coherent generator target-quality guard drifted: "
+            f"{guard_drift}"
+        )
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:

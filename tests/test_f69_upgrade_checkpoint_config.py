@@ -127,6 +127,15 @@ def test_structured_action_value_upgrade_enables_both_zero_diff_paths():
     assert upgraded.legal_action_value_residual is True
 
 
+def test_value_tower_split_upgrade_is_explicit_and_default_off():
+    base = EntityGraphConfig(action_size=607, static_action_feature_size=45)
+    assert base.value_tower_split_layers == 0
+    overrides = upgrade_tool._parse_flags("value_split:2")
+    assert overrides == {"value_tower_split_layers": 2}
+    upgraded = upgrade_tool._build_upgraded_config(base, overrides)
+    assert upgraded.value_tower_split_layers == 2
+
+
 def test_canonical_v3_flag_bundle_enables_all_structured_input_repairs():
     overrides = upgrade_tool._parse_flags(  # noqa: SLF001
         "structured_action_value,card_count_v2,meaningful_history"

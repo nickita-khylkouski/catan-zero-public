@@ -1211,7 +1211,7 @@ def play_one_game(
     actions.
 
     When ``config.target_reliability_audit_fraction`` is nonzero, eligible
-    recorded exact-n128 roots may run one diagnostic duplicate through
+    recorded full-search roots with nominal n128 budget may run one diagnostic duplicate through
     ``target_reliability_mcts``.  Its three stochastic roles are domain
     separated, its RNG is reset from (audit_seed, game_seed, decision_index),
     and only typed evidence is recorded; the primary result remains the sole
@@ -1376,10 +1376,10 @@ def play_one_game(
         reliability_fields: dict[str, Any] | None = None
         if reliability_fraction > 0.0 and record_row:
             reliability_fields = unaudited_target_reliability_fields()
-            eligible_exact_n128 = len(legal_rust) > 1 and _is_n128_reliability_result(
+            eligible_n128 = len(legal_rust) > 1 and _is_n128_reliability_result(
                 mcts.config, legal_width=len(legal_rust), result=result
             )
-            if eligible_exact_n128 and target_reliability_root_selected(
+            if eligible_n128 and target_reliability_root_selected(
                 game_seed=int(game_seed),
                 decision_index=int(decision_index),
                 audit_seed=int(config.target_reliability_audit_seed),
