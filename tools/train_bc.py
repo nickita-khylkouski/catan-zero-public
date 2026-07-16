@@ -1027,7 +1027,11 @@ def build_parser() -> argparse.ArgumentParser:
             "the desired DDP-global mean KL(prior_policy || trained_policy) over "
             "the existing authenticated, multi-action anchor rows. The current "
             "--policy-kl-anchor-weight is the initial dual coefficient; omitted "
-            "(default) leaves the fixed-weight anchor path unchanged."
+            "(default) leaves the fixed-weight anchor path unchanged. When an "
+            "authenticated corpus binds both identities, its stored-prior producer "
+            "must equal the declared exact parent; a mismatch is refused. Formats "
+            "without both identities are reported as diagnostic stored-prior KL, "
+            "not verified parent KL."
         ),
     )
     parser.add_argument(
@@ -1896,8 +1900,8 @@ def _value_trunk_gradient_routing(
     This is deliberately narrower than ``--trunk-lr-mult``.  The latter scales
     the optimizer update produced by *all* objectives in trunk parameters.  This
     intervention leaves the policy gradient, forward outputs, optimizer groups,
-    and value-head parameter gradient untouched and changes only the derivative
-    from ``value_head(state)`` into ``state``.
+    and value-readout parameter gradients untouched and changes only the
+    derivatives from the scalar value readout into its shared trunk inputs.
     """
 
     scale = float(getattr(args, "value_trunk_grad_scale", 1.0))
@@ -1921,13 +1925,13 @@ def _value_trunk_gradient_routing(
             "--value-trunk-grad-scale != 1 is sealed only for scalar-MSE value "
             "training"
         )
-    if active and model is not None and bool(
-        getattr(model, "value_attention_pool", False)
-    ):
-        raise SystemExit(
-            "--value-trunk-grad-scale != 1 refuses value-attention pooling: its "
-            "second token-to-value path would bypass the declared shared-state "
-            "gradient boundary"
+    value_attention_pool = bool(
+        model is not None and getattr(model, "value_attention_pool", False)
+    )
+    shared_input_paths = ["cls_state"]
+    if value_attention_pool:
+        shared_input_paths.extend(
+            ["attention_pool_state", "attention_pool_tokens"]
         )
     return {
         "schema_version": "scalar-value-trunk-gradient-routing-v1",
@@ -1936,7 +1940,11 @@ def _value_trunk_gradient_routing(
         "forward_value_identity": True,
         "value_head_parameter_gradient_scale": 1.0,
         "shared_state_upstream_gradient_scale": scale,
-        "scope": "scalar_value_head_state_input_only",
+        "scope": "scalar_value_readout_all_shared_inputs",
+        "legacy_scope_alias": "scalar_value_head_state_input_only",
+        "shared_input_paths": shared_input_paths,
+        "value_attention_pool_enabled": value_attention_pool,
+        "all_scalar_value_shared_inputs_scaled": True,
         "policy_gradient_unchanged": True,
         "optimizer_parameter_groups_unchanged": True,
         "ddp_semantics": (
@@ -6720,6 +6728,78 @@ def _validate_coherent_direct_corpus_binding(
     }
 
 
+def _validate_parent_policy_kl_authority(
+    args: argparse.Namespace,
+    training_binding: dict[str, object] | None,
+) -> dict[str, object] | None:
+    """Refuse an adaptive *parent* KL target backed by another producer.
+
+    ``prior_policy`` is a row payload, not an online evaluation of the
+    initializer.  A projected-dual controller can regulate KL to the stored
+    producer while KL to the actual parent keeps growing, so calling that
+    configuration a parent-policy trust region is false unless those
+    authorities are identical.
+
+    Bindings that expose both identities are checked regardless of their
+    corpus schema. Older formats that do not expose both identities retain
+    their existing optimization behavior, but the report labels the metric as
+    stored-prior-only and diagnostic rather than silently claiming parent KL.
+    """
+
+    if getattr(args, "policy_kl_target", None) is None:
+        return None
+    producer = (
+        training_binding.get("producer_checkpoint_sha256")
+        if isinstance(training_binding, dict)
+        else None
+    )
+    parent = (
+        training_binding.get("learner_parent_checkpoint_sha256")
+        if isinstance(training_binding, dict)
+        else None
+    ) or getattr(args, "init_checkpoint_sha256", None)
+    initializer = (
+        training_binding.get("learner_initializer_sha256")
+        if isinstance(training_binding, dict)
+        else None
+    ) or getattr(args, "init_checkpoint_sha256", None)
+    if producer is None or parent is None:
+        return {
+            "schema_version": "train-bc-parent-policy-kl-authority-v1",
+            "status": "stored_prior_not_verified_as_parent",
+            "metric_semantics": "stored_prior_policy_kl_not_parent_policy_kl",
+            "diagnostic_only": True,
+            "stored_prior_checkpoint_sha256": (
+                producer if _is_sha256(producer) else None
+            ),
+            "parent_checkpoint_sha256": parent if _is_sha256(parent) else None,
+            "initializer_checkpoint_sha256": (
+                initializer if _is_sha256(initializer) else None
+            ),
+        }
+    if not all(_is_sha256(value) for value in (producer, parent, initializer)):
+        raise SystemExit(
+            "adaptive parent-policy KL authority contains a malformed checkpoint identity"
+        )
+    if producer != parent:
+        raise SystemExit(
+            "--policy-kl-target cannot enforce a parent-policy trust region: "
+            f"stored prior_policy rows come from corpus producer {producer}, "
+            f"but the learner's exact parent is {parent} (initializer "
+            f"{initializer}). Regenerate prior_policy from the exact parent or "
+            "omit --policy-kl-target; a producer-policy KL target must not be "
+            "reported as parent KL."
+        )
+    return {
+        "schema_version": "train-bc-parent-policy-kl-authority-v1",
+        "status": "verified_exact_parent",
+        "stored_prior_checkpoint_sha256": producer,
+        "parent_checkpoint_sha256": parent,
+        "initializer_checkpoint_sha256": initializer,
+        "function_preserving_initializer_allowed": True,
+    }
+
+
 def _validate_a1_corpus_artifacts_and_seeds(
     corpus_meta: dict[str, object],
     validation_seed_contract: dict[str, object],
@@ -9721,6 +9801,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "runtime_code_tree_sha256"
         ]
         args.a1_learner_ablation = a1_training_binding.get("learner_ablation")
+    parent_policy_kl_authority = _validate_parent_policy_kl_authority(
+        args, a1_training_binding
+    )
     env_config = _env_config_for_teacher_data(args, data, ddp)
     training_information_surface = _a1_training_event_history_contract(
         args, a1_preflight_meta, env_config
@@ -13586,6 +13669,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             if policy_kl_controller is None
             else policy_kl_controller.state_dict()
         ),
+        "parent_policy_kl_authority": parent_policy_kl_authority,
         "policy_kl_anchor_normalization": (
             "conditional_authenticated_multi_action_prior_rows"
         ),

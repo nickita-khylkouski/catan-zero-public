@@ -1763,7 +1763,10 @@ def _verify_value_trunk_routing(
         or routing.get("value_head_parameter_gradient_scale") != 1.0
         or routing.get("policy_gradient_unchanged") is not True
         or routing.get("optimizer_parameter_groups_unchanged") is not True
-        or routing.get("scope") != "scalar_value_head_state_input_only"
+        or routing.get("scope") != "scalar_value_readout_all_shared_inputs"
+        or routing.get("all_scalar_value_shared_inputs_scaled") is not True
+        or not isinstance(routing.get("shared_input_paths"), list)
+        or "cls_state" not in routing.get("shared_input_paths", [])
     ):
         raise CampaignError(
             f"Stage-B arm {arm} did not execute its value-trunk routing contract"
