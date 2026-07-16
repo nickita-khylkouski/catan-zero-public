@@ -106,16 +106,39 @@ def test_value_outcome_balance_changes_typed_train_hash() -> None:
 
 def test_current_canonical_train_recipe_does_not_inherit_policy_phase_weights() -> None:
     from tools.train import _load_recipe
+    from tools.train_bc import _coverage_unsupported_objectives
 
     recipe = (
         Path(__file__).resolve().parents[1]
         / "configs/training/a1_current_35m_b200.schema1.json"
     )
-    config, _engine = _load_recipe(recipe)
+    config, engine = _load_recipe(recipe)
 
     assert config.phase_weights == "PLAY_TURN=4.0"
     assert config.value_phase_weights == "none"
     assert config.value_player_outcome_balance_mode == "none"
+    assert engine["base_sampler"] == "coverage_importance_v1"
+    assert config.moe_routed_experts == 0
+    assert config.moe_balance_loss_weight == pytest.approx(0.01)
+    assert _coverage_unsupported_objectives(
+        config,
+        categorical_value_loss_weight=config.value_categorical_loss_weight,
+    ) == ()
+
+
+def test_coverage_rejects_balance_loss_when_sparse_moe_is_active() -> None:
+    from tools.train_bc import _coverage_unsupported_objectives
+
+    config = dataclasses.replace(
+        TrainConfig(),
+        moe_routed_experts=4,
+        moe_balance_loss_weight=0.01,
+    )
+
+    assert _coverage_unsupported_objectives(
+        config,
+        categorical_value_loss_weight=config.value_categorical_loss_weight,
+    ) == ("moe_balance_loss_weight",)
 
 
 def test_config_from_payload_rejects_unknown_pipeline() -> None:

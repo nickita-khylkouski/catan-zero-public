@@ -14023,7 +14023,10 @@ def main(
                     ),
                     aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
                     belief_resource_loss_weight=float(args.belief_resource_loss_weight),
-                    moe_balance_loss_weight=float(args.moe_balance_loss_weight),
+                    moe_balance_loss_weight=_effective_moe_balance_loss_weight(
+                        routed_experts=int(args.moe_routed_experts),
+                        configured_weight=float(args.moe_balance_loss_weight),
+                    ),
                 )
             )
         value_balance_mode = str(args.value_player_outcome_balance_mode)
@@ -14570,29 +14573,11 @@ def main(
                 "learner only; policy AUX sampling needs a separate coverage "
                 "contract"
             )
-        unsupported_coverage_objectives = {
-            "advantage_policy_weighting": str(args.advantage_policy_weighting)
-            != "none",
-            "q_loss_weight": float(args.q_loss_weight) != 0.0,
-            "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight) != 0.0,
-            "policy_kl_target": args.policy_kl_target is not None,
-            "value_uncertainty_loss_weight": float(
-                args.value_uncertainty_loss_weight
-            )
-            != 0.0,
-            "aux_subgoal_loss_weight": float(args.aux_subgoal_loss_weight) != 0.0,
-            "belief_resource_loss_weight": float(
-                args.belief_resource_loss_weight
-            )
-            != 0.0,
-            "value_categorical_loss_weight": float(
+        enabled_unsupported = _coverage_unsupported_objectives(
+            args,
+            categorical_value_loss_weight=float(
                 resolved_categorical_value_weight
-            )
-            != 0.0,
-            "moe_balance_loss_weight": float(args.moe_balance_loss_weight) != 0.0,
-        }
-        enabled_unsupported = sorted(
-            key for key, enabled in unsupported_coverage_objectives.items() if enabled
+            ),
         )
         if enabled_unsupported:
             raise SystemExit(
@@ -36912,6 +36897,50 @@ def _coverage_importance_weights(
     ):
         raise RuntimeError("coverage importance mean drift")
     return factors
+
+
+def _effective_moe_balance_loss_weight(
+    *, routed_experts: int, configured_weight: float
+) -> float:
+    """Return the MoE balance coefficient that can produce a gradient.
+
+    The balance coefficient intentionally defaults to ``0.01`` while sparse
+    MoE itself defaults off. With no routed experts the model emits an
+    exact-zero balance term, so coverage admission and objective-scope
+    filtering must not mistake that inert coefficient for an active loss.
+    """
+
+    weight = float(configured_weight)
+    return weight if int(routed_experts) > 0 else 0.0
+
+
+def _coverage_unsupported_objectives(
+    args, *, categorical_value_loss_weight: float
+) -> tuple[str, ...]:
+    """List active objectives not yet normalized by coverage importance."""
+
+    unsupported = {
+        "advantage_policy_weighting": str(args.advantage_policy_weighting)
+        != "none",
+        "q_loss_weight": float(args.q_loss_weight) != 0.0,
+        "policy_kl_anchor_weight": float(args.policy_kl_anchor_weight) != 0.0,
+        "policy_kl_target": args.policy_kl_target is not None,
+        "value_uncertainty_loss_weight": float(
+            args.value_uncertainty_loss_weight
+        )
+        != 0.0,
+        "aux_subgoal_loss_weight": float(args.aux_subgoal_loss_weight) != 0.0,
+        "belief_resource_loss_weight": float(args.belief_resource_loss_weight)
+        != 0.0,
+        "value_categorical_loss_weight": float(categorical_value_loss_weight)
+        != 0.0,
+        "moe_balance_loss_weight": _effective_moe_balance_loss_weight(
+            routed_experts=int(args.moe_routed_experts),
+            configured_weight=float(args.moe_balance_loss_weight),
+        )
+        != 0.0,
+    }
+    return tuple(sorted(key for key, enabled in unsupported.items() if enabled))
 
 
 def _coverage_fixed_loss_normalizers(
