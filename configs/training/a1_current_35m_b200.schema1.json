@@ -26,6 +26,7 @@
     "fields": {
       "acknowledge_empty_event_history_payload_inventory_sha256": [],
       "action_module_lr_mult": 1.0,
+      "shared_action_lr_mult": 1.0,
       "action_target_gather": true,
       "advantage_policy_weighting": "none",
       "advantage_temperature": 1.0,
@@ -115,6 +116,7 @@
       "public_card_count_feature_schema": "public_card_state_v2",
       "public_card_count_features": true,
       "public_card_count_residual_bias": false,
+      "public_card_lr_mult": 1.0,
       "q_loss_weight": 0.0,
       "q_skip_teacher_prefixes": "catanatron_ab",
       "relational_action_cross_layers": 1,
@@ -124,6 +126,7 @@
       "relational_ff_size": 0,
       "resume_optimizer": false,
       "seed": 1,
+      "sampler_seed": null,
       "soft_target_min_legal_coverage": 1.0,
       "soft_target_source": "policy",
       "soft_target_temperature": 1.0,

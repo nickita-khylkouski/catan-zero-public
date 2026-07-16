@@ -257,6 +257,10 @@ class TrainConfig(PipelineConfig):
     )
     crop_authenticated_empty_event_history: bool = False
     seed: int = 1
+    # Keep data-order randomness independent from model initialization.  None
+    # preserves the historical shared seed; explicit experiments bind a
+    # separate sampler stream so architecture/LR arms see identical rows.
+    sampler_seed: int | None = None
     # Historical DDP used an identical PyTorch RNG stream on every rank. Keep
     # that trajectory as the generic default; sealed future flywheel recipes
     # opt in so different-rank samples see independent dropout masks.
@@ -344,6 +348,13 @@ class TrainConfig(PipelineConfig):
     value_uncertainty_head: bool = False
     value_lr_mult: float = 1.0
     action_module_lr_mult: float = 1.0
+    # Mature legal-action representation is shared by policy and the
+    # legal-action-aware value path.  It needs an optimizer group independent
+    # from newly initialized action-local adapters.
+    shared_action_lr_mult: float = 1.0
+    # Function-preserving public-card residual can be commissioned separately
+    # from the mature state trunk.
+    public_card_lr_mult: float = 1.0
     trunk_lr_mult: float = 1.0
     # Training-only causal intervention: scale the scalar value objective's
     # gradient at the shared-state boundary without changing its forward value
