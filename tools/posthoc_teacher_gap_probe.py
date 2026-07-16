@@ -80,21 +80,204 @@ def _policy_teacher_gap_objective(report: Mapping[str, Any]) -> dict[str, Any]:
         raise SystemExit("training report policy_aux_loss_weight is malformed") from error
     if not math.isfinite(coefficient) or coefficient < 0.0:
         raise SystemExit("training report policy_aux_loss_weight is malformed")
-    if raw_batch_size > 0:
+    enabled = raw_batch_size > 0
+    if enabled and coefficient <= 0.0:
         raise SystemExit(
-            "posthoc teacher-gap probe cannot score an AUX-enabled policy objective: "
-            "training used independently normalized base + coefficient*AUX(q*w), "
-            "but objective-matched AUX teacher-gap scoring is not implemented"
+            "AUX-enabled training report has no positive policy_aux_loss_weight"
         )
     return {
         "schema_version": POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA,
         "selection_authority": True,
         "objective_matched": True,
-        "formula": "base_policy_teacher_kl",
-        "policy_aux_enabled": False,
-        "policy_aux_active_batch_size": 0,
-        "policy_aux_loss_weight": 0.0,
-        "policy_aux_measure": "disabled",
+        "formula": (
+            "base_plus_coefficient_times_aux_policy_teacher_kl"
+            if enabled
+            else "base_policy_teacher_kl"
+        ),
+        "policy_aux_enabled": enabled,
+        "policy_aux_active_batch_size": raw_batch_size,
+        "policy_aux_loss_weight": coefficient,
+        "policy_aux_measure": (
+            "conditioned_sampling_x_policy_weight" if enabled else "disabled"
+        ),
+    }
+
+
+def _validate_policy_aux_array_binding(
+    train_bc,
+    values: np.ndarray,
+    binding: object,
+    *,
+    where: str,
+    require_mass: bool,
+) -> None:
+    array = np.asarray(values)
+    if not isinstance(binding, Mapping):
+        raise SystemExit(f"training report {where} binding is missing")
+    try:
+        expected_shape = list(binding["shape"])
+        expected_dtype = str(binding["dtype"])
+        expected_sha256 = str(binding["content_sha256"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit(f"training report {where} binding is malformed") from error
+    if (
+        expected_shape != list(array.shape)
+        or expected_dtype != str(array.dtype)
+        or expected_sha256 != train_bc._array_content_sha256(array)
+    ):
+        raise SystemExit(f"reconstructed {where} differs from training report")
+    if require_mass:
+        try:
+            expected_mass = float(binding["mass"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise SystemExit(
+                f"training report {where} mass binding is malformed"
+            ) from error
+        actual_mass = float(np.asarray(array, dtype=np.float64).sum())
+        if (
+            not math.isfinite(expected_mass)
+            or not math.isclose(
+                actual_mass, expected_mass, rel_tol=0.0, abs_tol=1.0e-12
+            )
+        ):
+            raise SystemExit(f"reconstructed {where} mass differs from training report")
+
+
+def _prepare_policy_aux_validation_measure(
+    *,
+    train_bc,
+    data,
+    train_indices: np.ndarray,
+    validation_indices: np.ndarray,
+    policy_weights: np.ndarray,
+    report: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    active_batch_size = int(report.get("policy_aux_active_batch_size", 0))
+    if active_batch_size <= 0:
+        sampler = report.get("policy_aux_sampling")
+        if isinstance(sampler, Mapping) and sampler.get("enabled") is not False:
+            raise SystemExit("disabled policy AUX recipe has an enabled sampler")
+        return None
+
+    sampler = report.get("policy_aux_sampling")
+    if (
+        not isinstance(sampler, Mapping)
+        or sampler.get("schema_version") != "train-policy-aux-sampling-v1"
+        or sampler.get("enabled") is not True
+        or sampler.get("conditioned_on_positive_policy_loss_weight") is not True
+    ):
+        raise SystemExit("AUX-enabled training report has no authenticated sampler")
+    if (
+        bool(report.get("per_game_policy_surprise_weighting", False))
+        or float(report.get("policy_surprise_weight", 0.0)) != 0.0
+        or sampler.get("exact_per_game_policy_surprise_weighting") is not False
+    ):
+        raise SystemExit(
+            "posthoc AUX teacher-gap scoring only supports the exact Stage-C "
+            "selected-root sampler without policy-surprise redistribution"
+        )
+
+    phase_weights = report.get("policy_aux_phase_sampling_weights")
+    phase_authenticated = bool(
+        getattr(data, "policy_aux_phase_scope_authenticated", False)
+    )
+    if bool(sampler.get("authenticated_phase_allocation_applied")) != (
+        phase_authenticated
+    ):
+        raise SystemExit("policy AUX phase-allocation authentication drifted")
+    if phase_authenticated:
+        if (
+            not isinstance(phase_weights, dict)
+            or phase_weights
+            != getattr(data, "policy_aux_phase_sampling_weights", None)
+        ):
+            raise SystemExit("policy AUX phase-allocation recipe drifted")
+    elif phase_weights is not None:
+        raise SystemExit("unauthenticated policy AUX phase allocation refused")
+
+    def reconstruct(indices: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
+        stage_c_base = train_bc._stage_c_policy_aux_base_measure(data, indices)
+        if stage_c_base is None:
+            raise SystemExit(
+                "AUX-enabled posthoc scoring requires the authenticated "
+                "Stage-C selected-root sampling distribution"
+            )
+        preconditioning, base_measure = stage_c_base
+        conditioned = train_bc._conditioned_policy_aux_sampling_weights(
+            preconditioning,
+            np.asarray(policy_weights)[indices],
+        )
+        if phase_authenticated:
+            conditioned = train_bc._authenticated_policy_aux_phase_sampling_weights(
+                data,
+                indices,
+                conditioned,
+                phase_weights,
+            )
+        return (
+            np.asarray(preconditioning, dtype=np.float64),
+            np.asarray(conditioned, dtype=np.float64),
+            str(base_measure),
+        )
+
+    try:
+        train_preconditioning, train_q, base_measure = reconstruct(train_indices)
+        _validation_preconditioning, validation_q, validation_base_measure = (
+            reconstruct(validation_indices)
+        )
+        validation_qw = train_bc._policy_aux_validation_objective_weights(
+            validation_q,
+            np.asarray(policy_weights)[validation_indices],
+        )
+    except (ValueError, RuntimeError) as error:
+        raise SystemExit(f"policy AUX measure reconstruction failed: {error}") from error
+    if (
+        base_measure != validation_base_measure
+        or sampler.get("base_measure") != base_measure
+    ):
+        raise SystemExit("policy AUX base measure differs from training report")
+    _validate_policy_aux_array_binding(
+        train_bc,
+        train_preconditioning,
+        sampler.get("preconditioning_weights"),
+        where="policy AUX preconditioning weights",
+        require_mass=False,
+    )
+    _validate_policy_aux_array_binding(
+        train_bc,
+        train_q,
+        sampler.get("final_sampling_weights"),
+        where="policy AUX final sampling weights",
+        require_mass=False,
+    )
+    _validate_policy_aux_array_binding(
+        train_bc,
+        validation_q,
+        sampler.get("validation_sampling_weights"),
+        where="policy AUX validation sampling weights",
+        require_mass=True,
+    )
+    if not math.isclose(
+        float(validation_q.sum()), 1.0, rel_tol=0.0, abs_tol=1.0e-12
+    ):
+        raise SystemExit("policy AUX validation sampling mass is not one")
+    coefficient = float(report["policy_aux_loss_weight"])
+    return {
+        "schema_version": "posthoc-policy-aux-validation-measure-v1",
+        "base_measure": base_measure,
+        "sampling_weights": validation_q,
+        "objective_weights": np.asarray(validation_qw, dtype=np.float64),
+        "sampling_weight_mass": float(validation_q.sum()),
+        "objective_weight_mass": float(validation_qw.sum()),
+        "policy_aux_loss_weight": coefficient,
+        "policy_loss_measure": "conditioned_sampling_x_policy_weight",
+        "normalization": "independent_stream_mean",
+        "validation_sampling_weights_sha256": train_bc._array_content_sha256(
+            validation_q
+        ),
+        "validation_objective_weights_sha256": train_bc._array_content_sha256(
+            validation_qw
+        ),
     }
 
 
@@ -556,6 +739,14 @@ def _prepare_probe(
     policy_weights = train_bc._apply_authenticated_policy_distillation_scope(
         data, policy_weights
     )
+    policy_aux_validation = _prepare_policy_aux_validation_measure(
+        train_bc=train_bc,
+        data=data,
+        train_indices=np.asarray(split["train"], dtype=np.int64),
+        validation_indices=validation_indices,
+        policy_weights=policy_weights,
+        report=report,
+    )
     forced_type_weights, forced_action_catalog = _forced_row_value_recipe(
         train_bc, report
     )
@@ -588,6 +779,15 @@ def _prepare_probe(
     objective_reconstruction = {
         "schema_version": "posthoc-objective-reconstruction-v1",
         "policy_teacher_gap_objective": policy_teacher_gap_objective,
+        "policy_aux_validation_measure": (
+            None
+            if policy_aux_validation is None
+            else {
+                key: value
+                for key, value in policy_aux_validation.items()
+                if key not in {"sampling_weights", "objective_weights"}
+            }
+        ),
         "component_scopes": scope_identity,
         "target_reliability_confidence_weighting": bool(
             report.get("target_reliability_confidence_weighting", False)
@@ -636,6 +836,7 @@ def _prepare_probe(
         "validation_indices": validation_indices,
         "policy_weights": policy_weights,
         "value_weights": value_weights,
+        "policy_aux_validation": policy_aux_validation,
         "device": str(device),
         "batch_size": eval_batch_size,
         "award_contract": award_contract,
@@ -764,7 +965,7 @@ def _evaluate_policy_metrics(
         )
     )
     blend_phases, blend_global = _root_blend_args(report)
-    return train_bc.evaluate_bc_batches(
+    base_metrics = train_bc.evaluate_bc_batches(
         policy,
         prepared["data"],
         prepared["validation_indices"],
@@ -810,10 +1011,145 @@ def _evaluate_policy_metrics(
         scalar_value_loss_readout=str(prepared["scalar_value_loss_readout"]),
         scalar_value_loss_scale=float(prepared["scalar_value_loss_scale"]),
     )
+    policy_aux = prepared.get("policy_aux_validation")
+    if policy_aux is None:
+        return base_metrics
+    indices = np.asarray(prepared["validation_indices"], dtype=np.int64)
+    try:
+        aux_policy_weights = train_bc._IndexedValidationWeights(
+            indices,
+            np.asarray(policy_aux["objective_weights"], dtype=np.float64),
+        )
+        aux_value_weights = train_bc._IndexedValidationWeights(
+            indices,
+            np.zeros(len(indices), dtype=np.float64),
+        )
+        aux_metrics = train_bc.evaluate_bc_batches(
+            policy,
+            prepared["data"],
+            indices,
+            aux_policy_weights,
+            aux_value_weights,
+            int(prepared["batch_size"]),
+            float(_required(report, "soft_target_temperature")),
+            float(_required(report, "soft_target_weight")),
+            str(_required(report, "soft_target_source")),
+            float(_required(report, "soft_target_min_legal_coverage")),
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            tuple(str(item) for item in _required(report, "q_skip_teacher_prefixes")),
+            int(report["vps_to_win"]),
+            str(_required(report, "advantage_policy_weighting")),
+            float(_required(report, "advantage_temperature")),
+            float(_required(report, "advantage_weight_cap")),
+            float(_required(report, "advantage_weight_floor")),
+            {"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+            str(_required(report, "amp")),
+            policy_target_blend_semantics=str(
+                report.get(
+                    "policy_target_blend_semantics",
+                    train_bc.POLICY_TARGET_BLEND_LEGACY_V1,
+                )
+            ),
+            policy_kl_anchor_weight=0.0,
+            policy_kl_anchor_direction=str(
+                report.get("policy_kl_anchor_direction", "forward")
+            ),
+            scalar_value_loss_readout=str(prepared["scalar_value_loss_readout"]),
+            scalar_value_loss_scale=float(prepared["scalar_value_loss_scale"]),
+        )
+        combined = train_bc._combine_policy_aux_validation_metrics(
+            base_metrics,
+            aux_metrics,
+            policy_loss_weight=float(_required(report, "policy_loss_weight")),
+            policy_aux_loss_weight=float(policy_aux["policy_aux_loss_weight"]),
+            policy_kl_anchor_weight=0.0,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit(
+            f"objective-matched policy AUX evaluation failed: {error}"
+        ) from error
+    combined.update(
+        _combine_policy_teacher_gap_metrics(
+            base_metrics,
+            aux_metrics,
+            coefficient=float(policy_aux["policy_aux_loss_weight"]),
+        )
+    )
+    combined["policy_aux_validation_measure"] = {
+        key: value
+        for key, value in policy_aux.items()
+        if key not in {"sampling_weights", "objective_weights"}
+    }
+    return combined
+
+
+def _combine_policy_teacher_gap_metrics(
+    base_metrics: Mapping[str, Any],
+    aux_metrics: Mapping[str, Any],
+    *,
+    coefficient: float,
+) -> dict[str, Any]:
+    """Combine independently normalized base and AUX teacher-KL objectives."""
+
+    try:
+        base_rows = int(base_metrics["active_policy_teacher_gap_rows"])
+        aux_rows = int(aux_metrics["active_policy_teacher_gap_rows"])
+        base_model = float(base_metrics["active_policy_kl_target_model_mean"])
+        aux_model = float(aux_metrics["active_policy_kl_target_model_mean"])
+        base_prior = float(base_metrics["active_policy_kl_target_prior_mean"])
+        aux_prior = float(aux_metrics["active_policy_kl_target_prior_mean"])
+        aux_coefficient = float(coefficient)
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("policy teacher-gap stream metrics are incomplete") from error
+    values = (
+        base_model,
+        aux_model,
+        base_prior,
+        aux_prior,
+        aux_coefficient,
+    )
+    if (
+        base_rows <= 0
+        or aux_rows <= 0
+        or not all(math.isfinite(value) for value in values)
+        or min(base_model, aux_model, base_prior, aux_prior) < -1.0e-9
+        or aux_coefficient <= 0.0
+    ):
+        raise ValueError("policy teacher-gap stream metrics are invalid")
+    combined_model = base_model + aux_coefficient * aux_model
+    combined_prior = base_prior + aux_coefficient * aux_prior
+    return {
+        "active_policy_teacher_gap_rows": base_rows + aux_rows,
+        "active_policy_kl_target_model_mean": combined_model,
+        "active_policy_kl_target_prior_mean": combined_prior,
+        "active_policy_teacher_gap_closure": (
+            1.0 - combined_model / combined_prior
+            if combined_prior > 1.0e-8
+            else 0.0
+        ),
+        "policy_teacher_gap_streams": {
+            "normalization": "independent_stream_means",
+            "formula": "base_plus_coefficient_times_aux",
+            "base": {
+                "rows": base_rows,
+                "active_policy_kl_target_model_mean": base_model,
+                "active_policy_kl_target_prior_mean": base_prior,
+            },
+            "aux": {
+                "rows": aux_rows,
+                "coefficient": aux_coefficient,
+                "active_policy_kl_target_model_mean": aux_model,
+                "active_policy_kl_target_prior_mean": aux_prior,
+            },
+        },
+    }
 
 
 def _teacher_gap_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    projection = {
         key: metrics[key]
         for key in (
             "active_policy_teacher_gap_rows",
@@ -822,6 +1158,12 @@ def _teacher_gap_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:
             "active_policy_teacher_gap_closure",
         )
     }
+    streams = metrics.get("policy_teacher_gap_streams")
+    if streams is not None:
+        if not isinstance(streams, Mapping):
+            raise SystemExit("posthoc policy teacher-gap stream metrics are malformed")
+        projection["policy_teacher_gap_streams"] = dict(streams)
+    return projection
 
 
 def _value_quality_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:

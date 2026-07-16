@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,6 +96,8 @@ def _report() -> dict:
 
 
 class _FakeTrainBC:
+    POLICY_TARGET_BLEND_LEGACY_V1 = "legacy"
+
     def __init__(self):
         self.calls = {}
         self.corpus_loads = 0
@@ -155,6 +158,8 @@ class _FakeTrainBC:
         self.evaluate_calls.append((args, kwargs))
         return {
             "samples": 2,
+            "loss": 0.6,
+            "policy_loss": 0.2,
             "active_policy_teacher_gap_rows": 2,
             "active_policy_kl_target_model_mean": 0.2,
             "active_policy_kl_target_prior_mean": 0.5,
@@ -171,6 +176,151 @@ class _FakeTrainBC:
         }
 
 
+class _AuxCorpus(dict):
+    def __init__(self) -> None:
+        super().__init__(
+            action_taken=np.arange(5),
+            game_seed=np.arange(5),
+            stage_c_policy_sampling_weight=np.ones(5, dtype=np.float64),
+            policy_weight_multiplier=np.asarray(
+                [1, 2, 3, 4, 5], dtype=np.float32
+            ),
+        )
+        self.meta = {
+            "stage_c_policy_overlay": {
+                "sampling_distribution": {
+                    "schema_version": "a1-stage-c-policy-sampling-distribution-v2",
+                    "column": "stage_c_policy_sampling_weight",
+                    "arm": "STRATEGIC_BALANCED",
+                }
+            }
+        }
+        self.policy_aux_phase_scope_authenticated = False
+
+
+class _AuxFakeTrainBC(_FakeTrainBC):
+    class _IndexedValidationWeights:
+        def __init__(self, rows, weights):
+            self.rows = np.asarray(rows, dtype=np.int64)
+            self.weights = np.asarray(weights, dtype=np.float64)
+
+        def __getitem__(self, rows):
+            requested = np.asarray(rows, dtype=np.int64)
+            positions = {
+                int(row): index for index, row in enumerate(self.rows.tolist())
+            }
+            return np.asarray(
+                [self.weights[positions[int(row)]] for row in requested],
+                dtype=np.float64,
+            )
+
+    def __init__(self):
+        super().__init__()
+        self.corpus = _AuxCorpus()
+
+    def load_teacher_data_memmap(self, path):
+        self.corpus_loads += 1
+        self.calls["corpus"] = path
+        return self.corpus
+
+    @staticmethod
+    def _array_content_sha256(array):
+        digest = hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
+        return f"sha256:{digest}"
+
+    @staticmethod
+    def _stage_c_policy_aux_base_measure(data, indices):
+        return (
+            np.asarray(
+                data["stage_c_policy_sampling_weight"][indices], dtype=np.float64
+            ),
+            "stage_c_strategic_balanced",
+        )
+
+    @staticmethod
+    def _conditioned_policy_aux_sampling_weights(base, multiplier):
+        conditioned = np.where(np.asarray(multiplier) > 0.0, base, 0.0)
+        return conditioned / conditioned.sum()
+
+    @staticmethod
+    def _policy_aux_validation_objective_weights(q, weights):
+        return np.asarray(q, dtype=np.float64) * np.asarray(
+            weights, dtype=np.float64
+        )
+
+    @staticmethod
+    def _combine_policy_aux_validation_metrics(
+        base, aux, *, policy_loss_weight, policy_aux_loss_weight, **_
+    ):
+        combined = dict(base)
+        combined["policy_loss"] = float(base["policy_loss"]) + float(
+            policy_aux_loss_weight
+        ) * float(aux["policy_loss"])
+        combined["loss"] = float(base["loss"]) + float(
+            policy_loss_weight
+        ) * float(policy_aux_loss_weight) * float(aux["policy_loss"])
+        return combined
+
+    def evaluate_bc_batches(self, *args, **kwargs):
+        self.calls["evaluate"] = (args, kwargs)
+        self.evaluate_calls.append((args, kwargs))
+        auxiliary = isinstance(args[3], self._IndexedValidationWeights)
+        model_kl = 0.8 if auxiliary else 0.2
+        prior_kl = 1.0 if auxiliary else 0.5
+        return {
+            "samples": 2,
+            "loss": model_kl + 0.4,
+            "policy_loss": model_kl,
+            "active_policy_teacher_gap_rows": 2,
+            "active_policy_kl_target_model_mean": model_kl,
+            "active_policy_kl_target_prior_mean": prior_kl,
+            "active_policy_teacher_gap_closure": 1.0 - model_kl / prior_kl,
+            "prior_kl_rows": 4,
+            "prior_kl_model_prior_mean": 0.3,
+            "prior_kl_target_prior_mean": 0.4,
+            "prior_kl_ratio": 0.75,
+            "primary_value_loss": 0.4,
+            "primary_value_loss_kind": "scalar_mse",
+            "scalar_value_mse_diagnostic": 0.4,
+            "value_loss": 0.4,
+            "loss_denominators": {
+                "policy_loss": 3.0 if auxiliary else 6.0,
+                "value_loss": 2.0,
+            },
+        }
+
+    def sampler_report(self) -> dict:
+        train = np.asarray([0, 2, 4], dtype=np.int64)
+        validation = np.asarray([1, 3], dtype=np.int64)
+        preconditioning = np.ones(3, dtype=np.float64)
+        train_q = np.full(3, 1.0 / 3.0, dtype=np.float64)
+        validation_q = np.full(2, 0.5, dtype=np.float64)
+
+        def binding(values, *, mass=False):
+            result = {
+                "shape": list(values.shape),
+                "dtype": str(values.dtype),
+                "content_sha256": self._array_content_sha256(values),
+            }
+            if mass:
+                result["mass"] = float(values.sum())
+            return result
+
+        assert train.tolist() == [0, 2, 4]
+        assert validation.tolist() == [1, 3]
+        return {
+            "schema_version": "train-policy-aux-sampling-v1",
+            "enabled": True,
+            "base_measure": "stage_c_strategic_balanced",
+            "exact_per_game_policy_surprise_weighting": False,
+            "conditioned_on_positive_policy_loss_weight": True,
+            "authenticated_phase_allocation_applied": False,
+            "preconditioning_weights": binding(preconditioning),
+            "final_sampling_weights": binding(train_q),
+            "validation_sampling_weights": binding(validation_q, mass=True),
+        }
+
+
 def _paths(tmp_path: Path, report: dict):
     report_path = tmp_path / "report.json"
     checkpoint = tmp_path / "candidate.pt"
@@ -183,21 +333,86 @@ def _paths(tmp_path: Path, report: dict):
     return report_path, checkpoint, data, manifest
 
 
-def test_aux_enabled_report_fails_before_loading_probe_runtime(
+def test_aux_enabled_report_reconstructs_exact_q_times_w_objective(
     tmp_path: Path, monkeypatch
 ) -> None:
     module = _module()
+    fake = _AuxFakeTrainBC()
     report = _report()
     report["policy_aux_active_batch_size"] = 64
     report["policy_aux_loss_weight"] = 0.25
+    report["policy_surprise_weight"] = 0.0
+    report["per_game_policy_surprise_weighting"] = False
+    report["policy_aux_phase_sampling_weights"] = None
+    report["policy_aux_sampling"] = fake.sampler_report()
     report_path, checkpoint, data, manifest = _paths(tmp_path, report)
-    monkeypatch.setattr(
-        module,
-        "_load_train_bc",
-        lambda: pytest.fail("AUX objective must fail before loading train_bc"),
+    monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
+    monkeypatch.setattr(module, "_load_policy", lambda *_: SimpleNamespace())
+
+    result = module.run_probe(
+        report_path=report_path,
+        checkpoint_path=checkpoint,
+        data_path=data,
+        validation_manifest_path=manifest,
+        device="cpu",
     )
 
-    with pytest.raises(SystemExit, match="AUX-enabled policy objective"):
+    assert len(fake.evaluate_calls) == 2
+    aux_weights = fake.evaluate_calls[1][0][3]
+    assert aux_weights[np.asarray([1, 3], dtype=np.int64)] == pytest.approx(
+        [1.0, 2.0]
+    )
+    assert result["policy_teacher_gap_objective"] == {
+        "schema_version": module.POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA,
+        "selection_authority": True,
+        "objective_matched": True,
+        "formula": "base_plus_coefficient_times_aux_policy_teacher_kl",
+        "policy_aux_enabled": True,
+        "policy_aux_active_batch_size": 64,
+        "policy_aux_loss_weight": 0.25,
+        "policy_aux_measure": "conditioned_sampling_x_policy_weight",
+    }
+    assert result["teacher_gap"]["active_policy_kl_target_model_mean"] == (
+        pytest.approx(0.4)
+    )
+    assert result["teacher_gap"]["active_policy_kl_target_prior_mean"] == (
+        pytest.approx(0.75)
+    )
+    assert result["teacher_gap"]["active_policy_teacher_gap_closure"] == (
+        pytest.approx(1.0 - 0.4 / 0.75)
+    )
+    measure = result["shared_holdout"]["objective_reconstruction"][
+        "policy_aux_validation_measure"
+    ]
+    assert measure["sampling_weight_mass"] == pytest.approx(1.0)
+    assert measure["objective_weight_mass"] == pytest.approx(3.0)
+
+
+def test_aux_enabled_report_refuses_validation_sampling_hash_drift(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _module()
+    fake = _AuxFakeTrainBC()
+    report = _report()
+    report.update(
+        {
+            "policy_aux_active_batch_size": 64,
+            "policy_aux_loss_weight": 0.25,
+            "policy_surprise_weight": 0.0,
+            "per_game_policy_surprise_weighting": False,
+            "policy_aux_phase_sampling_weights": None,
+            "policy_aux_sampling": fake.sampler_report(),
+        }
+    )
+    report["policy_aux_sampling"]["validation_sampling_weights"][
+        "content_sha256"
+    ] = "sha256:" + "0" * 64
+    report_path, checkpoint, data, manifest = _paths(tmp_path, report)
+    monkeypatch.setattr(module, "_load_train_bc", lambda: fake)
+
+    with pytest.raises(
+        SystemExit, match="validation sampling weights differs from training report"
+    ):
         module.run_probe(
             report_path=report_path,
             checkpoint_path=checkpoint,
@@ -205,7 +420,6 @@ def test_aux_enabled_report_fails_before_loading_probe_runtime(
             validation_manifest_path=manifest,
             device="cpu",
         )
-
 
 def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
     tmp_path, monkeypatch
@@ -418,6 +632,52 @@ def test_functional_drift_uses_only_active_multi_action_rows():
     assert parts["value_squared_delta_sum"] == pytest.approx(0.09)
     assert np.isfinite(parts["parent_candidate_kl_sum"])
     assert np.isfinite(parts["candidate_parent_kl_sum"])
+
+
+def test_combined_aux_teacher_gap_can_reverse_base_only_ranking() -> None:
+    module = _module()
+
+    def metrics(model_kl: float) -> dict:
+        return {
+            "active_policy_teacher_gap_rows": 10,
+            "active_policy_kl_target_model_mean": model_kl,
+            "active_policy_kl_target_prior_mean": 1.0,
+        }
+
+    parent = module._combine_policy_teacher_gap_metrics(  # noqa: SLF001
+        metrics(1.0),
+        metrics(1.0),
+        coefficient=0.25,
+    )
+    base_favorite = module._combine_policy_teacher_gap_metrics(  # noqa: SLF001
+        metrics(0.8),
+        metrics(2.0),
+        coefficient=0.25,
+    )
+    combined_favorite = module._combine_policy_teacher_gap_metrics(  # noqa: SLF001
+        metrics(0.9),
+        metrics(0.8),
+        coefficient=0.25,
+    )
+
+    # Base-only KL ranks 0.8 ahead of 0.9.
+    assert 0.8 < 0.9
+    # The trained objective reverses that ranking after the independently
+    # normalized AUX(q*w) term is included.
+    assert (
+        base_favorite["active_policy_kl_target_model_mean"]
+        > combined_favorite["active_policy_kl_target_model_mean"]
+    )
+    assert (
+        parent["active_policy_kl_target_model_mean"]
+        - base_favorite["active_policy_kl_target_model_mean"]
+        < 0.0
+    )
+    assert (
+        parent["active_policy_kl_target_model_mean"]
+        - combined_favorite["active_policy_kl_target_model_mean"]
+        > 0.0
+    )
 
 
 def test_single_checkpoint_parent_mode_uses_report_bound_parent(tmp_path, monkeypatch):
