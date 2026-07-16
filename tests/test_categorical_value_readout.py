@@ -84,7 +84,7 @@ def split_value_policy():
 
 @pytest.fixture()
 def evaluator_inputs(monkeypatch):
-    """Stub only the Rust/feature boundary; exercise each real evaluator path."""
+    """Stub the legacy feature boundary; exercise each real evaluator path."""
     legal = (3, 7)
     game = _FakeGame()
     monkeypatch.setattr(
@@ -305,15 +305,19 @@ def test_sync_and_evaluate_many_use_the_selected_readout(
     root = str(game.current_color())
     scalar = EntityGraphRustEvaluator(
         split_value_policy,
-        config=EntityGraphRustEvaluatorConfig(value_readout="scalar", cache_size=0),
+        config=EntityGraphRustEvaluatorConfig(
+            value_readout="scalar", cache_size=0, rust_featurize=False
+        ),
     )
     default = EntityGraphRustEvaluator(
         split_value_policy,
-        config=EntityGraphRustEvaluatorConfig(cache_size=0),
+        config=EntityGraphRustEvaluatorConfig(cache_size=0, rust_featurize=False),
     )
     categorical = EntityGraphRustEvaluator(
         split_value_policy,
-        config=EntityGraphRustEvaluatorConfig(value_readout="categorical", cache_size=0),
+        config=EntityGraphRustEvaluatorConfig(
+            value_readout="categorical", cache_size=0, rust_featurize=False
+        ),
     )
 
     scalar_result = scalar.evaluate(game, legal, root_color=root, colors=("RED", "BLUE"))
@@ -334,7 +338,9 @@ def test_async_batched_worker_uses_categorical_readout(
     root = str(game.current_color())
     evaluator = BatchedEntityGraphRustEvaluator(
         split_value_policy,
-        config=EntityGraphRustEvaluatorConfig(value_readout="categorical", cache_size=0),
+        config=EntityGraphRustEvaluatorConfig(
+            value_readout="categorical", cache_size=0, rust_featurize=False
+        ),
         max_batch_size=8,
         max_wait_ms=0.0,
     )
@@ -354,7 +360,9 @@ def test_d6_symmetry_averaging_uses_categorical_readout(
     root = str(game.current_color())
     evaluator = EntityGraphRustEvaluator(
         split_value_policy,
-        config=EntityGraphRustEvaluatorConfig(value_readout="categorical", cache_size=0),
+        config=EntityGraphRustEvaluatorConfig(
+            value_readout="categorical", cache_size=0, rust_featurize=False
+        ),
     )
     _priors, value = evaluator.evaluate_symmetry_averaged(
         game, legal, root_color=root, colors=("RED", "BLUE")

@@ -107,7 +107,7 @@ def _evaluate_path(evaluator, path: str, game: _FakeGame, root_color: str):
 @pytest.mark.parametrize("path", ["sync", "many", "async"])
 def test_cache_separates_root_value_perspectives(fake_feature_boundary, path: str) -> None:
     policy = _FakePolicy()
-    config = EntityGraphRustEvaluatorConfig(cache_size=2)
+    config = EntityGraphRustEvaluatorConfig(cache_size=2, rust_featurize=False)
     if path == "async":
         evaluator = BatchedEntityGraphRustEvaluator(
             policy, config=config, max_batch_size=4, max_wait_ms=0.0

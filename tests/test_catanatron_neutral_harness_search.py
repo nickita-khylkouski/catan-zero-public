@@ -584,7 +584,7 @@ def test_search_evaluator_receives_explicit_categorical_readout(monkeypatch) -> 
     assert captured["config"].value_readout == "categorical"
     assert captured["config"].cache_size == 0
     assert captured["config"].context_fill == 0.0
-    assert captured["config"].rust_featurize is False
+    assert captured["config"].rust_featurize is True
     assert captured["config"].emit_uncertainty is False
 
 

@@ -290,8 +290,8 @@ def test_shared_resolved_tuple_matches_independent_calls(public_observation):
 
 
 # ---------------------------------------------------------------------------
-# 2: each evaluate() site builds the resolved adapter exactly once per
-# non-cached, non-terminal request.
+# 2: each native evaluate() site builds the resolved adapter exactly once to
+# bootstrap its shared topology.
 # ---------------------------------------------------------------------------
 
 
@@ -312,7 +312,7 @@ def test_evaluate_builds_resolved_adapter_exactly_once():
     )
 
 
-def test_evaluate_many_builds_resolved_once_per_pending_request():
+def test_evaluate_many_builds_one_resolved_adapter_for_cold_topology():
     catanatron_rs = _rust()
     game_a = _advance_to_multi_action_state(catanatron_rs, seed=11)
     game_b = _advance_to_multi_action_state(catanatron_rs, seed=13)
@@ -327,9 +327,13 @@ def test_evaluate_many_builds_resolved_once_per_pending_request():
         evaluator.evaluate_many(
             [(game_a, legal_a), (game_b, legal_b)], root_color=actor, colors=COLORS
         )
-    assert counter.calls == 2, (
-        f"evaluate_many() must build one resolved adapter tuple per pending "
-        f"request (2 requests -> 2 calls), got {counter.calls} calls"
+        evaluator.evaluate_many(
+            [(game_a, legal_a), (game_b, legal_b)], root_color=actor, colors=COLORS
+        )
+    assert counter.calls == 1, (
+        "evaluate_many() must build one resolved adapter tuple for the cold "
+        "topology and reuse that topology for every request and warm call, "
+        f"got {counter.calls} calls"
     )
 
 
