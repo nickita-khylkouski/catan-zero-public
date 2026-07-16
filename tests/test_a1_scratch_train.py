@@ -217,6 +217,8 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command[command.index("--value-tower-split-layers") + 1] == "1"
     assert command.count("--meaningful-public-history-target-gather") == 1
     assert command.count("--entity-feature-adapter-version") == 1
+    assert command[command.index("--hidden-size") + 1] == "640"
+    assert command[command.index("--max-35m-params") + 1] == "42000000"
     assert command.count("--fused-optimizer") == 1
     assert command.count("--symmetry-augment") == 1
     assert command.count("--symmetry-augment-events") == 1
@@ -445,6 +447,7 @@ def _runtime_args() -> SimpleNamespace:
         event_history_limit=model["event_history_limit"],
         mask_hidden_info=model["mask_hidden_info"],
         require_35m_model=model["require_35m_model"],
+        max_35m_params=model["max_35m_params"],
         batch_size=topology["local_batch_size"],
         grad_accum_steps=topology["grad_accum_steps"],
         ddp_shard_data=topology["ddp_shard_data"],
@@ -472,6 +475,7 @@ def test_scratch_runtime_projection_accepts_every_current_field() -> None:
         ("entity_state_trunk", "rrt"),
         ("mask_hidden_info", False),
         ("require_35m_model", False),
+        ("max_35m_params", 40_000_000),
         ("training_rng_rank_offset", False),
         ("batch_size", 256),
     ),

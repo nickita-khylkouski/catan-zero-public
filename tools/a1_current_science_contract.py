@@ -155,10 +155,12 @@ PRODUCTION_LEARNER_INITIALIZATION_CONTRACT = {
 }
 PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "arch": "entity_graph",
-    # One private value block plus the post-trunk action-target join adds real
-    # capacity; width 624 keeps the complete model below the enforced 40M
-    # checkpoint ceiling.
-    "hidden_size": 624,
+    # H100 BF16 forward/backward profiling on the exact scratch topology found
+    # that width 624 falls off the tensor-core-friendly attention path: width
+    # 640 is materially faster and uses less peak memory. The resulting 41.7M
+    # checkpoint remains in the same model class, so bind its ceiling explicitly
+    # instead of silently relying on train_bc's generic 40M default.
+    "hidden_size": 640,
     "graph_tokens": None,
     "graph_layers": 6,
     "attention_heads": 8,
@@ -188,6 +190,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
         "rust_entity_adapter_v5_meaningful_history_v2"
     ),
     "require_35m_model": True,
+    "max_35m_params": 42_000_000,
 }
 PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT = {
     "schema_version": "a1-scratch-training-topology-v1",

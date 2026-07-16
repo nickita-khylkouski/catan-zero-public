@@ -9195,6 +9195,8 @@ def _validate_a1_scratch_runtime_projection(
         != model["mask_hidden_info"],
         "require_35m_model": bool(args.require_35m_model)
         != model["require_35m_model"],
+        "max_35m_params": int(args.max_35m_params)
+        != model["max_35m_params"],
         "topology_world_size": int(ddp.get("world_size", 0))
         != topology["world_size"],
         "topology_local_batch": int(args.batch_size)

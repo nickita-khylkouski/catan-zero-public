@@ -21,6 +21,8 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     )
     model = current_science.learner_model_construction()
     assert model["graph_tokens"] is None
+    assert model["hidden_size"] == 640
+    assert model["max_35m_params"] == 42_000_000
     assert model["public_card_count_residual_bias"] is False
     assert model["public_rule_state_features"] is True
     assert model["value_tower_split_layers"] == 1

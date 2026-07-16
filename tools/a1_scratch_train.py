@@ -460,6 +460,7 @@ def build_train_command(
         ("--entity-feature-adapter-version", "entity_feature_adapter_version"),
         ("--meaningful-public-history-pooling", "meaningful_public_history_pooling"),
         ("--event-history-limit", "event_history_limit"),
+        ("--max-35m-params", "max_35m_params"),
     ):
         _add(command, flag, model[key])
     command.extend(
