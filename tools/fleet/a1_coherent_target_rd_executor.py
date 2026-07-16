@@ -116,6 +116,36 @@ def _file_sha256(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _confirmed_worker_shard_path(
+    worker_dir: Path,
+    *,
+    filename: object,
+    index: int,
+) -> Path:
+    """Resolve one generated shard without permitting path escape or aliases."""
+
+    expected = {
+        f"gumbel_self_play_shard_{index:05d}.npz",
+        f"gumbel_self_play_shard_{index:05d}.npz.zst",
+    }
+    if not isinstance(filename, str) or filename not in expected:
+        raise ExecutorError(
+            f"confirmed shard filename is not canonical for index {index}: "
+            f"{filename!r}"
+        )
+    worker_root = worker_dir.resolve(strict=True)
+    shard_path = worker_dir / filename
+    try:
+        resolved = shard_path.resolve(strict=True)
+    except OSError as error:
+        raise ExecutorError(f"missing confirmed shard {shard_path}: {error}") from error
+    if resolved.parent != worker_root or shard_path.is_symlink():
+        raise ExecutorError(
+            f"confirmed shard escapes or aliases worker directory: {shard_path}"
+        )
+    return shard_path
+
+
 def _load(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -1847,7 +1877,11 @@ def _verify_worker_payload(
             raise ExecutorError(
                 f"non-contiguous confirmed shard inventory: {worker_id}"
             )
-        shard_path = worker_dir / str(record.get("filename", ""))
+        shard_path = _confirmed_worker_shard_path(
+            worker_dir,
+            filename=record.get("filename"),
+            index=expected_index,
+        )
         if str(shard_path) != str(manifest_shards[expected_index]):
             raise ExecutorError(
                 f"worker manifest/progress shard path drift: {shard_path}"
