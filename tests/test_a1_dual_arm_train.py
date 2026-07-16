@@ -713,6 +713,66 @@ def test_three_epoch_diagnostic_is_one_clean_trajectory_with_sealed_checkpoints(
         )
 
 
+def test_epoch_outputs_prefer_objective_matched_validation_when_present(
+    tmp_path: Path,
+) -> None:
+    verified = _bind_corrective_ablation(
+        _verified(tmp_path),
+        overrides={"epochs": 3, "lr": 0.00012, "loser_sample_weight": 1.0},
+    )
+    binding = dual._execution_binding(["train"], verified)  # noqa: SLF001
+    checkpoint, report = _write_outputs(tmp_path, verified, binding)
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    for epoch, metric in enumerate(payload["metrics"], start=1):
+        metric["validation"]["loss"] = 90.0 + epoch
+        metric["validation_objective_matched"] = {
+            "schema_version": "composite-validation-measure-v2",
+            "objective_matched": True,
+            "samples": verified["validation_rows"],
+            "metrics": {
+                "loss": 1.0 + epoch / 10.0,
+            },
+        }
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    outputs = dual.verify_outputs(
+        verified=verified, checkpoint=checkpoint, report=report, binding=binding
+    )
+
+    assert [
+        outputs["epoch_checkpoints"][str(epoch)]["validation"]["loss"]
+        for epoch in range(1, 4)
+    ] == [1.1, 1.2, 1.3]
+    assert all(
+        row["validation_measure"] == "objective_matched"
+        for row in outputs["epoch_checkpoints"].values()
+    )
+
+
+def test_epoch_outputs_reject_malformed_objective_matched_validation(
+    tmp_path: Path,
+) -> None:
+    verified = _bind_corrective_ablation(
+        _verified(tmp_path),
+        overrides={"epochs": 3, "lr": 0.00012, "loser_sample_weight": 1.0},
+    )
+    binding = dual._execution_binding(["train"], verified)  # noqa: SLF001
+    checkpoint, report = _write_outputs(tmp_path, verified, binding)
+    payload = json.loads(report.read_text(encoding="utf-8"))
+    for metric in payload["metrics"]:
+        metric["validation_objective_matched"] = {
+            "objective_matched": True,
+            "samples": verified["validation_rows"],
+            "metrics": {"loss": 1.0},
+        }
+    report.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(dual.DualTrainError, match="malformed objective-matched"):
+        dual.verify_outputs(
+            verified=verified, checkpoint=checkpoint, report=report, binding=binding
+        )
+
+
 def test_promotion_receipt_verifier_accepts_dual_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

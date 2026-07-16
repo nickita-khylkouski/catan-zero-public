@@ -812,7 +812,40 @@ def verify_outputs(
         )
         for index, row in enumerate(epoch_metrics, start=1)
     )
-    validation_metrics = [row.get("validation", {}) for row in epoch_metrics]
+    matched_validation_present = any(
+        "validation_objective_matched" in row
+        for row in epoch_metrics
+        if isinstance(row, dict)
+    )
+    try:
+        validation_metrics = []
+        for row in epoch_metrics:
+            if not matched_validation_present:
+                validation_metrics.append(
+                    train_bc.objective_matched_validation_metrics(row)
+                )
+                continue
+            matched = row.get("validation_objective_matched")
+            if (
+                not isinstance(matched, dict)
+                or matched.get("schema_version")
+                != "composite-validation-measure-v2"
+            ):
+                raise ValueError("matched validation schema is absent or unsupported")
+            validation_metrics.append(
+                {
+                    **train_bc.objective_matched_validation_metrics(
+                        row, require_matched=True
+                    ),
+                    # Wrapper coverage is authoritative; a metric named
+                    # ``samples`` must not be able to shadow it.
+                    "samples": matched.get("samples"),
+                }
+            )
+    except ValueError as error:
+        raise DualTrainError(
+            "dual-arm report has malformed objective-matched validation"
+        ) from error
     valid_validation_metrics = len(validation_metrics) == completed_epochs and all(
         isinstance(value, dict)
         and value.get("samples") == verified["validation_rows"]
@@ -869,7 +902,12 @@ def verify_outputs(
                 "optimizer": _file_ref(
                     epoch_optimizer, where=f"epoch {epoch} optimizer sidecar"
                 ),
-                "validation": epoch_metrics[epoch - 1]["validation"],
+                "validation": validation_metrics[epoch - 1],
+                "validation_measure": (
+                    "objective_matched"
+                    if matched_validation_present
+                    else "raw_row_concat"
+                ),
             }
         outputs["epoch_checkpoints"] = epoch_outputs
     return outputs

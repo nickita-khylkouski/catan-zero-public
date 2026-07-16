@@ -1090,12 +1090,43 @@ def _ensure_fd_limit(minimum: int = 65536) -> None:
         resource.setrlimit(resource.RLIMIT_NOFILE, (minimum, hard))
 
 
+def _decision_validation_metrics(metric: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Resolve the population used for a science-facing validation decision.
+
+    ``train_bc`` retains ``validation`` as a row-concatenated compatibility
+    statistic.  Authenticated composites also emit
+    ``validation_objective_matched`` for the actual component -> game -> row
+    training measure.  A decision must never silently prefer the compatibility
+    field when the exact population is present.
+    """
+
+    if "validation_objective_matched" in metric:
+        matched = metric.get("validation_objective_matched")
+        metrics = matched.get("metrics") if isinstance(matched, Mapping) else None
+        if (
+            not isinstance(matched, Mapping)
+            or matched.get("schema_version") != "composite-validation-measure-v2"
+            or matched.get("objective_matched") is not True
+            or not isinstance(metrics, Mapping)
+        ):
+            raise ContractError(
+                "completed report has malformed objective-matched validation"
+            )
+        return metrics
+    validation = metric.get("validation")
+    if not isinstance(validation, Mapping):
+        raise ContractError("completed report lacks validation metrics")
+    return validation
+
+
 def _report_trace(report: Mapping[str, Any], field: str) -> list[float]:
     result: list[float] = []
     for metric in report.get("metrics", []):
-        validation = metric.get("validation", {})
+        if not isinstance(metric, Mapping):
+            raise ContractError("completed report has a malformed epoch metric")
+        validation = _decision_validation_metrics(metric)
         if field not in validation:
-            raise ContractError(f"completed report lacks validation.{field}")
+            raise ContractError(f"completed report lacks decision validation.{field}")
         result.append(float(validation[field]))
     if len(result) != 3:
         raise ContractError(f"completed report has {len(result)} epochs, expected 3")
