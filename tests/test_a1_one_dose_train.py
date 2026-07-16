@@ -527,7 +527,7 @@ def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
         ),
         "learner_recipe_overrides_sha256": "sha256:" + "4" * 64,
         "policy_kl_anchor_component_ids": [],
-        "policy_distillation_component_ids": component_ids,
+        "policy_distillation_component_ids": component_ids[:3],
         "value_training_component_ids": component_ids,
         "aux_subgoal_target_contract_sha256": "sha256:" + "a" * 64,
         "public_award_feature_transition_contract_sha256": "sha256:" + "b" * 64,
@@ -1569,7 +1569,7 @@ def _descriptor_bound_production_verified(tmp_path: Path) -> tuple[dict, Path, d
         ),
         "policy_kl_anchor_component_ids": [],
         "policy_distillation_component_ids": list(
-            executor.ALL_POST_WAVE_COMPONENT_IDS
+            executor.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
         ),
         "value_training_component_ids": list(
             executor.ALL_POST_WAVE_COMPONENT_IDS
@@ -1636,7 +1636,7 @@ def test_policy_game_weight_ablation_derives_authenticated_descriptor(
         derived["learner_recipe_overrides"]
     )
     assert derived["policy_distillation_component_ids"] == list(
-        executor.ALL_POST_WAVE_COMPONENT_IDS
+        executor.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
     )
     assert base_path.read_text() == json.dumps(base, indent=2, sort_keys=True) + "\n"
     assert derived_path.stat().st_mode & 0o777 == 0o444
@@ -2042,10 +2042,7 @@ def test_fresh_policy_scope_retains_selected_policy_weight_baseline(
     )
 
     authority = arm["diagnostic_training_descriptor_authority"]
-    assert set(authority["semantic_delta"]) == {
-        "learner_recipe_overrides",
-        "policy_distillation_component_ids",
-    }
+    assert set(authority["semantic_delta"]) == {"learner_recipe_overrides"}
     assert authority["learner_recipe_overrides"]["per_game_policy_weight"] is False
     assert authority["policy_distillation_component_ids"] == list(
         executor.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
@@ -2089,7 +2086,7 @@ def test_fresh_value_scope_is_independent_from_policy_scope(
     }
     assert authority["learner_recipe_overrides"]["per_game_policy_weight"] is False
     assert authority["policy_distillation_component_ids"] == list(
-        executor.ALL_POST_WAVE_COMPONENT_IDS
+        executor.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
     )
     assert authority["value_training_component_ids"] == list(
         executor.FRESH_VALUE_TRAINING_COMPONENT_IDS
@@ -2108,7 +2105,7 @@ def test_fresh_value_scope_is_independent_from_policy_scope(
                 json.loads(base_path.read_text())
             ),
             "policy_distillation_component_ids": list(
-                executor.ALL_POST_WAVE_COMPONENT_IDS
+                executor.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
             ),
             "value_training_component_ids": list(
                 executor.ALL_POST_WAVE_COMPONENT_IDS
@@ -2120,7 +2117,7 @@ def test_fresh_value_scope_is_independent_from_policy_scope(
     )
     assert replayed is not None
     assert replayed["policy_distillation_component_ids"] == list(
-        executor.ALL_POST_WAVE_COMPONENT_IDS
+        executor.FRESH_POLICY_DISTILLATION_COMPONENT_IDS
     )
     assert replayed["value_training_component_ids"] == list(
         executor.FRESH_VALUE_TRAINING_COMPONENT_IDS

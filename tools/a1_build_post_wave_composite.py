@@ -75,8 +75,9 @@ EFFECTIVE_COMPONENT_RATIOS = {
 # target at T=1.0.  ``soft_target_temperature=0.7`` is deliberately inert for
 # stored-policy targets, so bind the source temperatures in the descriptor
 # instead of relying on that easy-to-misread global score-target flag.
-# Historical replay remains part of the exact known-winning TEMP control.  Its
-# stored policy temperature is source semantics, not a global retuning knob.
+# Historical replay is retained for value/state evidence only. Its old search
+# policy is not an interchangeable teacher for a new operator; temperature
+# scaling cannot repair that identity mismatch.
 STORED_POLICY_COMPONENT_TEMPERATURES = {
     "current_producer": 1.0,
     "recent_history": 1.0,
@@ -84,10 +85,9 @@ STORED_POLICY_COMPONENT_TEMPERATURES = {
     HISTORICAL_REPLAY_CATEGORY: 0.52,
 }
 
-# The first recovery learner is the causal TEMP control: policy and value on
-# every component, with no KL anchor.  Fresh-only policy, fresh-only value, and
-# replay KL are three separate treatments and must never be silently composed
-# into the production baseline.
+# The production baseline distils policy only from fresh, same-operator n128
+# components. Replay remains available to value/reanalysis; any replay KL is a
+# separate treatment and must never become stale search-policy CE.
 HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT = 0.0
 
 
@@ -1700,7 +1700,7 @@ def _build_descriptor(
         "learner_recipe_overrides": recipe,
         "learner_recipe_overrides_sha256": canonical_sha256(recipe),
         "policy_kl_anchor_component_ids": [],
-        "policy_distillation_component_ids": all_component_ids,
+        "policy_distillation_component_ids": fresh_component_ids,
         "stored_policy_component_temperatures": dict(
             STORED_POLICY_COMPONENT_TEMPERATURES
         ),

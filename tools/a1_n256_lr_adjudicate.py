@@ -33,8 +33,6 @@ MAX_PRECLIP_GRAD_NORM = 100.0
 MAX_VALIDATION_LOSS = 10.0
 EXTERNAL_GENERALIZATION_FLOOR = -0.02
 EXTERNAL_POINT_TIE_BAND = 0.02
-TEACHER_GAP_TIE_BREAK = 0.02
-VALUE_MSE_TIE_BREAK = 0.01
 
 
 class AdjudicationError(RuntimeError):
@@ -87,19 +85,17 @@ def _finite(value: Any) -> bool:
 
 
 def _pareto_frontier(metrics: dict[str, dict[str, Any]]) -> list[str]:
-    keys = ("external_delta", "internal_win_rate", "teacher_gap_closure")
+    keys = ("external_delta", "internal_win_rate")
     result = []
     for label, row in metrics.items():
         dominated = False
         for other_label, other in metrics.items():
             if other_label == label:
                 continue
-            no_worse = all(
-                float(other[key]) >= float(row[key]) for key in keys
-            ) and float(other["value_mse"]) <= float(row["value_mse"])
+            no_worse = all(float(other[key]) >= float(row[key]) for key in keys)
             strictly_better = any(
                 float(other[key]) > float(row[key]) for key in keys
-            ) or float(other["value_mse"]) < float(row["value_mse"])
+            )
             if no_worse and strictly_better:
                 dominated = True
                 break
@@ -153,8 +149,6 @@ def adjudicate_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, Any]:
         key=lambda label: (
             -float(safe[label]["external_delta"]),
             -float(safe[label]["internal_win_rate"]),
-            -float(safe[label]["teacher_gap_closure"]),
-            float(safe[label]["value_mse"]),
             label,
         ),
     )
@@ -193,30 +187,6 @@ def adjudicate_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 )
             ]
             candidate = internally_clear[0] if len(internally_clear) == 1 else None
-        if candidate is None and len(external_contenders) > 1:
-            # Final tie-break is deliberately conservative: one arm must improve
-            # teacher uptake materially without worse value calibration, or vice versa.
-            tie_breakers = []
-            for label in external_contenders:
-                if all(
-                    label == other
-                    or (
-                        float(safe[label]["teacher_gap_closure"])
-                        >= float(safe[other]["teacher_gap_closure"])
-                        + TEACHER_GAP_TIE_BREAK
-                        and float(safe[label]["value_mse"])
-                        <= float(safe[other]["value_mse"])
-                    )
-                    or (
-                        float(safe[label]["value_mse"])
-                        <= float(safe[other]["value_mse"]) - VALUE_MSE_TIE_BREAK
-                        and float(safe[label]["teacher_gap_closure"])
-                        >= float(safe[other]["teacher_gap_closure"])
-                    )
-                    for other in external_contenders
-                ):
-                    tie_breakers.append(label)
-            candidate = tie_breakers[0] if len(tie_breakers) == 1 else None
         if candidate is not None:
             if float(safe[candidate]["external_delta"]) < EXTERNAL_GENERALIZATION_FLOOR:
                 reason = "best_arm_fails_external_generalization_floor"
@@ -236,8 +206,8 @@ def adjudicate_metrics(metrics: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "max_validation_loss": MAX_VALIDATION_LOSS,
             "external_generalization_floor": EXTERNAL_GENERALIZATION_FLOOR,
             "external_point_tie_band": EXTERNAL_POINT_TIE_BAND,
-            "teacher_gap_tie_break": TEACHER_GAP_TIE_BREAK,
-            "value_mse_tie_break": VALUE_MSE_TIE_BREAK,
+            "teacher_gap_closure_role": "diagnostic_only_not_selection_authority",
+            "value_mse_role": "safety_and_reporting_not_uncertain_playing_tie_break",
         },
     }
 

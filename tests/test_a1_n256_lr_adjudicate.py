@@ -103,6 +103,28 @@ def test_exact_ties_do_not_invent_a_winner() -> None:
     assert result["pareto_frontier"] == ["lr120u", "lr240u", "lr60u"]
 
 
+def test_teacher_closure_cannot_break_a_playing_strength_tie() -> None:
+    shared = {
+        "external": 0.03,
+        "external_ci": (-0.02, 0.08),
+        "internal": 0.55,
+        "internal_ci": (0.49, 0.61),
+        "value_mse": 0.20,
+    }
+    rows = {
+        "low_closure": _row(**shared, teacher_gap=0.05),
+        "high_closure": _row(**shared, teacher_gap=0.50),
+    }
+
+    result = adjudicator.adjudicate_metrics(rows)
+
+    assert result["winner"] is None
+    assert result["decision_reason"] == "uncertainty_or_tradeoff_unresolved"
+    assert result["thresholds"]["teacher_gap_closure_role"].startswith(
+        "diagnostic_only"
+    )
+
+
 def test_clipping_pathology_rejects_apparent_best_arm() -> None:
     rows = {
         "unsafe": _row(

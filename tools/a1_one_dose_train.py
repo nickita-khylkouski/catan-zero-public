@@ -2424,7 +2424,7 @@ def _verify_production_composite_inputs(
         != composite_builder.STORED_POLICY_COMPONENT_TEMPERATURES
         or learner_overrides != composite_builder.LEARNER_RECIPE_OVERRIDES
         or meta.get("policy_kl_anchor_component_ids") != []
-        or meta.get("policy_distillation_component_ids") != expected_ids
+        or meta.get("policy_distillation_component_ids") != expected_ids[:3]
         or meta.get("value_training_component_ids") != expected_ids
         or not isinstance(meta.get("entity_feature_adapter_component_versions"), dict)
         or set(meta["entity_feature_adapter_component_versions"]) != set(expected_ids)
@@ -3753,7 +3753,7 @@ def bind_diagnostic_training_descriptor(
         or base_file_sha256 != verified["corpus_meta_file_sha256"]
         or _value_sha256(base) != verified["descriptor_fingerprint"]
         or tuple(base.get("policy_distillation_component_ids", ()))
-        != ALL_POST_WAVE_COMPONENT_IDS
+        != FRESH_POLICY_DISTILLATION_COMPONENT_IDS
         or tuple(base.get("value_training_component_ids", ()))
         != ALL_POST_WAVE_COMPONENT_IDS
     ):
@@ -9450,7 +9450,7 @@ def _verify_training_outputs(
             "policy_distillation_component_ids": (
                 verified.get("diagnostic_training_descriptor_authority", {}).get(
                     "policy_distillation_component_ids",
-                    list(ALL_POST_WAVE_COMPONENT_IDS),
+                    list(FRESH_POLICY_DISTILLATION_COMPONENT_IDS),
                 )
             ),
             "policy_distillation_scope_explicit": True,

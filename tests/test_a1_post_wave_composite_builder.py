@@ -910,7 +910,6 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
         "current_producer",
         "recent_history",
         "hard_negative",
-        "historical_replay",
     ]
     assert descriptor["value_training_component_ids"] == [
         "current_producer",

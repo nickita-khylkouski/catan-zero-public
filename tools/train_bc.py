@@ -999,6 +999,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Which stored soft labels to train against. prefer_scores allows temperature retuning.",
     )
     parser.add_argument(
+        "--accepted-policy-target-identity-sha256",
+        action="append",
+        default=[],
+        help=(
+            "Exact policy-target operator identity accepted for policy CE. Repeat "
+            "for multiple explicitly adjudicated identities. When supplied, every "
+            "component with positive policy mass must bind one accepted identity; "
+            "missing or unaccepted identity is rejected rather than silently acting "
+            "as a teacher."
+        ),
+    )
+    parser.add_argument(
         "--soft-target-min-legal-coverage",
         type=float,
         default=0.5,
@@ -11197,8 +11209,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.forced_row_value_action_type_weights
         )
     )
+    validation_action_catalog = _action_catalog_for_env_config(env_config)
+    _, value_validation_action_types_by_id = _action_catalog_type_projection(
+        validation_action_catalog, {}
+    )
     forced_row_value_action_catalog = (
-        _action_catalog_for_env_config(env_config)
+        validation_action_catalog
         if forced_row_value_action_type_weight_map
         else None
     )
@@ -11456,6 +11472,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         _policy_distillation_scope_report(data, policy_sample_weights)
         if int(ddp["rank"]) == 0
         else None
+    )
+    policy_target_identity_admission = _rank0_authoritative_call(
+        ddp,
+        "policy target identity admission",
+        lambda: _validate_policy_target_identity_scope(
+            data,
+            policy_sample_weights,
+            accepted_identities=tuple(
+                args.accepted_policy_target_identity_sha256
+            ),
+        ),
+    )
+    training_information_surface = {
+        **(training_information_surface or {}),
+        "policy_target_identity_admission": policy_target_identity_admission,
+    }
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "policy_target_identity_admission",
+                **policy_target_identity_admission,
+            },
+            sort_keys=True,
+        ),
+        ddp,
     )
     value_sample_weights = derived["value_sample_weights"]
     value_training_scope_report = (
@@ -13975,6 +14016,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 data_loader_prefetch=int(args.data_loader_prefetch),
                 scalar_value_loss_readout=str(args.scalar_value_loss_readout),
                 scalar_value_loss_scale=float(args.scalar_value_loss_scale),
+                value_validation_action_types_by_id=(
+                    value_validation_action_types_by_id
+                ),
             )
 
         validation_metrics = _evaluate_validation_indices(validation_indices)
@@ -14032,6 +14076,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 data_loader_prefetch=int(args.data_loader_prefetch),
                 scalar_value_loss_readout=str(args.scalar_value_loss_readout),
                 scalar_value_loss_scale=float(args.scalar_value_loss_scale),
+                value_validation_action_types_by_id=(
+                    value_validation_action_types_by_id
+                ),
             )
             base_wrapper = metrics[-1].get("validation_objective_matched")
             base_objective_metrics = (
@@ -14604,6 +14651,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "metrics": metrics,
         "data_quality": data_quality,
         "policy_distillation_scope": policy_distillation_scope_report,
+        "policy_target_identity_admission": policy_target_identity_admission,
         "value_training_scope": value_training_scope_report,
         "aux_subgoal_training_contract": aux_subgoal_training_contract,
         "policy_component_active_dose": policy_component_active_dose,
@@ -17059,6 +17107,175 @@ def _weighted_validation_means(
     return result
 
 
+_VALUE_VALIDATION_WIDTH_BUCKETS = (
+    (1, 1, "1"),
+    (2, 4, "2-4"),
+    (5, 10, "5-10"),
+    (11, 20, "11-20"),
+    (21, None, "21+"),
+)
+
+
+def _value_validation_width_bucket(legal_width: int) -> str:
+    width = int(legal_width)
+    for lower, upper, label in _VALUE_VALIDATION_WIDTH_BUCKETS:
+        if width >= lower and (upper is None or width <= upper):
+            return label
+    return "0"
+
+
+def _value_validation_strata_parts(
+    data: object,
+    batch: np.ndarray,
+    value_error,
+    value_weights,
+    value_active_mask,
+    *,
+    action_types_by_id: tuple[str, ...] | None = None,
+) -> dict[str, dict[str, dict[str, float]]]:
+    """Exact scalar-value MSE sufficient statistics by strategic row class.
+
+    This diagnostic deliberately follows the *same* per-row error, confidence,
+    sample weight, and eligibility mask as the scalar value objective.  It is
+    therefore able to expose a strategically important regression that a
+    corpus-wide mean hides without inventing a second validation measure.
+    """
+
+    errors = np.asarray(value_error.detach().float().cpu(), dtype=np.float64)
+    weights = np.asarray(value_weights.detach().float().cpu(), dtype=np.float64)
+    active = np.asarray(
+        value_active_mask.detach().bool().cpu(), dtype=np.bool_
+    )
+    if (
+        errors.shape != (len(batch),)
+        or weights.shape != errors.shape
+        or active.shape != errors.shape
+    ):
+        raise ValueError("value validation stratum input shape drift")
+    effective = np.where(active, weights, 0.0)
+    legal = np.asarray(data["legal_action_ids"][batch])
+    if legal.ndim != 2 or legal.shape[0] != len(batch):
+        raise ValueError("value validation requires rectangular legal actions")
+    legal_widths = np.sum(legal >= 0, axis=1).astype(np.int64, copy=False)
+    actions = np.asarray(data["action_taken"][batch], dtype=np.int64)
+    phases = (
+        np.asarray(data["phase"][batch]).astype(str)
+        if "phase" in data
+        else np.full(len(batch), "unknown")
+    )
+
+    result: dict[str, dict[str, dict[str, float]]] = {}
+
+    def _add(axis: str, label: str, mask: np.ndarray) -> None:
+        selected = np.asarray(mask, dtype=np.bool_) & active
+        row_weights = effective[selected]
+        axis_report = result.setdefault(axis, {})
+        axis_report[str(label)] = {
+            "weighted_sum": float(np.dot(errors[selected], row_weights)),
+            "weight_sum": float(row_weights.sum()),
+            "rows": float(np.count_nonzero(selected)),
+        }
+
+    forced = legal_widths == 1
+    _add("decision_class", "forced", forced)
+    _add("decision_class", "multi_action", legal_widths > 1)
+    for _, _, label in _VALUE_VALIDATION_WIDTH_BUCKETS:
+        _add(
+            "legal_width",
+            label,
+            np.fromiter(
+                (
+                    _value_validation_width_bucket(width) == label
+                    for width in legal_widths
+                ),
+                dtype=np.bool_,
+                count=len(legal_widths),
+            ),
+        )
+    for phase in sorted(set(phases.tolist())):
+        _add("phase", phase, phases == phase)
+
+    if action_types_by_id is not None:
+        action_types = tuple(str(value).upper() for value in action_types_by_id)
+        malformed = forced & (
+            (actions < 0) | (actions >= len(action_types))
+        )
+        if bool(np.any(malformed)):
+            raise ValueError(
+                "forced value-validation row has an action outside the "
+                "authoritative action catalog"
+            )
+        forced_labels = np.full(len(batch), "", dtype=object)
+        forced_rows = np.flatnonzero(forced)
+        forced_labels[forced_rows] = [
+            action_types[int(actions[row])] for row in forced_rows
+        ]
+        for label in ("ROLL", "END_TURN"):
+            _add("forced_action_type", label, forced & (forced_labels == label))
+        _add(
+            "forced_action_type",
+            "OTHER",
+            forced
+            & (forced_labels != "ROLL")
+            & (forced_labels != "END_TURN"),
+        )
+    return result
+
+
+def _merge_value_validation_strata(
+    target: dict[str, dict[str, dict[str, float]]],
+    source: dict[str, dict[str, dict[str, float]]],
+) -> None:
+    for axis, strata in source.items():
+        target_axis = target.setdefault(axis, {})
+        for label, parts in strata.items():
+            target_parts = target_axis.setdefault(
+                label, {"weighted_sum": 0.0, "weight_sum": 0.0, "rows": 0.0}
+            )
+            for key in ("weighted_sum", "weight_sum", "rows"):
+                target_parts[key] += float(parts.get(key, 0.0))
+
+
+def _reduce_value_validation_strata(
+    strata: dict[str, dict[str, dict[str, float]]],
+    ddp: dict[str, int | bool],
+) -> dict[str, dict[str, dict[str, float]]]:
+    flattened = {
+        f"{axis}\0{label}\0{key}": float(value)
+        for axis, labels in strata.items()
+        for label, parts in labels.items()
+        for key, value in parts.items()
+    }
+    reduced = _reduce_named_sums(flattened, ddp)
+    result: dict[str, dict[str, dict[str, float]]] = {}
+    for name, value in reduced.items():
+        axis, label, key = name.split("\0", 2)
+        result.setdefault(axis, {}).setdefault(label, {})[key] = float(value)
+    return result
+
+
+def _finalize_value_validation_strata(
+    strata: dict[str, dict[str, dict[str, float]]],
+) -> dict[str, dict[str, dict[str, float | int]]]:
+    return {
+        axis: {
+            label: {
+                "mse": (
+                    float(parts.get("weighted_sum", 0.0))
+                    / float(parts.get("weight_sum", 0.0))
+                    if float(parts.get("weight_sum", 0.0)) > 0.0
+                    else 0.0
+                ),
+                "weighted_sum": float(parts.get("weighted_sum", 0.0)),
+                "weight_sum": float(parts.get("weight_sum", 0.0)),
+                "rows": int(round(float(parts.get("rows", 0.0)))),
+            }
+            for label, parts in labels.items()
+        }
+        for axis, labels in strata.items()
+    }
+
+
 _TRAINING_OBJECTIVE_METRIC_KEYS = (
     "policy_loss",
     "value_loss",
@@ -17089,6 +17306,86 @@ def _objective_measure_validation_aggregate(
     normalized = np.asarray(weights, dtype=np.float64)
     normalized = normalized / float(normalized.sum())
     metrics = _weighted_validation_means(reports, normalized)
+    if all(
+        isinstance(report.get("value_mse_strata_sufficient_statistics"), dict)
+        and int(report.get("samples", 0)) > 0
+        for report in reports
+    ):
+        axes = sorted(
+            set().union(
+                *(
+                    set(report["value_mse_strata_sufficient_statistics"])
+                    for report in reports
+                )
+            )
+        )
+        aggregate_strata: dict[str, dict[str, dict[str, float]]] = {}
+        for axis in axes:
+            labels = sorted(
+                set().union(
+                    *(
+                        set(
+                            report["value_mse_strata_sufficient_statistics"].get(
+                                axis, {}
+                            )
+                        )
+                        for report in reports
+                    )
+                )
+            )
+            for label in labels:
+                weighted_sum_density = 0.0
+                weight_sum_density = 0.0
+                rows_density = 0.0
+                for probability, report in zip(normalized, reports, strict=True):
+                    samples = float(report["samples"])
+                    parts = (
+                        report["value_mse_strata_sufficient_statistics"]
+                        .get(axis, {})
+                        .get(label, {})
+                    )
+                    weighted_sum_density += (
+                        float(probability)
+                        * float(parts.get("weighted_sum", 0.0))
+                        / samples
+                    )
+                    weight_sum_density += (
+                        float(probability)
+                        * float(parts.get("weight_sum", 0.0))
+                        / samples
+                    )
+                    rows_density += (
+                        float(probability)
+                        * float(parts.get("rows", 0.0))
+                        / samples
+                    )
+                aggregate_strata.setdefault(axis, {})[label] = {
+                    "weighted_sum": weighted_sum_density,
+                    "weight_sum": weight_sum_density,
+                    "rows": rows_density,
+                }
+        metrics["value_mse_strata"] = {
+            axis: {
+                label: {
+                    "mse": (
+                        float(parts["weighted_sum"])
+                        / float(parts["weight_sum"])
+                        if float(parts["weight_sum"]) > 0.0
+                        else 0.0
+                    ),
+                    "weighted_numerator_per_sample": float(
+                        parts["weighted_sum"]
+                    ),
+                    "weight_per_sample": float(parts["weight_sum"]),
+                    "row_probability": float(parts["rows"]),
+                }
+                for label, parts in labels.items()
+            }
+            for axis, labels in aggregate_strata.items()
+        }
+        metrics["value_mse_strata_measure"] = (
+            "objective_measure_weighted_density"
+        )
     coefficient_rows = [report.get("objective_coefficients") for report in reports]
     has_objective_coefficients = bool(coefficient_rows) and all(
         isinstance(row, dict) and row == coefficient_rows[0]
@@ -17498,6 +17795,7 @@ def evaluate_bc_batches(
     data_loader_prefetch: int = 2,
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
+    value_validation_action_types_by_id: tuple[str, ...] | None = None,
 ) -> dict:
     if len(indices) == 0:
         return {}
@@ -17570,6 +17868,9 @@ def evaluate_bc_batches(
         phase_stats = _empty_phase_stats()
         phase_stats_unforced = _empty_phase_stats()
         teacher_stats = _empty_phase_stats()
+        value_mse_strata_sufficient_statistics: dict[
+            str, dict[str, dict[str, float]]
+        ] = {}
         eval_fn = _eval_xdim_batch if hasattr(policy, "forward_legal_np") else _eval_candidate_batch
         eval_fn_extra_kwargs: dict[str, object] = {}
         if eval_fn is _eval_xdim_batch:
@@ -17588,6 +17889,9 @@ def evaluate_bc_batches(
                 "value_root_blend_phases": tuple(value_root_blend_phases),
                 "value_root_blend_global_compat": bool(
                     value_root_blend_global_compat
+                ),
+                "value_validation_action_types_by_id": (
+                    value_validation_action_types_by_id
                 ),
             }
         # Validation used to bypass the streaming loader and synchronously
@@ -17722,6 +18026,12 @@ def evaluate_bc_batches(
                 batch_metrics.get("phase_stats_unforced", {}),
             )
             _merge_phase_stats(teacher_stats, batch_metrics["teacher_stats"])
+            _merge_value_validation_strata(
+                value_mse_strata_sufficient_statistics,
+                batch_metrics.get(
+                    "value_mse_strata_sufficient_statistics", {}
+                ),
+            )
         extra_sums = _reduce_named_sums(extra_sums, ddp)
         extra_denominators = _reduce_named_sums(extra_denominators, ddp)
         aux_subgoal_sums = _reduce_named_sums(aux_subgoal_sums, ddp)
@@ -17739,6 +18049,11 @@ def evaluate_bc_batches(
         phase_stats = _reduce_nested_count_stats(phase_stats, ddp)
         phase_stats_unforced = _reduce_nested_count_stats(phase_stats_unforced, ddp)
         teacher_stats = _reduce_nested_count_stats(teacher_stats, ddp)
+        value_mse_strata_sufficient_statistics = (
+            _reduce_value_validation_strata(
+                value_mse_strata_sufficient_statistics, ddp
+            )
+        )
         policy_loss_eval = _metric_from_sum_denominator(
             extra_sums["policy_loss"], extra_denominators["policy_loss"]
         )
@@ -17810,6 +18125,13 @@ def evaluate_bc_batches(
             "policy_loss": policy_loss_eval,
             "value_loss": value_loss_eval,
             "scalar_value_mse_diagnostic": value_loss_eval,
+            "value_mse_strata": _finalize_value_validation_strata(
+                value_mse_strata_sufficient_statistics
+            ),
+            "value_mse_strata_sufficient_statistics": (
+                value_mse_strata_sufficient_statistics
+            ),
+            "value_mse_strata_measure": "exact_weighted_rows",
             "final_vp_loss": final_vp_loss_eval,
             "q_loss": q_loss_eval,
             **auxiliary_loss_eval,
@@ -18180,6 +18502,7 @@ def _eval_xdim_batch(
     value_root_blend_global_compat: bool = False,
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
+    value_validation_action_types_by_id: tuple[str, ...] | None = None,
 ) -> dict:
     import torch
     from torch import nn
@@ -18311,6 +18634,7 @@ def _eval_xdim_batch(
             policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
             policy_loss = policy_loss_sum / torch.clamp(policy_loss_denominator, min=1e-6)
             value_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
+            value_mse_strata_sufficient_statistics = {}
             final_vp_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             q_loss = torch.tensor(0.0, dtype=torch.float32, device=policy.device)
             if value_outcome_targets is not None and "value" in outputs:
@@ -18328,6 +18652,17 @@ def _eval_xdim_batch(
                     mask=value_has_outcome,
                 )
                 value_loss = value_loss_sum / torch.clamp(value_loss_denominator, min=1e-6)
+                effective_value_weights = value_weights * outcome_confidence
+                value_mse_strata_sufficient_statistics = (
+                    _value_validation_strata_parts(
+                        data,
+                        batch,
+                        value_error,
+                        effective_value_weights,
+                        value_has_outcome & (effective_value_weights > 0.0),
+                        action_types_by_id=value_validation_action_types_by_id,
+                    )
+                )
             else:
                 value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
             if vp_targets is not None and "final_vp" in outputs:
@@ -18689,6 +19024,9 @@ def _eval_xdim_batch(
                 else "scalar_mse"
             ),
             "scalar_value_mse_diagnostic": float(value_loss.item()),
+            "value_mse_strata_sufficient_statistics": (
+                value_mse_strata_sufficient_statistics
+            ),
             "policy_loss_weighted_sum": float(policy_loss_sum.item()),
             "policy_loss_weight_sum": float(policy_loss_denominator.item()),
             "value_loss_weighted_sum": float(value_loss_sum.item()),
@@ -25143,6 +25481,114 @@ def _policy_distillation_scope_report(data, weights: np.ndarray) -> dict[str, ob
     return {
         "schema_version": "component-policy-distillation-scope-v1",
         "component_ids": [component_ids[index] for index in sorted(eligible)],
+        "components": components,
+    }
+
+
+def _policy_target_identity_from_meta(meta: object) -> str | None:
+    if not isinstance(meta, dict):
+        return None
+    candidates: list[object] = [
+        meta.get("policy_target_identity_sha256"),
+        meta.get("target_policy_target_identity_sha256"),
+    ]
+    overlay = meta.get("stage_c_policy_overlay")
+    if isinstance(overlay, dict):
+        candidates.append(overlay.get("target_policy_target_identity_sha256"))
+    realized = {str(value) for value in candidates if value not in {None, ""}}
+    if len(realized) > 1:
+        raise SystemExit(
+            "corpus metadata binds contradictory policy-target identities: "
+            + ", ".join(sorted(realized))
+        )
+    identity = next(iter(realized), None)
+    if identity is not None and not _is_sha256(identity):
+        raise SystemExit("corpus policy-target identity is not a SHA-256 digest")
+    return identity
+
+
+def _validate_policy_target_identity_scope(
+    data,
+    weights: np.ndarray,
+    *,
+    accepted_identities: Sequence[str],
+) -> dict[str, object]:
+    """Fail closed when policy CE mixes missing or different target operators."""
+
+    accepted = tuple(dict.fromkeys(str(value) for value in accepted_identities))
+    if any(not _is_sha256(value) for value in accepted):
+        raise SystemExit(
+            "--accepted-policy-target-identity-sha256 requires SHA-256 digests"
+        )
+    values = np.asarray(weights, dtype=np.float64)
+    if isinstance(data, ConcatMemmapCorpus):
+        component_ids = tuple(str(value) for value in data.component_ids)
+        corpora = tuple(data.corpora)
+        offsets = np.asarray(data.component_offsets, dtype=np.int64)
+    else:
+        component_ids = ("corpus",)
+        corpora = (data,)
+        offsets = np.asarray([0, len(values)], dtype=np.int64)
+
+    components: dict[str, dict[str, object]] = {}
+    active_identities: set[str] = set()
+    missing_active: list[str] = []
+    rejected: list[str] = []
+    for index, (component_id, corpus) in enumerate(
+        zip(component_ids, corpora, strict=True)
+    ):
+        part = values[offsets[index] : offsets[index + 1]]
+        active_rows = int(np.count_nonzero(part > 0.0))
+        identity = _policy_target_identity_from_meta(getattr(corpus, "meta", None))
+        if active_rows > 0:
+            if identity is None:
+                missing_active.append(component_id)
+            else:
+                active_identities.add(identity)
+                if accepted and identity not in accepted:
+                    rejected.append(component_id)
+        components[component_id] = {
+            "positive_policy_rows": active_rows,
+            "policy_target_identity_sha256": identity,
+            "accepted": bool(
+                active_rows == 0
+                or identity is not None
+                and (not accepted or identity in accepted)
+            ),
+        }
+
+    if accepted and missing_active:
+        raise SystemExit(
+            "policy-active component(s) lack exact target identity: "
+            + ", ".join(missing_active)
+        )
+    if rejected:
+        raise SystemExit(
+            "policy-active component(s) bind an unaccepted target operator: "
+            + ", ".join(rejected)
+        )
+    if active_identities and missing_active:
+        raise SystemExit(
+            "policy CE would mix exact-identity and legacy unbound targets: "
+            + ", ".join(missing_active)
+        )
+    if len(active_identities) > 1 and not accepted:
+        raise SystemExit(
+            "policy CE would mix distinct target operators without an explicit "
+            "accepted identity set"
+        )
+    return {
+        "schema_version": "policy-target-identity-admission-v1",
+        "mode": (
+            "explicit_accepted_identity_set"
+            if accepted
+            else "automatic_uniform_identity"
+            if active_identities
+            else "legacy_unbound_diagnostic"
+        ),
+        "accepted_policy_target_identity_sha256": list(accepted),
+        "realized_active_policy_target_identity_sha256": sorted(active_identities),
+        "legacy_unbound_active_components": missing_active,
         "components": components,
     }
 
