@@ -46,6 +46,75 @@ def test_projected_dual_controller_updates_from_eligible_row_mean() -> None:
     assert state["updates"] == 2
     assert state["eligible_rows"] == 40
     assert state["observed_kl_mean"] == pytest.approx(0.1)
+    assert state["metric_scope"] == (
+        "ddp_global_training_sampler_authenticated_stored_prior_multi_action_rows"
+    )
+    assert state["functional_parent_kl_authority"] == "none_measure_mismatch"
+    assert state["promotion_claim_authority"] is False
+
+
+def test_adaptive_controller_forces_diagnostic_only_promotion_contract() -> None:
+    controller = train_bc.AdaptivePolicyKLController(
+        target_kl=0.03,
+        dual_lr=0.5,
+        max_weight=1.0,
+        coefficient=0.2,
+    )
+    report = {
+        "diagnostic_only": False,
+        "promotion_eligible": True,
+    }
+
+    train_bc._apply_adaptive_policy_kl_promotion_guard(  # noqa: SLF001
+        report, controller
+    )
+
+    assert report["diagnostic_only"] is True
+    assert report["promotion_eligible"] is False
+    authority = report["adaptive_policy_kl_claim_authority"]
+    assert authority["status"] == "diagnostic_only_measure_mismatch"
+    assert authority["controller_metric_scope"] != authority["selection_metric_scope"]
+    assert (
+        authority["controller_target_does_not_certify_functional_parent_kl"] is True
+    )
+    assert authority["promotion_eligible"] is False
+    assert len(authority["required_implementation_before_promotion"]) == 4
+
+
+def test_disabled_controller_does_not_change_promotion_contract() -> None:
+    report = {
+        "diagnostic_only": False,
+        "promotion_eligible": True,
+    }
+
+    train_bc._apply_adaptive_policy_kl_promotion_guard(  # noqa: SLF001
+        report, None
+    )
+
+    assert report == {
+        "diagnostic_only": False,
+        "promotion_eligible": True,
+    }
+
+
+def test_checkpoint_surface_does_not_mislabel_training_sampler_kl_as_parent_kl() -> None:
+    controller = train_bc.AdaptivePolicyKLController(
+        target_kl=0.03,
+        dual_lr=0.5,
+        max_weight=1.0,
+        coefficient=0.2,
+    )
+
+    surface = train_bc._policy_kl_controller_surface(  # noqa: SLF001
+        {"base": "surface"}, controller
+    )
+
+    assert surface is not None
+    assert surface["base"] == "surface"
+    assert "adaptive_parent_policy_kl" not in surface
+    assert surface["adaptive_stored_prior_policy_kl"]["metric_scope"] == (
+        "ddp_global_training_sampler_authenticated_stored_prior_multi_action_rows"
+    )
 
 
 def test_controller_resume_restores_dynamic_coefficient_exactly() -> None:

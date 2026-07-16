@@ -2469,28 +2469,101 @@ def _policy_training_signal_attestation(
         )
         for metric in metrics
     )
+    equivalent_active_rows = sum(
+        float(
+            metric.get(
+                "policy_objective_equivalent_active_rows",
+                metric.get(
+                    "policy_objective_active_rows",
+                    int(metric.get("policy_base_active_rows", 0))
+                    + int(metric.get("policy_aux_active_rows", 0)),
+                ),
+            )
+        )
+        for metric in metrics
+    )
+    equivalent_effective_weight_sum = sum(
+        float(
+            metric["policy_objective_equivalent_effective_weight_sum"]
+            if "policy_objective_equivalent_effective_weight_sum" in metric
+            else (
+                float(metric["policy_objective_effective_weight_sum"])
+                / coefficient
+                if (
+                    coefficient > 0.0
+                    and "policy_objective_effective_weight_sum" in metric
+                )
+                else (metric.get("loss_denominators") or {}).get(
+                    "policy_loss", 0.0
+                )
+            )
+        )
+        for metric in metrics
+    )
+    policy_optimizer_updates = sum(
+        int(metric.get("policy_objective_optimizer_updates", 0))
+        for metric in metrics
+    )
+    equivalent_optimizer_updates = sum(
+        float(
+            metric.get(
+                "policy_objective_equivalent_optimizer_updates",
+                metric.get("policy_objective_optimizer_updates", 0),
+            )
+        )
+        for metric in metrics
+    )
+    # Historical metrics predate objective-specific update accounting. They
+    # used a constant nonzero policy coefficient, so a positive realized
+    # denominator implies every applied update belonged to the policy dose.
+    if (
+        policy_optimizer_updates == 0
+        and not any(
+            "policy_objective_optimizer_updates" in metric for metric in metrics
+        )
+        and effective_weight_sum > 0.0
+    ):
+        policy_optimizer_updates = int(optimizer_steps)
+        equivalent_optimizer_updates = float(optimizer_steps)
     trained = bool(
         policy_enabled
-        and int(optimizer_steps) > 0
+        and policy_optimizer_updates > 0
         and active_rows > 0
+        and math.isfinite(equivalent_active_rows)
+        and equivalent_active_rows > 0.0
         and math.isfinite(effective_weight_sum)
         and effective_weight_sum > 0.0
+        and math.isfinite(equivalent_effective_weight_sum)
+        and equivalent_effective_weight_sum > 0.0
     )
     attestation = {
-        "schema_version": "policy-training-signal-v1",
+        "schema_version": "policy-training-signal-v2",
         "policy_objective_enabled": policy_enabled,
         "policy_loss_weight": coefficient,
         "optimizer_steps": int(optimizer_steps),
+        "policy_optimizer_updates": int(policy_optimizer_updates),
+        "policy_equivalent_optimizer_updates": float(
+            equivalent_optimizer_updates
+        ),
         "base_sampler_draws": int(base_draws),
         "policy_aux_draws": int(aux_active_rows),
         "total_draws": int(total_draws),
         "policy_base_active_rows": int(base_active_rows),
         "policy_aux_active_rows": int(aux_active_rows),
         "policy_active_rows": int(active_rows),
+        "policy_equivalent_active_rows": float(equivalent_active_rows),
         "policy_active_draw_fraction": (
             float(active_rows) / float(total_draws) if total_draws > 0 else None
         ),
+        "policy_equivalent_active_draw_fraction": (
+            float(equivalent_active_rows) / float(total_draws)
+            if total_draws > 0
+            else None
+        ),
         "policy_effective_weight_sum": float(effective_weight_sum),
+        "policy_equivalent_effective_weight_sum": float(
+            equivalent_effective_weight_sum
+        ),
         "trained_policy_objective": trained,
         "status": (
             "disabled_value_only"
@@ -2507,7 +2580,10 @@ def _policy_training_signal_attestation(
             "policy objective was configured but no realized policy training "
             "signal reached an applied optimizer trajectory; refusing to save "
             "a checkpoint whose step count could be mistaken for policy "
-            f"learning (steps={optimizer_steps}, active_rows={active_rows}, "
+            f"learning (steps={optimizer_steps}, "
+            f"policy_updates={policy_optimizer_updates}, "
+            f"active_rows={active_rows}, "
+            f"equivalent_active_rows={equivalent_active_rows}, "
             f"effective_weight_sum={effective_weight_sum})"
         )
     return attestation
@@ -2550,6 +2626,28 @@ def _policy_weight_for_lr_area(
     if learning_rate == 0.0:
         return coefficient
     return min(coefficient, remaining / learning_rate)
+
+
+def _policy_objective_fraction(
+    policy_loss_weight: float, configured_policy_loss_weight: float
+) -> float:
+    """Return the full-dose-equivalent fraction for one learner batch."""
+
+    configured = _validate_policy_loss_weight(configured_policy_loss_weight)
+    realized = _validate_policy_loss_weight(policy_loss_weight)
+    if configured == 0.0:
+        if realized != 0.0:
+            raise ValueError(
+                "realized policy coefficient is nonzero while configured "
+                "policy coefficient is zero"
+            )
+        return 0.0
+    fraction = realized / configured
+    if fraction > 1.0 + 1.0e-12:
+        raise ValueError(
+            "realized policy coefficient exceeds its configured full dose"
+        )
+    return min(1.0, fraction)
 
 
 def _validate_policy_dose_topology(
@@ -12217,6 +12315,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         # excluded. The plain attribute survives wrappers and is absent from
         # state_dict/checkpoint serialization.
         unwrapped_model = getattr(policy.model, "module", policy.model)
+        # FSDP ``use_orig_params=True`` can expose an original parameter through
+        # its one-dimensional local shard outside forward. Preserve the true
+        # pre-wrap rank so AdamW decay classification does not mistake every
+        # sharded matrix for a bias/normalization vector.
+        for parameter in unwrapped_model.parameters():
+            parameter._optimizer_original_ndim = int(parameter.ndim)
         unwrapped_model._forward_inactive_parameter_modules = frozenset(
             forward_inactive_module_names
         )
@@ -13697,7 +13801,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         _rank0_print(
             json.dumps(
                 {
-                    "progress": "adaptive_parent_policy_kl",
+                    "progress": "adaptive_stored_prior_policy_kl",
                     "resumed": resume_progress is not None,
                     **policy_kl_controller.state_dict(),
                 },
@@ -13966,45 +14070,29 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_objective_gradient_observations: list[dict[str, object]] = []
         if bool(getattr(data, "policy_distillation_scope_authenticated", False)):
             component_ids = tuple(data.component_ids)
-            base_rows = train_indices[np.asarray(order, dtype=np.int64)]
-            base_rows = base_rows[
-                np.asarray(training_policy_sample_weights[base_rows], dtype=np.float32)
-                > 0.0
-            ]
-            base_components = data.component_indices_for_rows(base_rows)
-            aux_components = (
-                np.empty(0, dtype=np.int64)
-                if aux_order is None
-                else data.component_indices_for_rows(
-                    train_indices[np.asarray(aux_order, dtype=np.int64)]
-                )
-            )
-            for component, component_id in enumerate(component_ids):
-                epoch_policy_component_dose[f"{component_id}.base"] = float(
-                    np.count_nonzero(base_components == component)
-                )
-                epoch_policy_component_dose[f"{component_id}.aux"] = float(
-                    np.count_nonzero(aux_components == component)
-                )
+            for component_id in component_ids:
+                for suffix in (
+                    "base",
+                    "aux",
+                    "base_equivalent",
+                    "aux_equivalent",
+                ):
+                    epoch_policy_component_dose[
+                        f"{component_id}.{suffix}"
+                    ] = 0.0
             if policy_aux_phase_sampling_weights is not None:
                 phase_names = tuple(policy_aux_phase_sampling_weights)
-                epoch_policy_component_phase_dose.update(
-                    _policy_component_phase_dose(
-                        data, base_rows, phase_names, suffix="base"
-                    )
-                )
-                epoch_policy_component_phase_dose.update(
-                    _policy_component_phase_dose(
-                        data,
-                        (
-                            np.empty(0, dtype=np.int64)
-                            if aux_order is None
-                            else train_indices[np.asarray(aux_order, dtype=np.int64)]
-                        ),
-                        phase_names,
-                        suffix="aux",
-                    )
-                )
+                for component_id in component_ids:
+                    for phase in phase_names:
+                        for suffix in (
+                            "base",
+                            "aux",
+                            "base_equivalent",
+                            "aux_equivalent",
+                        ):
+                            epoch_policy_component_phase_dose[
+                                f"{component_id}\0{phase}\0{suffix}"
+                            ] = 0.0
         if bool(getattr(data, "value_training_scope_authenticated", False)):
             epoch_value_component_dose = {
                 str(component_id): 0.0
@@ -14084,7 +14172,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         epoch_policy_base_effective_weight = 0.0
         epoch_policy_aux_effective_weight = 0.0
         epoch_policy_objective_active_rows = 0.0
+        epoch_policy_objective_equivalent_active_rows = 0.0
         epoch_policy_objective_effective_weight = 0.0
+        epoch_policy_objective_equivalent_effective_weight = 0.0
+        epoch_policy_objective_optimizer_updates = 0
+        epoch_policy_objective_equivalent_optimizer_updates = 0.0
         epoch_value_active_count = 0.0
         epoch_anchor_eligible_count = 0.0
         epoch_policy_kl_weighted_objective_sum = 0.0
@@ -14126,6 +14218,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         # across the epoch boundary.
         micro_in_group = 0
         accumulation_group_size = accum
+        policy_group_objective_fraction = 0.0
         # The policy-KL anchor and value-uncertainty auxiliary loss are entity_graph
         # (_train_xdim_batch) features -- the legacy dense _train_candidate_batch path
         # does not accept them, so only forward them when the xdim trainer is active.
@@ -14252,6 +14345,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             micro_in_group += 1
             accum_do_zero_grad = micro_in_group == 1
             if accum_do_zero_grad:
+                policy_group_objective_fraction = 0.0
                 # The final accumulation group can contain fewer than ``accum``
                 # micro-batches.  Dividing those losses by the configured size
                 # would shrink the final optimizer update by k/accum and break
@@ -14288,6 +14382,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 scheduled_base_lr=scheduled_base_lr,
                 consumed_lr_area=policy_objective_lr_area,
                 target_lr_area=float(args.policy_dose_lr_area),
+            )
+            batch_policy_objective_fraction = _policy_objective_fraction(
+                batch_policy_loss_weight,
+                float(args.policy_loss_weight),
             )
             if train_fn is _train_xdim_batch:
                 train_fn_extra_kwargs["policy_kl_anchor_weight"] = (
@@ -14382,6 +14480,63 @@ def main(argv: Sequence[str] | None = None) -> None:
             source_global_rows = _source_global_rows_for_training_batch(
                 batch_data, batch
             )
+            if (
+                batch_policy_objective_fraction > 0.0
+                and bool(
+                    getattr(
+                        data,
+                        "policy_distillation_scope_authenticated",
+                        False,
+                    )
+                )
+            ):
+                base_policy_rows = source_global_rows[
+                    np.asarray(training_policy_sample_weights)[
+                        source_global_rows
+                    ]
+                    > 0.0
+                ]
+                auxiliary_policy_rows = (
+                    np.empty(0, dtype=np.int64)
+                    if aux_source_rows is None
+                    else np.asarray(aux_source_rows, dtype=np.int64)
+                )
+                if auxiliary_policy_rows.size:
+                    auxiliary_policy_rows = auxiliary_policy_rows[
+                        np.asarray(training_policy_sample_weights)[
+                            auxiliary_policy_rows
+                        ]
+                        > 0.0
+                    ]
+                phase_names = (
+                    ()
+                    if policy_aux_phase_sampling_weights is None
+                    else tuple(policy_aux_phase_sampling_weights)
+                )
+                for rows, suffix in (
+                    (base_policy_rows, "base"),
+                    (auxiliary_policy_rows, "aux"),
+                ):
+                    component_dose, component_phase_dose = (
+                        _policy_component_dose_for_batch(
+                            data,
+                            rows,
+                            suffix=suffix,
+                            phase_names=phase_names,
+                        )
+                    )
+                    for key, count in component_dose.items():
+                        epoch_policy_component_dose[key] += count
+                        epoch_policy_component_dose[
+                            f"{key}_equivalent"
+                        ] += count * batch_policy_objective_fraction
+                    for key, count in component_phase_dose.items():
+                        epoch_policy_component_phase_dose[key] += count
+                        component_id, phase, stream = key.split("\0", 2)
+                        epoch_policy_component_phase_dose[
+                            f"{component_id}\0{phase}\0"
+                            f"{stream}_equivalent"
+                        ] += count * batch_policy_objective_fraction
             batch_value_component_dose = (
                 _value_component_active_dose_for_batch(
                     data, source_global_rows, value_active_row_mask
@@ -14405,6 +14560,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         ],
                         value_active_mask=value_active_row_mask,
                         draw_stream="base",
+                        policy_objective_fraction=(
+                            batch_policy_objective_fraction
+                        ),
                     )
                 )
                 for key, value in realized_strata.items():
@@ -14426,6 +14584,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 len(aux_source_rows), dtype=np.bool_
                             ),
                             draw_stream="policy_aux",
+                            policy_objective_fraction=(
+                                batch_policy_objective_fraction
+                            ),
                         )
                     )
                     for key, value in realized_aux_strata.items():
@@ -14579,16 +14740,37 @@ def main(argv: Sequence[str] | None = None) -> None:
             epoch_policy_aux_effective_weight += float(
                 batch_metrics.get("policy_aux_loss_weight_sum", 0.0)
             )
-            if float(batch_policy_loss_weight) > 0.0:
-                epoch_policy_objective_active_rows += (
-                    active_count
-                    + float(batch_metrics.get("policy_aux_active_count", 0))
+            batch_policy_active_rows = active_count + float(
+                batch_metrics.get("policy_aux_active_count", 0)
+            )
+            batch_policy_effective_weight = float(
+                batch_metrics.get("policy_base_loss_weight_sum", 0.0)
+            ) + float(
+                batch_metrics.get("policy_aux_loss_weight_sum", 0.0)
+            )
+            if batch_policy_objective_fraction > 0.0:
+                epoch_policy_objective_active_rows += batch_policy_active_rows
+                epoch_policy_objective_equivalent_active_rows += (
+                    batch_policy_active_rows * batch_policy_objective_fraction
                 )
                 epoch_policy_objective_effective_weight += float(
                     batch_policy_loss_weight
-                ) * (
-                    float(batch_metrics.get("policy_base_loss_weight_sum", 0.0))
-                    + float(batch_metrics.get("policy_aux_loss_weight_sum", 0.0))
+                ) * batch_policy_effective_weight
+                epoch_policy_objective_equivalent_effective_weight += (
+                    batch_policy_effective_weight
+                    * batch_policy_objective_fraction
+                )
+            policy_group_objective_fraction = max(
+                policy_group_objective_fraction,
+                batch_policy_objective_fraction,
+            )
+            if (
+                optimizer_step_applied
+                and policy_group_objective_fraction > 0.0
+            ):
+                epoch_policy_objective_optimizer_updates += 1
+                epoch_policy_objective_equivalent_optimizer_updates += (
+                    policy_group_objective_fraction
                 )
             epoch_value_active_count += float(
                 batch_metrics.get("value_active_count", 0)
@@ -14632,7 +14814,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         _rank0_print(
                             json.dumps(
                                 {
-                                    "progress": "adaptive_parent_policy_kl_step",
+                                    "progress": "adaptive_stored_prior_policy_kl_step",
                                     "epoch": epoch + 1,
                                     "batch": batch_number,
                                     "optimizer_step": global_step + int(
@@ -14768,6 +14950,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "policy_aux_effective_weight_sum": float(
                             epoch_policy_aux_effective_weight
                         ),
+                        "policy_objective_active_rows": float(
+                            epoch_policy_objective_active_rows
+                        ),
+                        "policy_objective_equivalent_active_rows": float(
+                            epoch_policy_objective_equivalent_active_rows
+                        ),
+                        "policy_objective_effective_weight_sum": float(
+                            epoch_policy_objective_effective_weight
+                        ),
+                        "policy_objective_equivalent_effective_weight_sum": float(
+                            epoch_policy_objective_equivalent_effective_weight
+                        ),
                         "value_active_rows": float(epoch_value_active_count),
                         "policy_kl_anchor_eligible_rows": float(
                             epoch_anchor_eligible_count
@@ -14831,6 +15025,28 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "policy_aux_effective_weight_sum": checkpoint_counts[
                         "policy_aux_effective_weight_sum"
                     ],
+                    "policy_objective_active_rows": int(
+                        round(checkpoint_counts["policy_objective_active_rows"])
+                    ),
+                    "policy_objective_equivalent_active_rows": float(
+                        checkpoint_counts[
+                            "policy_objective_equivalent_active_rows"
+                        ]
+                    ),
+                    "policy_objective_effective_weight_sum": checkpoint_counts[
+                        "policy_objective_effective_weight_sum"
+                    ],
+                    "policy_objective_equivalent_effective_weight_sum": (
+                        checkpoint_counts[
+                            "policy_objective_equivalent_effective_weight_sum"
+                        ]
+                    ),
+                    "policy_objective_optimizer_updates": int(
+                        epoch_policy_objective_optimizer_updates
+                    ),
+                    "policy_objective_equivalent_optimizer_updates": float(
+                        epoch_policy_objective_equivalent_optimizer_updates
+                    ),
                     "value_active_rows": int(
                         round(checkpoint_counts["value_active_rows"])
                     ),
@@ -15051,8 +15267,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy_objective_active_rows_total = _reduce_scalar_sum(
             float(epoch_policy_objective_active_rows), ddp
         )
+        policy_objective_equivalent_active_rows_total = _reduce_scalar_sum(
+            float(epoch_policy_objective_equivalent_active_rows), ddp
+        )
         policy_objective_effective_weight_total = _reduce_scalar_sum(
             float(epoch_policy_objective_effective_weight), ddp
+        )
+        policy_objective_equivalent_effective_weight_total = (
+            _reduce_scalar_sum(
+                float(epoch_policy_objective_equivalent_effective_weight),
+                ddp,
+            )
         )
         value_active_count_total = _reduce_scalar_sum(
             float(epoch_value_active_count), ddp
@@ -15103,6 +15328,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                         + epoch_policy_component_dose[f"{component_id}.aux"]
                     )
                 ),
+                "base_equivalent_active_rows": float(
+                    epoch_policy_component_dose[
+                        f"{component_id}.base_equivalent"
+                    ]
+                ),
+                "aux_equivalent_active_rows": float(
+                    epoch_policy_component_dose[
+                        f"{component_id}.aux_equivalent"
+                    ]
+                ),
+                "total_equivalent_active_rows": float(
+                    epoch_policy_component_dose[
+                        f"{component_id}.base_equivalent"
+                    ]
+                    + epoch_policy_component_dose[
+                        f"{component_id}.aux_equivalent"
+                    ]
+                ),
             }
             for component_id in getattr(data, "component_ids", tuple())
         }
@@ -15125,6 +15368,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 ]
                             )
                         ),
+                        "base_equivalent_active_rows": float(
+                            epoch_policy_component_phase_dose[
+                                f"{component_id}\0{phase}\0"
+                                "base_equivalent"
+                            ]
+                        ),
+                        "aux_equivalent_active_rows": float(
+                            epoch_policy_component_phase_dose[
+                                f"{component_id}\0{phase}\0"
+                                "aux_equivalent"
+                            ]
+                        ),
                     }
                     for phase in policy_aux_phase_sampling_weights
                 }
@@ -15135,6 +15390,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                     phase_dose["total_active_rows"] = (
                         phase_dose["base_active_rows"]
                         + phase_dose["aux_active_rows"]
+                    )
+                    phase_dose["total_equivalent_active_rows"] = (
+                        phase_dose["base_equivalent_active_rows"]
+                        + phase_dose["aux_equivalent_active_rows"]
                     )
         value_component_active_dose = None
         if bool(getattr(data, "value_training_scope_authenticated", False)):
@@ -15435,8 +15694,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "policy_objective_active_rows": int(
                     policy_objective_active_rows_total
                 ),
+                "policy_objective_equivalent_active_rows": float(
+                    policy_objective_equivalent_active_rows_total
+                ),
                 "policy_objective_effective_weight_sum": (
                     policy_objective_effective_weight_total
+                ),
+                "policy_objective_equivalent_effective_weight_sum": float(
+                    policy_objective_equivalent_effective_weight_total
+                ),
+                "policy_objective_optimizer_updates": int(
+                    epoch_policy_objective_optimizer_updates
+                ),
+                "policy_objective_equivalent_optimizer_updates": float(
+                    epoch_policy_objective_equivalent_optimizer_updates
                 ),
                 "value_active_rows": int(value_active_count_total),
                 "policy_kl_anchor_eligible_rows": int(
@@ -16207,17 +16478,37 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     policy_component_active_dose = {
         component_id: {
-            key: int(
-                sum(
-                    int(
-                        metric.get("policy_component_active_dose", {})
-                        .get(component_id, {})
-                        .get(key, 0)
+            key: (
+                float(
+                    sum(
+                        float(
+                            metric.get("policy_component_active_dose", {})
+                            .get(component_id, {})
+                            .get(key, 0.0)
+                        )
+                        for metric in metrics
                     )
-                    for metric in metrics
+                )
+                if "equivalent" in key
+                else int(
+                    sum(
+                        int(
+                            metric.get("policy_component_active_dose", {})
+                            .get(component_id, {})
+                            .get(key, 0)
+                        )
+                        for metric in metrics
+                    )
                 )
             )
-            for key in ("base_active_rows", "aux_active_rows", "total_active_rows")
+            for key in (
+                "base_active_rows",
+                "aux_active_rows",
+                "total_active_rows",
+                "base_equivalent_active_rows",
+                "aux_equivalent_active_rows",
+                "total_equivalent_active_rows",
+            )
         }
         for component_id in getattr(data, "component_ids", tuple())
     }
@@ -16291,23 +16582,44 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy_component_phase_active_dose = {
             component_id: {
                 phase: {
-                    key: int(
-                        sum(
-                            int(
-                                metric.get(
-                                    "policy_component_phase_active_dose", {}
+                    key: (
+                        float(
+                            sum(
+                                float(
+                                    metric.get(
+                                        "policy_component_phase_active_dose",
+                                        {},
+                                    )
+                                    .get(component_id, {})
+                                    .get(phase, {})
+                                    .get(key, 0.0)
                                 )
-                                .get(component_id, {})
-                                .get(phase, {})
-                                .get(key, 0)
+                                for metric in metrics
                             )
-                            for metric in metrics
+                        )
+                        if "equivalent" in key
+                        else int(
+                            sum(
+                                int(
+                                    metric.get(
+                                        "policy_component_phase_active_dose",
+                                        {},
+                                    )
+                                    .get(component_id, {})
+                                    .get(phase, {})
+                                    .get(key, 0)
+                                )
+                                for metric in metrics
+                            )
                         )
                     )
                     for key in (
                         "base_active_rows",
                         "aux_active_rows",
                         "total_active_rows",
+                        "base_equivalent_active_rows",
+                        "aux_equivalent_active_rows",
+                        "total_equivalent_active_rows",
                     )
                 }
                 for phase in policy_aux_phase_sampling_weights
@@ -16721,6 +17033,62 @@ def main(argv: Sequence[str] | None = None) -> None:
                 for metric in metrics
             )
         ),
+        "policy_objective_active_rows": int(
+            sum(
+                int(metric.get("policy_objective_active_rows", 0))
+                for metric in metrics
+            )
+        ),
+        "policy_objective_equivalent_active_rows": float(
+            sum(
+                float(
+                    metric.get(
+                        "policy_objective_equivalent_active_rows",
+                        0.0,
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "policy_objective_effective_weight_sum": float(
+            sum(
+                float(
+                    metric.get(
+                        "policy_objective_effective_weight_sum",
+                        0.0,
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "policy_objective_equivalent_effective_weight_sum": float(
+            sum(
+                float(
+                    metric.get(
+                        "policy_objective_equivalent_effective_weight_sum",
+                        0.0,
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "policy_objective_optimizer_updates": int(
+            sum(
+                int(metric.get("policy_objective_optimizer_updates", 0))
+                for metric in metrics
+            )
+        ),
+        "policy_objective_equivalent_optimizer_updates": float(
+            sum(
+                float(
+                    metric.get(
+                        "policy_objective_equivalent_optimizer_updates",
+                        0.0,
+                    )
+                )
+                for metric in metrics
+            )
+        ),
         "value_active_rows": int(
             sum(int(metric.get("value_active_rows", 0)) for metric in metrics)
         ),
@@ -16974,6 +17342,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         report["diagnostic_only"] = diagnostic_only
         report["promotion_eligible"] = promotion_eligible
+    _apply_adaptive_policy_kl_promotion_guard(report, policy_kl_controller)
     if ddp["rank"] == 0:
         write_json(args.report, report)
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -29593,6 +29962,7 @@ def _training_strata_dose_for_batch(
     value_weights: np.ndarray,
     value_active_mask: np.ndarray,
     draw_stream: str = "base",
+    policy_objective_fraction: float = 1.0,
 ) -> dict[str, dict[str, dict[str, float]]]:
     """Attribute one realized training draw to science-relevant strata.
 
@@ -29607,6 +29977,7 @@ def _training_strata_dose_for_batch(
     policy = np.asarray(policy_weights, dtype=np.float64)
     value = np.asarray(value_weights, dtype=np.float64)
     value_active = np.asarray(value_active_mask, dtype=np.bool_)
+    objective_fraction = float(policy_objective_fraction)
     expected = (len(rows),)
     if (
         rows.ndim != 1
@@ -29616,6 +29987,9 @@ def _training_strata_dose_for_batch(
         or np.any(rows < 0)
         or not np.isfinite(policy).all()
         or not np.isfinite(value).all()
+        or not math.isfinite(objective_fraction)
+        or objective_fraction < 0.0
+        or objective_fraction > 1.0
     ):
         raise RuntimeError("training stratum dose inputs are misaligned")
 
@@ -29675,6 +30049,18 @@ def _training_strata_dose_for_batch(
                 "sampled_rows": float(np.count_nonzero(mask)),
                 "policy_active_rows": float(np.count_nonzero(mask & policy_active)),
                 "policy_weight_sum": float(policy[mask].sum()),
+                "policy_objective_active_rows": (
+                    float(np.count_nonzero(mask & policy_active))
+                    if objective_fraction > 0.0
+                    else 0.0
+                ),
+                "policy_objective_equivalent_rows": (
+                    float(np.count_nonzero(mask & policy_active))
+                    * objective_fraction
+                ),
+                "policy_objective_equivalent_weight_sum": (
+                    float(policy[mask].sum()) * objective_fraction
+                ),
                 "value_active_rows": float(np.count_nonzero(active_value)),
                 "value_weight_sum": float(value[active_value].sum()),
             }
@@ -29698,13 +30084,23 @@ def _nest_training_strata_dose(values: dict[str, float]) -> dict[str, object]:
     for key, value in sorted(values.items()):
         dimension, label, metric = key.split("\0", 2)
         converted: float | int = (
-            int(round(value)) if metric.endswith("_rows") else float(value)
+            int(round(value))
+            if metric.endswith("_rows") and "equivalent" not in metric
+            else float(value)
         )
         dimensions.setdefault(dimension, {}).setdefault(label, {})[metric] = converted
     headline = dimensions.get("fresh_vs_replay", {})
     total_rows = sum(int(row.get("sampled_rows", 0)) for row in headline.values())
     policy_rows = sum(
         int(row.get("policy_active_rows", 0)) for row in headline.values()
+    )
+    policy_objective_rows = sum(
+        int(row.get("policy_objective_active_rows", 0))
+        for row in headline.values()
+    )
+    policy_objective_equivalent_rows = sum(
+        float(row.get("policy_objective_equivalent_rows", 0.0))
+        for row in headline.values()
     )
     value_rows = sum(
         int(row.get("value_active_rows", 0)) for row in headline.values()
@@ -29719,6 +30115,13 @@ def _nest_training_strata_dose(values: dict[str, float]) -> dict[str, object]:
         "policy_aux_row_draws": auxiliary_rows,
         "policy_active_row_draws": policy_rows,
         "policy_active_fraction": policy_rows / max(total_rows, 1),
+        "policy_objective_active_row_draws": policy_objective_rows,
+        "policy_objective_equivalent_row_draws": (
+            policy_objective_equivalent_rows
+        ),
+        "policy_objective_equivalent_fraction": (
+            policy_objective_equivalent_rows / max(total_rows, 1)
+        ),
         "value_active_row_draws": value_rows,
         "value_active_fraction": value_rows / max(total_rows, 1),
         "dimensions": dimensions,
@@ -32212,6 +32615,83 @@ def _optimizer_param_group_report(params, *, base_lr: float) -> list[dict[str, o
     ]
 
 
+def _split_adamw_weight_decay_groups(
+    param_groups: list[dict[str, object]],
+    *,
+    weight_decay: float,
+) -> list[dict[str, object]]:
+    """Apply AdamW decay only to matrix-or-higher trainable parameters.
+
+    Biases, normalization scales, and scalar gates (including ``logit_scale``)
+    are all tensors with fewer than two dimensions. Decaying those parameters
+    moves calibration and normalization even when their objective is inactive,
+    while adding no useful capacity regularization. Preserve every source
+    group's LR metadata and split only its decay topology.
+    """
+    result: list[dict[str, object]] = []
+    assigned: list[int] = []
+    expected: list[int] = []
+    for group in param_groups:
+        source_params = [
+            parameter
+            for parameter in group["params"]
+            if parameter.requires_grad
+        ]
+        expected.extend(id(parameter) for parameter in source_params)
+        decay_params = [
+            parameter
+            for parameter in source_params
+            if int(
+                getattr(
+                    parameter,
+                    "_optimizer_original_ndim",
+                    parameter.ndim,
+                )
+            )
+            >= 2
+        ]
+        no_decay_params = [
+            parameter
+            for parameter in source_params
+            if int(
+                getattr(
+                    parameter,
+                    "_optimizer_original_ndim",
+                    parameter.ndim,
+                )
+            )
+            < 2
+        ]
+        metadata = {
+            key: value
+            for key, value in group.items()
+            if key not in {"params", "weight_decay"}
+        }
+        if decay_params:
+            result.append(
+                {
+                    **metadata,
+                    "params": decay_params,
+                    "weight_decay": float(weight_decay),
+                }
+            )
+            assigned.extend(id(parameter) for parameter in decay_params)
+        if no_decay_params:
+            result.append(
+                {
+                    **metadata,
+                    "params": no_decay_params,
+                    "weight_decay": 0.0,
+                }
+            )
+            assigned.extend(id(parameter) for parameter in no_decay_params)
+    if len(assigned) != len(set(assigned)) or set(assigned) != set(expected):
+        raise RuntimeError(
+            "AdamW decay grouping did not assign every trainable parameter exactly once"
+        )
+    return result
+
+
 def _build_optimizer_param_groups(
     model,
     *,
@@ -32419,7 +32899,8 @@ def _make_optimizer(params, args, device):
     import torch
 
     param_groups = list(params)
-    if param_groups and isinstance(param_groups[0], dict):
+    grouped_input = bool(param_groups and isinstance(param_groups[0], dict))
+    if grouped_input:
         # --value-lr-mult path: `params` is already a list of param-group dicts (see
         # `_build_optimizer_param_groups`), each carrying its own "lr". Drop any
         # non-trainable stragglers per group (mirrors the flat-list branch below).
@@ -32457,6 +32938,16 @@ def _make_optimizer(params, args, device):
     kwargs = {"lr": float(args.lr)}
     if optimizer_name == "adamw":
         kwargs["weight_decay"] = weight_decay
+        if weight_decay != 0.0:
+            normalized_groups = (
+                trainable_params
+                if grouped_input
+                else [{"params": trainable_params}]
+            )
+            trainable_params = _split_adamw_weight_decay_groups(
+                normalized_groups,
+                weight_decay=weight_decay,
+            )
     if bool(args.fused_optimizer) and str(device).startswith("cuda"):
         kwargs["fused"] = True
     try:
@@ -33620,6 +34111,43 @@ def _policy_component_phase_dose(
     return result
 
 
+def _policy_component_dose_for_batch(
+    data,
+    rows: np.ndarray,
+    *,
+    suffix: str,
+    phase_names: tuple[str, ...] = (),
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Attribute realized policy-objective rows to component and phase."""
+
+    indices = np.asarray(rows, dtype=np.int64)
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    component_dose = {
+        f"{component_id}.{suffix}": 0.0 for component_id in component_ids
+    }
+    phase_dose = {
+        f"{component_id}\0{phase}\0{suffix}": 0.0
+        for component_id in component_ids
+        for phase in phase_names
+    }
+    if indices.size == 0:
+        return component_dose, phase_dose
+    components = np.asarray(
+        data.component_indices_for_rows(indices), dtype=np.int64
+    )
+    if components.shape != indices.shape:
+        raise RuntimeError("policy component mapping shape drift")
+    for component, component_id in enumerate(component_ids):
+        component_dose[f"{component_id}.{suffix}"] = float(
+            np.count_nonzero(components == component)
+        )
+    if phase_names:
+        phase_dose = _policy_component_phase_dose(
+            data, indices, phase_names, suffix=suffix
+        )
+    return component_dose, phase_dose
+
+
 def _policy_aux_epoch_order(
     rng: np.random.Generator,
     n: int,
@@ -34602,6 +35130,64 @@ def _checkpoint_dose_telemetry(
 
     observed_steps = int(optimizer_observed_steps)
     draws = _training_draw_accounting(metrics)
+    policy_objective_dose = {
+        "active_rows": int(
+            sum(
+                int(metric.get("policy_objective_active_rows", 0))
+                for metric in metrics
+            )
+        ),
+        "equivalent_active_rows": float(
+            sum(
+                float(
+                    metric.get(
+                        "policy_objective_equivalent_active_rows",
+                        0.0,
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "coefficient_weighted_effective_weight_sum": float(
+            sum(
+                float(
+                    metric.get(
+                        "policy_objective_effective_weight_sum",
+                        0.0,
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "equivalent_effective_weight_sum": float(
+            sum(
+                float(
+                    metric.get(
+                        "policy_objective_equivalent_effective_weight_sum",
+                        0.0,
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+        "optimizer_updates": int(
+            sum(
+                int(metric.get("policy_objective_optimizer_updates", 0))
+                for metric in metrics
+            )
+        ),
+        "equivalent_optimizer_updates": float(
+            sum(
+                float(
+                    metric.get(
+                        "policy_objective_equivalent_optimizer_updates",
+                        0.0,
+                    )
+                )
+                for metric in metrics
+            )
+        ),
+    }
     return {
         "schema_version": CHECKPOINT_DOSE_TELEMETRY_SCHEMA,
         "optimizer_step": int(optimizer_step),
@@ -34616,6 +35202,7 @@ def _checkpoint_dose_telemetry(
             )
         },
         "active_rows": active_rows,
+        "policy_objective_dose": policy_objective_dose,
         "policy_effective_weight_sums": policy_effective,
         "policy_stream_objective": policy_stream_objective,
         "objective_effective_weight_sums": denominators,
@@ -34754,16 +35341,28 @@ def _reduce_scalar_sum(value: float, ddp: dict[str, int | bool]) -> float:
     return float(values[0].item())
 
 
-POLICY_KL_CONTROLLER_SCHEMA = "adaptive-parent-policy-kl-controller-v1"
+POLICY_KL_CONTROLLER_SCHEMA = "adaptive-policy-kl-controller-v2"
+POLICY_KL_CONTROLLER_METRIC_SCOPE = (
+    "ddp_global_training_sampler_authenticated_stored_prior_multi_action_rows"
+)
+FUNCTIONAL_PARENT_KL_SELECTION_SCOPE = (
+    "frozen_validation_policy_active_multi_action_rows"
+)
 
 
 class AdaptivePolicyKLController:
-    """Projected-dual controller for the authenticated parent-policy anchor.
+    """Projected-dual controller for the authenticated stored-prior objective.
 
     The observed constraint is the exact eligible-row mean used by the
     existing forward-KL loss.  Callers reduce numerator and denominator over
     every DDP rank and every microbatch in one optimizer-step group before
     invoking :meth:`update`, so every rank advances an identical coefficient.
+
+    This is deliberately *not* called a functional parent-KL controller.  Its
+    probability measure is the live training sampler, whereas checkpoint
+    selection measures parent→candidate KL on one frozen validation anchor.
+    Even when the stored-prior checkpoint is the exact causal parent, the two
+    means are not interchangeable.
     """
 
     def __init__(
@@ -34853,7 +35452,9 @@ class AdaptivePolicyKLController:
                 "clip(lambda+dual_lr*(global_eligible_mean_kl-target_kl),"
                 "0,max_weight)"
             ),
-            "metric_scope": "ddp_global_authenticated_multi_action_prior_rows",
+            "metric_scope": POLICY_KL_CONTROLLER_METRIC_SCOPE,
+            "functional_parent_kl_authority": "none_measure_mismatch",
+            "promotion_claim_authority": False,
             "target_kl": float(self.target_kl),
             "dual_lr": float(self.dual_lr),
             "max_weight": float(self.max_weight),
@@ -34884,7 +35485,7 @@ class AdaptivePolicyKLController:
                 "clip(lambda+dual_lr*(global_eligible_mean_kl-target_kl),"
                 "0,max_weight)"
             ),
-            "metric_scope": "ddp_global_authenticated_multi_action_prior_rows",
+            "metric_scope": POLICY_KL_CONTROLLER_METRIC_SCOPE,
             "target_kl": float(self.target_kl),
             "dual_lr": float(self.dual_lr),
             "max_weight": float(self.max_weight),
@@ -35024,7 +35625,46 @@ def _policy_kl_controller_surface(
         return surface
     return {
         **(surface or {}),
-        "adaptive_parent_policy_kl": controller.state_dict(),
+        "adaptive_stored_prior_policy_kl": controller.state_dict(),
+    }
+
+
+def _apply_adaptive_policy_kl_promotion_guard(
+    report: dict[str, object],
+    controller: AdaptivePolicyKLController | None,
+) -> None:
+    """Prevent a training-sampler KL controller from certifying promotion.
+
+    The functional dose selector evaluates the exact parent and candidate on a
+    frozen validation anchor.  The online controller instead observes
+    authenticated stored-prior probabilities under the live training sampler.
+    Those distributions can differ sharply under active/surprise sampling, so
+    a numerically satisfied controller target is not evidence that the frozen
+    functional parent-KL cap was satisfied.
+
+    Until the online controller is driven by the exact same immutable anchor
+    identity and weighting measure as selection, any run that enables it is an
+    ablation: useful for learning whether adaptive regularization helps, but
+    never directly promotion eligible.
+    """
+
+    if controller is None:
+        return
+    report["diagnostic_only"] = True
+    report["promotion_eligible"] = False
+    report["adaptive_policy_kl_claim_authority"] = {
+        "schema_version": "adaptive-policy-kl-claim-authority-v1",
+        "status": "diagnostic_only_measure_mismatch",
+        "controller_metric_scope": POLICY_KL_CONTROLLER_METRIC_SCOPE,
+        "selection_metric_scope": FUNCTIONAL_PARENT_KL_SELECTION_SCOPE,
+        "controller_target_does_not_certify_functional_parent_kl": True,
+        "promotion_eligible": False,
+        "required_implementation_before_promotion": [
+            "bind_one_immutable_balanced_anchor_identity_into_the_training_contract",
+            "evaluate_exact_parent_and_live_candidate_logits_on_that_anchor",
+            "update_the_dual_controller_from_anchor_parent_to_candidate_forward_kl",
+            "bind_checkpoint_selection_to_the_same_anchor_identity_and_weights",
+        ],
     }
 
 
