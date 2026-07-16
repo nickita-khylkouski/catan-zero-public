@@ -233,6 +233,7 @@ def load_campaign(path: str | Path) -> dict[str, Any]:
         "n_full": 128,
         "n_fast": 16,
         "coherent_public_belief_search": True,
+        "boundary_value_particles": 1,
         "information_set_search": False,
         "belief_chance_spectra": False,
         "determinization_particles": 1,
@@ -548,6 +549,7 @@ def _validate_h2h(
         "symmetry_averaged_eval": True,
         "symmetry_averaged_eval_threshold": 20,
         "forced_root_target_mode": "trajectory_only",
+        "boundary_value_particles": 1,
         "native_mcts_hot_loop": True,
         "determinization_particles": 1,
         "determinization_min_simulations": 32,
@@ -557,10 +559,22 @@ def _validate_h2h(
         "games_truncated": 0,
         "complete_pairs": pairs,
     }
+    # The already-issued teacher campaign predates the append-only provenance
+    # field. Its runtime operator used the dataclass default K=1, so preserve
+    # those immutable reports while requiring all newly emitted H2H reports to
+    # carry the explicit field.
+    actual = {
+        key: (
+            report.get(key, 1)
+            if key == "boundary_value_particles"
+            else report.get(key)
+        )
+        for key in exact
+    }
     drift = {
-        key: {"expected": expected, "actual": report.get(key)}
+        key: {"expected": expected, "actual": actual[key]}
         for key, expected in exact.items()
-        if report.get(key) != expected
+        if actual[key] != expected
     }
     if drift:
         raise CampaignError(f"paired-game report drift: {drift}")

@@ -22,6 +22,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     model = current_science.learner_model_construction()
     assert model["graph_tokens"] is None
     assert model["hidden_size"] == 640
+    assert model["min_parameter_count"] == 41_700_000
     assert model["max_parameter_count"] == 42_000_000
     assert model["public_card_count_residual_bias"] is False
     assert model["public_rule_state_features"] is True
@@ -145,6 +146,13 @@ def test_current_contract_rejects_scratch_construction_or_topology_drift(
 def test_current_target_quality_generation_is_bound_to_config_and_guard() -> None:
     generation = current_science.generation()
     learner = current_science.learner()
+    assert current_science.search()["boundary_value_particles"] == 1
+    assert (
+        current_science.fleet_evaluation_science_config()[
+            "boundary_value_particles"
+        ]
+        == 1
+    )
     assert generation["teacher_entity_feature_adapter_version"] == (
         current_science.CURRENT_TEACHER_ENTITY_ADAPTER
     )
@@ -166,6 +174,7 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     generator = json.loads(
         current_science.GENERATOR_CONFIG_PATH.read_text(encoding="utf-8")
     )["fields"]
+    assert generator["boundary_value_particles"] == 1
     assert generator["exact_budget_sh"] is False
     assert generator["exact_budget_sh_min_n"] == 0
     for (
@@ -182,9 +191,27 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     assert lint["expected_values"]["--exact-budget-sh-min-n"] == 0
     assert lint["expected_values"]["--target-reliability-audit-fraction"] == 0.05
     assert lint["expected_values"]["--target-reliability-audit-seed"] == 20260716
+    assert lint["expected_values"]["--boundary-value-particles"] == 1
     assert lint["expected_values"][
         "--learner-entity-feature-adapter-version"
     ] == current_science.CURRENT_LEARNER_ENTITY_ADAPTER
+
+
+@pytest.mark.parametrize("bad_value", (None, 0, 2))
+def test_current_contract_rejects_uncommissioned_boundary_particles(
+    tmp_path, monkeypatch, bad_value
+) -> None:
+    contract = copy.deepcopy(current_science.load())
+    contract["operator"]["search"]["boundary_value_particles"] = bad_value
+    path = tmp_path / "science.contract.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
+
+    with pytest.raises(
+        current_science.ScienceContractError,
+        match="boundary_value_particles=1",
+    ):
+        current_science.load()
 
 
 @pytest.mark.parametrize(

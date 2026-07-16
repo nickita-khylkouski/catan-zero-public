@@ -41,10 +41,10 @@
 - **How it's used here:** Self-play decisions are emitted as NPZ shards and converted to streaming memmap corpora for large training runs.
 - **What you need to follow:** Preserve schema/provenance fields, group validation by whole game seed, and use fresh output directories.
 
-### `multiprocessing` + EvalServer
+### `multiprocessing` + native/MPS inference
 - **Category:** Parallel inference
-- **How it's used here:** Independent game workers retain CPU parallelism while a per-GPU server batches neural forwards across processes.
-- **What you need to follow:** One generator/eval-server belongs to one physical GPU. Threads are not a substitute because Python search/feature work remains GIL-bound.
+- **How it's used here:** Independent game workers retain CPU parallelism. The current generator supports direct per-process CUDA/MPS operation and retains EvalServer as an experimental batching path.
+- **What you need to follow:** One generator belongs to one physical GPU. Do not assume the legacy EvalServer path is the commissioned production operator without checking the current science contract.
 
 ### pytest + canonical shell gate
 - **Category:** Verification
@@ -65,7 +65,7 @@ The repository also contains a richer 2–4 player Python environment with struc
 
 ```text
 Fleet launcher
-  → one generator + EvalServer per physical GPU
+  → one generator per physical GPU
   → multiprocessing game workers
   → catanatron_rs.Game
   → Python GumbelChanceMCTS
@@ -73,7 +73,7 @@ Fleet launcher
   → batched EntityGraphPolicy forward
   → NPZ decision shards
   → curated memmap corpus
-  → train_bc.py via DDP/FSDP
+  → train_bc.py via 8-rank B200 DDP
   → paired H2H + SPRT/promotion gate
   → generator/public champion registries
 ```
@@ -135,6 +135,9 @@ Fleet launcher
 - **Key files:**
   - `generate_gumbel_selfplay_data.py` — production generation CLI.
   - `train_bc.py` — behavior-cloning/DDP/FSDP trainer.
+  - `a1_scratch_train.py` — current native-v5 scratch-plan executor.
+  - `a1_current_science_contract.py` — current search/learner authority.
+  - `a1_iteration_orchestrator.py` — durable turn state machine; currently not connected to the from-scratch executor.
   - `perf_snapshot.py` and `bench_eval_server.py` — standing performance probes.
 - **Connects to:** Every package module and filesystem artifact contract.
 - **Contribute here if:** Work changes an end-to-end experiment or deployment workflow.
@@ -179,11 +182,10 @@ Fleet launcher
 - **If wrong →** Audit the checkpoint loader and current training save metadata.
 - **Verify:** `src/catan_zero/search/neural_rust_mcts.py` and `src/catan_zero/rl/entity_token_policy.py`
 
-### [HIGH CONFIDENCE] Cross-process evaluation is the supported GPU batching path
-- **Evidence:** The generator explicitly rejects the repeatedly slower threaded path and wires EvalServer clients to process workers.
-- **If correct →** Scale worker processes and one server per GPU.
-- **If wrong →** Re-profile only after Python search/feature work releases the GIL.
-- **Verify:** `tools/generate_gumbel_selfplay_data.py` and `src/catan_zero/search/eval_server.py`
+### [HIGH CONFIDENCE] EvalServer is not the current sealed default
+- **Status:** Retired assumption.
+- **Current evidence:** Production generation has used direct per-GPU MPS workers; EvalServer remains available but is not the current sealed default.
+- **Action:** Read the current operation contract before changing inference topology.
 
 ### [MEDIUM CONFIDENCE] Eval cache should be disabled for volume self-play
 - **Evidence:** Code comments and prior profiles report negligible transpositions but nonzero snapshot hashing/key cost.
@@ -191,17 +193,15 @@ Fleet launcher
 - **If wrong →** A future subtree-reuse/transposition design may create enough hits to justify a bounded cache.
 - **Verify:** Add hit/miss telemetry to a representative long run.
 
-### [MEDIUM CONFIDENCE] Independent outcomes currently buy more strength than higher simulation budgets
-- **Evidence:** The v9 analysis attributes value overfit to game-label scarcity; rollout-doubling is not yet powered on H100.
-- **If correct →** Favor fresh n64 games and targeted restarts after throughput certification.
-- **If wrong →** A powered n64-vs-n128 paired gate will show material teacher strength per GPU-hour.
-- **Verify:** Run the controlled rollout-doubling experiment in the execution plan.
+### [HIGH CONFIDENCE] The current canonical learner is not commissioned to run
+- **Evidence:** The coherent-public v3 contract sets the optimizer schedule unresolved and `go_authorized=false`; `a1_scratch_train.py --go` refuses it.
+- **If correct →** Do not interpret a plan receipt as a runnable flywheel turn.
+- **Verify:** `configs/operations/a1-next-wave-coherent-public-v3/science.contract.json` and `tools/a1_scratch_train.py`.
 
-### [LOW CONFIDENCE] All 24 H100s share the new 8-GPU node topology
-- **Evidence:** Only one 8×H100 host was freshly inventoried; older documents describe six 4×H100 boxes.
-- **If correct →** Reuse the NUMA/NVSwitch placement plan across three nodes.
-- **If wrong →** Keep host-specific worker and NCCL settings.
-- **Verify:** Inventory every current host before fleet-wide deployment.
+### [HIGH CONFIDENCE] Checked-in fleet manifests are historical, not live authority
+- **Evidence:** The previous H100 fleet has been archived and at least one accepted alias points at a host not owned by this project.
+- **If correct →** Require a fresh private owner-attested inventory before any generation/evaluation fan-out.
+- **Verify:** Compare provider ownership with `tools/fleet/a1_h100_eval_fleet.py` and `configs/gpu_fleet_*.json`.
 
 ---
 
@@ -235,7 +235,7 @@ Fleet launcher
 **Before touching this feature:**
 - Preserve seed determinism, hidden-information boundaries, forced-action weights, chance spectra, and pre-action feature capture.
 - Benchmark complete games/rows/simulations per second, not GPU utilization alone.
-- Treat EvalServer batching as numerically equivalent within tolerance, not necessarily bit-identical.
+- Bind boundary-belief particle count, belief implementation, and target identity explicitly; parser defaults are not a science contract.
 - Use powered paired H2H before promoting D6, subtree reuse, new tree traversal, or changed simulation budgets.
 
 **Likely files you'll modify:**

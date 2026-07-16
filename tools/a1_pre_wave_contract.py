@@ -335,6 +335,11 @@ CURRENT_LEARNER_TRAINING_RECIPE: dict[str, Any] = {
     "forced_row_value_weight": 1.0,
     "per_game_policy_weight": True,
     "per_game_policy_weight_mode": "equal",
+    # Bind the exact historical loss operator explicitly.  The command
+    # renderer now fails closed when this field is absent; leaving it implicit
+    # made the canonical P1 authority impossible to execute after the
+    # fail-closed target-semantics change.
+    "policy_target_blend_semantics": "legacy_interpolate_v1",
     # DDP ranks must share one NumPy epoch order but use independent PyTorch
     # dropout streams after identical model construction/loading.
     "training_rng_rank_offset": True,
@@ -593,6 +598,7 @@ _SEARCH_INPUT_KEYS = {
 _OPTIONAL_SEARCH_INPUT_KEYS = {
     "coherent_public_belief_search",
     "forced_root_target_mode",
+    "boundary_value_particles",
 }
 # Frozen explicit-operator shape in the sole issued markerless v2 lock. Keep
 # this independent of the expanding current dataclass/input schema.
@@ -1830,6 +1836,12 @@ def _validate_search_operator_fields(
                 "science.search.forced_root_target_mode must be 'full' or "
                 "'trajectory_only'"
             )
+    if "boundary_value_particles" in raw:
+        particles = raw["boundary_value_particles"]
+        if type(particles) is not int or particles < 1:
+            raise ContractError(
+                "science.search.boundary_value_particles must be an integer >= 1"
+            )
 
 
 def _target_information_regime_for_search(search: Mapping[str, Any]) -> str:
@@ -1870,6 +1882,9 @@ def _target_information_regime_for_search(search: Mapping[str, Any]) -> str:
             "coherent_public_belief_search uses one tree and requires "
             "determinization_particles=1"
         )
+    boundary_particles = search.get("boundary_value_particles", 1)
+    if type(boundary_particles) is not int or boundary_particles < 1:
+        raise ContractError("boundary_value_particles must be >= 1")
     return TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
 
 
@@ -1883,6 +1898,15 @@ def _effective_search(raw: dict[str, Any]) -> dict[str, Any]:
     # explicitly carries them binds their effective values.
     for key in _OPTIONAL_SEARCH_INPUT_KEYS - set(raw):
         effective.pop(key, None)
+    # ``rng_stream_separation`` was added to the runtime dataclass alongside
+    # the coherent-public teacher work. Issued PIMC locks predate that field
+    # and authenticated an effective config without it. Do not reinterpret
+    # those immutable operator bytes through today's expanded dataclass.
+    if (
+        "rng_stream_separation" not in raw
+        and not bool(raw.get("coherent_public_belief_search", False))
+    ):
+        effective.pop("rng_stream_separation", None)
     return effective
 
 
@@ -1991,6 +2015,7 @@ def _validate_guard_sync_provenance(
     selected_c_scale: float,
     s1_evidence: dict[str, Any] | None,
     allow_stale_synchronizer: bool = False,
+    expected_synchronizer_sha256: str | None = None,
 ) -> bool:
     """Require a self-contained receipt when S1 moves the static guard.
 
@@ -2042,8 +2067,11 @@ def _validate_guard_sync_provenance(
         raise ContractError(f"guard {path} has malformed synchronizer provenance")
     if synchronizer["path"] != GUARD_SYNC_TOOL:
         raise ContractError(f"guard {path} was synchronized by an unexpected tool")
-    synchronizer_path = (REPO_ROOT / GUARD_SYNC_TOOL).resolve(strict=True)
-    synchronizer_stale = synchronizer["sha256"] != _sha256(synchronizer_path)
+    expected_synchronizer = expected_synchronizer_sha256
+    if expected_synchronizer is None:
+        synchronizer_path = (REPO_ROOT / GUARD_SYNC_TOOL).resolve(strict=True)
+        expected_synchronizer = _sha256(synchronizer_path)
+    synchronizer_stale = synchronizer["sha256"] != expected_synchronizer
     if synchronizer_stale and not allow_stale_synchronizer:
         raise ContractError(f"guard {path} synchronizer implementation drift")
     return synchronizer_stale
@@ -2057,6 +2085,7 @@ def _validate_guard(
     generation: dict[str, Any],
     s1_evidence: dict[str, Any] | None = None,
     archived_markerless: bool = False,
+    expected_synchronizer_sha256: str | None = None,
 ) -> None:
     _validate_guard_payload(
         _load_json(path),
@@ -2066,6 +2095,7 @@ def _validate_guard(
         generation=generation,
         s1_evidence=s1_evidence,
         archived_markerless=archived_markerless,
+        expected_synchronizer_sha256=expected_synchronizer_sha256,
     )
 
 
@@ -2078,6 +2108,7 @@ def _validate_guard_payload(
     generation: dict[str, Any],
     s1_evidence: dict[str, Any] | None = None,
     archived_markerless: bool = False,
+    expected_synchronizer_sha256: str | None = None,
 ) -> None:
     """Validate prospective or on-disk guard bytes with identical semantics."""
 
@@ -2125,6 +2156,7 @@ def _validate_guard_payload(
     optional_contract_flags = {
         "coherent_public_belief_search": "--coherent-public-belief-search",
         "forced_root_target_mode": "--forced-root-target-mode",
+        "boundary_value_particles": "--boundary-value-particles",
     }
     for key, flag in optional_contract_flags.items():
         if key in search:
@@ -2195,6 +2227,7 @@ def _validate_guard_payload(
         path=path,
         selected_c_scale=float(search["c_scale"]),
         s1_evidence=s1_evidence,
+        expected_synchronizer_sha256=expected_synchronizer_sha256,
     )
 
 
@@ -7683,6 +7716,11 @@ def verify_lock(
     ):
         raise ContractError("learner value-objective digest mismatch")
     learner_training_recipe = dict(lock["science"]["learner_training_recipe"])
+    legacy_implicit_policy_target_semantics = (
+        "policy_target_blend_semantics" not in learner_training_recipe
+        and lock["science"].get("science_schema_version") is None
+        and not current_science.is_coherent_search(search)
+    )
     expected_learner_recipe = (
         HISTORICAL_MARKERLESS_LEARNER_TRAINING_RECIPE
         if historical_markerless
@@ -7696,9 +7734,21 @@ def verify_lock(
             )
         )
     )
+    recipe_for_validation = expected_learner_recipe
+    if (
+        legacy_implicit_policy_target_semantics
+        and expected_learner_recipe.get("policy_target_blend_semantics")
+        == "legacy_interpolate_v1"
+    ):
+        # Issued locks from before the loss-operator field was made explicit
+        # authenticated the same legacy interpolation behavior via the sole
+        # runtime default. Preserve their original recipe bytes and digest,
+        # but never grant them authority to select a newer blend operator.
+        recipe_for_validation = dict(expected_learner_recipe)
+        recipe_for_validation.pop("policy_target_blend_semantics")
     _validate_learner_training_recipe(
         learner_training_recipe,
-        expected_recipe=expected_learner_recipe,
+        expected_recipe=recipe_for_validation,
     )
     if (
         _digest_value(learner_training_recipe)
@@ -7723,8 +7773,12 @@ def verify_lock(
             raise ContractError("v3 lock does not bind its authoritative fleet manifest")
         _verify_artifact_records([fleet_manifest])
         manifest_path = Path(str(fleet_manifest.get("path", ""))).resolve(strict=True)
-        if manifest_path != CURRENT_FLEET_MANIFEST.resolve(strict=True):
-            raise ContractError("v3 lock fleet manifest path is not authoritative")
+        # Seal-time construction already requires CURRENT_FLEET_MANIFEST.
+        # Verification must instead follow the immutable artifact record:
+        # production locks are staged into composite/archive directories and
+        # remain valid after the runtime checkout moves. Requiring the verifier
+        # checkout's lexical path made an otherwise byte-authenticated lock
+        # non-portable.
         canonical_workers, canonical_manifest_record = (
             _canonical_workers_from_fleet_manifest(manifest_path)
         )
@@ -7809,8 +7863,22 @@ def verify_lock(
         contract_sha256=expected_digest,
         require_all_job_claims=require_all_job_claims,
     )
+    guard_path = Path(lock["provenance"]["guard_config"]["path"])
+    guard_payload = _load_json(guard_path)
+    expected_synchronizer_sha256: str | None = None
+    if GUARD_SYNC_KEY in guard_payload:
+        synchronizer_records = [
+            record
+            for record in runtime_code_tree
+            if str(record.get("path", "")).endswith(GUARD_SYNC_TOOL)
+        ]
+        if len(synchronizer_records) != 1:
+            raise ContractError(
+                "sealed runtime code tree must bind exactly one guard synchronizer"
+            )
+        expected_synchronizer_sha256 = str(synchronizer_records[0]["sha256"])
     _validate_guard(
-        Path(lock["provenance"]["guard_config"]["path"]),
+        guard_path,
         search=search,
         evaluator=evaluator,
         generation=dict(lock["generation"]),
@@ -7818,12 +7886,19 @@ def verify_lock(
             record for record in lock["science"]["evidence"] if record["kind"] == "s1"
         ),
         archived_markerless=historical_markerless,
+        expected_synchronizer_sha256=expected_synchronizer_sha256,
     )
     _validate_post_wave(
         dict(lock["post_wave_acceptance"]),
         expected_target_information_regime=target_information_regime,
     )
-    if not historical_markerless:
+    # Current build_lock intentionally requires the now-explicit loss
+    # operator. An issued v3 lock from before that field cannot be reconstructed
+    # by today's stricter builder without changing its authenticated draft.
+    # Its raw lock/draft/artifact/runtime-tree digests and every semantic field
+    # above have already been verified, so preserve it as an immutable legacy
+    # authority rather than silently injecting the new key.
+    if not historical_markerless and not legacy_implicit_policy_target_semantics:
         rebuilt = build_lock(
             Path(str(lock["source_draft"]["path"])),
             seed_ledger_snapshot=dict(lock["fleet"]["seed_ledger"]),
@@ -8301,6 +8376,10 @@ def _generator_argv(
     if "forced_root_target_mode" in search:
         argv.extend(
             ("--forced-root-target-mode", str(search["forced_root_target_mode"]))
+        )
+    if "boundary_value_particles" in search:
+        argv.extend(
+            ("--boundary-value-particles", str(search["boundary_value_particles"]))
         )
     if "temperature_clock" in generation:
         argv.extend(("--temperature-clock", str(generation["temperature_clock"])))
@@ -9281,6 +9360,7 @@ def _expected_cli_fields(lock: dict[str, Any], job: dict[str, Any]) -> dict[str,
             "coherent_public_belief_search", False
         ),
         "forced_root_target_mode": search.get("forced_root_target_mode", "full"),
+        "boundary_value_particles": search.get("boundary_value_particles", 1),
         "native_mcts_hot_loop": bool(
             generation.get("native_mcts_hot_loop", False)
         ),

@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from catan_zero.rl.gumbel_self_play import GumbelSelfPlayConfig
+from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
 from catan_zero.rl.raw_selfplay import RawSelfPlayConfig
 from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig
 from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluatorConfig
@@ -40,6 +41,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
 
 _MISSING = object()
+
+# Some config fields deliberately use ``None`` as an inherit/defer sentinel.
+# In particular, raw self-play has two different feature identities:
+#
+# * ``RawSelfPlayConfig.entity_feature_adapter_version`` is the schema used for
+#   newly stored learner rows.
+# * ``EntityGraphRustEvaluatorConfig.entity_feature_adapter_version=None``
+#   binds behavior inference to the loaded checkpoint's exact adapter.
+#
+# They share a Python field name but must not be forced to share one concrete
+# default.  Keep this exception explicit so unrelated concrete disagreements
+# still fail closed.
+_INHERITED_SHARED_DEFAULT_FIELDS = frozenset({"entity_feature_adapter_version"})
 
 # Each CLI is compared only against the dataclass(es) it actually constructs, so
 # an identically named flag that feeds a different config (e.g. raw's scalar
@@ -55,6 +69,21 @@ ARGPARSE_CLIS: dict[str, tuple[type, ...]] = {
     ),
     "gumbel_search_vs_raw_h2h.py": (GumbelChanceMCTSConfig, EntityGraphRustEvaluatorConfig),
     "generate_raw_selfplay_data.py": (RawSelfPlayConfig, EntityGraphRustEvaluatorConfig),
+}
+
+# A CLI can intentionally choose a stricter current operating regime than a
+# reusable dataclass's conservative compatibility default. Keep those choices
+# named here instead of weakening drift detection globally:
+#
+# * generic evaluators default to authoritative observation so legacy
+#   omniscient checkpoints remain usable;
+# * the current raw-data CLI defaults to a masked checkpoint and public
+#   behavior, and stores meaningful-history learner rows.
+ARGPARSE_CLI_DEFAULT_OVERRIDES: dict[str, dict[str, object]] = {
+    "generate_raw_selfplay_data.py": {
+        "public_observation": True,
+        "meaningful_public_history": True,
+    },
 }
 
 # Modal factory exposes its parameters as @app.local_entrypoint function kwargs,
@@ -83,6 +112,13 @@ def _merged_defaults(configs: tuple[type, ...]) -> dict[str, object]:
     for cls in configs:
         for name, value in _dataclass_defaults(cls).items():
             if name in merged and merged[name] != value:
+                inherited = name in _INHERITED_SHARED_DEFAULT_FIELDS and (
+                    merged[name] is None or value is None
+                )
+                if inherited:
+                    if merged[name] is None:
+                        merged[name] = value
+                    continue
                 raise AssertionError(
                     f"associated configs disagree on shared field {name!r}: "
                     f"{merged[name]!r} vs {value!r} (from {cls.__name__})"
@@ -99,6 +135,8 @@ def _flag_to_field(flag: str) -> str | None:
 
 
 def _literal(node: ast.AST) -> object:
+    if isinstance(node, ast.Name) and node.id == "RUST_ENTITY_ADAPTER_V5":
+        return RUST_ENTITY_ADAPTER_V5
     try:
         return ast.literal_eval(node)
     except (ValueError, SyntaxError):
@@ -179,9 +217,53 @@ def test_argparse_cli_defaults_match_dataclasses() -> None:
         path = TOOLS_DIR / filename
         assert path.exists(), f"expected CLI missing: {path}"
         truth = _merged_defaults(configs)
+        truth.update(ARGPARSE_CLI_DEFAULT_OVERRIDES.get(filename, {}))
         cli_defaults = _parse_argparse_defaults(path)
         problems.extend(_mismatches(filename, cli_defaults, truth))
     assert not problems, "config-default drift detected:\n" + "\n".join(problems)
+
+
+def test_inherited_shared_default_does_not_conflict_with_concrete_row_schema() -> None:
+    @dataclasses.dataclass
+    class LearnerRows:
+        entity_feature_adapter_version: str = "learner-v3"
+
+    @dataclasses.dataclass
+    class CheckpointOwnedEvaluator:
+        entity_feature_adapter_version: str | None = None
+
+    assert _merged_defaults(
+        (LearnerRows, CheckpointOwnedEvaluator)
+    )["entity_feature_adapter_version"] == "learner-v3"
+    assert _merged_defaults(
+        (CheckpointOwnedEvaluator, LearnerRows)
+    )["entity_feature_adapter_version"] == "learner-v3"
+
+
+def test_two_concrete_shared_adapter_defaults_still_fail_closed() -> None:
+    @dataclasses.dataclass
+    class AdapterV3:
+        entity_feature_adapter_version: str = "v3"
+
+    @dataclasses.dataclass
+    class AdapterV4:
+        entity_feature_adapter_version: str = "v4"
+
+    with pytest.raises(AssertionError, match="associated configs disagree"):
+        _merged_defaults((AdapterV3, AdapterV4))
+
+
+def test_raw_selfplay_keeps_teacher_and_stored_row_adapter_roles_separate() -> None:
+    assert EntityGraphRustEvaluatorConfig().entity_feature_adapter_version is None
+    assert RawSelfPlayConfig().entity_feature_adapter_version is not None
+    defaults = _parse_argparse_defaults(TOOLS_DIR / "generate_raw_selfplay_data.py")
+    assert "entity_feature_adapter_version" not in defaults
+    assert (
+        defaults["learner_entity_feature_adapter_version"]
+        == RUST_ENTITY_ADAPTER_V5
+    )
+    assert defaults["public_observation"] is True
+    assert defaults["meaningful_public_history"] is True
 
 
 def test_modal_entrypoint_defaults_match_dataclasses() -> None:

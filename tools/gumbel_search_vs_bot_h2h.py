@@ -369,6 +369,9 @@ def _search_config_kwargs(worker_args: dict[str, Any]) -> dict[str, Any]:
         lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
         information_set_search=bool(worker_args.get("information_set_search", False)),
+        boundary_value_particles=int(
+            worker_args.get("boundary_value_particles", 1)
+        ),
         determinization_particles=int(worker_args.get("determinization_particles", 1)),
         determinization_min_simulations=int(
             worker_args.get("determinization_min_simulations", 32)
@@ -537,6 +540,7 @@ def main() -> None:
     parser.add_argument(
         "--information-set-search", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument("--boundary-value-particles", type=int, default=1)
     parser.add_argument("--determinization-particles", type=int, default=1)
     parser.add_argument("--determinization-min-simulations", type=int, default=32)
     parser.add_argument("--n-full-wide", type=int, default=None)
@@ -604,6 +608,11 @@ def main() -> None:
         )
     if int(args.determinization_particles) < 1:
         parser.error("--determinization-particles must be >= 1")
+    if int(args.boundary_value_particles) != 1:
+        parser.error(
+            "--boundary-value-particles must remain 1 without "
+            "--coherent-public-belief-search"
+        )
     if int(args.determinization_min_simulations) < 1:
         parser.error("--determinization-min-simulations must be >= 1")
     _gate_cfg, _gate_params = resolve_gate_config(
@@ -677,6 +686,7 @@ def main() -> None:
                 "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
                 "evaluator_rust_featurize": bool(args.evaluator_rust_featurize),
                 "determinization_particles": int(args.determinization_particles),
+                "boundary_value_particles": int(args.boundary_value_particles),
                 "determinization_min_simulations": int(
                     args.determinization_min_simulations
                 ),
@@ -849,6 +859,9 @@ def _build_summary(
             else "python_reference"
         ),
         "determinization_particles": int(getattr(args, "determinization_particles", 1)),
+        "boundary_value_particles": int(
+            getattr(args, "boundary_value_particles", 1)
+        ),
         "determinization_min_simulations": int(
             getattr(args, "determinization_min_simulations", 32)
         ),

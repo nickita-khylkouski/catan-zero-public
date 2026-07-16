@@ -33,6 +33,10 @@ from tools.build_memmap_corpus import (  # noqa: E402
 
 CONFIG = (
     REPO
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema17.json"
+)
+HISTORICAL_SCHEMA16_CONFIG = (
+    REPO
     / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema16.json"
 )
 GUARD = (
@@ -82,10 +86,10 @@ def test_meaningful_history_uses_legacy_compatible_memmap_width() -> None:
     assert np.all(normalized["event_target_ids"][:, 32:] == -1)
 
 
-def test_next_wave_typed_generation_config_is_exact_schema_16_recipe() -> None:
+def test_next_wave_typed_generation_config_is_exact_schema_17_recipe() -> None:
     payload = json.loads(CONFIG.read_text())
     assert payload["pipeline"] == GenerateConfig.PIPELINE
-    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 16
+    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 17
 
     cfg = GenerateConfig(**payload["fields"])
     assert cfg.canonical_payload() == payload
@@ -115,6 +119,25 @@ def test_next_wave_typed_generation_config_is_exact_schema_16_recipe() -> None:
     # accidentally launch a real wave by itself.
     assert cfg.checkpoint is None
     assert cfg.games == 0
+
+
+def test_historical_schema16_generation_artifact_remains_byte_identical() -> None:
+    assert hashlib.sha256(HISTORICAL_SCHEMA16_CONFIG.read_bytes()).hexdigest() == (
+        "0ff3be4b5cb6161a10f8a912267a75cfe4a9e2b06fdc75889d8d18c23f88341f"
+    )
+
+
+def test_current_generation_config_has_no_duplicate_json_keys() -> None:
+    def reject_duplicates(pairs):
+        out = {}
+        for key, value in pairs:
+            if key in out:
+                raise AssertionError(f"duplicate JSON key: {key}")
+            out[key] = value
+        return out
+
+    payload = json.loads(CONFIG.read_text(), object_pairs_hook=reject_duplicates)
+    assert payload["fields"]["boundary_value_particles"] == 1
 
 
 def test_issued_v1_generation_artifacts_remain_byte_identical() -> None:
@@ -296,7 +319,7 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
         "sha256:3cf1a74225d562b48584796dd9148662893f0efb3c281e137cd5eeeb1c12876e"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:ce29f5aefea0c664908d7829e9bd27e6ee65254cd2a54b650f9dd9a94dd2fcd2"
+        "sha256:ccfe6ed035bdf5f29c2c7e0a7eb7e60fb722df2686bcf17441921c2eb8e47b99"
     )
 
 

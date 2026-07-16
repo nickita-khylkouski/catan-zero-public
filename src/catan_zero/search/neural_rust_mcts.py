@@ -477,13 +477,6 @@ class EntityGraphRustEvaluator:
             action_size=int(self.policy.action_size),
             topology=topology,
             public_observation=bool(self.config.public_observation),
-            public_card_count_features=bool(
-                getattr(
-                    getattr(self.policy, "config", None),
-                    "public_card_count_features",
-                    getattr(self.policy, "public_card_count_features", False),
-                )
-            ),
             meaningful_public_history=history_enabled,
             history_limit=history_limit,
             meaningful_public_history_schema=history_schema,
@@ -568,13 +561,6 @@ class EntityGraphRustEvaluator:
             action_size=int(self.policy.action_size),
             topology=topology,
             public_observation=bool(self.config.public_observation),
-            public_card_count_features=bool(
-                getattr(
-                    getattr(self.policy, "config", None),
-                    "public_card_count_features",
-                    getattr(self.policy, "public_card_count_features", False),
-                )
-            ),
             meaningful_public_history=history_enabled,
             history_limit=history_limit,
             meaningful_public_history_schema=history_schema,

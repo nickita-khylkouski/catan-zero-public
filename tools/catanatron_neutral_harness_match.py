@@ -227,6 +227,9 @@ def _search_config(
         forced_root_target_mode=str(
             search_kwargs.get("forced_root_target_mode", "full")
         ),
+        boundary_value_particles=int(
+            search_kwargs.get("boundary_value_particles", 1)
+        ),
         determinization_particles=int(
             search_kwargs.get("determinization_particles", 1)
         ),
@@ -478,6 +481,9 @@ def _search_recipe(args: Any) -> dict[str, Any]:
         ),
         "forced_root_target_mode": str(
             getattr(args, "forced_root_target_mode", "full")
+        ),
+        "boundary_value_particles": int(
+            getattr(args, "boundary_value_particles", 1)
         ),
         "determinization_particles": int(args.determinization_particles),
         "determinization_min_simulations": int(args.determinization_min_simulations),
@@ -920,6 +926,11 @@ def build_summary(
             if args.mode == "search"
             else None
         ),
+        "boundary_value_particles": (
+            int(getattr(args, "boundary_value_particles", 1))
+            if args.mode == "search"
+            else None
+        ),
         "determinization_particles": (
             int(args.determinization_particles) if args.mode == "search" else None
         ),
@@ -1125,6 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
             "prompts; the played action is mathematically unchanged."
         ),
     )
+    parser.add_argument("--boundary-value-particles", type=int, default=1)
     parser.add_argument(
         "--belief-chance-spectra",
         action=argparse.BooleanOptionalAction,
@@ -1290,6 +1302,16 @@ def main() -> None:
             parser.error(str(error))
         if int(args.determinization_particles) < 1:
             parser.error("--determinization-particles must be >= 1")
+        if int(args.boundary_value_particles) < 1:
+            parser.error("--boundary-value-particles must be >= 1")
+        if (
+            int(args.boundary_value_particles) > 1
+            and not bool(args.coherent_public_belief_search)
+        ):
+            parser.error(
+                "--boundary-value-particles > 1 requires "
+                "--coherent-public-belief-search"
+            )
         if int(args.determinization_min_simulations) < 1:
             parser.error("--determinization-min-simulations must be >= 1")
         if (

@@ -90,7 +90,12 @@ _T = TypeVar("_T", bound="PipelineConfig")
 
 # Bump when the *set* of fields on any pipeline config changes so that hashes
 # from before/after the change are never mistaken for equal regimes.
-CONFIG_SCHEMA_VERSION = 16
+# Schema 16 was already issued before ``boundary_value_particles`` became part
+# of both generation and evaluation identity.  Reusing 16 would allow an
+# evaluator payload without that field and one with it to claim the same
+# schema.  Schema 17 is the first pipeline schema that binds the boundary
+# particle count across every search-bearing pipeline.
+CONFIG_SCHEMA_VERSION = 17
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -612,6 +617,10 @@ class EvalConfig(PipelineConfig):
     information_set_search: bool = False
     coherent_public_belief_search: bool = False
     forced_root_target_mode: str = "full"
+    # Number of observer-information worlds averaged at the first
+    # opponent/new-turn continuation-value boundary. K=1 preserves the
+    # historical coherent-public evaluator exactly.
+    boundary_value_particles: int = 1
     # Explicit implementation arm. False preserves the reference Python tree
     # loop; True requires the matching catanatron_rs native-search binding and
     # fails closed rather than silently changing the evaluation operator.

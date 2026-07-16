@@ -25,7 +25,7 @@ CONTRACT_PATH = (
 TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract.template.json"
 GENERATOR_CONFIG_PATH = (
     REPO_ROOT
-    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema16.json"
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema17.json"
 )
 GENERATOR_GUARD_PATH = (
     REPO_ROOT
@@ -190,6 +190,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
         "rust_entity_adapter_v5_meaningful_history_v2"
     ),
     "require_35m_model": True,
+    "min_parameter_count": 41_700_000,
     "max_parameter_count": 42_000_000,
 }
 PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT = {
@@ -269,6 +270,12 @@ def _load() -> dict[str, Any]:
     for key in ("search", "evaluator"):
         if not isinstance(operator[key], dict) or not operator[key]:
             raise ScienceContractError(f"current operator.{key} is empty")
+    boundary_particles = operator["search"].get("boundary_value_particles")
+    if type(boundary_particles) is not int or boundary_particles != 1:
+        raise ScienceContractError(
+            "current production search must bind boundary_value_particles=1; "
+            "K>1 remains an uncommissioned operator"
+        )
     for key in ("generation", "learner", "evaluation", "promotion"):
         if not isinstance(value[key], dict) or not value[key]:
             raise ScienceContractError(f"current {key} contract is empty")
@@ -607,6 +614,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
         **PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT,
         "exact_budget_sh": search_value.get("exact_budget_sh"),
         "exact_budget_sh_min_n": search_value.get("exact_budget_sh_min_n"),
+        "boundary_value_particles": search_value["boundary_value_particles"],
         "learner_entity_feature_adapter_version": CURRENT_LEARNER_ENTITY_ADAPTER,
     }
     generator_drift = {
@@ -645,6 +653,9 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
         ],
         "--exact-budget-sh": expected_generator["exact_budget_sh"],
         "--exact-budget-sh-min-n": expected_generator["exact_budget_sh_min_n"],
+        "--boundary-value-particles": expected_generator[
+            "boundary_value_particles"
+        ],
         "--learner-entity-feature-adapter-version": (
             expected_generator["learner_entity_feature_adapter_version"]
         ),
@@ -841,6 +852,7 @@ def fleet_evaluation_science_config() -> dict[str, Any]:
             "determinization_min_simulations"
         ],
         "forced_root_target_mode": search_value["forced_root_target_mode"],
+        "boundary_value_particles": search_value["boundary_value_particles"],
         "n_full_wide": search_value["n_full_wide"],
         "n_full_wide_threshold": search_value["n_full_wide_threshold"],
         "wide_roots_always_full": search_value["wide_roots_always_full"],

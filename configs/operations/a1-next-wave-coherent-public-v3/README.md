@@ -13,6 +13,10 @@ post-search learner tensors advance, restoring Year of Plenty and Monopoly
 resource identity plus the current actor's development-card playability, Road
 Building continuation, remaining free roads, and discard remainder. Historical
 v1/v2 artifacts remain immutable and diagnostically replayable.
+The current typed generator artifact is schema 17, which binds
+`boundary_value_particles` into generation and evaluation identity. The
+schema-16 artifact remains byte-identical historical evidence and must not be
+used as the current launch config.
 
 The production learner starts natively from scratch with adapter v5,
 `public_rule_state` and meaningful-history target gather enabled, no learner
@@ -57,7 +61,7 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
 
 ```bash
 "$PY" tools/generate_gumbel_selfplay_data.py \
-  --config configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema16.json \
+  --config configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema17.json \
   --prelaunch-guard-config configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json \
   --checkpoint "$CHECKPOINT" --out-dir "$OUT" \
   --base-seed "$BASE_SEED" --games "$GAMES" --workers "$WORKERS" \

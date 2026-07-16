@@ -15,11 +15,18 @@ import torch
 
 from catan_zero.rl.entity_token_policy import EntityGraphConfig
 from tools import a1_pre_wave_contract as contract
+from tools import a1_current_science_contract as current_science
 from tools import a1_promotion_transaction as promotion
 from tools import generate_gumbel_selfplay_data as generator
 from tools import legacy_scalar_readout_attestation as legacy_scalar
 from tools import search_operator_binding as operator_binding
 from tools.fleet import a1_production_executor as production_executor
+
+
+def test_current_boundary_value_particles_survive_contract_projection() -> None:
+    search = current_science.search()
+    contract._validate_search_operator_fields(search)  # noqa: SLF001
+    assert contract._effective_search(search)["boundary_value_particles"] == 1  # noqa: SLF001
 
 
 TEMPLATE = (

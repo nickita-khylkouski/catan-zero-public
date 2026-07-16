@@ -1069,6 +1069,9 @@ def _build_search_config(
             worker_args.get("coherent_public_belief_search", False)
         ),
         forced_root_target_mode=str(worker_args.get("forced_root_target_mode", "full")),
+        boundary_value_particles=int(
+            worker_args.get("boundary_value_particles", 1)
+        ),
         determinization_particles=int(worker_args.get("determinization_particles", 1)),
         determinization_min_simulations=int(
             worker_args.get("determinization_min_simulations", 32)
@@ -1439,6 +1442,14 @@ def _validate_information_set_recipe(args: Any) -> None:
         raise ValueError("--determinization-particles must be >= 1")
     if int(args.determinization_min_simulations) < 1:
         raise ValueError("--determinization-min-simulations must be >= 1")
+    boundary_particles = int(getattr(args, "boundary_value_particles", 1))
+    if boundary_particles < 1:
+        raise ValueError("--boundary-value-particles must be >= 1")
+    if boundary_particles > 1 and not coherent:
+        raise ValueError(
+            "--boundary-value-particles > 1 requires "
+            "--coherent-public-belief-search"
+        )
     roles = _resolve_role_search_calibration(args)
     for role, resolved in roles.items():
         if (
@@ -1718,6 +1729,16 @@ def main() -> None:
             "Use trajectory_only to skip all neural/search work when exactly one "
             "action is legal. This cannot change a played move and substantially "
             "reduces Catan evaluation cost."
+        ),
+    )
+    parser.add_argument(
+        "--boundary-value-particles",
+        type=int,
+        default=1,
+        help=(
+            "Average this many observer-information worlds only at the first "
+            "opponent/new-turn continuation-value boundary. K=1 preserves the "
+            "historical coherent-public evaluator."
         ),
     )
     parser.add_argument(
@@ -2089,6 +2110,7 @@ def main() -> None:
             "information_set_search": bool(args.information_set_search),
             "coherent_public_belief_search": bool(args.coherent_public_belief_search),
             "forced_root_target_mode": str(args.forced_root_target_mode),
+            "boundary_value_particles": int(args.boundary_value_particles),
             "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
             "evaluator_rust_featurize": bool(args.evaluator_rust_featurize),
             "determinization_particles": int(args.determinization_particles),
@@ -2467,6 +2489,9 @@ def _build_summary(
         ),
         "forced_root_target_mode": str(
             getattr(args, "forced_root_target_mode", "full")
+        ),
+        "boundary_value_particles": int(
+            getattr(args, "boundary_value_particles", 1)
         ),
         "native_mcts_hot_loop": bool(getattr(args, "native_mcts_hot_loop", False)),
         "mcts_implementation": (

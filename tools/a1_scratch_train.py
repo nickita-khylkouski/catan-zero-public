@@ -525,8 +525,9 @@ def build_train_command(
         ("--event-history-limit", "event_history_limit"),
     ):
         _add(command, flag, model[key])
-    # Keep train_bc's backward-compatible CLI name while the sealed science
-    # contract uses a model-class-neutral parameter ceiling.
+    # Keep train_bc's backward-compatible CLI names while the sealed science
+    # contract uses model-class-neutral parameter bounds.
+    _add(command, "--min-35m-params", model["min_parameter_count"])
     _add(command, "--max-35m-params", model["max_parameter_count"])
     command.extend(
         [

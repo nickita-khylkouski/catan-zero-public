@@ -151,6 +151,14 @@ def test_generate_native_hot_loop_changes_science_hash() -> None:
     assert native.config_hash() != reference.config_hash()
 
 
+def test_boundary_value_particles_are_bound_in_eval_identity() -> None:
+    historical = EvalConfig(boundary_value_particles=1)
+    experimental = EvalConfig(boundary_value_particles=2)
+
+    assert historical.boundary_value_particles == 1
+    assert experimental.config_hash() != historical.config_hash()
+
+
 def test_initial_road_d1_scope_changes_generation_config_hash() -> None:
     global_d1 = GenerateConfig(rescale_noise_floor_c=8.0)
     road_only_d1 = GenerateConfig(

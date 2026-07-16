@@ -218,6 +218,8 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--meaningful-public-history-target-gather") == 1
     assert command.count("--entity-feature-adapter-version") == 1
     assert command[command.index("--hidden-size") + 1] == "640"
+    assert command.count("--min-35m-params") == 1
+    assert command[command.index("--min-35m-params") + 1] == "41700000"
     assert command.count("--max-35m-params") == 1
     assert command[command.index("--max-35m-params") + 1] == "42000000"
     assert command.count("--fused-optimizer") == 1
@@ -630,6 +632,7 @@ def _runtime_args() -> SimpleNamespace:
         event_history_limit=model["event_history_limit"],
         mask_hidden_info=model["mask_hidden_info"],
         require_35m_model=model["require_35m_model"],
+        min_35m_params=model["min_parameter_count"],
         max_35m_params=model["max_parameter_count"],
         batch_size=topology["local_batch_size"],
         grad_accum_steps=topology["grad_accum_steps"],

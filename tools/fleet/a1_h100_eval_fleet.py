@@ -590,6 +590,8 @@ def _science_args(
         "--no-belief-chance-spectra",
         "--determinization-particles",
         str(science["determinization_particles"]),
+        "--boundary-value-particles",
+        str(science.get("boundary_value_particles", 1)),
         "--determinization-min-simulations",
         str(science["determinization_min_simulations"]),
         "--symmetry-averaged-eval",
@@ -2990,6 +2992,7 @@ def _fixed_panel_expected_search_fields(
             public_observation=True,
             belief_chance_spectra=False,
             information_set_search=True,
+            boundary_value_particles=1,
             native_mcts_hot_loop=True,
             determinization_particles=canonical_operator["particle_count"],
             determinization_min_simulations=canonical_operator[

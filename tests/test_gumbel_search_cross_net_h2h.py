@@ -103,6 +103,7 @@ def test_direct_cli_help_resolves_replay_contract_sibling_import() -> None:
     assert "--native-wheel-path" in completed.stdout
     assert "--candidate-raw-policy-above-width" in completed.stdout
     assert "--baseline-raw-policy-above-width" in completed.stdout
+    assert "--boundary-value-particles" in completed.stdout
 
 
 def test_archived_state_reconstruction_binding_is_explicit_base_replay() -> None:
@@ -629,6 +630,7 @@ def test_coherent_public_belief_search_is_a_distinct_public_mode() -> None:
         information_set_search=False,
         coherent_public_belief_search=True,
         belief_chance_spectra=False,
+        boundary_value_particles=1,
         determinization_particles=4,
         determinization_min_simulations=32,
     )
@@ -638,12 +640,28 @@ def test_coherent_public_belief_search_is_a_distinct_public_mode() -> None:
         _base_worker_args(
             coherent_public_belief_search=True,
             forced_root_target_mode="trajectory_only",
+            boundary_value_particles=1,
         ),
         seed=1,
     )
     assert config.coherent_public_belief_search is True
     assert config.information_set_search is False
     assert config.forced_root_target_mode == "trajectory_only"
+    assert config.boundary_value_particles == 1
+
+
+def test_boundary_value_particles_require_coherent_public_search() -> None:
+    args = SimpleNamespace(
+        public_observation=True,
+        information_set_search=True,
+        coherent_public_belief_search=False,
+        belief_chance_spectra=False,
+        boundary_value_particles=2,
+        determinization_particles=4,
+        determinization_min_simulations=32,
+    )
+    with pytest.raises(ValueError, match="requires --coherent-public-belief-search"):
+        _validate_information_set_recipe(args)
 
 
 @pytest.mark.parametrize(
