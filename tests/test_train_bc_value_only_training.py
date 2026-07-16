@@ -496,7 +496,9 @@ def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
 
     monkeypatch.setattr(train_bc, "_objective_gradient_interference", interference)
 
-    def run(*, measure: bool, auxiliary: bool = False) -> dict:
+    def run(
+        *, measure: bool, auxiliary: bool = False, diagnostics: bool = True
+    ) -> dict:
         policy = _make_entity_policy()
         optimizer = torch.optim.SGD(policy.model.parameters(), lr=0.0)
         return _train_xdim_batch(
@@ -521,7 +523,7 @@ def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
             advantage_weight_cap=5.0,
             advantage_weight_floor=0.05,
             amp="none",
-            diagnostics=True,
+            diagnostics=diagnostics,
             measure_objective_gradient_interference=measure,
             **(
                 {
@@ -545,11 +547,19 @@ def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
     assert explicit["optimizer_observability"][
         "objective_gradient_interference"
     ] == {"available": True, "sentinel": True}
-    explicit_aux = run(measure=True, auxiliary=True)
+    explicit_without_module_diagnostics = run(measure=True, diagnostics=False)
     assert calls == 2
+    observability = explicit_without_module_diagnostics["optimizer_observability"]
+    assert "module_pre_clip_grad_norms" not in observability
+    assert observability["objective_gradient_interference"] == {
+        "available": True,
+        "sentinel": True,
+    }
+    explicit_aux = run(measure=True, auxiliary=True)
+    assert calls == 3
     assert aux_objectives[0] is None
-    assert aux_objectives[1] is not None
-    assert bool(aux_objectives[1].requires_grad)
+    assert aux_objectives[2] is not None
+    assert bool(aux_objectives[2].requires_grad)
     assert explicit_aux["optimizer_observability"][
         "objective_gradient_interference"
     ] == {"available": True, "sentinel": True}

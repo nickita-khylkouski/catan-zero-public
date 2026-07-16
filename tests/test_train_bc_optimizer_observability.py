@@ -12,6 +12,61 @@ def test_optimizer_observability_reuses_default_off_diagnostics_cadence() -> Non
     assert parser.get_default("train_diagnostics_every_batches") == 0
 
 
+def test_objective_gradient_interference_short_dose_gets_first_step_baseline() -> None:
+    assert train_bc._objective_gradient_interference_due(
+        cadence_batches=64,
+        batch_number=1,
+        baseline_observed=False,
+        accum_do_step=True,
+    )
+    assert not train_bc._objective_gradient_interference_due(
+        cadence_batches=64,
+        batch_number=1,
+        baseline_observed=False,
+        accum_do_step=False,
+    )
+
+
+def test_objective_gradient_interference_keeps_independent_batch_cadence() -> None:
+    assert train_bc._objective_gradient_interference_due(
+        cadence_batches=7,
+        batch_number=7,
+        baseline_observed=True,
+        accum_do_step=True,
+    )
+    assert not train_bc._objective_gradient_interference_due(
+        cadence_batches=7,
+        batch_number=8,
+        baseline_observed=True,
+        accum_do_step=True,
+    )
+    assert not train_bc._objective_gradient_interference_due(
+        cadence_batches=0,
+        batch_number=1,
+        baseline_observed=False,
+        accum_do_step=True,
+    )
+
+
+def test_objective_gradient_observation_does_not_require_module_diagnostics() -> None:
+    observed = train_bc._objective_gradient_observation_for_step(
+        {
+            "objective_gradient_interference": {
+                "available": True,
+                "trunk_gradient_cosine": -0.25,
+            }
+        },
+        global_step=6,
+        optimizer_step_applied=True,
+    )
+
+    assert observed == {
+        "available": True,
+        "trunk_gradient_cosine": -0.25,
+        "optimizer_step": 7,
+    }
+
+
 def test_max_grad_norm_cli_default_preserves_historical_threshold() -> None:
     parser = train_bc.build_parser()
     required = [

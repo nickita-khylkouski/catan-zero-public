@@ -11537,6 +11537,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     optimizer_zero_objective_steps = 0
     optimizer_pre_clip_grad_norm_sum = 0.0
     optimizer_pre_clip_grad_norm_max = 0.0
+    objective_gradient_baseline_observed = False
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
     intermediate_checkpoints: list[dict[str, object]] = []
     checkpoint_dose_snapshots: list[dict[str, object]] = []
@@ -12053,9 +12054,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
                     objective_interference_kwargs[
                         "measure_objective_gradient_interference"
-                    ] = bool(
-                        interference_cadence > 0
-                        and batch_number % interference_cadence == 0
+                    ] = _objective_gradient_interference_due(
+                        cadence_batches=interference_cadence,
+                        batch_number=batch_number,
+                        baseline_observed=objective_gradient_baseline_observed,
+                        accum_do_step=accum_do_step,
                     )
                 batch_metrics = train_fn(
                     policy,
@@ -12180,6 +12183,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 optimizer_pre_clip_grad_norm_max = max(
                     optimizer_pre_clip_grad_norm_max, pre_clip_norm
                 )
+                objective_observation = _objective_gradient_observation_for_step(
+                    optimizer_observability,
+                    global_step=global_step,
+                    optimizer_step_applied=optimizer_step_applied,
+                )
+                if objective_observation is not None:
+                    epoch_objective_gradient_observations.append(
+                        objective_observation
+                    )
+                    objective_gradient_baseline_observed = True
                 # Basic clip telemetry is collected every optimizer step. Emit
                 # the verbose progress record only on the existing diagnostics
                 # cadence, identified by the detailed module norms.
@@ -12232,18 +12245,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 "optimizer module parameter count changed mid-dose"
                             )
                         epoch_module_parameter_counts[module] = count
-                    objective_observation = optimizer_observability.get(
-                        "objective_gradient_interference"
-                    )
-                    if isinstance(objective_observation, dict):
-                        objective_observation = {
-                            **objective_observation,
-                            "optimizer_step": global_step
-                            + int(optimizer_step_applied),
-                        }
-                        epoch_objective_gradient_observations.append(
-                            objective_observation
-                        )
                     _rank0_print(
                         json.dumps(
                             {
@@ -15384,6 +15385,10 @@ def _train_xdim_batch(
                     max_grad_norm=max_grad_norm,
                 )
             )
+        if (
+            observability_state is not None
+            or objective_gradient_interference is not None
+        ):
             optimizer_observability["objective_gradient_interference"] = (
                 objective_gradient_interference
             )
@@ -22267,6 +22272,47 @@ def _shared_trunk_named_parameters(policy) -> list[tuple[str, object]]:
         ):
             selected.append((normalized, parameter))
     return selected
+
+
+def _objective_gradient_interference_due(
+    *,
+    cadence_batches: int,
+    batch_number: int,
+    baseline_observed: bool,
+    accum_do_step: bool,
+) -> bool:
+    """Schedule an independent probe and guarantee one short-dose baseline.
+
+    The probe can only be retained on a micro-batch that closes an optimizer
+    step. A positive cadence therefore observes the first such batch even when
+    the requested interval is longer than the whole dose, then resumes the
+    declared batch cadence. This keeps short commissioning runs observable
+    without coupling the probe to the separate module-diagnostics cadence.
+    """
+
+    cadence = int(cadence_batches)
+    if cadence <= 0 or not bool(accum_do_step):
+        return False
+    return not bool(baseline_observed) or int(batch_number) % cadence == 0
+
+
+def _objective_gradient_observation_for_step(
+    optimizer_observability: Mapping[str, object] | None,
+    *,
+    global_step: int,
+    optimizer_step_applied: bool,
+) -> dict[str, object] | None:
+    """Bind a retained objective probe to its optimizer step independently."""
+
+    if not isinstance(optimizer_observability, Mapping):
+        return None
+    observation = optimizer_observability.get("objective_gradient_interference")
+    if not isinstance(observation, dict):
+        return None
+    return {
+        **observation,
+        "optimizer_step": int(global_step) + int(bool(optimizer_step_applied)),
+    }
 
 
 def _objective_gradient_interference(
