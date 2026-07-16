@@ -81,6 +81,7 @@
       "value_loss_weight": 0.25,
       "scalar_value_loss_readout": "deployed_tanh",
       "scalar_value_loss_scale": 1.0,
+      "value_trunk_grad_scale": 1.0,
       "value_target_lambda": 1.0,
       "value_categorical_loss_weight": 0.0,
       "hlgauss_scalar_aux_loss_weight": 0.0,
