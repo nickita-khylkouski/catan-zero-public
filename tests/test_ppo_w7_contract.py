@@ -4,6 +4,7 @@ import pytest
 
 from catan_zero.rl.ppo_policy_factory import (
     CANONICAL_PPO_ARCHITECTURE,
+    canonical_actor_rollout_contract_fields,
     load_exact_parent_and_frozen_anchor,
     load_ppo_policy,
 )
@@ -244,15 +245,13 @@ def test_no_vtrace_policy_window_rejects_old_and_future_shards(tmp_path) -> None
     assert not future.exists()
 
 
-def test_modal_actor_payload_to_chunk_preserves_behavior_temperature() -> None:
-    from tools.modal_ppo_factory import _actor_rollout_contract_fields
-
+def test_actor_payload_to_chunk_preserves_behavior_temperature_without_modal() -> None:
     top_level_payload = {
         "gamma": 1.0,
         "gae_lambda": 0.97,
         "action_temperature": 0.625,
     }
 
-    chunk_fields = _actor_rollout_contract_fields(top_level_payload)
+    chunk_fields = canonical_actor_rollout_contract_fields(top_level_payload)
 
     assert chunk_fields == top_level_payload

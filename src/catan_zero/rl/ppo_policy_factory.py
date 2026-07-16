@@ -9,7 +9,7 @@ of the same checkpoint passed to ``ppo_update(..., ema_policy=<frozen bc>, ema_p
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Mapping
 
 
 CANONICAL_PPO_ARCHITECTURE = "entity_graph"
@@ -41,6 +41,17 @@ def validate_canonical_ppo_actor_contract(
         raise ValueError("canonical PPO requires gae_lambda in [0.95, 0.98]")
     if not math.isfinite(float(action_temperature)) or float(action_temperature) <= 0.0:
         raise ValueError("canonical PPO action_temperature must be finite and positive")
+
+
+def canonical_actor_rollout_contract_fields(
+    payload: Mapping[str, Any],
+) -> dict[str, float]:
+    """Extract fields that must survive actor payload to subprocess chunk."""
+    return {
+        "gamma": float(payload.get("gamma", 1.0)),
+        "gae_lambda": float(payload.get("gae_lambda", 0.95)),
+        "action_temperature": float(payload.get("action_temperature", 1.0)),
+    }
 
 
 def validate_canonical_ppo_staleness_contract(

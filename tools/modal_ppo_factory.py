@@ -467,7 +467,10 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
     containers would otherwise generate.
     """
     from catan_zero.rl import ppo_distributed as ppd
-    from catan_zero.rl.ppo_policy_factory import validate_canonical_ppo_actor_contract
+    from catan_zero.rl.ppo_policy_factory import (
+        canonical_actor_rollout_contract_fields,
+        validate_canonical_ppo_actor_contract,
+    )
 
     run_name = str(payload["run_name"])
     container_id = str(payload["worker_id"])
@@ -488,7 +491,7 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
     max_actor_lag = max(1, int(payload.get("max_actor_lag", DEFAULT_MAX_ACTOR_LAG)))
     lag_stall_rounds = max(1, int(payload.get("lag_stall_rounds", DEFAULT_LAG_STALL_ROUNDS)))
     lag_stall_sleep = float(payload.get("lag_stall_sleep", DEFAULT_LAG_STALL_SLEEP))
-    rollout_contract = _actor_rollout_contract_fields(payload)
+    rollout_contract = canonical_actor_rollout_contract_fields(payload)
     validate_canonical_ppo_actor_contract(
         architecture=architecture,
         gamma=rollout_contract["gamma"],
@@ -830,15 +833,6 @@ def ppo_learner(config_payload: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- payloads
-def _actor_rollout_contract_fields(payload: dict[str, Any]) -> dict[str, float]:
-    """Fields that must survive Modal top-level payload to subprocess chunk."""
-    return {
-        "gamma": float(payload.get("gamma", 1.0)),
-        "gae_lambda": float(payload.get("gae_lambda", 0.95)),
-        "action_temperature": float(payload.get("action_temperature", 1.0)),
-    }
-
-
 def _payloads(
     *,
     run_name: str,
