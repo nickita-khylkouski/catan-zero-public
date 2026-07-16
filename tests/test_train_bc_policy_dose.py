@@ -28,6 +28,16 @@ def test_policy_lr_area_hits_exact_boundary_and_then_stops() -> None:
     ) == 0.0
 
 
+def test_policy_lr_area_accounts_for_independent_aux_objective() -> None:
+    assert train_bc._policy_weight_for_lr_area(  # noqa: SLF001
+        1.0,
+        scheduled_base_lr=0.01,
+        consumed_lr_area=0.0,
+        target_lr_area=0.01,
+        objective_multiplier=2.0,
+    ) == pytest.approx(0.5)
+
+
 def test_zero_policy_dose_preserves_historical_constant_weight() -> None:
     assert train_bc._policy_weight_for_lr_area(  # noqa: SLF001
         0.75,
@@ -87,28 +97,42 @@ def test_policy_objective_fraction_preserves_fractional_boundary() -> None:
 
 
 @pytest.mark.parametrize(
-    ("presence", "group_size", "expected_weight", "expected_fraction"),
+    (
+        "base_presence",
+        "aux_presence",
+        "aux_weight",
+        "group_size",
+        "expected_weight",
+        "expected_fraction",
+    ),
     [
-        ([True, False, False, False], 4, 0.25, 0.25),
-        ([True, True, True, True], 4, 1.0, 1.0),
-        ([True, False], 2, 0.5, 0.5),
-        ([False, False, False, False], 4, 0.0, 0.0),
+        ([True, False, False, False], [False] * 4, 1.0, 4, 0.25, 0.25),
+        ([True] * 4, [False] * 4, 1.0, 4, 1.0, 1.0),
+        ([False] * 2, [True] * 2, 0.25, 2, 0.25, 0.25),
+        ([True] * 2, [True] * 2, 1.0, 2, 2.0, 2.0),
+        ([False] * 4, [False] * 4, 1.0, 4, 0.0, 0.0),
     ],
 )
 def test_policy_group_dose_follows_realized_active_microbatches(
-    presence,
+    base_presence,
+    aux_presence,
+    aux_weight,
     group_size,
     expected_weight,
     expected_fraction,
 ) -> None:
     weight = 0.0
     fraction = 0.0
-    for active in presence:
+    for base_active, aux_active in zip(
+        base_presence, aux_presence, strict=True
+    ):
         micro_weight, micro_fraction = (
             train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
                 policy_loss_weight=1.0,
                 policy_objective_fraction=1.0,
-                globally_policy_active=active,
+                globally_base_active=base_active,
+                globally_aux_active=aux_active,
+                policy_aux_loss_weight=aux_weight,
                 accumulation_group_size=group_size,
             )
         )
@@ -144,12 +168,22 @@ def test_global_policy_presence_uses_active_rows_not_fixed_denominator(
     )
 
 
+def test_policy_stream_presence_keeps_base_and_aux_separate() -> None:
+    assert train_bc._global_policy_stream_presence(  # noqa: SLF001
+        local_base_active_rows=0,
+        local_aux_active_rows=7,
+        ddp={"enabled": False, "world_size": 1, "rank": 0, "local_rank": 0},
+    ) == (False, True)
+
+
 def test_value_only_group_does_not_trigger_post_policy_freeze() -> None:
     consumed = 0.0
     weight, _fraction = train_bc._realized_policy_microbatch_dose(  # noqa: SLF001
         policy_loss_weight=1.0,
         policy_objective_fraction=1.0,
-        globally_policy_active=False,
+        globally_base_active=False,
+        globally_aux_active=False,
+        policy_aux_loss_weight=1.0,
         accumulation_group_size=1,
     )
     consumed += 0.01 * weight

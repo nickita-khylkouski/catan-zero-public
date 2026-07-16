@@ -2666,6 +2666,7 @@ def _policy_weight_for_lr_area(
     scheduled_base_lr: float,
     consumed_lr_area: float,
     target_lr_area: float,
+    objective_multiplier: float = 1.0,
 ) -> float:
     """Meter policy imitation by integrated optimizer dose, not step count."""
 
@@ -2673,10 +2674,16 @@ def _policy_weight_for_lr_area(
     learning_rate = float(scheduled_base_lr)
     consumed = float(consumed_lr_area)
     target = float(target_lr_area)
-    if not all(math.isfinite(value) for value in (learning_rate, consumed, target)):
+    multiplier = float(objective_multiplier)
+    if not all(
+        math.isfinite(value)
+        for value in (learning_rate, consumed, target, multiplier)
+    ):
         raise ValueError("policy LR-area inputs must be finite")
     if learning_rate < 0.0 or consumed < 0.0 or target < 0.0:
         raise ValueError("policy LR-area inputs must be non-negative")
+    if multiplier <= 0.0:
+        raise ValueError("policy objective multiplier must be positive")
     if target == 0.0 or coefficient == 0.0:
         return coefficient
     remaining = max(0.0, target - consumed)
@@ -2684,7 +2691,7 @@ def _policy_weight_for_lr_area(
         return 0.0
     if learning_rate == 0.0:
         return coefficient
-    return min(coefficient, remaining / learning_rate)
+    return min(coefficient, remaining / (learning_rate * multiplier))
 
 
 def _policy_objective_fraction(
@@ -2723,11 +2730,27 @@ def _global_policy_objective_presence(
     worker set.
     """
 
+    base_present, aux_present = _global_policy_stream_presence(
+        local_base_active_rows=local_base_active_rows,
+        local_aux_active_rows=local_aux_active_rows,
+        ddp=ddp,
+    )
+    return base_present or aux_present
+
+
+def _global_policy_stream_presence(
+    *,
+    local_base_active_rows: int,
+    local_aux_active_rows: int,
+    ddp: Mapping[str, int | bool],
+) -> tuple[bool, bool]:
+    """Return DDP-global presence for each independently normalized policy stream."""
+
     base_rows = int(local_base_active_rows)
     aux_rows = int(local_aux_active_rows)
     if base_rows < 0 or aux_rows < 0:
         raise ValueError("policy active-row counts must be non-negative")
-    present = base_rows + aux_rows > 0
+    present = (base_rows > 0, aux_rows > 0)
     if not bool(ddp.get("enabled", False)):
         return present
 
@@ -2740,39 +2763,51 @@ def _global_policy_objective_presence(
         else "cpu"
     )
     global_presence = torch.tensor(
-        int(present),
+        [int(present[0]), int(present[1])],
         dtype=torch.int32,
         device=device,
     )
     dist.all_reduce(global_presence, op=dist.ReduceOp.MAX)
-    return bool(global_presence.item())
+    return bool(global_presence[0].item()), bool(global_presence[1].item())
 
 
 def _realized_policy_microbatch_dose(
     *,
     policy_loss_weight: float,
     policy_objective_fraction: float,
-    globally_policy_active: bool,
+    globally_base_active: bool,
+    globally_aux_active: bool,
+    policy_aux_loss_weight: float,
     accumulation_group_size: int,
 ) -> tuple[float, float]:
     """Return this microbatch's contribution to one optimizer-group dose.
 
     The learner divides every microbatch objective by the actual accumulation
     group size, including a short trailing group. Policy LR-area and equivalent
-    optimizer updates must use the same divisor or value-only/empty
-    microbatches silently spend a dose they never applied.
+    optimizer updates must use the same divisor and the same independently
+    normalized base/AUX coefficients, or value-only/empty microbatches and
+    two-stream batches silently spend the wrong dose.
     """
 
     weight = _validate_policy_loss_weight(policy_loss_weight)
     fraction = float(policy_objective_fraction)
+    aux_weight = float(policy_aux_loss_weight)
     group_size = int(accumulation_group_size)
     if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
         raise ValueError("policy objective fraction must be finite and in [0, 1]")
+    if not math.isfinite(aux_weight) or aux_weight < 0.0:
+        raise ValueError("policy AUX objective weight must be finite and non-negative")
     if group_size < 1:
         raise ValueError("policy accumulation group size must be positive")
-    if not bool(globally_policy_active):
+    objective_multiplier = float(bool(globally_base_active)) + (
+        aux_weight * float(bool(globally_aux_active))
+    )
+    if objective_multiplier == 0.0:
         return 0.0, 0.0
-    return weight / group_size, fraction / group_size
+    return (
+        weight * objective_multiplier / group_size,
+        fraction * objective_multiplier / group_size,
+    )
 
 
 def _validate_policy_dose_topology(
@@ -14847,11 +14882,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 else float(policy_kl_controller.coefficient)
             )
             scheduled_base_lr = float(args.lr) * float(applied_lr_multiplier)
+            policy_stream_objective_multiplier = 1.0 + (
+                float(args.policy_aux_loss_weight)
+                if policy_aux_batch is not None
+                else 0.0
+            )
             batch_policy_loss_weight = _policy_weight_for_lr_area(
                 float(args.policy_loss_weight),
                 scheduled_base_lr=scheduled_base_lr,
                 consumed_lr_area=policy_objective_lr_area,
                 target_lr_area=float(args.policy_dose_lr_area),
+                objective_multiplier=policy_stream_objective_multiplier,
             )
             batch_policy_objective_fraction = _policy_objective_fraction(
                 batch_policy_loss_weight,
@@ -15091,7 +15132,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             optimizer_step_applied = bool(
                 batch_metrics.get("optimizer_step_applied", accum_do_step)
             )
-            globally_policy_active = _global_policy_objective_presence(
+            (
+                globally_base_policy_active,
+                globally_aux_policy_active,
+            ) = _global_policy_stream_presence(
                 local_base_active_rows=int(
                     batch_metrics.get(
                         "policy_base_active_count",
@@ -15109,7 +15153,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             ) = _realized_policy_microbatch_dose(
                 policy_loss_weight=batch_policy_loss_weight,
                 policy_objective_fraction=batch_policy_objective_fraction,
-                globally_policy_active=globally_policy_active,
+                globally_base_active=globally_base_policy_active,
+                globally_aux_active=globally_aux_policy_active,
+                policy_aux_loss_weight=float(args.policy_aux_loss_weight),
                 accumulation_group_size=accumulation_group_size,
             )
             policy_group_lr_area_weight += microbatch_lr_area_weight
@@ -15289,7 +15335,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             batch_policy_effective_weight = float(
                 batch_metrics.get("policy_base_loss_weight_sum", 0.0)
-            ) + float(
+            ) + float(args.policy_aux_loss_weight) * float(
                 batch_metrics.get("policy_aux_loss_weight_sum", 0.0)
             )
             if batch_policy_objective_fraction > 0.0:
