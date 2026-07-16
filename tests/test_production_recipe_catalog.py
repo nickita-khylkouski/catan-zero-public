@@ -10,6 +10,7 @@ from catan_zero.rl.production_recipe_catalog import (
     production_recipes,
     require_production_recipe,
 )
+from catan_zero.rl.pipeline_configs import config_from_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +56,16 @@ def test_checked_in_parent_update_recipe_is_authenticated() -> None:
         require_production_recipe(entrypoint="train", path=path, payload=payload)
         == expected_name
     )
+
+
+def test_generation_recipe_round_trips_every_typed_science_field() -> None:
+    path = ROOT / APPROVED["generate"][0]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    resolved = config_from_payload(payload)
+
+    assert resolved.field_values() == payload["fields"]
+    assert resolved.preserve_root_prior_value is True
 
 
 def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None:

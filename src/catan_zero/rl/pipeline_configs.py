@@ -510,6 +510,11 @@ class GenerateConfig(PipelineConfig):
     # Preserve completed-Q and visit-count tensors needed for post-hoc target
     # stability calibration and exact policy-target reconstruction.
     preserve_search_evidence: bool = False
+    # The generator has always materialized the pre-search evaluator value on
+    # eligible full-search roots.  Bind that invariant into typed provenance
+    # so the canonical schema19 file and the resolved GenerateConfig cannot
+    # silently claim different science identities.
+    preserve_root_prior_value: bool = True
     n_full_wide: int | None = None
     n_full_wide_threshold: int | None = None
     wide_roots_always_full: bool = False
