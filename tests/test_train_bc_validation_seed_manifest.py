@@ -662,7 +662,6 @@ def _decisive_semantics_args(**overrides: object) -> argparse.Namespace:
     ("overrides", "message"),
     [
         ({"grad_accum_steps": 2}, "union-weighted gradient accumulation"),
-        ({"symmetry_augment": True}, "per-rank RNG"),
         (
             {"advantage_policy_weighting": "outcome_value"},
             "global DDP normalization",
@@ -678,6 +677,19 @@ def test_decisive_distributed_a1_rejects_unsealed_semantics(
             {"world_size": 8, "enabled": True},
             {},
         )
+
+
+def test_decisive_distributed_a1_binds_shared_symmetry_stream() -> None:
+    contract = _validate_a1_decisive_training_semantics(
+        _decisive_semantics_args(symmetry_augment=True),
+        {"world_size": 8, "enabled": True},
+        {},
+    )
+    assert contract["decisive"] is True
+    assert (
+        contract["distributed_symmetry_contract"]
+        == "shared_rank_stream_exact_v1"
+    )
 
 
 def test_explicit_a1_diagnostic_authority_records_but_does_not_promote_unsafe_knobs(
@@ -697,7 +709,10 @@ def test_explicit_a1_diagnostic_authority_records_but_does_not_promote_unsafe_kn
     assert contract["gradient_accumulation_contract"] == (
         "diagnostic_approximate_microbatch_means"
     )
-    assert contract["distributed_symmetry_contract"] == "incomplete"
+    assert (
+        contract["distributed_symmetry_contract"]
+        == "shared_rank_stream_exact_v1"
+    )
     assert contract["distributed_advantage_contract"] == (
         "global_normalization_unsealed_for_a1"
     )

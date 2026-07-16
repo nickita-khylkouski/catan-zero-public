@@ -8274,8 +8274,10 @@ def _validate_a1_decisive_training_semantics(
 
     * gradient accumulation currently averages already-normalized microbatch
       means, not the exact union-weighted numerator/denominator;
-    * distributed symmetry augmentation has no completed per-rank RNG/resume
-      contract; and
+    * distributed symmetry augmentation uses one shared NumPy stream whose
+      cross-rank state equality is checked before every resumable checkpoint;
+      this is restart-exact but intentionally not a rank-independent stream;
+      and
     * outcome-value advantage weighting was historically rank-local under DDP.
       Its new global normalization still needs a fresh, explicitly reviewed A1
       seal before it can affect a promotable candidate.
@@ -34229,6 +34231,30 @@ def _save_optimizer_sidecar(checkpoint_path: str, policy, optimizer, ddp: dict):
     return save_optimizer_state(checkpoint_path, policy.model, optimizer, ddp)
 
 
+def _require_shared_symmetry_rng_state(
+    states: list[object],
+) -> dict[str, object] | None:
+    """Prove every DDP rank consumed the shared symmetry stream equally."""
+
+    if not states:
+        raise RuntimeError("symmetry RNG state gather returned no ranks")
+    if all(state is None for state in states):
+        return None
+    if any(not isinstance(state, dict) for state in states):
+        raise RuntimeError(
+            "distributed symmetry RNG state is enabled on only part of the ranks"
+        )
+    identities = [
+        _canonical_json_sha256(_rng_json_value(state)) for state in states
+    ]
+    if len(set(identities)) != 1:
+        raise RuntimeError(
+            "distributed symmetry RNG streams diverged across ranks; refusing "
+            "a falsely resumable checkpoint"
+        )
+    return copy.deepcopy(states[0])
+
+
 def _save_training_progress_sidecar(
     checkpoint_path: str,
     *,
@@ -34261,6 +34287,9 @@ def _save_training_progress_sidecar(
         ),
     }
     local_numpy_rng_state = rng.bit_generator.state
+    local_symmetry_rng_state = (
+        None if symmetry_rng is None else symmetry_rng.bit_generator.state
+    )
     if bool(ddp["enabled"]):
         import torch.distributed as dist
 
@@ -34276,11 +34305,26 @@ def _save_training_progress_sidecar(
         gathered_numpy_rng_states = [
             row for row in rank_numpy_rng_states if row is not None
         ]
+        rank_symmetry_rng_states: list[dict[str, object] | None] = [
+            None for _ in range(int(ddp["world_size"]))
+        ]
+        dist.all_gather_object(
+            rank_symmetry_rng_states,
+            local_symmetry_rng_state,
+        )
+        gathered_symmetry_rng_states: list[object] = list(
+            rank_symmetry_rng_states
+        )
     else:
         gathered_rng_states = [local_rng]
         gathered_numpy_rng_states = [local_numpy_rng_state]
+        gathered_symmetry_rng_states = [local_symmetry_rng_state]
 
-    # Non-zero DDP/FSDP ranks participate in optimizer/RNG collectives but never write.
+    shared_symmetry_rng_state = _require_shared_symmetry_rng_state(
+        gathered_symmetry_rng_states
+    )
+    # Non-zero DDP/FSDP ranks participate in optimizer/RNG collectives and the
+    # shared-symmetry invariant, but never write.
     if int(ddp["rank"]) != 0:
         return
     if optimizer_saved is None:
@@ -34296,9 +34340,7 @@ def _save_training_progress_sidecar(
             recipe_identity=recipe_identity,
             rng_state=rng.bit_generator.state,
             rank_numpy_rng_states=gathered_numpy_rng_states,
-            symmetry_rng_state=(
-                None if symmetry_rng is None else symmetry_rng.bit_generator.state
-            ),
+            symmetry_rng_state=shared_symmetry_rng_state,
             rank_torch_rng_states=gathered_rng_states,
             scalar_training_weight_sum=float(scalar_training_weight_sum),
             categorical_training_weight_sum=float(

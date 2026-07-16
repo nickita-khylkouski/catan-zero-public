@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 
 import numpy as np
 import pytest
@@ -176,6 +177,31 @@ def test_sampler_seed_decouples_every_numpy_data_trajectory_from_torch_seed() ->
         train_bc._resolved_sampler_seed(right) + 20260705
     ).integers(12, size=64)
     assert np.array_equal(left_symmetry, right_symmetry)
+
+
+def test_shared_symmetry_rng_state_requires_exact_rank_alignment() -> None:
+    rng = np.random.default_rng(20260705)
+    rng.integers(12, size=37)
+    state = rng.bit_generator.state
+
+    shared = train_bc._require_shared_symmetry_rng_state(  # noqa: SLF001
+        [copy.deepcopy(state) for _ in range(8)]
+    )
+    assert shared == state
+    assert train_bc._require_shared_symmetry_rng_state(  # noqa: SLF001
+        [None for _ in range(8)]
+    ) is None
+
+    drifted = copy.deepcopy(state)
+    drifted["state"]["state"] += 1
+    with pytest.raises(RuntimeError, match="streams diverged"):
+        train_bc._require_shared_symmetry_rng_state(  # noqa: SLF001
+            [copy.deepcopy(state), drifted]
+        )
+    with pytest.raises(RuntimeError, match="only part of the ranks"):
+        train_bc._require_shared_symmetry_rng_state(  # noqa: SLF001
+            [copy.deepcopy(state), None]
+        )
 
 
 def test_resume_identity_binds_explicit_sampler_and_torch_seeds_independently() -> None:
