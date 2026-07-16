@@ -301,6 +301,12 @@ def test_promotion_report_accepts_only_exact_authenticated_curriculum_parent(
         "vps_to_win": 10,
         "world_size": 8,
         "batch_size": 512,
+        "grad_accum_steps": 1,
+        "a1_decisive_training_semantics": {
+            "schema_version": "a1-decisive-training-semantics-v1",
+            "grad_accum_steps": 1,
+            "gradient_accumulation_contract": "single_microbatch_exact",
+        },
         "checkpoint": str(candidate),
         "init_checkpoint_sha256": parent_binding["parent_checkpoint"]["sha256"],
         "a1_curriculum_parent": parent_binding,

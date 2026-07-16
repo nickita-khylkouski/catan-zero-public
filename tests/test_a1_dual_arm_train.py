@@ -328,6 +328,49 @@ def test_two_b200_fallback_preserves_global_batch_4096(tmp_path: Path) -> None:
     assert binding["global_batch_size"] == 4096
 
 
+def test_two_rank_approximate_accumulation_is_diagnostic_and_not_promotable(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["topology"] = learner_contract.TOPOLOGIES[2]
+    verified["recipe"] = dict(verified["bound_recipe"])
+    verified["recipe"].update(
+        {
+            "world_size": 2,
+            "batch_size": 512,
+            "grad_accum_steps": 4,
+            "global_batch_size": 4096,
+        }
+    )
+    command = dual.build_command(
+        verified,
+        python=Path("/venv/bin/python"),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    binding = dual._execution_binding(command, verified)  # noqa: SLF001
+    checkpoint, report = _write_outputs(
+        tmp_path, verified, binding, world_size=2
+    )
+    dual.verify_outputs(
+        verified=verified,
+        checkpoint=checkpoint,
+        report=report,
+        binding=binding,
+    )
+    payload = json.loads(report.read_text())
+    assert payload["diagnostic_only"] is True
+    assert payload["promotion_eligible"] is False
+    with pytest.raises(
+        promotion.PromotionError, match="single_microbatch_exact"
+    ):
+        promotion._require_exact_gradient_accumulation_semantics(  # noqa: SLF001
+            payload,
+            where="test two-rank report",
+            required=True,
+        )
+
+
 def test_train_bc_accepts_only_reviewed_two_rank_topology(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -525,10 +568,12 @@ def _write_outputs(
     steps = math.ceil(verified["training_rows"] / 4096) * epochs
     lineage_dose = dual._lineage_dose(verified)  # noqa: SLF001
     parent = verified.get("curriculum_parent")
+    grad_accum_steps = int(verified["recipe"]["grad_accum_steps"])
     payload = {
         "arch": "entity_graph", "hidden_size": 640, "graph_layers": 6,
         "attention_heads": 8, "graph_dropout": 0.05, "world_size": world_size,
-        "batch_size": 512, "ddp_shard_data": False, "steps_completed": steps,
+        "batch_size": 512, "grad_accum_steps": grad_accum_steps,
+        "ddp_shard_data": False, "steps_completed": steps,
         "total_training_steps": steps, "epochs": epochs, "max_steps": 0,
         "samples": verified["corpus_rows"], "global_samples": verified["corpus_rows"],
         "train_samples": verified["training_rows"],
@@ -562,6 +607,22 @@ def _write_outputs(
         "a1_learner_code_sha256": verified["learner_code_sha256"],
         "a1_runtime_code_tree_sha256": verified["runtime_code_tree_sha256"],
         "a1_memmap_payload_inventory_sha256": verified["payload_inventory_sha256"],
+        "a1_decisive_training_semantics": {
+            "schema_version": "a1-decisive-training-semantics-v1",
+            "decisive": False,
+            "diagnostic_authority_present": True,
+            "world_size": world_size,
+            "grad_accum_steps": grad_accum_steps,
+            "gradient_accumulation_contract": (
+                "single_microbatch_exact"
+                if grad_accum_steps == 1
+                else "diagnostic_approximate_microbatch_means"
+            ),
+            "symmetry_augmentation": False,
+            "distributed_symmetry_contract": "not_applicable",
+            "advantage_policy_weighting": "none",
+            "distributed_advantage_contract": "not_applicable",
+        },
         "mask_hidden_info": True, "require_35m_model": True,
         "optimizer": "adam", "resume_optimizer": False,
         "optimizer_restored": False, "fused_optimizer": False, "amp": "bf16",
@@ -604,6 +665,8 @@ def _write_outputs(
             "promotion_eligible": False,
         })
         payload["value_training"]["learner_ablation"] = verified["learner_ablation"]
+    if grad_accum_steps != 1:
+        payload.update({"diagnostic_only": True, "promotion_eligible": False})
     if epochs > 1:
         for epoch in range(1, epochs + 1):
             epoch_checkpoint = dual.train_bc._epoch_checkpoint_path(  # noqa: SLF001
@@ -788,6 +851,12 @@ def test_promotion_receipt_verifier_accepts_dual_transaction(
         dual.REPORT_BINDING_FIELD: binding,
         "a1_bound_learner_training_recipe": {"world_size": 8},
         "a1_bound_learner_value_objective": {"objective": "mse"},
+        "grad_accum_steps": 1,
+        "a1_decisive_training_semantics": {
+            "schema_version": "a1-decisive-training-semantics-v1",
+            "grad_accum_steps": 1,
+            "gradient_accumulation_contract": "single_microbatch_exact",
+        },
     }))
     audit = tmp_path / "audit.json"
     audit.write_text(json.dumps({
@@ -887,6 +956,12 @@ def test_promotion_training_report_accepts_bound_eight_rank_recipe(
         "arch": "entity_graph", "mask_hidden_info": True,
         "track": "2p_no_trade", "vps_to_win": 10,
         "world_size": 8, "batch_size": 512,
+        "grad_accum_steps": 1,
+        "a1_decisive_training_semantics": {
+            "schema_version": "a1-decisive-training-semantics-v1",
+            "grad_accum_steps": 1,
+            "gradient_accumulation_contract": "single_microbatch_exact",
+        },
         "checkpoint": str(candidate),
         "init_checkpoint_sha256": verified["producer"]["sha256"],
         "steps_completed": 3, "epochs": 1, "max_steps": 0,

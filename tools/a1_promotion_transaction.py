@@ -806,6 +806,38 @@ def _training_evaluation_parent_sha256(
     )
 
 
+def _require_exact_gradient_accumulation_semantics(
+    report: Mapping[str, Any], *, where: str, required: bool = False
+) -> None:
+    """Reject promotion of conditional microbatch-mean accumulation.
+
+    The learner may run that operator under explicit diagnostic authority, but
+    it is not the same objective as a single union-weighted global batch.  Bind
+    promotion to the trainer's typed semantics rather than to a particular
+    world-size/topology spelling so future alternate topologies fail closed too.
+    """
+
+    semantics = report.get("a1_decisive_training_semantics")
+    if semantics is None and not required:
+        return
+    if not isinstance(semantics, Mapping):
+        raise PromotionError(f"{where} has no typed gradient accumulation semantics")
+    report_accum = report.get("grad_accum_steps")
+    if (
+        semantics.get("schema_version")
+        != "a1-decisive-training-semantics-v1"
+        or semantics.get("gradient_accumulation_contract")
+        != "single_microbatch_exact"
+        or type(semantics.get("grad_accum_steps")) is not int
+        or semantics.get("grad_accum_steps") != 1
+        or type(report_accum) is not int
+        or report_accum != 1
+    ):
+        raise PromotionError(
+            f"{where} does not attest single_microbatch_exact gradient accumulation"
+        )
+
+
 def _verify_training_report(
     path: Path,
     *,
@@ -978,6 +1010,11 @@ def _verify_training_report(
             "typed initializer chain is not an independent gate-eligible FINAL"
         )
     is_dual = report.get("a1_dual_arm_execution_binding") is not None
+    _require_exact_gradient_accumulation_semantics(
+        report,
+        where="candidate training report",
+        required=is_dual,
+    )
     if is_dual:
         recipe = report.get("a1_bound_learner_training_recipe")
         if not isinstance(recipe, dict):
@@ -2487,6 +2524,11 @@ def _verify_one_dose_training_receipt(
         ):
             raise PromotionError("dual-arm audit does not bind this contract lock")
         report = _load_json(training_report_path)
+        _require_exact_gradient_accumulation_semantics(
+            report,
+            where="dual-arm training receipt report",
+            required=True,
+        )
         if report.get("a1_dual_arm_execution_binding") != value.get(
             "execution_binding"
         ):

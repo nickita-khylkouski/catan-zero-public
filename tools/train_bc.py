@@ -7747,6 +7747,40 @@ def _validate_a1_decisive_training_semantics(
     return contract
 
 
+def _a1_report_eligibility_from_training_semantics(
+    semantics: Mapping[str, object] | None,
+    *,
+    diagnostic_only: bool,
+    promotion_eligible: bool,
+) -> tuple[bool, bool]:
+    """Demote any A1 report whose gradient accumulation is approximate.
+
+    Diagnostic authority permits bounded experiments with unsealed operators;
+    it must never turn those operators into a promotion path.  In particular,
+    the current ``grad_accum_steps > 1`` implementation averages already-
+    normalized conditional microbatch means.  It is not equivalent to the
+    union-weighted objective represented by one effective global batch.
+
+    Treat missing or malformed declared semantics as non-promotable too.  The
+    promotion transaction performs a stricter structural verification; this
+    projection makes the trainer's own report truthful at creation time.
+    """
+
+    if semantics is None:
+        return bool(diagnostic_only), bool(promotion_eligible)
+    exact = (
+        semantics.get("schema_version")
+        == "a1-decisive-training-semantics-v1"
+        and semantics.get("gradient_accumulation_contract")
+        == "single_microbatch_exact"
+        and type(semantics.get("grad_accum_steps")) is int
+        and semantics.get("grad_accum_steps") == 1
+    )
+    if not exact:
+        return True, False
+    return bool(diagnostic_only), bool(promotion_eligible)
+
+
 def _validate_a1_batch_probe_authorization(
     args: argparse.Namespace,
     effective: dict[str, object],
@@ -14633,6 +14667,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "a1_learner_topology_authorization": topology_authorization,
             }
         )
+    semantics = report.get("a1_decisive_training_semantics")
+    if semantics is not None:
+        diagnostic_only, promotion_eligible = (
+            _a1_report_eligibility_from_training_semantics(
+                semantics if isinstance(semantics, Mapping) else {},
+                diagnostic_only=bool(report.get("diagnostic_only", True)),
+                promotion_eligible=bool(report.get("promotion_eligible", False)),
+            )
+        )
+        report["diagnostic_only"] = diagnostic_only
+        report["promotion_eligible"] = promotion_eligible
     if ddp["rank"] == 0:
         write_json(args.report, report)
         print(json.dumps(report, indent=2, sort_keys=True))

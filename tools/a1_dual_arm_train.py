@@ -791,6 +791,32 @@ def verify_outputs(
                 "promotion_eligible": False,
             }
         )
+    semantics = payload.get("a1_decisive_training_semantics")
+    grad_accum_steps = verified["recipe"].get("grad_accum_steps")
+    expected_accumulation_contract = (
+        "single_microbatch_exact"
+        if grad_accum_steps == 1
+        else "diagnostic_approximate_microbatch_means"
+    )
+    if (
+        not isinstance(semantics, dict)
+        or semantics.get("schema_version")
+        != "a1-decisive-training-semantics-v1"
+        or semantics.get("world_size") != verified["recipe"].get("world_size")
+        or semantics.get("grad_accum_steps") != grad_accum_steps
+        or semantics.get("gradient_accumulation_contract")
+        != expected_accumulation_contract
+    ):
+        raise DualTrainError(
+            "dual-arm training report world_size/gradient accumulation semantics drift"
+        )
+    if expected_accumulation_contract != "single_microbatch_exact":
+        expected.update(
+            {
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+            }
+        )
     drift = {
         key: {"expected": value, "actual": payload.get(key)}
         for key, value in expected.items()

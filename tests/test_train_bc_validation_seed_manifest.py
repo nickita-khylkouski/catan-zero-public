@@ -24,6 +24,7 @@ from train_bc import (  # type: ignore  # noqa: E402
     _training_data_fingerprint,
     _validation_contract_config_identity,
     _value_training_metadata,
+    _a1_report_eligibility_from_training_semantics,
     _validate_a1_corpus_artifacts_and_seeds,
     _validate_a1_decisive_training_semantics,
     _validate_a1_learner_objective,
@@ -700,6 +701,35 @@ def test_explicit_a1_diagnostic_authority_records_but_does_not_promote_unsafe_kn
     assert contract["distributed_advantage_contract"] == (
         "global_normalization_unsealed_for_a1"
     )
+    assert _a1_report_eligibility_from_training_semantics(
+        contract,
+        diagnostic_only=False,
+        promotion_eligible=True,
+    ) == (True, False)
+
+
+def test_exact_single_microbatch_semantics_preserve_source_eligibility() -> None:
+    contract = _validate_a1_decisive_training_semantics(
+        _decisive_semantics_args(),
+        {"world_size": 8, "enabled": True},
+        {},
+    )
+    assert _a1_report_eligibility_from_training_semantics(
+        contract,
+        diagnostic_only=False,
+        promotion_eligible=True,
+    ) == (False, True)
+
+
+def test_four_way_conditional_mean_accumulation_can_attenuate_signal_75_percent() -> None:
+    # One sparse labeled microbatch followed by three empty ones. The current
+    # approximate operator divides every microbatch mean by grad_accum_steps:
+    # (g + 0 + 0 + 0) / 4. The union-weighted conditional mean is g / 1.
+    microbatch_gradients = np.asarray([1.0, 0.0, 0.0, 0.0])
+    approximate = float(microbatch_gradients.mean())
+    union_weighted = 1.0
+    assert approximate == pytest.approx(0.25)
+    assert 1.0 - approximate / union_weighted == pytest.approx(0.75)
 
 
 @pytest.mark.parametrize(
