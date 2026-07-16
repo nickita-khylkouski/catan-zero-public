@@ -202,8 +202,10 @@ def test_builder_smokes_the_compiled_capability_contract_before_hashing() -> Non
     assert "belief_target_evidence" in script
     assert "initial_road_d1_scope" in script
     assert "public_award_feature_parity" in script
+    assert "entity_feature_adapter_version" in script
     assert "policy_temperature_semantics" in script
     assert "coherent_public_belief_search" in script
+    assert "boundary_value_particles" in script
     assert "forced_root_trajectory_only" in script
 
 
