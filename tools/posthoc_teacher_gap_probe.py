@@ -794,6 +794,7 @@ def _value_quality_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:
     try:
         primary = float(metrics["primary_value_loss"])
         scalar_mse = float(metrics["scalar_value_mse_diagnostic"])
+        raw_value = float(metrics["value_loss"])
         kind = str(metrics["primary_value_loss_kind"])
         weighted_mass = float(denominators["value_loss"])
     except (KeyError, TypeError, ValueError) as error:
@@ -802,8 +803,10 @@ def _value_quality_projection(metrics: Mapping[str, Any]) -> dict[str, Any]:
         kind != "scalar_mse"
         or not math.isfinite(primary)
         or not math.isfinite(scalar_mse)
+        or not math.isfinite(raw_value)
         or weighted_mass <= 0.0
         or not math.isclose(primary, scalar_mse, rel_tol=0.0, abs_tol=1.0e-12)
+        or not math.isclose(primary, raw_value, rel_tol=0.0, abs_tol=1.0e-12)
     ):
         raise SystemExit(
             "posthoc value-quality metric does not match the scalar-MSE objective"

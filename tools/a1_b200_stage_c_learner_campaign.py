@@ -51,6 +51,7 @@ FINGERPRINT_SCHEMA = "a1-b200-stage-c-aligned-learner-fingerprint-v4"
 PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
 TRANSITIONAL_PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v1"
 SEPARATE_PARENT_GAP_SCHEMA = "posthoc-separate-parent-teacher-gap-v1"
+VALUE_QUALITY_SCHEMA = "posthoc-objective-matched-value-quality-v1"
 PAIRED_PARENT_VALUE_SCHEMA = "posthoc-paired-parent-value-quality-v1"
 WORLD_SIZE = 8
 LOCAL_BATCH_SIZE = 512
@@ -1205,7 +1206,11 @@ def _parent_functional_artifact(
 
 
 def _functional_artifact_path(
-    output_root: Path, step: int, *, allow_separate_parent: bool
+    output_root: Path,
+    step: int,
+    *,
+    allow_separate_parent: bool,
+    expected_bindings: Mapping[str, Any],
 ) -> Path:
     """Prefer reusable fresh-parent evidence; never overwrite existing bytes."""
 
@@ -1219,6 +1224,9 @@ def _functional_artifact_path(
         if not candidate.is_file():
             continue
         payload = _load_json(candidate, where=f"step {step} functional evidence")[1]
+        _authenticate_cached_functional_evidence(
+            payload, expected=expected_bindings, step=step
+        )
         paired = payload.get("paired_parent_teacher_gap")
         if isinstance(paired, dict) and paired.get("schema_version") in {
             PAIRED_PARENT_GAP_SCHEMA,
@@ -1237,6 +1245,86 @@ def _functional_artifact_path(
                 f"fresh-parent functional artifact is malformed: {fresh}"
             )
     return fresh
+
+
+def _authenticate_cached_functional_evidence(
+    payload: Mapping[str, Any],
+    *,
+    expected: Mapping[str, Any],
+    step: int,
+) -> None:
+    """Refuse cached evidence unless every live artifact binding still matches."""
+
+    inputs = payload.get("inputs")
+    shared = payload.get("shared_holdout")
+    if not isinstance(inputs, dict) or not isinstance(shared, dict):
+        raise CampaignError(f"step {step} cached functional bindings are missing")
+    shared_unsigned = {
+        key: value
+        for key, value in shared.items()
+        if key
+        not in {
+            "identity_sha256",
+            "training_report",
+            "memmap",
+            "validation_manifest",
+        }
+    }
+    try:
+        input_projection = {
+            "checkpoint": {
+                "path": inputs["checkpoint"]["path"],
+                "sha256": inputs["checkpoint"]["sha256"],
+            },
+            "training_report": {
+                "path": inputs["training_report"]["path"],
+                "sha256": inputs["training_report"]["sha256"],
+            },
+            "memmap": {
+                "path": inputs["memmap"]["path"],
+                "fingerprint": inputs["memmap"]["fingerprint"],
+                "payload_inventory_sha256": inputs["memmap"][
+                    "payload_inventory_sha256"
+                ],
+            },
+            "validation_manifest": {
+                "path": inputs["validation_manifest"]["path"],
+                "sha256": inputs["validation_manifest"]["sha256"],
+                "manifest_sha256": inputs["validation_manifest"]["manifest_sha256"],
+            },
+            "validation_game_seed_set_sha256": payload[
+                "validation_game_seed_set_sha256"
+            ],
+        }
+        shared_projection = {
+            "training_report": shared["training_report"],
+            "memmap": shared["memmap"],
+            "validation_manifest": shared["validation_manifest"],
+            "validation_game_seed_set_sha256": shared[
+                "validation_game_seed_set_sha256"
+            ],
+        }
+    except (KeyError, TypeError) as error:
+        raise CampaignError(
+            f"step {step} cached functional bindings are malformed"
+        ) from error
+    expected_shared = {
+        key: expected[key]
+        for key in (
+            "training_report",
+            "memmap",
+            "validation_manifest",
+            "validation_game_seed_set_sha256",
+        )
+    }
+    if (
+        input_projection != dict(expected)
+        or shared_projection != expected_shared
+        or shared.get("identity_sha256") != _value_sha256(shared_unsigned)
+    ):
+        raise CampaignError(
+            f"step {step} cached functional evidence is stale or misbound"
+        )
 
 
 def _select_fingerprint_winner(
@@ -1277,6 +1365,114 @@ def _select_fingerprint_winner(
     )
 
 
+def _value_projection_from_metrics(
+    functional: Mapping[str, Any], *, where: str
+) -> dict[str, Any]:
+    metrics = functional.get("metrics")
+    if not isinstance(metrics, dict):
+        raise CampaignError(f"{where} functional report has no raw value metrics")
+    try:
+        primary = float(metrics["primary_value_loss"])
+        scalar = float(metrics["scalar_value_mse_diagnostic"])
+        raw_value = float(metrics["value_loss"])
+        kind = str(metrics["primary_value_loss_kind"])
+        mass = float(metrics["loss_denominators"]["value_loss"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError(f"{where} raw value metrics are malformed") from error
+    if (
+        kind != "scalar_mse"
+        or not all(math.isfinite(value) for value in (primary, scalar, raw_value, mass))
+        or mass <= 0.0
+        or not math.isclose(primary, scalar, rel_tol=0.0, abs_tol=1.0e-12)
+        or not math.isclose(primary, raw_value, rel_tol=0.0, abs_tol=1.0e-12)
+    ):
+        raise CampaignError(f"{where} raw value metrics are inconsistent")
+    return {
+        "schema_version": VALUE_QUALITY_SCHEMA,
+        "selection_authority": True,
+        "surface": "same_reconstructed_holdout_and_value_weight_measure",
+        "metric": "primary_value_loss",
+        "metric_kind": kind,
+        "value": primary,
+        "scalar_value_mse_diagnostic": scalar,
+        "value_weight_mass": mass,
+    }
+
+
+def _reconciled_value_projection(
+    functional: Mapping[str, Any],
+    *,
+    field: str,
+    where: str,
+    require_emitted: bool,
+) -> dict[str, Any]:
+    raw = _value_projection_from_metrics(functional, where=where)
+    emitted = functional.get(field)
+    if emitted is None and not require_emitted:
+        return raw
+    if not isinstance(emitted, dict):
+        raise CampaignError(f"{where} emitted value-quality projection is missing")
+    try:
+        emitted_value = float(emitted["value"])
+        emitted_scalar = float(emitted["scalar_value_mse_diagnostic"])
+        emitted_mass = float(emitted["value_weight_mass"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError(
+            f"{where} emitted value-quality projection is malformed"
+        ) from error
+    if (
+        emitted.get("schema_version") != VALUE_QUALITY_SCHEMA
+        or emitted.get("selection_authority") is not True
+        or emitted.get("surface")
+        != "same_reconstructed_holdout_and_value_weight_measure"
+        or emitted.get("metric") != raw["metric"]
+        or emitted.get("metric_kind") != raw["metric_kind"]
+        or not math.isclose(
+            emitted_value, float(raw["value"]), rel_tol=0.0, abs_tol=1.0e-12
+        )
+        or not math.isclose(
+            emitted_scalar,
+            float(raw["scalar_value_mse_diagnostic"]),
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+        or not math.isclose(
+            emitted_mass,
+            float(raw["value_weight_mass"]),
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        )
+    ):
+        raise CampaignError(
+            f"{where} emitted value-quality projection contradicts raw metrics"
+        )
+    return dict(emitted)
+
+
+def _validated_emitted_value_projection(
+    projection: Mapping[str, Any], *, where: str
+) -> dict[str, Any]:
+    try:
+        value = float(projection["value"])
+        scalar = float(projection["scalar_value_mse_diagnostic"])
+        mass = float(projection["value_weight_mass"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CampaignError(f"{where} value-quality projection is malformed") from error
+    if (
+        projection.get("schema_version") != VALUE_QUALITY_SCHEMA
+        or projection.get("selection_authority") is not True
+        or projection.get("surface")
+        != "same_reconstructed_holdout_and_value_weight_measure"
+        or projection.get("metric") != "primary_value_loss"
+        or projection.get("metric_kind") != "scalar_mse"
+        or not all(math.isfinite(item) for item in (value, scalar, mass))
+        or mass <= 0.0
+        or not math.isclose(value, scalar, rel_tol=0.0, abs_tol=1.0e-12)
+    ):
+        raise CampaignError(f"{where} value-quality projection is inconsistent")
+    return dict(projection)
+
+
 def _paired_value_quality(
     functional: Mapping[str, Any],
     *,
@@ -1294,21 +1490,24 @@ def _paired_value_quality(
             parent_functional
         ):
             raise CampaignError("parent and candidate value holdout surfaces differ")
-        candidate_metrics = functional.get("metrics")
-        parent_metrics = parent_functional.get("metrics")
-        if not isinstance(candidate_metrics, dict) or not isinstance(parent_metrics, dict):
-            raise CampaignError("functional report has no value-quality metrics")
-        try:
-            candidate = float(candidate_metrics["primary_value_loss"])
-            parent = float(parent_metrics["primary_value_loss"])
-            candidate_kind = str(candidate_metrics["primary_value_loss_kind"])
-            parent_kind = str(parent_metrics["primary_value_loss_kind"])
-            candidate_mass = float(
-                candidate_metrics["loss_denominators"]["value_loss"]
-            )
-            parent_mass = float(parent_metrics["loss_denominators"]["value_loss"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise CampaignError("value-quality metrics are malformed") from error
+        candidate_projection = _reconciled_value_projection(
+            functional,
+            field="value_quality",
+            where="candidate",
+            require_emitted=False,
+        )
+        parent_projection = _reconciled_value_projection(
+            parent_functional,
+            field="value_quality",
+            where="parent",
+            require_emitted=False,
+        )
+        candidate = float(candidate_projection["value"])
+        parent = float(parent_projection["value"])
+        candidate_kind = str(candidate_projection["metric_kind"])
+        parent_kind = str(parent_projection["metric_kind"])
+        candidate_mass = float(candidate_projection["value_weight_mass"])
+        parent_mass = float(parent_projection["value_weight_mass"])
         paired = {
             "schema_version": PAIRED_PARENT_VALUE_SCHEMA,
             "selection_authority": True,
@@ -1329,6 +1528,30 @@ def _paired_value_quality(
             )
         ):
             raise CampaignError("parent and candidate value objectives differ")
+    else:
+        candidate_projection = _reconciled_value_projection(
+            functional,
+            field="value_quality",
+            where="candidate",
+            require_emitted=True,
+        )
+        parent_projection = functional.get("parent_value_quality")
+        if not isinstance(parent_projection, dict):
+            raise CampaignError("paired value evidence has no parent projection")
+        parent_projection = _validated_emitted_value_projection(
+            parent_projection, where="parent"
+        )
+        if parent_functional is not None:
+            exact_parent_projection = _reconciled_value_projection(
+                parent_functional,
+                field="value_quality",
+                where="parent",
+                require_emitted=False,
+            )
+            if parent_projection != exact_parent_projection:
+                raise CampaignError(
+                    "paired value parent projection contradicts exact parent metrics"
+                )
     try:
         parent = float(paired["parent_value"])
         candidate = float(paired["candidate_value"])
@@ -1347,6 +1570,30 @@ def _paired_value_quality(
         or mass <= 0.0
         or not math.isclose(
             delta, candidate - parent, rel_tol=1.0e-9, abs_tol=1.0e-12
+        )
+        or not math.isclose(
+            candidate,
+            float(candidate_projection["value"]),
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+        or not math.isclose(
+            parent,
+            float(parent_projection["value"]),
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
+        )
+        or not math.isclose(
+            mass,
+            float(candidate_projection["value_weight_mass"]),
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
+        )
+        or not math.isclose(
+            mass,
+            float(parent_projection["value_weight_mass"]),
+            rel_tol=0.0,
+            abs_tol=1.0e-9,
         )
     ):
         raise CampaignError("paired parent value evidence is inconsistent")
@@ -1436,6 +1683,31 @@ def _fingerprint(
             expected_input_manifest
         ),
     }
+    current_functional_binding = {
+        "training_report": {
+            "path": str(report),
+            "sha256": _file_sha256(report),
+        },
+        "memmap": {
+            "path": str(Path(str(plan["inputs"]["data"])).resolve(strict=True)),
+            "fingerprint": report_payload["data_fingerprint"],
+            "payload_inventory_sha256": plan["inputs"][
+                "payload_inventory_sha256"
+            ]
+            if "payload_inventory_sha256" in plan["inputs"]
+            else None,
+        },
+        "validation_manifest": {
+            "path": str(validation_manifest),
+            "sha256": _file_sha256(validation_manifest),
+            "manifest_sha256": one_dose.train_bc._canonical_json_sha256(  # noqa: SLF001
+                validation_payload
+            ),
+        },
+        "validation_game_seed_set_sha256": validation_payload[
+            "validation_game_seed_set_sha256"
+        ],
+    }
     authority = _load_json(
         Path(str(plan["inputs"]["independent_parent_authority"])),
         where="independent parent authority",
@@ -1468,6 +1740,13 @@ def _fingerprint(
             output_root,
             step,
             allow_separate_parent=separate_parent_payload is not None,
+            expected_bindings={
+                "checkpoint": {
+                    "path": str(checkpoint),
+                    "sha256": _file_sha256(checkpoint),
+                },
+                **current_functional_binding,
+            },
         )
         drift_path = output_root / f"step{step:04d}.drift.json"
         if drift_path.is_symlink():

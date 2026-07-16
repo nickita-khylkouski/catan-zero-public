@@ -166,6 +166,7 @@ class _FakeTrainBC:
             "primary_value_loss": 0.4,
             "primary_value_loss_kind": "scalar_mse",
             "scalar_value_mse_diagnostic": 0.4,
+            "value_loss": 0.4,
             "loss_denominators": {"value_loss": 2.0},
         }
 

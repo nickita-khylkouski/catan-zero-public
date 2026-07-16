@@ -88,6 +88,52 @@ def _completed_feature_signal_report() -> dict[str, object]:
     }
 
 
+def _cached_functional_payload(expected: dict[str, object]) -> dict[str, object]:
+    shared_semantics = {
+        "schema_version": "posthoc-shared-holdout-identity/v1",
+        "memmap_fingerprint": expected["memmap"]["fingerprint"],
+        "memmap_payload_inventory_sha256": expected["memmap"][
+            "payload_inventory_sha256"
+        ],
+        "validation_manifest_semantic_sha256": expected["validation_manifest"][
+            "manifest_sha256"
+        ],
+        "validation_game_seed_set_sha256": expected[
+            "validation_game_seed_set_sha256"
+        ],
+        "validation_rows": 10,
+    }
+    shared = {
+        **shared_semantics,
+        "identity_sha256": campaign._value_sha256(shared_semantics),  # noqa: SLF001
+        "training_report": expected["training_report"],
+        "memmap": expected["memmap"],
+        "validation_manifest": expected["validation_manifest"],
+    }
+    return {
+        "schema_version": "posthoc-checkpoint-teacher-gap/v1",
+        "arch": "entity_graph",
+        "batch_size": 16,
+        "validation_rows": 10,
+        "validation_game_seed_set_sha256": expected[
+            "validation_game_seed_set_sha256"
+        ],
+        "inputs": {
+            key: expected[key]
+            for key in (
+                "checkpoint",
+                "training_report",
+                "memmap",
+                "validation_manifest",
+            )
+        },
+        "shared_holdout": shared,
+        "paired_parent_teacher_gap": {
+            "schema_version": campaign.PAIRED_PARENT_GAP_SCHEMA,
+        },
+    }
+
+
 def test_stage_c_feature_learning_signal_is_evidence_backed() -> None:
     report = _completed_feature_signal_report()
     campaign._verify_completed_feature_learning_signal(report)  # noqa: SLF001
@@ -117,6 +163,113 @@ def test_stage_c_feature_learning_signal_is_evidence_backed() -> None:
     with pytest.raises(campaign.CampaignError, match="observation cadence"):
         campaign._verify_completed_feature_learning_signal(  # noqa: SLF001
             no_observations
+        )
+
+
+def _functional_bindings(
+    *,
+    checkpoint: Path,
+    report: Path,
+    data: Path,
+    manifest: Path,
+    manifest_semantic: str,
+) -> dict[str, object]:
+    return {
+        "checkpoint": {
+            "path": str(checkpoint.resolve()),
+            "sha256": campaign._file_sha256(checkpoint),  # noqa: SLF001
+        },
+        "training_report": {
+            "path": str(report.resolve()),
+            "sha256": campaign._file_sha256(report),  # noqa: SLF001
+        },
+        "memmap": {
+            "path": str(data.resolve()),
+            "fingerprint": "sha256:" + "a" * 64,
+            "payload_inventory_sha256": "sha256:" + "b" * 64,
+        },
+        "validation_manifest": {
+            "path": str(manifest.resolve()),
+            "sha256": campaign._file_sha256(manifest),  # noqa: SLF001
+            "manifest_sha256": manifest_semantic,
+        },
+        "validation_game_seed_set_sha256": "sha256:" + "c" * 64,
+    }
+
+
+def test_stage_c_rejects_cached_functional_for_stale_candidate(tmp_path: Path) -> None:
+    output = tmp_path / "fingerprints"
+    output.mkdir()
+    checkpoint = tmp_path / "candidate.pt"
+    report = tmp_path / "report.json"
+    data = tmp_path / "data"
+    manifest = tmp_path / "holdout.json"
+    checkpoint.write_bytes(b"old candidate")
+    report.write_text("{}\n", encoding="utf-8")
+    data.mkdir()
+    manifest.write_text("{}\n", encoding="utf-8")
+    old = _functional_bindings(
+        checkpoint=checkpoint,
+        report=report,
+        data=data,
+        manifest=manifest,
+        manifest_semantic="sha256:" + "d" * 64,
+    )
+    cached = output / "step0004.functional.fresh-parent.json"
+    _write_json(cached, _cached_functional_payload(old))
+    checkpoint.write_bytes(b"current candidate")
+    current = _functional_bindings(
+        checkpoint=checkpoint,
+        report=report,
+        data=data,
+        manifest=manifest,
+        manifest_semantic="sha256:" + "d" * 64,
+    )
+
+    with pytest.raises(campaign.CampaignError, match="stale or misbound"):
+        campaign._functional_artifact_path(  # noqa: SLF001
+            output,
+            4,
+            allow_separate_parent=False,
+            expected_bindings=current,
+        )
+
+
+def test_stage_c_rejects_cached_functional_for_stale_holdout(tmp_path: Path) -> None:
+    output = tmp_path / "fingerprints"
+    output.mkdir()
+    checkpoint = tmp_path / "candidate.pt"
+    report = tmp_path / "report.json"
+    data = tmp_path / "data"
+    manifest = tmp_path / "holdout.json"
+    checkpoint.write_bytes(b"candidate")
+    report.write_text("{}\n", encoding="utf-8")
+    data.mkdir()
+    manifest.write_text('{"version": 1}\n', encoding="utf-8")
+    old = _functional_bindings(
+        checkpoint=checkpoint,
+        report=report,
+        data=data,
+        manifest=manifest,
+        manifest_semantic="sha256:" + "d" * 64,
+    )
+    cached = output / "step0004.functional.fresh-parent.json"
+    _write_json(cached, _cached_functional_payload(old))
+    manifest.write_text('{"version": 2}\n', encoding="utf-8")
+    current = _functional_bindings(
+        checkpoint=checkpoint,
+        report=report,
+        data=data,
+        manifest=manifest,
+        manifest_semantic="sha256:" + "e" * 64,
+    )
+
+    with pytest.raises(campaign.CampaignError, match="stale or misbound"):
+        campaign._functional_artifact_path(  # noqa: SLF001
+            output,
+            4,
+            allow_separate_parent=False,
+            expected_bindings=current,
         )
 
 
@@ -571,19 +724,44 @@ def test_stage_c_accepts_earlier_mid_epoch_value_safe_checkpoint() -> None:
 
 def test_stage_c_value_gate_replays_b200_parent_comparison() -> None:
     def functional(candidate_value: float) -> dict:
-        return {"paired_parent_value_quality": {
-            "schema_version": campaign.PAIRED_PARENT_VALUE_SCHEMA,
-            "selection_authority": True,
-            "surface": (
-                "same_holdout_same_objective_weights_fresh_exact_parent_forward"
-            ),
-            "metric": "primary_value_loss",
-            "metric_kind": "scalar_mse",
-            "value_weight_mass": 100.0,
-            "parent_value": 0.6638134101444333,
-            "candidate_value": candidate_value,
-            "candidate_minus_parent": candidate_value - 0.6638134101444333,
-        }}
+        parent_value = 0.6638134101444333
+
+        def projection(value: float) -> dict:
+            return {
+                "schema_version": campaign.VALUE_QUALITY_SCHEMA,
+                "selection_authority": True,
+                "surface": "same_reconstructed_holdout_and_value_weight_measure",
+                "metric": "primary_value_loss",
+                "metric_kind": "scalar_mse",
+                "value": value,
+                "scalar_value_mse_diagnostic": value,
+                "value_weight_mass": 100.0,
+            }
+
+        return {
+            "metrics": {
+                "primary_value_loss": candidate_value,
+                "primary_value_loss_kind": "scalar_mse",
+                "scalar_value_mse_diagnostic": candidate_value,
+                "value_loss": candidate_value,
+                "loss_denominators": {"value_loss": 100.0},
+            },
+            "value_quality": projection(candidate_value),
+            "parent_value_quality": projection(parent_value),
+            "paired_parent_value_quality": {
+                "schema_version": campaign.PAIRED_PARENT_VALUE_SCHEMA,
+                "selection_authority": True,
+                "surface": (
+                    "same_holdout_same_objective_weights_fresh_exact_parent_forward"
+                ),
+                "metric": "primary_value_loss",
+                "metric_kind": "scalar_mse",
+                "value_weight_mass": 100.0,
+                "parent_value": parent_value,
+                "candidate_value": candidate_value,
+                "candidate_minus_parent": candidate_value - parent_value,
+            },
+        }
 
     early = campaign._paired_value_quality(  # noqa: SLF001
         functional(0.6618989103258975),
@@ -672,6 +850,57 @@ def test_checkpoint_signal_is_bound_to_exact_intermediate_bytes(
             step=16,
             checkpoint=checkpoint,
             terminal_checkpoint=terminal,
+        )
+
+
+def test_stage_c_rejects_paired_value_block_that_contradicts_raw_metrics() -> None:
+    candidate_value = 0.6618989103258975
+    parent_value = 0.6638134101444333
+
+    def projection(value: float) -> dict:
+        return {
+            "schema_version": campaign.VALUE_QUALITY_SCHEMA,
+            "selection_authority": True,
+            "surface": "same_reconstructed_holdout_and_value_weight_measure",
+            "metric": "primary_value_loss",
+            "metric_kind": "scalar_mse",
+            "value": value,
+            "scalar_value_mse_diagnostic": value,
+            "value_weight_mass": 100.0,
+        }
+
+    functional = {
+        "metrics": {
+            "primary_value_loss": candidate_value,
+            "primary_value_loss_kind": "scalar_mse",
+            "scalar_value_mse_diagnostic": candidate_value,
+            "value_loss": candidate_value,
+            "loss_denominators": {"value_loss": 100.0},
+        },
+        "value_quality": projection(candidate_value),
+        "parent_value_quality": projection(parent_value),
+        "paired_parent_value_quality": {
+            "schema_version": campaign.PAIRED_PARENT_VALUE_SCHEMA,
+            "selection_authority": True,
+            "surface": (
+                "same_holdout_same_objective_weights_fresh_exact_parent_forward"
+            ),
+            "metric": "primary_value_loss",
+            "metric_kind": "scalar_mse",
+            "value_weight_mass": 100.0,
+            "parent_value": parent_value,
+            # Internally consistent, but contradicts candidate projection/raw metrics.
+            "candidate_value": 0.70,
+            "candidate_minus_parent": 0.70 - parent_value,
+        },
+    }
+
+    with pytest.raises(campaign.CampaignError, match="inconsistent"):
+        campaign._paired_value_quality(  # noqa: SLF001
+            functional,
+            parent_functional=None,
+            policy=campaign.VALUE_GATE_POLICY,
+            max_absolute_regression=0.0,
         )
 
 
