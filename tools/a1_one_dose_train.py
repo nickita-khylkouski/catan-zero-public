@@ -5594,6 +5594,11 @@ def _build_direct_train_command(
             "--trust-curated-data-quality",
         ]
     )
+    if int(recipe["max_steps"]) > 0:
+        # Positive capped A1 recipes are sealed optimizer-update doses, not
+        # best-effort epoch caps. Keep max_steps=0 historical epoch-bounded
+        # recipes unchanged.
+        command.append("--exact-max-steps")
     if recipe.get("policy_kl_target") is not None:
         command.extend(
             [
@@ -8211,12 +8216,24 @@ def _expected_optimizer_steps(
     verified: dict[str, Any], *, recipe: dict[str, Any] | None = None
 ) -> int:
     effective = verified["recipe"] if recipe is None else recipe
-    steps = math.ceil(
+    available_steps = math.ceil(
         int(verified["training_row_count"]) / _effective_global_batch_size(effective)
     )
-    if int(effective["max_steps"]) > 0:
-        steps = min(steps, int(effective["max_steps"]))
-    return int(steps)
+    max_steps = int(effective["max_steps"])
+    if max_steps > 0:
+        if available_steps < max_steps:
+            required_rows = (
+                (max_steps - 1) * _effective_global_batch_size(effective) + 1
+            )
+            raise ExecutorError(
+                "sealed positive max_steps is an exact optimizer-update dose, "
+                f"but the training partition can realize only {available_steps}/"
+                f"{max_steps} steps in one epoch "
+                f"(rows={int(verified['training_row_count'])}, "
+                f"minimum_rows={required_rows})"
+            )
+        return max_steps
+    return int(available_steps)
 
 
 def _learner_lineage_parent_sha256(verified: Mapping[str, Any]) -> str:
@@ -9313,6 +9330,7 @@ def _verify_training_outputs(
         "fused_optimizer": False,
         "epochs": 1,
         "max_steps": int(recipe["max_steps"]),
+        "exact_max_steps": int(recipe["max_steps"]) > 0,
         "batch_size": int(recipe["batch_size"]),
         "grad_accum_steps": int(recipe["grad_accum_steps"]),
         "effective_global_batch_size": effective_global_batch_size,
@@ -11389,6 +11407,9 @@ def _execute_locked(
     """Claim, execute, verify, and atomically receipt exactly one A1 dose."""
 
     _require_current_production_trainer_authority(verified, command=command)
+    # Refuse an undersized capped corpus before probing hardware or consuming
+    # the durable one-dose claim.
+    _expected_optimizer_steps(verified)
 
     matched_aux = verified.get("learner_ablation", {}).get("matched_aux_regularization")
     if isinstance(matched_aux, dict) and not isinstance(

@@ -157,7 +157,7 @@ def test_train_config_hash_captures_data_init_grow_and_holdout_identity() -> Non
         TrainConfig(init_checkpoint_sha256="sha256:init"),
         TrainConfig(grow_from_checkpoint="/models/gen3-cat.pt"),
         TrainConfig(grow_from_checkpoint_sha256="sha256:grow"),
-        TrainConfig(resume_optimizer=False),
+        TrainConfig(resume_optimizer=True),
         TrainConfig(validation_fraction=0.10),
         TrainConfig(validation_max_samples=1234),
         TrainConfig(validation_game_seed_ranges="9000:9999"),

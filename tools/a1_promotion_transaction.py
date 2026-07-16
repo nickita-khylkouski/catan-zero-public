@@ -1246,6 +1246,34 @@ def _verify_training_report(
     return report
 
 
+def _require_exact_capped_one_dose_terminal(
+    *,
+    report: Mapping[str, Any],
+    outputs: Mapping[str, Any],
+    recipe: Mapping[str, Any],
+    command: Sequence[str],
+) -> None:
+    """Require positive-cap ordinary one-dose receipts to prove the full dose."""
+
+    max_steps = recipe.get("max_steps")
+    if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+        raise PromotionError("sealed one-dose recipe has an invalid max_steps")
+    if max_steps <= 0:
+        return
+    if (
+        command.count("--exact-max-steps") != 1
+        or "--no-exact-max-steps" in command
+        or report.get("exact_max_steps") is not True
+        or report.get("steps_completed") != max_steps
+        or report.get("total_training_steps") != max_steps
+        or outputs.get("steps_completed") != max_steps
+    ):
+        raise PromotionError(
+            "positive-cap one-dose receipt does not prove its exact sealed "
+            "optimizer-step terminal"
+        )
+
+
 def _reconstruct_completed_central_final(
     receipt: Mapping[str, Any],
     *,
@@ -3046,9 +3074,22 @@ def _verify_one_dose_training_receipt(
             _absolute(outputs["training_progress"], base=path.parent),
             where="one-dose training-progress marker",
         )
+        progress_payload = _load_json(progress)
+        sealed_max_steps = int(
+            contract["science"]["learner_training_recipe"]["max_steps"]
+        )
         if (
             _sha256(progress) != outputs["training_progress_sha256"]
             or not isinstance(outputs["training_progress_payload_sha256"], str)
+            or (
+                sealed_max_steps > 0
+                and (
+                    progress_payload.get("progress_sha256")
+                    != outputs["training_progress_payload_sha256"]
+                    or progress_payload.get("optimizer_step") != sealed_max_steps
+                    or progress_payload.get("completed_epochs") != 1
+                )
+            )
         ):
             raise PromotionError("one-dose training-progress provenance drifted")
     if outputs["execution_binding_sha256"] != _digest_value(execution_binding):
@@ -3081,6 +3122,12 @@ def _verify_one_dose_training_receipt(
         )
 
     report = _load_json(output_report)
+    _require_exact_capped_one_dose_terminal(
+        report=report,
+        outputs=outputs,
+        recipe=contract["science"]["learner_training_recipe"],
+        command=command,
+    )
     if report.get(one_dose.REPORT_EXECUTION_BINDING_FIELD) != execution_binding:
         raise PromotionError(
             "candidate training report does not bind the one-dose command/environment"

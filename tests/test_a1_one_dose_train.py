@@ -283,7 +283,8 @@ def _training_report(
         "optimizer_restored": False,
         "fused_optimizer": False,
         "epochs": 1,
-        "max_steps": 0,
+        "max_steps": recipe["max_steps"],
+        "exact_max_steps": int(recipe["max_steps"]) > 0,
         "batch_size": recipe["batch_size"],
         "grad_accum_steps": recipe["grad_accum_steps"],
         "effective_global_batch_size": recipe["global_batch_size"],
@@ -956,9 +957,68 @@ def test_production_one_dose_emits_same_trajectory_dose_snapshots(
     )
 
     assert _option(command, "--checkpoint-steps") == "64,96"
+    assert command.count("--exact-max-steps") == 1
     assert executor.train_bc._parse_checkpoint_steps(
         _option(command, "--checkpoint-steps"), max_steps=128
     ) == (64, 96)
+
+
+def test_positive_cap_refuses_a_training_partition_shorter_than_the_sealed_dose(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"] = {
+        **verified["recipe"],
+        "max_steps": 3,
+    }
+
+    with pytest.raises(
+        executor.ExecutorError,
+        match=r"can realize only 2/3 steps",
+    ):
+        executor._expected_optimizer_steps(verified)
+
+
+def test_positive_cap_report_must_attest_exact_max_steps(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    verified["recipe"] = {
+        **verified["recipe"],
+        "max_steps": 2,
+    }
+    checkpoint = tmp_path / "candidate.pt"
+    optimizer = Path(str(checkpoint) + ".optimizer.pt")
+    report = tmp_path / "report.json"
+    checkpoint.write_bytes(b"candidate")
+    optimizer.write_bytes(b"optimizer")
+    payload = _training_report(verified, checkpoint)
+    payload["exact_max_steps"] = False
+    report.write_text(json.dumps(payload))
+    _write_training_progress(checkpoint, payload)
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+    execution_binding = executor._execution_binding(
+        command=command, environment=executor._child_environment(0)
+    )
+    executor._bind_training_report(
+        report,
+        verified=verified,
+        execution_binding=execution_binding,
+    )
+
+    with pytest.raises(executor.ExecutorError, match="report invariant drift"):
+        executor._verify_training_outputs(
+            checkpoint=checkpoint,
+            report=report,
+            verified=verified,
+            execution_binding=execution_binding,
+            command=command,
+        )
 
 
 def test_coherent_one_dose_renders_deployed_scalar_value_objective(
@@ -975,7 +1035,8 @@ def test_coherent_one_dose_renders_deployed_scalar_value_objective(
 
     assert _option(command, "--scalar-value-loss-readout") == "deployed_tanh"
     assert _option(command, "--scalar-value-loss-scale") == "1.0"
-    assert _option(command, "--max-steps") == "32"
+    assert _option(command, "--max-steps") == "0"
+    assert "--exact-max-steps" not in command
     assert "--checkpoint-steps" not in command
 
 

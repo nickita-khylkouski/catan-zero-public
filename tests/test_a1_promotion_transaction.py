@@ -158,6 +158,39 @@ def test_current_coherent_promotion_requires_sealed_initialization(
         )
 
 
+def test_positive_cap_one_dose_promotion_refuses_short_or_nonexact_terminal() -> None:
+    recipe = {"max_steps": 128}
+    command = ["python", "train_bc.py", "--max-steps", "128"]
+    report = {
+        "exact_max_steps": False,
+        "steps_completed": 64,
+        "total_training_steps": 64,
+    }
+    outputs = {"steps_completed": 64}
+
+    with pytest.raises(promotion.PromotionError, match="exact sealed"):
+        promotion._require_exact_capped_one_dose_terminal(
+            report=report,
+            outputs=outputs,
+            recipe=recipe,
+            command=command,
+        )
+
+    command.append("--exact-max-steps")
+    report.update(
+        exact_max_steps=True,
+        steps_completed=128,
+        total_training_steps=128,
+    )
+    outputs["steps_completed"] = 128
+    promotion._require_exact_capped_one_dose_terminal(
+        report=report,
+        outputs=outputs,
+        recipe=recipe,
+        command=command,
+    )
+
+
 def _checkpoint_ref(path: Path) -> dict[str, str]:
     return {"path": str(path), "sha256": promotion._sha256(path)}
 
