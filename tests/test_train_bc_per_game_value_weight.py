@@ -4,12 +4,15 @@ import numpy as np
 import pytest
 
 from tools.train_bc import (
+    _MemmapCategoricalColumn,
     _apply_authenticated_value_training_scope,
     _value_component_active_dose_for_batch,
     _value_training_scope_report,
+    apply_value_player_outcome_balance,
     build_value_sample_weights,
     forced_action_type_value_mass_quality,
     per_game_weight_quality,
+    value_player_outcome_balance_quality,
 )
 from catan_zero.rl.action_mask import ActionCatalog
 
@@ -361,3 +364,372 @@ def test_invalid_composite_offsets_fail_closed() -> None:
 
     with pytest.raises(ValueError, match="component_offsets"):
         build_value_sample_weights(data, per_game_value_weight=True)
+
+
+class _ValueBalanceComposite(dict):
+    def __init__(self, corpora: tuple[dict, ...], ratios: tuple[float, ...]):
+        self.corpora = corpora
+        self.component_offsets = tuple(
+            np.concatenate(
+                (
+                    np.asarray([0], dtype=np.int64),
+                    np.cumsum(
+                        [len(corpus["action_taken"]) for corpus in corpora],
+                        dtype=np.int64,
+                    ),
+                )
+            ).tolist()
+        )
+        self.component_game_sampling_ratios = ratios
+        self.component_ids = tuple(f"component_{index}" for index in range(len(corpora)))
+        self.value_training_scope_authenticated = True
+        self.value_training_component_indices = tuple(range(len(corpora)))
+        super().__init__(
+            action_taken=np.concatenate(
+                [corpus["action_taken"] for corpus in corpora]
+            )
+        )
+
+
+def _outcome_component(
+    game_seed: list[int], player: list[str], winner: list[str]
+) -> dict:
+    n = len(game_seed)
+    return {
+        "action_taken": np.zeros(n, dtype=np.int16),
+        "game_seed": np.asarray(game_seed, dtype=np.int64),
+        "player": np.asarray(player),
+        "winner": np.asarray(winner),
+        "truncated": np.zeros(n, dtype=np.bool_),
+    }
+
+
+def test_sampler_balanced_value_mode_balances_bilateral_and_one_sided_games() -> None:
+    bilateral = _outcome_component(
+        [1, 1, 1, 1, 2, 2, 2, 2],
+        ["RED", "RED", "RED", "BLUE", "RED", "BLUE", "BLUE", "BLUE"],
+        ["RED"] * 4 + ["BLUE"] * 4,
+    )
+    one_sided = _outcome_component(
+        [3, 3, 4, 4, 5, 5],
+        ["RED", "RED", "BLUE", "BLUE", "RED", "RED"],
+        ["RED", "RED", "BLUE", "BLUE", "BLUE", "BLUE"],
+    )
+    data = _ValueBalanceComposite((bilateral, one_sided), (0.6, 0.4))
+    before = np.ones(len(data["action_taken"]), dtype=np.float32)
+    rows = np.arange(len(before), dtype=np.int64)
+
+    after = apply_value_player_outcome_balance(
+        data, before, rows, mode="sampler_balanced_v1"
+    )
+    report = value_player_outcome_balance_quality(
+        data,
+        before,
+        after,
+        rows,
+        mode="sampler_balanced_v1",
+    )
+
+    assert report["before"]["sampler_adjusted_target_mean"] != pytest.approx(0.0)
+    assert report["before"]["components"]["component_0"][
+        "sampler_adjusted_target_mean"
+    ] != pytest.approx(0.0)
+    assert report["after"]["sampler_adjusted_target_mean"] == pytest.approx(
+        0.0, abs=1e-7
+    )
+    assert report["after"]["components"]["component_0"][
+        "sampler_adjusted_target_mean"
+    ] == pytest.approx(0.0, abs=1e-7)
+    assert report["after"]["components"]["component_1"][
+        "sampler_adjusted_target_mean"
+    ] == pytest.approx(0.0, abs=1e-7)
+    assert report["after"]["bilateral_games"] == 2
+    assert report["after"]["one_sided_positive_games"] == 2
+    assert report["after"]["one_sided_negative_games"] == 1
+    assert report["after"]["outcome_effective_sample_size"] == pytest.approx(2.0)
+
+
+def test_sampler_balanced_value_mode_fails_when_component_has_one_outcome_sign() -> None:
+    one_sign = _outcome_component(
+        [1, 1, 2, 2],
+        ["RED", "RED", "BLUE", "BLUE"],
+        ["RED", "RED", "BLUE", "BLUE"],
+    )
+    data = _ValueBalanceComposite((one_sign,), (1.0,))
+    with pytest.raises(SystemExit, match="requires both outcome signs"):
+        apply_value_player_outcome_balance(
+            data,
+            np.ones(4, dtype=np.float32),
+            np.arange(4, dtype=np.int64),
+            mode="sampler_balanced_v1",
+        )
+
+
+def test_sampler_balanced_value_mode_requires_complete_outcome_provenance() -> None:
+    malformed = _outcome_component(
+        [1, 1, 2, 2],
+        ["RED", "RED", "BLUE", "BLUE"],
+        ["RED", "RED", "RED", "RED"],
+    )
+    del malformed["truncated"]
+    data = _ValueBalanceComposite((malformed,), (1.0,))
+    with pytest.raises(SystemExit, match="lacks required outcome provenance"):
+        apply_value_player_outcome_balance(
+            data,
+            np.ones(4, dtype=np.float32),
+            np.arange(4, dtype=np.int64),
+            mode="sampler_balanced_v1",
+        )
+
+
+@pytest.mark.parametrize("field", ["player", "winner"])
+@pytest.mark.parametrize("bad_code", [-1, 2])
+def test_sampler_balanced_value_mode_rejects_invalid_categorical_identity_codes(
+    field: str, bad_code: int
+) -> None:
+    categories = np.asarray(["RED", "BLUE"])
+    player_codes = np.asarray([1, 1, 0, 0], dtype=np.int32)
+    winner_codes = np.asarray([1, 1, 1, 1], dtype=np.int32)
+    if field == "player":
+        player_codes[:2] = bad_code
+    else:
+        winner_codes[:2] = bad_code
+    component = {
+        "action_taken": np.zeros(4, dtype=np.int16),
+        "game_seed": np.asarray([1, 1, 2, 2], dtype=np.int64),
+        "player": _MemmapCategoricalColumn(player_codes, categories),
+        "winner": _MemmapCategoricalColumn(winner_codes, categories),
+        "truncated": np.zeros(4, dtype=np.bool_),
+    }
+    data = _ValueBalanceComposite((component,), (1.0,))
+
+    with pytest.raises(
+        SystemExit,
+        match=(
+            "categorical identity code is out of range: "
+            rf"field='{field}' categories=2 examples=\[{bad_code}\]"
+        ),
+    ):
+        apply_value_player_outcome_balance(
+            data,
+            np.ones(4, dtype=np.float32),
+            np.arange(4, dtype=np.int64),
+            mode="sampler_balanced_v1",
+        )
+
+
+def test_sampler_balanced_value_mode_preserves_truncated_rows_and_reports_them() -> None:
+    component = _outcome_component(
+        [1, 1, 2, 2, 3, 3],
+        ["RED", "RED", "RED", "RED", "RED", "RED"],
+        ["RED", "RED", "BLUE", "BLUE", "", ""],
+    )
+    component["truncated"][4:] = True
+    data = _ValueBalanceComposite((component,), (1.0,))
+    before = np.asarray([1.0, 3.0, 2.0, 6.0, 5.0, 7.0], dtype=np.float32)
+    rows = np.arange(6, dtype=np.int64)
+
+    after = apply_value_player_outcome_balance(
+        data, before, rows, mode="sampler_balanced_v1"
+    )
+    report = value_player_outcome_balance_quality(
+        data,
+        before,
+        after,
+        rows,
+        mode="sampler_balanced_v1",
+    )
+
+    assert after[4:].tobytes() == before[4:].tobytes()
+    assert after[:4].tobytes() != before[:4].tobytes()
+    assert report["fit_partition_rows"] == 6
+    assert report["value_enabled_partition_rows"] == 6
+    assert report["completed_non_truncated_rows"] == 4
+    assert report["truncated_rows"] == 2
+    assert report["completed_non_truncated_games"] == 2
+    assert report["truncated_games"] == 1
+    assert report["normalization_policy"] == (
+        "preserve_actual_completed_sampler_mass_when_truncated_else_legacy_mean_one"
+    )
+    assert report["before"]["rows"] == 4
+    assert report["after"]["rows"] == 4
+    assert report["before"]["completed_non_truncated_weight_sum"] == pytest.approx(12.0)
+    assert report["after"]["completed_non_truncated_weight_sum"] == pytest.approx(12.0)
+    assert report["before"]["truncated_weight_sum"] == pytest.approx(12.0)
+    assert report["after"]["truncated_weight_sum"] == pytest.approx(12.0)
+    assert report["after"]["total_effective_mass"] == pytest.approx(
+        report["before"]["total_effective_mass"]
+    )
+    assert report["before"]["games"] == 2
+    assert report["after"]["games"] == 2
+    assert "" not in report["after"]["player_outcome_cells"]
+    component_report = report["after"]["components"]["component_0"]
+    assert component_report["partition_rows"] == 6
+    assert component_report["completed_non_truncated_rows"] == 4
+    assert component_report["truncated_rows"] == 2
+    assert component_report["partition_games"] == 3
+    assert component_report["completed_non_truncated_games"] == 2
+    assert component_report["truncated_games"] == 1
+
+
+def test_sampler_balanced_value_mode_preserves_game_uniform_mass_with_truncation() -> None:
+    component = _outcome_component(
+        [1, 2, 2, 2, 3, 3],
+        ["RED"] * 6,
+        ["RED", "BLUE", "BLUE", "BLUE", "", ""],
+    )
+    component["truncated"][4:] = True
+    data = _ValueBalanceComposite((component,), (1.0,))
+    before = np.asarray([2.0, 1.0, 3.0, 5.0, 7.0, 9.0], dtype=np.float32)
+    rows = np.arange(6, dtype=np.int64)
+
+    after = apply_value_player_outcome_balance(
+        data, before, rows, mode="sampler_balanced_v1"
+    )
+    report = value_player_outcome_balance_quality(
+        data,
+        before,
+        after,
+        rows,
+        mode="sampler_balanced_v1",
+    )
+
+    assert after[4:].tobytes() == before[4:].tobytes()
+    assert float(after[:4].sum(dtype=np.float64)) != pytest.approx(
+        float(before[:4].sum(dtype=np.float64))
+    )
+    assert report["before"]["total_effective_mass"] == pytest.approx(5.0 / 3.0)
+    assert report["after"]["total_effective_mass"] == pytest.approx(5.0 / 3.0)
+
+
+def test_sampler_balanced_value_mode_preserves_row_uniform_mass_with_truncation() -> None:
+    data = _outcome_component(
+        [1, 1, 2, 2, 3, 3],
+        ["RED"] * 6,
+        ["RED", "RED", "BLUE", "BLUE", "", ""],
+    )
+    data["truncated"][4:] = True
+    before = np.asarray([1.0, 3.0, 2.0, 6.0, 5.0, 7.0], dtype=np.float32)
+    rows = np.arange(6, dtype=np.int64)
+
+    after = apply_value_player_outcome_balance(
+        data, before, rows, mode="sampler_balanced_v1"
+    )
+    report = value_player_outcome_balance_quality(
+        data,
+        before,
+        after,
+        rows,
+        mode="sampler_balanced_v1",
+    )
+
+    assert after[4:].tobytes() == before[4:].tobytes()
+    assert report["before"]["total_effective_mass"] == pytest.approx(2.0)
+    assert report["after"]["total_effective_mass"] == pytest.approx(2.0)
+
+
+def test_sampler_balanced_value_mode_retains_completed_only_mean_one_normalization() -> None:
+    component = _outcome_component(
+        [1, 1, 2, 2],
+        ["RED", "RED", "RED", "RED"],
+        ["RED", "RED", "BLUE", "BLUE"],
+    )
+    data = _ValueBalanceComposite((component,), (1.0,))
+
+    after = apply_value_player_outcome_balance(
+        data,
+        np.asarray([1.0, 3.0, 2.0, 6.0], dtype=np.float32),
+        np.arange(4, dtype=np.int64),
+        mode="sampler_balanced_v1",
+    )
+
+    expected = np.asarray([0.5, 1.5, 0.5, 1.5], dtype=np.float32)
+    assert after.tobytes() == expected.tobytes()
+
+
+def test_sampler_balanced_value_mode_rejects_mixed_truncation_within_game() -> None:
+    component = _outcome_component(
+        [1, 1, 2, 2, 3, 3],
+        ["RED", "RED", "RED", "RED", "RED", "RED"],
+        ["RED", "RED", "BLUE", "BLUE", "", ""],
+    )
+    component["truncated"][4] = True
+    data = _ValueBalanceComposite((component,), (1.0,))
+
+    with pytest.raises(SystemExit, match="mixed truncation state within a game"):
+        apply_value_player_outcome_balance(
+            data,
+            np.ones(6, dtype=np.float32),
+            np.arange(6, dtype=np.int64),
+            mode="sampler_balanced_v1",
+        )
+
+
+def test_sampler_balanced_value_mode_fails_when_partition_omits_enabled_component() -> None:
+    first = _outcome_component(
+        [1, 1, 2, 2],
+        ["RED", "RED", "BLUE", "BLUE"],
+        ["RED", "RED", "RED", "RED"],
+    )
+    second = _outcome_component(
+        [3, 3, 4, 4],
+        ["RED", "RED", "BLUE", "BLUE"],
+        ["RED", "RED", "RED", "RED"],
+    )
+    data = _ValueBalanceComposite((first, second), (0.5, 0.5))
+    with pytest.raises(SystemExit, match="omits an authenticated"):
+        apply_value_player_outcome_balance(
+            data,
+            np.ones(8, dtype=np.float32),
+            np.arange(4, dtype=np.int64),
+            mode="sampler_balanced_v1",
+        )
+
+
+def test_validation_winner_changes_cannot_change_training_value_weights() -> None:
+    base = _outcome_component(
+        [1, 1, 2, 2, 3, 3, 4, 4, 5, 5],
+        ["RED"] * 10,
+        ["RED", "RED", "BLUE", "BLUE", "RED", "RED", "BLUE", "BLUE", "BLUE", "BLUE"],
+    )
+    changed = {key: np.array(value, copy=True) for key, value in base.items()}
+    changed["winner"][6:8] = np.asarray(["RED", "RED"])
+    train_rows = np.arange(4, dtype=np.int64)
+    validation_rows = np.arange(4, 10, dtype=np.int64)
+    initial = np.ones(10, dtype=np.float32)
+
+    first = apply_value_player_outcome_balance(
+        base, initial, train_rows, mode="sampler_balanced_v1"
+    )
+    first = apply_value_player_outcome_balance(
+        base, first, validation_rows, mode="sampler_balanced_v1"
+    )
+    second = apply_value_player_outcome_balance(
+        changed, initial, train_rows, mode="sampler_balanced_v1"
+    )
+    second = apply_value_player_outcome_balance(
+        changed, second, validation_rows, mode="sampler_balanced_v1"
+    )
+
+    assert first[train_rows].tobytes() == second[train_rows].tobytes()
+    assert first[validation_rows].tobytes() != second[validation_rows].tobytes()
+
+
+def test_composite_equal_per_game_weighting_reports_inert_when_means_match() -> None:
+    class _CompositeV2(dict):
+        component_offsets = (0, 2, 4)
+        component_game_sampling_ratios = (0.5, 0.5)
+
+    data = _CompositeV2(
+        action_taken=np.zeros(4, dtype=np.int16),
+        game_seed=np.asarray([1, 1, 2, 2], dtype=np.int64),
+    )
+    diagnostics: dict[str, object] = {}
+    build_value_sample_weights(
+        data,
+        per_game_value_weight=True,
+        per_game_weight_diagnostics=diagnostics,
+    )
+    assert diagnostics["requested"] is True
+    assert diagnostics["effective"] is False
+    assert diagnostics["denominator"]["std"] == pytest.approx(0.0)

@@ -1460,6 +1460,9 @@ def test_future_production_per_game_value_mode_is_explicit(tmp_path: Path) -> No
     verified = _verified(tmp_path)
     verified["recipe"]["per_game_value_weight"] = True
     verified["recipe"]["per_game_value_weight_mode"] = "sqrt"
+    verified["recipe"]["value_player_outcome_balance_mode"] = (
+        "sampler_balanced_v1"
+    )
 
     command = executor.build_train_command(
         verified,
@@ -1470,6 +1473,10 @@ def test_future_production_per_game_value_mode_is_explicit(tmp_path: Path) -> No
 
     assert "--per-game-value-weight" in command
     assert _option(command, "--per-game-value-weight-mode") == "sqrt"
+    assert (
+        _option(command, "--value-player-outcome-balance-mode")
+        == "sampler_balanced_v1"
+    )
 
 
 def test_latest_main_ablation_command_binds_inventory_ack_and_crop(tmp_path: Path) -> None:

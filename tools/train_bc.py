@@ -1708,6 +1708,19 @@ def build_parser() -> argparse.ArgumentParser:
             "No-op unless --per-game-value-weight is set."
         ),
     )
+    parser.add_argument(
+        "--value-player-outcome-balance-mode",
+        choices=("none", "sampler_balanced_v1"),
+        default="none",
+        help=(
+            "Explicit VALUE-label coverage contract. sampler_balanced_v1 fits "
+            "weights independently on the train and validation partitions: bilateral "
+            "games receive equal winner/loser effective mass, while one-sided positive "
+            "and negative games are balanced within each authenticated component under "
+            "the component->game->row sampler. Missing outcome/player provenance fails "
+            "closed. Default none preserves historical behavior."
+        ),
+    )
     # Internal A1 executor binding. These flags do not enable an ablation on
     # their own: the audited memmap/lock path below independently reconstructs
     # the effective recipe and rejects any mismatch or empty/no-op ablation.
@@ -4629,6 +4642,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "forced_row_value_action_type_weights",
         "hlgauss_scalar_aux_loss_weight", "loser_sample_weight",
         "lr", "per_game_value_weight", "per_game_value_weight_mode",
+        "value_player_outcome_balance_mode",
         "policy_loss_weight",
         "policy_kl_anchor_direction", "policy_kl_anchor_weight",
         "policy_kl_target", "policy_kl_dual_lr", "policy_kl_max_weight",
@@ -4652,6 +4666,13 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         "per_game_policy_weight_mode"
     ] not in {"equal", "sqrt"}:
         raise SystemExit("memmap composite per-game policy recipe override is invalid")
+    if overrides.get("value_player_outcome_balance_mode", "none") not in {
+        "none",
+        "sampler_balanced_v1",
+    }:
+        raise SystemExit(
+            "memmap composite value player/outcome balance override is invalid"
+        )
     typed_forced_spec = overrides.get("forced_row_value_action_type_weights")
     if typed_forced_spec is not None:
         if not isinstance(typed_forced_spec, str):
@@ -5251,6 +5272,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             and overrides.get("per_game_policy_weight_mode") == "equal"
             and overrides.get("per_game_value_weight") is True
             and overrides.get("per_game_value_weight_mode") == "equal"
+            and overrides.get("value_player_outcome_balance_mode")
+            == "sampler_balanced_v1"
             and overrides.get("loser_sample_weight") == 1.0
             and overrides.get("soft_target_temperature") == 0.7
             and overrides.get("soft_target_weight") == 1.0
@@ -5263,7 +5286,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         ):
             raise SystemExit(
                 "promotion-eligible flywheel composite requires sampler-aware "
-                "equal policy/value game weighting under the sampler-aware normalizer"
+                "equal policy/value game weighting plus sampler-balanced value outcomes"
             )
         flywheel_replay_contract = dict(raw_contract)
     return {
@@ -5339,7 +5362,15 @@ def _portable_composite_semantic_digests(
     include those paths are deliberately excluded.
     """
 
-    if list(component_ids) != [
+    if not component_ids:
+        # V1 predates explicit component ids. Keep its portable projection
+        # ordered and nonempty with deterministic positional identities rather
+        # than rejecting every legacy diagnostic descriptor or hashing no
+        # component semantics at all.
+        component_ids = tuple(
+            f"component_{index}" for index in range(len(components))
+        )
+    elif list(component_ids) != [
         str(component.get("component_id", "")) for component in components
     ]:
         raise SystemExit("composite semantic projection component order drift")
@@ -5555,6 +5586,7 @@ def _validate_composite_learner_recipe_authorization(
         "per_game_policy_weight_mode": str,
         "per_game_value_weight": bool,
         "per_game_value_weight_mode": str,
+        "value_player_outcome_balance_mode": str,
         "policy_aux_active_batch_size": int,
         "policy_aux_loss_weight": float,
         "policy_loss_weight": float,
@@ -7848,6 +7880,11 @@ def _effective_a1_learner_training_recipe(
         "ddp_shard_data",
     )
     effective = {field: getattr(args, field) for field in bound_fields}
+    value_balance_mode = str(
+        getattr(args, "value_player_outcome_balance_mode", "none")
+    )
+    if value_balance_mode != "none":
+        effective["value_player_outcome_balance_mode"] = value_balance_mode
     policy_target_blend_semantics = str(
         getattr(
             args,
@@ -8203,6 +8240,10 @@ def _validate_a1_batch_probe_authorization(
         raise SystemExit("A1 batch-probe baseline recipe authorization drift")
     actual = dict(effective)
     actual["per_game_value_weight_mode"] = str(args.per_game_value_weight_mode)
+    if str(args.value_player_outcome_balance_mode) != "none":
+        actual["value_player_outcome_balance_mode"] = str(
+            args.value_player_outcome_balance_mode
+        )
     if set(actual) != set(baseline):
         raise SystemExit("A1 batch-probe effective recipe shape drift")
     drift = {
@@ -8916,6 +8957,11 @@ def _validate_a1_learner_training_recipe(
         )
     effective["per_game_value_weight_mode"] = str(args.per_game_value_weight_mode)
     authorized_extra_fields = {"per_game_value_weight_mode"}
+    if str(args.value_player_outcome_balance_mode) != "none":
+        effective["value_player_outcome_balance_mode"] = str(
+            args.value_player_outcome_balance_mode
+        )
+        authorized_extra_fields.add("value_player_outcome_balance_mode")
     if int(getattr(args, "policy_aux_active_batch_size", 0)) > 0:
         authorized_extra_fields.add("policy_aux_active_batch_size")
         authorized_extra_fields.add("policy_aux_loss_weight")
@@ -11605,6 +11651,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         policy_weights = _apply_authenticated_policy_distillation_scope(
             data, policy_weights
         )
+        per_game_value_diagnostics: dict[str, object] = {}
         value_weights = build_value_sample_weights(
             data,
             phase_weights=value_phase_weight_map,
@@ -11615,6 +11662,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             action_catalog=forced_row_value_action_catalog,
             per_game_value_weight=args.per_game_value_weight,
             per_game_value_weight_mode=args.per_game_value_weight_mode,
+            per_game_weight_diagnostics=per_game_value_diagnostics,
         )
         value_weights = _apply_authenticated_value_training_scope(
             data, value_weights
@@ -11648,6 +11696,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         train_indices = np.asarray(split_result["train"], dtype=np.int64)
         validation_indices = np.asarray(split_result["validation"], dtype=np.int64)
+        value_balance_mode = str(args.value_player_outcome_balance_mode)
+        value_weights_before_balance = (
+            np.asarray(value_weights, dtype=np.float32).copy()
+            if value_balance_mode != "none"
+            else value_weights
+        )
+        if value_balance_mode != "none":
+            value_weights = apply_value_player_outcome_balance(
+                data,
+                value_weights,
+                train_indices,
+                mode=value_balance_mode,
+            )
+            if len(validation_indices):
+                value_weights = apply_value_player_outcome_balance(
+                    data,
+                    value_weights,
+                    validation_indices,
+                    mode=value_balance_mode,
+                )
 
         # Flag-off must remain exact rng.permutation, so these all-ones are only
         # retained for reporting and are not passed to _epoch_order. The exact
@@ -11690,10 +11758,42 @@ def main(argv: Sequence[str] | None = None) -> None:
         result = {
             "policy_sample_weights": policy_weights,
             "value_sample_weights": value_weights,
+            "value_per_game_weight_diagnostics": np.asarray(
+                [
+                    float(bool(per_game_value_diagnostics.get("requested", False))),
+                    float(bool(per_game_value_diagnostics.get("effective", False))),
+                    float(per_game_value_diagnostics.get("game_count", 0)),
+                    float(
+                        per_game_value_diagnostics.get("denominator", {}).get(
+                            "min", 0.0
+                        )
+                    ),
+                    float(
+                        per_game_value_diagnostics.get("denominator", {}).get(
+                            "max", 0.0
+                        )
+                    ),
+                    float(
+                        per_game_value_diagnostics.get("denominator", {}).get(
+                            "mean", 0.0
+                        )
+                    ),
+                    float(
+                        per_game_value_diagnostics.get("denominator", {}).get(
+                            "std", 0.0
+                        )
+                    ),
+                ],
+                dtype=np.float64,
+            ),
             "policy_surprise_weights_full": surprise_weights,
             "train_indices": train_indices,
             "validation_indices": validation_indices,
         }
+        if str(args.value_player_outcome_balance_mode) != "none":
+            result["value_sample_weights_before_player_outcome_balance"] = (
+                value_weights_before_balance
+            )
         if "game_seed" in data:
             result["held_out_game_seeds"] = np.sort(
                 np.unique(
@@ -11739,6 +11839,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "forced_row_value_weight": float(args.forced_row_value_weight),
             "per_game_value_weight": bool(args.per_game_value_weight),
             "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
+            "value_player_outcome_balance_mode": str(
+                args.value_player_outcome_balance_mode
+            ),
             "policy_surprise_weight": float(args.policy_surprise_weight),
             "policy_surprise_cap": float(args.policy_surprise_cap),
             "per_game_policy_surprise_weighting": bool(
@@ -11861,6 +11964,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         ddp,
     )
     value_sample_weights = derived["value_sample_weights"]
+    value_sample_weights_before_player_outcome_balance = derived.get(
+        "value_sample_weights_before_player_outcome_balance",
+        value_sample_weights,
+    )
+    per_game_diag_values = np.asarray(
+        derived["value_per_game_weight_diagnostics"], dtype=np.float64
+    )
+    value_per_game_weight_diagnostics = {
+        "requested": bool(per_game_diag_values[0]),
+        "mode": str(args.per_game_value_weight_mode),
+        "effective": bool(per_game_diag_values[1]),
+        "game_count": int(per_game_diag_values[2]),
+        "denominator": {
+            "min": float(per_game_diag_values[3]),
+            "max": float(per_game_diag_values[4]),
+            "mean": float(per_game_diag_values[5]),
+            "std": float(per_game_diag_values[6]),
+        },
+    }
     value_training_scope_report = (
         _value_training_scope_report(data, value_sample_weights)
         if int(ddp["rank"]) == 0
@@ -11890,6 +12012,31 @@ def main(argv: Sequence[str] | None = None) -> None:
     policy_surprise_weights_full = derived["policy_surprise_weights_full"]
     train_indices = derived["train_indices"]
     validation_indices = derived["validation_indices"]
+    if int(ddp["rank"]) == 0:
+        value_player_outcome_balance_report = {
+            "training": value_player_outcome_balance_quality(
+                data,
+                value_sample_weights_before_player_outcome_balance,
+                value_sample_weights,
+                np.asarray(train_indices, dtype=np.int64),
+                mode=str(args.value_player_outcome_balance_mode),
+                per_game_weighting=value_per_game_weight_diagnostics,
+            ),
+            "validation": (
+                value_player_outcome_balance_quality(
+                    data,
+                    value_sample_weights_before_player_outcome_balance,
+                    value_sample_weights,
+                    np.asarray(validation_indices, dtype=np.int64),
+                    mode=str(args.value_player_outcome_balance_mode),
+                    per_game_weighting=value_per_game_weight_diagnostics,
+                )
+                if len(validation_indices)
+                else None
+            ),
+        }
+    else:
+        value_player_outcome_balance_report = {}
     if len(train_indices) == 0:
         raise SystemExit(
             "training split is empty; refusing to save a checkpoint that could "
@@ -12287,6 +12434,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 }
         value_sample_weight_report["by_game"] = per_game_weight_quality(
             data, value_sample_weights
+        )
+        value_sample_weight_report["player_outcome_balance"] = (
+            value_player_outcome_balance_report
         )
         if forced_row_value_action_type_weight_map:
             value_sample_weight_report["by_forced_action_type"] = (
@@ -15224,6 +15374,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "sample_weight_quality": policy_sample_weight_report,
         "policy_sample_weight_quality": policy_sample_weight_report,
         "value_sample_weight_quality": value_sample_weight_report,
+        "value_player_outcome_balance": value_player_outcome_balance_report,
         "policy_surprise_weight": float(args.policy_surprise_weight),
         "policy_surprise_cap": float(args.policy_surprise_cap),
         "per_game_policy_surprise_weighting": bool(
@@ -15263,6 +15414,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "forced_row_value_weight": args.forced_row_value_weight,
         "per_game_value_weight": bool(args.per_game_value_weight),
         "per_game_value_weight_mode": str(args.per_game_value_weight_mode),
+        "value_player_outcome_balance_mode": str(
+            args.value_player_outcome_balance_mode
+        ),
         "winner_sample_weight": args.winner_sample_weight,
         "loser_sample_weight": args.loser_sample_weight,
         "outcome_conditioned_policy_distillation": (
@@ -25504,8 +25658,24 @@ def _validate_value_outcome_labels(
             f"rows={n}, malformed={malformed_lengths}"
         )
 
-    game_player_masks: dict[int, int] = {}
-    game_winner_masks: dict[int, int] = {}
+    component_ids = tuple(
+        str(value) for value in getattr(data, "component_ids", tuple())
+    )
+    component_mapper = getattr(data, "component_indices_for_rows", None)
+    authenticated_composite = bool(component_ids)
+    if authenticated_composite and (
+        not callable(component_mapper)
+        or "game_seed" not in data
+        or any(not value for value in component_ids)
+    ):
+        raise SystemExit(
+            "authenticated composite value outcomes lack component/game provenance"
+        )
+    if not authenticated_composite:
+        component_ids = ("ordinary_corpus",)
+
+    game_player_masks: dict[tuple[int, int], int] = {}
+    game_winner_masks: dict[tuple[int, int], int] = {}
     clean_outcome_rows = 0
     for start in range(0, n, int(chunk_rows)):
         stop = min(start + int(chunk_rows), n)
@@ -25560,9 +25730,32 @@ def _validate_value_outcome_labels(
         if "game_seed" not in data:
             continue
         seeds = np.asarray(data["game_seed"][row_slice], dtype=np.int64)
-        unique_seeds, inverse = np.unique(seeds, return_inverse=True)
-        player_masks = np.zeros(len(unique_seeds), dtype=np.uint8)
-        winner_masks = np.zeros(len(unique_seeds), dtype=np.uint8)
+        component_codes = (
+            np.asarray(
+                component_mapper(
+                    np.arange(start, stop, dtype=np.int64)
+                ),
+                dtype=np.int64,
+            )
+            if authenticated_composite
+            else np.zeros(stop - start, dtype=np.int64)
+        )
+        if (
+            component_codes.shape != seeds.shape
+            or np.any(component_codes < 0)
+            or np.any(component_codes >= len(component_ids))
+        ):
+            raise SystemExit(
+                "authenticated composite outcome component mapping is invalid"
+            )
+        unique_keys, inverse = np.unique(
+            np.rec.fromarrays(
+                (component_codes, seeds), names=("component", "seed")
+            ),
+            return_inverse=True,
+        )
+        player_masks = np.zeros(len(unique_keys), dtype=np.uint8)
+        winner_masks = np.zeros(len(unique_keys), dtype=np.uint8)
         np.bitwise_or.at(
             player_masks,
             inverse,
@@ -25576,33 +25769,65 @@ def _validate_value_outcome_labels(
                     np.uint8(1), winner_codes[nonempty].astype(np.uint8)
                 ),
             )
-        for seed, player_mask, winner_mask in zip(
-            unique_seeds, player_masks, winner_masks, strict=True
+        for key, player_mask, winner_mask in zip(
+            unique_keys, player_masks, winner_masks, strict=True
         ):
-            key = int(seed)
-            game_player_masks[key] = game_player_masks.get(key, 0) | int(
+            game_key = (int(key["component"]), int(key["seed"]))
+            game_player_masks[game_key] = game_player_masks.get(game_key, 0) | int(
                 player_mask
             )
-            game_winner_masks[key] = game_winner_masks.get(key, 0) | int(
+            game_winner_masks[game_key] = game_winner_masks.get(game_key, 0) | int(
                 winner_mask
             )
 
     malformed_games = []
     clean_outcome_games = 0
-    for seed, player_mask in game_player_masks.items():
-        winner_mask = game_winner_masks.get(seed, 0)
+    bilateral_games = 0
+    one_sided_games = 0
+    one_sided_winner_unobserved_games = 0
+    component_reports = {
+        component_id: {
+            "games": 0,
+            "clean_outcome_games": 0,
+            "bilateral_games": 0,
+            "one_sided_games": 0,
+            "one_sided_winner_unobserved_games": 0,
+        }
+        for component_id in component_ids
+    }
+    for (component_index, seed), player_mask in game_player_masks.items():
+        winner_mask = game_winner_masks.get((component_index, seed), 0)
+        component_id = component_ids[component_index]
+        component_report = component_reports[component_id]
+        component_report["games"] += 1
+        observed_players = int(player_mask).bit_count()
         if winner_mask:
             clean_outcome_games += 1
-        if (
+            component_report["clean_outcome_games"] += 1
+        if observed_players >= 2:
+            bilateral_games += 1
+            component_report["bilateral_games"] += 1
+        elif observed_players == 1:
+            one_sided_games += 1
+            component_report["one_sided_games"] += 1
+            if winner_mask and winner_mask & player_mask == 0:
+                one_sided_winner_unobserved_games += 1
+                component_report["one_sided_winner_unobserved_games"] += 1
+        malformed_winner = bool(
             winner_mask
-            and (winner_mask & (winner_mask - 1)) != 0
-            or winner_mask & ~player_mask
-        ):
+            and (
+                (winner_mask & (winner_mask - 1)) != 0
+                or (observed_players >= 2 and winner_mask & player_mask == 0)
+            )
+        )
+        if observed_players == 0 or malformed_winner:
             malformed_games.append(
                 {
+                    "component_id": component_id,
                     "game_seed": seed,
                     "seated_player_mask": player_mask,
                     "winner_mask": winner_mask,
+                    "observed_player_count": observed_players,
                 }
             )
             if len(malformed_games) >= 8:
@@ -25619,9 +25844,21 @@ def _validate_value_outcome_labels(
         "games": len(game_player_masks),
         "clean_outcome_rows": clean_outcome_rows,
         "clean_outcome_games": clean_outcome_games,
+        "bilateral_games": bilateral_games,
+        "one_sided_games": one_sided_games,
+        "one_sided_winner_unobserved_games": one_sided_winner_unobserved_games,
         "player_domain": list(_VALUE_PLAYER_NAMES),
         "actor_seat_perspective_verified": "seat" in data,
         "winner_seated_per_game_verified": "game_seed" in data,
+        "bilateral_winner_seated_per_game_verified": "game_seed" in data,
+        "game_identity_namespace": (
+            "component_id+game_seed"
+            if authenticated_composite
+            else "game_seed"
+            if "game_seed" in data
+            else "none"
+        ),
+        "components": component_reports,
     }
 
 
@@ -27625,6 +27862,7 @@ def build_value_sample_weights(
     action_catalog: object | None = None,
     per_game_value_weight: bool = False,
     per_game_value_weight_mode: str = "equal",
+    per_game_weight_diagnostics: dict[str, object] | None = None,
 ) -> np.ndarray:
     """Keep value targets unbiased by filtered-BC policy weighting.
 
@@ -27694,11 +27932,678 @@ def build_value_sample_weights(
             )
             weights[forced] *= multipliers[forced_actions]
     if per_game_value_weight and len(weights):
-        weights = _normalize_weights_per_game(data, weights, mode=per_game_value_weight_mode)
+        weights = _normalize_weights_per_game(
+            data,
+            weights,
+            mode=per_game_value_weight_mode,
+            diagnostics=per_game_weight_diagnostics,
+        )
+    elif per_game_weight_diagnostics is not None:
+        per_game_weight_diagnostics.update(
+            {
+                "requested": False,
+                "mode": str(per_game_value_weight_mode),
+                "effective": False,
+                "game_count": 0,
+                "denominator": {},
+            }
+        )
     mean = float(np.mean(weights)) if len(weights) else 1.0
     if mean > 0.0:
         weights = weights / mean
     return weights.astype(np.float32, copy=False)
+
+
+def _encoded_identity_values(
+    column: object,
+    indices: np.ndarray,
+    *,
+    field: str,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Return compact identity codes without decoding a full categorical column."""
+
+    if isinstance(column, _MemmapCategoricalColumn):
+        categories = tuple(str(value) for value in column.categories.tolist())
+        codes = np.asarray(column._codes[indices], dtype=np.int64)  # noqa: SLF001
+        invalid = (codes < 0) | (codes >= len(categories))
+        if bool(np.any(invalid)):
+            examples = sorted(set(map(int, codes[invalid].tolist())))[:8]
+            raise SystemExit(
+                "sampler_balanced_v1 categorical identity code is out of range: "
+                f"field={field!r} categories={len(categories)} examples={examples}"
+            )
+        return codes, categories
+    values = np.asarray(column[indices]).astype(str)
+    categories, codes = np.unique(values, return_inverse=True)
+    return np.asarray(codes, dtype=np.int64), tuple(map(str, categories.tolist()))
+
+
+def _paired_identity_codes(
+    player_column: object,
+    winner_column: object,
+    indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    player_codes, player_categories = _encoded_identity_values(
+        player_column, indices, field="player"
+    )
+    winner_codes, winner_categories = _encoded_identity_values(
+        winner_column, indices, field="winner"
+    )
+    identities = tuple(sorted(set(player_categories) | set(winner_categories)))
+    lookup = {name: index for index, name in enumerate(identities)}
+    player_remap = np.asarray(
+        [lookup[name] for name in player_categories], dtype=np.int64
+    )
+    winner_remap = np.asarray(
+        [lookup[name] for name in winner_categories], dtype=np.int64
+    )
+    return (
+        player_remap[player_codes],
+        winner_remap[winner_codes],
+        identities,
+    )
+
+
+def _value_balance_components(
+    data: dict, row_indices: np.ndarray
+) -> tuple[list[dict[str, object]], tuple[float, ...]]:
+    """Resolve complete selected games and authenticated component provenance."""
+
+    n = len(data["action_taken"])
+    selected = np.asarray(row_indices, dtype=np.int64)
+    if selected.ndim != 1 or np.any(selected < 0) or np.any(selected >= n):
+        raise SystemExit("value player/outcome balance row selection is invalid")
+    if selected.size > 1 and bool(np.any(selected[1:] < selected[:-1])):
+        selected = np.sort(selected)
+    if selected.size > 1 and bool(np.any(selected[1:] == selected[:-1])):
+        raise SystemExit("value player/outcome balance row selection is invalid")
+    offsets = _validated_component_offsets(data, n)
+    ranges = _component_row_ranges(offsets, n)
+    ratios = tuple(
+        float(value)
+        for value in getattr(data, "component_game_sampling_ratios", tuple())
+    )
+    component_ids = tuple(
+        str(value) for value in getattr(data, "component_ids", tuple())
+    )
+    corpora = tuple(getattr(data, "corpora", tuple()))
+    if offsets is not None:
+        if (
+            len(component_ids) != len(ranges)
+            or len(ratios) != len(ranges)
+            or len(corpora) != len(ranges)
+            or any(not value for value in component_ids)
+            or any(not math.isfinite(value) or value <= 0.0 for value in ratios)
+            or not bool(getattr(data, "value_training_scope_authenticated", False))
+        ):
+            raise SystemExit(
+                "sampler_balanced_v1 requires authenticated composite component "
+                "identity, sampling ratios, corpora, and value-training scope"
+            )
+        eligible = tuple(
+            int(value)
+            for value in getattr(data, "value_training_component_indices", tuple())
+        )
+        if (
+            not eligible
+            or len(set(eligible)) != len(eligible)
+            or any(value < 0 or value >= len(ranges) for value in eligible)
+        ):
+            raise SystemExit(
+                "sampler_balanced_v1 received an invalid authenticated value scope"
+            )
+        eligible_set = set(eligible)
+    else:
+        if ratios or component_ids or corpora:
+            raise SystemExit(
+                "sampler_balanced_v1 received partial composite provenance"
+            )
+        component_ids = ("ordinary_corpus",)
+        ratios = (1.0,)
+        corpora = (data,)
+        eligible_set = {0}
+
+    required = {"game_seed", "player", "winner", "truncated"}
+    resolved: list[dict[str, object]] = []
+    for component_index, (start, stop) in enumerate(ranges):
+        if component_index not in eligible_set:
+            continue
+        rows = selected[(selected >= start) & (selected < stop)]
+        if rows.size == 0:
+            if offsets is not None:
+                raise SystemExit(
+                    "sampler_balanced_v1 partition omits an authenticated "
+                    "value-enabled component: "
+                    f"component={component_ids[component_index]!r}"
+                )
+            continue
+        corpus = corpora[component_index]
+        missing = sorted(required - set(corpus.keys()))
+        if missing:
+            raise SystemExit(
+                "sampler_balanced_v1 component lacks required outcome provenance: "
+                f"component={component_ids[component_index]!r} missing={missing}"
+            )
+        local = rows - int(start)
+        seeds = np.asarray(corpus["game_seed"][local], dtype=np.int64)
+        truncated = np.asarray(corpus["truncated"][local], dtype=np.bool_)
+        if seeds.shape != local.shape or truncated.shape != local.shape:
+            raise SystemExit(
+                "sampler_balanced_v1 outcome provenance is not row-aligned: "
+                f"component={component_ids[component_index]!r}"
+            )
+        breaks = np.flatnonzero(
+            (seeds[1:] != seeds[:-1]) | (local[1:] != local[:-1] + 1)
+        ) + 1
+        partition_game_starts = np.concatenate(
+            (np.asarray([0], dtype=np.int64), breaks.astype(np.int64, copy=False))
+        )
+        partition_game_stops = np.concatenate(
+            (breaks.astype(np.int64, copy=False), np.asarray([len(local)], dtype=np.int64))
+        )
+        partition_game_seeds = seeds[partition_game_starts]
+        if len(np.unique(partition_game_seeds)) != len(partition_game_seeds):
+            raise SystemExit(
+                "sampler_balanced_v1 requires each selected game to be one "
+                f"contiguous run: component={component_ids[component_index]!r}"
+            )
+        full_seed_column = corpus["game_seed"]
+        begins_at_game_start = (local[partition_game_starts] == 0) | (
+            np.asarray(
+                full_seed_column[np.maximum(local[partition_game_starts] - 1, 0)],
+                dtype=np.int64,
+            )
+            != partition_game_seeds
+        )
+        last_local = local[partition_game_stops - 1]
+        ends_at_game_stop = (last_local == int(stop - start) - 1) | (
+            np.asarray(
+                full_seed_column[np.minimum(last_local + 1, int(stop - start) - 1)],
+                dtype=np.int64,
+            )
+            != partition_game_seeds
+        )
+        if not bool(np.all(begins_at_game_start & ends_at_game_stop)):
+            raise SystemExit(
+                "sampler_balanced_v1 refuses a partial-game train/validation split: "
+                f"component={component_ids[component_index]!r}"
+            )
+        partition_game_lengths = partition_game_stops - partition_game_starts
+        truncated_counts = np.add.reduceat(
+            truncated.astype(np.int64, copy=False), partition_game_starts
+        )
+        mixed_truncation = (truncated_counts > 0) & (
+            truncated_counts < partition_game_lengths
+        )
+        if bool(np.any(mixed_truncation)):
+            bad_seeds = partition_game_seeds[mixed_truncation][:8].tolist()
+            raise SystemExit(
+                "sampler_balanced_v1 found mixed truncation state within a game: "
+                f"component={component_ids[component_index]!r} seeds={bad_seeds}"
+            )
+        completed_games = truncated_counts == 0
+        if not bool(np.any(completed_games)):
+            raise SystemExit(
+                "sampler_balanced_v1 component has no completed outcome games: "
+                f"component={component_ids[component_index]!r}"
+            )
+        completed_row_mask = np.repeat(completed_games, partition_game_lengths)
+        completed_rows = rows[completed_row_mask]
+        truncated_row_indices = rows[~completed_row_mask]
+        completed_local = local[completed_row_mask]
+        completed_game_lengths = partition_game_lengths[completed_games]
+        game_stops = np.cumsum(completed_game_lengths, dtype=np.int64)
+        game_starts = np.concatenate(
+            (np.asarray([0], dtype=np.int64), game_stops[:-1])
+        )
+        game_seeds = partition_game_seeds[completed_games]
+        player_ids, winner_ids, identity_names = _paired_identity_codes(
+            corpus["player"], corpus["winner"], completed_local
+        )
+        empty_identity_ids = {
+            index for index, name in enumerate(identity_names) if not str(name)
+        }
+        if (
+            empty_identity_ids
+            and (
+                bool(np.any(np.isin(player_ids, list(empty_identity_ids))))
+                or bool(np.any(np.isin(winner_ids, list(empty_identity_ids))))
+            )
+        ):
+            raise SystemExit(
+                "sampler_balanced_v1 found empty player/winner provenance: "
+                f"component={component_ids[component_index]!r}"
+            )
+        resolved.append(
+            {
+                "component_index": int(component_index),
+                "component_id": component_ids[component_index],
+                "ratio": float(ratios[component_index]),
+                "game_uniform_sampler": bool(offsets is not None),
+                "partition_rows": int(len(rows)),
+                "completed_non_truncated_rows": int(len(completed_rows)),
+                "truncated_rows": int(len(rows) - len(completed_rows)),
+                "partition_games": int(len(partition_game_starts)),
+                "completed_non_truncated_games": int(len(game_starts)),
+                "truncated_games": int(np.count_nonzero(~completed_games)),
+                "rows": completed_rows,
+                "truncated_row_indices": truncated_row_indices,
+                "player_ids": player_ids,
+                "winner_ids": winner_ids,
+                "identity_names": identity_names,
+                "game_starts": game_starts,
+                "game_stops": game_stops,
+                "game_seeds": game_seeds,
+            }
+        )
+    if not resolved:
+        raise SystemExit("sampler_balanced_v1 selection has no value-enabled games")
+    return resolved, ratios
+
+
+def apply_value_player_outcome_balance(
+    data: dict,
+    weights: np.ndarray,
+    row_indices: np.ndarray,
+    *,
+    mode: str,
+) -> np.ndarray:
+    """Fit explicit value-label balancing on exactly one data partition."""
+
+    if mode == "none":
+        return np.asarray(weights, dtype=np.float32)
+    if mode != "sampler_balanced_v1":
+        raise ValueError(f"unknown value_player_outcome_balance_mode {mode!r}")
+    balanced = np.asarray(weights, dtype=np.float32).copy()
+    components, ratios = _value_balance_components(data, row_indices)
+    completed_sampler_mass_before = _value_balance_completed_sampler_mass(
+        components, ratios, balanced
+    )
+    active_rows: list[np.ndarray] = []
+    has_truncated_games = False
+    for component in components:
+        rows = np.asarray(component["rows"], dtype=np.int64)
+        player_ids = np.asarray(component["player_ids"], dtype=np.int64)
+        winner_ids = np.asarray(component["winner_ids"], dtype=np.int64)
+        game_starts = np.asarray(component["game_starts"], dtype=np.int64)
+        game_stops = np.asarray(component["game_stops"], dtype=np.int64)
+        outcome_positive = player_ids == winner_ids
+        component_weights = np.asarray(balanced[rows], dtype=np.float64)
+        if bool(np.any(~np.isfinite(component_weights))) or bool(
+            np.any(component_weights < 0.0)
+        ):
+            raise SystemExit(
+                "sampler_balanced_v1 received non-finite or negative value weights"
+            )
+        has_truncated_games |= int(component["truncated_games"]) > 0
+        positive_game_mass = 0.0
+        negative_game_mass = 0.0
+        positive_one_sided: list[tuple[int, int]] = []
+        negative_one_sided: list[tuple[int, int]] = []
+        component_has_positive = False
+        component_has_negative = False
+        for game_start, game_stop in zip(game_starts, game_stops, strict=True):
+            start, stop = int(game_start), int(game_stop)
+            signs = outcome_positive[start:stop]
+            game_weights = component_weights[start:stop]
+            positive = bool(np.any(signs))
+            negative = bool(np.any(~signs))
+            component_has_positive |= positive
+            component_has_negative |= negative
+            if not positive and not negative:
+                raise SystemExit("sampler_balanced_v1 found an outcome-free game")
+            if positive and negative:
+                positive_players = np.unique(player_ids[start:stop][signs])
+                negative_players = np.unique(player_ids[start:stop][~signs])
+                if (
+                    len(positive_players) != 1
+                    or len(negative_players) != 1
+                    or int(positive_players[0]) == int(negative_players[0])
+                    or len(np.unique(player_ids[start:stop])) != 2
+                    or len(np.unique(winner_ids[start:stop])) != 1
+                ):
+                    raise SystemExit(
+                        "sampler_balanced_v1 found malformed bilateral player/winner "
+                        f"coverage in component {component['component_id']!r}"
+                    )
+                positive_mass = float(game_weights[signs].sum())
+                negative_mass = float(game_weights[~signs].sum())
+                total_mass = positive_mass + negative_mass
+                if positive_mass <= 0.0 or negative_mass <= 0.0:
+                    raise SystemExit(
+                        "sampler_balanced_v1 bilateral game has zero effective "
+                        "winner or loser mass"
+                    )
+                game_weights[signs] *= total_mass / (2.0 * positive_mass)
+                game_weights[~signs] *= total_mass / (2.0 * negative_mass)
+            else:
+                if len(np.unique(player_ids[start:stop])) != 1 or len(
+                    np.unique(winner_ids[start:stop])
+                ) != 1:
+                    raise SystemExit(
+                        "sampler_balanced_v1 found malformed one-sided player/winner "
+                        f"coverage in component {component['component_id']!r}"
+                    )
+                game_mass = float(
+                    np.mean(game_weights)
+                    if bool(component["game_uniform_sampler"])
+                    else np.sum(game_weights)
+                )
+                if game_mass <= 0.0:
+                    raise SystemExit(
+                        "sampler_balanced_v1 one-sided game has zero effective mass"
+                    )
+                if positive:
+                    positive_one_sided.append((start, stop))
+                    positive_game_mass += game_mass
+                else:
+                    negative_one_sided.append((start, stop))
+                    negative_game_mass += game_mass
+        if not component_has_positive or not component_has_negative:
+            raise SystemExit(
+                "sampler_balanced_v1 requires both outcome signs in every enabled "
+                f"component: component={component['component_id']!r}"
+            )
+        if positive_one_sided or negative_one_sided:
+            if positive_game_mass <= 0.0 or negative_game_mass <= 0.0:
+                raise SystemExit(
+                    "sampler_balanced_v1 requires positive and negative one-sided "
+                    f"games together in component {component['component_id']!r}"
+                )
+            total_one_sided_mass = positive_game_mass + negative_game_mass
+            positive_scale = total_one_sided_mass / (2.0 * positive_game_mass)
+            negative_scale = total_one_sided_mass / (2.0 * negative_game_mass)
+            for start, stop in positive_one_sided:
+                component_weights[start:stop] *= positive_scale
+            for start, stop in negative_one_sided:
+                component_weights[start:stop] *= negative_scale
+        balanced[rows] = component_weights.astype(np.float32)
+        active_rows.append(rows[component_weights > 0.0])
+    active = np.concatenate(active_rows)
+    balanced_active = np.asarray(balanced[active], dtype=np.float64)
+    balanced_active_mass = float(balanced_active.sum())
+    if (
+        not math.isfinite(balanced_active_mass)
+        or balanced_active_mass <= 0.0
+    ):
+        raise SystemExit("sampler_balanced_v1 produced zero/non-finite global mass")
+    if not has_truncated_games:
+        # Preserve the established completed-only production behavior exactly.
+        balanced[active] /= balanced_active_mass / float(len(active))
+    else:
+        completed_sampler_mass_after = _value_balance_completed_sampler_mass(
+            components, ratios, balanced
+        )
+        if (
+            not math.isfinite(completed_sampler_mass_before)
+            or completed_sampler_mass_before <= 0.0
+            or not math.isfinite(completed_sampler_mass_after)
+            or completed_sampler_mass_after <= 0.0
+        ):
+            raise SystemExit(
+                "sampler_balanced_v1 produced zero/non-finite completed sampler mass"
+            )
+        # Preserve the actual completed contribution under the authenticated
+        # partition sampler, whose denominator still includes truncated games
+        # or rows. Truncated VP-margin weights remain byte-identical.
+        balanced[active] *= (
+            completed_sampler_mass_before / completed_sampler_mass_after
+        )
+    return balanced
+
+
+def _value_balance_completed_sampler_mass(
+    components: list[dict[str, object]],
+    ratios: tuple[float, ...],
+    weights: np.ndarray,
+) -> float:
+    total_ratio = float(sum(ratios))
+    mass = 0.0
+    for component in components:
+        rows = np.asarray(component["rows"], dtype=np.int64)
+        local_weights = np.asarray(weights[rows], dtype=np.float64)
+        if bool(component["game_uniform_sampler"]):
+            starts = np.asarray(component["game_starts"], dtype=np.int64)
+            stops = np.asarray(component["game_stops"], dtype=np.int64)
+            component_mass = sum(
+                float(np.mean(local_weights[int(start) : int(stop)]))
+                for start, stop in zip(starts, stops, strict=True)
+            ) / float(component["partition_games"])
+        else:
+            component_mass = float(local_weights.sum()) / float(
+                component["partition_rows"]
+            )
+        mass += (
+            float(component["ratio"]) / total_ratio
+        ) * component_mass
+    return mass
+
+
+def _value_balance_measure(
+    components: list[dict[str, object]],
+    ratios: tuple[float, ...],
+    weights: np.ndarray,
+) -> dict[str, object]:
+    total_ratio = sum(ratios)
+    positive_mass = 0.0
+    negative_mass = 0.0
+    game_masses: list[float] = []
+    player_cells: dict[str, dict[str, float | int]] = {}
+    component_reports: dict[str, dict[str, object]] = {}
+    bilateral_games = 0
+    positive_one_sided_games = 0
+    negative_one_sided_games = 0
+    truncated_weight_sum = 0.0
+    for component in components:
+        rows = np.asarray(component["rows"], dtype=np.int64)
+        truncated_rows = np.asarray(
+            component["truncated_row_indices"], dtype=np.int64
+        )
+        player_ids = np.asarray(component["player_ids"], dtype=np.int64)
+        winner_ids = np.asarray(component["winner_ids"], dtype=np.int64)
+        names = tuple(component["identity_names"])
+        starts = np.asarray(component["game_starts"], dtype=np.int64)
+        stops = np.asarray(component["game_stops"], dtype=np.int64)
+        local_weights = np.asarray(weights[rows], dtype=np.float64)
+        signs = player_ids == winner_ids
+        game_uniform_sampler = bool(component["game_uniform_sampler"])
+        ratio = float(component["ratio"]) / total_ratio
+        game_probability = (
+            ratio / float(component["partition_games"])
+            if game_uniform_sampler
+            else 0.0
+        )
+        ordinary_row_probability = (
+            ratio / float(component["partition_rows"])
+            if not game_uniform_sampler
+            else 0.0
+        )
+        component_positive = 0.0
+        component_negative = 0.0
+        component_bilateral = 0
+        component_positive_one_sided = 0
+        component_negative_one_sided = 0
+        for start, stop in zip(starts, stops, strict=True):
+            start_i, stop_i = int(start), int(stop)
+            row_probability = (
+                game_probability / float(stop_i - start_i)
+                if game_uniform_sampler
+                else ordinary_row_probability
+            )
+            game_signs = signs[start_i:stop_i]
+            game_weights = local_weights[start_i:stop_i]
+            positive = float(game_weights[game_signs].sum() * row_probability)
+            negative = float(game_weights[~game_signs].sum() * row_probability)
+            component_positive += positive
+            component_negative += negative
+            game_masses.append(positive + negative)
+            if positive > 0.0 and negative > 0.0:
+                component_bilateral += 1
+            elif positive > 0.0:
+                component_positive_one_sided += 1
+            elif negative > 0.0:
+                component_negative_one_sided += 1
+        for identity_id, identity in enumerate(names):
+            player_mask = player_ids == identity_id
+            for label, outcome_mask in (("win", signs), ("loss", ~signs)):
+                mask = player_mask & outcome_mask
+                if not bool(np.any(mask)):
+                    continue
+                # Rows have game-dependent probability. Accumulate by game to
+                # preserve the authenticated game-uniform measure.
+                mass = 0.0
+                for start, stop in zip(starts, stops, strict=True):
+                    start_i, stop_i = int(start), int(stop)
+                    local_mask = mask[start_i:stop_i]
+                    if bool(np.any(local_mask)):
+                        mass += float(
+                            local_weights[start_i:stop_i][local_mask].sum()
+                            * (
+                                game_probability / float(stop_i - start_i)
+                                if game_uniform_sampler
+                                else ordinary_row_probability
+                            )
+                        )
+                key = f"{identity}|{label}"
+                cell = player_cells.setdefault(
+                    key, {"raw_rows": 0, "effective_mass": 0.0}
+                )
+                cell["raw_rows"] = int(cell["raw_rows"]) + int(np.count_nonzero(mask))
+                cell["effective_mass"] = float(cell["effective_mass"]) + mass
+        component_reports[str(component["component_id"])] = {
+            "partition_rows": int(component["partition_rows"]),
+            "completed_non_truncated_rows": int(
+                component["completed_non_truncated_rows"]
+            ),
+            "truncated_rows": int(component["truncated_rows"]),
+            "partition_games": int(component["partition_games"]),
+            "completed_non_truncated_games": int(
+                component["completed_non_truncated_games"]
+            ),
+            "truncated_games": int(component["truncated_games"]),
+            "completed_non_truncated_weight_sum": float(local_weights.sum()),
+            "truncated_weight_sum": float(
+                np.asarray(weights[truncated_rows], dtype=np.float64).sum()
+            ),
+            "games": int(len(starts)),
+            "bilateral_games": int(component_bilateral),
+            "one_sided_positive_games": int(component_positive_one_sided),
+            "one_sided_negative_games": int(component_negative_one_sided),
+            "positive_effective_mass": component_positive,
+            "negative_effective_mass": component_negative,
+            "total_effective_mass": component_positive + component_negative,
+            "sampler_adjusted_target_mean": (
+                (component_positive - component_negative)
+                / (component_positive + component_negative)
+                if component_positive + component_negative > 0.0
+                else 0.0
+            ),
+        }
+        positive_mass += component_positive
+        negative_mass += component_negative
+        bilateral_games += component_bilateral
+        positive_one_sided_games += component_positive_one_sided
+        negative_one_sided_games += component_negative_one_sided
+        truncated_weight_sum += float(
+            np.asarray(weights[truncated_rows], dtype=np.float64).sum()
+        )
+    total_mass = positive_mass + negative_mass
+    game_mass_array = np.asarray(game_masses, dtype=np.float64)
+    game_ess_denom = float(np.sum(game_mass_array * game_mass_array))
+    outcome_masses = np.asarray([positive_mass, negative_mass], dtype=np.float64)
+    outcome_ess_denom = float(np.sum(outcome_masses * outcome_masses))
+    return {
+        "rows": int(sum(len(np.asarray(component["rows"])) for component in components)),
+        "completed_non_truncated_weight_sum": float(
+            sum(
+                np.asarray(
+                    weights[np.asarray(component["rows"], dtype=np.int64)],
+                    dtype=np.float64,
+                ).sum()
+                for component in components
+            )
+        ),
+        "truncated_weight_sum": truncated_weight_sum,
+        "games": int(len(game_masses)),
+        "bilateral_games": int(bilateral_games),
+        "one_sided_positive_games": int(positive_one_sided_games),
+        "one_sided_negative_games": int(negative_one_sided_games),
+        "positive_effective_mass": positive_mass,
+        "negative_effective_mass": negative_mass,
+        "total_effective_mass": total_mass,
+        "positive_effective_fraction": (
+            positive_mass / total_mass if total_mass > 0.0 else 0.0
+        ),
+        "negative_effective_fraction": (
+            negative_mass / total_mass if total_mass > 0.0 else 0.0
+        ),
+        "sampler_adjusted_target_mean": (
+            (positive_mass - negative_mass) / total_mass if total_mass > 0.0 else 0.0
+        ),
+        "game_effective_sample_size": (
+            float(game_mass_array.sum() ** 2 / game_ess_denom)
+            if game_ess_denom > 0.0
+            else 0.0
+        ),
+        "outcome_effective_sample_size": (
+            float(outcome_masses.sum() ** 2 / outcome_ess_denom)
+            if outcome_ess_denom > 0.0
+            else 0.0
+        ),
+        "player_outcome_cells": dict(sorted(player_cells.items())),
+        "components": component_reports,
+    }
+
+
+def value_player_outcome_balance_quality(
+    data: dict,
+    before_weights: np.ndarray,
+    after_weights: np.ndarray,
+    row_indices: np.ndarray,
+    *,
+    mode: str,
+    per_game_weighting: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if mode == "none":
+        return {
+            "schema_version": "value-player-outcome-balance-v1",
+            "mode": "none",
+            "enabled": False,
+            "per_game_weighting": dict(per_game_weighting or {}),
+        }
+    components, ratios = _value_balance_components(data, row_indices)
+    completed_rows = int(
+        sum(len(np.asarray(component["rows"])) for component in components)
+    )
+    value_enabled_partition_rows = int(
+        sum(int(component["partition_rows"]) for component in components)
+    )
+    truncated_rows = int(
+        sum(int(component["truncated_rows"]) for component in components)
+    )
+    completed_games = int(
+        sum(int(component["completed_non_truncated_games"]) for component in components)
+    )
+    truncated_games = int(
+        sum(int(component["truncated_games"]) for component in components)
+    )
+    return {
+        "schema_version": "value-player-outcome-balance-v1",
+        "mode": str(mode),
+        "enabled": True,
+        "fit_partition_rows": int(len(row_indices)),
+        "value_enabled_partition_rows": value_enabled_partition_rows,
+        "completed_non_truncated_rows": completed_rows,
+        "truncated_rows": truncated_rows,
+        "completed_non_truncated_games": completed_games,
+        "truncated_games": truncated_games,
+        "normalization_policy": (
+            "preserve_actual_completed_sampler_mass_when_truncated_else_legacy_mean_one"
+        ),
+        "per_game_weighting": dict(per_game_weighting or {}),
+        "before": _value_balance_measure(components, ratios, before_weights),
+        "after": _value_balance_measure(components, ratios, after_weights),
+    }
 
 
 def _legal_action_counts(legal_column: object) -> np.ndarray:
@@ -27896,7 +28801,13 @@ def _component_row_ranges(
     )
 
 
-def _normalize_weights_per_game(data: dict, weights: np.ndarray, *, mode: str = "equal") -> np.ndarray:
+def _normalize_weights_per_game(
+    data: dict,
+    weights: np.ndarray,
+    *,
+    mode: str = "equal",
+    diagnostics: dict[str, object] | None = None,
+) -> np.ndarray:
     """Rescale weights under the corpus's actual row-sampling measure.
 
     Ordinary corpora are sampled uniformly by row, so ``equal`` divides by a
@@ -27923,6 +28834,7 @@ def _normalize_weights_per_game(data: dict, weights: np.ndarray, *, mode: str = 
     if mode not in {"equal", "sqrt"}:
         raise ValueError(f"unknown per_game_value_weight_mode {mode!r}")
     normalized = np.empty_like(weights64)
+    denominators: list[np.ndarray] = []
     component_offsets = _validated_component_offsets(data, len(weights64))
     game_uniform_sampler = bool(
         tuple(getattr(data, "component_game_sampling_ratios", tuple()))
@@ -27943,7 +28855,40 @@ def _normalize_weights_per_game(data: dict, weights: np.ndarray, *, mode: str = 
             denominator = np.sqrt(safe_mass)
         else:
             denominator = safe_mass
+        denominators.append(np.asarray(denominator, dtype=np.float64))
         normalized[start:stop] = weights64[start:stop] / denominator[inverse]
+    if diagnostics is not None:
+        combined = (
+            np.concatenate(denominators)
+            if denominators
+            else np.asarray([], dtype=np.float64)
+        )
+        spread = float(combined.std()) if combined.size else 0.0
+        scale = float(np.mean(np.abs(combined))) if combined.size else 1.0
+        diagnostics.update(
+            {
+                "requested": True,
+                "mode": str(mode),
+                # A common denominator is erased by the final global mean
+                # normalization. Only between-game denominator variation changes
+                # the realized objective.
+                "effective": bool(
+                    combined.size > 1
+                    and spread > max(1e-12, 1e-9 * max(scale, 1.0))
+                ),
+                "game_count": int(combined.size),
+                "denominator": (
+                    {
+                        "min": float(combined.min()),
+                        "max": float(combined.max()),
+                        "mean": float(combined.mean()),
+                        "std": spread,
+                    }
+                    if combined.size
+                    else {}
+                ),
+            }
+        )
     return normalized.astype(np.float32, copy=False)
 
 

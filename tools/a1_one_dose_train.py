@@ -269,6 +269,7 @@ A1_LEARNER_ABLATION_FIELDS = frozenset(
         "per_game_policy_weight_mode",
         "per_game_value_weight",
         "per_game_value_weight_mode",
+        "value_player_outcome_balance_mode",
         "vp_margin_weight",
         "truncated_vp_margin_value_weight",
         "forced_action_weight",
@@ -3366,6 +3367,14 @@ def bind_learner_ablation(
                 )
             effective[key] = value
             continue
+        if key == "value_player_outcome_balance_mode":
+            if value not in {"none", "sampler_balanced_v1"}:
+                raise ExecutorError(
+                    "value_player_outcome_balance_mode must be 'none' or "
+                    "'sampler_balanced_v1'"
+                )
+            effective[key] = value
+            continue
         expected_type = (
             int
             if key == "policy_aux_active_batch_size"
@@ -3435,6 +3444,10 @@ def bind_learner_ablation(
         "advantage_policy_weighting": {"none", "outcome_value"},
         "per_game_policy_weight_mode": {"equal", "sqrt"},
         "per_game_value_weight_mode": {"equal", "sqrt"},
+        "value_player_outcome_balance_mode": {
+            "none",
+            "sampler_balanced_v1",
+        },
         "policy_kl_anchor_direction": {"forward"},
         "policy_target_blend_semantics": set(
             train_bc.POLICY_TARGET_BLEND_SEMANTICS
@@ -5684,6 +5697,13 @@ def _build_direct_train_command(
                     str(recipe.get("per_game_value_weight_mode", "equal")),
                 ]
             )
+    if str(recipe.get("value_player_outcome_balance_mode", "none")) != "none":
+        command.extend(
+            [
+                "--value-player-outcome-balance-mode",
+                str(recipe["value_player_outcome_balance_mode"]),
+            ]
+        )
     if bool(recipe.get("per_game_policy_weight", False)):
         command.extend(
             [
@@ -9284,6 +9304,10 @@ def _verify_training_outputs(
         "steps_completed": expected_steps,
         "total_training_steps": expected_steps,
     }
+    if "value_player_outcome_balance_mode" in recipe:
+        expected["value_player_outcome_balance_mode"] = str(
+            recipe["value_player_outcome_balance_mode"]
+        )
     if "scalar_value_loss_readout" in recipe:
         expected["scalar_value_loss_contract"] = {
             "schema_version": "scalar-value-loss-readout-v1",

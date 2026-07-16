@@ -98,12 +98,17 @@ _CURRENT_PER_GAME_VALUE_WEIGHT = _CURRENT_LEARNER_RECIPE.get(
 _CURRENT_PER_GAME_VALUE_WEIGHT_MODE = _CURRENT_LEARNER_RECIPE.get(
     "per_game_value_weight_mode", "equal"
 )
+_CURRENT_VALUE_PLAYER_OUTCOME_BALANCE_MODE = _CURRENT_LEARNER_RECIPE.get(
+    "value_player_outcome_balance_mode", "none"
+)
 if (
     _CURRENT_PER_GAME_VALUE_WEIGHT is not True
     or _CURRENT_PER_GAME_VALUE_WEIGHT_MODE != "equal"
+    or _CURRENT_VALUE_PLAYER_OUTCOME_BALANCE_MODE != "sampler_balanced_v1"
 ):
     raise RuntimeError(
-        "current science contract must bind equal per-game value weighting"
+        "current science contract must bind equal per-game value weighting and "
+        "sampler-balanced player/outcome coverage"
     )
 
 
@@ -194,6 +199,9 @@ LEARNER_RECIPE_OVERRIDES: dict[str, object] = {
     "per_game_policy_weight_mode": "equal",
     "per_game_value_weight": _CURRENT_PER_GAME_VALUE_WEIGHT,
     "per_game_value_weight_mode": _CURRENT_PER_GAME_VALUE_WEIGHT_MODE,
+    "value_player_outcome_balance_mode": (
+        _CURRENT_VALUE_PLAYER_OUTCOME_BALANCE_MODE
+    ),
     "policy_kl_anchor_direction": "forward",
     "policy_kl_anchor_weight": HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT,
     "policy_loss_weight": 1.0,

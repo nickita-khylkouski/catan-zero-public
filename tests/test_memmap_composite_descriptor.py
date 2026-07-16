@@ -48,6 +48,16 @@ def _component(root: Path, name: str) -> dict:
         "payload_inventory_sha256": _canonical(inventory),
         "selected_game_seed_manifest": {"a1_contract_sha256": "sha256:" + "1" * 64},
         "a1_post_wave_audit": {"contract_sha256": "sha256:" + "1" * 64},
+        "aux_subgoal_target_contract": {
+            "version_key": train_bc.AUX_SUBGOAL_TARGET_VERSION_KEY,
+            "supported_version": train_bc.AUX_SUBGOAL_TARGET_VERSION,
+            "semantic": train_bc.AUX_SUBGOAL_TARGET_SEMANTIC,
+            "version_zero_means_unversioned_ineligible": True,
+            "realized_version_counts": {
+                str(train_bc.AUX_SUBGOAL_TARGET_VERSION): 2
+            },
+            "all_rows_semantically_eligible": True,
+        },
     }
     meta_path = corpus / "corpus_meta.json"
     meta_path.write_text(json.dumps(meta), encoding="utf-8")

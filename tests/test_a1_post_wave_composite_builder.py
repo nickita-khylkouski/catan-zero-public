@@ -932,6 +932,9 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
         == "equal"
     )
     assert descriptor["learner_recipe_overrides"][
+        "value_player_outcome_balance_mode"
+    ] == "sampler_balanced_v1"
+    assert descriptor["learner_recipe_overrides"][
         "policy_target_blend_semantics"
     ] == "policy_target_fallback_v2"
     assert descriptor["entity_feature_adapter_component_versions"] == {
