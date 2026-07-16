@@ -709,6 +709,34 @@ def _reliability_stats(
     return float(weighted_gap / n), rows
 
 
+def _average_tie_ranks(values: np.ndarray) -> np.ndarray:
+    """Return one-based ranks with equal values assigned their average rank."""
+
+    array = np.asarray(values).reshape(-1)
+    order = np.argsort(array, kind="stable")
+    ranks = np.empty(len(array), dtype=np.float64)
+    start = 0
+    while start < len(order):
+        stop = start + 1
+        while stop < len(order) and array[order[stop]] == array[order[start]]:
+            stop += 1
+        ranks[order[start:stop]] = (start + 1 + stop) / 2.0
+        start = stop
+    return ranks
+
+
+def _spearman_correlation(left: np.ndarray, right: np.ndarray) -> float | None:
+    """Spearman correlation without an optional scipy runtime dependency."""
+
+    if len(left) < 2 or len(left) != len(right):
+        return None
+    left_rank = _average_tie_ranks(left)
+    right_rank = _average_tie_ranks(right)
+    if float(np.std(left_rank)) == 0.0 or float(np.std(right_rank)) == 0.0:
+        return None
+    return float(np.corrcoef(left_rank, right_rank)[0, 1])
+
+
 def _calibration_stats(
     q: np.ndarray,
     z: np.ndarray,
@@ -750,12 +778,18 @@ def _calibration_stats(
         "win_rate": (n_win / n) if n else None,
         "q_mean": float(q.mean()) if n else None,
         "q_std": float(q.std()) if n else None,
+        "bias": float(np.mean(q - z)) if n else None,
     }
     if n < min_rows or n_win == 0 or n_loss == 0 or float(np.std(q)) == 0.0:
         # corr is undefined without both classes / enough rows.
         stats["corr_q_z"] = None
     else:
         stats["corr_q_z"] = float(np.corrcoef(q, z)[0, 1])
+    stats["spearman_q_z"] = (
+        _spearman_correlation(q, z)
+        if n >= min_rows and n_win > 0 and n_loss > 0
+        else None
+    )
     stats["e_q_given_win"] = float(q[win_mask].mean()) if n_win else None
     stats["e_q_given_loss"] = float(q[~win_mask].mean()) if n_loss else None
     # Brier: outcome in {0,1}, predicted prob p = (q+1)/2 clipped to [0,1].

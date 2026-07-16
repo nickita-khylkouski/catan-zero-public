@@ -243,12 +243,25 @@ def test_calibration_stats_perfectly_calibrated():
     stats = _calibration_stats(q, z, min_rows=1)
     assert stats["n"] == 4
     assert stats["corr_q_z"] == pytest.approx(1.0)
+    assert stats["spearman_q_z"] == pytest.approx(1.0)
+    assert stats["bias"] == pytest.approx(0.0)
     assert stats["brier"] == pytest.approx(0.0)
     assert stats["value_rmse"] == pytest.approx(0.0)
     assert stats["e_q_given_win"] == pytest.approx(1.0)
     assert stats["e_q_given_loss"] == pytest.approx(-1.0)
     assert stats["win_probability_ece"] == pytest.approx(0.0)
     assert sum(row["n"] for row in stats["reliability_bins"]) == 4
+
+
+def test_calibration_stats_spearman_uses_average_tie_ranks():
+    q = np.array([0.1, 0.1, 0.8, 0.9], dtype=np.float32)
+    z = np.array([-1.0, -1.0, 1.0, 1.0], dtype=np.float32)
+    stats = _calibration_stats(q, z, min_rows=1)
+    expected = np.corrcoef(
+        np.array([1.5, 1.5, 3.0, 4.0]),
+        np.array([1.5, 1.5, 3.5, 3.5]),
+    )[0, 1]
+    assert stats["spearman_q_z"] == pytest.approx(expected)
 
 
 def test_value_rmse_measures_residual_std():
