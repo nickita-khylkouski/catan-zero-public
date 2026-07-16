@@ -6,8 +6,8 @@ Do not authorize the large scratch run yet.
 
 The next work must answer three root questions:
 
-1. Can the policy bind each legal settlement, road, city, or robber action to
-   the exact live board entity it affects?
+1. Can the policy reason from each legal target through the live board graph,
+   rather than only gathering the target's local token?
 2. Can value supervision shape a fresh shared representation, rather than
    being isolated from it at step zero?
 3. Are the coherent-search policy targets stable enough to imitate, especially
@@ -19,17 +19,18 @@ target correct.
 
 ## Evidence behind the decision
 
-### 1. The planned policy lacks a direct action-to-board join
+### 1. F7 lacks target binding; the scratch contract adds local gather but not topology
 
-The current scratch construction enables structured static-action features but
-does not enable `action_target_gather`, action cross-attention, or
-`edge_policy_head`. `legal_action_target_ids` therefore do not affect policy
-logits.
+The authenticated f7 tournament checkpoint has no `action_target_gather`,
+action cross-attention, edge-policy head, or relational trunk. The current
+scratch contract is newer and **does** enable `action_target_gather`; it must
+not be described or tested as a no-gather architecture.
 
-Static action features identify the catalog action and provide useful generic
-semantics. They cannot directly join a candidate road or settlement to the
-current ownership, production, blocking, and connectivity state stored in its
-live entity token.
+The larger unresolved gap is topology. Vertex token construction discards the
+topology object, edge tokens omit their endpoints, and the commissioned plain
+Transformer consumes no adjacency. Target gather can retrieve the chosen
+road's or settlement's local token, but it cannot follow that target through
+neighboring roads, cutoffs, blocking opportunities, or Longest Road plans.
 
 This is most damaging for:
 
@@ -40,7 +41,7 @@ This is most damaging for:
 - robber placement;
 - the two linked Road Building choices.
 
-### 2. Width 632 is an H100 performance cliff
+### 2. Inefficient attention widths are an H100 risk; current width 624 is unmeasured
 
 An exact synthetic training-step comparison used the current six-layer,
 one-private-value-block construction, BF16, batch 256, and the real audit-shard
@@ -63,24 +64,24 @@ width 640 and either:
 - remove/compress a dormant readout such as the Q head, which is frozen and
   unused when `q_loss_weight=0`.
 
-Do not retain width 632 for production training.
+The commissioned contract currently uses width 624, not 632. The 632 result is
+strong evidence that nonstandard head dimensions can be expensive, but it does
+not directly certify the 624 configuration. Measure exact 624-versus-640
+training steps before changing the contract; do not extrapolate the 632 number
+as if 624 had already been benchmarked.
 
-### 3. Fresh-scratch value learning is isolated too early
+### 3. Fresh-scratch value routing is selected in prose but not commissioned by evidence
 
-The planned model uses:
+The current scratch contract uses:
 
 - `value_tower_split_layers=1`;
-- `value_trunk_grad_scale=0.0`;
+- `value_trunk_grad_scale=0.25`;
 - random from-scratch initialization.
 
-This stops value/final-VP gradients at the input to the private value block.
-Value supervision cannot shape the first five Transformer blocks, history
-representation, action encoder, or shared public feature paths. That is a
-sensible mature-policy protection mechanism, but it is uncommissioned for a
-random representation.
-
-The first scratch experiment must compare shared value-gradient scales. Zero
-must not be the assumed baseline.
+This routes a reduced value/final-VP gradient into the shared trunk. It is a
+reasonable candidate, but no matched fresh-scratch result yet establishes that
+0.25 is better than 0 or 1. The first scratch experiment must therefore compare
+shared value-gradient scales with V25 as the exact commissioned control.
 
 ### 4. Historical policy targets can be extremely sharp on tiny Q spreads
 
@@ -127,6 +128,45 @@ The trust treatment improved robber play and small-sample match strength but
 regressed opening placement and heavily shifted toward development cards.
 These are exactly the tradeoffs a phase/scenario position book must expose.
 
+### 6. Fresh H100 gameplay shows opening myopia and a stable dev-card conversion failure
+
+On eight f7 opening roots, the raw policy repeatedly preferred high-pip but
+resource-duplicated settlements. Search often moved to a slightly lower-pip,
+more balanced mix. This is consistent with f7 seeing total target production
+without a clean action-local resource-composition binding.
+
+On 40 fresh opening boards under the adopted coherent public-belief operator:
+
+| Arm | Raw-to-search flip rate | Agreement with n128 |
+|---|---:|---:|
+| n128, `c_scale=.10` | 60.0% | 40/40 |
+| n256, `c_scale=.10` | 60.0% | 38/40 |
+| n128, noise-floor rescale | 57.5% | 38/40 |
+| n128, variance-aware Q | 60.0% | 40/40 |
+| n128, `c_scale=.03` | 52.5% | 35/40 |
+
+Doubling visits did not materially change the opening choices. The cheap
+search transforms also moved few roots, so none is yet a demonstrated fix.
+
+A replayable f7 game exposed a sharper tactical failure. At turn 46, raw f7
+assigned `END_TURN` 78.4% and Road Building 5.9%. Eight independent n128
+searches selected `END_TURN` 8/8 even though Road Building's completed Q was
+consistently higher by 0.00093--0.00109. In eight paired raw-policy
+continuations, ending won 0/8 while forcing Road Building won 3/8 and raised
+road length from four to six immediately. This is diagnostic, not a strength
+gate, but it proves the decision museum must include dev-card timing and
+multi-action road plans; search does not automatically repair them.
+
+### 7. The current deep-oracle path cannot use the H100 efficiently
+
+Four bounded opening-oracle jobs used only 11--15% GPU and hit a ten-minute
+stop before completing 12 roots. Historical profiling explains the result:
+ordinary native MCTS leaves remain serial, the evaluator queue was 64.09% idle,
+and Python/JSON decision-input construction consumed 43.59% inclusive wall
+time. Before scaling oracle panels, add neural-row accounting, deterministic
+leaf-wave batching, and a fused native decision payload with exact parity
+gates.
+
 ## Work already completed
 
 - Raw and restart trajectories generated by the hidden-information heuristic
@@ -140,14 +180,18 @@ These are exactly the tradeoffs a phase/scenario position book must expose.
 
 ## Experiment sequence
 
-### P0-A: preserve efficient attention and add action-to-target binding
+### P0-A: preserve efficient attention and add graph-aware target reasoning
 
-Run matched architecture arms at width 640:
+Run matched fresh-init architecture arms:
 
-1. `B0`: current policy path, no target binding.
-2. `G1`: `action_target_gather`.
-3. `E1`: `edge_policy_head`.
-4. `GE1`: gather plus edge head, only if each individual arm is positive.
+1. `C624`: exact current width-624, gather, V25 contract.
+2. `C640`: width 640 with otherwise identical gather and V25 settings.
+3. `T640`: `C640` plus topology residual/relational consumption.
+4. `E640`: edge-policy head only after `T640` identifies remaining policy
+   aliasing.
+
+Keep a no-gather permutation probe as a causal test fixture, not as the claimed
+current baseline.
 
 If the 40M ceiling is immovable, first test omitting/compressing the dormant Q
 head rather than shrinking the Transformer width.
@@ -170,7 +214,7 @@ Required measurements:
 Hard success criteria:
 
 - permuting `legal_action_target_ids` changes logits in the commissioned arm;
-- the baseline remains invariant, proving the probe is causal;
+- the no-gather test control remains invariant, proving the probe is causal;
 - settlement/road holdout loss improves without degrading robber/discard;
 - throughput remains on the width-640 efficient path.
 
@@ -270,6 +314,22 @@ Every record must include:
 - paired counterfactual outcome estimate;
 - exact checkpoint, operator, seed, and state hash.
 
+The first checked-in examples must include the observed f7 Road Building root,
+its eight repeated-search seeds, and its paired continuation branches.
+
+### P1: make fixed-root diagnostics H100-efficient and compute-accountable
+
+Before expanding deep-oracle panels:
+
+1. count neural rows, evaluator calls, unique leaf expansions, wall time, and
+   GPU time in every search result;
+2. batch one deterministic sequential-halving leaf wave at a time;
+3. replace repeated JSON/Python decision preambles with a fused native payload;
+4. require byte-exact entity/action tensors and exact selected-action, visit,
+   completed-Q, logit, and value parity on frozen roots.
+
+Stop an arm immediately on semantic drift. Throughput is secondary to parity.
+
 ### P1: generate an authenticated current-v5 corpus
 
 The historical audit data is useful for diagnosing old networks, but it cannot
@@ -313,11 +373,17 @@ The large retrain may start only when all are true:
 
 ## Immediate next implementation order
 
-1. Add a width-640 target-binding experiment configuration and parameter-budget
-   alternative.
-2. Add the action-target permutation/sensitivity probe.
-3. Add value-routing matched canaries.
-4. Extend the fixed-root position book and run the 16 scenario slices.
-5. Run the duplicate-search reliability calibration.
-6. Generate authenticated v5 data.
-7. Run the bounded scratch canary.
+1. Check in the replayable decision museum, beginning with the observed f7
+   opening and Road Building failures plus paired counterfactuals.
+2. Add a separate non-promotable bounded H100 scratch runner; do not weaken the
+   B200 production authority or `go_authorized=false` gate.
+3. Run matched `C624`/`C640`/`T640` 128--256-step canaries on identical rows and
+   initialization, including the action-target permutation probe.
+4. Materialize the evaluator-query/turn-boundary value holdout and run
+   V0/V25/V100 with matched optimizer exposure.
+5. Add neural-row accounting, deterministic ordinary-leaf batching, and the
+   fused native decision payload before scaling deep-oracle evidence.
+6. Run phase-calibrated duplicate-search reliability, generate authenticated
+   v5 data, and only then run the bounded scratch canary.
+7. Consider PPO only after the supervised architecture, value route, and
+   search teacher pass the frozen behavioral gates.
