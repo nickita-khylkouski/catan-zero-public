@@ -48,8 +48,8 @@ def test_canonical_non_moe_recipe_has_no_phantom_moe_objective() -> None:
     assert fields["moe_balance_loss_weight"] == 0.0
 
 
-def test_canonical_forced_value_baseline_preserves_turn_boundaries() -> None:
-    """Mechanical policy rows remain full-strength value observations."""
+def test_canonical_forced_value_baseline_preserves_boundary_evidence() -> None:
+    """Forced policy is inert while turn-boundary value evidence is retained."""
 
     fields = _fields()
     assert fields["forced_action_weight"] == 0.0

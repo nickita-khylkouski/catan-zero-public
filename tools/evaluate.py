@@ -9,7 +9,6 @@ large historical H2H CLI remains available solely for sealed replay and R&D.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -23,13 +22,16 @@ for import_root in (REPO_ROOT, SRC_ROOT):
         sys.path.remove(str(import_root))
     sys.path.insert(0, str(import_root))
 
-from catan_zero.rl.pipeline_configs import CONFIG_SCHEMA_VERSION, EvalConfig
+from catan_zero.rl.pipeline_configs import (  # noqa: E402
+    CONFIG_SCHEMA_VERSION,
+    EvalConfig,
+)
+from catan_zero.rl.production_recipe_catalog import (  # noqa: E402
+    require_production_recipe,
+)
 
 
 CANONICAL_OPTION_COUNT = 10
-CANONICAL_CONFIG_SHA256 = (
-    "65eb8e8097d8138c97121ad6c55135b70e8f8ceec97032292374d6120078065a"
-)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,17 +61,7 @@ def _validate_config(path: Path) -> None:
         raise ValueError(f"cannot load evaluation config {path}: {error}") from error
     if not isinstance(payload, dict):
         raise ValueError("evaluation config must contain a JSON object")
-    payload_sha256 = hashlib.sha256(
-        json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("ascii")
-    ).hexdigest()
-    if payload_sha256 != CANONICAL_CONFIG_SHA256:
-        raise ValueError(
-            "evaluation config is not the exact commissioned canonical payload: "
-            f"expected_sha256={CANONICAL_CONFIG_SHA256} "
-            f"actual_sha256={payload_sha256}"
-        )
+    require_production_recipe(entrypoint="evaluate", path=path, payload=payload)
     if payload.get("pipeline") != EvalConfig.PIPELINE:
         raise ValueError(f"evaluation config pipeline must be {EvalConfig.PIPELINE!r}")
     if payload.get("schema_version") != CONFIG_SCHEMA_VERSION:

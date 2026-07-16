@@ -15,6 +15,30 @@ consumes GPU-hours.** Training is expensive and self-play generation data
 compounds — a bug shipped into a multi-day generation run poisons everything
 downstream of it. Land the fix, land the test, then generate.
 
+## Production RL path
+
+The supported improvement system is configuration-first expert iteration:
+
+```text
+coherent-public n128 self-play
+  -> authenticated corpus
+  -> parent-bounded or commissioned scratch learner
+  -> same-operator evaluation
+  -> transactional promotion
+```
+
+Use `tools/generate.py`, `tools/train.py`, and `tools/evaluate.py` with recipes
+listed in `configs/production_recipes.json`. Each public launcher has at most
+ten operational options; model, search, objective, and optimizer settings live
+in reviewed recipe files. `tools/loop.py` journals one complete
+generate-to-promotion turn with three options and crash-safe stage receipts.
+
+`tools/train_bc.py`, `tools/generate_gumbel_selfplay_data.py`, and the older
+fleet shell launchers are implementation or historical-replay surfaces, not
+interfaces for constructing new experiments. PPO remains an explicit
+diagnostic/finisher lane after the observation and value contracts are stable;
+it is not the default replacement for MCTS distillation.
+
 ## Pointer map
 
 - `RL_AGENT_HANDOFF.md` — production RL operator runbook: release and artifact

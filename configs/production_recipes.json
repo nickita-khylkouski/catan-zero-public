@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "recipes": {
+    "evaluate": [
+      {
+        "canonical_sha256": "65eb8e8097d8138c97121ad6c55135b70e8f8ceec97032292374d6120078065a",
+        "name": "coherent-public-n128",
+        "path": "configs/eval/coherent_public_n128.schema19.json"
+      }
+    ],
+    "generate": [
+      {
+        "canonical_sha256": "748040c7957856d13b1203b2635dcba86cde23bbda941739d92b40db8fdcad8b",
+        "name": "coherent-public-n128",
+        "path": "configs/generation/coherent_public_n128.schema19.json"
+      }
+    ],
+    "train": [
+      {
+        "canonical_sha256": "eea4fbfec0b77bf2fce7950977425bde883f7cb7f430035a3b0b061af009a8ae",
+        "name": "a1-current-35m-b200",
+        "path": "configs/training/a1_current_35m_b200.schema1.json"
+      }
+    ]
+  }
+}

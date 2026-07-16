@@ -74,10 +74,11 @@ an authorized run.
 
 `tools/train_bc.py` remains temporarily importable as an internal compatibility
 engine because sealed historical receipts and the authenticated scratch/one-dose
-executors bind its script path, functions, and bytes. It is not a supported
-interface for new hand-authored runs. Once sealed replay and those executors
-are routed through an explicit legacy adapter, the parser implementation can
-be deleted from the engine entirely.
+executors bind its script path, functions, and bytes. It remains executable only
+for those issued authorities; it is not a supported interface for new
+hand-authored runs. Once sealed replay and those executors are routed through an
+explicit legacy adapter, the parser implementation can be deleted from the
+engine entirely.
 
 GitHub Actions workflows were removed. Cluster execution and local explicit
 commands are now the only supported run surfaces.

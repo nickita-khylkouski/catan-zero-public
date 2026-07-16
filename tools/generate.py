@@ -10,7 +10,6 @@ limited to run identity and placement.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -27,14 +26,14 @@ from catan_zero.rl.pipeline_configs import (  # noqa: E402
     CONFIG_SCHEMA_VERSION,
     GenerateConfig,
 )
+from catan_zero.rl.production_recipe_catalog import (  # noqa: E402
+    require_production_recipe,
+)
 
 from generate_gumbel_selfplay_data import main as _legacy_executor_main  # noqa: E402
 
 
 CANONICAL_OPTION_COUNT = 9
-CANONICAL_CONFIG_SHA256 = (
-    "748040c7957856d13b1203b2635dcba86cde23bbda941739d92b40db8fdcad8b"
-)
 
 # These are not tuning knobs on the production path anymore.  Historical
 # configs remain replayable through generate_gumbel_selfplay_data.py, while the
@@ -157,17 +156,7 @@ def _validate_config(path: Path) -> None:
         raise ValueError(f"cannot load generation config {path}: {error}") from error
     if not isinstance(payload, dict):
         raise ValueError("generation config must contain a JSON object")
-    payload_sha256 = hashlib.sha256(
-        json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("ascii")
-    ).hexdigest()
-    if payload_sha256 != CANONICAL_CONFIG_SHA256:
-        raise ValueError(
-            "generation config is not the exact commissioned canonical payload: "
-            f"expected_sha256={CANONICAL_CONFIG_SHA256} "
-            f"actual_sha256={payload_sha256}"
-        )
+    require_production_recipe(entrypoint="generate", path=path, payload=payload)
     if payload.get("pipeline") != GenerateConfig.PIPELINE:
         raise ValueError(
             f"generation config pipeline must be {GenerateConfig.PIPELINE!r}"

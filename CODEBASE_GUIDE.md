@@ -64,8 +64,9 @@ The repository also contains a richer 2–4 player Python environment with struc
 ### Request Flow
 
 ```text
-Fleet launcher
-  → tools/generate.py + one checked-in science config
+tools/loop.py + one sealed turn config
+  → tools/fleet/a1_production_executor.py on the H100 fleet
+  → tools/generate.py + one checked-in science config per lane
   → one generator per physical GPU
   → multiprocessing game workers
   → catanatron_rs.Game + native Gumbel MCTS
@@ -73,7 +74,8 @@ Fleet launcher
   → one cross-worker EvalServer per GPU
   → batched EntityGraphPolicy forward
   → NPZ decision shards
-  → curated memmap corpus
+  → atomic SSH harvest + post-wave audit
+  → curated, receipt-bound memmap composite
   → tools/train.py + one checked-in learner config via 8-rank B200 DDP
   → tools/evaluate.py + one checked-in evaluator config
   → paired H2H + SPRT/promotion gate
@@ -138,11 +140,16 @@ Fleet launcher
   - `generate.py` — nine-option config-first generation launcher.
   - `train.py` — eight-option config-first learner launcher.
   - `evaluate.py` — nine-option config-first candidate/champion evaluator.
+  - `loop.py` — three-option, crash-resumable coordinator for one complete
+    generate/harvest/audit/composite/train/evaluate/promote transaction. It
+    only invokes stage-allowlisted canonical tools and never a shell string.
   - `generate_gumbel_selfplay_data.py` — internal generation/replay engine.
   - `train_bc.py` — internal behavior-cloning/DDP/FSDP engine; it is not a supported CLI.
   - `a1_scratch_train.py` — current native-v5 scratch-plan executor.
   - `a1_current_science_contract.py` — current search/learner authority.
-  - `a1_iteration_orchestrator.py` — durable turn state machine; currently not connected to the from-scratch executor.
+  - `a1_iteration_orchestrator.py` — legacy A1 corpus-to-promotion state
+    machine retained for issued receipt replay; new complete turns enter via
+    `loop.py` and may still select it indirectly through sealed stage tools.
   - `perf_snapshot.py` and `bench_eval_server.py` — standing performance probes.
 - **Connects to:** Every package module and filesystem artifact contract.
 - **Contribute here if:** Work changes an end-to-end experiment or deployment workflow.
@@ -150,13 +157,17 @@ Fleet launcher
 
 ### `/tools/fleet`
 - **Owns:** Alias-based host resolution and guarded launch/stop/status operations.
-- **Entry point:** `tools/fleet/fleet_launch.sh`
+- **Entry point:** `tools/fleet/a1_production_executor.py` through a sealed
+  `tools/loop.py` generation stage.
 - **Key files:**
   - `fleet_lib.sh` — uncommitted alias-to-IP boundary.
+  - `a1_production_executor.py` — content-addressed multi-host generation transaction.
   - `launch_detached.sh` — teardown-safe supervision and heartbeat.
   - `fleet_stop.sh` / `fleet_status.sh` — explicit-PID control and read-only status.
 - **Connects to:** H100/B200 hosts, seed ledger, generator, and trainer.
 - **Contribute here if:** Work changes physical resource placement or launch safety.
+- **Retired path:** `fleet_launch.sh` still reconstructs legacy PIMC/history flags
+  and is excluded from new production turns.
 
 ### `/configs`
 - **Owns:** Typed pipeline settings, guard expectations, and experiment manifests.
@@ -191,7 +202,7 @@ Fleet launcher
 ### [HIGH CONFIDENCE] EvalServer is the canonical config-first generation path
 - **Evidence:** The canonical generation config selects strict-FP32 EvalServer batching with a 96-request cap, immediate draining, and the request collector. Historical paired H100 evidence measured 155,619 versus 87,742 rows/hour for EvalServer versus local evaluators.
 - **If correct →** Keep one server per physical GPU and size workers by host CPU topology; an eight-GPU host cannot blindly reuse a four-GPU host's total process count.
-- **Verify:** `configs/generation/coherent_public_n128.schema17.json`, `tools/generate.py`, and `docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md`.
+- **Verify:** `configs/generation/coherent_public_n128.schema19.json`, `tools/generate.py`, and `docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md`.
 
 ### [HIGH CONFIDENCE] Native feature construction is the current default
 - **Evidence:** The canonical generation/evaluation configs and evaluator dataclass select Rust features. Accepted B200 evidence measures neural forward at 3.726 ms of a 4.500 ms native-feature leaf, or 82.8%.
@@ -227,14 +238,14 @@ Fleet launcher
 1. **Performance-only versus search-semantic changes** — only the former can use parity alone; the latter need paired strength gates.
 2. **Config-first production configuration** — masking, search, architecture, optimizer, and feature settings live in complete checked-in typed configs. The public CLI is only run identity and placement.
 3. **One owner and one canonical path per box** — use alias-based fleet tools, fresh outputs, explicit PIDs, and heartbeat supervision.
-4. **Objective signal is not aggregate loss** — forced one-action rows have zero policy mass but retain value supervision; checkpoint selection uses the measured playing-strength frontier, not monotonic teacher closure.
+4. **Objective signal is not aggregate loss** — forced one-action rows have zero policy mass but retain full value supervision at `ROLL` and `END_TURN` boundaries; checkpoint selection uses the measured playing-strength frontier, not monotonic teacher closure.
 
 ### Common Mistakes to Avoid
 - ❌ Expose several GPUs to one `--device cuda` generator → ✅ launch one generator/eval-server per physical GPU.
 - ❌ Multiply seed claims by worker count → ✅ workers partition `--games`; claim games per GPU only.
 - ❌ Treat more correlated rows as more value labels → ✅ measure independent game outcomes and group validation by game.
 - ❌ Chain a candidate into the next learner arm → ✅ independently reload the exact declared parent with fresh optimizer state.
-- ❌ Downweight turn-boundary value rows by default → ✅ retain full `ROLL`/`END_TURN` value weight until a phase-calibrated ablation proves otherwise.
+- ❌ Drop forced rows because their policy is trivial → ✅ keep policy weight zero while retaining their full terminal-value evidence.
 - ❌ Apply the archived optimization patch bundle wholesale → ✅ land individually tested changes with current-stack benchmarks.
 - ❌ Claim the four-player benchmark from two-player results → ✅ keep separate powered evaluation milestones.
 
@@ -245,12 +256,13 @@ Fleet launcher
 ### Simulation Throughput and Playing Strength
 
 **To contribute here, start with:**
-1. `tools/fleet/fleet_launch.sh` — physical GPU/process placement and guarded production configuration.
-2. `tools/generate.py` — canonical generation interface and accepted science config.
-3. `tools/generate_gumbel_selfplay_data.py` — internal worker orchestration and manifest engine.
-4. `src/catan_zero/rl/gumbel_self_play.py` — game loop and decision rows.
-5. `src/catan_zero/search/native_gumbel_mcts.py` — production native traversal.
-6. `src/catan_zero/search/neural_rust_mcts.py` — native features and neural leaf evaluation.
+1. `tools/loop.py` — complete transaction and durable stage journal.
+2. `tools/fleet/a1_production_executor.py` — physical GPU/process placement and sealed generation transaction.
+3. `tools/generate.py` — canonical generation interface and approved science config.
+4. `tools/generate_gumbel_selfplay_data.py` — internal worker orchestration and manifest engine.
+5. `src/catan_zero/rl/gumbel_self_play.py` — game loop and decision rows.
+6. `src/catan_zero/search/native_gumbel_mcts.py` — production native traversal.
+7. `src/catan_zero/search/neural_rust_mcts.py` — native features and neural leaf evaluation.
 
 **Before touching this feature:**
 - Preserve seed determinism, hidden-information boundaries, forced-action weights, chance spectra, and pre-action feature capture.
@@ -259,10 +271,11 @@ Fleet launcher
 - Use powered paired H2H before promoting D6, subtree reuse, new tree traversal, or changed simulation budgets.
 
 **Likely files you'll modify:**
-- `tools/fleet/fleet_launch.sh`
+- `tools/fleet/a1_production_executor.py`
+- `configs/production_recipes.json`
 - `src/catan_zero/search/neural_rust_mcts.py`
 - `src/catan_zero/search/gumbel_chance_mcts.py`
-- `tests/test_fleet_launch_contract.py`
+- `tests/test_production_loop.py`
 - `tests/test_evaluator_shared_payload.py`
 
 ---

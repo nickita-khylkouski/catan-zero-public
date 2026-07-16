@@ -7,14 +7,28 @@ longer assembled from dozens of command-line switches.
 
 - `tools/generate.py`: 9 options
 - `tools/evaluate.py`: 10 options
-- `tools/train.py`: config-first learner adapter; the checked-in fresh-scratch
+- `tools/train.py`: 8-option config-first learner adapter; the checked-in fresh-scratch
   recipe is launchable only through `tools/a1_scratch_train.py`'s authenticated
   plan/`--go` flow
+- `tools/loop.py`: 3 options for one complete improvement turn
 
 The older executors remain executable for authenticated historical replay,
 sealed scratch/one-dose orchestration, and specialized R&D tools. They are not
 interfaces for new hand-authored production launches; disabling their script
 entrypoints would invalidate existing byte-bound authorities.
+
+Approved production recipes are listed in
+`configs/production_recipes.json`. The compact launchers accept only a
+checked-in path whose canonical JSON digest matches that catalog. This keeps
+experimental and historical configs out of production while allowing a newly
+commissioned recipe to be added as data, without editing launcher source or
+adding another CLI flag.
+
+`tools/fleet/fleet_launch.sh` is also excluded from new production turns. It
+still reconstructs retired PIMC and truncated-history behavior from shell
+flags. New multi-host generation enters through the sealed A1 executor selected
+by `tools/loop.py`; the old shell launcher exists only for historical evidence
+and explicitly bounded diagnostics.
 
 ## Retired generation experiments
 

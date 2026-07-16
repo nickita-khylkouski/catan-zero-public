@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -29,12 +28,13 @@ from catan_zero.rl.pipeline_configs import (  # noqa: E402
     TrainConfig,
     config_from_payload,
 )
+from catan_zero.rl.production_recipe_catalog import (  # noqa: E402
+    ProductionRecipeError,
+    require_production_recipe,
+)
 
 
 CANONICAL_TRAIN_LAUNCH_SCHEMA = 1
-CANONICAL_CONFIG_SHA256 = (
-    "eea4fbfec0b77bf2fce7950977425bde883f7cb7f430035a3b0b061af009a8ae"
-)
 _ENGINE_SETTING_KEYS = frozenset(
     {
         "base_sampler",
@@ -101,17 +101,10 @@ def _load_recipe(path: str | Path) -> tuple[TrainConfig, dict[str, Any]]:
         raise SystemExit(f"invalid canonical train config {source}: {error}") from error
     if not isinstance(payload, dict):
         raise SystemExit("canonical train config must be a JSON object")
-    payload_sha256 = hashlib.sha256(
-        json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode("ascii")
-    ).hexdigest()
-    if payload_sha256 != CANONICAL_CONFIG_SHA256:
-        raise SystemExit(
-            "canonical train config is not the exact commissioned payload: "
-            f"expected_sha256={CANONICAL_CONFIG_SHA256} "
-            f"actual_sha256={payload_sha256}"
-        )
+    try:
+        require_production_recipe(entrypoint="train", path=source, payload=payload)
+    except ProductionRecipeError as error:
+        raise SystemExit(str(error)) from error
     if payload.get("launcher_schema") != CANONICAL_TRAIN_LAUNCH_SCHEMA:
         raise SystemExit(
             "canonical train config launcher_schema must be "
