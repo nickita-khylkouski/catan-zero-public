@@ -167,7 +167,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
 
     assert command.count("torch.distributed.run") == 1
     assert command.count("--nproc_per_node=8") == 1
-    assert command[command.index("--batch-size") + 1] == "512"
+    assert command[command.index("--batch-size") + 1] == "64"
     assert command[command.index("--base-sampler") + 1] == (
         "coverage_importance_v1"
     )

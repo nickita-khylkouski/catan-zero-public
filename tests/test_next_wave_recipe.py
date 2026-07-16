@@ -254,7 +254,8 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert recipe["max_steps"] == 0
     assert recipe["base_sampler"] == "coverage_importance_v1"
     assert recipe["lr"] == 6e-5
-    assert recipe["lr_warmup_steps"] == 100
+    assert recipe["lr_warmup_steps"] == 250
+    assert recipe["global_batch_size"] == 512
     assert recipe["fused_optimizer"] is True
     assert recipe["symmetry_augment"] is True
     assert recipe["symmetry_augment_events"] is True
@@ -286,10 +287,10 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     ]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:2d4fdfd6cbfca0a99fa564675eb9792e3be232e9de783f0c3f52a17b2f368938"
+        "sha256:b7f1933d1e24f4c5b3494278cbe1288c16e3629b7fc18e1f0e1f4eba45e85416"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:7072aed22bc118c9afac6f463416a04d26480ff09de96a623ba4a96ff03a5b3f"
+        "sha256:a4590598cf71471e5e623cf57d2b9eaa0824837c965c53b0274437f7bc4217fa"
     )
 
 

@@ -518,14 +518,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         verified, python=python, checkpoint=checkpoint, report=report
     )
     plan_authority = _scratch_plan_authority(verified)
+    execution_topology = verified["execution_topology"]
+    optimization_schedule_authorized = bool(
+        execution_topology.get("go_authorized") is True
+        and execution_topology.get("optimization_schedule_status")
+        == "commissioned_scratch_update_horizon_v1"
+    )
     base = {
         "schema_version": PLAN_SCHEMA,
         "created_unix_ns": time.time_ns(),
         "status": "planned",
         "diagnostic_only": True,
         "promotion_eligible": False,
-        "go_authorized": False,
-        "optimization_schedule_authorized": False,
+        "go_authorized": optimization_schedule_authorized,
+        "optimization_schedule_authorized": optimization_schedule_authorized,
         "maximum_result": "none_plan_only",
         "contract": _ref(Path(verified["lock_path"]), where="A1 lock"),
         "science_contract": {

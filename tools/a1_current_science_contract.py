@@ -63,8 +63,11 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # therefore trains by complete corpus coverage rather than inheriting the
     # fine-tune frontier's 32-step cap.
     "world_size": 1,
-    "batch_size": 4096,
-    "global_batch_size": 4096,
+    # Random-init representation learning needs optimizer updates, not merely
+    # corpus passes. Global 512 preserves the same three-epoch row exposure
+    # while providing roughly 8x more Adam updates than global 4096.
+    "batch_size": 512,
+    "global_batch_size": 512,
     "grad_accum_steps": 1,
     "epochs": 3,
     "max_steps": 0,
@@ -72,7 +75,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "resume_optimizer": False,
     "optimizer": "adamw",
     "lr": 6e-5,
-    "lr_warmup_steps": 100,
+    "lr_warmup_steps": 250,
     "lr_schedule": "cosine",
     "weight_decay": 0.01,
     "fused_optimizer": True,
@@ -166,15 +169,15 @@ PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT = {
     "name": "b200-8gpu-ddp",
     "world_size": 8,
     "physical_gpus": list(range(8)),
-    "local_batch_size": 512,
+    "local_batch_size": 64,
     "grad_accum_steps": 1,
-    "global_batch_size": 4096,
+    "global_batch_size": 512,
     "ddp_shard_data": False,
     "training_rng_rank_offset": True,
-    "optimization_schedule_status": "unresolved",
-    "go_authorized": False,
+    "optimization_schedule_status": "commissioned_scratch_update_horizon_v1",
+    "go_authorized": True,
     "reviewed_optimizer_schedule_role": (
-        "checkpoint_initialized_diagnostic_canary_only"
+        "from_scratch_representation_learning_v1"
     ),
 }
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
