@@ -38,6 +38,12 @@ from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
+from catan_zero.rl.ordered_history import (
+    MASKED_MEAN_V1,
+    ORDERED_ATTENTION_V2,
+    SUPPORTED_HISTORY_POOLING,
+    build_ordered_history_pool,
+)
 from catan_zero.rl.torch_ppo import build_action_feature_table
 from catan_zero.rl.xdim_lite_policy import (
     _array_sha256,
@@ -355,6 +361,11 @@ class EntityGraphConfig:
     # semantics without rewriting legacy shard tensors.
     # Appended last for positional legacy-pickle compatibility.
     legal_action_value_residual: bool = False
+    # The v1 history adapter pooled event embeddings as an unordered masked
+    # mean. Fresh/re-featurized history corpora may opt into a lightweight
+    # order-aware attention pool while retaining the exact same input schema.
+    # Appended last for positional legacy-pickle compatibility.
+    meaningful_public_history_pooling: str = MASKED_MEAN_V1
 
 
 class EntityGraphNet:
@@ -539,6 +550,22 @@ class EntityGraphNet:
                     getattr(cfg, "meaningful_public_history", False)
                 )
                 if self.meaningful_public_history_enabled:
+                    self.meaningful_public_history_pooling = str(
+                        getattr(
+                            cfg,
+                            "meaningful_public_history_pooling",
+                            MASKED_MEAN_V1,
+                        )
+                        or MASKED_MEAN_V1
+                    )
+                    if (
+                        self.meaningful_public_history_pooling
+                        not in SUPPORTED_HISTORY_POOLING
+                    ):
+                        raise ValueError(
+                            "unsupported meaningful public-history pooling: "
+                            f"{self.meaningful_public_history_pooling!r}"
+                        )
                     # Per-channel zero gate is the smallest expressive
                     # function-preserving adapter: the existing event MLP can
                     # learn once the gate opens, while step zero contributes
@@ -546,6 +573,16 @@ class EntityGraphNet:
                     self.meaningful_history_residual_gate = nn.Parameter(
                         torch.zeros(h)
                     )
+                    if self.meaningful_public_history_pooling == ORDERED_ATTENTION_V2:
+                        self.meaningful_history_sequence = build_ordered_history_pool(
+                            h, MEANINGFUL_PUBLIC_HISTORY_LIMIT
+                        )
+                        # Add the order-aware path without replacing the v1
+                        # masked-mean path. A separate zero gate preserves a
+                        # trained v1 history checkpoint exactly at upgrade.
+                        self.meaningful_history_ordered_gate = nn.Parameter(
+                            torch.zeros(h)
+                        )
                 self.type_embedding = nn.Parameter(torch.zeros(7, h))
                 self.cls_token = nn.Parameter(torch.zeros(1, 1, h))
                 if self.state_trunk == "transformer":
@@ -1088,13 +1125,24 @@ class EntityGraphNet:
                     # incumbent before the first optimizer step. Scaling by the
                     # fixed cap preserves event-count mass as well as content.
                     history_weight = event_mask.to(event_piece.dtype).unsqueeze(-1)
-                    pooled_history = (event_piece * history_weight).sum(dim=1) / float(
-                        MEANINGFUL_PUBLIC_HISTORY_LIMIT
-                    )
+                    pooled_history = (
+                        event_piece * history_weight
+                    ).sum(dim=1) / float(MEANINGFUL_PUBLIC_HISTORY_LIMIT)
                     state = (
                         state
                         + pooled_history * self.meaningful_history_residual_gate
                     )
+                    if (
+                        self.meaningful_public_history_pooling
+                        == ORDERED_ATTENTION_V2
+                    ):
+                        ordered_history = self.meaningful_history_sequence(
+                            event_piece, event_mask
+                        )
+                        state = (
+                            state
+                            + ordered_history * self.meaningful_history_ordered_gate
+                        )
                 if self.moe_enabled:
                     return (
                         tokens,
@@ -1678,6 +1726,21 @@ class EntityGraphPolicy:
 
         torch.manual_seed(seed)
         self.config = config
+        history_pooling = str(
+            getattr(config, "meaningful_public_history_pooling", MASKED_MEAN_V1)
+            or MASKED_MEAN_V1
+        )
+        if history_pooling not in SUPPORTED_HISTORY_POOLING:
+            raise ValueError(
+                f"unsupported meaningful public-history pooling: {history_pooling!r}"
+            )
+        if history_pooling != MASKED_MEAN_V1 and not bool(
+            getattr(config, "meaningful_public_history", False)
+        ):
+            raise ValueError(
+                "order-aware public-history pooling requires "
+                "meaningful_public_history=True"
+            )
         if bool(getattr(config, "meaningful_public_history", False)):
             history_schema = str(
                 getattr(config, "meaningful_public_history_schema", "") or ""
@@ -1787,6 +1850,7 @@ class EntityGraphPolicy:
             MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
         ),
         event_history_limit: int = 64,
+        meaningful_public_history_pooling: str = MASKED_MEAN_V1,
         entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ) -> EntityGraphPolicy:
         env = ColonistMultiAgentEnv(env_config or ColonistMultiAgentConfig())
@@ -1837,6 +1901,9 @@ class EntityGraphPolicy:
                     min(int(event_history_limit), MEANINGFUL_PUBLIC_HISTORY_LIMIT)
                     if meaningful_public_history
                     else int(event_history_limit)
+                ),
+                meaningful_public_history_pooling=str(
+                    meaningful_public_history_pooling or MASKED_MEAN_V1
                 ),
             )
             return cls(
@@ -2457,6 +2524,8 @@ class EntityGraphPolicy:
             "legal_action_value_residual_proj.",
             "public_card_count_residual.",
             "meaningful_history_residual_gate",
+            "meaningful_history_ordered_gate",
+            "meaningful_history_sequence.",
         )
         if bool(allow_missing_optional_parameters):
             allowed_missing_prefixes += optional_warmstart_prefixes

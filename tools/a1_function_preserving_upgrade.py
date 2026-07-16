@@ -37,6 +37,10 @@ from catan_zero.rl.meaningful_history import (  # noqa: E402
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
+from catan_zero.rl.ordered_history import (  # noqa: E402
+    MASKED_MEAN_V1,
+    ORDERED_ATTENTION_V2,
+)
 
 
 SCHEMA = "a1-function-preserving-architecture-upgrade-v1"
@@ -68,6 +72,12 @@ MODULE_TARGET_GATHER_PUBLIC_CARD_COUNT_V2 = (
 )
 MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2 = (
     "entity_graph.public_card_count_features+meaningful_public_history.v2"
+)
+MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY = (
+    "entity_graph.meaningful_public_history.ordered_attention.v2"
+)
+MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY_FROM_V1 = (
+    "entity_graph.meaningful_public_history.ordered_attention.from_v1.v2"
 )
 
 # This is intentionally code, not caller-controlled configuration.  A new
@@ -332,6 +342,55 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
         },
     },
+    MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY: {
+        "flags": {
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+            "meaningful_public_history_pooling": ORDERED_ATTENTION_V2,
+        },
+        "new_parameter_initialization": {
+            "meaningful_history_residual_gate": "zeros",
+            "meaningful_history_ordered_gate": "zeros",
+            "meaningful_history_sequence.norm.bias": "zeros",
+            "meaningful_history_sequence.norm.weight": "ones",
+            "meaningful_history_sequence.position_embedding": "zeros",
+            "meaningful_history_sequence.query": "seeded_torch_default",
+        },
+        "config_delta": {
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+            "meaningful_public_history_pooling": ORDERED_ATTENTION_V2,
+        },
+    },
+    # Upgrade an already-trained v1 history checkpoint without replacing its
+    # learned mean path or gate. The only additions are the ordered branch and
+    # its zero gate; all v1 parameters remain byte-identical.
+    MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY_FROM_V1: {
+        "flags": {
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+            "meaningful_public_history_pooling": ORDERED_ATTENTION_V2,
+        },
+        "new_parameter_initialization": {
+            "meaningful_history_ordered_gate": "zeros",
+            "meaningful_history_sequence.norm.bias": "zeros",
+            "meaningful_history_sequence.norm.weight": "ones",
+            "meaningful_history_sequence.position_embedding": "zeros",
+            "meaningful_history_sequence.query": "seeded_torch_default",
+        },
+        "config_delta": {
+            "meaningful_public_history_pooling": ORDERED_ATTENTION_V2,
+        },
+    },
     MODULE_ACTION_CROSS_ATTENTION_1: {
         "flags": {"action_cross_attention_layers": 1},
         "new_parameter_initialization": {
@@ -406,6 +465,11 @@ def _effective_config_receipt_view(value: Mapping[str, Any]) -> dict[str, Any]:
         result.pop("public_card_count_residual_bias")
     if result.get("legal_action_value_residual") is False:
         result.pop("legal_action_value_residual")
+    # The historical history adapter was an unordered masked mean. Omitting
+    # that appended default preserves receipts issued before this field
+    # existed, while the order-aware v2 value remains receipt-significant.
+    if result.get("meaningful_public_history_pooling") == MASKED_MEAN_V1:
+        result.pop("meaningful_public_history_pooling")
     return result
 
 

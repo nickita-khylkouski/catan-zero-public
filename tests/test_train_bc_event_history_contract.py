@@ -187,6 +187,37 @@ def test_cropped_entity_batch_skips_event_payload_and_refuses_live_mask(
         train_bc._entity_batch(data, np.asarray([0, 1], dtype=np.int64))
 
 
+def test_meaningful_history_crop_retains_right_aligned_live_events(
+    monkeypatch,
+) -> None:
+    data = {
+        key: np.zeros((2, 1), dtype=np.float32)
+        for key in train_bc.ENTITY_BATCH_KEYS
+    }
+    data["player_tokens"] = np.zeros((2, 4, 31), dtype=np.float32)
+    data["event_tokens"] = np.zeros((2, 64, 41), dtype=np.float16)
+    data["event_target_ids"] = np.full((2, 64, 4), -1, dtype=np.int16)
+    data["event_mask"] = np.zeros((2, 64), dtype=np.bool_)
+    data["event_tokens"][:, -5:, 0] = np.arange(1, 6, dtype=np.float16)
+    data["event_target_ids"][:, -5:, 0] = np.arange(1, 6, dtype=np.int16)
+    data["event_mask"][:, -5:] = True
+
+    monkeypatch.setattr(train_bc, "_CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY", False)
+    monkeypatch.setattr(train_bc, "_MEANINGFUL_EVENT_HISTORY_LIMIT", 32)
+    monkeypatch.setattr(train_bc, "_PUBLIC_CARD_COUNT_FEATURES_ENABLED", False)
+    monkeypatch.setattr(train_bc, "_MASK_HIDDEN_INFO_PLAYER_TOKENS", False)
+    batch = train_bc._entity_batch(data, np.asarray([0, 1], dtype=np.int64))
+
+    assert batch["event_tokens"].shape == (2, 32, 41)
+    assert batch["event_target_ids"].shape == (2, 32, 4)
+    assert batch["event_mask"].shape == (2, 32)
+    assert batch["event_mask"][:, -5:].all()
+    np.testing.assert_array_equal(
+        batch["event_tokens"][:, -5:, 0],
+        np.tile(np.arange(1, 6, dtype=np.float16), (2, 1)),
+    )
+
+
 @pytest.mark.parametrize(
     ("augment", "relabel_events", "expected"),
     [

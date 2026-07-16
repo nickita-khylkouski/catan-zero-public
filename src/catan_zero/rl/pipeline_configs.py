@@ -230,6 +230,7 @@ class TrainConfig(PipelineConfig):
     meaningful_public_history: bool | None = None
     meaningful_public_history_schema: str = "meaningful_public_history_2p_no_trade_v1"
     event_history_limit: int | None = None
+    meaningful_public_history_pooling: str | None = None
     # Checkpoint-owned interpretation of player-token longest-road slot 12.
     # This changes the learner's actual input tensor and therefore must be in
     # both the experiment hash and optimizer-resume identity.

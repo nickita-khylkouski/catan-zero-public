@@ -79,6 +79,11 @@ from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
+from catan_zero.rl.ordered_history import (
+    MASKED_MEAN_V1,
+    ORDERED_ATTENTION_V2,
+    SUPPORTED_HISTORY_POOLING,
+)
 from catan_zero.rl.target_reliability import (
     TARGET_RELIABILITY_COLUMNS,
     TARGET_RELIABILITY_VERSION,
@@ -467,6 +472,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Event-token limit; meaningful public history requires exactly 32.",
+    )
+    parser.add_argument(
+        "--meaningful-public-history-pooling",
+        choices=tuple(sorted(SUPPORTED_HISTORY_POOLING)),
+        default=None,
+        help=(
+            "History aggregation owned by the checkpoint. Omitted inherits an "
+            "init/grow checkpoint; ordered_attention_v2 adds a zero-gated "
+            "order-aware branch without replacing the legacy masked mean."
+        ),
     )
     parser.add_argument(
         "--public-award-feature-contract",
@@ -2259,7 +2274,7 @@ def _checkpoint_public_card_count_features(checkpoint_path: str) -> bool:
 
 def _checkpoint_meaningful_public_history(
     checkpoint_path: str,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, str]:
     """Read the bounded event-history input contract from a checkpoint."""
 
     import torch
@@ -2275,7 +2290,11 @@ def _checkpoint_meaningful_public_history(
     config = config_attr_view(checkpoint["config"])
     enabled = bool(getattr(config, "meaningful_public_history", False))
     limit = int(getattr(config, "event_history_limit", 64) or 0)
-    return enabled, limit
+    pooling = str(
+        getattr(config, "meaningful_public_history_pooling", MASKED_MEAN_V1)
+        or MASKED_MEAN_V1
+    )
+    return enabled, limit, pooling
 
 
 def _sha256_existing_file(path: str | Path) -> str:
@@ -8578,29 +8597,35 @@ def _resolve_effective_public_card_count_features(
 
 def _resolve_effective_meaningful_public_history(
     args: argparse.Namespace,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, str]:
     requested_raw = getattr(args, "meaningful_public_history", None)
     requested = None if requested_raw is None else bool(requested_raw)
     requested_limit_raw = getattr(args, "event_history_limit", None)
     requested_limit = (
         None if requested_limit_raw is None else int(requested_limit_raw)
     )
+    requested_pooling_raw = getattr(
+        args, "meaningful_public_history_pooling", None
+    )
+    requested_pooling = (
+        None if requested_pooling_raw is None else str(requested_pooling_raw)
+    )
     if str(args.arch) != "entity_graph":
-        if requested:
+        if requested or requested_pooling not in (None, MASKED_MEAN_V1):
             raise SystemExit(
-                "--meaningful-public-history is supported only for --arch entity_graph"
+                "meaningful public history is supported only for --arch entity_graph"
             )
-        return False, 64
+        return False, 64, MASKED_MEAN_V1
 
     checkpoint_path = str(
         getattr(args, "init_checkpoint", "")
         or getattr(args, "grow_from_checkpoint", "")
         or ""
     )
-    inherited_enabled, inherited_limit = (
+    inherited_enabled, inherited_limit, inherited_pooling = (
         _checkpoint_meaningful_public_history(checkpoint_path)
         if checkpoint_path
-        else (False, 64)
+        else (False, 64, MASKED_MEAN_V1)
     )
     init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
     if init_checkpoint and requested is not None and requested != inherited_enabled:
@@ -8619,17 +8644,38 @@ def _resolve_effective_meaningful_public_history(
             f"checkpoint={inherited_limit} cli={requested_limit}. Use the "
             "function-preserving meaningful_history checkpoint upgrade."
         )
+    if (
+        init_checkpoint
+        and requested_pooling is not None
+        and requested_pooling != inherited_pooling
+    ):
+        raise SystemExit(
+            "--meaningful-public-history-pooling does not match "
+            f"--init-checkpoint: checkpoint={inherited_pooling} "
+            f"cli={requested_pooling}. Upgrade the checkpoint or omit the "
+            "flag to inherit its exact architecture."
+        )
     enabled = inherited_enabled if requested is None else requested
+    pooling = (
+        inherited_pooling if requested_pooling is None else requested_pooling
+    )
+    if pooling not in SUPPORTED_HISTORY_POOLING:
+        raise SystemExit(f"unsupported meaningful public-history pooling: {pooling}")
     if enabled:
         if requested_limit not in (None, MEANINGFUL_PUBLIC_HISTORY_LIMIT):
             raise SystemExit(
                 "--meaningful-public-history requires --event-history-limit 32"
             )
-        return True, MEANINGFUL_PUBLIC_HISTORY_LIMIT
+        return True, MEANINGFUL_PUBLIC_HISTORY_LIMIT, pooling
+    if pooling != MASKED_MEAN_V1:
+        raise SystemExit(
+            "ordered public-history pooling requires "
+            "--meaningful-public-history"
+        )
     limit = inherited_limit if requested_limit is None else requested_limit
     if not 0 <= int(limit) <= 64:
         raise SystemExit("--event-history-limit must be in [0, 64]")
-    return False, int(limit)
+    return False, int(limit), MASKED_MEAN_V1
 
 
 def _validate_outcome_conditioned_policy_distillation(
@@ -9327,6 +9373,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     (
         args.meaningful_public_history,
         args.event_history_limit,
+        args.meaningful_public_history_pooling,
     ) = _resolve_effective_meaningful_public_history(args)
     _preflight_init_checkpoint_architecture(args, ddp)
     a1_preflight_meta: dict[str, object] | None = None
@@ -9524,6 +9571,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     (
         args.meaningful_public_history,
         args.event_history_limit,
+        args.meaningful_public_history_pooling,
     ) = _resolve_effective_meaningful_public_history(args)
     args.policy_target_reanalysis = None
     if str(args.data_format) != "memmap":
@@ -10019,6 +10067,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
                     ),
                     event_history_limit=int(args.event_history_limit),
+                    meaningful_public_history_pooling=str(
+                        args.meaningful_public_history_pooling
+                    ),
                 )
                 policy.model.config = policy.config
             else:
@@ -10063,6 +10114,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
                     ),
                     event_history_limit=int(args.event_history_limit),
+                    meaningful_public_history_pooling=str(
+                        args.meaningful_public_history_pooling
+                    ),
                     state_trunk=str(args.entity_state_trunk),
                     relational_block_pattern=str(args.relational_block_pattern),
                     relational_ff_size=int(args.relational_ff_size),
@@ -14185,9 +14239,12 @@ def _entity_batch(data: dict, batch: np.ndarray) -> dict[str, np.ndarray]:
             key: data[key][batch] for key in ENTITY_BATCH_KEYS if key not in event_keys
         }
         limit = int(_MEANINGFUL_EVENT_HISTORY_LIMIT)
-        result["event_tokens"] = data["event_tokens"][batch][:, :limit]
-        result["event_target_ids"] = data["event_target_ids"][batch][:, :limit]
-        result["event_mask"] = data["event_mask"][batch][:, :limit]
+        # Producer tensors are right-aligned: the newest live events occupy
+        # the tail and padding is at the head. Cropping the left prefix here
+        # silently trained on padding while native serving consumed history.
+        result["event_tokens"] = data["event_tokens"][batch][:, -limit:]
+        result["event_target_ids"] = data["event_target_ids"][batch][:, -limit:]
+        result["event_mask"] = data["event_mask"][batch][:, -limit:]
     else:
         result = {key: data[key][batch] for key in ENTITY_BATCH_KEYS}
     if _PUBLIC_CARD_COUNT_FEATURES_ENABLED:
@@ -24569,6 +24626,29 @@ def _checkpoint_config_mismatches(
                 f"cli={requested_history}/{requested_history_limit}; upgrade "
                 "the checkpoint with --flags meaningful_history"
             )
+        checkpoint_history_pooling = str(
+            getattr(
+                config,
+                "meaningful_public_history_pooling",
+                MASKED_MEAN_V1,
+            )
+            or MASKED_MEAN_V1
+        )
+        requested_history_pooling_raw = getattr(
+            args, "meaningful_public_history_pooling", None
+        )
+        requested_history_pooling = (
+            checkpoint_history_pooling
+            if requested_history_pooling_raw is None
+            else str(requested_history_pooling_raw)
+        )
+        if checkpoint_history_pooling != requested_history_pooling:
+            mismatches.append(
+                "meaningful_public_history_pooling "
+                f"checkpoint={checkpoint_history_pooling} "
+                f"cli={requested_history_pooling}; upgrade the checkpoint "
+                "with --flags ordered_history"
+            )
     return mismatches
 
 
@@ -24776,6 +24856,8 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "global_encoder",
         "event_encoder",
         "meaningful_history_residual_gate",
+        "meaningful_history_ordered_gate",
+        "meaningful_history_sequence",
         "type_embedding",
         "cls_token",
         "blocks",
@@ -24793,7 +24875,11 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     # but clean target-alignment learners must be able to exclude only these
     # new zero-initialized paths while continuing to update the mature trunk.
     "public_card_residual": ("public_card_count_residual",),
-    "meaningful_history_gate": ("meaningful_history_residual_gate",),
+    "meaningful_history_gate": (
+        "meaningful_history_residual_gate",
+        "meaningful_history_ordered_gate",
+        "meaningful_history_sequence",
+    ),
     "policy_head": ("action_bias", "logit_scale"),
     # Keep optional action-local adapters independently freezable.  Grouping
     # them together would make a gather+edge ablation silently update the
@@ -24871,6 +24957,7 @@ def _effective_entity_graph_architecture_report(
             "public_card_count_features": False,
             "meaningful_public_history": False,
             "event_history_limit": 64,
+            "meaningful_public_history_pooling": MASKED_MEAN_V1,
             "requested_edge_policy_head": bool(requested_edge_policy_head),
             "requested_aux_subgoal_heads": bool(requested_aux_subgoal_heads),
             "requested_aux_settlement_pointer_head": bool(
@@ -24910,6 +24997,14 @@ def _effective_entity_graph_architecture_report(
         ),
         "event_history_limit": int(
             getattr(config, "event_history_limit", 64) or 0
+        ),
+        "meaningful_public_history_pooling": str(
+            getattr(
+                config,
+                "meaningful_public_history_pooling",
+                MASKED_MEAN_V1,
+            )
+            or MASKED_MEAN_V1
         ),
         "belief_resource_head": bool(
             getattr(config, "belief_resource_head", False)
@@ -27130,7 +27225,12 @@ def _checkpoint_dose_telemetry(
             ),
             "meaningful_history": _feature_path(
                 meaningful_history_enabled,
-                ("event_encoder", "meaningful_history_residual_gate"),
+                (
+                    "event_encoder",
+                    "meaningful_history_residual_gate",
+                    "meaningful_history_ordered_gate",
+                    "meaningful_history_sequence",
+                ),
             ),
         },
     }

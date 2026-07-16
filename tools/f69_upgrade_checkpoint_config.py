@@ -44,6 +44,7 @@ from catan_zero.rl.meaningful_history import (  # noqa: E402
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
 )
+from catan_zero.rl.ordered_history import ORDERED_ATTENTION_V2  # noqa: E402
 
 _ENTITY_POLICY_MODULE = sys.modules[EntityGraphPolicy.__module__]
 _ENTITY_POLICY_PATH = Path(str(_ENTITY_POLICY_MODULE.__file__)).resolve(strict=True)
@@ -75,6 +76,8 @@ NEW_PARAM_PREFIXES = (
     "legal_action_value_residual_proj.",
     "public_card_count_residual.",
     "meaningful_history_residual_gate",
+    "meaningful_history_ordered_gate",
+    "meaningful_history_sequence.",
 )
 
 
@@ -152,6 +155,17 @@ def _parse_flags(raw: str) -> dict[str, object]:
                 MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
             )
             overrides["event_history_limit"] = MEANINGFUL_PUBLIC_HISTORY_LIMIT
+        elif entry in (
+            "ordered_history",
+            "meaningful_history_ordered",
+            "meaningful_public_history_ordered",
+        ):
+            overrides["meaningful_public_history"] = True
+            overrides["meaningful_public_history_schema"] = (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            )
+            overrides["event_history_limit"] = MEANINGFUL_PUBLIC_HISTORY_LIMIT
+            overrides["meaningful_public_history_pooling"] = ORDERED_ATTENTION_V2
         elif entry.startswith("catbins"):
             # CAT-39: build the HL-Gauss categorical value head with N win-loss
             # bins (plus the truncation class, which the config enables by

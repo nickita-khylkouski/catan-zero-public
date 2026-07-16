@@ -3260,6 +3260,8 @@ def bind_learner_ablation(
             architecture_upgrade.MODULE_MEANINGFUL_PUBLIC_HISTORY,
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
+            architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY,
+            architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY_FROM_V1,
         }
     )
     # These reviewed modules are exact zero-output initializers. The generic
@@ -5281,8 +5283,20 @@ def _build_direct_train_command(
         architecture_upgrade.MODULE_MEANINGFUL_PUBLIC_HISTORY,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
+        architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY,
+        architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY_FROM_V1,
     }:
         command.extend(["--meaningful-public-history", "--event-history-limit", "32"])
+    if upgrade_module in {
+        architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY,
+        architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY_FROM_V1,
+    }:
+        command.extend(
+            [
+                "--meaningful-public-history-pooling",
+                "ordered_attention_v2",
+            ]
+        )
     command.extend(
         [
             "--data",

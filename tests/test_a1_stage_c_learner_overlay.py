@@ -200,4 +200,8 @@ def test_clean_stage_c_recipe_freezes_only_new_adapters() -> None:
     ] == ("public_card_count_residual",)
     assert train_bc.ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS[
         "meaningful_history_gate"
-    ] == ("meaningful_history_residual_gate",)
+    ] == (
+        "meaningful_history_residual_gate",
+        "meaningful_history_ordered_gate",
+        "meaningful_history_sequence",
+    )
