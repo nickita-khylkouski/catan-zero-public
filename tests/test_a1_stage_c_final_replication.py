@@ -99,39 +99,43 @@ def _fingerprint(
             if step != final.stage_c_campaign.MAX_STEPS
         ],
     }
-    report_path.write_text(json.dumps(report, sort_keys=True))
+    dose_rows = []
     for step, checkpoint in checkpoints.items():
         feature_authenticated = True
-        feature_signal = (
+        observability = {
+            "schema_version": "module-optimizer-observability-v1",
+            "observed_steps": 1,
+            "cadence_batches": (
+                final.stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
+            ),
+            "norm_scope": "global_replicated",
+            "modules": {
+                module: {
+                    "mean_pre_clip_grad_norm": 0.4,
+                    "max_pre_clip_grad_norm": 0.6,
+                    "mean_parameter_delta_norm": 0.02,
+                    "mean_parameter_update_rms": 0.001,
+                    "parameter_count": 8,
+                }
+                for module in final.stage_c_campaign.FEATURE_SIGNAL_MODULES
+            },
+        }
+        feature_paths = {
+            "public_card": {"enabled": True, "status": "observed"},
+            "meaningful_history": {"enabled": True, "status": "observed"},
+        }
+        feature_signal = {
+            "authenticated": True,
+            **observability,
+            "optimizer_step": step,
+            "feature_paths": feature_paths,
+        }
+        dose_rows.append(
             {
-                "authenticated": True,
-                "schema_version": "module-optimizer-observability-v1",
-                "observed_steps": 1,
-                "cadence_batches": (
-                    final.stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
-                ),
-                "norm_scope": "global_replicated",
-                "modules": {
-                    module: {
-                        "mean_pre_clip_grad_norm": 0.4,
-                        "max_pre_clip_grad_norm": 0.6,
-                        "mean_parameter_delta_norm": 0.02,
-                        "mean_parameter_update_rms": 0.001,
-                        "parameter_count": 8,
-                    }
-                    for module in final.stage_c_campaign.FEATURE_SIGNAL_MODULES
-                },
+                "schema_version": "train-bc-checkpoint-dose-telemetry-v1",
                 "optimizer_step": step,
-                "feature_paths": {
-                    "public_card": {"enabled": True, "status": "observed"},
-                    "meaningful_history": {"enabled": True, "status": "observed"},
-                },
-            }
-            if feature_authenticated
-            else {
-                "authenticated": False,
-                "reason": "awaiting_feature_optimizer_observation_cadence",
-                "optimizer_step": step,
+                "module_optimizer_observability": observability,
+                "feature_path_gradients": feature_paths,
             }
         )
         records.append(
@@ -156,6 +160,12 @@ def _fingerprint(
                 },
             }
         )
+    report["checkpoint_dose_trajectory"] = {
+        "schema_version": "train-bc-checkpoint-dose-trajectory-v1",
+        "checkpoint_steps": list(final.stage_c_campaign.CHECKPOINT_STEPS),
+        "checkpoints": dose_rows,
+    }
+    report_path.write_text(json.dumps(report, sort_keys=True))
     value = {
         "schema_version": final.FRESH_FINGERPRINT_SCHEMA,
         "campaign": {
@@ -573,6 +583,43 @@ def test_checkpoint_record_refuses_unbound_local_evidence(
     with pytest.raises(
         final.FinalReplicationError,
         match="checkpoint report binding|feature evidence",
+    ):
+        final._checkpoint_record(  # noqa: SLF001
+            verified,
+            16,
+            require_fingerprint_eligible=False,
+        )
+
+
+@pytest.mark.parametrize("mutation", ("missing_trajectory", "invented_signal"))
+def test_checkpoint_record_reconciles_feature_evidence_to_completed_report(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    fingerprint_path, fingerprint = _fingerprint(
+        tmp_path, parent_sha="sha256:" + "7" * 64, steps=(16,)
+    )
+    report_path = Path(fingerprint["completed_dose"]["report"]["path"])
+    report = json.loads(report_path.read_text())
+    if mutation == "missing_trajectory":
+        report.pop("checkpoint_dose_trajectory")
+    else:
+        report["checkpoint_dose_trajectory"]["checkpoints"][0][
+            "module_optimizer_observability"
+        ]["modules"][
+            next(iter(final.stage_c_campaign.FEATURE_SIGNAL_MODULES))
+        ]["mean_parameter_update_rms"] = 0.123
+    report_path.write_text(json.dumps(report, sort_keys=True))
+    fingerprint["completed_dose"]["report"]["file_sha256"] = final.file_sha256(
+        report_path
+    )
+    fingerprint.pop("fingerprint_sha256")
+    _write_sealed(fingerprint_path, fingerprint, "fingerprint_sha256")
+    _path, verified = final._fingerprint(fingerprint_path)  # noqa: SLF001
+
+    with pytest.raises(
+        final.FinalReplicationError,
+        match="feature trajectory is invalid|feature evidence differs from report",
     ):
         final._checkpoint_record(  # noqa: SLF001
             verified,

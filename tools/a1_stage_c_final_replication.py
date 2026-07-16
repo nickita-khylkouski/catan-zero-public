@@ -396,37 +396,23 @@ def _authenticate_checkpoint_evidence(
         raise FinalReplicationError(
             f"step {step} checkpoint-local feature evidence is missing"
         )
+    try:
+        report_signal = stage_c_campaign._checkpoint_feature_learning_signal(  # noqa: SLF001
+            report,
+            step=step,
+        )
+    except stage_c_campaign.CampaignError as error:
+        raise FinalReplicationError(
+            f"step {step} completed report feature trajectory is invalid"
+        ) from error
+    if signal != report_signal:
+        raise FinalReplicationError(
+            f"step {step} checkpoint-local feature evidence differs from report"
+        )
     authenticated = signal.get("authenticated") is True
     if record.get("feature_learning_signal_authenticated") is not authenticated:
         raise FinalReplicationError(
             f"step {step} checkpoint-local feature evidence contradicts summary"
-        )
-    if not authenticated:
-        if (
-            step >= stage_c_campaign.TRAIN_DIAGNOSTIC_CADENCE_BATCHES
-            or signal.get("reason")
-            != "awaiting_feature_optimizer_observation_cadence"
-        ):
-            raise FinalReplicationError(
-                f"step {step} unauthenticated feature evidence is inconsistent"
-            )
-        return
-    try:
-        stage_c_campaign._verify_feature_optimizer_observability(  # noqa: SLF001
-            signal,
-            minimum_observations=1,
-            where=f"final replication checkpoint {step}",
-        )
-    except stage_c_campaign.CampaignError as error:
-        raise FinalReplicationError(
-            f"step {step} checkpoint-local feature evidence is invalid"
-        ) from error
-    if signal.get("feature_paths") != {
-        "public_card": {"enabled": True, "status": "observed"},
-        "meaningful_history": {"enabled": True, "status": "observed"},
-    }:
-        raise FinalReplicationError(
-            f"step {step} checkpoint-local feature paths are invalid"
         )
 
 
