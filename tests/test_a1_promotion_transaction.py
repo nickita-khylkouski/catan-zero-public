@@ -2715,6 +2715,360 @@ def test_plan_only_scratch_receipt_is_deliberately_non_promotable(
         )
 
 
+def test_completed_scratch_receipt_dispatches_to_separate_verifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tools import a1_scratch_train as scratch_train
+
+    receipt_path = tmp_path / "scratch-execution.json"
+    _write_json(receipt_path, {"schema_version": scratch_train.EXECUTION_SCHEMA})
+    report = tmp_path / "report.json"
+    report.write_text("{}\n")
+    candidate = tmp_path / "epoch-2.pt"
+    candidate.write_bytes(b"selected scratch epoch")
+    selection = tmp_path / "scratch-selection.json"
+    selection.write_text("{}\n")
+    verified_receipt = {
+        "path": str(receipt_path),
+        "sha256": promotion._sha256(receipt_path),
+        "receipt_sha256": "sha256:" + "1" * 64,
+        "training_report": {
+            "path": str(report),
+            "file_sha256": promotion._sha256(report),
+        },
+        "epoch_frontier_sha256": "sha256:" + "2" * 64,
+        "epoch_frontier": [],
+        "execution_binding_sha256": "sha256:" + "3" * 64,
+        "initialization_mode": "from_scratch",
+    }
+    monkeypatch.setattr(
+        promotion,
+        "_verify_completed_scratch_training_receipt",
+        lambda *_args, **_kwargs: verified_receipt,
+    )
+    monkeypatch.setattr(
+        promotion,
+        "_verify_scratch_checkpoint_selection",
+        lambda *_args, **_kwargs: {
+            "selected_epoch": 2,
+            "evaluation_baseline": {
+                "path": str(tmp_path / "champion.pt"),
+                "sha256": "sha256:" + "4" * 64,
+            },
+            "screen_evidence": {
+                "path": str(selection),
+                "sha256": promotion._sha256(selection),
+            },
+        },
+    )
+    monkeypatch.setattr(
+        promotion,
+        "_require_training_receipt_initialization_authority",
+        lambda _contract: pytest.fail(
+            "scratch execution must not use checkpoint initialization verifier"
+        ),
+    )
+
+    verified = promotion._verify_one_dose_training_receipt(  # noqa: SLF001
+        receipt_path,
+        contract_lock=tmp_path / "contract.json",
+        contract={},
+        candidate_path=candidate,
+        candidate_sha256=promotion._sha256(candidate),
+        training_report_path=report,
+        training_report_sha256=promotion._sha256(report),
+        checkpoint_selection_path=selection,
+        checkpoint_selection_sha256=promotion._sha256(selection),
+    )
+
+    assert verified["initialization_mode"] == "from_scratch"
+    assert verified["checkpoint_selection"]["selected_epoch"] == 2
+
+
+def test_completed_scratch_receipt_requires_playing_strength_selection(
+    tmp_path: Path,
+) -> None:
+    from tools import a1_scratch_train as scratch_train
+
+    receipt = tmp_path / "scratch-execution.json"
+    _write_json(receipt, {"schema_version": scratch_train.EXECUTION_SCHEMA})
+
+    with pytest.raises(
+        promotion.PromotionError,
+        match="requires playing-strength epoch selection",
+    ):
+        promotion._verify_one_dose_training_receipt(  # noqa: SLF001
+            receipt,
+            contract_lock=tmp_path / "contract.json",
+            contract={},
+            candidate_path=tmp_path / "candidate.pt",
+            candidate_sha256="sha256:" + "0" * 64,
+            training_report_path=tmp_path / "report.json",
+            training_report_sha256="sha256:" + "1" * 64,
+        )
+
+
+def test_completed_scratch_receipt_authenticates_epoch_frontier(
+    tmp_path: Path,
+) -> None:
+    from tools import a1_scratch_train as scratch_train
+
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text("{}\n")
+    science_path = tmp_path / "science.json"
+    science_path.write_text("{}\n")
+    python_path = tmp_path / "python"
+    python_path.write_bytes(b"python")
+    validation_manifest = tmp_path / "validation.json"
+    validation_manifest.write_text("{}\n")
+    terminal = tmp_path / "model.pt"
+    terminal.write_bytes(b"terminal")
+    report = tmp_path / "report.json"
+    report_payload = {
+        "epochs": 2,
+        "checkpoint": str(terminal),
+        "input_validation_game_seed_manifest": str(validation_manifest),
+        "input_validation_game_seed_manifest_sha256": promotion._sha256(
+            validation_manifest
+        ),
+        "validation_game_seed_count": 32,
+        "validation_game_seed_set_sha256": "sha256:" + "7" * 64,
+    }
+    _write_json(report, report_payload)
+    frontier = []
+    for epoch in (1, 2):
+        checkpoint = tmp_path / f"model.epoch{epoch}.pt"
+        optimizer = tmp_path / f"model.epoch{epoch}.pt.optimizer.pt"
+        progress = tmp_path / f"model.epoch{epoch}.pt.training-progress.json"
+        checkpoint.write_bytes(f"epoch-{epoch}".encode())
+        optimizer.write_bytes(b"optimizer")
+        progress.write_text("{}\n")
+        frontier.append(
+            {
+                "epoch": epoch,
+                "checkpoint": {
+                    "path": str(checkpoint),
+                    "file_sha256": promotion._sha256(checkpoint),
+                },
+                "optimizer": {
+                    "path": str(optimizer),
+                    "file_sha256": promotion._sha256(optimizer),
+                },
+                "training_progress": {
+                    "path": str(progress),
+                    "file_sha256": promotion._sha256(progress),
+                },
+            }
+        )
+    initialization = {
+        "mode": "from_scratch",
+        "checkpoint": None,
+        "optimizer_state": "fresh",
+    }
+    model = {"arch": "entity_graph"}
+    topology = {
+        "world_size": 8,
+        "go_authorized": True,
+        "optimization_schedule_status": "commissioned_scratch_update_horizon_v1",
+    }
+    recipe = {"epochs": 2}
+    contract = {
+        "science": {
+            "learner_initialization": initialization,
+            "learner_initialization_sha256": promotion._digest_value(initialization),
+            "learner_model_construction": model,
+            "learner_execution_topology": topology,
+            "learner_training_recipe": recipe,
+        }
+    }
+    command = [
+        str(python_path),
+        "train_bc.py",
+        "--checkpoint",
+        str(terminal),
+        "--report",
+        str(report),
+        "--save-each-epoch",
+    ]
+    receipt = {
+        "schema_version": scratch_train.EXECUTION_SCHEMA,
+        "created_unix_ns": 1,
+        "status": "completed",
+        "diagnostic_only": False,
+        "promotion_eligible": False,
+        "go_authorized": True,
+        "optimization_schedule_authorized": True,
+        "maximum_result": (
+            "training_complete_requires_checkpoint_selection_and_gate"
+        ),
+        "contract": {
+            "path": str(contract_path),
+            "file_sha256": promotion._sha256(contract_path),
+        },
+        "science_contract": {
+            "path": str(science_path),
+            "file_sha256": promotion._sha256(science_path),
+            "semantic_sha256": promotion._digest_value({}),
+        },
+        "initialization": initialization,
+        "model_construction": model,
+        "execution_topology": topology,
+        "logical_recipe": recipe,
+        "effective_recipe": recipe,
+        "composite": {},
+        "plan_authority": {},
+        "python": {
+            "path": str(python_path),
+            "file_sha256": promotion._sha256(python_path),
+        },
+        "trainer_authority": {},
+        "launcher_authority": {},
+        "command": command,
+        "command_sha256": promotion._digest_value(command),
+        "go": True,
+        "started_unix_ns": 2,
+        "finished_unix_ns": 3,
+        "returncode": 0,
+        "outputs": {
+            "terminal_checkpoint": {
+                "path": str(terminal),
+                "file_sha256": promotion._sha256(terminal),
+            },
+            "training_report": {
+                "path": str(report),
+                "file_sha256": promotion._sha256(report),
+            },
+            "epoch_frontier": frontier,
+            "epoch_frontier_sha256": promotion._digest_value(frontier),
+        },
+    }
+    receipt["receipt_sha256"] = promotion._digest_value(receipt)
+    receipt_path = tmp_path / "receipt.json"
+    _write_json(receipt_path, receipt)
+
+    verified = promotion._verify_completed_scratch_training_receipt(  # noqa: SLF001
+        receipt_path,
+        contract_lock=contract_path,
+        contract=contract,
+    )
+
+    assert [row["epoch"] for row in verified["epoch_frontier"]] == [1, 2]
+    assert verified["report_checkpoint"]["sha256"] == promotion._sha256(terminal)
+    assert verified["validation_outputs"]["validation_game_seed_count"] == 32
+
+
+def test_scratch_epoch_selector_uses_strength_and_earliest_exact_tie() -> None:
+    assert promotion._select_scratch_epoch({1: 10, 2: 14, 3: 12}) == 2  # noqa: SLF001
+    assert promotion._select_scratch_epoch({1: 14, 2: 14, 3: 12}) == 1  # noqa: SLF001
+
+
+def test_scratch_selector_rejects_noncontiguous_frontier() -> None:
+    with pytest.raises(promotion.PromotionError, match="not contiguous"):
+        promotion._select_scratch_epoch({1: 10, 3: 20})  # noqa: SLF001
+
+
+def test_scratch_selection_replays_every_epoch_and_ignores_training_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt_path = tmp_path / "scratch-receipt.json"
+    receipt_path.write_text("{}\n")
+    report_path = tmp_path / "training-report.json"
+    report_path.write_text("{}\n")
+    baseline = tmp_path / "champion.pt"
+    baseline.write_bytes(b"champion")
+    epoch_paths: list[Path] = []
+    frontier = []
+    evaluation_paths: dict[int, Path] = {}
+    points = {1: 20, 2: 28, 3: 24}
+    for epoch in (1, 2, 3):
+        checkpoint = tmp_path / f"epoch-{epoch}.pt"
+        checkpoint.write_bytes(f"epoch-{epoch}".encode())
+        epoch_paths.append(checkpoint)
+        frontier.append(
+            {
+                "epoch": epoch,
+                "checkpoint": {
+                    "path": str(checkpoint),
+                    "file_sha256": promotion._sha256(checkpoint),
+                },
+            }
+        )
+        evaluation = tmp_path / f"eval-{epoch}.json"
+        evaluation.write_text("{}\n")
+        evaluation_paths[epoch] = evaluation
+
+    common_keys = [
+        {"game_seed": seed, "orientation": orientation}
+        for seed in (1, 2)
+        for orientation in ("candidate_blue", "candidate_red")
+    ]
+    common_search = {"operator": "sealed"}
+
+    def verify_report(path: Path, *, where: str) -> dict:
+        del where
+        epoch = int(path.stem.split("-")[-1])
+        checkpoint = epoch_paths[epoch - 1]
+        return {
+            "path": str(path),
+            "sha256": promotion._sha256(path),
+            "candidate_checkpoint": _checkpoint_ref(checkpoint),
+            "baseline_checkpoint": _checkpoint_ref(baseline),
+            "ordered_game_keys": common_keys,
+            "search_configuration": common_search,
+            "candidate_half_points": points[epoch],
+        }
+
+    monkeypatch.setattr(
+        promotion, "_verify_matched_quick_screen_report", verify_report
+    )
+    scratch_receipt = {
+        "sha256": promotion._sha256(receipt_path),
+        "receipt_sha256": "sha256:" + "1" * 64,
+        "epoch_frontier_sha256": "sha256:" + "2" * 64,
+        "epoch_frontier": frontier,
+    }
+    selection = {
+        "schema_version": promotion.SCRATCH_CHECKPOINT_SELECTION_SCHEMA,
+        "training_receipt": {
+            "path": str(receipt_path),
+            "sha256": scratch_receipt["sha256"],
+            "receipt_sha256": scratch_receipt["receipt_sha256"],
+        },
+        "training_report": _checkpoint_ref(report_path),
+        "epoch_frontier_sha256": scratch_receipt["epoch_frontier_sha256"],
+        "eligible_epochs": [1, 2, 3],
+        "evaluation_reports": [
+            {
+                "epoch": epoch,
+                "evaluation_report": _checkpoint_ref(evaluation_paths[epoch]),
+            }
+            for epoch in (1, 2, 3)
+        ],
+        "selected_epoch": 2,
+        "selected_checkpoint": _checkpoint_ref(epoch_paths[1]),
+        "selection_rule": promotion.SCRATCH_CHECKPOINT_SELECTION_RULE,
+        "matched_common_random_numbers": True,
+        "full_gate_requires_disjoint_cohort": True,
+    }
+    selection["selection_sha256"] = promotion._digest_value(selection)
+    selection_path = tmp_path / "scratch-selection.json"
+    _write_json(selection_path, selection)
+
+    verified = promotion._verify_scratch_checkpoint_selection(  # noqa: SLF001
+        selection_path,
+        expected_file_sha256=promotion._sha256(selection_path),
+        training_receipt_path=receipt_path,
+        scratch_receipt=scratch_receipt,
+        training_report_path=report_path,
+        candidate_path=epoch_paths[1],
+        candidate_sha256=promotion._sha256(epoch_paths[1]),
+    )
+
+    assert verified["selected_epoch"] == 2
+    assert verified["evaluation_baseline"] == _checkpoint_ref(baseline)
+    assert promotion.SCRATCH_CHECKPOINT_SELECTION_RULE["training_loss_used"] is False
+
+
 def test_select_dose_builder_seals_same_trajectory_choice(tmp_path: Path) -> None:
     fixture = _fixture(tmp_path)
     _receipt, modern = _modernize_one_dose_receipt(
