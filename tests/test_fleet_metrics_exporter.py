@@ -42,6 +42,80 @@ def _config(base_seed: int = 1000, games: int = 20, n_full: int = 128) -> dict:
     }
 
 
+def _coherent_public_config(
+    base_seed: int = 1000, games: int = 20
+) -> dict:
+    config = _config(base_seed=base_seed, games=games)
+    config["fields"].update(
+        {
+            "information_set_search": False,
+            "determinization_particles": 1,
+            "c_scale": 0.1,
+            "sigma_eval": 0.79,
+            "coherent_public_belief_search": True,
+            "correct_rust_chance_spectra": True,
+            "native_mcts_hot_loop": True,
+            "forced_root_target_mode": "trajectory_only",
+            "record_automatic_transitions": False,
+            "meaningful_public_history": True,
+            "event_history_limit": 32,
+            "rust_featurize": True,
+            "preserve_search_evidence": True,
+            "target_information_regime": "public_belief_single_tree_v1",
+        }
+    )
+    return config
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted"),
+    [
+        ("coherent_public_belief_search", False),
+        ("correct_rust_chance_spectra", False),
+        ("native_mcts_hot_loop", False),
+        ("forced_root_target_mode", "full"),
+        ("record_automatic_transitions", True),
+        ("meaningful_public_history", False),
+        ("event_history_limit", 64),
+        ("rust_featurize", False),
+        ("preserve_search_evidence", False),
+        ("sigma_eval", 1.0),
+        ("target_information_regime", "unknown"),
+    ],
+)
+def test_coherent_public_recipe_is_safe_and_semantic_drift_is_detected(
+    tmp_path: Path, field: str, drifted: object
+) -> None:
+    now = 9_000.0
+    output = tmp_path / "runs" / "n128" / "c1_gpu0__current_producer"
+    config = _coherent_public_config()
+    _write_json(output / "config.json", config, mtime=now - 2)
+    resolved = str(output.resolve())
+
+    snapshot = exporter.snapshot_run(
+        output,
+        host="c1",
+        processes={resolved: {41}},
+        now=now,
+        stale_after_seconds=60,
+    )
+    assert snapshot is not None
+    assert snapshot.recipe_safe is True
+    assert snapshot.target_information_regime == "public_belief_single_tree_v1"
+
+    config["fields"][field] = drifted
+    _write_json(output / "config.json", config, mtime=now - 1)
+    drifted_snapshot = exporter.snapshot_run(
+        output,
+        host="c1",
+        processes={resolved: {41}},
+        now=now,
+        stale_after_seconds=60,
+    )
+    assert drifted_snapshot is not None
+    assert drifted_snapshot.recipe_safe is False, field
+
+
 def test_live_progress_exports_process_health_config_seed_and_counters(
     tmp_path: Path,
 ) -> None:

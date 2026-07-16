@@ -36,6 +36,7 @@ A1_GPU_DIR_RE = re.compile(
 # wave is live. Keep this table synchronized with the sealed A1 contract and
 # generate_gumbel_selfplay_data guard.
 PUBLIC_TARGET_INFORMATION_REGIME = "public_conservation_pimc_v1"
+COHERENT_PUBLIC_TARGET_INFORMATION_REGIME = "public_belief_single_tree_v1"
 UNKNOWN_TARGET_INFORMATION_REGIME = "unknown"
 EXPECTED_LEGACY_A1_RECIPE: dict[str, Any] = {
     "public_observation": True,
@@ -53,6 +54,33 @@ EXPECTED_LEGACY_A1_RECIPE: dict[str, Any] = {
     "lazy_interior_chance": True,
     "belief_chance_spectra": False,
     "target_information_regime": PUBLIC_TARGET_INFORMATION_REGIME,
+}
+EXPECTED_COHERENT_PUBLIC_A1_RECIPE: dict[str, Any] = {
+    "public_observation": True,
+    "information_set_search": False,
+    "determinization_particles": 1,
+    "determinization_min_simulations": 32,
+    "n_full": 128,
+    "n_fast": 16,
+    "p_full": 0.25,
+    "symmetry_averaged_eval": True,
+    "symmetry_averaged_eval_threshold": 20,
+    "c_scale": 0.1,
+    "c_visit": 50.0,
+    "max_depth": 80,
+    "lazy_interior_chance": True,
+    "belief_chance_spectra": False,
+    "sigma_eval": 0.79,
+    "coherent_public_belief_search": True,
+    "correct_rust_chance_spectra": True,
+    "native_mcts_hot_loop": True,
+    "forced_root_target_mode": "trajectory_only",
+    "record_automatic_transitions": False,
+    "meaningful_public_history": True,
+    "event_history_limit": 32,
+    "rust_featurize": True,
+    "preserve_search_evidence": True,
+    "target_information_regime": COHERENT_PUBLIC_TARGET_INFORMATION_REGIME,
 }
 
 
@@ -79,7 +107,11 @@ def _is_post_promotion_attestation(
 
 
 def _expected_recipe(
-    *, run: str, category: str, post_promotion: bool = False
+    *,
+    run: str,
+    category: str,
+    post_promotion: bool = False,
+    coherent_public: bool = False,
 ) -> dict[str, Any]:
     """Return the exact safe recipe for historical or current A1 output.
 
@@ -90,6 +122,9 @@ def _expected_recipe(
     search the retained producer seat with the deployed v5 c_scale=.10.
     Legacy runs keep the pre-wave n128/.03 expectation.
     """
+
+    if coherent_public:
+        return dict(EXPECTED_COHERENT_PUBLIC_A1_RECIPE)
 
     expected = dict(EXPECTED_LEGACY_A1_RECIPE)
     if run in {"n128", "n256"} and category in {
@@ -300,6 +335,16 @@ class RunSnapshot:
     max_depth: int
     lazy_interior_chance: bool
     belief_chance_spectra: bool
+    sigma_eval: float
+    coherent_public_belief_search: bool
+    correct_rust_chance_spectra: bool
+    native_mcts_hot_loop: bool
+    forced_root_target_mode: str
+    record_automatic_transitions: bool
+    meaningful_public_history: bool
+    event_history_limit: int
+    rust_featurize: bool
+    preserve_search_evidence: bool
     target_information_regime: str
     target_information_regime_attested: bool
     recipe_safe: bool
@@ -463,6 +508,8 @@ def snapshot_run(
             "c_scale",
             "c_visit",
             "max_depth",
+            "sigma_eval",
+            "event_history_limit",
         )
     }
     public_observation = _recipe_bool_value(
@@ -505,6 +552,62 @@ def snapshot_run(
         positive="--belief-chance-spectra",
         negative="--no-belief-chance-spectra",
     )
+    coherent_public_belief_search = _recipe_bool_value(
+        "coherent_public_belief_search",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--coherent-public-belief-search",
+        negative="--no-coherent-public-belief-search",
+    )
+    correct_rust_chance_spectra = _recipe_bool_value(
+        "correct_rust_chance_spectra",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--correct-rust-chance-spectra",
+        negative="--no-correct-rust-chance-spectra",
+    )
+    native_mcts_hot_loop = _recipe_bool_value(
+        "native_mcts_hot_loop",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--native-mcts-hot-loop",
+        negative="--no-native-mcts-hot-loop",
+    )
+    record_automatic_transitions = _recipe_bool_value(
+        "record_automatic_transitions",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--record-automatic-transitions",
+        negative="--no-record-automatic-transitions",
+    )
+    meaningful_public_history = _recipe_bool_value(
+        "meaningful_public_history",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--meaningful-public-history",
+        negative="--no-meaningful-public-history",
+    )
+    rust_featurize = _recipe_bool_value(
+        "rust_featurize",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--rust-featurize",
+        negative="--no-rust-featurize",
+    )
+    preserve_search_evidence = _recipe_bool_value(
+        "preserve_search_evidence",
+        manifest=manifest,
+        fields=fields,
+        argv=argv,
+        positive="--preserve-search-evidence",
+        negative="--no-preserve-search-evidence",
+    )
     determinization_particles = int(_number(recipe_source["determinization_particles"]))
     determinization_min_simulations = int(
         _number(recipe_source["determinization_min_simulations"])
@@ -518,6 +621,18 @@ def snapshot_run(
     c_scale = _number(recipe_source["c_scale"])
     c_visit = _number(recipe_source["c_visit"])
     max_depth = int(_number(recipe_source["max_depth"]))
+    sigma_eval = _number(recipe_source["sigma_eval"])
+    event_history_limit = int(_number(recipe_source["event_history_limit"]))
+    forced_root_target_mode = str(
+        _recipe_value(
+            "forced_root_target_mode",
+            manifest=manifest,
+            fields=fields,
+            argv=argv,
+            flag="--forced-root-target-mode",
+        )
+        or ""
+    )
     raw_target_regime = (
         manifest.get("target_information_regime") if manifest is not None else None
     )
@@ -534,6 +649,8 @@ def snapshot_run(
     target_information_regime = (
         str(raw_target_regime)
         if raw_target_regime is not None
+        else COHERENT_PUBLIC_TARGET_INFORMATION_REGIME
+        if coherent_public_belief_search
         else PUBLIC_TARGET_INFORMATION_REGIME
         if information_set_search
         else UNKNOWN_TARGET_INFORMATION_REGIME
@@ -555,10 +672,29 @@ def snapshot_run(
         "belief_chance_spectra": belief_chance_spectra,
         "target_information_regime": target_information_regime,
     }
+    coherent_recipe = bool(coherent_public_belief_search) or (
+        target_information_regime == COHERENT_PUBLIC_TARGET_INFORMATION_REGIME
+    )
+    if coherent_recipe:
+        effective_recipe.update(
+            {
+                "sigma_eval": sigma_eval,
+                "coherent_public_belief_search": coherent_public_belief_search,
+                "correct_rust_chance_spectra": correct_rust_chance_spectra,
+                "native_mcts_hot_loop": native_mcts_hot_loop,
+                "forced_root_target_mode": forced_root_target_mode,
+                "record_automatic_transitions": record_automatic_transitions,
+                "meaningful_public_history": meaningful_public_history,
+                "event_history_limit": event_history_limit,
+                "rust_featurize": rust_featurize,
+                "preserve_search_evidence": preserve_search_evidence,
+            }
+        )
     recipe_safe = effective_recipe == _expected_recipe(
         run=run,
         category=(a1_match.group("category") if a1_match is not None else "legacy"),
         post_promotion=_is_post_promotion_attestation(a1_contract),
+        coherent_public=coherent_recipe,
     )
     seed_end = seed_start + games_requested
     if a1_contract is not None:
@@ -590,6 +726,16 @@ def snapshot_run(
         max_depth=max_depth,
         lazy_interior_chance=lazy_interior_chance,
         belief_chance_spectra=belief_chance_spectra,
+        sigma_eval=sigma_eval,
+        coherent_public_belief_search=coherent_public_belief_search,
+        correct_rust_chance_spectra=correct_rust_chance_spectra,
+        native_mcts_hot_loop=native_mcts_hot_loop,
+        forced_root_target_mode=forced_root_target_mode,
+        record_automatic_transitions=record_automatic_transitions,
+        meaningful_public_history=meaningful_public_history,
+        event_history_limit=event_history_limit,
+        rust_featurize=rust_featurize,
+        preserve_search_evidence=preserve_search_evidence,
         target_information_regime=target_information_regime,
         target_information_regime_attested=target_information_regime_attested,
         recipe_safe=recipe_safe,
@@ -723,6 +869,15 @@ def render_metrics(
         "generator_max_depth": "max_depth",
         "generator_lazy_interior_chance": "lazy_interior_chance",
         "generator_belief_chance_spectra": "belief_chance_spectra",
+        "generator_sigma_eval": "sigma_eval",
+        "generator_coherent_public_belief_search": "coherent_public_belief_search",
+        "generator_correct_rust_chance_spectra": "correct_rust_chance_spectra",
+        "generator_native_mcts_hot_loop": "native_mcts_hot_loop",
+        "generator_record_automatic_transitions": "record_automatic_transitions",
+        "generator_meaningful_public_history": "meaningful_public_history",
+        "generator_event_history_limit": "event_history_limit",
+        "generator_rust_featurize": "rust_featurize",
+        "generator_preserve_search_evidence": "preserve_search_evidence",
         "generator_target_information_regime_attested": "target_information_regime_attested",
         "generator_recipe_safe": "recipe_safe",
     }
@@ -753,6 +908,26 @@ def render_metrics(
             "max_depth": snapshot.max_depth,
             "lazy_interior_chance": str(snapshot.lazy_interior_chance).lower(),
             "belief_chance_spectra": str(snapshot.belief_chance_spectra).lower(),
+            "sigma_eval": snapshot.sigma_eval,
+            "coherent_public_belief_search": str(
+                snapshot.coherent_public_belief_search
+            ).lower(),
+            "correct_rust_chance_spectra": str(
+                snapshot.correct_rust_chance_spectra
+            ).lower(),
+            "native_mcts_hot_loop": str(snapshot.native_mcts_hot_loop).lower(),
+            "forced_root_target_mode": snapshot.forced_root_target_mode,
+            "record_automatic_transitions": str(
+                snapshot.record_automatic_transitions
+            ).lower(),
+            "meaningful_public_history": str(
+                snapshot.meaningful_public_history
+            ).lower(),
+            "event_history_limit": snapshot.event_history_limit,
+            "rust_featurize": str(snapshot.rust_featurize).lower(),
+            "preserve_search_evidence": str(
+                snapshot.preserve_search_evidence
+            ).lower(),
             "target_information_regime": snapshot.target_information_regime,
             "seed_range": f"[{snapshot.seed_start},{snapshot.seed_end})",
         }
