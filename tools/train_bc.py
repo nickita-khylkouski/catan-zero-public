@@ -26166,6 +26166,56 @@ def _optimizer_clip_observability(
     }
 
 
+def _synchronize_fsdp_ignored_gradients(policy) -> None:
+    """Average replicated ignored-parameter gradients in FSDP's process group.
+
+    ``ignored_states`` remain visible to ``FSDP.clip_grad_norm_`` as non-sharded
+    parameters, but FSDP does not synchronize their gradients during backward.
+    Every rank must enter the same collectives even when a locally unused
+    ignored parameter has ``grad is None``.
+    """
+    import torch
+    import torch.distributed as dist
+
+    model = policy.model
+    process_group = getattr(model, "process_group", None)
+    ignored_params = []
+    ignored_param_ids: set[int] = set()
+    for param in getattr(policy, "_fsdp_ignored_params", []) or []:
+        if param.requires_grad and id(param) not in ignored_param_ids:
+            ignored_params.append(param)
+            ignored_param_ids.add(id(param))
+    if not ignored_params:
+        return
+
+    presence_counts = torch.tensor(
+        [int(param.grad is not None) for param in ignored_params],
+        dtype=torch.int32,
+        device=ignored_params[0].device,
+    )
+    dist.all_reduce(
+        presence_counts,
+        op=dist.ReduceOp.SUM,
+        group=process_group,
+    )
+    globally_active = [int(count) > 0 for count in presence_counts.tolist()]
+    world_size = int(dist.get_world_size(group=process_group))
+    for param, active in zip(ignored_params, globally_active, strict=True):
+        if not active:
+            continue
+        grad = param.grad
+        if grad is None:
+            grad = torch.zeros_like(param)
+        dist.all_reduce(
+            grad,
+            op=dist.ReduceOp.SUM,
+            group=process_group,
+        )
+        grad.div_(float(world_size))
+        if param.grad is None:
+            param.grad = grad
+
+
 def _clip_grad_norm(policy, max_norm: float = 1.0):
     """Clip the gradient norm of ``policy.model``, correct under DDP, FSDP, and
     single-GPU. FSDP shards parameters, so ``torch.nn.utils.clip_grad_norm_`` over
@@ -26182,14 +26232,11 @@ def _clip_grad_norm(policy, max_norm: float = 1.0):
     if callable(fsdp_clip) and not isinstance(
         model, torch.nn.parallel.DistributedDataParallel
     ):
-        # FSDP ignores 0-dim params (e.g. logit_scale); FSDP's collective clip
-        # never sees them and never all-reduced their grads. Average those grads
-        # across ranks here so the replicated scalar stays identical everywhere.
-        import torch.distributed as dist
-
-        for param in getattr(policy, "_fsdp_ignored_params", []) or []:
-            if param.grad is not None:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        # FSDP includes ignored 0-dim parameters (e.g. logit_scale) in its
+        # non-sharded norm/clip surface, but it does not synchronize their
+        # gradients during backward. Average them first so every rank clips and
+        # steps the same replicated values.
+        _synchronize_fsdp_ignored_gradients(policy)
         return fsdp_clip(effective_max_norm)
     # The legacy candidate policy keeps its actor/action modules beside
     # ``model`` rather than inside it. `_params` is the historical authoritative
