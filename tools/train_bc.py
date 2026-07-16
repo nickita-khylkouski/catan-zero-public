@@ -8759,23 +8759,23 @@ def _validate_a1_scratch_runtime_projection(
 def _require_a1_scratch_execution_schedule(
     topology: Mapping[str, object],
 ) -> None:
-    """Prevent copied argv from inheriting an unreviewed scratch optimizer."""
+    """Require the exact commissioned from-scratch optimizer horizon."""
 
     if (
-        topology.get("optimization_schedule_status") != "reviewed"
+        topology.get("optimization_schedule_status")
+        != "commissioned_scratch_update_horizon_v1"
         or topology.get("go_authorized") is not True
         or topology.get("reviewed_optimizer_schedule_role")
-        != "production_scratch"
+        != "from_scratch_representation_learning_v1"
     ):
         raise SystemExit(
             "A1 native scratch optimization schedule is unresolved; the sealed "
-            "lr/warmup/32-step recipe is checkpoint-initialized diagnostic "
-            "evidence and cannot execute"
+            "launcher may execute only the commissioned from-scratch update horizon"
         )
 
 
 def _preflight_a1_scratch_execution_authority(raw: str) -> None:
-    """Reject every scratch plan marker immediately after CLI/config parse."""
+    """Authenticate the scratch marker before any corpus/model allocation."""
 
     if not raw:
         return
@@ -8789,10 +8789,15 @@ def _preflight_a1_scratch_execution_authority(raw: str) -> None:
         != "a1-coherent-scratch-plan-authority-v2"
     ):
         raise SystemExit("A1 scratch plan authority fields/schema drift")
-    raise SystemExit(
-        "A1 native scratch optimization schedule is unresolved; scratch "
-        "authority is planning-only and cannot execute"
+    science = authority.get("science")
+    topology = (
+        science.get("learner_execution_topology")
+        if isinstance(science, dict)
+        else None
     )
+    if not isinstance(topology, dict):
+        raise SystemExit("A1 scratch authority has no execution topology")
+    _require_a1_scratch_execution_schedule(topology)
 
 
 _A1_SCRATCH_SCIENCE_BINDING_FIELDS = {

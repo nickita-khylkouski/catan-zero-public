@@ -293,10 +293,10 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert "final_vp_head" in recipe["require_feature_learning_signal_modules"]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:d6d4682bec7eb842edf2e6314d0eb4b6b03af52e1ef08deef590c5a293b62d75"
+        "sha256:7335f52852dc2f47da0549fa3452fe4745b59892acf334450bc8a2594fa6fc5b"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:6d531a7e00c291807860efc427a3029306c4897da81f51a51a6c72e1692f13be"
+        "sha256:de611839f74fdd0fad8f38f93acfbb1e3109a0c7aaf58ae64270189d5f2a946c"
     )
 
 

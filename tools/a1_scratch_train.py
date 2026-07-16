@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Sealed native-scratch plan for the current coherent-public A1 learner.
+"""Sealed native-scratch executor for the current coherent-public A1 learner.
 
 The historical one-dose executor is checkpoint-initialized by design.  This
-entrypoint is the separate planning projection for the current science
-contract's native v3 model and fresh optimizer.  It cannot execute training
-until a production scratch optimizer schedule is reviewed and sealed.
+entrypoint is the separate execution path for the current science contract's
+native v5 model and fresh optimizer.  Without ``--go`` it emits the exact
+authenticated plan; with ``--go`` it executes only a commissioned topology and
+retains every epoch checkpoint for playing-strength selection.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 from typing import Any, Mapping, Sequence
@@ -30,6 +32,7 @@ from tools import train_bc  # noqa: E402
 
 
 PLAN_SCHEMA = "a1-coherent-scratch-training-receipt-v1"
+EXECUTION_SCHEMA = "a1-coherent-scratch-training-execution-v1"
 CHILD_AUTHORITY_SCHEMA = "a1-coherent-scratch-plan-authority-v2"
 CODE_SURFACE = (
     "tools/a1_scratch_train.py",
@@ -470,6 +473,7 @@ def build_train_command(
             str(checkpoint),
             "--report",
             str(report),
+            "--save-each-epoch",
             "--require-35m-model",
             "--skip-teacher-quality-gate",
             "--trust-curated-data-quality",
@@ -503,7 +507,76 @@ def _fresh_outputs(checkpoint: Path, report: Path, receipt: Path) -> None:
     one_dose._require_fresh_outputs(checkpoint, report, receipt)  # noqa: SLF001
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
+def _epoch_outputs(checkpoint: Path, epochs: int) -> list[Path]:
+    return [
+        train_bc._epoch_checkpoint_path(str(checkpoint), epoch)  # noqa: SLF001
+        for epoch in range(1, int(epochs) + 1)
+    ]
+
+
+def _require_fresh_epoch_outputs(checkpoint: Path, epochs: int) -> None:
+    collisions: list[str] = []
+    for epoch_path in _epoch_outputs(checkpoint, epochs):
+        for path in (
+            epoch_path,
+            Path(str(epoch_path) + ".optimizer.pt"),
+            Path(str(epoch_path) + ".training-progress.json"),
+        ):
+            if path.exists() or path.is_symlink():
+                collisions.append(str(path))
+    if collisions:
+        raise ScratchTrainError(
+            "scratch epoch frontier output already exists: " + ", ".join(collisions)
+        )
+
+
+def _completed_outputs(
+    *,
+    checkpoint: Path,
+    report: Path,
+    epochs: int,
+) -> dict[str, Any]:
+    terminal = _ref(checkpoint, where="terminal scratch checkpoint")
+    report_ref = _ref(report, where="scratch training report")
+    epoch_records: list[dict[str, Any]] = []
+    for epoch, epoch_path in enumerate(
+        _epoch_outputs(checkpoint, epochs), start=1
+    ):
+        epoch_records.append(
+            {
+                "epoch": epoch,
+                "checkpoint": _ref(
+                    epoch_path, where=f"scratch epoch-{epoch} checkpoint"
+                ),
+                "optimizer": _ref(
+                    Path(str(epoch_path) + ".optimizer.pt"),
+                    where=f"scratch epoch-{epoch} optimizer",
+                ),
+                "training_progress": _ref(
+                    Path(str(epoch_path) + ".training-progress.json"),
+                    where=f"scratch epoch-{epoch} training progress",
+                ),
+            }
+        )
+    try:
+        report_payload = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ScratchTrainError(f"scratch training report is unreadable: {error}") from error
+    if int(report_payload.get("epochs", -1)) != int(epochs):
+        raise ScratchTrainError("scratch report completed epoch count drift")
+    return {
+        "terminal_checkpoint": terminal,
+        "training_report": report_ref,
+        "epoch_frontier": epoch_records,
+        "epoch_frontier_sha256": _value_sha256(epoch_records),
+    }
+
+
+def run(
+    args: argparse.Namespace,
+    *,
+    runner: Any = subprocess.run,
+) -> dict[str, Any]:
     python = _regular_file(args.python, where="learner Python")
     checkpoint = args.checkpoint.expanduser().absolute()
     report = args.report.expanduser().absolute()
@@ -524,6 +597,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         and execution_topology.get("optimization_schedule_status")
         == "commissioned_scratch_update_horizon_v1"
     )
+    epochs = int(verified["recipe"]["epochs"])
+    if "--save-each-epoch" not in command:
+        raise ScratchTrainError("scratch command lost its checkpoint frontier")
+    _require_fresh_epoch_outputs(checkpoint, epochs)
     base = {
         "schema_version": PLAN_SCHEMA,
         "created_unix_ns": time.time_ns(),
@@ -561,8 +638,57 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "command": command,
         "command_sha256": _value_sha256(command),
     }
-    _write_receipt(receipt, base)
-    return base
+    if not bool(args.go):
+        _write_receipt(receipt, base)
+        return base
+    if not optimization_schedule_authorized:
+        raise ScratchTrainError(
+            "--go requires a commissioned scratch optimizer schedule"
+        )
+    started = time.time_ns()
+    try:
+        result = runner(command, cwd=REPO_ROOT, check=False)
+    except OSError as error:
+        raise ScratchTrainError(f"cannot execute scratch learner: {error}") from error
+    returncode = int(result.returncode)
+    if returncode != 0:
+        failed = {
+            **base,
+            "schema_version": EXECUTION_SCHEMA,
+            "status": "failed",
+            "go": True,
+            "diagnostic_only": True,
+            "promotion_eligible": False,
+            "maximum_result": "failed_training_attempt",
+            "started_unix_ns": started,
+            "finished_unix_ns": time.time_ns(),
+            "returncode": returncode,
+        }
+        _write_receipt(receipt, failed)
+        raise ScratchTrainError(
+            f"scratch learner exited with return code {returncode}; "
+            f"failure receipt={receipt}"
+        )
+    outputs = _completed_outputs(
+        checkpoint=checkpoint,
+        report=report,
+        epochs=epochs,
+    )
+    completed = {
+        **base,
+        "schema_version": EXECUTION_SCHEMA,
+        "status": "completed",
+        "go": True,
+        "diagnostic_only": False,
+        "promotion_eligible": False,
+        "maximum_result": "training_complete_requires_checkpoint_selection_and_gate",
+        "started_unix_ns": started,
+        "finished_unix_ns": time.time_ns(),
+        "returncode": 0,
+        "outputs": outputs,
+    }
+    _write_receipt(receipt, completed)
+    return completed
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -574,6 +700,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
+    parser.add_argument(
+        "--go",
+        action="store_true",
+        help="Execute the commissioned 8-GPU scratch learner instead of plan-only.",
+    )
     return parser.parse_args(argv)
 
 

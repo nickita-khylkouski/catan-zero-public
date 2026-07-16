@@ -47,9 +47,11 @@ candidate global batch of 512 provides roughly eight times as many optimizer
 updates as the rejected fine-tune-sized global batch of 4096, but the execution
 topology still records `optimization_schedule_status=unresolved` and
 `go_authorized=false`. Until a complete scratch-optimizer schedule authority is
-reviewed—including the exact-zero shared value-gradient choice—the planner
-exposes no execution switch and `train_bc` rejects its child marker before data
-loading; every planning receipt is diagnostic-only and non-promotion-eligible.
+reviewed—including the 0.25 shared-value routing and AdamW/cosine dose—the planner
+refuses its explicit `--go` switch and `train_bc` rejects its child marker
+before data loading; every planning receipt is diagnostic-only and
+non-promotion-eligible. Once commissioned, the same path executes the 8-rank
+learner and retains a digest-bound checkpoint for every epoch.
 
 Generate through the sealed pre-wave control plane. For a direct lane command:
 

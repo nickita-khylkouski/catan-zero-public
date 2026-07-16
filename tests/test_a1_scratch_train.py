@@ -184,6 +184,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--symmetry-augment") == 1
     assert command.count("--symmetry-augment-events") == 1
     assert command.count("--required-target-information-regime") == 1
+    assert command.count("--save-each-epoch") == 1
     assert command[command.index("--train-diagnostics-every-batches") + 1] == "16"
     assert (
         command[
@@ -273,6 +274,35 @@ def test_planned_receipt_is_semantically_authenticated(tmp_path: Path) -> None:
     assert stated == scratch._value_sha256(unsigned)  # noqa: SLF001
 
 
+def test_completed_outputs_bind_terminal_report_and_epoch_frontier(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "model.pt"
+    report = tmp_path / "report.json"
+    checkpoint.write_bytes(b"terminal")
+    report.write_text('{"epochs":3}\n', encoding="utf-8")
+    for epoch, epoch_path in enumerate(
+        scratch._epoch_outputs(checkpoint, 3), start=1  # noqa: SLF001
+    ):
+        epoch_path.write_bytes(f"epoch-{epoch}".encode())
+        Path(str(epoch_path) + ".optimizer.pt").write_bytes(b"optimizer")
+        Path(str(epoch_path) + ".training-progress.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+
+    outputs = scratch._completed_outputs(  # noqa: SLF001
+        checkpoint=checkpoint,
+        report=report,
+        epochs=3,
+    )
+
+    assert outputs["terminal_checkpoint"]["path"] == str(checkpoint.resolve())
+    assert [row["epoch"] for row in outputs["epoch_frontier"]] == [1, 2, 3]
+    assert outputs["epoch_frontier_sha256"] == scratch._value_sha256(  # noqa: SLF001
+        outputs["epoch_frontier"]
+    )
+
+
 def _runtime_args() -> SimpleNamespace:
     model = current_science.learner_model_construction()
     topology = current_science.learner_execution_topology()
@@ -347,7 +377,7 @@ def test_scratch_runtime_projection_rejects_grouped_tamper(
         )
 
 
-def test_scratch_plan_has_no_execution_switch(tmp_path: Path) -> None:
+def test_scratch_plan_has_explicit_execution_switch(tmp_path: Path) -> None:
     argv = [
         "--lock",
         str(tmp_path / "lock.json"),
@@ -363,19 +393,18 @@ def test_scratch_plan_has_no_execution_switch(tmp_path: Path) -> None:
         str(tmp_path / "receipt.json"),
     ]
     parsed = scratch.parse_args(argv)
-    assert not hasattr(parsed, "go")
-    with pytest.raises(SystemExit):
-        scratch.parse_args([*argv, "--go"])
+    assert parsed.go is False
+    assert scratch.parse_args([*argv, "--go"]).go is True
 
 
-def test_train_bc_refuses_copied_plan_without_optimizer_authority() -> None:
+def test_train_bc_refuses_current_unresolved_optimizer_authority() -> None:
     with pytest.raises(SystemExit, match="schedule is unresolved"):
         train_bc._require_a1_scratch_execution_schedule(  # noqa: SLF001
             current_science.learner_execution_topology()
         )
 
 
-def test_train_bc_rejects_scratch_authority_in_cheap_preflight(
+def test_train_bc_rejects_unresolved_scratch_authority_in_cheap_preflight(
     tmp_path: Path,
 ) -> None:
     _, _, authority = _authority_fixture(tmp_path)
