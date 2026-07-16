@@ -316,9 +316,12 @@ def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:
     assert "--coherent-public-belief-search" in text
     assert "--record-automatic-transitions" in text
     assert "--meaningful-public-history" in text
-    assert "--event-history-limit 32" in text
+    assert "--event-history-limit 64" in text
+    assert "--preserve-search-evidence" in text
     assert "public_rule_state" in text
-    assert "rust_entity_adapter_v4_actor_public_rule_state" in text
+    assert "rust_entity_adapter_v5_meaningful_history_v2" in text
+    assert "production confidence weighting" in text
+    assert "--value-phase-weights none" in text
     assert "complete forced-transition retention" in text
     assert "policy_weight_multiplier=0" in text
     assert "value_weight_multiplier=1" in text

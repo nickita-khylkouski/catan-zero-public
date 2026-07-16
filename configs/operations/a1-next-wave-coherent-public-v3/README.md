@@ -6,7 +6,7 @@ explicitly separates the pinned
 legacy teacher feature contract from the fresh learner-row contract:
 
 - teacher/search evaluator: `rust_entity_adapter_v2_land_topology_ports_maritime`
-- stored learner rows: `rust_entity_adapter_v4_actor_public_rule_state`
+- stored learner rows: `rust_entity_adapter_v5_meaningful_history_v2`
 
 Search priors, values, and selected actions remain checkpoint-bound. Only the
 post-search learner tensors advance, restoring Year of Plenty and Monopoly
@@ -14,33 +14,36 @@ resource identity plus the current actor's development-card playability, Road
 Building continuation, remaining free roads, and discard remainder. Historical
 v1/v2 artifacts remain immutable and diagnostically replayable.
 
-The production learner starts natively from scratch with adapter v4,
-`public_rule_state` enabled, no learner checkpoint, and fresh optimizer state.
+The production learner starts natively from scratch with adapter v5,
+`public_rule_state` and meaningful-history target gather enabled, no learner
+checkpoint, and fresh optimizer state.
 The search teacher remains the deployed adapter-v2 checkpoint; only stored
 learner features advance. The function-preserving v4 checkpoint upgrader
 remains available for isolated compatibility experiments, but it is not the
 production initialization path.
 
 The checkpoint-initialized legacy one-dose/iteration executor must refuse this
-production learner. The full retrain must construct a native v4 model rather
+production learner. The full retrain must construct a native v5 model rather
 than relabeling or resuming a v2/v3 checkpoint.
 
 The same authority now binds the fresh model construction and physical
 execution separately from the logical 4096-row dose. The model enables both
-structured-action residual paths, public-card counts, and meaningful public
-history at construction time. Execution is exactly 8 B200 ranks × 512 rows ×
-one accumulation step; no launcher may reinterpret the logical `1 × 4096`
-recipe as an arbitrary topology.
+structured-action residual paths, public-card counts, and ordered meaningful
+public history with target-entity gather at construction time. History is
+retained at the adapter-v5 cap of 64 events. Execution is exactly 8 B200 ranks
+× 512 rows × one accumulation step; no launcher may reinterpret the logical
+`1 × 4096` recipe as an arbitrary topology.
 
 `tools/a1_scratch_train.py` authenticates the admitted post-wave composite and
-renders the exact native-v4, bias-free 35M command plus a digest-bound planning
-receipt. It is intentionally plan-only today: the observed 32-step optimum came
-from checkpoint-initialized dose evidence and covers less than one percent of
-the full scratch corpus. Its LR, warmup, and flat schedule were likewise
-reviewed only for that warm start. Until a complete scratch-optimizer schedule
-authority is reviewed, the planner exposes no execution switch and `train_bc`
-rejects its child marker before data loading; every planning receipt is
-diagnostic-only and non-promotion-eligible.
+renders the exact native-v5, bias-free 35M command plus a digest-bound planning
+receipt. It is intentionally plan-only today. The current candidate recipe is
+epoch-bound (`epochs=3`, `max_steps=0`) with fresh AdamW, cosine decay, BF16,
+and the sealed symmetry/history relabeling flags, but the execution topology
+still records `optimization_schedule_status=unresolved` and
+`go_authorized=false`. Until a complete scratch-optimizer schedule authority is
+reviewed, the planner exposes no execution switch and `train_bc` rejects its
+child marker before data loading; every planning receipt is diagnostic-only and
+non-promotion-eligible.
 
 Generate through the sealed pre-wave control plane. For a direct lane command:
 
@@ -67,26 +70,27 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
   --native-mcts-hot-loop --forced-root-target-mode trajectory_only \
   --target-reliability-audit-fraction 0.05 \
   --target-reliability-audit-seed 20260716 \
+  --preserve-search-evidence \
   --record-automatic-transitions \
-  --meaningful-public-history --event-history-limit 32 \
+  --meaningful-public-history --event-history-limit 64 \
   --learner-entity-feature-adapter-version \
-    rust_entity_adapter_v4_actor_public_rule_state \
+    rust_entity_adapter_v5_meaningful_history_v2 \
   --rust-featurize --eval-cache-size 0 \
   --dump-config "$OUT/config.json" --config-purpose a1-next-wave-coherent-public-v3
 ```
 
 Post-wave admission must prove every worker used teacher v2 and emitted learner
-rows v4, with the legacy `adapter_version` row column equal to the learner
+rows v5, with the legacy `adapter_version` row column equal to the learner
 identity. Forced rows retain `policy_weight_multiplier=0` and
 `value_weight_multiplier=1`; training continues to use equal per-game value mass.
 
 The five-percent reliability slice is selected by a stable hash of audit seed,
 game seed, and decision index. Its duplicate search uses independent
-Gumbel/chance/belief streams and never selects the live move. The learner binds
-`--target-reliability-confidence-weighting` with a `0.25` floor and leaves both
-global and per-game surprise sampling disabled. This prevents raw
-search-vs-parent disagreement from amplifying unstable labels before duplicate
-search has measured their reliability.
+Gumbel/chance/belief streams and never selects the live move. This slice and
+the preserved completed-Q/visit fields are calibration evidence only:
+production confidence weighting and both global and per-game surprise
+sampling remain disabled until selector coverage and a weighting rule are
+separately authenticated.
 
 The learner also binds `--phase-weights PLAY_TURN=4.0`. On the admitted
 959,142-row coherent corpus, equal-per-game policy weighting otherwise assigns
@@ -96,12 +100,12 @@ only 34.16% of policy objective mass to ordinary `PLAY_TURN` decisions and
 historically successful selected-dose corpus while retaining supervision for
 every mandatory multi-action prompt.
 
-The coherent learner is capped at 32 optimizer steps. This is not the
-historical corpus's 128-step dose copied forward: on the matched coherent
-frontier, step 32 scored 56.25% against f7 and 51.17% against v5, while the
-step-128 checkpoint fell to 51.95% and 45.31%. The denser current sampler
-changes what one optimizer step means, so continuing to 128 erased the useful
-early update.
+Policy phase repair does not silently alter the value objective:
+`--value-phase-weights none` leaves value supervision unweighted across phases.
+The old checkpoint-initialized 32-step frontier is retained as diagnostic
+history, not copied into the native scratch schedule. The scratch planner is
+epoch-bound, and remains non-executable and non-promotion-eligible while its
+optimizer schedule authority is unresolved.
 
 The native scratch launcher must also render the four admission fields from
 `learner.training_recipe` exactly: diagnostics and policy/value interference

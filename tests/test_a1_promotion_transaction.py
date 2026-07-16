@@ -158,6 +158,32 @@ def test_current_coherent_promotion_requires_sealed_initialization(
         )
 
 
+def test_receipt_dispatch_does_not_depend_on_plan_only_scratch_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt = tmp_path / "receipt.json"
+    _write_json(receipt, {"schema_version": "unknown-training-receipt"})
+
+    def refuse_initialization(_contract: dict) -> None:
+        raise promotion.PromotionError("initialization authority reached")
+
+    monkeypatch.setattr(
+        promotion,
+        "_require_training_receipt_initialization_authority",
+        refuse_initialization,
+    )
+    with pytest.raises(promotion.PromotionError, match="initialization authority reached"):
+        promotion._verify_one_dose_training_receipt(
+            receipt,
+            contract_lock=tmp_path / "contract.lock.json",
+            contract={},
+            candidate_path=tmp_path / "candidate.pt",
+            candidate_sha256="sha256:" + "a" * 64,
+            training_report_path=tmp_path / "report.json",
+            training_report_sha256="sha256:" + "b" * 64,
+        )
+
+
 def test_positive_cap_one_dose_promotion_refuses_short_or_nonexact_terminal() -> None:
     recipe = {"max_steps": 128}
     command = ["python", "train_bc.py", "--max-steps", "128"]
