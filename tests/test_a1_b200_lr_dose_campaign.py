@@ -348,27 +348,32 @@ def _paired_metric_report() -> dict:
             "game_seed": 100,
             "orientation": "candidate_red",
             "candidate_won": True,
+            "search_won": True,
         },
         {
             "pair_id": 0,
             "game_seed": 100,
             "orientation": "candidate_blue",
             "candidate_won": False,
+            "search_won": False,
         },
         {
             "pair_id": 1,
             "game_seed": 101,
             "orientation": "candidate_red",
             "candidate_won": True,
+            "search_won": True,
         },
         {
             "pair_id": 1,
             "game_seed": 101,
             "orientation": "candidate_blue",
             "candidate_won": True,
+            "search_won": True,
         },
     ]
     return {
+        "base_seed": 100,
         "pairs_requested": 2,
         "complete_pairs": 2,
         "games_played": 4,
@@ -404,7 +409,7 @@ def test_paired_metric_replay_accepts_one_seed_and_both_seats_per_pair() -> None
     [
         (
             lambda report: report["games"][1].__setitem__("game_seed", 101),
-            "one game_seed",
+            "base_seed schedule",
         ),
         (
             lambda report: report["games"][1].__setitem__(
@@ -417,7 +422,25 @@ def test_paired_metric_replay_accepts_one_seed_and_both_seats_per_pair() -> None
                 game.__setitem__("game_seed", 100)
                 for game in report["games"][2:]
             ],
-            "duplicate retained game identities",
+            "base_seed schedule",
+        ),
+        (
+            lambda report: [
+                game.__setitem__("game_seed", 102)
+                for game in report["games"][2:]
+            ],
+            "base_seed schedule",
+        ),
+        (
+            lambda report: [
+                game.__setitem__("pair_id", 2)
+                for game in report["games"][2:]
+            ],
+            "pair_id schedule",
+        ),
+        (
+            lambda report: report["games"][0].__setitem__("search_won", False),
+            "candidate_won/search_won alias drift",
         ),
         (
             lambda report: report.__setitem__("candidate_wins", 2),

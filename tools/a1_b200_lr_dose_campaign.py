@@ -949,6 +949,13 @@ def _paired_score_metrics(report: Mapping[str, Any], *, where: str) -> dict[str,
     games = report.get("games")
     if not isinstance(games, list) or not games:
         raise CampaignError(f"{where} has no retained games for metric replay")
+    base_seed = report.get("base_seed")
+    if (
+        isinstance(base_seed, bool)
+        or not isinstance(base_seed, int)
+        or base_seed < 0
+    ):
+        raise CampaignError(f"{where} has invalid base_seed")
     by_pair: dict[int, list[tuple[int, str, bool]]] = {}
     game_keys: list[tuple[int, str]] = []
     for index, game in enumerate(games):
@@ -958,6 +965,7 @@ def _paired_score_metrics(report: Mapping[str, Any], *, where: str) -> dict[str,
         seed = game.get("game_seed")
         orientation = game.get("orientation")
         won = game.get("candidate_won")
+        search_won = game.get("search_won")
         if (
             isinstance(pair_id, bool)
             or not isinstance(pair_id, int)
@@ -969,8 +977,16 @@ def _paired_score_metrics(report: Mapping[str, Any], *, where: str) -> dict[str,
             or type(won) is not bool  # noqa: E721
         ):
             raise CampaignError(f"{where}.games[{index}] has invalid paired identity")
+        if type(search_won) is not bool or search_won is not won:  # noqa: E721
+            raise CampaignError(
+                f"{where}.games[{index}] candidate_won/search_won alias drift"
+            )
         by_pair.setdefault(pair_id, []).append((seed, str(orientation), won))
         game_keys.append((seed, str(orientation)))
+
+    expected_pair_ids = set(range(len(by_pair)))
+    if set(by_pair) != expected_pair_ids:
+        raise CampaignError(f"{where} pair_id schedule is not contiguous from zero")
 
     pair_scores: list[float] = []
     for pair_id, pair_games in sorted(by_pair.items()):
@@ -979,9 +995,11 @@ def _paired_score_metrics(report: Mapping[str, Any], *, where: str) -> dict[str,
                 f"{where} pair {pair_id} does not retain exactly two games"
             )
         seeds = {seed for seed, _orientation, _won in pair_games}
-        if len(seeds) != 1:
+        expected_seed = base_seed + pair_id
+        if seeds != {expected_seed}:
             raise CampaignError(
-                f"{where} pair {pair_id} does not bind one game_seed"
+                f"{where} pair {pair_id} does not replay base_seed schedule: "
+                f"expected={expected_seed} actual={sorted(seeds)}"
             )
         orientations = {
             orientation for _seed, orientation, _won in pair_games
