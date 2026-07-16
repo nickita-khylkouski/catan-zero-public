@@ -2089,6 +2089,123 @@ def _value_training_metadata(
     return metadata
 
 
+def _policy_training_signal_attestation(
+    metrics: Sequence[dict[str, object]],
+    *,
+    policy_loss_weight: float,
+    optimizer_steps: int,
+    train_value_only: bool,
+) -> dict[str, object]:
+    """Attest that a configured policy objective actually reached the learner.
+
+    A checkpoint step proves only that *some* configured objective advanced the
+    optimizer.  In a joint policy/value learner, value rows can therefore make a
+    run report thousands of successful steps even when the sampled policy mass
+    is exactly zero.  Build the attestation from realized, DDP-reduced epoch
+    sufficient statistics and fail closed before the final checkpoint is saved.
+    """
+
+    coefficient = float(policy_loss_weight)
+    base_active_rows = sum(
+        int(metric.get("policy_base_active_rows", 0)) for metric in metrics
+    )
+    aux_active_rows = sum(
+        int(metric.get("policy_aux_active_rows", 0)) for metric in metrics
+    )
+    base_draws = sum(int(metric.get("samples", 0)) for metric in metrics)
+    total_draws = base_draws + aux_active_rows
+    effective_weight_sum = sum(
+        float((metric.get("loss_denominators") or {}).get("policy_loss", 0.0))
+        for metric in metrics
+    )
+    policy_enabled = coefficient > 0.0 and not bool(train_value_only)
+    active_rows = base_active_rows + aux_active_rows
+    trained = bool(
+        policy_enabled
+        and int(optimizer_steps) > 0
+        and active_rows > 0
+        and math.isfinite(effective_weight_sum)
+        and effective_weight_sum > 0.0
+    )
+    attestation = {
+        "schema_version": "policy-training-signal-v1",
+        "policy_objective_enabled": policy_enabled,
+        "policy_loss_weight": coefficient,
+        "optimizer_steps": int(optimizer_steps),
+        "base_sampler_draws": int(base_draws),
+        "policy_aux_draws": int(aux_active_rows),
+        "total_draws": int(total_draws),
+        "policy_base_active_rows": int(base_active_rows),
+        "policy_aux_active_rows": int(aux_active_rows),
+        "policy_active_rows": int(active_rows),
+        "policy_active_draw_fraction": (
+            float(active_rows) / float(total_draws) if total_draws > 0 else None
+        ),
+        "policy_effective_weight_sum": float(effective_weight_sum),
+        "trained_policy_objective": trained,
+        "status": (
+            "disabled_value_only"
+            if bool(train_value_only)
+            else "disabled_zero_coefficient"
+            if coefficient <= 0.0
+            else "trained"
+            if trained
+            else "missing_realized_signal"
+        ),
+    }
+    if policy_enabled and not trained:
+        raise RuntimeError(
+            "policy objective was configured but no realized policy training "
+            "signal reached an applied optimizer trajectory; refusing to save "
+            "a checkpoint whose step count could be mistaken for policy "
+            f"learning (steps={optimizer_steps}, active_rows={active_rows}, "
+            f"effective_weight_sum={effective_weight_sum})"
+        )
+    return attestation
+
+
+def _optimizer_lr_dose_attestation(
+    *,
+    applied_updates: int,
+    schedule_multiplier_sum: float,
+    lr_area_by_group: Sequence[float],
+    optimizer,
+) -> dict[str, object]:
+    """Describe the exact LR integral over updates applied in this invocation."""
+
+    updates = int(applied_updates)
+    if updates < 0 or len(lr_area_by_group) != len(optimizer.param_groups):
+        raise ValueError("invalid optimizer LR-dose accounting")
+    groups = []
+    for index, (area, group) in enumerate(
+        zip(lr_area_by_group, optimizer.param_groups, strict=True)
+    ):
+        area = float(area)
+        if not math.isfinite(area) or area < 0.0:
+            raise ValueError("optimizer LR area must be finite and non-negative")
+        groups.append(
+            {
+                "group_index": int(index),
+                "base_lr": float(group.get("base_lr", group["lr"])),
+                "integrated_lr_area": area,
+                "mean_applied_lr": area / updates if updates > 0 else None,
+            }
+        )
+    multiplier_sum = float(schedule_multiplier_sum)
+    if not math.isfinite(multiplier_sum) or multiplier_sum < 0.0:
+        raise ValueError("schedule multiplier area must be finite and non-negative")
+    return {
+        "schema_version": "optimizer-lr-dose-v1",
+        "scope": "updates_applied_in_this_process_invocation",
+        "applied_updates": updates,
+        "integrated_schedule_multiplier_area": multiplier_sum,
+        "mean_schedule_multiplier": (
+            multiplier_sum / updates if updates > 0 else None
+        ),
+        "parameter_groups": groups,
+    }
+
+
 def _assert_value_heads_present_for_losses(model, args) -> None:
     """Fail LOUD (SystemExit) when a value-head objective was requested on the
     CLI but the constructed/loaded model lacks the head that objective needs --
@@ -11538,6 +11655,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     optimizer_pre_clip_grad_norm_sum = 0.0
     optimizer_pre_clip_grad_norm_max = 0.0
     objective_gradient_baseline_observed = False
+    optimizer_lr_applied_updates = 0
+    optimizer_schedule_multiplier_sum = 0.0
+    optimizer_lr_area_by_group = [0.0 for _ in optimizer.param_groups]
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
     intermediate_checkpoints: list[dict[str, object]] = []
     checkpoint_dose_snapshots: list[dict[str, object]] = []
@@ -12025,7 +12145,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "accum_do_zero_grad": accum_do_zero_grad,
                     "accum_do_step": accum_do_step,
                 }
-            _apply_lr_schedule(
+            applied_lr_multiplier = _apply_lr_schedule(
                 optimizer,
                 base_lr=float(args.lr),
                 step=global_step,
@@ -12168,6 +12288,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             optimizer_step_applied = bool(
                 batch_metrics.get("optimizer_step_applied", accum_do_step)
             )
+            if optimizer_step_applied:
+                optimizer_lr_applied_updates += 1
+                optimizer_schedule_multiplier_sum += float(applied_lr_multiplier)
+                for group_index, group in enumerate(optimizer.param_groups):
+                    optimizer_lr_area_by_group[group_index] += float(group["lr"])
             if optimizer_observability is not None:
                 optimizer_observed_steps += 1
                 optimizer_clipped_steps += int(optimizer_observability["clipped"])
@@ -12569,6 +12694,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "same_training_trajectory": True,
                     "optimizer_sidecar_intentionally_omitted": True,
                 }
+                snapshot_policy_signal = _policy_training_signal_attestation(
+                    [*metrics, checkpoint_partial_metric],
+                    policy_loss_weight=float(args.policy_loss_weight),
+                    optimizer_steps=global_step,
+                    train_value_only=bool(args.train_value_only),
+                )
+                snapshot_lr_dose = _optimizer_lr_dose_attestation(
+                    applied_updates=optimizer_lr_applied_updates,
+                    schedule_multiplier_sum=optimizer_schedule_multiplier_sum,
+                    lr_area_by_group=optimizer_lr_area_by_group,
+                    optimizer=optimizer,
+                )
                 _save_policy(
                     policy,
                     str(snapshot_path),
@@ -12577,7 +12714,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     soft_target_source=args.soft_target_source,
                     value_training=snapshot_value_training,
                     training_information_surface=_policy_kl_controller_surface(
-                        training_information_surface, policy_kl_controller
+                        {
+                            **(training_information_surface or {}),
+                            "policy_training_signal": snapshot_policy_signal,
+                            "optimizer_lr_dose": snapshot_lr_dose,
+                        },
+                        policy_kl_controller,
                     ),
                 )
                 if bool(ddp["enabled"]):
@@ -13120,6 +13262,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     cumulative_categorical_training_weight
                 ),
             )
+            epoch_policy_signal = _policy_training_signal_attestation(
+                metrics,
+                policy_loss_weight=float(args.policy_loss_weight),
+                optimizer_steps=global_step,
+                train_value_only=bool(args.train_value_only),
+            )
+            epoch_lr_dose = _optimizer_lr_dose_attestation(
+                applied_updates=optimizer_lr_applied_updates,
+                schedule_multiplier_sum=optimizer_schedule_multiplier_sum,
+                lr_area_by_group=optimizer_lr_area_by_group,
+                optimizer=optimizer,
+            )
             _save_policy(
                 policy,
                 str(epoch_path),
@@ -13128,7 +13282,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 soft_target_source=args.soft_target_source,
                 value_training=value_training,
                 training_information_surface=_policy_kl_controller_surface(
-                    training_information_surface, policy_kl_controller
+                    {
+                        **(training_information_surface or {}),
+                        "policy_training_signal": epoch_policy_signal,
+                        "optimizer_lr_dose": epoch_lr_dose,
+                    },
+                    policy_kl_controller,
                 ),
             )
             # CAT-128 patch #8: persist optimizer (Adam) state as <ckpt>.optimizer.pt.
@@ -13202,6 +13361,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             "scalar-MSE objective completed without any effective value training "
             "mass and optimizer update; refusing to save false provenance"
         )
+    policy_training_signal = _policy_training_signal_attestation(
+        metrics,
+        policy_loss_weight=float(args.policy_loss_weight),
+        optimizer_steps=global_step,
+        train_value_only=bool(args.train_value_only),
+    )
+    optimizer_lr_dose = _optimizer_lr_dose_attestation(
+        applied_updates=optimizer_lr_applied_updates,
+        schedule_multiplier_sum=optimizer_schedule_multiplier_sum,
+        lr_area_by_group=optimizer_lr_area_by_group,
+        optimizer=optimizer,
+    )
+    training_information_surface = {
+        **(training_information_surface or {}),
+        "policy_training_signal": policy_training_signal,
+        "optimizer_lr_dose": optimizer_lr_dose,
+    }
     _save_policy(
         policy,
         args.checkpoint,
@@ -13413,6 +13589,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "amp": args.amp,
         "optimizer": args.optimizer,
         "lr": float(args.lr),
+        "optimizer_lr_dose": optimizer_lr_dose,
         "max_grad_norm": float(args.max_grad_norm),
         "gradient_clipping_enabled": bool(float(args.max_grad_norm) > 0.0),
         "weight_decay": float(args.weight_decay),
@@ -13556,6 +13733,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "training_information_surface": _policy_kl_controller_surface(
             training_information_surface, policy_kl_controller
         ),
+        "policy_training_signal": policy_training_signal,
         "checkpoint": args.checkpoint,
         "checkpoint_steps_requested": list(checkpoint_steps),
         "intermediate_checkpoints": intermediate_checkpoints,
