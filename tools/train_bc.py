@@ -22451,6 +22451,11 @@ def _policy_target_completeness_report(
                 "policy_weight_multiplier shape drift during policy-target admission"
             )
         active = multiplier > 0.0
+    policy_scope = _policy_distillation_scope_mask(
+        data, np.arange(rows, dtype=np.int64)
+    )
+    if policy_scope is not None:
+        active &= policy_scope
     policy_active_rows = int(np.count_nonzero(active))
     objective_active = bool(
         float(policy_loss_weight) > 0.0
@@ -22828,24 +22833,35 @@ def _validate_target_information_admission(
             "required_target_information_regime must name one exact supported "
             f"public search operator, got {required_regime!r}"
         )
+    all_rows = np.arange(n, dtype=np.int64)
     policy_active = np.ones(n, dtype=np.bool_)
     if "policy_weight_multiplier" in data:
         policy_active = np.asarray(data["policy_weight_multiplier"]) > 0.0
         if policy_active.shape != (n,):
             raise SystemExit("policy_weight_multiplier shape drift during admission")
+    policy_scope = _policy_distillation_scope_mask(data, all_rows)
+    scoped_policy_active = policy_active.copy()
+    if policy_scope is not None:
+        scoped_policy_active &= policy_scope
     objective_active = np.zeros(n, dtype=np.bool_)
     if any(
         objective
         in {
             "soft_policy",
             "q_target",
-            "policy_kl_anchor",
             "policy_surprise_sampling",
             "per_game_capped_policy_surprise_sampling",
         }
         for objective in objectives
     ):
-        objective_active |= policy_active
+        objective_active |= scoped_policy_active
+    if "policy_kl_anchor" in objectives:
+        anchor_scope = _policy_kl_anchor_scope_mask(data, all_rows)
+        objective_active |= (
+            policy_active
+            if anchor_scope is None
+            else policy_active & anchor_scope
+        )
     if "root_value" in objectives:
         if "root_value_mask" in data:
             root_active = np.asarray(data["root_value_mask"], dtype=np.bool_)
@@ -22853,6 +22869,9 @@ def _validate_target_information_admission(
             root_active = np.isfinite(np.asarray(data["root_value"]))
         if root_active.shape != (n,):
             raise SystemExit("root-value activity mask shape drift during admission")
+        value_scope = _value_training_scope_mask(data, all_rows)
+        if value_scope is not None:
+            root_active &= value_scope
         objective_active |= root_active
     active_indices = np.flatnonzero(objective_active)
     if regime_column is None:
@@ -28558,6 +28577,41 @@ def build_sample_weights(
     return weights.astype(np.float32, copy=False)
 
 
+def _policy_distillation_scope_mask(
+    data: object,
+    rows: np.ndarray,
+) -> np.ndarray | None:
+    """Resolve the exact component mask used by policy CE and its admissions."""
+
+    if isinstance(data, dict) and "_policy_distillation_eligible" in data:
+        eligible = np.asarray(
+            data["_policy_distillation_eligible"][rows], dtype=np.bool_
+        )
+        if eligible.shape != (len(rows),):
+            raise ValueError("materialized policy distillation scope shape drift")
+        return eligible
+    if not bool(getattr(data, "policy_distillation_scope_authenticated", False)):
+        return None
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    eligible = tuple(
+        int(value)
+        for value in getattr(data, "policy_distillation_component_indices", tuple())
+    )
+    component_lookup = getattr(data, "component_indices_for_rows", None)
+    if (
+        not component_ids
+        or not eligible
+        or not callable(component_lookup)
+        or any(value < 0 or value >= len(component_ids) for value in eligible)
+        or len(set(eligible)) != len(eligible)
+    ):
+        raise SystemExit("authenticated policy distillation component scope is invalid")
+    components = np.asarray(component_lookup(rows), dtype=np.int64)
+    if components.shape != (len(rows),):
+        raise SystemExit("authenticated policy distillation row lookup shape drift")
+    return np.isin(components, np.asarray(eligible, dtype=np.int64))
+
+
 def _apply_authenticated_policy_distillation_scope(
     data, weights: np.ndarray
 ) -> np.ndarray:
@@ -28569,23 +28623,10 @@ def _apply_authenticated_policy_distillation_scope(
     distilling an obsolete search teacher.
     """
 
-    if not bool(getattr(data, "policy_distillation_scope_authenticated", False)):
-        return weights
-    component_ids = tuple(getattr(data, "component_ids", tuple()))
-    eligible = tuple(
-        int(value)
-        for value in getattr(data, "policy_distillation_component_indices", tuple())
-    )
-    if (
-        not component_ids
-        or not eligible
-        or any(value < 0 or value >= len(component_ids) for value in eligible)
-        or len(set(eligible)) != len(eligible)
-    ):
-        raise SystemExit("authenticated policy distillation component scope is invalid")
     rows = np.arange(len(weights), dtype=np.int64)
-    component_indices = data.component_indices_for_rows(rows)
-    keep = np.isin(component_indices, np.asarray(eligible, dtype=np.int64))
+    keep = _policy_distillation_scope_mask(data, rows)
+    if keep is None:
+        return weights
     scoped = np.asarray(weights, dtype=np.float32).copy()
     scoped[~keep] = 0.0
     if not np.any(scoped > 0.0):
@@ -28724,6 +28765,39 @@ def _validate_policy_target_identity_scope(
     }
 
 
+def _value_training_scope_mask(
+    data: object,
+    rows: np.ndarray,
+) -> np.ndarray | None:
+    """Resolve the component mask shared by value loss and its admissions."""
+
+    if isinstance(data, dict) and "_value_training_eligible" in data:
+        eligible = np.asarray(data["_value_training_eligible"][rows], dtype=np.bool_)
+        if eligible.shape != (len(rows),):
+            raise ValueError("materialized value training scope shape drift")
+        return eligible
+    if not bool(getattr(data, "value_training_scope_authenticated", False)):
+        return None
+    component_ids = tuple(getattr(data, "component_ids", tuple()))
+    eligible = tuple(
+        int(value)
+        for value in getattr(data, "value_training_component_indices", tuple())
+    )
+    component_lookup = getattr(data, "component_indices_for_rows", None)
+    if (
+        not component_ids
+        or not eligible
+        or not callable(component_lookup)
+        or any(value < 0 or value >= len(component_ids) for value in eligible)
+        or len(set(eligible)) != len(eligible)
+    ):
+        raise SystemExit("authenticated value training component scope is invalid")
+    components = np.asarray(component_lookup(rows), dtype=np.int64)
+    if components.shape != (len(rows),):
+        raise SystemExit("authenticated value training row lookup shape drift")
+    return np.isin(components, np.asarray(eligible, dtype=np.int64))
+
+
 def _apply_authenticated_value_training_scope(
     data, weights: np.ndarray
 ) -> np.ndarray:
@@ -28736,24 +28810,12 @@ def _apply_authenticated_value_training_scope(
     Ordinary corpora and old descriptors retain all-component behavior.
     """
 
-    if not bool(getattr(data, "value_training_scope_authenticated", False)):
-        return weights
-    component_ids = tuple(getattr(data, "component_ids", tuple()))
-    eligible = tuple(
-        int(value)
-        for value in getattr(data, "value_training_component_indices", tuple())
-    )
-    if (
-        not component_ids
-        or not eligible
-        or any(value < 0 or value >= len(component_ids) for value in eligible)
-        or len(set(eligible)) != len(eligible)
-    ):
-        raise SystemExit("authenticated value training component scope is invalid")
     rows = np.arange(len(weights), dtype=np.int64)
-    components = data.component_indices_for_rows(rows)
+    keep = _value_training_scope_mask(data, rows)
+    if keep is None:
+        return weights
     scoped = np.asarray(weights, dtype=np.float32).copy()
-    scoped[~np.isin(components, np.asarray(eligible, dtype=np.int64))] = 0.0
+    scoped[~keep] = 0.0
     if not np.any(scoped > 0.0):
         raise SystemExit("authenticated value training scope has no positive rows")
     return scoped

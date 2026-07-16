@@ -12,6 +12,16 @@ from tools.train_bc import (
 )
 
 
+class _ScopedPolicyData(dict):
+    component_ids = ("current", "historical_replay")
+    policy_distillation_component_indices = (0,)
+    policy_distillation_scope_authenticated = True
+
+    @staticmethod
+    def component_indices_for_rows(rows):
+        return np.asarray(rows, dtype=np.int64)
+
+
 def _data(
     regimes: list[str], *, root_value: bool = False, prior_policy: bool = False
 ) -> dict:
@@ -118,6 +128,29 @@ def test_public_teacher_regimes_cannot_be_mixed():
                 ]
             )
         )
+
+
+def test_authenticated_policy_scope_excludes_inactive_legacy_teacher() -> None:
+    data = _ScopedPolicyData(
+        _data(
+            [
+                TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+                TARGET_INFORMATION_REGIME_PUBLIC,
+            ]
+        )
+    )
+    data["policy_weight_multiplier"] = np.ones(2, dtype=np.float32)
+
+    report = _admit(data)
+
+    assert report["search_objective_active_rows"] == 1
+    assert report["search_objective_target_information_regime_counts"] == {
+        TARGET_INFORMATION_REGIME_PUBLIC_COHERENT: 1
+    }
+    assert report["mismatched_target_information_rows"] == 0
+    completeness = report["policy_target_completeness"]
+    assert completeness["policy_active_rows"] == 1
+    assert completeness["exact_complete_public_soft_target_rows"] == 1
 
 
 def test_legacy_rows_remain_usable_for_value_only_rehearsal():
