@@ -29,6 +29,7 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
     PLAYER_ACTOR_FLAG_SLOT,
     PUBLIC_MASK_PLAYER_SLOTS,
 )
+from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY  # noqa: E402
 from catan_zero.rl.entity_token_features_rust import (  # noqa: E402
     build_entity_features_batch_rust,
     build_entity_features_rust,
@@ -112,6 +113,7 @@ ALL_KEYS = (
     "edge_tokens",
     "edge_vertex_ids",
     "player_tokens",
+    DEDUCTION_FEATURES_KEY,
     "global_tokens",
     "legal_action_tokens",
     "legal_action_target_ids",

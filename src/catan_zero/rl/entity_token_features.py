@@ -1021,13 +1021,35 @@ def _edge_pair(value: Any) -> tuple[int, int] | None:
 
 
 def _node_pips_by_resource(production: Any) -> list[int]:
+    """Normalize either Catanatron probabilities or adapter pips to dice pips.
+
+    The live Python ``ColonistMultiAgentEnv`` exposes
+    ``board.map.node_production`` as per-roll probabilities (multiples of
+    ``1 / 36``), while the Rust snapshot adapter deliberately exposes the same
+    logical field as integer dice pips.  Treating both representations as
+    integers silently zeroed every live-Python production feature.
+    """
+
     result = [0] * len(RESOURCES)
     if not isinstance(production, dict):
         return result
     for resource, value in production.items():
         index = _resource_index(resource)
         if index is not None:
-            result[index] += int(value)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(numeric) or numeric <= 0.0:
+                continue
+            # A resource's live Catanatron node probability is at most 5/36,
+            # whereas the snapshot adapter stores integer pips in [1, 5].
+            pips = (
+                int(round(numeric * 36.0))
+                if 0.0 < numeric < 1.0
+                else int(round(numeric))
+            )
+            result[index] += max(pips, 0)
     return result
 
 

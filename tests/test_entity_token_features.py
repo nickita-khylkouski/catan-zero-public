@@ -11,6 +11,7 @@ from catan_zero.rl.entity_token_features import (
     LEGAL_ACTION_FEATURE_SIZE,
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
+    _node_pips_by_resource,
     _scale,
     _topology,
     build_entity_token_features,
@@ -76,6 +77,43 @@ def test_entity_token_features_only_actor_private_resources_visible():
     assert player_tokens[actor_rows[0], 15] == 1.0
     assert player_tokens[opponent_rows[0], 15] == 0.0
     assert np.all(player_tokens[opponent_rows[0], 16:21] == 0.0)
+
+
+def test_node_production_normalizes_live_probabilities_and_adapter_pips_identically():
+    probability_form = {
+        "wood": 4.0 / 36.0,
+        "brick": 5.0 / 36.0,
+        "sheep": 2.0 / 36.0,
+    }
+    pip_form = {"wood": 4, "brick": 5, "sheep": 2}
+
+    assert _node_pips_by_resource(probability_form) == [4, 5, 2, 0, 0]
+    assert _node_pips_by_resource(probability_form) == _node_pips_by_resource(
+        pip_form
+    )
+
+
+def test_live_python_vertex_production_features_encode_dice_pips():
+    env = ColonistMultiAgentEnv(ColonistMultiAgentConfig(players=2, vps_to_win=10))
+    try:
+        _observations, _info = env.reset(seed=600001)
+        features = build_entity_token_features(env, env.current_player_name())
+        node_production = env.game.state.board.map.node_production
+        node = max(node_production, key=lambda item: sum(node_production[item].values()))
+        expected_by_resource = _node_pips_by_resource(node_production[node])
+
+        assert sum(expected_by_resource) > 0
+        assert features["vertex_tokens"][node, 9] == pytest.approx(
+            sum(expected_by_resource) / 18.0,
+            abs=5e-4,
+        )
+        assert features["vertex_tokens"][node, 10:15] == pytest.approx(
+            np.asarray(expected_by_resource) / 10.0,
+            abs=5e-4,
+        )
+        assert np.count_nonzero(features["vertex_tokens"][:, 9]) > 0
+    finally:
+        env.close()
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ from typing import Any
 
 import numpy as np
 
+from catan_zero.rl.entity_token_features import _node_pips_by_resource
 from catan_zero.rl.multiagent_env import ColonistMultiAgentEnv
 
 
@@ -114,7 +115,8 @@ def _scaled_production(env: ColonistMultiAgentEnv, node_id: int) -> float:
     production = env.game.state.board.map.node_production.get(node_id)
     if production is None:
         return 0.0
-    return min(max(float(sum(production.values())) / 18.0, 0.0), 1.0)
+    total_pips = sum(_node_pips_by_resource(production))
+    return min(max(float(total_pips) / 18.0, 0.0), 1.0)
 
 
 def _port_access_score(payload: dict[str, Any], node_id: int) -> float:

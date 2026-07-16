@@ -262,7 +262,6 @@ def build_entity_features_rust(
     action_size: int,
     topology: RustTopology,
     public_observation: bool = False,
-    public_card_count_features: bool = False,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
     meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
@@ -316,16 +315,19 @@ def build_entity_features_rust(
     )
 
     result = _reshape_raw(raw, mask_has_shape=False)
-    if public_card_count_features:
-        # Existing-data one-dose training reconstructs this tensor from the
-        # checkpoint's public entity-token surface. Serving must use that same
-        # transform: calling the exact JSON API here created train/serve skew
-        # on legacy clipped counts and added serialization to every MCTS leaf.
-        result[DEDUCTION_FEATURES_KEY] = (
-            public_card_count_features_from_entity_tokens(
-                result["player_tokens"], result["global_tokens"]
-            )
+    # `build_entity_token_features` always includes this additive public
+    # tensor, regardless of whether the loaded checkpoint currently consumes
+    # its optional residual.  The native path must preserve the same complete
+    # entity-batch contract: checkpoint configuration controls model
+    # consumption, not whether a featurizer silently drops a field.  Derive it
+    # from the same public token surface used to backfill historical corpora;
+    # the exact native JSON audit API would create train/serve skew on legacy
+    # clipped counts and add serialization to every MCTS leaf.
+    result[DEDUCTION_FEATURES_KEY] = (
+        public_card_count_features_from_entity_tokens(
+            result["player_tokens"], result["global_tokens"]
         )
+    )
     result["hex_vertex_ids"] = topology.hex_vertex_ids.copy()
     result["hex_edge_ids"] = topology.hex_edge_ids.copy()
     result["edge_vertex_ids"] = topology.edge_vertex_ids.copy()
@@ -340,7 +342,6 @@ def build_entity_features_batch_rust(
     action_size: int,
     topology: RustTopology,
     public_observation: bool = False,
-    public_card_count_features: bool = False,
     parallel: bool = False,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
@@ -380,7 +381,6 @@ def build_entity_features_batch_rust(
             action_size=action_size,
             topology=topology,
             public_observation=public_observation,
-            public_card_count_features=public_card_count_features,
             meaningful_public_history=meaningful_public_history,
             history_limit=history_limit,
             meaningful_public_history_schema=meaningful_public_history_schema,
@@ -426,12 +426,11 @@ def build_entity_features_batch_rust(
     widths = [int(w) for w in raw["widths"]]
 
     result = _reshape_raw(raw, mask_has_shape=True)
-    if public_card_count_features:
-        result[DEDUCTION_FEATURES_KEY] = (
-            public_card_count_features_from_entity_tokens(
-                result["player_tokens"], result["global_tokens"]
-            )
+    result[DEDUCTION_FEATURES_KEY] = (
+        public_card_count_features_from_entity_tokens(
+            result["player_tokens"], result["global_tokens"]
         )
+    )
     batch_size = len(rust_games)
     result["hex_vertex_ids"] = np.broadcast_to(
         topology.hex_vertex_ids, (batch_size, *topology.hex_vertex_ids.shape)
