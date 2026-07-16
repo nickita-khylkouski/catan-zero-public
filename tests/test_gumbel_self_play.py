@@ -29,6 +29,8 @@ from catan_zero.rl.gumbel_self_play import (
     TARGET_INFORMATION_REGIME_PUBLIC,
     TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
     _apply_selected_action,
+    _full_search_simulation_accounting,
+    _is_n128_reliability_result,
     _search_execution_contract,
     _target_information_regime_for_search,
     action_size_for_evaluator,
@@ -52,6 +54,42 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from train_bc import _load_npz, _normalize_teacher_shard  # type: ignore  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("legal_width", "expected"),
+    ((3, 127), (16, 128), (26, 112), (40, 141), (54, 154)),
+)
+def test_n128_reliability_accepts_width_dependent_legacy_sh_counts(
+    legal_width: int, expected: int
+) -> None:
+    config = GumbelChanceMCTSConfig(n_full=128, exact_budget_sh=False)
+    result = SimpleNamespace(used_full_search=True, simulations_used=expected)
+
+    assert _full_search_simulation_accounting(config, legal_width) == (128, expected)
+    assert _is_n128_reliability_result(config, legal_width=legal_width, result=result)
+
+
+def test_n128_reliability_refuses_wrong_count_or_non_n128_wide_budget() -> None:
+    legacy = GumbelChanceMCTSConfig(n_full=128, exact_budget_sh=False)
+    assert not _is_n128_reliability_result(
+        legacy,
+        legal_width=26,
+        result=SimpleNamespace(used_full_search=True, simulations_used=128),
+    )
+    assert not _is_n128_reliability_result(
+        legacy,
+        legal_width=26,
+        result=SimpleNamespace(used_full_search=False, simulations_used=112),
+    )
+    adaptive = GumbelChanceMCTSConfig(n_full=128, n_full_wide=256)
+    nominal, expected = _full_search_simulation_accounting(adaptive, 54)
+    assert nominal == 256
+    assert not _is_n128_reliability_result(
+        adaptive,
+        legal_width=54,
+        result=SimpleNamespace(used_full_search=True, simulations_used=expected),
+    )
 
 
 def _rust():

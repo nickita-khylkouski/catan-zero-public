@@ -1062,6 +1062,50 @@ def _search_evidence_recalibration_scope(search_config: Any) -> str:
     return "information_set_aggregate_q_then_improve_v1"
 
 
+def _full_search_simulation_accounting(
+    config: GumbelChanceMCTSConfig, legal_width: int
+) -> tuple[int, int]:
+    """Return nominal full budget and deterministic realized root visits.
+
+    Legacy Sequential Halving does not promise ``simulations_used == n_full``:
+    the round/floor schedule realizes a legal-width-dependent count.  Reliability
+    selection must compare against that exact schedule instead of silently
+    selecting only widths whose realized count happens to equal 128.
+    """
+
+    width = int(legal_width)
+    wide = _gumbel_chance_mcts._wide_budget_applies(width, config)  # noqa: SLF001
+    nominal = int(config.n_full_wide) if wide else int(config.n_full)
+    candidates = _gumbel_chance_mcts._root_candidate_count(  # noqa: SLF001
+        width, config
+    )
+    exact = bool(config.exact_budget_sh) and (
+        int(config.exact_budget_sh_min_n) <= 0
+        or nominal >= int(config.exact_budget_sh_min_n)
+    )
+    schedule = (
+        _gumbel_chance_mcts.exact_budget_sh_phases(candidates, nominal)
+        if exact
+        else _gumbel_chance_mcts.sequential_halving_schedule(candidates, nominal)
+    )
+    realized = sum(int(count) * int(per_candidate) for count, per_candidate in schedule)
+    return nominal, realized
+
+
+def _is_n128_reliability_result(
+    config: GumbelChanceMCTSConfig,
+    *,
+    legal_width: int,
+    result: SearchResult,
+) -> bool:
+    nominal, expected = _full_search_simulation_accounting(config, legal_width)
+    return (
+        nominal == 128
+        and bool(result.used_full_search)
+        and int(result.simulations_used) == expected
+    )
+
+
 def play_one_game(
     mcts: GumbelChanceMCTS,
     evaluator: RustEvaluator,
@@ -1125,7 +1169,10 @@ def play_one_game(
     )
     chance_rng = random.Random(int(game_seed) ^ 0xA17E)
     reliability_fraction = float(config.target_reliability_audit_fraction)
-    if not math.isfinite(reliability_fraction) or not 0.0 <= reliability_fraction <= 1.0:
+    if (
+        not math.isfinite(reliability_fraction)
+        or not 0.0 <= reliability_fraction <= 1.0
+    ):
         raise ValueError("target reliability audit fraction must be in [0, 1]")
     if reliability_fraction > 0.0 and target_reliability_mcts is None:
         raise ValueError(
@@ -1265,10 +1312,8 @@ def play_one_game(
         reliability_fields: dict[str, Any] | None = None
         if reliability_fraction > 0.0 and record_row:
             reliability_fields = unaudited_target_reliability_fields()
-            eligible_exact_n128 = (
-                len(legal_rust) > 1
-                and bool(result.used_full_search)
-                and int(result.simulations_used) == 128
+            eligible_exact_n128 = len(legal_rust) > 1 and _is_n128_reliability_result(
+                mcts.config, legal_width=len(legal_rust), result=result
             )
             if eligible_exact_n128 and target_reliability_root_selected(
                 game_seed=int(game_seed),
@@ -1293,14 +1338,20 @@ def play_one_game(
                     )
                 )
                 duplicate = target_reliability_mcts.search(game.copy(), force_full=True)
-                if (
-                    not bool(duplicate.used_full_search)
-                    or int(duplicate.simulations_used) != 128
+                if not _is_n128_reliability_result(
+                    target_reliability_mcts.config,
+                    legal_width=len(legal_rust),
+                    result=duplicate,
                 ):
+                    nominal, expected = _full_search_simulation_accounting(
+                        target_reliability_mcts.config, len(legal_rust)
+                    )
                     raise RuntimeError(
-                        "target reliability duplicate was not an exact n128 full search: "
+                        "target reliability duplicate violated n128 full-search "
+                        "accounting: "
                         f"used_full={duplicate.used_full_search!r} "
-                        f"simulations={duplicate.simulations_used!r}"
+                        f"nominal={nominal!r} expected={expected!r} "
+                        f"actual={duplicate.simulations_used!r}"
                     )
                 reliability_fields = duplicate_search_reliability_fields(
                     primary_policy=result.improved_policy,
@@ -2460,7 +2511,10 @@ def run_worker_games(
             "(they both resolve the same PoolGameAssignment; running both is ambiguous)"
         )
     reliability_fraction = float(config.target_reliability_audit_fraction)
-    if not math.isfinite(reliability_fraction) or not 0.0 <= reliability_fraction <= 1.0:
+    if (
+        not math.isfinite(reliability_fraction)
+        or not 0.0 <= reliability_fraction <= 1.0
+    ):
         raise ValueError("target reliability audit fraction must be in [0, 1]")
     if reliability_fraction > 0.0:
         if not bool(search_config.coherent_public_belief_search):
@@ -2471,12 +2525,6 @@ def run_worker_games(
             raise ValueError(
                 "target reliability audit is contracted for n_full=128, got "
                 f"{search_config.n_full!r}"
-            )
-        if not bool(search_config.exact_budget_sh) or int(
-            search_config.exact_budget_sh_min_n
-        ) > 128:
-            raise ValueError(
-                "target reliability audit requires exact-budget n128 search"
             )
     if resume and resume_semantics_sha256 is None:
         raise ValueError(
@@ -2534,26 +2582,21 @@ def run_worker_games(
     if reliability_fraction > 0.0:
         # The replica is deliberately the feature-complete Python reference:
         # this gives it explicit Gumbel/chance/belief substreams even when the
-        # primary trajectory uses the parity-gated native hot loop.  Adaptive
-        # wide-root budgets are disabled because only primary roots that
-        # actually spent exact n128 are eligible for this contract.
+        # primary trajectory uses the parity-gated native hot loop. Preserve
+        # the primary exact/legacy SH and wide-budget semantics: otherwise the
+        # duplicate would audit a different target operator. Per-root
+        # eligibility below admits only roots whose nominal full budget is 128.
         reliability_search_config = dataclasses.replace(
             search_config,
             seed=int(config.target_reliability_audit_seed),
             n_full=128,
             n_fast=128,
             p_full=1.0,
-            n_full_wide=None,
-            wide_roots_always_full=False,
             raw_policy_above_width=None,
-            exact_budget_sh=True,
-            exact_budget_sh_min_n=0,
             temperature=0.0,
             rng_stream_separation=True,
         )
-        target_reliability_mcts = GumbelChanceMCTS(
-            reliability_search_config, evaluator
-        )
+        target_reliability_mcts = GumbelChanceMCTS(reliability_search_config, evaluator)
         assert target_reliability_manifest is not None
         target_reliability_manifest["duplicate_search_config"] = dataclasses.asdict(
             reliability_search_config
