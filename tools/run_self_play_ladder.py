@@ -8,7 +8,13 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
+
+
+CANONICAL_VPS_TO_WIN = 10
+MIN_PROMOTION_GAMES_PER_OPPONENT = 50
+NONCANONICAL_OVERWRITE_ACK_FLAG = "--allow-noncanonical-champion-overwrite"
+NO_CHAMPION_WRITE_FLAG = "--no-champion-write"
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +31,7 @@ class EvalScore:
         )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run a no-human-data self-play ladder: teacher warmup, PPO league "
@@ -78,18 +84,86 @@ def main() -> None:
         help="Value-bot eval games for each warmup checkpoint.",
     )
     parser.add_argument("--dry-run", action="store_true")
+    champion_write_group = parser.add_mutually_exclusive_group()
+    champion_write_group.add_argument(
+        NO_CHAMPION_WRITE_FLAG,
+        action="store_true",
+        help=(
+            "Run training and evaluation without creating or replacing the champion. "
+            "Use this for historical 3-VP runs and other diagnostics."
+        ),
+    )
+    champion_write_group.add_argument(
+        NONCANONICAL_OVERWRITE_ACK_FLAG,
+        action="store_true",
+        help=(
+            "Explicitly allow a champion write from noncanonical settings. This "
+            "preserves legacy experiments but is not a production promotion."
+        ),
+    )
     parser.add_argument(
         "--extra-train-arg",
         action="append",
         default=[],
         help="Extra argument forwarded to tools/train_ppo.py. Repeat as needed.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def champion_write_safety_issues(args: argparse.Namespace) -> tuple[str, ...]:
+    issues: list[str] = []
+    if args.vps_to_win != CANONICAL_VPS_TO_WIN:
+        issues.append(
+            f"--vps-to-win={args.vps_to_win} (canonical value is {CANONICAL_VPS_TO_WIN})"
+        )
+    if args.promotion_eval_games < MIN_PROMOTION_GAMES_PER_OPPONENT:
+        issues.append(
+            f"--promotion-eval-games={args.promotion_eval_games} "
+            f"(minimum is {MIN_PROMOTION_GAMES_PER_OPPONENT})"
+        )
+    if args.promotion_value_games < MIN_PROMOTION_GAMES_PER_OPPONENT:
+        issues.append(
+            f"--promotion-value-games={args.promotion_value_games} "
+            f"(minimum is {MIN_PROMOTION_GAMES_PER_OPPONENT})"
+        )
+    return tuple(issues)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    safety_issues = champion_write_safety_issues(args)
+    champion_write_enabled = not args.dry_run and not args.no_champion_write
+    if (
+        champion_write_enabled
+        and safety_issues
+        and not args.allow_noncanonical_champion_overwrite
+    ):
+        issue_summary = "; ".join(safety_issues)
+        print(
+            "[self-play-ladder] ERROR: refusing a champion write from "
+            f"noncanonical promotion settings: {issue_summary}. Use "
+            f"{NO_CHAMPION_WRITE_FLAG} for a non-mutating historical/diagnostic "
+            f"run, or pass {NONCANONICAL_OVERWRITE_ACK_FLAG} to explicitly "
+            "acknowledge the unsafe legacy overwrite path.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
 
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     champion_path = Path(args.champion)
-    report: dict[str, Any] = {"cycles": []}
+    report: dict[str, Any] = {
+        "champion_write_policy": {
+            "enabled": champion_write_enabled,
+            "noncanonical_settings": list(safety_issues),
+            "explicit_noncanonical_overwrite": bool(
+                args.allow_noncanonical_champion_overwrite
+            ),
+        },
+        "cycles": [],
+    }
 
     for cycle_index in range(args.cycles):
         cycle_seed = args.seed + cycle_index * 10_000
@@ -138,21 +212,26 @@ def main() -> None:
                 value_games=args.promotion_value_games,
                 prefix="champion",
             )
-        promoted, reason = should_promote(
+        promotion_recommended, reason = should_promote(
             candidate_score,
             champion_score,
             min_heuristic_win_rate=args.min_heuristic_win_rate,
             min_value_win_rate=args.min_value_win_rate,
         )
+        promoted = promotion_recommended and champion_write_enabled
         if promoted:
             champion_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(candidate_path, champion_path)
+        promotion_reason = reason
+        if promotion_recommended and not champion_write_enabled:
+            promotion_reason = f"{reason}; champion write disabled"
         cycle_report.update(
             {
                 "candidate_score": asdict(candidate_score),
                 "champion_score": asdict(champion_score) if champion_score else None,
                 "promoted": promoted,
-                "promotion_reason": reason,
+                "promotion_recommended": promotion_recommended,
+                "promotion_reason": promotion_reason,
             }
         )
         print(json.dumps({"cycle": cycle_report}, sort_keys=True), flush=True)
@@ -161,6 +240,7 @@ def main() -> None:
     report_path = run_dir / "ladder_report.json"
     report_path.write_text(json.dumps(report, sort_keys=True, indent=2), encoding="utf-8")
     print(json.dumps({"report": str(report_path)}, sort_keys=True), flush=True)
+    return 0
 
 
 def build_train_command(
@@ -372,4 +452,4 @@ def _win_rate(report: dict[str, Any] | None) -> float | None:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

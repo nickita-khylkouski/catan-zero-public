@@ -126,13 +126,22 @@ implemented and running on remote boxes.
   --checkpoint-eval-games 8 \
   --eval-games 24 \
   --promotion-eval-games 24 \
-  --min-heuristic-win-rate 0.25
+  --min-heuristic-win-rate 0.25 \
+  --no-champion-write
 ```
 
-The ladder is the preferred local no-human-data workflow. It does not assume a
-candidate is good because it beat random opponents; it promotes only after the
-held-out heuristic gate passes and, when a champion already exists, after the
-candidate beats the champion's promotion score.
+This is a historical 3-VP diagnostic workflow, so the example explicitly
+disables champion writes. The ladder fails closed before training if a
+champion-writing run uses anything other than 10 VP, fewer than 50 heuristic
+promotion games, or fewer than 50 value-opponent promotion games. For exact
+legacy reproduction, `--allow-noncanonical-champion-overwrite` restores the old
+mutation behavior, but that result is not a production promotion.
+
+The ladder does not assume a candidate is good because it beat random
+opponents; it recommends promotion only after the held-out heuristic/value
+gates pass and, when a champion already exists, after the candidate beats the
+champion's promotion score. `--no-champion-write` records that recommendation
+without creating or replacing the champion.
 
 ## Current Result Snapshot
 
