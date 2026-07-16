@@ -160,6 +160,8 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
             "used_full_search": np.asarray([False, True]),
             "root_value": np.asarray([0.2, 0.4], dtype=np.float32),
             "root_value_mask": np.asarray([True, True]),
+            "root_prior_value": np.asarray([0.1, 0.2], dtype=np.float32),
+            "root_prior_value_mask": np.asarray([True, True]),
             "afterstate_target": np.asarray(
                 [[0.1, np.nan], [0.2, 0.3]], dtype=np.float32
             ),
@@ -174,11 +176,25 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
     current._columns.update(
         {
             "legal_action_ids": {"kind": "fixed", "dtype": "int16", "inner_shape": [2]},
-            "policy_weight_multiplier": {"kind": "fixed", "dtype": "float32", "inner_shape": []},
+            "policy_weight_multiplier": {
+                "kind": "fixed",
+                "dtype": "float32",
+                "inner_shape": [],
+            },
             "is_forced": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
             "used_full_search": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
             "root_value": {"kind": "fixed", "dtype": "float32", "inner_shape": []},
             "root_value_mask": {"kind": "fixed", "dtype": "bool", "inner_shape": []},
+            "root_prior_value": {
+                "kind": "fixed",
+                "dtype": "float32",
+                "inner_shape": [],
+            },
+            "root_prior_value_mask": {
+                "kind": "fixed",
+                "dtype": "bool",
+                "inner_shape": [],
+            },
             "afterstate_target": {
                 "kind": "ragged2d",
                 "dtype": "float32",
@@ -216,7 +232,11 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
     old._columns.update(
         {
             "legal_action_ids": {"kind": "fixed", "dtype": "int16", "inner_shape": [2]},
-            "policy_weight_multiplier": {"kind": "fixed", "dtype": "float32", "inner_shape": []},
+            "policy_weight_multiplier": {
+                "kind": "fixed",
+                "dtype": "float32",
+                "inner_shape": [],
+            },
         }
     )
 
@@ -226,6 +246,12 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
     assert np.array_equal(mixed["used_full_search"][:], [False, True, False, True])
     assert np.allclose(mixed["root_value"][:], [0.2, 0.4, 0.0, 0.0])
     assert np.array_equal(mixed["root_value_mask"][:], [True, True, False, False])
+    np.testing.assert_allclose(
+        mixed["root_prior_value"][:],
+        [0.1, 0.2, np.nan, np.nan],
+        equal_nan=True,
+    )
+    assert np.array_equal(mixed["root_prior_value_mask"][:], [True, True, False, False])
     assert np.allclose(
         mixed["afterstate_target"][:],
         [[0.1, np.nan], [0.2, 0.3], [np.nan, np.nan], [np.nan, np.nan]],
@@ -252,6 +278,8 @@ def test_known_optional_columns_are_synthesized_with_safe_semantics():
             "aux_subgoal_target_version",
             "aux_vp_in_n",
             "is_forced",
+            "root_prior_value",
+            "root_prior_value_mask",
             "root_value",
             "root_value_mask",
             "simulations_used",
@@ -271,7 +299,9 @@ def test_old_component_gets_unknown_opponent_provenance_not_fabricated_identity(
             "opponent_checkpoint_md5": np.asarray(["", "deadbeef"]),
             "opponent_type": np.asarray(["", ""]),
             "opponent_provenance_present": np.asarray([False, True]),
-            "training_source_category": np.asarray(["current_producer", "recent_history"]),
+            "training_source_category": np.asarray(
+                ["current_producer", "recent_history"]
+            ),
             "training_source_category_verified": np.asarray([True, True]),
         }
     )
@@ -280,7 +310,11 @@ def test_old_component_gets_unknown_opponent_provenance_not_fabricated_identity(
             continue
         array = np.asarray(value)
         current._columns[name] = (
-            {"kind": "string", "dtype": "int32", "categories": sorted(set(array.tolist()))}
+            {
+                "kind": "string",
+                "dtype": "int32",
+                "categories": sorted(set(array.tolist())),
+            }
             if array.dtype.kind in {"U", "S", "O"}
             else {"kind": "fixed", "dtype": array.dtype.str, "inner_shape": []}
         )
@@ -337,7 +371,11 @@ def test_afterstate_target_and_mask_must_be_an_atomic_pair(missing: str) -> None
         }
     )
     broken = _Corpus(2, 2)
-    present = "afterstate_target_mask" if missing == "afterstate_target" else "afterstate_target"
+    present = (
+        "afterstate_target_mask"
+        if missing == "afterstate_target"
+        else "afterstate_target"
+    )
     broken._eager[present] = complete._eager[present].copy()
     broken._columns[present] = dict(complete._columns[present])
 

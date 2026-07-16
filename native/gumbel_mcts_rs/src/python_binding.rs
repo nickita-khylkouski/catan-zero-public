@@ -433,6 +433,7 @@ fn gumbel_search(
     }
     out.set_item("priors", priors_dict)?;
     out.set_item("root_value", result.root_value)?;
+    out.set_item("root_prior_value", result.root_prior_value)?;
     let completed_q_dict = PyDict::new(py);
     for (aid, q) in &result.completed_q_values {
         completed_q_dict.set_item(aid, *q)?;

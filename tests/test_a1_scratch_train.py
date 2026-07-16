@@ -154,6 +154,13 @@ def _verified(tmp_path: Path) -> dict:
             "training_event_history_trainable": True,
         },
         "accepted_policy_target_identity_sha256": "sha256:" + "a" * 64,
+        "policy_target_quality_admission": {
+            "path": str((tmp_path / "quality.json").resolve()),
+            "file_sha256": "sha256:" + "b" * 64,
+            "receipt_sha256": "sha256:" + "c" * 64,
+            "identity_sha256": "sha256:" + "d" * 64,
+            "metrics": {"admitted": True},
+        },
     }
 
 
@@ -200,16 +207,9 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("torch.distributed.run") == 1
     assert command.count("--nproc_per_node=8") == 1
     assert command[command.index("--batch-size") + 1] == "64"
-    assert command[command.index("--base-sampler") + 1] == (
-        "coverage_importance_v1"
-    )
+    assert command[command.index("--base-sampler") + 1] == ("coverage_importance_v1")
     assert (
-        command[
-            command.index(
-                "--minimum-policy-effective-rows-per-global-batch"
-            )
-            + 1
-        ]
+        command[command.index("--minimum-policy-effective-rows-per-global-batch") + 1]
         == "32.0"
     )
     assert command[command.index("--moe-balance-loss-weight") + 1] == "0.0"
@@ -218,9 +218,10 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert "--resume-optimizer" not in command
     assert command.count("--no-resume-optimizer") == 1
     assert command.count("--no-public-card-count-residual-bias") == 1
-    assert command[
-        command.index("--accepted-policy-target-identity-sha256") + 1
-    ] == "sha256:" + "a" * 64
+    assert (
+        command[command.index("--accepted-policy-target-identity-sha256") + 1]
+        == "sha256:" + "a" * 64
+    )
     assert command.count("--action-target-gather") == 1
     assert command.count("--legal-action-value-set-statistics") == 1
     assert command.count("--public-rule-state-features") == 1
@@ -241,21 +242,14 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command[command.index("--q-loss-weight") + 1] == "0.0"
     assert command.count("--required-target-information-regime") == 1
     assert command.count("--save-each-epoch") == 1
+    assert command.count("--trust-curated-data-quality") == 1
     assert command[command.index("--train-diagnostics-every-batches") + 1] == "16"
     assert (
-        command[
-            command.index(
-                "--objective-gradient-interference-every-batches"
-            )
-            + 1
-        ]
+        command[command.index("--objective-gradient-interference-every-batches") + 1]
         == "16"
     )
     assert (
-        command[
-            command.index("--minimum-feature-learning-signal-observations")
-            + 1
-        ]
+        command[command.index("--minimum-feature-learning-signal-observations") + 1]
         == "2"
     )
     required_modules = command[
@@ -267,10 +261,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert "--ddp-shard-data" not in command
     assert "--target-reliability-confidence-weighting" not in command
     assert (
-        command[
-            command.index("--post-policy-dose-value-trunk-grad-scale") + 1
-        ]
-        == "0.0"
+        command[command.index("--post-policy-dose-value-trunk-grad-scale") + 1] == "0.0"
     )
     trainer_index = command.index(str(verified["trainer_authority"]["path"]))
     parsed = train_bc.build_parser().parse_args(command[trainer_index + 1 :])
@@ -282,6 +273,24 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert effective == verified["recipe"]
     marker = json.loads(command[command.index("--a1-scratch-authority-json") + 1])
     assert marker == authority
+
+
+def test_scratch_command_cannot_emit_trust_without_quality_admission(
+    tmp_path: Path,
+) -> None:
+    verified = _verified(tmp_path)
+    del verified["policy_target_quality_admission"]
+
+    with pytest.raises(
+        scratch.ScratchTrainError,
+        match="requires verified policy-target quality admission",
+    ):
+        scratch.build_train_command(
+            verified,
+            python=Path("/usr/bin/python3"),
+            checkpoint=tmp_path / "model.pt",
+            report=tmp_path / "report.json",
+        )
 
 
 def test_scratch_topology_binder_preserves_512_global_batch(tmp_path: Path) -> None:
@@ -361,17 +370,11 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
         device="cpu",
         public_card_count_features=True,
         public_rule_state_features=model["public_rule_state_features"],
-        public_rule_state_feature_schema=model[
-            "public_rule_state_feature_schema"
-        ],
+        public_rule_state_feature_schema=model["public_rule_state_feature_schema"],
         entity_feature_adapter_version=model["entity_feature_adapter_version"],
         meaningful_public_history=model["meaningful_public_history"],
-        meaningful_public_history_schema=model[
-            "meaningful_public_history_schema"
-        ],
-        meaningful_public_history_pooling=model[
-            "meaningful_public_history_pooling"
-        ],
+        meaningful_public_history_schema=model["meaningful_public_history_schema"],
+        meaningful_public_history_pooling=model["meaningful_public_history_pooling"],
         meaningful_public_history_target_gather=model[
             "meaningful_public_history_target_gather"
         ],
@@ -385,8 +388,7 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     assert policy.config.public_rule_state_features is True
     assert policy.config.action_target_gather is True
     assert (
-        policy.entity_feature_adapter_version
-        == model["entity_feature_adapter_version"]
+        policy.entity_feature_adapter_version == model["entity_feature_adapter_version"]
     )
     assert policy.config.static_action_residual is True
     assert policy.config.legal_action_value_residual is True
@@ -460,7 +462,8 @@ def test_completed_outputs_bind_terminal_report_and_both_frontiers(
         encoding="utf-8",
     )
     for epoch, epoch_path in enumerate(
-        scratch._epoch_outputs(checkpoint, 3), start=1  # noqa: SLF001
+        scratch._epoch_outputs(checkpoint, 3),
+        start=1,  # noqa: SLF001
     ):
         epoch_path.write_bytes(f"epoch-{epoch}".encode())
         Path(str(epoch_path) + ".optimizer.pt").write_bytes(b"optimizer")
@@ -477,9 +480,10 @@ def test_completed_outputs_bind_terminal_report_and_both_frontiers(
 
     assert outputs["terminal_checkpoint"]["path"] == str(checkpoint.resolve())
     assert [row["epoch"] for row in outputs["epoch_frontier"]] == [1, 2, 3]
-    assert [
-        row["optimizer_step"] for row in outputs["optimizer_step_frontier"]
-    ] == [8, 16]
+    assert [row["optimizer_step"] for row in outputs["optimizer_step_frontier"]] == [
+        8,
+        16,
+    ]
     assert outputs["epoch_frontier_sha256"] == scratch._value_sha256(  # noqa: SLF001
         outputs["epoch_frontier"]
     )
@@ -551,6 +555,13 @@ def test_run_plan_then_go_does_not_collide_with_plan_receipt(
         "source_authority_semantic_sha256": "sha256:" + "3" * 64,
         "validation_split_receipt_sha256": "sha256:" + "4" * 64,
         "trainer_authority": {"trainer": "test"},
+        "policy_target_quality_admission": {
+            "path": str((tmp_path / "quality.json").resolve()),
+            "file_sha256": "sha256:" + "6" * 64,
+            "receipt_sha256": "sha256:" + "7" * 64,
+            "identity_sha256": "sha256:" + "8" * 64,
+            "metrics": {"admitted": True},
+        },
     }
     monkeypatch.setattr(scratch, "verify_inputs", lambda **_kwargs: verified)
     monkeypatch.setattr(
@@ -572,6 +583,7 @@ def test_run_plan_then_go_does_not_collide_with_plan_receipt(
         lock=lock,
         data=data,
         composite_build_receipt=build,
+        policy_target_quality_receipt=tmp_path / "quality.json",
         checkpoint=tmp_path / "model.pt",
         report=tmp_path / "report.json",
         receipt=tmp_path / "plan.json",
@@ -625,55 +637,61 @@ def _runtime_args() -> SimpleNamespace:
     topology = current_science.learner_execution_topology()
     parser_defaults = vars(
         train_bc.build_parser().parse_args(
-            ["--data", "fixture", "--checkpoint", "fixture.pt", "--report", "report.json"]
+            [
+                "--data",
+                "fixture",
+                "--checkpoint",
+                "fixture.pt",
+                "--report",
+                "report.json",
+            ]
         )
     )
     parser_defaults.update(
         {
             key: value
             for key, value in current_science.learner_training_recipe().items()
-            if key not in {"world_size", "global_batch_size"}
-            and key in parser_defaults
+            if key not in {"world_size", "global_batch_size"} and key in parser_defaults
         }
     )
     parser_defaults.update(
         dict(
-        init_checkpoint="",
-        grow_from_checkpoint="",
-        resume_optimizer=False,
-        arch=model["arch"],
-        hidden_size=model["hidden_size"],
-        graph_layers=model["graph_layers"],
-        attention_heads=model["attention_heads"],
-        graph_dropout=model["graph_dropout"],
-        entity_state_trunk=model["entity_state_trunk"],
-        action_target_gather=model["action_target_gather"],
-        static_action_residual=model["static_action_residual"],
-        legal_action_value_residual=model["legal_action_value_residual"],
-        legal_action_value_set_statistics=model[
-            "legal_action_value_set_statistics"
-        ],
-        value_tower_split_layers=model["value_tower_split_layers"],
-        public_card_count_features=model["public_card_count_features"],
-        public_card_count_residual_bias=model["public_card_count_residual_bias"],
-        public_rule_state_features=model["public_rule_state_features"],
-        entity_feature_adapter_version=model["entity_feature_adapter_version"],
-        meaningful_public_history=model["meaningful_public_history"],
-        meaningful_public_history_pooling=model[
-            "meaningful_public_history_pooling"
-        ],
-        meaningful_public_history_target_gather=model[
-            "meaningful_public_history_target_gather"
-        ],
-        event_history_limit=model["event_history_limit"],
-        mask_hidden_info=model["mask_hidden_info"],
-        require_35m_model=model["require_35m_model"],
-        min_35m_params=model["min_parameter_count"],
-        max_35m_params=model["max_parameter_count"],
-        batch_size=topology["local_batch_size"],
-        grad_accum_steps=topology["grad_accum_steps"],
-        ddp_shard_data=topology["ddp_shard_data"],
-        training_rng_rank_offset=topology["training_rng_rank_offset"],
+            init_checkpoint="",
+            grow_from_checkpoint="",
+            resume_optimizer=False,
+            arch=model["arch"],
+            hidden_size=model["hidden_size"],
+            graph_layers=model["graph_layers"],
+            attention_heads=model["attention_heads"],
+            graph_dropout=model["graph_dropout"],
+            entity_state_trunk=model["entity_state_trunk"],
+            action_target_gather=model["action_target_gather"],
+            static_action_residual=model["static_action_residual"],
+            legal_action_value_residual=model["legal_action_value_residual"],
+            legal_action_value_set_statistics=model[
+                "legal_action_value_set_statistics"
+            ],
+            value_tower_split_layers=model["value_tower_split_layers"],
+            public_card_count_features=model["public_card_count_features"],
+            public_card_count_residual_bias=model["public_card_count_residual_bias"],
+            public_rule_state_features=model["public_rule_state_features"],
+            entity_feature_adapter_version=model["entity_feature_adapter_version"],
+            meaningful_public_history=model["meaningful_public_history"],
+            meaningful_public_history_pooling=model[
+                "meaningful_public_history_pooling"
+            ],
+            meaningful_public_history_target_gather=model[
+                "meaningful_public_history_target_gather"
+            ],
+            event_history_limit=model["event_history_limit"],
+            mask_hidden_info=model["mask_hidden_info"],
+            require_35m_model=model["require_35m_model"],
+            min_35m_params=model["min_parameter_count"],
+            max_35m_params=model["max_parameter_count"],
+            batch_size=topology["local_batch_size"],
+            grad_accum_steps=topology["grad_accum_steps"],
+            ddp_shard_data=topology["ddp_shard_data"],
+            training_rng_rank_offset=topology["training_rng_rank_offset"],
         )
     )
     return SimpleNamespace(**parser_defaults)
@@ -726,6 +744,8 @@ def test_scratch_plan_has_explicit_execution_switch(tmp_path: Path) -> None:
         str(tmp_path / "descriptor.json"),
         "--composite-build-receipt",
         str(tmp_path / "build.json"),
+        "--policy-target-quality-receipt",
+        str(tmp_path / "quality.json"),
         "--checkpoint",
         str(tmp_path / "model.pt"),
         "--report",

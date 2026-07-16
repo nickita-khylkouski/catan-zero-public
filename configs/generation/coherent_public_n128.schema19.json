@@ -68,6 +68,7 @@
     "opponent_pool_manifest": null,
     "p_full": 0.25,
     "preserve_search_evidence": true,
+    "preserve_root_prior_value": true,
     "target_reliability_audit_fraction": 0.05,
     "target_reliability_audit_seed": 20260716,
     "prior_temperature": 1.0,

@@ -440,12 +440,8 @@ def test_play_one_game_materializes_aux_targets_from_full_rust_trajectory(monkey
     recorded_history_schemas: list[str] = []
 
     def fake_build(game, **kwargs):
-        recorded_adapter_versions.append(
-            str(kwargs["entity_feature_adapter_version"])
-        )
-        recorded_history_schemas.append(
-            str(kwargs["meaningful_public_history_schema"])
-        )
+        recorded_adapter_versions.append(str(kwargs["entity_feature_adapter_version"]))
+        recorded_history_schemas.append(str(kwargs["meaningful_public_history_schema"]))
         return {
             "player": str(game.current_color()),
             "policy_weight_multiplier": np.float32(0.0),
@@ -543,6 +539,8 @@ def test_fast_search_rows_are_value_only():
         assert float(row["value_weight_multiplier"]) == pytest.approx(1.0)
         assert not bool(row["root_value_mask"])
         assert np.isnan(row["root_value"])
+        assert not bool(row["root_prior_value_mask"])
+        assert np.isnan(row["root_prior_value"])
 
 
 def test_full_search_rows_have_nonzero_policy_weight():
@@ -567,6 +565,8 @@ def test_full_search_rows_have_nonzero_policy_weight():
         if not decision.row["is_forced"]:
             assert bool(decision.row["root_value_mask"])
             assert np.isfinite(decision.row["root_value"])
+            assert bool(decision.row["root_prior_value_mask"])
+            assert np.isfinite(decision.row["root_prior_value"])
 
 
 # ---------------------------------------------------------------------------
@@ -1001,9 +1001,7 @@ def test_nonunit_temperature_v2_invalidates_legacy_resume_identity():
         "opponent_mix": None,
         "public_award_feature_provenance": None,
     }
-    legacy_double_application_identity = _generation_resume_semantics_sha256(
-        **common
-    )
+    legacy_double_application_identity = _generation_resume_semantics_sha256(**common)
     fixed_single_application_identity = _generation_resume_semantics_sha256(
         **common,
         prior_temperature_application={

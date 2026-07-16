@@ -26,6 +26,13 @@ def _verified(tmp_path: Path) -> dict:
         "model_construction": current_science.learner_model_construction(),
         "execution_topology": current_science.learner_execution_topology(),
         "accepted_policy_target_identity_sha256": "sha256:" + "1" * 64,
+        "policy_target_quality_admission": {
+            "path": str((tmp_path / "quality.json").resolve()),
+            "file_sha256": "sha256:" + "2" * 64,
+            "receipt_sha256": "sha256:" + "3" * 64,
+            "identity_sha256": "sha256:" + "4" * 64,
+            "metrics": {"admitted": True},
+        },
         "trainer_authority": {
             "path": str((campaign.REPO_ROOT / "tools/train_bc.py").resolve())
         },
@@ -93,9 +100,7 @@ def test_bounded_diagnostic_authority_allows_only_exact_short_arm() -> None:
     parser = train_bc.build_parser()
     science = {
         "learner_training_recipe": current_science.learner_training_recipe(),
-        "learner_execution_topology": (
-            current_science.learner_execution_topology()
-        ),
+        "learner_execution_topology": (current_science.learner_execution_topology()),
     }
     code_sha = "sha256:" + "a" * 64
     authority = {
@@ -226,6 +231,7 @@ def test_prepare_and_verify_emit_nonpromotable_machine_readable_plan(
         lock=verified["lock_path"],
         data=verified["data_path"],
         composite_build_receipt=tmp_path / "build.json",
+        policy_target_quality_receipt=tmp_path / "quality.json",
         output_root=output_root,
         plan_path=plan_path,
         python=_python(tmp_path),
@@ -241,9 +247,7 @@ def test_prepare_and_verify_emit_nonpromotable_machine_readable_plan(
     assert replay["arms"]["V100"]["effective_recipe"][
         "value_trunk_grad_scale"
     ] == pytest.approx(1.0)
-    assert all(
-        arm["promotion_eligible"] is False for arm in replay["arms"].values()
-    )
+    assert all(arm["promotion_eligible"] is False for arm in replay["arms"].values())
 
 
 @pytest.mark.parametrize("max_steps", [0, 257])
@@ -264,6 +268,7 @@ def test_prepare_refuses_unbounded_or_full_horizon(
             lock=verified["lock_path"],
             data=verified["data_path"],
             composite_build_receipt=tmp_path / "build.json",
+            policy_target_quality_receipt=tmp_path / "quality.json",
             output_root=tmp_path / "campaign",
             plan_path=tmp_path / "campaign.plan.json",
             python=_python(tmp_path),

@@ -102,7 +102,9 @@ def _verify_receipt_ref(raw: object, *, where: str) -> tuple[Path, dict[str, Any
 
 def _trainer_index(command: Sequence[str]) -> int:
     found = [
-        index for index, token in enumerate(command) if Path(token).name == "train_bc.py"
+        index
+        for index, token in enumerate(command)
+        if Path(token).name == "train_bc.py"
     ]
     if len(found) != 1:
         raise ValueRoutingCampaignError("scratch command must name one train_bc.py")
@@ -152,9 +154,7 @@ def _parsed_effective_recipe(command: Sequence[str]) -> tuple[Any, dict[str, obj
         {"world_size": 8, "rank": 0, "local_rank": 0, "enabled": True},
     )
     if str(args.a1_learner_ablation_id or ""):
-        effective["per_game_value_weight_mode"] = str(
-            args.per_game_value_weight_mode
-        )
+        effective["per_game_value_weight_mode"] = str(args.per_game_value_weight_mode)
         if str(args.value_player_outcome_balance_mode) != "none":
             effective["value_player_outcome_balance_mode"] = str(
                 args.value_player_outcome_balance_mode
@@ -335,6 +335,7 @@ def prepare(
     lock: Path,
     data: Path,
     composite_build_receipt: Path,
+    policy_target_quality_receipt: Path,
     output_root: Path,
     plan_path: Path,
     python: Path,
@@ -345,9 +346,7 @@ def prepare(
     if plan_path.exists() or root.exists():
         raise ValueRoutingCampaignError("campaign output root and plan must be fresh")
     if not 1 <= int(diagnostic_max_steps) <= 256:
-        raise ValueRoutingCampaignError(
-            "diagnostic max steps must be in [1, 256]"
-        )
+        raise ValueRoutingCampaignError("diagnostic max steps must be in [1, 256]")
     python_authority = scratch._executable_ref(  # noqa: SLF001
         python, where="learner Python"
     )
@@ -355,6 +354,7 @@ def prepare(
         lock_path=lock,
         data_path=data,
         composite_build_receipt=composite_build_receipt,
+        policy_target_quality_receipt=policy_target_quality_receipt,
     )
     baseline_recipe = dict(verified["recipe"])
     if float(baseline_recipe.get("value_trunk_grad_scale", -1.0)) != 0.25:
@@ -449,9 +449,7 @@ def verify(plan_path: Path, *, require_fresh_outputs: bool) -> dict[str, Any]:
     arms: dict[str, dict[str, Any]] = {}
     baseline_recipe: dict[str, Any] | None = None
     for arm_id, scale in ARMS.items():
-        _path, arm = _verify_receipt_ref(
-            plan["arms"][arm_id], where=f"{arm_id} plan"
-        )
+        _path, arm = _verify_receipt_ref(plan["arms"][arm_id], where=f"{arm_id} plan")
         if (
             arm.get("schema_version") != ARM_PLAN_SCHEMA
             or arm.get("arm_id") != arm_id
@@ -459,8 +457,7 @@ def verify(plan_path: Path, *, require_fresh_outputs: bool) -> dict[str, Any]:
             or arm.get("promotion_eligible") is not False
             or int(arm["effective_recipe"]["max_steps"])
             != int(plan["diagnostic_max_steps"])
-            or arm.get("command_sha256")
-            != scratch._value_sha256(arm.get("command"))  # noqa: SLF001
+            or arm.get("command_sha256") != scratch._value_sha256(arm.get("command"))  # noqa: SLF001
         ):
             raise ValueRoutingCampaignError(f"{arm_id} plan contract drift")
         recipe = dict(arm["effective_recipe"])
@@ -476,7 +473,8 @@ def verify(plan_path: Path, *, require_fresh_outputs: bool) -> dict[str, Any]:
                 checkpoint, int(recipe["epochs"])
             )
             scratch._require_fresh_step_outputs(  # noqa: SLF001
-                checkpoint, scratch._checkpoint_steps(recipe)  # noqa: SLF001
+                checkpoint,
+                scratch._checkpoint_steps(recipe),  # noqa: SLF001
             )
     assert baseline_recipe is not None
     for arm_id, scale in ARMS.items():
@@ -581,9 +579,7 @@ def select(
     if arm_id not in ARMS:
         raise ValueRoutingCampaignError(f"unknown arm {arm_id!r}")
     for current, ref in campaign["arm_executions"].items():
-        _path, execution = _verify_receipt_ref(
-            ref, where=f"{current} execution"
-        )
+        _path, execution = _verify_receipt_ref(ref, where=f"{current} execution")
         if execution.get("status") != "completed":
             raise ValueRoutingCampaignError("selection requires completed arms")
     selection = {
@@ -612,6 +608,11 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--lock", required=True, type=Path)
     prep.add_argument("--data", required=True, type=Path)
     prep.add_argument("--composite-build-receipt", required=True, type=Path)
+    prep.add_argument(
+        "--policy-target-quality-receipt",
+        required=True,
+        type=Path,
+    )
     prep.add_argument("--output-root", required=True, type=Path)
     prep.add_argument("--plan", required=True, type=Path)
     prep.add_argument("--python", type=Path, default=Path(sys.executable))
@@ -637,6 +638,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             lock=args.lock,
             data=args.data,
             composite_build_receipt=args.composite_build_receipt,
+            policy_target_quality_receipt=args.policy_target_quality_receipt,
             output_root=args.output_root,
             plan_path=args.plan,
             python=args.python,

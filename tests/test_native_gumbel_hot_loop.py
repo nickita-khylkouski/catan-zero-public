@@ -292,6 +292,9 @@ def test_native_particle_root_callback_replays_immutable_precomputed_d6(
     assert cached == ({3: 0.25, 7: 0.75}, 0.4)
     assert search.evaluator.root_symmetry_calls == 0
     assert result.simulations_used == 32
+    # Old native wheels do not return this field, so the binding must retain
+    # the exact root callback value rather than substituting post-search value.
+    assert result.root_prior_value == pytest.approx(0.4)
 
 
 def test_native_leaf_observer_excludes_root_and_covers_scalar_and_batch(
@@ -315,9 +318,7 @@ def test_native_leaf_observer_excludes_root_and_covers_scalar_and_batch(
 
         def evaluate_many(self, requests, *, root_color, colors):
             return [
-                self.evaluate(
-                    game, legal, root_color=root_color, colors=colors
-                )
+                self.evaluate(game, legal, root_color=root_color, colors=colors)
                 for game, legal in requests
             ]
 
@@ -357,9 +358,7 @@ def test_native_leaf_observer_excludes_root_and_covers_scalar_and_batch(
     search.rng = random.Random(7)
     search.using_native_hot_loop = True
     search.set_leaf_evaluation_observer(
-        lambda game, legal, root_color: observed.append(
-            (game, legal, root_color)
-        )
+        lambda game, legal, root_color: observed.append((game, legal, root_color))
     )
 
     result = search._search_single_world(_Game(), force_full=True)
@@ -564,9 +563,7 @@ def test_native_boundary_callback_rejects_batch_cardinality_mismatch(
         boundary_evaluator,
     ):
         del evaluator_many, root_evaluator, force_full
-        boundary_evaluator(
-            game, "RED", config["boundary_value_particle_seeds"]
-        )
+        boundary_evaluator(game, "RED", config["boundary_value_particle_seeds"])
         raise AssertionError("cardinality mismatch should fail before search returns")
 
     monkeypatch.setitem(

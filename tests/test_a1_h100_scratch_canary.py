@@ -34,6 +34,13 @@ def _verified(tmp_path: Path) -> dict:
             "training_event_history_trainable": True,
         },
         "accepted_policy_target_identity_sha256": "sha256:" + "a" * 64,
+        "policy_target_quality_admission": {
+            "path": str((tmp_path / "quality.json").resolve()),
+            "file_sha256": "sha256:" + "b" * 64,
+            "receipt_sha256": "sha256:" + "c" * 64,
+            "identity_sha256": "sha256:" + "d" * 64,
+            "metrics": {"admitted": True},
+        },
     }
 
 
@@ -41,9 +48,7 @@ def _valid_report_payload() -> dict:
     recipe = current_science.learner_training_recipe()
     modules = sorted(
         name.strip()
-        for name in str(
-            recipe["require_feature_learning_signal_modules"]
-        ).split(",")
+        for name in str(recipe["require_feature_learning_signal_modules"]).split(",")
         if name.strip()
     )
     cadence = int(recipe["train_diagnostics_every_batches"])
@@ -66,9 +71,7 @@ def _valid_report_payload() -> dict:
     }
     objective = {
         "schema_version": "objective-gradient-dose-observations-v1",
-        "cadence_batches": int(
-            recipe["objective_gradient_interference_every_batches"]
-        ),
+        "cadence_batches": int(recipe["objective_gradient_interference_every_batches"]),
         "observed_steps": minimum,
         "observations": [
             {
@@ -100,9 +103,7 @@ def _valid_report_payload() -> dict:
     )
     objective_admission = canary.feature_signal.verify_objective_interference(
         objective,
-        cadence_batches=int(
-            recipe["objective_gradient_interference_every_batches"]
-        ),
+        cadence_batches=int(recipe["objective_gradient_interference_every_batches"]),
         minimum_observations=minimum,
         expected_world_size=8,
         expected_value_trunk_grad_scale=0.25,
@@ -186,6 +187,7 @@ def test_arm_commands_differ_only_declared_architecture_and_outputs(
         "--a1-scratch-authority-json",
         "{}",
     ]
+
     def fake_build(bound, **kwargs):
         command = list(base)
         command[command.index("--max-steps") + 1] = str(bound["recipe"]["max_steps"])
@@ -291,6 +293,7 @@ def test_dry_run_writes_non_promotable_receipt_without_execution(
             lock=tmp_path / "lock.json",
             data=verified["data_path"],
             composite_build_receipt=tmp_path / "build.json",
+            policy_target_quality_receipt=tmp_path / "quality.json",
             output_dir=tmp_path / "out",
             receipt=receipt_path,
             python=Path("/usr/bin/python3"),
@@ -313,9 +316,7 @@ def test_completion_summary_binds_counts_throughput_and_gradient_telemetry(
 ) -> None:
     report = tmp_path / "report.json"
     report.write_text(
-        json.dumps(
-            _valid_report_payload()
-        ),
+        json.dumps(_valid_report_payload()),
         encoding="utf-8",
     )
     summary = canary.summarize_report(
@@ -325,9 +326,12 @@ def test_completion_summary_binds_counts_throughput_and_gradient_telemetry(
     assert summary["parameter_counts"]["total"] == 41_708_233
     assert summary["throughput"]["optimizer_steps_per_second"] == 2.0
     assert summary["throughput"]["rows_per_second"] == 1024.0
-    assert summary["gradient_telemetry"]["feature_learning_signal_admission"][
-        "authenticated"
-    ] is True
+    assert (
+        summary["gradient_telemetry"]["feature_learning_signal_admission"][
+            "authenticated"
+        ]
+        is True
+    )
 
 
 @pytest.mark.parametrize("observed", [None, True, 127, 129])
@@ -380,9 +384,7 @@ def test_inventory_uses_authenticated_python_cuda_visibility(
     def fake_run(command, **_kwargs):
         seen.extend(command)
         return SimpleNamespace(
-            stdout=json.dumps(
-                {"cuda_available": True, "records": _cuda_inventory()}
-            )
+            stdout=json.dumps({"cuda_available": True, "records": _cuda_inventory()})
         )
 
     monkeypatch.setattr(canary.subprocess, "run", fake_run)
@@ -717,6 +719,7 @@ def test_failed_execution_receipt_binds_plan_and_preserves_completed_control(
         lock=tmp_path / "lock.json",
         data=verified["data_path"],
         composite_build_receipt=tmp_path / "build.json",
+        policy_target_quality_receipt=tmp_path / "quality.json",
         output_dir=output_dir,
         python=Path("/sealed/python"),
         max_steps=128,
@@ -763,9 +766,10 @@ def test_failed_execution_receipt_binds_plan_and_preserves_completed_control(
     assert execution["results"]["C640"]["checkpoint"]["file_sha256"].startswith(
         "sha256:"
     )
-    assert execution["plan_binding"]["plan_receipt"][
-        "plan_identity_sha256"
-    ] == execution["plan_binding"]["plan"]["plan_identity_sha256"]
+    assert (
+        execution["plan_binding"]["plan_receipt"]["plan_identity_sha256"]
+        == execution["plan_binding"]["plan"]["plan_identity_sha256"]
+    )
     assert len(execution["gpu_inventory"]) == 8
 
 
@@ -796,6 +800,7 @@ def test_execution_refuses_arguments_that_differ_from_reviewed_plan(
         lock=tmp_path / "lock.json",
         data=verified["data_path"],
         composite_build_receipt=tmp_path / "build.json",
+        policy_target_quality_receipt=tmp_path / "quality.json",
         python=Path("/sealed/python"),
         max_steps=128,
     )

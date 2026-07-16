@@ -107,9 +107,7 @@ def _plan_identity_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _seal_plan_identity(payload: dict[str, Any]) -> None:
-    payload["plan_identity_sha256"] = _value_sha256(
-        _plan_identity_payload(payload)
-    )
+    payload["plan_identity_sha256"] = _value_sha256(_plan_identity_payload(payload))
 
 
 def _load_bound_plan(path: Path, current: Mapping[str, Any]) -> dict[str, Any]:
@@ -340,7 +338,9 @@ def diagnostic_authority(
 
 def _trainer_index(command: Sequence[str]) -> int:
     positions = [
-        index for index, token in enumerate(command) if Path(token).name == "train_bc.py"
+        index
+        for index, token in enumerate(command)
+        if Path(token).name == "train_bc.py"
     ]
     if len(positions) != 1:
         raise CanaryError("scratch command must name exactly one train_bc.py")
@@ -403,9 +403,7 @@ def build_commands(
         command = scratch.build_train_command(
             arm_verified, python=python, checkpoint=checkpoint, report=report
         )
-        _replace_value(
-            command, "--max-35m-params", CANARY_MAX_PARAMETER_COUNT
-        )
+        _replace_value(command, "--max-35m-params", CANARY_MAX_PARAMETER_COUNT)
         if "--exact-max-steps" not in command:
             command.append("--exact-max-steps")
         command.append(
@@ -504,7 +502,9 @@ print(json.dumps({"cuda_available": torch.cuda.is_available(), "records": record
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        raise CanaryError("authenticated Python returned malformed CUDA inventory") from error
+        raise CanaryError(
+            "authenticated Python returned malformed CUDA inventory"
+        ) from error
     records = payload.get("records") if isinstance(payload, dict) else None
     if (
         not isinstance(payload, dict)
@@ -569,7 +569,9 @@ def summarize_report(
     try:
         payload = json.loads(report.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise CanaryError(f"cannot read canary training report {report}: {error}") from error
+        raise CanaryError(
+            f"cannot read canary training report {report}: {error}"
+        ) from error
     if not isinstance(payload, dict):
         raise CanaryError("canary training report root is not an object")
     required_counts = (
@@ -617,15 +619,13 @@ def summarize_report(
     required_modules = tuple(
         sorted(
             name.strip()
-            for name in str(
-                recipe["require_feature_learning_signal_modules"]
-            ).split(",")
+            for name in str(recipe["require_feature_learning_signal_modules"]).split(
+                ","
+            )
             if name.strip()
         )
     )
-    minimum_observations = int(
-        recipe["minimum_feature_learning_signal_observations"]
-    )
+    minimum_observations = int(recipe["minimum_feature_learning_signal_observations"])
     try:
         feature_contract = feature_signal.contract_from_cli(
             module_names=required_modules,
@@ -644,9 +644,7 @@ def summarize_report(
             ),
             minimum_observations=minimum_observations,
             expected_world_size=WORLD_SIZE,
-            expected_value_trunk_grad_scale=float(
-                recipe["value_trunk_grad_scale"]
-            ),
+            expected_value_trunk_grad_scale=float(recipe["value_trunk_grad_scale"]),
             where="H100 scratch canary report",
         )
     except feature_signal.FeatureSignalError as error:
@@ -655,8 +653,7 @@ def summarize_report(
         ) from error
     if (
         payload["feature_learning_signal_admission"] != verified_feature_signal
-        or payload["objective_gradient_signal_admission"]
-        != verified_objective_signal
+        or payload["objective_gradient_signal_admission"] != verified_objective_signal
     ):
         raise CanaryError("canary report gradient admission echo drift")
     seconds = float(elapsed_seconds)
@@ -677,9 +674,7 @@ def summarize_report(
             "rows_per_second": float(observed_steps * global_batch_size) / seconds,
             "scope": "end_to_end_including_validation_and_report_write",
         },
-        "gradient_telemetry": {
-            key: payload[key] for key in telemetry_fields
-        },
+        "gradient_telemetry": {key: payload[key] for key in telemetry_fields},
     }
 
 
@@ -730,6 +725,7 @@ def run(
         lock_path=args.lock,
         data_path=args.data,
         composite_build_receipt=args.composite_build_receipt,
+        policy_target_quality_receipt=args.policy_target_quality_receipt,
     )
     python_ref = scratch._executable_ref(  # noqa: SLF001
         args.python, where="H100 canary Python"
@@ -845,7 +841,9 @@ def run(
         )
         if isinstance(error, CanaryError):
             raise
-        raise CanaryError(f"H100 scratch canary failed during {stage}: {error}") from error
+        raise CanaryError(
+            f"H100 scratch canary failed during {stage}: {error}"
+        ) from error
     completed_payload = {
         **base,
         "schema_version": EXECUTION_SCHEMA,
@@ -864,11 +862,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--composite-build-receipt", required=True, type=Path)
+    parser.add_argument(
+        "--policy-target-quality-receipt",
+        required=True,
+        type=Path,
+    )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     parser.add_argument("--plan-receipt", type=Path)
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
-    parser.add_argument("--max-steps", type=int, choices=range(MIN_STEPS, MAX_STEPS + 1), default=128)
+    parser.add_argument(
+        "--max-steps", type=int, choices=range(MIN_STEPS, MAX_STEPS + 1), default=128
+    )
     parser.add_argument("--go", action="store_true")
     return parser.parse_args(argv)
 

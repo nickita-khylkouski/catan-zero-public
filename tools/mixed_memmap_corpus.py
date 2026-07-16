@@ -37,6 +37,11 @@ SYNTHESIZABLE_COLUMNS = frozenset(
         "decision_class",
         "root_value",
         "root_value_mask",
+        # Fresh search-evidence components preserve the pre-search evaluator
+        # baseline. Legacy replay has no recoverable value for this field, so
+        # synthesize an unavailable scalar rather than overloading root_value.
+        "root_prior_value",
+        "root_prior_value_mask",
         # The sealed gen3 replay corpus predates preserved search-accounting
         # and one-ply afterstate columns.  Their absence has an exact neutral
         # meaning: no authenticated afterstate target and no recorded search
@@ -154,8 +159,7 @@ class _ConcatColumn:
             for column in self._columns
         )
         self.supports_value_counts = all(
-            callable(getattr(column, "value_counts", None))
-            for column in self._columns
+            callable(getattr(column, "value_counts", None)) for column in self._columns
         )
 
     def __len__(self) -> int:
@@ -241,9 +245,7 @@ class _ConcatColumn:
             indices = None
         else:
             indices = np.asarray(index, dtype=np.int64).reshape(-1)
-            if indices.size and bool(
-                np.any((indices < 0) | (indices >= self._n))
-            ):
+            if indices.size and bool(np.any((indices < 0) | (indices >= self._n))):
                 raise IndexError("value-count index outside concatenated row range")
         merged: dict[str, int] = {}
         for part, column in enumerate(self._columns):
@@ -338,6 +340,10 @@ def _synthesized_column(corpus: Any, key: str):
         return _ConstantColumn(corpus.row_count, 0.0, np.float32)
     if key == "root_value_mask":
         return _ConstantColumn(corpus.row_count, False, np.bool_)
+    if key == "root_prior_value":
+        return _ConstantColumn(corpus.row_count, np.nan, np.float32)
+    if key == "root_prior_value_mask":
+        return _ConstantColumn(corpus.row_count, False, np.bool_)
     if key == "afterstate_target":
         return _ConstantColumn(
             corpus.row_count,
@@ -430,7 +436,9 @@ class ConcatMemmapCorpus:
             union_keys.add("adapter_version")
         common_keys = set.intersection(*component_key_sets)
         missing_keys = union_keys - common_keys
-        adapter_backfill = {"adapter_version"} if adapter_versions is not None else set()
+        adapter_backfill = (
+            {"adapter_version"} if adapter_versions is not None else set()
+        )
         unsupported_missing = missing_keys - SYNTHESIZABLE_COLUMNS - adapter_backfill
         if unsupported_missing:
             raise SystemExit(
@@ -451,7 +459,11 @@ class ConcatMemmapCorpus:
                     for part, keys in zip(self.corpora, component_key_sets, strict=True)
                     if key in keys
                 ]
-                if not present_schemas and key == "adapter_version" and adapter_versions:
+                if (
+                    not present_schemas
+                    and key == "adapter_version"
+                    and adapter_versions
+                ):
                     continue
                 if any(
                     _semantic_column_schema(schema)
@@ -599,6 +611,9 @@ class ConcatMemmapCorpus:
     def component_indices_for_rows(self, rows: Any) -> np.ndarray:
         """Map global row indices to their authenticated component index."""
         indices, _scalar = _normalize_global_index(rows, self.row_count)
-        return np.searchsorted(
-            self.component_offsets, indices, side="right"
-        ).astype(np.int64, copy=False) - 1
+        return (
+            np.searchsorted(self.component_offsets, indices, side="right").astype(
+                np.int64, copy=False
+            )
+            - 1
+        )

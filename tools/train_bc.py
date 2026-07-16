@@ -25217,6 +25217,8 @@ def load_teacher_data(
         *TARGET_RELIABILITY_COLUMNS,
         "root_value",
         "root_value_mask",
+        "root_prior_value",
+        "root_prior_value_mask",
         "afterstate_target",
         "afterstate_target_mask",
         "simulations_used",
@@ -26515,6 +26517,21 @@ def _normalize_teacher_shard(
             shard,
             "root_value_mask",
             np.isfinite(result["root_value"]),
+            path,
+            leading=n,
+        ).astype(np.bool_, copy=False)
+    if "root_prior_value" in shard:
+        result["root_prior_value"] = _field_or_default(
+            shard,
+            "root_prior_value",
+            np.full(n, np.nan, dtype=np.float32),
+            path,
+            leading=n,
+        ).astype(np.float32, copy=False)
+        result["root_prior_value_mask"] = _field_or_default(
+            shard,
+            "root_prior_value_mask",
+            np.isfinite(result["root_prior_value"]),
             path,
             leading=n,
         ).astype(np.bool_, copy=False)

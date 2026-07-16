@@ -84,7 +84,8 @@
     "native_mcts_hot_loop": true,
     "target_reliability_audit_fraction": 0.05,
     "target_reliability_audit_seed": 20260716,
-    "preserve_search_evidence": true
+    "preserve_search_evidence": true,
+    "preserve_root_prior_value": true
   },
   "learner": {
     "initialization": {

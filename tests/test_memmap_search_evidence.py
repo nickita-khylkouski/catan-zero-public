@@ -23,10 +23,12 @@ def _write_search_evidence_shard(path: Path) -> None:
         value_weight_multiplier=np.ones(3, dtype=np.float32),
         used_full_search=np.asarray([True, False, True]),
         is_forced=np.asarray([False, False, False]),
-        target_information_regime=np.asarray(
-            ["public_belief_single_tree_v1"] * 3
-        ),
+        target_information_regime=np.asarray(["public_belief_single_tree_v1"] * 3),
         simulations_used=np.asarray([6, 0, 8], dtype=np.int32),
+        root_value=np.asarray([0.3, np.nan, 0.45], dtype=np.float32),
+        root_value_mask=np.asarray([True, False, True]),
+        root_prior_value=np.asarray([0.1, np.nan, 0.2], dtype=np.float32),
+        root_prior_value_mask=np.asarray([True, False, True]),
         game_seed=np.asarray([901, 901, 901], dtype=np.int64),
         decision_index=np.asarray([0, 1, 2], dtype=np.int32),
         terminated=np.asarray([False, False, True]),
@@ -89,6 +91,15 @@ def test_memmap_preserves_compact_search_evidence_for_all_rows(tmp_path: Path) -
     exact_prior = corpus["search_prior_policy_flat"][[0, 1, 2]]
     np.testing.assert_allclose(exact_prior[0, :2], [0.7, 0.3])
     assert bool(np.all(np.isnan(exact_prior[1])))
+    np.testing.assert_allclose(
+        corpus["root_prior_value"][:],
+        [0.1, np.nan, 0.2],
+        equal_nan=True,
+    )
+    np.testing.assert_array_equal(
+        corpus["root_prior_value_mask"][:],
+        [True, False, True],
+    )
 
     inspected = inventory.inspect_memmap(
         label="coherent",
@@ -114,9 +125,7 @@ def test_memmap_rejects_zero_mass_exact_prior(tmp_path: Path) -> None:
     _write_search_evidence_shard(shard)
     with np.load(shard) as original:
         payload = {name: original[name] for name in original.files}
-    payload["search_prior_policy_flat"] = np.asarray(
-        [0.0, 0.0, 1.0], dtype=np.float32
-    )
+    payload["search_prior_policy_flat"] = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
     np.savez(shard, **payload)
 
     with pytest.raises(SystemExit, match="zero active-row mass"):

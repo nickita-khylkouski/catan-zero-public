@@ -572,6 +572,8 @@ pub struct SearchResult {
     pub q_values: Vec<(usize, f64)>,
     pub priors: Vec<(usize, f64)>,
     pub root_value: f64,
+    /// Evaluator value at root expansion, before any search backup.
+    pub root_prior_value: f64,
     /// Root-actor completed-Q for every legal root action.  Unvisited actions
     /// carry the ordinary per-world mctx mixed-value completion.
     pub completed_q_values: Vec<(usize, f64)>,
@@ -814,6 +816,7 @@ impl GumbelMctsEngine {
             q_values,
             priors,
             root_value: root.value(),
+            root_prior_value: root.prior_value,
             completed_q_values,
             used_full_search: use_full,
             simulations_used: used,
@@ -1723,6 +1726,7 @@ impl GumbelMctsEngine {
                 q_values: vec![],
                 priors: vec![(action_id, 1.0)],
                 root_value: f64::NAN,
+                root_prior_value: f64::NAN,
                 completed_q_values: vec![],
                 used_full_search: false,
                 simulations_used: 0,
@@ -1739,6 +1743,7 @@ impl GumbelMctsEngine {
                 q_values: vec![],
                 priors: vec![(action_id, 1.0)],
                 root_value: value.clamp(-1.0, 1.0),
+                root_prior_value: value.clamp(-1.0, 1.0),
                 completed_q_values: vec![(action_id, value.clamp(-1.0, 1.0))],
                 used_full_search: true,
                 simulations_used: 0,
@@ -1778,6 +1783,7 @@ impl GumbelMctsEngine {
             q_values: vec![],
             priors: vec![(action_id, 1.0)],
             root_value,
+            root_prior_value: f64::NAN,
             completed_q_values: vec![(action_id, root_value)],
             used_full_search: true,
             simulations_used: 0,
@@ -1829,6 +1835,7 @@ impl GumbelMctsEngine {
             q_values: vec![],
             priors: priors_vec,
             root_value: arena.get(root_idx).value(),
+            root_prior_value: arena.get(root_idx).prior_value,
             completed_q_values,
             used_full_search: false,
             simulations_used: 0,

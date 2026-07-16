@@ -232,6 +232,10 @@ EXTRA_KEYS = (
     # learner may consume it (authoritative-hidden-state targets fail closed).
     "root_value",
     "root_value_mask",
+    # Independent evaluator baseline captured before search backups. Do not
+    # substitute root_value: that field is the post-search visit mean.
+    "root_prior_value",
+    "root_prior_value_mask",
     "afterstate_target",
     "afterstate_target_mask",
     "used_full_search",
@@ -336,9 +340,7 @@ class GumbelSelfPlayConfig:
     # strategic public taxonomy and retain at most the latest 32 events.
     # Defaults preserve legacy shard shape/contents.
     meaningful_public_history: bool = False
-    meaningful_public_history_schema: str = (
-        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
-    )
+    meaningful_public_history_schema: str = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
     event_history_limit: int = 64
     # The search evaluator remains checkpoint-bound to its own feature adapter.
     # Fresh learner rows may explicitly use a newer, versioned adapter because
@@ -758,9 +760,7 @@ def _build_public_learner_features(
     snapshot: dict[str, Any] | None = None,
     action_by_id: dict[int, Any] | None = None,
     meaningful_public_history: bool = False,
-    meaningful_public_history_schema: str = (
-        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
-    ),
+    meaningful_public_history_schema: str = (MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION),
     event_history_limit: int = 64,
     entity_feature_adapter_version: str = RUST_ENTITY_ADAPTER_VERSION,
 ) -> tuple[
@@ -783,8 +783,7 @@ def _build_public_learner_features(
         snapshot = json.loads(game.json_snapshot())
     if action_by_id is None:
         action_ids = [
-            int(action)
-            for action in game.playable_action_indices(list(colors), None)
+            int(action) for action in game.playable_action_indices(list(colors), None)
         ]
         raw_actions = json.loads(game.playable_actions_json())
         action_by_id = dict(zip(action_ids, raw_actions))
@@ -859,9 +858,7 @@ def _build_decision_row(
     action_by_id: dict[int, Any] | None = None,
     target_information_regime: str = TARGET_INFORMATION_REGIME_AUTHORITATIVE,
     meaningful_public_history: bool = False,
-    meaningful_public_history_schema: str = (
-        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
-    ),
+    meaningful_public_history_schema: str = (MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION),
     event_history_limit: int = 64,
     decision_class: str = "normal_choice",
     search_budget_reason_value: str = "normal_choice_playout_cap_randomization",
@@ -982,9 +979,7 @@ def _build_decision_row(
             # "n128 teacher" corpus into a mixed n16/n128 policy objective.
             # Keep the paid fast-search distribution as evidence for sealed
             # reliability experiments, not as production policy authority.
-            1.0
-            if result.used_full_search and not is_forced
-            else 0.0
+            1.0 if result.used_full_search and not is_forced else 0.0
         ),
         # Forced rows remain terminal-outcome value examples even when
         # trajectory_only skips the discarded root-Q/afterstate computation.
@@ -1011,6 +1006,20 @@ def _build_decision_row(
         ),
         "root_value_mask": np.bool_(
             not is_forced and result.used_full_search and np.isfinite(result.root_value)
+        ),
+        "root_prior_value": np.float32(
+            result.root_prior_value
+            if (
+                not is_forced
+                and result.used_full_search
+                and np.isfinite(result.root_prior_value)
+            )
+            else np.nan
+        ),
+        "root_prior_value_mask": np.bool_(
+            not is_forced
+            and result.used_full_search
+            and np.isfinite(result.root_prior_value)
         ),
         "afterstate_target": afterstate_target,
         "afterstate_target_mask": afterstate_target_mask,
@@ -1175,9 +1184,7 @@ def _search_execution_contract(
         "native_mcts_hot_loop": bool(native_mcts_hot_loop),
     }
     if prior_temperature_application is not None:
-        contract["prior_temperature_application"] = dict(
-            prior_temperature_application
-        )
+        contract["prior_temperature_application"] = dict(prior_temperature_application)
     return contract
 
 
@@ -1548,9 +1555,7 @@ def play_one_game(
                 event_history_limit=int(config.event_history_limit),
                 decision_class=decision_class,
                 search_budget_reason_value=budget_reason,
-                entity_feature_adapter_version=(
-                    learner_entity_feature_adapter_version
-                ),
+                entity_feature_adapter_version=(learner_entity_feature_adapter_version),
             )
             if reliability_fields is not None:
                 row.update(reliability_fields)
@@ -1837,7 +1842,7 @@ def search_evidence_for_row(
     if version not in {1, SEARCH_EVIDENCE_VERSION}:
         raise ValueError(f"unsupported search evidence version {version!r}")
     if version == 1 and "search_prior_policy_flat" in shard:
-            raise ValueError("version-1 search evidence has an unversioned fp32 prior")
+        raise ValueError("version-1 search evidence has an unversioned fp32 prior")
     version_keys = (
         base_evidence_keys | {"search_prior_policy_flat"}
         if version == SEARCH_EVIDENCE_VERSION
@@ -2631,9 +2636,7 @@ def _generation_resume_semantics_sha256(
         ),
     }
     if prior_temperature_application is not None:
-        semantics["prior_temperature_application"] = dict(
-            prior_temperature_application
-        )
+        semantics["prior_temperature_application"] = dict(prior_temperature_application)
     encoded = json.dumps(
         semantics,
         sort_keys=True,

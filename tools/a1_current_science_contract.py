@@ -258,6 +258,10 @@ PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT = {
     # Completed-Q and visit evidence cost far less than one percent of the
     # corpus and are required to calibrate or reconstruct teacher reliability.
     "preserve_search_evidence": True,
+    # The empirical admission baseline is the evaluator output captured at
+    # root expansion, before search backups mutate root_value. Generation and
+    # memmap materialization must retain this distinct field and mask.
+    "preserve_root_prior_value": True,
 }
 
 

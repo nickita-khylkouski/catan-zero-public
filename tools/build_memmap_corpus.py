@@ -1188,6 +1188,8 @@ LOADER_KEYS: tuple[str, ...] = (
     *TARGET_RELIABILITY_COLUMNS,
     "root_value",
     "root_value_mask",
+    "root_prior_value",
+    "root_prior_value_mask",
     # Preserve the search products even while the canonical learner keeps
     # bootstrap losses off.  The generator paid for these columns; dropping
     # them here made authenticated refreshed-target/Q ablations impossible

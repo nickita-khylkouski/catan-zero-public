@@ -269,8 +269,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             )
             values.pop("n_full_wide", None)
         particle_seeds = tuple(
-            int(seed)
-            for seed in getattr(self, "_boundary_value_particle_seeds", ())
+            int(seed) for seed in getattr(self, "_boundary_value_particle_seeds", ())
         )
         if len(particle_seeds) > 1:
             values["boundary_value_particle_seeds"] = list(particle_seeds)
@@ -382,6 +381,32 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                     native_game, tuple(legal), root_color=root_color, colors=colors
                 )
 
+        # New native wheels expose the effective pre-search value directly.
+        # Capture the root callback too so old wheels remain exact rather than
+        # forcing callers to confuse their post-search ``root_value`` with the
+        # evaluator baseline. A fake/invalid wheel that never calls the root
+        # callback remains explicitly unavailable (NaN).
+        configured_root_evaluator = root_evaluator
+        captured_root_prior_values: list[float] = []
+
+        def root_evaluator(native_game: Any, legal: list[int], root_color: str):
+            result = configured_root_evaluator(native_game, legal, root_color)
+            value = float(result[1])
+            if not math.isfinite(value):
+                raise RuntimeError("native root evaluator produced non-finite value")
+            effective = float(max(min(value, 1.0), -1.0))
+            if captured_root_prior_values and not math.isclose(
+                captured_root_prior_values[0],
+                effective,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            ):
+                raise RuntimeError(
+                    "native root evaluator value changed within one search"
+                )
+            captured_root_prior_values.append(effective)
+            return result
+
         boundary_evaluator = None
         if int(self.config.boundary_value_particles) > 1:
 
@@ -424,14 +449,10 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                     )
                 )
                 if len(evaluations) != len(requests):
-                    raise RuntimeError(
-                        "boundary evaluator batch cardinality mismatch"
-                    )
+                    raise RuntimeError("boundary evaluator batch cardinality mismatch")
                 values = [float(result[1]) for result in evaluations]
                 if not values or not all(math.isfinite(value) for value in values):
-                    raise RuntimeError(
-                        "boundary evaluator produced non-finite values"
-                    )
+                    raise RuntimeError("boundary evaluator produced non-finite values")
                 return float(sum(values) / len(values))
 
         root_phase = self._resolve_d1_root_phase(game, attested_root_phase)
@@ -453,6 +474,22 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             ),
             **native_kwargs,
         )
+        raw_root_prior_value = raw.get("root_prior_value")
+        if raw_root_prior_value is None:
+            raw_root_prior_value = (
+                captured_root_prior_values[0]
+                if captured_root_prior_values
+                else float("nan")
+            )
+        elif captured_root_prior_values and not math.isclose(
+            float(raw_root_prior_value),
+            captured_root_prior_values[0],
+            rel_tol=0.0,
+            abs_tol=0.0,
+        ):
+            raise RuntimeError(
+                "native root_prior_value differs from root evaluator output"
+            )
         return SearchResult(
             selected_action=int(raw["selected_action"]),
             improved_policy={
@@ -466,6 +503,7 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             root_value=float(raw["root_value"]),
             used_full_search=bool(raw["used_full_search"]),
             simulations_used=int(raw["simulations_used"]),
+            root_prior_value=float(raw_root_prior_value),
             afterstate_values={
                 int(key): float(value)
                 for key, value in raw["afterstate_values"].items()

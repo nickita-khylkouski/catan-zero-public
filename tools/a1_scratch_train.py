@@ -36,6 +36,7 @@ EXECUTION_SCHEMA = "a1-coherent-scratch-training-execution-v2"
 CHILD_AUTHORITY_SCHEMA = "a1-coherent-scratch-plan-authority-v2"
 CODE_SURFACE = (
     "tools/a1_scratch_train.py",
+    "tools/a1_policy_target_quality_admission.py",
     "tools/a1_current_science_contract.py",
     "tools/a1_pre_wave_contract.py",
     "tools/a1_build_post_wave_composite.py",
@@ -138,15 +139,22 @@ def _load_matching_plan_receipt(
     try:
         payload = json.loads(plan_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ScratchTrainError(f"scratch plan receipt is unreadable: {error}") from error
+        raise ScratchTrainError(
+            f"scratch plan receipt is unreadable: {error}"
+        ) from error
     if not isinstance(payload, dict):
         raise ScratchTrainError("scratch plan receipt must be a JSON object")
     unsigned = dict(payload)
     declared = unsigned.pop("receipt_sha256", None)
     if declared != _value_sha256(unsigned):
         raise ScratchTrainError("scratch plan receipt semantic digest mismatch")
-    if unsigned.get("schema_version") != PLAN_SCHEMA or unsigned.get("status") != "planned":
-        raise ScratchTrainError("scratch execution requires a completed plan-only receipt")
+    if (
+        unsigned.get("schema_version") != PLAN_SCHEMA
+        or unsigned.get("status") != "planned"
+    ):
+        raise ScratchTrainError(
+            "scratch execution requires a completed plan-only receipt"
+        )
     if set(unsigned) != set(expected):
         raise ScratchTrainError("scratch plan receipt fields differ from current plan")
     for key, value in expected.items():
@@ -184,11 +192,9 @@ def _science_authority(lock: Mapping[str, Any]) -> dict[str, Any]:
     except current_science.ScienceContractError as error:
         raise ScratchTrainError(str(error)) from error
     initialization = current_science.learner_initialization()
-    if (
-        science.get("learner_initialization") != initialization
-        or science.get("learner_initialization_sha256")
-        != _value_sha256(initialization)
-    ):
+    if science.get("learner_initialization") != initialization or science.get(
+        "learner_initialization_sha256"
+    ) != _value_sha256(initialization):
         raise ScratchTrainError(
             "coherent lock does not bind the current native scratch initialization"
         )
@@ -198,8 +204,7 @@ def _science_authority(lock: Mapping[str, Any]) -> dict[str, Any]:
         science.get("learner_model_construction") != model
         or science.get("learner_model_construction_sha256") != _value_sha256(model)
         or science.get("learner_execution_topology") != topology
-        or science.get("learner_execution_topology_sha256")
-        != _value_sha256(topology)
+        or science.get("learner_execution_topology_sha256") != _value_sha256(topology)
     ):
         raise ScratchTrainError(
             "coherent lock does not bind current scratch model/topology authority"
@@ -236,10 +241,11 @@ def _scratch_plan_authority(verified: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(source_authority, Mapping):
         raise ScratchTrainError("verified composite has no source authority")
     current_contract = source_authority.get("current_contract")
-    if (
-        not isinstance(current_contract, Mapping)
-        or set(current_contract) != {"path", "file_sha256", "contract_sha256"}
-    ):
+    if not isinstance(current_contract, Mapping) or set(current_contract) != {
+        "path",
+        "file_sha256",
+        "contract_sha256",
+    }:
         raise ScratchTrainError("source authority has no exact staged current contract")
     staged_path = _regular_file(
         Path(str(current_contract["path"])), where="staged current A1 lock"
@@ -249,7 +255,9 @@ def _scratch_plan_authority(verified: Mapping[str, Any]) -> dict[str, Any]:
     try:
         staged_lock = json.loads(staged_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ScratchTrainError(f"cannot read staged current A1 lock: {error}") from error
+        raise ScratchTrainError(
+            f"cannot read staged current A1 lock: {error}"
+        ) from error
     unhashed = dict(staged_lock)
     stated = unhashed.pop("contract_sha256", None)
     if (
@@ -261,7 +269,9 @@ def _scratch_plan_authority(verified: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(science, dict) or any(
         field not in science for field in _SCIENCE_BINDING_FIELDS
     ):
-        raise ScratchTrainError("staged current A1 lock science authority is incomplete")
+        raise ScratchTrainError(
+            "staged current A1 lock science authority is incomplete"
+        )
     science_binding = {field: science[field] for field in _SCIENCE_BINDING_FIELDS}
     descriptor = {
         "path": str(verified["data_path"]),
@@ -276,7 +286,9 @@ def _scratch_plan_authority(verified: Mapping[str, Any]) -> dict[str, Any]:
         or set(build_receipt) != {"path", "file_sha256", "receipt_sha256"}
         or not isinstance(source_ref, dict)
     ):
-        raise ScratchTrainError("composite receipt/source authority binding is incomplete")
+        raise ScratchTrainError(
+            "composite receipt/source authority binding is incomplete"
+        )
     return {
         "schema_version": CHILD_AUTHORITY_SCHEMA,
         "staged_contract": dict(current_contract),
@@ -316,9 +328,7 @@ def _accepted_policy_target_identity(meta: Mapping[str, Any]) -> str:
     for component_id in distillation_ids:
         component = by_id.get(str(component_id))
         corpus_meta = (
-            component.get("corpus_meta")
-            if isinstance(component, Mapping)
-            else None
+            component.get("corpus_meta") if isinstance(component, Mapping) else None
         )
         identity = (
             corpus_meta.get("policy_target_identity_sha256")
@@ -346,12 +356,12 @@ def _accepted_policy_target_identity(meta: Mapping[str, Any]) -> str:
     return next(iter(identities))
 
 
-def verify_inputs(
+def _verify_base_inputs(
     *,
     lock_path: Path,
     data_path: Path,
     composite_build_receipt: Path,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         lock_path = _regular_file(lock_path, where="A1 lock")
         data_path = _regular_file(data_path, where="composite descriptor")
@@ -388,11 +398,42 @@ def verify_inputs(
         SystemExit,
         ValueError,
     ) as error:
-        raise ScratchTrainError(f"scratch input verification failed: {error}") from error
+        raise ScratchTrainError(
+            f"scratch input verification failed: {error}"
+        ) from error
     adapters = set(verified["entity_feature_adapter_component_versions"].values())
     if adapters != {science["initialization"]["entity_feature_adapter_version"]}:
         raise ScratchTrainError("composite adapter semantics differ from scratch model")
-    return {**verified, **science}
+    return {**verified, **science}, meta
+
+
+def verify_inputs(
+    *,
+    lock_path: Path,
+    data_path: Path,
+    composite_build_receipt: Path,
+    policy_target_quality_receipt: Path,
+) -> dict[str, Any]:
+    """Verify scratch inputs and the separate empirical target-quality gate."""
+
+    verified, meta = _verify_base_inputs(
+        lock_path=lock_path,
+        data_path=data_path,
+        composite_build_receipt=composite_build_receipt,
+    )
+    from tools import a1_policy_target_quality_admission as quality
+
+    try:
+        admission = quality.verify_receipt(
+            policy_target_quality_receipt,
+            verified=verified,
+            composite_meta=meta,
+        )
+    except quality.AdmissionError as error:
+        raise ScratchTrainError(
+            f"policy-target quality admission failed: {error}"
+        ) from error
+    return {**verified, "policy_target_quality_admission": admission}
 
 
 def _bind_scratch_training_topology(
@@ -419,13 +460,17 @@ def _bind_scratch_training_topology(
         )
     required_topology = current_science.learner_execution_topology()
     if dict(topology) != required_topology:
-        raise ScratchTrainError("scratch execution topology differs from current science")
+        raise ScratchTrainError(
+            "scratch execution topology differs from current science"
+        )
     if (
         str(topology.get("name")) != "b200-8gpu-ddp"
         or str(topology.get("launcher")) != "torch.distributed.run"
         or list(topology.get("physical_gpus", ())) != list(range(8))
     ):
-        raise ScratchTrainError("scratch execution topology is not exact 8-GPU B200 DDP")
+        raise ScratchTrainError(
+            "scratch execution topology is not exact 8-GPU B200 DDP"
+        )
     effective = dict(verified.get("recipe", bound))
     topology_fields = (
         "world_size",
@@ -456,10 +501,9 @@ def _bind_scratch_training_topology(
         * int(effective["batch_size"])
         * int(effective["grad_accum_steps"])
     )
-    if (
-        realized_global_batch != int(bound["global_batch_size"])
-        or realized_global_batch != int(topology["global_batch_size"])
-    ):
+    if realized_global_batch != int(
+        bound["global_batch_size"]
+    ) or realized_global_batch != int(topology["global_batch_size"]):
         raise ScratchTrainError("scratch topology changes the logical global batch")
     result = dict(verified)
     result.update(
@@ -499,6 +543,31 @@ def build_train_command(
     if not train_bc._is_sha256(accepted_policy_target_identity):  # noqa: SLF001
         raise ScratchTrainError(
             "scratch training requires one verified policy-target identity"
+        )
+    quality_admission = verified.get("policy_target_quality_admission")
+    if (
+        not isinstance(quality_admission, Mapping)
+        or set(quality_admission)
+        != {
+            "path",
+            "file_sha256",
+            "receipt_sha256",
+            "metrics",
+            "identity_sha256",
+        }
+        or not train_bc._is_sha256(  # noqa: SLF001
+            str(quality_admission.get("file_sha256", ""))
+        )
+        or not train_bc._is_sha256(  # noqa: SLF001
+            str(quality_admission.get("receipt_sha256", ""))
+        )
+        or not train_bc._is_sha256(  # noqa: SLF001
+            str(quality_admission.get("identity_sha256", ""))
+        )
+        or quality_admission.get("metrics", {}).get("admitted") is not True
+    ):
+        raise ScratchTrainError(
+            "scratch training requires verified policy-target quality admission"
         )
     model = dict(verified["model_construction"])
     topology = dict(verified["execution_topology"])
@@ -631,14 +700,20 @@ def build_train_command(
         ("aux_subgoal_loss_weight", "--aux-subgoal-loss-weight"),
         ("freeze_modules", "--freeze-modules"),
         ("policy_surprise_weight", "--policy-surprise-weight"),
-        ("target_reliability_confidence_floor", "--target-reliability-confidence-floor"),
+        (
+            "target_reliability_confidence_floor",
+            "--target-reliability-confidence-floor",
+        ),
         ("advantage_policy_weighting", "--advantage-policy-weighting"),
         ("vp_margin_weight", "--vp-margin-weight"),
         ("truncated_vp_margin_value_weight", "--truncated-vp-margin-value-weight"),
         ("amp", "--amp"),
         ("forced_action_weight", "--forced-action-weight"),
         ("forced_row_value_weight", "--forced-row-value-weight"),
-        ("forced_row_value_action_type_weights", "--forced-row-value-action-type-weights"),
+        (
+            "forced_row_value_action_type_weights",
+            "--forced-row-value-action-type-weights",
+        ),
         ("winner_sample_weight", "--winner-sample-weight"),
         ("loser_sample_weight", "--loser-sample-weight"),
         ("teacher_weights", "--teacher-weights"),
@@ -731,7 +806,9 @@ def build_train_command(
         command.append(one_dose.EVENT_HISTORY_CROP_FLAG)
     forbidden = {"--init-checkpoint", "--grow-from-checkpoint", "--resume-optimizer"}
     if forbidden.intersection(command) or "--ddp-shard-data" in command:
-        raise ScratchTrainError("scratch command inherited checkpoint/sharded semantics")
+        raise ScratchTrainError(
+            "scratch command inherited checkpoint/sharded semantics"
+        )
     if command.count("--no-public-card-count-residual-bias") != 1:
         raise ScratchTrainError("scratch command lost bias-free card-count v2")
     one_dose._require_current_production_trainer_authority(  # noqa: SLF001
@@ -767,10 +844,7 @@ def _checkpoint_steps(recipe: Mapping[str, Any]) -> tuple[int, ...]:
         values = tuple(int(token.strip()) for token in raw.split(","))
     except ValueError as error:
         raise ScratchTrainError("scratch checkpoint_steps is malformed") from error
-    if (
-        any(step <= 0 for step in values)
-        or tuple(sorted(set(values))) != values
-    ):
+    if any(step <= 0 for step in values) or tuple(sorted(set(values))) != values:
         raise ScratchTrainError(
             "scratch checkpoint_steps must be unique, positive, and increasing"
         )
@@ -823,9 +897,7 @@ def _completed_outputs(
     terminal = _ref(checkpoint, where="terminal scratch checkpoint")
     report_ref = _ref(report, where="scratch training report")
     epoch_records: list[dict[str, Any]] = []
-    for epoch, epoch_path in enumerate(
-        _epoch_outputs(checkpoint, epochs), start=1
-    ):
+    for epoch, epoch_path in enumerate(_epoch_outputs(checkpoint, epochs), start=1):
         epoch_records.append(
             {
                 "epoch": epoch,
@@ -845,18 +917,24 @@ def _completed_outputs(
     try:
         report_payload = json.loads(report.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ScratchTrainError(f"scratch training report is unreadable: {error}") from error
+        raise ScratchTrainError(
+            f"scratch training report is unreadable: {error}"
+        ) from error
     if int(report_payload.get("epochs", -1)) != int(epochs):
         raise ScratchTrainError("scratch report completed epoch count drift")
     if report_payload.get("checkpoint_steps_requested") != list(checkpoint_steps):
         raise ScratchTrainError("scratch report optimizer-step request drift")
     raw_intermediate = report_payload.get("intermediate_checkpoints")
     if not isinstance(raw_intermediate, list):
-        raise ScratchTrainError("scratch report has no intermediate checkpoint frontier")
+        raise ScratchTrainError(
+            "scratch report has no intermediate checkpoint frontier"
+        )
     by_step: dict[int, Mapping[str, Any]] = {}
     for raw_record in raw_intermediate:
         if not isinstance(raw_record, dict):
-            raise ScratchTrainError("scratch intermediate checkpoint record is malformed")
+            raise ScratchTrainError(
+                "scratch intermediate checkpoint record is malformed"
+            )
         step = raw_record.get("optimizer_step")
         if isinstance(step, bool) or not isinstance(step, int) or step in by_step:
             raise ScratchTrainError("scratch intermediate checkpoint step is malformed")
@@ -876,12 +954,11 @@ def _completed_outputs(
             step_path, where=f"scratch optimizer-step-{step} checkpoint"
         )
         if (
-            Path(str(raw_record.get("checkpoint", ""))).expanduser().resolve(
-                strict=False
-            )
+            Path(str(raw_record.get("checkpoint", "")))
+            .expanduser()
+            .resolve(strict=False)
             != step_path.expanduser().resolve(strict=False)
-            or raw_record.get("checkpoint_sha256")
-            != checkpoint_ref["file_sha256"]
+            or raw_record.get("checkpoint_sha256") != checkpoint_ref["file_sha256"]
             or raw_record.get("same_training_trajectory") is not True
             or raw_record.get("optimizer_sidecar") is not None
         ):
@@ -928,6 +1005,7 @@ def run(
         lock_path=args.lock,
         data_path=args.data,
         composite_build_receipt=args.composite_build_receipt,
+        policy_target_quality_receipt=args.policy_target_quality_receipt,
     )
     command = build_train_command(
         verified, python=python, checkpoint=checkpoint, report=report
@@ -975,6 +1053,7 @@ def run(
                 "validation_split_receipt_sha256"
             ],
         },
+        "policy_target_quality_admission": verified["policy_target_quality_admission"],
         "plan_authority": plan_authority,
         "python": python_authority,
         "trainer_authority": verified["trainer_authority"],
@@ -985,13 +1064,9 @@ def run(
     if not bool(args.go):
         _write_receipt(plan_receipt, base)
         return base
-    plan_payload, plan_ref = _load_matching_plan_receipt(
-        plan_receipt, expected=base
-    )
+    plan_payload, plan_ref = _load_matching_plan_receipt(plan_receipt, expected=base)
     base = {
-        key: value
-        for key, value in plan_payload.items()
-        if key != "receipt_sha256"
+        key: value for key, value in plan_payload.items() if key != "receipt_sha256"
     }
     if not optimization_schedule_authorized:
         raise ScratchTrainError(
@@ -1051,6 +1126,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--data", required=True, type=Path)
     parser.add_argument("--composite-build-receipt", required=True, type=Path)
+    parser.add_argument(
+        "--policy-target-quality-receipt",
+        required=True,
+        type=Path,
+        help=(
+            "Sealed terminal policy-target quality admission required before "
+            "the child may trust curated data quality."
+        ),
+    )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)

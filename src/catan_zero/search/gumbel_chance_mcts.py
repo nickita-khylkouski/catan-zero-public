@@ -803,6 +803,10 @@ class SearchResult:
     root_value: float
     used_full_search: bool
     simulations_used: int
+    # Evaluator value captured at root expansion, before any tree backup.
+    # ``root_value`` is the post-search visit mean and is therefore not an
+    # independent incumbent baseline for measuring search-target quality.
+    root_prior_value: float = field(default=float("nan"), compare=False)
     afterstate_values: dict[int, float] = field(default_factory=dict)
     # Evidence required to construct a belief-level completed-Q target.  These
     # append-only defaults preserve every existing SearchResult constructor.
@@ -1121,14 +1125,13 @@ class GumbelChanceMCTS:
         )
         if math.isclose(applied_temperature, 1.0, rel_tol=0.0, abs_tol=1.0e-12):
             return search_temperature
-        if (
-            math.isclose(search_temperature, 1.0, rel_tol=0.0, abs_tol=1.0e-12)
-            or math.isclose(
-                search_temperature,
-                applied_temperature,
-                rel_tol=0.0,
-                abs_tol=1.0e-12,
-            )
+        if math.isclose(
+            search_temperature, 1.0, rel_tol=0.0, abs_tol=1.0e-12
+        ) or math.isclose(
+            search_temperature,
+            applied_temperature,
+            rel_tol=0.0,
+            abs_tol=1.0e-12,
         ):
             return 1.0
         raise ValueError(
@@ -1409,9 +1412,7 @@ class GumbelChanceMCTS:
             )
         root_color = str(game.current_color())
         root_phase = self._phase_gated_d1_root_phase(game)
-        boundary_value_root_index = int(
-            getattr(self, "_boundary_value_root_index", 0)
-        )
+        boundary_value_root_index = int(getattr(self, "_boundary_value_root_index", 0))
         self._boundary_value_root_index = boundary_value_root_index + 1
 
         if self.config.forced_root_target_mode == "trajectory_only":
@@ -1736,6 +1737,7 @@ class GumbelChanceMCTS:
             root_value=sum(result.root_value for result in results) / count,
             used_full_search=bool(used_full_search),
             simulations_used=sum(result.simulations_used for result in results),
+            root_prior_value=sum(result.root_prior_value for result in results) / count,
             afterstate_values=afterstate_values,
             completed_q_values={
                 action: sum(
@@ -1987,6 +1989,7 @@ class GumbelChanceMCTS:
             root_value=root.value,
             used_full_search=use_full,
             simulations_used=used,
+            root_prior_value=root.prior_value,
             afterstate_values=afterstate_values,
             completed_q_values={
                 int(action): float(value) for action, value in completed_q.items()
@@ -2020,6 +2023,7 @@ class GumbelChanceMCTS:
             root_value=root.value,
             used_full_search=False,
             simulations_used=0,
+            root_prior_value=root.prior_value,
             completed_q_values={action: float(root.prior_value) for action in priors},
             q_values_root_perspective=True,
         )
@@ -2072,6 +2076,7 @@ class GumbelChanceMCTS:
                 root_value=float(max(min(value, 1.0), -1.0)),
                 used_full_search=True,
                 simulations_used=0,
+                root_prior_value=float(max(min(value, 1.0), -1.0)),
                 completed_q_values={action: float(max(min(value, 1.0), -1.0))},
                 q_values_root_perspective=True,
             )
@@ -2096,6 +2101,7 @@ class GumbelChanceMCTS:
             root_value=root_value,
             used_full_search=True,
             simulations_used=0,
+            root_prior_value=float("nan"),
             afterstate_values={action: afterstate_value},
             completed_q_values={action: float(root_value)},
             q_values_root_perspective=True,
@@ -2120,6 +2126,7 @@ class GumbelChanceMCTS:
             root_value=float("nan"),
             used_full_search=False,
             simulations_used=0,
+            root_prior_value=float("nan"),
             afterstate_values={},
             completed_q_values={},
             q_values_root_perspective=True,
@@ -2622,16 +2629,13 @@ class GumbelChanceMCTS:
 
         self._record_boundary_expansion(node)
         seeds = tuple(
-            int(seed)
-            for seed in getattr(self, "_boundary_value_particle_seeds", ())
+            int(seed) for seed in getattr(self, "_boundary_value_particle_seeds", ())
         )
         if len(seeds) <= 1:
             raise RuntimeError(
                 "boundary particle expansion requires at least two pre-drawn seeds"
             )
-        determinize = getattr(
-            node.game, "determinize_from_observer_information", None
-        )
+        determinize = getattr(node.game, "determinize_from_observer_information", None)
         if not callable(determinize):
             raise RuntimeError(
                 "boundary value particles require a native game exposing "
@@ -3794,8 +3798,9 @@ def belief_buy_development_card_outcomes(
             # each public-supported card with the same domain-separated seed,
             # discard only that impossible support, and condition the remaining
             # probabilities instead of aborting the entire paired evaluation.
-            if "no non-terminal hidden allocation can condition on requested dev draw" not in str(
-                error
+            if (
+                "no non-terminal hidden allocation can condition on requested dev draw"
+                not in str(error)
             ):
                 raise
             supported_names: list[str] = []
