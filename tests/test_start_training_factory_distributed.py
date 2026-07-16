@@ -177,7 +177,7 @@ def test_factory_can_replay_the_legacy_raw_scalar_readout(tmp_path: Path) -> Non
     assert command[command.index("--scalar-value-loss-scale") + 1] == "2.0"
 
 
-def test_factory_phase_weights_match_production_prompt_vocabulary(tmp_path: Path) -> None:
+def test_factory_defaults_to_unbiased_phase_mass(tmp_path: Path) -> None:
     result = _dry_run(tmp_path)
 
     assert result.returncode == 0, result.stderr
@@ -215,14 +215,29 @@ def test_factory_phase_weights_match_production_prompt_vocabulary(tmp_path: Path
     value_weights = train_bc.build_value_sample_weights(
         data, phase_weights=configured
     )
-    expected_relative_weights = np.asarray([3.0, 2.0, 2.0, 1.5, 1.0])
+    expected_relative_weights = np.ones(len(phases))
 
+    assert configured == {}
     assert policy_weights / policy_weights[-1] == pytest.approx(
         expected_relative_weights
     )
     assert value_weights / value_weights[-1] == pytest.approx(
         expected_relative_weights
     )
+
+
+def test_factory_accepts_explicit_current_prompt_phase_treatment(
+    tmp_path: Path,
+) -> None:
+    treatment = (
+        "MOVE_ROBBER=3.0,BUILD_INITIAL_SETTLEMENT=2.0,"
+        "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
+    )
+    result = _dry_run(tmp_path, "--phase-weights", treatment)
+
+    assert result.returncode == 0, result.stderr
+    command = _train_command(_manifest(tmp_path))
+    assert command[command.index("--phase-weights") + 1] == treatment
 
 
 def test_factory_accounts_for_gradient_accumulation_in_global_batch(tmp_path: Path) -> None:

@@ -131,13 +131,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--phase-weights",
-        default=(
-            "MOVE_ROBBER=3.0,BUILD_INITIAL_SETTLEMENT=2.0,"
-            "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
-        ),
+        default="",
         help=(
-            "Comma-separated exact current_prompt weights for current production "
-            "teacher shards. Both initial-placement prompts must be named separately."
+            "Optional comma-separated exact current_prompt policy weights. Fresh "
+            "training defaults to the current science contract's unbiased phase "
+            "measure; phase repair must be an explicit causal treatment."
         ),
     )
     parser.add_argument("--winner-sample-weight", type=float, default=1.0)
