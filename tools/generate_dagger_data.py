@@ -362,6 +362,10 @@ def _collect_game(
 
         if not terminated and decisions >= max_decisions:
             truncated = True
+        terminated, truncated = _canonical_episode_status(
+            terminated=bool(terminated),
+            truncated=bool(truncated),
+        )
         winner = _winner_from_rewards(rewards)
         final_public_vps = _final_vps(env, actual=False)
         final_actual_vps = _final_vps(env, actual=True)
@@ -401,6 +405,24 @@ def _effective_value_weight_multiplier(
     terminal value target, so they get their OWN (separately configurable) multiplier instead
     of silently sharing --value-weight-multiplier with completed games."""
     return float(truncated_value_weight if truncated else value_weight_multiplier)
+
+
+def _canonical_episode_status(
+    *,
+    terminated: bool,
+    truncated: bool,
+) -> tuple[bool, bool]:
+    """Give a realized terminal outcome precedence over a simultaneous limit.
+
+    Gym-style environments may report both flags on the action that wins at
+    the turn limit.  DAgger rows carry an exact winner in that case, so marking
+    them truncated would make ``train_bc._value_targets`` discard the clean
+    +/-1 outcome and route the rows through the lower-confidence truncation
+    path instead.
+    """
+
+    terminal = bool(terminated)
+    return terminal, bool(truncated) and not terminal
 
 
 def _row_from_sample(

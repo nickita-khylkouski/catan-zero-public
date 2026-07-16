@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from tools.generate_dagger_data import _effective_value_weight_multiplier
+from tools.generate_dagger_data import (
+    _canonical_episode_status,
+    _effective_value_weight_multiplier,
+)
 
 
 def test_completed_games_use_value_weight_multiplier() -> None:
@@ -31,3 +34,17 @@ def test_effective_value_weight_multiplier_respects_custom_values() -> None:
         value_weight_multiplier=0.7,
         truncated_value_weight=0.3,
     ) == 0.7
+
+
+def test_terminal_outcome_takes_precedence_over_simultaneous_truncation() -> None:
+    assert _canonical_episode_status(terminated=True, truncated=True) == (
+        True,
+        False,
+    )
+
+
+def test_nonterminal_truncation_is_preserved() -> None:
+    assert _canonical_episode_status(terminated=False, truncated=True) == (
+        False,
+        True,
+    )
