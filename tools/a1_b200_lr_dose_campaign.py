@@ -27,10 +27,15 @@ import sys
 import time
 from typing import Any, Mapping, Sequence
 
+from tools import a1_current_science_contract as current_science
+from tools.champion_registry import ChampionRegistry
+
 
 SCHEMA = "a1-b200-lr-dose-campaign-v1"
-SELECTION_SCHEMA = "a1-b200-lr-dose-selection-v2"
+SELECTION_SCHEMA = "a1-b200-lr-dose-selection-v3"
 NATIVE_EVAL_SUMMARY_SCHEMA = "a1-r5-native-eval-summary-v1"
+EVALUATION_MATRIX_SCHEMA = "a1-lr-dose-eval-matrix-v1"
+MIN_SELECTION_PAIRS = 128
 EVALUATION_BASELINE_ROLES = ("f7", "v5")
 SELECTION_OBJECTIVE = (
     "maximize_minimum_baseline_paired_score_regularized_95ci_lower"
@@ -940,6 +945,138 @@ def _metric_from_report_or_row(
     return row_value
 
 
+def _paired_score_metrics(report: Mapping[str, Any], *, where: str) -> dict[str, Any]:
+    games = report.get("games")
+    if not isinstance(games, list) or not games:
+        raise CampaignError(f"{where} has no retained games for metric replay")
+    by_pair: dict[int, list[bool]] = {}
+    game_keys: list[tuple[int, str]] = []
+    for index, game in enumerate(games):
+        if not isinstance(game, Mapping):
+            raise CampaignError(f"{where}.games[{index}] is not an object")
+        pair_id = game.get("pair_id")
+        seed = game.get("game_seed")
+        orientation = game.get("orientation")
+        won = game.get("candidate_won")
+        if (
+            isinstance(pair_id, bool)
+            or not isinstance(pair_id, int)
+            or isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or orientation not in {"candidate_red", "candidate_blue"}
+            or type(won) is not bool  # noqa: E721
+        ):
+            raise CampaignError(f"{where}.games[{index}] has invalid paired identity")
+        by_pair.setdefault(pair_id, []).append(won)
+        game_keys.append((seed, str(orientation)))
+    if any(len(outcomes) != 2 for outcomes in by_pair.values()):
+        raise CampaignError(f"{where} does not retain exactly two games per pair")
+    pair_scores = [sum(outcomes) / 2.0 for _, outcomes in sorted(by_pair.items())]
+    regularized = [0.0, 1.0, *pair_scores]
+    mu = sum(regularized) / len(regularized)
+    variance = sum((score - mu) ** 2 for score in regularized) / len(regularized)
+    se = math.sqrt(variance / len(regularized))
+    interval = [max(0.0, mu - 1.96 * se), min(1.0, mu + 1.96 * se)]
+    counts = {
+        "ww": sum(score == 1.0 for score in pair_scores),
+        "split": sum(score == 0.5 for score in pair_scores),
+        "ll": sum(score == 0.0 for score in pair_scores),
+    }
+    return {
+        "mu": mu,
+        "se": se,
+        "interval": interval,
+        "pair_counts": counts,
+        "game_keys": sorted(game_keys),
+    }
+
+
+def _evaluation_matrix_authority(
+    *,
+    campaign_path: Path,
+    campaign: Mapping[str, Any],
+    evaluation_paths: Mapping[str, Path],
+) -> dict[str, Any]:
+    resolved_summaries = {path.resolve(strict=True) for path in evaluation_paths.values()}
+    if len(resolved_summaries) != 1:
+        raise CampaignError(
+            "LR selection requires one common matrix summary, not per-arm summaries"
+        )
+    summary_path = next(iter(resolved_summaries))
+    summary = _load_json_object(summary_path, where="LR matrix evaluation summary")
+    matrix_path = summary_path.parent / "matrix.json"
+    matrix = _load_json_object(matrix_path, where="LR evaluation matrix")
+    unsigned = dict(matrix)
+    stated = unsigned.pop("state_sha256", None)
+    if (
+        matrix.get("schema_version") != EVALUATION_MATRIX_SCHEMA
+        or stated != _value_sha256(unsigned)
+        or summary.get("matrix_state_sha256") != stated
+    ):
+        raise CampaignError("LR evaluation matrix/summary authority does not replay")
+    training = matrix.get("training_campaign")
+    if (
+        not isinstance(training, Mapping)
+        or Path(str(training.get("path"))).resolve(strict=True) != campaign_path
+        or training.get("file_sha256") != _file_sha256(campaign_path)
+        or training.get("campaign_sha256") != campaign["campaign_sha256"]
+    ):
+        raise CampaignError("LR evaluation matrix binds another training campaign")
+    claim = matrix.get("internal_claim")
+    if (
+        not isinstance(claim, Mapping)
+        or int(claim.get("pairs", -1)) < MIN_SELECTION_PAIRS
+    ):
+        raise CampaignError(
+            f"LR selection requires at least {MIN_SELECTION_PAIRS} paired games per matchup"
+        )
+    rows = matrix.get("matchups")
+    if not isinstance(rows, list):
+        raise CampaignError("LR evaluation matrix has no matchup rows")
+    expected = {(arm, role) for arm in ARMS for role in EVALUATION_BASELINE_ROLES}
+    indexed = {
+        (str(row.get("arm")), str(row.get("baseline"))): row
+        for row in rows
+        if isinstance(row, Mapping)
+    }
+    if set(indexed) != expected:
+        raise CampaignError("LR evaluation matrix does not bind the full A-D x f7/v5 panel")
+    science = current_science.load()
+    if (
+        matrix.get("operator_selection") != science.get("operator_selection")
+        or matrix.get("selected_operator")
+        != science.get("operator_selection", {}).get("selected_operator")
+        or matrix.get("operator_search") != current_science.search()
+        or matrix.get("science_contract_sha256")
+        != _file_sha256(current_science.CONTRACT_PATH)
+    ):
+        raise CampaignError("LR evaluation matrix search-operator authority drifted")
+    f7_sha = campaign["lineage_contract"]["expected_parent_sha256"]
+    if any(indexed[(arm, "f7")].get("baseline_sha256") != f7_sha for arm in ARMS):
+        raise CampaignError("LR evaluation matrix f7 role is not the training parent")
+    v5_hashes = {indexed[(arm, "v5")].get("baseline_sha256") for arm in ARMS}
+    if len(v5_hashes) != 1 or f7_sha in v5_hashes:
+        raise CampaignError("LR evaluation matrix v5 identity is ambiguous or aliases f7")
+    registry_path = _regular_file(
+        Path(str(matrix.get("registry"))), where="LR evaluation registry"
+    )
+    incumbent = ChampionRegistry.load(registry_path).get_role("generator_champion")
+    v5_sha = next(iter(v5_hashes))
+    if (
+        incumbent is None
+        or _file_sha256(Path(incumbent.checkpoint_path).resolve(strict=True)) != v5_sha
+    ):
+        raise CampaignError("LR evaluation matrix v5 is not the registry champion")
+    return {
+        "summary": summary,
+        "summary_path": summary_path,
+        "matrix": matrix,
+        "rows": indexed,
+        "claim": dict(claim),
+        "baseline_sha_by_role": {"f7": f7_sha, "v5": next(iter(v5_hashes))},
+    }
+
+
 def _authenticate_evaluation_row(
     *,
     arm: str,
@@ -947,6 +1084,8 @@ def _authenticate_evaluation_row(
     row: Mapping[str, Any],
     summary_path: Path,
     candidate_sha256: str,
+    authority_row: Mapping[str, Any] | None = None,
+    expected_claim: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     where = f"arm {arm} versus {role}"
     report_path = _report_path_from_row(row, summary_path=summary_path, where=where)
@@ -983,7 +1122,8 @@ def _authenticate_evaluation_row(
     games_truncated = int(report.get("games_truncated", -1))
     games_requested = int(report.get("games_requested", pairs_requested * 2))
     if (
-        pairs_requested <= 0
+        pairs_requested
+        < (MIN_SELECTION_PAIRS if authority_row is not None else 1)
         or complete_pairs != pairs_requested
         or games_requested != pairs_requested * 2
         or games_played != games_requested
@@ -997,6 +1137,45 @@ def _authenticate_evaluation_row(
             f"games={games_with_winner}/{games_requested} "
             f"truncated={games_truncated}"
         )
+    if authority_row is not None:
+        if (
+            authority_row.get("candidate_sha256") != actual_candidate
+            or authority_row.get("baseline_sha256") != baseline_sha256
+        ):
+            raise CampaignError(f"{where} report differs from matrix checkpoint roles")
+        plan_path = _regular_file(Path(str(authority_row.get("plan"))), where=f"{where} plan")
+        plan = _load_json_object(plan_path, where=f"{where} plan")
+        unsigned_plan = dict(plan)
+        stated_plan = unsigned_plan.pop("plan_hash", None)
+        if stated_plan != _value_sha256(unsigned_plan) or stated_plan != authority_row.get(
+            "plan_hash"
+        ):
+            raise CampaignError(f"{where} matrix plan hash does not replay")
+        if (
+            report.get("planned_engine_identity") != plan.get("internal_engine_identity")
+            or report.get("engine_identity") != plan.get("internal_engine_identity")
+            or report.get("evaluation_binding") != plan.get("evaluation_binding")
+        ):
+            raise CampaignError(f"{where} engine/baseline binding differs from its plan")
+    if expected_claim is not None and (
+        int(report.get("base_seed", -1)) != int(expected_claim["base_seed"])
+        or pairs_requested != int(expected_claim["pairs"])
+    ):
+        raise CampaignError(f"{where} seed cohort differs from the matrix claim")
+    merge = report.get("fleet_merge")
+    replay: dict[str, Any] | None = None
+    if authority_row is not None:
+        if (
+            not isinstance(merge, Mapping)
+            or merge.get("schema_version") != "a1-fleet-evaluation-pool-v1"
+            or merge.get("kind") != "internal_h2h"
+            or report.get("comparison_contract")
+            != "paired_same_seed_color_swap_shared_search_operator"
+            or merge.get("effective_search_config_sha256")
+            != _value_sha256(report.get("effective_search_config"))
+        ):
+            raise CampaignError(f"{where} pooled report schema/operator contract drifted")
+        replay = _paired_score_metrics(report, where=where)
     mu = _finite_score(
         _metric_from_report_or_row(
             report,
@@ -1017,6 +1196,25 @@ def _authenticate_evaluation_row(
     )
     if not lower <= mu <= upper:
         raise CampaignError(f"{where} point score lies outside its 95ci")
+    if replay is not None and (
+        not math.isclose(mu, replay["mu"], rel_tol=0.0, abs_tol=1e-12)
+        or not math.isclose(lower, replay["interval"][0], rel_tol=0.0, abs_tol=1e-12)
+        or not math.isclose(upper, replay["interval"][1], rel_tol=0.0, abs_tol=1e-12)
+        or (
+            row.get("paired_score_regularized_se") is not None
+            and not math.isclose(
+                float(row["paired_score_regularized_se"]),
+                replay["se"],
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        )
+        or (
+            row.get("pair_counts") is not None
+            and row.get("pair_counts") != replay["pair_counts"]
+        )
+    ):
+        raise CampaignError(f"{where} paired score metrics do not replay from games")
     return {
         "baseline_role": role,
         "candidate_checkpoint_sha256": actual_candidate,
@@ -1029,6 +1227,17 @@ def _authenticate_evaluation_row(
         "games_truncated": games_truncated,
         "report": str(report_path),
         "report_file_sha256": _file_sha256(report_path),
+        **(
+            {
+                "engine_identity": report.get("engine_identity"),
+                "effective_search_config_sha256": merge[
+                    "effective_search_config_sha256"
+                ],
+                "ordered_game_identity_sha256": _value_sha256(replay["game_keys"]),
+            }
+            if replay is not None
+            else {}
+        ),
     }
 
 
@@ -1036,6 +1245,7 @@ def _rank_authenticated_evaluations(
     *,
     receipt_records: Mapping[str, Mapping[str, Any]],
     evaluation_paths: Mapping[str, Path],
+    matrix_authority: Mapping[str, Any] | None = None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     baseline_sha_by_role: dict[str, str] = {}
     arm_evidence: dict[str, Any] = {}
@@ -1057,6 +1267,14 @@ def _rank_authenticated_evaluations(
                 row=rows[role],
                 summary_path=summary_path,
                 candidate_sha256=candidate_sha,
+                authority_row=(
+                    None
+                    if matrix_authority is None
+                    else matrix_authority["rows"][(arm, role)]
+                ),
+                expected_claim=(
+                    None if matrix_authority is None else matrix_authority["claim"]
+                ),
             )
             baseline = evidence["baseline_checkpoint_sha256"]
             previous = baseline_sha_by_role.setdefault(role, baseline)
@@ -1074,9 +1292,14 @@ def _rank_authenticated_evaluations(
             float(value["paired_score_regularized_mu"])
             for value in comparisons.values()
         )
+        worst_upper = min(
+            float(value["paired_score_regularized_95ci"][1])
+            for value in comparisons.values()
+        )
         record = {
             "arm": arm,
             "robust_worst_baseline_95ci_lower": worst_lower,
+            "robust_worst_baseline_95ci_upper": worst_upper,
             "robust_worst_baseline_point_score": worst_mu,
             "comparisons": comparisons,
         }
@@ -1093,16 +1316,38 @@ def _rank_authenticated_evaluations(
             str(value["arm"]),
         )
     )
-    if len(ranking) < 2 or (
+    if len(ranking) < 2 or float(
         ranking[0]["robust_worst_baseline_95ci_lower"]
-        == ranking[1]["robust_worst_baseline_95ci_lower"]
-        and ranking[0]["robust_worst_baseline_point_score"]
-        == ranking[1]["robust_worst_baseline_point_score"]
+    ) <= max(
+        float(row["robust_worst_baseline_95ci_upper"]) for row in ranking[1:]
     ):
         raise CampaignError(
-            "playing-strength evidence is ambiguous after the declared robust "
-            "primary and secondary objectives"
+            "playing-strength evidence is statistically unresolved: the robust "
+            "winner confidence interval overlaps another arm"
         )
+    if matrix_authority is not None:
+        all_comparisons = [
+            comparison
+            for arm in arm_evidence.values()
+            for comparison in arm["comparisons"].values()
+        ]
+        if len(
+            {
+                comparison["effective_search_config_sha256"]
+                for comparison in all_comparisons
+            }
+        ) != 1:
+            raise CampaignError("LR evaluation reports use different search operators")
+        engine_hashes = {
+            _value_sha256(comparison["engine_identity"])
+            for comparison in all_comparisons
+        }
+        cohort_hashes = {
+            comparison["ordered_game_identity_sha256"]
+            for comparison in all_comparisons
+        }
+        if len(engine_hashes) != 1 or len(cohort_hashes) != 1:
+            raise CampaignError("LR evaluation reports differ in engine or paired cohort")
     return str(ranking[0]["arm"]), ranking, {
         "baseline_checkpoint_sha256_by_role": baseline_sha_by_role,
         "arms": arm_evidence,
@@ -1132,9 +1377,15 @@ def _select(args: argparse.Namespace) -> dict[str, Any]:
             "file_sha256": completed["receipt_file_sha256"],
             "checkpoint_sha256": completed["artifacts"]["checkpoint"]["sha256"],
         }
+    matrix_authority = _evaluation_matrix_authority(
+        campaign_path=campaign_path,
+        campaign=campaign,
+        evaluation_paths=evaluations,
+    )
     winner, ranking, authenticated_evidence = _rank_authenticated_evaluations(
         receipt_records=receipt_records,
         evaluation_paths=evaluations,
+        matrix_authority=matrix_authority,
     )
     _verify_winner_assertion(args.winner, winner)
     selection: dict[str, Any] = {
@@ -1153,6 +1404,10 @@ def _select(args: argparse.Namespace) -> dict[str, Any]:
         },
         "ranking": ranking,
         "authenticated_playing_strength_evidence": authenticated_evidence,
+        "evaluation_matrix": {
+            "path": str(Path(matrix_authority["summary_path"]).parent / "matrix.json"),
+            "state_sha256": matrix_authority["matrix"]["state_sha256"],
+        },
         "winner_recipe": _arm_overrides(
             winner,
             max_steps=LONG_STEPS,

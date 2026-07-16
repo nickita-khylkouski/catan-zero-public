@@ -34,7 +34,7 @@ for _entry in (_SRC_DIR, _REPO_ROOT, _TOOLS_DIR):
 from catan_zero.rl.pipeline_configs import config_from_payload  # noqa: E402
 from factory_common import write_json  # noqa: E402
 
-SCHEMA = "a1-neural-search-strength-decomposition-v1"
+SCHEMA = "a1-neural-search-strength-decomposition-v2"
 RAW_CONTRACT = "paired_same_seed_color_swap_raw_networks"
 SEARCHED_CONTRACT = "paired_same_seed_color_swap_shared_search_operator"
 UPLIFT_CONTRACT = "paired_same_seed_color_swap_candidate_search_vs_own_raw"
@@ -384,12 +384,22 @@ def build_decomposition(
         )
 
     searched_superiority = searched["superiority_verdict"]
+    raw_resolved_nonregression = raw["verdict"] == "H1"
+    uplift_resolved = uplift["verdict"] == "H1"
     raw_regressed = raw["verdict"] == "H0"
     search_uplift_failed = uplift["verdict"] == "H0"
+    search_compensation_risk = (
+        searched_superiority == "H1"
+        and (
+            raw["candidate_win_rate"] < 0.5
+            or uplift["candidate_win_rate"] <= 0.5
+        )
+    )
     ready = (
         searched_superiority == "H1"
-        and not raw_regressed
-        and not search_uplift_failed
+        and raw_resolved_nonregression
+        and uplift_resolved
+        and not search_compensation_risk
     )
     value = {
         "schema_version": SCHEMA,
@@ -421,15 +431,11 @@ def build_decomposition(
         },
         "diagnosis": {
             "searched_checkpoint_superiority_proven": searched_superiority == "H1",
+            "raw_network_nonregression_resolved": raw_resolved_nonregression,
+            "candidate_search_uplift_resolved": uplift_resolved,
             "raw_network_material_regression_detected": raw_regressed,
             "candidate_search_uplift_failure_detected": search_uplift_failed,
-            "search_compensation_risk": (
-                searched_superiority == "H1"
-                and (
-                    raw["candidate_win_rate"] < 0.5
-                    or uplift["candidate_win_rate"] <= 0.5
-                )
-            ),
+            "search_compensation_risk": search_compensation_risk,
         },
         "ready_for_promotion_adjudication": ready,
         "contract_note": (

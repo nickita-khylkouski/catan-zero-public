@@ -44,6 +44,7 @@ def _report(
     verdict: str = "continue",
     superiority_verdict: str = "H1",
     seed: int = 100,
+    candidate_win_rate: float = 0.5,
 ) -> Path:
     config = EvalConfig(
         mode="cross_net",
@@ -89,7 +90,7 @@ def _report(
         "games_played": 2,
         "games_with_winner": 2,
         "complete_pairs": 1,
-        "candidate_win_rate": 0.5,
+        "candidate_win_rate": candidate_win_rate,
         "verdict": verdict,
         "superiority_verdict": superiority_verdict,
     }
@@ -142,8 +143,30 @@ def test_build_decomposition_authenticates_three_matched_panels(
     assert receipt["schema_version"] == decomposition.SCHEMA
     assert receipt["cohort"]["complete_pairs"] == 1
     assert receipt["diagnosis"]["searched_checkpoint_superiority_proven"] is True
-    assert receipt["ready_for_promotion_adjudication"] is True
+    assert receipt["diagnosis"]["raw_network_nonregression_resolved"] is False
+    assert receipt["diagnosis"]["candidate_search_uplift_resolved"] is False
+    assert receipt["ready_for_promotion_adjudication"] is False
     assert receipt["receipt_sha256"].startswith("sha256:")
+
+
+def test_decomposition_is_ready_only_after_raw_and_uplift_resolve(
+    tmp_path: Path,
+) -> None:
+    raw, searched, uplift = _panels(tmp_path)
+    for path in (raw, uplift):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["verdict"] = "H1"
+        payload["candidate_win_rate"] = 0.6
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    receipt = decomposition.build_decomposition(
+        raw_cross=raw,
+        searched_cross=searched,
+        candidate_search_vs_raw=uplift,
+    )
+
+    assert receipt["diagnosis"]["search_compensation_risk"] is False
+    assert receipt["ready_for_promotion_adjudication"] is True
 
 
 def test_decomposition_surfaces_search_compensating_for_worse_raw_network(
@@ -199,6 +222,9 @@ def test_decomposition_authenticates_boundary_value_particle_operator(
     raw, searched, uplift = _panels(tmp_path)
     for path in (raw, searched, uplift):
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if path in (raw, uplift):
+            payload["verdict"] = "H1"
+            payload["candidate_win_rate"] = 0.6
         config = EvalConfig(
             **{
                 **payload["typed_config"]["fields"],

@@ -252,11 +252,20 @@ def _write_matched_quick_screen(
     effective_search_config = {
         "mode": "cross_net",
         "n_full": 128,
+        "n_fast": 128,
+        "candidate_n_full": 128,
+        "baseline_n_full": 128,
         "public_observation": True,
         "information_set_search": True,
         "determinization_particles": 4,
         "symmetry_averaged_eval": True,
     }
+    for key, value in evaluation_binding["authoritative_incumbent"][
+        "search_config"
+    ].items():
+        effective_search_config[key] = value
+        effective_search_config[f"candidate_{key}"] = value
+        effective_search_config[f"baseline_{key}"] = value
     planned_engine_identity = promotion._canonical_internal_h2h_engine_identity()  # noqa: SLF001
     runtime_engine_identity = dict(planned_engine_identity)
     search_configuration = {
@@ -293,6 +302,10 @@ def _write_matched_quick_screen(
         _scores, diagnostics = promotion.pair_scores_from_h2h_games(games)
         report = {
             "evaluation_binding": evaluation_binding,
+            "gate_config": "flywheel",
+            "comparison_contract": (
+                "paired_same_seed_color_swap_shared_search_operator"
+            ),
             "planned_engine_identity": planned_engine_identity,
             "engine_identity": runtime_engine_identity,
             "candidate_checkpoint": checkpoints[step]["path"],
@@ -3085,7 +3098,7 @@ def test_scratch_selection_replays_every_optimizer_step_and_ignores_training_los
     ]
     common_search = {"operator": "sealed"}
 
-    def verify_report(path: Path, *, where: str) -> dict:
+    def verify_report(path: Path, *, where: str, **_kwargs) -> dict:
         del where
         step = int(path.stem.split("-")[-1])
         checkpoint = checkpoint_paths[steps.index(step)]
@@ -3150,6 +3163,48 @@ def test_scratch_selection_replays_every_optimizer_step_and_ignores_training_los
     assert verified["selected_optimizer_step"] == 16
     assert verified["evaluation_baseline"] == _checkpoint_ref(baseline)
     assert promotion.SCRATCH_CHECKPOINT_SELECTION_RULE["training_loss_used"] is False
+
+    intervals, checkpoint_hashes = promotion._verify_prior_cohort_source(  # noqa: SLF001
+        selection_path,
+        expected_candidate_sha256=promotion._sha256(checkpoint_paths[1]),
+        kind="checkpoint_selection",
+        where="scratch selection dry promotion path",
+    )
+    assert intervals == [
+        {
+            "kind": "checkpoint_selection",
+            "base_seed": 1,
+            "end_seed": 3,
+        }
+    ]
+    assert checkpoint_hashes == sorted(
+        promotion._sha256(path) for path in checkpoint_paths
+    )
+    manifest = {
+        "schema_version": promotion.COHORT_EXCLUSIONS_SCHEMA,
+        "contract_sha256": "sha256:" + "9" * 64,
+        "candidate_sha256": promotion._sha256(checkpoint_paths[1]),
+        "cohorts": [
+            {
+                "label": "scratch-epoch-selection",
+                "kind": "checkpoint_selection",
+                "source": _checkpoint_ref(selection_path),
+                "seed_intervals": [{"base_seed": 1, "end_seed": 3}],
+            }
+        ],
+    }
+    manifest["manifest_sha256"] = promotion._digest_value(manifest)
+    manifest_path = tmp_path / "cohort-exclusions.json"
+    _write_json(manifest_path, manifest)
+    dry_run = promotion._verify_cohort_exclusions(  # noqa: SLF001
+        manifest_path,
+        contract_sha256=manifest["contract_sha256"],
+        candidate_sha256=manifest["candidate_sha256"],
+        final_intervals=[
+            {"kind": "internal_h2h", "base_seed": 100, "end_seed": 200}
+        ],
+    )
+    assert dry_run["overlap_count"] == 0
 
 
 def test_select_dose_builder_seals_same_trajectory_choice(tmp_path: Path) -> None:
@@ -3549,6 +3604,41 @@ def test_build_dose_screen_rejects_candidate_checkpoint_hash_drift(
     _write_json(reports[64], changed)
 
     with pytest.raises(promotion.PromotionError, match="checkpoint bytes drifted"):
+        promotion.create_matched_quick_screen(
+            step64_report_path=reports[64],
+            step96_report_path=reports[96],
+            step128_report_path=reports[128],
+            output_path=tmp_path / "operator-screen.json",
+        )
+
+
+def test_build_dose_screen_rejects_unmatched_role_operator(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _receipt, modern = _modernize_one_dose_receipt(
+        fixture, world_size=8, with_intermediate=True
+    )
+    fixture_screen = tmp_path / "fixture-screen.json"
+    fixture_payload = _write_matched_quick_screen(
+        fixture_screen,
+        intermediate=modern["intermediate"],
+        terminal=fixture["candidate"],
+        baseline=fixture["champion"],
+        evaluation_binding=fixture["evaluation_binding"],
+        points_by_step={64: 120.0, 96: 121.0, 128: 123.0},
+    )
+    reports = {
+        result["optimizer_step"]: Path(result["evaluation_report"]["path"])
+        for result in fixture_payload["results"]
+    }
+    changed = json.loads(reports[64].read_text(encoding="utf-8"))
+    changed["comparison_contract"] = (
+        "paired_same_seed_color_swap_role_specific_search_operators"
+    )
+    _write_json(reports[64], changed)
+
+    with pytest.raises(promotion.PromotionError, match="one matched search operator"):
         promotion.create_matched_quick_screen(
             step64_report_path=reports[64],
             step96_report_path=reports[96],
@@ -4539,6 +4629,24 @@ def test_calibration_non_regression_rejects_present_slice_cohort_mismatch() -> N
     del candidate["slices"]["by_phase:opening_placement"]
 
     with pytest.raises(promotion.PromotionError, match="slice cohort differs"):
+        promotion._verify_calibration_non_regression(  # noqa: SLF001
+            _calibration_non_regression_policy(),
+            expected_readout="scalar",
+            candidate_metrics=candidate,
+            champion_metrics=champion,
+        )
+
+
+@pytest.mark.parametrize("field", promotion.REQUIRED_CALIBRATION_SLICES)
+def test_calibration_non_regression_rejects_absent_critical_slice(
+    field: str,
+) -> None:
+    candidate = _deployed_value_metrics()
+    champion = _deployed_value_metrics()
+    del candidate["slices"][field]
+    del champion["slices"][field]
+
+    with pytest.raises(promotion.PromotionError, match="required slice is absent"):
         promotion._verify_calibration_non_regression(  # noqa: SLF001
             _calibration_non_regression_policy(),
             expected_readout="scalar",

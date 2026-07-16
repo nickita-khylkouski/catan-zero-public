@@ -172,10 +172,13 @@ HISTORICAL_MARKERLESS_A1_CONTRACT = {
 MAX_CALIBRATION_RMSE_REGRESSION = 0.02
 MAX_CALIBRATION_SLICE_RMSE_REGRESSION = 0.02
 MIN_CALIBRATION_SLICE_ROWS = 30
-REQUIRED_CALIBRATION_SLICES_IF_PRESENT = (
+REQUIRED_CALIBRATION_SLICES = (
     "by_phase:opening_placement",
     "by_legal_count_bucket:41+",
     "by_phase:robber",
+)
+REQUIRED_CALIBRATION_SLICES_IF_PRESENT = (
+    *REQUIRED_CALIBRATION_SLICES,
     # Forward-compatible aliases for a finer phase vocabulary.  The current
     # v2 artifact pools ROLL/END_TURN into play_turn, but a future producer
     # that exposes either boundary must make it load-bearing immediately.
@@ -1938,6 +1941,7 @@ def _verify_matched_quick_screen_report(
     path: Path,
     *,
     where: str,
+    expected_search_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replay one canonical pooled internal-H2H report used for dose selection."""
 
@@ -2042,6 +2046,29 @@ def _verify_matched_quick_screen_report(
     )
     if effective_search_sha256 != _digest_value(effective_search_config):
         raise PromotionError(f"{where} effective search configuration digest drifted")
+    if payload.get("gate_config") != "flywheel":
+        raise PromotionError(f"{where} is not a flywheel checkpoint screen")
+    if (
+        payload.get("comparison_contract")
+        != "paired_same_seed_color_swap_shared_search_operator"
+    ):
+        raise PromotionError(
+            f"{where} does not use one matched search operator for both roles"
+        )
+    if expected_search_config is not None:
+        for key, expected in expected_search_config.items():
+            candidate_value = effective_search_config.get(
+                f"candidate_{key}", effective_search_config.get(key)
+            )
+            baseline_value = effective_search_config.get(
+                f"baseline_{key}", effective_search_config.get(key)
+            )
+            if candidate_value != expected or baseline_value != expected:
+                raise PromotionError(
+                    f"{where} checkpoint-screen deployment operator drift: "
+                    f"{key} candidate={candidate_value!r} "
+                    f"baseline={baseline_value!r} expected={expected!r}"
+                )
     if payload.get("search_rng_contract") != INTERNAL_H2H_SEARCH_RNG_CONTRACT:
         raise PromotionError(f"{where} internal search RNG contract drifted")
     search_configuration = {
@@ -2072,6 +2099,10 @@ def _verify_matched_quick_screen_report(
         or payload.get("errors") != []
     ):
         raise PromotionError(f"{where} headline game counts do not replay")
+    if payload.get("complete_pairs", 0) < 64:
+        raise PromotionError(
+            f"{where} checkpoint screen has fewer than 64 complete pairs"
+        )
     ordered_game_keys: list[dict[str, Any]] = []
     normalized_games: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
@@ -2179,6 +2210,7 @@ def _verify_matched_quick_screen(
     *,
     checkpoint_refs: Mapping[int, Mapping[str, Any]],
     expected_training_parent_sha256: str | None = None,
+    expected_search_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Replay the typed common-random-number dose screen and select its dose.
 
@@ -2363,6 +2395,7 @@ def _verify_matched_quick_screen(
         report = _verify_matched_quick_screen_report(
             report_path,
             where=f"matched quick-screen step {step} evaluation report",
+            expected_search_config=expected_search_config,
         )
         if (
             result["checkpoint_sha256"] != verified_checkpoints[step]["sha256"]
@@ -2453,6 +2486,7 @@ def _verify_scratch_checkpoint_selection(
     training_report_path: Path,
     candidate_path: Path,
     candidate_sha256: str,
+    contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = _canonical_existing_file(path, where="scratch checkpoint selection")
     if _sha256(path) != expected_file_sha256:
@@ -2555,6 +2589,9 @@ def _verify_scratch_checkpoint_selection(
         report = _verify_matched_quick_screen_report(
             report_path,
             where=f"scratch optimizer-step-{expected_step} evaluation report",
+            expected_search_config=(
+                None if contract is None else _candidate_search_config(dict(contract))
+            ),
         )
         expected_checkpoint = {
             "path": frontier_record["checkpoint"]["path"],
@@ -2641,6 +2678,7 @@ def _verify_same_trajectory_checkpoint_selection(
     training_report_sha256: str,
     candidate_path: Path,
     candidate_sha256: str,
+    contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind an explicit 64/96/128 choice to one fresh-Adam trajectory.
 
@@ -2777,6 +2815,9 @@ def _verify_same_trajectory_checkpoint_selection(
         screen_path,
         checkpoint_refs=checkpoint_refs,
         expected_training_parent_sha256=training_parent_sha256,
+        expected_search_config=(
+            None if contract is None else _candidate_search_config(dict(contract))
+        ),
     )
     if raw_training_parent != screen["training_parent"]:
         raise PromotionError("checkpoint selection and screen bind different parents")
@@ -3339,6 +3380,7 @@ def _verify_one_dose_training_receipt(
             training_report_path=training_report_path,
             candidate_path=candidate_path,
             candidate_sha256=candidate_sha256,
+            contract=contract,
         )
         return {**scratch_receipt, "checkpoint_selection": selection}
     _require_training_receipt_initialization_authority(contract)
@@ -4309,6 +4351,7 @@ def _verify_one_dose_training_receipt(
             training_report_sha256=training_report_sha256,
             candidate_path=candidate_path,
             candidate_sha256=candidate_sha256,
+            contract=contract,
         )
 
     claim_path = _canonical_existing_file(
@@ -5832,6 +5875,10 @@ def _verify_calibration_non_regression(
         candidate_slice = candidate_slices.get(slice_ref)
         champion_slice = champion_slices.get(slice_ref)
         if candidate_slice is None and champion_slice is None:
+            if slice_ref in REQUIRED_CALIBRATION_SLICES:
+                raise PromotionError(
+                    f"mechanism calibration required slice is absent for {slice_ref}"
+                )
             continue
         if not isinstance(candidate_slice, dict) or not isinstance(
             champion_slice, dict
@@ -8804,6 +8851,112 @@ def _verify_prior_cohort_source(
     """Recompute a prior cohort from its authenticated candidate-bound report."""
 
     payload = _load_json(source_path)
+    if payload.get("schema_version") == SCRATCH_CHECKPOINT_SELECTION_SCHEMA:
+        unsigned = _require_exact_keys(
+            payload,
+            {
+                "schema_version",
+                "training_receipt",
+                "training_report",
+                "optimizer_step_frontier_sha256",
+                "eligible_optimizer_steps",
+                "evaluation_reports",
+                "selected_optimizer_step",
+                "selected_checkpoint",
+                "selection_rule",
+                "matched_common_random_numbers",
+                "full_gate_requires_disjoint_cohort",
+                "selection_sha256",
+            },
+            where=where,
+        )
+        declared = _validate_sha256(
+            unsigned["selection_sha256"], where=f"{where}.selection_sha256"
+        )
+        semantic = dict(unsigned)
+        semantic.pop("selection_sha256")
+        if declared != _digest_value(semantic):
+            raise PromotionError(f"{where} scratch selection digest mismatch")
+        if (
+            unsigned["selection_rule"] != SCRATCH_CHECKPOINT_SELECTION_RULE
+            or unsigned["matched_common_random_numbers"] is not True
+            or unsigned["full_gate_requires_disjoint_cohort"] is not True
+        ):
+            raise PromotionError(f"{where} scratch selection policy drifted")
+        _validate_sha256(
+            unsigned["optimizer_step_frontier_sha256"],
+            where=f"{where}.optimizer_step_frontier_sha256",
+        )
+        steps = unsigned["eligible_optimizer_steps"]
+        reports = unsigned["evaluation_reports"]
+        if (
+            not isinstance(steps, list)
+            or not steps
+            or any(
+                isinstance(step, bool) or not isinstance(step, int) or step <= 0
+                for step in steps
+            )
+            or steps != sorted(set(steps))
+            or not isinstance(reports, list)
+            or len(reports) != len(steps)
+        ):
+            raise PromotionError(
+                f"{where} scratch optimizer-step frontier is malformed"
+            )
+        common_keys: list[dict[str, Any]] | None = None
+        common_baseline: dict[str, str] | None = None
+        common_search: dict[str, Any] | None = None
+        half_points: dict[int, int] = {}
+        checkpoint_hashes: dict[int, str] = {}
+        for step, raw_report in zip(steps, reports, strict=True):
+            record = _require_exact_keys(
+                raw_report,
+                {"optimizer_step", "evaluation_report"},
+                where=f"{where}.evaluation_reports[{step}]",
+            )
+            if record["optimizer_step"] != step:
+                raise PromotionError(f"{where} scratch evaluation order drifted")
+            report_path, _report_ref = _validate_file_ref(
+                record["evaluation_report"],
+                base=source_path.parent,
+                where=f"{where} optimizer-step-{step} report",
+            )
+            report = _verify_matched_quick_screen_report(
+                report_path, where=f"{where} optimizer-step-{step} report"
+            )
+            if common_keys is None:
+                common_keys = report["ordered_game_keys"]
+                common_baseline = report["baseline_checkpoint"]
+                common_search = report["search_configuration"]
+            elif (
+                report["ordered_game_keys"] != common_keys
+                or report["baseline_checkpoint"] != common_baseline
+                or report["search_configuration"] != common_search
+            ):
+                raise PromotionError(
+                    f"{where} scratch reports do not share baseline/games/search"
+                )
+            half_points[step] = report["candidate_half_points"]
+            checkpoint_hashes[step] = report["candidate_checkpoint"]["sha256"]
+        selected_step = _select_scratch_optimizer_step(half_points)
+        selected = _require_exact_keys(
+            unsigned["selected_checkpoint"],
+            {"path", "sha256"},
+            where=f"{where}.selected_checkpoint",
+        )
+        if (
+            unsigned["selected_optimizer_step"] != selected_step
+            or selected["sha256"] != checkpoint_hashes[selected_step]
+            or selected["sha256"] != expected_candidate_sha256
+        ):
+            raise PromotionError(f"{where} scratch selected candidate drifted")
+        assert common_keys is not None
+        seeds = {key["game_seed"] for key in common_keys}
+        return (
+            _contiguous_seed_intervals(seeds, kind=kind, where=where),
+            sorted(checkpoint_hashes.values()),
+        )
+
     if payload.get("schema_version") == MATCHED_QUICK_SCREEN_SCHEMA:
         raw_checkpoints = payload.get("checkpoints")
         if not isinstance(raw_checkpoints, list):

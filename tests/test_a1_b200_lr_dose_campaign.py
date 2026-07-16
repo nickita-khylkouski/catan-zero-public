@@ -63,6 +63,135 @@ def _write_native_eval(
     return summary
 
 
+def _write_matrix_authority(
+    root: Path,
+    *,
+    pairs: int = campaign.MIN_SELECTION_PAIRS,
+    f7_sha: str = "sha256:" + "7" * 64,
+) -> tuple[Path, dict, dict[str, Path]]:
+    campaign_path = root / "campaign.json"
+    campaign_payload = {
+        "campaign_sha256": "sha256:" + "c" * 64,
+        "lineage_contract": {"expected_parent_sha256": f7_sha},
+    }
+    v5 = root / "v5.pt"
+    v5.write_bytes(b"v5")
+    v5_sha = campaign._file_sha256(v5)  # noqa: SLF001
+    science_contract = root / "science.json"
+    science_contract.write_text("{}\n", encoding="utf-8")
+    operator_selection = {
+        "status": "adopted_teacher_campaign",
+        "selected_operator": "base_n128_d6",
+    }
+    operator_search = {"n_full": 128}
+    campaign_path.write_text(json.dumps(campaign_payload), encoding="utf-8")
+    rows = [
+        {
+            "arm": arm,
+            "baseline": role,
+            "candidate_sha256": "sha256:" + arm.lower() * 64,
+            "baseline_sha256": f7_sha if role == "f7" else v5_sha,
+        }
+        for arm in campaign.ARMS
+        for role in campaign.EVALUATION_BASELINE_ROLES
+    ]
+    matrix = {
+        "schema_version": campaign.EVALUATION_MATRIX_SCHEMA,
+        "training_campaign": {
+            "path": str(campaign_path),
+            "file_sha256": campaign._file_sha256(campaign_path),  # noqa: SLF001
+            "campaign_sha256": campaign_payload["campaign_sha256"],
+        },
+        "internal_claim": {"base_seed": 1000, "pairs": pairs},
+        "matchups": rows,
+        "registry": str(root / "registry.json"),
+        "operator_selection": operator_selection,
+        "selected_operator": operator_selection["selected_operator"],
+        "operator_search": operator_search,
+        "science_contract_sha256": campaign._file_sha256(  # noqa: SLF001
+            science_contract
+        ),
+    }
+    (root / "registry.json").write_text("{}\n", encoding="utf-8")
+    matrix["state_sha256"] = campaign._value_sha256(matrix)  # noqa: SLF001
+    (root / "matrix.json").write_text(json.dumps(matrix), encoding="utf-8")
+    summary = root / "summary.json"
+    summary.write_text(
+        json.dumps(
+            {
+                "schema_version": campaign.NATIVE_EVAL_SUMMARY_SCHEMA,
+                "matrix_state_sha256": matrix["state_sha256"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    campaign_payload["_test_authority"] = {
+        "v5": str(v5),
+        "operator_selection": operator_selection,
+        "operator_search": operator_search,
+        "science_contract": str(science_contract),
+    }
+    return (
+        campaign_path,
+        campaign_payload,
+        {arm: summary for arm in campaign.ARMS},
+    )
+
+
+def test_lr_selector_matrix_authority_binds_f7_v5_and_minimum_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign_path, payload, evaluations = _write_matrix_authority(tmp_path)
+    authority_fixture = payload.pop("_test_authority")
+
+    class _Registry:
+        def get_role(self, role: str):
+            assert role == "generator_champion"
+            return type("Pointer", (), {"checkpoint_path": authority_fixture["v5"]})()
+
+    monkeypatch.setattr(campaign.ChampionRegistry, "load", lambda _path: _Registry())
+    monkeypatch.setattr(
+        campaign.current_science,
+        "load",
+        lambda: {"operator_selection": authority_fixture["operator_selection"]},
+    )
+    monkeypatch.setattr(
+        campaign.current_science,
+        "search",
+        lambda: authority_fixture["operator_search"],
+    )
+    monkeypatch.setattr(
+        campaign.current_science,
+        "CONTRACT_PATH",
+        Path(authority_fixture["science_contract"]),
+    )
+
+    authority = campaign._evaluation_matrix_authority(  # noqa: SLF001
+        campaign_path=campaign_path,
+        campaign=payload,
+        evaluation_paths=evaluations,
+    )
+
+    assert authority["baseline_sha_by_role"] == {
+        "f7": payload["lineage_contract"]["expected_parent_sha256"],
+        "v5": campaign._file_sha256(Path(authority_fixture["v5"])),  # noqa: SLF001
+    }
+    assert authority["claim"]["pairs"] == campaign.MIN_SELECTION_PAIRS
+
+    too_small = tmp_path / "too-small"
+    too_small.mkdir()
+    campaign_path, payload, evaluations = _write_matrix_authority(
+        too_small, pairs=campaign.MIN_SELECTION_PAIRS - 1
+    )
+    payload.pop("_test_authority")
+    with pytest.raises(campaign.CampaignError, match="at least"):
+        campaign._evaluation_matrix_authority(  # noqa: SLF001
+            campaign_path=campaign_path,
+            campaign=payload,
+            evaluation_paths=evaluations,
+        )
+
+
 def test_robust_selector_rejects_f7_only_ranking_reversal(tmp_path: Path) -> None:
     baseline_shas = {
         "f7": "sha256:" + "7" * 64,
@@ -75,10 +204,10 @@ def test_robust_selector_rejects_f7_only_ranking_reversal(tmp_path: Path) -> Non
     # B is the tempting f7-only winner but collapses against v5. C has the
     # strongest worst-baseline lower bound and must win the robust objective.
     scores = {
-        "A": ((0.55, 0.50, 0.60), (0.51, 0.46, 0.56)),
-        "B": ((0.65, 0.60, 0.70), (0.42, 0.37, 0.47)),
-        "C": ((0.58, 0.53, 0.63), (0.57, 0.52, 0.62)),
-        "D": ((0.54, 0.49, 0.59), (0.53, 0.48, 0.58)),
+        "A": ((0.55, 0.50, 0.60), (0.36, 0.34, 0.38)),
+        "B": ((0.65, 0.60, 0.70), (0.26, 0.24, 0.28)),
+        "C": ((0.68, 0.66, 0.70), (0.64, 0.62, 0.66)),
+        "D": ((0.54, 0.49, 0.59), (0.46, 0.44, 0.48)),
     }
     evaluations = {
         arm: _write_native_eval(
@@ -104,7 +233,7 @@ def test_robust_selector_rejects_f7_only_ranking_reversal(tmp_path: Path) -> Non
     assert winner == "C"
     assert [row["arm"] for row in ranking] == ["C", "D", "A", "B"]
     assert evidence["baseline_checkpoint_sha256_by_role"] == baseline_shas
-    assert evidence["arms"]["B"]["robust_worst_baseline_95ci_lower"] == 0.37
+    assert evidence["arms"]["B"]["robust_worst_baseline_95ci_lower"] == 0.24
 
 
 def test_robust_selector_accepts_real_flat_matchup_summary_shape(
@@ -121,7 +250,7 @@ def test_robust_selector_accepts_real_flat_matchup_summary_shape(
     rows = []
     for arm_index, arm in enumerate(campaign.ARMS):
         for role, base_mu in (("f7", 0.55), ("v5", 0.54)):
-            mu = base_mu - 0.01 * arm_index
+            mu = base_mu - 0.02 * arm_index
             report = tmp_path / f"{arm}-{role}.pooled.json"
             report.write_text(
                 json.dumps(
@@ -129,7 +258,7 @@ def test_robust_selector_accepts_real_flat_matchup_summary_shape(
                         "candidate_checkpoint_sha256": candidate_shas[arm],
                         "baseline_checkpoint_sha256": baseline_shas[role],
                         "paired_score_regularized_mu": mu,
-                        "paired_score_regularized_95ci": [mu - 0.05, mu + 0.05],
+                        "paired_score_regularized_95ci": [mu - 0.005, mu + 0.005],
                         "pairs_requested": 128,
                         "complete_pairs": 128,
                         "games_played": 256,
@@ -145,7 +274,7 @@ def test_robust_selector_accepts_real_flat_matchup_summary_shape(
                 {
                     "matchup": f"{arm.lower()}-vs-{role}",
                     "paired_score_regularized_mu": mu,
-                    "paired_score_regularized_95ci": [mu - 0.05, mu + 0.05],
+                    "paired_score_regularized_95ci": [mu - 0.005, mu + 0.005],
                     "report": str(report),
                 }
             )
@@ -239,7 +368,7 @@ def test_robust_selector_refuses_unresolved_top_tie(tmp_path: Path) -> None:
             v5=(0.58, 0.53, 0.63) if tied_top else (0.49, 0.44, 0.54),
             baseline_shas=baseline_shas,
         )
-    with pytest.raises(campaign.CampaignError, match="ambiguous"):
+    with pytest.raises(campaign.CampaignError, match="statistically unresolved"):
         campaign._rank_authenticated_evaluations(
             receipt_records={
                 arm: {"checkpoint_sha256": candidate_shas[arm]}
