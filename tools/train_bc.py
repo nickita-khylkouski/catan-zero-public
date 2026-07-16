@@ -16439,24 +16439,29 @@ def main(
                 else:
                     epoch_extra_sums[key] += float(batch_metrics.get(key, 0.0)) * len(batch)
                     epoch_extra_denominators[key] += float(len(batch))
-            if int(args.policy_aux_active_batch_size) > 0:
-                for key in ("policy_base_loss", "policy_aux_loss"):
-                    weighted_sum_key = f"{key}_weighted_sum"
-                    weight_sum_key = f"{key}_weight_sum"
-                    if (
-                        weighted_sum_key not in batch_metrics
-                        or weight_sum_key not in batch_metrics
-                    ):
-                        raise RuntimeError(
-                            "policy AUX training batch omitted independent "
-                            f"{key} sufficient statistics"
-                        )
-                    epoch_extra_sums[key] += float(
-                        batch_metrics[weighted_sum_key]
+            # Base and AUX policy streams expose independent sufficient
+            # statistics even when the optional AUX sampler is disabled.  Dose
+            # checkpoints always reconcile the base stream against its
+            # effective policy weight, so gating this accumulation on
+            # policy_aux_active_batch_size produced a false zero denominator
+            # for ordinary direct-policy training.
+            for key in ("policy_base_loss", "policy_aux_loss"):
+                weighted_sum_key = f"{key}_weighted_sum"
+                weight_sum_key = f"{key}_weight_sum"
+                if (
+                    weighted_sum_key not in batch_metrics
+                    or weight_sum_key not in batch_metrics
+                ):
+                    raise RuntimeError(
+                        "policy training batch omitted independent "
+                        f"{key} sufficient statistics"
                     )
-                    epoch_extra_denominators[key] += float(
-                        batch_metrics[weight_sum_key]
-                    )
+                epoch_extra_sums[key] += float(
+                    batch_metrics[weighted_sum_key]
+                )
+                epoch_extra_denominators[key] += float(
+                    batch_metrics[weight_sum_key]
+                )
             for field, parts in batch_metrics.get(
                 "aux_subgoal_loss_parts", {}
             ).items():
