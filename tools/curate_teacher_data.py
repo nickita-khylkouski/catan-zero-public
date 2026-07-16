@@ -7,16 +7,61 @@ import json
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
+
+from catan_zero.rl.action_mask import ActionCatalog
 
 from factory_common import write_json
 
 
-IMPORTANT_PHASES = {"initial_build", "main_turn", "robber", "discard"}
+# ``phase`` is the engine's public ``current_prompt`` in current teacher shards.
+# Keep the old aliases because legacy teacher data used the coarser lowercase
+# names, but never make production labels pass through the legacy spelling
+# accidentally.  In particular, a forced ROLL row has phase=PLAY_TURN; ROLL is
+# an action type, not a prompt, and is handled separately below.
+IMPORTANT_PHASES = frozenset(
+    {
+        "BUILD_INITIAL_ROAD",
+        "BUILD_INITIAL_SETTLEMENT",
+        "DISCARD",
+        "MOVE_ROBBER",
+        "PLAY_TURN",
+        "INITIAL_BUILD",
+        "MAIN_TURN",
+        "ROBBER",
+    }
+)
 PLAYER_NAMES = ("BLUE", "RED", "ORANGE", "WHITE")
 TARGET_INFORMATION_REGIME_UNKNOWN = "unknown"
+
+
+def _action_ids_for_type(action_type: str) -> frozenset[int]:
+    """Resolve stable flat-catalog ids instead of guessing from ``phase``."""
+
+    catalog = ActionCatalog(PLAYER_NAMES[:2])
+    ids = frozenset(
+        index
+        for index in range(catalog.size)
+        if catalog.describe(index)["action_type"] == action_type
+    )
+    if len(ids) != 1:
+        raise RuntimeError(
+            f"flat action catalog must have exactly one {action_type} id; got "
+            f"{sorted(ids)}"
+        )
+    return ids
+
+
+ROLL_ACTION_IDS = _action_ids_for_type("ROLL")
+
+
+def _roll_row_mask(action: np.ndarray, phases: np.ndarray) -> np.ndarray:
+    """Identify ROLL by action id, retaining only the explicit legacy alias."""
+
+    normalized_phases = np.char.upper(np.asarray(phases).astype(str))
+    return np.isin(action, tuple(ROLL_ACTION_IDS)) | (normalized_phases == "ROLL")
 KEYS = (
     "obs",
     "legal_action_ids",
@@ -790,8 +835,14 @@ def _curate_shard_mask(
     else:
         teacher_drop = np.zeros(n, dtype=np.bool_)
 
-    roll_drop = (phases == "roll") & (rng.random(n) > float(roll_keep_prob))
-    important = np.isin(phases, tuple(IMPORTANT_PHASES))
+    # Current shards label a ROLL decision with the public prompt PLAY_TURN.
+    # The former ``phases == 'roll'`` predicate therefore selected zero rows
+    # and made --roll-keep-prob a silent no-op.  Retain the legacy phase alias,
+    # but use the recorded action id for the production schema.
+    normalized_phases = np.char.upper(phases)
+    is_roll = _roll_row_mask(action, phases)
+    roll_drop = is_roll & (rng.random(n) > float(roll_keep_prob))
+    important = np.isin(normalized_phases, tuple(IMPORTANT_PHASES))
     protect_forced = important & (not bool(drop_forced_in_important_phases))
     forced_drop = (
         (legal_counts <= 1)
@@ -853,7 +904,7 @@ def _curate_shard_mask(
         "kept_policy_weight_positive": int(np.sum(kept_policy_positive)),
         "kept_value_weight_positive": int(np.sum(kept_value_positive)),
         "kept_policy_effective_forced": int(np.sum(kept_policy_positive & (legal_counts <= 1))),
-        "kept_policy_effective_roll": int(np.sum(kept_policy_positive & (phases == "roll"))),
+        "kept_policy_effective_roll": int(np.sum(kept_policy_positive & is_roll)),
         "kept_value_only_samples": int(np.sum(kept & (policy_weight_multiplier <= 0.0) & (value_weight_multiplier > 0.0))),
     }, policy_weight_multiplier, value_weight_multiplier
 
@@ -954,6 +1005,8 @@ def _subtract_dropped_duplicates(
     score_sources = np.asarray(shard.get("target_score_source", np.full(n, "", dtype="<U1"))).astype(str)
     score_source_labels = np.where(score_sources == "", "none", score_sources)
     phases = np.asarray(shard.get("phase", np.full(n, "", dtype="<U1"))).astype(str)
+    action = np.asarray(shard["action_taken"], dtype=np.int16)
+    is_roll = _roll_row_mask(action, phases)
     phase_labels = np.where(phases == "", "unknown", phases)
     legal = np.asarray(shard["legal_action_ids"], dtype=np.int16)
     legal_counts = np.sum(legal >= 0, axis=1)
@@ -991,7 +1044,9 @@ def _subtract_dropped_duplicates(
     out["kept_policy_weight_positive"] = int(np.sum(kept & (policy_weight > 0.0)))
     out["kept_value_weight_positive"] = int(np.sum(kept & (value_weight > 0.0)))
     out["kept_policy_effective_forced"] = int(np.sum(kept & (policy_weight > 0.0) & (legal_counts <= 1)))
-    out["kept_policy_effective_roll"] = int(np.sum(kept & (policy_weight > 0.0) & (phases == "roll")))
+    out["kept_policy_effective_roll"] = int(
+        np.sum(kept & (policy_weight > 0.0) & is_roll)
+    )
     out["kept_value_only_samples"] = int(
         np.sum(
             kept
