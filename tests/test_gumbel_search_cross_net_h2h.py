@@ -101,6 +101,8 @@ def test_direct_cli_help_resolves_replay_contract_sibling_import() -> None:
     assert "--evaluator-rust-featurize" in completed.stdout
     assert "--engine-repo-commit" in completed.stdout
     assert "--native-wheel-path" in completed.stdout
+    assert "--candidate-raw-policy-above-width" in completed.stdout
+    assert "--baseline-raw-policy-above-width" in completed.stdout
 
 
 def test_archived_state_reconstruction_binding_is_explicit_base_replay() -> None:
