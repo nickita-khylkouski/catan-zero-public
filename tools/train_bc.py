@@ -16300,6 +16300,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             _save_training_progress_sidecar(
                 str(epoch_path),
                 optimizer_saved=optimizer_saved,
+                checkpoint_role="resumable_epoch",
                 optimizer_step=global_step,
                 completed_epochs=epoch + 1,
                 recipe_identity=resume_recipe_identity,
@@ -16480,6 +16481,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     _save_training_progress_sidecar(
         args.checkpoint,
         optimizer_saved=optimizer_saved,
+        checkpoint_role="terminal_admitted",
         optimizer_step=global_step,
         completed_epochs=start_epoch + len(metrics),
         recipe_identity=resume_recipe_identity,
@@ -36016,6 +36018,7 @@ def _save_training_progress_sidecar(
     checkpoint_path: str,
     *,
     optimizer_saved,
+    checkpoint_role: str,
     optimizer_step: int,
     completed_epochs: int,
     recipe_identity: dict[str, object],
@@ -36029,6 +36032,8 @@ def _save_training_progress_sidecar(
 ) -> None:
     """Write the checkpoint-set commit marker on rank 0 after optimizer save."""
     from catan_zero.rl.optim_state import (
+        RESUMABLE_EPOCH_CHECKPOINT_ROLE,
+        TERMINAL_ADMITTED_CHECKPOINT_ROLE,
         TrainingProgressError,
         save_training_progress,
     )
@@ -36085,6 +36090,13 @@ def _save_training_progress_sidecar(
     # shared-symmetry invariant, but never write.
     if int(ddp["rank"]) != 0:
         return
+    if checkpoint_role not in {
+        RESUMABLE_EPOCH_CHECKPOINT_ROLE,
+        TERMINAL_ADMITTED_CHECKPOINT_ROLE,
+    }:
+        raise RuntimeError(
+            f"unknown training-progress checkpoint role {checkpoint_role!r}"
+        )
     if optimizer_saved is None:
         raise RuntimeError(
             "model checkpoint saved but optimizer sidecar failed; refusing to emit "
@@ -36095,6 +36107,7 @@ def _save_training_progress_sidecar(
             checkpoint_path,
             optimizer_step=int(optimizer_step),
             completed_epochs=int(completed_epochs),
+            checkpoint_role=checkpoint_role,
             recipe_identity=recipe_identity,
             rng_state=rng.bit_generator.state,
             rank_numpy_rng_states=gathered_numpy_rng_states,

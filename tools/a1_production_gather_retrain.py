@@ -804,6 +804,9 @@ def finalize(
     progress_digest = progress_unhashed.pop("progress_sha256", None)
     if (
         progress_digest != base._digest(progress_unhashed)  # noqa: SLF001
+        or progress.get("schema_version") != "train-bc-progress-v2"
+        or progress.get("status") != "complete"
+        or progress.get("checkpoint_role") != "terminal_admitted"
         or progress.get("optimizer_step") != OPTIMIZER_STEPS
         or progress.get("completed_epochs") != 1
         or not isinstance(progress.get("rank_torch_rng_states"), list)

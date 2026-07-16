@@ -25,9 +25,13 @@ matching LR step caused warmup, max-step dose, and reports to restart at zero. A
 versioned ``<checkpoint>.training-progress.json`` commit marker therefore binds hashes
 of the model and optimizer files to the exact recipe/schedule identity and records the
 optimizer step, completed epochs, cumulative value dose, NumPy sampler state, and
-per-rank CPU/CUDA torch RNG (dropout) state. ``train_bc``
-only restores moments after that marker validates. Any partial/mixed/legacy set fails
-closed; an operator can deliberately choose fresh Adam with ``--no-resume-optimizer``.
+per-rank CPU/CUDA torch RNG (dropout) state. The authenticated ``checkpoint_role``
+separates an epoch checkpoint that is safe to resume from a terminal checkpoint written
+only after dose and learning-signal admission. ``status="complete"`` continues to mean
+that the checkpoint set itself was committed atomically; it is not a terminal-admission
+claim. ``train_bc`` only restores moments after that marker validates. Any partial or
+mixed set fails closed; an operator can deliberately choose fresh Adam with
+``--no-resume-optimizer``.
 
 The low-level ``load_optimizer_state`` remains fail-soft and returns ``False`` on a
 pickle/API mismatch. The trainer converts that into a fail-closed resume error after a
@@ -46,7 +50,16 @@ from typing import Any
 
 _OPTIM_SIDECAR_SUFFIX = ".optimizer.pt"
 _PROGRESS_SIDECAR_SUFFIX = ".training-progress.json"
-TRAINING_PROGRESS_SCHEMA = "train-bc-progress-v1"
+LEGACY_TRAINING_PROGRESS_SCHEMA = "train-bc-progress-v1"
+TRAINING_PROGRESS_SCHEMA = "train-bc-progress-v2"
+RESUMABLE_EPOCH_CHECKPOINT_ROLE = "resumable_epoch"
+TERMINAL_ADMITTED_CHECKPOINT_ROLE = "terminal_admitted"
+TRAINING_PROGRESS_CHECKPOINT_ROLES = frozenset(
+    {
+        RESUMABLE_EPOCH_CHECKPOINT_ROLE,
+        TERMINAL_ADMITTED_CHECKPOINT_ROLE,
+    }
+)
 
 
 class TrainingProgressError(RuntimeError):
@@ -61,7 +74,7 @@ def optimizer_sidecar_path(checkpoint_path: str | os.PathLike) -> Path:
 
 
 def training_progress_sidecar_path(checkpoint_path: str | os.PathLike) -> Path:
-    """Commit marker for a model + optimizer checkpoint pair."""
+    """Commit marker for a model + optimizer checkpoint pair and its role."""
     p = Path(checkpoint_path)
     return p.with_name(p.name + _PROGRESS_SIDECAR_SUFFIX)
 
@@ -106,6 +119,7 @@ def save_training_progress(
     rank_torch_rng_states: list[dict[str, Any]],
     scalar_training_weight_sum: float,
     categorical_training_weight_sum: float,
+    checkpoint_role: str,
     policy_objective_lr_area: float = 0.0,
     policy_kl_controller_state: dict[str, Any] | None = None,
     ddp: dict | None,
@@ -113,12 +127,17 @@ def save_training_progress(
     """Atomically commit progress after model and optimizer sidecars are durable.
 
     The JSON is deliberately written last. Its byte hashes bind the two independently
-    atomic torch files into one checkpoint set; a crash or overwrite between any of the
-    three writes is detected on resume instead of mixing model weights, Adam moments,
-    and an unrelated LR-schedule position.
+    atomic torch files and the checkpoint role into one checkpoint set; a crash or
+    overwrite between any of the three writes is detected on resume instead of mixing
+    model weights, Adam moments, and an unrelated LR-schedule position. The role does
+    not change resumability: it tells terminal consumers whether admission completed.
     """
     if _rank(ddp) != 0:
         return None
+    if checkpoint_role not in TRAINING_PROGRESS_CHECKPOINT_ROLES:
+        raise TrainingProgressError(
+            f"unknown training progress checkpoint role {checkpoint_role!r}"
+        )
     checkpoint = Path(checkpoint_path)
     optimizer_path = optimizer_sidecar_path(checkpoint)
     if not checkpoint.is_file() or not optimizer_path.is_file():
@@ -128,6 +147,7 @@ def save_training_progress(
     payload: dict[str, Any] = {
         "schema_version": TRAINING_PROGRESS_SCHEMA,
         "status": "complete",
+        "checkpoint_role": checkpoint_role,
         "checkpoint": {
             "path": checkpoint.name,
             "sha256": _file_sha256(checkpoint),
@@ -165,6 +185,7 @@ def load_training_progress(
     checkpoint_path: str | os.PathLike,
     *,
     expected_recipe_identity: dict[str, Any],
+    required_checkpoint_role: str | None = None,
 ) -> dict[str, Any]:
     """Validate and return a committed checkpoint set, otherwise fail closed."""
     checkpoint = Path(checkpoint_path)
@@ -180,12 +201,33 @@ def load_training_progress(
         raise TrainingProgressError("training progress is not a JSON object")
     stated = payload.get("progress_sha256")
     unhashed = {key: value for key, value in payload.items() if key != "progress_sha256"}
+    schema = payload.get("schema_version")
     if (
-        payload.get("schema_version") != TRAINING_PROGRESS_SCHEMA
+        schema not in {LEGACY_TRAINING_PROGRESS_SCHEMA, TRAINING_PROGRESS_SCHEMA}
         or payload.get("status") != "complete"
         or stated != _canonical_sha256(unhashed)
     ):
         raise TrainingProgressError("training progress schema/status/digest mismatch")
+    checkpoint_role = payload.get("checkpoint_role")
+    if schema == TRAINING_PROGRESS_SCHEMA:
+        if checkpoint_role not in TRAINING_PROGRESS_CHECKPOINT_ROLES:
+            raise TrainingProgressError(
+                "training progress checkpoint role is missing or malformed"
+            )
+    elif checkpoint_role is not None:
+        raise TrainingProgressError(
+            "legacy training progress unexpectedly declares a checkpoint role"
+        )
+    if required_checkpoint_role is not None:
+        if required_checkpoint_role not in TRAINING_PROGRESS_CHECKPOINT_ROLES:
+            raise ValueError(
+                f"unknown required checkpoint role {required_checkpoint_role!r}"
+            )
+        if checkpoint_role != required_checkpoint_role:
+            raise TrainingProgressError(
+                "training progress does not attest required checkpoint role "
+                f"{required_checkpoint_role!r}"
+            )
     if (
         payload.get("recipe_identity") != expected_recipe_identity
         or payload.get("recipe_identity_sha256")

@@ -763,6 +763,7 @@ def _write_training_progress(checkpoint: Path, report_payload: dict) -> None:
         rank_torch_rng_states=torch_states,
         scalar_training_weight_sum=1.0,
         categorical_training_weight_sum=0.0,
+        checkpoint_role="terminal_admitted",
         ddp={"rank": 0},
     ) is not None
 

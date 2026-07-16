@@ -179,6 +179,36 @@ def test_resume_step_cap_guard_precedes_uniform_and_weighted_sampler_paths() -> 
     assert restore < guard < epoch_loop < order < terminal_save
 
 
+def test_epoch_progress_is_resumable_until_terminal_admission_finishes() -> None:
+    import inspect
+
+    from tools import train_bc
+
+    source = inspect.getsource(train_bc.main)
+    epoch_role = source.index('checkpoint_role="resumable_epoch"')
+    exact_dose_admission = source.index(
+        "_validate_exact_optimizer_step_dose(", epoch_role
+    )
+    feature_admission = source.index(
+        "feature_signal_admission.verify_observability(", exact_dose_admission
+    )
+    objective_admission = source.index(
+        "feature_signal_admission.verify_objective_interference(",
+        feature_admission,
+    )
+    terminal_role = source.index(
+        'checkpoint_role="terminal_admitted"', objective_admission
+    )
+
+    assert (
+        epoch_role
+        < exact_dose_admission
+        < feature_admission
+        < objective_admission
+        < terminal_role
+    )
+
+
 def test_nonstepping_microbatch_cannot_claim_an_optimizer_update() -> None:
     with pytest.raises(ValueError, match="non-stepping microbatch"):
         _advance_global_step(

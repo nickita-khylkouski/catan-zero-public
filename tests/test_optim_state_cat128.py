@@ -20,7 +20,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from catan_zero.rl import optim_state as optim_state_module  # noqa: E402
 from catan_zero.rl.optim_state import (  # noqa: E402
+    TERMINAL_ADMITTED_CHECKPOINT_ROLE,
     TrainingProgressError,
     is_fsdp,
     load_training_progress,
@@ -77,7 +79,13 @@ def test_load_corrupt_sidecar_never_raises(tmp_path):
     assert load_optimizer_state(ckpt, model, opt, _DDP_SINGLE) is False
 
 
-def _committed_progress(tmp_path: Path, *, recipe=None, controller_state=None):
+def _committed_progress(
+    tmp_path: Path,
+    *,
+    recipe=None,
+    controller_state=None,
+    checkpoint_role="resumable_epoch",
+):
     ckpt = tmp_path / "checkpoint.pt"
     ckpt.write_bytes(b"model-v1")
     model, optimizer = _stepped_adam()
@@ -102,6 +110,7 @@ def _committed_progress(tmp_path: Path, *, recipe=None, controller_state=None):
         ],
         scalar_training_weight_sum=123.5,
         categorical_training_weight_sum=44.0,
+        checkpoint_role=checkpoint_role,
         policy_kl_controller_state=controller_state,
         ddp=_DDP_SINGLE,
     )
@@ -113,10 +122,70 @@ def test_progress_commit_binds_model_optimizer_recipe_and_exact_step(tmp_path):
     loaded = load_training_progress(ckpt, expected_recipe_identity=identity)
     assert loaded["optimizer_step"] == 713
     assert loaded["completed_epochs"] == 2
+    assert loaded["checkpoint_role"] == "resumable_epoch"
     assert loaded["rng_state"] == rng_state
     assert training_progress_sidecar_path(ckpt).name.endswith(
         ".training-progress.json"
     )
+
+
+def test_progress_role_separates_resume_from_terminal_admission(tmp_path):
+    resumable, identity, _ = _committed_progress(tmp_path)
+    with pytest.raises(TrainingProgressError, match="required checkpoint role"):
+        load_training_progress(
+            resumable,
+            expected_recipe_identity=identity,
+            required_checkpoint_role=TERMINAL_ADMITTED_CHECKPOINT_ROLE,
+        )
+
+    terminal_dir = tmp_path / "terminal"
+    terminal_dir.mkdir()
+    terminal, identity, _ = _committed_progress(
+        terminal_dir,
+        checkpoint_role=TERMINAL_ADMITTED_CHECKPOINT_ROLE,
+    )
+    loaded = load_training_progress(
+        terminal,
+        expected_recipe_identity=identity,
+        required_checkpoint_role=TERMINAL_ADMITTED_CHECKPOINT_ROLE,
+    )
+    assert loaded["checkpoint_role"] == TERMINAL_ADMITTED_CHECKPOINT_ROLE
+
+
+def test_progress_digest_authenticates_checkpoint_role(tmp_path):
+    checkpoint, identity, _ = _committed_progress(tmp_path)
+    path = training_progress_sidecar_path(checkpoint)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["checkpoint_role"] = TERMINAL_ADMITTED_CHECKPOINT_ROLE
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(TrainingProgressError, match="digest mismatch"):
+        load_training_progress(
+            checkpoint,
+            expected_recipe_identity=identity,
+            required_checkpoint_role=TERMINAL_ADMITTED_CHECKPOINT_ROLE,
+        )
+
+
+def test_legacy_progress_remains_resumable_but_cannot_attest_terminal_role(tmp_path):
+    checkpoint, identity, _ = _committed_progress(tmp_path)
+    path = training_progress_sidecar_path(checkpoint)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = "train-bc-progress-v1"
+    del payload["checkpoint_role"]
+    payload.pop("progress_sha256")
+    payload["progress_sha256"] = optim_state_module._canonical_sha256(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert load_training_progress(
+        checkpoint, expected_recipe_identity=identity
+    )["schema_version"] == "train-bc-progress-v1"
+    with pytest.raises(TrainingProgressError, match="required checkpoint role"):
+        load_training_progress(
+            checkpoint,
+            expected_recipe_identity=identity,
+            required_checkpoint_role=TERMINAL_ADMITTED_CHECKPOINT_ROLE,
+        )
 
 
 def test_progress_round_trips_adaptive_policy_kl_controller_state(tmp_path):

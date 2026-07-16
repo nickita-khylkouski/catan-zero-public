@@ -1330,6 +1330,7 @@ def _verify_modern_one_dose_terminal(
             "modern one-dose report lacks an authenticated resume-recipe identity"
         )
     from catan_zero.rl.optim_state import (
+        TERMINAL_ADMITTED_CHECKPOINT_ROLE,
         TrainingProgressError,
         load_training_progress,
         training_progress_sidecar_path,
@@ -1344,7 +1345,9 @@ def _verify_modern_one_dose_terminal(
                 "one-dose receipt points at a non-canonical training-progress marker"
             )
         progress_payload = load_training_progress(
-            checkpoint, expected_recipe_identity=resume_identity
+            checkpoint,
+            expected_recipe_identity=resume_identity,
+            required_checkpoint_role=TERMINAL_ADMITTED_CHECKPOINT_ROLE,
         )
     except PromotionError:
         raise
@@ -3785,7 +3788,10 @@ def _verify_production_l1_completion_receipt(
         where="production L1 optimizer sidecar",
     )
     if (
-        progress_checkpoint != checkpoint_ref
+        progress.get("schema_version") != "train-bc-progress-v2"
+        or progress.get("status") != "complete"
+        or progress.get("checkpoint_role") != "terminal_admitted"
+        or progress_checkpoint != checkpoint_ref
         or progress_optimizer_path != optimizer_path
         or progress.get("optimizer_step") != 1024
         or progress.get("completed_epochs") != 1
@@ -4190,6 +4196,9 @@ def _verify_production_target_gather_completion_receipt(
     )
     if (
         progress_digest != _digest_value(progress_unhashed)
+        or progress.get("schema_version") != "train-bc-progress-v2"
+        or progress.get("status") != "complete"
+        or progress.get("checkpoint_role") != "terminal_admitted"
         or progress_checkpoint != checkpoint_ref
         or progress_optimizer_path != optimizer_path
         or progress_optimizer != optimizer_ref

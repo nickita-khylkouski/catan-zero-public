@@ -9278,12 +9278,15 @@ def _verify_training_outputs(
         )
     try:
         from catan_zero.rl.optim_state import (
+            TERMINAL_ADMITTED_CHECKPOINT_ROLE,
             TrainingProgressError,
             load_training_progress,
         )
 
         progress_payload = load_training_progress(
-            checkpoint, expected_recipe_identity=resume_identity
+            checkpoint,
+            expected_recipe_identity=resume_identity,
+            required_checkpoint_role=TERMINAL_ADMITTED_CHECKPOINT_ROLE,
         )
     except TrainingProgressError as error:
         raise ExecutorError(

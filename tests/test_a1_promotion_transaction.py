@@ -748,6 +748,7 @@ def _modernize_one_dose_receipt(
             ],
             scalar_training_weight_sum=1.0,
             categorical_training_weight_sum=0.0,
+            checkpoint_role="terminal_admitted",
             ddp=None,
         )
         progress_payload_sha256 = json.loads(
@@ -2044,6 +2045,94 @@ def test_modern_one_dose_rejects_authenticated_progress_step_disagreement(
             candidate_sha256=promotion._sha256(fixture["candidate"]),
             training_report_path=fixture["report"],
             training_report_sha256=promotion._sha256(fixture["report"]),
+        )
+
+
+def test_modern_one_dose_rejects_resumable_epoch_progress_role(
+    tmp_path: Path,
+) -> None:
+    from catan_zero.rl.optim_state import (
+        optimizer_sidecar_path,
+        save_training_progress,
+        training_progress_sidecar_path,
+    )
+
+    checkpoint = tmp_path / "candidate.pt"
+    checkpoint.write_bytes(b"candidate")
+    optimizer_sidecar_path(checkpoint).write_bytes(b"optimizer")
+    identity = {
+        "schema_version": "train-bc-resume-recipe-v1",
+        "normalized_train_config_sha256": "sha256:" + "a" * 64,
+        "grad_accum_steps": 1,
+        "world_size": 1,
+        "ddp_shard_data": False,
+        "fsdp": False,
+        "policy_aux_active_batch_size": 0,
+        "policy_dose_lr_area": 0.0,
+        "policy_dose_reference_global_batch_size": 0,
+        "public_card_lr_mult": 1.0,
+        "scalar_value_loss_readout": "raw",
+        "scalar_value_loss_scale": 1.0,
+        "value_player_outcome_balance_mode": "none",
+        "base_sampler": "weighted_replacement_v1",
+        "entity_feature_adapter_version": (
+            "rust_entity_adapter_v3_structured_action_resources"
+        ),
+        "public_rule_state_features": False,
+        "value_tower_split_layers": 0,
+        "meaningful_public_history": False,
+        "meaningful_public_history_schema": (
+            "meaningful_public_history_2p_no_trade_v1"
+        ),
+        "event_history_limit": 64,
+        "meaningful_public_history_pooling": "masked_mean_v1",
+        "meaningful_public_history_target_gather": False,
+        "require_feature_learning_signal_modules": "",
+        "minimum_feature_learning_signal_observations": 0,
+        "train_diagnostics_every_batches": 0,
+        "objective_gradient_interference_every_batches": 0,
+        "require_only_trainable_prefixes": "",
+        "accepted_policy_target_identity_sha256": [],
+    }
+    assert promotion.MODERN_RESUME_RECIPE_REQUIRED_FIELDS.issubset(identity)
+    progress_path = save_training_progress(
+        checkpoint,
+        optimizer_step=2,
+        completed_epochs=1,
+        recipe_identity=identity,
+        rng_state={"fixture": True},
+        rank_numpy_rng_states=[{"fixture": True}],
+        symmetry_rng_state=None,
+        rank_torch_rng_states=[{"cpu": [], "cuda": None}],
+        scalar_training_weight_sum=1.0,
+        categorical_training_weight_sum=0.0,
+        checkpoint_role="resumable_epoch",
+        ddp=None,
+    )
+    assert progress_path == training_progress_sidecar_path(checkpoint)
+    report = {
+        "training_resume_recipe_identity": identity,
+        "training_resume_recipe_identity_sha256": promotion._digest_value(
+            identity
+        ),
+    }
+    with pytest.raises(promotion.PromotionError, match="required checkpoint role"):
+        promotion._verify_modern_one_dose_terminal(  # noqa: SLF001
+            checkpoint=checkpoint,
+            progress_path=progress_path,
+            report=report,
+            outputs={"training_row_count": 2, "steps_completed": 2},
+            recipe={
+                "epochs": 1,
+                "max_steps": 2,
+                "grad_accum_steps": 1,
+                "world_size": 1,
+                "ddp_shard_data": False,
+                "fsdp": False,
+                "policy_aux_active_batch_size": 0,
+            },
+            command=["--no-resume-optimizer", "--exact-max-steps"],
+            effective_global_batch_size=1,
         )
 
 
@@ -5675,6 +5764,9 @@ def _production_l1_receipt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     optimizer.write_bytes(b"optimizer")
     progress_path = tmp_path / "candidate.pt.training-progress.json"
     progress = {
+        "schema_version": "train-bc-progress-v2",
+        "status": "complete",
+        "checkpoint_role": "terminal_admitted",
         "checkpoint": {"path": candidate.name, "sha256": promotion._sha256(candidate)},
         "optimizer": {"path": optimizer.name, "sha256": promotion._sha256(optimizer)},
         "optimizer_step": 1024,
@@ -5867,6 +5959,9 @@ def _production_gather_receipt_fixture(
     optimizer.write_bytes(b"fresh optimizer")
     progress_path = tmp_path / "candidate.pt.training-progress.json"
     progress = {
+        "schema_version": "train-bc-progress-v2",
+        "status": "complete",
+        "checkpoint_role": "terminal_admitted",
         "checkpoint": {"path": str(candidate), "sha256": promotion._sha256(candidate)},
         "optimizer": {"path": str(optimizer), "sha256": promotion._sha256(optimizer)},
         "optimizer_step": 2048,

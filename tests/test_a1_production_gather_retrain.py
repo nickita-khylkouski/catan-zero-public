@@ -320,6 +320,9 @@ def _completion_outputs(manifest: dict, path: Path, *, unit: str) -> Path:
     progress = {
         # train_bc intentionally records colocated outputs lexically relative
         # to this progress file, as the real production artifact does.
+        "schema_version": "train-bc-progress-v2",
+        "status": "complete",
+        "checkpoint_role": "terminal_admitted",
         "checkpoint": {"path": checkpoint.name, "sha256": _ref(checkpoint)["sha256"]},
         "optimizer": {"path": optimizer.name, "sha256": _ref(optimizer)["sha256"]},
         "optimizer_step": 2048,
