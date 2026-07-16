@@ -228,7 +228,7 @@ def test_independent_parent_authority_keeps_producer_and_f7_distinct(
     ]["sha256"]
 
 
-def test_selection_maximizes_teacher_gap_inside_explicit_drift_budgets(
+def test_selection_uses_closure_only_for_admission_and_nominates_smallest_update(
     tmp_path: Path,
 ) -> None:
     campaign_path = tmp_path / "campaign.json"
@@ -309,8 +309,8 @@ def test_selection_maximizes_teacher_gap_inside_explicit_drift_budgets(
         bindings[arm] = path
 
     selected = campaign._select(campaign_path, campaign_payload, bindings)
-    assert selected["winner"] == "P50"
-    assert selected["winner_step"] == 128
+    assert selected["winner"] == "P10"
+    assert selected["winner_step"] == 8
     assert selected["eligible_arms"] == ["P10", "P25", "P50", "P100"]
     assert selected["arm_fingerprints"]["P100"][
         "all_checkpoints_within_drift_budgets"
@@ -324,11 +324,11 @@ def test_selection_maximizes_teacher_gap_inside_explicit_drift_budgets(
     ]
     assert selected["arm_fingerprints"]["P100"]["selected_checkpoint"][
         "step"
-    ] == 64
-    assert selected["winner_meets_reference_teacher_gap_closure"] is True
+    ] == 8
+    assert selected["winner_meets_reference_teacher_gap_closure"] is False
 
 
-def test_selection_can_choose_an_earlier_checkpoint_over_overdosed_terminals(
+def test_selection_does_not_reward_a_later_teacher_closure_spike(
     tmp_path: Path,
 ) -> None:
     campaign_path = tmp_path / "campaign.json"
@@ -407,12 +407,12 @@ def test_selection_can_choose_an_earlier_checkpoint_over_overdosed_terminals(
 
     selected = campaign._select(campaign_path, campaign_payload, bindings)
 
-    assert selected["winner"] == "P100"
-    assert selected["winner_step"] == 32
-    assert selected["winner_checkpoint"]["path"].endswith("P100-step32.pt")
+    assert selected["winner"] == "P10"
+    assert selected["winner_step"] == 8
+    assert selected["winner_checkpoint"]["path"].endswith("P10-step8.pt")
     assert selected["arm_fingerprints"]["P100"]["selected_checkpoint"][
         "step"
-    ] == 32
+    ] == 8
 
 
 def test_explicit_diagnostic_checkpoint_schedule_excludes_terminal(

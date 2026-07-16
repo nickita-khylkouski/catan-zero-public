@@ -328,9 +328,10 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
             "requires_positive_fresh_parent_teacher_gap_closure": True,
             "stored_generation_prior_selection_authority": False,
             "objective": (
-                "max_fresh_parent_relative_teacher_gap_closure_within_posthoc_"
-                "trust_budgets_then_external_play"
+                "minimum_update_with_positive_fresh_parent_uptake_within_"
+                "posthoc_trust_budgets_then_paired_play"
             ),
+            "teacher_gap_closure_ranking_authority": False,
             "playing_strength_evaluation_required": True,
         },
         "optimizer_surface_contract": {
@@ -881,7 +882,12 @@ def _functional_artifact_path(
 def _select_fingerprint_winner(
     records: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any] | None:
-    """Choose maximum fresh-parent closure inside both trust budgets."""
+    """Nominate the smallest trusted update with positive teacher uptake.
+
+    B200 traces showed that larger teacher-gap closure was anti-correlated with
+    paired playing strength. Closure therefore admits a checkpoint but never
+    ranks it; paired H2H remains the only strength authority.
+    """
 
     eligible = [
         row
@@ -894,12 +900,12 @@ def _select_fingerprint_winner(
     if not eligible:
         return None
     return dict(
-        max(
+        min(
             eligible,
             key=lambda row: (
-                float(row["fresh_parent_teacher_gap_relative_closure"]),
-                float(row["fresh_parent_teacher_gap_absolute_closure"]),
-                -int(row["step"]),
+                int(row["step"]),
+                float(row["parent_kl"]),
+                float(row["trunk_relative_l2"]),
             ),
         )
     )
@@ -1115,9 +1121,10 @@ def _fingerprint(
         "optimizer_batch_kl_used_as_trust_authority": False,
         "stored_generation_prior_used_as_selection_authority": False,
         "selection_objective": (
-            "max_fresh_parent_relative_teacher_gap_closure_within_parent_kl_"
-            "and_trunk_drift_budgets"
+            "minimum_update_with_positive_fresh_parent_uptake_within_parent_"
+            "kl_and_trunk_drift_budgets"
         ),
+        "teacher_gap_closure_ranking_authority": False,
         "output": str(_fresh_parent_fingerprint_path(plan)),
         "checkpoints": records,
         "winner": winner,

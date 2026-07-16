@@ -18,10 +18,10 @@ The tool deliberately has two gates before optimizer launch:
 Selection is similarly explicit.  Existing read-only tools measure functional
 parent KL and layer drift at steps 8/12/16/32/64/128.  Each measured checkpoint
 is an independent dose candidate: a later over-budget checkpoint cannot erase
-an earlier in-budget dose from the same arm.  The selected exposure is the
-eligible arm/checkpoint pair with the largest active-policy teacher-gap closure
-under operator-declared parent-KL and trunk-drift budgets.  Candidate chaining
-is never an allowed transition.
+an earlier in-budget dose from the same arm. Teacher-gap closure is admission
+evidence only, never a ranking proxy for playing strength. The offline selector
+nominates the smallest in-budget update with positive uptake; paired playing-
+strength evaluation remains authoritative. Candidate chaining is never allowed.
 """
 
 from __future__ import annotations
@@ -907,7 +907,9 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
                 "both drift budgets and has positive teacher-gap closure; a later "
                 "over-budget checkpoint does not invalidate an earlier dose"
             ),
-            "objective": "max_in_budget_checkpoint_teacher_gap_closure",
+            "objective": "minimum_update_with_positive_teacher_uptake",
+            "teacher_gap_closure_ranking_authority": False,
+            "paired_playing_strength_is_final_authority": True,
             "reference_update_frontier": copy.deepcopy(
                 R2_UPDATE_FRONTIER_REFERENCE
             ),
@@ -916,10 +918,10 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
                 "playing-strength evaluation"
             ),
             "tie_break": [
+                "min_optimizer_steps",
                 "min_checkpoint_parent_kl",
                 "min_checkpoint_trunk_relative_l2",
-                "min_aux_exposure",
-                "min_optimizer_steps",
+                "min_policy_aux_loss_weight",
             ],
             "playing_strength_evaluation_required_before_promotion": True,
         },
@@ -1827,10 +1829,9 @@ def _select(
             sorted(
                 arm_eligible,
                 key=lambda candidate: (
-                    -candidate["teacher_gap_closure"],
+                    candidate["step"],
                     candidate["parent_kl"],
                     candidate["trunk_relative_l2"],
-                    candidate["step"],
                 ),
             )[0]
             if arm_eligible
@@ -1865,11 +1866,10 @@ def _select(
     winner_candidate = sorted(
         eligible_candidates,
         key=lambda candidate: (
-            -candidate["teacher_gap_closure"],
+            candidate["step"],
             candidate["parent_kl"],
             candidate["trunk_relative_l2"],
-            ARMS[candidate["arm"]]["policy_aux_active_batch_size"],
-            candidate["step"],
+            ARMS[candidate["arm"]]["policy_aux_loss_weight"],
             candidate["arm"],
         ),
     )[0]
