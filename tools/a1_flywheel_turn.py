@@ -367,10 +367,10 @@ def build_turn(
             "receipt_sha256": replayed["receipt_sha256"],
             "module": replayed["module"],
         }
-        if (
-            replayed["module"]
-            == upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2
-        ):
+        if replayed["module"] in {
+            upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
+            upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
+        }:
             initializer_binding["architecture_profile"] = (
                 V16_COMBINED_ARCHITECTURE_PROFILE
             )

@@ -6756,7 +6756,8 @@ COHERENT_DIRECT_CORPUS_BINDING_SCHEMA = (
     "a1-coherent-direct-memmap-learner-binding-v1"
 )
 COHERENT_DIRECT_UPGRADE_MODULE = (
-    "entity_graph.public_card_count_features+meaningful_public_history.v2"
+    "entity_graph.static_action_residual+legal_action_value_residual+"
+    "public_card_count_features+meaningful_public_history.v3"
 )
 
 

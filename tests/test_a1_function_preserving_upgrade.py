@@ -225,6 +225,57 @@ def _structured_action_value_checkpoints(
     return source, output
 
 
+def _canonical_v3_checkpoints(
+    tmp_path: Path, *, seed: int = 89
+) -> tuple[Path, Path]:
+    from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE
+    from catan_zero.rl.entity_token_features import LEGAL_ACTION_FEATURE_SIZE
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphPolicy
+
+    source = tmp_path / "champion-canonical-v3-source.pt"
+    output = tmp_path / "champion-canonical-v3.pt"
+    config = EntityGraphConfig(
+        action_size=16,
+        static_action_feature_size=45,
+        context_action_feature_size=CONTEXT_ACTION_FEATURE_SIZE,
+        legal_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        dropout=0.0,
+    )
+    static = np.zeros((config.action_size, config.static_action_feature_size))
+    base = EntityGraphPolicy(config, static, seed=13, device="cpu")
+    base.save(source, mask_hidden_info=True)
+    spec = upgrade.ALLOWLIST[
+        upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3
+    ]
+    treatment = EntityGraphPolicy(
+        dataclasses.replace(config, **spec["config_delta"]),
+        static,
+        seed=seed,
+        device="cpu",
+    )
+    missing, unexpected = treatment.model.load_state_dict(
+        base.model.state_dict(), strict=False
+    )
+    assert not unexpected
+    assert set(missing) == set(spec["new_parameter_initialization"])
+    treatment.save(output, mask_hidden_info=True)
+    raw = torch.load(output, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"] = {
+        "schema_version": "entity-graph-upgrade-v1",
+        "source_checkpoint_sha256": upgrade._sha(source).removeprefix("sha256:"),  # noqa: SLF001
+        "flags": dict(spec["flags"]),
+        "initialization_seed": seed,
+        "trained_value_readouts_added": [],
+        "forward_max_diff": 0.0,
+        "forward_identical_at_init": True,
+    }
+    torch.save(raw, output)
+    return source, output
+
+
 def _aux_checkpoints(tmp_path: Path, *, seed: int = 79) -> tuple[Path, Path]:
     """Build the exact shared auxiliary initializer for both matched arms."""
 
@@ -329,6 +380,51 @@ def test_receipt_replays_structured_action_value_upgrade(tmp_path: Path) -> None
             "new_parameter_initialization"
         ]
     )
+
+
+def test_canonical_v3_upgrade_combines_all_zero_output_repairs() -> None:
+    spec = upgrade.ALLOWLIST[
+        upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3
+    ]
+    assert spec["flags"] == {
+        "static_action_residual": True,
+        "legal_action_value_residual": True,
+        "public_card_count_features": True,
+        "public_card_count_residual_bias": False,
+        "meaningful_public_history": True,
+        "meaningful_public_history_schema": (
+            upgrade.MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+        ),
+        "event_history_limit": upgrade.MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+    }
+    assert set(spec["new_parameter_initialization"]) == {
+        "legal_action_value_residual_proj.weight",
+        "legal_action_value_static_proj.weight",
+        "static_action_residual_proj.bias",
+        "static_action_residual_proj.weight",
+        "public_card_count_residual.weight",
+        "meaningful_history_residual_gate",
+    }
+    assert set(spec["new_parameter_initialization"].values()) == {"zeros"}
+
+
+def test_canonical_v3_receipt_replays_exact_combined_initializer(
+    tmp_path: Path,
+) -> None:
+    source, initializer = _canonical_v3_checkpoints(tmp_path)
+    receipt = tmp_path / "canonical-v3.receipt.json"
+    issued = upgrade.issue_receipt(
+        source,
+        initializer,
+        receipt,
+        module=(
+            upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3
+        ),
+    )
+    verified = upgrade.verify_receipt(receipt)
+    assert verified["receipt_sha256"] == issued["receipt_sha256"]
+    assert verified["forward_max_diff"] == 0.0
+    assert verified["shared_parameters_bit_identical"] is True
 
 
 def test_bias_free_public_card_v2_upgrade_has_only_zero_weight_delta(

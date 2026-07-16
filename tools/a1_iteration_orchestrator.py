@@ -625,8 +625,9 @@ def initialize_next(
                 ) from error
             if upgrade.get("module") != learner_contract["architecture_upgrade_module"]:
                 raise IterationError(
-                    "current coherent-public turn requires the combined bias-free "
-                    "public-card + meaningful-history v2 initializer"
+                    "current coherent-public turn requires the combined structured-"
+                    "action/value + bias-free public-card + meaningful-history v3 "
+                    "initializer"
                 )
             history = verified.get("event_history_training_contract")
             if (

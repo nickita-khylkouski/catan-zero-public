@@ -161,10 +161,11 @@ UPGRADE_RECEIPT=/fresh/path/public-cards.receipt.json
 
 "$PY" tools/f69_upgrade_checkpoint_config.py \
   --in-checkpoint "$CHAMPION" --out-checkpoint "$UPGRADED" \
-  --flags card_count_v2,meaningful_history --device cuda:0 --seed 1
+  --flags structured_action_value,card_count_v2,meaningful_history \
+  --device cuda:0 --seed 1
 "$PY" tools/a1_function_preserving_upgrade.py \
   --source "$CHAMPION" --upgraded "$UPGRADED" \
-  --module entity_graph.public_card_count_features+meaningful_public_history.v2 \
+  --module entity_graph.static_action_residual+legal_action_value_residual+public_card_count_features+meaningful_public_history.v3 \
   --output "$UPGRADE_RECEIPT"
 ```
 

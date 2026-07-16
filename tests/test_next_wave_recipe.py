@@ -217,7 +217,7 @@ def test_canonical_short_dose_has_nontrivial_lr_and_equal_game_value_mass() -> N
         "sha256:f5845e2bb93feeb5d1bc9c4ce3a5f1eb65c4c37d95245297002fdee0a3afee9b"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:c183adbebca74ba78703d5a3c085eff1ed024828f4819f58002ddf85185d64bd"
+        "sha256:cd1756158d5801b88fe4d516ab7d091d48fb516be6018c2159629200f3e46dee"
     )
 
 
@@ -231,9 +231,13 @@ def test_next_wave_runbook_closes_generation_training_evaluation_loop() -> None:
     assert "--no-record-automatic-transitions" in text
     assert "--meaningful-public-history" in text
     assert "--event-history-limit 32" in text
-    assert "--flags card_count_v2,meaningful_history" in text
     assert (
-        "entity_graph.public_card_count_features+meaningful_public_history.v2"
+        "--flags structured_action_value,card_count_v2,meaningful_history"
+        in text
+    )
+    assert (
+        "entity_graph.static_action_residual+legal_action_value_residual+"
+        "public_card_count_features+meaningful_public_history.v3"
         in text
     )
     assert "tools/a1_iteration_orchestrator.py initialize-next" in text

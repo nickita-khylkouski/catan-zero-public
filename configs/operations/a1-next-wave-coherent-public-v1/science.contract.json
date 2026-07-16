@@ -81,8 +81,8 @@
     "native_mcts_hot_loop": true
   },
   "learner": {
-    "architecture_upgrade_flags": "card_count_v2,meaningful_history",
-    "architecture_upgrade_module": "entity_graph.public_card_count_features+meaningful_public_history.v2",
+    "architecture_upgrade_flags": "structured_action_value,card_count_v2,meaningful_history",
+    "architecture_upgrade_module": "entity_graph.static_action_residual+legal_action_value_residual+public_card_count_features+meaningful_public_history.v3",
     "topology": "b200-8gpu-ddp",
     "training_recipe": {
       "track": "2p_no_trade",

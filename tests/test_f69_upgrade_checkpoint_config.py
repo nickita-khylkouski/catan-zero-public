@@ -127,6 +127,18 @@ def test_structured_action_value_upgrade_enables_both_zero_diff_paths():
     assert upgraded.legal_action_value_residual is True
 
 
+def test_canonical_v3_flag_bundle_enables_all_structured_input_repairs():
+    overrides = upgrade_tool._parse_flags(  # noqa: SLF001
+        "structured_action_value,card_count_v2,meaningful_history"
+    )
+    assert overrides["static_action_residual"] is True
+    assert overrides["legal_action_value_residual"] is True
+    assert overrides["public_card_count_features"] is True
+    assert overrides["public_card_count_residual_bias"] is False
+    assert overrides["meaningful_public_history"] is True
+    assert overrides["event_history_limit"] == 32
+
+
 def test_bias_free_public_card_count_upgrade_is_explicit_v2():
     base = EntityGraphConfig(action_size=607, static_action_feature_size=1)
     overrides = upgrade_tool._parse_flags("card_count_v2")

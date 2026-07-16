@@ -73,6 +73,10 @@ MODULE_TARGET_GATHER_PUBLIC_CARD_COUNT_V2 = (
 MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2 = (
     "entity_graph.public_card_count_features+meaningful_public_history.v2"
 )
+MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3 = (
+    "entity_graph.static_action_residual+legal_action_value_residual+"
+    "public_card_count_features+meaningful_public_history.v3"
+)
 MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY = (
     "entity_graph.meaningful_public_history.ordered_attention.v2"
 )
@@ -334,6 +338,38 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "meaningful_history_residual_gate": "zeros",
         },
         "config_delta": {
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        },
+    },
+    MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3: {
+        "flags": {
+            "static_action_residual": True,
+            "legal_action_value_residual": True,
+            "public_card_count_features": True,
+            "public_card_count_residual_bias": False,
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+            ),
+            "event_history_limit": MEANINGFUL_PUBLIC_HISTORY_LIMIT,
+        },
+        "new_parameter_initialization": {
+            "legal_action_value_residual_proj.weight": "zeros",
+            "legal_action_value_static_proj.weight": "zeros",
+            "static_action_residual_proj.bias": "zeros",
+            "static_action_residual_proj.weight": "zeros",
+            "public_card_count_residual.weight": "zeros",
+            "meaningful_history_residual_gate": "zeros",
+        },
+        "config_delta": {
+            "static_action_residual": True,
+            "legal_action_value_residual": True,
             "public_card_count_features": True,
             "public_card_count_residual_bias": False,
             "meaningful_public_history": True,

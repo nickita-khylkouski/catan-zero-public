@@ -245,7 +245,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         or verified.get("recipe", {}).get("policy_kl_target") is not None
         or upgrade.get("source", {}).get("sha256") != stage_a.EXPECTED_F7_PARENT_SHA256
         or upgrade.get("module")
-        != architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2
+        != architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3
         or upgrade.get("forward_identical_at_init") is not True
         or float(upgrade.get("forward_max_diff", -1.0)) != 0.0
         or upgrade.get("shared_parameters_bit_identical") is not True

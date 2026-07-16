@@ -177,7 +177,7 @@ def test_independent_parent_authority_keeps_producer_and_f7_distinct(
     )
     verified["coherent_direct_corpus_binding"] = coherent_binding
     upgrade = {
-        "module": one_dose.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
+        "module": one_dose.architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
         "source": parent,
         "receipt": {
             "path": str(upgrade_receipt),
@@ -447,7 +447,7 @@ def test_explicit_diagnostic_checkpoint_schedule_excludes_terminal(
             "sha256": "sha256:" + "7" * 64,
         },
         "function_preserving_upgrade": {
-            "module": one_dose.architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
+            "module": one_dose.architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
         },
         "data_path": tmp_path / "corpus",
         "validation_path": tmp_path / "validation.json",

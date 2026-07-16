@@ -748,14 +748,14 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
     if (
         upgrade.get("source", {}).get("sha256") != EXPECTED_F7_PARENT_SHA256
         or upgrade.get("module")
-        != architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2
+        != architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3
         or upgrade.get("forward_identical_at_init") is not True
         or float(upgrade.get("forward_max_diff", -1.0)) != 0.0
         or upgrade.get("shared_parameters_bit_identical") is not True
     ):
         raise CampaignError(
-            "campaign requires exact f7 plus the combined public-card/history-v2 "
-            "function-preserving initializer"
+            "campaign requires exact f7 plus the combined structured-action/value, "
+            "public-card, and history-v3 function-preserving initializer"
         )
     reviewed_lock = (
         base_campaign._normalize_sha256(  # noqa: SLF001
@@ -799,7 +799,7 @@ def _plan(args: argparse.Namespace) -> dict[str, Any]:
         science["target_information_regime"] != TARGET_INFORMATION_REGIME
         or learner["topology"] != "b200-8gpu-ddp"
         or learner["architecture_upgrade_module"]
-        != architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2
+        != architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3
         or science_recipe["policy_loss_weight"] != 1.0
         or science_recipe["value_loss_weight"] != 0.25
     ):
