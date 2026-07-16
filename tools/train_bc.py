@@ -3901,8 +3901,19 @@ def _validate_flywheel_component_provenance(
     schema_version = payload.get("schema_version") if isinstance(payload, dict) else None
     if schema_version == "flywheel-replay-component-v2":
         expected.add("source_authority_manifest")
+        if corpus_meta.get("policy_target_identity_sha256") is not None:
+            expected.add("policy_target_identity_sha256")
     if not isinstance(payload, dict) or set(payload) != expected:
         raise SystemExit("flywheel component provenance fields differ from schema")
+    if "policy_target_identity_sha256" in expected:
+        identity = payload.get("policy_target_identity_sha256")
+        if (
+            not _is_sha256(identity)
+            or identity != corpus_meta.get("policy_target_identity_sha256")
+        ):
+            raise SystemExit(
+                "flywheel component policy-target identity provenance drift"
+            )
     if schema_version not in {
         "flywheel-replay-component-v1",
         "flywheel-replay-component-v2",
@@ -5131,7 +5142,8 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             and overrides.get("forced_row_value_weight") == 1.0
             and overrides.get("per_game_policy_weight") is True
             and overrides.get("per_game_policy_weight_mode") == "equal"
-            and overrides.get("per_game_value_weight") is False
+            and overrides.get("per_game_value_weight") is True
+            and overrides.get("per_game_value_weight_mode") == "equal"
             and overrides.get("loser_sample_weight") == 1.0
             and overrides.get("soft_target_temperature") == 0.7
             and overrides.get("soft_target_weight") == 1.0
@@ -5144,7 +5156,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         ):
             raise SystemExit(
                 "promotion-eligible flywheel composite requires sampler-aware "
-                "equal policy weighting and no duplicate value game weighting"
+                "equal policy/value game weighting under the sampler-aware normalizer"
             )
         flywheel_replay_contract = dict(raw_contract)
     return {

@@ -926,6 +926,11 @@ def test_descriptor_preserves_nested_fresh_mix_and_historical_replay(
     assert descriptor["learner_recipe_overrides"]["soft_target_weight"] == pytest.approx(
         1.0
     )
+    assert descriptor["learner_recipe_overrides"]["per_game_value_weight"] is True
+    assert (
+        descriptor["learner_recipe_overrides"]["per_game_value_weight_mode"]
+        == "equal"
+    )
     assert descriptor["learner_recipe_overrides"][
         "policy_target_blend_semantics"
     ] == "policy_target_fallback_v2"
@@ -1213,6 +1218,18 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     assert verified["corpus_row_count"] == 16
     assert verified["training_row_count"] + verified["validation_row_count"] == 16
     assert verified["validation_split_receipt"]["aggregate"]["selected_game_count"] == 8
+    fresh_target_identities = {
+        component["corpus_meta"].get("policy_target_identity_sha256")
+        for component in meta["components"][:3]
+    }
+    assert len(fresh_target_identities) == 1
+    assert builder.train_bc._is_sha256(next(iter(fresh_target_identities)))  # noqa: SLF001
+    assert (
+        meta["components"][3]["corpus_meta"].get(
+            "policy_target_identity_sha256"
+        )
+        is None
+    )
 
     authority_path = Path(receipt["source_authority"]["path"])
     enriched_authority = builder.train_bc._validate_flywheel_source_authority(  # noqa: SLF001

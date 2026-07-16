@@ -55,7 +55,9 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     require_known_entity_feature_adapter,
 )
 from tools import a1_pre_wave_contract as contract  # noqa: E402
+from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
+from tools import a1_target_eligibility_inventory as target_inventory  # noqa: E402
 from tools import build_memmap_corpus as memmap_builder  # noqa: E402
 from tools import train_bc  # noqa: E402
 
@@ -89,6 +91,20 @@ STORED_POLICY_COMPONENT_TEMPERATURES = {
 # components. Replay remains available to value/reanalysis; any replay KL is a
 # separate treatment and must never become stale search-policy CE.
 HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT = 0.0
+_CURRENT_LEARNER_RECIPE = current_science.learner_training_recipe()
+_CURRENT_PER_GAME_VALUE_WEIGHT = _CURRENT_LEARNER_RECIPE.get(
+    "per_game_value_weight"
+)
+_CURRENT_PER_GAME_VALUE_WEIGHT_MODE = _CURRENT_LEARNER_RECIPE.get(
+    "per_game_value_weight_mode", "equal"
+)
+if (
+    _CURRENT_PER_GAME_VALUE_WEIGHT is not True
+    or _CURRENT_PER_GAME_VALUE_WEIGHT_MODE != "equal"
+):
+    raise RuntimeError(
+        "current science contract must bind equal per-game value weighting"
+    )
 
 
 def _single_adapter_version(values: Sequence[object], *, source: str) -> str:
@@ -176,8 +192,8 @@ LEARNER_RECIPE_OVERRIDES: dict[str, object] = {
     "loser_sample_weight": 1.0,
     "per_game_policy_weight": True,
     "per_game_policy_weight_mode": "equal",
-    "per_game_value_weight": False,
-    "per_game_value_weight_mode": "equal",
+    "per_game_value_weight": _CURRENT_PER_GAME_VALUE_WEIGHT,
+    "per_game_value_weight_mode": _CURRENT_PER_GAME_VALUE_WEIGHT_MODE,
     "policy_kl_anchor_direction": "forward",
     "policy_kl_anchor_weight": HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT,
     "policy_loss_weight": 1.0,
@@ -1102,6 +1118,7 @@ def _build_fresh_component(
     output_root: Path,
     expected_games: int,
     source_authority: Mapping[str, str],
+    policy_target_identity_sha256: str,
     build_memmap_fn: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     if not records:
@@ -1137,6 +1154,7 @@ def _build_fresh_component(
         "shard_inventory_sha256": canonical_sha256(records),
         "component_mass": mass,
         "source_authority_manifest": dict(source_authority),
+        "policy_target_identity_sha256": policy_target_identity_sha256,
     }
     provenance_path = output_root / "provenance" / f"{category}.json"
     _atomic_json(provenance_path, provenance)
@@ -1148,6 +1166,7 @@ def _build_fresh_component(
         "file_sha256": _file_sha256(provenance_path),
     }
     meta["flywheel_component_provenance"] = provenance_ref
+    meta["policy_target_identity_sha256"] = policy_target_identity_sha256
     _atomic_json(meta_path, meta)
     return {
         "component_id": category,
@@ -1161,6 +1180,51 @@ def _build_fresh_component(
         "component_mass": mass,
         "source_authority_manifest": source_authority["path"],
         "source_authority_manifest_sha256": source_authority["file_sha256"],
+    }
+
+
+def _fresh_policy_target_identities(
+    source_authority: Mapping[str, str],
+) -> dict[str, str]:
+    """Resolve one exact search-teacher identity for every fresh component."""
+
+    payload = _load_json(Path(str(source_authority["path"])))
+    try:
+        groups = target_inventory._manifest_operator_groups(payload)  # noqa: SLF001
+    except (OSError, ValueError, target_inventory.InventoryError) as error:
+        raise CompositeBuildError(
+            f"cannot resolve fresh policy-target identities: {error}"
+        ) from error
+    by_category: dict[str, set[str]] = {
+        category: set() for category in FRESH_SOURCE_GAME_RATIOS
+    }
+    for group in groups:
+        category = str(group.get("category", ""))
+        if group.get("scope") == "fresh" and category in by_category:
+            identity = str(group.get("operator_sha256", ""))
+            if not train_bc._is_sha256(identity):  # noqa: SLF001
+                raise CompositeBuildError(
+                    f"fresh category {category!r} has malformed target identity"
+                )
+            by_category[category].add(identity)
+    malformed = {
+        category: sorted(identities)
+        for category, identities in by_category.items()
+        if len(identities) != 1
+    }
+    if malformed:
+        raise CompositeBuildError(
+            "fresh categories do not bind exactly one policy-target operator: "
+            f"{malformed}"
+        )
+    realized = {next(iter(identities)) for identities in by_category.values()}
+    if len(realized) != 1:
+        raise CompositeBuildError(
+            "fresh policy components were produced by different search operators"
+        )
+    return {
+        category: next(iter(identities))
+        for category, identities in by_category.items()
     }
 
 
@@ -1822,6 +1886,7 @@ def build_post_wave_composite(
         historical_lock_verifier_authority=historical_lock_verifier_authority,
         output_root=root,
     )
+    policy_target_identities = _fresh_policy_target_identities(source_authority)
     components = [
         _build_fresh_component(
             category=category,
@@ -1830,6 +1895,7 @@ def build_post_wave_composite(
             output_root=root,
             expected_games=int(expected_games[category]),
             source_authority=source_authority,
+            policy_target_identity_sha256=policy_target_identities[category],
             build_memmap_fn=build_memmap_fn,
         )
         for category in FRESH_SOURCE_GAME_RATIOS
