@@ -1,7 +1,7 @@
 # Catan-Zero 100+ experiment R&D report
 
-Date: 2026-07-10/11  
-Frozen public source: `c807874940fd5b3e4c51775f33a64279786504da`  
+Date: 2026-07-10/11
+Frozen public source: `c807874940fd5b3e4c51775f33a64279786504da`
 Status: local, promotion-ineligible research; no push or merge
 
 ## Experiment accounting

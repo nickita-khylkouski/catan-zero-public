@@ -1,7 +1,7 @@
 # A1 RL software diagnosis and repair program
 
-**Date:** 2026-07-15  
-**Scope:** 2-player, no-trade, 10-VP A1 research track  
+**Date:** 2026-07-15
+**Scope:** 2-player, no-trade, 10-VP A1 research track
 **Status:** Confirmed software diagnosis; large learner and generation runs are
 paused until the P0 information-state and value-routing repairs below land.
 
@@ -590,4 +590,3 @@ Primary external references:
   independent arm produces evidence.
 - Write the result and remaining uncertainty back into this document or a
   linked evidence artifact.
-

@@ -64,4 +64,3 @@ Archived but not made canonical:
 
 When salvaging from an archive ref, port the logic onto the current branch
 rather than cherry-picking a large historical commit range.
-

@@ -238,4 +238,3 @@ stronger Catan agent.
   motivates main agents plus exploiters that expose specific weaknesses.
 - The official [CATAN base-game FAQ](https://www.catan.com/faq/basegame) is the
   rules authority for development cards, Longest Road and Largest Army details.
-

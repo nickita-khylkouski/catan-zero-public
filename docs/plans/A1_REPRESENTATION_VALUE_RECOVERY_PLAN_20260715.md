@@ -1,8 +1,8 @@
 # A1 representation and value recovery plan
 
-**Date:** 2026-07-15  
+**Date:** 2026-07-15
 **Authority:** implementation plan for
-`docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md`  
+`docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md`
 **Execution state:** code repair only; no large learner, generation wave, or
 champion mutation is authorized by this plan.
 
@@ -246,4 +246,3 @@ Stop implementation and resolve the contract if:
   calibration.
 - Same-operator evaluation demonstrates whether it improved.
 - The production science contract is updated only after that evidence.
-
