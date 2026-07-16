@@ -6793,10 +6793,13 @@ def _validate_parent_policy_kl_authority(
     return {
         "schema_version": "train-bc-parent-policy-kl-authority-v1",
         "status": "verified_exact_parent",
+        "identity_comparison": (
+            "stored_prior_producer_vs_declared_causal_parent"
+        ),
         "stored_prior_checkpoint_sha256": producer,
         "parent_checkpoint_sha256": parent,
         "initializer_checkpoint_sha256": initializer,
-        "function_preserving_initializer_allowed": True,
+        "initializer_identity_differs_from_parent": initializer != parent,
     }
 
 

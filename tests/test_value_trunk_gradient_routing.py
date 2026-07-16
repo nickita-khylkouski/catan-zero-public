@@ -176,7 +176,7 @@ def _args(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_routing_validation_fails_closed_on_unsupported_or_bypassing_paths() -> None:
+def test_routing_validation_fails_closed_on_unsupported_paths() -> None:
     default = train_bc._value_trunk_gradient_routing(_args(), scalar_weight=0.25)
     assert default["active"] is False
     assert default["scalar_value_trunk_grad_scale"] == pytest.approx(1.0)
@@ -196,12 +196,18 @@ def test_routing_validation_fails_closed_on_unsupported_or_bypassing_paths() -> 
         )
 
     _torch, pooled_model = _tiny_model(value_attention_pool=True)
-    with pytest.raises(SystemExit, match="value-attention pooling"):
-        train_bc._value_trunk_gradient_routing(
-            _args(value_trunk_grad_scale=0.0),
-            scalar_weight=0.25,
-            model=pooled_model,
-        )
+    pooled = train_bc._value_trunk_gradient_routing(
+        _args(value_trunk_grad_scale=0.0),
+        scalar_weight=0.25,
+        model=pooled_model,
+    )
+    assert pooled["value_attention_pool_enabled"] is True
+    assert pooled["all_scalar_value_shared_inputs_scaled"] is True
+    assert pooled["shared_input_paths"] == [
+        "cls_state",
+        "attention_pool_state",
+        "attention_pool_tokens",
+    ]
 
 
 def test_checkpoint_metadata_carries_exact_gradient_routing_contract(tmp_path) -> None:
