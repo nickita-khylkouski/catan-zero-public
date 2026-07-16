@@ -1313,7 +1313,7 @@ class EntityGraphNet:
                     "value": value,
                 }
                 if return_final_vp and "final_vp_head" not in inactive_training_heads:
-                    outputs["final_vp"] = self.final_vp_head(state).squeeze(-1)
+                    outputs["final_vp"] = self.final_vp_head(value_state).squeeze(-1)
                 if (
                     self.latent_deliberation_steps > 0
                     and "deliberation_halt_head" not in inactive_training_heads
@@ -1344,7 +1344,7 @@ class EntityGraphNet:
                     self.value_categorical_head is not None
                     and "value_categorical_head" not in inactive_training_heads
                 ):
-                    cat_logits = self.value_categorical_head(state)
+                    cat_logits = self.value_categorical_head(value_state)
                     outputs["value_categorical_logits"] = cat_logits
                     n_bins = self.value_categorical_bins
                     probs = torch.softmax(cat_logits.float(), dim=-1)

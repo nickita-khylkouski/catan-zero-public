@@ -869,13 +869,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help=(
-            "Training-only scalar-value gradient routing. 1.0 preserves the "
+            "Training-only value-family gradient routing. 1.0 preserves the "
             "historical graph exactly. 0.0 keeps the scalar value forward and "
-            "value-head parameter gradient unchanged, but stops that objective's "
-            "gradient at the shared EntityGraph state/trunk boundary; intermediate "
-            "values scale only that upstream gradient. Requires --arch entity_graph "
-            "and a scalar-MSE objective. Value-attention pooling is refused because "
-            "it has an additional token-to-value path outside this boundary."
+            "all value-readout parameter gradients unchanged, but stops scalar, "
+            "final-VP, and categorical value gradients at the shared EntityGraph "
+            "state/trunk boundary; intermediate values scale only those upstream "
+            "gradients. Requires --arch entity_graph and a scalar-MSE objective."
         ),
     )
     parser.add_argument(
@@ -1981,11 +1980,13 @@ def _value_trunk_gradient_routing(
         "forward_value_identity": True,
         "value_head_parameter_gradient_scale": 1.0,
         "shared_state_upstream_gradient_scale": scale,
-        "scope": "scalar_value_readout_all_shared_inputs",
+        "scope": "value_family_readouts_all_shared_inputs",
         "legacy_scope_alias": "scalar_value_head_state_input_only",
         "shared_input_paths": shared_input_paths,
         "value_attention_pool_enabled": value_attention_pool,
         "all_scalar_value_shared_inputs_scaled": True,
+        "final_vp_shared_state_scaled": True,
+        "categorical_value_shared_state_scaled": True,
         "policy_gradient_unchanged": True,
         "optimizer_parameter_groups_unchanged": True,
         "ddp_semantics": (
