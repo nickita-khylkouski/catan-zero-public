@@ -20,6 +20,7 @@ STRICT_GATE_PLAN_PATH = RUN_DIR / "strict_gate_plan.json"
 TRANSFER_GATE_PLAN_PATH = RUN_DIR / "transfer_gate_plan.json"
 CODE_SYNC_PLAN_PATH = RUN_DIR / "code_sync_plan.json"
 TRAIN_PLAN_TEMPLATE = RUN_DIR / "train_plan_{recipe}.json"
+LEGACY_LIVE_ACK_FLAG = "--acknowledge-legacy-gcp-big-push"
 
 DEFAULT_CHAMPION = "runs/self_play/champions/current_best_s9752_iter0002.pt"
 DEFAULT_RECIPES = (
@@ -40,14 +41,22 @@ STRICT_PREFER_PREFIXES = (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Cluster-scale CatanZero big-push orchestrator. This script never "
-            "runs local RL training; it only launches remote fleet jobs through "
-            "tools/gcp_fleet_controller.py."
+            "LEGACY cluster-scale big-push orchestrator. It uses the retired GCP "
+            "controller, old champion/recipe defaults, and can automatically launch "
+            "remote jobs. Current fleet operations use tools/fleet."
         )
     )
     parser.add_argument("--cycles", type=int, default=1)
     parser.add_argument("--sleep-seconds", type=int, default=300)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        LEGACY_LIVE_ACK_FLAG,
+        action="store_true",
+        help=(
+            "Acknowledge an intentional live run through the retired GCP big-push "
+            "controller. Not required for --dry-run."
+        ),
+    )
     parser.add_argument(
         "--no-refresh",
         action="store_true",
@@ -98,8 +107,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _refuse_unacknowledged_legacy_live_run(args: argparse.Namespace) -> None:
+    """Keep the retired auto-launch controller inert unless explicitly armed."""
+
+    if not bool(args.dry_run) and not bool(
+        getattr(args, "acknowledge_legacy_gcp_big_push", False)
+    ):
+        raise SystemExit(
+            "live cluster_big_push execution is retired and may automatically "
+            "launch stale GCP training, grading, and code-sync plans. Use "
+            "tools/fleet for current operations. For an intentional historical "
+            f"live run only, pass {LEGACY_LIVE_ACK_FLAG} explicitly."
+        )
+
+
 def main() -> None:
     args = build_parser().parse_args()
+    _refuse_unacknowledged_legacy_live_run(args)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
 
     reports = []
@@ -111,6 +135,7 @@ def main() -> None:
 
 
 def run_cycle(args: argparse.Namespace, *, cycle_index: int) -> dict[str, Any]:
+    _refuse_unacknowledged_legacy_live_run(args)
     if not args.no_refresh:
         refresh_state(args)
     ensure_state_files()
