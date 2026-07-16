@@ -188,6 +188,15 @@ def _shallow_root_trace(mcts: GumbelChanceMCTS, game: Any) -> dict[str, Any]:
         "per_candidate": per_candidate,
         "selected_action": int(result.selected_action),
         "simulations_used": int(result.simulations_used),
+        "search_compute": {
+            "evaluator_method_calls": int(result.evaluator_method_calls),
+            "logical_leaf_evaluations": int(result.logical_leaf_evaluations),
+            "orientation_evaluation_rows": int(result.orientation_evaluation_rows),
+            "neural_evaluation_rows": result.neural_evaluation_rows,
+            "unique_leaf_expansions": result.unique_leaf_expansions,
+            "unique_boundary_expansions": result.unique_boundary_expansions,
+            "wall_time_sec": float(result.wall_time_sec),
+        },
     }
 
 
@@ -326,6 +335,7 @@ def evaluate_root(
             "top1_regret": None,
             "top3_coverage": None,
             "oracle_best_in_shallow_top3": None,
+            "search_compute": trace["search_compute"],
         }
 
     # Oracle ranking over the top-K prior candidates.
@@ -384,6 +394,7 @@ def evaluate_root(
         "top1_regret": float(top1_regret),
         "top3_coverage": top3_coverage,
         "oracle_best_in_shallow_top3": bool(oracle_best in shallow_top3),
+        "search_compute": trace["search_compute"],
     }
 
 
@@ -394,6 +405,27 @@ def _mean(values: list[float]) -> float | None:
 
 def aggregate(root_reports: list[dict[str, Any]]) -> dict[str, Any]:
     n = len(root_reports)
+    compute_rows = [report.get("search_compute") for report in root_reports]
+    search_compute: dict[str, int | float | None] | None = None
+    if n > 0 and all(isinstance(row, dict) for row in compute_rows):
+        search_compute = {}
+        for field_name in (
+            "evaluator_method_calls",
+            "logical_leaf_evaluations",
+            "orientation_evaluation_rows",
+            "neural_evaluation_rows",
+            "unique_leaf_expansions",
+            "unique_boundary_expansions",
+        ):
+            values = [row.get(field_name) for row in compute_rows]
+            search_compute[field_name] = (
+                sum(int(value) for value in values)
+                if all(value is not None for value in values)
+                else None
+            )
+        search_compute["wall_time_sec"] = sum(
+            float(row["wall_time_sec"]) for row in compute_rows
+        )
     return {
         "n_roots": n,
         "flip_rate": _mean([1.0 if r["flipped"] else 0.0 for r in root_reports]),
@@ -402,6 +434,7 @@ def aggregate(root_reports: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_kendall_tau": _mean([r["kendall_tau"] for r in root_reports]),
         "mean_top1_regret": _mean([r["top1_regret"] for r in root_reports]),
         "mean_top3_coverage": _mean([r["top3_coverage"] for r in root_reports]),
+        "search_compute": search_compute,
     }
 
 
@@ -571,7 +604,9 @@ def main() -> None:
         args.checkpoint,
         device=args.device,
         config=EntityGraphRustEvaluatorConfig(
-            public_observation=bool(args.public_observation)
+            public_observation=bool(args.public_observation),
+            # Make neural rows exact and independent of root/role ordering.
+            cache_size=0,
         ),
     )
     config = _build_config(args)

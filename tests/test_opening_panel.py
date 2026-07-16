@@ -65,6 +65,33 @@ def test_aggregate_means_and_nulls():
     assert agg["mean_kendall_tau"] == pytest.approx(0.5)
 
 
+def test_aggregate_sums_compute_and_preserves_unknown_neural_rows():
+    base = {
+        "flipped": False, "raw_q_spread": 0.1, "spread_over_floor": 1.0,
+        "kendall_tau": None, "top1_regret": None, "top3_coverage": None,
+    }
+    first = base | {"search_compute": {
+        "evaluator_method_calls": 2, "logical_leaf_evaluations": 3,
+        "orientation_evaluation_rows": 4, "neural_evaluation_rows": 4,
+        "unique_leaf_expansions": 2, "unique_boundary_expansions": 1,
+        "wall_time_sec": 0.25,
+    }}
+    second = base | {"search_compute": {
+        "evaluator_method_calls": 5, "logical_leaf_evaluations": 6,
+        "orientation_evaluation_rows": 7, "neural_evaluation_rows": None,
+        "unique_leaf_expansions": 4, "unique_boundary_expansions": 2,
+        "wall_time_sec": 0.5,
+    }}
+    compute = aggregate([first, second])["search_compute"]
+    assert compute["evaluator_method_calls"] == 7
+    assert compute["logical_leaf_evaluations"] == 9
+    assert compute["orientation_evaluation_rows"] == 11
+    assert compute["neural_evaluation_rows"] is None
+    assert compute["unique_leaf_expansions"] == 6
+    assert compute["unique_boundary_expansions"] == 3
+    assert compute["wall_time_sec"] == pytest.approx(0.75)
+
+
 def test_sample_from_priors_stays_in_support():
     rng = random.Random(0)
     legal = (3, 7, 9)
@@ -85,6 +112,13 @@ def test_shallow_trace_uses_public_search_result_not_private_root_expansion():
         priors={3: 0.6, 7: 0.4},
         root_value=0.05,
         simulations_used=8,
+        evaluator_method_calls=4,
+        logical_leaf_evaluations=9,
+        orientation_evaluation_rows=20,
+        neural_evaluation_rows=20,
+        unique_leaf_expansions=9,
+        unique_boundary_expansions=2,
+        wall_time_sec=0.125,
     )
 
     class SearchOnly:
@@ -101,6 +135,8 @@ def test_shallow_trace_uses_public_search_result_not_private_root_expansion():
     assert mcts.calls == [(game, True)]
     assert trace["selected_action"] == 7
     assert trace["simulations_used"] == 8
+    assert trace["search_compute"]["neural_evaluation_rows"] == 20
+    assert trace["search_compute"]["unique_boundary_expansions"] == 2
     assert trace["per_candidate"][7]["ranking_score"] == pytest.approx(0.75)
     assert trace["per_candidate"][3]["raw_q"] == pytest.approx(-0.1)
 

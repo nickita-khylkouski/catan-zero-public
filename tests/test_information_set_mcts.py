@@ -251,7 +251,7 @@ def test_information_set_d6_reuses_one_public_root_without_operator_drift() -> N
         ):
             del attested_root_phase
             if precomputed_root_evaluation is missing:
-                root_evaluation = evaluator.evaluate_symmetry_averaged(
+                root_evaluation = _self.evaluator.evaluate_symmetry_averaged(
                     game,
                     (11, 12),
                     root_color="RED",
@@ -296,6 +296,12 @@ def test_information_set_d6_reuses_one_public_root_without_operator_drift() -> N
     assert repeated_evaluator.calls == 4
     assert len({id(result) for result in shared_objects}) == 1
     assert shared_result == repeated_result
+    assert shared_result.evaluator_method_calls == 1
+    assert shared_result.logical_leaf_evaluations == 1
+    assert shared_result.orientation_evaluation_rows == 12
+    assert repeated_result.evaluator_method_calls == 4
+    assert repeated_result.logical_leaf_evaluations == 4
+    assert repeated_result.orientation_evaluation_rows == 48
 
 
 def test_per_particle_override_enforces_exact_total_budget() -> None:
@@ -715,6 +721,7 @@ def test_boundary_particles_average_values_with_real_per_world_legal_sets() -> N
     )
     mcts.evaluator = evaluator
     mcts._boundary_value_particle_seeds = (1, 2, 3)
+    mcts._begin_expansion_accounting()
 
     def fetch(_self, game):
         legal = (11,) if game.seed == 1 else ((11, 12) if game.seed == 2 else (12, 13, 14))
@@ -734,6 +741,7 @@ def test_boundary_particles_average_values_with_real_per_world_legal_sets() -> N
     assert [[legal for _game, legal in batch] for batch in evaluator.requests] == [
         [(11,), (11, 12), (12, 13, 14)]
     ]
+    assert mcts._expansion_accounting_snapshot() == (0, 1)
 
 
 def test_boundary_particle_configuration_fails_closed_on_uncertainty() -> None:

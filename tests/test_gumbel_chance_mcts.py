@@ -132,6 +132,12 @@ def test_search_result_actions_are_all_legal():
     assert set(result.visit_counts) == legal
     assert set(result.priors) == legal
     assert set(result.q_values).issubset(legal)
+    assert result.evaluator_method_calls > 0
+    assert result.logical_leaf_evaluations > 0
+    assert result.orientation_evaluation_rows >= result.logical_leaf_evaluations
+    assert result.unique_leaf_expansions == result.logical_leaf_evaluations
+    assert result.unique_boundary_expansions == 0
+    assert result.wall_time_sec >= 0.0
 
 
 def _legal_ids(game):
@@ -167,6 +173,11 @@ def test_forced_roll_still_enumerates_dice_and_reports_real_afterstate_value():
     assert action in result.afterstate_values
     assert -1.0 <= result.afterstate_values[action] <= 1.0
     assert -1.0 <= result.root_value <= 1.0
+    assert result.evaluator_method_calls == 1
+    assert result.logical_leaf_evaluations == 11
+    assert result.orientation_evaluation_rows == 11
+    assert result.unique_leaf_expansions == 11
+    assert result.unique_boundary_expansions == 0
 
 
 # ---------------------------------------------------------------------------

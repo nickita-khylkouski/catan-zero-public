@@ -41,9 +41,11 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
+from catan_zero.search.accounting import SearchAccountingEvaluator, SearchWork
 from catan_zero.search.rust_mcts import (
     HeuristicRustEvaluator,
     RustEvaluator,
@@ -804,6 +806,18 @@ class SearchResult:
     # synthetic/old-wheel results default false and experimental aggregation
     # refuses them.
     q_values_root_perspective: bool = False
+    # Per-search compute evidence. These append-only, non-semantic fields keep
+    # old constructors and deterministic result equality backward compatible.
+    # neural_evaluation_rows is exact only when the evaluator contract proves
+    # actual model work; unknown is represented by None rather than a request
+    # count that cache hits could make false.
+    evaluator_method_calls: int = field(default=0, compare=False)
+    logical_leaf_evaluations: int = field(default=0, compare=False)
+    orientation_evaluation_rows: int = field(default=0, compare=False)
+    neural_evaluation_rows: int | None = field(default=None, compare=False)
+    unique_leaf_expansions: int | None = field(default=0, compare=False)
+    unique_boundary_expansions: int | None = field(default=0, compare=False)
+    wall_time_sec: float = field(default=0.0, compare=False)
 
 
 @dataclass(slots=True)
@@ -1157,11 +1171,84 @@ class GumbelChanceMCTS:
     # Public search entry point.
     # ------------------------------------------------------------------
     def search(self, game: Any, *, force_full: bool | None = None) -> SearchResult:
+        accounting = self._ensure_accounting_evaluator()
+        before = accounting.snapshot()
+        self._begin_expansion_accounting()
+        started = time.perf_counter()
         if bool(getattr(self.config, "coherent_public_belief_search", False)):
-            return self._search_coherent_public_belief(game, force_full=force_full)
-        if bool(getattr(self.config, "information_set_search", False)):
-            return self._search_information_set(game, force_full=force_full)
-        return self._search_authoritative(game, force_full=force_full)
+            result = self._search_coherent_public_belief(game, force_full=force_full)
+        elif bool(getattr(self.config, "information_set_search", False)):
+            result = self._search_information_set(game, force_full=force_full)
+        else:
+            result = self._search_authoritative(game, force_full=force_full)
+        elapsed = time.perf_counter() - started
+        work = accounting.snapshot() - before
+        leaves, boundaries = self._expansion_accounting_snapshot()
+        return replace(
+            result,
+            evaluator_method_calls=int(work.evaluator_calls),
+            logical_leaf_evaluations=int(work.logical_leaf_evaluations),
+            orientation_evaluation_rows=int(work.orientation_evaluation_rows),
+            neural_evaluation_rows=self._exact_neural_rows(work),
+            unique_leaf_expansions=leaves,
+            unique_boundary_expansions=boundaries,
+            wall_time_sec=float(elapsed),
+        )
+
+    def _ensure_accounting_evaluator(self) -> SearchAccountingEvaluator:
+        """Install the transparent counter lazily, including test shells."""
+        if not isinstance(self.evaluator, SearchAccountingEvaluator):
+            self.evaluator = SearchAccountingEvaluator(self.evaluator)
+        return self.evaluator
+
+    def _exact_neural_rows(self, work: SearchWork) -> int | None:
+        """Return actual model rows only when the evaluator contract proves it."""
+        evaluator: Any = self.evaluator
+        while isinstance(evaluator, SearchAccountingEvaluator):
+            evaluator = evaluator.evaluator
+        if isinstance(evaluator, HeuristicRustEvaluator):
+            return 0
+        config = getattr(evaluator, "config", None)
+        if (
+            config is not None
+            and hasattr(evaluator, "policy")
+            and int(getattr(config, "cache_size", -1)) == 0
+        ):
+            return int(work.orientation_evaluation_rows)
+        return None
+
+    def _begin_expansion_accounting(self) -> None:
+        self._accounted_leaf_expansions = 0
+        self._accounted_boundary_expansions = 0
+        self._accounted_boundary_node_ids: set[int] = set()
+        self._expansion_counts_available = True
+
+    def _mark_expansion_accounting_unavailable(self) -> None:
+        self._expansion_counts_available = False
+
+    def _record_boundary_expansion(self, node: "_GNode") -> None:
+        if not getattr(self, "_expansion_counts_available", False):
+            return
+        node_id = id(node)
+        boundary_ids = self._accounted_boundary_node_ids
+        if node_id in boundary_ids:
+            return
+        boundary_ids.add(node_id)
+        self._accounted_boundary_expansions += 1
+
+    def _record_leaf_expansion(self, node: "_GNode") -> None:
+        if not getattr(self, "_expansion_counts_available", False):
+            return
+        if id(node) not in self._accounted_boundary_node_ids:
+            self._accounted_leaf_expansions += 1
+
+    def _expansion_accounting_snapshot(self) -> tuple[int | None, int | None]:
+        if not getattr(self, "_expansion_counts_available", False):
+            return None, None
+        return (
+            int(getattr(self, "_accounted_leaf_expansions", 0)),
+            int(getattr(self, "_accounted_boundary_expansions", 0)),
+        )
 
     def _search_authoritative(
         self, game: Any, *, force_full: bool | None = None
@@ -2408,6 +2495,7 @@ class GumbelChanceMCTS:
         and hidden-world legal supports are not policy-aligned.
         """
 
+        self._record_boundary_expansion(node)
         seeds = tuple(
             int(seed)
             for seed in getattr(self, "_boundary_value_particle_seeds", ())
@@ -2478,6 +2566,7 @@ class GumbelChanceMCTS:
         # was constructed independently of authoritative hidden truth.
         if self._is_information_set_turn_boundary(node, depth=depth):
             if not node.expanded:
+                self._record_boundary_expansion(node)
                 if int(self.config.boundary_value_particles) > 1:
                     value = self._expand_boundary_value_particles(node)
                     node.visits += 1
@@ -2612,6 +2701,7 @@ class GumbelChanceMCTS:
             return 1.0 if str(winner) == node.root_color else -1.0
         if self._is_information_set_turn_boundary(node, depth=depth):
             if not node.expanded:
+                self._record_boundary_expansion(node)
                 value = (
                     self._expand_boundary_value_particles(node)
                     if int(self.config.boundary_value_particles) > 1
@@ -3243,6 +3333,8 @@ class GumbelChanceMCTS:
         second, redundant per-child `evaluator.evaluate()` call. `uncertainty`
         (CAT-61) defaults to 0.0 so evaluators that do not emit it leave the
         capped backup weighting inert."""
+        if not node.expanded:
+            self._record_leaf_expansion(node)
         if legal_actions:
             missing = [action for action in legal_actions if action not in priors]
             if missing:

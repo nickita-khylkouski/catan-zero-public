@@ -113,3 +113,53 @@ def test_invalid_orientation_count_and_snapshot_order_fail_closed() -> None:
         SearchAccountingEvaluator(_Evaluator(), symmetry_orientations=0)
     with pytest.raises(ValueError, match="not monotonic"):
         _ = SearchWork() - SearchWork(1, 1, 1)
+
+
+def test_search_result_telemetry_is_append_only_and_non_semantic() -> None:
+    from catan_zero.search.gumbel_chance_mcts import SearchResult
+
+    common = dict(
+        selected_action=1,
+        improved_policy={1: 1.0},
+        visit_counts={1: 1},
+        q_values={1: 0.25},
+        priors={1: 1.0},
+        root_value=0.25,
+        used_full_search=True,
+        simulations_used=1,
+    )
+    baseline = SearchResult(**common)
+    measured = SearchResult(
+        **common,
+        evaluator_method_calls=3,
+        logical_leaf_evaluations=5,
+        orientation_evaluation_rows=16,
+        neural_evaluation_rows=16,
+        unique_leaf_expansions=5,
+        unique_boundary_expansions=1,
+        wall_time_sec=0.5,
+    )
+    assert baseline == measured
+    assert measured.neural_evaluation_rows == 16
+
+
+def test_neural_row_attestation_fails_closed_when_cache_can_hide_forwards() -> None:
+    from types import SimpleNamespace
+
+    from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTS
+
+    class NeuralLike:
+        policy = object()
+
+        def __init__(self, cache_size: int) -> None:
+            self.config = SimpleNamespace(cache_size=cache_size)
+
+        def evaluate(self, *_args, **_kwargs):
+            return {}, 0.0
+
+    mcts = object.__new__(GumbelChanceMCTS)
+    work = SearchWork(3, 5, 16)
+    mcts.evaluator = SearchAccountingEvaluator(NeuralLike(cache_size=0))
+    assert mcts._exact_neural_rows(work) == 16
+    mcts.evaluator = SearchAccountingEvaluator(NeuralLike(cache_size=1))
+    assert mcts._exact_neural_rows(work) is None

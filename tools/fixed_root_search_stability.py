@@ -9,8 +9,8 @@ legal-action set, checkpoint, evaluator config, or panel hash has drifted.
 
 Unlike whole-game H2H timing, this artifact makes search cost attributable:
 every recorded search reports ``SearchResult.simulations_used``, wall time,
-logical leaf evaluations, evaluator method calls, and orientation-expanded
-evaluation rows (so a D6 root counts as 12 orientation rows).  Repeated runs
+logical leaf evaluations, evaluator method calls, unique ordinary/boundary
+expansions, and exact neural rows (a D6 root counts as 12 rows).  Repeated runs
 use disjoint search seeds within and across roles and report pairwise
 Jensen-Shannon divergence and top-1 agreement globally and by phase/legal
 width, including the S3-critical ``>=40`` slice.
@@ -1048,9 +1048,7 @@ def _run_one_search(
     config = _make_search_config(spec, seed=search_seed)
     mcts = GumbelChanceMCTS(config, evaluator)
     before = evaluator.snapshot()
-    started = time.perf_counter()
     result = mcts.search(state.copy(), force_full=True)
-    wall_sec = time.perf_counter() - started
     eval_counts = CountingEvaluator.delta(before, evaluator.snapshot())
     improved = _normalize_policy(
         {int(action): float(value) for action, value in result.improved_policy.items()}
@@ -1085,8 +1083,26 @@ def _run_one_search(
             q_values[0] - q_values[1] if len(q_values) >= 2 else 0.0
         ),
         "simulations_used": int(result.simulations_used),
-        "wall_sec": float(wall_sec),
+        "wall_sec": float(result.wall_time_sec),
         **eval_counts,
+        "logical_leaf_evaluations": int(result.logical_leaf_evaluations),
+        "orientation_evaluation_rows": int(result.orientation_evaluation_rows),
+        "evaluator_method_calls": int(result.evaluator_method_calls),
+        "neural_evaluation_rows": (
+            int(result.neural_evaluation_rows)
+            if result.neural_evaluation_rows is not None
+            else None
+        ),
+        "unique_leaf_expansions": (
+            int(result.unique_leaf_expansions)
+            if result.unique_leaf_expansions is not None
+            else None
+        ),
+        "unique_boundary_expansions": (
+            int(result.unique_boundary_expansions)
+            if result.unique_boundary_expansions is not None
+            else None
+        ),
     }
 
 
@@ -1104,6 +1120,24 @@ def _aggregate_role(
     logical_evals = sum(int(run["logical_leaf_evaluations"]) for run in runs)
     orientation_evals = sum(int(run["orientation_evaluation_rows"]) for run in runs)
     evaluator_calls = sum(int(run["evaluator_method_calls"]) for run in runs)
+    neural_values = [run.get("neural_evaluation_rows") for run in runs]
+    neural_rows = (
+        sum(int(value) for value in neural_values)
+        if all(value is not None for value in neural_values)
+        else None
+    )
+    leaf_values = [run.get("unique_leaf_expansions") for run in runs]
+    leaf_expansions = (
+        sum(int(value) for value in leaf_values)
+        if all(value is not None for value in leaf_values)
+        else None
+    )
+    boundary_values = [run.get("unique_boundary_expansions") for run in runs]
+    boundary_expansions = (
+        sum(int(value) for value in boundary_values)
+        if all(value is not None for value in boundary_values)
+        else None
+    )
     js_values = [float(pair["js_divergence"]) for pair in pairwise]
     agreements = [1.0 if pair["top1_agreement"] else 0.0 for pair in pairwise]
 
@@ -1134,6 +1168,22 @@ def _aggregate_role(
         "evaluator_method_calls": evaluator_calls,
         "evaluator_method_calls_per_search": (
             evaluator_calls / len(runs) if runs else None
+        ),
+        "neural_evaluation_rows": neural_rows,
+        "neural_evaluation_rows_per_search": (
+            neural_rows / len(runs) if neural_rows is not None and runs else None
+        ),
+        "unique_leaf_expansions": leaf_expansions,
+        "unique_leaf_expansions_per_search": (
+            leaf_expansions / len(runs)
+            if leaf_expansions is not None and runs
+            else None
+        ),
+        "unique_boundary_expansions": boundary_expansions,
+        "unique_boundary_expansions_per_search": (
+            boundary_expansions / len(runs)
+            if boundary_expansions is not None and runs
+            else None
         ),
         "cross_seed_js_mean": _mean(js_values),
         "cross_seed_js_median": _median(js_values),

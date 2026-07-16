@@ -293,6 +293,11 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
                 precomputed_root_evaluation=precomputed_root_evaluation,
             )
 
+        # Evaluator callback work remains exact, but the current native result
+        # schema does not expose distinct expanded tree nodes. Unknown is safer
+        # than falsely reporting zero unique expansions.
+        self._mark_expansion_accounting_unavailable()
+
         import catanatron_rs  # type: ignore
 
         colors = tuple(self.config.colors)
