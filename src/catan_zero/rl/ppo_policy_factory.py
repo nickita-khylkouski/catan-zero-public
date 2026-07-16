@@ -8,6 +8,7 @@ of the same checkpoint passed to ``ppo_update(..., ema_policy=<frozen bc>, ema_p
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -23,6 +24,46 @@ def require_canonical_ppo_architecture(architecture: str) -> str:
             f"legacy architecture {architecture!r} is not accepted"
         )
     return resolved
+
+
+def validate_canonical_ppo_actor_contract(
+    *,
+    architecture: str,
+    gamma: float,
+    gae_lambda: float,
+    action_temperature: float,
+) -> None:
+    """Validate the rollout fields shared by every canonical PPO actor."""
+    require_canonical_ppo_architecture(architecture)
+    if float(gamma) != 1.0:
+        raise ValueError(f"canonical PPO requires terminal gamma=1.0, got {gamma}")
+    if not math.isfinite(float(gae_lambda)) or not 0.95 <= float(gae_lambda) <= 0.98:
+        raise ValueError("canonical PPO requires gae_lambda in [0.95, 0.98]")
+    if not math.isfinite(float(action_temperature)) or float(action_temperature) <= 0.0:
+        raise ValueError("canonical PPO action_temperature must be finite and positive")
+
+
+def validate_canonical_ppo_staleness_contract(
+    *,
+    use_vtrace: bool,
+    max_staleness: int,
+    vtrace_clip_rho: float,
+    vtrace_clip_pg_rho: float,
+) -> None:
+    """Validate bounded rollout reuse and explicit V-trace correction bounds."""
+    staleness = int(max_staleness)
+    if not 0 <= staleness <= 4:
+        raise ValueError("canonical PPO max_staleness must be in [0, 4]")
+    if not bool(use_vtrace) and staleness != 0:
+        raise ValueError(
+            "PPO without V-trace requires max_staleness=0 (version-exact rollouts)"
+        )
+    for name, value in (
+        ("vtrace_clip_rho", vtrace_clip_rho),
+        ("vtrace_clip_pg_rho", vtrace_clip_pg_rho),
+    ):
+        if not math.isfinite(float(value)) or not 0.0 < float(value) <= 1.0:
+            raise ValueError(f"canonical PPO {name} must be finite and in (0, 1]")
 
 
 def load_ppo_policy(
@@ -82,6 +123,13 @@ def load_exact_parent_and_frozen_anchor(
         not torch.equal(parent_state[name], anchor_state[name]) for name in parent_state
     ):
         raise RuntimeError("PPO parent and frozen anchor did not load identical checkpoint state")
+    parent_parameters = dict(parent.model.named_parameters())
+    anchor_parameters = dict(anchor.model.named_parameters())
+    if parent_parameters.keys() != anchor_parameters.keys() or any(
+        parent_parameters[name].data_ptr() == anchor_parameters[name].data_ptr()
+        for name in parent_parameters
+    ):
+        raise RuntimeError("PPO parent and frozen anchor share parameter storage")
     if any(parameter.requires_grad for parameter in anchor.model.parameters()):
         raise RuntimeError("PPO KL anchor is not fully frozen")
     return parent, anchor

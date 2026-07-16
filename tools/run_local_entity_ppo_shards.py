@@ -5,7 +5,6 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import multiprocessing as mp
-from pathlib import Path
 import time
 from typing import Any
 
@@ -15,6 +14,7 @@ from catan_zero.rl import ppo_distributed as dist
 from catan_zero.rl.ppo_policy_factory import (
     CANONICAL_PPO_ARCHITECTURE,
     load_ppo_policy,
+    validate_canonical_ppo_actor_contract,
 )
 from catan_zero.rl.torch_ppo import collect_ppo_episode
 from factory_common import make_named_policy, parse_track
@@ -61,13 +61,26 @@ def main() -> None:
     )
     parser.add_argument("--publish", action="store_true")
     args = parser.parse_args()
-    if float(args.gamma) != 1.0:
-        parser.error(f"canonical PPO requires terminal gamma=1.0, got {args.gamma}")
-    if not 0.95 <= float(args.gae_lambda) <= 0.98:
-        parser.error("canonical PPO requires gae-lambda in [0.95, 0.98]")
+    try:
+        validate_canonical_ppo_actor_contract(
+            architecture=args.architecture,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            action_temperature=args.action_temperature,
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
     root = dist.run_root(args.run_base, args.run_name)
     dist.ensure_run_dirs(root)
+    dist.bind_run_contract(
+        root,
+        init_checkpoint=args.checkpoint,
+        architecture=args.architecture,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        behavior_temperature=args.action_temperature,
+    )
     if args.publish or dist.read_version(root) is None:
         policy = load_ppo_policy(args.checkpoint, architecture=args.architecture, device="cpu")
         published = dist.publish_weights(root, policy.save, step=0)

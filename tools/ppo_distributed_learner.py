@@ -47,17 +47,18 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from catan_zero.rl import ppo_distributed as dist
-from catan_zero.rl.league import League
-from catan_zero.rl.ppo_policy_factory import (
+from catan_zero.rl import ppo_distributed as dist  # noqa: E402
+from catan_zero.rl.league import League  # noqa: E402
+from catan_zero.rl.ppo_policy_factory import (  # noqa: E402
     CANONICAL_PPO_ARCHITECTURE,
     load_exact_parent_and_frozen_anchor,
     load_frozen_bc_anchor,
     load_ppo_policy,
-    require_canonical_ppo_architecture,
+    validate_canonical_ppo_actor_contract,
+    validate_canonical_ppo_staleness_contract,
 )
-from catan_zero.rl.torch_ppo import make_ppo_optimizer, ppo_update
-from catan_zero.rl.vtrace import vtrace_from_log_probs
+from catan_zero.rl.torch_ppo import make_ppo_optimizer, ppo_update  # noqa: E402
+from catan_zero.rl.vtrace import vtrace_from_log_probs  # noqa: E402
 
 
 # --------------------------------------------------------------------------- config / CLI
@@ -113,6 +114,7 @@ class LearnerConfig:
     vtrace_clip_rho: float = 1.0
     vtrace_clip_pg_rho: float = 1.0
     gamma: float = 1.0
+    gae_lambda: float = 0.95
     vtrace_use_current_values: bool = True  # recompute critic values vs reuse traj.old_values
     # FIX H4: chunk the V-trace recompute forward into sub-batches of this many rows to bound
     # peak memory (one forward over 25k-150k rows x [action_size x ctx] would OOM the GPU).
@@ -263,6 +265,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--vtrace-forward-chunk", type=int, default=8192,
                    help="Rows per sub-batch for the V-trace recompute forward (caps peak memory).")
     g.add_argument("--gamma", type=float, default=1.0)
+    g.add_argument("--gae-lambda", type=float, default=0.95)
     g.add_argument("--vtrace-reuse-old-values", dest="vtrace_use_current_values",
                    action="store_false", default=True,
                    help="Use the stored traj.old_values as the V-trace baseline instead of "
@@ -312,6 +315,7 @@ def _flatten_config(raw: dict[str, Any]) -> dict[str, Any]:
 
     rollout = raw.get("rollout", {}) or {}
     take(rollout.get("gamma"), "gamma")
+    take(rollout.get("gae_lambda"), "gae_lambda")
     take(rollout.get("max_decisions_per_game"), "eval_max_decisions")
 
     ppo = raw.get("ppo", {}) or {}
@@ -431,6 +435,7 @@ def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argpar
         "vtrace_clip_pg_rho": args.vtrace_clip_pg_rho,
         "vtrace_forward_chunk": args.vtrace_forward_chunk,
         "gamma": args.gamma,
+        "gae_lambda": args.gae_lambda,
         "vtrace_use_current_values": args.vtrace_use_current_values,
         "checkpoint_every": args.checkpoint_every,
         "keep_last_checkpoints": args.keep_last_checkpoints,
@@ -468,9 +473,12 @@ def resolve_config(argv: list[str] | None = None) -> tuple[LearnerConfig, argpar
 
 def _validate_w7_config(config: LearnerConfig) -> None:
     """Enforce the canonical on-policy contract before loading a checkpoint."""
-    require_canonical_ppo_architecture(config.architecture)
-    if float(config.gamma) != 1.0:
-        raise ValueError(f"canonical PPO requires terminal gamma=1.0, got {config.gamma}")
+    validate_canonical_ppo_actor_contract(
+        architecture=config.architecture,
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda,
+        action_temperature=config.behavior_temperature,
+    )
     if not 2 <= int(config.ppo_epochs) <= 4:
         raise ValueError("canonical PPO requires 2-4 update epochs")
     if not 0.005 <= float(config.target_kl) <= 0.01:
@@ -481,12 +489,12 @@ def _validate_w7_config(config: LearnerConfig) -> None:
         0.0 < float(config.trunk_lr_mult) <= 0.1
     ):
         raise ValueError("canonical PPO requires trunk_lr_mult in (0, 0.1]")
-    if int(config.max_staleness) < 0:
-        raise ValueError("max_staleness must be non-negative")
-    if not bool(config.use_vtrace) and int(config.max_staleness) != 0:
-        raise ValueError(
-            "PPO without V-trace requires max_staleness=0 (version-exact rollouts)"
-        )
+    validate_canonical_ppo_staleness_contract(
+        use_vtrace=config.use_vtrace,
+        max_staleness=config.max_staleness,
+        vtrace_clip_rho=config.vtrace_clip_rho,
+        vtrace_clip_pg_rho=config.vtrace_clip_pg_rho,
+    )
 
 
 # --------------------------------------------------------------------------- KL-to-BC anneal
@@ -1166,6 +1174,15 @@ def train(
     dist.ensure_run_dirs(root)
 
     _validate_w7_config(config)
+    run_contract = dist.bind_run_contract(
+        root,
+        init_checkpoint=config.init_checkpoint,
+        architecture=config.architecture,
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda,
+        behavior_temperature=config.behavior_temperature,
+    )
+    print({"event": "run_contract", **run_contract}, flush=True)
 
     # 1. TRAINABLE policy + separate FROZEN anchor.  A cold start loads both
     # copies through one equality-checked factory call; a resume intentionally
@@ -1262,23 +1279,27 @@ def train(
         # 3a. pull bounded-staleness shards. FIX 5: with_envelope reuses the deserialized
         # envelope so read_shards does not deserialize each shard a second time. FIX 6:
         # volume_reload_fn lets a Modal-hosted learner see volume writes before scanning.
-        min_version = max(0, current_version - config.max_staleness)
+        min_version = (
+            current_version
+            if not config.use_vtrace
+            else max(0, current_version - config.max_staleness)
+        )
+        max_version = current_version
 
         # FIX C2 (drop the WHOLE stale backlog, not just the scanned window): once per step sweep
         # every unconsumed shard below min_version to the consumed marker so a backlog of stale
         # shards cannot pile up unboundedly. The backbone fn may not exist yet (parallel edit), so
         # call it defensively and just fall back to the per-scan staleness drop if absent.
-        sweep_fn = getattr(dist, "sweep_drop_stale", None)
+        sweep_fn = getattr(dist, "sweep_drop_outside_policy_window", None)
         if callable(sweep_fn):
             try:
-                sweep_fn(root, min_policy_version=min_version)
-            except TypeError:
-                try:  # tolerate a slightly different kwarg name during the parallel edit
-                    sweep_fn(root, min_version=min_version)  # type: ignore[call-arg]
-                except Exception as exc:
-                    print({"event": "sweep_drop_stale_error", "error": repr(exc)}, flush=True)
+                sweep_fn(
+                    root,
+                    min_policy_version=min_version,
+                    max_policy_version=max_version,
+                )
             except Exception as exc:
-                print({"event": "sweep_drop_stale_error", "error": repr(exc)}, flush=True)
+                print({"event": "sweep_drop_policy_window_error", "error": repr(exc)}, flush=True)
 
         # FIX C2 (train on the FRESHEST data): ask for newest-first so the scanned window is the
         # freshest shards, not the stalest. ``newest_first`` may not exist yet (parallel edit) —
@@ -1286,6 +1307,7 @@ def train(
         iter_kwargs = dict(
             max_shards=config.shards_per_step,
             min_policy_version=min_version,
+            max_policy_version=max_version,
             stable_secs=config.stable_secs,
             with_envelope=True,
             volume_reload_fn=volume_reload_fn,

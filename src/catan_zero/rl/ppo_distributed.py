@@ -26,6 +26,7 @@ returned path with its own loader. Pure stdlib + pickle; no torch/env import at 
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pickle
@@ -38,6 +39,8 @@ POLICY_DIRNAME = "policy"
 CURRENT_WEIGHTS_NAME = "current.pt"
 VERSION_FILENAME = "version.json"
 VERSIONED_WEIGHTS_GLOB = "weights_v*.pt"
+RUN_CONTRACT_FILENAME = "run_contract.json"
+RUN_CONTRACT_SCHEMA = "canonical_entity_ppo_run_v1"
 # How many old versioned weight files to keep on disk (newest N). The rest are GC'd by
 # publish_weights so a multi-day run does not accumulate hundreds of stale checkpoints.
 KEEP_VERSIONED_WEIGHTS = 3
@@ -75,6 +78,10 @@ def version_path(root: str | os.PathLike) -> Path:
     return policy_dir(root) / VERSION_FILENAME
 
 
+def run_contract_path(root: str | os.PathLike) -> Path:
+    return Path(root) / RUN_CONTRACT_FILENAME
+
+
 def trajectories_dir(root: str | os.PathLike, worker_id: str | None = None) -> Path:
     base = Path(root) / TRAJ_DIRNAME
     return base / worker_id if worker_id else base
@@ -100,6 +107,72 @@ def ensure_run_dirs(root: str | os.PathLike) -> None:
     for d in (policy_dir(root), trajectories_dir(root), consumed_dir(root),
               checkpoints_dir(root), league_dir(root), eval_dir(root)):
         Path(d).mkdir(parents=True, exist_ok=True)
+
+
+def checkpoint_sha256(path: str | os.PathLike) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def bind_run_contract(
+    root: str | os.PathLike,
+    *,
+    init_checkpoint: str | os.PathLike,
+    architecture: str,
+    gamma: float,
+    gae_lambda: float,
+    behavior_temperature: float,
+) -> dict[str, Any]:
+    """Atomically create or verify the immutable PPO initializer/actor contract."""
+    root_path = Path(root)
+    root_path.mkdir(parents=True, exist_ok=True)
+    checkpoint = Path(init_checkpoint).resolve()
+    payload = {
+        "schema": RUN_CONTRACT_SCHEMA,
+        "initializer_sha256": checkpoint_sha256(checkpoint),
+        "architecture": str(architecture),
+        "gamma": float(gamma),
+        "gae_lambda": float(gae_lambda),
+        "behavior_temperature": float(behavior_temperature),
+    }
+    path = run_contract_path(root_path)
+
+    def verify_existing() -> dict[str, Any]:
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"invalid PPO run contract at {path}") from error
+        if existing != payload:
+            raise RuntimeError(
+                "PPO run contract mismatch: immutable initializer/actor binding changed; "
+                f"expected={existing!r} requested={payload!r}"
+            )
+        return existing
+
+    if path.exists():
+        return verify_existing()
+
+    # Publish complete bytes with atomic create-if-absent semantics. Multiple
+    # actors may race; the loser verifies the winner's exact payload.
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    try:
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return verify_existing()
 
 
 # ------------------------------------------------------------------- weight versioning
@@ -249,11 +322,14 @@ def _consumed_marker(root: str | os.PathLike, shard_path: Path) -> Path:
 
 def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = None,
                            min_policy_version: int = 0, stable_secs: float = 0.0,
+                           max_policy_version: int | None = None,
                            with_envelope: bool = False, newest_first: bool = False,
                            volume_reload_fn: Callable[[], Any] | None = None) -> Iterator[Any]:
     """Yield shard paths not yet marked consumed.
 
-    ``min_policy_version`` drops over-stale shards (actor weights too old — staleness bound).
+    Versions outside the inclusive ``[min_policy_version, max_policy_version]``
+    window are consumed without training. ``max_policy_version=None`` leaves the
+    upper bound open for backward compatibility.
     ``stable_secs`` skips shards written within the last N seconds (avoid reading mid-write on
     filesystems without atomic rename guarantees; default 0 trusts the atomic rename).
 
@@ -288,7 +364,19 @@ def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = 
     now = time.time()
     # When we need the envelope at all (staleness drop, payload, or version-based ordering) we
     # must deserialize. newest_first additionally needs the version+mtime up front to sort.
-    need_envelope = min_policy_version > 0 or with_envelope or newest_first
+    need_envelope = (
+        min_policy_version > 0
+        or max_policy_version is not None
+        or with_envelope
+        or newest_first
+    )
+
+    def version_is_rejected(envelope: Any) -> bool:
+        policy_version = int(envelope.get("policy_version", 0))
+        return policy_version < min_policy_version or (
+            max_policy_version is not None
+            and policy_version > int(max_policy_version)
+        )
 
     if not newest_first:
         # ---- streaming oldest-first (original behavior; cheap when no envelope needed) ----
@@ -307,11 +395,8 @@ def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = 
                         envelope = read_trajectory_shard(shard)
                     except (pickle.UnpicklingError, EOFError, OSError):
                         continue
-                    if (
-                        min_policy_version > 0
-                        and int(envelope.get("policy_version", 0)) < min_policy_version
-                    ):
-                        mark_consumed(root, shard)  # too stale: drop it
+                    if version_is_rejected(envelope):
+                        mark_consumed(root, shard)
                         continue
                 yield (shard, envelope) if with_envelope else shard
                 count += 1
@@ -338,8 +423,8 @@ def iter_unconsumed_shards(root: str | os.PathLike, *, max_shards: int | None = 
             except (pickle.UnpicklingError, EOFError, OSError):
                 continue
             pv = int(envelope.get("policy_version", 0))
-            if min_policy_version > 0 and pv < min_policy_version:
-                mark_consumed(root, shard)  # too stale: drop it
+            if version_is_rejected(envelope):
+                mark_consumed(root, shard)
                 continue
             candidates.append((pv, mtime, shard, envelope))
     candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)  # version DESC, then mtime DESC
@@ -375,6 +460,35 @@ def sweep_drop_stale(root: str | os.PathLike, *, min_policy_version: int) -> int
             except (pickle.UnpicklingError, EOFError, OSError):
                 continue
             if int(envelope.get("policy_version", 0)) < min_policy_version:
+                mark_consumed(root, shard)
+                dropped += 1
+    return dropped
+
+
+def sweep_drop_outside_policy_window(
+    root: str | os.PathLike,
+    *,
+    min_policy_version: int,
+    max_policy_version: int,
+) -> int:
+    """Consume every shard outside an inclusive accepted policy-version window."""
+    base = trajectories_dir(root)
+    if not base.exists():
+        return 0
+    consumed_dir(root).mkdir(parents=True, exist_ok=True)
+    dropped = 0
+    for worker in sorted(base.iterdir()):
+        if not worker.is_dir():
+            continue
+        for shard in sorted(worker.glob("shard_*.pkl")):
+            if _consumed_marker(root, shard).exists():
+                continue
+            try:
+                envelope = read_trajectory_shard(shard)
+            except (pickle.UnpicklingError, EOFError, OSError):
+                continue
+            version = int(envelope.get("policy_version", 0))
+            if not int(min_policy_version) <= version <= int(max_policy_version):
                 mark_consumed(root, shard)
                 dropped += 1
     return dropped

@@ -59,6 +59,9 @@ def test_exact_parent_factory_returns_equal_independent_frozen_anchor(monkeypatc
     assert not anchor.model.training
     assert all(parameter.requires_grad for parameter in parent.model.parameters())
     assert all(not parameter.requires_grad for parameter in anchor.model.parameters())
+    assert {
+        parameter.data_ptr() for parameter in parent.model.parameters()
+    }.isdisjoint({parameter.data_ptr() for parameter in anchor.model.parameters()})
 
 
 def test_w7_defaults_are_canonical() -> None:
@@ -80,6 +83,11 @@ def test_w7_defaults_are_canonical() -> None:
         ({"target_kl": 0.0}, "target_kl"),
         ({"ppo_epochs": 1}, "2-4 update epochs"),
         ({"trunk_lr_mult": 0.25}, "trunk_lr_mult"),
+        ({"behavior_temperature": float("nan")}, "temperature"),
+        ({"gae_lambda": 0.9}, "gae_lambda"),
+        ({"vtrace_clip_rho": 0.0}, "vtrace_clip_rho"),
+        ({"vtrace_clip_pg_rho": 1.1}, "vtrace_clip_pg_rho"),
+        ({"max_staleness": 5}, "max_staleness"),
         ({"use_vtrace": False, "max_staleness": 1}, "max_staleness=0"),
     ],
 )
@@ -123,3 +131,128 @@ def test_entity_optimizer_protects_shared_trunk_with_lower_lr() -> None:
     assert trunk_ids | head_ids == {
         id(parameter) for parameter in policy.model.parameters()
     }
+
+
+def test_real_entity_optimizer_keeps_value_affordance_residual_at_head_lr() -> None:
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    policy = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        legal_action_value_residual=True,
+        seed=0,
+    )
+    optimizer = make_ppo_optimizer(
+        policy,
+        learning_rate=2.0e-4,
+        trunk_lr_mult=0.1,
+    )
+    groups = {group["name"]: group for group in optimizer.param_groups}
+    head_ids = {id(parameter) for parameter in groups["policy_value_heads"]["params"]}
+    trunk_ids = {id(parameter) for parameter in groups["protected_trunk"]["params"]}
+
+    residual_ids = {
+        id(parameter)
+        for parameter in policy.model.legal_action_value_residual_proj.parameters()
+    }
+    encoder_ids = {id(parameter) for parameter in policy.model.hex_encoder.parameters()}
+    assert residual_ids <= head_ids
+    assert residual_ids.isdisjoint(trunk_ids)
+    assert encoder_ids <= trunk_ids
+
+
+def test_run_contract_binds_initializer_and_behavior_identity(tmp_path) -> None:
+    from catan_zero.rl import ppo_distributed as dist
+
+    checkpoint = tmp_path / "parent.pt"
+    checkpoint.write_bytes(b"exact-parent-v1")
+    root = tmp_path / "run"
+    expected = dist.bind_run_contract(
+        root,
+        init_checkpoint=checkpoint,
+        architecture="entity_graph",
+        gamma=1.0,
+        gae_lambda=0.95,
+        behavior_temperature=0.7,
+    )
+
+    assert expected["initializer_sha256"] == dist.checkpoint_sha256(checkpoint)
+    assert dist.bind_run_contract(
+        root,
+        init_checkpoint=checkpoint,
+        architecture="entity_graph",
+        gamma=1.0,
+        gae_lambda=0.95,
+        behavior_temperature=0.7,
+    ) == expected
+    with pytest.raises(RuntimeError, match="run contract mismatch"):
+        dist.bind_run_contract(
+            root,
+            init_checkpoint=checkpoint,
+            architecture="entity_graph",
+            gamma=1.0,
+            gae_lambda=0.95,
+            behavior_temperature=1.0,
+        )
+    with pytest.raises(RuntimeError, match="run contract mismatch"):
+        dist.bind_run_contract(
+            root,
+            init_checkpoint=checkpoint,
+            architecture="entity",
+            gamma=1.0,
+            gae_lambda=0.95,
+            behavior_temperature=0.7,
+        )
+
+    checkpoint.write_bytes(b"mutated-parent")
+    with pytest.raises(RuntimeError, match="run contract mismatch"):
+        dist.bind_run_contract(
+            root,
+            init_checkpoint=checkpoint,
+            architecture="entity_graph",
+            gamma=1.0,
+            gae_lambda=0.95,
+            behavior_temperature=0.7,
+        )
+
+
+def test_no_vtrace_policy_window_rejects_old_and_future_shards(tmp_path) -> None:
+    from catan_zero.rl import ppo_distributed as dist
+
+    root = tmp_path / "run"
+    dist.ensure_run_dirs(root)
+    current = 8
+    old = dist.write_trajectory_shard(root, "old", 0, [], policy_version=current - 1)
+    exact = dist.write_trajectory_shard(root, "exact", 0, [], policy_version=current)
+    future = dist.write_trajectory_shard(root, "future", 0, [], policy_version=current + 1)
+
+    accepted = list(
+        dist.iter_unconsumed_shards(
+            root,
+            min_policy_version=current,
+            max_policy_version=current,
+            with_envelope=True,
+        )
+    )
+
+    assert [path for path, _envelope in accepted] == [exact]
+    assert not old.exists()
+    assert exact.exists()
+    assert not future.exists()
+
+
+def test_modal_actor_payload_to_chunk_preserves_behavior_temperature() -> None:
+    from tools.modal_ppo_factory import _actor_rollout_contract_fields
+
+    top_level_payload = {
+        "gamma": 1.0,
+        "gae_lambda": 0.97,
+        "action_temperature": 0.625,
+    }
+
+    chunk_fields = _actor_rollout_contract_fields(top_level_payload)
+
+    assert chunk_fields == top_level_payload

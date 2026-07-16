@@ -300,7 +300,10 @@ def _run_actor_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
     import torch
 
     from catan_zero.rl import ppo_distributed as ppd
-    from catan_zero.rl.ppo_policy_factory import load_ppo_policy
+    from catan_zero.rl.ppo_policy_factory import (
+        load_ppo_policy,
+        validate_canonical_ppo_actor_contract,
+    )
     from catan_zero.rl.torch_ppo import collect_ppo_episode
     from factory_common import parse_track
 
@@ -318,6 +321,12 @@ def _run_actor_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
     max_cache = int(chunk.get("opponent_cache_size", DEFAULT_OPPONENT_CACHE_SIZE))
     quantize_rollout = bool(chunk.get("quantize_rollout", False))
     action_temperature = float(chunk.get("action_temperature", 1.0))
+    validate_canonical_ppo_actor_contract(
+        architecture=architecture,
+        gamma=float(chunk.get("gamma", 1.0)),
+        gae_lambda=float(chunk.get("gae_lambda", 0.95)),
+        action_temperature=action_temperature,
+    )
 
     # Pin intra-op threads to 1 so the cpu_workers processes own the cores (no oversubscription).
     _tune_rollout_threads()
@@ -458,6 +467,7 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
     containers would otherwise generate.
     """
     from catan_zero.rl import ppo_distributed as ppd
+    from catan_zero.rl.ppo_policy_factory import validate_canonical_ppo_actor_contract
 
     run_name = str(payload["run_name"])
     container_id = str(payload["worker_id"])
@@ -478,6 +488,13 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
     max_actor_lag = max(1, int(payload.get("max_actor_lag", DEFAULT_MAX_ACTOR_LAG)))
     lag_stall_rounds = max(1, int(payload.get("lag_stall_rounds", DEFAULT_LAG_STALL_ROUNDS)))
     lag_stall_sleep = float(payload.get("lag_stall_sleep", DEFAULT_LAG_STALL_SLEEP))
+    rollout_contract = _actor_rollout_contract_fields(payload)
+    validate_canonical_ppo_actor_contract(
+        architecture=architecture,
+        gamma=rollout_contract["gamma"],
+        gae_lambda=rollout_contract["gae_lambda"],
+        action_temperature=rollout_contract["action_temperature"],
+    )
 
     root = ppd.run_root(VOLUME_ROOT, run_name)
     ppd.ensure_run_dirs(root)
@@ -515,6 +532,19 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
             ),
             flush=True,
         )
+
+    # The learner normally creates this immutable binding before publishing the
+    # version observed above. The actor verifies the same initializer and
+    # behavior distribution before producing any shard; a timeout fallback may
+    # create it, but can never overwrite a conflicting learner contract.
+    ppd.bind_run_contract(
+        root,
+        init_checkpoint=payload["init_checkpoint"],
+        architecture=architecture,
+        gamma=rollout_contract["gamma"],
+        gae_lambda=rollout_contract["gae_lambda"],
+        behavior_temperature=rollout_contract["action_temperature"],
+    )
 
     # ---- per-process shard namespaces: each of the cpu_workers processes owns a disjoint
     #      worker_id so their shard files never collide on disk. ----
@@ -618,8 +648,7 @@ def _run_actor(payload: dict[str, Any]) -> dict[str, Any]:
                         "opponents": payload.get("opponents", DEFAULT_OPPONENTS),
                         "pfsp_mode": payload.get("pfsp_mode", "pfsp"),
                         "opponent_cache_size": opponent_cache_size,
-                        "gamma": payload.get("gamma", 1.0),
-                        "gae_lambda": payload.get("gae_lambda", 0.95),
+                        **rollout_contract,
                         "value_shaping_coef": payload.get("value_shaping_coef", 0.0),
                         "value_shaping_scale": payload.get("value_shaping_scale", 100.0),
                         "value_shaping_opponent_penalty": payload.get(
@@ -801,6 +830,15 @@ def ppo_learner(config_payload: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- payloads
+def _actor_rollout_contract_fields(payload: dict[str, Any]) -> dict[str, float]:
+    """Fields that must survive Modal top-level payload to subprocess chunk."""
+    return {
+        "gamma": float(payload.get("gamma", 1.0)),
+        "gae_lambda": float(payload.get("gae_lambda", 0.95)),
+        "action_temperature": float(payload.get("action_temperature", 1.0)),
+    }
+
+
 def _payloads(
     *,
     run_name: str,
@@ -834,6 +872,14 @@ def _payloads(
     value_shaping_opponent_penalty: float,
     action_temperature: float,
 ) -> list[dict[str, Any]]:
+    from catan_zero.rl.ppo_policy_factory import validate_canonical_ppo_actor_contract
+
+    validate_canonical_ppo_actor_contract(
+        architecture=architecture,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        action_temperature=action_temperature,
+    )
     return [
         {
             "run_name": run_name,
@@ -1026,6 +1072,36 @@ def _launch(
 
 
 # --------------------------------------------------------------------------- entrypoints
+def _validate_modal_learner_contract(
+    *,
+    architecture: str,
+    behavior_temperature: float,
+    gamma: float,
+    gae_lambda: float,
+    use_vtrace: bool,
+    max_staleness: int,
+    vtrace_clip_rho: float,
+    vtrace_clip_pg_rho: float,
+) -> None:
+    from catan_zero.rl.ppo_policy_factory import (
+        validate_canonical_ppo_actor_contract,
+        validate_canonical_ppo_staleness_contract,
+    )
+
+    validate_canonical_ppo_actor_contract(
+        architecture=architecture,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        action_temperature=behavior_temperature,
+    )
+    validate_canonical_ppo_staleness_contract(
+        use_vtrace=use_vtrace,
+        max_staleness=max_staleness,
+        vtrace_clip_rho=vtrace_clip_rho,
+        vtrace_clip_pg_rho=vtrace_clip_pg_rho,
+    )
+
+
 @app.local_entrypoint()
 def smoke(
     run_name: str = "ppo_actor_smoke",
@@ -1178,6 +1254,10 @@ def launch_learner(
     ppo_epochs: int = 2,
     minibatch_size: int = 65536,
     behavior_temperature: float = 1.0,
+    gamma: float = 1.0,
+    gae_lambda: float = 0.95,
+    vtrace_clip_rho: float = 1.0,
+    vtrace_clip_pg_rho: float = 1.0,
     advantage_normalization: str = "global",
     vtrace_forward_chunk: int = 8192,
     no_vtrace: bool = False,
@@ -1188,6 +1268,16 @@ def launch_learner(
     runs until ``max_steps`` (0 == forever) on the A100, pulling shards off the shared volume,
     publishing weights the actors poll, and checkpointing/eval-ing periodically.
     """
+    _validate_modal_learner_contract(
+        architecture=architecture,
+        behavior_temperature=behavior_temperature,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        use_vtrace=not no_vtrace,
+        max_staleness=max_staleness,
+        vtrace_clip_rho=vtrace_clip_rho,
+        vtrace_clip_pg_rho=vtrace_clip_pg_rho,
+    )
     payload = {
         "run_name": run_name,
         "init_checkpoint": init_checkpoint,
@@ -1204,6 +1294,10 @@ def launch_learner(
         "ppo_epochs": ppo_epochs,
         "minibatch_size": minibatch_size,
         "behavior_temperature": behavior_temperature,
+        "gamma": gamma,
+        "gae_lambda": gae_lambda,
+        "vtrace_clip_rho": vtrace_clip_rho,
+        "vtrace_clip_pg_rho": vtrace_clip_pg_rho,
         "advantage_normalization": advantage_normalization,
         "vtrace_forward_chunk": vtrace_forward_chunk,
         "use_vtrace": not no_vtrace,
@@ -1263,6 +1357,10 @@ def run_learner_blocking(
     ppo_epochs: int = 2,
     minibatch_size: int = 65536,
     behavior_temperature: float = 1.0,
+    gamma: float = 1.0,
+    gae_lambda: float = 0.95,
+    vtrace_clip_rho: float = 1.0,
+    vtrace_clip_pg_rho: float = 1.0,
     advantage_normalization: str = "global",
     vtrace_forward_chunk: int = 8192,
     no_vtrace: bool = False,
@@ -1274,6 +1372,16 @@ def run_learner_blocking(
     learner publishes its initial policy. This entrypoint intentionally blocks so short capped
     Modal actor/learner smokes keep the learner alive while actors feed shards.
     """
+    _validate_modal_learner_contract(
+        architecture=architecture,
+        behavior_temperature=behavior_temperature,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        use_vtrace=not no_vtrace,
+        max_staleness=max_staleness,
+        vtrace_clip_rho=vtrace_clip_rho,
+        vtrace_clip_pg_rho=vtrace_clip_pg_rho,
+    )
     payload = {
         "run_name": run_name,
         "init_checkpoint": init_checkpoint,
@@ -1290,6 +1398,10 @@ def run_learner_blocking(
         "ppo_epochs": ppo_epochs,
         "minibatch_size": minibatch_size,
         "behavior_temperature": behavior_temperature,
+        "gamma": gamma,
+        "gae_lambda": gae_lambda,
+        "vtrace_clip_rho": vtrace_clip_rho,
+        "vtrace_clip_pg_rho": vtrace_clip_pg_rho,
         "advantage_normalization": advantage_normalization,
         "vtrace_forward_chunk": vtrace_forward_chunk,
         "use_vtrace": not no_vtrace,
