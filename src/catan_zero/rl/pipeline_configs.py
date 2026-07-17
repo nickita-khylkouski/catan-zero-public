@@ -100,8 +100,11 @@ _T = TypeVar("_T", bound="PipelineConfig")
 # fail-closed run must not share an identity with the historical no-floor run.
 # Schema 20 binds the optional nominal forced-row scalar-value mass ceiling.
 # A commissioned objective with a ceiling must never hash like the historical
-# diagnostic-only forced-row weighting regime.
-CONFIG_SCHEMA_VERSION = 20
+# diagnostic-only forced-row weighting regime. Schema 21 binds
+# ``policy_target_min_visits``: a target distribution written before this
+# field existed must not be able to claim the same producer schema merely
+# because today's default happens to be zero.
+CONFIG_SCHEMA_VERSION = 21
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -530,10 +533,6 @@ class GenerateConfig(PipelineConfig):
     n_full: int = 64
     n_fast: int = 16
     p_full: float = 0.25
-    # Minimum visit count retained in the stored MCTS policy target.  This is
-    # part of the teacher operator, so it must participate in the typed
-    # generation identity instead of being forwarded only to worker search.
-    policy_target_min_visits: int = 0
     # Diagnostic duplicate-search dose. Zero is a strict producer no-op; when
     # enabled the generator admits only coherent exact-n128 roots.
     target_reliability_audit_fraction: float = 0.0
@@ -548,7 +547,7 @@ class GenerateConfig(PipelineConfig):
     policy_target_min_visits: int = 0
     # The generator has always materialized the pre-search evaluator value on
     # eligible full-search roots.  Bind that invariant into typed provenance
-    # so the canonical schema20 file and the resolved GenerateConfig cannot
+    # so the canonical schema21 file and the resolved GenerateConfig cannot
     # silently claim different science identities.
     preserve_root_prior_value: bool = True
     n_full_wide: int | None = None

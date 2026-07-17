@@ -17,11 +17,11 @@ from catan_zero.rl.pipeline_configs import config_from_payload
 ROOT = Path(__file__).resolve().parents[1]
 APPROVED = {
     "generate": (
-        "configs/generation/coherent_public_n128.schema20.json",
+        "configs/generation/coherent_public_n128.schema21.json",
         "coherent-public-n128",
     ),
     "evaluate": (
-        "configs/eval/coherent_public_n128.schema20.json",
+        "configs/eval/coherent_public_n128.schema21.json",
         "coherent-public-n128",
     ),
     "train": (

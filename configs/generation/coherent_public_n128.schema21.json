@@ -102,5 +102,5 @@
     "workers": 24
   },
   "pipeline": "generate",
-  "schema_version": 20
+  "schema_version": 21
 }

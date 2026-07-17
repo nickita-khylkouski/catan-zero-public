@@ -422,7 +422,7 @@ assert soft >= {payload["required_nofile"]!r} and hard >= {payload["required_nof
 rc, out, err = run([str(python), "-c", limit_program]) if python.is_file() else (1, "", "python missing")
 check("nofile_wrapper", rc == 0, err or out or "wrapper raised soft limit")
 
-recipe_path = repo / "configs/generation/coherent_public_n128.schema20.json"
+recipe_path = repo / "configs/generation/coherent_public_n128.schema21.json"
 try: recipe = json.loads(recipe_path.read_text(encoding="utf-8"))["fields"]
 except Exception as error: recipe = {"error": repr(error)}
 single_owner = (

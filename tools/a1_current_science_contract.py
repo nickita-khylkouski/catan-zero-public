@@ -25,7 +25,7 @@ CONTRACT_PATH = (
 TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract_v4.template.json"
 GENERATOR_CONFIG_PATH = (
     REPO_ROOT
-    / "configs/generation/coherent_public_n128.schema20.json"
+    / "configs/generation/coherent_public_n128.schema21.json"
 )
 PRODUCTION_RECIPE_CATALOG_PATH = REPO_ROOT / "configs/production_recipes.json"
 GENERATOR_GUARD_PATH = (
@@ -160,11 +160,15 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "symmetry_augment_events": True,
     # The coherent corpus's natural policy-active distribution assigns only
     # 34.16% of policy objective mass to ordinary PLAY_TURN decisions; the
-    # successful selected-dose corpus assigned 66.08%.  Fourfold PLAY_TURN
-    # weighting restores 66.49% after the existing equal-per-game
-    # normalization, keeping mandatory prompts supervised without letting
-    # them dominate the strategic policy update.
-    "phase_weights": "PLAY_TURN=4.0",
+    # successful selected-dose corpus assigned 66.08%. Fourfold PLAY_TURN
+    # weighting restores ordinary-play representation, while the audited
+    # hard-decision multipliers prevent robber, initial-road, and discard
+    # choices from being drowned out by routine turns. The sealed r5 measure
+    # placed 52.27% of policy mass on PLAY_TURN after this repair.
+    "phase_weights": (
+        "PLAY_TURN=4.0,MOVE_ROBBER=3.0,"
+        "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
+    ),
     # Policy phase repair must not silently starve opening/robber/discard value
     # calibration.
     "value_phase_weights": "none",
@@ -257,7 +261,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "c99dd0d80ef3b233c6ce3121ac10ac95d9e37a0235e8ca14a5325353c17cd7d5"
+        "0979e6c73a13c3a0af2e5427528b03dab9c1a240f9f808c0b933be168c561aca"
     ),
     "initialization": {
         "mode": "parent_fresh_optimizer",
@@ -983,7 +987,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
     canonical_sha256 = _content_sha256(generator).removeprefix("sha256:")
     if (
         generator.get("pipeline") != "generate"
-        or generator.get("schema_version") != 20
+        or generator.get("schema_version") != 21
         or catalog_records[0].get("canonical_sha256") != canonical_sha256
     ):
         raise ScienceContractError(
@@ -1005,7 +1009,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
     if runtime_drift:
         raise ScienceContractError(
             "current science generation runtime differs from authenticated "
-            f"catalog schema20 recipe: {runtime_drift}"
+            f"catalog schema21 recipe: {runtime_drift}"
         )
     search_value = contract["operator"]["search"]
     expected_generator = {

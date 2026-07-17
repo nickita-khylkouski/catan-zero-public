@@ -147,7 +147,10 @@ def test_current_canonical_train_recipe_does_not_inherit_policy_phase_weights() 
     )
     config, engine = _load_recipe(recipe)
 
-    assert config.phase_weights == "PLAY_TURN=4.0"
+    assert config.phase_weights == (
+        "PLAY_TURN=4.0,MOVE_ROBBER=3.0,"
+        "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
+    )
     assert config.value_phase_weights == "none"
     assert config.value_player_outcome_balance_mode == "none"
     assert engine["base_sampler"] == "coverage_importance_v1"

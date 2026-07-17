@@ -183,6 +183,6 @@
       "winner_sample_weight": 1.0
     },
     "pipeline": "train",
-    "schema_version": 20
+    "schema_version": 21
   }
 }
