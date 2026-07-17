@@ -12316,6 +12316,9 @@ def _validate_a1_learner_training_recipe(
         projected_effective = _effective_a1_learner_training_recipe(
             projected_args, ddp
         )
+        _bind_late_a1_recipe_fields(
+            projected_effective, projected_args, immutable_expected
+        )
         if (
             not isinstance(canonical_parent_authority, dict)
             or set(canonical_parent_authority) != expected_authority_fields
