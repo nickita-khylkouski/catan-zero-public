@@ -196,11 +196,6 @@ def _parse_flags(raw: str) -> dict[str, object]:
             )
         elif entry in ("gather", "action_target_gather"):
             overrides["action_target_gather"] = True
-        elif entry in (
-            "v6_compatibility_preserving_inputs",
-            "v6-compatibility-preserving-inputs",
-        ):
-            overrides["v6_compatibility_preserving_inputs"] = True
         elif entry in ("value", "value_attention_pool"):
             overrides["value_attention_pool"] = True
         elif entry.startswith("cross"):

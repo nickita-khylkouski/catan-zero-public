@@ -43,7 +43,6 @@ from catan_zero.rl.meaningful_history import (  # noqa: E402
 from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     RUST_ENTITY_ADAPTER_V4,
     RUST_ENTITY_ADAPTER_V5,
-    RUST_ENTITY_ADAPTER_V6,
     resolve_checkpoint_entity_feature_adapter,
 )
 from catan_zero.rl.entity_token_features import (  # noqa: E402
@@ -68,9 +67,6 @@ MODULE_STRUCTURED_ACTION_VALUE = (
     "entity_graph.static_action_residual+legal_action_value_residual.v1"
 )
 MODULE_ACTION_CROSS_ATTENTION_1 = "entity_graph.action_cross_attention.1.v1"
-MODULE_V6_COMPATIBILITY_PRESERVING_INPUTS = (
-    "entity_graph.v6_compatibility_preserving_inputs.v1"
-)
 MODULE_PUBLIC_CARD_COUNT_FEATURES = "entity_graph.public_card_count_features.v1"
 MODULE_TARGET_GATHER_PUBLIC_CARD_COUNT = (
     "entity_graph.action_target_gather+public_card_count_features.v1"
@@ -646,20 +642,6 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "action_cross_blocks.0.norm_q.weight": "ones",
         },
         "config_delta": {"action_cross_attention_layers": 1},
-    },
-    # V6 widened two legacy player-token normalizations in place.  The model
-    # route below reconstructs the old clipped input for the mature encoder and
-    # learns exact physical counts through this new zero-output residual.
-    MODULE_V6_COMPATIBILITY_PRESERVING_INPUTS: {
-        "flags": {"v6_compatibility_preserving_inputs": True},
-        "source_config_requirements": {
-            "v6_compatibility_preserving_inputs": False,
-        },
-        "new_parameter_initialization": {
-            "v6_exact_resource_residual.weight": "zeros",
-        },
-        "config_delta": {"v6_compatibility_preserving_inputs": True},
-        "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V6,
     },
 }
 
