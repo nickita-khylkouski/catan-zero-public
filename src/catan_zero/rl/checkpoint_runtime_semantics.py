@@ -154,6 +154,10 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # The default topology-disabled path is therefore still the reviewed
         # legacy function even though its guarded AST surface changed again.
         "sha256:c2f9dd663839489263447263a0b01deb247aa3067cb1958e35465ffd73d6b473",
+        # Constructing the zero-init action decoder without consuming RNG is
+        # likewise gated to V7 checkpoints. Legacy topology-disabled models
+        # still execute the same reviewed forward function.
+        "sha256:911589137df1296d927feba059eaebb78704d8d5d41ffbf1dabb6e52016a9df9",
         # The legacy v2 tokenizer produces a different identity for the same
         # source across supported Python f-string tokenization modes. Schema v3
         # uses a stable AST surface, but both reviewed v2 spellings remain.
