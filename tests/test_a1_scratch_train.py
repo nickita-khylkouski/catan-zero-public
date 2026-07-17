@@ -331,14 +331,14 @@ def test_scratch_topology_binder_preserves_authenticated_recipe_overrides() -> N
     assert bound["recipe"]["global_batch_size"] == 512
 
 
-def test_scratch_topology_binder_does_not_require_legacy_4096_batch(
+def test_scratch_topology_wrapper_accepts_512_while_legacy_binder_rejects(
     tmp_path: Path,
 ) -> None:
     logical = current_science.learner_training_recipe()
     assert logical["global_batch_size"] == 512
     with pytest.raises(
         scratch.one_dose.ExecutorError,
-        match="exact legacy 4096-global dose",
+        match="sealed recipe does not match its logical global dose",
     ):
         scratch.one_dose.bind_training_topology(
             {"recipe": copy.deepcopy(logical)},

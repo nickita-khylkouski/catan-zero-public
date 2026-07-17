@@ -174,7 +174,7 @@ def test_current_coherent_render_accepts_disabled_adaptive_budget() -> None:
         assert projected[config_field] == generation[science_field]
 
 
-def test_current_opponent_mix_render_uses_supported_local_mps_runtime() -> None:
+def test_opponent_mix_local_mps_render_is_not_production_generation() -> None:
     lock, job = _current_coherent_lock_job()
     job["category"] = "recent_history"
     mix_path = Path("/sealed/recent_history.opponent-mix.json")
@@ -209,7 +209,9 @@ def test_current_opponent_mix_render_uses_supported_local_mps_runtime() -> None:
         forbidden_flags=lint.get("forbidden_flags", ()),
         parser=canary.contract.generation_cli.build_parser(),
     )
-    assert result.passed, result.reason
+    assert not result.passed
+    assert "--workers=16 (expected 128)" in result.reason
+    assert "--eval-server=False (expected True)" in result.reason
 
     provenance = canary.contract._expected_generate_config_provenance(  # noqa: SLF001
         lock, job, opponent_mix_manifest=str(mix_path)

@@ -232,8 +232,8 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     ] == current_science.CURRENT_LEARNER_ENTITY_ADAPTER
     assert "--workers" in lint["critical_flags"]
     assert "--eval-server" in lint["critical_flags"]
-    assert "--workers" not in lint["expected_values"]
-    assert "--eval-server" not in lint["expected_values"]
+    assert lint["expected_values"]["--workers"] == 128
+    assert lint["expected_values"]["--eval-server"] is True
     assert "--eval-server-max-batch" not in lint["critical_flags"]
     assert "--eval-server-request-collector" not in lint["critical_flags"]
 
