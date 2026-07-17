@@ -102,6 +102,7 @@ def _worker(
             needs_targets,
             needs_relational_topology,
             event_token_limit,
+            value_uncertainty_head_available,
             trained_value_readouts,
             value_training_present,
             value_training_provenance_errors,
@@ -119,6 +120,7 @@ def _worker(
             needs_action_targets=needs_targets,
             needs_relational_topology=bool(needs_relational_topology),
             event_token_limit=event_token_limit,
+            value_uncertainty_head_available=bool(value_uncertainty_head_available),
             trained_value_readouts=tuple(str(x) for x in trained_value_readouts),
             value_training_present=bool(value_training_present),
             value_training_provenance_errors=tuple(
@@ -276,6 +278,7 @@ def _run_arm(mode: str, a: dict[str, Any]) -> dict[str, Any]:
                     bool(meta.get("needs_action_targets", True)),
                     bool(meta.get("needs_relational_topology", False)),
                     meta.get("event_token_limit"),
+                    bool(meta.get("value_uncertainty_head_available", False)),
                     tuple(str(x) for x in meta.get("trained_value_readouts", ("scalar",))),
                     bool(meta.get("value_training_present", False)),
                     tuple(
@@ -487,6 +490,9 @@ def _parity(a: dict[str, Any]) -> dict[str, Any]:
                 meta.get("needs_relational_topology", False)
             ),
             event_token_limit=meta.get("event_token_limit"),
+            value_uncertainty_head_available=bool(
+                meta.get("value_uncertainty_head_available", False)
+            ),
             trained_value_readouts=tuple(
                 str(x) for x in meta.get("trained_value_readouts", ("scalar",))
             ),

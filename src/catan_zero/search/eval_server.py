@@ -1126,6 +1126,13 @@ def _server_main(
         )
         and "categorical" in trained_readouts
     )
+    handshake["value_uncertainty_head_available"] = bool(
+        getattr(policy_model, "value_uncertainty_head", None) is not None
+        and not any(
+            str(key).startswith("value_uncertainty_head.")
+            for key in missing_state_keys
+        )
+    )
     cuda_memory_device: Any | None = None
     cuda_api = getattr(torch, "cuda", None)
     if cuda_api is not None and cuda_api.is_available():
@@ -1622,6 +1629,9 @@ class EvalServer:
             "value_categorical_head_available": bool(
                 self._handshake["value_categorical_head_available"]
             ),
+            "value_uncertainty_head_available": bool(
+                self._handshake.get("value_uncertainty_head_available", False)
+            ),
             "trained_value_readouts": tuple(
                 str(readout)
                 for readout in self._handshake.get(
@@ -1721,6 +1731,7 @@ class _RemoteForwardProxy:
         ),
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
+        value_uncertainty_head_available: bool = False,
         trained_value_readouts: tuple[str, ...] = ("scalar",),
         value_training_present: bool = False,
         value_training_provenance_errors: tuple[str, ...] = (),
@@ -1768,6 +1779,9 @@ class _RemoteForwardProxy:
                 "value_categorical_head": (
                     object() if value_categorical_head_available else None
                 ),
+                "value_uncertainty_head": (
+                    object() if value_uncertainty_head_available else None
+                ),
             },
         )()
 
@@ -1813,6 +1827,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         event_token_limit: int | None = None,
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
+        value_uncertainty_head_available: bool = False,
         trained_value_readouts: tuple[str, ...] = ("scalar",),
         value_training_present: bool = False,
         value_training_provenance_errors: tuple[str, ...] = (),
@@ -1832,6 +1847,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             meaningful_public_history_schema=meaningful_public_history_schema,
             value_categorical_bins=value_categorical_bins,
             value_categorical_head_available=value_categorical_head_available,
+            value_uncertainty_head_available=value_uncertainty_head_available,
             trained_value_readouts=trained_value_readouts,
             value_training_present=value_training_present,
             value_training_provenance_errors=value_training_provenance_errors,

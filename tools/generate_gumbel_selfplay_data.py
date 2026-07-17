@@ -1851,6 +1851,7 @@ def _server_worker_entry(
     event_token_limit: int | None,
     value_categorical_bins: int,
     value_categorical_head_available: bool,
+    value_uncertainty_head_available: bool,
     trained_value_readouts: tuple[str, ...],
     value_training_present: bool,
     value_training_provenance_errors: tuple[str, ...],
@@ -1891,6 +1892,7 @@ def _server_worker_entry(
             event_token_limit=event_token_limit,
             value_categorical_bins=int(value_categorical_bins),
             value_categorical_head_available=bool(value_categorical_head_available),
+            value_uncertainty_head_available=bool(value_uncertainty_head_available),
             trained_value_readouts=tuple(str(x) for x in trained_value_readouts),
             value_training_present=bool(value_training_present),
             value_training_provenance_errors=tuple(
@@ -2056,6 +2058,7 @@ def _run_eval_server_batch(
                     meta.get("event_token_limit"),
                     int(meta.get("value_categorical_bins", 0)),
                     bool(meta.get("value_categorical_head_available", False)),
+                    bool(meta.get("value_uncertainty_head_available", False)),
                     tuple(str(x) for x in meta.get("trained_value_readouts", ("scalar",))),
                     bool(meta.get("value_training_present", False)),
                     tuple(

@@ -424,6 +424,34 @@ def test_remote_eval_client_enforces_modern_scalar_readout_provenance() -> None:
         )
 
 
+def test_remote_eval_client_carries_uncertainty_head_attestation() -> None:
+    """EvalServer must preserve the local uncertainty-readout admission gate."""
+    from catan_zero.search.eval_server import RemoteEvalClient
+
+    config = EntityGraphRustEvaluatorConfig(emit_uncertainty=True)
+    with pytest.raises(ValueError, match="requires a checkpoint with a complete"):
+        RemoteEvalClient(
+            object(),
+            object(),
+            0,
+            action_size=16,
+            trained_with_masked_hidden_info=False,
+            entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+            config=config,
+        )
+    client = RemoteEvalClient(
+        object(),
+        object(),
+        0,
+        action_size=16,
+        trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        value_uncertainty_head_available=True,
+        config=config,
+    )
+    assert client.config.emit_uncertainty is True
+
+
 def test_generator_cli_and_typed_hash_record_value_readout() -> None:
     default = generate_cli.build_parser().parse_args(["--out-dir", "/tmp/readout-default"])
     selected = generate_cli.build_parser().parse_args(
