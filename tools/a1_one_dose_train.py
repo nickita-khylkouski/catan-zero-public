@@ -6085,7 +6085,10 @@ def _build_direct_train_command(
                 str(recipe["forced_row_value_action_type_weights"]),
             ]
         )
-    if "sampler_seed" in recipe:
+    # ``None`` means "derive the sampler seed from the canonical training
+    # seed".  Serializing it as the literal CLI value ``None`` makes argparse
+    # reject an otherwise valid production recipe before optimizer step zero.
+    if recipe.get("sampler_seed") is not None:
         command.extend(["--sampler-seed", str(recipe["sampler_seed"])])
     max_steps = int(recipe.get("max_steps", 0))
     reporting = (verified.get("learner_ablation") or {}).get("reporting_contract", {})
