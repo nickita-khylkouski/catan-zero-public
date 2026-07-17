@@ -11,7 +11,6 @@ import pytest
 from tools import a1_build_post_wave_composite as builder
 from tools import a1_one_dose_train
 from tools import a1_pre_wave_contract as contract
-from tools import a1_seal_historical_replay_component as historical_sealer
 from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
 
 
@@ -343,6 +342,10 @@ def _write_source(path: Path, *, base_seed: int, version: int | None) -> None:
         "decision_index": np.zeros(2, dtype=np.int32),
         "is_forced": np.zeros(2, dtype=bool),
         "used_full_search": np.asarray([True, False]),
+        "decision_class": np.full(2, "normal_choice", dtype="U32"),
+        "decision_taxonomy_schema": np.full(
+            2, "public_decision_taxonomy_2p_no_trade_v2", dtype="U64"
+        ),
         "legal_action_ids": np.tile(
             np.asarray([[1, 2]], dtype=np.int16), (2, 1)
         ),
@@ -409,6 +412,10 @@ def _write_training_source(
         "used_full_search": np.tile(
             np.asarray([True, False]), game_count
         ),
+        "decision_class": np.full(rows, "normal_choice", dtype="U32"),
+        "decision_taxonomy_schema": np.full(
+            rows, "public_decision_taxonomy_2p_no_trade_v2", dtype="U64"
+        ),
         "adapter_version": np.full(
             rows, CURRENT_RUST_ENTITY_ADAPTER_VERSION, dtype="U64"
         ),
@@ -447,159 +454,6 @@ def _write_training_source(
             }
         )
     np.savez(path, **arrays)
-
-
-def _historical_reference(
-    tmp_path: Path,
-    *,
-    current_version: int,
-    base_seed: int,
-    monkeypatch: pytest.MonkeyPatch,
-) -> Path:
-    checkpoint = tmp_path / "historical.pt"
-    checkpoint.write_bytes(b"historical")
-    checkpoint_sha = builder._file_sha256(checkpoint)  # noqa: SLF001
-    shard = tmp_path / "historical.npz"
-    _write_training_source(
-        shard,
-        base_seed=base_seed,
-        game_count=2,
-        version=None,
-    )
-    source = tmp_path / "historical-source"
-    source.mkdir()
-    (source / "manifest.json").write_text(
-        json.dumps({"shards": [str(shard.resolve())]}), encoding="utf-8"
-    )
-    corpus_dir = tmp_path / "historical-corpus"
-    meta = builder.memmap_builder.build_memmap_corpus(
-        source, corpus_dir, progress_every=0
-    )
-    meta_path = corpus_dir / "corpus_meta.json"
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    prior_lock = {
-        "checkpoints": [
-            {
-                "id": "producer",
-                "role": "producer",
-                "path": str(checkpoint.resolve()),
-                "sha256": checkpoint_sha,
-                "version": current_version - 1,
-            }
-        ],
-        "source_categories": [
-            {"name": "current_producer", "checkpoint_ids": []}
-        ],
-        "generation": {},
-        "science": {},
-        "fleet": {
-            "jobs": [
-                {
-                    "job_id": "historical_gpu0__current_producer",
-                    "worker_id": "historical_gpu0",
-                    "category": "current_producer",
-                    "base_seed": base_seed,
-                    "seed_end": base_seed + 2,
-                }
-            ]
-        },
-    }
-    prior_lock["contract_sha256"] = builder._digest(prior_lock)  # noqa: SLF001
-    prior_lock_path = tmp_path / "historical.contract.lock.json"
-    prior_lock_path.write_text(json.dumps(prior_lock), encoding="utf-8")
-    selected_payload = {
-        "a1_contract_sha256": prior_lock["contract_sha256"],
-        "category_game_counts": {"current_producer": 2},
-        "selected_game_seed_set_sha256": builder._digest([base_seed, base_seed + 1]),  # noqa: SLF001
-        "records": [
-            {
-                "game_seed": base_seed + offset,
-                "job_id": "historical_gpu0__current_producer",
-                "worker_id": "historical_gpu0",
-                "category": "current_producer",
-                "producer_checkpoint_sha256": checkpoint_sha,
-                "opponent_checkpoint_sha256": [checkpoint_sha],
-                "split": "train" if offset == 0 else "validation",
-            }
-            for offset in range(2)
-        ],
-    }
-    selected_payload["records_sha256"] = builder._digest(selected_payload["records"])  # noqa: SLF001
-    selected_path = tmp_path / "historical.selected.json"
-    selected_path.write_text(json.dumps(selected_payload), encoding="utf-8")
-    generation_manifest = tmp_path / "historical.generation.json"
-    generation_manifest.write_text(json.dumps({"generation": "historical"}))
-    audit_shards = [
-        {
-            "kind": "generation_manifest",
-            "path": str(generation_manifest.resolve()),
-            "sha256": builder._file_sha256(generation_manifest),  # noqa: SLF001
-            "job_id": "historical_gpu0__current_producer",
-            "category": "current_producer",
-        },
-        {
-            "kind": "data_shard",
-            "path": str(shard.resolve()),
-            "sha256": builder._file_sha256(shard),  # noqa: SLF001
-            "job_id": "historical_gpu0__current_producer",
-            "category": "current_producer",
-        },
-    ]
-    audit_payload = {
-        "contract_sha256": prior_lock["contract_sha256"],
-        "shard_inventory_sha256": builder._digest(audit_shards),  # noqa: SLF001
-        "shards": audit_shards,
-    }
-    audit_payload["audit_sha256"] = builder._digest(audit_payload)  # noqa: SLF001
-    audit_path = tmp_path / "historical.audit.json"
-    audit_path.write_text(json.dumps(audit_payload), encoding="utf-8")
-    selected = {
-        "path": selected_path.resolve(),
-        "file_sha256": builder._file_sha256(selected_path),  # noqa: SLF001
-        "manifest_sha256": builder._digest(selected_payload),  # noqa: SLF001
-        "records_sha256": selected_payload["records_sha256"],
-        "selected_game_seed_set_sha256": selected_payload[
-            "selected_game_seed_set_sha256"
-        ],
-        "a1_contract_sha256": prior_lock["contract_sha256"],
-    }
-    audit = {
-        "path": audit_path.resolve(),
-        "file_sha256": builder._file_sha256(audit_path),  # noqa: SLF001
-        "audit_sha256": audit_payload["audit_sha256"],
-        "shard_inventory_sha256": audit_payload["shard_inventory_sha256"],
-        "contract_sha256": prior_lock["contract_sha256"],
-        "data_shards": [audit_shards[1]],
-    }
-    meta["selected_game_seed_manifest"] = {
-        "file_sha256": selected["file_sha256"]
-    }
-    meta["a1_post_wave_audit"] = {"file_sha256": audit["file_sha256"]}
-    meta_path.write_text(json.dumps(meta), encoding="utf-8")
-    corpus_hash_before = builder._file_sha256(meta_path)  # noqa: SLF001
-    monkeypatch.setattr(historical_sealer.contract, "verify_lock", lambda *_a, **_k: prior_lock)
-    monkeypatch.setattr(
-        historical_sealer.memmap_builder,
-        "_load_a1_selected_game_manifest",
-        lambda *_a, **_k: selected,
-    )
-    monkeypatch.setattr(
-        historical_sealer.memmap_builder,
-        "_load_a1_post_wave_audit",
-        lambda *_a, **_k: audit,
-    )
-    reference = tmp_path / "historical.component.json"
-    historical_sealer.seal_historical_replay_component(
-        lock_path=prior_lock_path,
-        selected_path=selected_path,
-        audit_path=audit_path,
-        corpus_dir=corpus_dir,
-        producer_version=current_version - 1,
-        current_version=current_version,
-        output_path=reference,
-    )
-    assert builder._file_sha256(meta_path) == corpus_hash_before  # noqa: SLF001
-    return reference
 
 
 def _audit_fixture(
@@ -664,6 +518,7 @@ def _audit_fixture(
                 selected_mask=selected_mask,
                 where=str(job["job_id"]),
                 require_policy_target_completeness=True,
+                wide_full_threshold=contract.WIDE_CHOICE_MIN_LEGAL_ACTIONS,
             )
         chunk = {
             "schema_version": activation["schema_version"],
@@ -695,6 +550,7 @@ def _audit_fixture(
         activation_chunks,
         categories=("current_producer", "recent_history", "hard_negative"),
         sealed_p_full=0.25,
+        wide_full_threshold=contract.WIDE_CHOICE_MIN_LEGAL_ACTIONS,
     )
     raw_audit = {
         "contract_sha256": lock["contract_sha256"],
@@ -865,7 +721,7 @@ def test_filter_wave_shards_rejects_selected_seed_in_wrong_job(tmp_path: Path) -
         )
 
 
-def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
+def test_descriptor_uses_fresh_only_policy_and_current_producer_value(
     tmp_path: Path,
 ) -> None:
     components = []
@@ -873,7 +729,7 @@ def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
         provenance = tmp_path / f"{category}.json"
         provenance.write_text(
             json.dumps(
-                {"checkpoint_versions": [6] if category == "historical_replay" else [7]}
+                {"checkpoint_versions": [7]}
             )
         )
         corpus_dir = tmp_path / f"{category}.corpus"
@@ -889,15 +745,14 @@ def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
                 }
             },
         }
-        if category != builder.HISTORICAL_REPLAY_CATEGORY:
-            corpus_meta["aux_subgoal_target_contract"] = {
-                "version_key": "aux_subgoal_target_version",
-                "supported_version": 1,
-                "semantic": "strict_future_after_current_row_v1",
-                "version_zero_means_unversioned_ineligible": True,
-                "realized_version_counts": {"1": 2},
-                "all_rows_semantically_eligible": True,
-            }
+        corpus_meta["aux_subgoal_target_contract"] = {
+            "version_key": "aux_subgoal_target_version",
+            "supported_version": 1,
+            "semantic": "strict_future_after_current_row_v1",
+            "version_zero_means_unversioned_ineligible": True,
+            "realized_version_counts": {"1": 2},
+            "all_rows_semantically_eligible": True,
+        }
         (corpus_dir / "corpus_meta.json").write_text(json.dumps(corpus_meta))
         components.append(
             {
@@ -918,15 +773,6 @@ def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
                     "mean_game_policy_weight_multiplier": 0.5,
                 },
                 "corpus_dir": str(corpus_dir),
-                **(
-                    {
-                        "entity_feature_adapter_version": (
-                            CURRENT_RUST_ENTITY_ADAPTER_VERSION
-                        )
-                    }
-                    if category == builder.HISTORICAL_REPLAY_CATEGORY
-                    else {}
-                ),
             }
         )
     producer = tmp_path / "producer.pt"
@@ -951,12 +797,11 @@ def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
         "hard_negative": 0.05,
     }
     assert replay["effective_component_sampling_ratios"] == {
-        "current_producer": 0.64,
-        "recent_history": 0.12,
-        "hard_negative": 0.04,
-        "historical_replay": 0.20,
+        "current_producer": 0.80,
+        "recent_history": 0.15,
+        "hard_negative": 0.05,
     }
-    assert replay["checkpoint_versions"] == [6, 7]
+    assert replay["checkpoint_versions"] == [7]
     assert descriptor["aux_subgoal_component_ids"] == [
         "current_producer",
         "recent_history",
@@ -966,7 +811,6 @@ def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
         "current_producer": 1.0,
         "recent_history": 1.0,
         "hard_negative": 1.0,
-        "historical_replay": 0.52,
     }
     assert descriptor["policy_kl_anchor_component_ids"] == []
     assert descriptor["policy_distillation_component_ids"] == [
@@ -975,20 +819,19 @@ def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
         "hard_negative",
     ]
     assert descriptor["value_training_component_ids"] == ["current_producer"]
-    # Replay and mixed-opponent rows remain authenticated for policy/state
-    # coverage; only producer self-play supplies the canonical search value.
-    assert replay["replay_component_ids"] == ["historical_replay"]
+    # Mixed-opponent rows remain valid policy evidence; only producer self-play
+    # supplies the canonical search value.
+    assert replay["replay_component_ids"] == []
     assert [
         component["component_id"] for component in descriptor["components"]
     ] == [
         "current_producer",
         "recent_history",
         "hard_negative",
-        "historical_replay",
     ]
     assert descriptor["learner_recipe_overrides"][
         "policy_kl_anchor_weight"
-    ] == builder.HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT
+    ] == builder.POLICY_KL_ANCHOR_WEIGHT
     assert descriptor["learner_recipe_overrides"]["policy_kl_anchor_direction"] == (
         "forward"
     )
@@ -1015,7 +858,6 @@ def test_descriptor_preserves_replay_but_scopes_policy_and_value_to_fresh_wave(
             "current_producer",
             "recent_history",
             "hard_negative",
-            "historical_replay",
         )
     }
 
@@ -1201,28 +1043,8 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         data_shards,
         selected_records=raw_selected["records"],
     )
-    historical_ref = _historical_reference(
-        tmp_path,
-        current_version=int(producer["version"]),
-        base_seed=400,
-        monkeypatch=monkeypatch,
-    )
     lock_path = tmp_path / "contract.lock.json"
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
-    historical_wrapper = json.loads(historical_ref.read_text(encoding="utf-8"))
-    prior_lock_path = Path(
-        historical_wrapper["authority"]["source_contract"]["path"]
-    )
-    prior_lock = json.loads(prior_lock_path.read_text(encoding="utf-8"))
-    historical_verify_calls: list[tuple[Path, bool]] = []
-
-    def historical_verify_lock(
-        path: Path, *, require_all_job_claims: bool = True
-    ) -> dict:
-        historical_verify_calls.append((path.resolve(), require_all_job_claims))
-        assert path.resolve() == prior_lock_path.resolve()
-        assert require_all_job_claims is False
-        return prior_lock
 
     current_verifier_authority = _lock_verifier_authority(
         tmp_path,
@@ -1230,13 +1052,6 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         lock_path=lock_path,
         lock=lock,
         require_all_job_claims=True,
-    )
-    historical_verifier_authority = _lock_verifier_authority(
-        tmp_path,
-        name="historical-frozen",
-        lock_path=prior_lock_path,
-        lock=prior_lock,
-        require_all_job_claims=False,
     )
     monkeypatch.setattr(
         builder,
@@ -1248,14 +1063,10 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         lock_path=lock_path,
         selected_path=selected_path,
         audit_path=Path(str(audit["path"])),
-        historical_component_path=historical_ref,
         output_root=output,
         verify_lock_fn=lambda *_args, **_kwargs: lock,
-        historical_verify_lock_fn=historical_verify_lock,
         current_lock_verifier_authority=current_verifier_authority,
-        historical_lock_verifier_authority=historical_verifier_authority,
     )
-    assert historical_verify_calls == [(prior_lock_path.resolve(), False)]
     descriptor_path = Path(str(receipt["descriptor"]["path"]))
     # A learner B200 receives the filtered composite and authority bundle, not
     # the multi-gigabyte raw generation tree.  Removing every original data
@@ -1265,8 +1076,6 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
     for record in json.loads(Path(audit["path"]).read_text())["shards"]:
         if record.get("kind") == "generation_manifest":
             Path(record["path"]).unlink()
-    (tmp_path / "historical.npz").unlink()
-    (tmp_path / "historical.generation.json").unlink()
     meta = builder.train_bc._preflight_memmap_composite_descriptor(  # noqa: SLF001
         descriptor_path
     )
@@ -1290,45 +1099,36 @@ def test_real_memmap_composite_is_accepted_by_one_dose_trainer(
         verified["production_mix_contract"]["effective_component_sampling_ratios"]
         == builder.EFFECTIVE_COMPONENT_RATIOS
     )
-    assert verified["corpus_row_count"] == 16
-    assert verified["training_row_count"] + verified["validation_row_count"] == 16
-    assert verified["validation_split_receipt"]["aggregate"]["selected_game_count"] == 8
+    assert verified["corpus_row_count"] == 12
+    assert verified["training_row_count"] + verified["validation_row_count"] == 12
+    assert verified["validation_split_receipt"]["aggregate"]["selected_game_count"] == 6
     fresh_target_identities = {
         component["corpus_meta"].get("policy_target_identity_sha256")
         for component in meta["components"][:3]
     }
     assert len(fresh_target_identities) == 1
     assert builder.train_bc._is_sha256(next(iter(fresh_target_identities)))  # noqa: SLF001
-    assert (
-        meta["components"][3]["corpus_meta"].get(
-            "policy_target_identity_sha256"
-        )
-        is None
-    )
+    assert len(meta["components"]) == 3
 
     authority_path = Path(receipt["source_authority"]["path"])
     enriched_authority = builder.train_bc._validate_flywheel_source_authority(  # noqa: SLF001
         authority_path
     )
     assert isinstance(enriched_authority["fresh_source_ids"], list)
-    assert isinstance(enriched_authority["historical_source_ids"], list)
+    assert enriched_authority["historical_source_ids"] == []
     # The enriched authority is sent from rank 0 to the other DDP ranks.
     # Exercise the real serialization boundary, not only semantic validation.
     json.dumps(enriched_authority, sort_keys=True)
     source_authority = json.loads(authority_path.read_text(encoding="utf-8"))
     assert source_authority["schema_version"] == (
-        "a1-post-wave-composite-source-authority-v3"
+        "a1-post-wave-composite-source-authority-v4"
     )
     assert source_authority["lock_verifier_authorities"] == {
         "current_wave": current_verifier_authority,
-        "historical_replay": historical_verifier_authority,
     }
     assert source_authority["lock_verifier_authorities"]["current_wave"][
         "require_all_job_claims"
     ] is True
-    assert source_authority["lock_verifier_authorities"]["historical_replay"][
-        "require_all_job_claims"
-    ] is False
     drifted_verifier = json.loads(authority_path.read_text(encoding="utf-8"))
     drifted_current = drifted_verifier["lock_verifier_authorities"]["current_wave"]
     drifted_current["require_all_job_claims"] = False

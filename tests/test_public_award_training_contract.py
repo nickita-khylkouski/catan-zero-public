@@ -156,7 +156,7 @@ def test_authoritative_training_rejects_legacy_or_mixed_corpus() -> None:
             _data(PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO),
             _args(PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE),
         )
-    with pytest.raises(SystemExit, match="exact 64/12/4/20"):
+    with pytest.raises(SystemExit, match="exact 80/15/5"):
         _configure_public_award_feature_training(
             policy,
             _data(PUBLIC_AWARD_FEATURE_CONTRACT_MIXED),
@@ -242,51 +242,21 @@ class _RoutedBatch(dict):
         return np.asarray(rows, dtype=np.int64)
 
 
-def test_exact_mixed_transition_routes_legacy_rows_only_and_is_promotable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    torch = pytest.importorskip("torch")
+def test_legacy_mixed_transition_is_retired() -> None:
     policy = _policy()
-    with torch.no_grad():
-        policy.model.player_encoder[0].weight[:, PLAYER_LONGEST_ROAD_SLOT].fill_(3.0)
     data = _MixedAwardComposite()
-
-    report = _configure_public_award_feature_training(
-        policy,
-        data,
-        _args(PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE, allow_mixed=True),
-    )
-
-    transition = report["mixed_authoritative_transition"]
-    assert transition["schema_version"] == "mixed-authoritative-transition-v1"
-    assert transition["corrected_sampler_mass"] == pytest.approx(0.80)
-    assert transition["legacy_sampler_mass"] == pytest.approx(0.20)
-    assert transition["legacy_rows_zero_slot12"] is True
-    assert report["diagnostic_only"] is False
-    assert report["promotion_eligible"] is True
-    assert report["legacy_column_zero_initialized"] is True
-    assert policy.public_award_feature_contract == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
-
-    monkeypatch.setattr(
-        train_bc,
-        "_PUBLIC_AWARD_FEATURE_CONTRACT",
-        PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
-    )
-    batch_data = _RoutedBatch(
-        {key: np.zeros((4, 1), dtype=np.float32) for key in ENTITY_BATCH_KEYS}
-    )
-    batch_data["player_tokens"] = np.zeros((4, 4, 31), dtype=np.float32)
-    batch_data["player_tokens"][..., PLAYER_LONGEST_ROAD_SLOT] = 1.0
-    routed = _entity_batch(batch_data, np.arange(4, dtype=np.int64))
-    slot = routed["player_tokens"][..., PLAYER_LONGEST_ROAD_SLOT]
-    assert np.all(slot[:3] == 1.0)
-    assert np.all(slot[3] == 0.0)
+    with pytest.raises(SystemExit, match="exact 80/15/5"):
+        _configure_public_award_feature_training(
+            policy,
+            data,
+            _args(PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE, allow_mixed=True),
+        )
 
 
-def test_mixed_transition_refuses_nonzero_legacy_or_empty_corrected_support() -> None:
+def test_mixed_transition_is_refused_before_feature_scanning() -> None:
     corrupted = _MixedAwardComposite()
     corrupted.corpora[-1]._player_tokens[0, 0, PLAYER_LONGEST_ROAD_SLOT] = 1.0
-    with pytest.raises(SystemExit, match="legacy.*nonzero"):
+    with pytest.raises(SystemExit, match="exact 80/15/5"):
         _configure_public_award_feature_training(
             _policy(),
             corrupted,
@@ -295,7 +265,7 @@ def test_mixed_transition_refuses_nonzero_legacy_or_empty_corrected_support() ->
 
     empty = _MixedAwardComposite()
     empty.corpora[1]._player_tokens[..., PLAYER_LONGEST_ROAD_SLOT] = 0.0
-    with pytest.raises(SystemExit, match="no positive"):
+    with pytest.raises(SystemExit, match="exact 80/15/5"):
         _configure_public_award_feature_training(
             _policy(),
             empty,

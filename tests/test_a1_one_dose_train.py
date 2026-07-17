@@ -524,26 +524,24 @@ def _production_composite_meta(tmp_path: Path, producer_sha256: str) -> dict:
         "current_producer",
         "recent_history",
         "hard_negative",
-        "historical_replay",
     ]
     ratios = {
-        "current_producer": 0.64,
-        "recent_history": 0.12,
-        "hard_negative": 0.04,
-        "historical_replay": 0.20,
+        "current_producer": 0.80,
+        "recent_history": 0.15,
+        "hard_negative": 0.05,
     }
     sampling_receipt = {"effective_component_sampling_ratios": ratios}
     contract_payload = {
-        "schema_version": "flywheel-replay-composite-v2",
-        "fresh_component_ids": component_ids[:3],
-        "replay_component_ids": component_ids[3:],
+        "schema_version": "flywheel-replay-composite-v3",
+        "fresh_component_ids": component_ids,
+        "replay_component_ids": [],
         "fresh_source_game_ratios": {
             "current_producer": 0.8,
             "recent_history": 0.15,
             "hard_negative": 0.05,
         },
         "effective_component_sampling_ratios": ratios,
-        "realized_replay_ratio": 0.20,
+        "realized_replay_ratio": 0.0,
         "initializer_checkpoint_sha256": producer_sha256,
         "sampling_receipt": sampling_receipt,
         "sampling_receipt_sha256": executor._value_sha256(sampling_receipt),
@@ -608,23 +606,27 @@ def _production_composite_build_receipt(
         "authority_sha256": "sha256:" + "8" * 64,
     }
     meta["source_authority_ref"] = authority_ref
+    activation = {"passed": True, "target_activation_sha256": "sha256:" + "9" * 64}
     meta["source_authority"] = {
         "current_contract": {
             "file_sha256": executor._file_sha256(verified["lock_path"]),
             "contract_sha256": verified["contract_sha256"],
         },
         "fresh_source_bindings": [],
+        "fresh_target_activation": activation,
     }
     payload = {
-        "schema_version": "a1-post-wave-composite-build-v1",
+        "schema_version": "a1-post-wave-composite-build-v3",
         "contract": {
             "path": str(verified["lock_path"]),
             "file_sha256": executor._file_sha256(verified["lock_path"]),
             "contract_sha256": verified["contract_sha256"],
         },
         "selected_game_manifest": {},
-        "post_wave_audit": {},
-        "historical_component_reference": {},
+        "post_wave_audit": {
+            "target_activation_sha256": activation["target_activation_sha256"]
+        },
+        "fresh_target_activation": activation,
         "source_bindings": [],
         "source_bindings_sha256": executor._value_sha256([]),
         "source_authority": authority_ref,
@@ -1331,10 +1333,9 @@ def test_production_composite_receipts_component_whole_game_split(
     descriptor.write_text("{}", encoding="utf-8")
     corpus = _FakeCompositeCorpus(
         [
-            [100, 100, 101, 101],
-            [200, 200, 201, 201],
-            [300, 300, 301, 301],
-            [400, 400, 401, 401],
+                [100, 100, 101, 101],
+                [200, 200, 201, 201],
+                [300, 300, 301, 301],
         ]
     )
     monkeypatch.setattr(
@@ -1346,9 +1347,9 @@ def test_production_composite_receipts_component_whole_game_split(
         executor.train_bc,
         "split_train_validation_indices",
         lambda *_args, **_kwargs: {
-            "train": np.asarray([0, 1, 4, 5, 8, 9, 12, 13], dtype=np.int64),
+            "train": np.asarray([0, 1, 4, 5, 8, 9], dtype=np.int64),
             "validation": np.asarray(
-                [2, 3, 6, 7, 10, 11, 14, 15], dtype=np.int64
+                [2, 3, 6, 7, 10, 11], dtype=np.int64
             ),
         },
     )
@@ -1382,21 +1383,20 @@ def test_production_composite_receipts_component_whole_game_split(
 
     split = result["validation_split_receipt"]
     assert split["aggregate"] == {
-        "selected_game_count": 8,
-        "training_game_count": 4,
-        "validation_game_count": 4,
-        "row_count": 16,
-        "training_row_count": 8,
-        "validation_row_count": 8,
+        "selected_game_count": 6,
+        "training_game_count": 3,
+        "validation_game_count": 3,
+        "row_count": 12,
+        "training_row_count": 6,
+        "validation_row_count": 6,
     }
     assert [row["component_id"] for row in split["components"]] == [
         "current_producer",
         "recent_history",
         "hard_negative",
-        "historical_replay",
     ]
-    assert result["training_row_count"] == 8
-    assert result["validation_row_count"] == 8
+    assert result["training_row_count"] == 6
+    assert result["validation_row_count"] == 6
     assert result["lock_verifier_authority"] == frozen_authority
     assert executor._input_binding(result)["lock_verifier_authority"] == (
         frozen_authority
@@ -1557,7 +1557,7 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         "epochs": 999,
         "symmetry_augment": True,
     }
-    assert bound["canonical_parent_update"]["checkpoint_steps"] == [8]
+    assert bound["canonical_parent_update"]["checkpoint_steps"] == [8, 10]
     assert bound["training_science_commissioning"]["authorized"] is False
     assert bound["training_science_commissioning"]["go_authorized"] is False
     assert bound["promotion_eligible"] is False
@@ -1591,7 +1591,7 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         checkpoint=tmp_path / "candidate.pt",
         report=tmp_path / "report.json",
     )
-    assert _option(command, "--checkpoint-steps") == "8"
+    assert _option(command, "--checkpoint-steps") == "8,10"
     assert _option(command, "--scalar-value-objective") == "binary_win_bce"
     assert _option(command, "--scalar-value-loss-readout") == "deployed_tanh"
     assert _option(command, "--scalar-value-loss-scale") == "1.0"

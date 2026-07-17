@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from tools import a1_scientific_evidence as evidence
-from tools import a1_aux_pair_coordinator as coordinator
 
 
 def _sha(character: str) -> str:
@@ -64,12 +63,15 @@ class _Composite:
         self.corpora = tuple(
             _Component(
                 rows_per_component,
-                award=component_id != "historical_replay",
+                award=True,
             )
             for component_id in self.component_ids
         )
-        self.component_offsets = np.arange(5, dtype=np.int64) * rows_per_component
-        self.row_count = rows_per_component * 4
+        self.component_offsets = (
+            np.arange(len(self.component_ids) + 1, dtype=np.int64)
+            * rows_per_component
+        )
+        self.row_count = rows_per_component * len(self.component_ids)
         width = 3
         self._legal = np.tile(np.arange(width, dtype=np.int64), (self.row_count, 1))
         self._prior = np.full((self.row_count, width), 1.0 / width, dtype=np.float32)
@@ -106,6 +108,7 @@ def _authenticated(data: _Composite) -> dict:
             "file_sha256": _sha("e"),
             "authority_sha256": _sha("f"),
         },
+        "policy_kl_anchor_component_ids": ["current_producer"],
         "components": [
             {
                 "component_id": component_id,
@@ -164,24 +167,26 @@ def test_routing_receipt_measures_component_rows_and_slot12(
     )
     monkeypatch.setattr(evidence, "_assert_composite_stable", lambda *_args: None)
 
-    receipt = evidence.build_mixed_routing_receipt(tmp_path / "descriptor.json")
+    receipt = evidence.build_component_routing_receipt(tmp_path / "descriptor.json")
     assert receipt["component_row_counts"] == {
         component_id: 20 for component_id in data.component_ids
     }
-    assert receipt["legacy_slot12_nonzero_count"] == 0
-    assert receipt["legacy_slot12_all_zero"] is True
+    assert receipt["all_components_authoritative"] is True
+    assert receipt["component_routes"] == {
+        component_id: "authoritative_v1" for component_id in data.component_ids
+    }
     assert receipt["origin_tool_sha256"] == evidence.origin_tool_sha256()
     routing_path = tmp_path / "routing.json"
     evidence._atomic_write(routing_path, receipt)
-    assert evidence.verify_mixed_routing_receipt(
+    assert evidence.verify_component_routing_receipt(
         routing_path,
         descriptor=tmp_path / "descriptor.json",
         expected_origin_tool_sha256=evidence.origin_tool_sha256(),
     ) == receipt
 
-    data.corpora[-1]._values[0, 0, 12] = 1.0
-    with pytest.raises(evidence.EvidenceError, match="legacy replay"):
-        evidence.build_mixed_routing_receipt(tmp_path / "descriptor.json")
+    data.corpora[-1]._values[..., 12] = 0.0
+    with pytest.raises(evidence.EvidenceError, match="no positive slot12 support"):
+        evidence.build_component_routing_receipt(tmp_path / "descriptor.json")
 
 
 def test_sample_evidence_replays_order_and_measures_kl_and_overlap(
@@ -190,7 +195,6 @@ def test_sample_evidence_replays_order_and_measures_kl_and_overlap(
     data = _Composite()
     authenticated = _authenticated(data)
     monkeypatch.setattr(evidence, "SHORT_SAMPLE_DOSE", 64)
-    monkeypatch.setattr(coordinator, "SHORT_SAMPLE_DOSE", 64)
     monkeypatch.setattr(
         evidence,
         "_load_composite",
@@ -245,40 +249,15 @@ def test_sample_evidence_replays_order_and_measures_kl_and_overlap(
     ) == second
 
     rows = [json.loads(line) for line in first_rows.read_text().splitlines()]
-    composite = {
-        "schema_version": "a1-typed-64-12-4-20-composite-v1",
-        "component_ids": list(coordinator.COMPONENT_IDS),
-        "component_sampling_ratios": list(coordinator.COMPONENT_RATIOS),
-        "descriptor_sha256": authenticated["descriptor_file_sha256"],
-        "data_fingerprint": _sha("8"),
-            "payload_inventory_sha256": authenticated["payload_inventory_sha256"],
-            "category_semantics": authenticated["category_semantics"],
-            "category_semantics_sha256": authenticated[
-                "category_semantics_sha256"
-            ],
-        "source_authority": authenticated["source_authority_ref"],
-        "learner_recipe_overrides_sha256": _sha("e"),
-        "aux_subgoal_target_contract_sha256": _sha("f"),
-        "public_award_feature_transition_contract_sha256": _sha("0"),
-        "source_authority_semantic_sha256": _sha("1"),
-        "production_sampling_receipt_sha256": _sha("9"),
-        "validation_split_receipt_sha256": _sha("a"),
-        "sampler_identity_sha256": first["sampler_identity_sha256"],
-        "sample_order_sha256": first["sample_order_sha256"],
-        "training_game_seed_set_sha256": _sha("b"),
-        "validation_game_seed_set_sha256": _sha("c"),
-        "truncation_surface_sha256": _sha("d"),
-        "truncated_rows": 0,
-        "complete_game_inputs": True,
-    }
-    replay = coordinator.build_p1_kl_eligibility_authority(
-        composite=composite,
-        sampled_row_evidence=rows,
-    )
-    assert replay["eligible_rows"] == first["kl_eligible_rows"]
-    assert replay["ordered_evidence_sha256"] == first[
-        "kl_ordered_evidence_sha256"
+    eligible = [
+        row
+        for row in rows
+        if row["component_id"] == "current_producer"
+        and row["prior_policy_present"]
+        and row["legal_action_count"] > 1
     ]
+    assert len(eligible) == first["kl_eligible_rows"]
+    assert first["policy_kl_anchor_component_ids"] == ["current_producer"]
 
 
 def test_slot12_receipts_bind_pre_optimizer_zero_and_post_optimizer_delta(

@@ -2463,7 +2463,6 @@ def _validate_production_composite_build_receipt(
         "contract",
         "selected_game_manifest",
         "post_wave_audit",
-        "historical_component_reference",
         "source_bindings",
         "source_bindings_sha256",
         "source_authority",
@@ -2475,8 +2474,13 @@ def _validate_production_composite_build_receipt(
     receipt_schema = (
         payload.get("schema_version") if isinstance(payload, dict) else None
     )
-    if receipt_schema == "a1-post-wave-composite-build-v2":
+    if receipt_schema in {
+        "a1-post-wave-composite-build-v2",
+        "a1-post-wave-composite-build-v3",
+    }:
         expected.add("fresh_target_activation")
+    if receipt_schema != "a1-post-wave-composite-build-v3":
+        expected.add("historical_component_reference")
     if (
         not isinstance(payload, dict)
         or set(payload) != expected
@@ -2484,6 +2488,7 @@ def _validate_production_composite_build_receipt(
         not in {
             "a1-post-wave-composite-build-v1",
             "a1-post-wave-composite-build-v2",
+            "a1-post-wave-composite-build-v3",
         }
     ):
         raise ExecutorError("composite build receipt fields/schema drift")
@@ -2535,7 +2540,10 @@ def _validate_production_composite_build_receipt(
         != meta.get("production_mix_contract", {}).get("sampling_receipt")
     ):
         raise ExecutorError("composite build receipt input/sampling binding drift")
-    if receipt_schema == "a1-post-wave-composite-build-v2":
+    if receipt_schema in {
+        "a1-post-wave-composite-build-v2",
+        "a1-post-wave-composite-build-v3",
+    }:
         activation = payload.get("fresh_target_activation")
         authority_activation = meta["source_authority"].get("fresh_target_activation")
         audit_ref = payload.get("post_wave_audit")
@@ -2571,7 +2579,7 @@ def _verify_production_composite_inputs(
     build_receipt_path: Path | None,
     lock_verifier_authority: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Authenticate the promotion-eligible 64/12/4/20 replay descriptor.
+    """Authenticate the promotion-eligible fresh-only 80/15/5 descriptor.
 
     The flywheel receipt describes the pre-split physical corpus. This executor
     independently replays train_bc's deterministic component-aware whole-game
@@ -2592,13 +2600,11 @@ def _verify_production_composite_inputs(
         "current_producer",
         "recent_history",
         "hard_negative",
-        "historical_replay",
     ]
     expected_ratios = {
-        "current_producer": 0.64,
-        "recent_history": 0.12,
-        "hard_negative": 0.04,
-        "historical_replay": 0.20,
+        "current_producer": 0.80,
+        "recent_history": 0.15,
+        "hard_negative": 0.05,
     }
     raw_components = meta.get("components")
     if not isinstance(raw_components, list) or len(raw_components) != len(expected_ids):
@@ -2711,10 +2717,10 @@ def _verify_production_composite_inputs(
         or meta.get("diagnostic_only") is not False
         or meta.get("promotion_eligible") is not True
         or not isinstance(contract, dict)
-        or contract.get("schema_version") != "flywheel-replay-composite-v2"
+        or contract.get("schema_version") != "flywheel-replay-composite-v3"
         or meta.get("component_ids") != expected_ids
         or contract.get("fresh_component_ids") != expected_ids[:3]
-        or contract.get("replay_component_ids") != expected_ids[3:]
+        or contract.get("replay_component_ids") != []
         or contract.get("fresh_source_game_ratios")
         != {"current_producer": 0.8, "recent_history": 0.15, "hard_negative": 0.05}
         or contract.get("effective_component_sampling_ratios") != expected_ratios
@@ -2731,12 +2737,12 @@ def _verify_production_composite_inputs(
         or len(set(meta["entity_feature_adapter_component_versions"].values())) != 1
         or not math.isclose(
             float(contract.get("realized_replay_ratio", -1.0)),
-            0.20,
+            0.0,
             rel_tol=0.0,
             abs_tol=1e-12,
         )
     ):
-        raise ExecutorError("production composite is not exact 64/12/4/20 replay")
+        raise ExecutorError("production composite is not exact fresh-only 80/15/5")
     if contract.get("initializer_checkpoint_sha256") != producer.get("sha256"):
         raise ExecutorError(
             "production composite initializer differs from sealed producer"
@@ -2764,12 +2770,12 @@ def _verify_production_composite_inputs(
     ):
         raise ExecutorError("production composite sampling receipt is invalid")
     components = meta.get("components")
-    if not isinstance(components, list) or len(components) != 4:
-        raise ExecutorError("production composite must have exactly four components")
+    if not isinstance(components, list) or len(components) != 3:
+        raise ExecutorError("production composite must have exactly three components")
     if [component.get("source_category") for component in components] != expected_ids:
         raise ExecutorError("production composite source categories/order drift")
     component_dirs = [Path(str(component["corpus_dir"])) for component in components]
-    if len(set(component_dirs)) != 4:
+    if len(set(component_dirs)) != 3:
         raise ExecutorError("production composite component corpora are not distinct")
 
     corpus = train_bc.load_teacher_data_memmap(data_path, composite_meta=meta)
@@ -4096,7 +4102,6 @@ FRESH_POLICY_DISTILLATION_COMPONENT_IDS = (
 FRESH_VALUE_TRAINING_COMPONENT_IDS = ("current_producer",)
 ALL_POST_WAVE_COMPONENT_IDS = (
     *FRESH_POLICY_DISTILLATION_COMPONENT_IDS,
-    "historical_replay",
 )
 DIAGNOSTIC_TRAINING_DESCRIPTOR_SCHEMA = "a1-diagnostic-training-descriptor-authority-v1"
 
@@ -4993,7 +4998,7 @@ def bind_aux_pair_arm(
         )
     composite = p1_authority["composite"]
     if verified.get("data_kind") != "production_composite_v2":
-        raise ExecutorError("corrected AUX requires the typed 64/12/4/20 composite")
+        raise ExecutorError("corrected AUX requires the typed fresh-only composite")
     data_checks = {
         "descriptor_sha256": verified.get("corpus_meta_file_sha256"),
         "data_fingerprint": verified.get("data_fingerprint"),
@@ -5318,10 +5323,15 @@ def bind_final_replication(
         or sampling.get("prior_unique_row_count")
         != p1["p1_sample_evidence_receipt"]["unique_row_count"]
         or sampling.get("replay_verified") is not True
-        or routing.get("mixed_authoritative_transition_approved") is not True
         or routing.get("per_row_component_authenticated") is not True
-        or routing.get("legacy_slot12_all_zero") is not True
-        or routing.get("model_slot12_zero_initialization_required") is not True
+        or routing.get("all_components_authoritative") is not True
+        or routing.get("component_ids")
+        != list(aux_coordinator.COMPONENT_IDS)
+        or routing.get("component_routes")
+        != {
+            component_id: "authoritative_v1"
+            for component_id in aux_coordinator.COMPONENT_IDS
+        }
     ):
         raise ExecutorError("FINAL dose/sampling/component-routing authority drift")
     selected_aux = final.get("selected_aux_decision")
@@ -5579,8 +5589,8 @@ def bind_stage_c_final_replication(
     checkpoint_steps = list(authority["training"]["checkpoint_steps"])
     if (
         int(effective.get("max_steps", -1)) != max_steps
-        or checkpoint_steps != [8, 12, 16, 32]
-        or checkpoint_steps[-1] != max_steps
+        or checkpoint_steps != [8, 10]
+        or max_steps != 12
         or selected_arm.get("recipe_sha256") != _value_sha256(selected_recipe)
         or effective.get("optimizer") != "adam"
         or effective.get("resume_optimizer") is not False
@@ -6136,16 +6146,14 @@ def _build_direct_train_command(
                 step *= 2
             command.extend(["--checkpoint-steps", ",".join(map(str, checkpoints))])
     if verified.get("data_kind") == "production_composite_v2":
-        # The production 64/12/4/20 descriptor has three corrected components
-        # plus homogeneous legacy replay. train_bc authenticates and routes
-        # slot12 per component, zero-initializes the inherited input column, and
-        # stamps the resulting checkpoint authoritative_v1. Omitting these
-        # flags either refuses the mixed corpus or erases the corrected signal.
+        # The production descriptor has three uniformly authoritative fresh
+        # components. train_bc authenticates the feature surface,
+        # zero-initializes the inherited input column, and stamps the resulting
+        # checkpoint authoritative_v1.
         command.extend(
             [
                 "--public-award-feature-contract",
                 "authoritative_v1",
-                "--allow-mixed-public-award-feature-contracts",
             ]
         )
         event_history_contract = verified.get("event_history_training_contract")
@@ -9516,89 +9524,35 @@ def _require_production_public_award_transition(
     verified: Mapping[str, Any],
     where: str,
 ) -> None:
-    """Replay the exact 64/12/4/20 legacy-to-authoritative transition."""
+    """Require one uniformly authoritative fresh V6 feature surface."""
 
-    transition = (
-        award_training.get("mixed_authoritative_transition")
+    provenance = (
+        award_training.get("corpus_provenance")
         if isinstance(award_training, dict)
         else None
     )
-    if not isinstance(transition, dict):
-        raise ExecutorError(f"{where} lacks a mixed public-award transition")
-    unhashed = dict(transition)
-    stated = unhashed.pop("transition_sha256", None)
-    expected_ids = [
-        "current_producer",
-        "recent_history",
-        "hard_negative",
-        "historical_replay",
-    ]
-    expected_ratios = [0.64, 0.12, 0.04, 0.20]
-    expected_contracts = [
-        "authoritative_v1",
-        "authoritative_v1",
-        "authoritative_v1",
-        "legacy_zero_v0",
-    ]
-    split_components = verified["validation_split_receipt"]["components"]
-    expected_rows = [int(record["row_count"]) for record in split_components]
-    audits = transition.get("component_audits")
+    components = provenance.get("components") if isinstance(provenance, dict) else None
+    expected_ids = ["current_producer", "recent_history", "hard_negative"]
     if (
-        stated != _value_sha256(unhashed)
-        or transition.get("schema_version") != "mixed-authoritative-transition-v1"
-        or transition.get("routing_authority")
-        != "authenticated_component_identity_not_feature_values"
-        or transition.get("component_ids") != expected_ids
-        or transition.get("component_sampling_ratios") != expected_ratios
-        or transition.get("component_contracts") != expected_contracts
-        or transition.get("corrected_corpus_rows") != sum(expected_rows[:3])
-        or transition.get("legacy_corpus_rows") != expected_rows[3]
-        or transition.get("corrected_sampler_mass") != 0.8
-        or transition.get("legacy_sampler_mass") != 0.2
-        or transition.get("legacy_rows_zero_slot12") is not True
-        or transition.get("corrected_rows_pass_slot12") is not True
-        or transition.get("checkpoint_contract") != "authoritative_v1"
-        or not isinstance(audits, list)
-        or len(audits) != 4
+        not isinstance(provenance, dict)
+        or provenance.get("contract") != "authoritative_v1"
+        or not isinstance(components, list)
+        or [record.get("component_id") for record in components] != expected_ids
+        or any(
+            not isinstance(record, dict)
+            or record.get("contract") != "authoritative_v1"
+            or record.get("provenance_authenticated") is not True
+            for record in components
+        )
     ):
-        raise ExecutorError(f"{where} public-award transition contract drifted")
-    for index, (audit, component_id, contract, row_count) in enumerate(
-        zip(audits, expected_ids, expected_contracts, expected_rows, strict=True)
-    ):
-        if not isinstance(audit, dict):
-            raise ExecutorError(f"{where} public-award audit {index} is malformed")
-        audit_unhashed = dict(audit)
-        audit_digest = audit_unhashed.pop("audit_sha256", None)
-        if (
-            audit_digest != _value_sha256(audit_unhashed)
-            or audit.get("component_id") != component_id
-            or audit.get("contract") != contract
-            or audit.get("rows") != row_count
-            or (
-                contract == "legacy_zero_v0"
-                and (
-                    audit.get("legacy_slot12_all_zero") is not True
-                    or audit.get("nonzero_award_values") != 0
-                )
-            )
-            or (
-                contract == "authoritative_v1"
-                and (
-                    audit.get("corrected_positive_support") is not True
-                    or not isinstance(audit.get("rows_with_award"), int)
-                    or int(audit["rows_with_award"]) <= 0
-                )
-            )
-        ):
-            raise ExecutorError(
-                f"{where} public-award component audit {component_id} drifted"
-            )
+        raise ExecutorError(f"{where} lacks uniform authoritative feature provenance")
     if (
         not isinstance(award_training, dict)
         or award_training.get("requested_contract") != "authoritative_v1"
         or award_training.get("initializer_contract") != "legacy_zero_v0"
         or award_training.get("effective_contract") != "authoritative_v1"
-        or award_training.get("mixed_corpus_acknowledged") is not True
+        or award_training.get("mixed_corpus_acknowledged") is not False
+        or award_training.get("component_routing_authority") is not None
         or award_training.get("legacy_column_zero_initialized") is not True
         or award_training.get("diagnostic_only") is not False
         or award_training.get("promotion_eligible") is not True
@@ -10181,14 +10135,13 @@ def _verify_training_outputs(
             "source_authority_semantic_sha256": verified.get(
                 "source_authority_semantic_sha256"
             ),
-            "component_count": 4,
+            "component_count": 3,
             "component_ids": [
                 "current_producer",
                 "recent_history",
                 "hard_negative",
-                "historical_replay",
             ],
-            "component_game_sampling_ratios": [0.64, 0.12, 0.04, 0.20],
+            "component_game_sampling_ratios": [0.80, 0.15, 0.05],
             "policy_distillation_component_ids": (
                 verified.get("diagnostic_training_descriptor_authority", {}).get(
                     "policy_distillation_component_ids",
@@ -10576,10 +10529,9 @@ def _verify_training_outputs(
                 "validation provenance"
             ) from error
         ratios = {
-            "current_producer": 0.64,
-            "recent_history": 0.12,
-            "hard_negative": 0.04,
-            "historical_replay": 0.20,
+            "current_producer": 0.80,
+            "recent_history": 0.15,
+            "hard_negative": 0.05,
         }
         split_components = {
             record["component_id"]: record

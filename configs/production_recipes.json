@@ -12,7 +12,7 @@
       {
         "canonical_sha256": "7b0d2a036c9d7cf00c095792bdbdd0a5200a12963d4af9006da61f86376f9c51",
         "guard": {
-          "canonical_sha256": "68e9766d449be58b4a7891a82a3b6ba34a8cc7f7697d43369f6187b036faef5c",
+          "canonical_sha256": "a8eec370af3ee639d44219814afcddd881c511e1c46c7715f6f575ee602dbde3",
           "path": "configs/guards/a1_generation_coherent_public_n128_v4.json"
         },
         "name": "coherent-public-n128",
@@ -26,7 +26,7 @@
         "path": "configs/training/a1_current_35m_b200.schema1.json"
       },
       {
-        "canonical_sha256": "a8297f183961b75066b8ec1ee5214ad5f52262f4ec56be34b7ea5691745b02f6",
+        "canonical_sha256": "2c118d3b6e09e9efb56eb91dbdcad5ab478f91c4d631e47c22228823e4f54471",
         "name": "a1-parent-update-35m-b200",
         "path": "configs/training/a1_parent_update_35m_b200.schema1.json"
       }

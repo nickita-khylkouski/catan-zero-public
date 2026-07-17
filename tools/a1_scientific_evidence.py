@@ -37,8 +37,8 @@ from tools.fleet import a1_production_executor as production_executor  # noqa: E
 
 
 SCHEMA_RUNTIME = "a1-b200-learner-runtime-admission-v1"
-SCHEMA_SAMPLE = "a1-authenticated-sample-evidence-v2"
-SCHEMA_ROUTING = "a1-mixed-component-routing-authority-v3"
+SCHEMA_SAMPLE = "a1-authenticated-sample-evidence-v3"
+SCHEMA_ROUTING = "a1-fresh-component-routing-authority-v1"
 SCHEMA_INITIALIZER_ZERO = "a1-initializer-slot12-zero-evidence-v1"
 SCHEMA_TRAINED_DELTA = "a1-trained-model-slot12-delta-evidence-v1"
 SCHEMA_PUBLIC_AWARD_TRANSITION = (
@@ -67,8 +67,9 @@ COMPONENT_IDS = (
     "current_producer",
     "recent_history",
     "hard_negative",
-    "historical_replay",
 )
+
+
 class EvidenceError(RuntimeError):
     """Refusal to emit evidence that was not measured exactly."""
 
@@ -461,11 +462,9 @@ def _assert_composite_stable(
         raise EvidenceError("composite descriptor or payload inventory changed during scan")
 
 
-def build_mixed_routing_receipt(descriptor: Path) -> dict[str, Any]:
+def build_component_routing_receipt(descriptor: Path) -> dict[str, Any]:
     descriptor, authenticated, data = _load_composite(descriptor)
     component_counts: dict[str, int] = {}
-    legacy_nonzero = 0
-    legacy_digest = hashlib.sha256()
     authoritative_digest = hashlib.sha256()
     ordered_digest = hashlib.sha256()
     for component, (component_id, corpus) in enumerate(
@@ -495,24 +494,14 @@ def build_mixed_routing_receipt(descriptor: Path) -> dict[str, Any]:
                 }
             ) + b"\0" + np.ascontiguousarray(slot).tobytes()
             ordered_digest.update(chunk_identity)
-            if component_id == "historical_replay":
-                legacy_digest.update(chunk_identity)
-            else:
-                authoritative_digest.update(chunk_identity)
-        if component_id == "historical_replay":
-            legacy_nonzero += positive
-        elif positive == 0:
+            authoritative_digest.update(chunk_identity)
+        if positive == 0:
             raise EvidenceError(
                 f"authoritative component {component_id} has no positive slot12 support"
             )
-    if legacy_nonzero != 0:
-        raise EvidenceError("legacy replay contains nonzero public-award slot12")
     _assert_composite_stable(descriptor, authenticated)
     routes = {
-        "current_producer": "authoritative_v1",
-        "recent_history": "authoritative_v1",
-        "hard_negative": "authoritative_v1",
-        "historical_replay": "legacy_zero_v0",
+        component_id: "authoritative_v1" for component_id in data.component_ids
     }
     return _sealed(
         {
@@ -530,17 +519,12 @@ def build_mixed_routing_receipt(descriptor: Path) -> dict[str, Any]:
             "component_ids": list(data.component_ids),
             "component_routes": routes,
             "component_row_counts": component_counts,
-            "legacy_slot12_nonzero_count": 0,
-            "legacy_slot12_all_zero": True,
-            "legacy_slot12_evidence_sha256": "sha256:"
-            + legacy_digest.hexdigest(),
             "authoritative_slot12_evidence_sha256": "sha256:"
             + authoritative_digest.hexdigest(),
             "ordered_row_routing_evidence_sha256": "sha256:"
             + ordered_digest.hexdigest(),
             "per_row_component_authenticated": True,
-            "mixed_authoritative_transition_approved": True,
-            "model_slot12_zero_initialization_required": True,
+            "all_components_authoritative": True,
             "origin_tool_sha256": origin_tool_sha256(),
         }
     )
@@ -566,9 +550,11 @@ def _row_set_sha256(row_identities: Iterable[str]) -> str:
 
 def _load_prior_rows(
     path: Path | None,
+    *,
+    component_ids: Iterable[str],
 ) -> tuple[set[str], dict[str, set[str]], str | None, str | None]:
     all_rows: set[str] = set()
-    by_component = {component: set() for component in COMPONENT_IDS}
+    by_component = {str(component): set() for component in component_ids}
     if path is None:
         return all_rows, by_component, None, None
     resolved = path.expanduser().resolve(strict=True)
@@ -645,9 +631,17 @@ def build_sample_evidence(
     evidence_digest = hashlib.sha256()
     eligible_digest = hashlib.sha256()
     identities: list[str] = []
-    identities_by_component = {
-        component: [] for component in COMPONENT_IDS
-    }
+    identities_by_component = {component: [] for component in data.component_ids}
+    anchor_component_ids = frozenset(
+        str(component)
+        for component in authenticated.get("policy_kl_anchor_component_ids", ())
+    )
+    unknown_anchor_components = anchor_component_ids - set(data.component_ids)
+    if unknown_anchor_components:
+        raise EvidenceError(
+            "policy KL anchor scope names unknown components: "
+            f"{sorted(unknown_anchor_components)}"
+        )
     eligible = 0
     rows_path = rows_path.expanduser().resolve(strict=False)
     rows_path.parent.mkdir(parents=True, exist_ok=True)
@@ -701,7 +695,7 @@ def build_sample_evidence(
                 ) + b"\n"
                 evidence_digest.update(evidence_line)
                 if (
-                    component_id == "historical_replay"
+                    component_id in anchor_component_ids
                     and row["prior_policy_present"]
                     and row["legal_action_count"] > 1
                 ):
@@ -711,7 +705,7 @@ def build_sample_evidence(
         os.fsync(handle.fileno())
     _publish_immutable(temporary, rows_path)
     prior, prior_by_component, prior_file_sha256, prior_row_set_sha256 = (
-        _load_prior_rows(prior_rows_path)
+        _load_prior_rows(prior_rows_path, component_ids=data.component_ids)
     )
     if prior_rows_path is not None and not prior:
         raise EvidenceError("FINAL prior sample evidence is empty")
@@ -754,6 +748,7 @@ def build_sample_evidence(
         ],
         "sampler_seed": sampler_seed,
         "sample_dose": sample_dose,
+        "policy_kl_anchor_component_ids": sorted(anchor_component_ids),
     }
     _assert_composite_stable(descriptor, authenticated)
     result = _sealed(
@@ -782,6 +777,7 @@ def build_sample_evidence(
             ),
             "component_overlap": per_component,
             "kl_eligible_rows": eligible,
+            "policy_kl_anchor_component_ids": sorted(anchor_component_ids),
             "kl_eligible_mass_decimal": format(
                 eligible / sample_dose, ".12f"
             ).rstrip("0").rstrip("."),
@@ -1313,17 +1309,17 @@ def verify_runtime_admission_receipt(
     return receipt
 
 
-def verify_mixed_routing_receipt(
+def verify_component_routing_receipt(
     path: Path, *, descriptor: Path, expected_origin_tool_sha256: str
 ) -> dict[str, Any]:
     receipt = _load_sealed(
         path,
-        where="mixed routing receipt",
+        where="component routing receipt",
         expected_origin_tool_sha256=expected_origin_tool_sha256,
     )
-    replay = build_mixed_routing_receipt(descriptor)
+    replay = build_component_routing_receipt(descriptor)
     if receipt != replay:
-        raise EvidenceError("mixed routing receipt failed payload replay")
+        raise EvidenceError("component routing receipt failed payload replay")
     return receipt
 
 
@@ -1426,7 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     runtime = sub.add_parser("runtime-admission")
     runtime.add_argument("--output", type=Path, required=True)
-    routing = sub.add_parser("mixed-routing")
+    routing = sub.add_parser("component-routing")
     routing.add_argument("--descriptor", type=Path, required=True)
     routing.add_argument("--output", type=Path, required=True)
     sample = sub.add_parser("sample")
@@ -1455,8 +1451,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "runtime-admission":
             receipt = build_runtime_admission_receipt()
-        elif args.command == "mixed-routing":
-            receipt = build_mixed_routing_receipt(args.descriptor)
+        elif args.command == "component-routing":
+            receipt = build_component_routing_receipt(args.descriptor)
         elif args.command == "sample":
             receipt = build_sample_evidence(
                 args.descriptor,

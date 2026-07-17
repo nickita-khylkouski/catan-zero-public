@@ -242,7 +242,7 @@ def test_parent_update_recipe_reproduces_split1_selected_step12() -> None:
 
     assert engine["initialization_mode"] == "parent_fresh_optimizer"
     assert engine["base_sampler"] == "weighted_replacement_v1"
-    assert engine["checkpoint_steps"] == "8"
+    assert engine["checkpoint_steps"] == "8,10"
     assert fields["batch_size"] == 64
     assert 8 * fields["batch_size"] == 512
     assert fields["epochs"] == 999
@@ -251,9 +251,9 @@ def test_parent_update_recipe_reproduces_split1_selected_step12() -> None:
     assert fields["lr"] == 6e-5
     assert fields["lr_schedule"] == "flat"
     assert fields["lr_warmup_steps"] == 16
-    assert fields["validation_fraction"] == 0.125
+    assert fields["validation_fraction"] == 0.05
     # The parent-update recipe accepts arbitrary authenticated coherent corpora;
-    # validation is the deterministic game-level 12.5% split above, not stale
+    # validation is the deterministic game-level 5% split above, not stale
     # seed ranges from one historical wave.
     assert fields["validation_game_seed_ranges"] == ""
     assert fields["validation_max_samples"] == 0
@@ -299,7 +299,7 @@ def test_parent_update_requires_exact_parent_and_uses_corpus_target_identity() -
 
     assert train_bc._parse_checkpoint_steps(
         resolved.checkpoint_steps, max_steps=resolved.max_steps
-    ) == (8,)
+    ) == (8, 10)
     train_bc._validate_coverage_sampler_configuration(
         resolved, categorical_value_loss_weight=0.0
     )

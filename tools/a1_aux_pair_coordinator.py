@@ -114,7 +114,6 @@ P1_ARMS = ("K0", "K3", "K10")
 P1_SCHEDULE_SLOTS = {"K0": 0, "K3": 1, "K10": 2}
 P1_TARGET_GLOBAL_DECIMALS = {"K0": "0", "K3": "0.03", "K10": "0.1"}
 P1_COEFFICIENT_QUANTUM = Decimal("0.000000000001")
-P1_HISTORICAL_ANCHOR_COMPONENT_IDS = ("historical_replay",)
 
 # Evaluation is an experiment input, not an operator knob.  These disjoint
 # cohorts live in the reserved validation-only seed band and are deliberately
@@ -133,9 +132,8 @@ COMPONENT_IDS = (
     "current_producer",
     "recent_history",
     "hard_negative",
-    "historical_replay",
 )
-COMPONENT_RATIOS = (0.64, 0.12, 0.04, 0.20)
+COMPONENT_RATIOS = (0.80, 0.15, 0.05)
 
 POINTER_MODULE = "entity_graph.aux_subgoal_pointer_heads.v1"
 POINTER_FLAGS = {
@@ -640,11 +638,11 @@ def _verify_composite(value: Any) -> dict[str, Any]:
     }
     composite = _require_exact_keys(value, expected_keys, "typed composite authority")
     if (
-        composite["schema_version"] != "a1-typed-64-12-4-20-composite-v1"
+        composite["schema_version"] != "a1-typed-fresh-80-15-5-composite-v1"
         or composite["component_ids"] != list(COMPONENT_IDS)
         or composite["component_sampling_ratios"] != list(COMPONENT_RATIOS)
     ):
-        raise CoordinatorError("P1 data is not the exact typed 64/12/4/20 composite")
+        raise CoordinatorError("P1 data is not the exact typed fresh 80/15/5 composite")
     for key in expected_keys - {
         "schema_version",
         "component_ids",
@@ -722,6 +720,7 @@ def _verify_sample_receipt_projection(
             "kl_eligible_mass_decimal",
             "kl_ordered_evidence_sha256",
             "kl_eligible_evidence_sha256",
+            "policy_kl_anchor_component_ids",
             "descriptor_sha256",
             "payload_inventory_sha256",
             "category_semantics",
@@ -739,14 +738,15 @@ def _verify_sample_receipt_projection(
         "."
     )
     if (
-        receipt["schema_version"] != "a1-authenticated-sample-evidence-v2"
+        receipt["schema_version"] != "a1-authenticated-sample-evidence-v3"
         or receipt["status"] != "complete"
         or receipt["sample_dose"] != SHORT_SAMPLE_DOSE
         or receipt["sampler_seed"] != sampler_seed
         or receipt["sampler_algorithm"]
         != scientific_evidence.SAMPLER_ALGORITHM
         or type(eligible) is not int
-        or not 0 < eligible <= SHORT_SAMPLE_DOSE
+        or eligible != 0
+        or receipt.get("policy_kl_anchor_component_ids") != []
         or receipt["kl_eligible_mass_decimal"] != expected_mass
         or receipt["descriptor_sha256"] != composite["descriptor_sha256"]
         or receipt["payload_inventory_sha256"]
@@ -819,7 +819,7 @@ def _kl_authority_from_verified_sample(
         "sample_order_sha256": sample["sample_order_sha256"],
         "ordered_evidence_sha256": sample["kl_ordered_evidence_sha256"],
         "eligible_evidence_sha256": sample["kl_eligible_evidence_sha256"],
-        "scope": "authenticated_historical_replay",
+        "scope": "descriptor_declared_anchor_components",
         "prior_policy_required": True,
         "multi_action_required": True,
     }
@@ -1993,7 +1993,7 @@ def verify_p1_kl_eligibility_authority(
         != composite["payload_inventory_sha256"]
         or authority["sampler_identity_sha256"] != composite["sampler_identity_sha256"]
         or authority["sample_order_sha256"] != composite["sample_order_sha256"]
-        or authority["scope"] != "authenticated_historical_replay"
+        or authority["scope"] != "descriptor_declared_anchor_components"
         or authority["prior_policy_required"] is not True
         or authority["multi_action_required"] is not True
         or authority["replay_verified"] is not True
@@ -2127,11 +2127,7 @@ def build_p1_kl_eligibility_authority(
         _ordered_identity_update(order_digest, index=index, row_identity_sha256=row_sha)
         encoded = _canonical_bytes({"draw_index": index, **row}) + b"\n"
         evidence_digest.update(encoded)
-        is_eligible = (
-            row["component_id"] == "historical_replay"
-            and row["prior_policy_present"]
-            and row["legal_action_count"] > 1
-        )
+        is_eligible = False
         if is_eligible:
             eligible += 1
             eligible_digest.update(encoded)
@@ -2142,8 +2138,6 @@ def build_p1_kl_eligibility_authority(
     order_sha = "sha256:" + order_digest.hexdigest()
     if order_sha != data["sample_order_sha256"]:
         raise CoordinatorError("P1 KL evidence does not replay canonical sample order")
-    if eligible == 0:
-        raise CoordinatorError("P1 KL sampled order contains zero eligible rows")
     core = {
         "schema_version": "a1-p1-kl-eligibility-authority-v1",
         "sampled_rows": sampled,
@@ -2157,7 +2151,7 @@ def build_p1_kl_eligibility_authority(
         "sample_order_sha256": order_sha,
         "ordered_evidence_sha256": "sha256:" + evidence_digest.hexdigest(),
         "eligible_evidence_sha256": "sha256:" + eligible_digest.hexdigest(),
-        "scope": "authenticated_historical_replay",
+        "scope": "descriptor_declared_anchor_components",
         "prior_policy_required": True,
         "multi_action_required": True,
     }
@@ -2566,65 +2560,11 @@ def _p1_training_descriptor_authorities(
     base_descriptor_sha256: str,
     eligible_rows: int,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Derive the exact trainer-visible KL scope for every P1 arm.
-
-    The production descriptor deliberately carries an empty anchor scope for
-    the ordinary K=0 learner.  A non-zero coefficient alone cannot change that
-    authenticated all-false mask.  K3/K10 therefore receive immutable derived
-    descriptors whose *only* semantic delta is the historical replay scope.
-    """
-
-    descriptor = copy.deepcopy(dict(base_descriptor))
-    if descriptor.get("policy_kl_anchor_component_ids") != []:
-        raise CoordinatorError(
-            "P1 base descriptor must carry the ordinary empty KL-anchor scope"
-        )
-    _require_sha(base_descriptor_sha256, "P1 base descriptor")
-    if isinstance(eligible_rows, bool) or not isinstance(eligible_rows, int):
-        raise CoordinatorError("P1 KL eligible-row count must be an integer")
-    if eligible_rows <= 0 or eligible_rows > SHORT_SAMPLE_DOSE:
-        raise CoordinatorError("P1 KL eligible-row count is outside the fixed dose")
-
-    authorities: dict[str, dict[str, Any]] = {}
-    derived_payloads: dict[str, dict[str, Any]] = {}
-    for arm_id in P1_ARMS:
-        anchor_ids = (
-            []
-            if arm_id == "K0"
-            else list(P1_HISTORICAL_ANCHOR_COMPONENT_IDS)
-        )
-        filename = (
-            None
-            if arm_id == "K0"
-            else f"p1-05-{arm_id.lower()}-training-descriptor.json"
-        )
-        if arm_id == "K0":
-            payload = descriptor
-            descriptor_file_sha256 = base_descriptor_sha256
-        else:
-            payload = copy.deepcopy(descriptor)
-            payload["policy_kl_anchor_component_ids"] = anchor_ids
-            encoded = (
-                json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-                + b"\n"
-            )
-            descriptor_file_sha256 = (
-                "sha256:" + hashlib.sha256(encoded).hexdigest()
-            )
-            derived_payloads[arm_id] = payload
-        authorities[arm_id] = {
-            "schema_version": P1_TRAINING_DESCRIPTOR_SCHEMA,
-            "kind": "base" if arm_id == "K0" else "derived_historical_anchor",
-            "filename": filename,
-            "base_descriptor_sha256": base_descriptor_sha256,
-            "descriptor_file_sha256": descriptor_file_sha256,
-            "descriptor_fingerprint": _digest(payload),
-            "policy_kl_anchor_component_ids": anchor_ids,
-            "expected_policy_kl_anchor_eligible_rows": (
-                0 if arm_id == "K0" else eligible_rows
-            ),
-        }
-    return authorities, derived_payloads
+    """Refuse the retired historical-replay KL-anchor experiment."""
+    del base_descriptor, base_descriptor_sha256, eligible_rows
+    raise CoordinatorError(
+        "P1 historical-anchor sweep is retired for the fresh-only production composite"
+    )
 
 
 def _verify_p1_training_descriptor_authority(
@@ -2649,7 +2589,7 @@ def _verify_p1_training_descriptor_authority(
         f"P1 {arm_id} training descriptor authority",
     )
     expected_ids = (
-        [] if arm_id == "K0" else list(P1_HISTORICAL_ANCHOR_COMPONENT_IDS)
+        []
     )
     expected_filename = (
         None
@@ -5194,7 +5134,7 @@ def issue_final_replication(
     evidence_origin = _repo_tool_sha256("tools/a1_scientific_evidence.py")
     descriptor = composite_descriptor_path.expanduser().resolve(strict=True)
     try:
-        routing = scientific_evidence.verify_mixed_routing_receipt(
+        routing = scientific_evidence.verify_component_routing_receipt(
             component_routing_receipt_path.expanduser().resolve(strict=True),
             descriptor=descriptor,
             expected_origin_tool_sha256=evidence_origin,

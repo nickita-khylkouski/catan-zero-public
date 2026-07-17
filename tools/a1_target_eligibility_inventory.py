@@ -1027,16 +1027,9 @@ def canonical_value_sha256(value: object) -> str:
 def _source_contract_payload(
     source_authority: Mapping[str, Any], *, scope: str
 ) -> dict[str, Any] | None:
-    raw: Any
-    if scope == "fresh":
-        raw = source_authority.get("current_contract")
-    else:
-        historical = source_authority.get("historical_replay")
-        raw = (
-            historical.get("source_contract")
-            if isinstance(historical, Mapping)
-            else None
-        )
+    if scope != "fresh":
+        raise InventoryError(f"unsupported policy-target authority scope: {scope!r}")
+    raw: Any = source_authority.get("current_contract")
     if not isinstance(raw, Mapping):
         return None
     path_value = raw.get("path")
@@ -1098,8 +1091,7 @@ def _operator_authorities(source_authority: Mapping[str, Any]) -> list[dict[str,
 def _manifest_operator_groups(source_authority: Mapping[str, Any]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
     scope_authorities = {
-        scope: _source_contract_payload(source_authority, scope=scope)
-        for scope in ("fresh", "historical_replay")
+        "fresh": _source_contract_payload(source_authority, scope="fresh")
     }
 
     def consume(scope: str, records: Any) -> None:
@@ -1170,9 +1162,6 @@ def _manifest_operator_groups(source_authority: Mapping[str, Any]) -> list[dict[
             group["rows"] += int(manifest.get("rows", 0))
 
     consume("fresh", source_authority.get("fresh_generation_manifests"))
-    historical = source_authority.get("historical_replay")
-    if isinstance(historical, Mapping):
-        consume("historical_replay", historical.get("generation_manifests"))
     return [grouped[key] for key in sorted(grouped)]
 
 
@@ -1191,8 +1180,8 @@ def _policy_operator_identity_inventory(
     still admitted the composite based on regime alone.
 
     Fresh manifest categories map directly to fresh composite component IDs.
-    The historical replay component is an aggregate, so when it is explicitly
-    policy-active all historical manifest groups are in scope.
+    Retired replay components are deliberately absent: their stale policy
+    operators cannot enter a fresh-only learner through this inventory.
     """
 
     relevant: list[dict[str, Any]] = []
@@ -1203,12 +1192,6 @@ def _policy_operator_identity_inventory(
         if scope == "fresh" and category in policy_distillation_component_ids:
             relevant.append(dict(raw))
             covered_components.add(category)
-        elif (
-            scope == "historical_replay"
-            and "historical_replay" in policy_distillation_component_ids
-        ):
-            relevant.append(dict(raw))
-            covered_components.add("historical_replay")
 
     expected_components = (
         policy_distillation_component_ids & policy_active_component_ids

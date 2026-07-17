@@ -62,7 +62,7 @@ def _eligibility_rows():
         facts = {
             "payload_member_sha256": _P1_PAYLOAD_SHA,
             "row_offset": index,
-            "component_id": "historical_replay" if eligible else "current_producer",
+            "component_id": "current_producer",
             "prior_policy_present": eligible,
             "legal_action_count": 2 if eligible else 1,
         }
@@ -444,7 +444,7 @@ def _composite(
 ) -> dict:
     semantics = _category_semantics()
     return {
-        "schema_version": "a1-typed-64-12-4-20-composite-v1",
+        "schema_version": "a1-typed-fresh-80-15-5-composite-v1",
         "component_ids": list(coordinator.COMPONENT_IDS),
         "component_sampling_ratios": list(coordinator.COMPONENT_RATIOS),
         "descriptor_sha256": descriptor_sha256 or _sha("a"),
@@ -669,7 +669,7 @@ def _isolate_external_evidence_verifiers(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         coordinator.scientific_evidence,
-        "verify_mixed_routing_receipt",
+        "verify_component_routing_receipt",
         lambda path, **_kwargs: coordinator._load_json(path, where="test routing"),
     )
     monkeypatch.setattr(

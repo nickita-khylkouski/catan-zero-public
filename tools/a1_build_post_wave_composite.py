@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Build the exact first-wave fresh/replay training composite.
+"""Build the exact fresh-only post-wave training composite.
 
 The post-wave audit authorizes whole games, not whole shard files.  This tool
 materializes three source-pure fresh components by filtering every audited NPZ
 on the signed ``(job_id, category, game_seed)`` selection before memmap
-expansion.  It then attaches an already authenticated historical-replay
-component and emits the promotion-eligible .64/.12/.04/.20 descriptor consumed
-by ``train_bc``.
+expansion and emits the promotion-eligible .80/.15/.05 descriptor consumed by
+``train_bc``.
 
 The resulting tree is host-portable at an identical canonical install path.
 Absolute paths are deliberately authenticated; transfer tooling must rsync the
@@ -41,7 +40,6 @@ if str(_SRC) not in sys.path:
 
 from catan_zero.rl.flywheel.composite_contract import (  # noqa: E402
     FRESH_SOURCE_GAME_RATIOS,
-    HISTORICAL_REPLAY_CATEGORY,
     build_sampling_receipt,
     canonical_sha256,
     measure_memmap_component,
@@ -62,39 +60,27 @@ from tools import build_memmap_corpus as memmap_builder  # noqa: E402
 from tools import train_bc  # noqa: E402
 
 
-HISTORICAL_COMPONENT_REF_SCHEMA = "a1-historical-replay-component-ref-v1"
-HISTORICAL_AUTHORITY_SCHEMA = "a1-historical-replay-authority-v1"
-SOURCE_AUTHORITY_SCHEMA = "a1-post-wave-composite-source-authority-v3"
-BUILD_RECEIPT_SCHEMA = "a1-post-wave-composite-build-v2"
+SOURCE_AUTHORITY_SCHEMA = "a1-post-wave-composite-source-authority-v4"
+BUILD_RECEIPT_SCHEMA = "a1-post-wave-composite-build-v3"
 EFFECTIVE_COMPONENT_RATIOS = {
-    "current_producer": 0.64,
-    "recent_history": 0.12,
-    "hard_negative": 0.04,
-    HISTORICAL_REPLAY_CATEGORY: 0.20,
+    "current_producer": 0.80,
+    "recent_history": 0.15,
+    "hard_negative": 0.05,
 }
 # The fresh rows in this recovery wave are all produced by the same n128
 # search teacher.  The winning TEMP experiment established the n128 policy
 # target at T=1.0.  ``soft_target_temperature=0.7`` is deliberately inert for
 # stored-policy targets, so bind the source temperatures in the descriptor
 # instead of relying on that easy-to-misread global score-target flag.
-# Historical replay is retained as authenticated state evidence for explicit
-# reanalysis and other replay-aware consumers.  Neither its old search policy
-# nor its terminal outcome is an interchangeable target for the current
-# producer: both were generated under a different continuation policy.
-# Temperature scaling cannot repair either identity mismatch.
 STORED_POLICY_COMPONENT_TEMPERATURES = {
     "current_producer": 1.0,
     "recent_history": 1.0,
     "hard_negative": 1.0,
-    HISTORICAL_REPLAY_CATEGORY: 0.52,
 }
 
-# The production baseline trains policy and value only from fresh,
-# same-operator n128 components.  Replay remains physically present and
-# authenticated for reanalysis/state-coverage treatments; any replay policy
-# anchor or value objective is a separate treatment and must never silently
-# become stale policy CE or off-policy terminal-return supervision.
-HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT = 0.0
+# The production baseline trains policy only from fresh, same-operator n128
+# components and value only from current-producer self-play.
+POLICY_KL_ANCHOR_WEIGHT = 0.0
 _CURRENT_LEARNER_RECIPE = current_science.learner_training_recipe()
 _CURRENT_PER_GAME_VALUE_WEIGHT = _CURRENT_LEARNER_RECIPE.get(
     "per_game_value_weight"
@@ -154,47 +140,6 @@ def _memmap_adapter_version(corpus_dir: Path, *, component_id: str) -> str:
     )
 
 
-def _historical_raw_adapter_version(
-    bindings: Sequence[Mapping[str, Any]],
-) -> str:
-    """Recover dropped legacy memmap metadata from byte-authenticated raw NPZs.
-
-    Historical conversion omitted ``adapter_version`` even though generation
-    wrote it.  The historical authority already binds every raw shard by hash;
-    read only that bound column and refuse absence/mixed semantics.  This is an
-    authenticated metadata recovery, not an inference from tensor shape or the
-    current runtime default.
-    """
-
-    observed: set[str] = set()
-    for binding in bindings:
-        try:
-            source = Path(str(binding["source_path"])).resolve(strict=True)
-        except (KeyError, OSError) as error:
-            raise CompositeBuildError(
-                f"cannot resolve historical adapter source: {error}"
-            ) from error
-        if _file_sha256(source) != binding.get("source_sha256"):
-            raise CompositeBuildError(
-                f"historical adapter source bytes drifted: {source}"
-            )
-        try:
-            with np.load(source, allow_pickle=False) as payload:
-                if "adapter_version" not in payload.files:
-                    raise CompositeBuildError(
-                        f"historical raw shard lacks adapter_version: {source}"
-                    )
-                values = np.asarray(payload["adapter_version"]).astype(str)
-        except (OSError, ValueError) as error:
-            raise CompositeBuildError(
-                f"cannot read historical adapter_version from {source}: {error}"
-            ) from error
-        observed.update(map(str, np.unique(values).tolist()))
-    return _single_adapter_version(
-        sorted(observed), source="historical raw replay authority"
-    )
-
-
 LEARNER_RECIPE_OVERRIDES: dict[str, object] = {
     "forced_action_weight": 0.0,
     "forced_row_value_weight": 1.0,
@@ -207,7 +152,7 @@ LEARNER_RECIPE_OVERRIDES: dict[str, object] = {
         _CURRENT_VALUE_PLAYER_OUTCOME_BALANCE_MODE
     ),
     "policy_kl_anchor_direction": "forward",
-    "policy_kl_anchor_weight": HISTORICAL_REPLAY_KL_ANCHOR_WEIGHT,
+    "policy_kl_anchor_weight": POLICY_KL_ANCHOR_WEIGHT,
     "policy_loss_weight": 1.0,
     "q_loss_weight": 0.0,
     "soft_target_source": "policy",
@@ -1364,202 +1309,6 @@ def _fresh_policy_target_identities(
     }
 
 
-def _load_historical_component(
-    path: Path,
-    *,
-    current_version: int,
-    verify_lock_fn: Callable[..., dict[str, Any]],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    reference_path = path.expanduser().resolve(strict=True)
-    wrapper = _load_json(reference_path)
-    if (
-        set(wrapper) != {"schema_version", "component", "authority"}
-        or wrapper.get("schema_version") != HISTORICAL_COMPONENT_REF_SCHEMA
-    ):
-        raise CompositeBuildError(
-            f"historical component reference must use {HISTORICAL_COMPONENT_REF_SCHEMA}"
-        )
-    component = wrapper.get("component")
-    expected = {
-        "component_id",
-        "source_category",
-        "game_sampling_ratio",
-        "corpus_dir",
-        "corpus_meta_sha256",
-        "payload_inventory_sha256",
-        "provenance_manifest",
-        "provenance_manifest_sha256",
-        "component_mass",
-    }
-    if not isinstance(component, dict) or set(component) != expected:
-        raise CompositeBuildError("historical component fields differ from schema")
-    if (
-        component["component_id"] != HISTORICAL_REPLAY_CATEGORY
-        or component["source_category"] != HISTORICAL_REPLAY_CATEGORY
-        or float(component["game_sampling_ratio"]) != 0.20
-    ):
-        raise CompositeBuildError("historical component identity/ratio drift")
-    try:
-        corpus_dir = Path(str(component["corpus_dir"])).resolve(strict=True)
-        provenance_path = Path(str(component["provenance_manifest"])).resolve(
-            strict=True
-        )
-        meta_path = corpus_dir / "corpus_meta.json"
-        meta = _load_json(meta_path)
-        if (
-            str(corpus_dir) != component["corpus_dir"]
-            or str(provenance_path) != component["provenance_manifest"]
-            or _file_sha256(meta_path) != component["corpus_meta_sha256"]
-            or _file_sha256(provenance_path) != component["provenance_manifest_sha256"]
-            or train_bc._validate_memmap_payload_inventory(corpus_dir, meta)  # noqa: SLF001
-            != component["payload_inventory_sha256"]
-        ):
-            raise CompositeBuildError("historical component byte binding drift")
-        provenance = _load_json(provenance_path)
-    except (OSError, SystemExit, ValueError) as error:
-        raise CompositeBuildError(
-            f"historical replay verification failed: {error}"
-        ) from error
-    if (
-        provenance["role"] != "replay"
-        or int(provenance["current_checkpoint_version"]) != current_version
-        or component["component_mass"] != provenance["component_mass"]
-    ):
-        raise CompositeBuildError("historical replay generation/mass drift")
-
-    authority = wrapper.get("authority")
-    authority_fields = {
-        "schema_version",
-        "source_contract",
-        "selected_game_manifest",
-        "post_wave_audit",
-        "source_bindings",
-        "source_bindings_sha256",
-        "component_provenance_sha256",
-        "component_payload_inventory_sha256",
-        "authority_sha256",
-    }
-    if (
-        not isinstance(authority, dict)
-        or set(authority) != authority_fields
-        or authority.get("schema_version") != HISTORICAL_AUTHORITY_SCHEMA
-    ):
-        raise CompositeBuildError(
-            "historical replay lacks a sealed prior lock/audit/selection authority"
-        )
-    unhashed_authority = dict(authority)
-    declared_authority_sha = unhashed_authority.pop("authority_sha256", None)
-    if declared_authority_sha != _digest(unhashed_authority):
-        raise CompositeBuildError("historical replay authority digest drift")
-
-    try:
-        contract_ref = dict(authority["source_contract"])
-        selected_ref = dict(authority["selected_game_manifest"])
-        audit_ref = dict(authority["post_wave_audit"])
-    except (TypeError, ValueError) as error:
-        raise CompositeBuildError("historical replay authority references are malformed") from error
-    if set(contract_ref) != {"path", "file_sha256", "contract_sha256"}:
-        raise CompositeBuildError("historical source-contract authority fields drift")
-    if set(selected_ref) != {
-        "path",
-        "file_sha256",
-        "manifest_sha256",
-        "records_sha256",
-        "selected_game_seed_set_sha256",
-    }:
-        raise CompositeBuildError("historical selected-game authority fields drift")
-    if set(audit_ref) != {
-        "path",
-        "file_sha256",
-        "audit_sha256",
-        "shard_inventory_sha256",
-    }:
-        raise CompositeBuildError("historical post-wave authority fields drift")
-    try:
-        prior_lock_path = Path(str(contract_ref["path"])).expanduser().resolve(
-            strict=True
-        )
-        selected_path = Path(str(selected_ref["path"])).expanduser().resolve(
-            strict=True
-        )
-        audit_path = Path(str(audit_ref["path"])).expanduser().resolve(strict=True)
-        prior_lock = verify_lock_fn(
-            prior_lock_path, require_all_job_claims=False
-        )
-        selected = memmap_builder._load_a1_selected_game_manifest(selected_path)  # noqa: SLF001
-        audit = memmap_builder._load_a1_post_wave_audit(audit_path, selected)  # noqa: SLF001
-    except (
-        OSError,
-        SystemExit,
-        contract.ContractError,
-        frozen_lock_verifier.FrozenVerifierError,
-    ) as error:
-        raise CompositeBuildError(
-            f"historical replay authority verification failed: {error}"
-        ) from error
-    if (
-        str(prior_lock_path) != contract_ref["path"]
-        or _file_sha256(prior_lock_path) != contract_ref["file_sha256"]
-        or prior_lock.get("contract_sha256") != contract_ref["contract_sha256"]
-        or selected.get("a1_contract_sha256") != prior_lock.get("contract_sha256")
-        or str(selected["path"]) != selected_ref["path"]
-        or selected["file_sha256"] != selected_ref["file_sha256"]
-        or selected["manifest_sha256"] != selected_ref["manifest_sha256"]
-        or selected["records_sha256"] != selected_ref["records_sha256"]
-        or selected["selected_game_seed_set_sha256"]
-        != selected_ref["selected_game_seed_set_sha256"]
-        or audit.get("contract_sha256") != prior_lock.get("contract_sha256")
-        or str(audit["path"]) != audit_ref["path"]
-        or audit["file_sha256"] != audit_ref["file_sha256"]
-        or audit["audit_sha256"] != audit_ref["audit_sha256"]
-        or audit["shard_inventory_sha256"] != audit_ref["shard_inventory_sha256"]
-    ):
-        raise CompositeBuildError("historical replay prior authority binding drift")
-    bindings = _validate_source_bindings(
-        authority["source_bindings"],
-        lock=prior_lock,
-        selected_file_sha256=selected["file_sha256"],
-        selected_records_sha256=selected["records_sha256"],
-        audit_file_sha256=audit["file_sha256"],
-        audit_sha256=audit["audit_sha256"],
-    )
-    if authority["source_bindings_sha256"] != canonical_sha256(bindings):
-        raise CompositeBuildError("historical replay source-binding digest drift")
-    # The old memmap conversion dropped this column, but the immutable raw NPZ
-    # sources retained it. Recover the semantic identity only from those exact
-    # hash-bound source bytes so the new composite can synthesize the missing
-    # scalar column without weakening mixed-adapter admission.
-    historical_adapter_version = _historical_raw_adapter_version(bindings)
-    binding_ids = {str(value["source_id"]) for value in bindings}
-    try:
-        provenance = train_bc._validate_flywheel_component_provenance(  # noqa: SLF001
-            provenance_path,
-            component_id=HISTORICAL_REPLAY_CATEGORY,
-            corpus_dir=corpus_dir,
-            corpus_meta=meta,
-            allowed_source_ids=binding_ids,
-        )
-    except SystemExit as error:
-        raise CompositeBuildError(
-            f"historical replay provenance verification failed: {error}"
-        ) from error
-    provenance_ids = {str(value["source_id"]) for value in provenance["shards"]}
-    if not provenance_ids or not provenance_ids.issubset(binding_ids):
-        raise CompositeBuildError(
-            "historical replay shards are not authorized by the prior wave sources"
-        )
-    if (
-        authority["component_provenance_sha256"]
-        != component["provenance_manifest_sha256"]
-        or authority["component_payload_inventory_sha256"]
-        != component["payload_inventory_sha256"]
-    ):
-        raise CompositeBuildError("historical replay authority/component bytes drift")
-    component = dict(component)
-    component["entity_feature_adapter_version"] = historical_adapter_version
-    return dict(component), dict(authority)
-
-
 def _build_source_authority(
     *,
     lock_path: Path,
@@ -1567,10 +1316,7 @@ def _build_source_authority(
     selected: Mapping[str, Any],
     audit: Mapping[str, Any],
     source_bindings: list[dict[str, Any]],
-    historical_component: Mapping[str, Any],
-    historical_authority: Mapping[str, Any],
     current_lock_verifier_authority: Mapping[str, Any],
-    historical_lock_verifier_authority: Mapping[str, Any],
     output_root: Path,
 ) -> dict[str, str]:
     """Materialize the complete, portable authority before the descriptor.
@@ -1643,10 +1389,6 @@ def _build_source_authority(
     audit_ref = staged_ref(Path(str(audit["path"])), "current/post_wave_audit.json")
     current_manifests = staged_manifests(normalized_bindings, namespace="current")
 
-    historical_contract_source = Path(
-        str(historical_authority["source_contract"]["path"])
-    )
-    historical_lock = _load_json(historical_contract_source)
     lock_verifier_authorities = {
         "current_wave": _validated_lock_verifier_authority(
             current_lock_verifier_authority,
@@ -1654,66 +1396,7 @@ def _build_source_authority(
             lock=lock,
             require_all_job_claims=True,
         ),
-        "historical_replay": _validated_lock_verifier_authority(
-            historical_lock_verifier_authority,
-            lock_path=historical_contract_source,
-            lock=historical_lock,
-            require_all_job_claims=False,
-        ),
     }
-    historical_selected_source = Path(
-        str(historical_authority["selected_game_manifest"]["path"])
-    )
-    historical_audit_source = Path(
-        str(historical_authority["post_wave_audit"]["path"])
-    )
-    historical_contract_ref = {
-        **staged_ref(historical_contract_source, "historical/contract.lock.json"),
-        "contract_sha256": historical_authority["source_contract"][
-            "contract_sha256"
-        ],
-    }
-    historical_selected_ref = {
-        **staged_ref(historical_selected_source, "historical/selected_games.json"),
-        **{
-            key: historical_authority["selected_game_manifest"][key]
-            for key in (
-                "manifest_sha256",
-                "records_sha256",
-                "selected_game_seed_set_sha256",
-            )
-        },
-    }
-    historical_audit_ref = {
-        **staged_ref(historical_audit_source, "historical/post_wave_audit.json"),
-        **{
-            key: historical_authority["post_wave_audit"][key]
-            for key in ("audit_sha256", "shard_inventory_sha256")
-        },
-    }
-    historical_bindings = list(historical_authority["source_bindings"])
-    historical_manifests = staged_manifests(
-        historical_bindings, namespace="historical"
-    )
-    historical_projection: dict[str, Any] = {
-        "schema_version": HISTORICAL_AUTHORITY_SCHEMA,
-        "source_contract": historical_contract_ref,
-        "selected_game_manifest": historical_selected_ref,
-        "post_wave_audit": historical_audit_ref,
-        "source_bindings": historical_bindings,
-        "source_bindings_sha256": historical_authority[
-            "source_bindings_sha256"
-        ],
-        "generation_manifests": historical_manifests,
-        "generation_manifests_sha256": canonical_sha256(historical_manifests),
-        "component_provenance_sha256": historical_component[
-            "provenance_manifest_sha256"
-        ],
-        "component_payload_inventory_sha256": historical_component[
-            "payload_inventory_sha256"
-        ],
-    }
-    historical_projection["authority_sha256"] = _digest(historical_projection)
     payload: dict[str, Any] = {
         "schema_version": SOURCE_AUTHORITY_SCHEMA,
         "canonical_composite_root": str(output_root.resolve(strict=True)),
@@ -1748,7 +1431,6 @@ def _build_source_authority(
         "fresh_generation_manifests": current_manifests,
         "fresh_generation_manifests_sha256": canonical_sha256(current_manifests),
         "lock_verifier_authorities": lock_verifier_authorities,
-        "historical_replay": historical_projection,
     }
     payload["authority_sha256"] = _digest(payload)
     path = output_root / "source_authority.json"
@@ -1770,7 +1452,7 @@ def _build_descriptor(
     category_semantics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     component_ids = [str(component["component_id"]) for component in components]
-    expected_ids = [*FRESH_SOURCE_GAME_RATIOS, HISTORICAL_REPLAY_CATEGORY]
+    expected_ids = list(FRESH_SOURCE_GAME_RATIOS)
     if component_ids != expected_ids:
         raise CompositeBuildError(
             f"component order/identity drift: {component_ids} != {expected_ids}"
@@ -1781,7 +1463,7 @@ def _build_descriptor(
     }
     if effective != EFFECTIVE_COMPONENT_RATIOS:
         raise CompositeBuildError(
-            "effective component ratios differ from .64/.12/.04/.20"
+            "effective component ratios differ from .80/.15/.05"
         )
     provenance_payloads = [
         _load_json(Path(str(component["provenance_manifest"])))
@@ -1805,15 +1487,9 @@ def _build_descriptor(
     adapter_versions: dict[str, str] = {}
     for component in components:
         component_id = str(component["component_id"])
-        if component_id == HISTORICAL_REPLAY_CATEGORY:
-            version = _single_adapter_version(
-                [component.get("entity_feature_adapter_version")],
-                source="historical replay component",
-            )
-        else:
-            version = _memmap_adapter_version(
-                Path(str(component["corpus_dir"])), component_id=component_id
-            )
+        version = _memmap_adapter_version(
+            Path(str(component["corpus_dir"])), component_id=component_id
+        )
         adapter_versions[component_id] = version
     if len(set(adapter_versions.values())) != 1:
         raise CompositeBuildError(
@@ -1823,13 +1499,6 @@ def _build_descriptor(
     aux_subgoal_component_ids: list[str] = []
     for component in components:
         component_id = str(component["component_id"])
-        # Historical replay predates the strict-future auxiliary target
-        # contract. It remains valid for the TEMP control's base policy/value
-        # objectives, but only fresh components may enter the auxiliary scope,
-        # and only when byte-bound metadata proves every row carries the
-        # strict-future version.
-        if component_id not in FRESH_SOURCE_GAME_RATIOS:
-            continue
         corpus_dir = component.get("corpus_dir")
         if not isinstance(corpus_dir, str):
             continue
@@ -1862,16 +1531,16 @@ def _build_descriptor(
         )
     fresh_component_ids = list(FRESH_SOURCE_GAME_RATIOS)
     replay_contract = {
-        "schema_version": "flywheel-replay-composite-v2",
+        "schema_version": "flywheel-replay-composite-v3",
         "current_checkpoint_version": int(current_version),
         "initializer_checkpoint_path": str(producer_path),
         "initializer_checkpoint_sha256": producer_sha256,
         "fresh_component_ids": fresh_component_ids,
-        "replay_component_ids": [HISTORICAL_REPLAY_CATEGORY],
+        "replay_component_ids": [],
         "fresh_source_game_ratios": dict(FRESH_SOURCE_GAME_RATIOS),
         "effective_component_sampling_ratios": effective,
-        "minimum_replay_ratio": 0.20,
-        "realized_replay_ratio": 0.20,
+        "minimum_replay_ratio": 0.0,
+        "realized_replay_ratio": 0.0,
         "checkpoint_versions": checkpoint_versions,
         "component_provenance_sha256": canonical_sha256(provenance_binding),
         "sampling_receipt": sampling_receipt,
@@ -1928,25 +1597,18 @@ def build_post_wave_composite(
     lock_path: Path,
     selected_path: Path,
     audit_path: Path,
-    historical_component_path: Path,
     output_root: Path,
     verify_lock_fn: Callable[..., dict[str, Any]],
-    historical_verify_lock_fn: Callable[..., dict[str, Any]],
     current_lock_verifier_authority: Mapping[str, Any] | None = None,
-    historical_lock_verifier_authority: Mapping[str, Any] | None = None,
     build_memmap_fn: Callable[..., dict[str, Any]] = memmap_builder.build_memmap_corpus,
     verify_descriptor_fn: Callable[[Path], dict[str, Any]] = (
         train_bc._preflight_memmap_composite_descriptor  # noqa: SLF001
     ),
     expected_games: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    if (
-        current_lock_verifier_authority is None
-        or historical_lock_verifier_authority is None
-    ):
+    if current_lock_verifier_authority is None:
         raise CompositeBuildError(
-            "post-wave composite requires distinct current and historical "
-            "frozen lock-verifier authorities"
+            "post-wave composite requires a current frozen lock-verifier authority"
         )
     root = _prepare_output_root(output_root)
     lock, selected, audit, raw_selected = _validated_wave_inputs(
@@ -2014,21 +1676,13 @@ def build_post_wave_composite(
         output_root=root,
         expected_games=expected_games,
     )
-    historical, historical_authority = _load_historical_component(
-        historical_component_path,
-        current_version=int(producer["version"]),
-        verify_lock_fn=historical_verify_lock_fn,
-    )
     source_authority = _build_source_authority(
         lock_path=lock_path,
         lock=lock,
         selected=selected,
         audit=audit,
         source_bindings=source_bindings,
-        historical_component=historical,
-        historical_authority=historical_authority,
         current_lock_verifier_authority=current_lock_verifier_authority,
-        historical_lock_verifier_authority=historical_lock_verifier_authority,
         output_root=root,
     )
     policy_target_identities = _fresh_policy_target_identities(source_authority)
@@ -2046,13 +1700,6 @@ def build_post_wave_composite(
         )
         for category in FRESH_SOURCE_GAME_RATIOS
     ]
-    historical.update(
-        {
-            "source_authority_manifest": source_authority["path"],
-            "source_authority_manifest_sha256": source_authority["file_sha256"],
-        }
-    )
-    components.append(historical)
     descriptor = _build_descriptor(
         components=components,
         producer_path=producer_path,
@@ -2062,7 +1709,7 @@ def build_post_wave_composite(
         category_semantics=lock.get("category_semantics"),
     )
     # This is the last mutation before the descriptor's atomic publication.
-    # Sealing all four component payload inventories here makes the builder's
+    # Sealing all three component payload inventories here makes the builder's
     # own descriptor preflight publish an authenticated identity cache, so the
     # one-dose trainer can reuse it instead of rehashing every payload byte.
     _finalize_component_payloads_read_only(components)
@@ -2097,12 +1744,6 @@ def build_post_wave_composite(
             ],
         },
         "fresh_target_activation": target_activation,
-        "historical_component_reference": {
-            "path": str(historical_component_path.expanduser().resolve(strict=True)),
-            "file_sha256": _file_sha256(
-                historical_component_path.expanduser().resolve(strict=True)
-            ),
-        },
         "source_bindings": source_bindings,
         "source_bindings_sha256": canonical_sha256(source_bindings),
         "source_authority": source_authority,
@@ -2124,23 +1765,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--selected-game-manifest", type=Path, required=True)
     parser.add_argument("--post-wave-audit", type=Path, required=True)
-    parser.add_argument("--historical-replay-component", type=Path, required=True)
     parser.add_argument("--frozen-repo", type=Path, required=True)
     parser.add_argument("--frozen-verifier-sha256", required=True)
-    parser.add_argument("--historical-frozen-repo", type=Path, required=True)
-    parser.add_argument("--historical-frozen-verifier-sha256", required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
-        try:
-            historical_wrapper = _load_json(args.historical_replay_component)
-            historical_lock_path = Path(
-                str(historical_wrapper["authority"]["source_contract"]["path"])
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise CompositeBuildError(
-                "historical replay component does not name its source lock"
-            ) from error
         try:
             verify_lock_fn, current_verifier_authority = (
                 frozen_lock_verifier.build_frozen_lock_verifier(
@@ -2150,28 +1779,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                     require_all_job_claims=True,
                 )
             )
-            historical_verify_lock_fn, historical_verifier_authority = (
-                frozen_lock_verifier.build_frozen_lock_verifier(
-                    frozen_repo=args.historical_frozen_repo,
-                    expected_verifier_sha256=(
-                        args.historical_frozen_verifier_sha256
-                    ),
-                    lock_path=historical_lock_path,
-                    require_all_job_claims=False,
-                )
-            )
         except frozen_lock_verifier.FrozenVerifierError as error:
             raise CompositeBuildError(str(error)) from error
         receipt = build_post_wave_composite(
             lock_path=args.lock,
             selected_path=args.selected_game_manifest,
             audit_path=args.post_wave_audit,
-            historical_component_path=args.historical_replay_component,
             output_root=args.out,
             verify_lock_fn=verify_lock_fn,
-            historical_verify_lock_fn=historical_verify_lock_fn,
             current_lock_verifier_authority=current_verifier_authority,
-            historical_lock_verifier_authority=historical_verifier_authority,
         )
     except CompositeBuildError as error:
         parser.error(str(error))

@@ -279,20 +279,18 @@ _TRAINING_ENTITY_FEATURE_ADAPTER_VERSION = CURRENT_RUST_ENTITY_ADAPTER_VERSION
 # The only mixed-corpus transition that can produce an authoritative checkpoint.
 # Each component remains semantically homogeneous; routing is derived from the
 # authenticated composite descriptor rather than inferred from feature values.
-_MIXED_AWARD_COMPONENT_IDS = (
+_COMPONENT_AWARD_IDS = (
     "current_producer",
     "recent_history",
     "hard_negative",
-    "historical_replay",
 )
-_MIXED_AWARD_COMPONENT_RATIOS = (0.64, 0.12, 0.04, 0.20)
-_MIXED_AWARD_COMPONENT_CONTRACTS = (
+_COMPONENT_AWARD_RATIOS = (0.80, 0.15, 0.05)
+_COMPONENT_AWARD_CONTRACTS = (
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
-    PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
 )
-_MIXED_AWARD_TRANSITION_SCHEMA = "mixed-authoritative-transition-v1"
+_COMPONENT_AWARD_AUTHORITY_SCHEMA = "fresh-authoritative-components-v1"
 
 TARGET_INFORMATION_REGIME_PUBLIC = "public_conservation_pimc_v1"
 TARGET_INFORMATION_REGIME_PUBLIC_COHERENT = "public_belief_single_tree_v1"
@@ -4368,7 +4366,6 @@ def _validate_flywheel_source_authority(
         "fresh_source_bindings_sha256",
         "fresh_generation_manifests",
         "fresh_generation_manifests_sha256",
-        "historical_replay",
         "authority_sha256",
     }
     source_authority_schema = (
@@ -4381,6 +4378,10 @@ def _validate_flywheel_source_authority(
         expected.add("lock_verifier_authorities")
     if source_authority_schema == "a1-post-wave-composite-source-authority-v3":
         expected.add("fresh_target_activation")
+    if source_authority_schema == "a1-post-wave-composite-source-authority-v4":
+        expected.update({"lock_verifier_authorities", "fresh_target_activation"})
+    else:
+        expected.add("historical_replay")
     if isinstance(payload, dict) and "category_semantics" in payload:
         expected.add("category_semantics")
     if (
@@ -4391,6 +4392,7 @@ def _validate_flywheel_source_authority(
             "a1-post-wave-composite-source-authority-v1",
             "a1-post-wave-composite-source-authority-v2",
             "a1-post-wave-composite-source-authority-v3",
+            "a1-post-wave-composite-source-authority-v4",
         }
     ):
         raise SystemExit("flywheel source authority fields/schema drift")
@@ -4477,7 +4479,10 @@ def _validate_flywheel_source_authority(
         "shard_inventory_sha256",
     }
     current_audit_fields = set(audit_fields)
-    if source_authority_schema == "a1-post-wave-composite-source-authority-v3":
+    if source_authority_schema in {
+        "a1-post-wave-composite-source-authority-v3",
+        "a1-post-wave-composite-source-authority-v4",
+    }:
         current_audit_fields.add("target_activation_sha256")
     _contract_path, current_contract = verified_json_ref(
         payload["current_contract"],
@@ -4508,7 +4513,10 @@ def _validate_flywheel_source_authority(
         raise SystemExit("flywheel current wave authority chain drift")
 
     target_activation_chunks: dict[tuple[str, str], dict[str, object]] = {}
-    if source_authority_schema == "a1-post-wave-composite-source-authority-v3":
+    if source_authority_schema in {
+        "a1-post-wave-composite-source-authority-v3",
+        "a1-post-wave-composite-source-authority-v4",
+    }:
         target_activation = payload.get("fresh_target_activation")
         if (
             not isinstance(target_activation, dict)
@@ -4820,9 +4828,62 @@ def _validate_flywheel_source_authority(
         category_semantics=category_semantics,
         require_target_activation=(
             source_authority_schema
-            == "a1-post-wave-composite-source-authority-v3"
+            in {
+                "a1-post-wave-composite-source-authority-v3",
+                "a1-post-wave-composite-source-authority-v4",
+            }
         ),
     )
+
+    if source_authority_schema == "a1-post-wave-composite-source-authority-v4":
+        verifier_authorities = payload.get("lock_verifier_authorities")
+        verifier_fields = {
+            "schema_version",
+            "lock",
+            "lock_file_sha256",
+            "contract_sha256",
+            "frozen_repo",
+            "verifier",
+            "verifier_sha256",
+            "require_all_job_claims",
+            "verified_lock_sha256",
+            "authority_sha256",
+        }
+        current_verifier = (
+            verifier_authorities.get("current_wave")
+            if isinstance(verifier_authorities, dict)
+            and set(verifier_authorities) == {"current_wave"}
+            else None
+        )
+        if not isinstance(current_verifier, dict) or set(current_verifier) != verifier_fields:
+            raise SystemExit("flywheel lock-verifier authority roles drift")
+        verifier_unhashed = dict(current_verifier)
+        verifier_declared = verifier_unhashed.pop("authority_sha256", None)
+        if (
+            current_verifier.get("schema_version")
+            != "a1-frozen-lock-verifier-authority-v1"
+            or verifier_declared != _canonical_json_sha256(verifier_unhashed)
+            or current_verifier.get("require_all_job_claims") is not True
+            or current_verifier.get("lock_file_sha256")
+            != payload["current_contract"].get("file_sha256")
+            or current_verifier.get("contract_sha256")
+            != payload["current_contract"].get("contract_sha256")
+            or current_verifier.get("verified_lock_sha256")
+            != _canonical_json_sha256(current_contract)
+            or not Path(str(current_verifier.get("lock", ""))).is_absolute()
+            or not Path(str(current_verifier.get("frozen_repo", ""))).is_absolute()
+            or not Path(str(current_verifier.get("verifier", ""))).is_absolute()
+            or not _is_sha256(current_verifier.get("verifier_sha256"))
+        ):
+            raise SystemExit("flywheel lock-verifier authority binding drift")
+        return {
+            **payload,
+            "fresh_source_bindings": fresh_bindings,
+            "fresh_source_ids": sorted(fresh_ids),
+            "historical_source_bindings": [],
+            "historical_source_ids": [],
+            "category_semantics": category_semantics,
+        }
 
     historical_authority = payload["historical_replay"]
     historical_fields = {
@@ -6258,15 +6319,24 @@ def _preflight_memmap_composite_descriptor(
         }
         if not isinstance(raw_contract, dict) or set(raw_contract) != expected_contract_fields:
             raise SystemExit("flywheel replay contract fields differ from schema")
-        if raw_contract.get("schema_version") != "flywheel-replay-composite-v2":
+        contract_schema = raw_contract.get("schema_version")
+        if contract_schema not in {
+            "flywheel-replay-composite-v2",
+            "flywheel-replay-composite-v3",
+        }:
             raise SystemExit("flywheel replay contract schema is unsupported")
         fresh_ids = raw_contract.get("fresh_component_ids")
         replay_ids = raw_contract.get("replay_component_ids")
+        expected_replay_ids = (
+            [HISTORICAL_REPLAY_CATEGORY]
+            if contract_schema == "flywheel-replay-composite-v2"
+            else []
+        )
         if (
             not isinstance(fresh_ids, list)
             or fresh_ids != list(FRESH_SOURCE_GAME_RATIOS)
             or not isinstance(replay_ids, list)
-            or replay_ids != [HISTORICAL_REPLAY_CATEGORY]
+            or replay_ids != expected_replay_ids
             or component_ids != fresh_ids + replay_ids
         ):
             raise SystemExit("flywheel fresh/replay component identity is invalid")
@@ -6286,16 +6356,21 @@ def _preflight_memmap_composite_descriptor(
             raise SystemExit("flywheel component roles differ from replay contract")
         if source_authority is None or source_authority_ref is None:
             raise SystemExit("flywheel production composite has no verified authority")
-        replay_authority = source_authority.get("historical_replay")
-        replay_component = components[component_ids.index(HISTORICAL_REPLAY_CATEGORY)]
-        if (
-            not isinstance(replay_authority, dict)
-            or replay_authority.get("component_provenance_sha256")
-            != replay_component.get("provenance_manifest_sha256")
-            or replay_authority.get("component_payload_inventory_sha256")
-            != replay_component.get("payload_inventory_sha256")
-        ):
-            raise SystemExit("historical source authority differs from replay component")
+        if replay_ids:
+            replay_authority = source_authority.get("historical_replay")
+            replay_component = components[
+                component_ids.index(HISTORICAL_REPLAY_CATEGORY)
+            ]
+            if (
+                not isinstance(replay_authority, dict)
+                or replay_authority.get("component_provenance_sha256")
+                != replay_component.get("provenance_manifest_sha256")
+                or replay_authority.get("component_payload_inventory_sha256")
+                != replay_component.get("payload_inventory_sha256")
+            ):
+                raise SystemExit(
+                    "historical source authority differs from replay component"
+                )
         current_version = raw_contract.get("current_checkpoint_version")
         if (
             isinstance(current_version, bool)
@@ -6314,10 +6389,11 @@ def _preflight_memmap_composite_descriptor(
                 for version in provenance["checkpoint_versions"]
             }
         )
-        if raw_contract.get("checkpoint_versions") != all_versions or not any(
-            version < int(current_version) for version in all_versions
+        if raw_contract.get("checkpoint_versions") != all_versions or (
+            replay_ids
+            and not any(version < int(current_version) for version in all_versions)
         ):
-            raise SystemExit("flywheel replay does not bind a distinct historical generation")
+            raise SystemExit("flywheel checkpoint-generation inventory drift")
         minimum_ratio = raw_contract.get("minimum_replay_ratio")
         realized_ratio = sum(
             component_ratios[component_ids.index(value)] for value in replay_ids
@@ -6325,12 +6401,18 @@ def _preflight_memmap_composite_descriptor(
         if (
             isinstance(minimum_ratio, bool)
             or not isinstance(minimum_ratio, (int, float))
-            or not 0.0 < float(minimum_ratio) < 1.0
+            or not 0.0 <= float(minimum_ratio) < 1.0
             or not math.isclose(
-                float(minimum_ratio), 0.20, rel_tol=0.0, abs_tol=1e-12
+                float(minimum_ratio),
+                0.20 if replay_ids else 0.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
             )
             or not math.isclose(
-                float(realized_ratio), 0.20, rel_tol=0.0, abs_tol=1e-12
+                float(realized_ratio),
+                0.20 if replay_ids else 0.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
             )
             or float(realized_ratio) + 1e-12 < float(minimum_ratio)
             or not math.isclose(
@@ -6646,10 +6728,7 @@ def _portable_composite_semantic_digests(
         selected = source_authority.get("selected_game_manifest")
         audit = source_authority.get("post_wave_audit")
         historical = source_authority.get("historical_replay")
-        if not all(
-            isinstance(value, Mapping)
-            for value in (current, selected, audit, historical)
-        ):
+        if not all(isinstance(value, Mapping) for value in (current, selected, audit)):
             raise SystemExit("source authority semantic projection is incomplete")
         source_projection = {
             "schema_version": source_authority.get("schema_version"),
@@ -6668,13 +6747,16 @@ def _portable_composite_semantic_digests(
             "fresh_generation_manifests_sha256": source_authority.get(
                 "fresh_generation_manifests_sha256"
             ),
-            "historical_replay_authority_sha256": historical.get(
-                "authority_sha256"
-            ),
             "category_semantics_sha256": _canonical_json_sha256(
                 source_authority.get("category_semantics")
             ),
         }
+        if historical is not None:
+            if not isinstance(historical, Mapping):
+                raise SystemExit("historical source authority projection is malformed")
+            source_projection["historical_replay_authority_sha256"] = historical.get(
+                "authority_sha256"
+            )
         verifier_authorities = source_authority.get("lock_verifier_authorities")
         if verifier_authorities is not None:
             source_projection["lock_verifier_authorities_sha256"] = (
@@ -12991,28 +13073,28 @@ def _audit_actor_public_rule_state_corpus(
     }
 
 
-def _authorize_mixed_public_award_transition(data: Any) -> dict[str, object]:
-    """Authorize the one exact 64/12/4/20 row-routed feature transition."""
+def _authorize_component_public_award_routing(data: Any) -> dict[str, object]:
+    """Authorize the exact 80/15/5 fresh authoritative feature surface."""
 
     corpora = tuple(getattr(data, "corpora", tuple()))
     component_ids = tuple(getattr(data, "component_ids", tuple()))
     ratios = tuple(getattr(data, "component_game_sampling_ratios", tuple()))
     if (
-        component_ids != _MIXED_AWARD_COMPONENT_IDS
-        or len(corpora) != len(_MIXED_AWARD_COMPONENT_IDS)
-        or len(ratios) != len(_MIXED_AWARD_COMPONENT_RATIOS)
+        component_ids != _COMPONENT_AWARD_IDS
+        or len(corpora) != len(_COMPONENT_AWARD_IDS)
+        or len(ratios) != len(_COMPONENT_AWARD_RATIOS)
         or any(
             not math.isclose(
                 float(observed), float(expected), rel_tol=0.0, abs_tol=1.0e-12
             )
             for observed, expected in zip(
-                ratios, _MIXED_AWARD_COMPONENT_RATIOS, strict=True
+                ratios, _COMPONENT_AWARD_RATIOS, strict=True
             )
         )
     ):
         raise SystemExit(
             "mixed authoritative public-award transition requires the exact "
-            "64/12/4/20 production composite descriptor"
+            "80/15/5 production composite descriptor"
         )
     component_contracts = tuple(
         str(
@@ -13020,10 +13102,9 @@ def _authorize_mixed_public_award_transition(data: Any) -> dict[str, object]:
         )
         for corpus in corpora
     )
-    if component_contracts != _MIXED_AWARD_COMPONENT_CONTRACTS:
+    if component_contracts != _COMPONENT_AWARD_CONTRACTS:
         raise SystemExit(
-            "mixed authoritative public-award transition requires three corrected "
-            "components and one homogeneous legacy replay component"
+            "production public-award features require three authoritative components"
         )
     def _scan_components() -> list[dict[str, object]]:
         return [
@@ -13074,7 +13155,7 @@ def _authorize_mixed_public_award_transition(data: Any) -> dict[str, object]:
         if row["contract"] == PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO
     )
     result: dict[str, object] = {
-        "schema_version": _MIXED_AWARD_TRANSITION_SCHEMA,
+        "schema_version": _COMPONENT_AWARD_AUTHORITY_SCHEMA,
         "routing_authority": "authenticated_component_identity_not_feature_values",
         "component_ids": list(component_ids),
         "component_sampling_ratios": [float(value) for value in ratios],
@@ -13141,16 +13222,16 @@ def _configure_public_award_feature_training(
             "mixed legacy/corrected public-award corpus requires "
             "--allow-mixed-public-award-feature-contracts"
         )
-    mixed_transition = None
+    component_routing_authority = None
     if (
         corpus_contract == PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
         and requested == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
     ):
-        mixed_transition = _authorize_mixed_public_award_transition(data)
+        component_routing_authority = _authorize_component_public_award_routing(data)
     if (
         requested == PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
         and corpus_contract != PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
-        and mixed_transition is None
+        and component_routing_authority is None
     ):
         raise SystemExit(
             "authoritative_v1 training requires an entirely corrected, authenticated corpus"
@@ -13203,15 +13284,15 @@ def _configure_public_award_feature_training(
         "effective_contract": requested,
         "corpus_provenance": corpus,
         "mixed_corpus_acknowledged": allow_mixed,
-        "mixed_authoritative_transition": mixed_transition,
+        "component_routing_authority": component_routing_authority,
         "legacy_column_zero_initialized": zero_initialized,
         "diagnostic_only": (
             corpus_contract == PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
-            and mixed_transition is None
+            and component_routing_authority is None
         ),
         "promotion_eligible": (
             corpus_contract != PUBLIC_AWARD_FEATURE_CONTRACT_MIXED
-            or mixed_transition is not None
+            or component_routing_authority is not None
         ),
     }
 
