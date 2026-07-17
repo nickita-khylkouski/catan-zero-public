@@ -92,6 +92,27 @@ def build_ordered_history_pool(width: int, max_events: int):
             # offset so retained events keep the same absolute positions.
             if position_offset is None:
                 position_offset = self.max_events - event_count
+            if torch.is_tensor(position_offset):
+                if position_offset.ndim != 1 or int(position_offset.shape[0]) != int(
+                    event_tokens.shape[0]
+                ):
+                    raise ValueError(
+                        "ordered history per-row position offsets must have shape "
+                        f"[B], got {tuple(position_offset.shape)}"
+                    )
+                # Transport validation checks the integer range on the host.
+                # Keep the captured CUDA path tensor-only: constructing these
+                # per-row position ids must not call .item() on a device scalar.
+                position_ids = position_offset.to(
+                    device=event_tokens.device,
+                    dtype=torch.long,
+                ).unsqueeze(1) + torch.arange(
+                    event_count,
+                    device=event_tokens.device,
+                    dtype=torch.long,
+                ).unsqueeze(0)
+                positions = self.position_embedding[position_ids]
+                return self.norm(event_tokens + positions)
             if (
                 isinstance(position_offset, bool)
                 or not isinstance(position_offset, int)

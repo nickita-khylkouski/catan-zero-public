@@ -21,6 +21,7 @@ import numpy as np
 
 from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY
 from catan_zero.rl.entity_token_policy import (
+    EVENT_POSITION_OFFSET_KEY,
     PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
     STATIC_ACTION_RESIDUAL_SLICE,
     _apply_public_award_feature_contract,
@@ -181,6 +182,7 @@ class CudaGraphInferenceRunner:
                 )
             ),
         )
+        entity_batch = self._with_event_position_offsets(entity_batch)
         # Preserve EntityGraphPolicy.forward_legal_np's public input contract on
         # every path, including disabled and capture-failure eager fallbacks.
         # Validate before cropping so event masks/tokens are checked against the
@@ -589,6 +591,23 @@ class CudaGraphInferenceRunner:
             raise ValueError(
                 f"event_token_limit {limit} exceeds event width {event_mask.shape[1]}"
             )
+        if (
+            bool(getattr(self.config, "meaningful_public_history", False))
+            and str(
+                getattr(
+                    self.config,
+                    "meaningful_public_history_pooling",
+                    "masked_mean_v1",
+                )
+            )
+            == "ordered_attention_v2"
+            and limit > int(getattr(self.config, "event_history_limit", limit))
+        ):
+            raise ValueError(
+                "event_token_limit exceeds ordered-history capacity: "
+                f"limit={limit} "
+                f"capacity={int(getattr(self.config, 'event_history_limit', limit))}"
+            )
         if bool(event_mask[:, limit:].any()):
             raise ValueError(
                 "event_token_limit would remove at least one unmasked event token"
@@ -599,6 +618,40 @@ class CudaGraphInferenceRunner:
         if event_targets is not None:
             cropped["event_target_ids"] = event_targets[:, :limit]
         return cropped
+
+    def _with_event_position_offsets(
+        self,
+        entity_batch: dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        """Bind physical event prefixes to their checkpoint-table positions."""
+
+        if not (
+            bool(getattr(self.config, "meaningful_public_history", False))
+            and str(
+                getattr(
+                    self.config,
+                    "meaningful_public_history_pooling",
+                    "masked_mean_v1",
+                )
+            )
+            == "ordered_attention_v2"
+        ):
+            return entity_batch
+        if EVENT_POSITION_OFFSET_KEY in entity_batch:
+            return entity_batch
+        event_tokens = _as_numpy(entity_batch["event_tokens"])
+        batch_size, event_width = int(event_tokens.shape[0]), int(
+            event_tokens.shape[1]
+        )
+        maximum = int(getattr(self.config, "event_history_limit", event_width))
+        semantic_width = min(event_width, maximum)
+        with_offsets = dict(entity_batch)
+        with_offsets[EVENT_POSITION_OFFSET_KEY] = np.full(
+            (batch_size,),
+            maximum - semantic_width,
+            dtype=np.int64,
+        )
+        return with_offsets
 
     def _graph_signature(
         self,
@@ -659,21 +712,33 @@ class CudaGraphInferenceRunner:
     def _state_input_keys(self) -> tuple[str, ...]:
         """State tensors consumed by the loaded trunk, including opt-in topology."""
 
-        public_card_inputs = (
-            (DEDUCTION_FEATURES_KEY,)
-            if bool(getattr(self.config, "public_card_count_features", False))
-            else ()
-        )
+        keys = list(_STATE_INPUT_KEYS)
+        if bool(getattr(self.config, "meaningful_public_history", False)) and str(
+            getattr(
+                self.config,
+                "meaningful_public_history_pooling",
+                "masked_mean_v1",
+            )
+        ) == "ordered_attention_v2":
+            keys.append(EVENT_POSITION_OFFSET_KEY)
+        if bool(getattr(self.config, "public_card_count_features", False)):
+            keys.append(DEDUCTION_FEATURES_KEY)
         needs_topology = bool(
             str(getattr(self.config, "state_trunk", "transformer")) != "transformer"
             or getattr(self.config, "topology_residual_adapter", False)
             or getattr(self.config, "v6_compatibility_preserving_inputs", False)
         )
-        return (
-            _STATE_INPUT_KEYS
-            + public_card_inputs
-            + (_TOPOLOGY_STATE_INPUT_KEYS if needs_topology else ())
-        )
+        if needs_topology:
+            keys.extend(_TOPOLOGY_STATE_INPUT_KEYS)
+        elif bool(
+            getattr(
+                self.config,
+                "meaningful_public_history_target_gather",
+                False,
+            )
+        ):
+            keys.append("event_target_ids")
+        return tuple(keys)
 
 
 def _as_numpy(value: Any) -> np.ndarray:

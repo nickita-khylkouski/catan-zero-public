@@ -23,13 +23,19 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
     PLAYER_FEATURE_SIZE,
     VERTEX_FEATURE_SIZE,
 )
+from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V6  # noqa: E402
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
     PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
     STATIC_ACTION_RESIDUAL_SLICE,
     EntityGraphConfig,
     EntityGraphNet,
+    EntityGraphPolicy,
 )
+from catan_zero.rl.meaningful_history import (  # noqa: E402
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+)
+from catan_zero.rl.ordered_history import ORDERED_ATTENTION_V2  # noqa: E402
 from catan_zero.search.cuda_graph_inference import (  # noqa: E402
     CudaGraphInferenceConfig,
     CudaGraphInferenceRunner,
@@ -222,6 +228,108 @@ def test_history_action_decoder_runs_through_split_eager_fallback() -> None:
     assert runner.last_path == "eager_disabled"
     assert outputs["logits"].shape == legal_ids.shape
     assert torch.isfinite(outputs["value"]).all()
+
+
+def test_ordered_v7_history_preserves_positions_through_runner_event_crop():
+    config = EntityGraphConfig(
+        action_size=64,
+        static_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
+        context_action_feature_size=CONTEXT_ACTION_FEATURE_SIZE,
+        legal_action_feature_size=LEGAL_ACTION_FEATURE_SIZE,
+        hidden_size=32,
+        state_layers=2,
+        attention_heads=4,
+        dropout=0.0,
+        action_cross_attention_layers=1,
+        v6_compatibility_preserving_inputs=True,
+        meaningful_public_history=True,
+        meaningful_public_history_pooling=ORDERED_ATTENTION_V2,
+        meaningful_public_history_target_gather=True,
+        meaningful_public_history_schema=MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+        event_history_limit=8,
+    )
+    policy = EntityGraphPolicy(
+        config,
+        torch.zeros(64, LEGAL_ACTION_FEATURE_SIZE),
+        device="cpu",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+    policy.model.eval()
+    policy.public_award_feature_contract = (
+        PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE
+    )
+    entity, legal_ids, context = _batch(event_width=8, live_events=4)
+    entity["event_target_ids"][:, :4, 0] = np.arange(4, dtype=np.int16)
+    generator = torch.Generator().manual_seed(20260718)
+    with torch.no_grad():
+        policy.model.meaningful_history_residual_gate.fill_(0.02)
+        policy.model.meaningful_history_ordered_gate.fill_(0.03)
+        policy.model.meaningful_history_sequence.position_embedding.copy_(
+            torch.randn(
+                policy.model.meaningful_history_sequence.position_embedding.shape,
+                generator=generator,
+            )
+            * 0.1
+        )
+        policy.model.meaningful_history_target_proj[1].weight.copy_(
+            torch.eye(config.hidden_size)
+        )
+        for name, parameter in policy.model.action_cross_blocks.named_parameters():
+            if name.endswith(("attn.out_proj.weight", "ff.3.weight")):
+                parameter.copy_(
+                    torch.randn(parameter.shape, generator=generator) * 0.01
+                )
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(enabled=False, event_token_limit=4),
+    )
+
+    expected = policy.forward_legal_np(entity, legal_ids, context, return_q=True)
+    actual = runner.forward_legal_np(
+        entity,
+        legal_ids,
+        context,
+        return_q=True,
+    )
+
+    for key in expected:
+        torch.testing.assert_close(actual[key], expected[key], rtol=3.0e-3, atol=2.0e-4)
+
+
+def test_runner_validates_storage64_then_crops_to_ordered_history32():
+    policy = _policy(
+        meaningful_public_history=True,
+        meaningful_public_history_pooling=ORDERED_ATTENTION_V2,
+        event_history_limit=32,
+    )
+    entity, legal_ids, context = _batch(event_width=64, live_events=0)
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(enabled=False, event_token_limit=32),
+    )
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context)
+
+    assert outputs["logits"].shape == legal_ids.shape
+    assert torch.isfinite(outputs["value"]).all()
+
+
+def test_cached_state_surface_includes_plain_history_targets():
+    policy = _policy(
+        meaningful_public_history=True,
+        meaningful_public_history_target_gather=True,
+        event_history_limit=8,
+    )
+    entity, legal_ids, context = _batch(event_width=8, live_events=2)
+    entity["event_target_ids"][:, 0, 1] = 3
+    runner = CudaGraphInferenceRunner(
+        policy, CudaGraphInferenceConfig(enabled=False)
+    )
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context)
+
+    assert "event_target_ids" in runner._state_input_keys()
+    assert outputs["logits"].shape == legal_ids.shape
 
 
 def test_v7_compatibility_route_matches_monolithic_split_eager() -> None:

@@ -20,6 +20,7 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
     VERTEX_FEATURE_SIZE,
 )
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
+    EVENT_POSITION_OFFSET_KEY,
     EntityGraphConfig,
     EntityGraphNet,
     event_batch_shape_telemetry,
@@ -351,6 +352,52 @@ def test_action_decoder_attends_only_live_processed_public_history():
     assert torch.max(torch.abs(retargeted_logits - baseline)).item() > 0.0
 
 
+def test_bottleneck_v7_decoder_attends_to_processed_history_without_v6_adapter():
+    from catan_zero.rl.ordered_history import ORDERED_ATTENTION_V2
+
+    model = EntityGraphNet(
+        _config(
+            action_cross_attention_layers=1,
+            action_cross_attention_bottleneck=80,
+            meaningful_public_history=True,
+            meaningful_public_history_pooling=ORDERED_ATTENTION_V2,
+            meaningful_public_history_target_gather=True,
+        )
+    ).eval()
+    batch = _batch(
+        batch_size=1,
+        action_width=3,
+        event_width=16,
+        live_event_width=4,
+    )
+    batch["event_target_ids"] = -torch.ones(1, 16, 4, dtype=torch.long)
+    batch["event_target_ids"][0, :4, 0] = torch.arange(4)
+    with torch.no_grad():
+        model.meaningful_history_residual_gate.zero_()
+        model.meaningful_history_ordered_gate.zero_()
+        for name, parameter in model.action_cross_blocks.named_parameters():
+            if name.endswith(("attn.out_proj.weight", "ff.3.weight")):
+                parameter.copy_(torch.randn_like(parameter))
+        model.meaningful_history_sequence.position_embedding.copy_(
+            torch.randn_like(
+                model.meaningful_history_sequence.position_embedding
+            )
+        )
+        model.meaningful_history_target_proj[1].weight.copy_(
+            torch.eye(model.config.hidden_size)
+        )
+        baseline = model(batch)["logits"]
+        live_changed = copy.deepcopy(batch)
+        live_changed["event_tokens"][0, 0, 0] += 3.0
+        live_logits = model(live_changed)["logits"]
+        padded_changed = copy.deepcopy(batch)
+        padded_changed["event_tokens"][0, -1] += 1000.0
+        padded_logits = model(padded_changed)["logits"]
+
+    assert torch.max(torch.abs(live_logits - baseline)).item() > 0.0
+    assert torch.equal(padded_logits, baseline)
+
+
 def test_action_history_positions_survive_trailing_padding_crop():
     from catan_zero.rl.ordered_history import ORDERED_ATTENTION_V2
 
@@ -373,8 +420,8 @@ def test_action_history_positions_survive_trailing_padding_crop():
     batch["event_target_ids"][0, :4, 0] = torch.arange(4)
     batch["edge_vertex_ids"] = torch.zeros(1, 72, 2, dtype=torch.long)
     with torch.no_grad():
-        model.meaningful_history_residual_gate.zero_()
-        model.meaningful_history_ordered_gate.zero_()
+        model.meaningful_history_residual_gate.fill_(0.2)
+        model.meaningful_history_ordered_gate.fill_(0.3)
         for name, parameter in model.action_cross_blocks.named_parameters():
             if name.endswith(("attn.out_proj.weight", "ff.3.weight")):
                 parameter.copy_(torch.randn_like(parameter))
@@ -386,10 +433,29 @@ def test_action_history_positions_survive_trailing_padding_crop():
         model.meaningful_history_target_proj[1].weight.copy_(
             torch.eye(model.config.hidden_size)
         )
-        full = model(batch)["logits"]
-        cropped = model(batch, event_token_limit=4)["logits"]
+        full = model(batch, return_q=True)
+        cropped = model(batch, return_q=True, event_token_limit=4)
+        physically_cropped = {
+            key: (
+                value[:, :4]
+                if key in {"event_tokens", "event_mask", "event_target_ids"}
+                else value
+            )
+            for key, value in batch.items()
+        }
+        physically_cropped[EVENT_POSITION_OFFSET_KEY] = torch.full(
+            (1,),
+            model.meaningful_public_history_normalization
+            - int(batch["event_tokens"].shape[1]),
+            dtype=torch.long,
+        )
+        transported = model(physically_cropped, return_q=True)
 
-    torch.testing.assert_close(full, cropped, rtol=1e-6, atol=1e-6)
+    for key in full:
+        torch.testing.assert_close(full[key], cropped[key], rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(
+            full[key], transported[key], rtol=1e-6, atol=1e-6
+        )
 
 
 @pytest.mark.parametrize(

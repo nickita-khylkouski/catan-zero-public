@@ -209,6 +209,13 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # H100 Linux tokenizer identities for the integrated source.
         "sha256:c397398c37b102afed19ccbd035ec3c0c90de53e9c61ccfd2036f88ce7a49e23",
         "sha256:ac723af4a46fd4cc3c16d25990e2493fcd1ffaf190f2dfea634aad5b4a328105",
+        # Physical ordered-history position metadata and scratch-bottleneck
+        # decoder activation are unreachable for legacy checkpoints:
+        # meaningful history and the bottleneck both default off. Optional
+        # offset validation is likewise inert when the key is absent. These
+        # are the exact macOS and H100/Linux guarded-source identities.
+        "sha256:0810d0c33db3a5fc51c716a7c23b1bfe06c6b6f1c4a65beedcddb0f58fbb0a90",
+        "sha256:de74d6d3e510a222fbf5a89de5f1555942e1e41d59c7e485354388673398cb05",
     }
 }
 

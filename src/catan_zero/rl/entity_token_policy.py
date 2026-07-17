@@ -183,6 +183,10 @@ _RELATIONAL_TOPOLOGY_KEYS = frozenset(
 # duplicate legal/context tokens, so the repair intentionally excludes them.
 STATIC_ACTION_RESIDUAL_SLICE = slice(19, 41)
 STATIC_ACTION_RESIDUAL_FEATURE_SIZE = 22
+# Optional per-row absolute position of event column zero in the checkpoint's
+# fixed history table. Inference transports attach it only when physically
+# removing a trailing padded event suffix.
+EVENT_POSITION_OFFSET_KEY = "_event_position_offset"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1569,9 +1573,10 @@ class EntityGraphNet:
                 history_delta = None
                 value_history_delta = None
                 if self.meaningful_public_history_enabled:
-                    history_position_offset = (
+                    history_position_offset = batch.get(
+                        EVENT_POSITION_OFFSET_KEY,
                         self.meaningful_public_history_normalization
-                        - int(batch["event_tokens"].shape[1])
+                        - int(batch["event_tokens"].shape[1]),
                     )
 
                     def pooled_history_delta(piece):
@@ -1660,7 +1665,10 @@ class EntityGraphNet:
                             )
                     if (
                         self.action_cross_attention_layers > 0
-                        and self.v6_compatibility_preserving_inputs_enabled
+                        and (
+                            self.v6_compatibility_preserving_inputs_enabled
+                            or self.action_cross_attention_bottleneck > 0
+                        )
                     ):
                         # The mature state trunk keeps event rows masked so a
                         # V5/V6 warm start cannot perturb its representation.
@@ -2180,7 +2188,10 @@ class EntityGraphNet:
                 # preserves V5 inputs and exposes the authenticated public event
                 # suffix to the *new* action decoder.
                 if (
-                    not self.v6_compatibility_preserving_inputs_enabled
+                    not (
+                        self.v6_compatibility_preserving_inputs_enabled
+                        or self.action_cross_attention_bottleneck > 0
+                    )
                     or self.action_cross_attention_layers <= 0
                     or not self.meaningful_public_history_enabled
                 ):
@@ -3946,6 +3957,28 @@ def _assert_entity_batch_shapes(
             raise ValueError(
                 "padded public-history event carries a target id: "
                 f"row={int(row)} event={int(event)} column={int(column)}"
+            )
+
+    if EVENT_POSITION_OFFSET_KEY in entity_batch:
+        offsets = np.asarray(entity_batch[EVENT_POSITION_OFFSET_KEY])
+        expected_shape = (batch_size,)
+        if offsets.shape != expected_shape:
+            raise ValueError(
+                f"{EVENT_POSITION_OFFSET_KEY} shape {offsets.shape} != "
+                f"{expected_shape}"
+            )
+        if not np.issubdtype(offsets.dtype, np.integer):
+            raise ValueError(f"{EVENT_POSITION_OFFSET_KEY} must contain integers")
+        event_width = int(np.asarray(entity_batch["event_tokens"]).shape[1])
+        maximum = int(getattr(config, "event_history_limit", event_width))
+        semantic_width = min(event_width, maximum)
+        invalid = (offsets < 0) | (offsets + semantic_width > maximum)
+        if bool(np.any(invalid)):
+            row = int(np.flatnonzero(invalid)[0])
+            raise ValueError(
+                f"{EVENT_POSITION_OFFSET_KEY} is outside the history table: "
+                f"row={row} offset={int(offsets[row])} width={semantic_width} "
+                f"maximum={maximum}"
             )
 
     if str(getattr(config, "state_trunk", "transformer")) != "transformer" or bool(

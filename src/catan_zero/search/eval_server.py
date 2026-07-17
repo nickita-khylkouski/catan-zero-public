@@ -56,6 +56,7 @@ from catan_zero.rl.entity_feature_adapter import (
     policy_entity_feature_adapter_version,
     require_known_entity_feature_adapter,
 )
+from catan_zero.rl.entity_token_policy import EVENT_POSITION_OFFSET_KEY
 from catan_zero.search.neural_rust_mcts import (
     EntityGraphRustEvaluator,
     EntityGraphRustEvaluatorConfig,
@@ -385,7 +386,10 @@ def _event_tail_info(
 
 
 def _crop_masked_event_tail(
-    entity: dict[str, np.ndarray], event_token_limit: int | None
+    entity: dict[str, np.ndarray],
+    event_token_limit: int | None,
+    *,
+    history_position_capacity: int | None = None,
 ) -> int:
     """Crop only a batch-wide all-masked event suffix, returning required width."""
     event_mask, event_tokens, required_width, limit = _event_tail_info(
@@ -401,6 +405,20 @@ def _crop_masked_event_tail(
             )
     if limit is None:
         return required_width
+    if (
+        history_position_capacity is not None
+        and limit > operator.index(history_position_capacity)
+    ):
+        raise ValueError(
+            "event_token_limit exceeds ordered-history capacity: "
+            f"limit={limit} capacity={operator.index(history_position_capacity)}"
+        )
+    _ensure_event_position_offsets(
+        entity,
+        batch_size=int(event_mask.shape[0]),
+        event_width=int(event_mask.shape[1]),
+        history_position_capacity=history_position_capacity,
+    )
     entity["event_mask"] = event_mask[:, :limit]
     entity["event_tokens"] = event_tokens[:, :limit]
     if event_targets is not None:
@@ -409,7 +427,10 @@ def _crop_masked_event_tail(
 
 
 def _crop_payload_event_tails_before_merge(
-    payloads: list[dict[str, Any]], event_token_limit: int | None
+    payloads: list[dict[str, Any]],
+    event_token_limit: int | None,
+    *,
+    history_position_capacity: int | None = None,
 ) -> int | None:
     """Validate then view-crop request event arrays before window allocation.
 
@@ -455,6 +476,15 @@ def _crop_payload_event_tails_before_merge(
                 f"event_token_limit {event_token_limit!r} is outside "
                 f"[0, {padded_width}]"
             )
+        if (
+            history_position_capacity is not None
+            and limit > operator.index(history_position_capacity)
+        ):
+            raise ValueError(
+                "event_token_limit exceeds ordered-history capacity: "
+                f"limit={limit} "
+                f"capacity={operator.index(history_position_capacity)}"
+            )
         event_arrays.append((event_mask, event_tokens, event_targets))
     # One C-level concatenate + reduction is materially cheaper than one NumPy
     # reduction per request at 36-128 requests/window. Widths are normally
@@ -482,11 +512,60 @@ def _crop_payload_event_tails_before_merge(
     for payload, (event_mask, event_tokens, event_targets) in zip(
         payloads, event_arrays
     ):
+        _ensure_event_position_offsets(
+            payload["entity"],
+            batch_size=int(event_mask.shape[0]),
+            event_width=int(event_mask.shape[1]),
+            history_position_capacity=history_position_capacity,
+        )
         payload["entity"]["event_mask"] = event_mask[:, :limit]
         payload["entity"]["event_tokens"] = event_tokens[:, :limit]
         if event_targets is not None:
             payload["entity"]["event_target_ids"] = event_targets[:, :limit]
     return required_width
+
+
+def _ensure_event_position_offsets(
+    entity: dict[str, Any],
+    *,
+    batch_size: int,
+    event_width: int,
+    history_position_capacity: int | None,
+) -> None:
+    """Attach or validate the absolute position of event column zero."""
+
+    maximum = (
+        event_width
+        if history_position_capacity is None
+        else operator.index(history_position_capacity)
+    )
+    if maximum < 0:
+        raise ValueError("history_position_capacity must be non-negative")
+    semantic_width = min(event_width, maximum)
+    offsets = entity.get(EVENT_POSITION_OFFSET_KEY)
+    if offsets is None:
+        entity[EVENT_POSITION_OFFSET_KEY] = np.full(
+            (batch_size,),
+            maximum - semantic_width,
+            dtype=np.int64,
+        )
+        return
+    offsets = np.asarray(offsets)
+    if offsets.shape != (batch_size,):
+        raise ValueError(
+            f"{EVENT_POSITION_OFFSET_KEY} shape {offsets.shape} != "
+            f"{(batch_size,)}"
+        )
+    if not np.issubdtype(offsets.dtype, np.integer):
+        raise ValueError(f"{EVENT_POSITION_OFFSET_KEY} must contain integers")
+    invalid = (offsets < 0) | (offsets + semantic_width > maximum)
+    if bool(np.any(invalid)):
+        row = int(np.flatnonzero(invalid)[0])
+        raise ValueError(
+            f"{EVENT_POSITION_OFFSET_KEY} is outside the history table: "
+            f"row={row} offset={int(offsets[row])} width={semantic_width} "
+            f"maximum={maximum}"
+        )
 
 
 def _payload_event_source_counts(payload: dict[str, Any]) -> tuple[int, int]:
@@ -1185,7 +1264,11 @@ def _server_main(
                     if not client_cropped_events:
                         premerge_required_event_width = (
                             _crop_payload_event_tails_before_merge(
-                                payloads, config.event_token_limit
+                                payloads,
+                                config.event_token_limit,
+                                history_position_capacity=int(
+                                    handshake["event_history_limit"]
+                                ),
                             )
                         )
                 forward_groups, oversized_requests, oversized_chunks = _forward_groups(
@@ -1212,7 +1295,13 @@ def _server_main(
                         group_payloads
                     )
                     required_event_widths.append(
-                        _crop_masked_event_tail(entity, config.event_token_limit)
+                        _crop_masked_event_tail(
+                            entity,
+                            config.event_token_limit,
+                            history_position_capacity=int(
+                                handshake["event_history_limit"]
+                            ),
+                        )
                     )
                     stats["merge_sec"] += time.perf_counter() - merge_started
 
@@ -1713,6 +1802,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         self._needs_relational_topology = bool(needs_relational_topology)
         self._needs_event_targets = bool(needs_event_targets)
         self._event_token_limit = event_token_limit
+        self._event_history_limit = int(event_history_limit)
         self._req_counter = 0
         self._timeout_s = max(0.001, float(client_timeout_ms) / 1000.0)
         # Failure isolation (design doc risk 5): on server timeout/error, if a
@@ -1803,7 +1893,11 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
                 "_event_source_active_tokens": int(np.count_nonzero(event_mask)),
                 "_event_source_padded_tokens": int(event_mask.size),
             }
-            _crop_masked_event_tail(forward_entity_batch, self._event_token_limit)
+            _crop_masked_event_tail(
+                forward_entity_batch,
+                self._event_token_limit,
+                history_position_capacity=self._event_history_limit,
+            )
 
         if self._degraded:
             return self._forward_local(

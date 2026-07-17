@@ -12,6 +12,7 @@ from catan_zero.rl.entity_feature_adapter import (
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     IMPLEMENTED_RUST_ENTITY_ADAPTER_VERSIONS,
 )
+from catan_zero.rl.entity_token_policy import EVENT_POSITION_OFFSET_KEY
 from catan_zero.search.eval_server import (
     RemoteEvalClient,
     _crop_masked_event_tail,
@@ -621,12 +622,45 @@ def test_remote_client_event_limit_validates_and_crops_before_queue_put() -> Non
     payload = request_queue.items[0][2]
     assert payload["entity"]["event_tokens"].shape == (2, 0, 41)
     assert payload["entity"]["event_mask"].shape == (2, 0)
+    np.testing.assert_array_equal(
+        payload["entity"][EVENT_POSITION_OFFSET_KEY],
+        np.zeros(2, dtype=np.int64),
+    )
     assert payload["_event_source_active_tokens"] == 0
     assert payload["_event_source_padded_tokens"] == 128
     # The evaluator-owned feature mapping and arrays are not mutated.
     assert entity["event_tokens"] is event_tokens
     assert entity["event_mask"] is event_mask
     assert entity["event_tokens"].shape == (2, 64, 41)
+
+
+def test_physical_event64_crop_to_history32_keeps_front_window_positions() -> None:
+    entity = {
+        "event_tokens": np.zeros((2, 64, 41), dtype=np.float16),
+        "event_mask": np.zeros((2, 64), dtype=np.bool_),
+    }
+
+    required = _crop_masked_event_tail(
+        entity,
+        32,
+        history_position_capacity=32,
+    )
+
+    assert required == 0
+    assert entity["event_tokens"].shape == (2, 32, 41)
+    np.testing.assert_array_equal(
+        entity[EVENT_POSITION_OFFSET_KEY],
+        np.zeros(2, dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="exceeds ordered-history capacity"):
+        _crop_masked_event_tail(
+            {
+                "event_tokens": np.zeros((1, 64, 41), dtype=np.float16),
+                "event_mask": np.zeros((1, 64), dtype=np.bool_),
+            },
+            33,
+            history_position_capacity=32,
+        )
 
 
 def test_no_fallback_client_latches_first_terminal_transport_failure() -> None:
