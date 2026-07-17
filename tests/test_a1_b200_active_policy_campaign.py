@@ -914,8 +914,25 @@ def test_arm_dose_telemetry_seals_exposure_grad_clip_and_update_rms() -> None:
     assert telemetry["dose_telemetry_sha256"].startswith("sha256:")
 
 
-def test_coherent_binding_authorizes_exact_independent_initializer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    (
+        "initializer_role",
+        "diagnostic_only",
+        "promotion_eligible_after_full_gate",
+        "full_gate_required",
+    ),
+    (
+        ("diagnostic_independent_parent", True, False, False),
+        ("stage_c_final_exact_current_parent", False, True, True),
+    ),
+)
+def test_one_dose_coherent_binding_round_trips_into_train_bc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initializer_role: str,
+    diagnostic_only: bool,
+    promotion_eligible_after_full_gate: bool,
+    full_gate_required: bool,
 ) -> None:
     corpus = tmp_path / "corpus"
     corpus.mkdir()
@@ -927,7 +944,11 @@ def test_coherent_binding_authorizes_exact_independent_initializer(
     seeds = np.asarray([100, 100, 101, 101], dtype=np.int64)
     validation_seeds = np.asarray([101], dtype=np.int64)
     target_contract_sha = "sha256:" + "2" * 64
-    parent_sha = "sha256:" + "3" * 64
+    parent_sha = (
+        campaign.EXPECTED_CORPUS_PRODUCER_SHA256
+        if initializer_role == "stage_c_final_exact_current_parent"
+        else "sha256:" + "3" * 64
+    )
     initializer_sha = "sha256:" + "4" * 64
     validation = {
         "path": str(validation_path.resolve()),
@@ -943,19 +964,26 @@ def test_coherent_binding_authorizes_exact_independent_initializer(
     recipe = current_science.learner_training_recipe()
     binding = {
         "schema_version": train_bc.COHERENT_DIRECT_CORPUS_BINDING_SCHEMA,
-        "diagnostic_only": True,
+        "diagnostic_only": diagnostic_only,
         "promotion_eligible": False,
+        # These fields are emitted unconditionally by
+        # a1_one_dose_train._verify_coherent_direct_training_inputs. Their
+        # values distinguish the diagnostic-independent-parent path from the
+        # Stage-C exact-current-parent path.
+        "promotion_eligible_after_full_gate": (
+            promotion_eligible_after_full_gate
+        ),
+        "full_gate_required": full_gate_required,
         "corpus_admission": {},
         "target_contract_sha256": target_contract_sha,
         "producer_checkpoint_sha256": campaign.EXPECTED_CORPUS_PRODUCER_SHA256,
         "learner_initializer": {
-            "role": "diagnostic_independent_parent",
+            "role": initializer_role,
             "parent_checkpoint_sha256": parent_sha,
             "initializer_checkpoint_sha256": initializer_sha,
             "upgrade_module": train_bc.COHERENT_DIRECT_UPGRADE_MODULE,
             "upgrade_receipt_file_sha256": "sha256:" + "5" * 64,
             "upgrade_receipt_sha256": "sha256:" + "6" * 64,
-            "independent_parent_authority_sha256": "sha256:" + "7" * 64,
         },
         "corpus": {
             "path": str(corpus.resolve()),
@@ -999,6 +1027,10 @@ def test_coherent_binding_authorizes_exact_independent_initializer(
             },
         },
     }
+    if initializer_role == "diagnostic_independent_parent":
+        binding["learner_initializer"][
+            "independent_parent_authority_sha256"
+        ] = "sha256:" + "7" * 64
     binding["binding_sha256"] = campaign._value_sha256(binding)
     monkeypatch.setattr(
         train_bc, "_validate_memmap_payload_inventory", lambda *_args: None
@@ -1010,6 +1042,11 @@ def test_coherent_binding_authorizes_exact_independent_initializer(
         validation_seed_contract=validation,
         game_seed_column=seeds,
     )
-    assert result["producer_checkpoint_sha256"] != parent_sha
+    assert result["diagnostic_only"] is diagnostic_only
+    assert (
+        result["promotion_eligible_after_full_gate"]
+        is promotion_eligible_after_full_gate
+    )
+    assert result["full_gate_required"] is full_gate_required
     assert result["learner_parent_checkpoint_sha256"] == parent_sha
     assert result["learner_initializer_sha256"] == initializer_sha

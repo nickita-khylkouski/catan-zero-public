@@ -8890,6 +8890,8 @@ def _validate_coherent_direct_corpus_binding(
         "schema_version",
         "diagnostic_only",
         "promotion_eligible",
+        "promotion_eligible_after_full_gate",
+        "full_gate_required",
         "corpus_admission",
         "target_contract_sha256",
         "producer_checkpoint_sha256",
@@ -8903,11 +8905,34 @@ def _validate_coherent_direct_corpus_binding(
         raise SystemExit("coherent corpus binding fields/schema drift")
     unsigned = dict(binding)
     stated = unsigned.pop("binding_sha256", None)
+    role = (
+        binding.get("learner_initializer", {}).get("role")
+        if isinstance(binding.get("learner_initializer"), dict)
+        else None
+    )
+    diagnostic_role = role == "diagnostic_independent_parent"
+    final_role = role == "stage_c_final_exact_current_parent"
     if (
         binding.get("schema_version") != COHERENT_DIRECT_CORPUS_BINDING_SCHEMA
-        or binding.get("diagnostic_only") is not True
         or binding.get("promotion_eligible") is not False
         or stated != _canonical_json_sha256(unsigned)
+        or (
+            diagnostic_role
+            and (
+                binding.get("diagnostic_only") is not True
+                or binding.get("promotion_eligible_after_full_gate") is not False
+                or binding.get("full_gate_required") is not False
+            )
+        )
+        or (
+            final_role
+            and (
+                binding.get("diagnostic_only") is not False
+                or binding.get("promotion_eligible_after_full_gate") is not True
+                or binding.get("full_gate_required") is not True
+            )
+        )
+        or not (diagnostic_role or final_role)
     ):
         raise SystemExit("coherent corpus binding digest/role drift")
 
@@ -8920,26 +8945,37 @@ def _validate_coherent_direct_corpus_binding(
         for value in (corpus, validation, learner, learner_initializer)
     ):
         raise SystemExit("coherent corpus binding sections are malformed")
-    expected_initializer_fields = {
+    common_initializer_fields = {
         "role",
         "parent_checkpoint_sha256",
         "initializer_checkpoint_sha256",
         "upgrade_module",
         "upgrade_receipt_file_sha256",
         "upgrade_receipt_sha256",
-        "independent_parent_authority_sha256",
     }
+    expected_initializer_fields = (
+        common_initializer_fields | {"independent_parent_authority_sha256"}
+        if diagnostic_role
+        else common_initializer_fields
+    )
     if (
         set(learner_initializer) != expected_initializer_fields
-        or learner_initializer.get("role") != "diagnostic_independent_parent"
         or learner_initializer.get("upgrade_module")
         != COHERENT_DIRECT_UPGRADE_MODULE
         or any(
             not _is_sha256(learner_initializer.get(field))
             for field in expected_initializer_fields - {"role", "upgrade_module"}
         )
-        or learner_initializer.get("parent_checkpoint_sha256")
-        == binding.get("producer_checkpoint_sha256")
+        or (
+            diagnostic_role
+            and learner_initializer.get("parent_checkpoint_sha256")
+            == binding.get("producer_checkpoint_sha256")
+        )
+        or (
+            final_role
+            and learner_initializer.get("parent_checkpoint_sha256")
+            != binding.get("producer_checkpoint_sha256")
+        )
     ):
         raise SystemExit("coherent learner parent/initializer authority drift")
     root = Path(data_path).expanduser().resolve(strict=True)
@@ -9040,8 +9076,12 @@ def _validate_coherent_direct_corpus_binding(
     ]
     return {
         "coherent_direct_corpus": True,
-        "diagnostic_only": True,
+        "diagnostic_only": bool(binding["diagnostic_only"]),
         "promotion_eligible": False,
+        "promotion_eligible_after_full_gate": bool(
+            binding["promotion_eligible_after_full_gate"]
+        ),
+        "full_gate_required": bool(binding["full_gate_required"]),
         "learner_value_objective": objective,
         "learner_training_recipe": recipe,
         "learner_training_recipe_sha256": _canonical_json_sha256(recipe),
@@ -17172,6 +17212,10 @@ def main(
             if coherent_direct_policy_aux and legacy_policy_surprise
             else "coherent_direct_uniform_row"
             if coherent_direct_policy_aux
+            else "authenticated_a1_direct_x_exact_per_game_policy_surprise"
+            if canonical_direct_policy_aux and exact_per_game_surprise
+            else "authenticated_a1_direct_x_legacy_policy_surprise"
+            if canonical_direct_policy_aux and legacy_policy_surprise
             else "authenticated_a1_direct_uniform_row"
             if canonical_direct_policy_aux
             else "authenticated_component_x_exact_per_game_policy_surprise"
