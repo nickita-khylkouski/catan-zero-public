@@ -4,9 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib
+from importlib import metadata
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 from typing import Any, Sequence
 
@@ -117,6 +122,194 @@ def interpreter_version(executable: str) -> str | None:
     return lines[0]
 
 
+def _stable_file_sha256(path: Path) -> str:
+    """Hash one canonical regular file without accepting replacement races."""
+
+    try:
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise RuntimeContractError(
+                f"native runtime must be a regular non-symlink file: {path}"
+            )
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise RuntimeContractError(
+                    f"native runtime changed while opening: {path}"
+                )
+            digest = hashlib.sha256()
+            while block := os.read(descriptor, 8 * 1024 * 1024):
+                digest.update(block)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise RuntimeContractError(
+            f"cannot attest native runtime {path}: {error}"
+        ) from error
+    identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(
+        getattr(opened, field) != getattr(after, field)
+        for field in identity_fields
+    ):
+        raise RuntimeContractError(f"native runtime changed while hashing: {path}")
+    return digest.hexdigest()
+
+
+def assert_native_runtime_contract(
+    path: Path = DEFAULT_CONTRACT,
+) -> dict[str, str]:
+    """Prove this interpreter loaded the one sealed native wheel.
+
+    A Git checkout update cannot update an existing virtualenv.  Version alone
+    is also insufficient because two local wheel builds can share a version.
+    Bind all three identities once at process launch: distribution version,
+    PEP 610 wheel archive digest, and loaded extension bytes.
+    """
+
+    expected = load_runtime_contract(path)
+    expected_extension = expected.get("catanatron_rs_extension_sha256")
+    if expected_extension is None:
+        raise RuntimeContractError(
+            "production runtime contract has no native extension SHA-256"
+        )
+    try:
+        distribution = metadata.distribution("catanatron-rs")
+    except metadata.PackageNotFoundError as error:
+        raise RuntimeContractError(
+            "catanatron-rs is not installed under the executing interpreter"
+        ) from error
+    if distribution.version != expected["catanatron_rs_version"]:
+        raise RuntimeContractError(
+            "catanatron-rs version drift: "
+            f"expected {expected['catanatron_rs_version']}, "
+            f"got {distribution.version}"
+        )
+
+    try:
+        direct_url_raw = distribution.read_text("direct_url.json")
+        direct_url = json.loads(direct_url_raw) if direct_url_raw is not None else None
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeContractError(
+            f"installed catanatron-rs has malformed direct_url.json: {error}"
+        ) from error
+    archive = direct_url.get("archive_info") if isinstance(direct_url, dict) else None
+    stated: set[str] = set()
+    if isinstance(archive, dict):
+        direct_hash = archive.get("hash")
+        if isinstance(direct_hash, str):
+            stated.add(direct_hash)
+        hashes = archive.get("hashes")
+        if isinstance(hashes, dict) and isinstance(hashes.get("sha256"), str):
+            stated.add(f"sha256={hashes['sha256']}")
+    expected_archive = "sha256=" + expected["catanatron_rs_wheel_sha256"]
+    if stated != {expected_archive}:
+        raise RuntimeContractError(
+            "installed catanatron-rs wheel archive drift: "
+            f"expected {expected_archive}, got {sorted(stated)}"
+        )
+
+    extension_records = [
+        record
+        for record in (distribution.files or ())
+        if str(record).endswith((".so", ".pyd", ".dylib"))
+    ]
+    if len(extension_records) != 1:
+        raise RuntimeContractError(
+            "installed catanatron-rs must contain exactly one native extension; "
+            f"found {len(extension_records)}"
+        )
+    relative_extension = Path(str(extension_records[0]))
+    if relative_extension.is_absolute() or ".." in relative_extension.parts:
+        raise RuntimeContractError(
+            f"installed native extension record is unsafe: {relative_extension}"
+        )
+    located_extension = Path(
+        os.path.abspath(os.fspath(distribution.locate_file(extension_records[0])))
+    )
+    try:
+        if located_extension.is_symlink():
+            raise RuntimeContractError(
+                "installed native extension itself may not be a symlink: "
+                f"{located_extension}"
+            )
+        extension = located_extension.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeContractError(
+            f"cannot resolve installed native extension {located_extension}: {error}"
+        ) from error
+
+    try:
+        native = importlib.import_module("catanatron_rs.catanatron_rs")
+    except ImportError as error:
+        raise RuntimeContractError(
+            f"cannot import catanatron-rs native extension: {error}"
+        ) from error
+    loaded_raw = getattr(native, "__file__", None)
+    if not isinstance(loaded_raw, str) or not loaded_raw:
+        raise RuntimeContractError(
+            "loaded catanatron-rs native extension has no file identity"
+        )
+    try:
+        loaded = Path(os.path.abspath(loaded_raw)).resolve(strict=True)
+    except OSError as error:
+        raise RuntimeContractError(
+            f"cannot resolve loaded native extension {loaded_raw}: {error}"
+        ) from error
+    if loaded != extension:
+        raise RuntimeContractError(
+            "loaded catanatron-rs extension path drift: "
+            f"installed={extension} loaded={loaded}"
+        )
+    actual_extension = _stable_file_sha256(extension)
+    if actual_extension != expected_extension:
+        raise RuntimeContractError(
+            "loaded catanatron-rs extension drift: "
+            f"expected {expected_extension}, got {actual_extension}"
+        )
+    return {
+        "version": distribution.version,
+        "wheel_sha256": expected["catanatron_rs_wheel_sha256"],
+        "extension_path": str(extension),
+        "extension_sha256": actual_extension,
+    }
+
+
+def assert_native_runtime_for_python(
+    executable: str | Path,
+    path: Path = DEFAULT_CONTRACT,
+) -> None:
+    """Run the exact native attestation under a prospective child interpreter."""
+
+    command = [
+        str(executable),
+        str(Path(__file__).resolve()),
+        "--contract",
+        str(path.resolve()),
+        "--check-native",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeContractError(
+            f"cannot attest child native runtime: {error}"
+        ) from error
+    if result.returncode != 0:
+        detail = result.stdout.strip() or result.stderr.strip() or "no diagnostic"
+        raise RuntimeContractError(f"child native runtime refused: {detail}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
@@ -130,6 +323,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--check-python",
         metavar="EXECUTABLE",
         help="succeed only when EXECUTABLE is the contracted Python patch",
+    )
+    parser.add_argument(
+        "--check-native",
+        action="store_true",
+        help="succeed only when this interpreter loaded the sealed native wheel",
     )
     return parser
 
@@ -151,6 +349,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 3
         print(f"Python runtime exact: {actual}")
+        return 0
+    if args.check_native:
+        try:
+            identity = assert_native_runtime_contract(args.contract)
+        except RuntimeContractError as error:
+            print(f"REFUSED: {error}")
+            return 4
+        print(json.dumps(identity, sort_keys=True, separators=(",", ":")))
         return 0
     if args.format == "lines":
         for key in (

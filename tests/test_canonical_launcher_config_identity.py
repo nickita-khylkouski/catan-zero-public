@@ -211,3 +211,43 @@ def test_canonical_evaluation_forwards_cpu_placement(
     forwarded = evaluate._executor_argv(args)  # noqa: SLF001
     index = forwarded.index("--threads-per-worker")
     assert forwarded[index + 1] == str(threads_per_worker)
+
+
+def test_canonical_evaluation_attests_native_runtime_before_exec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(evaluate, "_validate_config", lambda _path: None)
+    monkeypatch.setattr(
+        evaluate.production_runtime_contract,
+        "assert_native_runtime_contract",
+        lambda: events.append("attest"),
+    )
+    monkeypatch.setattr(
+        evaluate.os,
+        "execv",
+        lambda _executable, _argv: events.append("exec"),
+    )
+
+    evaluate.main(
+        [
+            "--config",
+            "eval.json",
+            "--candidate",
+            "candidate.pt",
+            "--champion",
+            "champion.pt",
+            "--out",
+            "report.json",
+            "--pairs",
+            "1",
+            "--workers",
+            "1",
+            "--devices",
+            "cuda:0",
+            "--base-seed",
+            "1",
+        ]
+    )
+
+    assert events == ["attest", "exec"]

@@ -29,6 +29,7 @@ from catan_zero.rl.pipeline_configs import (  # noqa: E402
 from catan_zero.rl.production_recipe_catalog import (  # noqa: E402
     require_production_recipe,
 )
+from tools import production_runtime_contract  # noqa: E402
 
 
 CANONICAL_OPTION_COUNT = 10
@@ -191,6 +192,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         _validate_config(args.config.expanduser())
     except ValueError as error:
         parser.error(str(error))
+    try:
+        production_runtime_contract.assert_native_runtime_contract()
+    except production_runtime_contract.RuntimeContractError as error:
+        parser.error(
+            "sealed native runtime refused before evaluation: "
+            f"{error}. Reinstall the wheel through tools/install_v1_freeze.sh."
+        )
     os.execv(sys.executable, [sys.executable, *_executor_argv(args)])
 
 
