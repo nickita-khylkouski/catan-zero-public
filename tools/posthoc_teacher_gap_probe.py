@@ -1176,6 +1176,10 @@ def _evaluate_policy_metrics(
         value_validation_action_types_by_id=tuple(
             prepared["value_validation_action_types_by_id"]
         ),
+        policy_behavior_action_types_by_id=tuple(
+            prepared["value_validation_action_types_by_id"]
+        ),
+        policy_behavior_action_catalog_abi=prepared["action_catalog_abi"],
     )
     policy_aux = prepared.get("policy_aux_validation")
     if policy_aux is None:
@@ -1229,6 +1233,10 @@ def _evaluate_policy_metrics(
             value_validation_action_types_by_id=tuple(
                 prepared["value_validation_action_types_by_id"]
             ),
+            policy_behavior_action_types_by_id=tuple(
+                prepared["value_validation_action_types_by_id"]
+            ),
+            policy_behavior_action_catalog_abi=prepared["action_catalog_abi"],
         )
         combined = train_bc._combine_policy_aux_validation_metrics(
             base_metrics,

@@ -198,6 +198,16 @@ class _FakeTrainBC:
             "BUILD_ROAD",
         )
 
+    @staticmethod
+    def _action_catalog_abi_binding(_action_catalog):
+        return {
+            "version": "fake-v1",
+            "size": 3,
+            "ordered_descriptors_sha256": "sha256:" + "1" * 64,
+            "action_types_by_id_sha256": "sha256:" + "2" * 64,
+            "identity_sha256": "sha256:" + "3" * 64,
+        }
+
     def evaluate_bc_batches(self, *args, **kwargs):
         self.calls["evaluate"] = (args, kwargs)
         self.evaluate_calls.append((args, kwargs))
@@ -533,6 +543,17 @@ def test_aux_enabled_report_reconstructs_exact_q_times_w_objective(
     )
 
     assert len(fake.evaluate_calls) == 2
+    expected_action_types = ("ROLL", "END_TURN", "BUILD_ROAD")
+    expected_action_catalog_abi = fake._action_catalog_abi_binding(
+        fake.action_catalog
+    )
+    for _args, kwargs in fake.evaluate_calls:
+        assert kwargs["policy_behavior_action_types_by_id"] == (
+            expected_action_types
+        )
+        assert kwargs["policy_behavior_action_catalog_abi"] == (
+            expected_action_catalog_abi
+        )
     aux_weights = fake.evaluate_calls[1][0][3]
     assert aux_weights[np.asarray([1, 3], dtype=np.int64)] == pytest.approx(
         [1.0, 2.0]
@@ -684,6 +705,14 @@ def test_reconstructs_exact_weights_holdout_and_evaluation_recipe(
         "ROLL",
         "END_TURN",
         "BUILD_ROAD",
+    )
+    assert kwargs["policy_behavior_action_types_by_id"] == (
+        "ROLL",
+        "END_TURN",
+        "BUILD_ROAD",
+    )
+    assert kwargs["policy_behavior_action_catalog_abi"] == (
+        fake._action_catalog_abi_binding(fake.action_catalog)
     )
     objective = result["shared_holdout"]["objective_reconstruction"]
     assert objective["target_reliability_confidence_weighting"] is True
