@@ -38,7 +38,7 @@ CANONICAL_PARENT_UPDATE_CONFIG_PATH = (
 TRAINING_SCIENCE_ADMISSION_PATH = (
     REPO_ROOT / "configs/production/training_science_admission.json"
 )
-SCHEMA_VERSION = "a1-current-science-contract-v3"
+SCHEMA_VERSION = "a1-current-science-contract-v4"
 TEACHER_REPORT_SCHEMA = "teacher-operator-causal-report-v1"
 ADOPTION_RECEIPT_SCHEMA = "a1-teacher-operator-adoption-v1"
 TRAINING_SCIENCE_COMMISSIONING_SCHEMA = (
@@ -315,6 +315,66 @@ PRODUCTION_LEARNER_VALUE_OBJECTIVE_CONTRACT = {
     "value_categorical_bins": None,
     "hlgauss_sigma_ratio": None,
 }
+MARITIME_BEHAVIORAL_COMPETENCE_GATE_CONTRACT = {
+    "schema_version": "a1-maritime-behavioral-competence-gate-v1",
+    "required_streams": ["base", "aux"],
+    "stream_admission": {
+        "mode": "independent",
+        "pooling": False,
+        "all_required_streams_must_pass": True,
+    },
+    "required_axis": "teacher_argmax_action_type",
+    "required_action_type": "MARITIME_TRADE",
+    "minimum_rows": 64,
+    "confidence_interval": {
+        "method": "wilson_score",
+        "sided": "one",
+        "confidence_level": 0.95,
+        "z": 1.6448536269514722,
+    },
+    "minimum_teacher_top1_lower_bound": 0.15,
+    "maximum_end_turn_confusion_upper_bound": 0.40,
+    "maximum_teacher_top1_parent_regression": 0.05,
+    "maximum_end_turn_confusion_parent_regression": 0.05,
+    "objective_weighted_diagnostic": {
+        "required": True,
+        "axis": "objective_weighted_teacher_argmax_action_type",
+        "selection_authority": False,
+    },
+    "playing_strength": {
+        "candidate_prefilter_only": True,
+        "h2h_final_ranking_authority": True,
+    },
+}
+MARITIME_BEHAVIORAL_COMPETENCE_NEGATIVE_OBSERVATION = {
+    "audit_role": "retrospective_negative_audit",
+    "promotion_authority": False,
+    "required_stream": "base",
+    "required_axis": "teacher_argmax_action_type",
+    "required_action_type": "MARITIME_TRADE",
+    "action_catalog_abi": {
+        "version": "catanatron-flat-v1",
+        "size": 332,
+        "ordered_descriptors_sha256": (
+            "sha256:3c4dbb523f45376e6de211a8b69b36ba5f3a9be5981e60a6fab320916ed9f741"
+        ),
+        "action_types_by_id_sha256": (
+            "sha256:184a8199061431a538607f58de53f453ad010046d2eed8727bb054a636169920"
+        ),
+        "identity_sha256": (
+            "sha256:bf8203d092568346c28b171e14e6c88b2aa480030c72d1c74c727167afe2dc51"
+        ),
+    },
+    "rows": 94,
+    "teacher_top1_correct": 6,
+    "teacher_top1_accuracy": 0.06382978723404255,
+    "teacher_top1_wilson_lower_bound": 0.03336295494479746,
+    "end_turn_confusion_rows": 74,
+    "end_turn_confusion_rate": 0.7872340425531915,
+    "end_turn_confusion_wilson_upper_bound": 0.8481230261724284,
+    "selection_admitted": False,
+    "requires_fresh_candidate_evidence": True,
+}
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
     {"policy_aux_active_batch_size", "policy_aux_loss_weight"}
 )
@@ -449,6 +509,16 @@ def _load() -> dict[str, Any]:
     for key in ("generation", "learner", "evaluation", "promotion"):
         if not isinstance(value[key], dict) or not value[key]:
             raise ScienceContractError(f"current {key} contract is empty")
+    promotion = value["promotion"]
+    if (
+        promotion.get("maritime_behavioral_competence_gate")
+        != MARITIME_BEHAVIORAL_COMPETENCE_GATE_CONTRACT
+        or promotion.get("maritime_behavioral_competence_negative_observation")
+        != MARITIME_BEHAVIORAL_COMPETENCE_NEGATIVE_OBSERVATION
+    ):
+        raise ScienceContractError(
+            "current maritime behavioral competence promotion contract drifted"
+        )
     selection = value["operator_selection"]
     if not isinstance(selection, dict) or selection.get("status") not in {
         "provisional_pending_teacher_campaign",
@@ -539,6 +609,12 @@ def _load() -> dict[str, Any]:
         if isinstance(admission_recipes, dict)
         else None
     )
+    admission_observations = (
+        admission_recipe.get("observations")
+        if isinstance(admission_recipe, dict)
+        and isinstance(admission_recipe.get("observations"), dict)
+        else {}
+    )
     if (
         admission.get("schema_version")
         != "catan-zero-training-science-admission-v1"
@@ -551,6 +627,12 @@ def _load() -> dict[str, Any]:
         is not selected_topology.get("go_authorized")
         or admission_recipe.get("reason")
         != selected_topology["authorization_reason"]
+        or admission_observations.get("maritime_behavioral_competence_gate")
+        != MARITIME_BEHAVIORAL_COMPETENCE_GATE_CONTRACT
+        or admission_observations.get(
+            "maritime_behavioral_competence_negative_observation"
+        )
+        != MARITIME_BEHAVIORAL_COMPETENCE_NEGATIVE_OBSERVATION
         or (
             admission_recipe.get("authorized") is True
             and (
@@ -728,6 +810,24 @@ def learner_production_selection() -> dict[str, Any]:
 
 def learner_value_objective() -> dict[str, Any]:
     return copy.deepcopy(_load()["learner"]["value_objective"])
+
+
+def maritime_behavioral_competence_gate() -> dict[str, Any]:
+    """Return the diagnostic prefilter applied before matched H2H ranking."""
+
+    return copy.deepcopy(
+        _load()["promotion"]["maritime_behavioral_competence_gate"]
+    )
+
+
+def maritime_behavioral_competence_negative_observation() -> dict[str, Any]:
+    """Return the retrospective observation that requires a fresh candidate."""
+
+    return copy.deepcopy(
+        _load()["promotion"][
+            "maritime_behavioral_competence_negative_observation"
+        ]
+    )
 
 
 def require_selected_parent_update(config_path: str | Path) -> Path:

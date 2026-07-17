@@ -43,6 +43,63 @@
         "v8_combined_information_migration_and_parent_fresh_dose"
       ],
       "observations": {
+        "maritime_behavioral_competence_gate": {
+          "schema_version": "a1-maritime-behavioral-competence-gate-v1",
+          "required_streams": [
+            "base",
+            "aux"
+          ],
+          "stream_admission": {
+            "mode": "independent",
+            "pooling": false,
+            "all_required_streams_must_pass": true
+          },
+          "required_axis": "teacher_argmax_action_type",
+          "required_action_type": "MARITIME_TRADE",
+          "minimum_rows": 64,
+          "confidence_interval": {
+            "method": "wilson_score",
+            "sided": "one",
+            "confidence_level": 0.95,
+            "z": 1.6448536269514722
+          },
+          "minimum_teacher_top1_lower_bound": 0.15,
+          "maximum_end_turn_confusion_upper_bound": 0.4,
+          "maximum_teacher_top1_parent_regression": 0.05,
+          "maximum_end_turn_confusion_parent_regression": 0.05,
+          "objective_weighted_diagnostic": {
+            "required": true,
+            "axis": "objective_weighted_teacher_argmax_action_type",
+            "selection_authority": false
+          },
+          "playing_strength": {
+            "candidate_prefilter_only": true,
+            "h2h_final_ranking_authority": true
+          }
+        },
+        "maritime_behavioral_competence_negative_observation": {
+          "audit_role": "retrospective_negative_audit",
+          "promotion_authority": false,
+          "required_stream": "base",
+          "required_axis": "teacher_argmax_action_type",
+          "required_action_type": "MARITIME_TRADE",
+          "action_catalog_abi": {
+            "version": "catanatron-flat-v1",
+            "size": 332,
+            "ordered_descriptors_sha256": "sha256:3c4dbb523f45376e6de211a8b69b36ba5f3a9be5981e60a6fab320916ed9f741",
+            "action_types_by_id_sha256": "sha256:184a8199061431a538607f58de53f453ad010046d2eed8727bb054a636169920",
+            "identity_sha256": "sha256:bf8203d092568346c28b171e14e6c88b2aa480030c72d1c74c727167afe2dc51"
+          },
+          "rows": 94,
+          "teacher_top1_correct": 6,
+          "teacher_top1_accuracy": 0.06382978723404255,
+          "teacher_top1_wilson_lower_bound": 0.03336295494479746,
+          "end_turn_confusion_rows": 74,
+          "end_turn_confusion_rate": 0.7872340425531915,
+          "end_turn_confusion_wilson_upper_bound": 0.8481230261724284,
+          "selection_admitted": false,
+          "requires_fresh_candidate_evidence": true
+        },
         "architecture_information_surface": "v6_b12_all_required_modules_positive_learning_signal",
         "retained_composite_adapter_status": "fresh_adapter_v6_composite_authenticated",
         "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",

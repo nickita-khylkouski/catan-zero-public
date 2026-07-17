@@ -8,6 +8,165 @@ import pytest
 from tools import a1_current_science_contract as current_science
 
 
+def test_maritime_behavioral_competence_is_a_prefilter_not_h2h_authority() -> None:
+    assert current_science.SCHEMA_VERSION == "a1-current-science-contract-v4"
+    gate = current_science.maritime_behavioral_competence_gate()
+    assert gate == current_science.MARITIME_BEHAVIORAL_COMPETENCE_GATE_CONTRACT
+    assert gate == {
+        "schema_version": "a1-maritime-behavioral-competence-gate-v1",
+        "required_streams": ["base", "aux"],
+        "stream_admission": {
+            "mode": "independent",
+            "pooling": False,
+            "all_required_streams_must_pass": True,
+        },
+        "required_axis": "teacher_argmax_action_type",
+        "required_action_type": "MARITIME_TRADE",
+        "minimum_rows": 64,
+        "confidence_interval": {
+            "method": "wilson_score",
+            "sided": "one",
+            "confidence_level": 0.95,
+            "z": 1.6448536269514722,
+        },
+        "minimum_teacher_top1_lower_bound": 0.15,
+        "maximum_end_turn_confusion_upper_bound": 0.40,
+        "maximum_teacher_top1_parent_regression": 0.05,
+        "maximum_end_turn_confusion_parent_regression": 0.05,
+        "objective_weighted_diagnostic": {
+            "required": True,
+            "axis": "objective_weighted_teacher_argmax_action_type",
+            "selection_authority": False,
+        },
+        "playing_strength": {
+            "candidate_prefilter_only": True,
+            "h2h_final_ranking_authority": True,
+        },
+    }
+
+    admission = json.loads(
+        current_science.TRAINING_SCIENCE_ADMISSION_PATH.read_text(
+            encoding="utf-8"
+        )
+    )
+    selected = admission["recipes"]["a1-parent-update-35m-b200"]
+    assert selected["observations"]["maritime_behavioral_competence_gate"] == gate
+    # Commissioning this selection filter does not alter either learner's
+    # optimization trajectory.
+    recipe = current_science.learner_training_recipe()
+    assert (recipe["optimizer"], recipe["lr"], recipe["lr_schedule"]) == (
+        "adamw",
+        6e-5,
+        "cosine",
+    )
+
+
+def test_maritime_negative_observation_requires_a_fresh_candidate() -> None:
+    observation = (
+        current_science.maritime_behavioral_competence_negative_observation()
+    )
+    assert (
+        observation
+        == current_science.MARITIME_BEHAVIORAL_COMPETENCE_NEGATIVE_OBSERVATION
+    )
+    assert observation["audit_role"] == "retrospective_negative_audit"
+    assert observation["promotion_authority"] is False
+    assert observation["rows"] == 94
+    assert observation["teacher_top1_correct"] == 6
+    assert observation["teacher_top1_accuracy"] == pytest.approx(6 / 94)
+    assert observation["teacher_top1_wilson_lower_bound"] == pytest.approx(
+        0.03336295494479746
+    )
+    assert observation["end_turn_confusion_rows"] == 74
+    assert observation["end_turn_confusion_rate"] == pytest.approx(74 / 94)
+    assert observation["end_turn_confusion_wilson_upper_bound"] == pytest.approx(
+        0.8481230261724284
+    )
+    assert observation["selection_admitted"] is False
+    assert observation["requires_fresh_candidate_evidence"] is True
+    assert observation["action_catalog_abi"]["identity_sha256"] == (
+        "sha256:bf8203d092568346c28b171e14e6c88b2aa480030c72d1c74c727167afe2dc51"
+    )
+
+    admission = json.loads(
+        current_science.TRAINING_SCIENCE_ADMISSION_PATH.read_text(
+            encoding="utf-8"
+        )
+    )
+    selected = admission["recipes"]["a1-parent-update-35m-b200"]
+    assert (
+        selected["observations"][
+            "maritime_behavioral_competence_negative_observation"
+        ]
+        == observation
+    )
+    assert selected["unresolved_requirements"] == [
+        "v8_combined_information_migration_and_parent_fresh_dose"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("surface", "field", "bad_value"),
+    (
+        ("gate", "minimum_rows", 63),
+        ("negative", "selection_admitted", True),
+        ("negative", "requires_fresh_candidate_evidence", False),
+    ),
+)
+def test_current_contract_rejects_maritime_commissioning_drift(
+    tmp_path, monkeypatch, surface: str, field: str, bad_value
+) -> None:
+    contract = copy.deepcopy(current_science.load())
+    key = (
+        "maritime_behavioral_competence_gate"
+        if surface == "gate"
+        else "maritime_behavioral_competence_negative_observation"
+    )
+    contract["promotion"][key][field] = bad_value
+    path = tmp_path / "science.contract.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
+
+    with pytest.raises(
+        current_science.ScienceContractError,
+        match="maritime behavioral competence promotion contract drifted",
+    ):
+        current_science.load()
+
+
+@pytest.mark.parametrize(
+    ("key", "field", "bad_value"),
+    (
+        ("maritime_behavioral_competence_gate", "minimum_rows", 63),
+        (
+            "maritime_behavioral_competence_negative_observation",
+            "selection_admitted",
+            True,
+        ),
+    ),
+)
+def test_current_contract_rejects_training_admission_maritime_drift(
+    tmp_path, monkeypatch, key: str, field: str, bad_value
+) -> None:
+    admission = json.loads(
+        current_science.TRAINING_SCIENCE_ADMISSION_PATH.read_text(
+            encoding="utf-8"
+        )
+    )
+    admission["recipes"]["a1-parent-update-35m-b200"]["observations"][key][
+        field
+    ] = bad_value
+    path = tmp_path / "training_science_admission.json"
+    path.write_text(json.dumps(admission), encoding="utf-8")
+    monkeypatch.setattr(current_science, "TRAINING_SCIENCE_ADMISSION_PATH", path)
+
+    with pytest.raises(
+        current_science.ScienceContractError,
+        match="admission must remain exact and fail-closed",
+    ):
+        current_science.load()
+
+
 def test_current_learner_selects_parent_update_and_keeps_scratch_research_only() -> None:
     recipe = current_science.learner_training_recipe()
 
