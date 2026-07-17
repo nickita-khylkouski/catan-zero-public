@@ -63,3 +63,24 @@ def test_migration_artifacts_refuse_symlinks(tmp_path: Path) -> None:
 
     with pytest.raises(migration.MigrationError, match="must not be a symlink"):
         migration._ref(alias)  # noqa: SLF001
+
+
+def test_anchor_replay_tolerates_only_float32_reduction_noise() -> None:
+    expected = {
+        "schema_version": migration.ANCHOR_SCHEMA,
+        "count": 4,
+        "changed": True,
+        "measurements": [0.17797088623046875, 0.014811873435974121],
+    }
+    replayed = {
+        **expected,
+        "measurements": [0.17797112464904785, 0.014811880886554718],
+    }
+
+    assert migration._anchor_replay_matches(expected, replayed)  # noqa: SLF001
+    assert not migration._anchor_replay_matches(  # noqa: SLF001
+        expected, {**replayed, "count": 5}
+    )
+    assert not migration._anchor_replay_matches(  # noqa: SLF001
+        expected, {**replayed, "measurements": [0.18, replayed["measurements"][1]]}
+    )

@@ -48,6 +48,43 @@ class MigrationError(RuntimeError):
     pass
 
 
+_ANCHOR_REPLAY_FLOAT_ABS_TOL = 1e-6
+_ANCHOR_REPLAY_FLOAT_REL_TOL = 1e-6
+
+
+def _anchor_replay_matches(expected: object, actual: object) -> bool:
+    """Compare replay evidence without making CPU reduction order semantic.
+
+    ``torchrun`` sets ``OMP_NUM_THREADS=1`` by default.  The same CPU forward
+    pass therefore differs from a normally issued receipt by a few float32
+    ulps even though its discrete identities, features, and decisions are
+    unchanged.  Receipt bytes and all non-floating fields remain exact; only
+    measured floating diagnostics receive a tight numerical tolerance.
+    """
+
+    if isinstance(expected, Mapping) and isinstance(actual, Mapping):
+        return set(expected) == set(actual) and all(
+            _anchor_replay_matches(expected[key], actual[key]) for key in expected
+        )
+    if isinstance(expected, list) and isinstance(actual, list):
+        return len(expected) == len(actual) and all(
+            _anchor_replay_matches(left, right)
+            for left, right in zip(expected, actual, strict=True)
+        )
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return type(expected) is type(actual) and expected == actual
+    if isinstance(expected, int) and isinstance(actual, int):
+        return expected == actual
+    if isinstance(expected, float) and isinstance(actual, (int, float)):
+        return math.isfinite(expected) and math.isfinite(float(actual)) and math.isclose(
+            expected,
+            float(actual),
+            rel_tol=_ANCHOR_REPLAY_FLOAT_REL_TOL,
+            abs_tol=_ANCHOR_REPLAY_FLOAT_ABS_TOL,
+        )
+    return type(expected) is type(actual) and expected == actual
+
+
 def _sha(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -320,7 +357,7 @@ def inspect_migration(
     recomputed_anchor = checkpoint_migration._migration_anchor_evidence(  # noqa: SLF001
         base_policy, migrated_policy, "cpu"
     )
-    if recomputed_anchor != anchor:
+    if not _anchor_replay_matches(anchor, recomputed_anchor):
         raise MigrationError("step-zero adapter-specific anchor replay drift")
     topology = _verify_topology_delta(
         Path(source_ref["path"]),
