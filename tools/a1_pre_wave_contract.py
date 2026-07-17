@@ -380,6 +380,20 @@ HISTORICAL_V5_HANDOFF_COMPATIBILITY_SCHEMA = (
 HISTORICAL_V5_RUST_FEATURIZER_COMPATIBILITY_SCHEMA = (
     "a1-v5-rust-featurizer-parity-compatibility-v1"
 )
+HISTORICAL_V5_COHERENT_OPERATOR_MIGRATION_SCHEMA = (
+    "a1-v5-coherent-public-operator-migration-v1"
+)
+HISTORICAL_V5_COHERENT_MISSING_FIELDS = {
+    "boundary_value_particles": 1,
+    "coherent_public_belief_search": True,
+    "forced_root_target_mode": "trajectory_only",
+}
+HISTORICAL_V5_COHERENT_CHANGED_FIELDS = {
+    "determinization_particles": (4, 1),
+    "evaluator_rust_featurize": (False, True),
+    "information_set_search": (True, False),
+    "sigma_eval": (0.98, 0.79),
+}
 RUST_FEATURIZER_PARITY_EVIDENCE_SCHEMA = "eval-rust-feature-b200-evidence-v1"
 RUST_FEATURIZER_PARITY_EVIDENCE_PATH = (
     REPO_ROOT / "docs/evidence/EVAL_RUST_FEATURE_B200_20260711.json"
@@ -1225,10 +1239,24 @@ def _historical_v5_handoff_identity_compatibility(
         and expected.get("evaluator_rust_featurize") is True
     )
     required_missing = set(HISTORICAL_V5_HANDOFF_DEFAULTS)
+    coherent_missing = {
+        **HISTORICAL_V5_HANDOFF_DEFAULTS,
+        **HISTORICAL_V5_COHERENT_MISSING_FIELDS,
+    }
+    coherent_operator_migration = bool(
+        missing == set(coherent_missing)
+        and not extra
+        and shared_drift == HISTORICAL_V5_COHERENT_CHANGED_FIELDS
+        and current_science.operator_selection_status()
+        == "adopted_teacher_campaign"
+    )
     if (
-        missing != required_missing
-        or extra
-        or (shared_drift and not rust_featurizer_transition)
+        not coherent_operator_migration
+        and (
+            missing != required_missing
+            or extra
+            or (shared_drift and not rust_featurizer_transition)
+        )
     ):
         raise ContractError(
             "promoted deployed search identity compatibility shape drift: "
@@ -1271,7 +1299,22 @@ def _historical_v5_handoff_identity_compatibility(
         )
     normalized = {**deployed, **HISTORICAL_V5_HANDOFF_DEFAULTS}
     parity_evidence: dict[str, Any] | None = None
-    if rust_featurizer_transition:
+    if coherent_operator_migration:
+        if {
+            key: expected[key] for key in HISTORICAL_V5_COHERENT_MISSING_FIELDS
+        } != HISTORICAL_V5_COHERENT_MISSING_FIELDS:
+            raise ContractError(
+                "coherent-public migration missing-field values drifted"
+            )
+        normalized.update(HISTORICAL_V5_COHERENT_MISSING_FIELDS)
+        normalized.update(
+            {
+                key: target
+                for key, (_, target) in HISTORICAL_V5_COHERENT_CHANGED_FIELDS.items()
+            }
+        )
+        parity_evidence = _authenticated_rust_featurizer_parity_evidence()
+    elif rust_featurizer_transition:
         parity_evidence = _authenticated_rust_featurizer_parity_evidence()
         normalized["evaluator_rust_featurize"] = True
     if normalized != dict(expected):
@@ -1280,15 +1323,31 @@ def _historical_v5_handoff_identity_compatibility(
         )
     compatibility = {
         "schema_version": (
-            HISTORICAL_V5_RUST_FEATURIZER_COMPATIBILITY_SCHEMA
-            if parity_evidence is not None
-            else HISTORICAL_V5_HANDOFF_COMPATIBILITY_SCHEMA
+            HISTORICAL_V5_COHERENT_OPERATOR_MIGRATION_SCHEMA
+            if coherent_operator_migration
+            else (
+                HISTORICAL_V5_RUST_FEATURIZER_COMPATIBILITY_SCHEMA
+                if parity_evidence is not None
+                else HISTORICAL_V5_HANDOFF_COMPATIBILITY_SCHEMA
+            )
         ),
         "authenticated_fingerprint": actual_fingerprint,
         "omitted_historical_defaults": dict(HISTORICAL_V5_HANDOFF_DEFAULTS),
         "raw_deployed_search_config_sha256": _digest_value(deployed),
         "normalized_search_config_sha256": _digest_value(normalized),
     }
+    if coherent_operator_migration:
+        compatibility["coherent_public_operator_migration"] = {
+            "missing_fields_added": dict(HISTORICAL_V5_COHERENT_MISSING_FIELDS),
+            "changed_fields": {
+                key: {"from": source, "to": target}
+                for key, (source, target) in (
+                    HISTORICAL_V5_COHERENT_CHANGED_FIELDS.items()
+                )
+            },
+            "promotion_claimed": False,
+            "target_information_regime": TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+        }
     if parity_evidence is not None:
         compatibility["rust_featurizer_implementation_transition"] = {
             "from": "python_entity_features_v1",
