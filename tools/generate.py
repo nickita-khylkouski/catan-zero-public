@@ -18,7 +18,8 @@ from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src"
-for import_root in (REPO_ROOT, SRC_ROOT):
+TOOLS_ROOT = REPO_ROOT / "tools"
+for import_root in (TOOLS_ROOT, REPO_ROOT, SRC_ROOT):
     while str(import_root) in sys.path:
         sys.path.remove(str(import_root))
     sys.path.insert(0, str(import_root))
