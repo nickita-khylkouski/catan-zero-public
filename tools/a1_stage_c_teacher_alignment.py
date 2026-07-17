@@ -153,6 +153,10 @@ SEARCH_FIELDS = (
 )
 BELIEF_FIELDS = (
     "coherent_public_belief_search",
+    # K changes opponent/new-turn continuation backups and therefore the
+    # stored policy target. It is not a GumbelChanceMCTSConfig field, so it
+    # must be bound here rather than relying on effective_gumbel_config.
+    "boundary_value_particles",
     "information_set_search",
     "determinization_particles",
     "determinization_min_simulations",
@@ -485,6 +489,7 @@ def _operator_identity(
         or search["n_full"] != 128
         or search["c_scale"] is None
         or belief["coherent_public_belief_search"] is not True
+        or belief["boundary_value_particles"] != 1
         or belief["information_set_search"] is not False
         or belief["determinization_particles"] != 1
         or chance["correct_rust_chance_spectra"] is not True
