@@ -151,6 +151,39 @@ def test_late_value_tower_clone_is_function_preserving_at_activation():
     assert len(split.encode_state(batch)) == 5
 
 
+def test_zero_init_action_cross_preserves_train_dropout_rng_and_value_path():
+    """An identity action adapter must not perturb later value-dropout masks."""
+    torch.manual_seed(17)
+    base = EntityGraphNet(
+        _config(state_layers=3, value_tower_split_layers=1, dropout=0.2)
+    )
+    upgraded = EntityGraphNet(
+        _config(
+            state_layers=3,
+            value_tower_split_layers=1,
+            dropout=0.2,
+            action_cross_attention_layers=1,
+        )
+    )
+    missing, unexpected = upgraded.load_state_dict(base.state_dict(), strict=False)
+    assert not unexpected
+    assert all(key.startswith("action_cross_blocks.") for key in missing)
+    upgraded.initialize_value_tower_from_policy()
+    base.train()
+    upgraded.train()
+    batch = _batch()
+
+    torch.manual_seed(20260717)
+    base_output = base(batch, return_q=True)
+    base_next_random = torch.rand(8)
+    torch.manual_seed(20260717)
+    upgraded_output = upgraded(batch, return_q=True)
+    upgraded_next_random = torch.rand(8)
+
+    _assert_outputs_equal(base_output, upgraded_output, exact=True)
+    assert torch.equal(base_next_random, upgraded_next_random)
+
+
 def test_split1_inference_cls_suffix_matches_loaded_full_block_parameters(
     monkeypatch,
 ):

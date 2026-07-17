@@ -1064,11 +1064,21 @@ class EntityGraphNet:
                         nn.init.zeros_(self.target_gather_proj[1].bias)
 
                 if self.action_cross_attention_layers > 0:
+                    # A zero-output warm-start must also preserve the training
+                    # computation, not merely eval logits.  Executing an
+                    # identity branch with ordinary Dropout would consume the
+                    # global RNG and change later value-tower dropout masks.
+                    # The Transformer-only cross adapter is therefore a
+                    # deterministic branch until its first learned update;
+                    # relational trunks retain their existing dropout path.
+                    cross_dropout = (
+                        dropout if self.uses_relational_topology else 0.0
+                    )
                     self.action_cross_blocks = nn.ModuleList(
                         _CrossBlock(
                             h,
                             cfg.attention_heads,
-                            dropout,
+                            cross_dropout,
                             identity_init=not self.uses_relational_topology,
                         )
                         for _ in range(self.action_cross_attention_layers)
