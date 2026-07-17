@@ -1,0 +1,149 @@
+{
+  "schema_version": "a1-coherent-v5-dose-selection-evidence-v1",
+  "status": "selected_stronger_candidate",
+  "date_utc": "2026-07-17",
+  "selected_arm": "trunk25_step12",
+  "selected_checkpoint": {
+    "runtime_stamped_path": "/home/ubuntu/catan-zero-production/runs/eval/runtime-stamped-20260717-v2/b12.pt",
+    "runtime_stamped_sha256": "sha256:1871f710623e0ee1ff8cb6d5fb659221f5e905f2718e502ca6a5b67a0bb6051c",
+    "source_step_checkpoint_path": "/home/ubuntu/catan-zero-production/runs/learner/a1-parent-update-coherent-v5-trunk25-20260717-r1/candidate_step0012.pt",
+    "source_step_checkpoint_sha256": "sha256:2e9b214a60ecea998ddfa4eafffe10b381677e240c3f7593ddb269a7489087f1",
+    "model_tensor_inventory_sha256": "sha256:b2a116caa21985be908a32981b7c8dfeda73172546cbad215b05da58c05ed9ce",
+    "runtime_reissue_receipt_sha256": "sha256:427275369950001793fd7970ea4dfd452529afd4b39c1ed97166f21d8a63e732",
+    "runtime_reissue_all_preexisting_values_identical": true
+  },
+  "exact_parent": {
+    "raw_f7_sha256": "sha256:f7e93dfb8cdb713d647b3e142c949d59083de9f719b6688b6faa6c918ce3eed4",
+    "commissioned_v5_initializer_sha256": "sha256:ed2ae496ad5d599559c0594da6b2951072b806f5f321af57a572f836aa7aecd3",
+    "initializer_forward_max_diff": 1.043081283569336e-07,
+    "initializer_forward_tolerance": 1.1920928955078125e-07
+  },
+  "training": {
+    "run_path": "/home/ubuntu/catan-zero-production/runs/learner/a1-parent-update-coherent-v5-trunk25-20260717-r1",
+    "train_report_sha256": "sha256:a354f4c5640646cabbfd6cb1dc01e915a94347b27592515f8a9cc83b2286868b",
+    "world_size": 8,
+    "accelerator": "NVIDIA B200",
+    "trunk_lr_multiplier": 0.25,
+    "selected_optimizer_step": 12,
+    "selected_shared_block_relative_drift_fraction": 0.000902,
+    "selected_policy_action_relative_drift_fraction": 0.003137,
+    "terminal_step": 48,
+    "terminal_rejected_reason": "The only held-out validation was at step 48 and showed negative teacher-gap closure; gameplay therefore selected from immutable intermediate dose checkpoints rather than assuming the terminal checkpoint was best.",
+    "terminal_target_to_model_kl": 0.794923,
+    "terminal_target_to_parent_kl": 0.685423,
+    "terminal_teacher_gap_closure_fraction": -0.1598
+  },
+  "corpus": {
+    "rows": 959142,
+    "games": 8192,
+    "shards": 1726,
+    "rows_with_meaningful_public_history": 950950,
+    "event_history_shape": [64, 41],
+    "corpus_meta_sha256": "sha256:cb88dacf78edaa2f3daade55a46c6db4e37956d59777c808fe854c5c8bf0db62",
+    "payload_inventory_sha256": "sha256:25b27e667648cde3e211d8e7436e26ddf6f6962ffe040a3b86e80cb204abe5f6"
+  },
+  "evaluation_contract": {
+    "config": "configs/eval/coherent_public_n128.schema19.json",
+    "comparison_contract": "paired_same_seed_color_swap_shared_search_operator",
+    "n_full": 128,
+    "coherent_public_belief_search": true,
+    "native_mcts_hot_loop": true,
+    "symmetry_averaged_eval": true,
+    "c_scale": 0.1,
+    "runtime_engine": "catanatron-rs 0.1.12",
+    "runtime_wheel_sha256": "sha256:e8e61626e5e99c9c61dcf79e3cc639d2070eb73dc79ea99a50efdece4cf34765"
+  },
+  "exact_f7_replication": {
+    "pooled_report_path": "/home/ubuntu/catan-eval-results/b12-vs-raw-f7-pooled-20260717.json",
+    "pooled_report_sha256": "sha256:59de43c0b3500344740f8e01d8e106b40f40dd42f97e8f492534c387f42beee8",
+    "seed_intervals": [
+      [910000001000, 910000001128],
+      [910000003000, 910000003096],
+      [910000004000, 910000004064]
+    ],
+    "source_report_sha256": [
+      "sha256:9f1e046d787ae3c37665de5a37e0a59bc013fed4217cdb2134cbc778c59453ae",
+      "sha256:93765eaf5cead77f85ffca1ff895174d5cec73f6c5a3c9108b1415425268e16f",
+      "sha256:08acd44ddac492266dfa17dfbce45cb555fa2dd872e3eca316a51e0b54a928e0"
+    ],
+    "games": 576,
+    "complete_pairs": 288,
+    "candidate_wins": 324,
+    "parent_wins": 252,
+    "candidate_win_rate": 0.5625,
+    "truncations": 0,
+    "errors": 0,
+    "pair_diagnostics": {
+      "candidate_double_win_pairs": 70,
+      "split_pairs": 184,
+      "candidate_double_loss_pairs": 34
+    },
+    "promotion_band": {
+      "elo0": -10.0,
+      "elo1": 15.0,
+      "llr": 6.967226893849809,
+      "upper_bound": 2.9444389791664403,
+      "decision": "H1"
+    },
+    "strict_superiority_band": {
+      "elo0": 0.0,
+      "elo1": 15.0,
+      "llr": 3.6655733179803454,
+      "upper_bound": 2.9444389791664403,
+      "decision": "H1"
+    }
+  },
+  "dose_comparison": {
+    "b12_vs_commissioned_parent": {
+      "games": 256,
+      "candidate_wins": 144,
+      "candidate_win_rate": 0.5625,
+      "pentanomial_llr": 2.346483936660041,
+      "decision": "continue",
+      "report_sha256": "sha256:2d5ae0d3e5a104badc70359ca477ca49898fe52994e718fa69ad82b2837f215e"
+    },
+    "b16_vs_commissioned_parent": {
+      "games": 256,
+      "candidate_wins": 151,
+      "candidate_win_rate": 0.58984375,
+      "pentanomial_llr": 3.1773746019750355,
+      "decision": "H1",
+      "report_sha256": "sha256:f4bea6e9766b2857aab00170b412f77b64c120425dc996b4393d264765309fcf"
+    },
+    "b16_vs_exact_raw_f7": {
+      "games": 192,
+      "candidate_wins": 94,
+      "candidate_win_rate": 0.4895833333333333,
+      "decision": "continue",
+      "report_sha256": "sha256:2066a274a953375caa2e9ba018cbb44987eb3eafd33ac0f74bf11ab7d2ad0dee"
+    },
+    "b16_vs_b12": {
+      "games": 192,
+      "b16_wins": 90,
+      "b12_wins": 102,
+      "b16_win_rate": 0.46875,
+      "report_sha256": "sha256:685207299080983ba43b344890a739f3bd91035cfc074334b47f2774a5ffefed"
+    },
+    "selection_reason": "B16 overfit the one-ULP commissioned-parent execution path: it passed against that parent but was flat against exact raw f7 and lost directly to B12. B12 replicated positive strength on all three disjoint raw-f7 cohorts and passed both pooled pentanomial bands."
+  },
+  "pipeline_repairs": [
+    {
+      "commit": "520273c",
+      "change": "DDP/FSDP learner checkpoints now stamp the executable forward-semantic identity required by evaluation."
+    },
+    {
+      "commit": "d69abc1",
+      "change": "Existing distributed checkpoints can be reissued by adding only the semantic stamp while recursively proving every pre-existing payload value and model tensor unchanged."
+    },
+    {
+      "commit": "cc537ee",
+      "change": "The reissue tensor inventory handles scalar state buffers without weakening byte-level tensor binding."
+    }
+  ],
+  "promotion": {
+    "automatic_pointer_change_performed": false,
+    "r_and_d_selection_complete": true,
+    "generator_candidate_eligible": true,
+    "public_release_claim": false
+  }
+}
