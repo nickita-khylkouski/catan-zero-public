@@ -267,6 +267,10 @@ def test_canonical_v7_value_routing_protects_only_the_shared_trunk() -> None:
     assert fields["value_trunk_grad_scale"] == 0.1
     assert engine["value_tower_split_layers"] == 1
 
+    parent = json.loads(PARENT_RECIPE.read_text(encoding="utf-8"))
+    assert parent["train_config"]["fields"]["value_trunk_grad_scale"] == 0.1
+    assert parent["engine_settings"]["value_tower_split_layers"] == 1
+
 
 @pytest.mark.parametrize("recipe", (RECIPE, PARENT_RECIPE))
 def test_canonical_recipe_emphasizes_hard_decisions_without_weighting_value(
@@ -493,7 +497,7 @@ def test_parent_update_recipe_reproduces_split1_selected_step12() -> None:
     assert fields["validation_game_seed_ranges"] == ""
     assert fields["validation_max_samples"] == 0
     assert fields["minimum_policy_effective_rows_per_global_batch"] == 0.0
-    assert fields["value_trunk_grad_scale"] == 1.0
+    assert fields["value_trunk_grad_scale"] == 0.1
     assert fields["post_policy_dose_value_trunk_grad_scale"] == 1.0
     assert fields["policy_dose_lr_area"] == 0.0
     assert fields["policy_kl_target"] is None

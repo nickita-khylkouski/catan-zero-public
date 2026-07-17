@@ -256,7 +256,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "c4787615b410f6a723efd2e5164f98544b661fbe08da9bc90bf9241a42b76f53"
+        "85359773c9685b96079759912c65ead695d8c09216d784b0c81211965d36c3a1"
     ),
     "initialization": {
         "mode": "parent_fresh_optimizer",
@@ -514,6 +514,10 @@ def _load() -> dict[str, Any]:
     ):
         raise ScienceContractError(
             "selected parent-update initialization/topology contradicts its config"
+        )
+    if selected_train.get("value_trunk_grad_scale") != 0.1:
+        raise ScienceContractError(
+            "selected V7 parent update must scale shared value gradients to 0.1"
         )
     admission = _read_object(TRAINING_SCIENCE_ADMISSION_PATH)
     admission_recipes = admission.get("recipes")
