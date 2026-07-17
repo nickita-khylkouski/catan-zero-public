@@ -37211,6 +37211,11 @@ def _preflight_init_checkpoint_architecture(args: argparse.Namespace, ddp: dict)
 
     checkpoint = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict):
+        if str(getattr(args, "require_feature_learning_signal_modules", "")).strip():
+            raise SystemExit(
+                "init checkpoint cannot satisfy required feature-learning-signal "
+                "modules before GPU launch: checkpoint is not an object"
+            )
         return
     mismatches = _checkpoint_config_mismatches(
         policy_type=checkpoint.get("policy_type"),
@@ -37222,6 +37227,37 @@ def _preflight_init_checkpoint_architecture(args: argparse.Namespace, ddp: dict)
             "init checkpoint architecture does not match requested run: "
             + "; ".join(mismatches)
         )
+    required_modules = tuple(
+        name.strip()
+        for name in str(
+            getattr(args, "require_feature_learning_signal_modules", "")
+        ).split(",")
+        if name.strip()
+    )
+    if required_modules:
+        state = checkpoint.get("model")
+        if not isinstance(state, Mapping) or not state:
+            raise SystemExit(
+                "init checkpoint cannot satisfy required feature-learning-signal "
+                "modules before GPU launch: missing model tensor mapping"
+            )
+        normalized_keys = tuple(
+            str(name)[len("module.") :] if str(name).startswith("module.") else str(name)
+            for name in state
+        )
+        missing = [
+            module_name
+            for module_name in required_modules
+            if not any(
+                key == module_name or key.startswith(f"{module_name}.")
+                for key in normalized_keys
+            )
+        ]
+        if missing:
+            raise SystemExit(
+                "init checkpoint cannot satisfy required feature-learning-signal "
+                "modules before GPU launch: missing=" + ",".join(missing)
+            )
     _rank0_print(
         json.dumps(
             {

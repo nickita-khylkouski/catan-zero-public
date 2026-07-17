@@ -34,6 +34,10 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     RUST_ENTITY_ADAPTER_V6,
     resolve_checkpoint_entity_feature_adapter,
 )
+from catan_zero.rl.checkpoint_runtime_semantics import (  # noqa: E402
+    ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+    current_entity_graph_forward_semantics,
+)
 
 
 SCHEMA = "a1-information-contract-migration-v1"
@@ -576,11 +580,23 @@ def _verify_v7_input_routing_delta(
         else:
             initialization[parameter] = "seeded_torch_default"
 
+    policy_source = (
+        REPO_ROOT / "src" / "catan_zero" / "rl" / "entity_token_policy.py"
+    )
+    if after.get(ENTITY_GRAPH_FORWARD_SEMANTICS_KEY) != (
+        current_entity_graph_forward_semantics(policy_source)
+    ):
+        raise MigrationError(
+            "V7 migration has no authenticated current entity-graph "
+            "forward-semantics stamp"
+        )
+
     ignored = {
         "model",
         "config",
         "entity_feature_adapter",
         "information_contract_migration_provenance",
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
         # Information migrations deliberately remove the source checkpoint's
         # function-preserving upgrade claim. inspect_migration independently
         # requires this key to be absent from the migrated artifact, so its
@@ -588,7 +604,12 @@ def _verify_v7_input_routing_delta(
         "upgrade_provenance",
     }
     unexpected_added = sorted(
-        set(after) - set(before) - {"information_contract_migration_provenance"}
+        set(after)
+        - set(before)
+        - {
+            "information_contract_migration_provenance",
+            ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+        }
     )
     metadata_drift = [
         key

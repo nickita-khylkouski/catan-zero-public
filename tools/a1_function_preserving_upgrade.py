@@ -53,6 +53,10 @@ from catan_zero.rl.ordered_history import (  # noqa: E402
     MASKED_MEAN_V1,
     ORDERED_ATTENTION_V2,
 )
+from catan_zero.rl.checkpoint_runtime_semantics import (  # noqa: E402
+    ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+    current_entity_graph_forward_semantics,
+)
 
 
 SCHEMA = "a1-function-preserving-architecture-upgrade-v1"
@@ -1147,10 +1151,31 @@ def inspect_upgrade(
     if effective_after != effective_expected:
         raise UpgradeError("effective checkpoint config delta is not allowlisted")
 
+    # Freshly constructed upgrades are stamped by EntityGraphPolicy.save().
+    # Authenticate a newly added/recomputed stamp against this checkout, while
+    # allowing an unchanged historical stamp to replay as ordinary immutable
+    # metadata.
+    before_semantics = before.get(ENTITY_GRAPH_FORWARD_SEMANTICS_KEY)
+    after_semantics = after.get(ENTITY_GRAPH_FORWARD_SEMANTICS_KEY)
+    semantics_changed = before_semantics != after_semantics
+    if semantics_changed:
+        policy_source = REPO_SRC / "catan_zero" / "rl" / "entity_token_policy.py"
+        if after_semantics != (
+            current_entity_graph_forward_semantics(policy_source)
+        ):
+            raise UpgradeError(
+                "upgraded checkpoint has no authenticated current "
+                "entity-graph forward-semantics stamp"
+            )
+
     ignored = {"model", "config", "upgrade_provenance"}
+    if semantics_changed:
+        ignored.add(ENTITY_GRAPH_FORWARD_SEMANTICS_KEY)
     if expected_adapter is not None:
         ignored.add("entity_feature_adapter")
     allowed_added_metadata = {"upgrade_provenance"}
+    if semantics_changed and ENTITY_GRAPH_FORWARD_SEMANTICS_KEY in after:
+        allowed_added_metadata.add(ENTITY_GRAPH_FORWARD_SEMANTICS_KEY)
     if expected_adapter is not None:
         allowed_added_metadata.add("entity_feature_adapter")
     unexpected_metadata = sorted(set(after) - set(before) - allowed_added_metadata)

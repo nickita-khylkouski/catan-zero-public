@@ -54,6 +54,10 @@ from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
 from catan_zero.rl.entity_token_features import (  # noqa: E402
     PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
 )
+from catan_zero.rl.checkpoint_runtime_semantics import (  # noqa: E402
+    ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+    current_entity_graph_forward_semantics,
+)
 from catan_zero.rl.meaningful_history import (  # noqa: E402
     MEANINGFUL_PUBLIC_HISTORY_LIMIT,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
@@ -801,20 +805,40 @@ def _preserve_source_top_level_keys(
 
     Re-open both checkpoints and restore every top-level key from the SOURCE
     except the ones this upgrade intentionally mutates (``model`` weights and the
-    ``config`` flags). Returns the sorted list of preserved source keys.
+    ``config`` flags).  The one deliberately retained output-only key is the
+    freshly recomputed forward-semantics stamp emitted by ``save()``.  It binds
+    the migrated tensors/config to this checkout's executable neural surface;
+    copying an absent or stale source stamp would make a newly constructed
+    checkpoint unloadable (or, worse, mis-authenticated).
+
+    Returns the sorted list of preserved source keys.
     """
     import torch
 
     in_raw = torch.load(in_checkpoint, map_location="cpu", weights_only=False)
     out_raw = torch.load(out_checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(in_raw, dict) or not isinstance(out_raw, dict):
-        return []
+        raise RuntimeError("checkpoint upgrade input/output is malformed")
+    expected_semantics = current_entity_graph_forward_semantics(_ENTITY_POLICY_PATH)
+    output_semantics = out_raw.get(ENTITY_GRAPH_FORWARD_SEMANTICS_KEY)
+    if output_semantics != expected_semantics:
+        raise RuntimeError(
+            "fresh checkpoint is missing the authenticated current "
+            "entity-graph forward-semantics stamp"
+        )
     merged = dict(in_raw)
     for key in mutated_keys:
         if key in out_raw:
             merged[key] = out_raw[key]
+    # Do not copy arbitrary output-only metadata.  This exact stamp is owned by
+    # the constructor and was independently recomputed above.
+    merged[ENTITY_GRAPH_FORWARD_SEMANTICS_KEY] = expected_semantics
     torch.save(merged, out_checkpoint)
-    return sorted(k for k in in_raw if k not in mutated_keys)
+    return sorted(
+        key
+        for key in in_raw
+        if key not in mutated_keys and key != ENTITY_GRAPH_FORWARD_SEMANTICS_KEY
+    )
 
 
 def _sha256_file(path: str | Path) -> str:

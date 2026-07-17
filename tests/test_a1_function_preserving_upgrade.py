@@ -24,6 +24,63 @@ def test_upgrade_tools_bind_project_imports_to_their_checkout() -> None:
     assert upgrade_tool._REPO_SRC in module_path.parents  # noqa: SLF001
 
 
+def test_upgrade_receipt_authenticates_recomputed_runtime_stamp(
+    tmp_path: Path,
+) -> None:
+    from catan_zero.rl.checkpoint_runtime_semantics import (
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+        current_entity_graph_forward_semantics,
+    )
+    import catan_zero.rl.entity_token_policy as entity_token_policy
+
+    source, initializer = _checkpoints(tmp_path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw[ENTITY_GRAPH_FORWARD_SEMANTICS_KEY] = (
+        current_entity_graph_forward_semantics(
+            Path(entity_token_policy.__file__)
+        )
+    )
+    torch.save(raw, initializer)
+
+    evidence = upgrade.inspect_upgrade(source, initializer)
+    assert evidence["shared_parameters_bit_identical"] is True
+
+    raw[ENTITY_GRAPH_FORWARD_SEMANTICS_KEY] = {
+        "schema_version": "entity-graph-forward-semantics-v3",
+        "semantic_sha256": "sha256:forged",
+    }
+    torch.save(raw, initializer)
+    with pytest.raises(upgrade.UpgradeError, match="authenticated current"):
+        upgrade.inspect_upgrade(source, initializer)
+
+
+def test_upgrade_receipt_replays_unchanged_historical_runtime_stamp(
+    tmp_path: Path,
+) -> None:
+    from catan_zero.rl.checkpoint_runtime_semantics import (
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+    )
+
+    source, initializer = _checkpoints(tmp_path)
+    historical = {
+        "schema_version": "entity-graph-forward-semantics-v3",
+        "semantic_token_sha256": "sha256:" + "1" * 64,
+    }
+    for path in (source, initializer):
+        raw = torch.load(path, map_location="cpu", weights_only=False)
+        raw[ENTITY_GRAPH_FORWARD_SEMANTICS_KEY] = historical
+        torch.save(raw, path)
+    raw = torch.load(initializer, map_location="cpu", weights_only=False)
+    raw["upgrade_provenance"]["source_checkpoint_sha256"] = upgrade._sha(  # noqa: SLF001
+        source
+    ).removeprefix("sha256:")
+    torch.save(raw, initializer)
+
+    evidence = upgrade.inspect_upgrade(source, initializer)
+
+    assert evidence["shared_parameters_bit_identical"] is True
+
+
 def _checkpoints(tmp_path: Path) -> tuple[Path, Path]:
     source = tmp_path / "champion.pt"
     upgraded = tmp_path / "champion-gather.pt"

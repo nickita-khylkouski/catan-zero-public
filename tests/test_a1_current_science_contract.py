@@ -399,7 +399,7 @@ def test_current_contract_rejects_uncommissioned_boundary_particles(
         ("value_trunk_grad_scale", 0.25),
         ("grad_accum_steps", 4),
         ("max_steps", 1024),
-            ("phase_weights", "PLAY_TURN=1.0"),
+        ("phase_weights", "PLAY_TURN=1.0"),
     ),
 )
 def test_current_contract_rejects_diagnostic_training_settings(

@@ -104,10 +104,17 @@ def test_v7_input_migration_constructs_complete_strict_checkpoint(
         RUST_ENTITY_ADAPTER_V5,
         RUST_ENTITY_ADAPTER_V6,
     )
+    from catan_zero.rl.checkpoint_runtime_semantics import (
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+        current_entity_graph_forward_semantics,
+    )
+    import catan_zero.rl.entity_token_policy as entity_token_policy
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.self_play import make_env_config
+    from tools import a1_information_contract_migration as migration_receipt
 
-    source = tmp_path / "v5.pt"
+    legacy = tmp_path / "legacy-v5.pt"
+    source = tmp_path / "current-v5.pt"
     migrated = tmp_path / "v7.pt"
     base = EntityGraphPolicy.create(
         env_config=make_env_config(vps_to_win=3),
@@ -117,7 +124,32 @@ def test_v7_input_migration_constructs_complete_strict_checkpoint(
         seed=11,
         entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
     )
-    base.save(source)
+    base.save(legacy)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "f69_upgrade_checkpoint_config.py",
+            "--in-checkpoint",
+            str(legacy),
+            "--out-checkpoint",
+            str(source),
+            "--flags",
+            "current_v5_split1",
+            "--seed",
+            "67",
+            "--device",
+            "cpu",
+            "--no-verify",
+        ],
+    )
+    upgrade_tool.main()
+    # Exact legacy/V5 parent bytes may predate runtime-semantics metadata.
+    # The migration must authenticate its newly constructed output rather than
+    # merely copying whatever the source happened to contain.
+    source_raw = torch.load(source, map_location="cpu", weights_only=False)
+    source_raw.pop(ENTITY_GRAPH_FORWARD_SEMANTICS_KEY)
+    torch.save(source_raw, source)
     # The repository test environment may intentionally carry an older native
     # wheel; native anchor generation is covered by the sealed H100 gate.  This
     # unit test isolates checkpoint construction and strict serialization.
@@ -152,7 +184,21 @@ def test_v7_input_migration_constructs_complete_strict_checkpoint(
 
     source_raw = torch.load(source, map_location="cpu", weights_only=False)
     migrated_raw = torch.load(migrated, map_location="cpu", weights_only=False)
-    policy = EntityGraphPolicy.load(migrated, device="cpu")
+    expected_semantics = current_entity_graph_forward_semantics(
+        Path(entity_token_policy.__file__)
+    )
+    assert (
+        migrated_raw[ENTITY_GRAPH_FORWARD_SEMANTICS_KEY] == expected_semantics
+    )
+    policy = EntityGraphPolicy.load(
+        migrated, device="cpu", enforce_runtime_semantics=True
+    )
+    replay = migration_receipt._verify_v7_input_routing_delta(  # noqa: SLF001
+        source_raw,
+        migrated_raw,
+        initialization_seed=73,
+    )
+    assert replay["shared_parameters_bit_identical"] is True
     assert policy.config.v6_compatibility_preserving_inputs is True
     assert policy._checkpoint_missing_state_keys == ()  # noqa: SLF001
     assert (
@@ -173,6 +219,21 @@ def test_v7_input_migration_constructs_complete_strict_checkpoint(
     )
     for name, tensor in source_raw["model"].items():
         assert torch.equal(tensor, migrated_raw["model"][name]), name
+
+    forged_raw = copy.deepcopy(migrated_raw)
+    forged_raw[ENTITY_GRAPH_FORWARD_SEMANTICS_KEY] = {
+        "schema_version": "entity-graph-forward-semantics-v3",
+        "semantic_sha256": "sha256:forged",
+    }
+    with pytest.raises(
+        migration_receipt.MigrationError,
+        match="authenticated current",
+    ):
+        migration_receipt._verify_v7_input_routing_delta(  # noqa: SLF001
+            source_raw,
+            forged_raw,
+            initialization_seed=73,
+        )
 
     truncated = tmp_path / "v7-truncated.pt"
     truncated_raw = copy.deepcopy(migrated_raw)
@@ -345,6 +406,11 @@ def test_preserve_source_top_level_keys_restores_mask_hidden_info(tmp_path):
     masked net as omniscient). _preserve_source_top_level_keys restores every
     source top-level key except the intentionally-mutated model+config."""
     import torch
+    from catan_zero.rl.checkpoint_runtime_semantics import (
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+        current_entity_graph_forward_semantics,
+    )
+    import catan_zero.rl.entity_token_policy as entity_token_policy
 
     in_ckpt = tmp_path / "in.pt"
     out_ckpt = tmp_path / "out.pt"
@@ -373,6 +439,11 @@ def test_preserve_source_top_level_keys_restores_mask_hidden_info(tmp_path):
             # the new random readout was optimized.
             "trained_value_readouts": ["categorical"],
             "value_training": {"primary_readout": "categorical"},
+            ENTITY_GRAPH_FORWARD_SEMANTICS_KEY: (
+                current_entity_graph_forward_semantics(
+                    Path(entity_token_policy.__file__)
+                )
+            ),
         },
         out_ckpt,
     )
@@ -391,6 +462,37 @@ def test_preserve_source_top_level_keys_restores_mask_hidden_info(tmp_path):
     assert "model" not in preserved and "config" not in preserved
     assert "trained_value_readouts" not in merged
     assert "value_training" not in merged
+    assert merged[ENTITY_GRAPH_FORWARD_SEMANTICS_KEY] == (
+        current_entity_graph_forward_semantics(Path(entity_token_policy.__file__))
+    )
+
+
+def test_preserve_source_top_level_keys_rejects_forged_runtime_stamp(tmp_path):
+    import torch
+
+    from catan_zero.rl.checkpoint_runtime_semantics import (
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+    )
+
+    in_ckpt = tmp_path / "in.pt"
+    out_ckpt = tmp_path / "out.pt"
+    torch.save({"config": {}, "model": {}}, in_ckpt)
+    torch.save(
+        {
+            "config": {},
+            "model": {},
+            ENTITY_GRAPH_FORWARD_SEMANTICS_KEY: {
+                "schema_version": "entity-graph-forward-semantics-v3",
+                "semantic_sha256": "sha256:forged",
+            },
+        },
+        out_ckpt,
+    )
+
+    with pytest.raises(RuntimeError, match="authenticated current"):
+        upgrade_tool._preserve_source_top_level_keys(  # noqa: SLF001
+            str(in_ckpt), str(out_ckpt)
+        )
 
 
 def test_upgrade_seed_is_deterministic_and_durably_attested(
