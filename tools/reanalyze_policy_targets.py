@@ -54,14 +54,26 @@ for _import_root in (_TOOLS_DIR, _SRC_DIR):
 from regret_common import discover_shards, load_shard  # noqa: E402
 from reconstruct_state import (  # noqa: E402
     GameActionSequence,
-    action_size_for_colors,
     featurize_state,
     reconstruct_state,
     round_trip_row,
 )
 
+from catan_zero.rl.action_mask import ActionCatalog  # noqa: E402
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
+    ACTION_MASK_VERSION,
     TARGET_INFORMATION_REGIME_PUBLIC,
+)
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
+    require_known_entity_feature_adapter,
+    resolve_checkpoint_entity_feature_adapter,
+)
+from catan_zero.rl.meaningful_history import (  # noqa: E402
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V1,
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
+    meaningful_public_history_limit,
 )
 from catan_zero.rl.target_reliability import (  # noqa: E402
     TARGET_RELIABILITY_COLUMNS,
@@ -76,11 +88,15 @@ from catan_zero.search.neural_rust_mcts import (  # noqa: E402
 )
 
 
-PLAN_SCHEMA = "a1-policy-target-reanalysis-plan-v2"
+PLAN_SCHEMA = "a1-policy-target-reanalysis-plan-v3"
 CLAIM_SCHEMA = "a1-policy-target-reanalysis-claim-v2"
 MERGE_SCHEMA = "a1-policy-target-reanalysis-merged-v2"
 PAYLOAD_INVENTORY_SCHEMA = "reanalysis-payload-inventory-v1"
+PRODUCER_INPUT_ABI_SCHEMA = "a1-trajectory-producer-input-abi-v1"
 COLORS = ("RED", "BLUE")
+KNOWN_COMPATIBLE_ACTION_MASK_VERSIONS = frozenset(
+    {str(ActionCatalog.version), str(ACTION_MASK_VERSION)}
+)
 REWRITTEN_COLUMNS = frozenset(
     {
         "teacher_name",
@@ -146,6 +162,19 @@ RECONSTRUCTION_COLUMNS = frozenset(
 
 class ReanalysisError(RuntimeError):
     """Fail-closed contract violation."""
+
+
+class _LegacyInputABIMetadataUnavailable(ReanalysisError):
+    """Checkpoint predates the explicit ABI or cannot be decoded."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        explicit_input_fields: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.explicit_input_fields = dict(explicit_input_fields or {})
 
 
 def _runtime_attestation() -> dict[str, Any]:
@@ -223,6 +252,341 @@ def _canonical_bytes(value: Any) -> bytes:
 
 def _value_sha256(value: Any) -> str:
     return "sha256:" + hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _seal_producer_input_abi(
+    raw: Mapping[str, Any],
+    *,
+    checkpoint_sha256: str,
+    binding_source: str,
+) -> dict[str, Any]:
+    """Validate and hash the exact feature contract used by source rows."""
+
+    action_size = raw.get("action_size")
+    if (
+        not isinstance(action_size, (int, np.integer))
+        or isinstance(action_size, (bool, np.bool_))
+        or int(action_size) < 1
+    ):
+        raise ReanalysisError("producer input ABI action_size must be a positive integer")
+    history_enabled = raw.get("meaningful_public_history")
+    if not isinstance(history_enabled, (bool, np.bool_)):
+        raise ReanalysisError(
+            "producer input ABI meaningful_public_history must be an explicit boolean"
+        )
+    history_limit = raw.get("event_history_limit")
+    if (
+        not isinstance(history_limit, (int, np.integer))
+        or isinstance(history_limit, (bool, np.bool_))
+        or int(history_limit) < 1
+    ):
+        raise ReanalysisError(
+            "producer input ABI event_history_limit must be a positive integer"
+        )
+    history_schema = str(raw.get("meaningful_public_history_schema", "") or "")
+    try:
+        schema_history_limit = meaningful_public_history_limit(history_schema)
+    except ValueError as error:
+        raise ReanalysisError(
+            "producer input ABI has an unsupported meaningful-public-history schema"
+        ) from error
+    if bool(history_enabled):
+        if int(history_limit) > int(schema_history_limit):
+            raise ReanalysisError(
+                "producer input ABI event_history_limit exceeds its enabled schema "
+                f"cap: limit={int(history_limit)}, cap={int(schema_history_limit)}"
+            )
+    action_mask_version = str(raw.get("action_mask_version", "") or "")
+    if not action_mask_version:
+        raise ReanalysisError(
+            "producer input ABI action_mask_version must be nonempty"
+        )
+    if action_mask_version not in KNOWN_COMPATIBLE_ACTION_MASK_VERSIONS:
+        raise ReanalysisError(
+            "producer input ABI has an unsupported action_mask_version "
+            f"{action_mask_version!r}; known compatible versions are "
+            f"{sorted(KNOWN_COMPATIBLE_ACTION_MASK_VERSIONS)!r}"
+        )
+    try:
+        adapter_version = require_known_entity_feature_adapter(
+            raw.get("entity_feature_adapter_version")
+        )
+    except ValueError as error:
+        raise ReanalysisError(
+            "producer input ABI has an unsupported entity feature adapter"
+        ) from error
+    if bool(history_enabled):
+        adapter_requires_v2 = adapter_version in {
+            RUST_ENTITY_ADAPTER_V5,
+            RUST_ENTITY_ADAPTER_V6,
+        }
+        expected_history_schema = (
+            MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+            if adapter_requires_v2
+            else MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V1
+        )
+        if history_schema != expected_history_schema:
+            raise ReanalysisError(
+                "producer input ABI meaningful-public-history schema/adapter "
+                "mismatch: "
+                f"adapter={adapter_version!r} requires "
+                f"schema={expected_history_schema!r} when history is enabled"
+            )
+    abi = {
+        "schema_version": PRODUCER_INPUT_ABI_SCHEMA,
+        "checkpoint_sha256": str(checkpoint_sha256),
+        "binding_source": str(binding_source),
+        "action_size": int(action_size),
+        "meaningful_public_history": bool(history_enabled),
+        "meaningful_public_history_schema": history_schema,
+        "event_history_limit": int(history_limit),
+        "entity_feature_adapter_version": adapter_version,
+        "action_mask_version": action_mask_version,
+    }
+    abi["input_abi_sha256"] = _value_sha256(abi)
+    return abi
+
+
+def _checkpoint_config_fields(config: Any) -> tuple[Mapping[str, Any], bool]:
+    if isinstance(config, Mapping) and isinstance(config.get("fields"), Mapping):
+        return config["fields"], True
+    if dataclasses.is_dataclass(config) and not isinstance(config, type):
+        return (
+            {
+                field.name: getattr(config, field.name)
+                for field in dataclasses.fields(config)
+                if hasattr(config, field.name)
+            },
+            False,
+        )
+    raise ReanalysisError(
+        "trajectory producer checkpoint lacks an authenticated name-keyed or "
+        "legacy dataclass config"
+    )
+
+
+def _producer_input_abi_from_checkpoint(
+    checkpoint: Path,
+    checkpoint_sha256: str,
+    *,
+    binding_source: str = "trajectory_producer_checkpoint",
+    checkpoint_role: str = "trajectory producer",
+) -> dict[str, Any]:
+    try:
+        import torch
+        from catan_zero.rl.entity_token_policy import EntityGraphConfig
+
+        try:
+            from numpy._core.multiarray import scalar as numpy_scalar
+        except ImportError:  # NumPy 1.x compatibility.
+            from numpy.core.multiarray import scalar as numpy_scalar
+
+        safe_globals = [
+            numpy_scalar,
+            np.dtype,
+            type(np.dtype(np.int64)),
+            EntityGraphConfig,
+        ]
+        with torch.serialization.safe_globals(safe_globals):
+            payload = torch.load(
+                checkpoint,
+                map_location="cpu",
+                weights_only=True,
+            )
+    except Exception as error:
+        raise _LegacyInputABIMetadataUnavailable(
+            f"cannot safely read {checkpoint_role} checkpoint input ABI"
+        ) from error
+    if not isinstance(payload, Mapping) or payload.get("policy_type") != "entity_graph":
+        raise ReanalysisError(
+            f"{checkpoint_role} checkpoint is not an authenticated entity_graph policy"
+        )
+    fields, modern_name_keyed_config = _checkpoint_config_fields(
+        payload.get("config")
+    )
+    required = {
+        "action_size",
+        "action_mask_version",
+        "meaningful_public_history",
+        "meaningful_public_history_schema",
+        "event_history_limit",
+    }
+    explicit_input_fields = {
+        key: fields[key] for key in required if key in fields
+    }
+    config_action_mask_version = (
+        str(fields["action_mask_version"] or "")
+        if "action_mask_version" in fields
+        else None
+    )
+    if "action_mask_version" in payload:
+        top_level_action_mask_version = str(payload["action_mask_version"] or "")
+        if config_action_mask_version is not None and (
+            not top_level_action_mask_version
+            or top_level_action_mask_version != config_action_mask_version
+        ):
+            raise ReanalysisError(
+                f"{checkpoint_role} checkpoint action_mask_version conflicts "
+                "between top-level metadata and config"
+            )
+        explicit_input_fields["action_mask_version"] = (
+            top_level_action_mask_version
+        )
+    adapter_version: str | None = None
+    if "entity_feature_adapter" in payload:
+        try:
+            adapter_version, _source = resolve_checkpoint_entity_feature_adapter(
+                payload["entity_feature_adapter"], metadata_present=True
+            )
+        except ValueError as error:
+            raise ReanalysisError(
+                f"{checkpoint_role} checkpoint has invalid entity feature adapter "
+                "metadata"
+            ) from error
+        explicit_input_fields["entity_feature_adapter_version"] = adapter_version
+    missing = required - set(fields)
+    if missing:
+        error_type = (
+            ReanalysisError
+            if modern_name_keyed_config
+            else _LegacyInputABIMetadataUnavailable
+        )
+        message = (
+            f"{checkpoint_role} checkpoint config lacks explicit input ABI fields: "
+            + ", ".join(sorted(missing))
+        )
+        if error_type is _LegacyInputABIMetadataUnavailable:
+            raise error_type(
+                message, explicit_input_fields=explicit_input_fields
+            )
+        raise error_type(message)
+    if adapter_version is None:
+        error_type = (
+            ReanalysisError
+            if modern_name_keyed_config
+            else _LegacyInputABIMetadataUnavailable
+        )
+        message = (
+            f"{checkpoint_role} checkpoint lacks explicit entity feature adapter "
+            "metadata"
+        )
+        if error_type is _LegacyInputABIMetadataUnavailable:
+            raise error_type(
+                message, explicit_input_fields=explicit_input_fields
+            )
+        raise error_type(message)
+    return _seal_producer_input_abi(
+        {
+            **{key: fields[key] for key in required},
+            "entity_feature_adapter_version": adapter_version,
+        },
+        checkpoint_sha256=checkpoint_sha256,
+        binding_source=binding_source,
+    )
+
+
+def _producer_input_abi_from_manifest(
+    manifest: Mapping[str, Any],
+    checkpoint_sha256: str,
+    *,
+    explicit_checkpoint_fields: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Admit legacy checkpoints only through an explicit, self-hashed contract."""
+
+    raw = manifest.get("producer_input_abi")
+    if not isinstance(raw, Mapping):
+        raise ReanalysisError(
+            "legacy trajectory producer checkpoint has no explicit producer_input_abi "
+            "contract in its authenticated source manifest"
+        )
+    if raw.get("schema_version") != PRODUCER_INPUT_ABI_SCHEMA:
+        raise ReanalysisError("unsupported manifest producer_input_abi schema")
+    if raw.get("checkpoint_sha256") != checkpoint_sha256:
+        raise ReanalysisError(
+            "manifest producer_input_abi is not bound to the trajectory producer "
+            "checkpoint"
+        )
+    expected_hash = _value_sha256(
+        {key: value for key, value in raw.items() if key != "input_abi_sha256"}
+    )
+    if raw.get("input_abi_sha256") != expected_hash:
+        raise ReanalysisError("manifest producer_input_abi semantic hash mismatch")
+    sealed = _seal_producer_input_abi(
+        raw,
+        checkpoint_sha256=checkpoint_sha256,
+        binding_source="source_manifest_explicit_legacy_contract",
+    )
+    # The manifest may not choose a different provenance label after hashing.
+    if raw.get("binding_source") != sealed["binding_source"]:
+        raise ReanalysisError("manifest producer_input_abi binding source mismatch")
+    if raw.get("input_abi_sha256") != sealed["input_abi_sha256"]:
+        raise ReanalysisError("manifest producer_input_abi is not canonical")
+    explicit_fields = dict(explicit_checkpoint_fields or {})
+    if explicit_fields:
+        completed_from_checkpoint = _seal_producer_input_abi(
+            {**sealed, **explicit_fields},
+            checkpoint_sha256=checkpoint_sha256,
+            binding_source="source_manifest_explicit_legacy_contract",
+        )
+        if completed_from_checkpoint != sealed:
+            conflicts = sorted(
+                key
+                for key in explicit_fields
+                if completed_from_checkpoint.get(key) != sealed.get(key)
+            )
+            raise ReanalysisError(
+                "manifest producer_input_abi conflicts with explicit legacy "
+                "checkpoint fields: "
+                + ", ".join(conflicts)
+            )
+    return sealed
+
+
+def _resolve_producer_input_abi(
+    checkpoint: Path,
+    *,
+    checkpoint_sha256: str,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        return _producer_input_abi_from_checkpoint(checkpoint, checkpoint_sha256)
+    except _LegacyInputABIMetadataUnavailable as checkpoint_error:
+        try:
+            return _producer_input_abi_from_manifest(
+                manifest,
+                checkpoint_sha256,
+                explicit_checkpoint_fields=checkpoint_error.explicit_input_fields,
+            )
+        except ReanalysisError as manifest_error:
+            raise ReanalysisError(
+                "cannot authenticate trajectory producer input ABI from checkpoint "
+                f"or source manifest: checkpoint={checkpoint_error}; "
+                f"manifest={manifest_error}"
+            ) from manifest_error
+
+
+def _assert_policy_catalog_compatible(
+    producer_input_abi: Mapping[str, Any],
+    target_input_abi: Mapping[str, Any],
+) -> None:
+    producer_action_size = int(producer_input_abi["action_size"])
+    target_action_size = int(target_input_abi["action_size"])
+    producer_mask_version = str(producer_input_abi["action_mask_version"])
+    target_mask_version = str(target_input_abi["action_mask_version"])
+    if (
+        producer_action_size != target_action_size
+        or producer_mask_version != target_mask_version
+    ):
+        raise ReanalysisError(
+            "trajectory producer and target reanalyzer policy catalogs are "
+            "incompatible: "
+            f"producer action_size={producer_action_size}, "
+            f"target action_size={target_action_size}, "
+            f"producer action_mask_version={producer_mask_version!r}, "
+            f"target action_mask_version={target_mask_version!r}. "
+            "Refusing reanalysis until "
+            "an explicit authenticated policy-ID mapping exists."
+        )
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
@@ -457,6 +821,19 @@ def build_plan(
             "trajectory producer checkpoint does not match source manifest: "
             f"declared={manifest.get('producer_checkpoint_sha256')!r}, actual={producer_sha!r}"
         )
+    producer_input_abi = _resolve_producer_input_abi(
+        trajectory_producer_checkpoint,
+        checkpoint_sha256=producer_sha,
+        manifest=manifest,
+    )
+    target_sha = _sha256(target_checkpoint)
+    target_input_abi = _producer_input_abi_from_checkpoint(
+        target_checkpoint,
+        target_sha,
+        binding_source="target_reanalyzer_checkpoint",
+        checkpoint_role="target reanalyzer",
+    )
+    _assert_policy_catalog_compatible(producer_input_abi, target_input_abi)
     shard_paths = _manifest_shards(source_manifest, manifest)
     loaded = [(path, load_shard(path)) for path in shard_paths]
     sequences = _assert_complete_games(loaded)
@@ -544,10 +921,12 @@ def build_plan(
         "trajectory_producer": {
             "checkpoint_path": str(Path(trajectory_producer_checkpoint).resolve()),
             "checkpoint_sha256": producer_sha,
+            "input_abi": producer_input_abi,
         },
         "target_reanalyzer": {
             "checkpoint_path": str(Path(target_checkpoint).resolve()),
-            "checkpoint_sha256": _sha256(target_checkpoint),
+            "checkpoint_sha256": target_sha,
+            "input_abi": target_input_abi,
         },
         "target_information_regime": TARGET_INFORMATION_REGIME_PUBLIC,
         "claim_auth_key_sha256": key_sha,
@@ -592,6 +971,30 @@ def _verify_plan(plan: Mapping[str, Any]) -> None:
         raise ReanalysisError(
             "plan trajectory producer no longer matches source manifest"
         )
+    trajectory_producer = plan["trajectory_producer"]
+    expected_input_abi = _resolve_producer_input_abi(
+        Path(trajectory_producer["checkpoint_path"]),
+        checkpoint_sha256=str(trajectory_producer["checkpoint_sha256"]),
+        manifest=manifest_payload,
+    )
+    if trajectory_producer.get("input_abi") != expected_input_abi:
+        raise ReanalysisError(
+            "plan trajectory producer input ABI does not match authenticated "
+            "checkpoint/source-manifest metadata"
+        )
+    target_reanalyzer = plan["target_reanalyzer"]
+    expected_target_input_abi = _producer_input_abi_from_checkpoint(
+        Path(target_reanalyzer["checkpoint_path"]),
+        str(target_reanalyzer["checkpoint_sha256"]),
+        binding_source="target_reanalyzer_checkpoint",
+        checkpoint_role="target reanalyzer",
+    )
+    if target_reanalyzer.get("input_abi") != expected_target_input_abi:
+        raise ReanalysisError(
+            "plan target reanalyzer input ABI does not match authenticated "
+            "checkpoint metadata"
+        )
+    _assert_policy_catalog_compatible(expected_input_abi, expected_target_input_abi)
     if plan.get("target_information_regime") != TARGET_INFORMATION_REGIME_PUBLIC:
         raise ReanalysisError("plan target information regime is not public PIMC")
     config = plan.get("search_config")
@@ -651,7 +1054,11 @@ def _stored_features(
 
 
 def _verify_reconstruction(
-    *, shard: Mapping[str, np.ndarray], row: int, sequence: GameActionSequence
+    *,
+    shard: Mapping[str, np.ndarray],
+    row: int,
+    sequence: GameActionSequence,
+    producer_input_abi: Mapping[str, Any],
 ) -> tuple[Any, dict[str, Any]]:
     missing = RECONSTRUCTION_COLUMNS - set(shard)
     if missing:
@@ -660,13 +1067,24 @@ def _verify_reconstruction(
             + ", ".join(sorted(missing))
         )
     decision = int(_scalar(shard, "decision_index", row, -1))
+    action_size = int(producer_input_abi["action_size"])
+    history_enabled = bool(producer_input_abi["meaningful_public_history"])
+    history_schema = str(
+        producer_input_abi["meaningful_public_history_schema"]
+    )
+    history_limit = int(producer_input_abi["event_history_limit"])
+    adapter_version = str(producer_input_abi["entity_feature_adapter_version"])
     result = round_trip_row(
         sequence,
         decision,
         _stored_features(shard, row),
         np.asarray(shard["legal_action_ids"])[row],
         correct_rust_chance_spectra=True,
-        action_size=action_size_for_colors(COLORS),
+        action_size=action_size,
+        meaningful_public_history=history_enabled,
+        meaningful_public_history_schema=history_schema,
+        history_limit=history_limit,
+        entity_feature_adapter_version=adapter_version,
     )
     if not result.ok:
         raise ReanalysisError(
@@ -678,13 +1096,29 @@ def _verify_reconstruction(
         sequence.game_seed,
         sequence.actions,
         decision,
+        decision_indices=sequence.decision_indices,
         colors=COLORS,
         correct_rust_chance_spectra=True,
+        action_size=action_size,
     )
-    return game, featurize_state(game, colors=COLORS)
+    return game, featurize_state(
+        game,
+        colors=COLORS,
+        action_size=action_size,
+        meaningful_public_history=history_enabled,
+        meaningful_public_history_schema=history_schema,
+        history_limit=history_limit,
+        entity_feature_adapter_version=adapter_version,
+    )
 
 
-def _search_patch(search: Any, game: Any, feature: Mapping[str, Any]) -> dict[str, Any]:
+def _search_patch(
+    search: Any,
+    game: Any,
+    feature: Mapping[str, Any],
+    *,
+    target_input_abi: Mapping[str, Any],
+) -> dict[str, Any]:
     result = search.search(game, force_full=True)
     legal_rust = tuple(
         int(action) for action in game.playable_action_indices(list(COLORS), None)
@@ -695,7 +1129,7 @@ def _search_patch(search: Any, game: Any, feature: Mapping[str, Any]) -> dict[st
             game,
             legal_rust,
             colors=COLORS,
-            action_size=action_size_for_colors(COLORS),
+            action_size=int(target_input_abi["action_size"]),
         )
     )
     if mapped != tuple(int(value) for value in feature["legal_policy_ids"]):
@@ -809,7 +1243,12 @@ def run_chunk(
         if not _eligible_policy_row(shard, row):
             raise ReanalysisError("planned row is no longer policy-active/admissible")
         sequence = sequences[int(identity["game_seed"])]
-        game, feature = _verify_reconstruction(shard=shard, row=row, sequence=sequence)
+        game, feature = _verify_reconstruction(
+            shard=shard,
+            row=row,
+            sequence=sequence,
+            producer_input_abi=plan["trajectory_producer"]["input_abi"],
+        )
         row_seed = int(
             str(identity["identity_sha256"]).removeprefix("sha256:")[:16], 16
         )
@@ -818,7 +1257,12 @@ def run_chunk(
             if search_factory is not None
             else _search_from_plan(plan, evaluator=evaluator, row_seed=row_seed)
         )
-        patch = _search_patch(search, game, feature)
+        patch = _search_patch(
+            search,
+            game,
+            feature,
+            target_input_abi=plan["target_reanalyzer"]["input_abi"],
+        )
         patches.append(
             {
                 "identity_sha256": identity["identity_sha256"],

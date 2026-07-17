@@ -1,13 +1,65 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import numpy as np
 import pytest
+import torch
 
+from catan_zero.rl.entity_token_policy import EntityGraphConfig
 from tools import reanalyze_policy_targets as target
 from tools import train_bc
+
+
+class _MaliciousCheckpointPayload:
+    def __init__(self, marker: Path) -> None:
+        self.marker = marker
+
+    def __reduce__(self):
+        return os.system, (f"touch {self.marker}",)
+
+
+def _write_entity_checkpoint(
+    path: Path,
+    *,
+    action_size: int = 567,
+    action_mask_version: str = "colonist-multiagent-v1",
+    top_level_action_mask_version: str | None = None,
+    meaningful_public_history: bool = True,
+    history_schema: str = "meaningful_public_history_2p_no_trade_v2",
+    event_history_limit: int = 64,
+    adapter_version: str = (
+        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+    ),
+) -> None:
+    torch.save(
+        {
+            "policy_type": "entity_graph",
+            "action_mask_version": (
+                action_mask_version
+                if top_level_action_mask_version is None
+                else top_level_action_mask_version
+            ),
+            "config": {
+                "__config_dataclass__": "EntityGraphConfig",
+                "__config_schema__": 1,
+                "fields": {
+                    "action_size": action_size,
+                    "action_mask_version": action_mask_version,
+                    "meaningful_public_history": meaningful_public_history,
+                    "meaningful_public_history_schema": history_schema,
+                    "event_history_limit": event_history_limit,
+                },
+            },
+            "entity_feature_adapter": {
+                "schema_version": "entity-feature-adapter-v1",
+                "version": adapter_version,
+            },
+        },
+        path,
+    )
 
 
 def _write_source(
@@ -15,8 +67,8 @@ def _write_source(
 ):
     producer = tmp_path / "producer.pt"
     reanalyzer = tmp_path / "reanalyzer.pt"
-    producer.write_bytes(b"producer")
-    reanalyzer.write_bytes(b"reanalyzer")
+    _write_entity_checkpoint(producer)
+    _write_entity_checkpoint(reanalyzer)
     shard = tmp_path / "source.npz"
     arrays = {
         "obs": np.zeros((2, 1), dtype=np.float16),
@@ -111,7 +163,7 @@ def _plan(
     return plan, producer, reanalyzer, shard, arrays, auth_key, runtime
 
 
-def _patch(_search, _game, _feature):
+def _patch(_search, _game, _feature, **_kwargs):
     return {
         "target_policy": [0.25, 0.75],
         "target_policy_mask": [True, True],
@@ -131,6 +183,470 @@ def _bypass_reconstruction(**_kwargs):
     return object(), {"legal_policy_ids": (10, 12)}
 
 
+def _input_abi(*, action_size: int = 567, role: str = "target") -> dict:
+    return target._seal_producer_input_abi(
+        {
+            "action_size": action_size,
+            "action_mask_version": "colonist-multiagent-v1",
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                "meaningful_public_history_2p_no_trade_v2"
+            ),
+            "event_history_limit": 64,
+            "entity_feature_adapter_version": (
+                "rust_entity_adapter_v6_exact_actor_resources_"
+                "initial_road_two_hop"
+            ),
+        },
+        checkpoint_sha256="sha256:" + "a" * 64,
+        binding_source=f"{role}_checkpoint",
+    )
+
+
+def _current_manifest_input_abi(checkpoint_sha256: str) -> dict:
+    return target._seal_producer_input_abi(
+        {
+            "action_size": 567,
+            "action_mask_version": "colonist-multiagent-v1",
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                "meaningful_public_history_2p_no_trade_v2"
+            ),
+            "event_history_limit": 64,
+            "entity_feature_adapter_version": (
+                "rust_entity_adapter_v6_exact_actor_resources_"
+                "initial_road_two_hop"
+            ),
+        },
+        checkpoint_sha256=checkpoint_sha256,
+        binding_source="source_manifest_explicit_legacy_contract",
+    )
+
+
+def test_plan_seals_current_producer_input_abi(tmp_path: Path) -> None:
+    plan, *_rest = _plan(tmp_path)
+    abi = plan["trajectory_producer"]["input_abi"]
+    assert abi["schema_version"] == target.PRODUCER_INPUT_ABI_SCHEMA
+    assert abi["binding_source"] == "trajectory_producer_checkpoint"
+    assert abi["action_size"] == 567
+    assert abi["action_mask_version"] == "colonist-multiagent-v1"
+    assert abi["meaningful_public_history"] is True
+    assert (
+        abi["meaningful_public_history_schema"]
+        == "meaningful_public_history_2p_no_trade_v2"
+    )
+    assert abi["event_history_limit"] == 64
+    assert abi["entity_feature_adapter_version"].startswith(
+        "rust_entity_adapter_v6_"
+    )
+    assert abi["input_abi_sha256"] == target._value_sha256(
+        {key: value for key, value in abi.items() if key != "input_abi_sha256"}
+    )
+    target_abi = plan["target_reanalyzer"]["input_abi"]
+    assert target_abi["binding_source"] == "target_reanalyzer_checkpoint"
+    assert target_abi["action_size"] == 567
+    assert target_abi["action_mask_version"] == "colonist-multiagent-v1"
+
+
+def test_plan_rejects_mismatched_producer_and_target_policy_catalogs(
+    tmp_path: Path,
+) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    _write_entity_checkpoint(reanalyzer, action_size=332)
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    with pytest.raises(target.ReanalysisError, match="policy catalogs are incompatible"):
+        target.build_plan(
+            source_manifest=manifest,
+            trajectory_producer_checkpoint=producer,
+            target_checkpoint=reanalyzer,
+            chunks=1,
+            search_config=target.default_search_config(),
+            claim_auth_key=auth_key,
+            runtime_attestation=runtime,
+        )
+
+
+def test_plan_rejects_mismatched_action_mask_versions(tmp_path: Path) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    _write_entity_checkpoint(
+        reanalyzer, action_mask_version="catanatron-flat-v1"
+    )
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    with pytest.raises(target.ReanalysisError, match="policy catalogs are incompatible"):
+        target.build_plan(
+            source_manifest=manifest,
+            trajectory_producer_checkpoint=producer,
+            target_checkpoint=reanalyzer,
+            chunks=1,
+            search_config=target.default_search_config(),
+            claim_auth_key=auth_key,
+            runtime_attestation=runtime,
+        )
+
+
+def test_plan_rejects_same_unknown_action_mask_version(tmp_path: Path) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    unknown_version = "matching-but-unknown-policy-catalog-v99"
+    _write_entity_checkpoint(producer, action_mask_version=unknown_version)
+    _write_entity_checkpoint(reanalyzer, action_mask_version=unknown_version)
+    payload = json.loads(manifest.read_text())
+    payload["producer_checkpoint_sha256"] = target._sha256(producer)
+    manifest.write_text(json.dumps(payload))
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    with pytest.raises(target.ReanalysisError, match="unsupported action_mask_version"):
+        target.build_plan(
+            source_manifest=manifest,
+            trajectory_producer_checkpoint=producer,
+            target_checkpoint=reanalyzer,
+            chunks=1,
+            search_config=target.default_search_config(),
+            claim_auth_key=auth_key,
+            runtime_attestation=runtime,
+        )
+
+
+def test_enabled_history_limit_above_schema_cap_is_rejected(tmp_path: Path) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    _write_entity_checkpoint(producer, event_history_limit=999)
+    payload = json.loads(manifest.read_text())
+    payload["producer_checkpoint_sha256"] = target._sha256(producer)
+    manifest.write_text(json.dumps(payload))
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    with pytest.raises(target.ReanalysisError, match="exceeds its enabled schema cap"):
+        target.build_plan(
+            source_manifest=manifest,
+            trajectory_producer_checkpoint=producer,
+            target_checkpoint=reanalyzer,
+            chunks=1,
+            search_config=target.default_search_config(),
+            claim_auth_key=auth_key,
+            runtime_attestation=runtime,
+        )
+
+
+@pytest.mark.parametrize(
+    ("history_schema", "adapter_version"),
+    [
+        (
+            "meaningful_public_history_2p_no_trade_v2",
+            "rust_entity_adapter_v4_actor_public_rule_state",
+        ),
+        (
+            "meaningful_public_history_2p_no_trade_v1",
+            (
+                "rust_entity_adapter_v6_exact_actor_resources_"
+                "initial_road_two_hop"
+            ),
+        ),
+    ],
+)
+def test_enabled_history_schema_must_match_adapter_generation(
+    history_schema: str, adapter_version: str
+) -> None:
+    with pytest.raises(target.ReanalysisError, match="schema/adapter mismatch"):
+        target._seal_producer_input_abi(
+            {
+                "action_size": 567,
+                "action_mask_version": "colonist-multiagent-v1",
+                "meaningful_public_history": True,
+                "meaningful_public_history_schema": history_schema,
+                "event_history_limit": (
+                    64 if history_schema.endswith("_v2") else 32
+                ),
+                "entity_feature_adapter_version": adapter_version,
+            },
+            checkpoint_sha256="sha256:" + "a" * 64,
+            binding_source="trajectory_producer_checkpoint",
+        )
+
+
+def test_modern_checkpoint_conflict_cannot_use_manifest_fallback(
+    tmp_path: Path,
+) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    _write_entity_checkpoint(
+        producer,
+        top_level_action_mask_version="conflicting-top-level-mask-v2",
+    )
+    producer_sha = target._sha256(producer)
+    payload = json.loads(manifest.read_text())
+    payload["producer_checkpoint_sha256"] = producer_sha
+    payload["producer_input_abi"] = _current_manifest_input_abi(producer_sha)
+    manifest.write_text(json.dumps(payload))
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    with pytest.raises(target.ReanalysisError, match="conflicts"):
+        target.build_plan(
+            source_manifest=manifest,
+            trajectory_producer_checkpoint=producer,
+            target_checkpoint=reanalyzer,
+            chunks=1,
+            search_config=target.default_search_config(),
+            claim_auth_key=auth_key,
+            runtime_attestation=runtime,
+        )
+
+
+def test_modern_invalid_adapter_cannot_use_manifest_fallback(tmp_path: Path) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    _write_entity_checkpoint(producer, adapter_version="invalid-adapter")
+    producer_sha = target._sha256(producer)
+    payload = json.loads(manifest.read_text())
+    payload["producer_checkpoint_sha256"] = producer_sha
+    payload["producer_input_abi"] = _current_manifest_input_abi(producer_sha)
+    manifest.write_text(json.dumps(payload))
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    with pytest.raises(target.ReanalysisError, match="invalid entity feature adapter"):
+        target.build_plan(
+            source_manifest=manifest,
+            trajectory_producer_checkpoint=producer,
+            target_checkpoint=reanalyzer,
+            chunks=1,
+            search_config=target.default_search_config(),
+            claim_auth_key=auth_key,
+            runtime_attestation=runtime,
+        )
+
+
+def test_unsupported_pickle_uses_manifest_without_executing_payload(
+    tmp_path: Path,
+) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    marker = tmp_path / "unsafe-load-executed"
+    torch.save({"payload": _MaliciousCheckpointPayload(marker)}, producer)
+    producer_sha = target._sha256(producer)
+    payload = json.loads(manifest.read_text())
+    payload["producer_checkpoint_sha256"] = producer_sha
+    manifest.write_text(json.dumps(payload))
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    with pytest.raises(target.ReanalysisError, match="cannot authenticate"):
+        target.build_plan(
+            source_manifest=manifest,
+            trajectory_producer_checkpoint=producer,
+            target_checkpoint=reanalyzer,
+            chunks=1,
+            search_config=target.default_search_config(),
+            claim_auth_key=auth_key,
+            runtime_attestation=runtime,
+        )
+    assert not marker.exists()
+    payload["producer_input_abi"] = _current_manifest_input_abi(producer_sha)
+    manifest.write_text(json.dumps(payload))
+    plan = target.build_plan(
+        source_manifest=manifest,
+        trajectory_producer_checkpoint=producer,
+        target_checkpoint=reanalyzer,
+        chunks=1,
+        search_config=target.default_search_config(),
+        claim_auth_key=auth_key,
+        runtime_attestation=runtime,
+    )
+    assert not marker.exists()
+    assert (
+        plan["trajectory_producer"]["input_abi"]["binding_source"]
+        == "source_manifest_explicit_legacy_contract"
+    )
+
+
+def test_reconstruction_uses_sealed_producer_input_abi(monkeypatch) -> None:
+    shard = {
+        key: np.zeros((1,), dtype=np.float32)
+        for key in target.RECONSTRUCTION_COLUMNS
+    }
+    shard["decision_index"] = np.asarray([0], dtype=np.int32)
+    shard["legal_action_ids"] = np.asarray([[10, -1]], dtype=np.int16)
+    sequence = target.GameActionSequence(
+        7, target.COLORS, [10], [0], ["A"], ["RED"]
+    )
+    abi = target._seal_producer_input_abi(
+        {
+            "action_size": 567,
+            "action_mask_version": "colonist-multiagent-v1",
+            "meaningful_public_history": True,
+            "meaningful_public_history_schema": (
+                "meaningful_public_history_2p_no_trade_v2"
+            ),
+            "event_history_limit": 64,
+            "entity_feature_adapter_version": (
+                "rust_entity_adapter_v6_exact_actor_resources_"
+                "initial_road_two_hop"
+            ),
+        },
+        checkpoint_sha256="sha256:" + "a" * 64,
+        binding_source="trajectory_producer_checkpoint",
+    )
+    captured: dict[str, dict] = {}
+
+    def fake_round_trip(*_args, **kwargs):
+        captured["round_trip"] = kwargs
+        return SimpleNamespace(
+            ok=True,
+            legal_ids_match=True,
+            worst_key="",
+            max_abs_diff=0.0,
+        )
+
+    def fake_reconstruct(*_args, **kwargs):
+        captured["reconstruct"] = kwargs
+        return object()
+
+    def fake_featurize(_game, **kwargs):
+        captured["featurize"] = kwargs
+        return {"legal_policy_ids": (10,)}
+
+    monkeypatch.setattr(target, "round_trip_row", fake_round_trip)
+    monkeypatch.setattr(target, "reconstruct_state", fake_reconstruct)
+    monkeypatch.setattr(target, "featurize_state", fake_featurize)
+    _game, feature = target._verify_reconstruction(
+        shard=shard,
+        row=0,
+        sequence=sequence,
+        producer_input_abi=abi,
+    )
+    assert feature == {"legal_policy_ids": (10,)}
+    for call in ("round_trip", "featurize"):
+        assert captured[call]["action_size"] == 567
+        assert captured[call]["meaningful_public_history"] is True
+        assert (
+            captured[call]["meaningful_public_history_schema"]
+            == "meaningful_public_history_2p_no_trade_v2"
+        )
+        assert captured[call]["history_limit"] == 64
+        assert captured[call]["entity_feature_adapter_version"].startswith(
+            "rust_entity_adapter_v6_"
+        )
+    assert captured["reconstruct"]["action_size"] == 567
+    assert captured["reconstruct"]["decision_indices"] == [0]
+
+
+def test_legacy_checkpoint_without_explicit_manifest_abi_fails_closed(
+    tmp_path: Path,
+) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    producer.write_bytes(b"legacy-checkpoint-without-input-contract")
+    payload = json.loads(manifest.read_text())
+    payload["producer_checkpoint_sha256"] = target._sha256(producer)
+    manifest.write_text(json.dumps(payload))
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    with pytest.raises(target.ReanalysisError, match="cannot authenticate"):
+        target.build_plan(
+            source_manifest=manifest,
+            trajectory_producer_checkpoint=producer,
+            target_checkpoint=reanalyzer,
+            chunks=1,
+            search_config=target.default_search_config(),
+            claim_auth_key=auth_key,
+            runtime_attestation=runtime,
+        )
+
+
+def test_legacy_manifest_cannot_override_explicit_checkpoint_action_size(
+    tmp_path: Path,
+) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    torch.save(
+        {
+            "policy_type": "entity_graph",
+            "action_mask_version": "colonist-multiagent-v1",
+            "config": EntityGraphConfig(
+                action_size=567,
+                static_action_feature_size=45,
+                action_mask_version="colonist-multiagent-v1",
+                meaningful_public_history=False,
+                meaningful_public_history_schema=(
+                    "meaningful_public_history_2p_no_trade_v1"
+                ),
+                event_history_limit=64,
+            ),
+        },
+        producer,
+    )
+    _write_entity_checkpoint(reanalyzer, action_size=332)
+    producer_sha = target._sha256(producer)
+    payload = json.loads(manifest.read_text())
+    payload["producer_checkpoint_sha256"] = producer_sha
+    payload["producer_input_abi"] = target._seal_producer_input_abi(
+        {
+            "action_size": 332,
+            "action_mask_version": "colonist-multiagent-v1",
+            "meaningful_public_history": False,
+            "meaningful_public_history_schema": (
+                "meaningful_public_history_2p_no_trade_v1"
+            ),
+            "event_history_limit": 64,
+            "entity_feature_adapter_version": (
+                "rust_entity_adapter_v2_land_topology_ports_maritime"
+            ),
+        },
+        checkpoint_sha256=producer_sha,
+        binding_source="source_manifest_explicit_legacy_contract",
+    )
+    manifest.write_text(json.dumps(payload))
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    with pytest.raises(target.ReanalysisError, match="conflicts.*action_size"):
+        target.build_plan(
+            source_manifest=manifest,
+            trajectory_producer_checkpoint=producer,
+            target_checkpoint=reanalyzer,
+            chunks=1,
+            search_config=target.default_search_config(),
+            claim_auth_key=auth_key,
+            runtime_attestation=runtime,
+        )
+
+
+def test_legacy_checkpoint_requires_checkpoint_bound_hashed_manifest_abi(
+    tmp_path: Path,
+) -> None:
+    producer, reanalyzer, _shard, manifest, _arrays, auth_key = _write_source(tmp_path)
+    producer.write_bytes(b"legacy-checkpoint")
+    _write_entity_checkpoint(reanalyzer, action_size=332)
+    producer_sha = target._sha256(producer)
+    payload = json.loads(manifest.read_text())
+    payload["producer_checkpoint_sha256"] = producer_sha
+    payload["producer_input_abi"] = target._seal_producer_input_abi(
+        {
+            "action_size": 332,
+            "action_mask_version": "colonist-multiagent-v1",
+            "meaningful_public_history": False,
+            "meaningful_public_history_schema": (
+                "meaningful_public_history_2p_no_trade_v1"
+            ),
+            "event_history_limit": 64,
+            "entity_feature_adapter_version": (
+                "rust_entity_adapter_v2_land_topology_ports_maritime"
+            ),
+        },
+        checkpoint_sha256=producer_sha,
+        binding_source="source_manifest_explicit_legacy_contract",
+    )
+    manifest.write_text(json.dumps(payload))
+    runtime = {"repo_commit": "test", "source_files": [], "catanatron_rs": {}}
+    runtime["runtime_sha256"] = target._value_sha256(runtime)
+    plan = target.build_plan(
+        source_manifest=manifest,
+        trajectory_producer_checkpoint=producer,
+        target_checkpoint=reanalyzer,
+        chunks=1,
+        search_config=target.default_search_config(),
+        claim_auth_key=auth_key,
+        runtime_attestation=runtime,
+    )
+    assert plan["trajectory_producer"]["input_abi"]["action_size"] == 332
+    assert (
+        plan["trajectory_producer"]["input_abi"]["binding_source"]
+        == "source_manifest_explicit_legacy_contract"
+    )
+
+
 def test_search_patch_preserves_zero_mass_coverage_and_pairs_root_prior(
     monkeypatch,
 ) -> None:
@@ -146,16 +662,20 @@ def test_search_patch_preserves_zero_mass_coverage_and_pairs_root_prior(
         root_prior_value=0.2,
         simulations_used=16,
     )
-    monkeypatch.setattr(
-        target,
-        "rust_policy_action_ids",
-        lambda *_args, **_kwargs: (10, 12),
-    )
+    captured = {}
+
+    def mapped(*_args, **kwargs):
+        captured.update(kwargs)
+        return (10, 12)
+
+    monkeypatch.setattr(target, "rust_policy_action_ids", mapped)
     patch = target._search_patch(  # noqa: SLF001
         SimpleNamespace(search=lambda _game, force_full: result),
         game,
         {"legal_policy_ids": (10, 12)},
+        target_input_abi=_input_abi(action_size=567),
     )
+    assert captured["action_size"] == 567
     assert patch["target_policy_mask"] == [True, True]
     assert patch["root_value"] == pytest.approx(0.3)
     assert patch["root_prior_value"] == pytest.approx(0.2)
@@ -185,11 +705,12 @@ def test_search_patch_rejects_invalid_root_prior(
             SimpleNamespace(search=lambda _game, force_full: result),
             game,
             {"legal_policy_ids": (10,)},
+            target_input_abi=_input_abi(action_size=567),
         )
 
 
 def test_reconstruction_mismatch_stops_before_search(tmp_path: Path) -> None:
-    _plan_value, _producer, _reanalyzer, shard_path, _arrays, _key, _runtime = _plan(
+    plan_value, _producer, _reanalyzer, shard_path, _arrays, _key, _runtime = _plan(
         tmp_path
     )
     shard = target.load_shard(shard_path)
@@ -199,7 +720,12 @@ def test_reconstruction_mismatch_stops_before_search(tmp_path: Path) -> None:
     with pytest.raises(
         target.ReanalysisError, match="complete public reconstruction surface"
     ):
-        target._verify_reconstruction(shard=shard, row=0, sequence=sequence)
+        target._verify_reconstruction(
+            shard=shard,
+            row=0,
+            sequence=sequence,
+            producer_input_abi=plan_value["trajectory_producer"]["input_abi"],
+        )
 
 
 def test_hidden_information_targets_are_not_admitted(tmp_path: Path) -> None:

@@ -45,7 +45,13 @@ from typing import Any
 import numpy as np
 
 from catan_zero.rl.action_mask import ActionCatalog
+from catan_zero.rl.entity_feature_adapter import (
+    CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+)
 from catan_zero.rl.gumbel_self_play import _action_type_of, _apply_selected_action
+from catan_zero.rl.meaningful_history import (
+    MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION,
+)
 from catan_zero.search.neural_rust_mcts import (
     rust_action_context_batch,
     rust_game_to_entity_batch,
@@ -486,6 +492,10 @@ def featurize_state(
     action_size: int | None = None,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
+    meaningful_public_history_schema: str = (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    ),
+    entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
 ) -> dict[str, Any]:
     """Entity tokens + legal policy ids + context for the live game's current state.
 
@@ -518,6 +528,8 @@ def featurize_state(
         public_observation=True,
         meaningful_public_history=meaningful_public_history,
         history_limit=history_limit,
+        meaningful_public_history_schema=meaningful_public_history_schema,
+        entity_feature_adapter_version=entity_feature_adapter_version,
     )
     features = {key: value[0] for key, value in entity.items()}
     context = rust_action_context_batch(
@@ -530,6 +542,7 @@ def featurize_state(
         snapshot=snapshot,
         action_by_id=action_by_id,
         public_observation=True,
+        entity_feature_adapter_version=entity_feature_adapter_version,
     )[0]
     return {
         "features": features,
@@ -592,6 +605,10 @@ def round_trip_row(
     action_size: int | None = None,
     meaningful_public_history: bool = False,
     history_limit: int = 64,
+    meaningful_public_history_schema: str = (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    ),
+    entity_feature_adapter_version: str = CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     reconstructed_game: Any | None = None,
 ) -> RoundTripResult:
     """Reconstruct the state at `row_decision_index` and compare to stored data."""
@@ -611,6 +628,8 @@ def round_trip_row(
         action_size=action_size,
         meaningful_public_history=meaningful_public_history,
         history_limit=history_limit,
+        meaningful_public_history_schema=meaningful_public_history_schema,
+        entity_feature_adapter_version=entity_feature_adapter_version,
     )
 
     try:
