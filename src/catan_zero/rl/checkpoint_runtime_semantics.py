@@ -200,6 +200,8 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # Same guarded graph-safe path after the V8 public-resource residual
         # repair landed in the inherited player input branch.
         "sha256:76802390eb12cc613e1db28d4182e1bc70d4435ce2d333da04e2ba3faa404c8f",
+        # H100 Linux tokenizer identity for the same guarded V8 source.
+        "sha256:fb7c92a2a5fbc376ea98c1d7a9874e78da59521d9764358856ad827dd532a1f4",
     }
 }
 
