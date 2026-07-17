@@ -11446,16 +11446,27 @@ def _validate_production_composite_parent_update_authority(
     canonical_unhashed = dict(canonical)
     canonical_digest = canonical_unhashed.pop("authority_sha256", None)
     try:
+        from tools import train as canonical_train
+
         selected_config = current_science.require_selected_parent_update(
             Path(str(canonical.get("config", "")))
         )
+        selected_train_config, selected_engine_settings = canonical_train._load_recipe(  # noqa: SLF001
+            selected_config
+        )
         current_commissioning = current_science.selected_parent_update_commissioning()
-    except current_science.ScienceContractError as error:
+    except (current_science.ScienceContractError, SystemExit) as error:
         raise SystemExit(f"canonical parent-update science refused: {error}") from error
+    canonical_recipe = canonical.get("recipe")
     if (
         canonical_digest != _canonical_json_sha256(canonical_unhashed)
         or str(selected_config) != canonical.get("config")
         or _sha256_existing_file(selected_config) != canonical.get("config_sha256")
+        or not isinstance(canonical_recipe, dict)
+        or canonical.get("recipe_sha256")
+        != _canonical_json_sha256(canonical_recipe)
+        or canonical.get("engine_settings_sha256")
+        != _canonical_json_sha256(selected_engine_settings)
         or canonical.get("parent_checkpoint_sha256") != parent.get("sha256")
         or canonical.get("composite_descriptor_sha256")
         != composite_meta.get("descriptor_file_sha256")
@@ -11491,6 +11502,28 @@ def _validate_production_composite_parent_update_authority(
 
     runtime_recipe = authority["runtime_recipe"]
     topology = authority["training_topology"]
+    try:
+        canonical_namespace = canonical_train._engine_namespace(  # noqa: SLF001
+            config=selected_train_config,
+            engine_settings=selected_engine_settings,
+            public_args=argparse.Namespace(
+                data=str(args.data),
+                checkpoint=str(args.checkpoint),
+                report=str(args.report),
+                init_checkpoint=str(args.init_checkpoint),
+                device=str(args.device),
+                host_lock_file=str(args.host_lock_file),
+                allow_concurrent_bc=bool(args.allow_concurrent_bc),
+            ),
+        )
+        commissioned_runtime_recipe = _effective_a1_learner_training_recipe(
+            canonical_namespace,
+            ddp,
+        )
+    except SystemExit as error:
+        raise SystemExit(
+            f"canonical parent-update runtime projection refused: {error}"
+        ) from error
     if (
         not isinstance(runtime_recipe, dict)
         or authority["runtime_recipe_sha256"]
@@ -11502,6 +11535,7 @@ def _validate_production_composite_parent_update_authority(
         or int(topology.get("local_batch_size", 0)) != int(args.batch_size)
         or int(topology.get("global_batch_size", 0))
         != int(args.batch_size) * int(ddp["world_size"])
+        or runtime_recipe != commissioned_runtime_recipe
         or runtime_recipe != _effective_a1_learner_training_recipe(args, ddp)
     ):
         raise SystemExit("canonical parent-update effective recipe/topology drift")

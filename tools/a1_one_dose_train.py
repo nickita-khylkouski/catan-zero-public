@@ -86,6 +86,7 @@ PRODUCTION_TRAINER_CODE_SURFACE = tuple(
         train_bc.A1_REQUIRED_LEARNER_CODE_SUFFIXES
         | {
             "tools/a1_one_dose_train.py",
+            "tools/train.py",
             "tools/a1_current_science_contract.py",
             "tools/a1_build_post_wave_composite.py",
             "tools/audit_entity_graph_information_surface.py",

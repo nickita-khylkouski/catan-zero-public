@@ -92,6 +92,7 @@ _CANONICAL_RUNTIME_DEFAULTS: dict[str, Any] = {
     "acknowledge_diagnostic_outcome_conditioned_policy_distillation": False,
     "a1_learner_ablation_id": "",
     "a1_scratch_authority_json": "",
+    "a1_canonical_parent_update_authority_json": "",
     "a1_scratch_diagnostic_authority_json": "",
     "a1_effective_learner_recipe_json": "",
     "a1_effective_learner_recipe_sha256": "",
