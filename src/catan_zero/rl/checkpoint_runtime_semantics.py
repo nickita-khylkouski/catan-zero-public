@@ -197,6 +197,9 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # macOS and H100 Linux guarded-source identities.
         "sha256:1ec23d4529460fea85dabc978550abb3f23fe62a07207ac0bd34ed045c915656",
         "sha256:f09180dc0a372d8b2170e50e9e722d128036e6cc2276542945a426635a9020c3",
+        # Same guarded graph-safe path after the V8 public-resource residual
+        # repair landed in the inherited player input branch.
+        "sha256:76802390eb12cc613e1db28d4182e1bc70d4435ce2d333da04e2ba3faa404c8f",
     }
 }
 
