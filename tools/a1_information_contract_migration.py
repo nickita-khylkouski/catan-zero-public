@@ -368,12 +368,16 @@ def _verify_topology_delta(
 def _verify_v7_input_routing_delta(
     before: Mapping[str, Any],
     after: Mapping[str, Any],
+    *,
+    initialization_seed: int,
 ) -> dict[str, Any]:
-    """Prove the V7 edge adds only its two exact-zero input residuals.
+    """Replay the complete budgeted V7 construction from the V5 bytes.
 
     The inherited tensors and all non-migration checkpoint metadata must remain
-    byte-identical.  The sole config change activates the model-side legacy
-    reconstruction; the entity adapter advances from V5 to V6.
+    byte-identical. V7 adds the topology residual, the low-rank action decoder,
+    and two compatibility-preserving input residuals in one deterministic
+    construction; checking only the two zero residuals would leave more than a
+    million unauthenticated parameters outside the receipt.
     """
 
     import dataclasses
@@ -383,13 +387,23 @@ def _verify_v7_input_routing_delta(
     after_model = after.get("model")
     if not isinstance(before_model, Mapping) or not isinstance(after_model, Mapping):
         raise MigrationError("V7 migration checkpoint model state is malformed")
-    expected_parameters = {
+    added = set(after_model) - set(before_model)
+    removed = set(before_model) - set(after_model)
+    required_parameters = {
         "v6_exact_resource_residual.weight",
         "v6_initial_road_residual.weight",
     }
-    added = set(after_model) - set(before_model)
-    removed = set(before_model) - set(after_model)
-    if added != expected_parameters or removed:
+    allowed_prefixes = (
+        "topology_residual_adapter.",
+        "action_cross_blocks.0.",
+        "v6_exact_resource_residual.",
+        "v6_initial_road_residual.",
+    )
+    if (
+        removed
+        or not required_parameters <= added
+        or any(not name.startswith(allowed_prefixes) for name in added)
+    ):
         raise MigrationError(
             "V7 input migration parameter delta drift: "
             f"added={sorted(added)} removed={sorted(removed)}"
@@ -405,15 +419,6 @@ def _verify_v7_input_routing_delta(
         raise MigrationError(
             f"V7 input migration changed inherited parameters: {changed[:8]}"
         )
-    for parameter in sorted(expected_parameters):
-        residual = after_model[parameter]
-        if not torch.is_tensor(residual) or not torch.equal(
-            residual, torch.zeros_like(residual)
-        ):
-            raise MigrationError(
-                f"V7 input residual is not initialized to zero: {parameter}"
-            )
-
     from catan_zero.rl.entity_token_policy import EntityGraphConfig
 
     before_config = function_upgrade._config(before.get("config"))  # noqa: SLF001
@@ -427,10 +432,54 @@ def _verify_v7_input_routing_delta(
         raise MigrationError("V7 migration source already uses compatibility routing")
     expected_config = {
         **effective_before,
+        "topology_residual_adapter": True,
         "v6_compatibility_preserving_inputs": True,
+        "action_cross_attention_layers": 1,
+        "action_cross_attention_bottleneck": 80,
     }
     if effective_after != expected_config:
         raise MigrationError("V7 migration changed config outside input routing")
+
+    # Rebuild the complete target module from the source tensors and the
+    # provenance-bound initialization seed. This simultaneously proves that
+    # the set of additions is complete and that every random/zero/identity
+    # initialization matches the actual reviewed constructor.
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    static = before.get("static_action_features")
+    if static is None:
+        raise MigrationError("V7 migration source lacks static action features")
+    if hasattr(static, "detach"):
+        static = static.detach().cpu().numpy()
+    replay = EntityGraphPolicy(
+        EntityGraphConfig(**expected_config),
+        static,
+        seed=int(initialization_seed),
+        device="cpu",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+    missing, unexpected = replay.model.load_state_dict(before_model, strict=False)
+    if unexpected or set(missing) != added:
+        raise MigrationError(
+            "V7 deterministic constructor parameter delta drift: "
+            f"missing={sorted(missing)} added={sorted(added)} "
+            f"unexpected={sorted(unexpected)}"
+        )
+    replay_state = replay.model.state_dict()
+    initialization: dict[str, str] = {}
+    for parameter in sorted(added):
+        observed = after_model[parameter]
+        expected = replay_state[parameter]
+        if not function_upgrade._tensor_equal_exact(expected, observed):  # noqa: SLF001
+            raise MigrationError(
+                f"V7 deterministic initialization replay drift: {parameter}"
+            )
+        if torch.equal(expected, torch.zeros_like(expected)):
+            initialization[parameter] = "zeros"
+        elif torch.equal(expected, torch.ones_like(expected)):
+            initialization[parameter] = "ones"
+        else:
+            initialization[parameter] = "seeded_torch_default"
 
     ignored = {
         "model",
@@ -473,10 +522,8 @@ def _verify_v7_input_routing_delta(
     return {
         "shared_parameters_bit_identical": True,
         "shared_parameter_count": len(before_model),
-        "new_parameters": sorted(expected_parameters),
-        "new_parameter_initialization": {
-            parameter: "zeros" for parameter in sorted(expected_parameters)
-        },
+        "new_parameters": sorted(added),
+        "new_parameter_initialization": initialization,
         "source_input_routing": "v5_legacy_resource_and_initial_road_inputs",
         "target_input_routing": (
             "v6_raw_inputs_with_legacy_encoder_views_plus_zero_output_residuals"
@@ -555,6 +602,12 @@ def inspect_migration(
         or "upgrade_provenance" in after
     ):
         raise MigrationError("checkpoint migration provenance is malformed")
+    try:
+        initialization_seed = int(provenance["initialization_seed"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise MigrationError(
+            "checkpoint migration provenance lacks a valid initialization seed"
+        ) from error
     source_adapter, _ = resolve_checkpoint_entity_feature_adapter(
         before.get("entity_feature_adapter"),
         metadata_present="entity_feature_adapter" in before,
@@ -590,7 +643,11 @@ def inspect_migration(
     )
     _verify_anchor_replay(anchor, recomputed_anchor, migration=migration)
     topology = (
-        _verify_v7_input_routing_delta(before, after)
+        _verify_v7_input_routing_delta(
+            before,
+            after,
+            initialization_seed=initialization_seed,
+        )
         if v7_input_routing
         else _verify_topology_delta(
             Path(source_ref["path"]),

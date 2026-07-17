@@ -74,6 +74,12 @@ def test_missing_fields_take_current_defaults():
     assert rebuilt.dropout == 0.05
 
 
+def test_action_cross_bottleneck_is_appended_for_positional_pickle_safety():
+    assert tuple(EntityGraphConfig.__dataclass_fields__)[-1] == (
+        "action_cross_attention_bottleneck"
+    )
+
+
 def test_unknown_fields_warn_and_drop():
     payload = config_to_dict(_entity_config())
     payload[CONFIG_FIELDS_KEY]["field_from_the_future"] = 42

@@ -216,6 +216,7 @@ def _parse_flags(raw: str) -> dict[str, object]:
                     **_parse_flags("current_v5_topology_split1"),
                     "v6_compatibility_preserving_inputs": True,
                     "action_cross_attention_layers": 1,
+                    "action_cross_attention_bottleneck": 80,
                 }
             )
         elif entry in ("gather", "action_target_gather"):

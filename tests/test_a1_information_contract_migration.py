@@ -223,8 +223,9 @@ def test_v7_receipt_replay_uses_v5_to_v7_anchor_semantics(
             ),
             "forward_identical": True,
             "promotion_eligible": False,
-            "commissioning_status": "non_promotable_architecture_treatment",
-            "step0_anchor_evidence": evidence,
+                "commissioning_status": "non_promotable_architecture_treatment",
+                "initialization_seed": 73,
+                "step0_anchor_evidence": evidence,
         },
     }
     monkeypatch.setattr(
@@ -258,7 +259,7 @@ def test_v7_receipt_replay_uses_v5_to_v7_anchor_semantics(
     monkeypatch.setattr(
         migration,
         "_verify_v7_input_routing_delta",
-        lambda *_args: {"shared_parameters_bit_identical": True},
+        lambda *_args, **_kwargs: {"shared_parameters_bit_identical": True},
     )
 
     inspected = migration.inspect_migration(
@@ -304,25 +305,15 @@ def _v7_delta() -> tuple[dict, dict]:
     return before, after
 
 
-def test_v7_delta_replay_accepts_only_zero_residual_and_one_config_flag() -> None:
+def test_v7_delta_replay_rejects_the_old_residual_only_receipt_model() -> None:
     before, after = _v7_delta()
 
-    replay = migration._verify_v7_input_routing_delta(before, after)  # noqa: SLF001
-
-    assert replay["shared_parameters_bit_identical"] is True
-    assert replay["new_parameter_initialization"] == {
-        "v6_exact_resource_residual.weight": "zeros",
-        "v6_initial_road_residual.weight": "zeros",
-    }
-
-    nonzero = copy.deepcopy(after)
-    nonzero["model"]["v6_exact_resource_residual.weight"][0, 0] = 1.0
-    with pytest.raises(migration.MigrationError, match="not initialized to zero"):
-        migration._verify_v7_input_routing_delta(before, nonzero)  # noqa: SLF001
-
-    metadata_drift = copy.deepcopy(after)
-    metadata_drift["mask_hidden_info"] = False
-    with pytest.raises(migration.MigrationError, match="metadata"):
+    with pytest.raises(
+        migration.MigrationError,
+        match="changed config outside input routing",
+    ):
         migration._verify_v7_input_routing_delta(  # noqa: SLF001
-            before, metadata_drift
+            before,
+            after,
+            initialization_seed=73,
         )

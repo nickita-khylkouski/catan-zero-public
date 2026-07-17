@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import operator
 from pathlib import Path
@@ -429,6 +429,14 @@ class EntityGraphConfig:
     # legacy-compatible view remains its input, while a bias-free zero-output
     # residual learns the new exact counts.  Appended for pickle compatibility.
     v6_compatibility_preserving_inputs: bool = False
+    # Explicit serialized topology for the Transformer-only action adapter.
+    # Zero retains the historical full-width block used by issued f69
+    # checkpoints/receipts. A positive value selects the parameter-efficient
+    # Q/K/V and FF bottleneck used by V7. Older checkpoint configs predate this
+    # field; load() infers their topology from state-dict tensor names before
+    # constructing the module, so both historical and budgeted artifacts remain
+    # replayable. Appended last for positional legacy-pickle compatibility.
+    action_cross_attention_bottleneck: int = 0
 
 
 class EntityGraphNet:
@@ -613,10 +621,10 @@ class EntityGraphNet:
                 heads: int,
                 dropout: float,
                 *,
+                bottleneck: int,
                 identity_init: bool = True,
             ) -> None:
                 super().__init__()
-                bottleneck = max(int(heads), (width // 8 // int(heads)) * int(heads))
                 self.norm_q = nn.LayerNorm(width)
                 self.norm_kv = nn.LayerNorm(width)
                 self.attn = _BottleneckCrossAttention(width, heads, bottleneck)
@@ -1122,8 +1130,23 @@ class EntityGraphNet:
                     if self.uses_relational_topology
                     else int(getattr(cfg, "action_cross_attention_layers", 0))
                 )
+                self.action_cross_attention_bottleneck = int(
+                    getattr(cfg, "action_cross_attention_bottleneck", 0) or 0
+                )
                 if self.action_cross_attention_layers < 0:
                     raise ValueError("action cross-attention layer count must be >= 0")
+                if self.action_cross_attention_bottleneck < 0:
+                    raise ValueError(
+                        "action cross-attention bottleneck must be >= 0"
+                    )
+                if (
+                    self.uses_relational_topology
+                    and self.action_cross_attention_bottleneck
+                ):
+                    raise ValueError(
+                        "relational trunks use their native action decoder; "
+                        "action_cross_attention_bottleneck is Transformer-only"
+                    )
                 if (
                     self.v6_compatibility_preserving_inputs_enabled
                     and not self.uses_relational_topology
@@ -1171,18 +1194,30 @@ class EntityGraphNet:
                     )
                     cross_block_type = (
                         _CrossBlock
-                        if self.uses_relational_topology
+                        if (
+                            self.uses_relational_topology
+                            or self.action_cross_attention_bottleneck == 0
+                        )
                         else _BottleneckCrossBlock
                     )
-                    self.action_cross_blocks = nn.ModuleList(
-                        cross_block_type(
-                            h,
-                            cfg.attention_heads,
-                            cross_dropout,
-                            identity_init=not self.uses_relational_topology,
+                    blocks = []
+                    for _ in range(self.action_cross_attention_layers):
+                        kwargs = {
+                            "identity_init": not self.uses_relational_topology,
+                        }
+                        if cross_block_type is _BottleneckCrossBlock:
+                            kwargs["bottleneck"] = (
+                                self.action_cross_attention_bottleneck
+                            )
+                        blocks.append(
+                            cross_block_type(
+                                h,
+                                cfg.attention_heads,
+                                cross_dropout,
+                                **kwargs,
+                            )
                         )
-                        for _ in range(self.action_cross_attention_layers)
-                    )
+                    self.action_cross_blocks = nn.ModuleList(blocks)
 
                 if self.value_attention_pool:
                     self.value_probe = nn.Parameter(torch.zeros(1, 1, h))
@@ -2776,6 +2811,7 @@ class EntityGraphPolicy:
         aux_settlement_pointer_head: bool = False,
         action_target_gather: bool = False,
         action_cross_attention_layers: int = 0,
+        action_cross_attention_bottleneck: int = 0,
         static_action_residual: bool = False,
         legal_action_value_residual: bool = False,
         legal_action_value_set_statistics: bool = False,
@@ -2832,6 +2868,9 @@ class EntityGraphPolicy:
                 aux_settlement_pointer_head=bool(aux_settlement_pointer_head),
                 action_target_gather=bool(action_target_gather),
                 action_cross_attention_layers=int(action_cross_attention_layers),
+                action_cross_attention_bottleneck=int(
+                    action_cross_attention_bottleneck
+                ),
                 static_action_residual=bool(static_action_residual),
                 legal_action_value_residual=bool(
                     legal_action_value_residual
@@ -3332,6 +3371,32 @@ class EntityGraphPolicy:
         # missing fields from current defaults, warns+drops unknown fields.
         if isinstance(config, EntityGraphConfig) or _is_config_dict(config):
             config = _config_from_dict(EntityGraphConfig, config)
+        # action_cross_attention_layers predates the budgeted V7 adapter. Both
+        # historical full-width and new low-rank checkpoints therefore exist
+        # with otherwise identical config values. Infer the omitted topology
+        # from an unambiguous state-dict key before module construction, then
+        # persist it on the reconstructed config for all subsequent saves.
+        if int(getattr(config, "action_cross_attention_layers", 0) or 0) > 0:
+            model_state = data.get("model", {})
+            has_budgeted_q = any(
+                str(key).startswith("action_cross_blocks.")
+                and str(key).endswith(".attn.q_proj.weight")
+                for key in model_state
+            )
+            configured_bottleneck = int(
+                getattr(config, "action_cross_attention_bottleneck", 0) or 0
+            )
+            if has_budgeted_q and configured_bottleneck == 0:
+                first_q = next(
+                    value
+                    for key, value in model_state.items()
+                    if str(key).startswith("action_cross_blocks.")
+                    and str(key).endswith(".attn.q_proj.weight")
+                )
+                config = replace(
+                    config,
+                    action_cross_attention_bottleneck=int(first_q.shape[0]),
+                )
         if strict_metadata:
             if str(data.get("policy_type", "") or "") != cls.policy_type:
                 raise ValueError(

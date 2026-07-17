@@ -254,7 +254,11 @@ def test_action_cross_cold_commissioning_opens_inner_gradients_first_backward():
     from tools.train_bc import _initialize_cold_start_action_cross_attention_path
 
     model = EntityGraphNet(
-        dataclasses.replace(_base_config(), action_cross_attention_layers=1)
+        dataclasses.replace(
+            _base_config(),
+            action_cross_attention_layers=1,
+            action_cross_attention_bottleneck=8,
+        )
     ).train()
     block = model.action_cross_blocks[0]
     assert torch.count_nonzero(block.attn.out_proj.weight).item() == 0
@@ -282,7 +286,11 @@ def test_action_cross_cold_commissioning_opens_inner_gradients_first_backward():
 def test_transformer_action_cross_is_a_budgeted_adapter_not_a_second_tower():
     from catan_zero.rl.entity_token_policy import EntityGraphNet
 
-    config = dataclasses.replace(_base_config(), action_cross_attention_layers=1)
+    config = dataclasses.replace(
+        _base_config(),
+        action_cross_attention_layers=1,
+        action_cross_attention_bottleneck=8,
+    )
     model = EntityGraphNet(config)
     cross_parameters = sum(
         parameter.numel() for parameter in model.action_cross_blocks.parameters()
@@ -301,7 +309,11 @@ def test_action_cross_cold_commissioning_preserves_moved_checkpoint():
     from tools.train_bc import _initialize_cold_start_action_cross_attention_path
 
     model = EntityGraphNet(
-        dataclasses.replace(_base_config(), action_cross_attention_layers=1)
+        dataclasses.replace(
+            _base_config(),
+            action_cross_attention_layers=1,
+            action_cross_attention_bottleneck=8,
+        )
     )
     block = model.action_cross_blocks[0]
     with torch.no_grad():
