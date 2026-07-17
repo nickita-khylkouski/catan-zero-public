@@ -148,6 +148,64 @@ def test_entity_ppo_update_all_forced_batch_does_not_crash() -> None:
     assert np.isfinite(metrics["value_loss"])
 
 
+def test_entity_top_advantage_filter_retains_forced_value_and_policy_signal() -> None:
+    """High-advantage forced rows remain critic evidence but cannot crowd every
+    policy-active row out of an opt-in top-advantage update."""
+    from catan_zero.rl.torch_ppo import ppo_update
+
+    samples = _collect_real_samples(4)
+    trajectory = _make_trajectory(samples, force_indices={0, 1})
+    trajectory.advantages = [100.0, 90.0, 2.0, 1.0]
+    trajectory.returns = [20.0, -20.0, 0.0, 0.0]
+    trajectory.old_log_probs = [0.0] * 4
+    policy = _make_entity_policy()
+    model_before = {
+        name: value.detach().clone() for name, value in policy.model.state_dict().items()
+    }
+
+    metrics = ppo_update(
+        policy,
+        [trajectory],
+        learning_rate=1.0e-3,
+        clip_ratio=0.2,
+        value_coef=0.0,
+        entropy_coef=0.0,
+        epochs=1,
+        minibatch_size=64,
+        top_advantage_fraction=0.5,
+        min_advantage_samples=1,
+    )
+
+    model_delta = max(
+        float((value - model_before[name]).abs().max())
+        for name, value in policy.model.state_dict().items()
+    )
+    assert metrics["samples_before_filter"] == 4.0
+    assert metrics["samples"] == 3.0
+    assert metrics["policy_active_fraction"] == pytest.approx(1.0 / 3.0)
+    assert metrics["advantage_filter_threshold"] == 2.0
+    assert metrics["policy_loss"] != 0.0
+    assert model_delta > 0.0
+
+    baseline_trajectory = _make_trajectory(samples, force_indices={0, 1})
+    baseline_trajectory.advantages = trajectory.advantages
+    baseline_trajectory.returns = [0.0] * 4
+    baseline_trajectory.old_log_probs = [0.0] * 4
+    baseline = ppo_update(
+        _make_entity_policy(),
+        [baseline_trajectory],
+        learning_rate=0.0,
+        clip_ratio=0.2,
+        value_coef=0.0,
+        entropy_coef=0.0,
+        epochs=1,
+        minibatch_size=64,
+        top_advantage_fraction=0.5,
+        min_advantage_samples=1,
+    )
+    assert metrics["value_loss"] > baseline["value_loss"] + 100.0
+
+
 def test_forced_rows_do_not_dilute_entity_ppo_kl() -> None:
     """KL early-stop telemetry must measure only rows where policy can change."""
     import torch

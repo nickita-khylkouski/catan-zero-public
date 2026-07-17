@@ -166,7 +166,14 @@ def _normalize_advantages_by_group(
     group_labels: list[str],
     *,
     mode: str,
+    eligible_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, int]:
+    """Normalize each group using only rows that can contribute policy gradient.
+
+    The same affine transform is applied to every row so callers can retain
+    policy-inactive rows for value training without letting those rows determine
+    the policy normalization statistics.
+    """
     mode = str(mode or "global").strip().lower()
     if mode in {"global", "standard", "default"}:
         return advantages.copy(), 0
@@ -181,16 +188,27 @@ def _normalize_advantages_by_group(
             "advantage group label count does not match advantage count: "
             f"{len(group_labels)} vs {len(advantages)}"
         )
+    if eligible_mask is None:
+        eligible = np.ones(len(advantages), dtype=np.bool_)
+    else:
+        eligible = np.asarray(eligible_mask, dtype=np.bool_)
+        if eligible.shape != advantages.shape:
+            raise ValueError(
+                "advantage eligibility mask does not match advantage shape: "
+                f"{eligible.shape} vs {advantages.shape}"
+            )
     normalized = advantages.astype(np.float32, copy=True)
     groups = sorted(set(str(label) for label in group_labels))
     for group in groups:
         mask = np.asarray([str(label) == group for label in group_labels], dtype=bool)
+        stats_mask = mask & eligible & np.isfinite(normalized)
+        if not np.any(stats_mask):
+            continue
+        stats_values = normalized[stats_mask]
+        mean = float(stats_values.mean())
+        std = float(stats_values.std())
         values = normalized[mask]
         finite = np.isfinite(values)
-        if not np.any(finite):
-            continue
-        mean = float(values[finite].mean())
-        std = float(values[finite].std())
         if std > 1.0e-8:
             values[finite] = (values[finite] - mean) / std
         else:
@@ -1349,6 +1367,13 @@ def ppo_update(
             (1.0 - q_advantage_mix) * raw_advantages
             + q_advantage_mix * q_advantages
         )
+    # A sole legal action has probability one under every masked policy. Such a
+    # row is useful critic evidence, but its PPO ratio and policy gradient are
+    # identically fixed, so it must not rank or normalize policy advantages.
+    policy_active_np = np.asarray(
+        [len(sample.valid_actions) > 1 for sample in samples],
+        dtype=np.bool_,
+    )
     advantage_normalization_mode = str(advantage_normalization or "global").strip().lower()
     advantage_group_count = 0
     advantage_group_labels = _advantage_group_labels(trajectories)
@@ -1357,6 +1382,7 @@ def ppo_update(
             raw_advantages,
             advantage_group_labels,
             mode=advantage_normalization_mode,
+            eligible_mask=policy_active_np,
         )
     raw_advantages, advantage_group_weight_count, advantage_group_weight_mean = (
         _apply_advantage_group_weights(
@@ -1365,11 +1391,24 @@ def ppo_update(
             advantage_group_weights,
         )
     )
+    advantages = torch.as_tensor(
+        raw_advantages,
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    full_policy_active = torch.as_tensor(policy_active_np, device=policy.device)
+    if advantage_normalization_mode in {"global", "standard", "default"}:
+        advantages = _standardize_advantages_excluding_forced(
+            advantages,
+            full_policy_active,
+        )
     samples_before_filter = len(samples)
     keep_indices, advantage_filter_threshold = _top_advantage_keep_indices(
         raw_advantages,
         top_fraction=top_advantage_fraction,
         min_samples=min_advantage_samples,
+        eligible_mask=policy_active_np,
+        retain_ineligible=True,
     )
     if len(keep_indices) != len(samples):
         samples = [samples[int(i)] for i in keep_indices]
@@ -1379,6 +1418,10 @@ def ppo_update(
         old_values = old_values[keep_indices]
         old_q_values = old_q_values[keep_indices]
         q_targets = q_targets[keep_indices]
+        policy_active_np = policy_active_np[keep_indices]
+        advantages = advantages[
+            torch.as_tensor(keep_indices, dtype=torch.long, device=policy.device)
+        ]
     old_action_probs = [
         probs for trajectory in trajectories for probs in trajectory.old_action_probs
     ]
@@ -1430,17 +1473,7 @@ def ppo_update(
             policy.action_size,
             policy.device,
         )
-    advantages = torch.as_tensor(
-        raw_advantages,
-        dtype=torch.float32,
-        device=policy.device,
-    )
-    if advantage_normalization_mode in {"global", "standard", "default"}:
-        advantage_std = advantages.std(unbiased=False)
-        if bool(torch.isfinite(advantage_std).item()) and float(advantage_std.item()) > 1e-8:
-            advantages = (advantages - advantages.mean()) / advantage_std
-        else:
-            advantages = advantages - advantages.mean()
+    policy_active = torch.as_tensor(policy_active_np, device=policy.device)
 
     behavior_temperature = max(float(behavior_temperature), 1.0e-6)
     n = len(samples)
@@ -1470,6 +1503,7 @@ def ppo_update(
             batch_old_policy = old_policy_t[batch_idx]
             batch_ema_policy = ema_policy_t[batch_idx] if ema_policy_t is not None else None
             batch_advantages = advantages[batch_idx]
+            batch_policy_active = policy_active[batch_idx]
             batch_valid = [valid_actions[int(i)] for i in batch_idx]
 
             logits, values = policy.forward(batch_obs, batch_context)
@@ -1486,7 +1520,11 @@ def ppo_update(
             ratio = torch.exp(log_probs - batch_old_log_probs)
             unclipped = ratio * batch_advantages
             clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * batch_advantages
-            policy_loss = -torch.min(unclipped, clipped).mean()
+            per_sample_policy_loss = -torch.min(unclipped, clipped)
+            if bool(batch_policy_active.any()):
+                policy_loss = per_sample_policy_loss[batch_policy_active].mean()
+            else:
+                policy_loss = per_sample_policy_loss.new_tensor(0.0)
             value_loss = _ppo_value_loss(
                 values,
                 batch_returns,
@@ -1512,34 +1550,53 @@ def ppo_update(
                     device=policy.device,
                 )
                 entropy_values = entropy_values / torch.log(valid_counts)
-            entropy = entropy_values.mean()
+            if bool(batch_policy_active.any()):
+                entropy = entropy_values[batch_policy_active].mean()
+            else:
+                entropy = entropy_values.new_tensor(0.0)
             with torch.no_grad():
-                approx_kl = (batch_old_log_probs - log_probs).mean()
-                clip_fraction = (
-                    (torch.abs(ratio - 1.0) > clip_ratio).float().mean()
-                )
+                per_sample_kl = batch_old_log_probs - log_probs
+                per_sample_clipped = (torch.abs(ratio - 1.0) > clip_ratio).float()
+                if bool(batch_policy_active.any()):
+                    approx_kl = per_sample_kl[batch_policy_active].mean()
+                    clip_fraction = per_sample_clipped[batch_policy_active].mean()
+                else:
+                    approx_kl = per_sample_kl.new_tensor(0.0)
+                    clip_fraction = per_sample_clipped.new_tensor(0.0)
             if kl_coef > 0.0:
                 log_policy = nn.functional.log_softmax(masked, dim=-1)
-                old_policy_kl = (
+                per_sample_old_policy_kl = (
                     batch_old_policy
                     * (
                         torch.log(torch.clamp(batch_old_policy, min=1e-8))
                         - log_policy
                     )
-                ).sum(dim=-1).mean()
+                ).sum(dim=-1)
+                if bool(batch_policy_active.any()):
+                    old_policy_kl = per_sample_old_policy_kl[
+                        batch_policy_active
+                    ].mean()
+                else:
+                    old_policy_kl = per_sample_old_policy_kl.new_tensor(0.0)
             else:
                 log_policy = None
                 old_policy_kl = values.new_tensor(0.0)
             if batch_ema_policy is not None and ema_policy_kl_coef > 0.0:
                 if log_policy is None:
                     log_policy = nn.functional.log_softmax(masked, dim=-1)
-                ema_policy_kl = (
+                per_sample_ema_policy_kl = (
                     batch_ema_policy
                     * (
                         torch.log(torch.clamp(batch_ema_policy, min=1e-8))
                         - log_policy
                     )
-                ).sum(dim=-1).mean()
+                ).sum(dim=-1)
+                if bool(batch_policy_active.any()):
+                    ema_policy_kl = per_sample_ema_policy_kl[
+                        batch_policy_active
+                    ].mean()
+                else:
+                    ema_policy_kl = per_sample_ema_policy_kl.new_tensor(0.0)
             else:
                 ema_policy_kl = values.new_tensor(0.0)
             loss = (
@@ -1599,6 +1656,7 @@ def ppo_update(
         "advantage_groups": float(advantage_group_count),
         "advantage_group_weight_count": float(advantage_group_weight_count),
         "advantage_group_weight_mean": float(advantage_group_weight_mean),
+        "policy_active_fraction": float(policy_active_np.mean()) if len(policy_active_np) else 1.0,
     }
 
 
@@ -1822,6 +1880,10 @@ def _ppo_update_entity_graph_body(
         old_q_values = old_values.copy()
     q_targets = returns.copy()
 
+    policy_active_np = np.asarray(
+        [len(sample.valid_actions) > 1 for sample in samples],
+        dtype=np.bool_,
+    )
     advantage_normalization_mode = str(advantage_normalization or "global").strip().lower()
     advantage_group_count = 0
     advantage_group_labels = _advantage_group_labels(trajectories)
@@ -1830,6 +1892,7 @@ def _ppo_update_entity_graph_body(
             raw_advantages,
             advantage_group_labels,
             mode=advantage_normalization_mode,
+            eligible_mask=policy_active_np,
         )
     raw_advantages, advantage_group_weight_count, advantage_group_weight_mean = (
         _apply_advantage_group_weights(
@@ -1838,12 +1901,25 @@ def _ppo_update_entity_graph_body(
             advantage_group_weights,
         )
     )
+    advantages = torch.as_tensor(
+        raw_advantages,
+        dtype=torch.float32,
+        device=policy.device,
+    )
+    full_policy_active = torch.as_tensor(policy_active_np, device=policy.device)
+    if advantage_normalization_mode in {"global", "standard", "default"}:
+        advantages = _standardize_advantages_excluding_forced(
+            advantages,
+            full_policy_active,
+        )
 
     samples_before_filter = len(samples)
     keep_indices, advantage_filter_threshold = _top_advantage_keep_indices(
         raw_advantages,
         top_fraction=top_advantage_fraction,
         min_samples=min_advantage_samples,
+        eligible_mask=policy_active_np,
+        retain_ineligible=True,
     )
     shaped_rewards = np.asarray(
         [reward for trajectory in trajectories for reward in trajectory.shaped_rewards],
@@ -1858,6 +1934,10 @@ def _ppo_update_entity_graph_body(
         old_q_values = old_q_values[keep_indices]
         q_targets = q_targets[keep_indices]
         shaped_rewards = shaped_rewards[keep_indices]
+        policy_active_np = policy_active_np[keep_indices]
+        advantages = advantages[
+            torch.as_tensor(keep_indices, dtype=torch.long, device=policy.device)
+        ]
 
     action_columns = np.asarray(
         [_entity_action_column(sample) for sample in samples],
@@ -1869,20 +1949,13 @@ def _ppo_update_entity_graph_body(
     # advantage-normalization mean/std with values that can never move the policy. Track which
     # samples are "policy-active" (legal_count > 1) so both can be excluded; they still
     # participate fully in the value loss.
-    policy_active_np = np.asarray(
-        [len(sample.valid_actions) > 1 for sample in samples],
-        dtype=np.bool_,
-    )
     optimizer = optimizer or make_ppo_optimizer(policy, learning_rate=learning_rate)
     returns_t = torch.as_tensor(returns, dtype=torch.float32, device=policy.device)
     q_targets_t = torch.as_tensor(q_targets, dtype=torch.float32, device=policy.device)
     old_log_probs_t = torch.as_tensor(old_log_probs, dtype=torch.float32, device=policy.device)
     old_values_t = torch.as_tensor(old_values, dtype=torch.float32, device=policy.device)
     old_q_values_t = torch.as_tensor(old_q_values, dtype=torch.float32, device=policy.device)
-    advantages = torch.as_tensor(raw_advantages, dtype=torch.float32, device=policy.device)
     policy_active = torch.as_tensor(policy_active_np, device=policy.device)
-    if advantage_normalization_mode in {"global", "standard", "default"}:
-        advantages = _standardize_advantages_excluding_forced(advantages, policy_active)
 
     behavior_temperature = max(float(behavior_temperature), 1.0e-6)
     n = len(samples)
@@ -2247,15 +2320,34 @@ def _top_advantage_keep_indices(
     *,
     top_fraction: float,
     min_samples: int,
+    eligible_mask: np.ndarray | None = None,
+    retain_ineligible: bool = False,
 ) -> tuple[np.ndarray, float]:
+    """Select top positive eligible rows, optionally retaining value-only rows.
+
+    ``min_samples`` and ``top_fraction`` apply to the eligible positive
+    population. If that population has no positive advantage, filtering is a
+    no-op, matching the historical safe fallback.
+    """
     n = len(advantages)
     if n == 0:
         return np.asarray([], dtype=np.int64), 0.0
+    if eligible_mask is None:
+        eligible = np.ones(n, dtype=np.bool_)
+    else:
+        eligible = np.asarray(eligible_mask, dtype=np.bool_)
+        if eligible.shape != advantages.shape:
+            raise ValueError(
+                "advantage eligibility mask does not match advantage shape: "
+                f"{eligible.shape} vs {advantages.shape}"
+            )
     fraction = float(top_fraction)
     if not math.isfinite(fraction) or fraction >= 1.0:
         return np.arange(n, dtype=np.int64), 0.0
     fraction = max(fraction, 0.0)
-    positive_indices = np.flatnonzero(np.isfinite(advantages) & (advantages > 0.0))
+    positive_indices = np.flatnonzero(
+        eligible & np.isfinite(advantages) & (advantages > 0.0)
+    )
     if len(positive_indices) == 0:
         return np.arange(n, dtype=np.int64), 0.0
     keep_count = int(math.ceil(len(positive_indices) * fraction))
@@ -2265,6 +2357,10 @@ def _top_advantage_keep_indices(
     selected_offset = np.argpartition(positive_values, -keep_count)[-keep_count:]
     selected = np.sort(positive_indices[selected_offset]).astype(np.int64)
     threshold = float(np.min(advantages[selected])) if len(selected) else 0.0
+    if retain_ineligible:
+        selected = np.sort(
+            np.concatenate((selected, np.flatnonzero(~eligible)))
+        ).astype(np.int64)
     return selected, threshold
 
 
