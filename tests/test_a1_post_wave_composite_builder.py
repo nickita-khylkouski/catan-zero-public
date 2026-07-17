@@ -15,6 +15,57 @@ from tools import a1_seal_historical_replay_component as historical_sealer
 from catan_zero.rl.entity_feature_adapter import CURRENT_RUST_ENTITY_ADAPTER_VERSION
 
 
+def test_selected_source_filter_rebuilds_compact_search_evidence() -> None:
+    payload = {
+        "game_seed": np.asarray([10, 11, 12, 13, 14], dtype=np.int64),
+        "policy_weight_multiplier": np.asarray(
+            [1.0, 0.0, 1.0, 1.0, 0.0], dtype=np.float32
+        ),
+        "search_evidence_version": np.asarray(2, dtype=np.uint8),
+        "search_evidence_offsets": np.asarray([0, 2, 5, 6], dtype=np.uint32),
+        "search_visit_counts_flat": np.asarray(
+            [10, 11, 20, 21, 22, 30], dtype=np.uint16
+        ),
+        "search_completed_q_flat": np.asarray(
+            [0.10, 0.11, 0.20, 0.21, 0.22, 0.30], dtype=np.float32
+        ),
+        "search_prior_policy_flat": np.asarray(
+            [0.4, 0.6, 0.2, 0.3, 0.5, 1.0], dtype=np.float32
+        ),
+    }
+
+    filtered = builder._filter_selected_source_arrays(  # noqa: SLF001
+        payload,
+        selected_mask=np.asarray([False, True, True, False, True]),
+        rows=5,
+        source=Path("fixture.npz"),
+    )
+
+    assert filtered["game_seed"].tolist() == [11, 12, 14]
+    assert filtered["search_evidence_version"].item() == 2
+    assert filtered["search_evidence_offsets"].tolist() == [0, 3]
+    assert filtered["search_visit_counts_flat"].tolist() == [20, 21, 22]
+    assert filtered["search_completed_q_flat"].tolist() == pytest.approx(
+        [0.20, 0.21, 0.22]
+    )
+    assert filtered["search_prior_policy_flat"].tolist() == pytest.approx(
+        [0.2, 0.3, 0.5]
+    )
+
+
+def test_selected_source_filter_rejects_unknown_non_row_aligned_column() -> None:
+    with pytest.raises(builder.CompositeBuildError, match="unknown non-row-aligned"):
+        builder._filter_selected_source_arrays(  # noqa: SLF001
+            {
+                "game_seed": np.asarray([10, 11], dtype=np.int64),
+                "mystery_offsets": np.asarray([0, 1, 2], dtype=np.int32),
+            },
+            selected_mask=np.asarray([True, False]),
+            rows=2,
+            source=Path("fixture.npz"),
+        )
+
+
 def _payload_component(root: Path, component_id: str) -> dict[str, object]:
     root.mkdir()
     (root / "row_offsets.dat").write_bytes(f"{component_id}-offsets".encode())

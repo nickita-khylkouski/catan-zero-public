@@ -379,6 +379,143 @@ def _atomic_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+_SEARCH_EVIDENCE_FLAT_COLUMNS = (
+    "search_visit_counts_flat",
+    "search_completed_q_flat",
+)
+_SEARCH_EVIDENCE_PRIOR_COLUMN = "search_prior_policy_flat"
+_SEARCH_EVIDENCE_COLUMNS = {
+    "search_evidence_version",
+    "search_evidence_offsets",
+    *_SEARCH_EVIDENCE_FLAT_COLUMNS,
+    _SEARCH_EVIDENCE_PRIOR_COLUMN,
+}
+
+
+def _filter_selected_source_arrays(
+    payload: Mapping[str, np.ndarray],
+    *,
+    selected_mask: np.ndarray,
+    rows: int,
+    source: Path,
+) -> dict[str, np.ndarray]:
+    """Filter row data and its policy-active compact search evidence together.
+
+    Search evidence is deliberately not row aligned: offsets index only rows
+    with positive policy weight, while the flat arrays concatenate the legal
+    actions for those active rows.  Filtering physical rows therefore requires
+    rebuilding that compact index rather than slicing or copying it unchanged.
+    """
+
+    keep = np.asarray(selected_mask, dtype=bool)
+    if keep.shape != (rows,):
+        raise CompositeBuildError(
+            f"selected mask is not row-aligned for {source}: {keep.shape}"
+        )
+    names = set(payload)
+    evidence_names = names.intersection(_SEARCH_EVIDENCE_COLUMNS)
+    ragged: dict[str, np.ndarray] = {}
+    if evidence_names:
+        required = {
+            "search_evidence_version",
+            "search_evidence_offsets",
+            *_SEARCH_EVIDENCE_FLAT_COLUMNS,
+        }
+        if not required.issubset(names):
+            missing = sorted(required - names)
+            raise CompositeBuildError(
+                f"incomplete compact search evidence in {source}: missing {missing}"
+            )
+        version_array = np.asarray(payload["search_evidence_version"])
+        if version_array.ndim != 0:
+            raise CompositeBuildError(
+                f"search_evidence_version is not scalar in {source}"
+            )
+        version = int(version_array)
+        if version not in (1, 2):
+            raise CompositeBuildError(
+                f"unsupported search_evidence_version={version} in {source}"
+            )
+        has_prior = _SEARCH_EVIDENCE_PRIOR_COLUMN in names
+        if has_prior != (version == 2):
+            requirement = "requires" if version == 2 else "forbids"
+            raise CompositeBuildError(
+                f"search evidence v{version} {requirement} "
+                f"{_SEARCH_EVIDENCE_PRIOR_COLUMN} in {source}"
+            )
+        if "policy_weight_multiplier" not in names:
+            raise CompositeBuildError(
+                f"compact search evidence lacks policy weights in {source}"
+            )
+        weights = np.asarray(payload["policy_weight_multiplier"])
+        if weights.ndim < 1 or weights.shape[0] != rows:
+            raise CompositeBuildError(
+                f"policy_weight_multiplier is not row-aligned in {source}"
+            )
+        active_rows = np.flatnonzero(weights > 0.0)
+        offsets = np.asarray(payload["search_evidence_offsets"])
+        flat_names = [*_SEARCH_EVIDENCE_FLAT_COLUMNS]
+        if has_prior:
+            flat_names.append(_SEARCH_EVIDENCE_PRIOR_COLUMN)
+        flat_arrays = {name: np.asarray(payload[name]) for name in flat_names}
+        if (
+            offsets.ndim != 1
+            or not np.issubdtype(offsets.dtype, np.integer)
+            or offsets.shape != (active_rows.size + 1,)
+            or offsets.size == 0
+            or int(offsets[0]) != 0
+            or np.any(np.diff(offsets.astype(np.int64, copy=False)) < 0)
+            or any(values.ndim != 1 for values in flat_arrays.values())
+        ):
+            raise CompositeBuildError(
+                f"malformed compact search evidence index in {source}"
+            )
+        flat_size = int(offsets[-1])
+        if any(values.size != flat_size for values in flat_arrays.values()):
+            raise CompositeBuildError(
+                f"compact search evidence flat lengths disagree in {source}"
+            )
+
+        kept_active_indices = np.flatnonzero(keep[active_rows])
+        lengths = np.diff(offsets.astype(np.int64, copy=False))
+        kept_lengths = lengths[kept_active_indices]
+        new_offsets = np.empty(kept_active_indices.size + 1, dtype=offsets.dtype)
+        new_offsets[0] = 0
+        if kept_lengths.size:
+            np.cumsum(kept_lengths, dtype=np.int64, out=new_offsets[1:])
+        segments = [
+            slice(int(offsets[index]), int(offsets[index + 1]))
+            for index in kept_active_indices
+        ]
+        ragged["search_evidence_version"] = version_array
+        ragged["search_evidence_offsets"] = new_offsets
+        for name, values in flat_arrays.items():
+            ragged[name] = (
+                np.concatenate([values[segment] for segment in segments])
+                if segments
+                else np.empty(0, dtype=values.dtype)
+            )
+
+    filtered: dict[str, np.ndarray] = {}
+    for name in payload:
+        values = np.asarray(payload[name])
+        if name in ragged:
+            filtered[name] = ragged[name]
+        elif name in _SEARCH_EVIDENCE_COLUMNS:
+            raise CompositeBuildError(
+                f"unhandled compact search evidence column {name!r} in {source}"
+            )
+        elif values.ndim > 0 and values.shape[0] == rows:
+            filtered[name] = values[keep]
+        elif values.ndim == 0:
+            filtered[name] = values
+        else:
+            raise CompositeBuildError(
+                f"unknown non-row-aligned source column {name!r} in {source}"
+            )
+    return filtered
+
+
 def _prepare_output_root(path: Path) -> Path:
     root = path.expanduser().absolute()
     if root.exists():
@@ -986,14 +1123,12 @@ def _filter_wave_shards(
                             allowed_versions=allowed_versions,
                             colors=selfplay_colors,
                         )
-                    arrays: dict[str, np.ndarray] = {}
-                    for name in payload.files:
-                        values = np.asarray(payload[name])
-                        if values.ndim < 1 or values.shape[0] != seeds.size:
-                            raise CompositeBuildError(
-                                f"source column {name!r} is not row-aligned: {source}"
-                            )
-                        arrays[name] = values[selected_mask]
+                    arrays = _filter_selected_source_arrays(
+                        payload,
+                        selected_mask=selected_mask,
+                        rows=int(seeds.size),
+                        source=source,
+                    )
             except (KeyError, OSError, ValueError, contract.ContractError) as error:
                 raise CompositeBuildError(
                     f"cannot filter source shard {source}: {error}"
