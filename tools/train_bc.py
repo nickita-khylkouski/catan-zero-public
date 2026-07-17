@@ -22088,6 +22088,7 @@ def _train_entity_batch(
                     aux_has_soft,
                     aux_weights > 0.0,
                     aux_support,
+                    objective_weights=aux_weights.detach().float().cpu().numpy(),
                 )
             )
             if diagnostics:
@@ -22684,6 +22685,7 @@ def _train_entity_batch(
         has_soft,
         active,
         soft_support,
+        objective_weights=policy_weights.detach().float().cpu().numpy(),
     )
     _merge_policy_target_distribution_stats(
         policy_target_distribution_stats,
@@ -31858,6 +31860,8 @@ def _policy_target_metric_parts(
 def _sum_policy_target_metric_rows(
     row_metrics: Mapping[str, np.ndarray],
     mask: np.ndarray | None = None,
+    *,
+    weights: np.ndarray | None = None,
 ) -> dict[str, float]:
     if not row_metrics:
         return _empty_policy_target_metric_parts()
@@ -31867,10 +31871,23 @@ def _sum_policy_target_metric_rows(
     if mask is not None:
         selected &= np.asarray(mask, dtype=np.bool_)
     result = _empty_policy_target_metric_parts()
-    result["rows"] = float(np.count_nonzero(selected))
+    selected_weights = None
+    if weights is None:
+        result["rows"] = float(np.count_nonzero(selected))
+    else:
+        all_weights = np.asarray(weights, dtype=np.float64)
+        if all_weights.shape != selected.shape:
+            raise ValueError("policy target metric weight shape drift")
+        if not np.isfinite(all_weights).all() or np.any(all_weights < 0.0):
+            raise ValueError("policy target metric weights must be finite and >= 0")
+        selected_weights = all_weights[selected]
+        result["rows"] = float(np.sum(selected_weights))
     for key in _POLICY_TARGET_METRIC_SUM_KEYS:
+        values = np.asarray(row_metrics[key], dtype=np.float64)[selected]
         result[key] = float(
-            np.asarray(row_metrics[key], dtype=np.float64)[selected].sum()
+            values.sum()
+            if selected_weights is None
+            else np.dot(values, selected_weights)
         )
     return result
 
@@ -31883,6 +31900,8 @@ def _policy_target_distribution_stats(
     has_soft,
     active,
     support,
+    *,
+    objective_weights: np.ndarray | None = None,
 ) -> dict[str, object]:
     row_metrics = _policy_target_metric_parts(
         logits, soft_targets, has_soft, active, support
@@ -31890,6 +31909,9 @@ def _policy_target_distribution_stats(
     result: dict[str, object] = {
         "schema_version": "policy-target-distribution-sufficient-stats-v1",
         "overall": _sum_policy_target_metric_rows(row_metrics),
+        "objective_weighted_overall": _sum_policy_target_metric_rows(
+            row_metrics, weights=objective_weights
+        ),
         "phase": {},
         "opening_decision_index": {},
     }
@@ -31943,13 +31965,19 @@ def _merge_policy_target_distribution_stats(
                     "policy-target-distribution-sufficient-stats-v1"
                 ),
                 "overall": _empty_policy_target_metric_parts(),
+                "objective_weighted_overall": _empty_policy_target_metric_parts(),
                 "phase": {},
                 "opening_decision_index": {},
             }
         )
-    for axis in ("overall", "phase", "opening_decision_index"):
+    for axis in (
+        "overall",
+        "objective_weighted_overall",
+        "phase",
+        "opening_decision_index",
+    ):
         source_axis = source.get(axis)
-        if axis == "overall":
+        if axis in {"overall", "objective_weighted_overall"}:
             if not isinstance(source_axis, Mapping):
                 continue
             target_axis = target.setdefault(
@@ -32053,6 +32081,15 @@ def _finalize_policy_target_distribution_stats(
             else {},
             rows_are_density=rows_are_density,
         ),
+        "objective_weighted_overall": {
+            **_finalize_policy_target_metric_parts(
+                stats.get("objective_weighted_overall", {})
+                if isinstance(stats.get("objective_weighted_overall"), Mapping)
+                else {},
+                rows_are_density=True,
+            ),
+            "weighting": "actual_policy_objective_weight",
+        },
     }
     for axis in ("phase", "opening_decision_index"):
         source = stats.get(axis)
