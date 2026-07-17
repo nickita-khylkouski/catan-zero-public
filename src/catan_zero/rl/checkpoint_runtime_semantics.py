@@ -20,7 +20,8 @@ from typing import Mapping
 
 
 ENTITY_GRAPH_FORWARD_SEMANTICS_KEY = "entity_graph_forward_semantics"
-ENTITY_GRAPH_FORWARD_SEMANTICS_SCHEMA = "entity-graph-forward-semantics-v1"
+ENTITY_GRAPH_FORWARD_SEMANTICS_SCHEMA = "entity-graph-forward-semantics-v2"
+_LEGACY_ENTITY_GRAPH_FORWARD_SEMANTICS_SCHEMA = "entity-graph-forward-semantics-v1"
 ENTITY_GRAPH_POLICY_SCHEMA = "entity_graph_policy_v1"
 
 # These are the source definitions that construct or execute the entity-graph
@@ -36,7 +37,7 @@ _TOP_LEVEL_FORWARD_FUNCTIONS = frozenset(
     }
 )
 _POLICY_FORWARD_METHODS = frozenset({"__init__", "forward_legal_np"})
-_SELECTED_SYMBOLS = (
+_POLICY_SELECTED_SYMBOLS = (
     "_validate_public_award_feature_contract",
     "_apply_public_award_feature_contract",
     "_entity_token_start_offsets",
@@ -45,6 +46,29 @@ _SELECTED_SYMBOLS = (
     "EntityGraphPolicy.__init__",
     "EntityGraphPolicy.forward_legal_np",
     "_assert_entity_batch_shapes",
+)
+_RELATIONAL_SELECTED_SYMBOLS = (
+    "RELATION_COUNT",
+    "DISTANCE_BUCKETS",
+    "REL_NONE",
+    "REL_SELF",
+    "REL_HEX_TO_VERTEX",
+    "REL_VERTEX_TO_HEX",
+    "REL_HEX_TO_EDGE",
+    "REL_EDGE_TO_HEX",
+    "REL_EDGE_TO_VERTEX",
+    "REL_VERTEX_TO_EDGE",
+    "REL_HUB_READS",
+    "REL_READ_GLOBAL",
+    "REL_EVENT_TO_TARGET",
+    "REL_TARGET_TO_EVENT",
+    "TopologyResidualAdapter",
+    "build_relation_ids",
+    "RelationalAttention",
+    "RelationalTransformerBlock",
+    "VectorizedRelGraphBlock",
+    "SparseTopKMoE",
+    "SparseMoERelationalTransformerBlock",
 )
 
 # Before this binding was added, the selected canonical learner saved its
@@ -55,6 +79,18 @@ _REVIEWED_TRAINING_SOURCE_SEMANTICS = {
     "sha256:b4e2618bc36296470f13ce3dee228b34fd7d117c0211380c46393450793ce975": (
         "sha256:460f78322abb3af4ba5255593b9ef3a4db93c53a114fdef15a9a8f1dae828f7e"
     )
+}
+
+# Reviewed compatibility is deliberately directional and restricted to the
+# topology-disabled historical Transformer. The newer policy fingerprint adds
+# the zero-output topology construction branch; with the config gate off, that
+# branch and every relational_trunks symbol are unreachable, so the executable
+# legacy function remains 460f. _uses_relational_forward_semantics is checked
+# before this translation can authorize either the adapter or rrt/resrgcn.
+_REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
+    "sha256:460f78322abb3af4ba5255593b9ef3a4db93c53a114fdef15a9a8f1dae828f7e": {
+        "sha256:334f85e44e1c0482a66ccc607d7091e6b123a9f49f658687b74328eec7dbb84e"
+    }
 }
 
 # The canonical f7 incumbent predates checkout-runtime metadata.  Its exact
@@ -82,7 +118,7 @@ def _file_sha256(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _semantic_nodes(source: str) -> list[ast.AST]:
+def _policy_semantic_nodes(source: str) -> list[ast.AST]:
     tree = ast.parse(source)
     selected: list[ast.AST] = []
     for node in tree.body:
@@ -102,22 +138,37 @@ def _semantic_nodes(source: str) -> list[ast.AST]:
                 if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and method.name in _POLICY_FORWARD_METHODS
             )
-    if len(selected) != len(_SELECTED_SYMBOLS):
+    if len(selected) != len(_POLICY_SELECTED_SYMBOLS):
         raise RuntimeError(
             "cannot identify the complete entity-graph forward semantic surface"
         )
     return selected
 
 
-@lru_cache(maxsize=4)
-def current_entity_graph_forward_semantics(
-    policy_source: str | Path,
-) -> dict[str, object]:
-    """Return the canonical, comment-insensitive forward semantic identity."""
+def _relational_semantic_nodes(source: str) -> list[ast.AST]:
+    tree = ast.parse(source)
+    selected: list[ast.AST] = []
+    selected_names: list[str] = []
+    for node in tree.body:
+        name: str | None = None
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = node.name
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            name = target.id if isinstance(target, ast.Name) else None
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name = node.target.id
+        if name in _RELATIONAL_SELECTED_SYMBOLS:
+            selected.append(node)
+            selected_names.append(name)
+    if selected_names != list(_RELATIONAL_SELECTED_SYMBOLS):
+        raise RuntimeError(
+            "cannot identify the complete relational forward semantic surface"
+        )
+    return selected
 
-    source_path = Path(policy_source).resolve(strict=True)
-    source = source_path.read_text(encoding="utf-8")
-    nodes = _semantic_nodes(source)
+
+def _semantic_tokens(source: str, nodes: list[ast.AST]) -> list[object]:
     ignored_tokens = {
         "ENCODING",
         "COMMENT",
@@ -127,9 +178,6 @@ def current_entity_graph_forward_semantics(
         "DEDENT",
         "ENDMARKER",
     }
-    # Token text is stable across supported Python parsers, unlike ast.dump's
-    # field list (for example Python 3.12 adds type_params).  Ignore comments
-    # and layout while retaining every executable token and literal.
     semantic_tokens = []
     for node in nodes:
         segment = ast.get_source_segment(source, node)
@@ -142,11 +190,54 @@ def current_entity_graph_forward_semantics(
                 if tokenize.tok_name[token.type] not in ignored_tokens
             ]
         )
+    return semantic_tokens
+
+
+def _component_identity(
+    source_path: Path,
+    *,
+    selected_symbols: tuple[str, ...],
+    nodes: list[ast.AST],
+) -> dict[str, object]:
+    source = source_path.read_text(encoding="utf-8")
+    return {
+        "selected_symbols": list(selected_symbols),
+        "semantic_token_sha256": _canonical_sha256(_semantic_tokens(source, nodes)),
+    }
+
+
+@lru_cache(maxsize=4)
+def current_entity_graph_forward_semantics(
+    policy_source: str | Path,
+    relational_source: str | Path | None = None,
+) -> dict[str, object]:
+    """Return the canonical, comment-insensitive multi-file neural identity."""
+
+    source_path = Path(policy_source).resolve(strict=True)
+    relational_path = (
+        Path(relational_source).resolve(strict=True)
+        if relational_source is not None
+        else source_path.with_name("relational_trunks.py").resolve(strict=True)
+    )
+    policy_text = source_path.read_text(encoding="utf-8")
+    relational_text = relational_path.read_text(encoding="utf-8")
+    components = {
+        "entity_token_policy": _component_identity(
+            source_path,
+            selected_symbols=_POLICY_SELECTED_SYMBOLS,
+            nodes=_policy_semantic_nodes(policy_text),
+        ),
+        "relational_trunks": _component_identity(
+            relational_path,
+            selected_symbols=_RELATIONAL_SELECTED_SYMBOLS,
+            nodes=_relational_semantic_nodes(relational_text),
+        ),
+    }
     identity: dict[str, object] = {
         "schema_version": ENTITY_GRAPH_FORWARD_SEMANTICS_SCHEMA,
         "policy_schema_version": ENTITY_GRAPH_POLICY_SCHEMA,
-        "semantic_token_sha256": _canonical_sha256(semantic_tokens),
-        "selected_symbols": list(_SELECTED_SYMBOLS),
+        "components": components,
+        "semantic_token_sha256": _canonical_sha256(components),
     }
     identity["binding_sha256"] = _canonical_sha256(identity)
     return identity
@@ -166,12 +257,38 @@ def _validate_explicit_identity(value: object) -> dict[str, object]:
             "checkpoint forward semantic identity has wrong policy schema: "
             f"{identity.get('policy_schema_version')!r}"
         )
-    if identity.get("selected_symbols") != list(_SELECTED_SYMBOLS):
+    components = identity.get("components")
+    if not isinstance(components, Mapping) or set(components) != {
+        "entity_token_policy",
+        "relational_trunks",
+    }:
         raise RuntimeError(
-            "checkpoint forward semantic identity names a different executable surface"
+            "checkpoint forward semantic identity has an incomplete source surface"
         )
+    expected_symbols = {
+        "entity_token_policy": list(_POLICY_SELECTED_SYMBOLS),
+        "relational_trunks": list(_RELATIONAL_SELECTED_SYMBOLS),
+    }
+    for name, symbols in expected_symbols.items():
+        component = components.get(name)
+        if (
+            not isinstance(component, Mapping)
+            or component.get("selected_symbols") != symbols
+            or not str(component.get("semantic_token_sha256", "")).startswith(
+                "sha256:"
+            )
+            or len(str(component.get("semantic_token_sha256", ""))) != 71
+        ):
+            raise RuntimeError(
+                "checkpoint forward semantic identity names a different executable "
+                f"surface: {name}"
+            )
     semantic_sha = str(identity.get("semantic_token_sha256", "") or "")
-    if not semantic_sha.startswith("sha256:") or len(semantic_sha) != 71:
+    if (
+        semantic_sha != _canonical_sha256(dict(components))
+        or not semantic_sha.startswith("sha256:")
+        or len(semantic_sha) != 71
+    ):
         raise RuntimeError(
             "checkpoint forward semantic identity has an invalid semantic hash"
         )
@@ -180,6 +297,53 @@ def _validate_explicit_identity(value: object) -> dict[str, object]:
         raise RuntimeError("checkpoint forward semantic identity hash is invalid")
     identity["binding_sha256"] = binding_sha
     return identity
+
+
+def _validate_legacy_explicit_identity(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise RuntimeError("checkpoint forward semantic identity must be an object")
+    identity = dict(value)
+    if (
+        identity.get("schema_version")
+        != _LEGACY_ENTITY_GRAPH_FORWARD_SEMANTICS_SCHEMA
+        or identity.get("policy_schema_version") != ENTITY_GRAPH_POLICY_SCHEMA
+        or identity.get("selected_symbols") != list(_POLICY_SELECTED_SYMBOLS)
+    ):
+        raise RuntimeError("checkpoint legacy forward semantic identity is malformed")
+    semantic_sha = str(identity.get("semantic_token_sha256", "") or "")
+    binding_sha = str(identity.pop("binding_sha256", "") or "")
+    if (
+        not semantic_sha.startswith("sha256:")
+        or len(semantic_sha) != 71
+        or binding_sha != _canonical_sha256(identity)
+    ):
+        raise RuntimeError("checkpoint legacy forward semantic identity hash is invalid")
+    identity["binding_sha256"] = binding_sha
+    return identity
+
+
+def _uses_relational_forward_semantics(checkpoint: Mapping[str, object]) -> bool:
+    config = checkpoint.get("config")
+    if isinstance(config, Mapping):
+        fields = config.get("fields", config)
+        if not isinstance(fields, Mapping):
+            raise RuntimeError("checkpoint config fields are malformed")
+        state_trunk = str(fields.get("state_trunk", "transformer"))
+        topology = bool(fields.get("topology_residual_adapter", False))
+    elif config is not None:
+        state_trunk = str(getattr(config, "state_trunk", "transformer"))
+        topology = bool(getattr(config, "topology_residual_adapter", False))
+    else:
+        raise RuntimeError(
+            "legacy checkpoint has no config proving topology-disabled transformer semantics"
+        )
+    return state_trunk != "transformer" or topology
+
+
+def _reviewed_policy_semantics_match(checkpoint_sha: str, runtime_sha: str) -> bool:
+    return checkpoint_sha == runtime_sha or runtime_sha in (
+        _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS.get(checkpoint_sha, set())
+    )
 
 
 def _legacy_training_source_sha(checkpoint: Mapping[str, object]) -> str:
@@ -203,16 +367,33 @@ def assert_entity_graph_checkpoint_runtime_semantics(
     *,
     checkpoint_path: str | Path,
     policy_source: str | Path,
+    relational_source: str | Path | None = None,
 ) -> dict[str, object]:
     """Refuse checkpoints whose trained forward differs from this checkout."""
 
-    current = current_entity_graph_forward_semantics(policy_source)
+    current = current_entity_graph_forward_semantics(policy_source, relational_source)
     explicit = checkpoint.get(ENTITY_GRAPH_FORWARD_SEMANTICS_KEY)
     provenance: str
     if explicit is not None:
-        stamped = _validate_explicit_identity(explicit)
-        checkpoint_semantic_sha = str(stamped["semantic_token_sha256"])
-        provenance = "checkpoint_stamp"
+        explicit_schema = (
+            explicit.get("schema_version") if isinstance(explicit, Mapping) else None
+        )
+        if explicit_schema == _LEGACY_ENTITY_GRAPH_FORWARD_SEMANTICS_SCHEMA:
+            if _uses_relational_forward_semantics(checkpoint):
+                raise RuntimeError(
+                    "legacy checkpoint stamp does not bind relational topology semantics"
+                )
+            stamped = _validate_legacy_explicit_identity(explicit)
+            checkpoint_semantic_sha = str(stamped["semantic_token_sha256"])
+            checkpoint_current_sha = str(
+                current["components"]["entity_token_policy"]["semantic_token_sha256"]
+            )
+            provenance = "checkpoint_stamp_v1_topology_disabled_compat"
+        else:
+            stamped = _validate_explicit_identity(explicit)
+            checkpoint_semantic_sha = str(stamped["semantic_token_sha256"])
+            checkpoint_current_sha = str(current["semantic_token_sha256"])
+            provenance = "checkpoint_stamp"
     else:
         source_sha = _legacy_training_source_sha(checkpoint)
         checkpoint_semantic_sha = _REVIEWED_TRAINING_SOURCE_SEMANTICS.get(
@@ -224,7 +405,11 @@ def assert_entity_graph_checkpoint_runtime_semantics(
             checkpoint_sha = _file_sha256(path)
             legacy_review = _REVIEWED_LEGACY_CHECKPOINTS.get(checkpoint_sha)
             if legacy_review:
-                checkpoint_semantic_sha = str(current["semantic_token_sha256"])
+                checkpoint_semantic_sha = str(
+                    current["components"]["entity_token_policy"][
+                        "semantic_token_sha256"
+                    ]
+                )
                 provenance = legacy_review
             else:
                 raise RuntimeError(
@@ -232,17 +417,25 @@ def assert_entity_graph_checkpoint_runtime_semantics(
                     "evaluation is fail-closed. Re-save it through a reviewed "
                     "function-preserving upgrade or add one exact checkpoint review."
                 )
-    current_semantic_sha = str(current["semantic_token_sha256"])
-    if checkpoint_semantic_sha != current_semantic_sha:
+        if _uses_relational_forward_semantics(checkpoint):
+            raise RuntimeError(
+                "unstamped checkpoint does not bind relational topology semantics"
+            )
+        checkpoint_current_sha = str(
+            current["components"]["entity_token_policy"]["semantic_token_sha256"]
+        )
+    if not _reviewed_policy_semantics_match(
+        checkpoint_semantic_sha, checkpoint_current_sha
+    ):
         raise RuntimeError(
             "entity-graph checkpoint/runtime forward semantic mismatch: "
-            f"checkpoint={checkpoint_semantic_sha} runtime={current_semantic_sha} "
+            f"checkpoint={checkpoint_semantic_sha} runtime={checkpoint_current_sha} "
             f"path={Path(checkpoint_path)}"
         )
     return {
         "schema_version": ENTITY_GRAPH_FORWARD_SEMANTICS_SCHEMA,
         "checkpoint_semantic_token_sha256": checkpoint_semantic_sha,
-        "runtime_semantic_token_sha256": current_semantic_sha,
+        "runtime_semantic_token_sha256": checkpoint_current_sha,
         "provenance": provenance,
         "compatible": True,
     }

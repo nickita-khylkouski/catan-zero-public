@@ -436,8 +436,9 @@ class TrainConfig(PipelineConfig):
     # order. ``None`` is the CLI inherit sentinel; train_bc resolves it to the
     # checkpoint-owned concrete architecture before hashing.
     action_target_gather: bool | None = None
-    # Function-preserving incidence path for the legacy Transformer trunk.
-    # This changes the value information surface and must be recipe/resume-bound.
+    # Function-preserving incidence path for the legacy Transformer trunk. This
+    # changes the value information surface, so it is inherited and hashed as
+    # checkpoint-owned architecture. Keep new fields appended for compatibility.
     topology_residual_adapter: bool | None = None
 
     @classmethod

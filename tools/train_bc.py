@@ -608,11 +608,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--topology-residual-adapter",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Enable the zero-output direct-incidence residual before the entity "
-            "Transformer. Default off for compatibility; sealed production "
-            "scratch binds the explicit reviewed model-construction value."
+            "Transformer. Omitted inherits an init/grow checkpoint and resolves "
+            "off for fresh models; sealed production binds the explicit reviewed "
+            "model-construction value."
         ),
     )
     parser.add_argument(
@@ -3584,6 +3585,23 @@ def _checkpoint_action_target_gather(checkpoint_path: str) -> bool:
         )
     config = config_attr_view(checkpoint["config"])
     return bool(getattr(config, "action_target_gather", False))
+
+
+def _checkpoint_topology_residual_adapter(checkpoint_path: str) -> bool:
+    """Read the checkpoint-owned topology-aware Transformer residual."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --topology-residual-adapter"
+        )
+    config = config_attr_view(checkpoint["config"])
+    return bool(getattr(config, "topology_residual_adapter", False))
 
 
 def _checkpoint_value_tower_split_layers(checkpoint_path: str) -> int:
@@ -11625,6 +11643,37 @@ def _resolve_effective_action_target_gather(
     return False if requested is None else requested
 
 
+def _resolve_effective_topology_residual_adapter(
+    args: argparse.Namespace,
+) -> bool:
+    """Resolve the topology residual as checkpoint-owned architecture."""
+
+    requested_raw = getattr(args, "topology_residual_adapter", None)
+    requested = None if requested_raw is None else bool(requested_raw)
+    if str(args.arch) != "entity_graph":
+        if requested:
+            raise SystemExit(
+                "--topology-residual-adapter is supported only for --arch entity_graph"
+            )
+        return False
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_topology_residual_adapter(init_checkpoint)
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "--topology-residual-adapter does not match --init-checkpoint: "
+                f"checkpoint={inherited} cli={requested}. Upgrade the checkpoint "
+                "first or omit the flag to inherit its exact architecture."
+            )
+        return inherited
+    if grow_checkpoint:
+        inherited = _checkpoint_topology_residual_adapter(grow_checkpoint)
+        return inherited if requested is None else requested
+    return False if requested is None else requested
+
+
 def _resolve_effective_value_tower_split_layers(
     args: argparse.Namespace,
 ) -> int:
@@ -12620,6 +12669,9 @@ def main(
         _resolve_effective_public_rule_state_features(args)
     )
     args.action_target_gather = _resolve_effective_action_target_gather(args)
+    args.topology_residual_adapter = (
+        _resolve_effective_topology_residual_adapter(args)
+    )
     (
         args.static_action_residual,
         args.legal_action_value_residual,
@@ -35087,6 +35139,19 @@ def _checkpoint_config_mismatches(
                 f"cli={requested_target_gather}; use the action_target_gather "
                 "checkpoint upgrade"
             )
+        checkpoint_topology_residual = bool(
+            getattr(config, "topology_residual_adapter", False)
+        )
+        requested_topology_residual = bool(
+            getattr(args, "topology_residual_adapter", False)
+        )
+        if checkpoint_topology_residual != requested_topology_residual:
+            mismatches.append(
+                "topology_residual_adapter "
+                f"checkpoint={checkpoint_topology_residual} "
+                f"cli={requested_topology_residual}; use the topology checkpoint "
+                "upgrade or omit the flag to inherit it"
+            )
         for field in (
             "static_action_residual",
             "legal_action_value_residual",
@@ -40383,6 +40448,9 @@ def _training_resume_recipe_identity(
         "entity_feature_adapter_version": resume_entity_adapter,
         "public_rule_state_features": bool(
             getattr(args, "public_rule_state_features", False)
+        ),
+        "topology_residual_adapter": bool(
+            getattr(args, "topology_residual_adapter", False)
         ),
         "value_tower_split_layers": int(
             getattr(args, "value_tower_split_layers", 0) or 0

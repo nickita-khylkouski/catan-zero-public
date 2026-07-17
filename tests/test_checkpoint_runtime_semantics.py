@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -31,10 +32,15 @@ def _canonical_sha256(value: object) -> str:
 
 
 def _identity(*, semantic_sha: str | None = None) -> dict[str, object]:
-    identity = dict(current_entity_graph_forward_semantics(POLICY_SOURCE))
+    identity = copy.deepcopy(current_entity_graph_forward_semantics(POLICY_SOURCE))
     identity.pop("binding_sha256")
     if semantic_sha is not None:
-        identity["semantic_token_sha256"] = semantic_sha
+        identity["components"]["entity_token_policy"][
+            "semantic_token_sha256"
+        ] = semantic_sha
+        identity["semantic_token_sha256"] = _canonical_sha256(
+            identity["components"]
+        )
     identity["binding_sha256"] = _canonical_sha256(identity)
     return identity
 
@@ -110,6 +116,12 @@ def test_reviewed_b4_training_binding_is_accepted_without_new_stamp(
     checkpoint = tmp_path / "pre-stamp.pt"
     checkpoint.write_bytes(b"only path identity is needed for stamped training source")
     payload = {
+        "config": {
+            "fields": {
+                "state_trunk": "transformer",
+                "topology_residual_adapter": False,
+            }
+        },
         "value_training": {
             "checkout_runtime_binding": {
                 "modules": {
@@ -132,6 +144,121 @@ def test_reviewed_b4_training_binding_is_accepted_without_new_stamp(
 
     assert result["compatible"] is True
     assert result["provenance"] == "reviewed_training_source_binding"
+
+    payload["config"]["fields"]["topology_residual_adapter"] = True
+    with pytest.raises(RuntimeError, match="does not bind relational topology"):
+        assert_entity_graph_checkpoint_runtime_semantics(
+            payload,
+            checkpoint_path=checkpoint,
+            policy_source=POLICY_SOURCE,
+        )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    (
+        (
+            "adjacency.sum(dim=-1, keepdim=True)",
+            "adjacency.sum(dim=-1, keepdim=True) + 1.0",
+        ),
+        (
+            "qkv = self.qkv(x).reshape(",
+            "qkv = (self.qkv(x) * 0.5).reshape(",
+        ),
+    ),
+)
+def test_relational_semantic_mutation_changes_binding_and_is_rejected(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    relational_source = REPO / "src/catan_zero/rl/relational_trunks.py"
+    mutated_source = tmp_path / "relational_trunks.py"
+    original = relational_source.read_text(encoding="utf-8")
+    mutated = original.replace(old, new, 1)
+    assert mutated != original
+    mutated_source.write_text(mutated, encoding="utf-8")
+
+    stamped = current_entity_graph_forward_semantics(POLICY_SOURCE)
+    changed = current_entity_graph_forward_semantics(POLICY_SOURCE, mutated_source)
+    assert stamped["semantic_token_sha256"] != changed["semantic_token_sha256"]
+    assert (
+        stamped["components"]["relational_trunks"]["semantic_token_sha256"]
+        != changed["components"]["relational_trunks"]["semantic_token_sha256"]
+    )
+
+    checkpoint = tmp_path / "topology.pt"
+    checkpoint.write_bytes(b"semantic preflight does not load checkpoint tensors")
+    payload = {
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY: stamped,
+        "config": {
+            "fields": {
+                "state_trunk": "transformer",
+                "topology_residual_adapter": True,
+            }
+        },
+    }
+    with pytest.raises(RuntimeError, match="forward semantic mismatch"):
+        assert_entity_graph_checkpoint_runtime_semantics(
+            payload,
+            checkpoint_path=checkpoint,
+            policy_source=POLICY_SOURCE,
+            relational_source=mutated_source,
+        )
+
+
+def test_legacy_single_file_stamp_is_refused_for_topology_checkpoint(
+    tmp_path: Path,
+) -> None:
+    legacy = {
+        "schema_version": "entity-graph-forward-semantics-v1",
+        "policy_schema_version": "entity_graph_policy_v1",
+        "semantic_token_sha256": (
+            "sha256:460f78322abb3af4ba5255593b9ef3a4db93c53a114fdef15a9a8f1dae828f7e"
+        ),
+        "selected_symbols": [
+            "_validate_public_award_feature_contract",
+            "_apply_public_award_feature_contract",
+            "_entity_token_start_offsets",
+            "EntityGraphNet",
+            "_token_encoder",
+            "EntityGraphPolicy.__init__",
+            "EntityGraphPolicy.forward_legal_np",
+            "_assert_entity_batch_shapes",
+        ],
+    }
+    legacy["binding_sha256"] = _canonical_sha256(legacy)
+    checkpoint = tmp_path / "legacy-topology.pt"
+    checkpoint.write_bytes(b"legacy topology stamp")
+
+    compatible_payload = {
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY: legacy,
+        "config": {
+            "fields": {
+                "state_trunk": "transformer",
+                "topology_residual_adapter": False,
+            }
+        },
+    }
+    accepted = assert_entity_graph_checkpoint_runtime_semantics(
+        compatible_payload,
+        checkpoint_path=checkpoint,
+        policy_source=POLICY_SOURCE,
+    )
+    assert accepted["provenance"] == "checkpoint_stamp_v1_topology_disabled_compat"
+
+    with pytest.raises(RuntimeError, match="does not bind relational topology"):
+        assert_entity_graph_checkpoint_runtime_semantics(
+            {
+                ENTITY_GRAPH_FORWARD_SEMANTICS_KEY: legacy,
+                "config": {
+                    "fields": {
+                        "state_trunk": "transformer",
+                        "topology_residual_adapter": True,
+                    }
+                },
+            },
+            checkpoint_path=checkpoint,
+            policy_source=POLICY_SOURCE,
+        )
 
 
 def test_unreviewed_metadata_free_checkpoint_is_rejected(tmp_path: Path) -> None:

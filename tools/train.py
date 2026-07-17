@@ -117,6 +117,55 @@ def _require_production_opening_policy_mass_contract(
     return minima
 
 
+def _require_exact_cap_feature_observability(
+    config: TrainConfig,
+    engine_settings: Mapping[str, Any],
+) -> None:
+    """Reject an exact dose that cannot produce its required observations."""
+
+    if not bool(config.exact_max_steps) or int(config.max_steps) <= 0:
+        return
+    required_modules = tuple(
+        name.strip()
+        for name in str(
+            engine_settings.get("require_feature_learning_signal_modules", "")
+        ).split(",")
+        if name.strip()
+    )
+    if not required_modules:
+        return
+    minimum = engine_settings.get("minimum_feature_learning_signal_observations", 0)
+    cadence = engine_settings.get("train_diagnostics_every_batches", 0)
+    for name, value in (
+        ("minimum_feature_learning_signal_observations", minimum),
+        ("train_diagnostics_every_batches", cadence),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise SystemExit(f"canonical engine setting {name} must be an integer >= 0")
+    if minimum == 0:
+        return
+
+    # max_steps counts applied optimizer updates. Each update consumes at most
+    # grad_accum_steps micro-batches, while module diagnostics are sampled by
+    # micro-batch number. Epoch-boundary counter resets and partial accumulation
+    # groups can only reduce this upper bound.
+    maximum_observations = (
+        0
+        if cadence == 0
+        else int(config.max_steps) * int(config.grad_accum_steps) // cadence
+    )
+    if maximum_observations < minimum:
+        raise SystemExit(
+            "canonical exact-capped training cannot satisfy feature-learning-signal "
+            "observability before GPU launch: "
+            f"max_steps={config.max_steps} "
+            f"grad_accum_steps={config.grad_accum_steps} "
+            f"train_diagnostics_every_batches={cadence} "
+            f"maximum_feature_learning_signal_observations={maximum_observations} "
+            f"minimum_feature_learning_signal_observations={minimum}"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -563,6 +612,7 @@ def _bind_parent_report(
 def main(argv: Sequence[str] | None = None) -> None:
     public_args = build_parser().parse_args(argv)
     config, engine_settings = _load_recipe(public_args.config)
+    _require_exact_cap_feature_observability(config, engine_settings)
     if engine_settings.get("initialization_mode") == "scratch_fresh_optimizer":
         raise SystemExit(
             "tools/train.py is not launch authority for the checked-in "

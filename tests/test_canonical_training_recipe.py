@@ -62,8 +62,14 @@ def test_production_opening_mass_contract_is_fail_closed_until_reviewed() -> Non
         train._require_production_opening_policy_mass_contract(engine)
 
 
-def test_parent_production_launcher_refuses_before_training_without_minima() -> None:
-    with pytest.raises(SystemExit, match="remains fail-closed"):
+def test_parent_production_launcher_refuses_impossible_observability_first() -> None:
+    with pytest.raises(
+        SystemExit,
+        match=(
+            "max_steps=12 .*maximum_feature_learning_signal_observations=1 "
+            ".*minimum_feature_learning_signal_observations=2"
+        ),
+    ):
         train.main(
             [
                 "--config",
@@ -78,6 +84,58 @@ def test_parent_production_launcher_refuses_before_training_without_minima() -> 
                 "/tmp/unopened-initializer.pt",
             ]
         )
+
+
+def _feature_observability_engine() -> dict[str, object]:
+    return {
+        "require_feature_learning_signal_modules": "event_encoder,value_head",
+        "minimum_feature_learning_signal_observations": 2,
+        "train_diagnostics_every_batches": 8,
+    }
+
+
+@pytest.mark.parametrize("max_steps", (12, 15))
+def test_exact_cap_rejects_insufficient_feature_observations(max_steps: int) -> None:
+    config = train.TrainConfig(
+        max_steps=max_steps,
+        exact_max_steps=True,
+        grad_accum_steps=1,
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match=(
+            f"max_steps={max_steps} .*maximum_feature_learning_signal_observations=1 "
+            ".*minimum_feature_learning_signal_observations=2"
+        ),
+    ):
+        train._require_exact_cap_feature_observability(
+            config, _feature_observability_engine()
+        )
+
+
+def test_exact_cap_accepts_feature_observation_boundary() -> None:
+    config = train.TrainConfig(
+        max_steps=16,
+        exact_max_steps=True,
+        grad_accum_steps=1,
+    )
+
+    train._require_exact_cap_feature_observability(
+        config, _feature_observability_engine()
+    )
+
+
+def test_epoch_mode_skips_exact_cap_feature_observation_arithmetic() -> None:
+    config = train.TrainConfig(
+        max_steps=0,
+        exact_max_steps=True,
+        grad_accum_steps=1,
+    )
+
+    train._require_exact_cap_feature_observability(
+        config, _feature_observability_engine()
+    )
 
 
 def test_production_opening_mass_contract_accepts_only_complete_reviewed_pair() -> None:
