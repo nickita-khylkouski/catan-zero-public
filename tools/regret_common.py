@@ -166,8 +166,14 @@ def validate_h2h_search_rng_report(
 
 def promotion_phase_bucket(phases: set[str]) -> str:
     upper = " ".join(phases).upper()
-    if "BUILD_INITIAL_SETTLEMENT" in upper or "BUILD_INITIAL_ROAD" in upper:
-        return "opening"
+    has_settlement = "BUILD_INITIAL_SETTLEMENT" in upper
+    has_road = "BUILD_INITIAL_ROAD" in upper
+    if has_settlement and has_road:
+        raise ValueError("promotion phase source mixes both opening prompts")
+    if has_settlement:
+        return "initial_settlement"
+    if has_road:
+        return "initial_road"
     if "ROBBER" in upper or "KNIGHT" in upper or "DEVELOPMENT_CARD" in upper:
         return "robber_dev"
     if "DISCARD" in upper or "ROLL" in upper:

@@ -357,13 +357,13 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
     shard = shard_dir / "relative-shard.npz"
     np.savez(
         shard,
-        game_seed=np.arange(123, 143),
-        decision_index=np.zeros(20, dtype=np.int32),
-        action_taken=np.arange(20),
+        game_seed=np.arange(123, 147),
+        decision_index=np.zeros(24, dtype=np.int32),
+        action_taken=np.arange(24),
     )
     source = tmp_path / "regret.npz"
     validation = tmp_path / "validation-seeds.json"
-    validation_seeds = np.arange(123, 143, dtype=np.int64)
+    validation_seeds = np.arange(123, 147, dtype=np.int64)
     validation_payload = {
         "schema_version": "train-validation-game-seeds-v1",
         "game_seeds": validation_seeds.tolist(),
@@ -392,10 +392,10 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
             validation_binding["game_seed_set_sha256"]
         ),
         shard_paths=np.asarray([str(shard)]),
-        shard_id=np.zeros(20, dtype=np.int32),
-        row_index=np.arange(20, dtype=np.int32),
-        game_seed=np.arange(123, 143, dtype=np.int64),
-        decision_index=np.zeros(20, dtype=np.int32),
+        shard_id=np.zeros(24, dtype=np.int32),
+        row_index=np.arange(24, dtype=np.int32),
+        game_seed=np.arange(123, 147, dtype=np.int64),
+        decision_index=np.zeros(24, dtype=np.int32),
     )
     scope_digest, scope_count = scope_inventory_sha256(shard_dir)
     suite = {
@@ -408,18 +408,19 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
         },
         "validation_seed_manifest": validation_binding,
         "selection": {
-            "algorithm": "trainer-validation-stratified-regret-unique-game-v3",
+            "algorithm": "trainer-validation-stratified-regret-unique-game-v4",
             "selection_scope": "full_authenticated_training_validation_manifest",
             "holdout_fraction": 1.0,
             "holdout_seed": 17,
-            "eligible_unique_states": 20,
-            "eligible_unique_games": 20,
-            "replay_complete_unique_games": 20,
-            "selected_unique_games": 20,
-            "selected_pairs": 20,
+            "eligible_unique_states": 24,
+            "eligible_unique_games": 24,
+            "replay_complete_unique_games": 24,
+            "selected_unique_games": 24,
+            "selected_pairs": 24,
             "stratum_min_pairs": 4,
             "selected_by_stratum": {
-                "phase:opening": 4,
+                "phase:initial_settlement": 4,
+                "phase:initial_road": 4,
                 "phase:robber_dev": 4,
                 "phase:chance": 4,
                 "phase:build_trade": 4,
@@ -427,8 +428,8 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
             },
             "replay_preflight": {
                 "contract": REPLAY_CONTRACT,
-                "candidate_states": 20,
-                "replay_complete_states": 20,
+                "candidate_states": 24,
+                "replay_complete_states": 24,
                 "rejected_bad_source": 0,
                 "rejected_noncontiguous": 0,
             },
@@ -441,12 +442,13 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
                 "game_seed": 123 + pair,
                 "decision_index": 0,
                 "shard_path": "worker/relative-shard.npz",
-                "phase": (
-                    "BUILD_INITIAL_SETTLEMENT",
-                    "MOVE_ROBBER",
+                    "phase": (
+                        "BUILD_INITIAL_SETTLEMENT",
+                        "BUILD_INITIAL_ROAD",
+                        "MOVE_ROBBER",
                     "ROLL",
                     "BUILD_ROAD",
-                )[pair % 4],
+                    )[pair % 5],
                 "legal_count": 54 if pair < 4 else 12,
                 "replay_source": {
                     "contract": REPLAY_CONTRACT,
@@ -455,7 +457,7 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
                     "scope_shard_count": scope_count,
                 },
             }
-            for pair in range(20)
+            for pair in range(24)
         ],
     }
     suite["suite_sha256"] = (
@@ -472,7 +474,7 @@ def test_held_out_suite_loader_replays_digest_and_source_manifest(
 
     assert resolved_path == path.resolve()
     assert loaded == suite
-    assert len(pairs) == 20
+    assert len(pairs) == 24
     assert pairs[0] == {
         "pair_id": 0,
         "game_seed": 123,

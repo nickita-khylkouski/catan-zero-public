@@ -25,6 +25,7 @@ from phase_sliced_value_calibration import (  # type: ignore  # noqa: E402
     parse_validation_game_seed_ranges,
     _calibration_stats,
     _hlgauss_targets,
+    _PHASE_LABELS,
     _legal_bucket,
     _slice_by,
     compute_q,
@@ -87,7 +88,7 @@ def _fake_groups() -> list[dict[str, np.ndarray]]:
             "legal_action_ids": np.zeros((2, 2), dtype=np.int64),
             "legal_action_context": np.zeros((2, 2, 1), dtype=np.float32),
             "z": np.array([1.0, -1.0], dtype=np.float32),
-            "phase_label": np.array(["opening_placement", "play_turn"]),
+            "phase_label": np.array(["initial_settlement", "play_turn"]),
             "forced": np.array([False, True]),
             "legal_count": np.array([54, 1]),
         }
@@ -127,6 +128,11 @@ def test_legal_bucket_boundaries():
     assert _legal_bucket(40) == "21-40"
     assert _legal_bucket(41) == "41+"
     assert _legal_bucket(54) == "41+"
+
+
+def test_opening_prompts_have_distinct_calibration_slices() -> None:
+    assert _PHASE_LABELS["BUILD_INITIAL_SETTLEMENT"] == "initial_settlement"
+    assert _PHASE_LABELS["BUILD_INITIAL_ROAD"] == "initial_road"
 
 
 def test_validation_fraction_derivation_matches_trainer_game_split(
@@ -300,10 +306,10 @@ def test_brier_clips_out_of_range_q():
 def test_slice_by_partitions_rows():
     q = np.array([0.9, 0.8, -0.9, -0.8], dtype=np.float32)
     z = np.array([1.0, 1.0, -1.0, -1.0], dtype=np.float32)
-    keys = np.array(["opening_placement", "robber", "opening_placement", "robber"])
+    keys = np.array(["initial_settlement", "robber", "initial_settlement", "robber"])
     sliced = _slice_by(q, z, keys, min_rows=1)
-    assert set(sliced.keys()) == {"opening_placement", "robber"}
-    assert sliced["opening_placement"]["n"] == 2
+    assert set(sliced.keys()) == {"initial_settlement", "robber"}
+    assert sliced["initial_settlement"]["n"] == 2
     assert sliced["robber"]["n"] == 2
 
 
@@ -381,7 +387,8 @@ def test_categorical_summary_reports_same_slices_plus_proper_score() -> None:
     assert summary["global"][
         "categorical_truncation_probability_mean"
     ] == pytest.approx(1 / 6)
-    assert set(summary["by_phase"]) == {"opening_placement", "play_turn"}
+    assert set(summary["by_phase"]) == {"initial_settlement", "play_turn"}
+    assert set(summary["by_phase_family"]) == {"opening_placement", "play_turn"}
     assert set(summary["by_forced"]) == {"forced", "unforced"}
     assert set(summary["by_legal_count_bucket"]) == {"1", "41+"}
     deployed = summary["deployed_readout_diagnostics"]
@@ -389,7 +396,7 @@ def test_categorical_summary_reports_same_slices_plus_proper_score() -> None:
     assert deployed["changes_operator_default"] is False
     assert deployed["categorical_bypasses_scalar_tanh"] is True
     assert deployed["configured_effective_transform"] == "scalar_clip"
-    assert summary["by_phase"]["opening_placement"][
+    assert summary["by_phase"]["initial_settlement"][
         "categorical_terminal_nll"
     ] == pytest.approx(np.log(2.0))
 
@@ -426,7 +433,8 @@ def test_scalar_summary_reports_raw_tanh_and_clip_by_phase() -> None:
         np.sqrt(np.mean((expected_tanh - np.array([1.0, -1.0])) ** 2))
     )
     assert clip["global"]["value_rmse"] == pytest.approx(0.0)
-    assert set(tanh["by_phase"]) == {"opening_placement", "play_turn"}
+    assert set(tanh["by_phase"]) == {"initial_settlement", "play_turn"}
+    assert set(tanh["by_phase_family"]) == {"opening_placement", "play_turn"}
 
 
 def test_value_scale_fit_uses_disjoint_games_and_recovers_interior_scale() -> None:

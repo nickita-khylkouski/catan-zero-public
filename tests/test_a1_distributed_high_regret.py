@@ -34,10 +34,11 @@ def _fake_suite(tmp_path: Path, *, pairs: int = 40) -> Path:
             "decision_index": pair % 3,
             "phase": (
                 "BUILD_INITIAL_SETTLEMENT",
+                "BUILD_INITIAL_ROAD",
                 "MOVE_ROBBER",
                 "ROLL",
                 "BUILD_ROAD",
-            )[pair % 4],
+            )[pair % 5],
             "legal_count": 54,
             "regret_score": float(pair),
             "replay_source": {
@@ -65,14 +66,15 @@ def _fake_suite(tmp_path: Path, *, pairs: int = 40) -> Path:
             "game_seed_set_sha256": "sha256:" + "b" * 64,
         },
         "selection": {
-            "algorithm": "stable-hash-holdout-stratified-regret-v1",
+            "algorithm": "trainer-validation-stratified-regret-unique-game-v4",
             "holdout_fraction": 0.1,
             "holdout_seed": 17,
             "eligible_unique_states": pairs,
             "selected_pairs": pairs,
             "stratum_min_pairs": 4,
             "selected_by_stratum": {
-                "phase:opening": 4,
+                "phase:initial_settlement": 4,
+                "phase:initial_road": 4,
                 "phase:robber_dev": 4,
                 "phase:chance": 4,
                 "phase:build_trade": 4,
@@ -409,10 +411,11 @@ def test_real_evaluator_loader_accepts_every_fragment(tmp_path: Path) -> None:
             [
                 (
                     "BUILD_INITIAL_SETTLEMENT",
+                    "BUILD_INITIAL_ROAD",
                     "MOVE_ROBBER",
                     "ROLL",
                     "BUILD_ROAD",
-                )[index % 4]
+                )[index % 5]
                 for index in range(len(seeds))
             ]
         ),

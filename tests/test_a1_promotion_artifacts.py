@@ -204,7 +204,7 @@ def _high_regret_report(
         "held_out": True,
         "source_manifest": _ref(source_manifest),
         "selection": {
-            "algorithm": "trainer-validation-stratified-regret-unique-game-v3",
+            "algorithm": "trainer-validation-stratified-regret-unique-game-v4",
             "selection_scope": "full_authenticated_training_validation_manifest",
             "holdout_fraction": 1.0,
             "holdout_seed": 17,
@@ -215,7 +215,8 @@ def _high_regret_report(
             "selected_pairs": pairs,
             "stratum_min_pairs": 20,
             "selected_by_stratum": {
-                "phase:opening": 20,
+                "phase:initial_settlement": 20,
+                "phase:initial_road": 20,
                 "phase:robber_dev": 20,
                 "phase:chance": 20,
                 "phase:build_trade": 20,
@@ -232,10 +233,11 @@ def _high_regret_report(
                 "decision_index": pair % 20,
                 "phase": (
                     "BUILD_INITIAL_SETTLEMENT",
+                    "BUILD_INITIAL_ROAD",
                     "MOVE_ROBBER",
                     "ROLL",
                     "BUILD_ROAD",
-                )[pair % 4],
+                )[pair % 5],
                 "legal_count": 54 if pair < 20 else 12,
                 "regret_score": 1.0,
             }
@@ -247,6 +249,7 @@ def _high_regret_report(
     games = []
     phases = (
         "BUILD_INITIAL_SETTLEMENT",
+        "BUILD_INITIAL_ROAD",
         "MOVE_ROBBER",
         "ROLL",
         "BUILD_ROAD",
@@ -529,10 +532,11 @@ def test_held_out_suite_is_deterministic_and_derived_from_manifest(
             [
                 (
                     "BUILD_INITIAL_SETTLEMENT",
+                    "BUILD_INITIAL_ROAD",
                     "MOVE_ROBBER",
                     "ROLL",
                     "BUILD_ROAD",
-                )[index % 4]
+                )[index % 5]
                 for index in range(200)
             ]
         ),
@@ -544,31 +548,32 @@ def test_held_out_suite_is_deterministic_and_derived_from_manifest(
         manifest_path=manifest,
         holdout_fraction=1.0,
         holdout_seed=17,
-        pairs=20,
+        pairs=24,
     )
     second = artifacts.build_held_out_high_regret_suite(
         manifest_path=manifest,
         holdout_fraction=1.0,
         holdout_seed=17,
-        pairs=20,
+        pairs=24,
     )
 
     assert first == second
-    assert len(first["states"]) == 20
-    assert len({state["game_seed"] for state in first["states"]}) == 20
-    assert first["selection"]["selected_unique_games"] == 20
+    assert len(first["states"]) == 24
+    assert len({state["game_seed"] for state in first["states"]}) == 24
+    assert first["selection"]["selected_unique_games"] == 24
     assert first["source_manifest"] == _ref(manifest)
     assert first["suite_sha256"] == promotion._digest_value(
         {key: value for key, value in first.items() if key != "suite_sha256"}
     )
     assert first["selection"]["selected_by_stratum"] == {
-        "phase:opening": 4,
+        "phase:initial_settlement": 4,
+        "phase:initial_road": 4,
         "phase:robber_dev": 4,
         "phase:chance": 4,
         "phase:build_trade": 4,
         "41+": 4,
     }
-    assert first["selection"]["replay_preflight"]["replay_complete_states"] > 20
+    assert first["selection"]["replay_preflight"]["replay_complete_states"] > 24
     assert all(
         state["replay_source"]["scope"] == str(shard_dir)
         for state in first["states"]
@@ -647,10 +652,11 @@ def test_held_out_suite_rejects_gaps_duplicates_and_partial_lanes(
     phases = [
         (
             "BUILD_INITIAL_SETTLEMENT",
+            "BUILD_INITIAL_ROAD",
             "MOVE_ROBBER",
             "ROLL",
             "BUILD_ROAD",
-        )[index % 4]
+        )[index % 5]
         for index in range(len(candidate_seeds))
     ]
     manifest = tmp_path / "regret.npz"
@@ -674,7 +680,7 @@ def test_held_out_suite_rejects_gaps_duplicates_and_partial_lanes(
         manifest_path=manifest,
         holdout_fraction=1.0,
         holdout_seed=17,
-        pairs=20,
+        pairs=24,
     )
 
     identities = {
@@ -720,7 +726,7 @@ def test_held_out_suite_fails_clearly_when_replay_complete_pool_is_too_small(
             manifest_path=manifest,
             holdout_fraction=1.0,
             holdout_seed=17,
-            pairs=20,
+            pairs=24,
         )
 
 
@@ -750,7 +756,7 @@ def test_held_out_suite_refuses_any_non_validation_source_row(tmp_path: Path) ->
             manifest_path=manifest,
             holdout_fraction=1.0,
             holdout_seed=17,
-            pairs=20,
+            pairs=24,
         )
 
 
@@ -782,7 +788,7 @@ def test_held_out_suite_refuses_validation_manifest_drift(tmp_path: Path) -> Non
             manifest_path=manifest,
             holdout_fraction=1.0,
             holdout_seed=17,
-            pairs=20,
+            pairs=24,
         )
 
 
@@ -805,7 +811,9 @@ def test_bucket_report_is_extracted_from_retained_high_regret_games(
     assert first["candidate_color"] == "RED"
     assert first["baseline_color"] == "BLUE"
     assert first["final_actual_vps"] == {"RED": 10, "BLUE": 4}
-    assert first["buckets"] == ["41+", "blowout", "opening", "phase:opening"]
+    assert first["buckets"] == [
+        "41+", "blowout", "opening", "phase:initial_settlement"
+    ]
 
 
 def test_bucket_report_rejects_forged_close_label_for_blowout(
@@ -1080,6 +1088,40 @@ def test_bucket_builder_computes_pass_from_counts(tmp_path: Path) -> None:
     }
 
 
+def test_prompt_regression_cannot_hide_in_pooled_opening_bucket(
+    tmp_path: Path,
+) -> None:
+    candidate, champion = _checkpoints(tmp_path)
+    raw = _bucket_report(candidate, champion)
+    raw["games"] = [
+        _bucket_game(pair, orientation, candidate_won=False,
+                     phase="BUILD_INITIAL_SETTLEMENT")
+        for pair in range(4)
+        for orientation in ("candidate_red", "candidate_blue")
+    ] + [
+        _bucket_game(100 + pair, orientation, candidate_won=True,
+                     phase="BUILD_INITIAL_ROAD")
+        for pair in range(4)
+        for orientation in ("candidate_red", "candidate_blue")
+    ]
+    _sync_bucket_source(raw)
+    report = tmp_path / "bucket-games.json"
+    _json(report, raw)
+
+    value = artifacts.build_bucket_veto_source(
+        report_path=report, candidate=candidate, champion=champion
+    )
+
+    assert value["per_bucket"]["opening"] == {
+        "status": "pass", "n": 16, "winrate": 0.5
+    }
+    assert value["per_bucket"]["phase:initial_settlement"] == {
+        "status": "fail", "n": 8, "winrate": 0.0
+    }
+    assert value["per_bucket"]["phase:initial_road"]["status"] == "pass"
+    assert "phase:initial_settlement" in value["veto_buckets"]
+
+
 def test_bucket_builder_preserves_fail_and_insufficient_data(tmp_path: Path) -> None:
     candidate, champion = _checkpoints(tmp_path)
     raw = _bucket_report(candidate, champion)
@@ -1141,7 +1183,7 @@ def test_bucket_builder_uses_fixed_five_percent_regression_limit(
         report_path=report, candidate=candidate, champion=champion
     )
 
-    assert value["per_bucket"]["phase:opening"]["status"] == "pass"
+    assert value["per_bucket"]["phase:initial_settlement"]["status"] == "pass"
     assert value["per_bucket"]["phase:build_trade"]["status"] == "fail"
     assert "phase:build_trade" in value["veto_buckets"]
 

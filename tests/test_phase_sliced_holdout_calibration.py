@@ -102,8 +102,8 @@ class TestCollectHoldoutRowsWithSlices:
         assert "legal_count" in group
         assert list(group["legal_count"]) == [3] * n
         assert group["forced"].sum() == 3
-        # opening-placement rows (BUILD_INITIAL_SETTLEMENT) mapped correctly
-        assert (group["phase_label"][:5] == "opening_placement").all()
+        # Opening settlement rows remain prompt-specific for promotion.
+        assert (group["phase_label"][:5] == "initial_settlement").all()
         assert (group["phase_label"][5:] == "play_turn").all()
 
     def test_respects_game_seed_range_filter(self, tmp_path):

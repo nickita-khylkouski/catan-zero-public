@@ -1010,6 +1010,12 @@ def _fixture(
         deployed_view = {
             "global": {"n": 4096, "value_rmse": rmse},
             "by_phase": {
+                "initial_settlement": {"n": 256, "value_rmse": rmse},
+                "initial_road": {"n": 256, "value_rmse": rmse},
+                "robber": {"n": 256, "value_rmse": rmse},
+                "play_turn": {"n": 3328, "value_rmse": rmse},
+            },
+            "by_phase_family": {
                 "opening_placement": {"n": 512, "value_rmse": rmse},
                 "robber": {"n": 256, "value_rmse": rmse},
                 "play_turn": {"n": 3328, "value_rmse": rmse},
@@ -1065,6 +1071,7 @@ def _fixture(
                 },
                 "global": {"n": 4096, "value_rmse": rmse},
                 "by_phase": deployed_view["by_phase"],
+                "by_phase_family": deployed_view["by_phase_family"],
                 "by_forced": deployed_view["by_forced"],
                 "by_legal_count_bucket": deployed_view["by_legal_count_bucket"],
             },
@@ -1344,7 +1351,7 @@ def _fixture(
         "source_manifest": _checkpoint_ref(high_regret_source_manifest),
         "validation_seed_manifest": validation_binding,
         "selection": {
-            "algorithm": "trainer-validation-stratified-regret-unique-game-v3",
+            "algorithm": "trainer-validation-stratified-regret-unique-game-v4",
             "selection_scope": "full_authenticated_training_validation_manifest",
             "holdout_fraction": 1.0,
             "holdout_seed": 17,
@@ -1355,7 +1362,8 @@ def _fixture(
             "selected_pairs": 240,
             "stratum_min_pairs": 24,
             "selected_by_stratum": {
-                "phase:opening": 24,
+                "phase:initial_settlement": 24,
+                "phase:initial_road": 24,
                 "phase:robber_dev": 24,
                 "phase:chance": 24,
                 "phase:build_trade": 24,
@@ -1379,10 +1387,11 @@ def _fixture(
                 "decision_index": 0,
                 "phase": (
                     "BUILD_INITIAL_SETTLEMENT",
+                    "BUILD_INITIAL_ROAD",
                     "MOVE_ROBBER",
                     "ROLL",
                     "BUILD_ROAD",
-                )[pair % 4],
+                )[pair % 5],
                 "legal_count": 54 if pair < 24 else 12,
                 "regret_score": 1.0,
                 "replay_source": {
@@ -1402,6 +1411,7 @@ def _fixture(
     high_regret_games = []
     high_regret_phases = (
         "BUILD_INITIAL_SETTLEMENT",
+        "BUILD_INITIAL_ROAD",
         "MOVE_ROBBER",
         "ROLL",
         "BUILD_ROAD",
@@ -1564,19 +1574,14 @@ def _fixture(
                 "41+": {"status": "pass", "n": 48, "winrate": 1.0},
                 "blowout": {"status": "pass", "n": 240, "winrate": 1.0},
                 "close": {"status": "pass", "n": 240, "winrate": 1.0},
-                "opening": {"status": "pass", "n": 120, "winrate": 1.0},
-                "phase:build_trade": {
-                    "status": "pass",
-                    "n": 120,
-                    "winrate": 1.0,
+                "opening": {"status": "pass", "n": 192, "winrate": 1.0},
+                "phase:build_trade": {"status": "pass", "n": 96, "winrate": 1.0},
+                "phase:chance": {"status": "pass", "n": 96, "winrate": 1.0},
+                "phase:initial_road": {"status": "pass", "n": 96, "winrate": 1.0},
+                "phase:initial_settlement": {
+                    "status": "pass", "n": 96, "winrate": 1.0,
                 },
-                "phase:chance": {"status": "pass", "n": 120, "winrate": 1.0},
-                "phase:opening": {"status": "pass", "n": 120, "winrate": 1.0},
-                "phase:robber_dev": {
-                    "status": "pass",
-                    "n": 120,
-                    "winrate": 1.0,
-                },
+                "phase:robber_dev": {"status": "pass", "n": 96, "winrate": 1.0},
             },
             "report": _checkpoint_ref(bucket_report),
         },
@@ -4653,6 +4658,32 @@ def test_bucket_verifier_rejects_compound_fact_and_label_rewrites(
         _execute(fixture, go=False)
 
 
+def test_high_regret_archived_prompt_is_bound_to_authenticated_suite_state(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+
+    def tamper_archived_prompt(source: dict) -> None:
+        report_path = Path(source["report"]["path"])
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        game = next(
+            row for row in report["games"]
+            if row["archived_phase"] == "BUILD_INITIAL_SETTLEMENT"
+        )
+        game["archived_phase"] = "BUILD_INITIAL_ROAD"
+        _write_json(report_path, report)
+        source["report"]["sha256"] = promotion._sha256(report_path)
+
+    _mutate_evidence_source(
+        fixture, kind="high_regret", role="high_regret",
+        mutate=tamper_archived_prompt,
+    )
+    with pytest.raises(
+        promotion.PromotionError, match="not from its held-out suite state"
+    ):
+        _execute(fixture, go=False)
+
+
 def test_bucket_veto_must_use_adjudicated_high_regret_report(
     tmp_path: Path,
 ) -> None:
@@ -4699,16 +4730,23 @@ def _calibration_non_regression_policy() -> dict:
 def _deployed_value_metrics(
     *,
     global_rmse: float = 0.20,
-    opening_rmse: float = 0.20,
+    settlement_rmse: float = 0.20,
+    road_rmse: float = 0.20,
+    pooled_opening_rmse: float = 0.20,
     wide_rmse: float = 0.20,
     robber_rmse: float = 0.20,
 ) -> dict:
     return {
         "global_rmse": global_rmse,
         "slices": {
-            "by_phase:opening_placement": {
-                "n": 512,
-                "value_rmse": opening_rmse,
+            "by_phase:initial_settlement": {
+                "n": 256, "value_rmse": settlement_rmse,
+            },
+            "by_phase:initial_road": {
+                "n": 256, "value_rmse": road_rmse,
+            },
+            "by_phase_family:opening_placement": {
+                "n": 512, "value_rmse": pooled_opening_rmse,
             },
             "by_legal_count_bucket:41+": {
                 "n": 1024,
@@ -4731,7 +4769,8 @@ def test_calibration_non_regression_accepts_bound_load_bearing_slices() -> None:
 @pytest.mark.parametrize(
     ("field", "candidate_rmse"),
     [
-        ("by_phase:opening_placement", 0.50),
+        ("by_phase:initial_settlement", 0.50),
+        ("by_phase:initial_road", 0.50),
         ("by_phase:robber", 0.50),
         ("by_legal_count_bucket:41+", 0.50),
     ],
@@ -4742,6 +4781,28 @@ def test_calibration_non_regression_rejects_load_bearing_slice(
     candidate = _deployed_value_metrics()
     candidate["slices"][field]["value_rmse"] = candidate_rmse
 
+    with pytest.raises(promotion.PromotionError, match="slice RMSE regression"):
+        promotion._verify_calibration_non_regression(  # noqa: SLF001
+            _calibration_non_regression_policy(),
+            expected_readout="scalar",
+            candidate_metrics=candidate,
+            champion_metrics=_deployed_value_metrics(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("regressed_prompt", "improved_prompt"),
+    [
+        ("by_phase:initial_settlement", "by_phase:initial_road"),
+        ("by_phase:initial_road", "by_phase:initial_settlement"),
+    ],
+)
+def test_calibration_prompt_regression_cannot_hide_in_pooled_opening_slice(
+    regressed_prompt: str, improved_prompt: str
+) -> None:
+    candidate = _deployed_value_metrics(pooled_opening_rmse=0.20)
+    candidate["slices"][regressed_prompt]["value_rmse"] = 0.50
+    candidate["slices"][improved_prompt]["value_rmse"] = 0.05
     with pytest.raises(promotion.PromotionError, match="slice RMSE regression"):
         promotion._verify_calibration_non_regression(  # noqa: SLF001
             _calibration_non_regression_policy(),
@@ -4771,7 +4832,7 @@ def test_calibration_non_regression_requires_minimum_rows_if_slice_exists() -> N
 def test_calibration_non_regression_rejects_present_slice_cohort_mismatch() -> None:
     candidate = _deployed_value_metrics()
     champion = _deployed_value_metrics()
-    del candidate["slices"]["by_phase:opening_placement"]
+    del candidate["slices"]["by_phase:initial_settlement"]
 
     with pytest.raises(promotion.PromotionError, match="slice cohort differs"):
         promotion._verify_calibration_non_regression(  # noqa: SLF001
@@ -4894,7 +4955,8 @@ def test_calibration_gate_scores_the_sealed_deployed_transform(tmp_path: Path) -
 @pytest.mark.parametrize(
     ("axis", "label"),
     [
-        ("by_phase", "opening_placement"),
+        ("by_phase", "initial_settlement"),
+        ("by_phase", "initial_road"),
         ("by_phase", "robber"),
         ("by_legal_count_bucket", "41+"),
     ],
@@ -4931,7 +4993,7 @@ def test_calibration_gate_rejects_deployed_slice_inventory_drift(
     def omit_deployed_opening(source: dict) -> None:
         del source["deployed_readout_diagnostics"]["views"]["scalar_tanh"][
             "by_phase"
-        ]["opening_placement"]
+        ]["initial_settlement"]
 
     _mutate_evidence_source(
         fixture,

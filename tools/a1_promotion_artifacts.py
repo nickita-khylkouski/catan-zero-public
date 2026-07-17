@@ -38,6 +38,7 @@ from tools.high_regret_suite_contract import (  # noqa: E402
 from tools.regret_common import (  # noqa: E402
     H2H_SEARCH_RNG_CONTRACT,
     PROMOTION_BUCKET_GAME_FIELDS,
+    promotion_phase_bucket,
     project_promotion_bucket_game,
     validate_h2h_search_rng_report,
     validate_promotion_bucket_game,
@@ -389,8 +390,10 @@ def build_held_out_high_regret_suite(
             "promotion suite must use the full authenticated trainer validation set"
         )
     pairs = _positive_int(pairs, where="held-out suite pairs")
-    if pairs < 20:
-        raise ArtifactBuildError("held-out suite requires at least 20 pairs")
+    if pairs < 24:
+        raise ArtifactBuildError(
+            "held-out suite requires at least 24 pairs for six sealed strata"
+        )
     try:
         with np.load(manifest_path, allow_pickle=False) as data:
             required = {
@@ -472,14 +475,10 @@ def build_held_out_high_regret_suite(
     )
 
     def phase_stratum(phase: str) -> str:
-        upper = str(phase).upper()
-        if "BUILD_INITIAL_SETTLEMENT" in upper or "BUILD_INITIAL_ROAD" in upper:
-            return "opening"
-        if "ROBBER" in upper or "KNIGHT" in upper or "DEVELOPMENT_CARD" in upper:
-            return "robber_dev"
-        if "DISCARD" in upper or "ROLL" in upper:
-            return "chance"
-        return "build_trade"
+        try:
+            return promotion_phase_bucket({str(phase)})
+        except ValueError as error:
+            raise ArtifactBuildError(f"ambiguous promotion phase: {error}") from error
 
     selected: list[int] = []
     seen_game_seeds: set[int] = set()
@@ -504,7 +503,13 @@ def build_held_out_high_regret_suite(
             )
 
     stratum_min_pairs = max(4, pairs // 10)
-    for stratum in ("opening", "robber_dev", "chance", "build_trade"):
+    for stratum in (
+        "initial_settlement",
+        "initial_road",
+        "robber_dev",
+        "chance",
+        "build_trade",
+    ):
         select_from(
             [index for index in eligible if phase_stratum(phases[index]) == stratum],
             stratum_min_pairs,
@@ -569,7 +574,7 @@ def build_held_out_high_regret_suite(
         "source_manifest": _file_ref(manifest_path, where="regret manifest"),
         "validation_seed_manifest": validation_binding,
         "selection": {
-            "algorithm": "trainer-validation-stratified-regret-unique-game-v3",
+            "algorithm": "trainer-validation-stratified-regret-unique-game-v4",
             "selection_scope": "full_authenticated_training_validation_manifest",
             "holdout_fraction": float(holdout_fraction),
             "holdout_seed": int(holdout_seed),

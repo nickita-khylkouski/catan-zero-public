@@ -35,7 +35,13 @@ from tools.regret_common import (  # noqa: E402
 
 MANIFEST_SCHEMA = "a1-distributed-high-regret-shards-v1"
 PARTITION_ALGORITHM = "stratified-wide-first-stable-round-robin-v1"
-PHASES = ("opening", "robber_dev", "chance", "build_trade")
+PHASES = (
+    "initial_settlement",
+    "initial_road",
+    "robber_dev",
+    "chance",
+    "build_trade",
+)
 ORIENTATIONS = {
     "legacy": {"candidate_first", "candidate_second"},
     "color": {"candidate_red", "candidate_blue"},
@@ -124,8 +130,10 @@ def _publish_exact(path: Path, value: dict[str, Any]) -> None:
 
 def _phase(state: dict[str, Any]) -> str:
     value = str(state.get("phase", "")).upper()
-    if "BUILD_INITIAL_SETTLEMENT" in value or "BUILD_INITIAL_ROAD" in value:
-        return "opening"
+    if "BUILD_INITIAL_SETTLEMENT" in value:
+        return "initial_settlement"
+    if "BUILD_INITIAL_ROAD" in value:
+        return "initial_road"
     if "ROBBER" in value or "KNIGHT" in value or "DEVELOPMENT_CARD" in value:
         return "robber_dev"
     if "DISCARD" in value or "ROLL" in value:
@@ -218,7 +226,8 @@ def shard_suite(*, suite_path: Path, shards: int, out_dir: Path) -> dict[str, An
                 "selected_unique_games": len(states),
                 "stratum_min_pairs": 4,
                 "selected_by_stratum": {
-                    "phase:opening": 4,
+                    "phase:initial_settlement": 4,
+                    "phase:initial_road": 4,
                     "phase:robber_dev": 4,
                     "phase:chance": 4,
                     "phase:build_trade": 4,

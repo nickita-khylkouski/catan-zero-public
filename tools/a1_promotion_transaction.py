@@ -64,6 +64,7 @@ from tools.regret_common import (  # noqa: E402
     H2H_SEARCH_RNG_CONTRACT,
     PROMOTION_BUCKET_GAME_FIELDS,
     h2h_search_seed,
+    promotion_phase_bucket,
     project_promotion_bucket_game,
     validate_h2h_search_rng_report,
     validate_promotion_bucket_game,
@@ -176,7 +177,8 @@ MAX_CALIBRATION_RMSE_REGRESSION = 0.02
 MAX_CALIBRATION_SLICE_RMSE_REGRESSION = 0.02
 MIN_CALIBRATION_SLICE_ROWS = 30
 REQUIRED_CALIBRATION_SLICES = (
-    "by_phase:opening_placement",
+    "by_phase:initial_settlement",
+    "by_phase:initial_road",
     "by_legal_count_bucket:41+",
     "by_phase:robber",
 )
@@ -211,7 +213,8 @@ ROLE_SEARCH_CONFIG_SCHEMA = "a1-deployed-agent-search-config-v1"
 MIN_BUCKET_WIN_RATE = 0.45
 MIN_BUCKET_GAMES = 8
 REQUIRED_PROMOTION_BUCKETS = {
-    "phase:opening",
+    "phase:initial_settlement",
+    "phase:initial_road",
     "phase:robber_dev",
     "phase:chance",
     "phase:build_trade",
@@ -5875,7 +5878,12 @@ def _deployed_calibration_slice_metrics(
     """Extract immutable slice counts/RMSE from the deployed readout view."""
 
     slices: dict[str, dict[str, float | int]] = {}
-    for axis in ("by_phase", "by_forced", "by_legal_count_bucket"):
+    for axis in (
+        "by_phase",
+        "by_phase_family",
+        "by_forced",
+        "by_legal_count_bucket",
+    ):
         raw_axis = deployed_view.get(axis, {})
         if not isinstance(raw_axis, dict):
             raise PromotionError(f"{where}.{axis} must be an object")
@@ -8122,7 +8130,7 @@ def _verify_high_regret_source(
     if (
         not isinstance(selection, dict)
         or selection.get("algorithm")
-        != "trainer-validation-stratified-regret-unique-game-v3"
+        != "trainer-validation-stratified-regret-unique-game-v4"
         or not isinstance(states, list)
         or not states
         or selection.get("selected_pairs") != len(states)
@@ -8141,7 +8149,8 @@ def _verify_high_regret_source(
             f"{where} suite and source manifest bind different training holdouts"
         )
     expected_strata = {
-        "phase:opening",
+        "phase:initial_settlement",
+        "phase:initial_road",
         "phase:robber_dev",
         "phase:chance",
         "phase:build_trade",
@@ -8165,7 +8174,7 @@ def _verify_high_regret_source(
         raise PromotionError(
             f"{where} held-out suite violates the fixed stratified policy"
         )
-    state_by_pair: dict[int, tuple[int, int]] = {}
+    state_by_pair: dict[int, tuple[int, int, str]] = {}
     selected_game_seeds: set[int] = set()
     actual_strata = {label: 0 for label in expected_strata}
     inventory_cache: dict[Path, tuple[str, int]] = {}
@@ -8205,18 +8214,19 @@ def _verify_high_regret_source(
             or pair_id in state_by_pair
         ):
             raise PromotionError(f"{where}.suite.states[{index}] has invalid identity")
-        state_by_pair[pair_id] = (game_seed, decision_index)
+        state_by_pair[pair_id] = (
+            game_seed,
+            decision_index,
+            str(state.get("phase", "")),
+        )
         selected_game_seeds.add(game_seed)
         bound_states.append(state)
-        phase = str(state.get("phase", "")).upper()
-        if "BUILD_INITIAL_SETTLEMENT" in phase or "BUILD_INITIAL_ROAD" in phase:
-            phase_stratum = "opening"
-        elif "ROBBER" in phase or "KNIGHT" in phase or "DEVELOPMENT_CARD" in phase:
-            phase_stratum = "robber_dev"
-        elif "DISCARD" in phase or "ROLL" in phase:
-            phase_stratum = "chance"
-        else:
-            phase_stratum = "build_trade"
+        try:
+            phase_stratum = promotion_phase_bucket({str(state.get("phase", ""))})
+        except ValueError as error:
+            raise PromotionError(
+                f"{where}.suite.states[{index}] has ambiguous phase: {error}"
+            ) from error
         actual_strata[f"phase:{phase_stratum}"] += 1
         if legal_count >= 41:
             actual_strata["41+"] += 1
@@ -8305,6 +8315,7 @@ def _verify_high_regret_source(
         if state_by_pair.get(pair_id) != (
             game.get("archived_game_seed"),
             game.get("archived_decision_index"),
+            game.get("archived_phase"),
         ):
             raise PromotionError(
                 f"{where}.report.games[{index}] is not from its held-out suite state"

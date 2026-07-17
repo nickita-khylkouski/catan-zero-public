@@ -86,10 +86,12 @@ ENTITY_KEYS = (
     "event_mask",
 )
 
-# Map the coarse stored `phase` values to friendly slice labels.
+# Map the coarse stored `phase` values to friendly slice labels. The two
+# opening prompts deliberately remain distinct so one cannot hide the other's
+# RMSE regression.
 _PHASE_LABELS = {
-    "BUILD_INITIAL_SETTLEMENT": "opening_placement",
-    "BUILD_INITIAL_ROAD": "opening_placement",
+    "BUILD_INITIAL_SETTLEMENT": "initial_settlement",
+    "BUILD_INITIAL_ROAD": "initial_road",
     "MOVE_ROBBER": "robber",
     "DISCARD": "discard",
     "PLAY_TURN": "play_turn",
@@ -1082,6 +1084,13 @@ def build_calibration_summary(
     q = predictions.q
     z = np.concatenate([g["z"] for g in groups], axis=0)
     phase = np.concatenate([g["phase_label"] for g in groups], axis=0)
+    # Retain the historical pooled opening view as supplementary diagnostics;
+    # promotion consumes the exact prompt slices above.
+    phase_family = np.where(
+        np.isin(phase, ("initial_settlement", "initial_road")),
+        "opening_placement",
+        phase,
+    )
     forced = np.concatenate([g["forced"] for g in groups], axis=0)
     legal_count = np.concatenate([g["legal_count"] for g in groups], axis=0)
     if len(q) != len(z):
@@ -1114,6 +1123,7 @@ def build_calibration_summary(
         return {
             "global": _calibration_stats(view_q, z, **view_common),
             "by_phase": _slice_by(view_q, z, phase, **view_common),
+            "by_phase_family": _slice_by(view_q, z, phase_family, **view_common),
             "by_forced": _slice_by(view_q, z, forced_label, **view_common),
             "by_legal_count_bucket": _slice_by(
                 view_q, z, legal_bucket, **view_common
@@ -1173,6 +1183,7 @@ def build_calibration_summary(
         },
         "global": _calibration_stats(q, z, **common),
         "by_phase": _slice_by(q, z, phase, **common),
+        "by_phase_family": _slice_by(q, z, phase_family, **common),
         "by_forced": _slice_by(q, z, forced_label, **common),
         "by_legal_count_bucket": _slice_by(q, z, legal_bucket, **common),
     }

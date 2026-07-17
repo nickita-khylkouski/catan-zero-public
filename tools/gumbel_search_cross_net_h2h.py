@@ -358,7 +358,7 @@ def _load_held_out_high_regret_suite(
     if (
         not isinstance(selection, dict)
         or selection.get("algorithm")
-        != "trainer-validation-stratified-regret-unique-game-v3"
+        != "trainer-validation-stratified-regret-unique-game-v4"
         or not isinstance(states, list)
         or not states
         or selection.get("selected_pairs") != len(states)
@@ -366,7 +366,8 @@ def _load_held_out_high_regret_suite(
         raise ValueError("held-out suite selection is malformed")
     validate_replay_metadata(selection, states)
     expected_strata = {
-        "phase:opening",
+        "phase:initial_settlement",
+        "phase:initial_road",
         "phase:robber_dev",
         "phase:chance",
         "phase:build_trade",
@@ -445,7 +446,13 @@ def _load_held_out_high_regret_suite(
             promotion_phase_bucket({str(state.get("phase", ""))}) == stratum
             for state in bound_states
         )
-        for stratum in ("opening", "robber_dev", "chance", "build_trade")
+        for stratum in (
+            "initial_settlement",
+            "initial_road",
+            "robber_dev",
+            "chance",
+            "build_trade",
+        )
     }
     actual_strata["41+"] = sum(state["legal_count"] >= 41 for state in bound_states)
     if any(actual_strata[label] < stratum_min_pairs for label in expected_strata):
