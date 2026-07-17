@@ -135,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Placement override; defaults to the config's commissioned 128 "
+            "Placement override; defaults to the 8xH100 config's commissioned 24 "
             "cross-game EvalServer workers."
         ),
     )

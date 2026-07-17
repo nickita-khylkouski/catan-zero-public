@@ -76,7 +76,7 @@
     "event_history_limit": 64,
     "teacher_entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
     "learner_entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
-    "workers_per_gpu": 128,
+    "workers_per_gpu": 24,
     "shard_size": 512,
     "format": "npz",
     "device": "cuda",

@@ -98,7 +98,7 @@
     "vps_to_win": 10,
     "wide_candidates_threshold": 24,
     "wide_roots_always_full": false,
-    "workers": 128
+    "workers": 24
   },
   "pipeline": "generate",
   "schema_version": 20

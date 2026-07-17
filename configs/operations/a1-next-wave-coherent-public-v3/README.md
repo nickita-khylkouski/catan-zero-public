@@ -23,7 +23,7 @@ cannot silently redefine the value-state distribution.
 The current typed generator artifact is schema 19, which binds
 `boundary_value_particles` and the retained H100 EvalServer runtime into
 generation and evaluation identity. Current-producer jobs run one generator
-per physical GPU with 128 cross-game workers, strict-FP32 EvalServer inference,
+per physical GPU with 24 cross-game workers, strict-FP32 EvalServer inference,
 an immediate request collector, and a 96-request batch cap. Opponent-mix jobs
 use the generator's supported 16-worker local/MPS evaluator path because the
 EvalServer cannot yet route multiple checkpoint evaluators. The

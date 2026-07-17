@@ -10,9 +10,9 @@
     ],
     "generate": [
       {
-        "canonical_sha256": "c4a179ceb4a592d1fe43ae780c32b06a60eee0a8b10aae6eeb681307a2416671",
+        "canonical_sha256": "0fe5fa083b9346c1e2d88ee1487f03b55e3f0a7d9cf26752b755b63452c6c801",
         "guard": {
-          "canonical_sha256": "cd08e6f8e3fdce1816127fd77f8064545a15071c53d5954b5f9e71aeef6cd0f0",
+          "canonical_sha256": "efbe8419a0b49e0ea7684c1218cb766e9a496f4a5a0f7ac51eefb29d2888ba95",
           "path": "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
         },
         "name": "coherent-public-n128",

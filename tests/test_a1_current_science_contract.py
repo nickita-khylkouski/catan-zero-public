@@ -213,7 +213,7 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
         current_science.PRODUCTION_GENERATION_RUNTIME_FIELD_MAP.items()
     ):
         assert generation[science_field] == generator[config_field]
-    assert generation["workers_per_gpu"] == 128
+    assert generation["workers_per_gpu"] == 24
     assert generation["eval_server"] is True
     assert generation["eval_server_max_batch"] == 96
     assert generation["eval_server_request_collector"] is True
@@ -248,7 +248,7 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     )
     assert "--workers" in lint["critical_flags"]
     assert "--eval-server" in lint["critical_flags"]
-    assert lint["expected_values"]["--workers"] == 128
+    assert lint["expected_values"]["--workers"] == 24
     assert lint["expected_values"]["--eval-server"] is True
     assert "--eval-server-max-batch" not in lint["critical_flags"]
     assert "--eval-server-request-collector" not in lint["critical_flags"]
