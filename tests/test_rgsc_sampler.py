@@ -20,6 +20,7 @@ Covers:
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -216,6 +217,9 @@ def _write_synthetic_manifest(path: Path, n: int = 60) -> None:
     scores = np.sort(rng.uniform(0.01, 2.0, size=n))[::-1]  # score-sorted desc
     game_seed = np.arange(1_000_000, 1_000_000 + n, dtype=np.int64)
     decision_index = rng.integers(0, 600, size=n).astype(np.int32)
+    shard = path.parent / "fake_shard_0.npz"
+    shard.write_bytes(b"synthetic-regret-source")
+    shard_hash = "sha256:" + hashlib.sha256(shard.read_bytes()).hexdigest()
     cols = {
         "shard_id": np.zeros(n, dtype=np.int32),
         "row_index": np.arange(n, dtype=np.int32),
@@ -223,7 +227,8 @@ def _write_synthetic_manifest(path: Path, n: int = 60) -> None:
         "decision_index": decision_index,
         "regret_score": scores.astype(np.float32),
         "phase": np.asarray(phases),
-        "shard_paths": np.asarray(["fake_shard_0.npz"]),
+        "shard_paths": np.asarray([shard.name]),
+        "shard_sha256": np.asarray([shard_hash]),
     }
     np.savez(path, **cols)
 

@@ -391,6 +391,34 @@ def test_regret_manifest_binds_sources_sampling_and_checkpoint(tmp_path) -> None
         assert str(data["extraction_identity_sha256"]).startswith("sha256:")
 
 
+def test_restart_selection_rejects_replaced_regret_source_shard(tmp_path) -> None:
+    import extract_regret_states as ex
+    import generate_restart_selfplay as gr
+
+    shard = tmp_path / "source.npz"
+    shard.write_bytes(b"authenticated-source")
+    manifest = tmp_path / "regret.npz"
+    np.savez(
+        manifest,
+        shard_id=np.asarray([0], dtype=np.int32),
+        game_seed=np.asarray([7], dtype=np.int64),
+        decision_index=np.asarray([3], dtype=np.int32),
+        regret_score=np.asarray([1.0], dtype=np.float32),
+        phase=np.asarray(["BUILD_INITIAL_SETTLEMENT"]),
+        shard_paths=np.asarray([str(shard)]),
+        shard_sha256=np.asarray([ex._file_sha256(shard)]),
+    )
+    counts = {"opening": 1, "robber_dev": 0, "random_archived": 0}
+    selected = gr.select_archived_states(
+        manifest, counts, rng=np.random.default_rng(1)
+    )
+    assert selected["opening"][0]["shard_path"] == str(shard.resolve())
+
+    shard.write_bytes(b"replaced-source")
+    with pytest.raises(ValueError, match="source shard sha256 mismatch"):
+        gr.select_archived_states(manifest, counts, rng=np.random.default_rng(1))
+
+
 def test_restart_generation_rejects_failed_or_incomplete_mix() -> None:
     import generate_restart_selfplay as gr
 

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import random
 import time
@@ -416,6 +417,16 @@ def write_holdout_manifest(
         "holdout_fraction": np.asarray(holdout_fraction, dtype=np.float64),
         "holdout_seed": np.asarray(holdout_seed, dtype=np.int64),
     }
+    for name in (
+        "manifest_schema",
+        "extraction_identity_sha256",
+        "sample_frac",
+        "sample_seed",
+        "value_checkpoint_sha256",
+        "shard_sha256",
+    ):
+        if name in data:
+            cols[name] = np.asarray(data[name])
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_name(out_path.name + ".tmp")
@@ -454,6 +465,41 @@ def select_archived_states(
         raise ValueError(f"unknown sampling mode: {sampling!r}")
     data = np.load(manifest_path, allow_pickle=True)
     shard_paths = [str(p) for p in np.asarray(data["shard_paths"])]
+    if "shard_sha256" not in data:
+        raise ValueError(
+            "regret manifest lacks byte-bound shard_sha256 inventory; "
+            "re-extract it before restart generation"
+        )
+    shard_sha256 = [str(value) for value in np.asarray(data["shard_sha256"])]
+    if len(shard_paths) != len(shard_sha256):
+        raise ValueError("regret manifest shard path/hash inventory is misaligned")
+    verified_shard_paths: dict[int, str] = {}
+
+    def verified_shard_path(shard_id: int) -> str:
+        if shard_id in verified_shard_paths:
+            return verified_shard_paths[shard_id]
+        if shard_id < 0 or shard_id >= len(shard_paths):
+            raise ValueError(f"regret manifest shard_id out of range: {shard_id}")
+        path = Path(shard_paths[shard_id]).expanduser()
+        if not path.is_absolute():
+            path = Path(manifest_path).parent / path
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise ValueError(f"regret source shard is unavailable: {path}") from error
+        digest = hashlib.sha256()
+        with resolved.open("rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(block)
+        actual = "sha256:" + digest.hexdigest()
+        expected = shard_sha256[shard_id]
+        if actual != expected:
+            raise ValueError(
+                "regret source shard sha256 mismatch: "
+                f"path={resolved} expected={expected} actual={actual}"
+            )
+        verified_shard_paths[shard_id] = str(resolved)
+        return str(resolved)
     n = int(np.asarray(data["game_seed"]).shape[0])
     phases = np.asarray(data["phase"]).astype(str)
     regret_scores = np.asarray(data["regret_score"], dtype=np.float64)
@@ -461,8 +507,9 @@ def select_archived_states(
     pool = np.arange(n, dtype=np.int64) if usable_idx is None else np.asarray(usable_idx, dtype=np.int64)
 
     def record(i: int) -> dict[str, Any]:
+        shard_id = int(data["shard_id"][i])
         return {
-            "shard_path": shard_paths[int(data["shard_id"][i])],
+            "shard_path": verified_shard_path(shard_id),
             "game_seed": int(data["game_seed"][i]),
             "decision_index": int(data["decision_index"][i]),
             "phase": str(phases[i]),
