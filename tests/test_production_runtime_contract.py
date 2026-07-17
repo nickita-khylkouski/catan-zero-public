@@ -17,15 +17,15 @@ def test_canonical_production_runtime_is_exact_and_self_consistent() -> None:
         "python_version": "3.11.15",
         "torch_version": "2.11.0+cu128",
         "torch_cuda_version": "12.8",
-        "catanatron_rs_version": "0.1.12",
+        "catanatron_rs_version": "0.1.13",
         "catanatron_rs_extension_sha256": (
-            "e9193d26b83855babb6fdadaa131bf5642be5295ad40d739ca144ec95d325c7b"
+            "e9f85102c65b98a7d0e3f89209c28e10b84159a006e0ef5589c776cc60dbefa4"
         ),
         "catanatron_rs_wheel_filename": (
-            "catanatron_rs-0.1.12-cp311-cp311-manylinux_2_34_x86_64.whl"
+            "catanatron_rs-0.1.13-cp311-cp311-manylinux_2_34_x86_64.whl"
         ),
         "catanatron_rs_wheel_sha256": (
-            "e8e61626e5e99c9c61dcf79e3cc639d2070eb73dc79ea99a50efdece4cf34765"
+            "2e0c6fda344ae85dd1bccd1f5474acea92218a0b561cdde0e43b386ec284fb97"
         ),
         "numpy_version": "2.4.6",
         "networkx_version": "3.6.1",
@@ -78,9 +78,9 @@ def test_installer_line_protocol_has_fixed_complete_order(capsys) -> None:
         "3.11.15",
         "2.11.0+cu128",
         "12.8",
-        "0.1.12",
-        "catanatron_rs-0.1.12-cp311-cp311-manylinux_2_34_x86_64.whl",
-        "e8e61626e5e99c9c61dcf79e3cc639d2070eb73dc79ea99a50efdece4cf34765",
+        "0.1.13",
+        "catanatron_rs-0.1.13-cp311-cp311-manylinux_2_34_x86_64.whl",
+        "2e0c6fda344ae85dd1bccd1f5474acea92218a0b561cdde0e43b386ec284fb97",
         "2.4.6",
         "3.6.1",
         "1.3.0",
