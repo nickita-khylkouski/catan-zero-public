@@ -2569,6 +2569,10 @@ def _value_trunk_gradient_routing(
         if model is not None
         else 0
     )
+    legal_action_value_residual = bool(
+        model is not None
+        and getattr(model, "legal_action_value_residual_enabled", False)
+    )
     shared_input_paths = (
         ["value_tower_shared_prefix_tokens"]
         if value_tower_split_layers > 0
@@ -2578,6 +2582,12 @@ def _value_trunk_gradient_routing(
         shared_input_paths.extend(
             ["attention_pool_state", "attention_pool_tokens"]
         )
+    if legal_action_value_residual:
+        # The affordance residual reads encoded actions after every enabled
+        # shared action-side adapter. score_actions applies the same boundary
+        # scale before the private value projection, so this path belongs in
+        # durable checkpoint provenance alongside the state-token inputs.
+        shared_input_paths.append("legal_action_encoded_affordance")
     return {
         "schema_version": "scalar-value-trunk-gradient-routing-v1",
         "scalar_value_trunk_grad_scale": scale,
@@ -2593,6 +2603,10 @@ def _value_trunk_gradient_routing(
         "shared_input_paths": shared_input_paths,
         "value_attention_pool_enabled": value_attention_pool,
         "value_tower_split_layers": value_tower_split_layers,
+        "legal_action_value_residual_enabled": legal_action_value_residual,
+        "shared_action_representation_upstream_gradient_scale": (
+            scale if legal_action_value_residual else None
+        ),
         "private_value_tower_parameter_gradient_scale": 1.0,
         "all_scalar_value_shared_inputs_scaled": True,
         "all_value_family_shared_inputs_scaled": True,
@@ -32532,18 +32546,36 @@ def _objective_gradient_module_name(parameter_name: str) -> str:
 
 
 def _shared_trunk_named_parameters(policy) -> list[tuple[str, object]]:
-    """Select logical EntityGraph trunk parameters without either task head."""
+    """Select every representation parameter shared by policy and value.
+
+    The legal-action-aware value residual consumes ``encoded_actions`` after
+    the mature action encoder and each enabled action-local adapter. Those
+    modules are therefore just as shared as the state-token trunk.
+    """
     model = policy.model
     module = getattr(model, "module", model)
-    trunk_names = ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
-    trunk_prefixes = tuple(f"{name}." for name in trunk_names)
+    action_value_shared = bool(
+        getattr(module, "legal_action_value_residual_enabled", False)
+    )
+    shared_names = list(ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"])
+    if action_value_shared:
+        shared_names.extend(
+            (
+                *ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["action_encoder"],
+                *ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["target_gather"],
+                *ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["action_cross"],
+                *ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["static_action_residual"],
+            )
+        )
+    shared_names = tuple(dict.fromkeys(shared_names))
+    shared_prefixes = tuple(f"{name}." for name in shared_names)
     selected = []
     for name, parameter in module.named_parameters():
         normalized = str(name)
         while normalized.startswith("_fsdp_wrapped_module."):
             normalized = normalized[len("_fsdp_wrapped_module.") :]
         if parameter.requires_grad and (
-            normalized in trunk_names or normalized.startswith(trunk_prefixes)
+            normalized in shared_names or normalized.startswith(shared_prefixes)
         ):
             selected.append((normalized, parameter))
     return selected
@@ -32599,12 +32631,13 @@ def _objective_gradient_interference(
     additional_objectives: Mapping[str, object] | None = None,
     value_trunk_grad_scale: float = 1.0,
 ) -> dict[str, object]:
-    """Measure weighted policy/value gradient interaction in the shared trunk.
+    """Measure weighted policy/value gradients in the shared representation.
 
     ``autograd.grad`` leaves ``Parameter.grad`` and the optimizer trajectory
     untouched. Objectives already include configured loss coefficients. This
-    therefore measures what reaches shared layers, unlike ``--value-lr-mult``,
-    which only changes named value-head parameter groups.
+    therefore measures what reaches both the state trunk and the shared
+    legal-action representation, unlike ``--value-lr-mult``, which only
+    changes named value-head parameter groups.
 
     ``autograd.grad`` does not trigger DDP's reducer, so DDP gradients are
     manually all-reduced and world-averaged before any norms or cosines are

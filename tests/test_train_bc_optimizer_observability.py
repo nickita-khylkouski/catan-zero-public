@@ -260,6 +260,45 @@ def test_objective_gradient_interference_measures_shared_trunk_not_heads() -> No
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
+def test_objective_gradient_interference_includes_shared_action_representation() -> None:
+    """Action-aware value gradients must not disappear from interference telemetry."""
+    torch = pytest.importorskip("torch")
+
+    class TinyActionAwareModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.legal_action_value_residual_enabled = True
+            self.blocks = torch.nn.ModuleList(
+                [torch.nn.Linear(1, 1, bias=False)]
+            )
+            self.action_encoder = torch.nn.Linear(1, 1, bias=False)
+            self.policy_head = torch.nn.Linear(1, 1, bias=False)
+            self.value_head = torch.nn.Linear(1, 1, bias=False)
+
+    model = TinyActionAwareModel()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(1.0)
+    state = model.blocks[0](torch.ones(1, 1))
+    action = model.action_encoder(torch.full((1, 1), 2.0))
+    shared = state + action
+    policy_objective = model.policy_head(shared).sum()
+    value_objective = -model.value_head(shared).sum()
+
+    observed = train_bc._objective_gradient_interference(
+        SimpleNamespace(model=model),
+        policy_objective=policy_objective,
+        value_objective=value_objective,
+    )
+
+    expected = 5.0**0.5
+    assert observed["policy_trunk_grad_norm"] == pytest.approx(expected)
+    assert observed["value_trunk_grad_norm"] == pytest.approx(expected)
+    assert observed["trunk_gradient_cosine"] == pytest.approx(-1.0)
+    assert set(observed["modules"]) == {"action_encoder", "blocks.0"}
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+
 def test_objective_gradient_interference_is_explicit_when_objective_inactive() -> None:
     torch = pytest.importorskip("torch")
 

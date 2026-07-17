@@ -8,7 +8,11 @@ import pytest
 from tools import train_bc
 
 
-def _tiny_model(*, value_attention_pool: bool = False):
+def _tiny_model(
+    *,
+    value_attention_pool: bool = False,
+    legal_action_value_residual: bool = False,
+):
     torch = pytest.importorskip("torch")
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.self_play import make_env_config
@@ -21,6 +25,7 @@ def _tiny_model(*, value_attention_pool: bool = False):
         dropout=0.0,
         seed=4,
         device="cpu",
+        legal_action_value_residual=legal_action_value_residual,
     )
     if value_attention_pool:
         policy = EntityGraphPolicy(
@@ -267,6 +272,22 @@ def test_categorical_value_objective_can_use_trunk_gradient_protection() -> None
         "categorical_ce": 0.25,
         "final_vp": 0.0,
     }
+
+
+def test_routing_metadata_binds_shared_action_affordance_path() -> None:
+    _torch, model = _tiny_model(legal_action_value_residual=True)
+
+    routing = train_bc._value_trunk_gradient_routing(
+        _args(value_trunk_grad_scale=0.1),
+        scalar_weight=0.25,
+        model=model,
+    )
+
+    assert routing["legal_action_value_residual_enabled"] is True
+    assert routing["shared_action_representation_upstream_gradient_scale"] == (
+        pytest.approx(0.1)
+    )
+    assert "legal_action_encoded_affordance" in routing["shared_input_paths"]
 
 
 def test_binary_win_routing_reports_the_actual_scalar_objective() -> None:
