@@ -19,7 +19,8 @@ from catan_zero.rl.production_loop import (
 from tools import loop
 
 
-WRITER = r"""from pathlib import Path
+WRITER = r"""import json
+from pathlib import Path
 import sys
 
 args = sys.argv[1:]
@@ -53,7 +54,25 @@ assert outputs
 prefix = "" if source is None else source.read_text()
 for output in outputs:
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(prefix + Path(sys.argv[0]).name + "\n")
+    if (
+        Path(sys.argv[0]).name == "a1_one_dose_train.py"
+        and "--receipt" in args
+        and output == Path(args[args.index("--receipt") + 1])
+    ):
+        diagnostic = "--test-diagnostic-receipt" in args
+        output.write_text(json.dumps({
+            "schema_version": (
+                "a1-learner-ablation-training-receipt-v1"
+                if diagnostic
+                else "a1-one-dose-training-receipt-v3"
+            ),
+            "status": "complete",
+            "returncode": 0,
+            "failure": None,
+            **({"diagnostic_only": True, "promotion_eligible": False} if diagnostic else {}),
+        }))
+    else:
+        output.write_text(prefix + Path(sys.argv[0]).name + "\n")
 """
 
 
@@ -241,6 +260,44 @@ def test_loop_binds_and_executes_exact_artifact_chain(tmp_path: Path) -> None:
     ]
     assert execute(loaded, state_dir=state_dir) == state
     assert plan(loaded, state_dir=state_dir)["pending_stages"] == []
+
+
+def test_diagnostic_one_dose_stops_before_evaluator_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repository, config_path, _final, payload = _fixture(tmp_path)
+    stages = payload["stages"]
+    assert isinstance(stages, dict) and isinstance(stages["train"], dict)
+    train_command = stages["train"]["command"]
+    assert isinstance(train_command, list)
+    train_command.append("--test-diagnostic-receipt")
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    state_dir = tmp_path / "state"
+    loaded = load_config(config_path, state_dir=state_dir)
+    original_run = production_loop._run_local_stage  # noqa: SLF001
+    launched: list[str] = []
+
+    def record_stage(command, **kwargs):
+        launched.append(Path(command[1]).name)
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(production_loop, "_run_local_stage", record_stage)
+
+    with pytest.raises(
+        ProductionLoopError, match="diagnostic and cannot enter evaluation"
+    ):
+        execute(loaded, state_dir=state_dir)
+
+    assert launched == [
+        "a1_production_executor.py",
+        "a1_harvest_transaction.py",
+        "a1_pre_wave_contract.py",
+        "a1_build_post_wave_composite.py",
+        "a1_one_dose_train.py",
+    ]
+    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
+    assert state["completed_stages"] == list(STAGES[:5])
+    assert not (tmp_path / "evaluate.json").exists()
 
 
 def test_train_data_must_be_exact_immediate_composite_output(tmp_path: Path) -> None:

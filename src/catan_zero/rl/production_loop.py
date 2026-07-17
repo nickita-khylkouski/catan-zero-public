@@ -46,6 +46,15 @@ STAGE_TOOLS = {
     "promote": frozenset(("tools/a1_promotion_transaction.py",)),
 }
 PLACEHOLDERS = frozenset(("repo", "state_dir", "python"))
+SCRATCH_EXECUTION_RECEIPT_SCHEMA = "a1-coherent-scratch-training-execution-v2"
+PROMOTABLE_ONE_DOSE_RECEIPT_SCHEMAS = frozenset(
+    (
+        "a1-one-dose-training-receipt-v3",
+        "a1-one-dose-training-receipt-v4",
+        "a1-architecture-upgrade-training-receipt-v1",
+        "a1-central-learner-training-receipt-v1",
+    )
+)
 
 # These are the semantic edges that make a turn one RL transaction.  A path
 # merely appearing in ``inputs``/``outputs`` is not evidence that the stage
@@ -436,6 +445,64 @@ def _remote_cancellation_command(
     if "--go" not in result:
         result.append("--go")
     return result
+
+
+def _admit_training_receipt_for_evaluation(config: Mapping[str, Any]) -> None:
+    """Refuse non-executable or diagnostic learner outcomes before evaluation."""
+
+    stage = config["stages"]["train"]
+    tool = _command_tool(stage["command"], repo=Path(config["repository"]))
+    receipt_paths = [
+        binding["path"]
+        for binding in stage.get("artifact_bindings", [])
+        if binding.get("kind") == "training_execution_receipt"
+        and binding.get("direction") == "output"
+    ]
+    if len(receipt_paths) != 1:
+        raise ProductionLoopError(
+            "train stage must issue exactly one typed execution receipt"
+        )
+    receipt_path = Path(receipt_paths[0])
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ProductionLoopError(
+            "train stage did not emit a readable execution receipt"
+        ) from error
+    if not isinstance(receipt, dict):
+        raise ProductionLoopError("train stage execution receipt must be a JSON object")
+
+    if tool == "tools/a1_scratch_train.py":
+        if not (
+            receipt.get("schema_version") == SCRATCH_EXECUTION_RECEIPT_SCHEMA
+            and receipt.get("status") == "completed"
+            and receipt.get("go") is True
+        ):
+            raise ProductionLoopError(
+                "scratch stage execution receipt is not a completed --go run"
+            )
+        return
+    if tool != "tools/a1_one_dose_train.py":  # pragma: no cover - stage allowlist.
+        raise ProductionLoopError(f"unsupported train-stage receipt producer: {tool}")
+    if (
+        receipt.get("diagnostic_only") is True
+        or receipt.get("promotion_eligible") is False
+    ):
+        raise ProductionLoopError(
+            "one-dose training receipt is diagnostic and cannot enter evaluation"
+        )
+    if receipt.get("schema_version") not in PROMOTABLE_ONE_DOSE_RECEIPT_SCHEMAS:
+        raise ProductionLoopError(
+            "one-dose training receipt schema is not eligible for promotion"
+        )
+    if not (
+        receipt.get("status") == "complete"
+        and receipt.get("returncode") == 0
+        and receipt.get("failure") is None
+    ):
+        raise ProductionLoopError(
+            "one-dose training receipt is not a successful promotable completion"
+        )
 
 
 def load_config(path: Path, *, state_dir: Path) -> dict[str, Any]:
@@ -917,6 +984,8 @@ def execute(config: Mapping[str, Any], *, state_dir: Path) -> dict[str, Any]:
     with _lock(state_dir):
         state = _load_state(state_path, config)
         for name in STAGES[len(state["completed_stages"]) :]:
+            if name == "evaluate":
+                _admit_training_receipt_for_evaluation(config)
             stage = config["stages"][name]
             _repository_guard(config, stage=name)
             inputs = [
@@ -986,24 +1055,7 @@ def execute(config: Mapping[str, Any], *, state_dir: Path) -> dict[str, Any]:
                 and _command_tool(stage["command"], repo=Path(config["repository"]))
                 == "tools/a1_scratch_train.py"
             ):
-                execution_path = Path(
-                    _flag_path(stage["command"], "--execution-receipt", stage=name)
-                )
-                try:
-                    execution = json.loads(execution_path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError, json.JSONDecodeError) as error:
-                    raise ProductionLoopError(
-                        "scratch stage did not emit a readable execution receipt"
-                    ) from error
-                if not isinstance(execution, dict) or not (
-                    execution.get("schema_version")
-                    == "a1-coherent-scratch-training-execution-v2"
-                    and execution.get("status") == "completed"
-                    and execution.get("go") is True
-                ):
-                    raise ProductionLoopError(
-                        "scratch stage execution receipt is not a completed --go run"
-                    )
+                _admit_training_receipt_for_evaluation(config)
             outputs = [
                 _artifact_ref(Path(item), where=f"{name} output")
                 for item in stage["outputs"]
