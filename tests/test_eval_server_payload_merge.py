@@ -19,6 +19,7 @@ from catan_zero.search.eval_server import (
     _legal_cell_counts,
     _merge_forward_payloads,
     _policy_needs_action_targets,
+    _policy_needs_event_targets,
     _policy_needs_relational_topology,
 )
 from catan_zero.search.neural_rust_mcts import _policy_history_options
@@ -267,6 +268,21 @@ def test_policy_topology_requirement_handshake_is_safe(config, expected: bool) -
     assert _policy_needs_relational_topology(policy) is expected
 
 
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (None, True),
+        (types.SimpleNamespace(meaningful_public_history_target_gather=False), False),
+        (types.SimpleNamespace(meaningful_public_history_target_gather=True), True),
+    ],
+)
+def test_policy_event_target_requirement_is_independent_of_topology(
+    config, expected: bool
+) -> None:
+    policy = types.SimpleNamespace(config=config) if config is not None else object()
+    assert _policy_needs_event_targets(policy) is expected
+
+
 def test_remote_client_preserves_checkpoint_history_featurization_contract() -> None:
     """Remote and local evaluators must select the identical history surface."""
     local_policy = types.SimpleNamespace(
@@ -479,6 +495,53 @@ def test_remote_client_transports_topology_for_relational_trunks() -> None:
     )
     payload = request_queue.items[0][2]["entity"]
     assert set(topology).issubset(payload)
+
+
+def test_remote_client_transports_history_targets_without_relational_topology() -> None:
+    from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluatorConfig
+
+    class _RequestQueue:
+        def __init__(self) -> None:
+            self.items = []
+
+        def put(self, item) -> None:
+            self.items.append(item)
+
+    class _ResponseQueue:
+        def get(self, *, timeout: float):
+            return (
+                1,
+                {
+                    "logits": np.zeros((1, 2), dtype=np.float32),
+                    "value": np.zeros((1,), dtype=np.float32),
+                },
+                None,
+            )
+
+    request_queue = _RequestQueue()
+    event_targets = np.zeros((1, 64, 4), dtype=np.int16)
+    client = RemoteEvalClient(
+        request_queue,
+        _ResponseQueue(),
+        0,
+        action_size=332,
+        trained_with_masked_hidden_info=False,
+        entity_feature_adapter=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+        needs_relational_topology=False,
+        needs_event_targets=True,
+        config=EntityGraphRustEvaluatorConfig(),
+    )
+    client._remote_forward(
+        {
+            "global_tokens": np.zeros((1, 1, 3), dtype=np.float16),
+            "event_target_ids": event_targets,
+        },
+        np.array([[1, 2]], dtype=np.int64),
+        np.zeros((1, 2, 4), dtype=np.float32),
+        False,
+    )
+    payload = request_queue.items[0][2]["entity"]
+    np.testing.assert_array_equal(payload["event_target_ids"], event_targets)
 
 
 def test_remote_client_event_limit_validates_and_crops_before_queue_put() -> None:

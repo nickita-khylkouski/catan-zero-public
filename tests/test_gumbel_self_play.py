@@ -35,6 +35,7 @@ from catan_zero.rl.gumbel_self_play import (
     TARGET_INFORMATION_REGIME_AUTHORITATIVE,
     TARGET_INFORMATION_REGIME_PUBLIC,
     TARGET_INFORMATION_REGIME_PUBLIC_COHERENT,
+    _align_native_legal_features,
     _apply_selected_action,
     _full_search_simulation_accounting,
     _generation_resume_semantics_sha256,
@@ -63,6 +64,28 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 from train_bc import _load_npz, _normalize_teacher_shard  # type: ignore  # noqa: E402
+
+
+def test_native_rule_state_repair_aligns_legal_tensors_by_engine_action_id() -> None:
+    native = {
+        "legal_action_tokens": np.asarray([[30.0], [10.0], [20.0]]),
+        "legal_action_target_ids": np.asarray([[300], [100], [200]]),
+        "legal_action_mask": np.asarray([True, False, True]),
+        "global_tokens": np.asarray([7.0]),
+    }
+
+    aligned = _align_native_legal_features(
+        native,
+        native_legal=(30, 10, 20),
+        learner_legal=(10, 20, 30),
+        native_mapped=(3, 1, 2),
+        learner_mapped=(1, 2, 3),
+    )
+
+    assert aligned["legal_action_tokens"][:, 0].tolist() == [10.0, 20.0, 30.0]
+    assert aligned["legal_action_target_ids"][:, 0].tolist() == [100, 200, 300]
+    assert aligned["legal_action_mask"].tolist() == [False, True, True]
+    assert aligned["global_tokens"] is native["global_tokens"]
 
 
 @pytest.mark.parametrize(

@@ -1864,6 +1864,9 @@ def _server_worker_entry(
             ),
             needs_action_targets=bool(needs_action_targets),
             needs_relational_topology=bool(needs_relational_topology),
+            needs_event_targets=bool(
+                worker_args.get("_eval_server_needs_event_targets", True)
+            ),
             event_token_limit=event_token_limit,
             value_categorical_bins=int(value_categorical_bins),
             value_categorical_head_available=bool(value_categorical_head_available),
@@ -2002,6 +2005,9 @@ def _run_eval_server_batch(
             wargs["_eval_server_event_history_limit"] = server_history[1]
             wargs["_eval_server_meaningful_public_history_schema"] = (
                 server_history[2]
+            )
+            wargs["_eval_server_needs_event_targets"] = bool(
+                meta.get("needs_event_targets", True)
             )
             request_queue_for_client = getattr(server, "request_queue_for_client", None)
             client_request_queue = (

@@ -762,6 +762,48 @@ def _game_outcome_fields(
     }
 
 
+def _align_native_legal_features(
+    native_entity: dict[str, np.ndarray],
+    *,
+    native_legal: tuple[int, ...],
+    learner_legal: tuple[int, ...],
+    native_mapped: tuple[int, ...],
+    learner_mapped: tuple[int, ...],
+) -> dict[str, np.ndarray]:
+    """Align native-order legal tensors to the learner's stable action order."""
+    if len(set(native_legal)) != len(native_legal) or len(set(learner_legal)) != len(
+        learner_legal
+    ):
+        raise RuntimeError("native actor public-rule-state repair found duplicate actions")
+    if set(native_legal) != set(learner_legal):
+        raise RuntimeError(
+            "native actor public-rule-state repair found different legal action sets"
+        )
+    native_position = {action: index for index, action in enumerate(native_legal)}
+    permutation = np.asarray(
+        [native_position[action] for action in learner_legal], dtype=np.int64
+    )
+    reordered_mapped = tuple(native_mapped[index] for index in permutation)
+    if reordered_mapped != learner_mapped:
+        raise RuntimeError(
+            "native actor public-rule-state repair found Python/native action-id drift"
+        )
+    aligned = dict(native_entity)
+    for key in (
+        "legal_action_tokens",
+        "legal_action_target_ids",
+        "legal_action_mask",
+    ):
+        value = np.asarray(native_entity[key])
+        if value.shape[0] != len(native_legal):
+            raise RuntimeError(
+                "native actor public-rule-state repair found malformed legal tensor "
+                f"{key}: rows={value.shape[0]} expected={len(native_legal)}"
+            )
+        aligned[key] = value[permutation].copy()
+    return aligned
+
+
 def _build_public_learner_features(
     game: Any,
     legal_rust: tuple[int, ...],
@@ -876,11 +918,13 @@ def _build_public_learner_features(
             meaningful_public_history_schema=meaningful_public_history_schema,
             entity_feature_adapter_version=adapter_version,
         )
-        if native_legal != tuple(legal_rust) or native_mapped != tuple(mapped):
-            raise RuntimeError(
-                "native actor public-rule-state repair requires identical legal "
-                "action ordering between learner and native featurizers"
-            )
+        native_entity = _align_native_legal_features(
+            native_entity,
+            native_legal=native_legal,
+            learner_legal=tuple(legal_rust),
+            native_mapped=native_mapped,
+            learner_mapped=tuple(mapped),
+        )
         parity_failures: list[str] = []
         for key, python_value in entity.items():
             if key not in native_entity:

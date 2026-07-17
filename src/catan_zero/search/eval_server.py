@@ -874,6 +874,21 @@ def _policy_needs_relational_topology(policy: Any) -> bool:
     )
 
 
+def _policy_needs_event_targets(policy: Any) -> bool:
+    """Whether public-history attention gathers referenced board entities.
+
+    Event targets are not board-topology inputs. Keeping the two capabilities
+    separate matters for policies such as B12, which use history-target gather
+    with a plain transformer trunk and no topology residual adapter.
+    """
+    policy_config = getattr(policy, "config", None)
+    if policy_config is None:
+        return True
+    return bool(
+        getattr(policy_config, "meaningful_public_history_target_gather", False)
+    )
+
+
 def _make_forward_policy(policy: Any, config: EvalServerConfig) -> Any:
     """Return the narrow inference wrapper while retaining ``policy`` itself.
 
@@ -964,6 +979,7 @@ def _server_main(
     ) = _policy_history_options(policy)
     handshake["needs_action_targets"] = _policy_needs_action_targets(policy)
     handshake["needs_relational_topology"] = _policy_needs_relational_topology(policy)
+    handshake["needs_event_targets"] = _policy_needs_event_targets(policy)
     handshake["matmul_precision"] = precision
     handshake["transport"] = str(config.transport)
     handshake["max_neural_rows"] = config.max_neural_rows
@@ -1456,6 +1472,11 @@ class EvalServer:
             "needs_relational_topology": bool(
                 self._handshake.get("needs_relational_topology", False)
             ),
+            # Fail closed for an older/custom server: transporting an unused
+            # annotation is harmless; dropping a required one aborts inference.
+            "needs_event_targets": bool(
+                self._handshake.get("needs_event_targets", True)
+            ),
             "matmul_precision": str(self._handshake.get("matmul_precision", "highest")),
             "transport": str(self._handshake.get("transport", "mp_queue")),
             "max_neural_rows": self._handshake.get("max_neural_rows"),
@@ -1636,6 +1657,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         ),
         needs_action_targets: bool = True,
         needs_relational_topology: bool = False,
+        needs_event_targets: bool = True,
         event_token_limit: int | None = None,
         value_categorical_bins: int = 0,
         value_categorical_head_available: bool = False,
@@ -1662,6 +1684,7 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
         self._client_id = int(client_id)
         self._needs_action_targets = bool(needs_action_targets)
         self._needs_relational_topology = bool(needs_relational_topology)
+        self._needs_event_targets = bool(needs_event_targets)
         self._event_token_limit = event_token_limit
         self._req_counter = 0
         self._timeout_s = max(0.001, float(client_timeout_ms) / 1000.0)
@@ -1780,9 +1803,9 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
                             "hex_vertex_ids",
                             "hex_edge_ids",
                             "edge_vertex_ids",
-                            "event_target_ids",
                         }
                     )
+                    or (self._needs_event_targets and k == "event_target_ids")
                 )
                 and (k != "legal_action_target_ids" or self._needs_action_targets)
             },
@@ -1808,7 +1831,8 @@ class RemoteEvalClient(EntityGraphRustEvaluator):
             if self._fallback_checkpoint is None:
                 self._terminal_failure = (
                     f"eval-server request failed (client {self._client_id}, req {req_id}); "
-                    "no fallback checkpoint configured; client permanently failed"
+                    "no fallback checkpoint configured; client permanently failed; "
+                    f"cause={type(exc).__name__}: {exc}"
                 )
                 raise TimeoutError(self._terminal_failure) from exc
             print(
