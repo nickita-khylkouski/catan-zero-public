@@ -530,6 +530,11 @@ class GenerateConfig(PipelineConfig):
     # Preserve completed-Q and visit-count tensors needed for post-hoc target
     # stability calibration and exact policy-target reconstruction.
     preserve_search_evidence: bool = False
+    # Pruning low-visit actions changes the stored policy support and therefore
+    # the teacher target.  Keep it in the typed generation identity as well as
+    # forwarding it to worker MCTS; otherwise a sealed JSON recipe can claim a
+    # different target operator from the one reconstructed by GenerateConfig.
+    policy_target_min_visits: int = 0
     # The generator has always materialized the pre-search evaluator value on
     # eligible full-search roots.  Bind that invariant into typed provenance
     # so the canonical schema20 file and the resolved GenerateConfig cannot
