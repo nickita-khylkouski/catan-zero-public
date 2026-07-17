@@ -12205,8 +12205,12 @@ def _validate_a1_learner_training_recipe(
             "central learner projection and executor-authority path/SHA must be "
             "supplied together"
         )
+    canonical_parent_authority = getattr(
+        args, "a1_canonical_parent_update_authority", None
+    )
     if (
         not central_binding_raw
+        and canonical_parent_authority is None
         and bound.get("coherent_direct_corpus") is not True
         and (
         bool(getattr(args, "per_game_policy_weight", False))
@@ -12270,9 +12274,6 @@ def _validate_a1_learner_training_recipe(
         bound["learner_ablation"] = batch_probe
         bound["batch_probe_authorization"] = batch_probe
         return effective
-    canonical_parent_authority = getattr(
-        args, "a1_canonical_parent_update_authority", None
-    )
     if canonical_parent_authority is not None:
         expected_authority_fields = {
             "schema_version",
