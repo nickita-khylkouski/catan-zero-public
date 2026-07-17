@@ -151,6 +151,13 @@ OPERATOR_FIELDS = (
 )
 TARGET_SEMANTIC_FIELDS = (
     "target_information_regime",
+    # These alter the produced policy distribution rather than only runtime
+    # throughput. Boundary K changes coherent opponent-turn continuation
+    # values; minimum visits explicitly prunes target support. Keep both in
+    # the immutable target identity so K1/K4 or pruned/unpruned shards cannot
+    # be merged as one teacher.
+    "boundary_value_particles",
+    "policy_target_min_visits",
     "forced_root_target_mode",
     "record_automatic_transitions",
     "public_observation",
@@ -949,6 +956,12 @@ def _canonical_policy_target_identity(
     regime = _first_operator_value(candidates, "target_information_regime")
     if not isinstance(regime, str) or not regime:
         missing.append("target_information_regime")
+    for field in ("boundary_value_particles", "policy_target_min_visits"):
+        value = _first_operator_value(candidates, field)
+        if type(value) is not int or value < 0 or (
+            field == "boundary_value_particles" and value < 1
+        ):
+            missing.append(field)
     if missing:
         raise InventoryError(
             "current policy-target identity is incomplete; missing "

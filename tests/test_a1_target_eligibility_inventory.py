@@ -394,6 +394,8 @@ def test_current_manifest_identity_resolves_complete_teacher_and_code_contract(
                     "rescale_noise_floor_c": 0.0,
                     "public_observation": True,
                     "rust_featurize": True,
+                    "boundary_value_particles": 1,
+                    "policy_target_min_visits": 0,
                 },
             }
         ),
@@ -427,6 +429,8 @@ def test_current_manifest_identity_resolves_complete_teacher_and_code_contract(
     assert identity["effective_search_config"]["max_depth"] == 80
     assert identity["effective_search_config"]["belief_chance_spectra"] is False
     assert identity["effective_evaluator_config"]["value_squash"] == "clip"
+    assert identity["target_semantics"]["boundary_value_particles"] == 1
+    assert identity["target_semantics"]["policy_target_min_visits"] == 0
     assert identity["teacher_feature_contract"][
         "entity_feature_adapter_version"
     ] == "rust_entity_adapter_v2_land_topology_ports_maritime"
