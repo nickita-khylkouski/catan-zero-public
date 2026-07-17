@@ -10451,9 +10451,10 @@ _A1_SCRATCH_DIAGNOSTIC_AUTHORITY_FIELDS = {
 }
 _A1_SCRATCH_VALUE_ROUTING_ARMS = {
     "V0": 0.0,
-    "V25": 0.25,
+    "V10": 0.1,
     "V100": 1.0,
 }
+_A1_SCRATCH_TOPOLOGY_VALUE_TRUNK_GRAD_SCALE = 0.1
 _A1_SCRATCH_TOPOLOGY_DIAGNOSTIC_FIELDS = (
     _A1_SCRATCH_DIAGNOSTIC_AUTHORITY_FIELDS
     | {
@@ -10483,7 +10484,7 @@ def _a1_scratch_topology_expected_effective_recipe(
     source_topology: Mapping[str, object],
     max_steps: int,
 ) -> dict[str, object]:
-    """Project current V25 science into the one allowed H100 diagnostic dose."""
+    """Project current V10 science into the one allowed H100 diagnostic dose."""
 
     expected = copy.deepcopy(dict(source_recipe))
     expected.update(
@@ -10656,8 +10657,8 @@ def _validate_a1_scratch_diagnostic_authority(
     schema = authority.get("schema_version")
     campaign_id = authority.get("campaign_id")
     value_routing = (
-        schema == "a1-scratch-bounded-diagnostic-authority-v1"
-        and campaign_id == "scratch-value-routing-v0-v25-v100"
+        schema == "a1-scratch-bounded-diagnostic-authority-v2"
+        and campaign_id == "scratch-value-routing-v0-v10-v100"
         and set(authority) == _A1_SCRATCH_DIAGNOSTIC_AUTHORITY_FIELDS
     )
     topology_campaign = (
@@ -10676,7 +10677,11 @@ def _validate_a1_scratch_diagnostic_authority(
     expected_scale = (
         _A1_SCRATCH_VALUE_ROUTING_ARMS.get(arm_id)
         if value_routing
-        else 0.25 if arm_id in _A1_SCRATCH_TOPOLOGY_ARMS else None
+        else (
+            _A1_SCRATCH_TOPOLOGY_VALUE_TRUNK_GRAD_SCALE
+            if arm_id in _A1_SCRATCH_TOPOLOGY_ARMS
+            else None
+        )
     )
     expected_topology_residual = (
         False
@@ -10809,7 +10814,7 @@ def _validate_a1_scratch_diagnostic_authority(
                 != expected_effective_sha
             ):
                 raise SystemExit(
-                    "A1 topology diagnostic matched V25 recipe drift"
+                    "A1 topology diagnostic matched V10 recipe drift"
                 )
             if args is not None:
                 actual_effective = _effective_a1_learner_training_recipe(
@@ -10861,7 +10866,7 @@ def _validate_a1_scratch_diagnostic_authority(
                     != str(source_recipe["value_player_outcome_balance_mode"])
                 ):
                     raise SystemExit(
-                        "A1 topology diagnostic command differs from exact V25 recipe"
+                        "A1 topology diagnostic command differs from exact V10 recipe"
                     )
                 _validate_a1_scratch_topology_code_binding(
                     args,

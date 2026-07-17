@@ -813,7 +813,9 @@ def test_fresh_production_composite_cannot_delete_scratch_marker(
     _, meta, _ = _authority_fixture(tmp_path)
     args = _runtime_args()
     args.a1_scratch_authority_json = ""
-    with pytest.raises(SystemExit, match="exactly one sealed scratch or central"):
+    with pytest.raises(
+        SystemExit, match="exactly one sealed scratch, central learner"
+    ):
         train_bc._require_production_composite_execution_authority(  # noqa: SLF001
             args, meta
         )
@@ -847,7 +849,9 @@ def test_warm_production_composite_cannot_fall_back_to_descriptor_subset(
     # listed subset, so trajectory-changing fields outside that subset pass.
     train_bc._validate_composite_learner_recipe_authorization(args, meta)  # noqa: SLF001
 
-    with pytest.raises(SystemExit, match="exactly one sealed scratch or central"):
+    with pytest.raises(
+        SystemExit, match="exactly one sealed scratch, central learner"
+    ):
         train_bc._require_production_composite_execution_authority(  # noqa: SLF001
             args, meta
         )
@@ -868,7 +872,9 @@ def test_warm_production_composite_requires_central_not_scratch_authority(
     args.a1_scratch_authority_json = json.dumps(authority)
     args.a1_central_learner_binding_json = ""
 
-    with pytest.raises(SystemExit, match="warm-start.*central learner authority"):
+    with pytest.raises(
+        SystemExit, match="warm-start.*central learner or canonical parent-update"
+    ):
         train_bc._require_production_composite_execution_authority(  # noqa: SLF001
             args, meta
         )
@@ -905,7 +911,9 @@ def test_production_composite_refuses_multiple_execution_authorities(
     args.a1_scratch_authority_json = json.dumps(authority)
     args.a1_central_learner_binding_json = "{}"
 
-    with pytest.raises(SystemExit, match="exactly one sealed scratch or central"):
+    with pytest.raises(
+        SystemExit, match="exactly one sealed scratch, central learner"
+    ):
         train_bc._require_production_composite_execution_authority(  # noqa: SLF001
             args, meta
         )

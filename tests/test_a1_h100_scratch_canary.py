@@ -82,7 +82,7 @@ def _valid_report_payload() -> dict:
                     "manual_all_reduce_then_world_average_of_ddp_scaled_gradients"
                 ),
                 "world_size": 8,
-                "scalar_value_trunk_grad_scale": 0.25,
+                "scalar_value_trunk_grad_scale": 0.1,
                 "policy_trunk_grad_norm": 1.0,
                 "value_trunk_grad_norm": 0.5,
                 "combined_trunk_grad_norm": 1.1,
@@ -106,7 +106,7 @@ def _valid_report_payload() -> dict:
         cadence_batches=int(recipe["objective_gradient_interference_every_batches"]),
         minimum_observations=minimum,
         expected_world_size=8,
-        expected_value_trunk_grad_scale=0.25,
+        expected_value_trunk_grad_scale=0.1,
         where="test",
     )
     return {
@@ -144,7 +144,7 @@ def test_required_arms_are_current_c640_and_single_delta_t640() -> None:
     assert set(arms) == {"C640", "T640"}
     assert control["model_construction"]["hidden_size"] == 640
     assert control["model_construction"]["action_target_gather"] is True
-    assert control["recipe"]["value_trunk_grad_scale"] == 0.25
+    assert control["recipe"]["value_trunk_grad_scale"] == 0.1
     assert control["model_construction"]["topology_residual_adapter"] is False
     assert treatment["model_construction"]["topology_residual_adapter"] is True
     assert canary.arm_drift(control, treatment) == {
@@ -606,7 +606,7 @@ def test_topology_authority_rejects_self_declared_recipe_drift(
         "learner_model_construction": current_science.learner_model_construction(),
         "learner_execution_topology": current_science.learner_execution_topology(),
     }
-    with pytest.raises(SystemExit, match="matched V25 recipe drift"):
+    with pytest.raises(SystemExit, match="matched V10 recipe drift"):
         train_bc._validate_a1_scratch_diagnostic_authority(  # noqa: SLF001
             args.a1_scratch_diagnostic_authority_json,
             args=args,

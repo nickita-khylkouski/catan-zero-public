@@ -41,6 +41,7 @@ MIN_STEPS = 128
 MAX_STEPS = 256
 ARM_IDS = ("C640", "T640")
 CANARY_MAX_PARAMETER_COUNT = 43_000_000
+CONTROL_VALUE_TRUNK_GRAD_SCALE = 0.1
 CODE_SURFACE = (
     "tools/a1_h100_scratch_canary.py",
     "tools/a1_scratch_train.py",
@@ -185,8 +186,11 @@ def build_arm_contracts(*, max_steps: int) -> dict[str, dict[str, Any]]:
     ):
         raise CanaryError("current control is no longer the sealed C640 gather model")
     recipe = current_science.learner_training_recipe()
-    if float(recipe.get("value_trunk_grad_scale", -1.0)) != 0.25:
-        raise CanaryError("current control is no longer the sealed V25 recipe")
+    if (
+        float(recipe.get("value_trunk_grad_scale", -1.0))
+        != CONTROL_VALUE_TRUNK_GRAD_SCALE
+    ):
+        raise CanaryError("current control is no longer the sealed V10 recipe")
     model_base = {**production_model, "topology_residual_adapter": False}
     matched = _matched_identity(model=model_base, recipe=recipe, max_steps=steps)
     matched_sha = _value_sha256(matched)

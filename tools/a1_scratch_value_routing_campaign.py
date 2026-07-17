@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Matched V0/V25/V100 scratch value-routing campaign.
+"""Matched V0/V10/V100 scratch value-routing campaign.
 
-The canonical A1 scratch plan currently binds ``value_trunk_grad_scale=0.25``.
+The canonical A1 scratch plan currently binds ``value_trunk_grad_scale=0.1``.
 This diagnostic reuses that exact initializer, corpus, model, optimizer, RNG,
 dose, and 8-GPU topology while independently launching three fresh arms:
 
 * V0:   scalar value loss cannot update the shared representation;
-* V25:  the canonical 0.25 routing control;
+* V10:  the canonical 0.1 routing control;
 * V100: full scalar value gradient reaches the shared representation.
 
 Plans and execution receipts are immutable and non-promotion-eligible. A
@@ -34,13 +34,16 @@ from tools import a1_scratch_train as scratch  # noqa: E402
 from tools import train_bc  # noqa: E402
 
 
-CAMPAIGN_PLAN_SCHEMA = "a1-scratch-value-routing-campaign-plan-v1"
-ARM_PLAN_SCHEMA = "a1-scratch-value-routing-arm-plan-v1"
-ARM_EXECUTION_SCHEMA = "a1-scratch-value-routing-arm-execution-v1"
-CAMPAIGN_EXECUTION_SCHEMA = "a1-scratch-value-routing-campaign-execution-v1"
-SELECTION_SCHEMA = "a1-scratch-value-routing-selection-v1"
-ARMS = {"V0": 0.0, "V25": 0.25, "V100": 1.0}
-BASELINE_ARM = "V25"
+CAMPAIGN_PLAN_SCHEMA = "a1-scratch-value-routing-campaign-plan-v2"
+ARM_PLAN_SCHEMA = "a1-scratch-value-routing-arm-plan-v2"
+ARM_EXECUTION_SCHEMA = "a1-scratch-value-routing-arm-execution-v2"
+CAMPAIGN_EXECUTION_SCHEMA = "a1-scratch-value-routing-campaign-execution-v2"
+SELECTION_SCHEMA = "a1-scratch-value-routing-selection-v2"
+DIAGNOSTIC_AUTHORITY_SCHEMA = "a1-scratch-bounded-diagnostic-authority-v2"
+CAMPAIGN_ID = "scratch-value-routing-v0-v10-v100"
+ARMS = {"V0": 0.0, "V10": 0.1, "V100": 1.0}
+BASELINE_ARM = "V10"
+BASELINE_SCALE = ARMS[BASELINE_ARM]
 ABLATION_CODE_SURFACE = (
     "tools/a1_scratch_value_routing_campaign.py",
     "tools/a1_scratch_train.py",
@@ -228,8 +231,8 @@ def _derive_arm(
     logical_recipe = dict(verified["logical_recipe"])
     ablation_id = f"scratch-value-routing-{arm_id.lower()}"
     diagnostic_authority = {
-        "schema_version": "a1-scratch-bounded-diagnostic-authority-v1",
-        "campaign_id": "scratch-value-routing-v0-v25-v100",
+        "schema_version": DIAGNOSTIC_AUTHORITY_SCHEMA,
+        "campaign_id": CAMPAIGN_ID,
         "arm_id": arm_id,
         "diagnostic_only": True,
         "promotion_eligible": False,
@@ -357,9 +360,12 @@ def prepare(
         policy_target_quality_receipt=policy_target_quality_receipt,
     )
     baseline_recipe = dict(verified["recipe"])
-    if float(baseline_recipe.get("value_trunk_grad_scale", -1.0)) != 0.25:
+    if (
+        float(baseline_recipe.get("value_trunk_grad_scale", -1.0))
+        != BASELINE_SCALE
+    ):
         raise ValueRoutingCampaignError(
-            "current scratch authority must bind value_trunk_grad_scale=0.25"
+            "current scratch authority must bind value_trunk_grad_scale=0.1"
         )
     code_binding = _code_binding()
     arm_refs: dict[str, dict[str, str]] = {}
@@ -390,7 +396,7 @@ def prepare(
         "promotion_eligible": False,
         "evaluation_eligible": False,
         "maximum_result": "matched_training_campaign_pending_selection",
-        "campaign_id": "scratch-value-routing-v0-v25-v100",
+        "campaign_id": CAMPAIGN_ID,
         "baseline_arm": BASELINE_ARM,
         "causal_axis": "value_trunk_grad_scale",
         "diagnostic_max_steps": int(diagnostic_max_steps),

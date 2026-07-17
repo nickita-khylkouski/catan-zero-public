@@ -104,8 +104,8 @@ def test_bounded_diagnostic_authority_allows_only_exact_short_arm() -> None:
     }
     code_sha = "sha256:" + "a" * 64
     authority = {
-        "schema_version": "a1-scratch-bounded-diagnostic-authority-v1",
-        "campaign_id": "scratch-value-routing-v0-v25-v100",
+        "schema_version": "a1-scratch-bounded-diagnostic-authority-v2",
+        "campaign_id": "scratch-value-routing-v0-v10-v100",
         "arm_id": "V100",
         "diagnostic_only": True,
         "promotion_eligible": False,
@@ -166,6 +166,29 @@ def test_bounded_diagnostic_authority_allows_only_exact_short_arm() -> None:
         )
 
 
+def test_legacy_v25_authority_is_not_reinterpreted_as_v10() -> None:
+    legacy = {
+        "schema_version": "a1-scratch-bounded-diagnostic-authority-v1",
+        "campaign_id": "scratch-value-routing-v0-v25-v100",
+        "arm_id": "V25",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "exact_max_steps": True,
+        "max_steps": 128,
+        "epochs": 1,
+        "checkpoint_steps": [8, 16, 32, 64],
+        "value_trunk_grad_scale": 0.25,
+        "source_recipe_sha256": "sha256:" + "a" * 64,
+        "source_execution_topology_sha256": "sha256:" + "b" * 64,
+        "code_tree_sha256": "sha256:" + "c" * 64,
+    }
+
+    with pytest.raises(SystemExit, match="fields/schema drift"):
+        train_bc._validate_a1_scratch_diagnostic_authority(  # noqa: SLF001
+            json.dumps(legacy)
+        )
+
+
 def test_derive_arms_changes_only_value_routing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -186,7 +209,7 @@ def test_derive_arms_changes_only_value_routing(
         for arm_id, scale in campaign.ARMS.items()
     }
 
-    baseline = arms["V25"]["effective_recipe"]
+    baseline = arms["V10"]["effective_recipe"]
     for arm_id, scale in campaign.ARMS.items():
         campaign._assert_one_axis_recipe(  # noqa: SLF001
             baseline, arms[arm_id]["effective_recipe"], scale=scale
@@ -204,12 +227,12 @@ def test_derive_arms_changes_only_value_routing(
         }
     assert arms["V0"]["causal_recipe_delta"] == {
         "field": "value_trunk_grad_scale",
-        "baseline": 0.25,
+        "baseline": 0.1,
         "treatment": 0.0,
     }
     assert arms["V100"]["causal_recipe_delta"] == {
         "field": "value_trunk_grad_scale",
-        "baseline": 0.25,
+        "baseline": 0.1,
         "treatment": 1.0,
     }
 
@@ -243,7 +266,7 @@ def test_prepare_and_verify_emit_nonpromotable_machine_readable_plan(
     assert planned["evaluation_eligible"] is False
     assert planned["causal_axis"] == "value_trunk_grad_scale"
     assert planned["diagnostic_max_steps"] == 128
-    assert set(replay["arms"]) == {"V0", "V25", "V100"}
+    assert set(replay["arms"]) == {"V0", "V10", "V100"}
     assert replay["arms"]["V100"]["effective_recipe"][
         "value_trunk_grad_scale"
     ] == pytest.approx(1.0)
