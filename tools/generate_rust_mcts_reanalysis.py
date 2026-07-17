@@ -23,6 +23,9 @@ from catan_zero.search.neural_rust_mcts import (
 from catan_zero.rl.entity_feature_adapter import (
     policy_entity_feature_adapter_version,
 )
+from catan_zero.rl.gumbel_self_play import (
+    TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+)
 
 # Make the sibling ``tools/`` modules importable whether this module is run as a script or
 # imported as a package submodule (``from tools.generate_rust_mcts_reanalysis import ...``,
@@ -31,7 +34,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from convert_teacher_to_entity_tokens import EntityShardWriter
+from convert_teacher_to_entity_tokens import EntityShardWriter  # noqa: E402
 
 
 COLORS = ("BLUE", "RED")
@@ -327,6 +330,13 @@ def _feature_contract_manifest_fields(
             "meaningful_public_history_schema"
         ],
         "event_history_limit": feature_contract["event_history_limit"],
+        # This legacy reanalyzer searches the authoritative game object. Masking
+        # the evaluator observation does not turn that tree into an information-
+        # set search: transitions and chance still follow the one hidden state.
+        # Stamp the rows and manifest explicitly so generic BC ingestion cannot
+        # silently treat these omniscient targets as public-policy supervision.
+        "target_information_regime": TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+        "policy_weight_multiplier": 0.0,
     }
 
 
@@ -409,6 +419,8 @@ def _mcts_row(
         "target_policy_mask": target_policy_mask,
         "target_scores_mask": target_scores_mask,
         "target_score_source": "rust_mcts_visit_q",
+        "target_information_regime": TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+        "policy_weight_multiplier": np.float32(0.0),
         "game_seed": np.int64(game_seed),
         "teacher_name": "rust_mcts_reanalysis",
         "adapter_version": feature_contract["entity_feature_adapter_version"],

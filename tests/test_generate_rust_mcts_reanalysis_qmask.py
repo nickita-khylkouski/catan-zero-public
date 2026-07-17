@@ -10,11 +10,15 @@ from catan_zero.rl.entity_feature_adapter import (
     RUST_ENTITY_ADAPTER_V2,
     RUST_ENTITY_ADAPTER_V5,
 )
+from catan_zero.rl.gumbel_self_play import (
+    TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+)
 from catan_zero.rl.meaningful_history import (
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V1,
     MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2,
 )
 from tools import generate_rust_mcts_reanalysis as reanalysis
+from tools.convert_teacher_to_entity_tokens import _rows_to_arrays
 from tools.generate_rust_mcts_reanalysis import _target_scores_and_mask
 
 
@@ -181,6 +185,30 @@ def test_legacy_reanalysis_rows_use_checkpoint_bound_feature_semantics(
     assert observed["entity"]["meaningful_public_history"] is False
     assert observed["entity"]["meaningful_public_history_schema"].endswith("_v1")
     assert observed["entity"]["history_limit"] == 17
+    assert row["target_information_regime"] == (
+        TARGET_INFORMATION_REGIME_AUTHORITATIVE
+    )
+    assert float(row["policy_weight_multiplier"]) == 0.0
+
+
+def test_authoritative_value_only_provenance_survives_shard_materialization() -> None:
+    arrays = _rows_to_arrays(
+        [
+            {
+                "legal_action_ids": np.asarray([23], dtype=np.int16),
+                "target_information_regime": (
+                    TARGET_INFORMATION_REGIME_AUTHORITATIVE
+                ),
+                "policy_weight_multiplier": np.float32(0.0),
+            }
+        ],
+        entity_keys=(),
+    )
+
+    assert arrays["target_information_regime"].astype(str).tolist() == [
+        TARGET_INFORMATION_REGIME_AUTHORITATIVE
+    ]
+    assert arrays["policy_weight_multiplier"].astype(float).tolist() == [0.0]
 
 
 def test_commissioned_v5_contract_clamps_history_and_serializes_manifest() -> None:
@@ -214,6 +242,8 @@ def test_commissioned_v5_contract_clamps_history_and_serializes_manifest() -> No
             MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
         ),
         "event_history_limit": 64,
+        "target_information_regime": TARGET_INFORMATION_REGIME_AUTHORITATIVE,
+        "policy_weight_multiplier": 0.0,
     }
 
 
