@@ -8433,6 +8433,57 @@ def _replay_a1_v3_promotion_handoff(
     ):
         raise SystemExit("A1 v3 contract has a malformed producer handoff")
 
+    if handoff["mode"] == "disaster_recovery":
+        receipt_path, receipt, receipt_file_sha = _read_sha256_bound_json(
+            handoff["path"],
+            handoff.get("sha256"),
+            label="A1 disaster-recovery receipt",
+        )
+        if str(receipt_path) != handoff["path"]:
+            raise SystemExit("A1 disaster-recovery receipt path is not canonical")
+        unsigned_receipt = dict(receipt)
+        receipt_semantic_sha = unsigned_receipt.pop(
+            "recovery_receipt_sha256", None
+        )
+        recovered = receipt.get("recovered_checkpoint")
+        identity = receipt.get("producer_identity")
+        safety = receipt.get("safety_reference")
+        lineage = receipt.get("lineage")
+        if (
+            receipt.get("schema_version")
+            != "a1-v5-disaster-recovery-bootstrap-v1"
+            or receipt.get("mode") != "committed"
+            or receipt_semantic_sha != _canonical_json_sha256(unsigned_receipt)
+            or handoff.get("kind") != "disaster_recovery_receipt"
+            or handoff.get("document_schema") != receipt.get("schema_version")
+            or handoff.get("sha256") != receipt_file_sha
+            or handoff.get("recovery_receipt_sha256") != receipt_semantic_sha
+            or not isinstance(recovered, dict)
+            or handoff.get("producer_checkpoint")
+            != {
+                "path": recovered.get("path"),
+                "sha256": recovered.get("sha256"),
+            }
+            or producers[0].get("path") != recovered.get("path")
+            or producers[0].get("sha256") != recovered.get("sha256")
+            or not isinstance(identity, dict)
+            or handoff.get("producer_identity_sha256")
+            != identity.get("agent_identity_sha256")
+            or handoff.get("producer_search_config")
+            != identity.get("search_config")
+            or handoff.get("producer_search_config_sha256")
+            != _canonical_json_sha256(identity.get("search_config"))
+            or handoff.get("safety_reference") != safety
+            or not isinstance(lineage, dict)
+            or handoff.get("recovery_lineage_id") != lineage.get("lineage_id")
+            or handoff.get("promotion_proof_recreated") is not False
+            or handoff.get("wave_lineage_mode") != "recovery_reference"
+        ):
+            raise SystemExit(
+                "A1 disaster-recovery handoff differs from its immutable receipt"
+            )
+        return
+
     from tools import a1_pre_wave_contract as pre_wave_contract
 
     try:
