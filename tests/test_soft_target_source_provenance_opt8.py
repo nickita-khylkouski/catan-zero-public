@@ -19,6 +19,10 @@ if str(_TOOLS_DIR) not in sys.path:
 
 import train_bc  # type: ignore  # noqa: E402
 
+from catan_zero.rl.checkpoint_runtime_semantics import (  # noqa: E402
+    ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+    current_entity_graph_forward_semantics,
+)
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
     EntityGraphConfig,
     EntityGraphPolicy,
@@ -82,6 +86,12 @@ def test_distributed_checkpoint_writer_records_soft_target_source(tmp_path):
     assert data["soft_target_source"] == "policy"
     assert data["mask_hidden_info"] is True
     assert data["public_award_feature_contract"] == "legacy_zero_v0"
+    assert data[ENTITY_GRAPH_FORWARD_SEMANTICS_KEY] == (
+        current_entity_graph_forward_semantics(
+            Path(__file__).resolve().parents[1]
+            / "src/catan_zero/rl/entity_token_policy.py"
+        )
+    )
 
 
 def test_all_entity_checkpoint_writers_record_information_surface(tmp_path):

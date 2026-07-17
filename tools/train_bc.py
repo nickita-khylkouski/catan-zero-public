@@ -40558,9 +40558,14 @@ def _write_entity_checkpoint(
     import torch
 
     from catan_zero.rl.config_serialization import config_to_dict
+    from catan_zero.rl.checkpoint_runtime_semantics import (
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY,
+        current_entity_graph_forward_semantics,
+    )
     from catan_zero.rl.entity_token_policy import (
         _validate_public_award_feature_contract,
     )
+    import catan_zero.rl.entity_token_policy as entity_token_policy_module
 
     award_contract = _validate_public_award_feature_contract(
         getattr(policy, "public_award_feature_contract", "legacy_zero_v0")
@@ -40587,6 +40592,16 @@ def _write_entity_checkpoint(
                     policy.static_action_features.detach().cpu().numpy()
                 ),
                 "static_action_features": policy.static_action_features.detach().cpu(),
+                # DDP/FSDP checkpoints must carry the same executable-forward
+                # identity as EntityGraphPolicy.save().  Omitting this field
+                # made every distributedly trained checkpoint fail closed at
+                # evaluation even though its commissioned initializer was
+                # accepted and its tensors were complete.
+                ENTITY_GRAPH_FORWARD_SEMANTICS_KEY: (
+                    current_entity_graph_forward_semantics(
+                        Path(entity_token_policy_module.__file__)
+                    )
+                ),
                 "model": model_state,
             }
         if value_training is not None:
