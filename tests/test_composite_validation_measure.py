@@ -6,6 +6,8 @@ import pytest
 from tools.train_bc import (
     _combine_policy_aux_validation_metrics,
     _canonical_json_sha256,
+    _empty_policy_target_behavior_parts,
+    _empty_policy_target_metric_parts,
     _IndexedValidationWeights,
     _objective_measure_validation_aggregate,
     _policy_aux_validation_objective_weights,
@@ -446,6 +448,126 @@ def test_objective_measure_aggregates_weight_density_before_dividing() -> None:
     assert report["metrics"]["policy_loss"] == pytest.approx(11.0 / 3.0)
     assert report["metrics"]["loss"] == pytest.approx(11.0 / 3.0)
     assert report["metrics"]["raw_batch_mean_loss"] == 5.0
+
+
+def test_objective_measure_density_scales_behavioral_sufficient_stats() -> None:
+    abi = {
+        "version": "synthetic-v1",
+        "size": 2,
+        "ordered_descriptors_sha256": "sha256:" + "1" * 64,
+        "action_types_by_id_sha256": "sha256:" + "2" * 64,
+        "identity_sha256": "sha256:" + "3" * 64,
+    }
+
+    def one_report(
+        *,
+        samples: int,
+        rows: float,
+        confusion: float,
+        weighted_rows: float,
+        weighted_confusion: float,
+    ) -> dict:
+        uniform = _empty_policy_target_behavior_parts()
+        uniform.update(
+            {
+                "rows": rows,
+                "teacher_top1_correct": rows - confusion,
+                "teacher_top3_correct": rows,
+                "teacher_top3_mass_sum": rows,
+                "end_turn_confusion_rows": confusion,
+                "end_turn_confusion_teacher_probability_regret_sum": (
+                    confusion * 0.5
+                ),
+            }
+        )
+        weighted = _empty_policy_target_behavior_parts()
+        weighted.update(
+            {
+                "rows": weighted_rows,
+                "teacher_top1_correct": weighted_rows - weighted_confusion,
+                "teacher_top3_correct": weighted_rows,
+                "teacher_top3_mass_sum": weighted_rows,
+                "end_turn_confusion_rows": weighted_confusion,
+                "end_turn_confusion_teacher_probability_regret_sum": (
+                    weighted_confusion * 0.5
+                ),
+            }
+        )
+        return {
+            "samples": samples,
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "loss_denominators": {},
+            "policy_target_distribution_sufficient_statistics": {
+                "schema_version": (
+                    "policy-target-distribution-sufficient-stats-v1"
+                ),
+                "overall": _empty_policy_target_metric_parts(),
+                "objective_weighted_overall": (
+                    _empty_policy_target_metric_parts()
+                ),
+                "phase": {},
+                "opening_decision_index": {},
+                "behavioral_competence": {
+                    "schema_version": (
+                        "policy-target-behavior-sufficient-stats-v1"
+                    ),
+                    "action_catalog_abi": dict(abi),
+                    "teacher_argmax_action_type": {
+                        "MARITIME_TRADE": uniform
+                    },
+                    "objective_weighted_teacher_argmax_action_type": {
+                        "MARITIME_TRADE": weighted
+                    },
+                },
+            },
+        }
+
+    metrics, sufficient = _objective_measure_validation_aggregate(
+        [
+            one_report(
+                samples=10,
+                rows=5.0,
+                confusion=5.0,
+                weighted_rows=2.0,
+                weighted_confusion=2.0,
+            ),
+            one_report(
+                samples=20,
+                rows=10.0,
+                confusion=0.0,
+                weighted_rows=8.0,
+                weighted_confusion=0.0,
+            ),
+        ],
+        np.asarray([0.7, 0.3], dtype=np.float64),
+    )
+
+    behavior = metrics["policy_target_distribution_metrics"][
+        "behavioral_competence"
+    ]
+    uniform = behavior["teacher_argmax_action_type"]["MARITIME_TRADE"]
+    assert uniform["row_probability"] == pytest.approx(0.5)
+    assert "rows" not in uniform
+    assert uniform["end_turn_confusion_rate"] == pytest.approx(0.7)
+    assert uniform[
+        "end_turn_confusion_teacher_probability_regret_per_row"
+    ] == pytest.approx(0.35)
+    assert uniform[
+        "end_turn_confusion_teacher_probability_regret_conditional_mean"
+    ] == pytest.approx(0.5)
+    weighted = behavior[
+        "objective_weighted_teacher_argmax_action_type"
+    ]["MARITIME_TRADE"]
+    assert weighted["row_probability"] == pytest.approx(0.26)
+    assert weighted["end_turn_confusion_rate"] == pytest.approx(7.0 / 13.0)
+    assert sufficient is not None
+    nested = sufficient["policy_target_distribution_metrics"][
+        "behavioral_competence"
+    ]
+    assert nested["teacher_argmax_action_type"]["MARITIME_TRADE"][
+        "rows"
+    ] == pytest.approx(0.5)
 
 
 def test_common_uniform_value_metric_ignores_composite_objective_ratios() -> None:

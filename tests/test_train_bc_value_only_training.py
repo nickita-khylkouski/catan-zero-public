@@ -1763,6 +1763,220 @@ def test_policy_target_distribution_metrics_follow_soft_teacher_and_opening_inde
     assert "9" not in metrics["opening_decision_index"]
 
 
+def test_action_catalog_abi_binding_is_ordered_and_identity_bound() -> None:
+    from tools import train_bc
+
+    class Catalog:
+        version = "synthetic-v1"
+        size = 3
+
+        def describe(self, action_id: int) -> dict:
+            return {
+                "index": action_id,
+                "action_type": (
+                    "END_TURN",
+                    "MARITIME_TRADE",
+                    "BUILD_ROAD",
+                )[action_id],
+                "value": action_id,
+            }
+
+    binding = train_bc._action_catalog_abi_binding(Catalog())  # noqa: SLF001
+    descriptors = [Catalog().describe(index) for index in range(3)]
+    action_types = [
+        descriptor["action_type"].upper() for descriptor in descriptors
+    ]
+
+    assert binding == {
+        "version": "synthetic-v1",
+        "size": 3,
+        "ordered_descriptors_sha256": train_bc._canonical_json_sha256(  # noqa: SLF001
+            descriptors
+        ),
+        "action_types_by_id_sha256": train_bc._canonical_json_sha256(  # noqa: SLF001
+            action_types
+        ),
+        "identity_sha256": binding["identity_sha256"],
+    }
+    assert binding["identity_sha256"] == train_bc._canonical_json_sha256(  # noqa: SLF001
+        {key: value for key, value in binding.items() if key != "identity_sha256"}
+    )
+
+    class MalformedCatalog:
+        version = "synthetic-v1"
+        size = 1
+
+        def describe(self, _action_id: int) -> dict:
+            return {"index": 0}
+
+    with pytest.raises(ValueError, match="missing an action_type"):
+        train_bc._action_catalog_abi_binding(  # noqa: SLF001
+            MalformedCatalog()
+        )
+
+
+def test_policy_target_behavior_metrics_report_maritime_end_turn_confusion() -> None:
+    import torch
+    from tools import train_bc
+
+    class Catalog:
+        version = "synthetic-v1"
+        size = 3
+
+        def describe(self, action_id: int) -> dict:
+            return {
+                "index": action_id,
+                "action_type": (
+                    "END_TURN",
+                    "MARITIME_TRADE",
+                    "BUILD_ROAD",
+                )[action_id],
+            }
+
+    action_types = ("END_TURN", "MARITIME_TRADE", "BUILD_ROAD")
+    abi = train_bc._action_catalog_abi_binding(Catalog())  # noqa: SLF001
+    logits = torch.tensor(
+        [[5.0, 1.0, 0.0], [0.0, 5.0, 1.0], [5.0, 1.0, 0.0]]
+    )
+    targets = torch.tensor(
+        [[0.2, 0.7, 0.1], [0.1, 0.6, 0.3], [0.8, 0.1, 0.1]]
+    )
+    data = {
+        "legal_action_ids": np.asarray([[0, 1, 2]] * 3),
+        "phase": np.asarray(["PLAY_TURN"] * 3),
+    }
+
+    legacy = train_bc._policy_target_distribution_stats(  # noqa: SLF001
+        data,
+        np.arange(3, dtype=np.int64),
+        logits,
+        targets,
+        torch.ones(3, dtype=torch.bool),
+        torch.ones(3, dtype=torch.bool),
+        torch.ones_like(targets, dtype=torch.bool),
+        objective_weights=np.asarray([9.0, 1.0, 5.0]),
+    )
+    sufficient = train_bc._policy_target_distribution_stats(  # noqa: SLF001
+        data,
+        np.arange(3, dtype=np.int64),
+        logits,
+        targets,
+        torch.ones(3, dtype=torch.bool),
+        torch.ones(3, dtype=torch.bool),
+        torch.ones_like(targets, dtype=torch.bool),
+        objective_weights=np.asarray([9.0, 1.0, 5.0]),
+        action_types_by_id=action_types,
+        action_catalog_abi=abi,
+    )
+    metrics = train_bc._finalize_policy_target_distribution_stats(  # noqa: SLF001
+        sufficient
+    )
+
+    assert "behavioral_competence" not in legacy
+    behavior = metrics["behavioral_competence"]
+    assert behavior["schema_version"] == "policy-target-behavior-metrics-v1"
+    assert behavior["action_catalog_abi"] == abi
+    uniform = behavior["teacher_argmax_action_type"]["MARITIME_TRADE"]
+    assert uniform["rows"] == 2
+    assert uniform["teacher_top1_accuracy"] == pytest.approx(0.5)
+    assert uniform["teacher_top3_accuracy"] == pytest.approx(1.0)
+    assert uniform["teacher_top3_mass"] == pytest.approx(1.0)
+    assert uniform["end_turn_confusion_rate"] == pytest.approx(0.5)
+    assert uniform[
+        "end_turn_confusion_teacher_probability_regret_per_row"
+    ] == pytest.approx(0.25)
+    assert uniform[
+        "end_turn_confusion_teacher_probability_regret_conditional_mean"
+    ] == pytest.approx(0.5)
+    weighted = behavior[
+        "objective_weighted_teacher_argmax_action_type"
+    ]["MARITIME_TRADE"]
+    assert weighted["row_probability"] == pytest.approx(10.0)
+    assert weighted["teacher_top1_accuracy"] == pytest.approx(0.1)
+    assert weighted["end_turn_confusion_rate"] == pytest.approx(0.9)
+    assert weighted[
+        "end_turn_confusion_teacher_probability_regret_per_row"
+    ] == pytest.approx(0.45)
+    assert weighted[
+        "end_turn_confusion_teacher_probability_regret_conditional_mean"
+    ] == pytest.approx(0.5)
+    teacher_end_turn = behavior["teacher_argmax_action_type"]["END_TURN"]
+    assert teacher_end_turn["rows"] == 1
+    assert teacher_end_turn["teacher_top1_accuracy"] == pytest.approx(1.0)
+    assert teacher_end_turn["end_turn_confusion_rate"] == pytest.approx(0.0)
+    assert teacher_end_turn[
+        "end_turn_confusion_teacher_probability_regret_per_row"
+    ] == pytest.approx(0.0)
+
+
+def test_policy_target_behavior_merge_sums_and_rejects_abi_drift() -> None:
+    from tools import train_bc
+
+    abi = {
+        "version": "synthetic-v1",
+        "size": 2,
+        "ordered_descriptors_sha256": "sha256:" + "1" * 64,
+        "action_types_by_id_sha256": "sha256:" + "2" * 64,
+        "identity_sha256": "sha256:" + "3" * 64,
+    }
+
+    def sufficient(rows: float, confusion: float) -> dict:
+        parts = train_bc._empty_policy_target_behavior_parts()  # noqa: SLF001
+        parts.update(
+            {
+                "rows": rows,
+                "teacher_top1_correct": rows - confusion,
+                "end_turn_confusion_rows": confusion,
+                "end_turn_confusion_teacher_probability_regret_sum": (
+                    confusion * 0.4
+                ),
+            }
+        )
+        return {
+            "schema_version": "policy-target-distribution-sufficient-stats-v1",
+            "overall": train_bc._empty_policy_target_metric_parts(),  # noqa: SLF001
+            "objective_weighted_overall": (
+                train_bc._empty_policy_target_metric_parts()  # noqa: SLF001
+            ),
+            "phase": {},
+            "opening_decision_index": {},
+            "behavioral_competence": {
+                "schema_version": (
+                    "policy-target-behavior-sufficient-stats-v1"
+                ),
+                "action_catalog_abi": dict(abi),
+                "teacher_argmax_action_type": {
+                    "MARITIME_TRADE": dict(parts)
+                },
+                "objective_weighted_teacher_argmax_action_type": {
+                    "MARITIME_TRADE": dict(parts)
+                },
+            },
+        }
+
+    merged: dict[str, object] = {}
+    train_bc._merge_policy_target_distribution_stats(  # noqa: SLF001
+        merged, sufficient(2.0, 1.0)
+    )
+    train_bc._merge_policy_target_distribution_stats(  # noqa: SLF001
+        merged, sufficient(3.0, 2.0)
+    )
+    maritime = merged["behavioral_competence"][
+        "teacher_argmax_action_type"
+    ]["MARITIME_TRADE"]
+    assert maritime["rows"] == pytest.approx(5.0)
+    assert maritime["end_turn_confusion_rows"] == pytest.approx(3.0)
+
+    drifted = sufficient(1.0, 0.0)
+    drifted["behavioral_competence"]["action_catalog_abi"]["version"] = (
+        "synthetic-v2"
+    )
+    with pytest.raises(ValueError, match="ActionCatalog ABI drift"):
+        train_bc._merge_policy_target_distribution_stats(  # noqa: SLF001
+            merged, drifted
+        )
+
+
 def test_eval_policy_target_metrics_use_actual_objective_weights(
     monkeypatch,
 ) -> None:
@@ -1796,6 +2010,18 @@ def test_eval_policy_target_metrics_use_actual_objective_weights(
         device="cpu",
         config=SimpleNamespace(moe_routed_experts=0),
     )
+
+    class Catalog:
+        version = "synthetic-v1"
+        size = 2
+
+        def describe(self, action_id: int) -> dict:
+            return {
+                "index": action_id,
+                "action_type": ("END_TURN", "MARITIME_TRADE")[action_id],
+            }
+
+    abi = train_bc._action_catalog_abi_binding(Catalog())  # noqa: SLF001
     metrics = train_bc._eval_entity_batch(  # noqa: SLF001
         policy,
         data,
@@ -1816,6 +2042,11 @@ def test_eval_policy_target_metrics_use_actual_objective_weights(
         1.0,
         5.0,
         0.05,
+        policy_behavior_action_types_by_id=(
+            "END_TURN",
+            "MARITIME_TRADE",
+        ),
+        policy_behavior_action_catalog_abi=abi,
     )
     sufficient = metrics["policy_target_distribution_stats"]
     finalized = train_bc._finalize_policy_target_distribution_stats(  # noqa: SLF001
@@ -1830,6 +2061,14 @@ def test_eval_policy_target_metrics_use_actual_objective_weights(
     assert weighted["row_probability"] == pytest.approx(10.0)
     assert weighted["teacher_argmax_top1_accuracy"] == pytest.approx(0.1)
     assert weighted["model_top1_target_mass"] == pytest.approx(0.18)
+    maritime = finalized["behavioral_competence"][
+        "objective_weighted_teacher_argmax_action_type"
+    ]["MARITIME_TRADE"]
+    assert maritime["row_probability"] == pytest.approx(9.0)
+    assert maritime["end_turn_confusion_rate"] == pytest.approx(1.0)
+    assert maritime[
+        "end_turn_confusion_teacher_probability_regret_per_row"
+    ] == pytest.approx(0.8)
 
 
 def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
@@ -1837,6 +2076,37 @@ def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
 ) -> None:
     import torch.distributed as dist
     from tools import train_bc
+
+    behavior_abi = {
+        "version": "synthetic-v1",
+        "size": 2,
+        "ordered_descriptors_sha256": "sha256:" + "1" * 64,
+        "action_types_by_id_sha256": "sha256:" + "2" * 64,
+        "identity_sha256": "sha256:" + "3" * 64,
+    }
+
+    def behavior(rows: float, correct: float, confusion: float) -> dict:
+        parts = train_bc._empty_policy_target_behavior_parts()  # noqa: SLF001
+        parts.update(
+            {
+                "rows": rows,
+                "teacher_top1_correct": correct,
+                "end_turn_confusion_rows": confusion,
+                "end_turn_confusion_teacher_probability_regret_sum": (
+                    confusion * 0.5
+                ),
+            }
+        )
+        return {
+            "schema_version": "policy-target-behavior-sufficient-stats-v1",
+            "action_catalog_abi": dict(behavior_abi),
+            "teacher_argmax_action_type": {
+                "MARITIME_TRADE": dict(parts)
+            },
+            "objective_weighted_teacher_argmax_action_type": {
+                "MARITIME_TRADE": dict(parts)
+            },
+        }
 
     local = {
         "schema_version": "policy-target-distribution-sufficient-stats-v1",
@@ -1856,6 +2126,7 @@ def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
         },
         "phase": {},
         "opening_decision_index": {},
+        "behavioral_competence": behavior(1.0, 1.0, 0.0),
     }
     remote = {
         "schema_version": "policy-target-distribution-sufficient-stats-v1",
@@ -1876,6 +2147,7 @@ def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
         },
         "phase": {},
         "opening_decision_index": {},
+        "behavioral_competence": behavior(3.0, 0.0, 2.0),
     }
 
     def fake_all_gather_object(output, value):
@@ -1901,6 +2173,17 @@ def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
     )["objective_weighted_overall"]
     assert weighted["row_probability"] == pytest.approx(8.0)
     assert weighted["teacher_argmax_top1_accuracy"] == pytest.approx(0.25)
+    maritime = train_bc._finalize_policy_target_distribution_stats(  # noqa: SLF001
+        reduced
+    )["behavioral_competence"]["teacher_argmax_action_type"][
+        "MARITIME_TRADE"
+    ]
+    assert maritime["rows"] == 4
+    assert maritime["teacher_top1_accuracy"] == pytest.approx(0.25)
+    assert maritime["end_turn_confusion_rate"] == pytest.approx(0.5)
+    assert maritime[
+        "end_turn_confusion_teacher_probability_regret_conditional_mean"
+    ] == pytest.approx(0.5)
 
 
 def test_objective_validation_aggregates_teacher_metrics_by_eligible_density() -> None:

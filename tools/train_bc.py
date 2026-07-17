@@ -16383,6 +16383,9 @@ def main(
     _, value_validation_action_types_by_id = _action_catalog_type_projection(
         validation_action_catalog, {}
     )
+    validation_action_catalog_abi = _action_catalog_abi_binding(
+        validation_action_catalog
+    )
     forced_row_value_action_catalog = (
         validation_action_catalog if forced_value_mass_report_requested else None
     )
@@ -17946,6 +17949,12 @@ def main(
             scalar_value_loss_scale=float(args.scalar_value_loss_scale),
             value_validation_action_types_by_id=(
                 value_validation_action_types_by_id
+            ),
+            policy_behavior_action_types_by_id=(
+                value_validation_action_types_by_id
+            ),
+            policy_behavior_action_catalog_abi=(
+                validation_action_catalog_abi
             ),
         )
 
@@ -20577,6 +20586,12 @@ def main(
                 value_validation_action_types_by_id=(
                     value_validation_action_types_by_id
                 ),
+                policy_behavior_action_types_by_id=(
+                    value_validation_action_types_by_id
+                ),
+                policy_behavior_action_catalog_abi=(
+                    validation_action_catalog_abi
+                ),
             )
             effective_anchor_weight = (
                 float(args.policy_kl_anchor_weight)
@@ -20624,6 +20639,12 @@ def main(
                     scalar_value_loss_scale=float(args.scalar_value_loss_scale),
                     value_validation_action_types_by_id=(
                         value_validation_action_types_by_id
+                    ),
+                    policy_behavior_action_types_by_id=(
+                        value_validation_action_types_by_id
+                    ),
+                    policy_behavior_action_catalog_abi=(
+                        validation_action_catalog_abi
                     ),
                 )
                 validation_policy_aux["policy_kl_anchor_loss"] = float(
@@ -25558,6 +25579,20 @@ def _objective_measure_validation_aggregate(
         and int(report.get("samples", 0)) > 0
         for report in reports
     ):
+        behavior_presence = [
+            isinstance(
+                report[
+                    "policy_target_distribution_sufficient_statistics"
+                ].get("behavioral_competence"),
+                Mapping,
+            )
+            for report in reports
+        ]
+        if any(behavior_presence) and not all(behavior_presence):
+            raise ValueError(
+                "objective-matched policy-target behavioral sufficient stats "
+                "are incomplete across components"
+            )
         aggregate_target_stats: dict[str, object] = {}
         for probability, report in zip(normalized, reports, strict=True):
             samples = float(report["samples"])
@@ -25596,6 +25631,11 @@ def _objective_measure_validation_aggregate(
                                 * float(probability)
                                 / samples
                             )
+            behavior = scaled.get("behavioral_competence")
+            if isinstance(behavior, dict):
+                _scale_policy_target_behavior_stats(
+                    behavior, float(probability) / samples
+                )
             _merge_policy_target_distribution_stats(
                 aggregate_target_stats, scaled
             )
@@ -26058,6 +26098,8 @@ def evaluate_bc_batches(
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
     value_validation_action_types_by_id: tuple[str, ...] | None = None,
+    policy_behavior_action_types_by_id: tuple[str, ...] | None = None,
+    policy_behavior_action_catalog_abi: Mapping[str, object] | None = None,
 ) -> dict:
     if len(indices) == 0:
         return {}
@@ -26169,6 +26211,12 @@ def evaluate_bc_batches(
             "value_root_blend_global_compat": bool(value_root_blend_global_compat),
             "value_validation_action_types_by_id": (
                 value_validation_action_types_by_id
+            ),
+            "policy_behavior_action_types_by_id": (
+                policy_behavior_action_types_by_id
+            ),
+            "policy_behavior_action_catalog_abi": (
+                policy_behavior_action_catalog_abi
             ),
         }
         # Validation used to bypass the streaming loader and synchronously
@@ -26711,6 +26759,8 @@ def _eval_entity_batch(
     scalar_value_loss_readout: str = "raw",
     scalar_value_loss_scale: float = 1.0,
     value_validation_action_types_by_id: tuple[str, ...] | None = None,
+    policy_behavior_action_types_by_id: tuple[str, ...] | None = None,
+    policy_behavior_action_catalog_abi: Mapping[str, object] | None = None,
 ) -> dict:
     import torch
     from torch import nn
@@ -27188,6 +27238,8 @@ def _eval_entity_batch(
                 objective_weights=(
                     policy_weights.detach().float().cpu().numpy()
                 ),
+                action_types_by_id=policy_behavior_action_types_by_id,
+                action_catalog_abi=policy_behavior_action_catalog_abi,
             )
         )
         # Success telemetry (gen-1 recipe): KL(model||prior_policy) vs the
@@ -33000,11 +33052,216 @@ _POLICY_TARGET_METRIC_SUM_KEYS = (
     "model_top3_target_mass_sum",
 )
 
+_POLICY_TARGET_BEHAVIOR_SUM_KEYS = (
+    "teacher_top1_correct",
+    "teacher_top3_correct",
+    "teacher_top3_mass_sum",
+    "end_turn_confusion_rows",
+    "end_turn_confusion_teacher_probability_regret_sum",
+)
+
 
 def _empty_policy_target_metric_parts() -> dict[str, float]:
     return {
         "rows": 0.0,
         **{key: 0.0 for key in _POLICY_TARGET_METRIC_SUM_KEYS},
+    }
+
+
+def _empty_policy_target_behavior_parts() -> dict[str, float]:
+    return {
+        "rows": 0.0,
+        **{key: 0.0 for key in _POLICY_TARGET_BEHAVIOR_SUM_KEYS},
+    }
+
+
+def _validate_policy_target_behavior_binding(
+    action_types_by_id: Sequence[str],
+    action_catalog_abi: Mapping[str, object],
+) -> tuple[str, ...]:
+    action_types = tuple(str(value).upper() for value in action_types_by_id)
+    bound_size = action_catalog_abi.get("size")
+    if (
+        not action_types
+        or isinstance(bound_size, bool)
+        or not isinstance(bound_size, int)
+        or bound_size != len(action_types)
+        or action_catalog_abi.get("action_types_by_id_sha256")
+        != _canonical_json_sha256(list(action_types))
+    ):
+        raise ValueError(
+            "policy-target behavioral metrics ActionCatalog ABI/type projection "
+            "drifted"
+        )
+    identity = action_catalog_abi.get("identity_sha256")
+    payload = {
+        str(key): value
+        for key, value in action_catalog_abi.items()
+        if key != "identity_sha256"
+    }
+    if identity != _canonical_json_sha256(payload):
+        raise ValueError(
+            "policy-target behavioral metrics ActionCatalog ABI identity drifted"
+        )
+    return action_types
+
+
+def _sum_policy_target_behavior_rows(
+    row_metrics: Mapping[str, np.ndarray],
+    mask: np.ndarray,
+    *,
+    weights: np.ndarray | None,
+) -> dict[str, float]:
+    selected = np.asarray(mask, dtype=np.bool_)
+    result = _empty_policy_target_behavior_parts()
+    if weights is None:
+        measure = np.ones(selected.shape, dtype=np.float64)
+    else:
+        measure = np.asarray(weights, dtype=np.float64)
+        if (
+            measure.shape != selected.shape
+            or not np.isfinite(measure).all()
+            or np.any(measure < 0.0)
+        ):
+            raise ValueError(
+                "policy-target behavioral objective weights are invalid"
+            )
+    result["rows"] = float(np.sum(measure[selected], dtype=np.float64))
+    for key in (
+        "teacher_top1_correct",
+        "teacher_top3_correct",
+        "teacher_top3_mass_sum",
+    ):
+        result[key] = float(
+            np.dot(
+                np.asarray(row_metrics[key], dtype=np.float64)[selected],
+                measure[selected],
+            )
+        )
+    confusion = selected & np.asarray(
+        row_metrics["end_turn_confusion"], dtype=np.bool_
+    )
+    result["end_turn_confusion_rows"] = float(
+        np.sum(measure[confusion], dtype=np.float64)
+    )
+    result[
+        "end_turn_confusion_teacher_probability_regret_sum"
+    ] = float(
+        np.dot(
+            np.asarray(
+                row_metrics["end_turn_confusion_teacher_probability_regret"],
+                dtype=np.float64,
+            )[confusion],
+            measure[confusion],
+        )
+    )
+    return result
+
+
+def _policy_target_behavior_sufficient_stats(
+    data: object,
+    batch: np.ndarray,
+    logits,
+    soft_targets,
+    has_soft,
+    active,
+    *,
+    objective_weights: np.ndarray | None,
+    action_types_by_id: Sequence[str],
+    action_catalog_abi: Mapping[str, object],
+) -> dict[str, object]:
+    import torch
+
+    action_types = _validate_policy_target_behavior_binding(
+        action_types_by_id, action_catalog_abi
+    )
+    eligible = (
+        has_soft.to(dtype=torch.bool) & active.to(dtype=torch.bool)
+    ).detach().cpu().numpy().astype(np.bool_, copy=False)
+    teacher_argmax = torch.argmax(soft_targets, dim=-1)
+    model_top3 = torch.topk(
+        logits,
+        k=min(3, int(logits.shape[-1])),
+        dim=-1,
+    ).indices
+    model_top1 = model_top3[:, 0]
+    legal = np.asarray(data["legal_action_ids"][batch], dtype=np.int64)
+    if legal.shape != tuple(logits.shape):
+        raise ValueError(
+            "policy-target behavioral legal-action shape drifted"
+        )
+    teacher_columns = teacher_argmax.detach().cpu().numpy().astype(np.int64)
+    model_columns = model_top1.detach().cpu().numpy().astype(np.int64)
+    row_indices = np.arange(len(batch), dtype=np.int64)
+    teacher_action_ids = legal[row_indices, teacher_columns]
+    model_action_ids = legal[row_indices, model_columns]
+    invalid = eligible & (
+        (teacher_action_ids < 0)
+        | (teacher_action_ids >= len(action_types))
+        | (model_action_ids < 0)
+        | (model_action_ids >= len(action_types))
+    )
+    if np.any(invalid):
+        raise ValueError(
+            "policy-target behavioral action id is outside the bound "
+            "ActionCatalog ABI"
+        )
+    type_lookup = np.asarray(action_types, dtype="<U48")
+    safe_teacher_ids = np.where(eligible, teacher_action_ids, 0)
+    safe_model_ids = np.where(eligible, model_action_ids, 0)
+    teacher_types = type_lookup[safe_teacher_ids]
+    model_types = type_lookup[safe_model_ids]
+    teacher_top3_correct = (
+        model_top3 == teacher_argmax.unsqueeze(-1)
+    ).any(dim=-1)
+    teacher_top3_mass = soft_targets.gather(1, model_top3).sum(dim=-1)
+    teacher_probability = soft_targets.gather(
+        1, teacher_argmax.unsqueeze(-1)
+    ).squeeze(-1)
+    model_probability = soft_targets.gather(
+        1, model_top1.unsqueeze(-1)
+    ).squeeze(-1)
+    confusion = (
+        eligible
+        & (teacher_types != "END_TURN")
+        & (model_types == "END_TURN")
+    )
+    row_metrics = {
+        "teacher_top1_correct": (
+            model_top1 == teacher_argmax
+        ).detach().cpu().numpy().astype(np.float64, copy=False),
+        "teacher_top3_correct": (
+            teacher_top3_correct.detach().cpu().numpy().astype(
+                np.float64, copy=False
+            )
+        ),
+        "teacher_top3_mass_sum": (
+            teacher_top3_mass.detach().float().cpu().numpy()
+        ),
+        "end_turn_confusion": confusion,
+        "end_turn_confusion_teacher_probability_regret": (
+            (teacher_probability - model_probability)
+            .detach()
+            .float()
+            .cpu()
+            .numpy()
+        ),
+    }
+    uniform: dict[str, dict[str, float]] = {}
+    weighted: dict[str, dict[str, float]] = {}
+    for action_type in sorted(set(teacher_types[eligible].tolist())):
+        selected = eligible & (teacher_types == action_type)
+        uniform[str(action_type)] = _sum_policy_target_behavior_rows(
+            row_metrics, selected, weights=None
+        )
+        weighted[str(action_type)] = _sum_policy_target_behavior_rows(
+            row_metrics, selected, weights=objective_weights
+        )
+    return {
+        "schema_version": "policy-target-behavior-sufficient-stats-v1",
+        "action_catalog_abi": dict(action_catalog_abi),
+        "teacher_argmax_action_type": uniform,
+        "objective_weighted_teacher_argmax_action_type": weighted,
     }
 
 
@@ -33119,6 +33376,8 @@ def _policy_target_distribution_stats(
     support,
     *,
     objective_weights: np.ndarray | None = None,
+    action_types_by_id: Sequence[str] | None = None,
+    action_catalog_abi: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     row_metrics = _policy_target_metric_parts(
         logits, soft_targets, has_soft, active, support
@@ -33132,6 +33391,40 @@ def _policy_target_distribution_stats(
         "phase": {},
         "opening_decision_index": {},
     }
+    behavior_enabled = (
+        action_types_by_id is not None or action_catalog_abi is not None
+    )
+    if behavior_enabled:
+        if action_types_by_id is None or action_catalog_abi is None:
+            raise ValueError(
+                "policy-target behavioral metrics require both ActionCatalog "
+                "types and ABI binding"
+            )
+        if soft_targets is None:
+            _validate_policy_target_behavior_binding(
+                action_types_by_id, action_catalog_abi
+            )
+            behavior_stats: dict[str, object] = {
+                "schema_version": (
+                    "policy-target-behavior-sufficient-stats-v1"
+                ),
+                "action_catalog_abi": dict(action_catalog_abi),
+                "teacher_argmax_action_type": {},
+                "objective_weighted_teacher_argmax_action_type": {},
+            }
+        else:
+            behavior_stats = _policy_target_behavior_sufficient_stats(
+                data,
+                batch,
+                logits,
+                soft_targets,
+                has_soft,
+                active,
+                objective_weights=objective_weights,
+                action_types_by_id=action_types_by_id,
+                action_catalog_abi=action_catalog_abi,
+            )
+        result["behavioral_competence"] = behavior_stats
     if not row_metrics:
         return result
     phases = (
@@ -33169,6 +33462,76 @@ def _policy_target_distribution_stats(
     return result
 
 
+def _merge_policy_target_behavior_stats(
+    target: dict[str, object],
+    source: Mapping[str, object],
+) -> None:
+    if source.get("schema_version") != (
+        "policy-target-behavior-sufficient-stats-v1"
+    ):
+        raise ValueError(
+            "policy-target behavioral sufficient-stat schema drifted"
+        )
+    source_abi = source.get("action_catalog_abi")
+    if not isinstance(source_abi, Mapping):
+        raise ValueError(
+            "policy-target behavioral sufficient stats lack ActionCatalog ABI"
+        )
+    if not target:
+        target.update(
+            {
+                "schema_version": (
+                    "policy-target-behavior-sufficient-stats-v1"
+                ),
+                "action_catalog_abi": dict(source_abi),
+                "teacher_argmax_action_type": {},
+                "objective_weighted_teacher_argmax_action_type": {},
+            }
+        )
+    elif target.get("action_catalog_abi") != dict(source_abi):
+        raise ValueError(
+            "cannot merge policy-target behavioral metrics across ActionCatalog "
+            "ABI drift"
+        )
+    for axis in (
+        "teacher_argmax_action_type",
+        "objective_weighted_teacher_argmax_action_type",
+    ):
+        source_axis = source.get(axis)
+        if not isinstance(source_axis, Mapping):
+            continue
+        target_axis = target.setdefault(axis, {})
+        assert isinstance(target_axis, dict)
+        for action_type, parts in source_axis.items():
+            if not isinstance(parts, Mapping):
+                continue
+            target_parts = target_axis.setdefault(
+                str(action_type), _empty_policy_target_behavior_parts()
+            )
+            for key in ("rows", *_POLICY_TARGET_BEHAVIOR_SUM_KEYS):
+                target_parts[key] = float(target_parts.get(key, 0.0)) + float(
+                    parts.get(key, 0.0)
+                )
+
+
+def _scale_policy_target_behavior_stats(
+    stats: dict[str, object],
+    factor: float,
+) -> None:
+    for axis in (
+        "teacher_argmax_action_type",
+        "objective_weighted_teacher_argmax_action_type",
+    ):
+        axis_value = stats.get(axis)
+        if not isinstance(axis_value, dict):
+            continue
+        for parts in axis_value.values():
+            if not isinstance(parts, dict):
+                continue
+            for key in ("rows", *_POLICY_TARGET_BEHAVIOR_SUM_KEYS):
+                parts[key] = float(parts.get(key, 0.0)) * float(factor)
+
+
 def _merge_policy_target_distribution_stats(
     target: dict[str, object],
     source: Mapping[str, object],
@@ -33186,6 +33549,16 @@ def _merge_policy_target_distribution_stats(
                 "phase": {},
                 "opening_decision_index": {},
             }
+        )
+    source_behavior = source.get("behavioral_competence")
+    if isinstance(source_behavior, Mapping):
+        target_behavior = target.setdefault("behavioral_competence", {})
+        if not isinstance(target_behavior, dict):
+            raise ValueError(
+                "policy-target behavioral sufficient-stat target is malformed"
+            )
+        _merge_policy_target_behavior_stats(
+            target_behavior, source_behavior
         )
     for axis in (
         "overall",
@@ -33283,6 +33656,86 @@ def _finalize_policy_target_metric_parts(
     return result
 
 
+def _finalize_policy_target_behavior_parts(
+    parts: Mapping[str, object],
+    *,
+    rows_are_density: bool,
+) -> dict[str, float | int]:
+    rows = float(parts.get("rows", 0.0))
+    denominator = rows if rows > 0.0 else 1.0
+    confusion_rows = float(parts.get("end_turn_confusion_rows", 0.0))
+    confusion_denominator = (
+        confusion_rows if confusion_rows > 0.0 else 1.0
+    )
+    result: dict[str, float | int] = {
+        "teacher_top1_accuracy": float(
+            parts.get("teacher_top1_correct", 0.0)
+        )
+        / denominator,
+        "teacher_top3_accuracy": float(
+            parts.get("teacher_top3_correct", 0.0)
+        )
+        / denominator,
+        "teacher_top3_mass": float(
+            parts.get("teacher_top3_mass_sum", 0.0)
+        )
+        / denominator,
+        "end_turn_confusion_rate": confusion_rows / denominator,
+        "end_turn_confusion_teacher_probability_regret_per_row": float(
+            parts.get(
+                "end_turn_confusion_teacher_probability_regret_sum", 0.0
+            )
+        )
+        / denominator,
+        "end_turn_confusion_teacher_probability_regret_conditional_mean": (
+            float(
+                parts.get(
+                    "end_turn_confusion_teacher_probability_regret_sum",
+                    0.0,
+                )
+            )
+            / confusion_denominator
+        ),
+    }
+    if rows_are_density:
+        result["row_probability"] = rows
+    else:
+        result["rows"] = int(round(rows))
+    return result
+
+
+def _finalize_policy_target_behavior_stats(
+    stats: Mapping[str, object],
+    *,
+    rows_are_density: bool = False,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "schema_version": "policy-target-behavior-metrics-v1",
+        "action_catalog_abi": dict(
+            stats.get("action_catalog_abi", {})
+            if isinstance(stats.get("action_catalog_abi"), Mapping)
+            else {}
+        ),
+    }
+    for axis, density in (
+        ("teacher_argmax_action_type", rows_are_density),
+        ("objective_weighted_teacher_argmax_action_type", True),
+    ):
+        source = stats.get(axis)
+        result[axis] = (
+            {
+                str(action_type): _finalize_policy_target_behavior_parts(
+                    parts, rows_are_density=density
+                )
+                for action_type, parts in sorted(source.items())
+                if isinstance(parts, Mapping)
+            }
+            if isinstance(source, Mapping)
+            else {}
+        )
+    return result
+
+
 def _finalize_policy_target_distribution_stats(
     stats: Mapping[str, object],
     *,
@@ -33320,6 +33773,13 @@ def _finalize_policy_target_distribution_stats(
             }
             if isinstance(source, Mapping)
             else {}
+        )
+    behavior = stats.get("behavioral_competence")
+    if isinstance(behavior, Mapping):
+        result["behavioral_competence"] = (
+            _finalize_policy_target_behavior_stats(
+                behavior, rows_are_density=rows_are_density
+            )
         )
     return result
 
@@ -36176,6 +36636,43 @@ def _action_catalog_type_projection(
         count=size,
     )
     return multipliers, action_types
+
+
+def _action_catalog_abi_binding(action_catalog: object) -> dict[str, object]:
+    """Bind behavioral metrics to one exact ordered ActionCatalog ABI."""
+
+    size = getattr(action_catalog, "size", None)
+    describe = getattr(action_catalog, "describe", None)
+    version = getattr(action_catalog, "version", None)
+    if (
+        isinstance(size, bool)
+        or not isinstance(size, int)
+        or size <= 0
+        or not callable(describe)
+        or version is None
+    ):
+        raise ValueError("behavioral metrics received an invalid ActionCatalog")
+    descriptors: list[dict[str, object]] = []
+    action_types: list[str] = []
+    for action_id in range(size):
+        descriptor = describe(action_id)
+        if (
+            not isinstance(descriptor, Mapping)
+            or "action_type" not in descriptor
+        ):
+            raise ValueError(
+                "ActionCatalog descriptor is missing an action_type"
+            )
+        descriptors.append(dict(descriptor))
+        action_types.append(str(descriptor["action_type"]).upper())
+    report: dict[str, object] = {
+        "version": str(version),
+        "size": size,
+        "ordered_descriptors_sha256": _canonical_json_sha256(descriptors),
+        "action_types_by_id_sha256": _canonical_json_sha256(action_types),
+    }
+    report["identity_sha256"] = _canonical_json_sha256(report)
+    return report
 
 
 def _validated_forced_action_ids(
