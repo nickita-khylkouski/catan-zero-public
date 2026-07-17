@@ -82,6 +82,68 @@ def _write_job(tmp_path: Path, pipeline: str = "generate", **updates: object) ->
     return path
 
 
+def _mock_exact_runtime(
+    plan: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    device_names: list[str],
+) -> None:
+    runtime = json.loads(
+        (ROOT / "configs/runtime/a1_production_runtime.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    monkeypatch.setattr(
+        cli.platform, "python_version", lambda: runtime["python_version"]
+    )
+    monkeypatch.setattr(
+        cli,
+        "_package_version",
+        lambda distribution: {
+            "catanatron-rs": runtime["catanatron_rs_version"],
+            "numpy": runtime["numpy_version"],
+            "networkx": runtime["networkx_version"],
+            "gymnasium": runtime["gymnasium_version"],
+            "zstandard": runtime["zstandard_version"],
+            "scipy": runtime["scipy_version"],
+            "whr": runtime["whr_version"],
+            "torch": runtime["torch_version"],
+        }[distribution],
+    )
+    fake_torch = SimpleNamespace(
+        version=SimpleNamespace(cuda=runtime["torch_cuda_version"]),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: len(device_names),
+            get_device_name=lambda index: device_names[index],
+        ),
+    )
+    monkeypatch.setitem(cli.sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        cli,
+        "_nvidia_driver_identity",
+        lambda: {"versions": [runtime["nvidia_driver_version"]], "error": None},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_native_runtime_identity",
+        lambda: {
+            "wheel_sha256": runtime["catanatron_rs_wheel_sha256"],
+            "extension_sha256": runtime["catanatron_rs_extension_sha256"],
+            "capabilities": sorted(NATIVE_REQUIRED_CAPABILITIES),
+        },
+    )
+    repository = plan["repository"]
+    assert isinstance(repository, dict)
+    clean_repository = {
+        "commit": repository["commit"],
+        "tracked_changes": [],
+        "clean": True,
+    }
+    plan["repository"] = clean_repository
+    monkeypatch.setattr(cli, "_git_identity", lambda _root: clean_repository)
+
+
 def test_status_exposes_only_commissioned_production_state() -> None:
     status = production_status(ROOT)
 
@@ -229,6 +291,67 @@ def test_production_job_rejects_unknown_keys_and_relative_paths(tmp_path: Path) 
         cli.load_job(relative)
 
 
+@pytest.mark.parametrize(
+    ("devices", "message"),
+    (
+        (["cpu"], "exact cuda:N form"),
+        ([""], "exact cuda:N form"),
+        (["cuda:0", "cuda:0"], "unique CUDA devices"),
+    ),
+)
+def test_evaluation_job_rejects_ambiguous_cuda_placement(
+    tmp_path: Path, devices: list[str], message: str
+) -> None:
+    job = _write_job(tmp_path, "evaluate", devices=devices)
+
+    with pytest.raises(cli.ProductionCLIError, match=message):
+        cli.load_job(job)
+
+
+def test_doctor_refuses_out_of_range_device_before_stage_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = cli.build_plan(
+        _write_job(tmp_path, "evaluate", devices=["cuda:0", "cuda:8"])
+    )
+    _mock_exact_runtime(
+        plan,
+        monkeypatch,
+        device_names=["NVIDIA H100 80GB HBM3"] * 8,
+    )
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("stage subprocess must not start"),
+    )
+
+    with pytest.raises(cli.ProductionCLIError, match="outside visible device count"):
+        cli.execute(plan)
+    assert not Path(plan["run_receipt"]).exists()
+
+
+def test_doctor_attests_requested_evaluation_devices_are_h100(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = cli.build_plan(
+        _write_job(tmp_path, "evaluate", devices=["cuda:0", "cuda:1"])
+    )
+    _mock_exact_runtime(
+        plan,
+        monkeypatch,
+        device_names=["NVIDIA H100 80GB HBM3", "NVIDIA B200"],
+    )
+
+    result = cli.doctor(plan)
+
+    assert result["ok"] is False
+    assert result["runtime_actual"]["requested_cuda_device_indices"] == [0, 1]
+    assert any(
+        "production placement requires only NVIDIA H100" in error
+        for error in result["errors"]
+    )
+
+
 def test_ppo_gets_a_typed_refusal(tmp_path: Path) -> None:
     job = _write_job(tmp_path, "ppo")
 
@@ -243,6 +366,112 @@ def test_plan_artifact_drift_is_detected(tmp_path: Path) -> None:
     assert any(
         "input checkpoint drift" in error for error in cli._verify_plan_artifacts(plan)
     )  # noqa: SLF001
+
+
+class _FakeNativeDistribution:
+    def __init__(self, root: Path, files: list[Path]) -> None:
+        self.root = root
+        self.files = files
+
+    def read_text(self, name: str) -> str | None:
+        assert name == "direct_url.json"
+        return json.dumps(
+            {
+                "archive_info": {
+                    "hashes": {"sha256": "a" * 64},
+                }
+            }
+        )
+
+    def locate_file(self, record: Path) -> Path:
+        return self.root / record
+
+
+def _fake_native_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    records: list[Path] | None = None,
+    loaded_path: Path | None = None,
+) -> Path:
+    relative = Path("catanatron_rs/catanatron_rs.cpython-311-x86_64-linux-gnu.so")
+    extension = tmp_path / relative
+    extension.parent.mkdir(parents=True, exist_ok=True)
+    extension.write_bytes(b"sealed-native-extension")
+    distribution = _FakeNativeDistribution(tmp_path, records or [relative])
+    monkeypatch.setattr(cli.metadata, "distribution", lambda _name: distribution)
+    package = SimpleNamespace(
+        gumbel_search_capabilities=lambda: sorted(NATIVE_REQUIRED_CAPABILITIES)
+    )
+    native_module = SimpleNamespace(__file__=str(loaded_path or extension))
+    monkeypatch.setitem(cli.sys.modules, "catanatron_rs", package)
+    monkeypatch.setitem(
+        cli.sys.modules, "catanatron_rs.catanatron_rs", native_module
+    )
+    return extension
+
+
+def test_native_runtime_hashes_the_exact_loaded_extension(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    extension = _fake_native_runtime(tmp_path, monkeypatch)
+
+    exact = cli._native_runtime_identity()  # noqa: SLF001
+    assert exact["wheel_sha256"] == "a" * 64
+    assert exact["extension_path"] == str(extension)
+    assert exact["extension_sha256"] == cli._file_sha256(extension)  # noqa: SLF001
+    assert "error" not in exact
+
+    extension.write_bytes(b"tampered-native-extension")
+    drifted = cli._native_runtime_identity()  # noqa: SLF001
+    assert drifted["wheel_sha256"] == exact["wheel_sha256"]
+    assert drifted["capabilities"] == exact["capabilities"]
+    assert drifted["extension_sha256"] != exact["extension_sha256"]
+
+
+def test_native_runtime_refuses_multiple_or_symlinked_extensions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    second = Path("catanatron_rs/other.so")
+    _fake_native_runtime(
+        tmp_path,
+        monkeypatch,
+        records=[
+            Path("catanatron_rs/catanatron_rs.cpython-311-x86_64-linux-gnu.so"),
+            second,
+        ],
+    )
+    (tmp_path / second).write_bytes(b"other")
+    multiple = cli._native_runtime_identity()  # noqa: SLF001
+    assert "exactly one native extension; found=2" in multiple["error"]
+    assert multiple["extension_sha256"] is None
+
+    target = tmp_path / "native-target.so"
+    target.write_bytes(b"target")
+    relative = Path("catanatron_rs/catanatron_rs.cpython-311-x86_64-linux-gnu.so")
+    extension = tmp_path / relative
+    extension.unlink()
+    extension.symlink_to(target)
+    distribution = _FakeNativeDistribution(tmp_path, [relative])
+    monkeypatch.setattr(cli.metadata, "distribution", lambda _name: distribution)
+    cli.sys.modules["catanatron_rs.catanatron_rs"].__file__ = str(extension)
+
+    symlinked = cli._native_runtime_identity()  # noqa: SLF001
+    assert "canonical regular non-symlink file" in symlinked["error"]
+    assert symlinked["extension_sha256"] is None
+
+
+def test_native_runtime_refuses_loaded_extension_path_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    other = tmp_path / "other-loaded-extension.so"
+    other.write_bytes(b"other")
+    _fake_native_runtime(tmp_path, monkeypatch, loaded_path=other)
+
+    identity = cli._native_runtime_identity()  # noqa: SLF001
+
+    assert "loaded native extension path drift" in identity["error"]
+    assert identity["extension_sha256"] is None
 
 
 def test_doctor_accepts_only_exact_runtime_and_clean_repository(
@@ -290,6 +519,7 @@ def test_doctor_accepts_only_exact_runtime_and_clean_repository(
         "_native_runtime_identity",
         lambda: {
             "wheel_sha256": runtime["catanatron_rs_wheel_sha256"],
+            "extension_sha256": runtime["catanatron_rs_extension_sha256"],
             "capabilities": sorted(NATIVE_REQUIRED_CAPABILITIES),
         },
     )
@@ -305,6 +535,19 @@ def test_doctor_accepts_only_exact_runtime_and_clean_repository(
 
     assert result["ok"] is True
     assert result["errors"] == []
+
+    monkeypatch.setattr(
+        cli,
+        "_native_runtime_identity",
+        lambda: {
+            "wheel_sha256": runtime["catanatron_rs_wheel_sha256"],
+            "extension_sha256": "0" * 64,
+            "capabilities": sorted(NATIVE_REQUIRED_CAPABILITIES),
+        },
+    )
+    drifted = cli.doctor(plan)
+    assert drifted["ok"] is False
+    assert any("native extension drift" in error for error in drifted["errors"])
 
 
 def test_doctor_refuses_b200_training_recipe_on_h100(
@@ -354,6 +597,7 @@ def test_doctor_refuses_b200_training_recipe_on_h100(
         "_native_runtime_identity",
         lambda: {
             "wheel_sha256": runtime["catanatron_rs_wheel_sha256"],
+            "extension_sha256": runtime["catanatron_rs_extension_sha256"],
             "capabilities": sorted(NATIVE_REQUIRED_CAPABILITIES),
         },
     )

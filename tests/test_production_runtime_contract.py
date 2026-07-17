@@ -18,6 +18,9 @@ def test_canonical_production_runtime_is_exact_and_self_consistent() -> None:
         "torch_version": "2.11.0+cu128",
         "torch_cuda_version": "12.8",
         "catanatron_rs_version": "0.1.12",
+        "catanatron_rs_extension_sha256": (
+            "e9193d26b83855babb6fdadaa131bf5642be5295ad40d739ca144ec95d325c7b"
+        ),
         "catanatron_rs_wheel_filename": (
             "catanatron_rs-0.1.12-cp311-cp311-manylinux_2_34_x86_64.whl"
         ),
@@ -40,6 +43,7 @@ def test_canonical_production_runtime_is_exact_and_self_consistent() -> None:
         lambda value: value.pop("torch_version"),
         lambda value: value.__setitem__("python_version", "3.11.invalid"),
         lambda value: value.__setitem__("catanatron_rs_wheel_sha256", "0" * 63),
+        lambda value: value.__setitem__("catanatron_rs_extension_sha256", "0" * 63),
         lambda value: value.__setitem__(
             "catanatron_rs_wheel_filename", "catanatron_rs-0.1.7-fake.whl"
         ),
@@ -55,6 +59,17 @@ def test_runtime_contract_rejects_missing_or_inconsistent_identity(
 
     with pytest.raises(runtime.RuntimeContractError):
         runtime.load_runtime_contract(path)
+
+
+def test_legacy_runtime_contract_without_extension_digest_remains_readable(
+    tmp_path: Path,
+) -> None:
+    payload = runtime.load_runtime_contract()
+    payload.pop("catanatron_rs_extension_sha256")
+    path = tmp_path / "legacy-runtime-v1.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert runtime.load_runtime_contract(path) == payload
 
 
 def test_installer_line_protocol_has_fixed_complete_order(capsys) -> None:

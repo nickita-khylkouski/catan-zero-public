@@ -31,6 +31,7 @@ JOB_SCHEMA = "catan-zero-production-job-v1"
 PLAN_SCHEMA = "catan-zero-production-plan-v1"
 RUN_RECEIPT_SCHEMA = "catan-zero-production-run-v1"
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{2,95}$")
+_CUDA_DEVICE = re.compile(r"^cuda:(0|[1-9][0-9]*)$")
 _COMMON_KEYS = {"schema_version", "pipeline", "run_id", "run_dir"}
 _PIPELINE_KEYS = {
     "generate": {
@@ -96,6 +97,23 @@ def _positive_integer(value: object, *, field: str, allow_zero: bool = False) ->
     if value < minimum:
         raise ProductionCLIError(f"{field} must be >= {minimum}")
     return value
+
+
+def _cuda_device_indices(value: object, *, field: str = "devices") -> list[int]:
+    """Return one unambiguous set of logical CUDA device indices."""
+
+    if not isinstance(value, list) or not value:
+        raise ProductionCLIError(f"{field} must be a non-empty list of cuda:N strings")
+    indices: list[int] = []
+    for device in value:
+        if not isinstance(device, str) or _CUDA_DEVICE.fullmatch(device) is None:
+            raise ProductionCLIError(
+                f"{field} entries must use the exact cuda:N form: {device!r}"
+            )
+        indices.append(int(device.removeprefix("cuda:")))
+    if len(indices) != len(set(indices)):
+        raise ProductionCLIError(f"{field} must name unique CUDA devices")
+    return indices
 
 
 def _absolute_path(value: object, *, field: str) -> Path:
@@ -237,13 +255,7 @@ def load_job(path: Path) -> dict[str, Any]:
             allow_zero=True,
         )
         _positive_integer(job.get("base_seed"), field="base_seed", allow_zero=True)
-        devices = job.get("devices")
-        if (
-            not isinstance(devices, list)
-            or not devices
-            or any(not isinstance(value, str) or not value for value in devices)
-        ):
-            raise ProductionCLIError("devices must be a non-empty list of strings")
+        _cuda_device_indices(job.get("devices"))
     return job
 
 
@@ -521,6 +533,8 @@ def _package_version(distribution: str) -> str | None:
 def _native_runtime_identity() -> dict[str, Any]:
     result: dict[str, Any] = {
         "wheel_sha256": None,
+        "extension_path": None,
+        "extension_sha256": None,
         "capabilities": [],
     }
     try:
@@ -536,6 +550,61 @@ def _native_runtime_identity() -> dict[str, Any]:
                 result["wheel_sha256"] = archive["hash"].removeprefix("sha256=")
         import catanatron_rs  # type: ignore
 
+        native_suffixes = (".so", ".pyd", ".dylib")
+        extension_records = [
+            record
+            for record in (distribution.files or ())
+            if str(record).endswith(native_suffixes)
+        ]
+        if len(extension_records) != 1:
+            raise ProductionCLIError(
+                "installed catanatron-rs must contain exactly one native extension; "
+                f"found={len(extension_records)}"
+            )
+        relative = Path(str(extension_records[0]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ProductionCLIError(
+                f"installed native extension record is unsafe: {relative}"
+            )
+        extension = Path(
+            os.path.abspath(os.fspath(distribution.locate_file(extension_records[0])))
+        )
+        try:
+            extension_stat = extension.lstat()
+            resolved_extension = extension.resolve(strict=True)
+        except OSError as error:
+            raise ProductionCLIError(
+                f"cannot resolve installed native extension {extension}: {error}"
+            ) from error
+        if (
+            stat.S_ISLNK(extension_stat.st_mode)
+            or not stat.S_ISREG(extension_stat.st_mode)
+            or resolved_extension != extension
+        ):
+            raise ProductionCLIError(
+                "installed native extension must be a canonical regular "
+                f"non-symlink file: {extension}"
+            )
+        loaded_module = sys.modules.get("catanatron_rs.catanatron_rs")
+        loaded_raw = getattr(loaded_module, "__file__", None)
+        if not isinstance(loaded_raw, str) or not loaded_raw:
+            raise ProductionCLIError(
+                "loaded catanatron-rs native extension has no file identity"
+            )
+        loaded_extension = Path(os.path.abspath(loaded_raw))
+        try:
+            resolved_loaded = loaded_extension.resolve(strict=True)
+        except OSError as error:
+            raise ProductionCLIError(
+                f"cannot resolve loaded native extension {loaded_extension}: {error}"
+            ) from error
+        if resolved_loaded != loaded_extension or loaded_extension != extension:
+            raise ProductionCLIError(
+                "loaded native extension path drift: "
+                f"installed={extension} loaded={loaded_extension}"
+            )
+        result["extension_path"] = str(extension)
+        result["extension_sha256"] = _file_sha256(extension)
         capability_fn = getattr(catanatron_rs, "gumbel_search_capabilities", None)
         if callable(capability_fn):
             result["capabilities"] = sorted(set(map(str, capability_fn())))
@@ -669,6 +738,14 @@ def doctor(plan: dict[str, Any]) -> dict[str, Any]:
             f"expected={runtime.get('catanatron_rs_wheel_sha256')} "
             f"actual={native.get('wheel_sha256')}"
         )
+    if native.get("extension_sha256") != runtime.get(
+        "catanatron_rs_extension_sha256"
+    ):
+        errors.append(
+            "native extension drift: "
+            f"expected={runtime.get('catanatron_rs_extension_sha256')} "
+            f"actual={native.get('extension_sha256')}"
+        )
     missing_capabilities = sorted(
         NATIVE_REQUIRED_CAPABILITIES - set(native.get("capabilities", []))
     )
@@ -676,16 +753,42 @@ def doctor(plan: dict[str, Any]) -> dict[str, Any]:
         errors.append(f"native runtime lacks capabilities: {missing_capabilities}")
     if plan["job"]["pipeline"] == "train" and actual["cuda_device_count"] != 8:
         errors.append("canonical training requires exactly 8 visible CUDA devices")
+    requested_device_indices: list[int]
+    if plan["job"]["pipeline"] == "evaluate":
+        requested_device_indices = _cuda_device_indices(plan["job"].get("devices"))
+    elif plan["job"]["pipeline"] == "generate" and plan["job"].get("gpu") is not None:
+        requested_device_indices = [int(plan["job"]["gpu"])]
+    else:
+        requested_device_indices = list(range(actual["cuda_device_count"]))
+    out_of_range_devices = [
+        index
+        for index in requested_device_indices
+        if index >= actual["cuda_device_count"]
+    ]
+    if out_of_range_devices:
+        errors.append(
+            "requested CUDA devices are outside visible device count "
+            f"{actual['cuda_device_count']}: {out_of_range_devices}"
+        )
+    actual["requested_cuda_device_indices"] = requested_device_indices
+    actual["requested_cuda_device_names"] = [
+        actual["cuda_device_names"][index]
+        for index in requested_device_indices
+        if index < len(actual["cuda_device_names"])
+    ]
     required_accelerator = plan["contract"].get("required_accelerator_model")
     mismatched_devices = [
         name
-        for name in actual["cuda_device_names"]
+        for name in actual["requested_cuda_device_names"]
         if isinstance(required_accelerator, str) and required_accelerator not in name
     ]
-    if required_accelerator and (not actual["cuda_device_names"] or mismatched_devices):
+    if required_accelerator and (
+        not actual["requested_cuda_device_names"] or mismatched_devices
+    ):
         errors.append(
             "production placement requires only "
-            f"{required_accelerator} devices; actual={actual['cuda_device_names']}"
+            f"{required_accelerator} devices; "
+            f"actual={actual['requested_cuda_device_names']}"
         )
     if (
         plan["job"]["pipeline"] == "train"
@@ -695,12 +798,6 @@ def doctor(plan: dict[str, Any]) -> dict[str, Any]:
         errors.append(
             "training requires an authenticated plan receipt; "
             "run catan-zero prepare first"
-        )
-    requested_gpu = plan["job"].get("gpu")
-    if requested_gpu is not None and requested_gpu >= actual["cuda_device_count"]:
-        errors.append(
-            f"requested GPU {requested_gpu} is outside visible device count "
-            f"{actual['cuda_device_count']}"
         )
     readiness = plan["readiness"]
     if readiness.get("authorized") is not True:

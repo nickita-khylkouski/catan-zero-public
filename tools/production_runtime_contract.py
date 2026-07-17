@@ -30,6 +30,7 @@ REQUIRED_KEYS = {
     "scipy_version",
     "whr_version",
 }
+OPTIONAL_KEYS = {"catanatron_rs_extension_sha256"}
 _VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+)+(?:\+[A-Za-z0-9.]+)?$")
 _WHEEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*\.whl$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -44,7 +45,11 @@ def load_runtime_contract(path: Path = DEFAULT_CONTRACT) -> dict[str, str]:
         payload: Any = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise RuntimeContractError(f"cannot load production runtime contract: {error}") from error
-    if not isinstance(payload, dict) or set(payload) != REQUIRED_KEYS:
+    if (
+        not isinstance(payload, dict)
+        or not REQUIRED_KEYS.issubset(payload)
+        or set(payload).difference(REQUIRED_KEYS | OPTIONAL_KEYS)
+    ):
         raise RuntimeContractError("production runtime contract key set drift")
     if payload.get("schema_version") != SCHEMA:
         raise RuntimeContractError("production runtime contract schema drift")
@@ -70,6 +75,12 @@ def load_runtime_contract(path: Path = DEFAULT_CONTRACT) -> dict[str, str]:
     wheel_sha256 = payload.get("catanatron_rs_wheel_sha256")
     if not isinstance(wheel_sha256, str) or not _SHA256.fullmatch(wheel_sha256):
         raise RuntimeContractError("invalid production runtime wheel SHA-256")
+    extension_sha256 = payload.get("catanatron_rs_extension_sha256")
+    if extension_sha256 is not None and (
+        not isinstance(extension_sha256, str)
+        or not _SHA256.fullmatch(extension_sha256)
+    ):
+        raise RuntimeContractError("invalid production runtime extension SHA-256")
     expected_prefix = f"catanatron_rs-{payload['catanatron_rs_version']}-"
     if not wheel.startswith(expected_prefix):
         raise RuntimeContractError("native wheel filename/version drift")
