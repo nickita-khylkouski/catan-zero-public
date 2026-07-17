@@ -9469,15 +9469,25 @@ def _validate_a1_learner_objective(
 ) -> None:
     objective = bound["learner_value_objective"]
     assert isinstance(objective, dict)
-    mode = str(getattr(args, "value_head_type", "mse"))
-    if mode == "scalar":
-        mode = "mse"
-    if mode != objective.get("objective"):
+    head_mode = str(getattr(args, "value_head_type", "mse"))
+    if head_mode == "scalar":
+        head_mode = "mse"
+    # ``value_head_type`` selects the scalar-vs-categorical head family.
+    # ``scalar_value_objective`` selects MSE vs Bernoulli BCE *within* the
+    # scalar family.  Treating the former as the objective made every sealed
+    # binary_win_bce scalar learner impossible to launch even though its CLI
+    # recipe was internally coherent.
+    cli_objective = (
+        str(getattr(args, "scalar_value_objective", "mse"))
+        if head_mode == "mse"
+        else "hlgauss"
+    )
+    if cli_objective != objective.get("objective"):
         raise SystemExit(
             "A1 learner objective differs from the immutable contract: "
-            f"contract={objective.get('objective')!r} cli={mode!r}"
+            f"contract={objective.get('objective')!r} cli={cli_objective!r}"
         )
-    expected_readout = "scalar" if mode == "mse" else "categorical"
+    expected_readout = "scalar" if head_mode == "mse" else "categorical"
     if objective.get("value_readout") != expected_readout:
         raise SystemExit("A1 learner readout differs from the immutable contract")
     expected_scalar_loss_readout = str(
@@ -9530,7 +9540,7 @@ def _validate_a1_learner_objective(
         raise SystemExit(
             "A1 scalar value objective differs from the immutable contract"
         )
-    if mode == "mse":
+    if head_mode == "mse":
         if int(getattr(args, "value_categorical_bins", 0)) != 0:
             raise SystemExit("A1 scalar learner cannot construct categorical bins")
         scalar_weight, categorical_weight = _resolve_value_objective_weights(args)

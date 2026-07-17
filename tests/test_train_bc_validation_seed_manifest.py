@@ -613,6 +613,23 @@ def test_a1_artifact_chain_replays_actual_seed_set_and_learner_objective(
         init_checkpoint_sha256=bound["producer_checkpoint_sha256"],
     )
     _validate_a1_learner_objective(args, bound)
+    binary_bound = dict(bound)
+    binary_bound["learner_value_objective"] = {
+        "objective": "binary_win_bce",
+        "value_readout": "scalar",
+        "value_categorical_bins": None,
+        "hlgauss_sigma_ratio": None,
+    }
+    binary_bound["learner_training_recipe"] = {
+        **recipe,
+        "scalar_value_objective": "binary_win_bce",
+        "scalar_value_loss_readout": "deployed_tanh",
+    }
+    args.scalar_value_objective = "binary_win_bce"
+    args.scalar_value_loss_readout = "deployed_tanh"
+    _validate_a1_learner_objective(args, binary_bound)
+    args.scalar_value_objective = recipe.get("scalar_value_objective", "mse")
+    args.scalar_value_loss_readout = recipe.get("scalar_value_loss_readout", "raw")
     ddp = {"world_size": 1, "rank": 0, "local_rank": 0, "enabled": False}
     assert _validate_a1_learner_training_recipe(args, ddp, bound) == recipe
     assert bound["decisive_training_semantics"] == {
