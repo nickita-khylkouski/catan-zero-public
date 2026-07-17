@@ -610,6 +610,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--action-cross-attention-layers",
+        type=int,
+        default=None,
+        help=(
+            "Post-trunk action-to-board cross-attention layers for the incumbent "
+            "Transformer decoder. This is checkpoint-owned architecture: omitted "
+            "inherits an init/grow checkpoint and resolves to 0 for a fresh model. "
+            "Do not confuse it with --relational-action-cross-layers, which applies "
+            "only to RRT/ResRGCN trunks."
+        ),
+    )
+    parser.add_argument(
         "--topology-residual-adapter",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -3628,6 +3640,28 @@ def _checkpoint_action_target_gather(checkpoint_path: str) -> bool:
         )
     config = config_attr_view(checkpoint["config"])
     return bool(getattr(config, "action_target_gather", False))
+
+
+def _checkpoint_action_cross_attention_layers(checkpoint_path: str) -> int:
+    """Read the checkpoint-owned incumbent action-to-board decoder depth."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --action-cross-attention-layers"
+        )
+    config = config_attr_view(checkpoint["config"])
+    layers = int(getattr(config, "action_cross_attention_layers", 0) or 0)
+    if layers < 0:
+        raise SystemExit(
+            f"{checkpoint_path} records invalid action_cross_attention_layers={layers}"
+        )
+    return layers
 
 
 def _checkpoint_topology_residual_adapter(checkpoint_path: str) -> bool:
@@ -12869,6 +12903,57 @@ def _resolve_effective_action_target_gather(
     return False if requested is None else requested
 
 
+def _resolve_effective_action_cross_attention_layers(
+    args: argparse.Namespace,
+) -> int:
+    """Resolve the incumbent Transformer action decoder without guessing.
+
+    ``relational_action_cross_layers`` deliberately does not participate here:
+    that knob constructs the from-scratch decoder only for relational trunks.
+    Keeping the two surfaces separate prevents a Transformer recipe from claiming
+    one action-cross layer while constructing none.
+    """
+
+    requested_raw = getattr(args, "action_cross_attention_layers", None)
+    requested = None if requested_raw is None else int(requested_raw)
+    if requested is not None and requested < 0:
+        raise SystemExit("--action-cross-attention-layers must be >= 0")
+    if str(args.arch) != "entity_graph":
+        if requested not in (None, 0):
+            raise SystemExit(
+                "--action-cross-attention-layers is supported only for "
+                "--arch entity_graph"
+            )
+        return 0
+
+    state_trunk = str(getattr(args, "entity_state_trunk", "transformer"))
+    if state_trunk != "transformer":
+        if requested not in (None, 0):
+            raise SystemExit(
+                "--action-cross-attention-layers belongs to the transformer "
+                "decoder; use --relational-action-cross-layers with "
+                f"--entity-state-trunk {state_trunk}"
+            )
+        return 0
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_action_cross_attention_layers(init_checkpoint)
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "--action-cross-attention-layers does not match "
+                f"--init-checkpoint: checkpoint={inherited} cli={requested}. "
+                "Upgrade the checkpoint first or omit the flag to inherit its "
+                "exact architecture."
+            )
+        return inherited
+    if grow_checkpoint:
+        inherited = _checkpoint_action_cross_attention_layers(grow_checkpoint)
+        return inherited if requested is None else requested
+    return 0 if requested is None else requested
+
+
 def _resolve_effective_topology_residual_adapter(
     args: argparse.Namespace,
 ) -> bool:
@@ -12936,11 +13021,14 @@ def _resolve_effective_value_tower_split_layers(
 
 def _structured_action_create_kwargs(
     args: argparse.Namespace,
-) -> dict[str, bool]:
+) -> dict[str, bool | int]:
     """Single construction boundary shared by the trainer and wiring tests."""
 
     return {
         "action_target_gather": bool(args.action_target_gather),
+        "action_cross_attention_layers": int(
+            args.action_cross_attention_layers
+        ),
         "static_action_residual": bool(args.static_action_residual),
         "legal_action_value_residual": bool(args.legal_action_value_residual),
         "legal_action_value_set_statistics": bool(
@@ -14033,6 +14121,9 @@ def main(
     args.action_target_gather = _resolve_effective_action_target_gather(
         checkpoint_args
     )
+    args.action_cross_attention_layers = (
+        _resolve_effective_action_cross_attention_layers(checkpoint_args)
+    )
     args.topology_residual_adapter = (
         _resolve_effective_topology_residual_adapter(checkpoint_args)
     )
@@ -14056,6 +14147,7 @@ def main(
         "public_card_count_residual_bias",
         "public_rule_state_features",
         "action_target_gather",
+        "action_cross_attention_layers",
         "topology_residual_adapter",
         "static_action_residual",
         "legal_action_value_residual",
@@ -14970,6 +15062,23 @@ def main(
                 json.dumps({"progress": "warm_start_grow", **grow_report}, sort_keys=True),
                 ddp,
             )
+        action_cross_initialization = (
+            _initialize_cold_start_action_cross_attention_path(policy)
+        )
+        training_information_surface = {
+            **(training_information_surface or {}),
+            "action_cross_attention_initialization": action_cross_initialization,
+        }
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "action_cross_attention_initialization",
+                    **action_cross_initialization,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
         scratch_history_initialization = _initialize_cold_start_meaningful_history_path(
             policy,
             scratch=not bool(args.init_checkpoint or args.grow_from_checkpoint),
@@ -21107,6 +21216,113 @@ def _route_mixed_public_award_batch(
 # than the scratch-model scale: it opens a gradient path without giving a
 # cold adapter enough amplitude to replace an incumbent's representation.
 MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE = 0.01
+
+# Function-preserving checkpoint upgrades construct Transformer action cross-
+# attention blocks as exact identities.  That is required for zero-step parity,
+# but an all-zero attention output projection and all-zero final FFN projection
+# also prevent q/k/v and the first FFN layer from receiving any gradient on the
+# first learner step.  Short parent updates then spend much of their tiny dose
+# merely opening the residual path.  Commission the terminal projections at a
+# small deterministic physical scale only when training starts.
+ACTION_CROSS_ATTENTION_COLD_START_INITIAL_SCALE = 0.01
+
+
+def _initialize_cold_start_action_cross_attention_path(
+    policy: Any,
+) -> dict[str, object]:
+    """Open a cold Transformer action decoder without changing upgrade parity.
+
+    The checkpoint upgrader continues to emit an exact identity block.  The
+    learner calls this function after loading/growing the checkpoint and before
+    optimizer construction.  A genuinely cold block receives a small,
+    deterministic identity-shaped terminal projection so every inner
+    attention/FFN parameter gets gradient on the first backward pass.  Any
+    checkpoint whose decoder has already moved is preserved byte-for-byte.
+    Relational trunks use their normal from-scratch initialization and are not
+    touched here.
+    """
+
+    import torch
+
+    model = getattr(policy, "model", policy)
+    config = getattr(policy, "config", getattr(model, "config", None))
+    state_trunk = str(
+        getattr(config, "state_trunk", "transformer") or "transformer"
+    ).strip().lower()
+    layer_count = int(getattr(config, "action_cross_attention_layers", 0) or 0)
+    if state_trunk != "transformer" or layer_count <= 0:
+        return {
+            "enabled": False,
+            "state_trunk": state_trunk,
+            "layer_count": layer_count,
+            "initialization": "not_applicable",
+        }
+    blocks = getattr(model, "action_cross_blocks", None)
+    if blocks is None or len(blocks) != layer_count:
+        raise RuntimeError(
+            "Transformer action cross-attention is enabled but its block list "
+            f"is absent or incomplete: configured={layer_count} "
+            f"constructed={0 if blocks is None else len(blocks)}"
+        )
+
+    terminal_parameters = [
+        parameter
+        for block in blocks
+        for parameter in (block.attn.out_proj.weight, block.ff[3].weight)
+    ]
+    if any(
+        bool(torch.count_nonzero(parameter).item())
+        for parameter in terminal_parameters
+    ):
+        return {
+            "enabled": True,
+            "state_trunk": state_trunk,
+            "layer_count": layer_count,
+            "initialization": "checkpoint_preserved",
+        }
+
+    scale = ACTION_CROSS_ATTENTION_COLD_START_INITIAL_SCALE
+    with torch.no_grad():
+        for block in blocks:
+            out_weight = block.attn.out_proj.weight
+            width = int(out_weight.shape[0])
+            if tuple(out_weight.shape) != (width, width):
+                raise RuntimeError(
+                    "unexpected action cross-attention output projection shape "
+                    f"{tuple(out_weight.shape)}"
+                )
+            out_weight.copy_(
+                torch.eye(width, dtype=out_weight.dtype, device=out_weight.device)
+                * scale
+            )
+            if block.attn.out_proj.bias is not None:
+                block.attn.out_proj.bias.zero_()
+
+            ff_weight = block.ff[3].weight
+            if tuple(ff_weight.shape) != (width, 4 * width):
+                raise RuntimeError(
+                    "unexpected action cross-attention FF terminal shape "
+                    f"{tuple(ff_weight.shape)}"
+                )
+            ff_weight.zero_()
+            identity = torch.eye(
+                width, dtype=ff_weight.dtype, device=ff_weight.device
+            )
+            for group in range(4):
+                ff_weight[:, group * width : (group + 1) * width].copy_(
+                    identity * (scale / 4.0)
+                )
+            block.ff[3].bias.zero_()
+    return {
+        "enabled": True,
+        "state_trunk": state_trunk,
+        "layer_count": layer_count,
+        "initialization": "cold_start_small_nonzero_identity",
+        "initial_scale": scale,
+        "upgrade_artifact_zero_step_parity_preserved": True,
+        "training_start_function_preserving": False,
+        "first_backward_inner_gradient_path": True,
+    }
 
 
 def _initialize_cold_start_meaningful_history_path(
@@ -36087,6 +36303,11 @@ def _checkpoint_config_mismatches(
         if dropout is not None and abs(float(dropout) - float(args.graph_dropout)) > 1.0e-9:
             mismatches.append(f"graph_dropout checkpoint={dropout} cli={args.graph_dropout}")
         for config_name, cli_name, default in (
+            (
+                "action_cross_attention_layers",
+                "action_cross_attention_layers",
+                0,
+            ),
             ("relational_block_pattern", "relational_block_pattern", ""),
             ("relational_ff_size", "relational_ff_size", 0),
             ("relational_bases", "relational_bases", 4),
@@ -36108,6 +36329,8 @@ def _checkpoint_config_mismatches(
         ):
             checkpoint_value = getattr(config, config_name, default)
             cli_value = getattr(args, cli_name, default)
+            if cli_value is None:
+                continue
             if checkpoint_value != cli_value:
                 mismatches.append(
                     f"{cli_name} checkpoint={checkpoint_value} cli={cli_value}"
@@ -36644,6 +36867,10 @@ def _effective_entity_graph_architecture_report(
                 requested_belief_resource_head
             ),
         }
+    state_trunk = str(getattr(config, "state_trunk", "transformer"))
+    configured_relational_action_cross_layers = int(
+        getattr(config, "relational_action_cross_layers", 1) or 0
+    )
     return {
         "action_target_gather": bool(
             getattr(config, "action_target_gather", False)
@@ -36721,12 +36948,22 @@ def _effective_entity_graph_architecture_report(
         "belief_resource_head": bool(
             getattr(config, "belief_resource_head", False)
         ),
-        "state_trunk": str(getattr(config, "state_trunk", "transformer")),
+        "state_trunk": state_trunk,
         "relational_block_pattern": str(
             getattr(config, "relational_block_pattern", "") or ""
         ),
-        "relational_action_cross_layers": int(
-            getattr(config, "relational_action_cross_layers", 1) or 0
+        # This report describes the architecture that actually ran. The legacy
+        # config default is 1 even on Transformer checkpoints, but the model
+        # constructor consumes it only for relational trunks. Preserve the raw
+        # knob separately so old recipes remain diagnosable without claiming a
+        # decoder layer that does not exist.
+        "relational_action_cross_layers": (
+            configured_relational_action_cross_layers
+            if state_trunk != "transformer"
+            else 0
+        ),
+        "configured_relational_action_cross_layers": (
+            configured_relational_action_cross_layers
         ),
         "relational_edge_policy_head": bool(
             getattr(config, "relational_edge_policy_head", True)

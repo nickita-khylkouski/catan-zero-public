@@ -247,6 +247,61 @@ def test_each_flag_alone_warm_starts_exactly(flags):
         assert (ob[key] - ou[key]).abs().max().item() == 0.0, key
 
 
+def test_action_cross_cold_commissioning_opens_inner_gradients_first_backward():
+    import torch
+
+    from catan_zero.rl.entity_token_policy import EntityGraphNet
+    from tools.train_bc import _initialize_cold_start_action_cross_attention_path
+
+    model = EntityGraphNet(
+        dataclasses.replace(_base_config(), action_cross_attention_layers=1)
+    ).train()
+    block = model.action_cross_blocks[0]
+    assert torch.count_nonzero(block.attn.out_proj.weight).item() == 0
+    assert torch.count_nonzero(block.ff[3].weight).item() == 0
+
+    report = _initialize_cold_start_action_cross_attention_path(model)
+
+    assert report["initialization"] == "cold_start_small_nonzero_identity"
+    assert report["initial_scale"] == 0.01
+    assert report["upgrade_artifact_zero_step_parity_preserved"] is True
+    assert report["training_start_function_preserving"] is False
+    assert torch.count_nonzero(block.attn.out_proj.weight).item() > 0
+    assert torch.count_nonzero(block.ff[3].weight).item() > 0
+
+    outputs = model(_to_torch(_real_entity_batch(n_states=2)))
+    outputs["logits"].square().mean().backward()
+
+    assert block.attn.in_proj_weight.grad is not None
+    assert float(block.attn.in_proj_weight.grad.abs().sum()) > 0.0
+    assert block.ff[0].weight.grad is not None
+    assert float(block.ff[0].weight.grad.abs().sum()) > 0.0
+
+
+def test_action_cross_cold_commissioning_preserves_moved_checkpoint():
+    import torch
+
+    from catan_zero.rl.entity_token_policy import EntityGraphNet
+    from tools.train_bc import _initialize_cold_start_action_cross_attention_path
+
+    model = EntityGraphNet(
+        dataclasses.replace(_base_config(), action_cross_attention_layers=1)
+    )
+    block = model.action_cross_blocks[0]
+    with torch.no_grad():
+        block.attn.out_proj.weight[0, 0] = 0.125
+    before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.action_cross_blocks.named_parameters()
+    }
+
+    report = _initialize_cold_start_action_cross_attention_path(model)
+
+    assert report["initialization"] == "checkpoint_preserved"
+    for name, parameter in model.action_cross_blocks.named_parameters():
+        assert torch.equal(parameter, before[name])
+
+
 def test_target_gather_uses_disjoint_local_id_namespaces_exactly():
     """Hex/vertex/edge/player ids are local, then receive sequence offsets."""
 

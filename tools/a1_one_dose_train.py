@@ -5939,6 +5939,15 @@ def _build_direct_train_command(
         # initializer receipt. train_bc independently verifies that this flag
         # agrees with the checkpoint-owned architecture.
         command.append("--public-card-count-features")
+    if (
+        upgrade_module
+        == architecture_upgrade.MODULE_ACTION_CROSS_ATTENTION_1
+    ):
+        # The checkpoint receipt owns the zero-output decoder parameters; expose
+        # the same topology in argv so train_bc can resolve and hash the effective
+        # Transformer architecture instead of silently reporting the unrelated
+        # relational decoder default.
+        command.extend(["--action-cross-attention-layers", "1"])
     if upgrade_module in {
         architecture_upgrade.MODULE_MEANINGFUL_PUBLIC_HISTORY,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY,

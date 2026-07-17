@@ -43,6 +43,8 @@ def test_report_uses_upgraded_checkpoint_config_not_cli_default() -> None:
 
     assert report["action_target_gather"] is True
     assert report["action_cross_attention_layers"] == 1
+    assert report["relational_action_cross_layers"] == 0
+    assert report["configured_relational_action_cross_layers"] == 1
     assert report["edge_policy_head"] is True
     assert report["aux_settlement_pointer_head"] is True
     assert report["legal_action_value_residual"] is True
@@ -73,6 +75,23 @@ def test_non_entity_report_preserves_requested_cli_values() -> None:
         report["meaningful_public_history_schema"]
         == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
     )
+
+
+def test_report_distinguishes_relational_decoder_from_transformer_knob() -> None:
+    policy = SimpleNamespace(
+        policy_type="entity_graph",
+        config=SimpleNamespace(
+            state_trunk="rrt",
+            action_cross_attention_layers=0,
+            relational_action_cross_layers=2,
+        ),
+    )
+
+    report = _effective_entity_graph_architecture_report(policy)
+
+    assert report["action_cross_attention_layers"] == 0
+    assert report["relational_action_cross_layers"] == 2
+    assert report["configured_relational_action_cross_layers"] == 2
 
 
 def test_report_binds_effective_meaningful_history_contract() -> None:

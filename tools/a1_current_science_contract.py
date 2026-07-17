@@ -246,7 +246,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "7780697033485eba9c9f768676bc59cd51456414391693f77b766917fd9d1198"
+        "8f33933fba79c178b8945b6c9e398217154e005963fbf865aa0a18284f5f8c63"
     ),
     "initialization": {
         "mode": "parent_fresh_optimizer",

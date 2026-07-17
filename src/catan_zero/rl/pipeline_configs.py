@@ -442,6 +442,11 @@ class TrainConfig(PipelineConfig):
     # changes the value information surface, so it is inherited and hashed as
     # checkpoint-owned architecture. Keep new fields appended for compatibility.
     topology_residual_adapter: bool | None = None
+    # Warm-start-safe action-to-board decoder for the incumbent Transformer.
+    # This is distinct from ``relational_action_cross_layers``, which is consumed
+    # only by RRT/ResRGCN. ``None`` inherits checkpoint topology; fresh models
+    # resolve it to zero unless explicitly commissioned.
+    action_cross_attention_layers: int | None = None
 
     @classmethod
     def from_namespace(cls, args: Any) -> "TrainConfig":

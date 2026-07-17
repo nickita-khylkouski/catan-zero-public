@@ -2617,6 +2617,7 @@ class EntityGraphPolicy:
         belief_resource_head: bool = False,
         aux_settlement_pointer_head: bool = False,
         action_target_gather: bool = False,
+        action_cross_attention_layers: int = 0,
         static_action_residual: bool = False,
         legal_action_value_residual: bool = False,
         legal_action_value_set_statistics: bool = False,
@@ -2672,6 +2673,7 @@ class EntityGraphPolicy:
                 belief_resource_head=bool(belief_resource_head),
                 aux_settlement_pointer_head=bool(aux_settlement_pointer_head),
                 action_target_gather=bool(action_target_gather),
+                action_cross_attention_layers=int(action_cross_attention_layers),
                 static_action_residual=bool(static_action_residual),
                 legal_action_value_residual=bool(
                     legal_action_value_residual

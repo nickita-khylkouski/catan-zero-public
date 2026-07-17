@@ -10,6 +10,7 @@ from catan_zero.rl.self_play import make_env_config
 from tools.train_bc import (
     _checkpoint_config_mismatches,
     _effective_a1_learner_training_recipe,
+    _resolve_effective_action_cross_attention_layers,
     _resolve_effective_action_target_gather,
     _resolve_effective_structured_action_residuals,
     _resolve_effective_topology_residual_adapter,
@@ -71,6 +72,8 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
             "--arch",
             "entity_graph",
             "--action-target-gather",
+            "--action-cross-attention-layers",
+            "1",
             "--static-action-residual",
             "--legal-action-value-residual",
             "--legal-action-value-set-statistics",
@@ -87,6 +90,9 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
         parsed.legal_action_value_set_statistics,
     ) = _resolve_effective_structured_action_residuals(parsed)
     parsed.action_target_gather = _resolve_effective_action_target_gather(parsed)
+    parsed.action_cross_attention_layers = (
+        _resolve_effective_action_cross_attention_layers(parsed)
+    )
     parsed.topology_residual_adapter = _resolve_effective_topology_residual_adapter(
         parsed
     )
@@ -94,6 +100,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
     kwargs = _structured_action_create_kwargs(parsed)
     assert kwargs == {
         "action_target_gather": True,
+        "action_cross_attention_layers": 1,
         "static_action_residual": True,
         "legal_action_value_residual": True,
         "legal_action_value_set_statistics": True,
@@ -108,6 +115,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
         **kwargs,
     )
     assert policy.config.action_target_gather is True
+    assert policy.config.action_cross_attention_layers == 1
     assert policy.config.static_action_residual is True
     assert policy.config.legal_action_value_residual is True
     assert policy.config.legal_action_value_set_statistics is True
@@ -117,6 +125,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
 
     identity = TrainConfig.from_namespace(parsed)
     assert identity.action_target_gather is True
+    assert identity.action_cross_attention_layers == 1
     assert identity.topology_residual_adapter is False
     assert identity.static_action_residual is True
     assert identity.legal_action_value_residual is True
@@ -169,6 +178,58 @@ def test_init_checkpoint_inherits_and_refuses_architecture_drift(tmp_path) -> No
                 set_stats=True,
             )
         )
+
+
+def test_action_cross_attention_is_checkpoint_owned_and_trunk_specific(
+    tmp_path,
+) -> None:
+    checkpoint = tmp_path / "action-cross.pt"
+    EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        action_cross_attention_layers=1,
+        seed=7,
+        device="cpu",
+    ).save(checkpoint)
+    parsed = build_parser().parse_args(
+        [
+            "--data",
+            "corpus",
+            "--checkpoint",
+            "candidate.pt",
+            "--report",
+            "report.json",
+            "--arch",
+            "entity_graph",
+            "--init-checkpoint",
+            str(checkpoint),
+        ]
+    )
+    assert _resolve_effective_action_cross_attention_layers(parsed) == 1
+    parsed.action_cross_attention_layers = 0
+    with pytest.raises(SystemExit, match="does not match --init-checkpoint"):
+        _resolve_effective_action_cross_attention_layers(parsed)
+
+    relational = build_parser().parse_args(
+        [
+            "--data",
+            "corpus",
+            "--checkpoint",
+            "candidate.pt",
+            "--report",
+            "report.json",
+            "--arch",
+            "entity_graph",
+            "--entity-state-trunk",
+            "rrt",
+            "--action-cross-attention-layers",
+            "1",
+        ]
+    )
+    with pytest.raises(SystemExit, match="relational-action-cross-layers"):
+        _resolve_effective_action_cross_attention_layers(relational)
 
 
 def test_topology_residual_inherits_and_binds_typed_science_identity(tmp_path) -> None:

@@ -1025,6 +1025,27 @@ def test_production_one_dose_emits_same_trajectory_dose_snapshots(
     ) == (64, 96)
 
 
+def test_action_cross_upgrade_is_explicit_in_one_dose_trainer_argv(
+    tmp_path: Path,
+) -> None:
+    verified = _production_trainer_verified(tmp_path)
+    verified["function_preserving_upgrade"] = {
+        "module": (
+            executor.architecture_upgrade.MODULE_ACTION_CROSS_ATTENTION_1
+        )
+    }
+
+    command = executor._build_direct_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    assert _option(command, "--action-cross-attention-layers") == "1"
+    assert _option(command, "--relational-action-cross-layers") == "1"
+
+
 def test_positive_cap_refuses_a_training_partition_shorter_than_the_sealed_dose(
     tmp_path: Path,
 ) -> None:
