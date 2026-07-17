@@ -41,10 +41,11 @@ TOOLS_DIR = REPO_ROOT / "tools"
 ALL_CONFIGS = (TrainConfig, GenerateConfig, EvalConfig, GateConfig)
 
 
-def test_train_action_cross_field_remains_append_only() -> None:
-    assert [field.name for field in dataclasses.fields(TrainConfig)[-2:]] == [
+def test_train_v7_migration_fields_remain_append_only() -> None:
+    assert [field.name for field in dataclasses.fields(TrainConfig)[-3:]] == [
         "action_cross_attention_layers",
         "action_cross_attention_bottleneck",
+        "v6_compatibility_preserving_inputs",
     ]
 
 
