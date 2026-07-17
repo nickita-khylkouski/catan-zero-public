@@ -13427,6 +13427,17 @@ def _public_card_count_create_kwargs(
     }
 
 
+def _entity_adapter_create_kwargs(
+    adapter_version: object,
+) -> dict[str, bool]:
+    """Commission adapter-owned residuals for fresh model construction."""
+
+    resolved = require_known_entity_feature_adapter(adapter_version)
+    return {
+        "v6_compatibility_preserving_inputs": resolved == RUST_ENTITY_ADAPTER_V6,
+    }
+
+
 def _resolve_effective_meaningful_public_history(
     args: argparse.Namespace,
 ) -> tuple[bool, int, str, bool]:
@@ -15414,6 +15425,7 @@ def main(
                     entity_feature_adapter_version=(
                         training_adapter
                     ),
+                    **_entity_adapter_create_kwargs(training_adapter),
                     **_structured_action_create_kwargs(args),
                     value_tower_split_layers=int(
                         args.value_tower_split_layers
@@ -15818,6 +15830,27 @@ def main(
                 args,
                 getattr(policy, "device", args.device),
             )
+        feature_signal_surface_preflight = (
+            _preflight_required_feature_signal_modules(
+                policy.model,
+                optimizer,
+                str(args.require_feature_learning_signal_modules or ""),
+            )
+        )
+        training_information_surface = {
+            **(training_information_surface or {}),
+            "feature_signal_surface_preflight": feature_signal_surface_preflight,
+        }
+        _rank0_print(
+            json.dumps(
+                {
+                    "progress": "feature_signal_surface_preflight",
+                    **feature_signal_surface_preflight,
+                },
+                sort_keys=True,
+            ),
+            ddp,
+        )
         train_fn = _train_entity_batch
 
     _rank0_authoritative_call(
@@ -32940,6 +32973,9 @@ def _shared_trunk_named_parameters(policy) -> list[tuple[str, object]]:
                 *ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["target_gather"],
                 *ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["action_cross"],
                 *ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["static_action_residual"],
+                *ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS[
+                    "v7_initial_road_residual"
+                ],
             )
         )
     shared_names = tuple(dict.fromkeys(shared_names))
@@ -38175,6 +38211,88 @@ def _make_optimizer(params, args, device):
             raise
         kwargs.pop("fused", None)
         return cls(trainable_params, **kwargs)
+
+
+def _preflight_required_feature_signal_modules(
+    model,
+    optimizer,
+    required_modules: str,
+) -> dict[str, object]:
+    """Fail before training when a promised signal surface cannot update."""
+
+    names = tuple(
+        sorted(
+            {
+                name.strip()
+                for name in str(required_modules or "").split(",")
+                if name.strip()
+            }
+        )
+    )
+    if not names:
+        return {
+            "schema_version": "feature-signal-surface-preflight-v1",
+            "required_modules": [],
+            "modules": {},
+        }
+    if optimizer is None:
+        raise SystemExit(
+            "required feature learning-signal modules need a constructed optimizer"
+        )
+
+    module = getattr(model, "module", model)
+    optimizer_ownership: dict[int, int] = {}
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            identity = id(parameter)
+            optimizer_ownership[identity] = optimizer_ownership.get(identity, 0) + 1
+
+    failures: dict[str, list[str]] = {}
+    report: dict[str, dict[str, int]] = {}
+    for name in names:
+        target = getattr(module, name, None)
+        if target is None:
+            failures[name] = ["missing"]
+            continue
+        if hasattr(target, "parameters"):
+            parameters = list(target.parameters())
+        elif hasattr(target, "requires_grad") and hasattr(target, "numel"):
+            parameters = [target]
+        else:
+            parameters = []
+        trainable = [parameter for parameter in parameters if parameter.requires_grad]
+        issues: list[str] = []
+        if not parameters:
+            issues.append("no_parameters")
+        if not trainable:
+            issues.append("no_trainable_parameters")
+        ownership = [optimizer_ownership.get(id(parameter), 0) for parameter in trainable]
+        if any(count == 0 for count in ownership):
+            issues.append("optimizer_missing_parameters")
+        if any(count > 1 for count in ownership):
+            issues.append("optimizer_duplicate_parameters")
+        if issues:
+            failures[name] = issues
+        report[name] = {
+            "parameter_tensors": len(parameters),
+            "trainable_parameter_tensors": len(trainable),
+            "trainable_parameters": sum(
+                int(parameter.numel()) for parameter in trainable
+            ),
+            "optimizer_owned_parameter_tensors": sum(
+                count == 1 for count in ownership
+            ),
+        }
+    if failures:
+        raise SystemExit(
+            "required feature learning-signal optimizer preflight failed: "
+            + json.dumps(failures, sort_keys=True)
+        )
+    return {
+        "schema_version": "feature-signal-surface-preflight-v1",
+        "required_modules": list(names),
+        "modules": report,
+    }
 
 
 def _amp_context(device, amp: str):

@@ -299,6 +299,49 @@ def test_objective_gradient_interference_includes_shared_action_representation()
     assert all(parameter.grad is None for parameter in model.parameters())
 
 
+def test_objective_gradient_interference_includes_initial_road_residual() -> None:
+    """The repaired road context is shared once value consumes legal actions."""
+    torch = pytest.importorskip("torch")
+
+    class TinyRoadAwareModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.legal_action_value_residual_enabled = True
+            self.blocks = torch.nn.ModuleList(
+                [torch.nn.Linear(1, 1, bias=False)]
+            )
+            self.v6_initial_road_residual = torch.nn.Linear(1, 1, bias=False)
+            self.policy_head = torch.nn.Linear(1, 1, bias=False)
+            self.value_head = torch.nn.Linear(1, 1, bias=False)
+
+    model = TinyRoadAwareModel()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(1.0)
+    shared = model.blocks[0](torch.ones(1, 1))
+    shared = shared + model.v6_initial_road_residual(
+        torch.full((1, 1), 2.0)
+    )
+    policy_objective = model.policy_head(shared).sum()
+    value_objective = -model.value_head(shared).sum()
+
+    observed = train_bc._objective_gradient_interference(
+        SimpleNamespace(model=model),
+        policy_objective=policy_objective,
+        value_objective=value_objective,
+    )
+
+    expected = 5.0**0.5
+    assert observed["policy_trunk_grad_norm"] == pytest.approx(expected)
+    assert observed["value_trunk_grad_norm"] == pytest.approx(expected)
+    assert observed["trunk_gradient_cosine"] == pytest.approx(-1.0)
+    assert set(observed["modules"]) == {
+        "blocks.0",
+        "v6_initial_road_residual",
+    }
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+
 def test_objective_gradient_interference_is_explicit_when_objective_inactive() -> None:
     torch = pytest.importorskip("torch")
 

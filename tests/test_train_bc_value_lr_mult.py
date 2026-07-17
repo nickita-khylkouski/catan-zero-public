@@ -12,6 +12,7 @@ from tools.train_bc import (
     _build_optimizer_param_groups,
     _make_optimizer,
     _optimizer_param_group_report,
+    _preflight_required_feature_signal_modules,
     _set_scalar_value_head_trainable,
 )
 
@@ -665,6 +666,84 @@ def test_make_optimizer_single_group_when_mult_is_one() -> None:
 
     assert len(optimizer.param_groups) == 1
     assert optimizer.param_groups[0]["lr"] == pytest.approx(2e-4)
+
+
+def test_required_feature_signal_preflight_accepts_owned_v6_residuals() -> None:
+    policy = _make_entity_policy(v6_compatibility_preserving_inputs=True)
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=1.0
+    )
+    optimizer = _make_optimizer(groups, _Args(lr=2e-4), "cpu")
+
+    report = _preflight_required_feature_signal_modules(
+        policy.model,
+        optimizer,
+        "v6_initial_road_residual,v6_exact_resource_residual",
+    )
+
+    assert report["required_modules"] == [
+        "v6_exact_resource_residual",
+        "v6_initial_road_residual",
+    ]
+    assert all(
+        row["trainable_parameter_tensors"]
+        == row["optimizer_owned_parameter_tensors"]
+        > 0
+        for row in report["modules"].values()
+    )
+
+
+def test_required_feature_signal_preflight_rejects_missing_module() -> None:
+    policy = _make_entity_policy()
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=1.0
+    )
+    optimizer = _make_optimizer(groups, _Args(lr=2e-4), "cpu")
+
+    with pytest.raises(SystemExit, match=r"v6_exact_resource_residual.*missing"):
+        _preflight_required_feature_signal_modules(
+            policy.model,
+            optimizer,
+            "v6_exact_resource_residual",
+        )
+
+
+def test_required_feature_signal_preflight_rejects_frozen_module() -> None:
+    policy = _make_entity_policy(v6_compatibility_preserving_inputs=True)
+    for parameter in policy.model.v6_initial_road_residual.parameters():
+        parameter.requires_grad = False
+    groups = _build_optimizer_param_groups(
+        policy.model, base_lr=2e-4, value_lr_mult=1.0
+    )
+    optimizer = _make_optimizer(groups, _Args(lr=2e-4), "cpu")
+
+    with pytest.raises(SystemExit, match="no_trainable_parameters"):
+        _preflight_required_feature_signal_modules(
+            policy.model,
+            optimizer,
+            "v6_initial_road_residual",
+        )
+
+
+def test_required_feature_signal_preflight_rejects_unowned_parameter() -> None:
+    policy = _make_entity_policy(v6_compatibility_preserving_inputs=True)
+    excluded = {
+        id(parameter)
+        for parameter in policy.model.v6_exact_resource_residual.parameters()
+    }
+    groups = [
+        parameter
+        for parameter in policy.model.parameters()
+        if parameter.requires_grad and id(parameter) not in excluded
+    ]
+    optimizer = _make_optimizer(groups, _Args(lr=2e-4), "cpu")
+
+    with pytest.raises(SystemExit, match="optimizer_missing_parameters"):
+        _preflight_required_feature_signal_modules(
+            policy.model,
+            optimizer,
+            "v6_exact_resource_residual",
+        )
 
 
 # --------------------------------------------------------------------------- schedule respects per-group base_lr
