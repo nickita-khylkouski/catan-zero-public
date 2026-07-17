@@ -40733,13 +40733,15 @@ def _policy_action_type_target_mass_admission(
     A row coefficient alone cannot attribute policy mass inside a mixed-action
     phase such as ``PLAY_TURN``. The played ``action_taken`` is also not the
     teacher under pure search-policy distillation. This admission therefore
-    multiplies the final row/draw coefficient by the effective teacher
-    probability on legal actions of ``target_action_type``.
+    multiplies the final fixed-normalizer coverage-row coefficient by the
+    effective teacher probability on legal actions of ``target_action_type``.
 
     The first version deliberately supports only the current scratch contract.
     Dynamic advantage weighting and the independently normalized policy-AUX
     stream would change the realized measure after this preflight and must gain
-    their own versioned accounting before they can use this floor.
+    their own versioned accounting before they can use this floor. Weighted
+    replacement is also refused: a ratio of population expectations is not the
+    expected attribution of a batch-normalized weighted loss.
     """
 
     minimum = float(minimum_target_mass_fraction)
@@ -40776,6 +40778,18 @@ def _policy_action_type_target_mass_admission(
             "action-type policy target-mass admission requires the exact pure "
             "complete-policy scratch contract: "
             + json.dumps(drift, sort_keys=True)
+        )
+    required_objective_measure = (
+        "uniform_coverage_row_probability_x_policy_loss_weight_v1"
+    )
+    if (
+        str(objective_measure) != required_objective_measure
+        or sampling_weights is not None
+    ):
+        raise SystemExit(
+            "action-type policy target-mass admission requires exact fixed-"
+            "normalizer coverage traversal; weighted-replacement draw "
+            "probabilities are not an exact batch-normalized attribution"
         )
     temperature = float(soft_target_temperature)
     if not math.isfinite(temperature) or temperature <= 0.0:
@@ -40819,22 +40833,34 @@ def _policy_action_type_target_mass_admission(
             "action-type policy target-mass admission received duplicate "
             "authenticated component ids"
         )
+    if authenticated_components and bool(
+        getattr(data, "policy_distillation_scope_authenticated", False)
+    ):
+        enforced_component_indices = tuple(
+            int(value)
+            for value in getattr(
+                data, "policy_distillation_component_indices", tuple()
+            )
+        )
+        if (
+            not enforced_component_indices
+            or len(set(enforced_component_indices))
+            != len(enforced_component_indices)
+            or any(
+                value < 0 or value >= len(component_ids)
+                for value in enforced_component_indices
+            )
+        ):
+            raise SystemExit(
+                "action-type policy target-mass authenticated policy-"
+                "distillation component scope is invalid"
+            )
+        authenticated_policy_scope = True
+    else:
+        enforced_component_indices = tuple(range(len(component_ids)))
+        authenticated_policy_scope = False
     component_total_mass = np.zeros(len(component_ids), dtype=np.float64)
     component_target_mass = np.zeros(len(component_ids), dtype=np.float64)
-
-    draw_weights = None
-    if sampling_weights is not None:
-        draw_weights = np.asarray(sampling_weights, dtype=np.float64)
-        if (
-            draw_weights.shape != rows.shape
-            or not np.isfinite(draw_weights).all()
-            or np.any(draw_weights < 0.0)
-            or float(draw_weights.sum()) <= 0.0
-        ):
-            raise ValueError(
-                "action-type policy target-mass sampling measure is invalid"
-            )
-        draw_weights = draw_weights / float(draw_weights.sum())
 
     total_objective_mass = 0.0
     target_objective_mass = 0.0
@@ -40852,8 +40878,6 @@ def _policy_action_type_target_mass_admission(
                 "action-type policy target-mass weights must be finite and "
                 "non-negative"
             )
-        if draw_weights is not None:
-            coefficients = coefficients * draw_weights[start:stop]
         active = coefficients > 0.0
         policy_active_rows += int(np.count_nonzero(active))
         if not np.any(active):
@@ -40996,6 +41020,14 @@ def _policy_action_type_target_mass_admission(
             np.count_nonzero(selected_types == target_type)
         )
 
+    if authenticated_policy_scope:
+        excluded = np.ones(len(component_ids), dtype=np.bool_)
+        excluded[np.asarray(enforced_component_indices, dtype=np.int64)] = False
+        if np.any(component_total_mass[excluded] > 0.0):
+            raise SystemExit(
+                "action-type policy target-mass found positive policy objective "
+                "mass outside the authenticated policy-distillation scope"
+            )
     if not math.isfinite(total_objective_mass) or total_objective_mass <= 0.0:
         raise SystemExit(
             "action-type policy target-mass admission found zero policy objective mass"
@@ -41005,7 +41037,8 @@ def _policy_action_type_target_mass_admission(
     per_component: dict[str, dict[str, object]] = {}
     component_admitted = True
     if authenticated_components:
-        for index, component_id in enumerate(component_ids):
+        for index in enforced_component_indices:
+            component_id = component_ids[index]
             component_total = float(component_total_mass[index])
             component_target = float(component_target_mass[index])
             if not math.isfinite(component_total) or component_total <= 0.0:
@@ -41043,6 +41076,12 @@ def _policy_action_type_target_mass_admission(
         "target_action_policy_objective_mass_fraction": float(fraction),
         "minimum_target_action_policy_objective_mass_fraction": minimum,
         "authenticated_composite_components_enforced": authenticated_components,
+        "authenticated_policy_distillation_scope_enforced": (
+            authenticated_policy_scope
+        ),
+        "enforced_component_ids": [
+            component_ids[index] for index in enforced_component_indices
+        ],
         "per_component": per_component,
         "effective_target_contract": observed_contract,
         "admission_enforced": True,
