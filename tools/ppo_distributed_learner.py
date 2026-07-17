@@ -836,11 +836,17 @@ VTRACE_BAD_TRAJECTORY_SKIP_FRACTION = 0.10
 
 def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerConfig) -> dict[str, float]:
     """Off-policy correct each trajectory with V-trace under the CURRENT policy, OVERWRITING
-    ``traj.returns`` (<- vs) and ``traj.advantages`` (<- pg_advantages).
+    ``traj.returns`` (<- vs), ``traj.advantages`` (<- pg_advantages), and the learner-only PPO
+    policy/value references (<- the current learner snapshot before the update).
 
     Behavior log-probs are the actor's stored ``old_log_probs`` (the stale μ); target log-probs
-    and (optionally) values are recomputed under the live π. NaN/inf guards protect the
-    recursion from bad shards.
+    and (optionally) values are recomputed under the live π. V-trace already applies the
+    actor-to-learner importance ratio to ``pg_advantages``. Rebasing PPO's ``old_log_probs`` to
+    the pre-update learner policy makes PPO optimize π_θ / π_preupdate instead of applying
+    π_preupdate / μ a second time. Rebasing the learner-only value reference likewise makes
+    value clipping measure the learner update rather than actor staleness. The actor's
+    ``old_log_probs``/``old_values`` remain immutable evidence, so the correction is auditable
+    and idempotent. NaN/inf guards protect the recursion from bad shards.
 
     FIX 3: a SINGLE batched forward pass over all trajectories' samples computes target log-probs
     and current values for every step at once; results are split back per trajectory by length,
@@ -879,7 +885,9 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
     n_steps = 0
     n_bad = 0
     offset = 0
-    pending: list[tuple[Any, list[float], list[float]]] = []
+    pending: list[
+        tuple[Any, list[float], list[float], list[float], list[float]]
+    ] = []
     for trajectory in non_empty:
         n = len(trajectory.samples)
         target_logp = batched_target_logp[offset : offset + n]
@@ -887,7 +895,13 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
         offset += n
 
         behavior_logp = np.asarray(trajectory.old_log_probs, dtype=np.float64)
-        if behavior_logp.shape[0] != n or target_logp.shape[0] != n:
+        if (
+            behavior_logp.shape[0] != n
+            or target_logp.shape[0] != n
+            or current_values.shape[0] != n
+            or not np.isfinite(target_logp).all()
+            or not np.isfinite(current_values).all()
+        ):
             n_bad += 1
             continue
 
@@ -934,7 +948,15 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
             n_bad += 1
             continue
         # Stage the result; only commit once we know the whole step is healthy (FIX 4).
-        pending.append((trajectory, [float(x) for x in vs], [float(x) for x in pg]))
+        pending.append(
+            (
+                trajectory,
+                [float(x) for x in vs],
+                [float(x) for x in pg],
+                [float(x) for x in target_logp],
+                [float(x) for x in current_values],
+            )
+        )
         n_steps += n
 
     bad_fraction = (n_bad / total) if total else 0.0
@@ -959,9 +981,11 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
             "vtrace_skipped": 1.0,
         }
 
-    for trajectory, vs_list, pg_list in pending:
+    for trajectory, vs_list, pg_list, target_logp_list, current_values_list in pending:
         trajectory.returns = vs_list
         trajectory.advantages = pg_list
+        trajectory.ppo_reference_log_probs = target_logp_list
+        trajectory.ppo_reference_values = current_values_list
 
     return {
         "vtrace_steps": float(n_steps),

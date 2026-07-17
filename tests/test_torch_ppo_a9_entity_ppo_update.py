@@ -20,7 +20,6 @@ def _collect_real_samples(n: int):
     samples = []
     try:
         observations, info = env.reset(seed=4)
-        rng = np.random.default_rng(0)
         for decision_index in range(n):
             player = str(info["current_player"])
             observation = np.asarray(observations[player], dtype=np.float64)
@@ -188,3 +187,57 @@ def test_forced_rows_do_not_dilute_entity_ppo_kl() -> None:
     )
 
     assert metrics["approx_kl"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_entity_ppo_uses_learner_reference_without_losing_actor_evidence() -> None:
+    import torch
+    from catan_zero.rl.torch_ppo import (
+        _behavior_policy_logits,
+        _entity_action_column,
+        _entity_behavior_valid_mask,
+        _entity_graph_outputs,
+        ppo_update,
+    )
+
+    samples = _collect_real_samples(4)
+    trajectory = _make_trajectory(samples, force_indices=set())
+    policy = _make_entity_policy()
+    with torch.no_grad():
+        outputs = _entity_graph_outputs(policy, trajectory.samples)
+        behavior_logits = _behavior_policy_logits(
+            outputs["logits"],
+            1.0,
+            valid_mask=_entity_behavior_valid_mask(
+                trajectory.samples,
+                outputs["logits"],
+            ),
+        )
+        columns = torch.as_tensor(
+            [_entity_action_column(sample) for sample in trajectory.samples],
+            dtype=torch.long,
+            device=policy.device,
+        )
+        learner_log_probs = (
+            torch.distributions.Categorical(logits=behavior_logits)
+            .log_prob(columns)
+            .cpu()
+            .tolist()
+        )
+    trajectory.old_log_probs = [value + 0.7 for value in learner_log_probs]
+    trajectory.ppo_reference_log_probs = learner_log_probs
+    actor_evidence = trajectory.old_log_probs.copy()
+
+    metrics = ppo_update(
+        policy,
+        [trajectory],
+        learning_rate=0.0,
+        clip_ratio=0.1,
+        value_coef=0.0,
+        entropy_coef=0.0,
+        epochs=1,
+        minibatch_size=64,
+    )
+
+    assert metrics["approx_kl"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["clip_fraction"] == 0.0
+    assert trajectory.old_log_probs == actor_evidence

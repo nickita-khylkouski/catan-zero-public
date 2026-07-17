@@ -85,6 +85,36 @@ class PPOTrajectory:
     # a terminal 0. For genuinely terminal games both stay at their 0.0/False defaults.
     bootstrap_value: float = 0.0
     truncated: bool = False
+    # Learner-snapshot references used by PPO after V-trace has already corrected from the
+    # actor behavior policy. Empty (or an unset slot in an older pickle) falls back to the
+    # actor-side old_* evidence, preserving the ordinary non-V-trace PPO contract.
+    ppo_reference_log_probs: list[float] = field(default_factory=list)
+    ppo_reference_values: list[float] = field(default_factory=list)
+
+
+def _ppo_reference_array(
+    trajectories: list[PPOTrajectory],
+    *,
+    reference_attr: str,
+    fallback_attr: str,
+) -> np.ndarray:
+    """Flatten an optional per-trajectory PPO reference, failing closed on misalignment."""
+
+    flattened: list[float] = []
+    for trajectory in trajectories:
+        reference = getattr(trajectory, reference_attr, None)
+        values = reference if reference is not None and len(reference) > 0 else getattr(
+            trajectory,
+            fallback_attr,
+        )
+        expected = len(trajectory.samples)
+        if len(values) != expected:
+            raise ValueError(
+                f"PPOTrajectory.{reference_attr or fallback_attr} must align with samples "
+                f"({len(values)} != {expected})"
+            )
+        flattened.extend(float(value) for value in values)
+    return np.asarray(flattened, dtype=np.float32)
 
 
 def _trajectory_opponent_mix(trajectory: PPOTrajectory) -> str:
@@ -1193,13 +1223,15 @@ def ppo_update(
         dtype=np.float32,
     )
     gae_advantages = raw_advantages.copy()
-    old_log_probs = np.asarray(
-        [lp for trajectory in trajectories for lp in trajectory.old_log_probs],
-        dtype=np.float32,
+    old_log_probs = _ppo_reference_array(
+        trajectories,
+        reference_attr="ppo_reference_log_probs",
+        fallback_attr="old_log_probs",
     )
-    old_values = np.asarray(
-        [value for trajectory in trajectories for value in trajectory.old_values],
-        dtype=np.float32,
+    old_values = _ppo_reference_array(
+        trajectories,
+        reference_attr="ppo_reference_values",
+        fallback_attr="old_values",
     )
     old_q_values_list = [
         q_value
@@ -1690,13 +1722,15 @@ def _ppo_update_entity_graph_body(
         [adv for trajectory in trajectories for adv in trajectory.advantages],
         dtype=np.float32,
     )
-    old_log_probs = np.asarray(
-        [lp for trajectory in trajectories for lp in trajectory.old_log_probs],
-        dtype=np.float32,
+    old_log_probs = _ppo_reference_array(
+        trajectories,
+        reference_attr="ppo_reference_log_probs",
+        fallback_attr="old_log_probs",
     )
-    old_values = np.asarray(
-        [value for trajectory in trajectories for value in trajectory.old_values],
-        dtype=np.float32,
+    old_values = _ppo_reference_array(
+        trajectories,
+        reference_attr="ppo_reference_values",
+        fallback_attr="old_values",
     )
     old_q_values_list = [
         q_value
