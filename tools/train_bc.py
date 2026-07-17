@@ -25542,9 +25542,17 @@ def _objective_measure_validation_aggregate(
             ]
             scaled: dict[str, object] = {}
             _merge_policy_target_distribution_stats(scaled, source)
-            for axis in ("overall", "phase", "opening_decision_index"):
+            for axis in (
+                "overall",
+                "objective_weighted_overall",
+                "phase",
+                "opening_decision_index",
+            ):
                 axis_value = scaled.get(axis)
-                if axis == "overall" and isinstance(axis_value, dict):
+                if (
+                    axis in {"overall", "objective_weighted_overall"}
+                    and isinstance(axis_value, dict)
+                ):
                     for key in ("rows", *_POLICY_TARGET_METRIC_SUM_KEYS):
                         axis_value[key] = (
                             float(axis_value.get(key, 0.0))
@@ -27153,6 +27161,9 @@ def _eval_entity_batch(
                 has_soft,
                 active,
                 soft_support,
+                objective_weights=(
+                    policy_weights.detach().float().cpu().numpy()
+                ),
             )
         )
         # Success telemetry (gen-1 recipe): KL(model||prior_policy) vs the

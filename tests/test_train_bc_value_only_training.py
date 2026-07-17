@@ -1763,6 +1763,75 @@ def test_policy_target_distribution_metrics_follow_soft_teacher_and_opening_inde
     assert "9" not in metrics["opening_decision_index"]
 
 
+def test_eval_policy_target_metrics_use_actual_objective_weights(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import torch
+    from tools import train_bc
+
+    data = {
+        "legal_action_ids": np.asarray([[0, 1], [0, 1]], dtype=np.int16),
+        "action_taken": np.asarray([0, 1], dtype=np.int64),
+        "target_policy": np.asarray(
+            [[0.9, 0.1], [0.1, 0.9]], dtype=np.float32
+        ),
+        "target_policy_mask": np.ones((2, 2), dtype=np.bool_),
+        "phase": np.asarray(["PLAY_TURN", "PLAY_TURN"]),
+        "teacher_name": np.asarray(["teacher", "teacher"]),
+    }
+
+    def controlled_forward(*_args, **_kwargs):
+        return {
+            "logits": torch.tensor(
+                [[3.0, 0.0], [3.0, 0.0]], dtype=torch.float32
+            )
+        }
+
+    monkeypatch.setattr(
+        train_bc, "_forward_legal_np_for_batch", controlled_forward
+    )
+    policy = SimpleNamespace(
+        device="cpu",
+        config=SimpleNamespace(moe_routed_experts=0),
+    )
+    metrics = train_bc._eval_entity_batch(  # noqa: SLF001
+        policy,
+        data,
+        np.arange(2, dtype=np.int64),
+        np.asarray([1.0, 9.0], dtype=np.float32),
+        np.zeros(2, dtype=np.float32),
+        1.0,
+        1.0,
+        "policy",
+        1.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        (),
+        10,
+        "none",
+        1.0,
+        5.0,
+        0.05,
+    )
+    sufficient = metrics["policy_target_distribution_stats"]
+    finalized = train_bc._finalize_policy_target_distribution_stats(  # noqa: SLF001
+        sufficient
+    )
+
+    assert finalized["overall"]["teacher_argmax_top1_accuracy"] == pytest.approx(
+        0.5
+    )
+    assert finalized["overall"]["model_top1_target_mass"] == pytest.approx(0.5)
+    weighted = finalized["objective_weighted_overall"]
+    assert weighted["row_probability"] == pytest.approx(10.0)
+    assert weighted["teacher_argmax_top1_accuracy"] == pytest.approx(0.1)
+    assert weighted["model_top1_target_mass"] == pytest.approx(0.18)
+
+
 def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
     monkeypatch,
 ) -> None:
@@ -1780,6 +1849,11 @@ def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
             "kl_target_model_sum": 0.3,
             "excess_cross_entropy_sum": 0.3,
         },
+        "objective_weighted_overall": {
+            **train_bc._empty_policy_target_metric_parts(),  # noqa: SLF001
+            "rows": 2.0,
+            "teacher_argmax_top1_correct": 2.0,
+        },
         "phase": {},
         "opening_decision_index": {},
     }
@@ -1794,6 +1868,11 @@ def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
             "target_entropy_sum": 1.0,
             "kl_target_model_sum": 1.5,
             "excess_cross_entropy_sum": 1.5,
+        },
+        "objective_weighted_overall": {
+            **train_bc._empty_policy_target_metric_parts(),  # noqa: SLF001
+            "rows": 6.0,
+            "teacher_argmax_top1_correct": 0.0,
         },
         "phase": {},
         "opening_decision_index": {},
@@ -1817,6 +1896,11 @@ def test_policy_target_distribution_ddp_reducer_sums_sufficient_stats(
     assert metrics["soft_target_cross_entropy"] == pytest.approx(0.75)
     assert metrics["target_entropy"] == pytest.approx(0.30)
     assert metrics["kl_target_model"] == pytest.approx(0.45)
+    weighted = train_bc._finalize_policy_target_distribution_stats(  # noqa: SLF001
+        reduced
+    )["objective_weighted_overall"]
+    assert weighted["row_probability"] == pytest.approx(8.0)
+    assert weighted["teacher_argmax_top1_accuracy"] == pytest.approx(0.25)
 
 
 def test_objective_validation_aggregates_teacher_metrics_by_eligible_density() -> None:
@@ -1864,3 +1948,57 @@ def test_objective_validation_aggregates_teacher_metrics_by_eligible_density() -
     assert target["teacher_argmax_top1_accuracy"] == pytest.approx(0.6)
     assert target["teacher_argmax_top3_accuracy"] == pytest.approx(1.0)
     assert target["soft_target_cross_entropy"] == pytest.approx(1.0)
+
+
+def test_objective_validation_scales_weighted_teacher_metrics_by_component_density() -> None:
+    from tools import train_bc
+
+    def report(
+        *,
+        samples: int,
+        weighted_rows: float,
+        weighted_hits: float,
+    ) -> dict:
+        overall = train_bc._empty_policy_target_metric_parts()  # noqa: SLF001
+        overall.update(
+            {
+                "rows": float(samples),
+                "teacher_argmax_top1_correct": float(samples),
+            }
+        )
+        weighted = train_bc._empty_policy_target_metric_parts()  # noqa: SLF001
+        weighted.update(
+            {
+                "rows": weighted_rows,
+                "teacher_argmax_top1_correct": weighted_hits,
+            }
+        )
+        return {
+            "samples": samples,
+            "loss": 0.0,
+            "policy_loss": 0.0,
+            "loss_denominators": {},
+            "policy_target_distribution_sufficient_statistics": {
+                "schema_version": (
+                    "policy-target-distribution-sufficient-stats-v1"
+                ),
+                "overall": overall,
+                "objective_weighted_overall": weighted,
+                "phase": {},
+                "opening_decision_index": {},
+            },
+        }
+
+    metrics, _ = train_bc._objective_measure_validation_aggregate(  # noqa: SLF001
+        [
+            report(samples=10, weighted_rows=2.0, weighted_hits=2.0),
+            report(samples=20, weighted_rows=8.0, weighted_hits=0.0),
+        ],
+        np.asarray([0.25, 0.75]),
+    )
+
+    weighted = metrics["policy_target_distribution_metrics"][
+        "objective_weighted_overall"
+    ]
+    assert weighted["row_probability"] == pytest.approx(0.35)
+    assert weighted["teacher_argmax_top1_accuracy"] == pytest.approx(1.0 / 7.0)
