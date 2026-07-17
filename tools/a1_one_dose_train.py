@@ -3731,6 +3731,12 @@ def bind_learner_ablation(
             architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4,
             architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY,
             architecture_upgrade.MODULE_ORDERED_MEANINGFUL_PUBLIC_HISTORY_FROM_V1,
+            # V8 restores the exact public two-player resource composition on
+            # its own zero-output, bias-free residual.  It is a normal
+            # function-preserving input migration, so parent-fresh learner
+            # ablations (including value-routing) must be able to use its
+            # receipt rather than falling back to the pre-repair V7 model.
+            architecture_upgrade.MODULE_V7_PUBLIC_CARD_EXACT_RESOURCE_RESIDUAL,
         }
     )
     # These reviewed modules are exact zero-output initializers. The generic
@@ -3754,6 +3760,7 @@ def bind_learner_ablation(
             architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V2,
             architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
             architecture_upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_RULE_STATE_V4,
+            architecture_upgrade.MODULE_V7_PUBLIC_CARD_EXACT_RESOURCE_RESIDUAL,
         }
         if (
             not isinstance(upgrade, dict)

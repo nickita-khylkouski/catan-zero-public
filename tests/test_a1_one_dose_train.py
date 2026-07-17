@@ -2449,6 +2449,48 @@ def test_generic_ablation_can_bind_trunk_lr_and_adaptive_parent_kl(
     assert _option(command, "--policy-kl-anchor-direction") == "forward"
 
 
+def test_generic_ablation_accepts_v8_public_resource_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V8 can take part in causal learner comparisons after its migration."""
+
+    verified = _verified(tmp_path)
+    verified["reviewed_lock_file_sha256"] = verified["lock_file_sha256"]
+    code_binding = _reviewed_ablation_code_binding()
+    code_sha = code_binding["code_tree_sha256"]
+    monkeypatch.setattr(
+        executor,
+        "_current_ablation_code_binding",
+        lambda _lock: code_binding,
+    )
+    v8 = {
+        **_fake_public_card_upgrade(verified, tmp_path),
+        "module": (
+            executor.architecture_upgrade.MODULE_V7_PUBLIC_CARD_EXACT_RESOURCE_RESIDUAL
+        ),
+    }
+    monkeypatch.setattr(
+        executor.architecture_upgrade,
+        "verify_receipt",
+        lambda _path: v8,
+    )
+    upgraded = executor.bind_function_preserving_upgrade(
+        verified, Path(v8["receipt"]["path"])
+    )
+
+    arm = executor.bind_learner_ablation(
+        upgraded,
+        ablation_id="v8-value-trunk10",
+        overrides_json='{"value_trunk_grad_scale":0.1}',
+        reviewed_code_tree_sha256=code_sha,
+    )
+
+    assert arm["recipe"]["value_trunk_grad_scale"] == pytest.approx(0.1)
+    assert arm["learner_ablation"]["recipe_drift"]["value_trunk_grad_scale"] == {
+        "contract": 1.0,
+        "effective": 0.1,
+    }
+
 def test_generic_ablation_preserves_explicit_parent_moe_balance_weight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
