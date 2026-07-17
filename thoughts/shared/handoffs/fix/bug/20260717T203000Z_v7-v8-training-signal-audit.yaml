@@ -64,7 +64,8 @@ verification:
   hashes:
     scratch_recipe: f41b90e0111788d92cb9555d63ca7b0d94db7c761838eb08c24c438d1e3ca1a8
     parent_recipe: 85359773c9685b96079759912c65ead695d8c09216d784b0c81211965d36c3a1
-  pushed_main: 1d17f7bba89b01a40eb3c736ddbea8e799702464
+  pushed_main_base: 1d17f7bba89b01a40eb3c736ddbea8e799702464
+  post_handoff_fix: 8c60a8a6 Deduplicate V7 fresh model construction
 
 next:
   - Commission the exact current V8 initializer and 0.1 parent recipe before changing authorized to true.
