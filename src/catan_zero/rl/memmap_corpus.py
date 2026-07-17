@@ -53,6 +53,73 @@ MEMMAP_LAZY_COLUMNS = frozenset(
     }
 )
 
+_VALIDATION_BLOCK_ROWS = 1024 * 1024
+
+
+def _require_exact_file_size(path: Path, expected_bytes: int, *, label: str) -> None:
+    """Fail before mapping a missing, truncated, or trailing-byte payload."""
+
+    try:
+        actual_bytes = path.stat().st_size
+    except OSError as error:
+        raise SystemExit(f"{label}: cannot stat {path}: {error}") from error
+    if actual_bytes != expected_bytes:
+        raise SystemExit(
+            f"{label}: {path.name} size {actual_bytes} bytes != expected "
+            f"{expected_bytes} bytes"
+        )
+
+
+def _validate_offsets(
+    offsets: np.ndarray,
+    *,
+    expected_final: int | None,
+    legal_width: int,
+    label: str,
+) -> None:
+    """Block-scan a ragged row index without materializing it in RAM."""
+
+    if int(offsets[0]) != 0:
+        raise SystemExit(f"{label}: offsets must start at 0, got {int(offsets[0])}")
+    for start in range(0, len(offsets) - 1, _VALIDATION_BLOCK_ROWS):
+        stop = min(len(offsets), start + _VALIDATION_BLOCK_ROWS + 1)
+        block = np.asarray(offsets[start:stop], dtype=np.int64)
+        decreasing = block[1:] < block[:-1]
+        if bool(np.any(decreasing)):
+            local = int(np.flatnonzero(decreasing)[0])
+            raise SystemExit(f"{label}: offsets decrease at row {start + local}")
+        widths = block[1:] - block[:-1]
+        if bool(np.any(widths > legal_width)):
+            local = int(np.flatnonzero(widths > legal_width)[0])
+            raise SystemExit(
+                f"{label}: row {start + local} width {int(widths[local])} "
+                f"exceeds legal_width {legal_width}"
+            )
+    if expected_final is not None and int(offsets[-1]) != expected_final:
+        raise SystemExit(
+            f"{label}: final offset {int(offsets[-1])} != flat count {expected_final}"
+        )
+
+
+def _validate_categorical_codes(
+    codes: np.ndarray,
+    *,
+    category_count: int,
+    label: str,
+) -> None:
+    """Reject negative and upper-bound dictionary codes during corpus construction."""
+
+    for start in range(0, len(codes), _VALIDATION_BLOCK_ROWS):
+        stop = min(len(codes), start + _VALIDATION_BLOCK_ROWS)
+        block = np.asarray(codes[start:stop], dtype=np.int64)
+        invalid = (block < 0) | (block >= category_count)
+        if bool(np.any(invalid)):
+            local = int(np.flatnonzero(invalid)[0])
+            raise SystemExit(
+                f"{label}: categorical code {int(block[local])} at row "
+                f"{start + local} is outside [0, {category_count})"
+            )
+
 
 def normalize_index(idx, n: int) -> np.ndarray:
     """Coerce an indexing key into an int64 row-index array."""
@@ -345,6 +412,13 @@ class MemmapCorpus:
             )
         self.row_count = int(self.meta["row_count"])
         self.legal_width = int(self.meta["legal_width"])
+        if self.row_count < 0 or self.legal_width < 0:
+            raise SystemExit(
+                f"{meta_path}: row_count and legal_width must be non-negative"
+            )
+        flat_count = int(self.meta["flat_count"])
+        if flat_count < 0:
+            raise SystemExit(f"{meta_path}: flat_count must be non-negative")
         self.stats = self.meta.get("stats", {})
         self._columns = self.meta["columns"]
         implicit_columns = {
@@ -390,26 +464,54 @@ class MemmapCorpus:
                     f"{meta_path}: implicit-zero columns must declare fill=0; "
                     f"nonzero/missing fill for {nonzero_fill}"
                 )
-        self._offsets = np.fromfile(corpus_dir / "row_offsets.dat", dtype=np.int64)
-        if self._offsets.shape[0] != self.row_count + 1:
-            raise SystemExit(
-                f"{corpus_dir}: row_offsets length {self._offsets.shape[0]} != "
-                f"row_count+1 {self.row_count + 1}"
-            )
+        shared_offsets_path = corpus_dir / "row_offsets.dat"
+        _require_exact_file_size(
+            shared_offsets_path,
+            (self.row_count + 1) * np.dtype(np.int64).itemsize,
+            label=str(meta_path),
+        )
+        self._offsets = np.memmap(
+            shared_offsets_path,
+            dtype=np.int64,
+            mode="r",
+            shape=(self.row_count + 1,),
+        )
+        _validate_offsets(
+            self._offsets,
+            expected_final=flat_count,
+            legal_width=self.legal_width,
+            label=f"{meta_path}: row_offsets",
+        )
         self._eager: dict[str, np.ndarray] = {}
         self._lazy: dict[str, object] = {}
         independent_offsets: dict[str, np.memmap] = {}
         for name, schema in self._columns.items():
             if schema["kind"] != "row_offsets":
                 continue
+            dtype = np.dtype(schema["dtype"])
+            if dtype != np.dtype(np.int64):
+                raise SystemExit(
+                    f"{meta_path}: row-offset column {name!r} must use int64, "
+                    f"got {dtype}"
+                )
+            path = corpus_dir / f"{name}.dat"
+            _require_exact_file_size(
+                path,
+                (self.row_count + 1) * dtype.itemsize,
+                label=str(meta_path),
+            )
             offsets = np.memmap(
-                corpus_dir / f"{name}.dat",
-                dtype=np.dtype(schema["dtype"]),
+                path,
+                dtype=dtype,
                 mode="r",
                 shape=(self.row_count + 1,),
             )
-            if int(offsets[0]) != 0 or bool(np.any(offsets[1:] < offsets[:-1])):
-                raise SystemExit(f"{meta_path}: invalid row offsets in {name!r}")
+            _validate_offsets(
+                offsets,
+                expected_final=None,
+                legal_width=self.legal_width,
+                label=f"{meta_path}: {name}",
+            )
             independent_offsets[name] = offsets
             self._lazy[name] = MemmapRowOffsetsColumn(offsets)
         for name, schema in self._columns.items():
@@ -417,24 +519,57 @@ class MemmapCorpus:
             if kind == "row_offsets":
                 continue
             if kind == "string":
-                codes = np.memmap(
-                    corpus_dir / f"{name}.codes.dat",
-                    dtype=np.int32,
-                    mode="r",
-                    shape=(self.row_count,),
+                path = corpus_dir / f"{name}.codes.dat"
+                _require_exact_file_size(
+                    path,
+                    self.row_count * np.dtype(np.int32).itemsize,
+                    label=str(meta_path),
+                )
+                codes = (
+                    np.memmap(
+                        path,
+                        dtype=np.int32,
+                        mode="r",
+                        shape=(self.row_count,),
+                    )
+                    if self.row_count
+                    else np.empty(0, dtype=np.int32)
                 )
                 categories = np.asarray(schema["categories"], dtype=str)
+                if categories.ndim != 1:
+                    raise SystemExit(
+                        f"{meta_path}: string categories for {name!r} must be "
+                        "a one-dimensional sequence"
+                    )
                 if categories.size == 0:
                     categories = np.asarray([""], dtype=str)
+                _validate_categorical_codes(
+                    codes,
+                    category_count=len(categories),
+                    label=f"{meta_path}: {name}",
+                )
                 self._lazy[name] = MemmapCategoricalColumn(codes, categories)
                 continue
             if kind == "fixed":
                 inner = tuple(int(d) for d in schema["inner_shape"])
-                mm = np.memmap(
-                    corpus_dir / f"{name}.dat",
-                    dtype=np.dtype(schema["dtype"]),
-                    mode="r",
-                    shape=(self.row_count, *inner),
+                dtype = np.dtype(schema["dtype"])
+                path = corpus_dir / f"{name}.dat"
+                element_count = self.row_count * int(np.prod(inner, dtype=np.int64))
+                _require_exact_file_size(
+                    path,
+                    element_count * dtype.itemsize,
+                    label=str(meta_path),
+                )
+                shape = (self.row_count, *inner)
+                mm = (
+                    np.memmap(
+                        path,
+                        dtype=dtype,
+                        mode="r",
+                        shape=shape,
+                    )
+                    if element_count
+                    else np.empty(shape, dtype=dtype)
                 )
                 if name in MEMMAP_LAZY_COLUMNS:
                     self._lazy[name] = MemmapFixedColumn(mm, self.row_count)
@@ -460,15 +595,22 @@ class MemmapCorpus:
                         f"{meta_path}: independent ragged column {name!r} has "
                         f"unknown offsets {offsets_name!r}"
                     )
-                flat_count = int(offsets[-1])
+                independent_flat_count = int(offsets[-1])
+                dtype = np.dtype(schema["dtype"])
+                path = corpus_dir / f"{name}.dat"
+                _require_exact_file_size(
+                    path,
+                    independent_flat_count * dtype.itemsize,
+                    label=str(meta_path),
+                )
                 flat = (
                     np.memmap(
-                        corpus_dir / f"{name}.dat",
-                        dtype=np.dtype(schema["dtype"]),
+                        path,
+                        dtype=dtype,
                         mode="r",
-                        shape=(flat_count,),
+                        shape=(independent_flat_count,),
                     )
-                    if flat_count
+                    if independent_flat_count
                     else np.empty(0, dtype=np.dtype(schema["dtype"]))
                 )
                 self._lazy[name] = MemmapRaggedColumn(
@@ -486,15 +628,27 @@ class MemmapCorpus:
                 )
             feat = int(schema["feat"]) if kind == "ragged3d" else None
             flat_shape = (
-                (int(self.meta["flat_count"]), feat)
+                (flat_count, feat)
                 if feat is not None
-                else (int(self.meta["flat_count"]),)
+                else (flat_count,)
             )
-            flat = np.memmap(
-                corpus_dir / f"{name}.dat",
-                dtype=np.dtype(schema["dtype"]),
-                mode="r",
-                shape=flat_shape,
+            dtype = np.dtype(schema["dtype"])
+            path = corpus_dir / f"{name}.dat"
+            element_count = flat_count * (feat if feat is not None else 1)
+            _require_exact_file_size(
+                path,
+                element_count * dtype.itemsize,
+                label=str(meta_path),
+            )
+            flat = (
+                np.memmap(
+                    path,
+                    dtype=dtype,
+                    mode="r",
+                    shape=flat_shape,
+                )
+                if flat_count
+                else np.empty(flat_shape, dtype=dtype)
             )
             column = MemmapRaggedColumn(
                 flat,
