@@ -21,8 +21,8 @@ def test_lite_reanalysis_refuses_search_value_columns(component: str) -> None:
         rl.validate_v_component(component)
 
 
-def test_lite_reanalysis_only_exposes_provenance_bound_q_columns() -> None:
-    assert set(rl.V_COMPONENTS) == {"target_scores", "afterstate_target"}
+def test_lite_reanalysis_only_exposes_provenance_bound_search_q_columns() -> None:
+    assert set(rl.V_COMPONENTS) == {"target_scores"}
     assert all(
         spec == {"forward_output": "q_values", "kind": "per_action"}
         for spec in rl.V_COMPONENTS.values()

@@ -107,7 +107,7 @@ if str(_SRC_DIR) not in sys.path:
 import reanalyze_lite as rl  # noqa: E402
 
 TOOL_NAME = "reanalyze_banked_corpus"
-TOOL_VERSION = "1.2"
+TOOL_VERSION = "1.3"
 
 # Conservative default: 32.6M rows / 500k ~= 66 chunks, each small enough to finish
 # in a between-wave idle slot even at modest rows/s (the preemption lesson).
@@ -845,6 +845,7 @@ def do_merge(
             "re-plan a true search reanalysis"
         )
     source = Path(manifest["source_corpus"])
+    source_meta = load_meta(source)
     chunks = manifest["chunks"]
 
     # 1. Every chunk must be done (verified: marker + hash + checkpoint match).
@@ -862,6 +863,10 @@ def do_merge(
         raise SystemExit(
             f"output dir already exists (refusing to overwrite): {out_dir}"
         )
+
+    source_inventory_sha = rl.validate_authenticated_payload_inventory(
+        source, source_meta
+    )
 
     dtype = np.dtype(manifest["column_dtype"])
     expected_entries = manifest["flat_count"]
@@ -918,11 +923,16 @@ def do_merge(
         link_report[name] = _link_or_copy(src_file, out_dir / name, link_mode)
 
     # 4. Fresh corpus_meta.json.
-    out_meta = load_meta(source)
-    meta_changed = False
+    out_meta = dict(source_meta)
     (out_dir / "corpus_meta.json").write_text(
         json.dumps(out_meta, indent=2, sort_keys=True), encoding="utf-8"
     )
+    output_inventory_sha = rl.rebuild_authenticated_payload_inventory(
+        out_dir,
+        source_meta=source_meta,
+        rewritten_filenames={rewritten_file},
+    )
+    meta_changed = output_inventory_sha is not None
 
     # 5. Row-count proof via a real MemmapCorpus open of source + overlay.
     src_row_count = int(load_meta(source)["row_count"])
@@ -977,6 +987,8 @@ def do_merge(
         "no_loss_no_dup_verified": total_entries == expected_entries
         and reloaded.row_count == src_row_count,
         "meta_changed": meta_changed,
+        "source_payload_inventory_sha256": source_inventory_sha,
+        "output_payload_inventory_sha256": output_inventory_sha,
         "link_mode": link_mode,
         "overlay_links": link_report,
         "assembled_column_file": rewritten_file,
@@ -1072,8 +1084,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--q-head-provenance",
         type=Path,
         default=None,
-        help="required checkpoint-bound validation JSON for target_scores or "
-        "afterstate_target",
+        help="required checkpoint-bound validation JSON for target_scores",
     )
     p.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS)
     p.add_argument(

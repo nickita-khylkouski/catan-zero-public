@@ -32,6 +32,7 @@ if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
 import reanalyze_lite as rl  # type: ignore  # noqa: E402
+import train_bc  # type: ignore  # noqa: E402
 from train_bc import MemmapCorpus  # type: ignore  # noqa: E402
 
 
@@ -114,6 +115,24 @@ def _make_synthetic_corpus(corpus_dir: Path) -> None:
     (corpus_dir / "corpus_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
     )
+
+
+def _authenticate_corpus(corpus_dir: Path) -> dict:
+    meta_path = corpus_dir / "corpus_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    inventory = [
+        {
+            "filename": filename,
+            "size_bytes": (corpus_dir / filename).stat().st_size,
+            "sha256": "sha256:" + rl.sha256_file(corpus_dir / filename),
+        }
+        for filename in sorted(train_bc._expected_memmap_payload_filenames(meta))
+    ]
+    meta["payload_inventory_schema"] = train_bc.MEMMAP_PAYLOAD_INVENTORY_SCHEMA
+    meta["payload_inventory"] = inventory
+    meta["payload_inventory_sha256"] = train_bc._canonical_json_sha256(inventory)
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+    return meta
 
 
 def _fresh_q_all() -> np.ndarray:
@@ -211,6 +230,7 @@ def test_source_corpus_untouched(corpus_dir, tmp_path, monkeypatch):
 
 
 def test_full_run_manifest_and_integrity(corpus_dir, tmp_path, monkeypatch):
+    source_meta = _authenticate_corpus(corpus_dir)
     manifest = _run_full_with_fake_forward(
         corpus_dir, tmp_path, monkeypatch, v_component="target_scores"
     )
@@ -234,6 +254,14 @@ def test_full_run_manifest_and_integrity(corpus_dir, tmp_path, monkeypatch):
         == manifest["integrity"]["row_count_after"]
     )
     assert manifest["integrity"]["expected_changed_files"] == ["target_scores.dat"]
+    output_meta = json.loads((out_dir / "corpus_meta.json").read_text())
+    assert output_meta["payload_inventory_sha256"] != source_meta[
+        "payload_inventory_sha256"
+    ]
+    assert (
+        train_bc._validate_memmap_payload_inventory(out_dir, output_meta)
+        == output_meta["payload_inventory_sha256"]
+    )
 
     # Stats carry a real mean shift + per-phase deltas.
     stats = manifest["stats"]
@@ -264,6 +292,11 @@ def test_backward_compat_load_through_memmap_corpus(corpus_dir, tmp_path, monkey
 def test_value_component_reanalysis_is_refused(component):
     with pytest.raises(SystemExit, match="single stored-feature forward"):
         rl.validate_v_component(component)
+
+
+def test_afterstate_target_reanalysis_is_refused():
+    with pytest.raises(SystemExit, match="immediate one-ply evaluator"):
+        rl.validate_v_component("afterstate_target")
 
 
 def test_integrity_guard_detects_unexpected_change(corpus_dir, tmp_path, monkeypatch):
@@ -483,6 +516,59 @@ def test_batch_forward_assembles_value_and_q(corpus_dir, monkeypatch):
     for r in range(len(idx)):
         for c in range(_LEGAL_WIDTH):
             assert fwd["q_values"][r, c] == pytest.approx(idx[r] * 100.0 + c)
+
+
+@pytest.mark.parametrize("defect", ["rank", "rows", "width", "nonfinite"])
+def test_batch_forward_refuses_malformed_q_output(corpus_dir, monkeypatch, defect):
+    torch = pytest.importorskip("torch")
+
+    corpus = MemmapCorpus(corpus_dir)
+
+    class _FakeModel:
+        def eval(self):
+            return self
+
+    fake_policy = type("P", (), {"model": _FakeModel(), "policy_type": "entity_graph"})()
+
+    def _fake_forward(policy, data, batch, legal_action_ids, *, return_q, **kwargs):
+        rows, width = legal_action_ids.shape
+        q = torch.zeros((rows, width), dtype=torch.float32)
+        if defect == "rank":
+            q = q.reshape(-1)
+        elif defect == "rows":
+            q = torch.zeros((rows + 1, width), dtype=torch.float32)
+        elif defect == "width":
+            q = torch.zeros((rows, width - 1), dtype=torch.float32)
+        elif defect == "nonfinite":
+            q[0, 0] = float("nan")
+        return {"value": torch.zeros(rows), "q_values": q}
+
+    monkeypatch.setattr(train_bc, "_forward_legal_np_for_batch", _fake_forward)
+    with pytest.raises(SystemExit, match="q_values output"):
+        rl.batch_forward(
+            fake_policy,
+            corpus,
+            np.array([0, 1], dtype=np.int64),
+            batch_size=2,
+            want_q=True,
+            legal_width=_LEGAL_WIDTH,
+        )
+
+
+def test_rewrite_refuses_masked_in_nonfinite_q_before_write(corpus_dir, tmp_path):
+    corpus = MemmapCorpus(corpus_dir)
+    out_dir = tmp_path / "out"
+    import shutil
+
+    shutil.copytree(corpus_dir, out_dir)
+    before = (out_dir / "target_scores.dat").read_bytes()
+    fresh = _fresh_q_all()
+    fresh[0, 0] = np.nan
+    with pytest.raises(SystemExit, match="masked target slot"):
+        rl.rewrite_per_action_column(
+            corpus, out_dir, "target_scores", fresh, legal_width=_LEGAL_WIDTH
+        )
+    assert (out_dir / "target_scores.dat").read_bytes() == before
 
 
 # --------------------------------------------------------------------------- #

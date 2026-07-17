@@ -37,6 +37,7 @@ if str(_TOOLS_DIR) not in sys.path:
 
 import reanalyze_banked_corpus as rbc  # type: ignore  # noqa: E402
 import reanalyze_lite as rl  # type: ignore  # noqa: E402
+import train_bc  # type: ignore  # noqa: E402
 from train_bc import MemmapCorpus  # type: ignore  # noqa: E402
 
 
@@ -116,6 +117,24 @@ def _make_corpus(corpus_dir: Path, n_rows: int) -> None:
     (corpus_dir / "corpus_meta.json").write_text(
         json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8"
     )
+
+
+def _authenticate_corpus(corpus_dir: Path) -> dict:
+    meta_path = corpus_dir / "corpus_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    inventory = [
+        {
+            "filename": filename,
+            "size_bytes": (corpus_dir / filename).stat().st_size,
+            "sha256": "sha256:" + rl.sha256_file(corpus_dir / filename),
+        }
+        for filename in sorted(train_bc._expected_memmap_payload_filenames(meta))
+    ]
+    meta["payload_inventory_schema"] = train_bc.MEMMAP_PAYLOAD_INVENTORY_SCHEMA
+    meta["payload_inventory"] = inventory
+    meta["payload_inventory_sha256"] = train_bc._canonical_json_sha256(inventory)
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+    return meta
 
 
 def _fresh_q_for_indices(indices: np.ndarray, legal_width: int, corpus) -> np.ndarray:
@@ -367,6 +386,7 @@ def test_chunked_merge_matches_single_shot_reference(
     corpus_dir, tmp_path, fake_forward
 ):
     pytest.importorskip("torch")
+    source_meta = _authenticate_corpus(corpus_dir)
     ckpt = _fake_ckpt(tmp_path)
     v_component = "target_scores"
 
@@ -415,6 +435,14 @@ def test_chunked_merge_matches_single_shot_reference(
     ovl_col = np.asarray(MemmapCorpus(overlay)[v_component])
     np.testing.assert_array_equal(
         np.nan_to_num(ref_col, nan=-999.0), np.nan_to_num(ovl_col, nan=-999.0)
+    )
+    overlay_meta = json.loads((overlay / "corpus_meta.json").read_text())
+    assert overlay_meta["payload_inventory_sha256"] != source_meta[
+        "payload_inventory_sha256"
+    ]
+    assert (
+        train_bc._validate_memmap_payload_inventory(overlay, overlay_meta)
+        == overlay_meta["payload_inventory_sha256"]
     )
 
 

@@ -25,14 +25,20 @@ the producer, operator, payload, and exact eligible-row mask. A true search
 rerun is necessary but is not by itself sufficient for learner admission.
 
 Do not use `target_scores` merely because that column already exists in an older
-corpus. Those modes forward the model's per-action `q_values`. Normal `train_bc`
+corpus. That mode forwards the model's per-action `q_values`. Normal `train_bc`
 runs use `q_loss_weight=0` and freeze that branch, so its presence in a checkpoint
 does not mean it was trained. Rewriting `target_scores` from it would silently
 replace searched targets with untrained outputs.
 
+`afterstate_target` is intentionally not a q-values mode. It records the
+immediate one-ply evaluator value after applying an action and any enumerated
+chance outcome, before deeper search. These tools cannot reproduce that operator
+from a root q-head forward and therefore refuse to rewrite the column; use the
+generation evaluator that materializes the one-ply afterstate contract.
+
 ## Explicit q-values mode
 
-`target_scores` and `afterstate_target` are fail-closed. They require
+`target_scores` is fail-closed and requires
 `--q-head-provenance PATH`, where `PATH` is a JSON object of this form:
 
 ```json

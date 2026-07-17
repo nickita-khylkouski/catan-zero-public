@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Reanalyze-lite v1.3: refresh provenance-qualified per-action Q targets.
+"""Reanalyze-lite v1.4: refresh provenance-qualified search-Q targets.
 
 WHAT THIS FIXES (CAT-34)
 ------------------------
 This tool batch-forwards the current checkpoint over stored states and may rewrite
-``target_scores`` or ``afterstate_target`` only when the checkpoint carries
+``target_scores`` only when the checkpoint carries
 explicit, validation-bound Q-head provenance. It is not a search reanalyzer and
 therefore refuses both root value columns.
 
@@ -64,8 +64,8 @@ must never rewrite either ``root_value`` or ``root_prior_value``. Those paired
 columns may only be refreshed by a tool that actually reruns the sealed search
 operator.
 
-The per-action ``target_scores`` and ``afterstate_target`` modes remain available
-only for a checkpoint whose q head has explicit, validated provenance supplied by
+The per-action ``target_scores`` mode remains available only for a checkpoint
+whose q head has explicit, validated provenance supplied by
 ``--q-head-provenance``. The provenance is checkpoint-md5-bound and must attest
 that the q head was trained for root-to-move search-action values in ``[-1, 1]``
 and passed a named validation. See ``docs/REANALYZE_Q_HEAD_PROVENANCE.md``.
@@ -92,21 +92,27 @@ if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
 TOOL_NAME = "reanalyze_lite"
-TOOL_VERSION = "1.3"
+TOOL_VERSION = "1.4"
 
 Q_HEAD_PROVENANCE_SCHEMA = "catan_zero_q_head_provenance_v1"
 Q_HEAD_TARGET_SEMANTICS = "root_to_move_search_action_value_v1"
 
-# The two q-value columns this tool can refresh. Both are ragged
+# The search-Q column this tool can refresh. It is ragged
 #   (N, legal_width), stored trimmed to each row's legal count; refreshed from the
 #   q_values head, overwriting only the entries that were finite (masked) before.
 V_COMPONENTS: dict[str, dict[str, str]] = {
     "target_scores": {"forward_output": "q_values", "kind": "per_action"},
-    "afterstate_target": {"forward_output": "q_values", "kind": "per_action"},
 }
 
 
 def validate_v_component(v_component: str) -> dict[str, str]:
+    if v_component == "afterstate_target":
+        raise SystemExit(
+            "REFUSING --v-component afterstate_target: it is the immediate one-ply "
+            "evaluator value after applying an action/chance outcome, while this "
+            "tool can only emit deeper root search Q. Rerun the generation evaluator "
+            "that materializes the one-ply afterstate contract."
+        )
     if v_component in {"root_value", "root_prior_value"}:
         raise SystemExit(
             f"REFUSING --v-component {v_component}: a single stored-feature forward "
@@ -151,7 +157,7 @@ def validate_q_head_provenance(
         if provenance is not None:
             raise SystemExit(
                 "--q-head-provenance is only valid with a q_values component "
-                "(target_scores or afterstate_target)"
+                "(target_scores)"
             )
         return None
 
@@ -263,6 +269,105 @@ def md5_file(path: Path) -> str:
 def hash_corpus_dats(corpus_dir: Path) -> dict[str, str]:
     """sha256 of every ``.dat`` file in a corpus dir, keyed by filename."""
     return {p.name: sha256_file(p) for p in sorted(Path(corpus_dir).glob("*.dat"))}
+
+
+def validate_authenticated_payload_inventory(
+    corpus_dir: Path, corpus_meta: dict
+) -> str | None:
+    """Authenticate a source inventory when present; reject partial metadata.
+
+    Legacy non-A1 corpora have no inventory and remain supported. Once any
+    inventory field exists, however, all fields must be present and valid before
+    reanalysis is allowed to mint a replacement inventory.
+    """
+    import train_bc
+
+    fields = {
+        "payload_inventory_schema",
+        "payload_inventory",
+        "payload_inventory_sha256",
+    }
+    present = fields.intersection(corpus_meta)
+    if not present:
+        return None
+    if present != fields:
+        raise SystemExit(
+            "memmap payload authentication metadata is partial; refusing to "
+            "reanalyze and bless an unverified source"
+        )
+    return train_bc._validate_memmap_payload_inventory(corpus_dir, corpus_meta)
+
+
+def rebuild_authenticated_payload_inventory(
+    corpus_dir: Path,
+    *,
+    source_meta: dict,
+    rewritten_filenames: set[str],
+) -> str | None:
+    """Replace authenticated inventory records after payload mutation.
+
+    ``source_meta`` must already have passed
+    :func:`validate_authenticated_payload_inventory`. Unchanged records can be
+    retained because lite verifies copied bytes independently and banked overlays
+    link/copy those exact authenticated source files. Rewritten payloads are always
+    re-sized and re-hashed from the output bytes.
+    """
+    import train_bc
+
+    if "payload_inventory" not in source_meta:
+        return None
+    meta_path = Path(corpus_dir) / "corpus_meta.json"
+    output_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    expected = train_bc._expected_memmap_payload_filenames(output_meta)
+    actual = {
+        path.name
+        for path in Path(corpus_dir).iterdir()
+        if path.is_file()
+        and (path.name.endswith(".dat") or path.name.endswith(".codes.dat"))
+    }
+    if actual != expected:
+        raise SystemExit(
+            "reanalyzed payload filenames differ from the column schema: "
+            f"missing={sorted(expected - actual)} unexpected={sorted(actual - expected)}"
+        )
+    source_records = {
+        record["filename"]: record for record in source_meta["payload_inventory"]
+    }
+    if set(source_records) != expected:
+        raise SystemExit("authenticated source inventory no longer matches its schema")
+
+    inventory: list[dict] = []
+    for filename in sorted(expected):
+        path = Path(corpus_dir) / filename
+        if filename in rewritten_filenames:
+            record = {
+                "filename": filename,
+                "size_bytes": path.stat().st_size,
+                "sha256": "sha256:" + sha256_file(path),
+            }
+        else:
+            record = dict(source_records[filename])
+            if path.stat().st_size != record["size_bytes"]:
+                raise SystemExit(
+                    f"unchanged payload {filename} size drifted while materializing output"
+                )
+        inventory.append(record)
+
+    inventory_sha = train_bc._canonical_json_sha256(inventory)
+    output_meta["payload_inventory_schema"] = train_bc.MEMMAP_PAYLOAD_INVENTORY_SCHEMA
+    output_meta["payload_inventory"] = inventory
+    output_meta["payload_inventory_sha256"] = inventory_sha
+    scan = output_meta.get("event_history_payload_scan")
+    if isinstance(scan, dict):
+        scan["payload_inventory_sha256"] = inventory_sha
+        scan.pop("scan_sha256", None)
+        scan["scan_sha256"] = train_bc._canonical_json_sha256(scan)
+    temporary = meta_path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(output_meta, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    temporary.replace(meta_path)
+    return inventory_sha
 
 
 # --------------------------------------------------------------------------- #
@@ -416,11 +521,31 @@ def batch_forward(
                 )
             values[start : start + len(batch)] = value
             if want_q:
+                if "q_values" not in outputs:
+                    raise SystemExit(
+                        f"q_values output is missing; keys={sorted(outputs)}"
+                    )
                 q = outputs["q_values"].detach().float().cpu().numpy()
-                # q is (b, W_batch); the corpus pads legal_action_ids to legal_width,
-                # so W_batch == legal_width. Guard anyway against a narrower slice.
-                w = min(q.shape[1], legal_width)
-                q_out[start : start + len(batch), :w] = q[:, :w]
+                expected_shape = (len(batch), legal_width)
+                if q.ndim != 2 or q.shape != expected_shape:
+                    raise SystemExit(
+                        "q_values output shape mismatch: "
+                        f"expected {expected_shape}, got {q.shape}"
+                    )
+                legal = legal_action_ids >= 0
+                if legal.shape != expected_shape:
+                    raise SystemExit(
+                        "legal_action_ids shape mismatch during q_values validation: "
+                        f"expected {expected_shape}, got {legal.shape}"
+                    )
+                bad = legal & ~np.isfinite(q)
+                if np.any(bad):
+                    row, column = np.argwhere(bad)[0]
+                    raise SystemExit(
+                        "q_values output contains a non-finite legal-action value "
+                        f"at batch row {int(row)}, column {int(column)}"
+                    )
+                q_out[start : start + len(batch)] = q
             if progress_every and (start // batch_size + 1) % progress_every == 0:
                 elapsed = time.perf_counter() - started
                 done = start + len(batch)
@@ -475,6 +600,24 @@ def rewrite_per_action_column(
         mask_padded = np.isfinite(old_padded)
     prefix, counts = _legal_prefix_mask(corpus, legal_width)
     change = mask_padded & prefix & np.isfinite(old_padded)
+
+    try:
+        fresh_q = np.asarray(fresh_q)
+        finite_fresh = np.isfinite(fresh_q)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"fresh q_values are not a numeric array: {exc}") from exc
+    if fresh_q.ndim != 2 or fresh_q.shape != old_padded.shape:
+        raise SystemExit(
+            "fresh q_values shape mismatch for rewrite: "
+            f"expected {old_padded.shape}, got {fresh_q.shape}"
+        )
+    bad = change & ~finite_fresh
+    if np.any(bad):
+        row, column = np.argwhere(bad)[0]
+        raise SystemExit(
+            "fresh q_values contain a non-finite masked target slot at "
+            f"row {int(row)}, column {int(column)}"
+        )
 
     new_padded = old_padded.copy()
     new_padded[change] = fresh_q[change].astype(np.float32)
@@ -611,6 +754,10 @@ def run_reanalyze(
         v_component=v_component,
     )
     corpus = MemmapCorpus(corpus_dir)
+    source_meta = json.loads(
+        (Path(corpus_dir) / "corpus_meta.json").read_text(encoding="utf-8")
+    )
+    source_inventory_sha = None
     legal_width = corpus.legal_width
     n = len(corpus)
 
@@ -684,6 +831,9 @@ def run_reanalyze(
             f"output dir already exists (refusing to overwrite): {out_dir}"
         )
 
+    source_inventory_sha = validate_authenticated_payload_inventory(
+        corpus_dir, source_meta
+    )
     src_hashes = hash_corpus_dats(corpus_dir)
     src_meta_hash = sha256_file(corpus_dir / "corpus_meta.json")
 
@@ -703,6 +853,11 @@ def run_reanalyze(
 
     rewrite = rewrite_per_action_column(
         corpus, out_dir, v_component, fwd["q_values"], legal_width=legal_width
+    )
+    output_inventory_sha = rebuild_authenticated_payload_inventory(
+        out_dir,
+        source_meta=source_meta,
+        rewritten_filenames=set(rewrite["changed_files"]),
     )
 
     stats = compute_stats(rewrite, phases)
@@ -724,6 +879,8 @@ def run_reanalyze(
         "new_files": new_files,
         "row_count_before": corpus.row_count,
         "row_count_after": MemmapCorpus(out_dir).row_count,
+        "source_payload_inventory_sha256": source_inventory_sha,
+        "output_payload_inventory_sha256": output_inventory_sha,
     }
     if unexpected:
         raise SystemExit(
@@ -752,7 +909,7 @@ def run_reanalyze(
         "batch_size": batch_size,
         "rows_total": rewrite["rows_total"],
         "entries_rewritten": rewrite["entries_rewritten"],
-        "meta_changed": rewrite["meta_changed"],
+        "meta_changed": output_inventory_sha is not None,
         "integrity": integrity,
         "stats": stats,
         "perspective_note": (
@@ -847,7 +1004,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--q-head-provenance",
         type=Path,
         default=None,
-        help="required JSON provenance for target_scores/afterstate_target q_values "
+        help="required JSON provenance for target_scores q_values "
         "rewrites; must be bound to this checkpoint and attest trained, validated "
         "root-to-move search-action-value semantics",
     )
