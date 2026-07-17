@@ -1586,7 +1586,7 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert bound["training_science_commissioning"]["authorized"] is False
     assert bound["training_science_commissioning"]["go_authorized"] is False
     assert bound["training_science_commissioning"]["reason"] == (
-        "v7_action_decoder_requires_fresh_commissioning"
+        "v8_parent_update_requires_fresh_commissioning"
     )
     assert bound["promotion_eligible"] is False
     assert bound["eligible_for_full_gate"] is False

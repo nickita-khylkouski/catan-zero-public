@@ -292,7 +292,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
             "configs/production/training_science_admission.json"
         ),
         "authorization_reason": (
-            "v7_action_decoder_requires_fresh_commissioning"
+            "v8_parent_update_requires_fresh_commissioning"
         ),
     },
     "research_scratch_status": "research_only_unresolved_not_selected",
@@ -522,7 +522,7 @@ def _load() -> dict[str, Any]:
         )
     if selected_train.get("value_trunk_grad_scale") != 0.1:
         raise ScienceContractError(
-            "selected V7 parent update must scale shared value gradients to 0.1"
+            "selected V7/V8 parent update must scale shared value gradients to 0.1"
         )
     admission = _read_object(TRAINING_SCIENCE_ADMISSION_PATH)
     admission_recipes = admission.get("recipes")

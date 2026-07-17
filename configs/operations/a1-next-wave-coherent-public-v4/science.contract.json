@@ -153,7 +153,7 @@
         "global_batch_size": 512,
         "go_authorized": false,
         "authorization_authority": "configs/production/training_science_admission.json",
-        "authorization_reason": "v7_action_decoder_requires_fresh_commissioning"
+        "authorization_reason": "v8_parent_update_requires_fresh_commissioning"
       },
       "research_scratch_status": "research_only_unresolved_not_selected"
     },

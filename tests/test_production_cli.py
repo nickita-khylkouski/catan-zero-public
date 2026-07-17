@@ -286,7 +286,7 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
     parent = train["recipes"]["a1-parent-update-35m-b200"]
     assert parent["authorized"] is False
     assert parent["status"] == "blocked"
-    assert parent["reason"] == ("v7_action_decoder_requires_fresh_commissioning")
+    assert parent["reason"] == ("v8_parent_update_requires_fresh_commissioning")
     assert len(parent["unresolved_requirements"]) == 2
     assert status["pipelines"]["ppo"]["authorized"] is False
 
@@ -359,7 +359,7 @@ def test_cataloged_parent_update_uses_exact_blocked_v7_recipe_and_parent(
 
     assert plan["readiness"]["authorized"] is False
     assert plan["readiness"]["reason"] == (
-        "v7_action_decoder_requires_fresh_commissioning"
+        "v8_parent_update_requires_fresh_commissioning"
     )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
