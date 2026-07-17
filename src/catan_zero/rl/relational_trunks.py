@@ -205,17 +205,20 @@ def build_relation_ids(batch: dict[str, Any], *, sequence_length: int):
     )
 
     # CLS, player, and global tokens act as readers/aggregators in local blocks.
-    hub_rows = torch.tensor(
-        (
-            0,
-            player_offset,
-            player_offset + 1,
-            player_offset + 2,
-            player_offset + 3,
-            global_index,
-        ),
-        dtype=torch.long,
-        device=device,
+    # Build device constants from capturable device-side ops. `torch.tensor(
+    # ..., device="cuda")` performs a CPU->CUDA copy on every call, which is
+    # forbidden while the V7 state trunk is inside CUDA Graph capture.
+    hub_positions = torch.arange(6, dtype=torch.long, device=device)
+    hub_rows = player_offset + hub_positions - 1
+    hub_rows = torch.where(
+        hub_positions == 0,
+        torch.zeros_like(hub_rows),
+        hub_rows,
+    )
+    hub_rows = torch.where(
+        hub_positions == 5,
+        torch.full_like(hub_rows, global_index),
+        hub_rows,
     )
     unset = relation[:, hub_rows, :] == REL_NONE
     relation[:, hub_rows, :] = torch.where(
@@ -235,10 +238,22 @@ def build_relation_ids(batch: dict[str, Any], *, sequence_length: int):
         targets = batch["event_target_ids"].long()
         event_count = min(int(targets.shape[1]), length - event_offset)
         targets = targets[:, :event_count, :]
-        offsets = torch.tensor(
-            (hex_offset, vertex_offset, edge_offset, player_offset),
-            dtype=torch.long,
-            device=device,
+        namespaces = torch.arange(4, dtype=torch.long, device=device)
+        offsets = torch.full_like(namespaces, player_offset)
+        offsets = torch.where(
+            namespaces == 0,
+            torch.full_like(offsets, hex_offset),
+            offsets,
+        )
+        offsets = torch.where(
+            namespaces == 1,
+            torch.full_like(offsets, vertex_offset),
+            offsets,
+        )
+        offsets = torch.where(
+            namespaces == 2,
+            torch.full_like(offsets, edge_offset),
+            offsets,
         )
         valid = targets >= 0
         b = torch.arange(batch_size, device=device).view(-1, 1, 1).expand_as(targets)
