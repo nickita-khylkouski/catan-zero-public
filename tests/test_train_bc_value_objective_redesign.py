@@ -12,6 +12,7 @@ import pytest
 
 from tools import train_bc
 from tools.train_bc import (
+    _initialization_reference_value_training,
     _resolve_value_objective_weights,
     _train_entity_batch,
     _value_training_metadata,
@@ -248,6 +249,45 @@ def test_value_training_metadata_attests_real_mid_epoch_updates() -> None:
     assert midpoint["optimizer_steps"] == 64
     assert midpoint["completed_epochs"] == 0
     assert midpoint["trained_value_readouts"] == ["scalar"]
+
+
+def test_initialization_reference_preserves_inherited_value_attestation() -> None:
+    source = {
+        "schema_version": "value-training-v1",
+        "primary_readout": "scalar",
+        "trained_value_readouts": ["scalar"],
+        "resolved_scalar_mse_weight": 0.25,
+        "resolved_categorical_ce_weight": 0.0,
+        "hlgauss_bins": 0,
+        "optimizer_steps": 680,
+        "completed_epochs": 1,
+        "scalar_training_weight_sum": 2_781_407.0,
+        "categorical_training_weight_sum": 0.0,
+    }
+    policy = SimpleNamespace(value_training=source)
+
+    inherited = _initialization_reference_value_training(policy)
+
+    assert inherited is not source
+    assert inherited["trained_value_readouts"] == ["scalar"]
+    assert inherited["optimizer_steps"] == 680
+    assert inherited["scalar_training_weight_sum"] == pytest.approx(2_781_407.0)
+    assert inherited["initialization_reference"] == {
+        "schema_version": "value-training-initialization-reference-v1",
+        "inherited_from_source_checkpoint": True,
+        "optimizer_steps_in_current_trajectory": 0,
+        "function_preserving_weights": True,
+    }
+    assert "initialization_reference" not in source
+
+
+def test_initialization_reference_keeps_legacy_scalar_metadata_absent() -> None:
+    assert (
+        _initialization_reference_value_training(
+            SimpleNamespace(value_training=None)
+        )
+        is None
+    )
 
 
 def test_report_records_requested_and_resolved_value_objective_weights() -> None:

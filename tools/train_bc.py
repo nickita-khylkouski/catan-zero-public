@@ -2687,6 +2687,34 @@ def _value_training_metadata(
     return metadata
 
 
+def _initialization_reference_value_training(policy) -> dict[str, object] | None:
+    """Preserve readout provenance on a function-preserving step-zero save.
+
+    The initialization checkpoint is written before this learner applies an
+    optimizer update.  Rebuilding ``value-training-v1`` with zero local steps
+    erases the source checkpoint's already-trained scalar/categorical
+    attestation, even though the readout weights are copied exactly.  Search
+    then correctly rejects those inherited weights as untrained.
+
+    Carry the source attestation forward and add an explicit current-trajectory
+    marker.  Legacy checkpoints have no structured value provenance; returning
+    ``None`` retains their legacy scalar compatibility instead of manufacturing
+    a new zero-dose record.
+    """
+
+    inherited = getattr(policy, "value_training", None)
+    if not isinstance(inherited, dict):
+        return None
+    durable = copy.deepcopy(inherited)
+    durable["initialization_reference"] = {
+        "schema_version": "value-training-initialization-reference-v1",
+        "inherited_from_source_checkpoint": True,
+        "optimizer_steps_in_current_trajectory": 0,
+        "function_preserving_weights": True,
+    }
+    return durable
+
+
 def _policy_training_signal_attestation(
     metrics: Sequence[dict[str, object]],
     *,
@@ -16909,18 +16937,8 @@ def main(
             raise SystemExit(
                 "effective initialization reference requires a fresh optimizer-step-zero start"
             )
-        checkpoint_model = getattr(policy.model, "module", policy.model)
-        initialization_value_training = _value_training_metadata(
-            args,
-            scalar_weight=resolved_scalar_value_weight,
-            categorical_weight=resolved_categorical_value_weight,
-            categorical_bins=int(
-                getattr(checkpoint_model, "value_categorical_bins", 0) or 0
-            ),
-            optimizer_steps=0,
-            completed_epochs=0,
-            scalar_training_weight_sum=0.0,
-            categorical_training_weight_sum=0.0,
+        initialization_value_training = _initialization_reference_value_training(
+            policy
         )
         _save_policy(
             policy,
