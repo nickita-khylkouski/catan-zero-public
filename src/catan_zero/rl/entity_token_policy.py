@@ -1562,6 +1562,11 @@ class EntityGraphNet:
                 history_delta = None
                 value_history_delta = None
                 if self.meaningful_public_history_enabled:
+                    history_position_offset = (
+                        self.meaningful_public_history_normalization
+                        - int(batch["event_tokens"].shape[1])
+                    )
+
                     def pooled_history_delta(piece):
                         # Event rows stay masked from the mature trunk. Their
                         # bounded pooled representation enters only through the
@@ -1579,7 +1584,9 @@ class EntityGraphNet:
                             delta = (
                                 delta
                                 + self.meaningful_history_sequence(
-                                    piece, event_mask
+                                    piece,
+                                    event_mask,
+                                    position_offset=history_position_offset,
                                 )
                                 * self.meaningful_history_ordered_gate
                             )
@@ -1644,6 +1651,37 @@ class EntityGraphNet:
                                     value_history_targets
                                 )
                             )
+                    if (
+                        self.action_cross_attention_layers > 0
+                        and self.v6_compatibility_preserving_inputs_enabled
+                    ):
+                        # The mature state trunk keeps event rows masked so a
+                        # V5/V6 warm start cannot perturb its representation.
+                        # Give only the new action decoder a processed history
+                        # memory: event content plus target binding and the same
+                        # learned positions used by ordered history pooling.
+                        action_history_piece = event_piece
+                        if (
+                            self.meaningful_public_history_pooling
+                            == ORDERED_ATTENTION_V2
+                        ):
+                            action_history_piece = (
+                                self.meaningful_history_sequence.encode_sequence(
+                                    action_history_piece,
+                                    position_offset=history_position_offset,
+                                )
+                            )
+                        event_start = (
+                            _entity_token_start_offsets(batch)[3]
+                            + int(batch["player_tokens"].shape[1])
+                            + int(batch["global_tokens"].shape[1])
+                        )
+                        tokens = tokens.clone()
+                        tokens[
+                            :,
+                            event_start : event_start
+                            + action_history_piece.shape[1],
+                        ] = action_history_piece
                     history_delta = pooled_history_delta(event_piece)
                     state = state + history_delta
                     if self.value_tower_split_layers:

@@ -37,24 +37,19 @@ def build_ordered_history_pool(width: int, max_events: int):
             nn.init.normal_(self.query, mean=0.0, std=self.width ** -0.5)
             self.norm = nn.LayerNorm(self.width)
 
-        def forward(self, event_tokens, event_mask):
+        def forward(self, event_tokens, event_mask, *, position_offset=None):
             if event_tokens.ndim != 3 or event_tokens.shape[-1] != self.width:
                 raise ValueError("ordered history token shape drift")
             if event_mask.shape != event_tokens.shape[:2]:
                 raise ValueError("ordered history mask shape drift")
+            sequence = self.encode_sequence(
+                event_tokens,
+                position_offset=position_offset,
+            )
             event_count = int(event_tokens.shape[1])
-            if event_count > self.max_events:
-                raise ValueError(
-                    "ordered history exceeds configured maximum: "
-                    f"{event_count} > {self.max_events}"
-                )
             if event_count == 0:
                 return event_tokens.new_zeros((event_tokens.shape[0], self.width))
 
-            # Event tensors are right-aligned, so use the matching tail of the
-            # position table when a batch is physically cropped.
-            positions = self.position_embedding[self.max_events - event_count :]
-            sequence = self.norm(event_tokens + positions.unsqueeze(0))
             # The query already uses Transformer scaling at initialization
             # (std=width**-0.5). Dividing by sqrt(width) again would make a
             # width-640 adapter almost uniform and starve the ordering path.
@@ -71,5 +66,46 @@ def build_ordered_history_pool(width: int, max_events: int):
                 self.max_events
             )
             return pooled * occupancy
+
+        def encode_sequence(self, event_tokens, *, position_offset=None):
+            """Add the same learned order representation without pooling.
+
+            The action decoder uses this view as per-event memory. Keeping the
+            transformation here prevents the pooled history path and the
+            action-local history path from learning contradictory positions.
+            """
+
+            if event_tokens.ndim != 3 or event_tokens.shape[-1] != self.width:
+                raise ValueError("ordered history token shape drift")
+            event_count = int(event_tokens.shape[1])
+            if event_count > self.max_events:
+                raise ValueError(
+                    "ordered history exceeds configured maximum: "
+                    f"{event_count} > {self.max_events}"
+                )
+            if event_count == 0:
+                return event_tokens
+
+            # A standalone semantic window is right-aligned in the configured
+            # table. Inference may instead remove a trailing all-padding suffix
+            # from a wider physical window; its caller supplies the original
+            # offset so retained events keep the same absolute positions.
+            if position_offset is None:
+                position_offset = self.max_events - event_count
+            if (
+                isinstance(position_offset, bool)
+                or not isinstance(position_offset, int)
+                or position_offset < 0
+                or position_offset + event_count > self.max_events
+            ):
+                raise ValueError(
+                    "ordered history position range exceeds configured maximum: "
+                    f"offset={position_offset} count={event_count} "
+                    f"maximum={self.max_events}"
+                )
+            positions = self.position_embedding[
+                position_offset : position_offset + event_count
+            ]
+            return self.norm(event_tokens + positions.unsqueeze(0))
 
     return _OrderedHistoryPool()

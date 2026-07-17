@@ -283,6 +283,115 @@ def test_v7_compatibility_route_requires_live_action_cross_attention():
         EntityGraphNet(_config(v6_compatibility_preserving_inputs=True))
 
 
+def test_action_decoder_attends_only_live_processed_public_history():
+    from catan_zero.rl.ordered_history import ORDERED_ATTENTION_V2
+
+    model = EntityGraphNet(
+        _config(
+            action_cross_attention_layers=1,
+            v6_compatibility_preserving_inputs=True,
+            meaningful_public_history=True,
+            meaningful_public_history_pooling=ORDERED_ATTENTION_V2,
+            meaningful_public_history_target_gather=True,
+        )
+    ).eval()
+    batch = _batch(
+        batch_size=1,
+        action_width=3,
+        event_width=16,
+        live_event_width=4,
+    )
+    batch["event_mask"].zero_()
+    batch["event_mask"][:, -4:] = True
+    batch["event_target_ids"] = -torch.ones(1, 16, 4, dtype=torch.long)
+    batch["event_target_ids"][0, -4:, 0] = torch.arange(4)
+    batch["edge_vertex_ids"] = torch.zeros(1, 72, 2, dtype=torch.long)
+    with torch.no_grad():
+        # Isolate the decoder from the pre-existing pooled global-history path.
+        model.meaningful_history_residual_gate.zero_()
+        model.meaningful_history_ordered_gate.zero_()
+        # Open the exact-identity decoder for this causal test.
+        for name, parameter in model.action_cross_blocks.named_parameters():
+            if name.endswith(("attn.out_proj.weight", "ff.3.weight")):
+                parameter.copy_(torch.randn_like(parameter))
+        model.meaningful_history_sequence.position_embedding.copy_(
+            torch.randn_like(
+                model.meaningful_history_sequence.position_embedding
+            )
+        )
+        model.meaningful_history_target_proj[1].weight.copy_(
+            torch.eye(model.config.hidden_size)
+        )
+        baseline = model(batch)["logits"]
+
+        live_changed = copy.deepcopy(batch)
+        live_changed["event_tokens"][0, -1, 0] += 3.0
+        live_logits = model(live_changed)["logits"]
+
+        padded_changed = copy.deepcopy(batch)
+        padded_changed["event_tokens"][0, 0] += 1000.0
+        padded_logits = model(padded_changed)["logits"]
+
+        reordered = copy.deepcopy(batch)
+        reordered["event_tokens"][:, [-2, -1]] = reordered["event_tokens"][
+            :, [-1, -2]
+        ]
+        reordered["event_target_ids"][:, [-2, -1]] = reordered[
+            "event_target_ids"
+        ][:, [-1, -2]]
+        reordered_logits = model(reordered)["logits"]
+
+        retargeted = copy.deepcopy(batch)
+        retargeted["event_target_ids"][0, -1, 0] = 8
+        retargeted_logits = model(retargeted)["logits"]
+
+    assert torch.max(torch.abs(live_logits - baseline)).item() > 0.0
+    assert torch.equal(padded_logits, baseline)
+    assert torch.max(torch.abs(reordered_logits - baseline)).item() > 0.0
+    assert torch.max(torch.abs(retargeted_logits - baseline)).item() > 0.0
+
+
+def test_action_history_positions_survive_trailing_padding_crop():
+    from catan_zero.rl.ordered_history import ORDERED_ATTENTION_V2
+
+    model = EntityGraphNet(
+        _config(
+            action_cross_attention_layers=1,
+            v6_compatibility_preserving_inputs=True,
+            meaningful_public_history=True,
+            meaningful_public_history_pooling=ORDERED_ATTENTION_V2,
+            meaningful_public_history_target_gather=True,
+        )
+    ).eval()
+    batch = _batch(
+        batch_size=1,
+        action_width=3,
+        event_width=16,
+        live_event_width=4,
+    )
+    batch["event_target_ids"] = -torch.ones(1, 16, 4, dtype=torch.long)
+    batch["event_target_ids"][0, :4, 0] = torch.arange(4)
+    batch["edge_vertex_ids"] = torch.zeros(1, 72, 2, dtype=torch.long)
+    with torch.no_grad():
+        model.meaningful_history_residual_gate.zero_()
+        model.meaningful_history_ordered_gate.zero_()
+        for name, parameter in model.action_cross_blocks.named_parameters():
+            if name.endswith(("attn.out_proj.weight", "ff.3.weight")):
+                parameter.copy_(torch.randn_like(parameter))
+        model.meaningful_history_sequence.position_embedding.copy_(
+            torch.randn_like(
+                model.meaningful_history_sequence.position_embedding
+            )
+        )
+        model.meaningful_history_target_proj[1].weight.copy_(
+            torch.eye(model.config.hidden_size)
+        )
+        full = model(batch)["logits"]
+        cropped = model(batch, event_token_limit=4)["logits"]
+
+    torch.testing.assert_close(full, cropped, rtol=1e-6, atol=1e-6)
+
+
 @pytest.mark.parametrize(
     ("split_layers", "value_attention_pool", "training", "expect_cls_only"),
     (

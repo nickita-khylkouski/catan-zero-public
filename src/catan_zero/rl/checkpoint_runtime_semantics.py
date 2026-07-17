@@ -164,6 +164,14 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # Same reviewed guarded source under the commissioned Linux/Python
         # tokenizer used by the H100 training runtime.
         "sha256:2e7e4ca59d0dacc83dd8225092a33b620245b7a88062b39b3da1bd56fe5ee897",
+        # V7 replaces its newly exposed event rows with target-bound,
+        # order-aware decoder memory. The write remains jointly gated by the
+        # V7 compatibility flag and action cross-attention, so legacy
+        # topology-disabled checkpoints execute the reviewed function.
+        "sha256:ed173ec230eeb29481dd0c2ba01414368b92a6300f8f7b169a4e6b4f4ec8e393",
+        # Same guarded V7 decoder source under the commissioned H100/Linux
+        # tokenizer (also emitted by supported local Python 3.10 runtimes).
+        "sha256:a4878f690fe1ae15fe0d4c0314490d84d3668ff49b3536baa5b8116044abba6d",
         # Rebasing the V7 decoder onto the final bit-exact input migration
         # changed the selected policy AST fingerprint once more. Every added
         # path remains behind the absent/false V7 compatibility flags for a
