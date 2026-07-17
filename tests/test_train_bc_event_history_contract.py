@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
 from tools import train_bc
 
 
@@ -18,10 +19,11 @@ def _meta(digit: str, *, implicit_zero: bool = True) -> dict:
     }
 
 
-def _args(*, arch: str, acknowledgements=()):
+def _args(*, arch: str, acknowledgements=(), adapter_version=None):
     return SimpleNamespace(
         arch=arch,
         acknowledge_empty_event_history_payload_inventory_sha256=list(acknowledgements),
+        entity_feature_adapter_version=adapter_version,
     )
 
 
@@ -118,6 +120,7 @@ def test_composite_routes_fresh_history_and_acknowledged_legacy_replay() -> None
         _args(
             arch="entity_graph",
             acknowledgements=[replay["payload_inventory_sha256"]],
+            adapter_version=RUST_ENTITY_ADAPTER_V5,
         ),
         composite,
         SimpleNamespace(use_graph_history_features=False),
@@ -127,6 +130,7 @@ def test_composite_routes_fresh_history_and_acknowledged_legacy_replay() -> None
     )
     assert contract["training_event_history_trainable"] is True
     assert contract["event_history_end_to_end_usable"] is True
+    assert contract["native_inference"]["history_limit"] == 64
 
 
 def test_non_event_arch_rejects_meaningless_ack() -> None:
@@ -216,6 +220,50 @@ def test_meaningful_history_crop_retains_right_aligned_live_events(
         batch["event_tokens"][:, -5:, 0],
         np.tile(np.arange(1, 6, dtype=np.float16), (2, 1)),
     )
+
+
+def test_v5_training_contract_delivers_full_64_event_batch(monkeypatch) -> None:
+    fresh = _meta("3", implicit_zero=False)
+    fresh["event_history_payload_scan"] = {
+        "row_count": 3,
+        "payload_inventory_sha256": fresh["payload_inventory_sha256"],
+        "columns": {
+            "event_tokens": {"nonzero_count": 2},
+            "event_mask": {"nonzero_count": 2},
+        },
+    }
+    contract = train_bc._a1_training_event_history_contract(
+        _args(arch="entity_graph", adapter_version=RUST_ENTITY_ADAPTER_V5),
+        fresh,
+        SimpleNamespace(use_graph_history_features=True),
+    )
+
+    data = {
+        key: np.zeros((1, 1), dtype=np.float32)
+        for key in train_bc.ENTITY_BATCH_KEYS
+    }
+    data["player_tokens"] = np.zeros((1, 4, 31), dtype=np.float32)
+    data["event_tokens"] = np.zeros((1, 64, 41), dtype=np.float16)
+    data["event_target_ids"] = np.full((1, 64, 4), -1, dtype=np.int16)
+    data["event_mask"] = np.zeros((1, 64), dtype=np.bool_)
+    data["event_tokens"][0, 0, 0] = 1.0
+    data["event_tokens"][0, 63, 0] = 64.0
+    data["event_mask"][0, [0, 63]] = True
+
+    monkeypatch.setattr(train_bc, "_CROP_AUTHENTICATED_EMPTY_EVENT_HISTORY", False)
+    monkeypatch.setattr(
+        train_bc,
+        "_MEANINGFUL_EVENT_HISTORY_LIMIT",
+        contract["native_inference"]["history_limit"],
+    )
+    monkeypatch.setattr(train_bc, "_PUBLIC_CARD_COUNT_FEATURES_ENABLED", False)
+    monkeypatch.setattr(train_bc, "_MASK_HIDDEN_INFO_PLAYER_TOKENS", False)
+    batch = train_bc._entity_batch(data, np.asarray([0], dtype=np.int64))
+
+    assert batch["event_tokens"].shape == (1, 64, 41)
+    assert batch["event_mask"].shape == (1, 64)
+    assert batch["event_tokens"][0, 0, 0] == 1.0
+    assert batch["event_tokens"][0, 63, 0] == 64.0
 
 
 def test_meaningful_history_crop_retains_front_padded_memmap_events(

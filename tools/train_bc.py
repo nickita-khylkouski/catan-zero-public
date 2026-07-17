@@ -26268,6 +26268,10 @@ def _a1_training_event_history_contract(
         for component_id, metadata in components.items()
         if isinstance(metadata.get("event_history_payload_scan"), dict)
     }
+    selected_adapter = getattr(args, "entity_feature_adapter_version", None)
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    if selected_adapter is None and init_checkpoint:
+        selected_adapter = _checkpoint_entity_feature_adapter_version(init_checkpoint)
     try:
         return build_a1_training_event_history_contract(
             components,
@@ -26275,6 +26279,7 @@ def _a1_training_event_history_contract(
                 getattr(env_config, "use_graph_history_features", False)
             ),
             event_history_consumer_enabled=str(args.arch) == "entity_graph",
+            entity_feature_adapter_version=selected_adapter,
             empty_payload_inventory_acknowledgements=tuple(
                 args.acknowledge_empty_event_history_payload_inventory_sha256
             ),

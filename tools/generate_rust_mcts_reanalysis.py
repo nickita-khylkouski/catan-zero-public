@@ -267,6 +267,25 @@ def _target_scores_and_mask(
     return target_scores, target_scores_mask
 
 
+def _target_policy_and_mask(
+    policy_by_rust: dict[int, float],
+    legal_rust: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Materialize the search policy with support over every legal action.
+
+    Exact-zero probabilities are still teacher labels.  The mask describes
+    which legal actions the distribution covers, not which entries carry
+    positive probability.
+    """
+
+    target_policy = np.asarray(
+        [float(policy_by_rust.get(int(action), 0.0)) for action in legal_rust],
+        dtype=np.float16,
+    )
+    target_policy_mask = np.ones(target_policy.shape, dtype=np.bool_)
+    return target_policy, target_policy_mask
+
+
 def _evaluator_feature_contract(
     evaluator: EntityGraphRustEvaluator,
 ) -> dict[str, Any]:
@@ -332,11 +351,10 @@ def _mcts_row(
     result = search.search(game)
     policy_by_rust = result.policy
     q_by_rust = result.q_values
-    target_policy = np.asarray(
-        [float(policy_by_rust.get(int(action), 0.0)) for action in legal_rust],
-        dtype=np.float16,
+    target_policy, target_policy_mask = _target_policy_and_mask(
+        policy_by_rust,
+        legal_rust,
     )
-    target_policy_mask = target_policy.astype(np.float32) > 0.0
     target_scores, target_scores_mask = _target_scores_and_mask(
         q_by_rust,
         getattr(result, "visits", {}) or {},

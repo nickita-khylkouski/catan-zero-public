@@ -415,6 +415,7 @@ def build_a1_training_event_history_contract(
     *,
     graph_history_features: bool,
     event_history_consumer_enabled: bool,
+    entity_feature_adapter_version: str | None = None,
     empty_payload_inventory_acknowledgements: Sequence[str] = (),
     component_payload_scans: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -435,6 +436,10 @@ def build_a1_training_event_history_contract(
     The caller must pass metadata only after the normal A1 payload-inventory
     authentication.  Requiring component ids as mapping keys makes a composite
     report stable and prevents positional ambiguity.
+
+    ``entity_feature_adapter_version`` is the learner/runtime adapter selected
+    by the authenticated training recipe or checkpoint.  Omitting it retains
+    the legacy v1/32 history capability; v5 explicitly selects v2/64.
     """
 
     if not isinstance(component_metadata, Mapping) or not component_metadata:
@@ -456,6 +461,20 @@ def build_a1_training_event_history_contract(
         raise InformationSurfaceError(
             "empty-history payload acknowledgements must not contain duplicates"
         )
+
+    resolved_adapter: str | None = None
+    if entity_feature_adapter_version is not None:
+        from catan_zero.rl.entity_feature_adapter import (
+            EntityFeatureAdapterContractError,
+            require_known_entity_feature_adapter,
+        )
+
+        try:
+            resolved_adapter = require_known_entity_feature_adapter(
+                entity_feature_adapter_version
+            )
+        except EntityFeatureAdapterContractError as error:
+            raise InformationSurfaceError(str(error)) from error
 
     payload_scans = component_payload_scans or {}
     if not isinstance(payload_scans, Mapping) or not set(payload_scans).issubset(
@@ -565,7 +584,7 @@ def build_a1_training_event_history_contract(
 
     any_trainable = trainable_components > 0
     native_capability = (
-        native_meaningful_public_history_capability()
+        native_meaningful_public_history_capability(resolved_adapter)
         if any_trainable
         else native_inference_event_history_capability()
     )

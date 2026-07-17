@@ -18,6 +18,16 @@ from tools import generate_rust_mcts_reanalysis as reanalysis
 from tools.generate_rust_mcts_reanalysis import _target_scores_and_mask
 
 
+def test_policy_mask_covers_zero_probability_legal_actions() -> None:
+    target, mask = reanalysis._target_policy_and_mask(
+        {10: 0.7, 20: 0.3, 30: 0.0, 40: 0.0},
+        (10, 20, 30, 40),
+    )
+
+    np.testing.assert_allclose(target, [0.7, 0.3, 0.0, 0.0], rtol=2e-3)
+    assert mask.tolist() == [True, True, True, True]
+
+
 def test_unvisited_action_is_excluded_even_though_q_defaults_to_a_finite_zero() -> None:
     """FIX (Q-mask): RustMCTSResult.q_values defaults an unvisited action's Q to 0.0 (finite,
     not NaN), so isfinite alone can't tell an unvisited action from a genuinely-scored one at

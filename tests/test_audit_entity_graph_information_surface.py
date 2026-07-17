@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 import numpy as np
 
+from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V5
+from catan_zero.rl.meaningful_history import MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
 from catan_zero.rl.entity_token_policy import EntityGraphConfig
 from tools.audit_entity_graph_information_surface import (
     InformationSurfaceError,
@@ -274,7 +276,7 @@ def test_a1_training_contract_rejects_unbound_inventory_identity() -> None:
         )
 
 
-def test_a1_training_contract_admits_reviewed_meaningful_public_history() -> None:
+def test_a1_training_contract_defaults_legacy_history_to_v1_width() -> None:
     metadata = {"fresh": _a1_meta("3", implicit_zero=False)}
     scan = {
         "payload_inventory_sha256": metadata["fresh"]["payload_inventory_sha256"],
@@ -295,6 +297,31 @@ def test_a1_training_contract_admits_reviewed_meaningful_public_history() -> Non
     assert report["native_inference"]["available"] is True
     assert report["native_inference"]["history_limit"] == 32
     assert report["event_history_end_to_end_usable"] is True
+
+
+def test_a1_training_contract_binds_v5_history_to_v2_width() -> None:
+    metadata = {"fresh": _a1_meta("3", implicit_zero=False)}
+    scan = {
+        "payload_inventory_sha256": metadata["fresh"]["payload_inventory_sha256"],
+        "row_count": 3,
+        "columns": {
+            "event_tokens": {"nonzero_count": 7},
+            "event_mask": {"nonzero_count": 2},
+        },
+    }
+
+    report = build_a1_training_event_history_contract(
+        metadata,
+        graph_history_features=True,
+        event_history_consumer_enabled=True,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+        component_payload_scans={"fresh": scan},
+    )
+
+    assert report["native_inference"]["history_schema"] == (
+        MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
+    )
+    assert report["native_inference"]["history_limit"] == 64
 
 
 def test_a1_training_contract_rejects_scan_for_different_inventory() -> None:

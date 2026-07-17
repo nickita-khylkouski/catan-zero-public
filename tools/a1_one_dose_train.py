@@ -2587,6 +2587,9 @@ def _verify_production_composite_inputs(
                 component_metadata,
                 graph_history_features=True,
                 event_history_consumer_enabled=True,
+                entity_feature_adapter_version=(
+                    current_science.CURRENT_LEARNER_ENTITY_ADAPTER
+                ),
                 empty_payload_inventory_acknowledgements=(
                     event_history_acknowledgements
                 ),
