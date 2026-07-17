@@ -71,7 +71,12 @@ _NON_FORWARD_ENTITY_KEYS = frozenset(
     {"hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids"}
 )
 _LEGAL_PADDED_ENTITY_KEYS = frozenset(
-    {"legal_action_tokens", "legal_action_target_ids", "legal_action_mask"}
+    {
+        "legal_action_tokens",
+        "legal_action_target_ids",
+        "legal_action_mask",
+        "_symmetry_legal_action_ids",
+    }
 )
 
 
@@ -190,8 +195,22 @@ def _merge_forward_payloads(
     legal_ids = np.full((total_rows, max_legal), -1, dtype=np.int64)
     context = np.zeros((total_rows, max_legal, context_width), dtype=np.float32)
     entity: dict[str, np.ndarray] = {}
-    for key, value in payloads[0]["entity"].items():
-        value = np.asarray(value)
+    entity_keys = list(payloads[0]["entity"])
+    # Ordinary and D6-averaged roots share an EvalServer window.  Only D6
+    # requests carry remapped static-action catalog ids; for an ordinary root
+    # the legal ids are the catalog ids.  Treat this as an optional padded
+    # field instead of inheriting the first request's key set (which either
+    # dropped the D6 mapping or raised KeyError under concurrent generation).
+    symmetry_key = "_symmetry_legal_action_ids"
+    if symmetry_key not in entity_keys and any(
+        symmetry_key in payload["entity"] for payload in payloads
+    ):
+        entity_keys.append(symmetry_key)
+    for key in entity_keys:
+        first_value = payloads[0]["entity"].get(key)
+        if first_value is None and key == symmetry_key:
+            first_value = payloads[0]["legal_ids"]
+        value = np.asarray(first_value)
         if key == "legal_action_tokens":
             entity[key] = np.zeros(
                 (total_rows, max_legal, int(value.shape[2])), dtype=value.dtype
@@ -202,6 +221,10 @@ def _merge_forward_payloads(
             )
         elif key == "legal_action_mask":
             entity[key] = np.zeros((total_rows, max_legal), dtype=np.bool_)
+        elif key == symmetry_key:
+            entity[key] = np.full(
+                (total_rows, max_legal), -1, dtype=value.dtype
+            )
         else:
             # Fixed-shape fields need no padding. Let NumPy perform their whole
             # window copy in C rather than issuing requests*fields small Python
@@ -220,7 +243,9 @@ def _merge_forward_payloads(
         for key, destination in entity.items():
             if key not in _LEGAL_PADDED_ENTITY_KEYS:
                 continue
-            value = payload["entity"][key]
+            value = payload["entity"].get(key)
+            if value is None and key == symmetry_key:
+                value = payload["legal_ids"]
             destination[offset:end, :legal_width] = value
         offset = end
     return entity, legal_ids, context, row_counts

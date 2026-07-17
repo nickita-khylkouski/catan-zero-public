@@ -1663,8 +1663,19 @@ def _merge_batched_eval_requests(
         axis=0,
     ).astype(np.float32, copy=False)
     entity_batch: dict[str, np.ndarray] = {}
-    for key in requests[0].entity:
-        values = [request.entity[key] for request in requests]
+    entity_keys = list(requests[0].entity)
+    symmetry_key = "_symmetry_legal_action_ids"
+    if symmetry_key not in entity_keys and any(
+        symmetry_key in request.entity for request in requests
+    ):
+        entity_keys.append(symmetry_key)
+    for key in entity_keys:
+        values = [
+            request.entity.get(key, request.legal_action_ids)
+            if key == symmetry_key
+            else request.entity[key]
+            for request in requests
+        ]
         if key == "legal_action_tokens":
             feature_size = int(values[0].shape[2])
             entity_batch[key] = np.stack(
@@ -1688,6 +1699,11 @@ def _merge_batched_eval_requests(
                 [_pad_1d_np(value[0], max_legal, fill=False) for value in values],
                 axis=0,
             ).astype(np.bool_, copy=False)
+        elif key == symmetry_key:
+            entity_batch[key] = np.stack(
+                [_pad_1d_np(value[0], max_legal, fill=-1) for value in values],
+                axis=0,
+            ).astype(values[0].dtype, copy=False)
         else:
             entity_batch[key] = np.concatenate(values, axis=0)
     return entity_batch, legal_ids.astype(np.int64, copy=False), context

@@ -140,6 +140,32 @@ def test_merge_forward_payloads_promotes_mixed_fixed_field_dtypes() -> None:
     )
 
 
+@pytest.mark.parametrize("symmetry_first", [False, True])
+def test_merge_forward_payloads_mixes_plain_and_d6_catalog_ids(
+    symmetry_first: bool,
+) -> None:
+    plain = _payload(marker=1, rows=1, legal_width=2)
+    symmetry = _payload(marker=2, rows=1, legal_width=3)
+    symmetry_ids = np.array([[91, 92, 93]], dtype=np.int64)
+    symmetry["entity"]["_symmetry_legal_action_ids"] = symmetry_ids
+    payloads = [symmetry, plain] if symmetry_first else [plain, symmetry]
+
+    entity, _legal_ids, _context, _row_counts = _merge_forward_payloads(payloads)
+
+    expected = [
+        payload["entity"].get(
+            "_symmetry_legal_action_ids", payload["legal_ids"]
+        )
+        for payload in payloads
+    ]
+    for row, values in enumerate(expected):
+        width = int(values.shape[1])
+        np.testing.assert_array_equal(
+            entity["_symmetry_legal_action_ids"][row, :width], values[0]
+        )
+        assert np.all(entity["_symmetry_legal_action_ids"][row, width:] == -1)
+
+
 def test_legal_cell_counts_excludes_padding_inside_each_request() -> None:
     first = _payload(marker=0, rows=2, legal_width=4)
     second = _payload(marker=1, rows=1, legal_width=2)
