@@ -13,6 +13,17 @@ from tools.fleet import a1_h100_eval_fleet as fleet
 from tools.champion_registry import ChampionRegistry
 
 
+@pytest.fixture(autouse=True)
+def _attested_production_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit plans model the sealed Linux controller without requiring its ELF."""
+
+    monkeypatch.setattr(
+        fleet,
+        "_native_runtime_sha256",
+        fleet._sealed_native_runtime_sha256,  # noqa: SLF001
+    )
+
+
 def test_future_plan_default_uses_validated_16_worker_packing() -> None:
     assert fleet.DEFAULT_WORKERS_PER_GPU == 16
     assert (
@@ -149,6 +160,48 @@ def test_remote_preflight_refuses_untracked_runtime_code(tmp_path: Path) -> None
     assert "_assert_installed_native_wheel_sha256" in command
     assert plan["engine_identity"]["native_wheel_sha256"] in command
     assert plan["internal_engine_identity"]["native_runtime_sha256"] in command
+    assert fleet._sealed_native_runtime_sha256() in command  # noqa: SLF001
+    assert "supported_action_context_adapter_versions" in command
+    assert fleet.RUST_ENTITY_ADAPTER_V6 in command
+
+
+def test_planning_refuses_controller_runtime_outside_sealed_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = fleet._sealed_native_runtime_sha256()  # noqa: SLF001
+    monkeypatch.setattr(
+        fleet,
+        "_native_runtime_sha256",
+        lambda: "sha256:" + "0" * 64,
+    )
+
+    with pytest.raises(
+        fleet.FleetError,
+        match="planning controller native extension differs",
+    ):
+        fleet._assert_planning_native_runtime_attested()  # noqa: SLF001
+
+    monkeypatch.setattr(fleet, "_native_runtime_sha256", lambda: expected)
+    assert fleet._assert_planning_native_runtime_attested() == expected  # noqa: SLF001
+
+
+def test_remote_preflight_refuses_plan_that_blessed_an_unsealed_runtime(
+    tmp_path: Path,
+) -> None:
+    manifest, plan = _plan(tmp_path)
+    plan["internal_engine_identity"]["native_runtime_sha256"] = (
+        "sha256:" + "0" * 64
+    )
+
+    with pytest.raises(
+        fleet.FleetError,
+        match="plan native runtime differs from production runtime authority",
+    ):
+        fleet._preflight_command(  # noqa: SLF001
+            manifest,
+            plan,
+            manifest["hosts"][0],
+        )
 
 
 def test_local_plan_source_requires_clean_head_and_exact_pooler_hash(
@@ -270,7 +323,7 @@ def test_checked_in_eval_manifest_is_the_current_48_gpu_authority() -> None:
         for host in manifest["hosts"]
     } == fleet.EXPECTED_HOSTS
     assert len(fleet.gpu_slots(manifest)) == 48
-    assert manifest["remote_repo"] == "/home/ubuntu/catan-zero-fleet-v2"
+    assert manifest["remote_repo"] == "/home/ubuntu/catan-zero-v6-eval"
     assert manifest["remote_python"] == (
         "/home/ubuntu/catan-zero-fleet-v2/.venv/bin/python"
     )

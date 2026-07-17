@@ -44,6 +44,7 @@ from tools import a1_evaluation_pool as evaluation_pool  # noqa: E402
 from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import production_runtime_contract as runtime_contract  # noqa: E402
 from catan_zero.production_contracts import NATIVE_REQUIRED_CAPABILITIES  # noqa: E402
+from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V6  # noqa: E402
 from catan_zero.rl.pipeline_configs import EvalConfig  # noqa: E402
 from tools.champion_registry import ChampionRegistry  # noqa: E402
 from tools.prelaunch_guard import VAL_ONLY_SEED_RANGE  # noqa: E402
@@ -1178,7 +1179,36 @@ def _native_runtime_sha256() -> str:
         str(path).endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES
     ):
         raise FleetError("catanatron_rs runtime is not a compiled extension")
+    try:
+        if path.read_bytes()[:4] != b"\x7fELF":
+            raise FleetError("catanatron_rs runtime is not an ELF binary")
+    except OSError as error:
+        raise FleetError("cannot read installed native extension") from error
     return _sha256(path)
+
+
+def _sealed_native_runtime_sha256() -> str:
+    """Return the Linux extension digest authorized by the runtime contract."""
+
+    raw = PRODUCTION_RUNTIME.get("catanatron_rs_extension_sha256")
+    if not isinstance(raw, str) or not re.fullmatch(r"[0-9a-f]{64}", raw):
+        raise FleetError(
+            "production runtime contract has no native extension SHA-256"
+        )
+    return "sha256:" + raw
+
+
+def _assert_planning_native_runtime_attested() -> str:
+    """Refuse to let an arbitrary controller runtime become fleet authority."""
+
+    expected = _sealed_native_runtime_sha256()
+    actual = _native_runtime_sha256()
+    if actual != expected:
+        raise FleetError(
+            "planning controller native extension differs from production runtime "
+            f"authority: expected={expected} actual={actual}"
+        )
+    return expected
 
 
 def _internal_engine_identity(
@@ -1189,7 +1219,7 @@ def _internal_engine_identity(
         "repo_commit": repo_commit,
         "native_wheel_sha256": wheel_sha256,
         "evaluator_sha256": evaluator_sha256,
-        "native_runtime_sha256": _native_runtime_sha256(),
+        "native_runtime_sha256": _assert_planning_native_runtime_attested(),
     }
 
 
@@ -2191,6 +2221,14 @@ def _preflight_command(
     repo = shlex.quote(manifest["remote_repo"])
     pythonpath = manifest["remote_repo"] + "/src:" + manifest["remote_repo"]
     expected_wheel_sha256 = plan["engine_identity"]["native_wheel_sha256"]
+    expected_runtime_sha256 = _sealed_native_runtime_sha256()
+    if (
+        plan["internal_engine_identity"]["native_runtime_sha256"]
+        != expected_runtime_sha256
+    ):
+        raise FleetError(
+            "evaluation plan native runtime differs from production runtime authority"
+        )
     import_probe = (
         "from importlib.metadata import version; from pathlib import Path; "
         "from tools.fleet.a1_h100_eval_fleet import "
@@ -2200,11 +2238,14 @@ def _preflight_command(
         f"Path({manifest['remote_repo']!r}) / 'src'); "
         f"_assert_installed_native_wheel_sha256({expected_wheel_sha256!r}); "
         "assert _native_runtime_sha256() == "
-        f"{plan['internal_engine_identity']['native_runtime_sha256']!r}; "
+        f"{expected_runtime_sha256!r}; "
         f"assert version('catanatron-rs') == {NATIVE_WHEEL_VERSION!r}; "
         "capability_fn=getattr(catanatron_rs,'gumbel_search_capabilities',None); "
         "assert callable(capability_fn); "
-        f"assert set({tuple(sorted(NATIVE_REQUIRED_CAPABILITIES))!r}) <= set(capability_fn())"
+        f"assert set({tuple(sorted(NATIVE_REQUIRED_CAPABILITIES))!r}) <= set(capability_fn()); "
+        "adapter_fn=getattr(catanatron_rs,'supported_action_context_adapter_versions',None); "
+        "assert callable(adapter_fn); "
+        f"assert {RUST_ENTITY_ADAPTER_V6!r} in set(adapter_fn())"
     )
     lines = [
         "set -euo pipefail",
@@ -3149,7 +3190,7 @@ def _verify_fixed_panel_engine_identity(
             "evaluator_sha256": _tool_hashes(_REPO_ROOT)[
                 "tools/gumbel_search_cross_net_h2h.py"
             ],
-            "native_runtime_sha256": _native_runtime_sha256(),
+            "native_runtime_sha256": _assert_planning_native_runtime_attested(),
         }
     if value != expected:
         raise FleetError("fixed-panel planned engine differs from canonical source")

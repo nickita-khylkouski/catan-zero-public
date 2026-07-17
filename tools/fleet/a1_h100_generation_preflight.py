@@ -12,9 +12,10 @@ directly coordinator -> H100; checkpoint and wheel bytes never transit an
 operator laptop.
 
 ``remote_repo`` is an immutable deployment directory.  Re-running bootstrap
-with the same commit is a no-op; requesting a different commit fails closed.
-An upgrade must use a fresh manifest path (for example fleet-v2), leaving the
-old runtime untouched until the new path passes this preflight.
+with the same commit re-installs and re-attests the sealed native wheel;
+requesting a different commit fails closed.  An upgrade must use a fresh
+manifest path (for example fleet-v2), leaving the old runtime untouched until
+the new path passes this preflight.
 """
 
 from __future__ import annotations
@@ -62,6 +63,9 @@ REQUIRED_NATIVE_CAPABILITIES = (
     "policy_temperature_semantics",
     "public_award_feature_parity",
     "sigma_reference_visits",
+)
+REQUIRED_LEARNER_ENTITY_ADAPTER = (
+    "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
 )
 
 
@@ -351,7 +355,8 @@ else:
         check(name, False, "remote repository missing")
 
 python = pathlib.Path(payload["remote_python"])
-runtime_program = """import json, pathlib, sys
+runtime_program = """import hashlib, importlib, json, pathlib, sys
+from importlib.metadata import distribution
 value={"python":sys.version.split()[0]}
 try:
  import torch
@@ -359,9 +364,25 @@ try:
 except Exception as error: value["torch_error"]=repr(error)
 try:
  import catanatron_rs
- from importlib.metadata import version
+ metadata=distribution("catanatron-rs")
+ native=importlib.import_module("catanatron_rs.catanatron_rs")
+ extension_path=pathlib.Path(native.__file__).resolve(strict=True)
+ digest=hashlib.sha256()
+ with extension_path.open("rb") as handle:
+  for block in iter(lambda:handle.read(1<<20),b""): digest.update(block)
+ direct_url_raw=metadata.read_text("direct_url.json")
+ direct_url=json.loads(direct_url_raw) if direct_url_raw is not None else None
+ archive=direct_url.get("archive_info") if isinstance(direct_url,dict) else None
+ stated=set()
+ if isinstance(archive,dict):
+  direct_hash=archive.get("hash")
+  if isinstance(direct_hash,str): stated.add(direct_hash)
+  hashes=archive.get("hashes")
+  if isinstance(hashes,dict) and isinstance(hashes.get("sha256"),str): stated.add("sha256="+hashes["sha256"])
  caps=getattr(catanatron_rs,"gumbel_search_capabilities",lambda:())()
- value.update(catanatron_rs=version("catanatron-rs"),capabilities=sorted(caps))
+ adapter_fn=getattr(catanatron_rs,"supported_action_context_adapter_versions",None)
+ adapters=sorted(map(str,adapter_fn())) if callable(adapter_fn) else []
+ value.update(catanatron_rs=metadata.version,capabilities=sorted(caps),action_context_adapters=adapters,installed_wheel_hashes=sorted(stated),extension_path=str(extension_path),extension_sha256=digest.hexdigest())
 except Exception as error: value["rust_error"]=repr(error)
 try:
  import catan_zero
@@ -377,6 +398,9 @@ details["runtime"] = runtime
 check("python_runtime", runtime.get("python") == payload["python_version"], runtime.get("python"))
 check("torch_runtime", runtime.get("torch") == payload["torch_version"] and runtime.get("cuda") == payload["torch_cuda_version"] and runtime.get("cuda_available") is True, runtime)
 check("rust_runtime", runtime.get("catanatron_rs") == payload["rust_version"] and set(payload["required_capabilities"]) <= set(runtime.get("capabilities", [])), runtime)
+check("rust_wheel_install_binding", runtime.get("installed_wheel_hashes") == ["sha256=" + payload["wheel_sha256"]], runtime)
+check("rust_extension_identity", runtime.get("extension_sha256") == payload["rust_extension_sha256"], runtime)
+check("rust_v6_action_context", payload["required_entity_adapter"] in runtime.get("action_context_adapters", []), runtime)
 repo_prefix = str(repo / "src") + os.sep
 check("python_code_origin", str(runtime.get("catan_zero_file", "")).startswith(repo_prefix), runtime.get("catan_zero_file"))
 
@@ -488,7 +512,9 @@ def _inspect_host(
         "torch_version": runtime["torch_version"],
         "torch_cuda_version": runtime["torch_cuda_version"],
         "rust_version": runtime["catanatron_rs_version"],
+        "rust_extension_sha256": runtime["catanatron_rs_extension_sha256"],
         "required_capabilities": list(REQUIRED_NATIVE_CAPABILITIES),
+        "required_entity_adapter": REQUIRED_LEARNER_ENTITY_ADAPTER,
         "checkpoint_path": manifest["checkpoint"]["path"],
         "checkpoint_sha256": manifest["checkpoint"]["sha256"],
         "wheel_path": manifest["native_wheel"]["path"],
@@ -673,6 +699,7 @@ def _bootstrap_host(
     *,
     repo_commit: str,
     host: dict[str, Any],
+    runtime: dict[str, Any],
     checkpoint_source: Path,
     wheel_source: Path,
 ) -> None:
@@ -684,11 +711,15 @@ def _bootstrap_host(
     authority_token = base64.urlsafe_b64encode(_canonical(authority)).decode().rstrip("=")
     command = f'''set -euo pipefail
 repo={shlex.quote(manifest["remote_repo"])}
+python={shlex.quote(manifest["remote_python"])}
+wheel={shlex.quote(manifest["native_wheel"]["path"])}
+reused=0
 if [ -x {shlex.quote(manifest["remote_python"])} ]; then
   if [ "$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)" != {repo_commit} ]; then
     echo "immutable deployment path contains a different commit; select a fresh remote_repo path" >&2
     exit 44
   fi
+  reused=1
 else
   test ! -e "$repo" || test -z "$(find "$repo" -mindepth 1 -maxdepth 1 -print -quit)"
   temp=$(mktemp -d /tmp/catan-bootstrap.XXXXXXXX)
@@ -701,6 +732,53 @@ else
     bash "$temp/src/tools/install_v1_freeze.sh"
 fi
 test "$(git -C "$repo" rev-parse HEAD)" = {repo_commit}
+test "$(sha256sum "$wheel" | cut -d' ' -f1)" = {shlex.quote(manifest["native_wheel"]["sha256"])}
+if [ "$reused" = 1 ]; then
+  "$python" -m pip install --force-reinstall --no-deps "$wheel"
+fi
+"$python" - \
+  {shlex.quote(runtime["catanatron_rs_version"])} \
+  {shlex.quote(manifest["native_wheel"]["sha256"])} \
+  {shlex.quote(runtime["catanatron_rs_extension_sha256"])} \
+  {shlex.quote(REQUIRED_LEARNER_ENTITY_ADAPTER)} <<'PY'
+import hashlib, importlib, json, pathlib, sys
+from importlib.metadata import distribution
+
+expected_version, wheel_sha256, extension_sha256, required_adapter = sys.argv[1:]
+metadata = distribution("catanatron-rs")
+if metadata.version != expected_version:
+    raise SystemExit(f"catanatron-rs version drift: expected={{expected_version}} got={{metadata.version}}")
+raw = metadata.read_text("direct_url.json")
+try:
+    direct_url = json.loads(raw) if raw is not None else None
+except json.JSONDecodeError as error:
+    raise SystemExit(f"installed catanatron-rs direct_url.json is invalid: {{error}}") from error
+archive = direct_url.get("archive_info") if isinstance(direct_url, dict) else None
+stated = set()
+if isinstance(archive, dict):
+    if isinstance(archive.get("hash"), str):
+        stated.add(archive["hash"])
+    hashes = archive.get("hashes")
+    if isinstance(hashes, dict) and isinstance(hashes.get("sha256"), str):
+        stated.add("sha256=" + hashes["sha256"])
+expected_wheel = "sha256=" + wheel_sha256
+if stated != {{expected_wheel}}:
+    raise SystemExit(f"installed wheel provenance drift: expected={{expected_wheel}} got={{sorted(stated)}}")
+native = importlib.import_module("catanatron_rs.catanatron_rs")
+extension = pathlib.Path(native.__file__).resolve(strict=True)
+digest = hashlib.sha256()
+with extension.open("rb") as handle:
+    for block in iter(lambda: handle.read(1 << 20), b""):
+        digest.update(block)
+observed_extension = digest.hexdigest()
+if observed_extension != extension_sha256:
+    raise SystemExit(f"loaded extension drift: expected={{extension_sha256}} got={{observed_extension}} path={{extension}}")
+package = importlib.import_module("catanatron_rs")
+adapter_fn = getattr(package, "supported_action_context_adapter_versions", None)
+adapters = set(map(str, adapter_fn())) if callable(adapter_fn) else set()
+if required_adapter not in adapters:
+    raise SystemExit(f"native runtime lacks required V6 action-context adapter: {{required_adapter}}; supported={{sorted(adapters)}}")
+PY
 mkdir -p {shlex.quote(authority["output_root"])} {shlex.quote(str(Path(manifest["seed_authority"]["path"]).parent))}
 python3 - {shlex.quote(manifest["seed_authority"]["path"])} {authority_token} <<'PY'
 import base64, json, os, pathlib, sys
@@ -777,6 +855,8 @@ def main() -> None:
     runtime = _runtime_contract_for_commit(manifest, args.repo_commit)
     if runtime["catanatron_rs_wheel_sha256"] != manifest["native_wheel"]["sha256"]:
         raise SystemExit("manifest native wheel differs from runtime contract")
+    if not SHA_RE.fullmatch(str(runtime.get("catanatron_rs_extension_sha256", ""))):
+        raise SystemExit("runtime contract has no canonical native extension SHA-256")
     selected_aliases = set(args.host) or {host["alias"] for host in manifest["hosts"]}
     known_aliases = {host["alias"] for host in manifest["hosts"]}
     unknown_aliases = sorted(selected_aliases - known_aliases)
@@ -799,6 +879,7 @@ def main() -> None:
                     manifest,
                     repo_commit=args.repo_commit,
                     host=host,
+                    runtime=runtime,
                     checkpoint_source=checkpoint_source,
                     wheel_source=wheel_source,
                 ): host["alias"]

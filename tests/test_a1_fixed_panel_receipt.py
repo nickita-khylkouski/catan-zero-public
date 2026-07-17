@@ -155,7 +155,7 @@ def _aux_inputs(
         monkeypatch.setattr(
             fleet,
             "_native_runtime_sha256",
-            lambda: "sha256:" + "d" * 64,
+            fleet._sealed_native_runtime_sha256,  # noqa: SLF001
         )
         planned_engine_identity = fleet._internal_engine_identity(  # noqa: SLF001
             repo_commit=neutral_engine_identity["repo_commit"],
