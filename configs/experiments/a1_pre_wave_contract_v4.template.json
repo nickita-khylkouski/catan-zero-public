@@ -139,7 +139,7 @@
       "scalar_value_objective": "binary_win_bce",
       "scalar_value_loss_readout": "deployed_tanh",
       "scalar_value_loss_scale": 1.0,
-      "value_trunk_grad_scale": 0.25,
+      "value_trunk_grad_scale": 0.1,
       "post_policy_dose_value_trunk_grad_scale": 0.0,
       "value_root_blend_phases": "",
       "value_root_blend_global_compat": false,

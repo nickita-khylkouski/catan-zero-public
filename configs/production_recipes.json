@@ -12,7 +12,7 @@
       {
         "canonical_sha256": "5b298912cb2cb7f435fa8b13f67ec4cc87b3cabeed14b9fda9b13d2054482b20",
         "guard": {
-          "canonical_sha256": "31277e4d67ac02c8fd56eb1fca7e2e272218402a2d5f995db7f96cf251abf07c",
+          "canonical_sha256": "d16b9a9516fff98e770576a4f92f927eeb15b20f2459ae28ea1783ddd54334fc",
           "path": "configs/guards/a1_generation_coherent_public_n128_v4.json"
         },
         "name": "coherent-public-n128",

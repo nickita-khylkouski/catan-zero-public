@@ -643,6 +643,9 @@ _OPTIONAL_SEARCH_INPUT_KEYS = {
     "coherent_public_belief_search",
     "forced_root_target_mode",
     "boundary_value_particles",
+    # Explicit even at zero in the current n128 contract: pruning changes the
+    # policy target's legal support, so the pre-wave operator must bind it.
+    "policy_target_min_visits",
 }
 # Frozen explicit-operator shape in the sole issued markerless v2 lock. Keep
 # this independent of the expanding current dataclass/input schema.
@@ -1921,6 +1924,7 @@ def _validate_search_operator_fields(
         "n_full_wide_threshold",
         "raw_policy_above_width",
         "symmetry_averaged_eval_threshold",
+        "policy_target_min_visits",
     }
     numeric_keys = {
         "c_visit",
@@ -1937,7 +1941,7 @@ def _validate_search_operator_fields(
         if type(raw[key]) is not int:
             raise ContractError(f"science.search.{key} must be an integer")
     for key in optional_int_keys:
-        if raw[key] is not None and type(raw[key]) is not int:
+        if key in raw and raw[key] is not None and type(raw[key]) is not int:
             raise ContractError(f"science.search.{key} must be an integer or null")
     for key in numeric_keys:
         if isinstance(raw[key], bool) or not isinstance(raw[key], (int, float)):
@@ -1955,6 +1959,10 @@ def _validate_search_operator_fields(
             raise ContractError(
                 "science.search.boundary_value_particles must be an integer >= 1"
             )
+    if "policy_target_min_visits" in raw and int(raw["policy_target_min_visits"]) < 0:
+        raise ContractError(
+            "science.search.policy_target_min_visits must be an integer >= 0"
+        )
 
 
 def _target_information_regime_for_search(search: Mapping[str, Any]) -> str:
