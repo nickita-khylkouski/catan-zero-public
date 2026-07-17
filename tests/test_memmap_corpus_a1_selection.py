@@ -190,7 +190,9 @@ def _write_audit(
     return payload
 
 
-def _upgrade_audit_to_relocated_v3(audit_path: Path, shard: Path) -> dict:
+def _upgrade_audit_to_relocated_v3(
+    audit_path: Path, shard: Path, *, include_manifest: bool = True
+) -> dict:
     """Bind a v2 fixture audit to the same local shard through a typed map."""
 
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
@@ -205,6 +207,20 @@ def _upgrade_audit_to_relocated_v3(audit_path: Path, shard: Path) -> dict:
             "host_alias": "h0",
         }
     ]
+    generation_manifest = shard.parent / "manifest.json"
+    if include_manifest and generation_manifest.is_file():
+        files.append(
+            {
+                "source_path": "/sealed/a1/job-0/manifest.json",
+                "relative_path": generation_manifest.relative_to(
+                    audit_path.parent
+                ).as_posix(),
+                "size_bytes": generation_manifest.stat().st_size,
+                "sha256": _file_sha256(generation_manifest),
+                "job_id": "job-0",
+                "host_alias": "h0",
+            }
+        )
     identities = [
         {
             "job_id": "job-0",
@@ -419,6 +435,78 @@ def test_relocated_v3_audit_is_consumed_without_losing_shard_identity(
     assert meta["a1_post_wave_audit"]["shard_inventory_sha256"] == audit[
         "shard_inventory_sha256"
     ]
+
+
+def test_relocated_v3_resolves_original_manifest_shards_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    selected_path = tmp_path / "selected.json"
+    selected = _write_selected_manifest(selected_path)
+    source = tmp_path / "jobs/job-0"
+    source.mkdir(parents=True)
+    shard = source / "shard0.npz"
+    _write_shard(shard, [record["game_seed"] for record in selected["records"]])
+    generation_manifest = source / "manifest.json"
+    generation_manifest.write_text(
+        json.dumps({"shards": ["/sealed/a1/job-0/shard0.npz"]}, sort_keys=True),
+        encoding="utf-8",
+    )
+    original_manifest_bytes = generation_manifest.read_bytes()
+    audit_path = tmp_path / "audit.json"
+    _write_audit(
+        audit_path,
+        manifest_path=selected_path,
+        manifest=selected,
+        shards=[shard],
+    )
+    _upgrade_audit_to_relocated_v3(audit_path, shard)
+
+    meta = build_memmap_corpus(
+        source,
+        tmp_path / "corpus",
+        selected_game_seed_manifest=selected_path,
+        a1_post_wave_audit=audit_path,
+        progress_every=0,
+    )
+
+    assert meta["row_count"] == A1_SELECTED_GAME_COUNT
+    assert generation_manifest.read_bytes() == original_manifest_bytes
+
+
+def test_relocated_v3_rejects_manifest_missing_from_authenticated_map(
+    tmp_path: Path,
+) -> None:
+    selected_path = tmp_path / "selected.json"
+    selected = _write_selected_manifest(selected_path)
+    source = tmp_path / "jobs/job-0"
+    source.mkdir(parents=True)
+    shard = source / "shard0.npz"
+    _write_shard(shard, [record["game_seed"] for record in selected["records"]])
+    (source / "manifest.json").write_text(
+        json.dumps({"shards": ["/sealed/a1/job-0/shard0.npz"]}),
+        encoding="utf-8",
+    )
+    audit_path = tmp_path / "audit.json"
+    _write_audit(
+        audit_path,
+        manifest_path=selected_path,
+        manifest=selected,
+        shards=[shard],
+    )
+    _upgrade_audit_to_relocated_v3(
+        audit_path, shard, include_manifest=False
+    )
+
+    with pytest.raises(
+        SystemExit, match="generation manifest is absent from the authenticated"
+    ):
+        build_memmap_corpus(
+            source,
+            tmp_path / "corpus",
+            selected_game_seed_manifest=selected_path,
+            a1_post_wave_audit=audit_path,
+            progress_every=0,
+        )
 
 
 def test_relocated_v3_audit_rejects_changed_map_bytes(tmp_path: Path) -> None:

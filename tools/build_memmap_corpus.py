@@ -38,7 +38,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 import numpy as np
@@ -926,12 +926,18 @@ def _load_a1_post_wave_audit(
         ):
             raise SystemExit("A1 harvest relocation binding/digest mismatch")
         relocation_by_local: dict[Path, dict[str, Any]] = {}
+        relocation_by_source: dict[str, tuple[Path, dict[str, Any]]] = {}
         for index, record in enumerate(relocation.get("files", [])):
             if not isinstance(record, dict):
                 raise SystemExit(f"A1 harvest file record {index} is malformed")
+            source_path = record.get("source_path")
             relative = Path(str(record.get("relative_path", "")))
             if (
-                relative.is_absolute()
+                not isinstance(source_path, str)
+                or not source_path
+                or not PurePosixPath(source_path).is_absolute()
+                or ".." in PurePosixPath(source_path).parts
+                or relative.is_absolute()
                 or ".." in relative.parts
                 or not relative.parts
                 or relative.parts[0] != "jobs"
@@ -950,7 +956,10 @@ def _load_a1_post_wave_audit(
                 )
             if local in relocation_by_local:
                 raise SystemExit("A1 harvest relocation repeats a local file")
+            if source_path in relocation_by_source:
+                raise SystemExit("A1 harvest relocation repeats a source file")
             relocation_by_local[local] = record
+            relocation_by_source[source_path] = (local, record)
         harvest_provenance = {
             "path": relocation_path,
             "file_sha256": binding["file_sha256"],
@@ -960,6 +969,7 @@ def _load_a1_post_wave_audit(
             "file_inventory_sha256": binding["file_inventory_sha256"],
             **({} if not is_dual else {"arm_id": binding["arm_id"]}),
             "by_local": relocation_by_local,
+            "by_source": relocation_by_source,
         }
     elif "harvest_relocation" in payload:
         raise SystemExit("legacy A1 audit must not carry a harvest relocation binding")
@@ -1170,6 +1180,96 @@ def _load_a1_post_wave_audit(
         "data_shards": data_shards,
         "contract_attestations": contract_attestations,
     }
+
+
+def _audited_relocated_manifest_shards(
+    source: Path | str,
+    post_wave_audit: Mapping[str, Any],
+) -> list[Path] | None:
+    """Resolve an immutable harvested manifest through its authenticated map.
+
+    Fleet manifests intentionally retain their generation-host paths so their
+    bytes and hashes remain unchanged after harvest.  For a v3 audited harvest,
+    those paths are usable only through the audit-bound relocation map.  This
+    resolver never guesses by basename and never rewrites the manifest: every
+    manifest and shard reference must have one exact source-path record whose
+    local bytes are already part of the authenticated harvest inventory.
+    """
+
+    relocation = post_wave_audit.get("harvest_relocation")
+    if not isinstance(relocation, Mapping):
+        return None
+    source_path = Path(source).expanduser().resolve()
+    manifest_path = (
+        source_path
+        if source_path.is_file() and source_path.name == "manifest.json"
+        else source_path / "manifest.json"
+    )
+    if not manifest_path.is_file():
+        return None
+    try:
+        canonical_manifest = manifest_path.resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(
+            f"cannot resolve relocated generation manifest {manifest_path}: {error}"
+        ) from error
+    manifest_record = relocation["by_local"].get(canonical_manifest)
+    if manifest_record is None:
+        raise SystemExit(
+            "relocated generation manifest is absent from the authenticated "
+            f"harvest map: {canonical_manifest}"
+        )
+    if (
+        manifest_record.get("size_bytes") != canonical_manifest.stat().st_size
+        or manifest_record.get("sha256") != _file_sha256(canonical_manifest)
+    ):
+        raise SystemExit(
+            "relocated generation manifest bytes differ from the authenticated "
+            f"harvest map: {canonical_manifest}"
+        )
+    original_manifest = PurePosixPath(str(manifest_record["source_path"]))
+    try:
+        manifest = json.loads(canonical_manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"cannot load relocated generation manifest {canonical_manifest}: {error}"
+        ) from error
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("shards"), list):
+        raise SystemExit(
+            f"relocated generation manifest {canonical_manifest} has no shard list"
+        )
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for index, raw_value in enumerate(manifest["shards"]):
+        if not isinstance(raw_value, str) or not raw_value:
+            raise SystemExit(
+                f"relocated generation manifest shard {index} is not a path string"
+            )
+        raw = PurePosixPath(raw_value)
+        if ".." in raw.parts or str(raw) != raw_value:
+            raise SystemExit(
+                f"relocated generation manifest shard {index} is non-canonical"
+            )
+        original_shard = raw if raw.is_absolute() else original_manifest.parent / raw
+        binding = relocation["by_source"].get(str(original_shard))
+        if binding is None:
+            raise SystemExit(
+                "relocated generation manifest shard is absent from the "
+                f"authenticated harvest map: {original_shard}"
+            )
+        local, shard_record = binding
+        if shard_record.get("job_id") != manifest_record.get("job_id"):
+            raise SystemExit(
+                "relocated generation manifest shard crosses authenticated job "
+                f"identity: {original_shard}"
+            )
+        if local in seen:
+            raise SystemExit(
+                f"relocated generation manifest repeats shard {original_shard}"
+            )
+        seen.add(local)
+        files.append(local)
+    return files
 
 # The exact column set (and order) load_teacher_data keeps in its local ``keys``
 # tuple. Anything not present in a normalised shard is simply skipped, matching
@@ -1776,7 +1876,13 @@ def build_memmap_corpus(
     file_records: list[tuple[Path, int]] = []
     source_first_files: list[Path] = []
     for source_index, src in enumerate(sources):
-        src_files = _teacher_shard_files(Path(src))
+        src_files = (
+            None
+            if post_wave_audit is None
+            else _audited_relocated_manifest_shards(src, post_wave_audit)
+        )
+        if src_files is None:
+            src_files = _teacher_shard_files(Path(src))
         if not src_files:
             raise SystemExit(f"no teacher shards found in {src}")
         source_first_files.append(src_files[0])
@@ -2508,7 +2614,7 @@ def build_memmap_corpus(
                         for key, value in post_wave_audit[
                             "harvest_relocation"
                         ].items()
-                        if key != "by_local"
+                        if key not in {"by_local", "by_source"}
                     }
                 }
             ),
