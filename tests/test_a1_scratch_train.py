@@ -997,8 +997,9 @@ def test_production_authority_precedes_checkpoint_payload_cuda_and_corpus() -> N
         < corpus
     )
     assert cheap_guards < metadata
-    assert "EntityGraphPolicy.load(\n                    checkpoint_load_path," in source
-    assert "XDimLitePolicy.load(\n                    checkpoint_load_path," in source
+    assert "policy = EntityGraphPolicy.load(" in source
+    assert "checkpoint_load_path," in source
+    assert "XDimLitePolicy.load(" not in source
 
 
 def test_diagnostic_to_production_descriptor_race_is_refused() -> None:

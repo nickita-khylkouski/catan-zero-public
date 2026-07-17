@@ -6245,44 +6245,25 @@ def _build_direct_train_command(
                     EVENT_HISTORY_CROP_FLAG,
                 ]
             )
+        reporting_contract = learner_ablation.get("reporting_contract", {})
+        if reporting_contract.get("diagnostic_dose_curve"):
+            _set_literal_option_value(
+                command, "--train-diagnostics-every-batches", "16"
+            )
+        objective_diagnostic_cadence = int(
+            reporting_contract.get(
+                "objective_gradient_interference_every_batches",
+                64 if reporting_contract.get("diagnostic_dose_curve") else 0,
+            )
+        )
+        if objective_diagnostic_cadence > 0:
+            _set_literal_option_value(
+                command,
+                "--objective-gradient-interference-every-batches",
+                str(objective_diagnostic_cadence),
+            )
         command.extend(
             [
-                # Module gradient/update attribution is reporting-only and
-                # leaves the optimizer trajectory unchanged. Sample every 16th
-                # batch so a short 128-step dose gets eight observations without
-                # cloning the 35M parameter set on every update.
-                *(
-                    ["--train-diagnostics-every-batches", "16"]
-                    if learner_ablation.get("reporting_contract", {}).get(
-                        "diagnostic_dose_curve"
-                    )
-                    else []
-                ),
-                *(
-                    [
-                        "--objective-gradient-interference-every-batches",
-                        str(
-                            learner_ablation.get("reporting_contract", {}).get(
-                                "objective_gradient_interference_every_batches",
-                                64,
-                            )
-                        ),
-                    ]
-                    if int(
-                        learner_ablation.get("reporting_contract", {}).get(
-                            "objective_gradient_interference_every_batches",
-                            (
-                                64
-                                if learner_ablation.get("reporting_contract", {}).get(
-                                    "diagnostic_dose_curve"
-                                )
-                                else 0
-                            ),
-                        )
-                    )
-                    > 0
-                    else []
-                ),
                 # Each executor child sees exactly one physical GPU through
                 # CUDA_VISIBLE_DEVICES and owns a distinct durable ablation
                 # claim/output set.  The generic host-wide BC lock would
@@ -7219,6 +7200,21 @@ def _literal_option_values(command: list[str], flag: str) -> list[str]:
         elif item.startswith(flag + "="):
             values.append(item.split("=", 1)[1])
     return values
+
+
+def _set_literal_option_value(command: list[str], flag: str, value: str) -> None:
+    """Set one scalar option without allowing duplicate parser-last-wins drift."""
+
+    positions = [index for index, token in enumerate(command) if token == flag]
+    if len(positions) > 1:
+        raise ExecutorError(f"A1 training command repeats {flag}")
+    if not positions:
+        command.extend([flag, value])
+        return
+    position = positions[0]
+    if position + 1 >= len(command) or command[position + 1].startswith("--"):
+        raise ExecutorError(f"A1 training command has no scalar value for {flag}")
+    command[position + 1] = value
 
 
 def _checkpoint_architecture_mismatches(args: argparse.Namespace) -> list[str]:
