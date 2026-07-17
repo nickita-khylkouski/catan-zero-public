@@ -95,6 +95,11 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     "minimum_initial_road_policy_mass_fraction": 0.02,
     "minimum_discard_policy_mass_fraction": 0.02,
     "minimum_move_robber_policy_mass_fraction": 0.02,
+    # The authenticated r4-v4 composite carries 10.4546% maritime soft-label
+    # objective mass overall and 10.4209%/10.7970%/9.9672% in its three
+    # components. Require 8% globally and per component, leaving 1.967 points
+    # of measured margin in the weakest hard-negative source.
+    "minimum_maritime_trade_policy_objective_mass_fraction": 0.08,
     # The commissioned scratch model has no routed experts.  The generic
     # trainer default is intentionally useful for MoE experiments, but leaving
     # it implicit here makes coverage_importance_v1 reject the production

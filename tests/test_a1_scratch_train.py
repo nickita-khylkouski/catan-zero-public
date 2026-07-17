@@ -217,7 +217,9 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     ):
         assert command.count(flag) == 1
         assert command[command.index(flag) + 1] == "0.02"
-    assert "--minimum-maritime-trade-policy-objective-mass-fraction" not in command
+    maritime_flag = "--minimum-maritime-trade-policy-objective-mass-fraction"
+    assert command.count(maritime_flag) == 1
+    assert command[command.index(maritime_flag) + 1] == "0.08"
     assert command[command.index("--moe-balance-loss-weight") + 1] == "0.0"
     assert "--init-checkpoint" not in command
     assert "--grow-from-checkpoint" not in command

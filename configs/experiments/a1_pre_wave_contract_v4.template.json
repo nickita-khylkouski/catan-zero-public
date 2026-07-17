@@ -138,6 +138,7 @@
       "minimum_initial_road_policy_mass_fraction": 0.02,
       "minimum_discard_policy_mass_fraction": 0.02,
       "minimum_move_robber_policy_mass_fraction": 0.02,
+      "minimum_maritime_trade_policy_objective_mass_fraction": 0.08,
       "soft_target_source": "policy",
       "soft_target_weight": 1.0,
       "policy_target_blend_semantics": "policy_target_fallback_v2",

@@ -115,6 +115,10 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
         "DISCARD": 0.02,
         "MOVE_ROBBER": 0.02,
     }
+    assert (
+        recipe["minimum_maritime_trade_policy_objective_mass_fraction"]
+        == 0.08
+    )
     assert recipe["moe_balance_loss_weight"] == 0.0
     assert recipe["soft_target_source"] == "policy"
     assert recipe["soft_target_weight"] == 1.0
@@ -417,6 +421,7 @@ def test_current_contract_rejects_uncommissioned_boundary_particles(
         ("max_steps", 1024),
         ("phase_weights", "PLAY_TURN=1.0"),
         ("minimum_discard_policy_mass_fraction", 0.0),
+        ("minimum_maritime_trade_policy_objective_mass_fraction", 0.0),
     ),
 )
 def test_current_contract_rejects_diagnostic_training_settings(
