@@ -19,9 +19,10 @@ The v5 quarantine evidence currently covers:
 - 7,440 rows at resource saturation risk.
 
 The machine-readable admission state is in
-`configs/production/training_science_admission.json`. The selected parent update
-is authorized on the fresh v6 composite; native scratch training remains
-fail-closed.
+`configs/production/training_science_admission.json`. The selected V7 parent
+update and native scratch training remain fail-closed until the exact budgeted
+action decoder is commissioned; the older V6 B12 result is retained as
+historical evidence but cannot authorize the changed architecture.
 
 V7 also retains the commissioned `PLAY_TURN=4.0` repair while adding the
 previously audited exact-prompt weights `MOVE_ROBBER=3.0`,

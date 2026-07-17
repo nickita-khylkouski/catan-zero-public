@@ -151,9 +151,9 @@
         "local_batch_size": 64,
         "grad_accum_steps": 1,
         "global_batch_size": 512,
-        "go_authorized": true,
+        "go_authorized": false,
         "authorization_authority": "configs/production/training_science_admission.json",
-        "authorization_reason": "v7_hard_decision_mass_correction_bound_to_v6_b12"
+        "authorization_reason": "v7_action_decoder_requires_fresh_commissioning"
       },
       "research_scratch_status": "research_only_unresolved_not_selected"
     },
@@ -169,8 +169,8 @@
       "checkpoint": null,
       "optimizer_state": "fresh"
     },
-    "architecture_upgrade_flags": "current_v6_information_migration_topology_split1",
-    "architecture_upgrade_module": "entity_graph.current_v2_to_v6_information_contract+topology+split1.v1",
+    "architecture_upgrade_flags": "v5_to_v7_input_compatibility_migration",
+    "architecture_upgrade_module": "entity_graph.v5_to_v7_input_compatibility.v1",
     "research_scratch_model_construction": {
       "arch": "entity_graph",
       "hidden_size": 640,

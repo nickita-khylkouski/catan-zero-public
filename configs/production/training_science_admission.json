@@ -37,12 +37,15 @@
     },
     "a1-parent-update-35m-b200": {
       "recipe_canonical_sha256": "c4787615b410f6a723efd2e5164f98544b661fbe08da9bc90bf9241a42b76f53",
-      "authorized": true,
-      "reason": "v7_hard_decision_mass_correction_bound_to_v6_b12",
-      "unresolved_requirements": [],
+      "authorized": false,
+      "reason": "v7_action_decoder_requires_fresh_commissioning",
+      "unresolved_requirements": [
+        "issue and authenticate the exact V5-to-V7 compatibility initializer with one budgeted action-cross layer",
+        "recommission the 12-step parent update and policy/value no-regression gates on the exact V7 architecture"
+      ],
       "observations": {
-        "architecture_information_surface": "v6_b12_all_required_modules_positive_learning_signal",
-        "retained_composite_adapter_status": "fresh_adapter_v6_composite_authenticated",
+        "architecture_information_surface": "v7_budgeted_action_decoder_bound_pending_learning_evidence",
+        "retained_composite_adapter_status": "v6_b12_evidence_retained_but_not_reused_for_v7_authorization",
         "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
         "adapter_v5_r2_quarantine": {
           "status": "quarantined_actor_public_rule_state_contradiction",

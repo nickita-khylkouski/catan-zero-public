@@ -145,23 +145,23 @@ def _mock_exact_runtime(
     monkeypatch.setattr(cli, "_git_identity", lambda _root: clean_repository)
 
 
-def test_status_exposes_commissioned_parent_and_blocked_scratch_recipe() -> None:
+def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
     status = production_status(ROOT)
 
     assert status["supported_operator_interface"] == "catan-zero"
     assert status["pipelines"]["generate"]["authorized"] is True
     assert status["pipelines"]["evaluate"]["authorized"] is True
     train = status["pipelines"]["train"]
-    assert train["authorized"] is True
+    assert train["authorized"] is False
     assert train["reason"] == "recipe_specific_authorization"
     assert train["recipes"]["a1-current-35m-b200"]["authorized"] is False
     parent = train["recipes"]["a1-parent-update-35m-b200"]
-    assert parent["authorized"] is True
-    assert parent["status"] == "ready"
+    assert parent["authorized"] is False
+    assert parent["status"] == "blocked"
     assert parent["reason"] == (
-        "v7_hard_decision_mass_correction_bound_to_v6_b12"
+        "v7_action_decoder_requires_fresh_commissioning"
     )
-    assert parent["unresolved_requirements"] == []
+    assert len(parent["unresolved_requirements"]) == 2
     assert status["pipelines"]["ppo"]["authorized"] is False
 
 
@@ -224,16 +224,16 @@ def test_other_pipelines_resolve_through_compact_launchers(
         assert "--lock" in plan["command"]
 
 
-def test_cataloged_parent_update_uses_exact_authorized_recipe_and_parent(
+def test_cataloged_parent_update_uses_exact_blocked_v7_recipe_and_parent(
     tmp_path: Path,
 ) -> None:
     plan = cli.build_plan(
         _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
     )
 
-    assert plan["readiness"]["authorized"] is True
+    assert plan["readiness"]["authorized"] is False
     assert plan["readiness"]["reason"] == (
-        "v7_hard_decision_mass_correction_bound_to_v6_b12"
+        "v7_action_decoder_requires_fresh_commissioning"
     )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
@@ -281,8 +281,8 @@ def test_training_science_admission_keeps_v5_quarantine_after_v6_commissioning()
         expected_adapter in requirement
         for requirement in scratch["unresolved_requirements"]
     )
-    assert parent["authorized"] is True
-    assert parent["unresolved_requirements"] == []
+    assert parent["authorized"] is False
+    assert len(parent["unresolved_requirements"]) == 2
 
     for admission in (scratch, parent):
         observations = admission["observations"]
@@ -296,7 +296,7 @@ def test_training_science_admission_keeps_v5_quarantine_after_v6_commissioning()
             "training_admission": False,
         }
     assert parent["observations"]["retained_composite_adapter_status"] == (
-        "fresh_adapter_v6_composite_authenticated"
+        "v6_b12_evidence_retained_but_not_reused_for_v7_authorization"
     )
 
 

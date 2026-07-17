@@ -55,10 +55,10 @@ CURRENT_LEARNER_ENTITY_ADAPTER = (
     "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
 )
 CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
-    "current_v6_information_migration_topology_split1"
+    "v5_to_v7_input_compatibility_migration"
 )
 CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
-    "entity_graph.current_v2_to_v6_information_contract+topology+split1.v1"
+    "entity_graph.v5_to_v7_input_compatibility.v1"
 )
 CURRENT_MEANINGFUL_HISTORY_POOLING = "ordered_attention_v2"
 PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
@@ -282,12 +282,12 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
         "local_batch_size": 64,
         "grad_accum_steps": 1,
         "global_batch_size": 512,
-        "go_authorized": True,
+        "go_authorized": False,
         "authorization_authority": (
             "configs/production/training_science_admission.json"
         ),
         "authorization_reason": (
-            "v7_hard_decision_mass_correction_bound_to_v6_b12"
+            "v7_action_decoder_requires_fresh_commissioning"
         ),
     },
     "research_scratch_status": "research_only_unresolved_not_selected",
