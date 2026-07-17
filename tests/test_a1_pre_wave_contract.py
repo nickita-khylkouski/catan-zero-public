@@ -1189,6 +1189,29 @@ def test_current_v4_provenance_resolves_exact_v6_science_authority() -> None:
         )
     assert runtime
 
+
+def test_v6_teacher_can_start_the_reviewed_self_distillation_turn() -> None:
+    """The V2 bootstrap must not strand a commissioned V6 model forever."""
+
+    payload = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+    generation = dict(payload["generation"])
+    generation["teacher_entity_feature_adapter_version"] = (
+        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+    )
+
+    contract._validate_generation(generation)  # noqa: SLF001
+
+
+def test_unreviewed_teacher_adapter_transition_is_refused() -> None:
+    payload = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+    generation = dict(payload["generation"])
+    generation["teacher_entity_feature_adapter_version"] = (
+        "rust_entity_adapter_v5_meaningful_history_v2"
+    )
+
+    with pytest.raises(contract.ContractError, match="adapter transition"):
+        contract._validate_generation(generation)  # noqa: SLF001
+
     historical = json.loads(
         (
             Path(__file__).resolve().parents[1]

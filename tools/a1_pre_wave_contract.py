@@ -2750,10 +2750,30 @@ def _validate_generation(generation: dict[str, Any]) -> None:
                 "current generation learner rows must use the reviewed v5/v6 "
                 "ordered-history/public-rule-state adapter"
             )
-        if teacher_adapter != RUST_ENTITY_ADAPTER_V2:
+        # There are exactly two reviewed adapter transitions in the flywheel:
+        #
+        # * V2 -> V5/V6 is the one-time bootstrap from the historical f7
+        #   producer.  The learner rows may expose the new public-history and
+        #   exact-resource surfaces while the old checkpoint remains a V2
+        #   teacher.
+        # * V6 -> V6 is the next, normal self-distillation turn.  Without
+        #   this transition the newly commissioned V6/V7 feature paths can
+        #   never receive policy supervision from a teacher that actually
+        #   consumed those features: every post-promotion campaign is rejected
+        #   before it can launch.
+        #
+        # Do not generalize this to arbitrary known adapters.  Each additional
+        # migration needs its own function-preserving receipt and explicit
+        # contract review.
+        allowed_adapter_transitions = {
+            (RUST_ENTITY_ADAPTER_V2, RUST_ENTITY_ADAPTER_V5),
+            (RUST_ENTITY_ADAPTER_V2, RUST_ENTITY_ADAPTER_V6),
+            (RUST_ENTITY_ADAPTER_V6, RUST_ENTITY_ADAPTER_V6),
+        }
+        if (teacher_adapter, learner_adapter) not in allowed_adapter_transitions:
             raise ContractError(
-                "the pinned pre-metadata producer must remain explicitly bound "
-                "to the historical v2 teacher adapter"
+                "unsupported reviewed teacher/learner adapter transition: "
+                f"{teacher_adapter!r}->{learner_adapter!r}"
             )
         if int(generation["event_history_limit"]) != MEANINGFUL_PUBLIC_HISTORY_V2_LIMIT:
             raise ContractError(
