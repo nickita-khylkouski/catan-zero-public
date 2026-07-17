@@ -790,6 +790,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         engine_settings=engine_settings,
         public_args=public_args,
     )
+    # train_bc independently replays the sealed corpus contract. Preserve the
+    # already-verified parent -> migrated initializer edge so that replay can
+    # distinguish a function-preserving architecture expansion from candidate
+    # chaining. This is an internal attribute, not a public bypass flag.
+    engine_args.a1_parent_update_initialization = initialization
     from tools import train_bc
 
     train_bc.main(engine_args)

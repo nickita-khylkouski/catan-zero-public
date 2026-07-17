@@ -9561,9 +9561,36 @@ def _validate_a1_learner_objective(
     expected_initializer_sha256 = bound.get(
         "learner_initializer_sha256", bound["producer_checkpoint_sha256"]
     )
+    actual_initializer_sha256 = getattr(args, "init_checkpoint_sha256", None)
+    initialization = getattr(args, "a1_parent_update_initialization", None)
+    migration = (
+        initialization.get("information_contract_migration")
+        if isinstance(initialization, dict)
+        else None
+    )
+    authorized_migrated_initializer = (
+        isinstance(initialization, dict)
+        and initialization.get("schema_version")
+        == "a1-canonical-parent-initializer-v1"
+        and initialization.get("mode") == "information_contract_migration"
+        and isinstance(initialization.get("parent"), dict)
+        and initialization["parent"].get("sha256")
+        == bound["producer_checkpoint_sha256"]
+        and isinstance(initialization.get("initializer"), dict)
+        and initialization["initializer"].get("sha256")
+        == actual_initializer_sha256
+        and isinstance(migration, dict)
+        and migration.get("schema_version")
+        == "a1-lineage-information-contract-migration-v1"
+        and migration.get("source_checkpoint_sha256")
+        == bound["producer_checkpoint_sha256"]
+        and migration.get("migrated_initializer_sha256")
+        == actual_initializer_sha256
+        and migration.get("promotion_eligible") is False
+    )
     if (
-        getattr(args, "init_checkpoint_sha256", None)
-        != expected_initializer_sha256
+        actual_initializer_sha256 != expected_initializer_sha256
+        and not authorized_migrated_initializer
         and curriculum_parent is None
     ):
         raise SystemExit(

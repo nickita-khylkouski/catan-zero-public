@@ -630,6 +630,30 @@ def test_a1_artifact_chain_replays_actual_seed_set_and_learner_objective(
     _validate_a1_learner_objective(args, binary_bound)
     args.scalar_value_objective = recipe.get("scalar_value_objective", "mse")
     args.scalar_value_loss_readout = recipe.get("scalar_value_loss_readout", "raw")
+
+    migrated_sha = "sha256:" + "1" * 64
+    args.init_checkpoint_sha256 = migrated_sha
+    args.a1_parent_update_initialization = {
+        "schema_version": "a1-canonical-parent-initializer-v1",
+        "mode": "information_contract_migration",
+        "parent": {"sha256": bound["producer_checkpoint_sha256"]},
+        "initializer": {"sha256": migrated_sha},
+        "information_contract_migration": {
+            "schema_version": "a1-lineage-information-contract-migration-v1",
+            "source_checkpoint_sha256": bound["producer_checkpoint_sha256"],
+            "migrated_initializer_sha256": migrated_sha,
+            "promotion_eligible": False,
+        },
+    }
+    _validate_a1_learner_objective(args, bound)
+    args.a1_parent_update_initialization["information_contract_migration"][
+        "source_checkpoint_sha256"
+    ] = "sha256:" + "2" * 64
+    with pytest.raises(SystemExit, match="warm-start checkpoint differs"):
+        _validate_a1_learner_objective(args, bound)
+    args.init_checkpoint_sha256 = bound["producer_checkpoint_sha256"]
+    del args.a1_parent_update_initialization
+
     ddp = {"world_size": 1, "rank": 0, "local_rank": 0, "enabled": False}
     assert _validate_a1_learner_training_recipe(args, ddp, bound) == recipe
     assert bound["decisive_training_semantics"] == {
