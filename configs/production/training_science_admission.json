@@ -36,7 +36,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-35m-b200": {
-      "recipe_canonical_sha256": "1a89018a6d3c5174472508b0ae7cc7ffdb204dfda11a8ae39119e7a3d243b31e",
+      "recipe_canonical_sha256": "c99dd0d80ef3b233c6ce3121ac10ac95d9e37a0235e8ca14a5325353c17cd7d5",
       "authorized": true,
       "reason": "v6_b12_commissioned_on_fresh_coherent_n128",
       "unresolved_requirements": [],
