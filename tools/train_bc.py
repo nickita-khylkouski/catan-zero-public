@@ -18553,6 +18553,13 @@ def main(
                     meaningful_history_enabled=bool(
                         args.meaningful_public_history
                     ),
+                    v7_compatibility_inputs_enabled=bool(
+                        getattr(
+                            policy.config,
+                            "v6_compatibility_preserving_inputs",
+                            False,
+                        )
+                    ),
                 )
                 # These are model-selection snapshots from the SAME optimizer
                 # trajectory.  They deliberately have no optimizer sidecar so
@@ -20158,6 +20165,13 @@ def main(
             ),
             public_card_enabled=bool(args.public_card_count_features),
             meaningful_history_enabled=bool(args.meaningful_public_history),
+            v7_compatibility_inputs_enabled=bool(
+                getattr(
+                    policy.config,
+                    "v6_compatibility_preserving_inputs",
+                    False,
+                )
+            ),
         )
         dose_by_step = {
             int(record["optimizer_step"]): record
@@ -40972,6 +40986,7 @@ def _checkpoint_dose_telemetry(
     train_diagnostic_cadence_batches: int,
     public_card_enabled: bool,
     meaningful_history_enabled: bool,
+    v7_compatibility_inputs_enabled: bool = False,
 ) -> dict[str, object]:
     """Build the exact cumulative learning dose at one saved checkpoint.
 
@@ -41310,6 +41325,13 @@ def _checkpoint_dose_telemetry(
                     "meaningful_history_ordered_gate",
                     "meaningful_history_sequence",
                     "meaningful_history_target_proj",
+                ),
+            ),
+            "v7_compatibility_inputs": _feature_path(
+                v7_compatibility_inputs_enabled,
+                (
+                    "v6_exact_resource_residual",
+                    "v6_initial_road_residual",
                 ),
             ),
         },

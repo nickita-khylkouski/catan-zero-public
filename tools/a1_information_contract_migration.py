@@ -40,8 +40,10 @@ SCHEMA = "a1-information-contract-migration-v1"
 MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1 = (
     "entity_graph.current_v2_to_v6_information_contract+topology+split1.v1"
 )
+MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY = "entity_graph.v5_to_v7_input_compatibility.v1"
 CHECKPOINT_PROVENANCE_SCHEMA = "entity-graph-information-contract-migration-v1"
 ANCHOR_SCHEMA = "adapter-v6-step0-anchor-evidence-v1"
+V7_INPUT_ANCHOR_SCHEMA = "adapter-v7-compatibility-step0-anchor-evidence-v1"
 
 
 class MigrationError(RuntimeError):
@@ -76,13 +78,35 @@ def _anchor_replay_matches(expected: object, actual: object) -> bool:
     if isinstance(expected, int) and isinstance(actual, int):
         return expected == actual
     if isinstance(expected, float) and isinstance(actual, (int, float)):
-        return math.isfinite(expected) and math.isfinite(float(actual)) and math.isclose(
-            expected,
-            float(actual),
-            rel_tol=_ANCHOR_REPLAY_FLOAT_REL_TOL,
-            abs_tol=_ANCHOR_REPLAY_FLOAT_ABS_TOL,
+        return (
+            math.isfinite(expected)
+            and math.isfinite(float(actual))
+            and math.isclose(
+                expected,
+                float(actual),
+                rel_tol=_ANCHOR_REPLAY_FLOAT_REL_TOL,
+                abs_tol=_ANCHOR_REPLAY_FLOAT_ABS_TOL,
+            )
         )
     return type(expected) is type(actual) and expected == actual
+
+
+def _verify_anchor_replay(
+    expected: Mapping[str, Any],
+    actual: object,
+    *,
+    migration: str,
+) -> None:
+    """Validate replay invariants before applying diagnostic float tolerance.
+
+    The historical comparator tolerates CPU reduction noise in measured
+    diagnostics.  V7's exact-forward claim is not a diagnostic: a nonzero
+    replayed output delta must fail even when it is below that tolerance.
+    """
+
+    verified_actual = _verify_anchor_evidence(actual, migration=migration)
+    if not _anchor_replay_matches(expected, verified_actual):
+        raise MigrationError("step-zero adapter-specific anchor replay drift")
 
 
 def _sha(path: Path) -> str:
@@ -119,22 +143,36 @@ def _finite_nonnegative(value: object) -> bool:
     )
 
 
-def _verify_anchor_evidence(value: object) -> dict[str, Any]:
+def _verify_anchor_evidence(
+    value: object,
+    *,
+    migration: str = MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise MigrationError("migration lacks step-zero anchor evidence")
     evidence = dict(value)
+    v7_input_routing = migration == MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY
+    expected_schema = V7_INPUT_ANCHOR_SCHEMA if v7_input_routing else ANCHOR_SCHEMA
+    expected_source_adapter = (
+        RUST_ENTITY_ADAPTER_V5 if v7_input_routing else RUST_ENTITY_ADAPTER_V2
+    )
     if (
-        evidence.get("schema_version") != ANCHOR_SCHEMA
+        evidence.get("schema_version") != expected_schema
         or evidence.get("device") != "cpu"
-        or evidence.get("source_adapter") != RUST_ENTITY_ADAPTER_V2
+        or evidence.get("source_adapter") != expected_source_adapter
         or evidence.get("target_adapter") != RUST_ENTITY_ADAPTER_V6
         or evidence.get("public_observation") is not True
         or evidence.get("separate_adapter_specific_entity_features") is not True
         or evidence.get("separate_adapter_specific_action_contexts") is not True
-        or evidence.get("forward_identical") is not False
         or evidence.get("promotion_eligible") is not False
     ):
         raise MigrationError("step-zero anchor contract is malformed")
+    if evidence.get("forward_identical") is not v7_input_routing:
+        raise MigrationError(
+            "step-zero forward-identity claim mismatches migration type"
+        )
+    if v7_input_routing and evidence.get("adapter_features_identical") is not False:
+        raise MigrationError("V7 evidence must bind the real V5->V6 feature change")
     numeric = (
         "migration_output_max_abs_diff",
         "feature_max_abs_diff",
@@ -151,13 +189,23 @@ def _verify_anchor_evidence(value: object) -> dict[str, Any]:
     if (
         evidence.get("topology_construction_proof")
         != "deterministic_parameter_replay_in_receipt"
-        or float(evidence["migration_output_max_abs_diff"]) <= 0.0
-        or float(evidence["feature_max_abs_diff"]) <= 0.0
         or isinstance(evidence.get("feature_changed_value_count"), bool)
         or not isinstance(evidence.get("feature_changed_value_count"), int)
-        or int(evidence["feature_changed_value_count"]) <= 0
     ):
-        raise MigrationError("step-zero evidence does not prove a bounded real migration")
+        raise MigrationError(
+            "step-zero evidence does not prove a bounded real migration"
+        )
+    feature_max = float(evidence["feature_max_abs_diff"])
+    feature_changes = int(evidence["feature_changed_value_count"])
+    output_max = float(evidence["migration_output_max_abs_diff"])
+    if feature_max <= 0.0 or feature_changes <= 0:
+        raise MigrationError("information migration must prove a real feature change")
+    if v7_input_routing and output_max != 0.0:
+        raise MigrationError(
+            "V7 compatibility routing must preserve exact forward output"
+        )
+    if not v7_input_routing and output_max <= 0.0:
+        raise MigrationError("V2->V6 evidence must prove real output drift")
     anchors = evidence.get("anchors")
     if not isinstance(anchors, list) or not anchors:
         raise MigrationError("migration anchor suite is empty")
@@ -193,6 +241,10 @@ def _verify_anchor_evidence(value: object) -> dict[str, Any]:
             or not isinstance(row.get("legal_policy_top1_flip"), bool)
         ):
             raise MigrationError("migration anchor identity/flip evidence is malformed")
+        if isinstance(row.get("feature_changed_value_count"), bool) or not isinstance(
+            row.get("feature_changed_value_count"), int
+        ):
+            raise MigrationError("migration anchor feature-change count is malformed")
     count = len(anchors)
     if (
         evidence.get("anchor_count") != count
@@ -204,6 +256,11 @@ def _verify_anchor_evidence(value: object) -> dict[str, Any]:
     forward = [float(row["legal_policy_forward_kl"]) for row in anchors]
     reverse = [float(row["legal_policy_reverse_kl"]) for row in anchors]
     values = [float(row["scalar_value_abs_error"]) for row in anchors]
+    migration_diffs = [float(row["migration_output_max_abs_diff"]) for row in anchors]
+    feature_diffs = [float(row["feature_max_abs_diff"]) for row in anchors]
+    feature_change_count = sum(
+        int(row["feature_changed_value_count"]) for row in anchors
+    )
     import numpy as np
 
     expected_aggregates = {
@@ -214,19 +271,28 @@ def _verify_anchor_evidence(value: object) -> dict[str, Any]:
         "legal_policy_top1_flip_rate": flip_count / count,
         "scalar_value_rmse": float(np.sqrt(np.mean(np.square(values)))),
         "scalar_value_max_abs_error": max(values),
+        "migration_output_max_abs_diff": max(migration_diffs),
+        "feature_max_abs_diff": max(feature_diffs),
     }
-    if evidence["legal_policy_top1_flip_count"] != flip_count or any(
-        float(evidence[name]) != expected
-        for name, expected in expected_aggregates.items()
+    if (
+        evidence["legal_policy_top1_flip_count"] != flip_count
+        or evidence["feature_changed_value_count"] != feature_change_count
+        or any(
+            float(evidence[name]) != expected
+            for name, expected in expected_aggregates.items()
+        )
     ):
         raise MigrationError("migration anchor aggregate metrics do not replay")
-    expected_set = "sha256:" + hashlib.sha256(
-        json.dumps(
-            [row["anchor_identity_sha256"] for row in anchors],
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    expected_set = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                [row["anchor_identity_sha256"] for row in anchors],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
     if evidence.get("anchor_set_sha256") != expected_set:
         raise MigrationError("migration anchor-set identity drift")
     return evidence
@@ -294,12 +360,137 @@ def _verify_topology_delta(
         "shared_parameters_bit_identical": replay["shared_parameters_bit_identical"],
         "new_parameters": replay["new_parameters"],
         "new_parameter_initialization": replay["new_parameter_initialization"],
-        "effective_source_config_sha256": replay[
-            "effective_source_config_sha256"
-        ],
-        "effective_migrated_config_sha256": replay[
-            "effective_upgraded_config_sha256"
-        ],
+        "effective_source_config_sha256": replay["effective_source_config_sha256"],
+        "effective_migrated_config_sha256": replay["effective_upgraded_config_sha256"],
+    }
+
+
+def _verify_v7_input_routing_delta(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Prove the V7 edge adds only its two exact-zero input residuals.
+
+    The inherited tensors and all non-migration checkpoint metadata must remain
+    byte-identical.  The sole config change activates the model-side legacy
+    reconstruction; the entity adapter advances from V5 to V6.
+    """
+
+    import dataclasses
+    import torch
+
+    before_model = before.get("model")
+    after_model = after.get("model")
+    if not isinstance(before_model, Mapping) or not isinstance(after_model, Mapping):
+        raise MigrationError("V7 migration checkpoint model state is malformed")
+    expected_parameters = {
+        "v6_exact_resource_residual.weight",
+        "v6_initial_road_residual.weight",
+    }
+    added = set(after_model) - set(before_model)
+    removed = set(before_model) - set(after_model)
+    if added != expected_parameters or removed:
+        raise MigrationError(
+            "V7 input migration parameter delta drift: "
+            f"added={sorted(added)} removed={sorted(removed)}"
+        )
+    changed = [
+        name
+        for name in before_model
+        if not function_upgrade._tensor_equal_exact(  # noqa: SLF001
+            before_model[name], after_model[name]
+        )
+    ]
+    if changed:
+        raise MigrationError(
+            f"V7 input migration changed inherited parameters: {changed[:8]}"
+        )
+    for parameter in sorted(expected_parameters):
+        residual = after_model[parameter]
+        if not torch.is_tensor(residual) or not torch.equal(
+            residual, torch.zeros_like(residual)
+        ):
+            raise MigrationError(
+                f"V7 input residual is not initialized to zero: {parameter}"
+            )
+
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig
+
+    before_config = function_upgrade._config(before.get("config"))  # noqa: SLF001
+    after_config = function_upgrade._config(after.get("config"))  # noqa: SLF001
+    known = {field.name for field in dataclasses.fields(EntityGraphConfig)}
+    if set(before_config) - known or set(after_config) - known:
+        raise MigrationError("V7 migration checkpoint config has unknown fields")
+    effective_before = dataclasses.asdict(EntityGraphConfig(**before_config))
+    effective_after = dataclasses.asdict(EntityGraphConfig(**after_config))
+    if effective_before.get("v6_compatibility_preserving_inputs") is not False:
+        raise MigrationError("V7 migration source already uses compatibility routing")
+    expected_config = {
+        **effective_before,
+        "v6_compatibility_preserving_inputs": True,
+    }
+    if effective_after != expected_config:
+        raise MigrationError("V7 migration changed config outside input routing")
+
+    ignored = {
+        "model",
+        "config",
+        "entity_feature_adapter",
+        "information_contract_migration_provenance",
+    }
+    unexpected_added = sorted(
+        set(after) - set(before) - {"information_contract_migration_provenance"}
+    )
+    metadata_drift = [
+        key
+        for key in before
+        if key not in ignored
+        and (
+            key not in after or not function_upgrade._equal(before[key], after[key])  # noqa: SLF001
+        )
+    ]
+    if unexpected_added or metadata_drift:
+        raise MigrationError(
+            "V7 migration changed checkpoint metadata: "
+            f"added={unexpected_added} drift={metadata_drift}"
+        )
+    source_adapter, _ = resolve_checkpoint_entity_feature_adapter(
+        before.get("entity_feature_adapter"),
+        metadata_present="entity_feature_adapter" in before,
+    )
+    target_adapter, _ = resolve_checkpoint_entity_feature_adapter(
+        after.get("entity_feature_adapter"),
+        metadata_present="entity_feature_adapter" in after,
+    )
+    if (
+        source_adapter != RUST_ENTITY_ADAPTER_V5
+        or target_adapter != RUST_ENTITY_ADAPTER_V6
+    ):
+        raise MigrationError(
+            "V7 compatibility migration must be constructed directly from "
+            f"V5/f7 bytes, got {source_adapter} -> {target_adapter}"
+        )
+    return {
+        "shared_parameters_bit_identical": True,
+        "shared_parameter_count": len(before_model),
+        "new_parameters": sorted(expected_parameters),
+        "new_parameter_initialization": {
+            parameter: "zeros" for parameter in sorted(expected_parameters)
+        },
+        "source_input_routing": "v5_legacy_resource_and_initial_road_inputs",
+        "target_input_routing": (
+            "v6_raw_inputs_with_legacy_encoder_views_plus_zero_output_residuals"
+        ),
+        "effective_source_config_sha256": function_upgrade._digest(  # noqa: SLF001
+            function_upgrade._effective_config_receipt_view(  # noqa: SLF001
+                effective_before
+            )
+        ),
+        "effective_migrated_config_sha256": function_upgrade._digest(  # noqa: SLF001
+            function_upgrade._effective_config_receipt_view(  # noqa: SLF001
+                effective_after
+            )
+        ),
     }
 
 
@@ -309,7 +500,10 @@ def inspect_migration(
     *,
     migration: str = MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
 ) -> dict[str, Any]:
-    if migration != MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1:
+    if migration not in {
+        MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+        MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+    }:
         raise MigrationError(f"information migration is not allowlisted: {migration!r}")
     import torch
 
@@ -319,15 +513,42 @@ def inspect_migration(
     if not isinstance(before, dict) or not isinstance(after, dict):
         raise MigrationError("migration checkpoints are malformed")
     provenance = after.get("information_contract_migration_provenance")
+    v7_input_routing = migration == MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY
+    expected_checkpoint_migration = (
+        "v5_to_v7_input_compatibility"
+        if v7_input_routing
+        else "current_v2_to_v6_topology_split1"
+    )
+    expected_source_adapter = (
+        RUST_ENTITY_ADAPTER_V5 if v7_input_routing else RUST_ENTITY_ADAPTER_V2
+    )
+    expected_source_routing = (
+        "v5_legacy_resource_and_initial_road_inputs"
+        if v7_input_routing
+        else "adapter_v2_legacy_information_surface"
+    )
+    expected_target_routing = (
+        "v6_raw_inputs_with_legacy_encoder_views_plus_zero_output_residuals"
+        if v7_input_routing
+        else "adapter_v6_exact_resource_and_initial_road_surface"
+    )
     if (
         not isinstance(provenance, Mapping)
         or provenance.get("schema_version") != CHECKPOINT_PROVENANCE_SCHEMA
-        or provenance.get("migration") != "current_v2_to_v6_topology_split1"
+        or provenance.get("migration") != expected_checkpoint_migration
         or provenance.get("source_checkpoint_sha256")
         != source_ref["sha256"].removeprefix("sha256:")
-        or provenance.get("source_adapter") != RUST_ENTITY_ADAPTER_V2
+        or provenance.get("source_adapter") != expected_source_adapter
         or provenance.get("target_adapter") != RUST_ENTITY_ADAPTER_V6
-        or provenance.get("forward_identical") is not False
+        or (
+            v7_input_routing
+            and provenance.get("source_input_routing") != expected_source_routing
+        )
+        or (
+            v7_input_routing
+            and provenance.get("target_input_routing") != expected_target_routing
+        )
+        or provenance.get("forward_identical") is not v7_input_routing
         or provenance.get("promotion_eligible") is not False
         or provenance.get("commissioning_status")
         != "non_promotable_architecture_treatment"
@@ -342,11 +563,18 @@ def inspect_migration(
         after.get("entity_feature_adapter"),
         metadata_present="entity_feature_adapter" in after,
     )
-    if source_adapter != RUST_ENTITY_ADAPTER_V2 or target_adapter != RUST_ENTITY_ADAPTER_V6:
+    if (
+        source_adapter != expected_source_adapter
+        or target_adapter != RUST_ENTITY_ADAPTER_V6
+    ):
         raise MigrationError(
-            f"checkpoint adapters do not realize v2->v6: {source_adapter} -> {target_adapter}"
+            "checkpoint adapters do not realize the selected information migration: "
+            f"{source_adapter} -> {target_adapter}"
         )
-    anchor = _verify_anchor_evidence(provenance.get("step0_anchor_evidence"))
+    anchor = _verify_anchor_evidence(
+        provenance.get("step0_anchor_evidence"),
+        migration=migration,
+    )
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from tools import f69_upgrade_checkpoint_config as checkpoint_migration
 
@@ -357,13 +585,16 @@ def inspect_migration(
     recomputed_anchor = checkpoint_migration._migration_anchor_evidence(  # noqa: SLF001
         base_policy, migrated_policy, "cpu"
     )
-    if not _anchor_replay_matches(anchor, recomputed_anchor):
-        raise MigrationError("step-zero adapter-specific anchor replay drift")
-    topology = _verify_topology_delta(
-        Path(source_ref["path"]),
-        Path(migrated_ref["path"]),
-        provenance=provenance,
-        anchor=anchor,
+    _verify_anchor_replay(anchor, recomputed_anchor, migration=migration)
+    topology = (
+        _verify_v7_input_routing_delta(before, after)
+        if v7_input_routing
+        else _verify_topology_delta(
+            Path(source_ref["path"]),
+            Path(migrated_ref["path"]),
+            provenance=provenance,
+            anchor=anchor,
+        )
     )
     return {
         "migration": migration,
@@ -371,7 +602,7 @@ def inspect_migration(
         "migrated_initializer": migrated_ref,
         "source_adapter": source_adapter,
         "target_adapter": target_adapter,
-        "forward_identical": False,
+        "forward_identical": bool(v7_input_routing),
         "promotion_eligible": False,
         "commissioning_status": "non_promotable_architecture_treatment",
         "step0_anchor_evidence": anchor,
@@ -452,13 +683,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--migrated", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--migration",
+        default=MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+        choices=(
+            MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+            MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        payload = issue_receipt(args.source, args.migrated, args.output)
+        payload = issue_receipt(
+            args.source,
+            args.migrated,
+            args.output,
+            migration=args.migration,
+        )
     except MigrationError as error:
         raise SystemExit(f"REFUSED: {error}") from error
     print(json.dumps(payload, indent=2, sort_keys=True))

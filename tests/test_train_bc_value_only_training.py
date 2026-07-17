@@ -103,6 +103,13 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
     assert "value_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
     assert "public_rule_state_residual" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
     assert (
+        "v6_exact_resource_residual"
+        in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
+    )
+    assert ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["v7_initial_road_residual"] == (
+        "v6_initial_road_residual",
+    )
+    assert (
         "value_categorical_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
     )
     assert "final_vp_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]

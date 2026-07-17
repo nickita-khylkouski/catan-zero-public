@@ -510,6 +510,52 @@ def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
     )
 
 
+def test_checkpoint_dose_telemetry_reports_v7_input_paths() -> None:
+    def row(value: float) -> dict[str, float | int]:
+        return {
+            "mean_pre_clip_grad_norm": value,
+            "max_pre_clip_grad_norm": value,
+            "mean_parameter_delta_norm": value,
+            "mean_parameter_update_rms": value,
+            "mean_relative_parameter_delta": value,
+            "parameter_count": 8,
+        }
+
+    metric = {
+        "module_optimizer_observability": {
+            "schema_version": "module-optimizer-observability-v1",
+            "observed_steps": 1,
+            "cadence_batches": 1,
+            "norm_scope": "pre_clip",
+            "modules": {
+                "v6_exact_resource_residual": row(0.1),
+                "v6_initial_road_residual": row(0.2),
+            },
+        }
+    }
+    dose = train_bc._checkpoint_dose_telemetry(
+        [metric],
+        optimizer_step=1,
+        optimizer_observed_steps=1,
+        optimizer_clipped_steps=0,
+        optimizer_zero_objective_steps=0,
+        optimizer_pre_clip_grad_norm_sum=0.3,
+        optimizer_pre_clip_grad_norm_max=0.3,
+        objective_gradient_cadence_batches=0,
+        train_diagnostic_cadence_batches=1,
+        public_card_enabled=False,
+        meaningful_history_enabled=False,
+        v7_compatibility_inputs_enabled=True,
+    )
+
+    path = dose["feature_path_gradients"]["v7_compatibility_inputs"]
+    assert path["status"] == "observed_nonzero"
+    assert path["nonzero_signal_modules"] == [
+        "v6_exact_resource_residual",
+        "v6_initial_road_residual",
+    ]
+
+
 def test_checkpoint_dose_telemetry_distinguishes_zero_signal_modules() -> None:
     zero_signal = {
         "mean_pre_clip_grad_norm": 0.0,

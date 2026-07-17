@@ -200,11 +200,17 @@ def _parse_flags(raw: str) -> dict[str, object]:
             "current_v7_compatibility_action_cross1",
             "current-v7-compatibility-action-cross1",
         ):
-            # V7 is deliberately an information-routing treatment, not a
-            # function-preserving upgrade.  The mature V5 encoders receive
-            # reconstructed legacy resource/initial-road inputs; V6's exact
-            # values enter through new residuals, and the existing
-            # action-to-board cross block is activated as an identity path.
+            raise SystemExit(
+                "unsafe V6-trained -> V7 migration is forbidden; construct V7 "
+                "directly from the exact V5/f7 initializer"
+            )
+        elif entry in (
+            "v5_to_v7_input_compatibility_migration",
+            "v5-to-v7-input-compatibility-migration",
+        ):
+            # One-step V5/f7 -> V7 construction: inherited encoders retain
+            # their exact legacy semantics while V6 information enters through
+            # zero-output residuals.
             overrides.update(
                 {
                     **_parse_flags("current_v5_topology_split1"),
@@ -489,11 +495,12 @@ def _migration_anchor_evidence(
 
     source_adapter = str(base.entity_feature_adapter_version)
     target_adapter = str(upgraded.entity_feature_adapter_version)
-    adapter_surface_change = migration == "current_v2_to_v6_topology_split1"
-    if adapter_surface_change:
+    legacy_v2_to_v6 = migration == "current_v2_to_v6_topology_split1"
+    v5_to_v7 = migration == "v5_to_v7_input_compatibility"
+    if legacy_v2_to_v6:
         expected = (RUST_ENTITY_ADAPTER_V2, RUST_ENTITY_ADAPTER_V6)
-    elif migration == "current_v6_to_v7_compatibility_action_cross1":
-        expected = (RUST_ENTITY_ADAPTER_V6, RUST_ENTITY_ADAPTER_V6)
+    elif v5_to_v7:
+        expected = (RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6)
     else:
         raise RuntimeError(f"unsupported information migration: {migration!r}")
     if (source_adapter, target_adapter) != expected:
@@ -675,11 +682,15 @@ def _migration_anchor_evidence(
                 "anchor_identity_sha256": anchor_sha256,
             }
         )
-    if adapter_surface_change and (
+    if (legacy_v2_to_v6 or v5_to_v7) and (
         feature_changed_values <= 0 or feature_max_diff <= 0.0
     ):
         raise RuntimeError("v6 migration anchors did not observe a feature change")
-    if migration_max_diff <= 0.0:
+    if v5_to_v7 and migration_max_diff != 0.0:
+        raise RuntimeError(
+            "V7 compatibility routing failed exact step-zero forward identity"
+        )
+    if legacy_v2_to_v6 and migration_max_diff <= 0.0:
         raise RuntimeError("migration anchors did not observe output drift")
     anchor_count = len(rows)
     anchor_set_sha256 = "sha256:" + hashlib.sha256(
@@ -692,17 +703,17 @@ def _migration_anchor_evidence(
     return {
         "schema_version": (
             "adapter-v6-step0-anchor-evidence-v1"
-            if adapter_surface_change
-            else "v7-compatibility-input-routing-step0-anchor-evidence-v1"
+            if legacy_v2_to_v6
+            else "adapter-v7-compatibility-step0-anchor-evidence-v1"
         ),
         "device": "cpu",
         "source_adapter": source_adapter,
         "target_adapter": target_adapter,
         "public_observation": True,
-        "separate_adapter_specific_entity_features": adapter_surface_change,
-        "separate_adapter_specific_action_contexts": adapter_surface_change,
-        "internal_model_input_routing_changed": not adapter_surface_change,
-        "forward_identical": False,
+        "separate_adapter_specific_entity_features": True,
+        "separate_adapter_specific_action_contexts": True,
+        "adapter_features_identical": False,
+        "forward_identical": bool(v5_to_v7),
         "promotion_eligible": False,
         "topology_construction_proof": "deterministic_parameter_replay_in_receipt",
         "migration_output_max_abs_diff": migration_max_diff,
@@ -840,6 +851,7 @@ def _record_information_migration_provenance(
 
     output = Path(out_checkpoint)
     raw = torch.load(output, map_location="cpu", weights_only=False)
+    v5_to_v7 = migration == "v5_to_v7_input_compatibility"
     raw["information_contract_migration_provenance"] = {
         "schema_version": "entity-graph-information-contract-migration-v1",
         "migration": str(migration),
@@ -848,7 +860,19 @@ def _record_information_migration_provenance(
         "initialization_seed": int(seed),
         "source_adapter": anchor_evidence["source_adapter"],
         "target_adapter": anchor_evidence["target_adapter"],
-        "forward_identical": False,
+        **(
+            {
+                "source_input_routing": (
+                    "v5_legacy_resource_and_initial_road_inputs"
+                ),
+                "target_input_routing": (
+                    "v6_raw_inputs_with_legacy_encoder_views_plus_zero_output_residuals"
+                ),
+            }
+            if v5_to_v7
+            else {}
+        ),
+        "forward_identical": bool(v5_to_v7),
         "promotion_eligible": False,
         "commissioning_status": "non_promotable_architecture_treatment",
         "step0_anchor_evidence": anchor_evidence,
@@ -899,8 +923,8 @@ def main() -> None:
     requested_v7_migration = any(
         piece.strip()
         in {
-            "current_v7_compatibility_action_cross1",
-            "current-v7-compatibility-action-cross1",
+            "v5_to_v7_input_compatibility_migration",
+            "v5-to-v7-input-compatibility-migration",
         }
         for piece in args.flags.split(",")
     )
@@ -910,7 +934,7 @@ def main() -> None:
     migration_name = (
         "current_v2_to_v6_topology_split1"
         if requested_v6_migration
-        else "current_v6_to_v7_compatibility_action_cross1"
+        else "v5_to_v7_input_compatibility"
     )
     if requested_information_migration and str(args.device) != "cpu":
         raise SystemExit(
@@ -925,6 +949,16 @@ def main() -> None:
         torch.cuda.manual_seed_all(int(args.seed))
     base = EntityGraphPolicy.load(args.in_checkpoint, device=args.device)
     base.model.eval()
+    if requested_v7_migration and (
+        base.entity_feature_adapter_version != RUST_ENTITY_ADAPTER_V5
+        or bool(
+            getattr(base.config, "v6_compatibility_preserving_inputs", False)
+        )
+    ):
+        raise SystemExit(
+            "V7 compatibility migration requires exact V5/f7 inherited encoder "
+            "semantics; already-V6-trained or previously routed sources are unsafe"
+        )
 
     upgraded_config = _build_upgraded_config(base.config, overrides)
     static = base.static_action_features.detach().cpu().numpy()
@@ -993,7 +1027,8 @@ def main() -> None:
         args.out_checkpoint,
         mutated_keys=(
             ("model", "config", "entity_feature_adapter")
-            if bool(overrides.get("public_rule_state_features", False))
+            if requested_information_migration
+            or bool(overrides.get("public_rule_state_features", False))
             or overrides.get("meaningful_public_history_schema")
             == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
             else ("model", "config")

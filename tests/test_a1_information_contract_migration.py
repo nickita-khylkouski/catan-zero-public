@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 from pathlib import Path
 import stat
 
 import pytest
+import torch
 
+from catan_zero.rl.entity_feature_adapter import (
+    RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
+    checkpoint_entity_feature_adapter_metadata,
+)
+from catan_zero.rl.entity_token_policy import EntityGraphConfig
 from tools import a1_information_contract_migration as migration
 
 
@@ -84,3 +94,155 @@ def test_anchor_replay_tolerates_only_float32_reduction_noise() -> None:
     assert not migration._anchor_replay_matches(  # noqa: SLF001
         expected, {**replayed, "measurements": [0.18, replayed["measurements"][1]]}
     )
+
+
+def _v7_anchor_evidence() -> dict:
+    identity = "sha256:" + "a" * 64
+    anchor = {
+        "label": "resource_initial_road",
+        "phase": "BUILD_INITIAL_ROAD",
+        "actor": "RED",
+        "actor_resource_total": 2,
+        "legal_width": 3,
+        "migration_output_max_abs_diff": 0.0,
+        "migration_output_max_abs_diff_by_key": {
+            "logits": 0.0,
+            "value": 0.0,
+            "final_vp": 0.0,
+            "q_values": 0.0,
+        },
+        "legal_policy_forward_kl": 0.0,
+        "legal_policy_reverse_kl": 0.0,
+        "legal_policy_top1_flip": False,
+        "scalar_value_abs_error": 0.0,
+        "feature_max_abs_diff": 0.25,
+        "feature_changed_value_count": 1,
+        "anchor_identity_sha256": identity,
+    }
+    anchor_set = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps([identity], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    return {
+        "schema_version": migration.V7_INPUT_ANCHOR_SCHEMA,
+        "device": "cpu",
+        "source_adapter": RUST_ENTITY_ADAPTER_V5,
+        "target_adapter": RUST_ENTITY_ADAPTER_V6,
+        "public_observation": True,
+        "separate_adapter_specific_entity_features": True,
+        "separate_adapter_specific_action_contexts": True,
+        "adapter_features_identical": False,
+        "forward_identical": True,
+        "promotion_eligible": False,
+        "topology_construction_proof": "deterministic_parameter_replay_in_receipt",
+        "migration_output_max_abs_diff": 0.0,
+        "feature_max_abs_diff": 0.25,
+        "feature_changed_value_count": 1,
+        "legal_policy_forward_kl_mean": 0.0,
+        "legal_policy_forward_kl_max": 0.0,
+        "legal_policy_reverse_kl_mean": 0.0,
+        "legal_policy_reverse_kl_max": 0.0,
+        "legal_policy_top1_flip_count": 0,
+        "legal_policy_top1_flip_rate": 0.0,
+        "scalar_value_rmse": 0.0,
+        "scalar_value_max_abs_error": 0.0,
+        "anchor_count": 1,
+        "anchor_set_sha256": anchor_set,
+        "anchors": [anchor],
+    }
+
+
+def test_v7_anchor_requires_real_feature_change_and_exact_forward_identity() -> None:
+    evidence = _v7_anchor_evidence()
+
+    assert (
+        migration._verify_anchor_evidence(  # noqa: SLF001
+            evidence,
+            migration=migration.MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+        )
+        == evidence
+    )
+
+    output_drift = copy.deepcopy(evidence)
+    output_drift["migration_output_max_abs_diff"] = 0.1
+    output_drift["anchors"][0]["migration_output_max_abs_diff"] = 0.1
+    with pytest.raises(migration.MigrationError, match="exact forward"):
+        migration._verify_anchor_evidence(  # noqa: SLF001
+            output_drift,
+            migration=migration.MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+        )
+
+
+def test_v7_replay_does_not_apply_float_tolerance_to_exact_forward_claim() -> None:
+    evidence = _v7_anchor_evidence()
+    replayed = copy.deepcopy(evidence)
+    replayed["migration_output_max_abs_diff"] = 5.0e-7
+    replayed["anchors"][0]["migration_output_max_abs_diff"] = 5.0e-7
+
+    # Historical diagnostic replay tolerance alone would accept this delta.
+    assert migration._anchor_replay_matches(evidence, replayed)  # noqa: SLF001
+    with pytest.raises(migration.MigrationError, match="exact forward"):
+        migration._verify_anchor_replay(  # noqa: SLF001
+            evidence,
+            replayed,
+            migration=migration.MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+        )
+
+
+def _v7_delta() -> tuple[dict, dict]:
+    before_config = EntityGraphConfig(action_size=4, static_action_feature_size=3)
+    after_config = EntityGraphConfig(
+        action_size=4,
+        static_action_feature_size=3,
+        v6_compatibility_preserving_inputs=True,
+    )
+    before = {
+        "policy_type": "entity_graph",
+        "config": {
+            field: getattr(before_config, field)
+            for field in before_config.__dataclass_fields__
+        },
+        "entity_feature_adapter": checkpoint_entity_feature_adapter_metadata(
+            RUST_ENTITY_ADAPTER_V5
+        ),
+        "model": {"player_encoder.0.weight": torch.ones((2, 3))},
+        "mask_hidden_info": True,
+    }
+    after = copy.deepcopy(before)
+    after["config"] = {
+        field: getattr(after_config, field)
+        for field in after_config.__dataclass_fields__
+    }
+    after["entity_feature_adapter"] = checkpoint_entity_feature_adapter_metadata(
+        RUST_ENTITY_ADAPTER_V6
+    )
+    after["model"]["v6_exact_resource_residual.weight"] = torch.zeros((2, 7))
+    after["model"]["v6_initial_road_residual.weight"] = torch.zeros((2, 1))
+    after["information_contract_migration_provenance"] = {"bound": True}
+    return before, after
+
+
+def test_v7_delta_replay_accepts_only_zero_residual_and_one_config_flag() -> None:
+    before, after = _v7_delta()
+
+    replay = migration._verify_v7_input_routing_delta(before, after)  # noqa: SLF001
+
+    assert replay["shared_parameters_bit_identical"] is True
+    assert replay["new_parameter_initialization"] == {
+        "v6_exact_resource_residual.weight": "zeros",
+        "v6_initial_road_residual.weight": "zeros",
+    }
+
+    nonzero = copy.deepcopy(after)
+    nonzero["model"]["v6_exact_resource_residual.weight"][0, 0] = 1.0
+    with pytest.raises(migration.MigrationError, match="not initialized to zero"):
+        migration._verify_v7_input_routing_delta(before, nonzero)  # noqa: SLF001
+
+    metadata_drift = copy.deepcopy(after)
+    metadata_drift["mask_hidden_info"] = False
+    with pytest.raises(migration.MigrationError, match="metadata"):
+        migration._verify_v7_input_routing_delta(  # noqa: SLF001
+            before, metadata_drift
+        )

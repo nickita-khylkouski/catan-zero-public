@@ -10,6 +10,7 @@ dataclass defaults, then applies the flag overrides.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import sys
 from dataclasses import fields
@@ -80,6 +81,107 @@ def test_build_upgraded_config_tolerates_missing_field():
     assert upgraded.state_layers == 6
 
 
+def test_v7_input_route_has_only_explicit_information_migration_constructor():
+    overrides = upgrade_tool._parse_flags(  # noqa: SLF001
+        "v5_to_v7_input_compatibility_migration"
+    )
+
+    assert overrides["v6_compatibility_preserving_inputs"] is True
+    assert overrides["action_cross_attention_layers"] == 1
+    assert overrides["topology_residual_adapter"] is True
+    with pytest.raises(SystemExit, match="unsafe V6-trained"):
+        upgrade_tool._parse_flags(  # noqa: SLF001
+            "current_v7_compatibility_action_cross1"
+        )
+
+
+def test_v7_input_migration_constructs_complete_strict_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import torch
+
+    from catan_zero.rl.entity_feature_adapter import (
+        RUST_ENTITY_ADAPTER_V5,
+        RUST_ENTITY_ADAPTER_V6,
+    )
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    source = tmp_path / "v5.pt"
+    migrated = tmp_path / "v7.pt"
+    base = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        seed=11,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+    )
+    base.save(source)
+    # The repository test environment may intentionally carry an older native
+    # wheel; native anchor generation is covered by the sealed H100 gate.  This
+    # unit test isolates checkpoint construction and strict serialization.
+    monkeypatch.setattr(
+        upgrade_tool,
+        "_migration_anchor_evidence",
+        lambda *_args, **_kwargs: {
+            "schema_version": "adapter-v7-compatibility-step0-anchor-evidence-v1",
+            "source_adapter": RUST_ENTITY_ADAPTER_V5,
+            "target_adapter": RUST_ENTITY_ADAPTER_V6,
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "f69_upgrade_checkpoint_config.py",
+            "--in-checkpoint",
+            str(source),
+            "--out-checkpoint",
+            str(migrated),
+            "--flags",
+            "v5_to_v7_input_compatibility_migration",
+            "--seed",
+            "73",
+            "--device",
+            "cpu",
+        ],
+    )
+
+    upgrade_tool.main()
+
+    source_raw = torch.load(source, map_location="cpu", weights_only=False)
+    migrated_raw = torch.load(migrated, map_location="cpu", weights_only=False)
+    policy = EntityGraphPolicy.load(migrated, device="cpu")
+    assert policy.config.v6_compatibility_preserving_inputs is True
+    assert policy._checkpoint_missing_state_keys == ()  # noqa: SLF001
+    assert (
+        migrated_raw["information_contract_migration_provenance"]["migration"]
+        == "v5_to_v7_input_compatibility"
+    )
+    assert (
+        torch.count_nonzero(
+            migrated_raw["model"]["v6_exact_resource_residual.weight"]
+        ).item()
+        == 0
+    )
+    assert (
+        torch.count_nonzero(
+            migrated_raw["model"]["v6_initial_road_residual.weight"]
+        ).item()
+        == 0
+    )
+    for name, tensor in source_raw["model"].items():
+        assert torch.equal(tensor, migrated_raw["model"][name]), name
+
+    truncated = tmp_path / "v7-truncated.pt"
+    truncated_raw = copy.deepcopy(migrated_raw)
+    truncated_raw["model"].pop("v6_initial_road_residual.weight")
+    torch.save(truncated_raw, truncated)
+    with pytest.raises(RuntimeError, match="checkpoint state mismatch"):
+        EntityGraphPolicy.load(truncated, device="cpu")
+
+
 def test_build_upgraded_config_preserves_a_full_config():
     """A current (non-stale) config round-trips with only the overrides changed."""
     base = EntityGraphConfig(
@@ -125,10 +227,7 @@ def test_public_rule_state_upgrade_binds_v4_schema_and_parameter_allowlist():
     }
     upgraded = upgrade_tool._build_upgraded_config(base, overrides)
     assert upgraded.public_rule_state_features is True
-    assert (
-        upgraded.public_rule_state_feature_schema
-        == "actor_public_rule_state_2p_v1"
-    )
+    assert upgraded.public_rule_state_feature_schema == "actor_public_rule_state_2p_v1"
     assert "public_rule_state_residual." in upgrade_tool.NEW_PARAM_PREFIXES
 
 
@@ -141,7 +240,7 @@ def test_action_cross_upgrade_parameters_are_admitted_by_checkpoint_builder():
 
 def test_v7_migration_token_binds_compatibility_route_and_live_decoder():
     overrides = upgrade_tool._parse_flags(
-        "current_v7_compatibility_action_cross1"
+        "v5_to_v7_input_compatibility_migration"
     )
     assert overrides["v6_compatibility_preserving_inputs"] is True
     assert overrides["action_cross_attention_layers"] == 1
