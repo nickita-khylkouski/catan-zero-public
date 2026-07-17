@@ -99,6 +99,22 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
     )
     assert recipe["base_sampler"] == "coverage_importance_v1"
     assert recipe["minimum_policy_effective_rows_per_global_batch"] == 32.0
+    assert {
+        phase: recipe[field]
+        for phase, field in {
+            "BUILD_INITIAL_SETTLEMENT": (
+                "minimum_initial_settlement_policy_mass_fraction"
+            ),
+            "BUILD_INITIAL_ROAD": "minimum_initial_road_policy_mass_fraction",
+            "DISCARD": "minimum_discard_policy_mass_fraction",
+            "MOVE_ROBBER": "minimum_move_robber_policy_mass_fraction",
+        }.items()
+    } == {
+        "BUILD_INITIAL_SETTLEMENT": 0.02,
+        "BUILD_INITIAL_ROAD": 0.02,
+        "DISCARD": 0.02,
+        "MOVE_ROBBER": 0.02,
+    }
     assert recipe["moe_balance_loss_weight"] == 0.0
     assert recipe["soft_target_source"] == "policy"
     assert recipe["soft_target_weight"] == 1.0
@@ -400,6 +416,7 @@ def test_current_contract_rejects_uncommissioned_boundary_particles(
         ("grad_accum_steps", 4),
         ("max_steps", 1024),
         ("phase_weights", "PLAY_TURN=1.0"),
+        ("minimum_discard_policy_mass_fraction", 0.0),
     ),
 )
 def test_current_contract_rejects_diagnostic_training_settings(

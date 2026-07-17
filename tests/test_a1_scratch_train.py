@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from catan_zero.rl.entity_token_policy import EntityGraphPolicy
@@ -208,6 +209,14 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
         command[command.index("--minimum-policy-effective-rows-per-global-batch") + 1]
         == "32.0"
     )
+    for flag in (
+        "--minimum-initial-settlement-policy-mass-fraction",
+        "--minimum-initial-road-policy-mass-fraction",
+        "--minimum-discard-policy-mass-fraction",
+        "--minimum-move-robber-policy-mass-fraction",
+    ):
+        assert command.count(flag) == 1
+        assert command[command.index(flag) + 1] == "0.02"
     assert command[command.index("--moe-balance-loss-weight") + 1] == "0.0"
     assert "--init-checkpoint" not in command
     assert "--grow-from-checkpoint" not in command
@@ -274,6 +283,34 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert effective == verified["recipe"]
     marker = json.loads(command[command.index("--a1-scratch-authority-json") + 1])
     assert marker == authority
+
+
+def test_current_scratch_hard_decision_starvation_fails_before_training() -> None:
+    recipe = current_science.learner_training_recipe()
+    minima = {
+        "BUILD_INITIAL_SETTLEMENT": recipe[
+            "minimum_initial_settlement_policy_mass_fraction"
+        ],
+        "BUILD_INITIAL_ROAD": recipe[
+            "minimum_initial_road_policy_mass_fraction"
+        ],
+        "DISCARD": recipe["minimum_discard_policy_mass_fraction"],
+        "MOVE_ROBBER": recipe["minimum_move_robber_policy_mass_fraction"],
+    }
+    phases = np.asarray(["PLAY_TURN"] * 64)
+
+    with pytest.raises(
+        SystemExit,
+        match="hard-decision policy-mass admission refused before the first optimizer step",
+    ):
+        train_bc._policy_phase_objective_mass_admission(  # noqa: SLF001
+            {"phase": phases},
+            np.arange(phases.size, dtype=np.int64),
+            policy_sample_weights=np.ones(phases.size, dtype=np.float32),
+            sampling_weights=None,
+            minimum_phase_mass_fractions=minima,
+            objective_measure="current_scratch_contract_probe",
+        )
 
 
 def test_scratch_command_emits_optional_forced_value_mass_ceiling(
@@ -714,6 +751,9 @@ def _runtime_args() -> SimpleNamespace:
             ],
             value_tower_split_layers=model["value_tower_split_layers"],
             public_card_count_features=model["public_card_count_features"],
+            public_card_exact_resource_residual=model[
+                "public_card_exact_resource_residual"
+            ],
             public_card_count_residual_bias=model["public_card_count_residual_bias"],
             public_rule_state_features=model["public_rule_state_features"],
             entity_feature_adapter_version=model["entity_feature_adapter_version"],

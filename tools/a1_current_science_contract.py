@@ -87,6 +87,14 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # measures 41.002. Require 32: 8.77x above the failed regime with a 28%
     # measured margin on the commissioned corpus.
     "minimum_policy_effective_rows_per_global_batch": 32.0,
+    # A global policy ESS floor cannot prove that rare strategic phases survive
+    # phase weighting, forced-row exclusion, the train/holdout split, and the
+    # authenticated coverage measure. Bind the reviewed per-phase floor already
+    # commissioned by the canonical parent-update recipe.
+    "minimum_initial_settlement_policy_mass_fraction": 0.02,
+    "minimum_initial_road_policy_mass_fraction": 0.02,
+    "minimum_discard_policy_mass_fraction": 0.02,
+    "minimum_move_robber_policy_mass_fraction": 0.02,
     # The commissioned scratch model has no routed experts.  The generic
     # trainer default is intentionally useful for MoE experiments, but leaving
     # it implicit here makes coverage_importance_v1 reject the production

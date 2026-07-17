@@ -10047,6 +10047,18 @@ def _bind_late_a1_recipe_fields(
         "value_root_blend_global_compat": bool(
             getattr(args, "value_root_blend_global_compat", False)
         ),
+        "minimum_initial_settlement_policy_mass_fraction": getattr(
+            args, "minimum_initial_settlement_policy_mass_fraction", None
+        ),
+        "minimum_initial_road_policy_mass_fraction": getattr(
+            args, "minimum_initial_road_policy_mass_fraction", None
+        ),
+        "minimum_discard_policy_mass_fraction": getattr(
+            args, "minimum_discard_policy_mass_fraction", None
+        ),
+        "minimum_move_robber_policy_mass_fraction": getattr(
+            args, "minimum_move_robber_policy_mass_fraction", None
+        ),
     }
     for key, value in late_bound_values.items():
         if key in expected:

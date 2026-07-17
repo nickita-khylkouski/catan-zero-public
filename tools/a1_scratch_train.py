@@ -746,6 +746,40 @@ def build_train_command(
             _add(command, flag, recipe.get(key, optional_scalar_defaults[key]))
         else:
             _add(command, flag, recipe[key])
+    # This is a current scratch-science admission, not a new generic trainer
+    # default. Historical authorities that omit all four fields retain their
+    # exact command; a partial authority is ambiguous and fails closed.
+    hard_decision_mass_fields = (
+        (
+            "minimum_initial_settlement_policy_mass_fraction",
+            "--minimum-initial-settlement-policy-mass-fraction",
+        ),
+        (
+            "minimum_initial_road_policy_mass_fraction",
+            "--minimum-initial-road-policy-mass-fraction",
+        ),
+        (
+            "minimum_discard_policy_mass_fraction",
+            "--minimum-discard-policy-mass-fraction",
+        ),
+        (
+            "minimum_move_robber_policy_mass_fraction",
+            "--minimum-move-robber-policy-mass-fraction",
+        ),
+    )
+    present_hard_decision_fields = [
+        key for key, _flag in hard_decision_mass_fields if key in recipe
+    ]
+    if present_hard_decision_fields and len(present_hard_decision_fields) != len(
+        hard_decision_mass_fields
+    ):
+        raise ScratchTrainError(
+            "scratch hard-decision policy-mass admission must bind all four "
+            "reviewed phase minima"
+        )
+    for key, flag in hard_decision_mass_fields:
+        if key in recipe:
+            _add(command, flag, recipe[key])
     maximum_forced_value_mass = recipe.get(
         "maximum_nominal_forced_scalar_value_mass_fraction"
     )
