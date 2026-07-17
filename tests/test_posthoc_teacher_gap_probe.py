@@ -900,6 +900,151 @@ def test_combined_aux_teacher_gap_can_reverse_base_only_ranking() -> None:
     )
 
 
+def _behavioral_surface(
+    *,
+    abi_identity: str,
+    top1: float,
+    confusion: float,
+    rows: int = 80,
+) -> dict:
+    uniform = {
+        "rows": rows,
+        "teacher_top1_accuracy": top1,
+        "teacher_top3_mass": 0.86,
+        "end_turn_confusion_rate": confusion,
+        "end_turn_confusion_teacher_probability_regret_per_row": 0.17,
+        "end_turn_confusion_teacher_probability_regret_conditional_mean": 0.34,
+    }
+    weighted = {
+        **uniform,
+        "row_probability": 0.1,
+    }
+    weighted.pop("rows")
+    return {
+        "schema_version": "policy-target-behavior-metrics-v1",
+        "action_catalog_abi": {
+            "schema_version": "action-catalog-abi-v1",
+            "identity_sha256": abi_identity,
+        },
+        "teacher_argmax_action_type": {"MARITIME_TRADE": uniform},
+        "objective_weighted_teacher_argmax_action_type": {
+            "MARITIME_TRADE": weighted
+        },
+    }
+
+
+def test_behavioral_competence_legacy_omission_is_optional_but_contract_fails_closed() -> None:
+    module = _module()
+    abi = {"identity_sha256": "sha256:" + "a" * 64}
+
+    assert (
+        module._behavioral_competence_projection(  # noqa: SLF001
+            {},
+            prepared_action_catalog_abi=abi,
+            required=False,
+        )
+        is None
+    )
+    with pytest.raises(SystemExit, match="required.*surface is absent"):
+        module._behavioral_competence_projection(  # noqa: SLF001
+            {},
+            prepared_action_catalog_abi=abi,
+            required=True,
+        )
+
+
+def test_behavioral_competence_keeps_base_and_aux_surfaces_separate() -> None:
+    module = _module()
+    identity = "sha256:" + "a" * 64
+    base = _behavioral_surface(
+        abi_identity=identity,
+        top1=0.21,
+        confusion=0.74,
+    )
+    aux = _behavioral_surface(
+        abi_identity=identity,
+        top1=0.48,
+        confusion=0.31,
+        rows=64,
+    )
+
+    projected = module._behavioral_competence_projection(  # noqa: SLF001
+        {
+            "policy_behavioral_competence_streams": {
+                "base": base,
+                "aux": aux,
+            }
+        },
+        prepared_action_catalog_abi={"identity_sha256": identity},
+        required=True,
+    )
+
+    assert projected is not None
+    assert set(projected["streams"]) == {"base", "aux"}
+    assert projected["streams"]["base"]["teacher_argmax_action_type"][
+        "MARITIME_TRADE"
+    ]["teacher_top1_accuracy"] == pytest.approx(0.21)
+    assert projected["streams"]["aux"]["teacher_argmax_action_type"][
+        "MARITIME_TRADE"
+    ]["teacher_top1_accuracy"] == pytest.approx(0.48)
+
+
+def test_behavioral_competence_refuses_action_catalog_abi_drift() -> None:
+    module = _module()
+    with pytest.raises(SystemExit, match="ActionCatalog ABI differs"):
+        module._behavioral_competence_projection(  # noqa: SLF001
+            {
+                "policy_target_distribution_metrics": {
+                    "behavioral_competence": _behavioral_surface(
+                        abi_identity="sha256:" + "b" * 64,
+                        top1=0.2,
+                        confusion=0.7,
+                    )
+                }
+            },
+            prepared_action_catalog_abi={
+                "identity_sha256": "sha256:" + "a" * 64
+            },
+            required=True,
+        )
+
+
+def test_paired_behavioral_competence_reports_candidate_parent_deltas() -> None:
+    module = _module()
+    identity = "sha256:" + "a" * 64
+
+    def projection(top1: float, confusion: float) -> dict:
+        result = module._behavioral_competence_projection(  # noqa: SLF001
+            {
+                "policy_target_distribution_metrics": {
+                    "behavioral_competence": _behavioral_surface(
+                        abi_identity=identity,
+                        top1=top1,
+                        confusion=confusion,
+                    )
+                }
+            },
+            prepared_action_catalog_abi={"identity_sha256": identity},
+            required=True,
+        )
+        assert result is not None
+        return result
+
+    paired = module._paired_parent_behavioral_competence(  # noqa: SLF001
+        parent=projection(0.20, 0.75),
+        candidate=projection(0.45, 0.30),
+    )
+    maritime = paired["streams"]["base"]["teacher_argmax_action_type"][
+        "MARITIME_TRADE"
+    ]
+    assert maritime["candidate_minus_parent"]["teacher_top1_accuracy"] == (
+        pytest.approx(0.25)
+    )
+    assert maritime["candidate_minus_parent"]["end_turn_confusion_rate"] == (
+        pytest.approx(-0.45)
+    )
+
+
 def test_single_checkpoint_parent_mode_uses_report_bound_parent(tmp_path, monkeypatch):
     module = _module()
     report_path, candidate, data, manifest = _paths(tmp_path, _report())

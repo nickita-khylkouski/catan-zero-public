@@ -20,6 +20,11 @@ PAIRED_PARENT_GAP_SCHEMA = "posthoc-paired-parent-teacher-gap-v2"
 VALUE_QUALITY_SCHEMA = "posthoc-objective-matched-value-quality-v1"
 PAIRED_PARENT_VALUE_SCHEMA = "posthoc-paired-parent-value-quality-v1"
 POLICY_TEACHER_GAP_OBJECTIVE_SCHEMA = "posthoc-policy-teacher-gap-objective-v1"
+POLICY_BEHAVIOR_METRICS_SCHEMA = "policy-target-behavior-metrics-v1"
+POSTHOC_BEHAVIORAL_COMPETENCE_SCHEMA = "posthoc-behavioral-competence-v1"
+PAIRED_BEHAVIORAL_COMPETENCE_SCHEMA = (
+    "posthoc-paired-parent-behavioral-competence-v1"
+)
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 
@@ -562,9 +567,9 @@ def _forced_row_value_recipe(
     return weights, train_bc._action_catalog_for_env_config(env_config)
 
 
-def _value_validation_action_types_by_id(
+def _value_validation_action_catalog(
     train_bc, report: Mapping[str, Any]
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], Mapping[str, Any] | None]:
     """Rebuild the authoritative action-type catalog used by value strata."""
 
     graph_history_features = _required(report, "graph_history_features")
@@ -577,7 +582,15 @@ def _value_validation_action_types_by_id(
     )
     action_catalog = train_bc._action_catalog_for_env_config(env_config)
     _, action_types = train_bc._action_catalog_type_projection(action_catalog, {})
-    return action_types
+    abi_builder = getattr(train_bc, "_action_catalog_abi_binding", None)
+    action_catalog_abi = (
+        abi_builder(action_catalog) if callable(abi_builder) else None
+    )
+    if action_catalog_abi is not None and not isinstance(
+        action_catalog_abi, Mapping
+    ):
+        raise SystemExit("reconstructed ActionCatalog ABI is malformed")
+    return action_types, action_catalog_abi
 
 
 def _scope_identity(data, report: Mapping[str, Any]) -> dict[str, Any]:
@@ -812,7 +825,10 @@ def _prepare_probe(
     forced_type_weights, forced_action_catalog = _forced_row_value_recipe(
         train_bc, report
     )
-    value_validation_action_types_by_id = _value_validation_action_types_by_id(
+    (
+        value_validation_action_types_by_id,
+        action_catalog_abi,
+    ) = _value_validation_action_catalog(
         train_bc, report
     )
     value_weights = train_bc.build_value_sample_weights(
@@ -911,6 +927,7 @@ def _prepare_probe(
         "value_validation_action_types_by_id": (
             value_validation_action_types_by_id
         ),
+        "action_catalog_abi": action_catalog_abi,
         "scalar_value_objective": scalar_objective,
         "scalar_value_loss_readout": scalar_readout,
         "scalar_value_loss_scale": scalar_scale,
@@ -1231,12 +1248,182 @@ def _evaluate_policy_metrics(
             coefficient=float(policy_aux["policy_aux_loss_weight"]),
         )
     )
+    behavioral_streams: dict[str, Any] = {}
+    for stream, stream_metrics in (("base", base_metrics), ("aux", aux_metrics)):
+        surface = _raw_behavioral_competence_surface(stream_metrics)
+        if surface is not None:
+            behavioral_streams[stream] = surface
+    if behavioral_streams:
+        combined["policy_behavioral_competence_streams"] = behavioral_streams
     combined["policy_aux_validation_measure"] = {
         key: value
         for key, value in policy_aux.items()
         if key not in {"sampling_weights", "objective_weights"}
     }
     return combined
+
+
+def _raw_behavioral_competence_surface(
+    metrics: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    target_metrics = metrics.get("policy_target_distribution_metrics")
+    if target_metrics is None:
+        return None
+    if not isinstance(target_metrics, Mapping):
+        raise SystemExit("posthoc policy target-distribution metrics are malformed")
+    surface = target_metrics.get("behavioral_competence")
+    if surface is None:
+        return None
+    if not isinstance(surface, Mapping):
+        raise SystemExit("posthoc behavioral competence surface is malformed")
+    return surface
+
+
+def _behavior_metric_projection(
+    raw: object,
+    *,
+    where: str,
+) -> dict[str, float | int]:
+    if not isinstance(raw, Mapping):
+        raise SystemExit(f"{where} is malformed")
+    has_rows = "rows" in raw
+    has_probability = "row_probability" in raw
+    if has_rows == has_probability:
+        raise SystemExit(
+            f"{where} must contain exactly one of rows or row_probability"
+        )
+    count_key = "rows" if has_rows else "row_probability"
+    required_metrics = (
+        "teacher_top1_accuracy",
+        "end_turn_confusion_rate",
+        "end_turn_confusion_teacher_probability_regret_per_row",
+        "end_turn_confusion_teacher_probability_regret_conditional_mean",
+    )
+    optional_metrics = ("teacher_top3_accuracy", "teacher_top3_mass")
+    try:
+        count_value = float(raw[count_key])
+        numeric = {
+            key: float(raw[key])
+            for key in (*required_metrics, *optional_metrics)
+            if key in raw
+        }
+    except (TypeError, ValueError) as error:
+        raise SystemExit(f"{where} contains non-numeric metrics") from error
+    if (
+        not math.isfinite(count_value)
+        or count_value < 0.0
+        or any(not math.isfinite(value) for value in numeric.values())
+        or any(
+            not 0.0 <= numeric[key] <= 1.0
+            for key in (
+                "teacher_top1_accuracy",
+                "end_turn_confusion_rate",
+                "teacher_top3_accuracy",
+                "teacher_top3_mass",
+            )
+            if key in numeric
+        )
+        or any(
+            numeric[key] < 0.0
+            for key in (
+                "end_turn_confusion_teacher_probability_regret_per_row",
+                "end_turn_confusion_teacher_probability_regret_conditional_mean",
+            )
+        )
+    ):
+        raise SystemExit(f"{where} contains invalid metrics")
+    missing = [key for key in required_metrics if key not in numeric]
+    if missing:
+        raise SystemExit(f"{where} lacks required metric {missing[0]!r}")
+    count: float | int = count_value
+    if has_rows:
+        if not count_value.is_integer():
+            raise SystemExit(f"{where} rows must be an integer")
+        count = int(count_value)
+    return {count_key: count, **numeric}
+
+
+def _behavioral_competence_surface_projection(
+    surface: Mapping[str, Any],
+    *,
+    prepared_action_catalog_abi: Mapping[str, Any] | None,
+    where: str,
+) -> dict[str, Any]:
+    if surface.get("schema_version") != POLICY_BEHAVIOR_METRICS_SCHEMA:
+        raise SystemExit(f"{where} has an unsupported schema")
+    evaluation_abi = surface.get("action_catalog_abi")
+    if not isinstance(evaluation_abi, Mapping):
+        raise SystemExit(f"{where} lacks its ActionCatalog ABI")
+    if not isinstance(prepared_action_catalog_abi, Mapping):
+        raise SystemExit(
+            f"{where} cannot verify its ActionCatalog ABI against the probe"
+        )
+    prepared_identity = str(prepared_action_catalog_abi.get("identity_sha256", ""))
+    evaluation_identity = str(evaluation_abi.get("identity_sha256", ""))
+    if (
+        not prepared_identity.startswith("sha256:")
+        or not evaluation_identity.startswith("sha256:")
+        or evaluation_identity != prepared_identity
+    ):
+        raise SystemExit(f"{where} ActionCatalog ABI differs from the probe")
+
+    projection: dict[str, Any] = {
+        "schema_version": POLICY_BEHAVIOR_METRICS_SCHEMA,
+        "action_catalog_abi": dict(evaluation_abi),
+    }
+    for axis in (
+        "teacher_argmax_action_type",
+        "objective_weighted_teacher_argmax_action_type",
+    ):
+        raw_axis = surface.get(axis)
+        if not isinstance(raw_axis, Mapping):
+            raise SystemExit(f"{where} lacks {axis!r}")
+        maritime = raw_axis.get("MARITIME_TRADE")
+        projection[axis] = {
+            "MARITIME_TRADE": _behavior_metric_projection(
+                maritime,
+                where=f"{where} {axis}.MARITIME_TRADE",
+            )
+        }
+    return projection
+
+
+def _behavioral_competence_projection(
+    metrics: Mapping[str, Any],
+    *,
+    prepared_action_catalog_abi: Mapping[str, Any] | None,
+    required: bool,
+) -> dict[str, Any] | None:
+    """Project optional competence metrics without changing legacy probes."""
+
+    raw_streams = metrics.get("policy_behavioral_competence_streams")
+    if raw_streams is None:
+        base = _raw_behavioral_competence_surface(metrics)
+        if base is None:
+            if required:
+                raise SystemExit(
+                    "required posthoc behavioral competence surface is absent"
+                )
+            return None
+        raw_streams = {"base": base}
+    if not isinstance(raw_streams, Mapping) or not raw_streams:
+        raise SystemExit("posthoc behavioral competence streams are malformed")
+    unknown = set(raw_streams) - {"base", "aux"}
+    if unknown or "base" not in raw_streams:
+        raise SystemExit("posthoc behavioral competence streams are malformed")
+    return {
+        "schema_version": POSTHOC_BEHAVIORAL_COMPETENCE_SCHEMA,
+        "selection_authority": False,
+        "surface": "same_reconstructed_holdout_teacher_argmax_action_type",
+        "streams": {
+            stream: _behavioral_competence_surface_projection(
+                surface,
+                prepared_action_catalog_abi=prepared_action_catalog_abi,
+                where=f"posthoc {stream} behavioral competence",
+            )
+            for stream, surface in raw_streams.items()
+        },
+    }
 
 
 def _combine_policy_teacher_gap_metrics(
@@ -1450,6 +1637,112 @@ def _paired_parent_teacher_gap(
     }
 
 
+def _paired_parent_behavioral_competence(
+    *,
+    candidate: Mapping[str, Any],
+    parent: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compare candidate and parent competence on identical typed strata."""
+
+    if (
+        candidate.get("schema_version") != POSTHOC_BEHAVIORAL_COMPETENCE_SCHEMA
+        or parent.get("schema_version") != POSTHOC_BEHAVIORAL_COMPETENCE_SCHEMA
+    ):
+        raise SystemExit("candidate and parent behavioral competence schemas differ")
+    candidate_streams = candidate.get("streams")
+    parent_streams = parent.get("streams")
+    if (
+        not isinstance(candidate_streams, Mapping)
+        or not isinstance(parent_streams, Mapping)
+        or set(candidate_streams) != set(parent_streams)
+    ):
+        raise SystemExit("candidate and parent behavioral competence streams differ")
+    result_streams: dict[str, Any] = {}
+    for stream in candidate_streams:
+        candidate_surface = candidate_streams[stream]
+        parent_surface = parent_streams[stream]
+        if (
+            not isinstance(candidate_surface, Mapping)
+            or not isinstance(parent_surface, Mapping)
+            or candidate_surface.get("action_catalog_abi")
+            != parent_surface.get("action_catalog_abi")
+        ):
+            raise SystemExit(
+                "candidate and parent behavioral ActionCatalog ABIs differ"
+            )
+        result_axes: dict[str, Any] = {}
+        for axis in (
+            "teacher_argmax_action_type",
+            "objective_weighted_teacher_argmax_action_type",
+        ):
+            candidate_axis = candidate_surface.get(axis)
+            parent_axis = parent_surface.get(axis)
+            if not isinstance(candidate_axis, Mapping) or not isinstance(
+                parent_axis, Mapping
+            ):
+                raise SystemExit(
+                    "candidate and parent behavioral competence axes differ"
+                )
+            candidate_metrics = candidate_axis.get("MARITIME_TRADE")
+            parent_metrics = parent_axis.get("MARITIME_TRADE")
+            if not isinstance(candidate_metrics, Mapping) or not isinstance(
+                parent_metrics, Mapping
+            ):
+                raise SystemExit(
+                    "candidate and parent maritime competence strata differ"
+                )
+            count_keys = {"rows", "row_probability"}
+            candidate_count = count_keys.intersection(candidate_metrics)
+            parent_count = count_keys.intersection(parent_metrics)
+            if candidate_count != parent_count or len(candidate_count) != 1:
+                raise SystemExit(
+                    "candidate and parent maritime competence measures differ"
+                )
+            count_key = next(iter(candidate_count))
+            candidate_count_value = float(candidate_metrics[count_key])
+            parent_count_value = float(parent_metrics[count_key])
+            if not math.isclose(
+                candidate_count_value,
+                parent_count_value,
+                rel_tol=0.0,
+                abs_tol=1.0e-9,
+            ):
+                raise SystemExit(
+                    "candidate and parent maritime competence measures differ"
+                )
+            metric_keys = set(candidate_metrics) - {count_key}
+            if metric_keys != set(parent_metrics) - {count_key}:
+                raise SystemExit(
+                    "candidate and parent maritime competence metrics differ"
+                )
+            deltas = {
+                key: float(candidate_metrics[key]) - float(parent_metrics[key])
+                for key in sorted(metric_keys)
+            }
+            result_axes[axis] = {
+                "MARITIME_TRADE": {
+                    count_key: candidate_metrics[count_key],
+                    "parent": {
+                        key: parent_metrics[key] for key in sorted(metric_keys)
+                    },
+                    "candidate": {
+                        key: candidate_metrics[key] for key in sorted(metric_keys)
+                    },
+                    "candidate_minus_parent": deltas,
+                }
+            }
+        result_streams[str(stream)] = {
+            "action_catalog_abi": dict(candidate_surface["action_catalog_abi"]),
+            **result_axes,
+        }
+    return {
+        "schema_version": PAIRED_BEHAVIORAL_COMPETENCE_SCHEMA,
+        "selection_authority": False,
+        "surface": "same_holdout_same_teacher_argmax_action_type_strata",
+        "streams": result_streams,
+    }
+
+
 def _evaluate_candidate(
     prepared: Mapping[str, Any],
     *,
@@ -1460,6 +1753,7 @@ def _evaluate_candidate(
     parent_surface: Mapping[str, Any] | None = None,
     parent_teacher_gap: Mapping[str, Any] | None = None,
     parent_metrics: Mapping[str, Any] | None = None,
+    require_behavioral_competence: bool = False,
 ) -> dict[str, Any]:
     path = checkpoint_path.resolve(strict=True)
     report = prepared["report"]
@@ -1472,6 +1766,11 @@ def _evaluate_candidate(
         )
     metrics = _evaluate_policy_metrics(prepared, policy, input_surface=input_surface)
     teacher_gap = _teacher_gap_projection(metrics)
+    behavioral_competence = _behavioral_competence_projection(
+        metrics,
+        prepared_action_catalog_abi=prepared["action_catalog_abi"],
+        required=require_behavioral_competence,
+    )
     value_quality = _value_quality_projection(metrics)
     result = {
         "label": label,
@@ -1503,6 +1802,8 @@ def _evaluate_candidate(
             prepared["policy_teacher_gap_objective"]
         ),
     }
+    if behavioral_competence is not None:
+        result["behavioral_competence"] = behavioral_competence
     if parent_policy is not None:
         assert (
             parent_ref is not None
@@ -1524,6 +1825,27 @@ def _evaluate_candidate(
             candidate=value_quality,
             parent=parent_value_quality,
         )
+        parent_behavioral_competence = _behavioral_competence_projection(
+            parent_metrics,
+            prepared_action_catalog_abi=prepared["action_catalog_abi"],
+            required=behavioral_competence is not None
+            or require_behavioral_competence,
+        )
+        if behavioral_competence is None and parent_behavioral_competence is not None:
+            raise SystemExit(
+                "candidate lacks the parent's behavioral competence surface"
+            )
+        if behavioral_competence is not None:
+            assert parent_behavioral_competence is not None
+            result["parent_behavioral_competence"] = (
+                parent_behavioral_competence
+            )
+            result["paired_parent_behavioral_competence"] = (
+                _paired_parent_behavioral_competence(
+                    candidate=behavioral_competence,
+                    parent=parent_behavioral_competence,
+                )
+            )
         result["functional_dose_fingerprint"] = _functional_drift(
             train_bc=train_bc,
             parent_policy=parent_policy,
@@ -1545,6 +1867,7 @@ def run_probe(
     device: str,
     batch_size: int | None = None,
     parent_checkpoint_path: Path | None = None,
+    require_behavioral_competence: bool = False,
 ) -> dict[str, Any]:
     """Evaluate one checkpoint and, when supplied, its report-bound parent."""
 
@@ -1575,6 +1898,7 @@ def run_probe(
         parent_surface=parent_surface,
         parent_teacher_gap=parent_teacher_gap,
         parent_metrics=parent_metrics,
+        require_behavioral_competence=require_behavioral_competence,
     )
     shared = prepared["shared_holdout"]
     result = {
@@ -1603,6 +1927,8 @@ def run_probe(
         "legacy_prior_kl": candidate["legacy_prior_kl"],
         "metrics": candidate["metrics"],
     }
+    if "behavioral_competence" in candidate:
+        result["behavioral_competence"] = candidate["behavioral_competence"]
     if parent_ref is not None:
         # Keep the established parent input projection small. Batch mode
         # exposes the training-report binding field in its richer shared record.
@@ -1618,6 +1944,13 @@ def run_probe(
         result["paired_parent_value_quality"] = candidate[
             "paired_parent_value_quality"
         ]
+        if "parent_behavioral_competence" in candidate:
+            result["parent_behavioral_competence"] = candidate[
+                "parent_behavioral_competence"
+            ]
+            result["paired_parent_behavioral_competence"] = candidate[
+                "paired_parent_behavioral_competence"
+            ]
     return result
 
 
@@ -1661,6 +1994,7 @@ def run_batch_probe(
     validation_manifest_path: Path,
     device: str,
     batch_size: int | None = None,
+    require_behavioral_competence: bool = False,
 ) -> dict[str, Any]:
     """Evaluate labeled candidates on one corpus against one bound parent."""
 
@@ -1698,6 +2032,7 @@ def run_batch_probe(
             parent_surface=parent_surface,
             parent_teacher_gap=parent_teacher_gap,
             parent_metrics=parent_metrics,
+            require_behavioral_competence=require_behavioral_competence,
         )
         for label, checkpoint_path in checkpoints
     }
