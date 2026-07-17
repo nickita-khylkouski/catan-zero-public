@@ -190,6 +190,23 @@ def _parse_flags(raw: str) -> dict[str, object]:
                 }
             )
         elif entry in (
+            "current_v8_information_migration_topology_split1",
+            "current-v8-information-migration-topology-split1",
+        ):
+            # Direct current-V2 -> V6 construction with the separately
+            # zero-output exact-public-resource path.  This is an information
+            # migration (V2 and V6 inputs genuinely differ), not a V5/V8
+            # compatibility receipt and must therefore carry its own anchors.
+            overrides.update(
+                {
+                    **_parse_flags("current_v5_topology_split1"),
+                    "v6_compatibility_preserving_inputs": True,
+                    "action_cross_attention_layers": 1,
+                    "action_cross_attention_bottleneck": 80,
+                    "public_card_exact_resource_residual": True,
+                }
+            )
+        elif entry in (
             "current_v6_topology_split1",
             "current-v6-topology-split1",
         ):
@@ -519,7 +536,10 @@ def _migration_anchor_evidence(
 
     source_adapter = str(base.entity_feature_adapter_version)
     target_adapter = str(upgraded.entity_feature_adapter_version)
-    legacy_v2_to_v6 = migration == "current_v2_to_v6_topology_split1"
+    legacy_v2_to_v6 = migration in {
+        "current_v2_to_v6_topology_split1",
+        "current_v2_to_v6_topology_split1_public_resource_v8",
+    }
     v5_to_v7 = migration == "v5_to_v7_input_compatibility"
     v5_to_v8 = migration == "v5_to_v8_public_resource_compatibility"
     v5_compatibility = v5_to_v7 or v5_to_v8
@@ -952,6 +972,14 @@ def main() -> None:
         }
         for piece in args.flags.split(",")
     )
+    requested_v8_current_migration = any(
+        piece.strip()
+        in {
+            "current_v8_information_migration_topology_split1",
+            "current-v8-information-migration-topology-split1",
+        }
+        for piece in args.flags.split(",")
+    )
     requested_v7_migration = any(
         piece.strip()
         in {
@@ -972,6 +1000,7 @@ def main() -> None:
         int(value)
         for value in (
             requested_v6_migration,
+            requested_v8_current_migration,
             requested_v7_migration,
             requested_v8_migration,
         )
@@ -979,12 +1008,15 @@ def main() -> None:
         raise SystemExit("only one information-contract migration may be requested")
     requested_information_migration = (
         requested_v6_migration
+        or requested_v8_current_migration
         or requested_v7_migration
         or requested_v8_migration
     )
     migration_name = (
         "current_v2_to_v6_topology_split1"
         if requested_v6_migration
+        else "current_v2_to_v6_topology_split1_public_resource_v8"
+        if requested_v8_current_migration
         else (
             "v5_to_v8_public_resource_compatibility"
             if requested_v8_migration

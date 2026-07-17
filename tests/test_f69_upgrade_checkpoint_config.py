@@ -193,6 +193,17 @@ def test_direct_v8_migration_preserves_v7_route_and_adds_exact_public_resources(
     assert overrides["public_card_exact_resource_residual"] is True
 
 
+def test_current_v8_migration_builds_the_complete_v2_to_v6_route():
+    overrides = upgrade_tool._parse_flags(  # noqa: SLF001
+        "current_v8_information_migration_topology_split1"
+    )
+
+    assert overrides["topology_residual_adapter"] is True
+    assert overrides["v6_compatibility_preserving_inputs"] is True
+    assert overrides["action_cross_attention_layers"] == 1
+    assert overrides["public_card_exact_resource_residual"] is True
+
+
 def test_build_upgraded_config_preserves_a_full_config():
     """A current (non-stale) config round-trips with only the overrides changed."""
     base = EntityGraphConfig(

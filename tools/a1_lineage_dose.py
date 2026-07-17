@@ -310,6 +310,10 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
                 "entity_graph.current_v2_to_v6_information_contract"
                 "+topology+split1.v1"
             ): False,
+            (
+                "entity_graph.current_v2_to_v6_information_contract+topology+"
+                "split1+public_resource_v8.v1"
+            ): False,
             "entity_graph.v5_to_v7_input_compatibility.v1": True,
             "entity_graph.v5_to_v8_public_resource_compatibility.v1": True,
         }.get(migration_kind)

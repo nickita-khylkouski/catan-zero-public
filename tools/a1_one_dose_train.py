@@ -2525,7 +2525,7 @@ def bind_canonical_parent_update_recipe(
     if (
         not isinstance(migration, dict)
         or migration.get("migration")
-        != information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
+        != information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8
         or not _same_checkpoint_reference(
             migration.get("source"), verified["producer"]
         )
@@ -2533,8 +2533,8 @@ def bind_canonical_parent_update_recipe(
         or migration.get("promotion_eligible") is not False
     ):
         raise ExecutorError(
-            "canonical parent update requires the direct non-promotable v2->v6 "
-            "information-contract migration receipt"
+            "canonical parent update requires the direct non-promotable "
+            "V2->V6+exact-public-resource migration receipt"
         )
     result = dict(verified)
     result["bound_recipe"] = recipe
@@ -7006,7 +7006,7 @@ def bind_function_preserving_upgrade(
 def bind_information_contract_migration(
     verified: dict[str, Any], receipt_path: Path
 ) -> dict[str, Any]:
-    """Bind the reviewed v2->v6 treatment without claiming continuity."""
+    """Bind a reviewed direct V2 information-contract treatment."""
 
     if verified.get("learner_ablation") is not None:
         raise ExecutorError("information migration cannot hide inside an ablation")
@@ -7016,7 +7016,10 @@ def bind_information_contract_migration(
         raise ExecutorError(f"information migration receipt refused: {error}") from error
     if (
         migration.get("migration")
-        != information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
+        not in {
+            information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+            information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8,
+        }
         or not _same_checkpoint_reference(
             migration.get("source"), verified.get("producer")
         )
@@ -7025,7 +7028,7 @@ def bind_information_contract_migration(
     ):
         raise ExecutorError(
             "information migration must connect the exact corpus producer to "
-            "the non-promotable v6 treatment"
+            "the non-promotable current-V2 information treatment"
         )
     receipt = migration["receipt"]
     lineage_binding = {

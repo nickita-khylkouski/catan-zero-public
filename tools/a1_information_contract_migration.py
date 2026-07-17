@@ -40,6 +40,10 @@ SCHEMA = "a1-information-contract-migration-v1"
 MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1 = (
     "entity_graph.current_v2_to_v6_information_contract+topology+split1.v1"
 )
+MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8 = (
+    "entity_graph.current_v2_to_v6_information_contract+topology+split1+"
+    "public_resource_v8.v1"
+)
 MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY = "entity_graph.v5_to_v7_input_compatibility.v1"
 MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY = (
     "entity_graph.v5_to_v8_public_resource_compatibility.v1"
@@ -320,6 +324,7 @@ def _verify_topology_delta(
     *,
     provenance: Mapping[str, Any],
     anchor: Mapping[str, Any],
+    require_exact_public_resource_residual: bool = False,
 ) -> dict[str, Any]:
     """Replay parameter construction through the reviewed historical v5 spec.
 
@@ -330,9 +335,92 @@ def _verify_topology_delta(
 
     import torch
 
+    if require_exact_public_resource_residual:
+        # Reconstruct the complete direct V2->V6+V8 transition from the V2
+        # bytes.  It cannot reuse the historical V5 topology verifier because
+        # V6 compatibility routing and the V8 residual are both intentionally
+        # absent from that old receipt contract.
+        from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+        from tools import f69_upgrade_checkpoint_config as upgrader
+
+        before = torch.load(source, map_location="cpu", weights_only=False)
+        after = torch.load(migrated, map_location="cpu", weights_only=False)
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise MigrationError("combined V8 migration checkpoints are malformed")
+        base = EntityGraphPolicy.load(source, device="cpu")
+        expected_config = upgrader._build_upgraded_config(  # noqa: SLF001
+            base.config,
+            upgrader._parse_flags(  # noqa: SLF001
+                "current_v8_information_migration_topology_split1"
+            ),
+        )
+        static = base.static_action_features.detach().cpu().numpy()
+        replay = EntityGraphPolicy(
+            expected_config,
+            static,
+            seed=int(provenance["initialization_seed"]),
+            device="cpu",
+            entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+        )
+        before_model = before.get("model")
+        after_model = after.get("model")
+        if not isinstance(before_model, Mapping) or not isinstance(after_model, Mapping):
+            raise MigrationError("combined V8 migration model state is malformed")
+        missing, unexpected = replay.model.load_state_dict(before_model, strict=False)
+        if unexpected or set(missing) != set(after_model) - set(before_model):
+            raise MigrationError("combined V8 migration parameter topology drift")
+        if int(getattr(expected_config, "value_tower_split_layers", 0) or 0) > int(
+            getattr(base.config, "value_tower_split_layers", 0) or 0
+        ):
+            replay.model.initialize_value_tower_from_policy()
+        if any(
+            not function_upgrade._tensor_equal_exact(before_model[name], after_model[name])  # noqa: SLF001
+            for name in before_model
+        ) or any(
+            not function_upgrade._tensor_equal_exact(replay.model.state_dict()[name], after_model[name])  # noqa: SLF001
+            for name in set(after_model) - set(before_model)
+        ):
+            raise MigrationError("combined V8 migration parameter replay drift")
+        actual_config = function_upgrade._effective_config_receipt_view(  # noqa: SLF001
+            function_upgrade._config(after.get("config"))  # noqa: SLF001
+        )
+        expected_config_view = function_upgrade._effective_config_receipt_view(  # noqa: SLF001
+            __import__("dataclasses").asdict(expected_config)
+        )
+        if actual_config != expected_config_view:
+            raise MigrationError("combined V8 migration config drift")
+        return {
+            "module": "current_v2_to_v6_topology_split1_public_resource_v8",
+            "shared_parameters_bit_identical": True,
+            "new_parameters": sorted(set(after_model) - set(before_model)),
+            "effective_migrated_config_sha256": function_upgrade._digest(expected_config_view),  # noqa: SLF001
+        }
+
     raw = torch.load(migrated, map_location="cpu", weights_only=False)
     if not isinstance(raw, dict):
         raise MigrationError("migrated checkpoint is malformed")
+    if require_exact_public_resource_residual:
+        # The combined V2->V6+V8 edge is deliberately a new migration label:
+        # issued V2->V6 receipts remain replayable and cannot silently acquire
+        # a new information path.  The exact residual is zero-output at step
+        # zero but must be present in the migrated checkpoint so the learner
+        # can actually optimize the public two-player deduction.
+        model = raw.get("model")
+        config = raw.get("config")
+        if not isinstance(model, Mapping) or not isinstance(config, Mapping):
+            raise MigrationError("combined V8 migration checkpoint is malformed")
+        weight = model.get("public_card_exact_resource_residual.weight")
+        if weight is None or tuple(weight.shape[:1]) == () or not torch.equal(
+            weight, torch.zeros_like(weight)
+        ):
+            raise MigrationError(
+                "combined V8 migration lacks a zero-initialized exact-public "
+                "resource residual"
+            )
+        if config.get("public_card_exact_resource_residual") is not True:
+            raise MigrationError(
+                "combined V8 migration does not enable the exact-public resource route"
+            )
     normalized = dict(raw)
     normalized.pop("information_contract_migration_provenance", None)
     normalized["entity_feature_adapter"] = {
@@ -583,6 +671,7 @@ def inspect_migration(
 ) -> dict[str, Any]:
     if migration not in {
         MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+        MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8,
         MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
         MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY,
     }:
@@ -595,6 +684,10 @@ def inspect_migration(
     if not isinstance(before, dict) or not isinstance(after, dict):
         raise MigrationError("migration checkpoints are malformed")
     provenance = after.get("information_contract_migration_provenance")
+    current_v8 = (
+        migration
+        == MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8
+    )
     v7_input_routing = migration == MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY
     v8_input_routing = (
         migration == MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY
@@ -605,6 +698,8 @@ def inspect_migration(
         if v8_input_routing
         else "v5_to_v7_input_compatibility"
         if v7_input_routing
+        else "current_v2_to_v6_topology_split1_public_resource_v8"
+        if current_v8
         else "current_v2_to_v6_topology_split1"
     )
     expected_source_adapter = (
@@ -696,6 +791,7 @@ def inspect_migration(
             Path(migrated_ref["path"]),
             provenance=provenance,
             anchor=anchor,
+            require_exact_public_resource_residual=current_v8,
         )
     )
     return {
@@ -790,6 +886,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
         choices=(
             MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+            MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8,
             MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
             MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY,
         ),
