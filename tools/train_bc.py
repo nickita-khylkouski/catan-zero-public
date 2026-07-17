@@ -12835,28 +12835,17 @@ def main(
     checkpoint_steps = _parse_checkpoint_steps(
         args.checkpoint_steps, max_steps=int(args.max_steps)
     )
-    # Snapshots are immutable evidence from one trajectory, not overwriteable
-    # convenience outputs. Refuse before model/data work if a requested path is
-    # already occupied.
-    for step in checkpoint_steps:
-        snapshot_path = _step_checkpoint_path(args.checkpoint, step)
-        if snapshot_path.exists() or snapshot_path.is_symlink():
-            raise SystemExit(
-                f"intermediate checkpoint path already exists: {snapshot_path}"
-            )
-    initialization_reference_path = (
-        _step_checkpoint_path(args.checkpoint, 0)
-        if checkpoint_steps and args.init_checkpoint
-        else None
+    # A fresh/model-only start owns an entirely new immutable checkpoint
+    # frontier, including the optional effective step-zero parent reference.
+    # An exact optimizer resume is different: already-passed snapshots are
+    # durable evidence that must be authenticated after progress restoration,
+    # while only future paths must remain unoccupied.
+    initialization_reference_path = _prepare_checkpoint_frontier_start(
+        args.checkpoint,
+        checkpoint_steps=checkpoint_steps,
+        init_checkpoint=str(args.init_checkpoint),
+        resume_optimizer=bool(args.resume_optimizer),
     )
-    if initialization_reference_path is not None and (
-        initialization_reference_path.exists()
-        or initialization_reference_path.is_symlink()
-    ):
-        raise SystemExit(
-            "effective initialization reference path already exists: "
-            f"{initialization_reference_path}"
-        )
     if int(args.policy_aux_active_batch_size) < 0:
         raise SystemExit("--policy-aux-active-batch-size must be >= 0")
     if not math.isfinite(float(args.policy_aux_loss_weight)) or float(
@@ -15639,7 +15628,16 @@ def main(
     checkpoint_dose_snapshots: list[dict[str, object]] = []
     checkpoint_holdout_snapshots: list[dict[str, object]] = []
     effective_initialization_reference: dict[str, object] | None = None
-    saved_checkpoint_steps: set[int] = set()
+    saved_checkpoint_steps = (
+        _verify_resumed_checkpoint_frontier(
+            args.checkpoint,
+            checkpoint_steps=checkpoint_steps,
+            restored_global_step=global_step,
+            resume_recipe_identity=resume_recipe_identity,
+        )
+        if resume_progress is not None
+        else set()
+    )
 
     def _evaluate_validation_indices(eval_indices: np.ndarray) -> dict:
         return evaluate_bc_batches(
@@ -17229,11 +17227,17 @@ def main(
                     categorical_training_weight_sum=snapshot_categorical_weight,
                 )
                 snapshot_value_training["intermediate_checkpoint"] = {
-                    "schema_version": "train-bc-intermediate-checkpoint-v1",
+                    "schema_version": INTERMEDIATE_CHECKPOINT_SCHEMA,
                     "optimizer_step": int(global_step),
                     "same_training_trajectory": True,
                     "optimizer_sidecar_intentionally_omitted": True,
                 }
+                snapshot_value_training["intermediate_checkpoint_trajectory"] = (
+                    _intermediate_checkpoint_trajectory_binding(
+                        optimizer_step=global_step,
+                        resume_recipe_identity=resume_recipe_identity,
+                    )
+                )
                 snapshot_policy_signal = _policy_training_signal_attestation(
                     [*metrics, checkpoint_partial_metric],
                     policy_loss_weight=float(args.policy_loss_weight),
@@ -17278,7 +17282,7 @@ def main(
                     snapshot_sha256 = _sha256_existing_file(snapshot_path)
                     intermediate_checkpoints.append(
                         {
-                            "schema_version": "train-bc-intermediate-checkpoint-v1",
+                            "schema_version": INTERMEDIATE_CHECKPOINT_SCHEMA,
                             "optimizer_step": int(global_step),
                             "checkpoint": str(snapshot_path),
                             "checkpoint_sha256": snapshot_sha256,
@@ -36583,6 +36587,181 @@ def _step_checkpoint_path(checkpoint: str | Path, step: int) -> Path:
     suffix = "".join(path.suffixes) or ".pt"
     stem = path.name[: -len(suffix)] if path.name.endswith(suffix) else path.stem
     return path.with_name(f"{stem}_step{int(step):04d}{suffix}")
+
+
+INTERMEDIATE_CHECKPOINT_SCHEMA = "train-bc-intermediate-checkpoint-v1"
+INTERMEDIATE_CHECKPOINT_TRAJECTORY_SCHEMA = (
+    "train-bc-intermediate-checkpoint-trajectory-v1"
+)
+
+
+def _prepare_checkpoint_frontier_start(
+    checkpoint: str | Path,
+    *,
+    checkpoint_steps: Sequence[int],
+    init_checkpoint: str,
+    resume_optimizer: bool,
+) -> Path | None:
+    """Reserve immutable snapshot paths for a fresh or model-only start.
+
+    Exact optimizer resume cannot classify requested steps until its authenticated
+    progress marker supplies the restored optimizer step.  It therefore creates
+    no step-zero reference and defers both past/future path checks to
+    :func:`_verify_resumed_checkpoint_frontier`.
+    """
+
+    steps = tuple(int(step) for step in checkpoint_steps)
+    if bool(resume_optimizer):
+        return None
+    for step in steps:
+        snapshot_path = _step_checkpoint_path(checkpoint, step)
+        if snapshot_path.exists() or snapshot_path.is_symlink():
+            raise SystemExit(
+                f"intermediate checkpoint path already exists: {snapshot_path}"
+            )
+    initialization_reference_path = (
+        _step_checkpoint_path(checkpoint, 0)
+        if steps and str(init_checkpoint).strip()
+        else None
+    )
+    if initialization_reference_path is not None and (
+        initialization_reference_path.exists()
+        or initialization_reference_path.is_symlink()
+    ):
+        raise SystemExit(
+            "effective initialization reference path already exists: "
+            f"{initialization_reference_path}"
+        )
+    return initialization_reference_path
+
+
+def _intermediate_checkpoint_trajectory_binding(
+    *, optimizer_step: int, resume_recipe_identity: Mapping[str, object]
+) -> dict[str, object]:
+    """Bind one model-only snapshot to its exact resumable optimizer trajectory."""
+
+    return {
+        "schema_version": INTERMEDIATE_CHECKPOINT_TRAJECTORY_SCHEMA,
+        "optimizer_step": int(optimizer_step),
+        "training_resume_recipe_identity_sha256": _canonical_json_sha256(
+            dict(resume_recipe_identity)
+        ),
+    }
+
+
+def _verify_resumed_checkpoint_frontier(
+    checkpoint: str | Path,
+    *,
+    checkpoint_steps: Sequence[int],
+    restored_global_step: int,
+    resume_recipe_identity: Mapping[str, object],
+) -> set[int]:
+    """Authenticate passed snapshots and reserve future paths on exact resume.
+
+    A path alone is not evidence that the snapshot belongs to this optimizer
+    trajectory.  Passed steps must be regular model-only checkpoint files whose
+    embedded step and recipe identity match the validated training-progress
+    marker.  Future paths must be absent so resuming never overwrites evidence.
+    """
+
+    import torch
+
+    restored = int(restored_global_step)
+    expected_identity_sha256 = _canonical_json_sha256(
+        dict(resume_recipe_identity)
+    )
+    verified: set[int] = set()
+    from catan_zero.rl.optim_state import (
+        optimizer_sidecar_path,
+        training_progress_sidecar_path,
+    )
+
+    for raw_step in checkpoint_steps:
+        step = int(raw_step)
+        snapshot_path = _step_checkpoint_path(checkpoint, step)
+        optimizer_path = optimizer_sidecar_path(snapshot_path)
+        progress_path = training_progress_sidecar_path(snapshot_path)
+        occupied_paths = tuple(
+            path
+            for path in (snapshot_path, optimizer_path, progress_path)
+            if path.exists() or path.is_symlink()
+        )
+        if step > restored:
+            if occupied_paths:
+                raise SystemExit(
+                    "future intermediate checkpoint path already exists during "
+                    f"optimizer resume: step={step} paths="
+                    f"{[str(path) for path in occupied_paths]}"
+                )
+            continue
+        if not snapshot_path.is_file() or snapshot_path.is_symlink():
+            raise SystemExit(
+                "optimizer resume is missing an immutable past intermediate "
+                f"checkpoint: step={step} path={snapshot_path}"
+            )
+        if (
+            optimizer_path.exists()
+            or optimizer_path.is_symlink()
+            or progress_path.exists()
+            or progress_path.is_symlink()
+        ):
+            raise SystemExit(
+                "past intermediate checkpoint is not model-only: "
+                f"step={step} path={snapshot_path}"
+            )
+        try:
+            payload = torch.load(snapshot_path, map_location="cpu", weights_only=False)
+        except Exception as error:
+            raise SystemExit(
+                "cannot authenticate past intermediate checkpoint "
+                f"step={step} path={snapshot_path}: {error}"
+            ) from error
+        value_training = (
+            payload.get("value_training") if isinstance(payload, dict) else None
+        )
+        intermediate = (
+            value_training.get("intermediate_checkpoint")
+            if isinstance(value_training, dict)
+            else None
+        )
+        trajectory = (
+            value_training.get("intermediate_checkpoint_trajectory")
+            if isinstance(value_training, dict)
+            else None
+        )
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("model"), dict)
+            or not payload.get("model")
+            or not isinstance(value_training, dict)
+            or type(value_training.get("optimizer_steps")) is not int
+            or value_training.get("optimizer_steps") != step
+            or not isinstance(intermediate, dict)
+            or type(intermediate.get("optimizer_step")) is not int
+            or intermediate
+            != {
+                "schema_version": INTERMEDIATE_CHECKPOINT_SCHEMA,
+                "optimizer_step": step,
+                "same_training_trajectory": True,
+                "optimizer_sidecar_intentionally_omitted": True,
+            }
+            or not isinstance(trajectory, dict)
+            or type(trajectory.get("optimizer_step")) is not int
+            or trajectory
+            != {
+                "schema_version": INTERMEDIATE_CHECKPOINT_TRAJECTORY_SCHEMA,
+                "optimizer_step": step,
+                "training_resume_recipe_identity_sha256": (
+                    expected_identity_sha256
+                ),
+            }
+        ):
+            raise SystemExit(
+                "past intermediate checkpoint step/trajectory metadata mismatch: "
+                f"step={step} path={snapshot_path}"
+            )
+        verified.add(step)
+    return verified
 
 
 def _parse_checkpoint_steps(raw: str, *, max_steps: int) -> tuple[int, ...]:
