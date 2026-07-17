@@ -645,6 +645,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--v6-compatibility-preserving-inputs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Route V6 physical resource and corrected initial-road features "
+            "through the function-preserving V7 input adapters. This is "
+            "checkpoint-owned architecture and is never inferred from the "
+            "entity adapter name."
+        ),
+    )
+    parser.add_argument(
         "--topology-residual-adapter",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -3766,6 +3777,25 @@ def _checkpoint_topology_residual_adapter(checkpoint_path: str) -> bool:
         )
     config = config_attr_view(checkpoint["config"])
     return bool(getattr(config, "topology_residual_adapter", False))
+
+
+def _checkpoint_v6_compatibility_preserving_inputs(
+    checkpoint_path: str,
+) -> bool:
+    """Read the checkpoint-owned V7 compatibility input topology."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --v6-compatibility-preserving-inputs"
+        )
+    config = config_attr_view(checkpoint["config"])
+    return bool(getattr(config, "v6_compatibility_preserving_inputs", False))
 
 
 def _checkpoint_value_tower_split_layers(checkpoint_path: str) -> int:
@@ -10364,6 +10394,10 @@ def _validate_a1_scratch_runtime_projection(
             args.action_cross_attention_bottleneck
         )
         != model["action_cross_attention_bottleneck"],
+        "v6_compatibility_preserving_inputs": bool(
+            args.v6_compatibility_preserving_inputs
+        )
+        is not model["v6_compatibility_preserving_inputs"],
         "topology_residual_adapter": bool(
             getattr(args, "topology_residual_adapter", False)
         )
@@ -11416,6 +11450,7 @@ def _require_explicit_production_checkpoint_architecture(
         "action_target_gather",
         "action_cross_attention_layers",
         "action_cross_attention_bottleneck",
+        "v6_compatibility_preserving_inputs",
         "topology_residual_adapter",
         "static_action_residual",
         "legal_action_value_residual",
@@ -13212,6 +13247,65 @@ def _resolve_effective_topology_residual_adapter(
     return False if requested is None else requested
 
 
+def _resolve_effective_v6_compatibility_preserving_inputs(
+    args: argparse.Namespace,
+) -> bool:
+    """Resolve the V7 input migration as explicit checkpoint-owned topology."""
+
+    requested = getattr(args, "v6_compatibility_preserving_inputs", None)
+    if requested is not None:
+        requested = bool(requested)
+    if str(args.arch) != "entity_graph":
+        if requested:
+            raise SystemExit(
+                "--v6-compatibility-preserving-inputs is supported only for "
+                "--arch entity_graph"
+            )
+        return False
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_v6_compatibility_preserving_inputs(
+            init_checkpoint
+        )
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "--v6-compatibility-preserving-inputs does not match "
+                f"--init-checkpoint: checkpoint={inherited} cli={requested}. "
+                "Use the reviewed information-contract migration."
+            )
+        result = inherited
+    elif grow_checkpoint:
+        inherited = _checkpoint_v6_compatibility_preserving_inputs(
+            grow_checkpoint
+        )
+        result = inherited if requested is None else requested
+    else:
+        result = False if requested is None else requested
+
+    if result:
+        if init_checkpoint:
+            adapter = _checkpoint_entity_feature_adapter_version(init_checkpoint)
+        elif grow_checkpoint and getattr(
+            args, "entity_feature_adapter_version", None
+        ) is None:
+            adapter = _checkpoint_entity_feature_adapter_version(grow_checkpoint)
+        else:
+            adapter = _resolved_training_entity_adapter(args)
+        if adapter != RUST_ENTITY_ADAPTER_V6:
+            raise SystemExit(
+                "--v6-compatibility-preserving-inputs requires the V6 entity "
+                f"adapter, got {adapter!r}"
+            )
+        if int(getattr(args, "action_cross_attention_layers", 0) or 0) < 1:
+            raise SystemExit(
+                "--v6-compatibility-preserving-inputs requires at least one "
+                "--action-cross-attention-layers"
+            )
+    return result
+
+
 def _resolve_effective_value_tower_split_layers(
     args: argparse.Namespace,
 ) -> int:
@@ -13258,6 +13352,9 @@ def _structured_action_create_kwargs(
         ),
         "action_cross_attention_bottleneck": int(
             args.action_cross_attention_bottleneck
+        ),
+        "v6_compatibility_preserving_inputs": bool(
+            args.v6_compatibility_preserving_inputs
         ),
         "static_action_residual": bool(args.static_action_residual),
         "legal_action_value_residual": bool(args.legal_action_value_residual),
@@ -14360,6 +14457,12 @@ def main(
     args.action_cross_attention_bottleneck = (
         _resolve_effective_action_cross_attention_bottleneck(checkpoint_args)
     )
+    checkpoint_args.action_cross_attention_bottleneck = (
+        args.action_cross_attention_bottleneck
+    )
+    args.v6_compatibility_preserving_inputs = (
+        _resolve_effective_v6_compatibility_preserving_inputs(checkpoint_args)
+    )
     args.topology_residual_adapter = (
         _resolve_effective_topology_residual_adapter(checkpoint_args)
     )
@@ -14385,6 +14488,7 @@ def main(
         "action_target_gather",
         "action_cross_attention_layers",
         "action_cross_attention_bottleneck",
+        "v6_compatibility_preserving_inputs",
         "topology_residual_adapter",
         "static_action_residual",
         "legal_action_value_residual",
@@ -36594,6 +36698,11 @@ def _checkpoint_config_mismatches(
                 "action_cross_attention_bottleneck",
                 0,
             ),
+            (
+                "v6_compatibility_preserving_inputs",
+                "v6_compatibility_preserving_inputs",
+                False,
+            ),
             ("relational_block_pattern", "relational_block_pattern", ""),
             ("relational_ff_size", "relational_ff_size", 0),
             ("relational_bases", "relational_bases", 4),
@@ -42259,6 +42368,9 @@ def _training_resume_recipe_identity(
         ),
         "action_cross_attention_bottleneck": int(
             getattr(args, "action_cross_attention_bottleneck", 0) or 0
+        ),
+        "v6_compatibility_preserving_inputs": bool(
+            getattr(args, "v6_compatibility_preserving_inputs", False)
         ),
         "value_tower_split_layers": int(
             getattr(args, "value_tower_split_layers", 0) or 0

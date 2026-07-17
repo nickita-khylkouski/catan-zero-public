@@ -31,6 +31,7 @@
       "action_module_lr_mult": 1.0,
       "action_cross_attention_layers": 1,
       "action_cross_attention_bottleneck": 80,
+      "v6_compatibility_preserving_inputs": true,
       "shared_action_lr_mult": 1.0,
       "action_target_gather": true,
       "advantage_policy_weighting": "none",

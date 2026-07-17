@@ -11,6 +11,7 @@ from tools.train_bc import (
     _checkpoint_config_mismatches,
     _effective_a1_learner_training_recipe,
     _resolve_effective_action_cross_attention_bottleneck,
+    _resolve_effective_v6_compatibility_preserving_inputs,
     _resolve_effective_action_cross_attention_layers,
     _resolve_effective_action_target_gather,
     _resolve_effective_structured_action_residuals,
@@ -77,6 +78,13 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
             "1",
             "--action-cross-attention-bottleneck",
             "80",
+            "--v6-compatibility-preserving-inputs",
+            "--entity-feature-adapter-version",
+            "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+            "--public-rule-state-features",
+            "--meaningful-public-history",
+            "--event-history-limit",
+            "64",
             "--static-action-residual",
             "--legal-action-value-residual",
             "--legal-action-value-set-statistics",
@@ -85,6 +93,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
     assert parser.get_default("action_target_gather") is None
     assert parser.get_default("action_cross_attention_layers") is None
     assert parser.get_default("action_cross_attention_bottleneck") is None
+    assert parser.get_default("v6_compatibility_preserving_inputs") is None
     assert parser.get_default("topology_residual_adapter") is None
     assert parser.get_default("static_action_residual") is None
     assert parser.get_default("legal_action_value_residual") is None
@@ -101,6 +110,9 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
     parsed.action_cross_attention_bottleneck = (
         _resolve_effective_action_cross_attention_bottleneck(parsed)
     )
+    parsed.v6_compatibility_preserving_inputs = (
+        _resolve_effective_v6_compatibility_preserving_inputs(parsed)
+    )
     parsed.topology_residual_adapter = _resolve_effective_topology_residual_adapter(
         parsed
     )
@@ -112,6 +124,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
         "action_target_gather": True,
         "action_cross_attention_layers": 1,
         "action_cross_attention_bottleneck": 80,
+        "v6_compatibility_preserving_inputs": True,
         "static_action_residual": True,
         "legal_action_value_residual": True,
         "legal_action_value_set_statistics": True,
@@ -123,11 +136,13 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
         attention_heads=2,
         seed=7,
         device="cpu",
+        entity_feature_adapter_version=parsed.entity_feature_adapter_version,
         **kwargs,
     )
     assert policy.config.action_target_gather is True
     assert policy.config.action_cross_attention_layers == 1
     assert policy.config.action_cross_attention_bottleneck == 80
+    assert policy.config.v6_compatibility_preserving_inputs is True
     assert policy.config.static_action_residual is True
     assert policy.config.legal_action_value_residual is True
     assert policy.config.legal_action_value_set_statistics is True
@@ -139,6 +154,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
     assert identity.action_target_gather is True
     assert identity.action_cross_attention_layers == 1
     assert identity.action_cross_attention_bottleneck == 80
+    assert identity.v6_compatibility_preserving_inputs is True
     assert identity.topology_residual_adapter is False
     assert identity.static_action_residual is True
     assert identity.legal_action_value_residual is True

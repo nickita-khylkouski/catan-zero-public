@@ -66,6 +66,7 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
     assert model["action_target_gather"] is True
     assert model["action_cross_attention_layers"] == 1
     assert model["action_cross_attention_bottleneck"] == 80
+    assert model["v6_compatibility_preserving_inputs"] is True
     assert model["legal_action_value_set_statistics"] is True
     assert model["actor_public_rule_state"].startswith("dev_used_")
     assert recipe["value_trunk_grad_scale"] == 0.1

@@ -607,6 +607,7 @@ def build_train_command(
     command.extend(
         [
             "--action-target-gather",
+            "--v6-compatibility-preserving-inputs",
             "--static-action-residual",
             "--legal-action-value-residual",
             "--legal-action-value-set-statistics",

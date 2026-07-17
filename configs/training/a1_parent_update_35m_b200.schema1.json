@@ -34,6 +34,7 @@
       "acknowledge_empty_event_history_payload_inventory_sha256": [],
       "action_cross_attention_layers": null,
       "action_cross_attention_bottleneck": null,
+      "v6_compatibility_preserving_inputs": null,
       "action_module_lr_mult": 1.0,
       "shared_action_lr_mult": 1.0,
       "action_target_gather": true,

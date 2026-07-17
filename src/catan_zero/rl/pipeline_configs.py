@@ -448,6 +448,7 @@ class TrainConfig(PipelineConfig):
     # resolve it to zero unless explicitly commissioned.
     action_cross_attention_layers: int | None = None
     action_cross_attention_bottleneck: int | None = None
+    v6_compatibility_preserving_inputs: bool | None = None
 
     @classmethod
     def from_namespace(cls, args: Any) -> "TrainConfig":

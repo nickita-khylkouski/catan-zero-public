@@ -221,6 +221,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--action-target-gather") == 1
     assert command[command.index("--action-cross-attention-layers") + 1] == "1"
     assert command[command.index("--action-cross-attention-bottleneck") + 1] == "80"
+    assert command.count("--v6-compatibility-preserving-inputs") == 1
     assert command.count("--topology-residual-adapter") == 1
     assert command.count("--legal-action-value-set-statistics") == 1
     assert command.count("--public-rule-state-features") == 1
@@ -376,6 +377,7 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
         action_target_gather=True,
         action_cross_attention_layers=1,
         action_cross_attention_bottleneck=80,
+        v6_compatibility_preserving_inputs=True,
         static_action_residual=True,
         legal_action_value_residual=True,
         legal_action_value_set_statistics=True,
@@ -408,6 +410,9 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     assert policy.config.action_target_gather is True
     assert policy.config.action_cross_attention_layers == 1
     assert policy.config.action_cross_attention_bottleneck == 80
+    assert policy.config.v6_compatibility_preserving_inputs is True
+    assert hasattr(policy.model, "v6_exact_resource_residual")
+    assert hasattr(policy.model, "v6_initial_road_residual")
     assert (
         policy.entity_feature_adapter_version == model["entity_feature_adapter_version"]
     )
@@ -692,6 +697,9 @@ def _runtime_args() -> SimpleNamespace:
             ],
             action_cross_attention_bottleneck=model[
                 "action_cross_attention_bottleneck"
+            ],
+            v6_compatibility_preserving_inputs=model[
+                "v6_compatibility_preserving_inputs"
             ],
             topology_residual_adapter=model["topology_residual_adapter"],
             static_action_residual=model["static_action_residual"],

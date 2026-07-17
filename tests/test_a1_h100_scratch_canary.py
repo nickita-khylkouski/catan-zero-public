@@ -441,6 +441,9 @@ def test_production_runtime_projection_requires_reviewed_topology() -> None:
         action_cross_attention_bottleneck=model[
             "action_cross_attention_bottleneck"
         ],
+        v6_compatibility_preserving_inputs=model[
+            "v6_compatibility_preserving_inputs"
+        ],
         topology_residual_adapter=False,
         static_action_residual=model["static_action_residual"],
         legal_action_value_residual=model["legal_action_value_residual"],
@@ -511,6 +514,9 @@ def test_topology_diagnostic_is_the_only_runtime_projection_exception() -> None:
         action_cross_attention_layers=model["action_cross_attention_layers"],
         action_cross_attention_bottleneck=model[
             "action_cross_attention_bottleneck"
+        ],
+        v6_compatibility_preserving_inputs=model[
+            "v6_compatibility_preserving_inputs"
         ],
         topology_residual_adapter=True,
         static_action_residual=model["static_action_residual"],

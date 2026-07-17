@@ -190,8 +190,9 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "graph_dropout": 0.05,
     "entity_state_trunk": "transformer",
     "action_target_gather": True,
-    "action_cross_attention_layers": 1,
-    "action_cross_attention_bottleneck": 80,
+        "action_cross_attention_layers": 1,
+        "action_cross_attention_bottleneck": 80,
+        "v6_compatibility_preserving_inputs": True,
     "topology_residual_adapter": True,
     "static_action_residual": True,
     "legal_action_value_residual": True,
@@ -251,7 +252,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "ffdb35ba09227021475bddd174fa93be9b600887a8c72bc346a042cd2dd0c6b9"
+        "b0f7cad82a94849ebc5c1ebcf007a9ed20741025f03387d2b3002433b7765c09"
     ),
     "initialization": {
         "mode": "parent_fresh_optimizer",
