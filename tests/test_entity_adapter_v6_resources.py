@@ -13,8 +13,13 @@ from catan_zero.rl.entity_feature_adapter import (
     RUST_ENTITY_ADAPTER_V6,
 )
 from catan_zero.rl.entity_token_features import (
+    EDGE_FEATURE_SIZE,
+    EVENT_FEATURE_SIZE,
     GLOBAL_FEATURE_SIZE,
+    HEX_FEATURE_SIZE,
+    LEGAL_ACTION_FEATURE_SIZE,
     PLAYER_FEATURE_SIZE,
+    VERTEX_FEATURE_SIZE,
     _player_tokens,
     public_card_count_features_from_entity_tokens,
 )
@@ -113,6 +118,186 @@ def test_v6_public_card_backfill_decodes_physical_scales_without_skew():
     np.testing.assert_allclose(
         features[1, 0:5],
         np.asarray([0, 1, 0, 0, 0], dtype=np.float32) / 19.0,
+    )
+
+
+def _minimal_torch_entity_batch(player_tokens):
+    torch = pytest.importorskip("torch")
+    batch_size = int(player_tokens.shape[0])
+    return {
+        "hex_tokens": torch.zeros(batch_size, 19, HEX_FEATURE_SIZE),
+        "hex_mask": torch.ones(batch_size, 19, dtype=torch.bool),
+        "vertex_tokens": torch.zeros(batch_size, 54, VERTEX_FEATURE_SIZE),
+        "vertex_mask": torch.ones(batch_size, 54, dtype=torch.bool),
+        "edge_tokens": torch.zeros(batch_size, 72, EDGE_FEATURE_SIZE),
+        "edge_mask": torch.ones(batch_size, 72, dtype=torch.bool),
+        "player_tokens": torch.as_tensor(player_tokens, dtype=torch.float32),
+        "player_mask": torch.ones(batch_size, 4, dtype=torch.bool),
+        "global_tokens": torch.zeros(batch_size, 1, GLOBAL_FEATURE_SIZE),
+        "event_tokens": torch.zeros(batch_size, 0, EVENT_FEATURE_SIZE),
+        "event_mask": torch.zeros(batch_size, 0, dtype=torch.bool),
+        "legal_action_tokens": torch.zeros(
+            batch_size, 1, LEGAL_ACTION_FEATURE_SIZE
+        ),
+        "legal_action_context": torch.zeros(batch_size, 1, 18),
+    }
+
+
+def test_v7_resource_route_reconstructs_exact_legacy_player_encoder_input():
+    torch = pytest.importorskip("torch")
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet
+
+    class CapturePlayerEncoder(torch.nn.Module):
+        def __init__(self, width: int):
+            super().__init__()
+            self.width = width
+            self.seen = None
+
+        def forward(self, value):
+            self.seen = value.detach().clone()
+            return value.new_zeros((*value.shape[:2], self.width))
+
+    physical = _player_tokens(
+        _payload(_counts(11, 10, 0, 0, 0)),
+        "BLUE",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )[None, ...]
+    legacy = _player_tokens(
+        _payload(_counts(11, 10, 0, 0, 0)),
+        "BLUE",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+    )[None, ...]
+    model = EntityGraphNet(
+        EntityGraphConfig(
+            action_size=1,
+            static_action_feature_size=1,
+            hidden_size=16,
+            state_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+            action_cross_attention_layers=1,
+            v6_compatibility_preserving_inputs=True,
+        )
+    ).eval()
+    capture = CapturePlayerEncoder(model.config.hidden_size)
+    model.player_encoder = capture
+
+    with torch.no_grad():
+        model._state_tokens(_minimal_torch_entity_batch(physical))
+
+    assert capture.seen is not None
+    torch.testing.assert_close(
+        capture.seen,
+        torch.as_tensor(legacy, dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.count_nonzero(model.v6_exact_resource_residual.weight) == 0
+
+
+def test_v7_exact_resource_residual_weight_learns_on_first_backward():
+    torch = pytest.importorskip("torch")
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet
+
+    physical = _player_tokens(
+        _payload(_counts(11, 10, 0, 0, 0)),
+        "BLUE",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )[None, ...]
+    model = EntityGraphNet(
+        EntityGraphConfig(
+            action_size=1,
+            static_action_feature_size=1,
+            hidden_size=16,
+            state_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+            action_cross_attention_layers=1,
+            v6_compatibility_preserving_inputs=True,
+        )
+    )
+    tokens, _mask, _history, _event_mask = model._state_tokens(
+        _minimal_torch_entity_batch(physical)
+    )
+    tokens.sum().backward()
+
+    gradient = model.v6_exact_resource_residual.weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+
+
+def test_v7_resource_route_preserves_inherited_public_card_residual_input():
+    torch = pytest.importorskip("torch")
+    from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet
+
+    class CaptureResidual(torch.nn.Module):
+        def __init__(self, width: int):
+            super().__init__()
+            self.width = width
+            self.seen = None
+
+        def forward(self, value):
+            self.seen = value.detach().clone()
+            return value.new_zeros((*value.shape[:2], self.width))
+
+    payload = _payload(_counts(11, 10, 0, 0, 0))
+    physical = _player_tokens(
+        payload,
+        "BLUE",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )[None, ...]
+    legacy = _player_tokens(
+        payload,
+        "BLUE",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+    )[None, ...]
+    globals_ = np.zeros((1, 1, GLOBAL_FEATURE_SIZE), dtype=np.float32)
+    globals_[0, 0, 26:31] = (
+        np.asarray([8, 8, 19, 19, 19], dtype=np.float32) / 19.0
+    )
+    physical_features = public_card_count_features_from_entity_tokens(
+        physical,
+        globals_,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+    legacy_features = public_card_count_features_from_entity_tokens(
+        legacy,
+        globals_,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V5,
+    )
+    assert not np.array_equal(physical_features, legacy_features)
+
+    model = EntityGraphNet(
+        EntityGraphConfig(
+            action_size=1,
+            static_action_feature_size=1,
+            hidden_size=16,
+            state_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+            action_cross_attention_layers=1,
+            v6_compatibility_preserving_inputs=True,
+            public_card_count_features=True,
+            public_card_count_residual_bias=False,
+        )
+    ).eval()
+    capture = CaptureResidual(model.config.hidden_size)
+    model.public_card_count_residual = capture
+    batch = _minimal_torch_entity_batch(physical)
+    batch["global_tokens"] = torch.as_tensor(globals_)
+    batch[DEDUCTION_FEATURES_KEY] = torch.as_tensor(physical_features)
+
+    with torch.no_grad():
+        model._state_tokens(batch)
+
+    assert capture.seen is not None
+    torch.testing.assert_close(
+        capture.seen,
+        torch.as_tensor(legacy_features, dtype=torch.float32),
+        rtol=0,
+        atol=0,
     )
 
 

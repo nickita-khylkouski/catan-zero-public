@@ -38,6 +38,7 @@ from catan_zero.rl.entity_token_features import (
     GLOBAL_FEATURE_SIZE,
     HEX_FEATURE_SIZE,
     LEGAL_ACTION_FEATURE_SIZE,
+    PLAYER_ACTOR_FLAG_SLOT,
     PLAYER_FEATURE_SIZE,
     PUBLIC_RULE_STATE_FEATURE_SCHEMA_VERSION,
     PUBLIC_RULE_STATE_FEATURE_SIZE,
@@ -1575,10 +1576,19 @@ class EntityGraphNet:
                         safe_vertices.unsqueeze(-1).expand(-1, -1, -1, vertices.shape[-1]),
                     )
                     endpoint_live = endpoint_ids >= 0
+                    # Vertex slot 9 was stored as float16 total_pips / 18,
+                    # while the historical action-context table stored the
+                    # same division directly as float32.  Multiplying the
+                    # quantized vertex value through would therefore perturb
+                    # inherited action weights. Recover the integer pips first.
+                    endpoint_empty = endpoint_tokens[..., 6] > 0.5
+                    endpoint_pips = torch.round(
+                        endpoint_tokens[..., 9] * 18.0
+                    )
                     legacy_endpoint_score = torch.where(
-                        endpoint_live,
-                        endpoint_tokens[..., 6] * endpoint_tokens[..., 9],
-                        torch.zeros_like(endpoint_tokens[..., 9]),
+                        endpoint_live & endpoint_empty,
+                        endpoint_pips / 18.0,
+                        torch.zeros_like(endpoint_pips),
                     ).amax(dim=-1)
                     legacy_context = context.clone()
                     legacy_context[..., 16] = torch.where(
@@ -2043,21 +2053,25 @@ class EntityGraphNet:
                     else event_piece
                 )
                 raw_player_tokens = batch["player_tokens"].float()
+                global_tokens = batch["global_tokens"].float()
                 if self.v6_compatibility_preserving_inputs_enabled:
                     legacy_player_tokens = raw_player_tokens.clone()
                     # Recover integer card counts from V6's physical scales,
-                    # then reproduce the V2--V5 clipped normalization expected
-                    # by the inherited player encoder.
+                    # then reproduce the V2--V5 clipped *float16* normalization
+                    # expected by the inherited player encoder.  The explicit
+                    # half round-trip is semantic: historical feature builders
+                    # stored these tensors as float16, whereas dividing the
+                    # recovered count in float32 changes old encoder inputs.
                     legacy_player_tokens[..., 6] = torch.clamp(
                         torch.round(raw_player_tokens[..., 6] * 95.0) / 20.0,
                         min=0.0,
                         max=1.0,
-                    )
+                    ).to(torch.float16).float()
                     legacy_player_tokens[..., 16:21] = torch.clamp(
                         torch.round(raw_player_tokens[..., 16:21] * 19.0) / 10.0,
                         min=0.0,
                         max=1.0,
-                    )
+                    ).to(torch.float16).float()
                     player_piece = self.player_encoder(legacy_player_tokens)
                     exact_resource_features = torch.cat(
                         (
@@ -2073,10 +2087,61 @@ class EntityGraphNet:
                 else:
                     player_piece = self.player_encoder(raw_player_tokens)
                 if self.public_card_count_features_enabled:
+                    public_card_count_features = batch[DEDUCTION_FEATURES_KEY].float()
+                    if self.v6_compatibility_preserving_inputs_enabled:
+                        # The mature public-card residual was also trained on a
+                        # V5-derived tensor.  V6 exact actor counts can make its
+                        # opponent-resource conservation branch succeed where
+                        # V5's clipped actor hand deliberately failed closed.
+                        # Reconstruct only that legacy resource slice; the new
+                        # exact-count residual above owns the corrected signal.
+                        actor = raw_player_tokens[..., PLAYER_ACTOR_FLAG_SLOT] > 0.5
+                        present = raw_player_tokens[..., 0] > 0.5
+                        batch_index = torch.arange(
+                            raw_player_tokens.shape[0],
+                            device=raw_player_tokens.device,
+                        )
+                        actor_index = actor.to(torch.int64).argmax(dim=1)
+                        own_resources = torch.round(
+                            raw_player_tokens[
+                                batch_index, actor_index, 16:21
+                            ]
+                            * 19.0
+                        ).clamp(0.0, 10.0)
+                        bank_resources = torch.round(
+                            global_tokens[:, 0, 26:31] * 19.0
+                        )
+                        unseen_resources = (
+                            19.0 - bank_resources - own_resources
+                        ).clamp(0.0, 19.0)
+                        legacy_totals = torch.round(
+                            raw_player_tokens[..., 6] * 95.0
+                        ).clamp(0.0, 20.0)
+                        eligible = present & ~actor
+                        exact = (
+                            eligible
+                            & (present.sum(dim=1) == 2).unsqueeze(1)
+                            & (
+                                legacy_totals
+                                == unseen_resources.sum(dim=-1).unsqueeze(1)
+                            )
+                        )
+                        legacy_resource_features = torch.where(
+                            exact.unsqueeze(-1),
+                            unseen_resources.unsqueeze(1) / 19.0,
+                            torch.zeros_like(
+                                public_card_count_features[..., :5]
+                            ),
+                        )
+                        public_card_count_features = (
+                            public_card_count_features.clone()
+                        )
+                        public_card_count_features[..., :5] = (
+                            legacy_resource_features
+                        )
                     player_piece = player_piece + self.public_card_count_residual(
-                        batch[DEDUCTION_FEATURES_KEY].float()
+                        public_card_count_features
                     )
-                global_tokens = batch["global_tokens"].float()
                 if self.public_rule_state_features_enabled:
                     rule_state = global_tokens[
                         :, :, PUBLIC_RULE_STATE_FEATURE_SLICE

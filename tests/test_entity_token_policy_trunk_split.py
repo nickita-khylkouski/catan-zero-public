@@ -212,9 +212,9 @@ def test_v7_compatibility_route_preserves_legacy_initial_road_input():
     batch["legal_action_context"][0, 0, 16] = 0.91  # V6 two-hop score
     batch["vertex_tokens"].zero_()
     batch["vertex_tokens"][0, 3, 6] = 1.0
-    batch["vertex_tokens"][0, 3, 9] = 0.25
+    batch["vertex_tokens"][0, 3, 9] = 4.0 / 18.0
     batch["vertex_tokens"][0, 11, 6] = 1.0
-    batch["vertex_tokens"][0, 11, 9] = 0.75
+    batch["vertex_tokens"][0, 11, 9] = 13.0 / 18.0
 
     seen: list[torch.Tensor] = []
     hook = model.action_encoder.register_forward_pre_hook(
@@ -228,11 +228,21 @@ def test_v7_compatibility_route_preserves_legacy_initial_road_input():
 
     assert len(seen) == 1
     legacy_context_offset = LEGAL_ACTION_FEATURE_SIZE + 16
-    # max(endpoint unoccupied * pips) = max(.25, .75), not V6's .91.
-    assert seen[0][0, 0, legacy_context_offset].item() == pytest.approx(0.75)
+    # Recover integer pips before division so the inherited float32 context is
+    # exact rather than inheriting vertex-token float16 quantization.
+    assert seen[0][0, 0, legacy_context_offset].item() == np.float32(
+        13.0 / 18.0
+    ).item()
     # Non-initial-road actions retain their old context feature unchanged.
     assert seen[0][0, 1, legacy_context_offset].item() == pytest.approx(0.0)
     assert torch.count_nonzero(model.v6_initial_road_residual.weight) == 0
+
+    model.zero_grad(set_to_none=True)
+    model(batch)["logits"].sum().backward()
+    residual_gradient = model.v6_initial_road_residual.weight.grad
+    assert residual_gradient is not None
+    assert torch.isfinite(residual_gradient).all()
+    assert torch.count_nonzero(residual_gradient) > 0
 
 
 def test_v7_compatibility_route_requires_live_action_cross_attention():
