@@ -53,9 +53,10 @@ except ValueError:
 sys.path.insert(0, str(_LOCAL_SRC))
 
 from catan_zero.rl.gumbel_self_play import _apply_selected_action  # noqa: E402
-from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
-    GumbelChanceMCTS,
-    GumbelChanceMCTSConfig,
+from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig  # noqa: E402
+from catan_zero.search.native_gumbel_mcts import (  # noqa: E402
+    create_gumbel_search,
+    native_hot_loop_available,
 )
 from catan_zero.search.neural_rust_mcts import (  # noqa: E402
     BatchedEntityGraphRustEvaluator,
@@ -1044,9 +1045,18 @@ def _run_one_search(
     evaluator: CountingEvaluator,
     spec: dict[str, Any],
     search_seed: int,
+    native_mcts_hot_loop: bool = False,
 ) -> dict[str, Any]:
     config = _make_search_config(spec, seed=search_seed)
-    mcts = GumbelChanceMCTS(config, evaluator)
+    # Production data uses the Rust traversal/bookkeeping hot loop.  The
+    # reference Python implementation remains the default for historical
+    # reports, but a prospective production-operator experiment must be able
+    # to measure the exact native implementation it proposes to ship.
+    mcts = create_gumbel_search(
+        config,
+        evaluator,
+        native_hot_loop=bool(native_mcts_hot_loop),
+    )
     before = evaluator.snapshot()
     result = mcts.search(state.copy(), force_full=True)
     eval_counts = CountingEvaluator.delta(before, evaluator.snapshot())
@@ -1298,6 +1308,7 @@ def run_fixed_root_comparison(
     spec_a: dict[str, Any],
     spec_b: dict[str, Any],
     seed_manifests: dict[str, dict[str, Any]],
+    native_mcts_hot_loop: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if len(states) != len(panel["roots"]):
         raise ValueError("reconstructed state count does not match root panel")
@@ -1324,6 +1335,7 @@ def run_fixed_root_comparison(
                         evaluator=evaluator,
                         spec=spec,
                         search_seed=int(seed),
+                        native_mcts_hot_loop=bool(native_mcts_hot_loop),
                     )
                 )
 
@@ -1468,10 +1480,26 @@ def main() -> None:
         "--search-seed-base-b", type=int, default=DEFAULT_SEARCH_SEED_BASE_B
     )
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--native-mcts-hot-loop",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the Rust traversal/bookkeeping implementation used by production "
+            "generation. Requires a matching catanatron_rs wheel; never falls back "
+            "silently to the Python reference implementation."
+        ),
+    )
     parser.add_argument("--max-batch-size", type=int, default=64)
     parser.add_argument("--max-wait-ms", type=float, default=3.0)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
+
+    if bool(args.native_mcts_hot_loop) and not native_hot_loop_available():
+        parser.error(
+            "--native-mcts-hot-loop requires catanatron_rs.gumbel_search; "
+            "refusing a Python fallback for a production-operator probe"
+        )
 
     checkpoint = Path(args.checkpoint)
     if not checkpoint.is_file():
@@ -1592,6 +1620,7 @@ def main() -> None:
             spec_a=spec_a,
             spec_b=spec_b,
             seed_manifests=seeds,
+            native_mcts_hot_loop=bool(args.native_mcts_hot_loop),
         )
         elapsed = time.perf_counter() - started
     finally:
@@ -1630,6 +1659,11 @@ def main() -> None:
         "locked_input_file_hashes": locked_input_file_hashes,
         "protocol": {
             "force_full": True,
+            "mcts_implementation": (
+                "native_rust_hot_loop"
+                if bool(args.native_mcts_hot_loop)
+                else "python_reference"
+            ),
             "repeats_per_root_per_role": int(args.repeats),
             "role_order": "alternating_by_root_plus_repeat",
             "cache_size_required": 0,

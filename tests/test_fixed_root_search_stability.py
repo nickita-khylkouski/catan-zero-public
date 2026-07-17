@@ -704,6 +704,7 @@ def test_cli_help_is_cpu_only_and_imports_the_local_source_tree():
     assert "--min-wide-roots" in result.stdout
     assert "--root-stratum-quota" in result.stdout
     assert "--allowed-search-config-differences" in result.stdout
+    assert "--native-mcts-hot-loop" in result.stdout
 
     source_result = subprocess.run(
         [
@@ -725,3 +726,22 @@ def test_cli_help_is_cpu_only_and_imports_the_local_source_tree():
     )
     assert source_result.returncode == 0, source_result.stderr
     assert str((_ROOT / "src").resolve()) in source_result.stdout
+
+
+def test_boundary_particle_experiment_is_a_single_field_operator_change() -> None:
+    experiment = (
+        _ROOT / "configs" / "experiments" / "boundary_particles_k4_v1"
+    )
+    k1 = load_search_spec(experiment / "base_coherent_n128_d6_k1.json")
+    k4 = load_search_spec(experiment / "coherent_n128_d6_k4.json")
+
+    differences = validate_search_comparison(
+        k1, k4, allowed_differences={"boundary_value_particles"}
+    )
+
+    assert differences == {
+        "boundary_value_particles": {
+            "coherent_n128_d6_boundary_k1": 1,
+            "coherent_n128_d6_boundary_k4": 4,
+        }
+    }
