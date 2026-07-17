@@ -1284,6 +1284,18 @@ def _write_worker_progress(
         pass
 
 
+def _prepare_progress_dir(report_path: str) -> str:
+    """Create an empty progress directory for one evaluator invocation."""
+    import shutil as _shutil
+    from pathlib import Path as _Path
+
+    progress_dir = _Path(f"{report_path}.progress")
+    if progress_dir.exists():
+        _shutil.rmtree(progress_dir)
+    progress_dir.mkdir(parents=True)
+    return str(progress_dir)
+
+
 def _run_worker(worker_args: dict[str, Any]) -> dict[str, Any]:
     threads_per_worker = int(worker_args.get("threads_per_worker", 0))
     if threads_per_worker > 0:
@@ -2144,14 +2156,13 @@ def main() -> None:
     )
     # Live progress: workers write per-worker tallies here so a poller can peek the running win rate
     # without waiting for the whole run (the old single-write-at-end blindness).
-    from pathlib import Path as _Path
-
     # A run directory may contain several simultaneous panels (for example,
     # candidate-vs-incumbent and candidate-vs-generator).  Key live telemetry
     # by the report path so workers from one panel cannot overwrite another's
-    # otherwise-identical worker_NNN files.
-    progress_dir = _Path(f"{args.out}.progress")
-    progress_dir.mkdir(parents=True, exist_ok=True)
+    # otherwise-identical worker_NNN files. A repeated invocation for the
+    # same report path must start empty; stale tallies can otherwise make a
+    # live stop/continue decision use games from the previous run.
+    progress_dir = _prepare_progress_dir(args.out)
 
     worker_args = []
     for worker_index, pair_shard in enumerate(shards):
@@ -2163,7 +2174,7 @@ def main() -> None:
             "candidate_checkpoint": args.candidate,
             "baseline_checkpoint": args.baseline,
             "device": devices[worker_index % len(devices)],
-            "progress_dir": str(progress_dir),
+            "progress_dir": progress_dir,
             "n_full": int(args.n_full),
             "max_depth": int(args.max_depth),
             "max_decisions": int(args.max_decisions),

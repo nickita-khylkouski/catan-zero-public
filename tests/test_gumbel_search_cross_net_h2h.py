@@ -34,6 +34,7 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     _build_summary,
     _load_held_out_high_regret_suite,
     _new_search_telemetry,
+    _prepare_progress_dir,
     _resolve_c_scales,
     _resolve_role_search_calibration,
     _resolve_raw_policy_thresholds,
@@ -42,6 +43,16 @@ from gumbel_search_cross_net_h2h import (  # type: ignore  # noqa: E402
     play_one_h2h_game,
     _validate_information_set_recipe,
 )
+
+
+def test_prepare_progress_dir_removes_stale_worker_tallies(tmp_path: Path) -> None:
+    report = tmp_path / "panel.json"
+    progress = Path(_prepare_progress_dir(str(report)))
+    stale = progress / "worker_007.json"
+    stale.write_text('{"games_done": 4, "candidate_wins": 4}')
+
+    assert Path(_prepare_progress_dir(str(report))) == progress
+    assert list(progress.iterdir()) == []
 
 
 def test_role_specific_raw_policy_thresholds_enable_three_panel_decomposition() -> None:
