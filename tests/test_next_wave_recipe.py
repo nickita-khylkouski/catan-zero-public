@@ -313,6 +313,9 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert "public_rule_state_residual" in recipe[
         "require_feature_learning_signal_modules"
     ]
+    assert "topology_residual_adapter" in recipe[
+        "require_feature_learning_signal_modules"
+    ]
     assert "event_encoder" in recipe[
         "require_feature_learning_signal_modules"
     ]
@@ -330,10 +333,10 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
     assert "final_vp_head" in recipe["require_feature_learning_signal_modules"]
     assert contract.COHERENT_PUBLIC_LEARNER_TRAINING_RECIPE == recipe
     assert _canonical_sha256(recipe) == (
-        "sha256:2ecaec2ddd5224096842e305ccaabf63a09c6c02e48db599937ce9bc4f6e16d5"
+        "sha256:8c009e071671e99f4897eaad7af29f330fa285f05f8597d262de4b16a69fc6a9"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:cbec966a7ff15b343833b4149c1d5acaf5b0002257c112f08eba8decda68f631"
+        "sha256:3b269c986c300c8d3b0f63fc9acf7956d7115e1816a48336559f987136b72b2e"
     )
 
 
