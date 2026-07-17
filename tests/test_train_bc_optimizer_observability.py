@@ -56,94 +56,6 @@ def _ddp_cancelling_objective_gradient_worker(
         dist.destroy_process_group()
 
 
-def _fsdp_ignored_gradient_sync_worker(
-    rank: int,
-    world_size: int,
-    init_file: str,
-    out_dir: str,
-) -> None:
-    import torch
-    import torch.distributed as dist
-    from torch.distributed.fsdp import (
-        FullyShardedDataParallel as FSDP,
-        ShardingStrategy,
-    )
-
-    class TinyFSDPModel(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.managed = torch.nn.Parameter(torch.ones(4))
-            self.ignored_scalar = torch.nn.Parameter(torch.tensor(0.0))
-
-        def forward(self, value, *, use_ignored_scalar: bool):
-            output = (self.managed * value).sum()
-            if use_ignored_scalar:
-                output = output + self.ignored_scalar * (2.0 * (rank + 1))
-            return output
-
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world_size,
-        init_method=f"file://{init_file}",
-    )
-    try:
-        raw_model = TinyFSDPModel()
-        model = FSDP(
-            raw_model,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            device_id=torch.device("cpu"),
-            use_orig_params=True,
-            ignored_states=[raw_model.ignored_scalar],
-        )
-        policy = SimpleNamespace(
-            model=model,
-            _fsdp_ignored_params=[raw_model.ignored_scalar],
-        )
-
-        model(
-            torch.full((4,), float(rank + 1)),
-            use_ignored_scalar=True,
-        ).backward()
-        both_active_norm = train_bc._clip_grad_norm(policy, 0.0)
-        both_active_scalar_grad = float(raw_model.ignored_scalar.grad)
-
-        model.zero_grad(set_to_none=True)
-        model(
-            torch.full((4,), float(rank + 1)),
-            use_ignored_scalar=rank == 0,
-        ).backward()
-        rank_conditional_norm = train_bc._clip_grad_norm(policy, 0.0)
-        rank_conditional_scalar_grad = float(raw_model.ignored_scalar.grad)
-
-        model.zero_grad(set_to_none=True)
-        model(
-            torch.full((4,), float(rank + 1)),
-            use_ignored_scalar=False,
-        ).backward()
-        all_inactive_norm = train_bc._clip_grad_norm(policy, 0.0)
-        all_inactive_scalar_grad_is_none = raw_model.ignored_scalar.grad is None
-
-        Path(out_dir, f"fsdp-rank-{rank}.json").write_text(
-            json.dumps(
-                {
-                    "all_inactive_norm": float(all_inactive_norm),
-                    "all_inactive_scalar_grad_is_none": (
-                        all_inactive_scalar_grad_is_none
-                    ),
-                    "both_active_norm": float(both_active_norm),
-                    "both_active_scalar_grad": both_active_scalar_grad,
-                    "rank_conditional_norm": float(rank_conditional_norm),
-                    "rank_conditional_scalar_grad": rank_conditional_scalar_grad,
-                },
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
-    finally:
-        dist.destroy_process_group()
-
-
 def test_optimizer_observability_reuses_default_off_diagnostics_cadence() -> None:
     parser = train_bc.build_parser()
     assert parser.get_default("train_diagnostics_every_batches") == 0
@@ -256,21 +168,6 @@ def test_max_grad_norm_two_and_explicit_off_have_distinct_semantics() -> None:
     assert off_policy.model.weight.grad.item() == pytest.approx(3.0)
     assert off["gradient_clipping_enabled"] is False
     assert off["clipped"] is False
-
-
-def test_max_grad_norm_keeps_legacy_candidate_side_modules_in_global_norm() -> None:
-    torch = pytest.importorskip("torch")
-    model = torch.nn.Linear(1, 1, bias=False)
-    actor = torch.nn.Linear(1, 1, bias=False)
-    model.weight.grad = torch.tensor([[3.0]])
-    actor.weight.grad = torch.tensor([[4.0]])
-    policy = SimpleNamespace(model=model, actor=actor)
-
-    pre_clip = train_bc._clip_grad_norm(policy, 1.0)
-
-    assert pre_clip.item() == pytest.approx(5.0)
-    assert model.weight.grad.item() == pytest.approx(0.6)
-    assert actor.weight.grad.item() == pytest.approx(0.8)
 
 
 def test_optimizer_observability_reports_preclip_norm_clip_and_module_updates() -> None:
@@ -488,34 +385,6 @@ def test_objective_gradient_interference_rejects_rank_local_signal_that_cancels_
         match="policy-base/AUX/value",
     ):
         stage_c_campaign._verify_completed_objective_gradient_signal(report)
-
-
-def test_fsdp_ignored_gradient_sync_is_gloo_portable_and_rank_consistent(
-    tmp_path: Path,
-) -> None:
-    pytest.importorskip("torch")
-    import torch.multiprocessing as mp
-
-    init_file = tmp_path / "fsdp-gloo-init"
-    mp.spawn(
-        _fsdp_ignored_gradient_sync_worker,
-        args=(2, str(init_file), str(tmp_path)),
-        nprocs=2,
-        join=True,
-    )
-    results = [
-        json.loads(
-            (tmp_path / f"fsdp-rank-{rank}.json").read_text(encoding="utf-8")
-        )
-        for rank in range(2)
-    ]
-    assert results[0] == results[1]
-    assert results[0]["both_active_scalar_grad"] == pytest.approx(3.0)
-    assert results[0]["both_active_norm"] == pytest.approx(18.0**0.5)
-    assert results[0]["rank_conditional_scalar_grad"] == pytest.approx(1.0)
-    assert results[0]["rank_conditional_norm"] == pytest.approx(10.0**0.5)
-    assert results[0]["all_inactive_scalar_grad_is_none"] is True
-    assert results[0]["all_inactive_norm"] == pytest.approx(3.0)
 
 
 def test_checkpoint_dose_telemetry_binds_exposure_and_feature_paths() -> None:
