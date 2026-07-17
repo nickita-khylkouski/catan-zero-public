@@ -1,0 +1,78 @@
+---
+session: fix-bug-v7-training-contracts
+ts: 2026-07-17T18:16:52Z
+commit: 559db3f
+branch: codex/v7-value-signal-audit-20260717
+status: complete
+---
+
+scope: bug
+options: []
+
+issue:
+  description: >-
+    Audit and fix V7 architecture and training-signal integration without
+    corrupting inherited V5 representations or weakening policy learning.
+  evidence:
+    - Production scratch authority still sealed value_trunk_grad_scale=0.25 instead of V7's 0.1 boundary.
+    - V7 exact-resource residual was outside the mature-trunk optimizer contract and value-only freeze surface.
+    - Parent-update child-authority fallback aliased and cleared the caller's verified launch mapping.
+    - Current guarded V7 AST fingerprints were absent from the exact legacy runtime translation set.
+
+diagnosis:
+  root_cause: >-
+    V7 feature paths landed across model construction, training, checkpoint,
+    and launcher surfaces at different times, leaving production authority,
+    optimizer/freeze grouping, and compatibility receipts temporarily out of sync.
+  hypothesis: >-
+    Binding each new residual at the correct gradient boundary and updating the
+    exact production/runtime contracts preserves legacy behavior while making
+    new features trainable under the intended objective.
+  files:
+    - tools/a1_current_science_contract.py
+    - configs/operations/a1-next-wave-coherent-public-v4/science.contract.json
+    - configs/training/a1_current_35m_b200.schema1.json
+    - configs/production_recipes.json
+    - tools/train_bc.py
+    - src/catan_zero/rl/checkpoint_runtime_semantics.py
+    - tools/a1_one_dose_train.py
+
+fix:
+  approach: >-
+    Set the shared value boundary to 0.1 while leaving the private tower fully
+    trainable; freeze V7 policy-affecting adapters during value-only repair;
+    keep the exact-resource cold residual at commissioning LR; bind guarded
+    runtime semantics; and make parent-update fallback mutation alias-safe.
+  files_modified:
+    - configs/operations/a1-next-wave-coherent-public-v4/science.contract.json
+    - configs/production_recipes.json
+    - configs/training/a1_current_35m_b200.schema1.json
+    - src/catan_zero/rl/checkpoint_runtime_semantics.py
+    - tests/test_a1_current_science_contract.py
+    - tests/test_canonical_training_recipe.py
+    - tests/test_train_bc_value_lr_mult.py
+    - tests/test_train_bc_value_only_training.py
+    - tools/a1_current_science_contract.py
+    - tools/a1_one_dose_train.py
+    - tools/train_bc.py
+  test_added:
+    - tests/test_canonical_training_recipe.py
+    - tests/test_train_bc_value_lr_mult.py
+    - tests/test_train_bc_value_only_training.py
+
+verification:
+  test_command: >-
+    pytest -q tests/test_checkpoint_runtime_semantics.py
+    tests/test_train_bc_value_only_training.py tests/test_train_bc_value_lr_mult.py
+    tests/test_train_bc_optimizer_observability.py
+    tests/test_a1_current_science_contract.py tests/test_canonical_training_recipe.py
+  result: 157 passed after final race rebase; earlier combined V7 suite 173 passed
+  h100: >-
+    Bounded probe measured shared value-gradient ratios approximately 0.1,
+    private value tower/head ratios 1.0, both V7 adapters frozen value-only,
+    and complete optimizer coverage.
+  human_confirmed: true
+
+next:
+  - Retrain V7 from scratch only after the commissioned production recipe is selected.
+  - Treat unrelated legacy P1/promotion-suite failures as separate retired-contract cleanup.
