@@ -1546,7 +1546,7 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         "corpus_meta_file_sha256": "sha256:" + "3" * 64,
         "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
         "information_contract_migration": {
-            "migration": executor.information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
+            "migration": executor.information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1_PUBLIC_RESOURCE_V8,
             "source": producer,
             "receipt": {"sha256": "sha256:" + "5" * 64},
             "receipt_sha256": "sha256:" + "6" * 64,
