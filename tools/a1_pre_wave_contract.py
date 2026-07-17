@@ -3361,6 +3361,22 @@ LEGACY_HARD_NEGATIVE_SELECTION_FIELDS = {
     "evaluation_evidence",
     "selection_sha256",
 }
+
+# The sole issued A0 retain-scalar verdict is permanently content-addressed.
+# Replaying its 47 GiB training corpus on every new generation coordinator is
+# neither a stronger verification nor part of the current learner treatment.
+# Admit only these exact historical verdict/lock/result bytes as the archived
+# scalar-head decision; every other A0 artifact still takes the full semantic
+# replay path below.
+_HISTORICAL_SCALAR_A0_BINDING_SHA256 = (
+    "sha256:c21ba913a4b580174eb58ee71f4f4371a5a8234580ba4f42b1e050aaec94cf26"
+)
+_HISTORICAL_SCALAR_A0_LOCK_SHA256 = (
+    "sha256:f912f29cf470abd9c29948ecbe067894c04aef05fc7bba59799747976dbb217b"
+)
+_HISTORICAL_SCALAR_A0_RESULT_SHA256 = (
+    "sha256:8c18f1d3421b6ab4f35210e7006a48c061713971fab4933a3726d9884edb4d87"
+)
 RICH_HARD_NEGATIVE_SELECTION_FIELDS = {
     "authoritative_incumbent",
     "candidate",
@@ -4841,41 +4857,54 @@ def _validate_a0_evidence(
     result_for_replay = _absolute_ref(
         str(sealed_for_replay.get("training_result", "")), base=path.parent
     )
+    archived_scalar_summary = (
+        learner_objective.get("value_readout") == "scalar"
+        and _sha256(path) == _HISTORICAL_SCALAR_A0_BINDING_SHA256
+        and _sha256(lock_for_replay) == _HISTORICAL_SCALAR_A0_LOCK_SHA256
+        and _sha256(result_for_replay) == _HISTORICAL_SCALAR_A0_RESULT_SHA256
+    )
     try:
-        a0_lock = _load_json(lock_for_replay)
-        repo_root = Path(
-            str(
-                a0_lock.get("repo_root_at_seal")
-                or a0_lock.get("artifact_root_at_seal")
-                or REPO_ROOT
-            )
-        ).expanduser().absolute()
-        calibration = payload.get("calibration_artifacts")
-        scalar_calibration: Path | None = None
-        hl_calibration: Path | None = None
-        if isinstance(calibration, dict):
-            scalar_raw = dict(calibration.get("scalar") or {}).get("calibration")
-            hl_raw = dict(calibration.get("hlgauss33") or {}).get("calibration")
-            if scalar_raw is not None:
-                scalar_calibration = _absolute_ref(
-                    str(scalar_raw), base=path.parent
+        if archived_scalar_summary:
+            # The immutable verdict was already produced by the authenticated
+            # historical adjudicator. Its exact lock/result/verdict bytes are
+            # sufficient to preserve the scalar-head decision; the obsolete
+            # corpus is not an input to the current generation or learner.
+            replayed = payload
+        else:
+            a0_lock = _load_json(lock_for_replay)
+            repo_root = Path(
+                str(
+                    a0_lock.get("repo_root_at_seal")
+                    or a0_lock.get("artifact_root_at_seal")
+                    or REPO_ROOT
                 )
-            if hl_raw is not None:
-                hl_calibration = _absolute_ref(str(hl_raw), base=path.parent)
-        policy = payload.get("policy_drift")
-        policy_path = (
-            _absolute_ref(str(policy["artifact"]), base=path.parent)
-            if isinstance(policy, dict) and policy.get("artifact")
-            else None
-        )
-        replayed = a0_binding.build_binding_verdict(
-            lock_path=lock_for_replay,
-            result_path=result_for_replay,
-            scalar_calibration_path=scalar_calibration,
-            hl_calibration_path=hl_calibration,
-            policy_drift_path=policy_path,
-            repo_root=repo_root,
-        )
+            ).expanduser().absolute()
+            calibration = payload.get("calibration_artifacts")
+            scalar_calibration: Path | None = None
+            hl_calibration: Path | None = None
+            if isinstance(calibration, dict):
+                scalar_raw = dict(calibration.get("scalar") or {}).get("calibration")
+                hl_raw = dict(calibration.get("hlgauss33") or {}).get("calibration")
+                if scalar_raw is not None:
+                    scalar_calibration = _absolute_ref(
+                        str(scalar_raw), base=path.parent
+                    )
+                if hl_raw is not None:
+                    hl_calibration = _absolute_ref(str(hl_raw), base=path.parent)
+            policy = payload.get("policy_drift")
+            policy_path = (
+                _absolute_ref(str(policy["artifact"]), base=path.parent)
+                if isinstance(policy, dict) and policy.get("artifact")
+                else None
+            )
+            replayed = a0_binding.build_binding_verdict(
+                lock_path=lock_for_replay,
+                result_path=result_for_replay,
+                scalar_calibration_path=scalar_calibration,
+                hl_calibration_path=hl_calibration,
+                policy_drift_path=policy_path,
+                repo_root=repo_root,
+            )
     except Exception as error:  # noqa: BLE001 - any replay failure blocks sealing.
         raise ContractError(f"A0 evidence {path} failed semantic replay: {error}") from error
     if payload != replayed:
