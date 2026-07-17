@@ -23677,6 +23677,7 @@ def _train_entity_batch(
     shared_policy_representation_gradients_suppressed: tuple[str, ...] = ()
     if (
         float(policy_loss_weight) == 0.0
+        and float(q_loss_weight) == 0.0
         and float(policy_kl_anchor_weight) == 0.0
         and not bool(preserve_accumulated_policy_gradients)
     ):

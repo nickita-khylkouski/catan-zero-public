@@ -576,6 +576,62 @@ def test_policy_loss_weight_scales_the_policy_term_in_train_entity_batch(
     )
 
 
+def test_q_only_training_keeps_shared_action_gradients(tmp_path) -> None:
+    """Q regression is a policy objective and must not trigger value-only freezing."""
+
+    import torch
+
+    data = _write_and_load_shard(tmp_path, _collect_real_samples(6))
+    legal = np.asarray(data["legal_action_ids"])
+    scores = np.full(legal.shape, np.nan, dtype=np.float32)
+    score_mask = legal >= 0
+    for row in range(legal.shape[0]):
+        count = int(np.count_nonzero(score_mask[row]))
+        assert count >= 2
+        scores[row, :count] = np.linspace(-1.0, 1.0, count, dtype=np.float32)
+    data["target_scores"] = scores
+    data["target_scores_mask"] = score_mask
+
+    batch = np.arange(len(data["action_taken"]))
+    policy_weights = np.ones(len(batch), dtype=np.float32)
+    value_weights = np.zeros(len(batch), dtype=np.float32)
+    policy = _make_entity_policy()
+    optimizer = torch.optim.SGD(policy.model.parameters(), lr=1e-2)
+    action_weight = policy.model.action_encoder[0].weight
+    before = action_weight.detach().clone()
+
+    metrics = _train_entity_batch(
+        policy,
+        optimizer,
+        data,
+        batch,
+        policy_weights,
+        value_weights,
+        soft_target_temperature=1.0,
+        soft_target_weight=0.0,
+        soft_target_source="scores",
+        soft_target_min_legal_coverage=0.0,
+        policy_loss_weight=0.0,
+        value_loss_weight=0.0,
+        final_vp_loss_weight=0.0,
+        q_loss_weight=1.0,
+        q_skip_teacher_prefixes=(),
+        vps_to_win=10,
+        advantage_policy_weighting="none",
+        advantage_temperature=1.0,
+        advantage_weight_cap=5.0,
+        advantage_weight_floor=0.05,
+        amp="none",
+        diagnostics=False,
+        value_trunk_grad_scale=0.0,
+    )
+
+    assert metrics["q_loss_weight_sum"] > 0.0
+    assert metrics["policy_only_gradients_suppressed"] == []
+    assert metrics["shared_policy_representation_gradients_suppressed"] == []
+    assert not torch.equal(action_weight.detach(), before)
+
+
 def test_train_diagnostics_do_not_implicitly_run_two_extra_gradient_traversals(
     tmp_path, monkeypatch
 ) -> None:
