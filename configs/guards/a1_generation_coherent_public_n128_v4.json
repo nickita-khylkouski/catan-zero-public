@@ -1,4 +1,17 @@
 {
+  "a1_pre_wave_guard_sync": {
+    "previous_guard_sha256": "sha256:bbcf6ea7c1b57e674193aefab0e437a3876815fdc44b45f6d9bc8a322565f45d",
+    "schema_version": "a1-pre-wave-generation-guard-sync-v1",
+    "selected_c_scale": 0.1,
+    "source_s1_evidence": {
+      "path": "/home/ubuntu/catan-zero-production/authority/science-20260717/s1.recovery.json",
+      "sha256": "sha256:b96b97953b8d824bec2cce2db240d2d9d7ba2b642ea0fba875356085cc243254"
+    },
+    "synchronizer": {
+      "path": "tools/a1_pre_wave_contract.py",
+      "sha256": "sha256:a4b82f471ee1ee9380cc74fc254252d08f8f1874899d237927b06d33a534dfc6"
+    }
+  },
   "guards": [
     {
       "name": "cli_flag_lint",
