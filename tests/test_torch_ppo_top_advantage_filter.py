@@ -184,3 +184,68 @@ def test_dense_all_forced_rows_are_value_only() -> None:
     assert metrics["approx_kl"] == 0.0
     assert metrics["clip_fraction"] == 0.0
     assert metrics["value_loss"] > 0.0
+
+
+@pytest.mark.parametrize("field", ["returns", "advantages"])
+def test_dense_update_rejects_cross_trajectory_target_misalignment(field: str) -> None:
+    """Equal global row counts must not hide a shift across trajectory boundaries."""
+    pytest.importorskip("torch")
+    trajectories = [
+        _dense_trajectory(
+            valid_actions=[(0, 1), (0, 1)],
+            advantages=[2.0, 1.0],
+            returns=[20.0, 10.0],
+        ),
+        _dense_trajectory(
+            valid_actions=[(0, 1)],
+            advantages=[3.0],
+            returns=[30.0],
+        ),
+    ]
+    first_values = getattr(trajectories[0], field)
+    second_values = getattr(trajectories[1], field)
+    second_values.insert(0, first_values.pop())
+
+    with pytest.raises(
+        ValueError,
+        match=rf"PPOTrajectory\.{field} must align with samples.*trajectory 0",
+    ):
+        ppo_update(
+            TorchPPOPolicy(3, 5, hidden_size=8, seed=43),
+            trajectories,
+            learning_rate=0.0,
+            clip_ratio=0.2,
+            value_coef=1.0,
+            entropy_coef=0.0,
+            epochs=1,
+            minibatch_size=64,
+        )
+
+
+def test_dense_update_accepts_aligned_multi_trajectory_targets() -> None:
+    pytest.importorskip("torch")
+    trajectories = [
+        _dense_trajectory(
+            valid_actions=[(0, 1), (0, 1)],
+            advantages=[2.0, 1.0],
+            returns=[20.0, 10.0],
+        ),
+        _dense_trajectory(
+            valid_actions=[(0, 1)],
+            advantages=[3.0],
+            returns=[30.0],
+        ),
+    ]
+
+    metrics = ppo_update(
+        TorchPPOPolicy(3, 5, hidden_size=8, seed=44),
+        trajectories,
+        learning_rate=0.0,
+        clip_ratio=0.2,
+        value_coef=1.0,
+        entropy_coef=0.0,
+        epochs=1,
+        minibatch_size=64,
+    )
+
+    assert metrics["samples"] == 3.0

@@ -299,3 +299,58 @@ def test_entity_ppo_uses_learner_reference_without_losing_actor_evidence() -> No
     assert metrics["approx_kl"] == pytest.approx(0.0, abs=1e-6)
     assert metrics["clip_fraction"] == 0.0
     assert trajectory.old_log_probs == actor_evidence
+
+
+@pytest.mark.parametrize("field", ["returns", "advantages"])
+def test_entity_update_rejects_cross_trajectory_target_misalignment(
+    field: str,
+) -> None:
+    """Equal global row counts must not hide a shift across trajectory boundaries."""
+    samples = _collect_real_samples(3)
+    trajectories = [
+        _make_trajectory(samples[:2], force_indices=set()),
+        _make_trajectory(samples[2:], force_indices=set()),
+    ]
+    first_values = getattr(trajectories[0], field)
+    second_values = getattr(trajectories[1], field)
+    second_values.insert(0, first_values.pop())
+
+    with pytest.raises(
+        ValueError,
+        match=rf"PPOTrajectory\.{field} must align with samples.*trajectory 0",
+    ):
+        from catan_zero.rl.torch_ppo import ppo_update
+
+        ppo_update(
+            _make_entity_policy(),
+            trajectories,
+            learning_rate=0.0,
+            clip_ratio=0.2,
+            value_coef=1.0,
+            entropy_coef=0.0,
+            epochs=1,
+            minibatch_size=64,
+        )
+
+
+def test_entity_update_accepts_aligned_multi_trajectory_targets() -> None:
+    from catan_zero.rl.torch_ppo import ppo_update
+
+    samples = _collect_real_samples(3)
+    trajectories = [
+        _make_trajectory(samples[:2], force_indices=set()),
+        _make_trajectory(samples[2:], force_indices=set()),
+    ]
+
+    metrics = ppo_update(
+        _make_entity_policy(),
+        trajectories,
+        learning_rate=0.0,
+        clip_ratio=0.2,
+        value_coef=1.0,
+        entropy_coef=0.0,
+        epochs=1,
+        minibatch_size=64,
+    )
+
+    assert metrics["samples"] == 3.0

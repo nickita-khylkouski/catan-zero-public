@@ -144,6 +144,23 @@ def _ppo_reference_array(
     return np.asarray(flattened, dtype=np.float32)
 
 
+def _validate_ppo_trajectory_alignment(
+    trajectories: list[PPOTrajectory],
+) -> None:
+    """Fail closed before flattening per-step policy/value targets."""
+
+    for trajectory_index, trajectory in enumerate(trajectories):
+        expected = len(trajectory.samples)
+        for field_name in ("returns", "advantages"):
+            values = getattr(trajectory, field_name, None)
+            actual = len(values) if values is not None else 0
+            if actual != expected:
+                raise ValueError(
+                    f"PPOTrajectory.{field_name} must align with samples for "
+                    f"trajectory {trajectory_index} ({actual} != {expected})"
+                )
+
+
 def _trajectory_opponent_mix(trajectory: PPOTrajectory) -> str:
     names = getattr(trajectory, "opponent_names", None) or {}
     if isinstance(names, dict) and names:
@@ -1266,6 +1283,7 @@ def ppo_update(
     import torch
     from torch import nn
 
+    _validate_ppo_trajectory_alignment(trajectories)
     if _is_entity_graph_policy(policy):
         return _ppo_update_entity_graph(
             policy,
