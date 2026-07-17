@@ -44,6 +44,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import numbers
 import os
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,134 @@ TRAINING_PROGRESS_CHECKPOINT_ROLES = frozenset(
 
 class TrainingProgressError(RuntimeError):
     """The checkpoint set cannot be proven to describe one training trajectory."""
+
+
+def _nested_numeric_state_is_finite(value: Any) -> bool:
+    """Return whether every floating/complex leaf in nested durable state is finite."""
+
+    import numpy as np
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return not (value.is_floating_point() or value.is_complex()) or bool(
+            torch.isfinite(value).all().item()
+        )
+    if isinstance(value, np.ndarray):
+        return not np.issubdtype(value.dtype, np.number) or bool(
+            np.isfinite(value).all()
+        )
+    if isinstance(value, np.generic):
+        return not np.issubdtype(value.dtype, np.number) or bool(np.isfinite(value))
+    if isinstance(value, numbers.Complex) and not isinstance(value, bool):
+        return math.isfinite(float(value.real)) and math.isfinite(float(value.imag))
+    if isinstance(value, dict):
+        return all(_nested_numeric_state_is_finite(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_nested_numeric_state_is_finite(item) for item in value)
+    return True
+
+
+def _iter_nested_tensors(value: Any):
+    """Yield tensors from optimizer state without copying its state_dict."""
+
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_nested_tensors(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_nested_tensors(item)
+
+
+def _nested_non_tensor_state_is_finite(value: Any) -> bool:
+    """Check numeric metadata while leaving tensor checks on the accelerator."""
+
+    import numpy as np
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, np.ndarray):
+        return not np.issubdtype(value.dtype, np.number) or bool(
+            np.isfinite(value).all()
+        )
+    if isinstance(value, np.generic):
+        return not np.issubdtype(value.dtype, np.number) or bool(np.isfinite(value))
+    if isinstance(value, numbers.Complex) and not isinstance(value, bool):
+        return math.isfinite(float(value.real)) and math.isfinite(float(value.imag))
+    if isinstance(value, dict):
+        return all(
+            _nested_non_tensor_state_is_finite(item) for item in value.values()
+        )
+    if isinstance(value, (list, tuple)):
+        return all(_nested_non_tensor_state_is_finite(item) for item in value)
+    return True
+
+
+def assert_finite_optimizer_generation(model: Any, optimizer: Any) -> None:
+    """Reject poisoned state with one accelerator synchronization and rank consensus."""
+
+    import torch
+    import torch.distributed as dist
+
+    model_tensors = [*model.parameters(), *model.buffers()]
+    seen = {id(tensor) for tensor in model_tensors}
+    optimizer_parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group.get("params", ())
+        if id(parameter) not in seen
+    ]
+    tensors = [
+        *model_tensors,
+        *optimizer_parameters,
+        *(
+            tensor
+            for state in optimizer.state.values()
+            for tensor in _iter_nested_tensors(state)
+        ),
+    ]
+    device = tensors[0].device if tensors else torch.device("cpu")
+    finite_flag = torch.ones((), dtype=torch.int32, device=device)
+    local_error: Exception | None = None
+    try:
+        for tensor in tensors:
+            if tensor.is_floating_point() or tensor.is_complex():
+                finite_flag = torch.minimum(
+                    finite_flag,
+                    torch.isfinite(tensor)
+                    .all()
+                    .to(device=device, dtype=torch.int32),
+                )
+        param_group_metadata = [
+            {key: value for key, value in group.items() if key != "params"}
+            for group in optimizer.param_groups
+        ]
+        if not _nested_non_tensor_state_is_finite(
+            optimizer.state
+        ) or not _nested_non_tensor_state_is_finite(param_group_metadata):
+            finite_flag.zero_()
+    except Exception as error:
+        # Every rank must still enter the consensus collective or one malformed
+        # FSDP shard could make its peers hang instead of failing together.
+        local_error = error
+        finite_flag.zero_()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+    globally_finite = bool(finite_flag.item())
+    if not globally_finite:
+        detail = (
+            ""
+            if local_error is None
+            else f" (local validation error: {type(local_error).__name__}: {local_error})"
+        )
+        raise FloatingPointError(
+            "non-finite model or optimizer state after BC optimizer operation"
+            f"{detail}"
+        )
 
 
 def optimizer_sidecar_path(checkpoint_path: str | os.PathLike) -> Path:
@@ -420,6 +549,10 @@ def load_optimizer_state(
     try:
         blob = torch.load(sidecar, map_location="cpu", weights_only=False)
         full_osd = blob["optimizer"] if isinstance(blob, dict) and "optimizer" in blob else blob
+        if not _nested_numeric_state_is_finite(full_osd):
+            raise FloatingPointError(
+                "optimizer sidecar contains non-finite numeric state"
+            )
         if is_fsdp(model):
             from torch.distributed.fsdp import (
                 FullOptimStateDictConfig,
@@ -442,6 +575,7 @@ def load_optimizer_state(
             optimizer.load_state_dict(sharded)
         else:
             optimizer.load_state_dict(full_osd)
+        assert_finite_optimizer_generation(model, optimizer)
         _log(f"restored optimizer state from {sidecar}", ddp)
         return True
     except Exception as error:

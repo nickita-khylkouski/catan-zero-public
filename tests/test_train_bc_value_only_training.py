@@ -920,8 +920,9 @@ def test_ddp_zero_gradient_uses_global_objective_presence_before_skipping(
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
 
     def peer_has_objective(flag, op=None):
-        assert op == dist.ReduceOp.MAX
-        flag.fill_(1)
+        assert op in {dist.ReduceOp.MAX, dist.ReduceOp.MIN}
+        if op == dist.ReduceOp.MAX:
+            flag.fill_(1)
 
     monkeypatch.setattr(dist, "all_reduce", peer_has_objective)
 
@@ -965,6 +966,32 @@ def test_ddp_globally_empty_zero_gradient_still_skips(monkeypatch) -> None:
     assert applied is False
     assert skipped is True
     assert torch.equal(before, model.weight.detach())
+
+
+def test_nonfinite_adam_state_aborts_after_finite_gradient() -> None:
+    from types import SimpleNamespace
+
+    import torch
+    from tools.train_bc import _step_optimizer_fail_closed
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    policy = SimpleNamespace(model=model)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    parameter = next(model.parameters())
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    optimizer.state[parameter]["exp_avg"].fill_(float("inf"))
+    loss = model(torch.ones(1, 1)).square().mean()
+    loss.backward()
+
+    with pytest.raises(FloatingPointError, match="model or optimizer state"):
+        _step_optimizer_fail_closed(
+            policy,
+            optimizer,
+            loss=loss,
+            max_grad_norm=1.0,
+        )
 
 
 def test_nonfinite_gradient_norm_aborts_before_optimizer_step(

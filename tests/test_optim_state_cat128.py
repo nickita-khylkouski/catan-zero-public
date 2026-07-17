@@ -24,6 +24,7 @@ from catan_zero.rl import optim_state as optim_state_module  # noqa: E402
 from catan_zero.rl.optim_state import (  # noqa: E402
     TERMINAL_ADMITTED_CHECKPOINT_ROLE,
     TrainingProgressError,
+    assert_finite_optimizer_generation,
     is_fsdp,
     load_training_progress,
     load_optimizer_state,
@@ -77,6 +78,28 @@ def test_load_corrupt_sidecar_never_raises(tmp_path):
     optimizer_sidecar_path(ckpt).write_bytes(b"not a torch pickle")
     model, opt = _stepped_adam()
     assert load_optimizer_state(ckpt, model, opt, _DDP_SINGLE) is False
+
+
+def test_load_refuses_nonfinite_legacy_optimizer_state(tmp_path):
+    ckpt = tmp_path / "ckpt.pt"
+    model, optimizer = _stepped_adam()
+    optimizer.state[model.weight]["exp_avg"].reshape(-1)[0] = float("inf")
+    torch.save(
+        {"optimizer": optimizer.state_dict(), "format": "plain"},
+        optimizer_sidecar_path(ckpt),
+    )
+    fresh = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    assert load_optimizer_state(ckpt, model, fresh, _DDP_SINGLE) is False
+    assert len(fresh.state) == 0
+
+
+def test_finite_generation_validator_rejects_nonfinite_hyperparameter():
+    model, optimizer = _stepped_adam()
+    optimizer.param_groups[0]["lr"] = float("nan")
+
+    with pytest.raises(FloatingPointError, match="model or optimizer state"):
+        assert_finite_optimizer_generation(model, optimizer)
 
 
 def _committed_progress(

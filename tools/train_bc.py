@@ -17114,6 +17114,11 @@ def main(
                     lr_area_by_group=optimizer_lr_area_by_group,
                     optimizer=optimizer,
                 )
+                from catan_zero.rl.optim_state import (
+                    assert_finite_optimizer_generation,
+                )
+
+                assert_finite_optimizer_generation(policy.model, optimizer)
                 _save_policy(
                     policy,
                     str(snapshot_path),
@@ -18343,6 +18348,9 @@ def main(
                 lr_area_by_group=optimizer_lr_area_by_group,
                 optimizer=optimizer,
             )
+            from catan_zero.rl.optim_state import assert_finite_optimizer_generation
+
+            assert_finite_optimizer_generation(policy.model, optimizer)
             _save_policy(
                 policy,
                 str(epoch_path),
@@ -18531,6 +18539,9 @@ def main(
         "policy_training_signal": policy_training_signal,
         "optimizer_lr_dose": optimizer_lr_dose,
     }
+    from catan_zero.rl.optim_state import assert_finite_optimizer_generation
+
+    assert_finite_optimizer_generation(policy.model, optimizer)
     _save_policy(
         policy,
         args.checkpoint,
@@ -32116,6 +32127,9 @@ def _step_optimizer_fail_closed(
     optimizer_step_applied = not zero_objective_step_skipped
     if optimizer_step_applied:
         optimizer.step()
+        from catan_zero.rl.optim_state import assert_finite_optimizer_generation
+
+        assert_finite_optimizer_generation(policy.model, optimizer)
     return (
         pre_clip_total_grad_norm,
         optimizer_step_applied,
