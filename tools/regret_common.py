@@ -226,8 +226,19 @@ def derive_promotion_bucket_labels(game: Mapping[str, Any]) -> list[str]:
     ):
         raise ValueError("bucket game max_legal_count must be non-negative integer")
 
+    # A retained state has one authoritative archived prompt.  A full H2H game,
+    # however, naturally visits several prompts (including both opening
+    # settlement and opening road).  Promotion slices are multi-label evidence:
+    # assign the game to every phase bucket it actually visited instead of
+    # trying to collapse an entire trajectory into one mutually-exclusive
+    # prompt and rejecting every clean opening.
     phase_source = {archived_phase} if archived_phase else set(phases)
-    labels = [f"phase:{promotion_phase_bucket(phase_source)}"]
+    labels = sorted(
+        {
+            f"phase:{promotion_phase_bucket({phase})}"
+            for phase in phase_source
+        }
+    )
     phase_upper = " ".join({*phases, archived_phase}).upper()
     if "BUILD_INITIAL_SETTLEMENT" in phase_upper or "BUILD_INITIAL_ROAD" in phase_upper:
         labels.append("opening")

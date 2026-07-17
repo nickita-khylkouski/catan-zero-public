@@ -101,6 +101,30 @@ def _set_bucket_game_outcome(game: dict, candidate_won: bool) -> None:
     game["buckets"] = derive_promotion_bucket_labels(game)
 
 
+def test_full_game_is_multi_label_across_visited_promotion_phases() -> None:
+    labels = derive_promotion_bucket_labels(
+        {
+            "candidate_color": "RED",
+            "baseline_color": "BLUE",
+            "final_actual_vps": {"RED": 10, "BLUE": 8},
+            "archived_phase": "",
+            "phases_seen": [
+                "BUILD_INITIAL_SETTLEMENT",
+                "BUILD_INITIAL_ROAD",
+                "ROLL",
+                "PLAY_TURN",
+            ],
+            "max_legal_count": 20,
+        }
+    )
+
+    assert "phase:initial_settlement" in labels
+    assert "phase:initial_road" in labels
+    assert "phase:chance" in labels
+    assert "phase:build_trade" in labels
+    assert "opening" in labels
+
+
 def test_cohort_exclusions_are_derived_from_candidate_bound_game_seeds(
     tmp_path: Path,
 ) -> None:
