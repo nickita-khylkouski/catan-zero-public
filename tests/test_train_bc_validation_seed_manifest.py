@@ -631,6 +631,47 @@ def test_a1_artifact_chain_replays_actual_seed_set_and_learner_objective(
     ]
 
 
+def test_a1_artifact_chain_accepts_authenticated_relocated_v3_audit(
+    tmp_path: Path,
+) -> None:
+    meta, validation_contract, seeds = _write_a1_chain(tmp_path)
+    audit_meta = meta["a1_post_wave_audit"]
+    audit_path = Path(audit_meta["path"])
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["schema_version"] = "a1-post-wave-audit-v3"
+    relocation = {
+        "path": str((tmp_path / "relocation.json").resolve()),
+        "file_sha256": "sha256:" + "a" * 64,
+        "relocation_sha256": "sha256:" + "a" * 64,
+        "render_sha256": "sha256:" + "b" * 64,
+        "job_identities_sha256": "sha256:" + "c" * 64,
+        "file_inventory_sha256": "sha256:" + "d" * 64,
+    }
+    audit["harvest_relocation"] = relocation
+    audit.pop("audit_sha256")
+    audit["audit_sha256"] = _canonical_json_sha256(audit)
+    audit_path.write_text(
+        json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    audit_meta["file_sha256"] = (
+        "sha256:" + hashlib.sha256(audit_path.read_bytes()).hexdigest()
+    )
+    audit_meta["audit_sha256"] = audit["audit_sha256"]
+    audit_meta["harvest_relocation"] = dict(relocation)
+
+    bound = _validate_a1_corpus_artifacts_and_seeds(
+        meta, validation_contract, seeds
+    )
+
+    assert bound["producer_checkpoint_sha256"].startswith("sha256:")
+
+    audit_meta["harvest_relocation"]["render_sha256"] = "sha256:" + "e" * 64
+    with pytest.raises(SystemExit, match="relocated post-wave audit binding"):
+        _validate_a1_corpus_artifacts_and_seeds(
+            meta, validation_contract, seeds
+        )
+
+
 def test_a1_artifact_chain_rejects_learner_code_drift_before_training(
     tmp_path: Path,
 ) -> None:

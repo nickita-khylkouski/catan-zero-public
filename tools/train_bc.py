@@ -359,6 +359,18 @@ A1_REQUIRED_RUNTIME_CODE_SUFFIXES = (
 )
 
 DUAL_ARM_SELECTED_GAMES_SCHEMA = "a1-dual-arm-selected-training-games-v1"
+A1_POST_WAVE_AUDIT_SCHEMAS = {
+    "a1-post-wave-audit-v2",
+    "a1-post-wave-audit-v3",
+}
+A1_HARVEST_RELOCATION_BINDING_FIELDS = {
+    "path",
+    "file_sha256",
+    "relocation_sha256",
+    "render_sha256",
+    "job_identities_sha256",
+    "file_inventory_sha256",
+}
 DUAL_ARM_AUDIT_SCHEMAS = {
     "a1-dual-arm-post-wave-audit-v1",
     "a1-dual-arm-derived-post-wave-audit-v1",
@@ -9032,12 +9044,29 @@ def _validate_a1_corpus_artifacts_and_seeds(
     )
     if str(audit_path) != str(audit_meta.get("path")):
         raise SystemExit("A1 post-wave audit path is not canonical")
+    audit_schema = audit_payload.get("schema_version")
     if (
-        audit_payload.get("schema_version") != "a1-post-wave-audit-v2"
+        audit_schema not in A1_POST_WAVE_AUDIT_SCHEMAS
         or audit_payload.get("passed") is not True
         or audit_payload.get("errors") != []
     ):
         raise SystemExit("A1 post-wave audit is not a clean passing artifact")
+    if audit_schema == "a1-post-wave-audit-v3":
+        audit_relocation = audit_payload.get("harvest_relocation")
+        corpus_relocation = audit_meta.get("harvest_relocation")
+        if (
+            not isinstance(audit_relocation, dict)
+            or set(audit_relocation) != A1_HARVEST_RELOCATION_BINDING_FIELDS
+            or audit_relocation != corpus_relocation
+        ):
+            raise SystemExit(
+                "A1 relocated post-wave audit binding differs from corpus metadata"
+            )
+    elif (
+        "harvest_relocation" in audit_payload
+        or "harvest_relocation" in audit_meta
+    ):
+        raise SystemExit("A1 v2 post-wave audit carries unauthorized relocation metadata")
     actual_audit_sha = _canonical_json_sha256(
         {key: value for key, value in audit_payload.items() if key != "audit_sha256"}
     )
