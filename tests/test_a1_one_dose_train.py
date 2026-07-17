@@ -875,7 +875,7 @@ def test_current_a1_requires_global_n128_and_exact_scalar_dose() -> None:
         executor._require_a1_science(_lock(n_full=256))
 
 
-def test_current_coherent_scratch_refuses_shared_one_dose_authority(
+def test_current_coherent_one_dose_requires_selected_parent_update_authority(
 ) -> None:
     initialization = executor.current_science.learner_initialization()
     lock = {
@@ -899,7 +899,7 @@ def test_current_coherent_scratch_refuses_shared_one_dose_authority(
 
     with pytest.raises(
         executor.ExecutorError,
-        match="contract-bound to native from-scratch initialization",
+        match="selects the canonical parent update",
     ):
         executor._require_a1_science(lock)
 

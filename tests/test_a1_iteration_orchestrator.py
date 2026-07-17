@@ -315,7 +315,7 @@ def _initialize_next_fake(
     return state_path, state, verified
 
 
-def test_current_v3_scratch_refuses_checkpoint_one_dose_orchestrator(
+def test_current_v3_requires_selected_parent_update_in_one_dose_orchestrator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -329,7 +329,7 @@ def test_current_v3_scratch_refuses_checkpoint_one_dose_orchestrator(
 
     with pytest.raises(
         iteration.IterationError,
-        match="contract-bound to native from-scratch initialization",
+        match="selects the canonical parent update",
     ):
         _initialize_next_fake(tmp_path, monkeypatch)
 

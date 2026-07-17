@@ -12,6 +12,14 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     recipe = current_science.learner_training_recipe()
 
     assert (
+        current_science.learner_production_selection()
+        == current_science.PRODUCTION_LEARNER_SELECTION_CONTRACT
+    )
+    assert current_science.require_selected_parent_update(
+        current_science.CANONICAL_PARENT_UPDATE_CONFIG_PATH
+    ) == current_science.CANONICAL_PARENT_UPDATE_CONFIG_PATH.resolve()
+
+    assert (
         current_science.learner_initialization()
         == current_science.PRODUCTION_LEARNER_INITIALIZATION_CONTRACT
     )
@@ -142,6 +150,22 @@ def test_current_contract_rejects_scratch_construction_or_topology_drift(
     monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
 
     with pytest.raises(current_science.ScienceContractError, match="scratch"):
+        current_science.load()
+
+
+def test_current_contract_rejects_ambiguous_production_learner_selection(
+    tmp_path, monkeypatch
+) -> None:
+    contract = copy.deepcopy(current_science.load())
+    contract["learner"]["production_selection"]["mode"] = "from_scratch"
+    path = tmp_path / "science.contract.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    monkeypatch.setattr(current_science, "CONTRACT_PATH", path)
+
+    with pytest.raises(
+        current_science.ScienceContractError,
+        match="production learner selection drifted",
+    ):
         current_science.load()
 
 

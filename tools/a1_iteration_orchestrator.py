@@ -623,20 +623,20 @@ def initialize_next(
         )
         if current_science.is_coherent_search(search):
             learner_contract = current_science.learner()
-            initialization = learner_contract["initialization"]
+            selection = learner_contract["production_selection"]
             if topology != learner_contract["topology"]:
                 raise IterationError(
                     "current coherent-public turn must use the contract-bound "
                     "8xB200 topology"
                 )
             if (
-                initialization["mode"] == "from_scratch"
+                selection["mode"] == "canonical_parent_update"
                 and canonical_parent_update_config is None
             ):
                 raise IterationError(
-                    "current coherent-public v3 learner is contract-bound to native "
-                    "from-scratch initialization; the checkpoint-initialized one-dose "
-                    "iteration orchestrator cannot launch it"
+                    "current coherent-public production learner selects the "
+                    "canonical parent update; --canonical-parent-update-config "
+                    "is required and unresolved scratch is not a production fallback"
                 )
             if architecture_upgrade_receipt is None:
                 raise IterationError(

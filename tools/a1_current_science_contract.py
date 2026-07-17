@@ -32,6 +32,9 @@ GENERATOR_GUARD_PATH = (
     REPO_ROOT
     / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
 )
+CANONICAL_PARENT_UPDATE_CONFIG_PATH = (
+    REPO_ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json"
+)
 SCHEMA_VERSION = "a1-current-science-contract-v2"
 TEACHER_REPORT_SCHEMA = "teacher-operator-causal-report-v1"
 ADOPTION_RECEIPT_SCHEMA = "a1-teacher-operator-adoption-v1"
@@ -233,6 +236,21 @@ PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT = {
         "candidate_horizon_pending_optimizer_and_value_routing_evidence_v1"
     ),
 }
+PRODUCTION_LEARNER_SELECTION_CONTRACT = {
+    # The full random-initialization learner remains a useful R&D contract, but
+    # its optimizer horizon is deliberately unresolved and go_authorized=false.
+    # The commissioned production turn is the independently initialized,
+    # parent-fresh 48-step update.  Keep that routing decision separate from
+    # the scratch construction so callers cannot infer "selected" from which
+    # recipe happened to be added most recently.
+    "mode": "canonical_parent_update",
+    "recipe": "a1-parent-update-35m-b200",
+    "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
+    "config_canonical_sha256": (
+        "4da048c7c470ef1b53cc8836b66821f8fcb777711b77ee2be241a8b68620b180"
+    ),
+    "scratch_status": "research_only_unresolved_not_selected",
+}
 DIAGNOSTIC_POLICY_AUX_FIELDS = frozenset(
     {"policy_aux_active_batch_size", "policy_aux_loss_weight"}
 )
@@ -386,6 +404,7 @@ def _load() -> dict[str, Any]:
             raise ScienceContractError("adopted teacher operator evidence drifted")
     learner_value = value["learner"]
     if set(learner_value) != {
+        "production_selection",
         "initialization",
         "architecture_upgrade_flags",
         "architecture_upgrade_module",
@@ -395,6 +414,19 @@ def _load() -> dict[str, Any]:
         "training_recipe",
     } or not isinstance(learner_value["training_recipe"], dict):
         raise ScienceContractError("current learner contract shape drifted")
+    if (
+        learner_value.get("production_selection")
+        != PRODUCTION_LEARNER_SELECTION_CONTRACT
+    ):
+        raise ScienceContractError("current production learner selection drifted")
+    selected_config = _read_object(CANONICAL_PARENT_UPDATE_CONFIG_PATH)
+    if (
+        _content_sha256(selected_config).removeprefix("sha256:")
+        != PRODUCTION_LEARNER_SELECTION_CONTRACT["config_canonical_sha256"]
+    ):
+        raise ScienceContractError(
+            "selected canonical parent-update config content drifted"
+        )
     if learner_value.get("initialization") != PRODUCTION_LEARNER_INITIALIZATION_CONTRACT:
         raise ScienceContractError(
             "current coherent learner initialization must be native from-scratch "
@@ -542,6 +574,42 @@ def generation() -> dict[str, Any]:
 
 def learner() -> dict[str, Any]:
     return copy.deepcopy(_load()["learner"])
+
+
+def learner_production_selection() -> dict[str, Any]:
+    return copy.deepcopy(_load()["learner"]["production_selection"])
+
+
+def require_selected_parent_update(config_path: str | Path) -> Path:
+    """Authenticate the one selected production learner route.
+
+    This does not authorize a corpus or a training execution.  The one-dose
+    executor still has to prove the production composite, direct architecture
+    upgrade, DDP canary, and fresh optimizer transaction independently.
+    """
+
+    selection = learner_production_selection()
+    if selection.get("mode") != "canonical_parent_update":
+        raise ScienceContractError(
+            "current production learner does not select a parent update"
+        )
+    try:
+        supplied = Path(config_path).expanduser().resolve(strict=True)
+        expected = (REPO_ROOT / str(selection["config_path"])).resolve(strict=True)
+    except OSError as error:
+        raise ScienceContractError(
+            f"cannot resolve selected parent-update config: {error}"
+        ) from error
+    if supplied != expected or supplied.is_symlink():
+        raise ScienceContractError(
+            "production learner must use the selected canonical parent-update config"
+        )
+    actual = _content_sha256(_read_object(supplied)).removeprefix("sha256:")
+    if actual != selection["config_canonical_sha256"]:
+        raise ScienceContractError(
+            "selected canonical parent-update config content drifted"
+        )
+    return supplied
 
 
 def learner_training_recipe() -> dict[str, Any]:

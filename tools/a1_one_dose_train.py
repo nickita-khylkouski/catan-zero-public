@@ -1729,6 +1729,7 @@ def _require_a1_science(
             "n64 and global n196/n256 are not authorized"
         )
     if current_science.is_coherent_search(search):
+        selection = current_science.learner_production_selection()
         try:
             current_science.require_current_operator(
                 search_value=search,
@@ -1757,11 +1758,13 @@ def _require_a1_science(
             raise ExecutorError(
                 "sealed coherent learner initialization differs from current science"
             )
-        if initialization["mode"] == "from_scratch" and not allow_canonical_parent_update:
+        if (
+            selection["mode"] == "canonical_parent_update"
+            and not allow_canonical_parent_update
+        ):
             raise ExecutorError(
-                "current coherent-public v3 learner is contract-bound to native "
-                "from-scratch initialization; the checkpoint-initialized one-dose "
-                "executor cannot launch it"
+                "current coherent-public production learner selects the canonical "
+                "parent update; the exact --canonical-parent-update-config is required"
             )
     recipe = science.get("learner_training_recipe")
     if recipe not in (
@@ -2257,14 +2260,9 @@ def bind_canonical_parent_update_recipe(
     """
 
     try:
-        path = config_path.expanduser().resolve(strict=True)
-    except OSError as error:
-        raise ExecutorError(f"cannot resolve parent-update config: {error}") from error
-    expected = CANONICAL_PARENT_UPDATE_CONFIG.resolve(strict=True)
-    if path != expected or path.is_symlink():
-        raise ExecutorError(
-            "parent update must use the exact checked-in canonical config"
-        )
+        path = current_science.require_selected_parent_update(config_path)
+    except current_science.ScienceContractError as error:
+        raise ExecutorError(str(error)) from error
     try:
         config, engine = canonical_train._load_recipe(path)  # noqa: SLF001
     except SystemExit as error:
