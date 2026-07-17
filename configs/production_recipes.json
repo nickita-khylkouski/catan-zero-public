@@ -3,30 +3,30 @@
   "recipes": {
     "evaluate": [
       {
-        "canonical_sha256": "65eb8e8097d8138c97121ad6c55135b70e8f8ceec97032292374d6120078065a",
+        "canonical_sha256": "89657aafc7c6d77ae85965e34fd708a28432aa0e260b6bf1027ec99639cc340d",
         "name": "coherent-public-n128",
-        "path": "configs/eval/coherent_public_n128.schema19.json"
+        "path": "configs/eval/coherent_public_n128.schema20.json"
       }
     ],
     "generate": [
       {
-        "canonical_sha256": "3878df62151135cad2fe1db0b8b138622471e9bb22c4fd3a18badfe9f674414b",
+        "canonical_sha256": "8b8a07ebc844d5d1eb85b6a63c008e554d292cff202854b8f757738520fcfff6",
         "guard": {
           "canonical_sha256": "99a19aa2a7e557083bbfa813653f9b763edce9d8662ec9e5ec3dce14f1ff9d5a",
           "path": "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json"
         },
         "name": "coherent-public-n128",
-        "path": "configs/generation/coherent_public_n128.schema19.json"
+        "path": "configs/generation/coherent_public_n128.schema20.json"
       }
     ],
     "train": [
       {
-        "canonical_sha256": "eea4fbfec0b77bf2fce7950977425bde883f7cb7f430035a3b0b061af009a8ae",
+        "canonical_sha256": "e7d2d234d07db747dcdbbba98d9a9b31e1a7c6bf703ac8b403429b552742195f",
         "name": "a1-current-35m-b200",
         "path": "configs/training/a1_current_35m_b200.schema1.json"
       },
       {
-        "canonical_sha256": "999c2966996f27108344ab936551c5c60c256963a8acfcdf0016ebbb649eedef",
+        "canonical_sha256": "da77bf63dcbd25e966d8e043949fa71574ab40efdf5cac209e19f0f3d6b1b222",
         "name": "a1-parent-update-35m-b200",
         "path": "configs/training/a1_parent_update_35m_b200.schema1.json"
       }

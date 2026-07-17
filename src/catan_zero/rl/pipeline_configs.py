@@ -98,7 +98,10 @@ _T = TypeVar("_T", bound="PipelineConfig")
 # outcome-balancing control used by the canonical learner. Schema 19 binds the
 # coverage sampler's minimum effective policy-signal admission floor; a
 # fail-closed run must not share an identity with the historical no-floor run.
-CONFIG_SCHEMA_VERSION = 19
+# Schema 20 binds the optional nominal forced-row scalar-value mass ceiling.
+# A commissioned objective with a ceiling must never hash like the historical
+# diagnostic-only forced-row weighting regime.
+CONFIG_SCHEMA_VERSION = 20
 
 # Length (hex chars) of the short hash embedded in artifacts. 16 hex chars =
 # 64 bits; collision probability is negligible for the run counts here and the
@@ -412,6 +415,10 @@ class TrainConfig(PipelineConfig):
     # historical objective exactly while making an enabled typed objective
     # part of the immutable learner identity.
     forced_row_value_action_type_weights: str = ""
+    # Optional fail-closed admission ceiling on forced-row mass under the exact
+    # nominal scalar-value objective measure. ``None`` preserves the historical
+    # diagnostic-only behavior.
+    maximum_nominal_forced_scalar_value_mass_fraction: float | None = None
     per_game_value_weight: bool = False
     per_game_value_weight_mode: str = "equal"
     policy_surprise_weight: float = 0.0
@@ -512,7 +519,7 @@ class GenerateConfig(PipelineConfig):
     preserve_search_evidence: bool = False
     # The generator has always materialized the pre-search evaluator value on
     # eligible full-search roots.  Bind that invariant into typed provenance
-    # so the canonical schema19 file and the resolved GenerateConfig cannot
+    # so the canonical schema20 file and the resolved GenerateConfig cannot
     # silently claim different science identities.
     preserve_root_prior_value: bool = True
     n_full_wide: int | None = None

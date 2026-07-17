@@ -734,6 +734,15 @@ def build_train_command(
             _add(command, flag, recipe.get(key, optional_scalar_defaults[key]))
         else:
             _add(command, flag, recipe[key])
+    maximum_forced_value_mass = recipe.get(
+        "maximum_nominal_forced_scalar_value_mass_fraction"
+    )
+    if maximum_forced_value_mass is not None:
+        _add(
+            command,
+            "--maximum-nominal-forced-scalar-value-mass-fraction",
+            maximum_forced_value_mass,
+        )
     command.extend(
         [
             "--no-resume-optimizer",

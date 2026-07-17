@@ -191,7 +191,7 @@ def test_parent_update_recipe_reproduces_split1_selected_step12() -> None:
     assert fields["init_checkpoint"] == ""
     assert fields["grow_from_checkpoint"] == ""
     assert engine["value_tower_split_layers"] == 1
-    assert payload["train_config"]["schema_version"] == 19
+    assert payload["train_config"]["schema_version"] == 20
 
 
 def test_parent_update_requires_exact_parent_and_uses_corpus_target_identity() -> None:
@@ -217,7 +217,7 @@ def test_parent_update_requires_exact_parent_and_uses_corpus_target_identity() -
 
     assert train_bc._parse_checkpoint_steps(
         resolved.checkpoint_steps, max_steps=resolved.max_steps
-    ) == (8, 12, 16, 24, 32)
+    ) == (8,)
     train_bc._validate_coverage_sampler_configuration(
         resolved, categorical_value_loss_weight=0.0
     )

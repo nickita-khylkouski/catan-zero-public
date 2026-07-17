@@ -59,6 +59,7 @@
       "final_vp_loss_weight": 0.05,
       "forced_action_weight": 0.0,
       "forced_row_value_action_type_weights": "END_TURN=1.0,ROLL=1.0",
+      "maximum_nominal_forced_scalar_value_mass_fraction": null,
       "forced_row_value_weight": 1.0,
       "freeze_modules": "",
       "fsdp": false,
@@ -173,6 +174,6 @@
       "winner_sample_weight": 1.0
     },
     "pipeline": "train",
-    "schema_version": 19
+    "schema_version": 20
   }
 }

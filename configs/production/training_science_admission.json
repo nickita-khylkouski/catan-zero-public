@@ -2,7 +2,7 @@
   "schema_version": "catan-zero-training-science-admission-v1",
   "recipes": {
     "a1-current-35m-b200": {
-      "recipe_canonical_sha256": "eea4fbfec0b77bf2fce7950977425bde883f7cb7f430035a3b0b061af009a8ae",
+      "recipe_canonical_sha256": "e7d2d234d07db747dcdbbba98d9a9b31e1a7c6bf703ac8b403429b552742195f",
       "authorized": false,
       "reason": "scratch_training_signal_contract_unresolved",
       "unresolved_requirements": [
@@ -19,7 +19,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-35m-b200": {
-      "recipe_canonical_sha256": "999c2966996f27108344ab936551c5c60c256963a8acfcdf0016ebbb649eedef",
+      "recipe_canonical_sha256": "da77bf63dcbd25e966d8e043949fa71574ab40efdf5cac209e19f0f3d6b1b222",
       "authorized": false,
       "reason": "parent_update_training_signal_contract_unresolved",
       "unresolved_requirements": [

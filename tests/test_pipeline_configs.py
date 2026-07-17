@@ -87,6 +87,15 @@ def test_policy_signal_admission_floor_changes_typed_train_hash() -> None:
     assert config_from_payload(fail_closed.canonical_payload()) == fail_closed
 
 
+def test_forced_scalar_value_mass_ceiling_changes_typed_train_hash() -> None:
+    historical = TrainConfig()
+    fail_closed = TrainConfig(maximum_nominal_forced_scalar_value_mass_fraction=0.4)
+
+    assert historical.maximum_nominal_forced_scalar_value_mass_fraction is None
+    assert historical.config_hash() != fail_closed.config_hash()
+    assert config_from_payload(fail_closed.canonical_payload()) == fail_closed
+
+
 def test_exact_step_dose_changes_typed_train_hash() -> None:
     epoch_bounded = TrainConfig(max_steps=128, exact_max_steps=False)
     exact_dose = TrainConfig(max_steps=128, exact_max_steps=True)

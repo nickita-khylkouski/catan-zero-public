@@ -108,7 +108,7 @@ REMOTE_ROOT = Path("/root/catan-zero")
 VOLUME_ROOT = Path("/data")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CANONICAL_GENERATION_CONFIG = (
-    REPO_ROOT / "configs/generation/coherent_public_n128.schema19.json"
+    REPO_ROOT / "configs/generation/coherent_public_n128.schema20.json"
 )
 PRODUCTION_RUNTIME_CONFIG = REPO_ROOT / "configs/runtime/a1_production_runtime.json"
 

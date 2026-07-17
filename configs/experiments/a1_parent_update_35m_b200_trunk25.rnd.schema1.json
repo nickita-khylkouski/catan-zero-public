@@ -1,6 +1,6 @@
 {
   "base_recipe": {
-    "canonical_sha256": "999c2966996f27108344ab936551c5c60c256963a8acfcdf0016ebbb649eedef",
+    "canonical_sha256": "da77bf63dcbd25e966d8e043949fa71574ab40efdf5cac209e19f0f3d6b1b222",
     "name": "a1-parent-update-35m-b200",
     "path": "configs/training/a1_parent_update_35m_b200.schema1.json"
   },

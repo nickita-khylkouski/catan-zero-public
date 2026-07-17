@@ -1927,6 +1927,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--maximum-nominal-forced-scalar-value-mass-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Optional fail-closed ceiling in [0,1] for the fraction of the "
+            "nominal scalar outcome-value objective carried by forced rows. "
+            "The measure includes the training split, exact sampler measure, "
+            "value loss weights, and scalar outcome confidence. Omitted by "
+            "default; no production threshold is inferred."
+        ),
+    )
+    parser.add_argument(
         "--per-game-value-weight",
         action="store_true",
         help=(
@@ -8977,6 +8989,15 @@ def _effective_a1_learner_training_recipe(
         effective["forced_row_value_action_type_weights"] = (
             _canonical_forced_row_value_action_type_weights(forced_type_weights)
         )
+    maximum_forced_value_mass = getattr(
+        args,
+        "maximum_nominal_forced_scalar_value_mass_fraction",
+        None,
+    )
+    if maximum_forced_value_mass is not None:
+        effective["maximum_nominal_forced_scalar_value_mass_fraction"] = float(
+            maximum_forced_value_mass
+        )
     if getattr(args, "sampler_seed", None) is not None:
         # Historical A1 recipes keep their exact shape when this additive flag
         # is omitted. An explicit independent sampler stream changes the
@@ -11088,6 +11109,8 @@ def _validate_a1_learner_training_recipe(
         authorized_extra_fields.add("policy_target_blend_semantics")
     if effective.get("forced_row_value_action_type_weights"):
         authorized_extra_fields.add("forced_row_value_action_type_weights")
+    if "maximum_nominal_forced_scalar_value_mass_fraction" in effective:
+        authorized_extra_fields.add("maximum_nominal_forced_scalar_value_mass_fraction")
     # a1_one_dose_train canonically expands these post-seal defaults for every
     # generic ablation. They remain fully value-checked below and are absent
     # from non-ablation historical recipe shapes.
@@ -11159,6 +11182,11 @@ def _validate_a1_learner_training_recipe(
         drift["forced_row_value_action_type_weights"] = {
             "contract": "disabled (implicit historical default)",
             "effective": effective["forced_row_value_action_type_weights"],
+        }
+    if "maximum_nominal_forced_scalar_value_mass_fraction" in effective:
+        drift["maximum_nominal_forced_scalar_value_mass_fraction"] = {
+            "contract": "disabled (implicit historical default)",
+            "effective": effective["maximum_nominal_forced_scalar_value_mass_fraction"],
         }
     if float(effective.get("public_card_lr_mult", 1.0)) != 1.0:
         drift["public_card_lr_mult"] = {
@@ -12418,6 +12446,19 @@ def main(
         argv=raw_argv,
         expected_pipeline=TrainConfig.PIPELINE,
     )
+    maximum_forced_value_mass = getattr(
+        args,
+        "maximum_nominal_forced_scalar_value_mass_fraction",
+        None,
+    )
+    if maximum_forced_value_mass is not None and (
+        not math.isfinite(float(maximum_forced_value_mass))
+        or not 0.0 <= float(maximum_forced_value_mass) <= 1.0
+    ):
+        raise SystemExit(
+            "--maximum-nominal-forced-scalar-value-mass-fraction must be "
+            "finite and in [0, 1]"
+        )
     _preflight_a1_scratch_execution_authority(
         str(getattr(args, "a1_scratch_authority_json", "") or ""),
         str(
@@ -14129,14 +14170,21 @@ def main(
             args.forced_row_value_action_type_weights
         )
     )
+    maximum_forced_value_mass_fraction = getattr(
+        args,
+        "maximum_nominal_forced_scalar_value_mass_fraction",
+        None,
+    )
+    forced_value_mass_report_requested = (
+        bool(forced_row_value_action_type_weight_map)
+        or maximum_forced_value_mass_fraction is not None
+    )
     validation_action_catalog = _action_catalog_for_env_config(env_config)
     _, value_validation_action_types_by_id = _action_catalog_type_projection(
         validation_action_catalog, {}
     )
     forced_row_value_action_catalog = (
-        validation_action_catalog
-        if forced_row_value_action_type_weight_map
-        else None
+        validation_action_catalog if forced_value_mass_report_requested else None
     )
 
     _validate_coverage_sampler_configuration(
@@ -15172,7 +15220,18 @@ def main(
         value_sample_weight_report["player_outcome_balance"] = (
             value_player_outcome_balance_report
         )
-        if forced_row_value_action_type_weight_map:
+    else:
+        # Reports are only printed/written by rank 0. Avoid repeating their
+        # O(rows) grouping work and transient arrays on every local DDP rank.
+        policy_sample_weight_report = {}
+        value_sample_weight_report = {}
+        policy_surprise_weight_report = {}
+        policy_surprise_sampling_report = {}
+        policy_aux_sampling_report = {}
+    forced_value_mass_report: dict[str, object] | None = None
+    if forced_value_mass_report_requested:
+
+        def _build_forced_value_mass_report() -> dict[str, object]:
             if (
                 float(resolved_scalar_value_weight) > 0.0
                 and "winner" in data
@@ -15205,26 +15264,45 @@ def main(
                 component_game_sampling=component_game_sampling,
                 objective_confidence=forced_value_outcome_confidence,
             )
-            value_sample_weight_report["by_forced_action_type"] = (
-                forced_action_type_value_mass_quality(
-                    data,
-                    forced_value_objective_measure,
-                    row_indices=train_indices,
-                    weights_aligned_to_rows=True,
-                    objective_measure=forced_value_objective_measure_name,
-                    objective_active=forced_value_objective_active,
-                    action_catalog=forced_row_value_action_catalog,
-                    configured_weights=forced_row_value_action_type_weight_map,
-                )
+            return forced_action_type_value_mass_quality(
+                data,
+                forced_value_objective_measure,
+                row_indices=train_indices,
+                weights_aligned_to_rows=True,
+                objective_measure=forced_value_objective_measure_name,
+                objective_active=forced_value_objective_active,
+                action_catalog=forced_row_value_action_catalog,
+                configured_weights=forced_row_value_action_type_weight_map,
             )
-    else:
-        # Reports are only printed/written by rank 0. Avoid repeating their
-        # O(rows) grouping work and transient arrays on every local DDP rank.
-        policy_sample_weight_report = {}
-        value_sample_weight_report = {}
-        policy_surprise_weight_report = {}
-        policy_surprise_sampling_report = {}
-        policy_aux_sampling_report = {}
+
+        forced_value_mass_report = _rank0_authoritative_call(
+            ddp,
+            "forced scalar-value mass audit",
+            _build_forced_value_mass_report,
+        )
+        if int(ddp["rank"]) == 0:
+            value_sample_weight_report["by_forced_action_type"] = (
+                forced_value_mass_report
+            )
+    forced_value_mass_admission = forced_scalar_value_mass_admission(
+        forced_value_mass_report,
+        maximum_fraction=maximum_forced_value_mass_fraction,
+    )
+    _rank0_print(
+        json.dumps(
+            {
+                "progress": "forced_scalar_value_mass_admission",
+                **forced_value_mass_admission,
+            },
+            sort_keys=True,
+        ),
+        ddp,
+    )
+    if forced_value_mass_admission["admitted"] is not True:
+        raise SystemExit(
+            "forced scalar-value mass admission refused before optimizer step: "
+            + json.dumps(forced_value_mass_admission, sort_keys=True)
+        )
     _rank0_print(
         json.dumps(
             {
@@ -19161,6 +19239,7 @@ def main(
         "policy_sample_weight_quality": policy_sample_weight_report,
         "value_sample_weight_quality": value_sample_weight_report,
         "value_player_outcome_balance": value_player_outcome_balance_report,
+        "forced_scalar_value_mass_admission": forced_value_mass_admission,
         "policy_surprise_weight": float(args.policy_surprise_weight),
         "policy_surprise_cap": float(args.policy_surprise_cap),
         "per_game_policy_surprise_weighting": bool(
@@ -34049,6 +34128,88 @@ def forced_action_type_value_mass_quality(
             forced_mass / total_mass if total_mass > 0.0 else 0.0
         ),
         "by_action_type": by_action_type,
+    }
+
+
+def forced_scalar_value_mass_admission(
+    mass_report: Mapping[str, object] | None,
+    *,
+    maximum_fraction: float | None,
+) -> dict[str, object]:
+    """Build the fail-closed admission record for forced scalar-value mass."""
+
+    enforced = maximum_fraction is not None
+    if maximum_fraction is not None and (
+        not math.isfinite(float(maximum_fraction))
+        or not 0.0 <= float(maximum_fraction) <= 1.0
+    ):
+        raise ValueError(
+            "forced scalar-value mass ceiling must be finite and in [0, 1]"
+        )
+
+    objective_active = bool(
+        mass_report is not None and mass_report.get("objective_active") is True
+    )
+    total_mass = (
+        None
+        if mass_report is None
+        else float(mass_report.get("effective_total_value_mass", 0.0))
+    )
+    observed = (
+        None
+        if mass_report is None or total_mass is None or total_mass <= 0.0
+        else float(
+            mass_report.get("effective_forced_value_mass_fraction", float("nan"))
+        )
+    )
+    valid_observation = bool(
+        objective_active
+        and total_mass is not None
+        and math.isfinite(total_mass)
+        and total_mass > 0.0
+        and observed is not None
+        and math.isfinite(observed)
+        and 0.0 <= observed <= 1.0
+    )
+    if not enforced:
+        admitted = True
+        reason = "ceiling_disabled"
+    elif not objective_active:
+        admitted = False
+        reason = "scalar_outcome_value_objective_inactive_or_unauthenticated"
+    elif not valid_observation:
+        admitted = False
+        reason = "nominal_scalar_value_mass_unavailable_or_zero"
+    elif observed <= float(maximum_fraction):
+        admitted = True
+        reason = "observed_fraction_within_ceiling"
+    else:
+        admitted = False
+        reason = "observed_fraction_exceeds_ceiling"
+
+    return {
+        "schema_version": "forced-scalar-value-mass-admission-v1",
+        "objective": "scalar_outcome_value_loss",
+        "objective_active": objective_active,
+        "scope": (None if mass_report is None else mass_report.get("scope")),
+        "measure_semantics": (
+            None if mass_report is None else mass_report.get("measure_semantics")
+        ),
+        "objective_measure": (
+            None if mass_report is None else mass_report.get("objective_measure")
+        ),
+        "observed_nominal_forced_mass_fraction": observed,
+        "maximum_nominal_forced_scalar_value_mass_fraction": (
+            None if maximum_fraction is None else float(maximum_fraction)
+        ),
+        "admission_enforced": enforced,
+        "admitted": admitted,
+        "reason": reason,
+        "comparison": "observed <= maximum",
+        "source_report_schema_version": (
+            None if mass_report is None else mass_report.get("schema_version")
+        ),
+        "raw_mass_cross_sampler_comparable": False,
     }
 
 

@@ -272,7 +272,9 @@ def test_resume_step_cap_guard_precedes_uniform_and_weighted_sampler_paths() -> 
     epoch_guard = source.index("_validate_resumed_epoch_boundary(")
     epoch_loop = source.index("for epoch in range(")
     order = source.index("order = _epoch_order(")
-    terminal_save = source.index("_save_policy(", epoch_guard)
+    # Check the terminal save after sampling. A pre-loop holdout-frontier save
+    # is also valid and must not be mistaken for the terminal checkpoint.
+    terminal_save = source.index("_save_policy(", order)
 
     assert restore < step_guard < epoch_guard < epoch_loop < order < terminal_save
 

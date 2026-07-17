@@ -25,7 +25,7 @@ CONTRACT_PATH = (
 TEMPLATE_PATH = REPO_ROOT / "configs/experiments/a1_pre_wave_contract.template.json"
 GENERATOR_CONFIG_PATH = (
     REPO_ROOT
-    / "configs/generation/coherent_public_n128.schema19.json"
+    / "configs/generation/coherent_public_n128.schema20.json"
 )
 PRODUCTION_RECIPE_CATALOG_PATH = REPO_ROOT / "configs/production_recipes.json"
 GENERATOR_GUARD_PATH = (
@@ -247,7 +247,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "999c2966996f27108344ab936551c5c60c256963a8acfcdf0016ebbb649eedef"
+        "da77bf63dcbd25e966d8e043949fa71574ab40efdf5cac209e19f0f3d6b1b222"
     ),
     "scratch_status": "research_only_unresolved_not_selected",
 }
@@ -772,7 +772,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
     canonical_sha256 = _content_sha256(generator).removeprefix("sha256:")
     if (
         generator.get("pipeline") != "generate"
-        or generator.get("schema_version") != 19
+        or generator.get("schema_version") != 20
         or catalog_records[0].get("canonical_sha256") != canonical_sha256
     ):
         raise ScienceContractError(
@@ -794,7 +794,7 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
     if runtime_drift:
         raise ScienceContractError(
             "current science generation runtime differs from authenticated "
-            f"catalog schema19 recipe: {runtime_drift}"
+            f"catalog schema20 recipe: {runtime_drift}"
         )
     search_value = contract["operator"]["search"]
     expected_generator = {

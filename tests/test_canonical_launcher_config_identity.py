@@ -23,11 +23,11 @@ import train  # noqa: E402
     (
         (
             generate._validate_config,  # noqa: SLF001
-            "configs/generation/coherent_public_n128.schema19.json",
+            "configs/generation/coherent_public_n128.schema20.json",
         ),
         (
             evaluate._validate_config,  # noqa: SLF001
-            "configs/eval/coherent_public_n128.schema19.json",
+            "configs/eval/coherent_public_n128.schema20.json",
         ),
     ),
 )
@@ -150,7 +150,7 @@ def test_canonical_launchers_ignore_ambient_stale_pythonpath(
 def test_canonical_evaluation_uses_the_production_promotion_gate() -> None:
     payload = json.loads(
         (
-            ROOT / "configs/eval/coherent_public_n128.schema19.json"
+            ROOT / "configs/eval/coherent_public_n128.schema20.json"
         ).read_text(encoding="utf-8")
     )
 

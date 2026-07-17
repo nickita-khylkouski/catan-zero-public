@@ -33,7 +33,7 @@ from tools.build_memmap_corpus import (  # noqa: E402
 
 CONFIG = (
     REPO
-    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema19.json"
+    / "configs/experiments/next_wave/coherent_public_n128_adaptive256_forced_value_v3.schema20.json"
 )
 HISTORICAL_SCHEMA16_CONFIG = (
     REPO
@@ -86,10 +86,10 @@ def test_meaningful_history_uses_legacy_compatible_memmap_width() -> None:
     assert np.all(normalized["event_target_ids"][:, 32:] == -1)
 
 
-def test_next_wave_typed_generation_config_is_exact_schema_19_recipe() -> None:
+def test_next_wave_typed_generation_config_is_exact_schema_20_recipe() -> None:
     payload = json.loads(CONFIG.read_text())
     assert payload["pipeline"] == GenerateConfig.PIPELINE
-    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 19
+    assert payload["schema_version"] == CONFIG_SCHEMA_VERSION == 20
 
     cfg = GenerateConfig(**payload["fields"])
     assert cfg.canonical_payload() == payload
@@ -333,7 +333,7 @@ def test_canonical_scratch_recipe_has_nontrivial_lr_and_equal_game_value_mass() 
         "sha256:b9932d38227e924a75b87c98a5fc0b3dba2551bfbb36f625754bd7255b8b5828"
     )
     assert "sha256:" + hashlib.sha256(SCIENCE_CONTRACT.read_bytes()).hexdigest() == (
-        "sha256:c2f74db2c22b4854fd680ef0b05ef3d463b7c71b9d060ced484857aed72b15e3"
+        "sha256:55dfa43088ee61fea04686e2d360edd26e412d0886ce306ba2354dd72fe03788"
     )
 
 

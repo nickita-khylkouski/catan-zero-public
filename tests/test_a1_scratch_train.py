@@ -275,6 +275,23 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert marker == authority
 
 
+def test_scratch_command_emits_optional_forced_value_mass_ceiling(
+    tmp_path: Path,
+) -> None:
+    verified, _, _ = _authority_fixture(tmp_path)
+    verified["recipe"]["maximum_nominal_forced_scalar_value_mass_fraction"] = 0.4
+
+    command = scratch.build_train_command(
+        verified,
+        python=Path("/usr/bin/python3"),
+        checkpoint=tmp_path / "model.pt",
+        report=tmp_path / "report.json",
+    )
+
+    flag = "--maximum-nominal-forced-scalar-value-mass-fraction"
+    assert command[command.index(flag) + 1] == "0.4"
+
+
 def test_scratch_command_cannot_emit_trust_without_quality_admission(
     tmp_path: Path,
 ) -> None:

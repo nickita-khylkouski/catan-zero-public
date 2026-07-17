@@ -202,7 +202,7 @@ tools/loop.py + one sealed turn config
 ### [HIGH CONFIDENCE] EvalServer is the canonical config-first generation path
 - **Evidence:** The canonical generation config selects strict-FP32 EvalServer batching with a 96-request cap, immediate draining, and the request collector. Historical paired H100 evidence measured 155,619 versus 87,742 rows/hour for EvalServer versus local evaluators.
 - **If correct →** Keep one server per physical GPU and size workers by host CPU topology; an eight-GPU host cannot blindly reuse a four-GPU host's total process count.
-- **Verify:** `configs/generation/coherent_public_n128.schema19.json`, `tools/generate.py`, and `docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md`.
+- **Verify:** `configs/generation/coherent_public_n128.schema20.json`, `tools/generate.py`, and `docs/plans/H100_EXECUTION_UPDATE_2026-07-09.md`.
 
 ### [HIGH CONFIDENCE] Native feature construction is the current default
 - **Evidence:** The canonical generation/evaluation configs and evaluator dataclass select Rust features. Accepted B200 evidence measures neural forward at 3.726 ms of a 4.500 ms native-feature leaf, or 82.8%.

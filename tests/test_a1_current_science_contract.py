@@ -249,7 +249,7 @@ def test_current_contract_rejects_authenticated_catalog_runtime_mismatch(
         current_science.GENERATOR_CONFIG_PATH.read_text(encoding="utf-8")
     )
     generator["fields"][config_field] = bad_value
-    generator_path = tmp_path / "coherent_public_n128.schema19.json"
+    generator_path = tmp_path / "coherent_public_n128.schema20.json"
     generator_path.write_text(json.dumps(generator), encoding="utf-8")
 
     catalog = json.loads(
@@ -269,7 +269,7 @@ def test_current_contract_rejects_authenticated_catalog_runtime_mismatch(
     )
     with pytest.raises(
         current_science.ScienceContractError,
-        match="runtime differs from authenticated catalog schema19 recipe",
+        match="runtime differs from authenticated catalog schema20 recipe",
     ):
         current_science.load()
 

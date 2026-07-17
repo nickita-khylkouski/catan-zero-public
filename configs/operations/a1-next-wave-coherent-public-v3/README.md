@@ -73,7 +73,7 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
 
 ```bash
 "$PY" tools/generate.py \
-  --config configs/generation/coherent_public_n128.schema19.json \
+  --config configs/generation/coherent_public_n128.schema20.json \
   --guard configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v3.json \
   --checkpoint "$CHECKPOINT" --out-dir "$OUT" \
   --base-seed "$BASE_SEED" --games "$GAMES" --workers "$WORKERS" \
@@ -82,7 +82,7 @@ Generate through the sealed pre-wave control plane. For a direct lane command:
 
 `tools/generate_gumbel_selfplay_data.py` remains the internal historical replay
 executor. New launches must not address its experiment-by-flag interface
-directly; the schema-19 config above is the complete science contract.
+directly; the schema-20 config above is the complete science contract.
 
 Post-wave admission must prove every worker used teacher v2 and emitted learner
 rows v5, with the legacy `adapter_version` row column equal to the learner

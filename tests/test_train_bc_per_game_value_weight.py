@@ -13,6 +13,7 @@ from tools.train_bc import (
     apply_value_player_outcome_balance,
     build_value_sample_weights,
     forced_action_type_value_mass_quality,
+    forced_scalar_value_mass_admission,
     per_game_weight_quality,
     value_player_outcome_balance_quality,
 )
@@ -304,6 +305,74 @@ def test_forced_value_nominal_measure_composes_sampler_and_label_confidence() ->
     )
     assert coverage_name == "coverage_importance_scalar_outcome_value_loss_v1"
     assert weights.tolist() == [10.0, 20.0, 30.0, 40.0]
+
+
+def test_forced_scalar_value_mass_ceiling_is_fail_closed() -> None:
+    report = {
+        "schema_version": "forced-action-type-value-mass-v2",
+        "objective_active": True,
+        "scope": "training_rows",
+        "measure_semantics": "nominal_population_objective_v1",
+        "objective_measure": "uniform_training_row_scalar_outcome_value_loss_v1",
+        "effective_total_value_mass": 10.0,
+        "effective_forced_value_mass_fraction": 0.4,
+    }
+
+    disabled = forced_scalar_value_mass_admission(
+        report,
+        maximum_fraction=None,
+    )
+    equal = forced_scalar_value_mass_admission(
+        report,
+        maximum_fraction=0.4,
+    )
+    exceeded = forced_scalar_value_mass_admission(
+        report,
+        maximum_fraction=0.399,
+    )
+
+    assert disabled["admission_enforced"] is False
+    assert disabled["admitted"] is True
+    assert equal["admitted"] is True
+    assert equal["observed_nominal_forced_mass_fraction"] == pytest.approx(0.4)
+    assert exceeded["admitted"] is False
+    assert exceeded["reason"] == "observed_fraction_exceeds_ceiling"
+
+
+@pytest.mark.parametrize(
+    "report",
+    [
+        {
+            "schema_version": "forced-action-type-value-mass-v2",
+            "objective_active": False,
+            "effective_total_value_mass": 10.0,
+            "effective_forced_value_mass_fraction": 0.2,
+        },
+        {
+            "schema_version": "forced-action-type-value-mass-v2",
+            "objective_active": True,
+            "effective_total_value_mass": 0.0,
+            "effective_forced_value_mass_fraction": 0.0,
+        },
+        None,
+    ],
+)
+def test_forced_scalar_value_mass_ceiling_rejects_missing_objective_measure(
+    report: dict[str, object] | None,
+) -> None:
+    admission = forced_scalar_value_mass_admission(
+        report,
+        maximum_fraction=0.5,
+    )
+    assert admission["admitted"] is False
+
+
+@pytest.mark.parametrize("maximum", [-0.1, 1.1, float("nan"), float("inf")])
+def test_forced_scalar_value_mass_ceiling_rejects_invalid_values(
+    maximum: float,
+) -> None:
+    with pytest.raises(ValueError, match="finite and in"):
+        forced_scalar_value_mass_admission(None, maximum_fraction=maximum)
 
 
 @pytest.mark.parametrize(
