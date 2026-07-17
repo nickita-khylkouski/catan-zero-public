@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import resource
 import sys
 import time
 from pathlib import Path
@@ -39,6 +40,7 @@ from catan_zero.rl.production_recipe_catalog import (  # noqa: E402
 
 
 CANONICAL_TRAIN_LAUNCH_SCHEMA = 1
+REQUIRED_NOFILE_SOFT = 65_536
 CANONICAL_CONFIG_ROLES_BY_CATALOG_NAME = {
     "a1-current-35m-b200": "scratch_fresh_optimizer",
     "a1-parent-update-35m-b200": "parent_fresh_optimizer",
@@ -692,6 +694,7 @@ def _bind_parent_report(
 
 def main(argv: Sequence[str] | None = None) -> None:
     public_args = build_parser().parse_args(argv)
+    _ensure_runtime_limits()
     config, engine_settings = _load_recipe(public_args.config)
     _require_exact_cap_feature_observability(config, engine_settings)
     if engine_settings.get("initialization_mode") == "scratch_fresh_optimizer":
@@ -716,6 +719,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     # emission on rank zero, so only rank zero may seal the post-run binding.
     if int(os.environ.get("RANK", "0")) == 0:
         _bind_parent_report(public_args.report, initialization=initialization)
+
+
+def _ensure_runtime_limits() -> None:
+    """Make the canonical learner satisfy its own FD admission contract."""
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    unlimited = resource.RLIM_INFINITY
+    if hard != unlimited and hard < REQUIRED_NOFILE_SOFT:
+        raise SystemExit(
+            f"hard RLIMIT_NOFILE {hard} is below required {REQUIRED_NOFILE_SOFT}"
+        )
+    if soft != unlimited and soft < REQUIRED_NOFILE_SOFT:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (REQUIRED_NOFILE_SOFT, hard))
 
 
 if __name__ == "__main__":

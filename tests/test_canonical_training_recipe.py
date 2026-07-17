@@ -378,3 +378,23 @@ def test_parent_update_rejects_growth_or_optimizer_resume() -> None:
                 engine_settings=engine,
                 public_args=_public_args(init_checkpoint="/tmp/f7.pt"),
             )
+
+
+def test_canonical_train_raises_its_own_fd_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        train.resource,
+        "getrlimit",
+        lambda _kind: (1024, 1_048_576),
+    )
+    monkeypatch.setattr(
+        train.resource,
+        "setrlimit",
+        lambda _kind, value: applied.append(value),
+    )
+
+    train._ensure_runtime_limits()
+
+    assert applied == [(65_536, 1_048_576)]
