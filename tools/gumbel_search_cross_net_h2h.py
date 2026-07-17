@@ -60,8 +60,14 @@ from catan_zero.rl.config_cli import (  # noqa: E402
     resolve_config,
 )
 from catan_zero.rl import entity_token_policy as _entity_token_policy  # noqa: E402
+from catan_zero.rl.action_context_features_rust import (  # noqa: E402
+    require_native_context_adapter,
+)
 from catan_zero.rl.checkpoint_runtime_semantics import (  # noqa: E402
     assert_entity_graph_checkpoint_runtime_semantics,
+)
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    resolve_checkpoint_entity_feature_adapter,
 )
 from catan_zero.rl.entity_token_features_rust import (  # noqa: E402
     require_rust_feature_path,
@@ -129,12 +135,41 @@ def _preflight_checkpoint_runtime_semantics(
             payload = torch.load(checkpoint, map_location="cpu")
         if not isinstance(payload, dict):
             raise RuntimeError(f"{role} checkpoint payload is not an object")
-        results[role] = assert_entity_graph_checkpoint_runtime_semantics(
+        result = assert_entity_graph_checkpoint_runtime_semantics(
             payload,
             checkpoint_path=checkpoint,
             policy_source=Path(_entity_token_policy.__file__).resolve(strict=True),
         )
+        adapter_version, adapter_provenance = (
+            resolve_checkpoint_entity_feature_adapter(
+                payload.get("entity_feature_adapter"),
+                metadata_present="entity_feature_adapter" in payload,
+            )
+        )
+        result["entity_feature_adapter_version"] = adapter_version
+        result["entity_feature_adapter_provenance"] = adapter_provenance
+        results[role] = result
     return results
+
+
+def _preflight_native_context_adapters(
+    checkpoint_runtime_semantics: dict[str, dict[str, object]],
+) -> None:
+    """Reject a stale native extension before evaluator workers are spawned."""
+
+    try:
+        package = importlib.import_module("catanatron_rs")
+    except ImportError as error:
+        raise RuntimeError("catanatron_rs is unavailable") from error
+    for role, evidence in checkpoint_runtime_semantics.items():
+        version = str(evidence.get("entity_feature_adapter_version", "") or "")
+        try:
+            require_native_context_adapter(package, version)
+        except (RuntimeError, ValueError) as error:
+            raise RuntimeError(
+                f"{role} checkpoint cannot use the loaded native context "
+                f"runtime: {error}"
+            ) from error
 
 
 def _native_runtime_extension_path() -> Path:
@@ -2033,6 +2068,9 @@ def main() -> None:
     if bool(args.evaluator_rust_featurize):
         try:
             require_rust_feature_path()
+            _preflight_native_context_adapters(
+                args.checkpoint_runtime_semantics
+            )
         except RuntimeError as error:
             parser.error(str(error))
     try:

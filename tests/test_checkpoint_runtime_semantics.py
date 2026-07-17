@@ -20,7 +20,10 @@ from catan_zero.rl.entity_token_policy import (  # noqa: E402
     EntityGraphConfig,
     EntityGraphPolicy,
 )
-from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V6  # noqa: E402
+from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
+    RUST_ENTITY_ADAPTER_V6,
+    checkpoint_entity_feature_adapter_metadata,
+)
 from tools import gumbel_search_cross_net_h2h as h2h  # noqa: E402
 
 
@@ -151,6 +154,72 @@ def test_h2h_preflight_accepts_same_forward_semantics(tmp_path: Path) -> None:
     assert result["candidate"]["compatible"] is True
     assert result["baseline"]["compatible"] is True
     assert result["candidate"]["provenance"] == "checkpoint_stamp"
+    assert (
+        result["candidate"]["entity_feature_adapter_provenance"]
+        == "legacy_missing_metadata_explicit_v2_mapping"
+    )
+
+
+def test_h2h_native_preflight_rejects_stale_context_runtime_before_workers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY: _identity(),
+        "entity_feature_adapter": checkpoint_entity_feature_adapter_metadata(
+            RUST_ENTITY_ADAPTER_V6
+        ),
+    }
+    candidate = tmp_path / "candidate.pt"
+    baseline = tmp_path / "baseline.pt"
+    torch.save(payload, candidate)
+    torch.save(payload, baseline)
+    evidence = h2h._preflight_checkpoint_runtime_semantics(candidate, baseline)
+    stale_native = type("StaleNative", (), {})()
+    monkeypatch.setattr(
+        h2h.importlib,
+        "import_module",
+        lambda name: stale_native if name == "catanatron_rs" else None,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="candidate checkpoint cannot use the loaded native context runtime",
+    ):
+        h2h._preflight_native_context_adapters(evidence)
+
+
+def test_h2h_native_preflight_accepts_advertised_v6_context_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        ENTITY_GRAPH_FORWARD_SEMANTICS_KEY: _identity(),
+        "entity_feature_adapter": checkpoint_entity_feature_adapter_metadata(
+            RUST_ENTITY_ADAPTER_V6
+        ),
+    }
+    candidate = tmp_path / "candidate.pt"
+    baseline = tmp_path / "baseline.pt"
+    torch.save(payload, candidate)
+    torch.save(payload, baseline)
+    evidence = h2h._preflight_checkpoint_runtime_semantics(candidate, baseline)
+    native = type(
+        "Native",
+        (),
+        {
+            "supported_action_context_adapter_versions": staticmethod(
+                lambda: [RUST_ENTITY_ADAPTER_V6]
+            )
+        },
+    )()
+    monkeypatch.setattr(
+        h2h.importlib,
+        "import_module",
+        lambda name: native if name == "catanatron_rs" else None,
+    )
+
+    h2h._preflight_native_context_adapters(evidence)
 
 
 def test_h2h_preflight_rejects_mismatch_before_evaluator_or_gpu(

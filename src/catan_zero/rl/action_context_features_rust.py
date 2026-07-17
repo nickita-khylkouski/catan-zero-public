@@ -37,7 +37,18 @@ from catan_zero.rl.entity_feature_adapter import (
 from catan_zero.rl.entity_token_features_rust import RustTopology
 
 
-def _require_native_context_adapter(catanatron_rs: Any, adapter_version: str) -> None:
+def require_native_context_adapter(
+    catanatron_rs: Any, adapter_version: str
+) -> None:
+    """Prove that the loaded extension implements the requested context ABI.
+
+    Adapters v2-v5 use the historical unversioned native call. V6 changes the
+    meaning of the opening-road context slot and therefore requires an explicit
+    capability advertisement from the extension; accepting the generic native
+    feature capability is not sufficient evidence.
+    """
+
+    adapter_version = require_known_entity_feature_adapter(adapter_version)
     if adapter_version != RUST_ENTITY_ADAPTER_V6:
         return
     capability = getattr(
@@ -72,7 +83,7 @@ def build_action_context_rust(
     adapter_version = require_known_entity_feature_adapter(
         entity_feature_adapter_version
     )
-    _require_native_context_adapter(catanatron_rs, adapter_version)
+    require_native_context_adapter(catanatron_rs, adapter_version)
     if adapter_version == RUST_ENTITY_ADAPTER_V6:
         flat, shape = catanatron_rs.build_action_context_flat(
             rust_game, topology.rust, adapter_version
@@ -120,7 +131,7 @@ def build_action_context_batch_rust(
     adapter_version = require_known_entity_feature_adapter(
         entity_feature_adapter_version
     )
-    _require_native_context_adapter(catanatron_rs, adapter_version)
+    require_native_context_adapter(catanatron_rs, adapter_version)
     if adapter_version == RUST_ENTITY_ADAPTER_V6:
         raw = catanatron_rs.build_action_context_batch(
             list(rust_games), topology.rust, parallel, adapter_version
