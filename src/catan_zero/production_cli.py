@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 from importlib import metadata
 import json
@@ -15,7 +17,7 @@ import stat
 import subprocess
 import sys
 from time import time
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 from catan_zero.production_contracts import (
     NATIVE_REQUIRED_CAPABILITIES,
@@ -845,6 +847,358 @@ def _write_json_atomic(path: Path, value: object) -> None:
             temporary.unlink()
 
 
+@contextmanager
+def _exclusive_run_claim(receipt_path: Path, plan_sha256: str) -> Iterator[None]:
+    """Hold one cross-process claim for a run receipt until execution settles."""
+
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    claim_path = receipt_path.with_name(f".{receipt_path.name}.claim")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(claim_path, flags, 0o600)
+    except OSError as error:
+        raise ProductionCLIError(
+            f"cannot open exclusive run claim {claim_path}: {error}"
+        ) from error
+    locked = False
+    try:
+        claim_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(claim_stat.st_mode) or claim_stat.st_nlink != 1:
+            raise ProductionCLIError(
+                f"exclusive run claim must be a singly linked regular file: {claim_path}"
+            )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ProductionCLIError(
+                f"production run is already claimed: {receipt_path}"
+            ) from error
+        locked = True
+        owner = (
+            json.dumps(
+                {
+                    "hostname": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "plan_sha256": plan_sha256,
+                    "claimed_unix_seconds": time(),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        offset = 0
+        while offset < len(owner):
+            offset += os.write(descriptor, owner[offset:])
+        os.fsync(descriptor)
+        yield
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _stable_output_ref(
+    path: Path, *, label: str, json_object: bool = False
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Hash one regular output while proving its path and bytes stay stable."""
+
+    descriptor = -1
+    try:
+        before = path.lstat()
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            raise ProductionCLIError(
+                f"required {label} must be a regular non-symlink file: {path}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ProductionCLIError(f"required {label} changed while opening: {path}")
+        digest = hashlib.sha256()
+        captured = bytearray() if json_object else None
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+                if captured is not None:
+                    captured.extend(block)
+        after = os.fstat(descriptor)
+        path_after = path.lstat()
+    except OSError as error:
+        raise ProductionCLIError(f"cannot attest required {label} {path}: {error}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    identity_path_after = (
+        path_after.st_dev,
+        path_after.st_ino,
+        path_after.st_size,
+        path_after.st_mtime_ns,
+        path_after.st_ctime_ns,
+    )
+    if identity_before != identity_after or identity_after != identity_path_after:
+        raise ProductionCLIError(f"required {label} changed while hashing: {path}")
+    if after.st_size <= 0:
+        raise ProductionCLIError(f"required {label} is empty: {path}")
+    payload: dict[str, Any] | None = None
+    if captured is not None:
+        try:
+            decoded = json.loads(captured.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ProductionCLIError(
+                f"required {label} is malformed JSON: {path}: {error}"
+            ) from error
+        if not isinstance(decoded, dict) or not decoded:
+            raise ProductionCLIError(
+                f"required {label} must be a non-empty JSON object: {path}"
+            )
+        payload = decoded
+    return (
+        {
+            "path": str(path),
+            "sha256": digest.hexdigest(),
+            "size_bytes": int(after.st_size),
+        },
+        payload,
+    )
+
+
+def _require_exact_integer(
+    payload: dict[str, Any], key: str, expected: int, *, label: str
+) -> None:
+    actual = payload.get(key)
+    if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
+        raise ProductionCLIError(
+            f"required {label} {key} drift: expected={expected} actual={actual!r}"
+        )
+
+
+def _require_checkpoint_ref(
+    value: object,
+    *,
+    expected_path: Path,
+    expected_sha256: str,
+    label: str,
+) -> None:
+    if not isinstance(value, dict):
+        raise ProductionCLIError(f"required {label} checkpoint reference is malformed")
+    raw_path = value.get("path")
+    if not isinstance(raw_path, str):
+        raise ProductionCLIError(f"required {label} checkpoint path is malformed")
+    actual_path = Path(raw_path).expanduser().resolve(strict=False)
+    if (
+        actual_path != expected_path.expanduser().resolve(strict=False)
+        or value.get("sha256") != expected_sha256
+    ):
+        raise ProductionCLIError(f"required {label} checkpoint binding drift")
+
+
+def _admit_required_outputs(plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Validate and hash the minimum successful artifact set for a pipeline."""
+
+    job = plan["job"]
+    pipeline = str(job["pipeline"])
+    run_dir = Path(job["run_dir"])
+    outputs: dict[str, dict[str, Any]] = {}
+    if pipeline == "generate":
+        ref, manifest = _stable_output_ref(
+            run_dir / "manifest.json", label="generation manifest", json_object=True
+        )
+        assert manifest is not None
+        if Path(str(manifest.get("out_dir", ""))).resolve(strict=False) != run_dir.resolve(
+            strict=False
+        ):
+            raise ProductionCLIError("required generation manifest out_dir binding drift")
+        games = int(job["games"])
+        _require_exact_integer(
+            manifest, "games_requested", games, label="generation manifest"
+        )
+        _require_exact_integer(
+            manifest, "games_completed", games, label="generation manifest"
+        )
+        _require_exact_integer(
+            manifest, "games_failed", 0, label="generation manifest"
+        )
+        rows = manifest.get("rows")
+        if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
+            raise ProductionCLIError("required generation manifest has no learner rows")
+        errors = manifest.get("errors")
+        if not isinstance(errors, list) or errors:
+            raise ProductionCLIError(
+                f"required generation manifest contains errors: {errors!r}"
+            )
+        shards = manifest.get("shards")
+        if not isinstance(shards, list) or not shards:
+            raise ProductionCLIError("required generation manifest has no output shards")
+        outputs["generation_manifest"] = ref
+        run_root = run_dir.resolve(strict=False)
+        seen_shards: set[Path] = set()
+        for index, raw_shard in enumerate(shards):
+            if not isinstance(raw_shard, str):
+                raise ProductionCLIError(
+                    f"required generation shard {index} path is malformed"
+                )
+            shard = Path(raw_shard).expanduser()
+            if not shard.is_absolute():
+                raise ProductionCLIError(
+                    f"required generation shard {index} path is not absolute: {shard}"
+                )
+            resolved_shard = shard.resolve(strict=False)
+            try:
+                resolved_shard.relative_to(run_root)
+            except ValueError as error:
+                raise ProductionCLIError(
+                    f"required generation shard {index} escapes run_dir: {shard}"
+                ) from error
+            if resolved_shard in seen_shards:
+                raise ProductionCLIError(
+                    f"required generation shard inventory contains a duplicate: {shard}"
+                )
+            seen_shards.add(resolved_shard)
+            shard_ref, _ = _stable_output_ref(
+                shard, label=f"generation shard {index}"
+            )
+            outputs[f"generation_shard_{index:06d}"] = shard_ref
+        return outputs
+
+    if pipeline == "train":
+        checkpoint_path = run_dir / "candidate.pt"
+        checkpoint_ref, _ = _stable_output_ref(
+            checkpoint_path, label="training candidate"
+        )
+        report_ref, report = _stable_output_ref(
+            run_dir / "train.report.json",
+            label="training report",
+            json_object=True,
+        )
+        assert report is not None
+        report_checkpoint = report.get("checkpoint")
+        if not isinstance(report_checkpoint, str) or (
+            Path(report_checkpoint).expanduser().resolve(strict=False)
+            != checkpoint_path.resolve(strict=False)
+        ):
+            raise ProductionCLIError("required training report checkpoint binding drift")
+        steps = report.get("steps_completed")
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
+            raise ProductionCLIError(
+                "required training report has no completed optimizer steps"
+            )
+        outputs.update(training_candidate=checkpoint_ref, training_report=report_ref)
+        if job["recipe"] == "a1-current-35m-b200":
+            execution_ref, execution = _stable_output_ref(
+                run_dir / "scratch.execution.json",
+                label="scratch execution receipt",
+                json_object=True,
+            )
+            assert execution is not None
+            unsigned = dict(execution)
+            declared_receipt_sha256 = unsigned.pop("receipt_sha256", None)
+            if (
+                execution.get("schema_version")
+                != "a1-coherent-scratch-training-execution-v2"
+                or execution.get("status") != "completed"
+                or execution.get("returncode") != 0
+                or declared_receipt_sha256
+                != "sha256:" + canonical_json_sha256(unsigned)
+            ):
+                raise ProductionCLIError(
+                    "required scratch execution receipt is not an authenticated "
+                    "completed execution"
+                )
+            execution_outputs = execution.get("outputs")
+            if not isinstance(execution_outputs, dict):
+                raise ProductionCLIError(
+                    "required scratch execution receipt has no output bindings"
+                )
+            terminal = execution_outputs.get("terminal_checkpoint")
+            training_report = execution_outputs.get("training_report")
+            for value, expected, label in (
+                (terminal, checkpoint_ref, "scratch terminal checkpoint"),
+                (training_report, report_ref, "scratch training report"),
+            ):
+                if not isinstance(value, dict):
+                    raise ProductionCLIError(f"required {label} binding is malformed")
+                bound_path = value.get("path")
+                if not isinstance(bound_path, str) or (
+                    Path(bound_path).resolve(strict=False)
+                    != Path(expected["path"]).resolve(strict=False)
+                    or value.get("file_sha256") != "sha256:" + expected["sha256"]
+                ):
+                    raise ProductionCLIError(f"required {label} binding drift")
+            outputs["scratch_execution_receipt"] = execution_ref
+        return outputs
+
+    evaluation_ref, evaluation = _stable_output_ref(
+        run_dir / "evaluation.json", label="evaluation report", json_object=True
+    )
+    assert evaluation is not None
+    errors = evaluation.get("errors")
+    games = evaluation.get("games")
+    if not isinstance(errors, list) or errors:
+        raise ProductionCLIError(f"required evaluation report contains errors: {errors!r}")
+    if not isinstance(games, list) or not games:
+        raise ProductionCLIError("required evaluation report has no games")
+    if job.get("held_out_suite") is None:
+        _require_exact_integer(
+            evaluation, "pairs_requested", int(job["pairs"]), label="evaluation report"
+        )
+        _require_exact_integer(
+            evaluation,
+            "games_played",
+            int(job["pairs"]) * 2,
+            label="evaluation report",
+        )
+        if len(games) != int(job["pairs"]) * 2:
+            raise ProductionCLIError("required evaluation report game inventory drift")
+        candidate_ref = {
+            "path": evaluation.get("candidate_checkpoint"),
+            "sha256": evaluation.get("candidate_checkpoint_sha256"),
+        }
+        champion_ref = {
+            "path": evaluation.get("baseline_checkpoint"),
+            "sha256": evaluation.get("baseline_checkpoint_sha256"),
+        }
+    else:
+        if (
+            evaluation.get("schema_version") != "a1-held-out-high-regret-report-v2"
+            or evaluation.get("held_out") is not True
+        ):
+            raise ProductionCLIError("required held-out evaluation report schema drift")
+        candidate_ref = evaluation.get("candidate")
+        champion_ref = evaluation.get("champion")
+    _require_checkpoint_ref(
+        candidate_ref,
+        expected_path=Path(job["candidate"]),
+        expected_sha256=plan["inputs"]["candidate"]["sha256"],
+        label="evaluation candidate",
+    )
+    _require_checkpoint_ref(
+        champion_ref,
+        expected_path=Path(job["champion"]),
+        expected_sha256=plan["inputs"]["champion"]["sha256"],
+        label="evaluation champion",
+    )
+    outputs["evaluation_report"] = evaluation_ref
+    return outputs
+
+
 def execute(plan: dict[str, Any]) -> int:
     check = doctor(plan)
     if not check["ok"]:
@@ -852,6 +1206,13 @@ def execute(plan: dict[str, Any]) -> int:
             "production doctor refused run: " + "; ".join(check["errors"])
         )
     receipt_path = Path(plan["run_receipt"])
+    with _exclusive_run_claim(receipt_path, str(plan["plan_sha256"])):
+        return _execute_claimed(plan, check, receipt_path)
+
+
+def _execute_claimed(
+    plan: dict[str, Any], check: dict[str, Any], receipt_path: Path
+) -> int:
     prior_receipt: dict[str, Any] | None = None
     if receipt_path.exists():
         prior_receipt = _load_json_object(receipt_path, label="prior run receipt")
@@ -910,11 +1271,21 @@ def execute(plan: dict[str, Any]) -> int:
         receipt.update(status="failed_to_start", error=str(error))
         _write_json_atomic(receipt_path, receipt)
         raise ProductionCLIError(f"cannot start production command: {error}") from error
-    receipt["returncode"] = int(completed.returncode)
-    receipt["status"] = "complete" if completed.returncode == 0 else "failed"
+    returncode = int(completed.returncode)
+    receipt["command_returncode"] = returncode
+    if returncode == 0:
+        try:
+            receipt["outputs"] = _admit_required_outputs(plan)
+        except Exception as error:  # noqa: BLE001 - malformed outputs must fail closed.
+            returncode = 1
+            receipt["output_admission_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+    receipt["returncode"] = returncode
+    receipt["status"] = "complete" if returncode == 0 else "failed"
     receipt["finished_unix_seconds"] = time()
     _write_json_atomic(receipt_path, receipt)
-    return int(completed.returncode)
+    return returncode
 
 
 def prepare_training(plan: dict[str, Any]) -> int:

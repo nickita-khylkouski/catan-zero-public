@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -663,6 +664,250 @@ def test_execute_refuses_before_receipt_or_subprocess(
     with pytest.raises(cli.ProductionCLIError, match="deliberate refusal"):
         cli.execute(plan)
     assert not Path(plan["run_receipt"]).exists()
+
+
+def _write_admissible_outputs(plan: dict[str, object]) -> set[str]:
+    job = plan["job"]
+    inputs = plan["inputs"]
+    assert isinstance(job, dict)
+    assert isinstance(inputs, dict)
+    run_dir = Path(str(job["run_dir"]))
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if job["pipeline"] == "generate":
+        shard = run_dir / "worker_000" / "shard_000000.npz"
+        shard.parent.mkdir()
+        shard.write_bytes(b"rows")
+        (run_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "out_dir": str(run_dir),
+                    "games_requested": job["games"],
+                    "games_completed": job["games"],
+                    "games_failed": 0,
+                    "rows": 8,
+                    "errors": [],
+                    "shards": [str(shard)],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {"generation_manifest", "generation_shard_000000"}
+    if job["pipeline"] == "train":
+        candidate = run_dir / "candidate.pt"
+        report = run_dir / "train.report.json"
+        candidate.write_bytes(b"trained-candidate")
+        report.write_text(
+            json.dumps(
+                {
+                    "checkpoint": str(candidate),
+                    "steps_completed": 3,
+                    "epochs": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        expected = {"training_candidate", "training_report"}
+        if job["recipe"] == "a1-current-35m-b200":
+            execution = {
+                "schema_version": "a1-coherent-scratch-training-execution-v2",
+                "status": "completed",
+                "returncode": 0,
+                "outputs": {
+                    "terminal_checkpoint": {
+                        "path": str(candidate),
+                        "file_sha256": "sha256:" + cli._file_sha256(candidate),  # noqa: SLF001
+                    },
+                    "training_report": {
+                        "path": str(report),
+                        "file_sha256": "sha256:" + cli._file_sha256(report),  # noqa: SLF001
+                    },
+                },
+            }
+            execution["receipt_sha256"] = (
+                "sha256:" + canonical_json_sha256(execution)
+            )
+            (run_dir / "scratch.execution.json").write_text(
+                json.dumps(execution), encoding="utf-8"
+            )
+            expected.add("scratch_execution_receipt")
+        return expected
+    candidate = inputs["candidate"]
+    champion = inputs["champion"]
+    assert isinstance(candidate, dict)
+    assert isinstance(champion, dict)
+    games = [{"pair_id": index // 2} for index in range(int(job["pairs"]) * 2)]
+    (run_dir / "evaluation.json").write_text(
+        json.dumps(
+            {
+                "errors": [],
+                "games": games,
+                "pairs_requested": job["pairs"],
+                "games_played": len(games),
+                "candidate_checkpoint": job["candidate"],
+                "candidate_checkpoint_sha256": candidate["sha256"],
+                "baseline_checkpoint": job["champion"],
+                "baseline_checkpoint_sha256": champion["sha256"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {"evaluation_report"}
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "recipe", "expected_error"),
+    (
+        ("generate", None, "generation manifest"),
+        ("train", "a1-parent-update-35m-b200", "training report"),
+        ("train", "a1-current-35m-b200", "scratch execution receipt"),
+        ("evaluate", None, "evaluation report must be a non-empty JSON object"),
+    ),
+)
+def test_zero_exit_without_required_outputs_is_failed_and_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline: str,
+    recipe: str | None,
+    expected_error: str,
+) -> None:
+    updates = {} if recipe is None else {"recipe": recipe}
+    plan = cli.build_plan(_write_job(tmp_path, pipeline, **updates))
+    monkeypatch.setattr(cli, "doctor", lambda _plan: {"ok": True, "errors": []})
+
+    def zero_exit(_command, **_kwargs):
+        run_dir = Path(plan["job"]["run_dir"])
+        if pipeline == "train":
+            candidate = run_dir / "candidate.pt"
+            candidate.write_bytes(b"candidate")
+            if recipe == "a1-current-35m-b200":
+                (run_dir / "train.report.json").write_text(
+                    json.dumps(
+                        {
+                            "checkpoint": str(candidate),
+                            "steps_completed": 1,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+        elif pipeline == "evaluate":
+            (run_dir / "evaluation.json").write_text("[]", encoding="utf-8")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", zero_exit)
+
+    assert cli.execute(plan) == 1
+    receipt = json.loads(Path(plan["run_receipt"]).read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    assert receipt["command_returncode"] == 0
+    assert receipt["returncode"] == 1
+    assert expected_error in receipt["output_admission_error"]
+    assert "outputs" not in receipt
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "recipe"),
+    (
+        ("generate", None),
+        ("train", "a1-parent-update-35m-b200"),
+        ("train", "a1-current-35m-b200"),
+        ("evaluate", None),
+    ),
+)
+def test_success_requires_and_hashes_pipeline_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline: str,
+    recipe: str | None,
+) -> None:
+    updates = {} if recipe is None else {"recipe": recipe}
+    plan = cli.build_plan(_write_job(tmp_path, pipeline, **updates))
+    monkeypatch.setattr(cli, "doctor", lambda _plan: {"ok": True, "errors": []})
+    expected_outputs: set[str] = set()
+
+    def zero_exit(_command, **_kwargs):
+        expected_outputs.update(_write_admissible_outputs(plan))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", zero_exit)
+
+    assert cli.execute(plan) == 0
+    receipt = json.loads(Path(plan["run_receipt"]).read_text(encoding="utf-8"))
+    assert receipt["status"] == "complete"
+    assert receipt["command_returncode"] == 0
+    assert receipt["returncode"] == 0
+    assert set(receipt["outputs"]) == expected_outputs
+    for output in receipt["outputs"].values():
+        path = Path(output["path"])
+        assert output["sha256"] == cli._file_sha256(path)  # noqa: SLF001
+        assert output["size_bytes"] == path.stat().st_size
+
+
+def test_zero_exit_generation_refuses_a_missing_manifest_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = cli.build_plan(_write_job(tmp_path))
+    monkeypatch.setattr(cli, "doctor", lambda _plan: {"ok": True, "errors": []})
+
+    def zero_exit(_command, **_kwargs):
+        run_dir = Path(plan["job"]["run_dir"])
+        missing = run_dir / "worker_000" / "missing.npz"
+        (run_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "out_dir": str(run_dir),
+                    "games_requested": plan["job"]["games"],
+                    "games_completed": plan["job"]["games"],
+                    "games_failed": 0,
+                    "rows": 8,
+                    "errors": [],
+                    "shards": [str(missing)],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", zero_exit)
+
+    assert cli.execute(plan) == 1
+    receipt = json.loads(Path(plan["run_receipt"]).read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    assert "generation shard 0" in receipt["output_admission_error"]
+    assert "outputs" not in receipt
+
+
+def test_run_claim_is_exclusive_across_processes(tmp_path: Path) -> None:
+    plan = cli.build_plan(_write_job(tmp_path))
+    context = multiprocessing.get_context("fork")
+    claimed = context.Event()
+    release = context.Event()
+
+    def hold_claim() -> None:
+        with cli._exclusive_run_claim(  # noqa: SLF001
+            Path(plan["run_receipt"]), str(plan["plan_sha256"])
+        ):
+            claimed.set()
+            release.wait(timeout=5)
+
+    worker = context.Process(target=hold_claim)
+    worker.start()
+    assert claimed.wait(timeout=5)
+    try:
+        with pytest.raises(cli.ProductionCLIError, match="already claimed"):
+            with cli._exclusive_run_claim(  # noqa: SLF001
+                Path(plan["run_receipt"]), str(plan["plan_sha256"])
+            ):
+                pytest.fail("a second process acquired the same run claim")
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert worker.exitcode == 0
+    with cli._exclusive_run_claim(  # noqa: SLF001
+        Path(plan["run_receipt"]), str(plan["plan_sha256"])
+    ):
+        pass
 
 
 def test_resume_refuses_changed_attempt_identity(
