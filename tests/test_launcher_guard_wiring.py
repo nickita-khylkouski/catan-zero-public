@@ -51,6 +51,7 @@ VAL_ONLY_SEED = 6_195_000_000  # inside prelaunch_guard.VAL_ONLY_SEED_RANGE
 GOLDEN_OPTION_STRINGS = {
     "train": {
         ("--allow-concurrent-bc",),
+        ("--architecture-upgrade-receipt",),
         ("--checkpoint",),
         ("--config",),
         ("--data",),
@@ -58,6 +59,7 @@ GOLDEN_OPTION_STRINGS = {
         ("--help", "-h"),
         ("--host-lock-file",),
         ("--init-checkpoint",),
+        ("--parent-checkpoint",),
         ("--report",),
     },
     "generate_gumbel_selfplay_data": {
@@ -384,7 +386,7 @@ def _option_strings(parser: argparse.ArgumentParser) -> set[tuple[str, ...]]:
     }
 
 
-def test_canonical_train_cli_has_at_most_ten_options() -> None:
+def test_canonical_train_cli_exposes_only_config_and_artifact_bindings() -> None:
     """The old exact-flag golden fossilized experimental parser growth.
 
     New training runs have one intentionally small config-first surface.

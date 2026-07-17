@@ -72,7 +72,7 @@ def test_generation_guard_is_authenticated_by_the_same_catalog() -> None:
 
     assert Path(entry["guard"]).is_absolute()
     assert entry["guard_sha256"] == (
-        "ca2909a0f725b0af82f144ab1cc1b2db2b42b4d30676304031066842b2ded5a8"
+        "99a19aa2a7e557083bbfa813653f9b763edce9d8662ec9e5ec3dce14f1ff9d5a"
     )
 
 

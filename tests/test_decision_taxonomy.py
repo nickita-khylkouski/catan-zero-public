@@ -155,6 +155,7 @@ def test_self_play_row_persists_typed_budget_reason(monkeypatch) -> None:
         used_full_search=True,
         simulations_used=128,
         root_value=0.15,
+        root_prior_value=0.05,
     )
     game = SimpleNamespace(current_color=lambda: "RED")
 

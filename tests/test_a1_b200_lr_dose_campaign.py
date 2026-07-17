@@ -542,7 +542,7 @@ def test_campaign_seals_independent_parent_arms_and_policy_active_target(
         assert override["public_card_lr_mult"] == 1.0
         assert (
             override["forced_row_value_action_type_weights"]
-            == "END_TURN=0.1,ROLL=1.0"
+            == "END_TURN=1.0,ROLL=1.0"
         )
 
 

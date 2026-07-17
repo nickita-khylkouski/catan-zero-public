@@ -49,7 +49,7 @@ SCIENCE_CONTRACT_RELATIVE = Path(
     "configs/operations/a1-next-wave-coherent-public-v3/science.contract.json"
 )
 EXISTING_CORPUS_SCIENCE_FIELDS = {
-    "forced_row_value_action_type_weights": "END_TURN=0.1,ROLL=1.0",
+    "forced_row_value_action_type_weights": "END_TURN=1.0,ROLL=1.0",
     # These are omitted from the canonical recipe when they retain the trainer
     # defaults. Bind the effective values so the campaign cannot resurrect an
     # obsolete experimental optimizer/sampler treatment merely because the

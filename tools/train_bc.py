@@ -26736,18 +26736,23 @@ def _normalize_teacher_shard(
                     f"{path} field {key} must be an integral ({n},) column"
                 )
             result[key] = value.astype(np.int64, copy=False)
+        present = np.asarray(
+            result["restart_provenance_present"], dtype=np.bool_
+        )
         modes = np.asarray(result["start_mode"]).astype(str)
         buckets = np.asarray(result["start_bucket"]).astype(str)
-        archived = modes == "archived_public_state"
-        normal = modes == "normal"
-        if not bool(np.all(result["restart_provenance_present"])):
-            raise SystemExit(f"{path} restart provenance presence bit is false")
-        if bool(np.any(~(archived | normal))):
+        archived = present & (modes == "archived_public_state")
+        normal = present & (modes == "normal")
+        legacy = ~present
+        if bool(np.any(present & ~(archived | normal))):
             raise SystemExit(f"{path} has unknown restart start_mode")
         if bool(
             np.any(
-                np.asarray(result["restart_select_seed"], dtype=np.int64)
-                != np.asarray(result["game_seed"], dtype=np.int64)
+                present
+                & (
+                    np.asarray(result["restart_select_seed"], dtype=np.int64)
+                    != np.asarray(result["game_seed"], dtype=np.int64)
+                )
             )
         ):
             raise SystemExit(
@@ -26758,6 +26763,22 @@ def _normalize_teacher_shard(
         archived_decisions = np.asarray(
             result["archived_decision_index"], dtype=np.int64
         )
+        restart_select_seeds = np.asarray(
+            result["restart_select_seed"], dtype=np.int64
+        )
+        if bool(
+            np.any(
+                legacy
+                & (
+                    (modes != "legacy_unknown")
+                    | (buckets != "")
+                    | (restart_select_seeds != -1)
+                    | (archived_seeds != -1)
+                    | (archived_decisions != -1)
+                )
+            )
+        ):
+            raise SystemExit(f"{path} has invalid legacy restart provenance")
         if bool(
             np.any(
                 archived
