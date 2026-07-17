@@ -462,6 +462,9 @@ def _engine_namespace(
             "allow_concurrent_bc": bool(public_args.allow_concurrent_bc),
         }
     )
+    validation_manifest = _validation_manifest_from_memmap(public_args.data)
+    if validation_manifest:
+        settings["validation_game_seed_manifest"] = validation_manifest
     if public_args.init_checkpoint:
         settings["init_checkpoint"] = public_args.init_checkpoint
 
@@ -535,6 +538,65 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return "sha256:" + digest.hexdigest()
+
+
+def _validation_manifest_from_memmap(raw_data: str | Path) -> str:
+    """Bind the exact validation split already authenticated by a memmap.
+
+    The corpus builder records the immutable selected-game manifest and its
+    file digest in ``corpus_meta.json``.  Canonical training must consume that
+    exact sidecar; leaving the internal flag blank makes every valid A1 corpus
+    fail preflight, while recomputing a fractional split would change the
+    experiment.  Non-directory/composite inputs retain their existing routing.
+    """
+
+    raw_path = Path(raw_data).expanduser()
+    if not raw_path.is_dir():
+        return ""
+    meta_path = raw_path / "corpus_meta.json"
+    if not meta_path.exists():
+        return ""
+    if meta_path.is_symlink() or not meta_path.is_file():
+        raise SystemExit(f"memmap corpus metadata must be a regular file: {meta_path}")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid memmap corpus metadata {meta_path}: {error}") from error
+    selected = meta.get("selected_game_seed_manifest")
+    if selected is None:
+        return ""
+    if not isinstance(selected, Mapping):
+        raise SystemExit("memmap selected_game_seed_manifest must be an object")
+    path_raw = selected.get("path")
+    digest = selected.get("file_sha256")
+    if not isinstance(path_raw, str) or not path_raw:
+        raise SystemExit("memmap selected-game manifest path is missing")
+    if not isinstance(digest, str) or not digest.startswith("sha256:"):
+        raise SystemExit("memmap selected-game manifest SHA256 is missing")
+    candidate = Path(path_raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = meta_path.parent / candidate
+    if candidate.is_symlink():
+        raise SystemExit(
+            f"memmap selected-game manifest must not be a symlink: {candidate}"
+        )
+    try:
+        manifest = candidate.resolve(strict=True)
+    except OSError as error:
+        raise SystemExit(
+            f"cannot resolve memmap selected-game manifest: {error}"
+        ) from error
+    if not manifest.is_file():
+        raise SystemExit(
+            f"memmap selected-game manifest must be a regular file: {manifest}"
+        )
+    actual = _sha256(manifest)
+    if actual != digest:
+        raise SystemExit(
+            "memmap selected-game manifest digest mismatch: "
+            f"declared={digest} actual={actual}"
+        )
+    return str(manifest)
 
 
 def _checkpoint_ref(raw: str, *, where: str) -> dict[str, str]:

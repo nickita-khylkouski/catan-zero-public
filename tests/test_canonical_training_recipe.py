@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 from pathlib import Path
 
@@ -70,6 +71,48 @@ def test_parent_production_recipe_can_collect_two_signal_observations() -> None:
     assert config.max_steps == 12
     assert engine["train_diagnostics_every_batches"] == 6
     assert engine["minimum_feature_learning_signal_observations"] == 2
+
+
+def test_canonical_memmap_binds_authenticated_validation_manifest(tmp_path) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    manifest = tmp_path / "selected-games.json"
+    manifest.write_text('{"schema_version":"selected-games-v1"}\n', encoding="utf-8")
+    digest = "sha256:" + hashlib.sha256(manifest.read_bytes()).hexdigest()
+    (corpus / "corpus_meta.json").write_text(
+        json.dumps(
+            {
+                "selected_game_seed_manifest": {
+                    "path": str(manifest),
+                    "file_sha256": digest,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert train._validation_manifest_from_memmap(corpus) == str(manifest.resolve())
+
+
+def test_canonical_memmap_rejects_changed_validation_manifest(tmp_path) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    manifest = tmp_path / "selected-games.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    (corpus / "corpus_meta.json").write_text(
+        json.dumps(
+            {
+                "selected_game_seed_manifest": {
+                    "path": str(manifest),
+                    "file_sha256": "sha256:" + ("0" * 64),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="digest mismatch"):
+        train._validation_manifest_from_memmap(corpus)
 
 
 def _feature_observability_engine() -> dict[str, object]:
