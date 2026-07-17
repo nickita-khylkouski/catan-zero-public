@@ -202,6 +202,13 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         "sha256:76802390eb12cc613e1db28d4182e1bc70d4435ce2d333da04e2ba3faa404c8f",
         # H100 Linux tokenizer identity for the same guarded V8 source.
         "sha256:fb7c92a2a5fbc376ea98c1d7a9874e78da59521d9764358856ad827dd532a1f4",
+        # Ordered V7 decoder memory landed after the graph-safe V8 source.
+        # It remains jointly gated by the V7 compatibility flag and a
+        # commissioned action decoder, so legacy topology-disabled checkpoints
+        # still execute the reviewed function. These are the exact macOS and
+        # H100 Linux tokenizer identities for the integrated source.
+        "sha256:c397398c37b102afed19ccbd035ec3c0c90de53e9c61ccfd2036f88ce7a49e23",
+        "sha256:ac723af4a46fd4cc3c16d25990e2493fcd1ffaf190f2dfea634aad5b4a328105",
     }
 }
 
