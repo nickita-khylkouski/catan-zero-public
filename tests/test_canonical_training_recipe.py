@@ -283,22 +283,96 @@ def test_canonical_recipe_emphasizes_hard_decisions_without_weighting_value(
     assert fields["forced_action_weight"] == 0.0
 
 
-def test_hard_decision_mass_projection_replays_sealed_objective_measure() -> None:
+def test_hard_decision_mass_replay_uses_per_game_runtime_operator() -> None:
     evidence = json.loads(HARD_DECISION_EVIDENCE.read_text(encoding="utf-8"))
-    baseline = evidence["baseline"]["policy_objective_mass_fraction"]
-    factors = evidence["correction"]["relative_to_baseline_recipe"]
-    projected = evidence["same_measure_projection"][
-        "policy_objective_mass_fraction"
-    ]
-    denominator = sum(baseline[phase] * factors[phase] for phase in baseline)
+    replay = evidence["exact_runtime_replay"]
+    assert replay["aggregate_projection_valid"] is False
+    assert replay["training_row_count"] == 2_392_241
+    assert replay["policy_objective_mass_fraction"] == pytest.approx(
+        {
+            "BUILD_INITIAL_ROAD": 0.05617698802311918,
+            "BUILD_INITIAL_SETTLEMENT": 0.02808849401155959,
+            "DISCARD": 0.05581640524684239,
+            "MOVE_ROBBER": 0.3299306883373039,
+            "PLAY_TURN": 0.5299874243811756,
+        }
+    )
 
-    for phase, old_fraction in baseline.items():
-        assert projected[phase] == pytest.approx(
-            old_fraction * factors[phase] / denominator
+    phases = np.asarray(
+        [
+            "DISCARD",
+            "PLAY_TURN",
+            "BUILD_INITIAL_SETTLEMENT",
+            "BUILD_INITIAL_ROAD",
+            "MOVE_ROBBER",
+            "PLAY_TURN",
+            "PLAY_TURN",
+        ]
+    )
+    data = {
+        "action_taken": np.arange(phases.size, dtype=np.int16),
+        "phase": phases,
+        "game_seed": np.asarray([11, 11, 22, 22, 22, 22, 22], dtype=np.int64),
+        "legal_action_ids": np.tile(
+            np.asarray([[0, 1]], dtype=np.int16), (phases.size, 1)
+        ),
+    }
+    common = {
+        "teacher_weights": {},
+        "forced_action_weight": 0.0,
+        "winner_sample_weight": 1.0,
+        "loser_sample_weight": 1.0,
+        "vp_margin_weight": 0.0,
+        "vps_to_win": 10,
+        "per_game_policy_weight": True,
+        "per_game_policy_weight_mode": "equal",
+    }
+    def runtime_mass(
+        phase_weights: dict[str, float], *, enforce_minima: bool = False
+    ) -> tuple[dict[str, float], dict[str, object]]:
+        weights = train_bc.build_sample_weights(
+            data, phase_weights=phase_weights, **common
         )
+        report = train_bc._policy_phase_objective_mass_admission(
+            data,
+            np.arange(phases.size, dtype=np.int64),
+            policy_sample_weights=weights,
+            sampling_weights=None,
+            minimum_phase_mass_fractions=(
+                {phase: 0.02 for phase in train_bc.HARD_DECISION_POLICY_MASS_PHASES}
+                if enforce_minima
+                else None
+            ),
+            objective_measure="synthetic_uniform_row_probability_x_policy_loss_weight",
+        )
+        return (
+            {
+                phase: row["policy_objective_mass_fraction"]
+                for phase, row in report["per_phase"].items()
+            },
+            report,
+        )
+
+    baseline, _ = runtime_mass({"PLAY_TURN": 4.0})
+    corrected, corrected_report = runtime_mass(
+        train_bc._parse_weight_map(HARD_DECISION_POLICY_PHASE_WEIGHTS),
+        enforce_minima=True,
+    )
+    factors = evidence["correction"]["relative_to_baseline_recipe"]
+    denominator = sum(baseline[phase] * factors[phase] for phase in baseline)
+    invalid_aggregate_projection = {
+        phase: baseline[phase] * factors[phase] / denominator for phase in baseline
+    }
+
+    assert corrected["DISCARD"] == pytest.approx(0.1363636352)
+    assert invalid_aggregate_projection["DISCARD"] == pytest.approx(0.1264367816)
+    assert corrected["DISCARD"] != pytest.approx(
+        invalid_aggregate_projection["DISCARD"]
+    )
+    assert corrected_report["admitted"] is True
     for phase in ("BUILD_INITIAL_ROAD", "DISCARD", "MOVE_ROBBER"):
-        assert projected[phase] > baseline[phase]
-    assert projected["PLAY_TURN"] < baseline["PLAY_TURN"]
+        assert corrected[phase] > baseline[phase]
+    assert corrected["PLAY_TURN"] < baseline["PLAY_TURN"]
     assert evidence["isolation"] == {
         "forced_action_weight": 0.0,
         "value_phase_weights": "none",

@@ -25,7 +25,10 @@ fail-closed.
 
 V7 also retains the commissioned `PLAY_TURN=4.0` repair while adding the
 previously audited exact-prompt weights `MOVE_ROBBER=3.0`,
-`BUILD_INITIAL_ROAD=2.0`, and `DISCARD=1.5`. Replaying those multipliers against
-the sealed r5 objective measure lowers `PLAY_TURN` from 71.71% to 52.27% and
-raises all three named hard-decision masses. This changes policy sampling only:
-forced rows remain policy-inactive and value phase weights remain disabled.
+`BUILD_INITIAL_ROAD=2.0`, and `DISCARD=1.5`. Replaying the complete canonical
+weighting and composite-sampling operator over the sealed r5 training split
+lowers `PLAY_TURN` from 71.71% to 53.00% and raises all three named
+hard-decision masses. Aggregate phase fractions cannot be rescaled directly:
+equal-per-game normalization changes each game's denominator after phase
+weighting. This changes policy sampling only; forced rows remain policy-inactive
+and value phase weights remain disabled.

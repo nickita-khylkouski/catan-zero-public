@@ -1,5 +1,5 @@
 {
-  "schema_version": "a1-v7-hard-decision-policy-mass-correction-v1",
+  "schema_version": "a1-v7-hard-decision-policy-mass-correction-v2",
   "status": "commissioned_recipe_correction",
   "scope": "policy_objective_only",
   "source": {
@@ -8,7 +8,17 @@
     "file_sha256": "sha256:d3faad69d9e5c36b3cdeb8be6c25fdd635169817950992f72ba0002bb4d5fbdd",
     "data_fingerprint": "sha256:50c4ac6b0d4e1a4fb4dc5d8c5c816a0beac58fd5b2d5c5bb6dd1c6ddc78d6f25",
     "policy_phase_objective_mass_identity_sha256": "sha256:c9ee59c17be83f69b915ad98e6d6ea370cdfac52e45a5fae84db1f437e35809f",
-    "objective_measure": "weighted_replacement_draw_probability_x_policy_loss_weight_v1"
+    "objective_measure": "weighted_replacement_draw_probability_x_policy_loss_weight_v1",
+    "corpus_root": "/home/ubuntu/catan-zero-production/runs/composites/a1-v6-coherent-n128-12000-20260717-r4-v4/corpora",
+    "copied_columns": [
+      "corpus_meta.json",
+      "game_seed.dat",
+      "phase.codes.dat",
+      "policy_weight_multiplier.dat",
+      "legal_action_ids.dat",
+      "row_offsets.dat"
+    ],
+    "calculation_host_role": "non_b200_audit_host"
   },
   "baseline": {
     "phase_weights": {
@@ -36,16 +46,33 @@
       "MOVE_ROBBER": 3.0,
       "PLAY_TURN": 1.0
     },
-    "rationale": "preserve the commissioned PLAY_TURN=4 repair while adding the previously audited absolute hard-decision weights in exact production prompt vocabulary"
+    "rationale": "preserve the commissioned PLAY_TURN=4 repair while adding the previously audited absolute hard-decision weights in exact production prompt vocabulary; validate the result by replaying the complete canonical weighting and sampling operator because equal-per-game normalization changes each game's denominator"
   },
-  "same_measure_projection": {
-    "formula": "normalize(baseline_policy_objective_mass * correction_weight / baseline_weight)",
+  "exact_runtime_replay": {
+    "method": "split_train_validation_indices(validation_fraction=0.05, validation_seed=17, validation_max_samples=0), then build_sample_weights(per_game_policy_weight=true, per_game_policy_weight_mode=equal) and _composite_game_sampling_weights; sum policy_sample_weight * draw_probability by phase",
+    "formula": "sum_for_phase(build_sample_weights(raw_rows, corrected_phase_weights, per_game_policy_weight=true/equal) * composite_game_draw_probability) / sum_all_phases(the_same_row_measure)",
+    "aggregate_projection_valid": false,
+    "aggregate_projection_exclusion_reason": "normalize(baseline aggregate phase mass * relative phase factor) is not the runtime operator: phase multipliers are applied before each game's policy weights are normalized",
+    "total_row_count": 2518324,
+    "training_row_count": 2392241,
+    "component_game_sampling_ratios": {
+      "current_producer": 0.8,
+      "recent_history": 0.15,
+      "hard_negative": 0.05
+    },
+    "baseline_reproduction_policy_objective_mass_fraction": {
+      "BUILD_INITIAL_ROAD": 0.038800592898066096,
+      "BUILD_INITIAL_SETTLEMENT": 0.038800592898066096,
+      "DISCARD": 0.051644565692265984,
+      "MOVE_ROBBER": 0.1536625222468012,
+      "PLAY_TURN": 0.7170917262648007
+    },
     "policy_objective_mass_fraction": {
-      "BUILD_INITIAL_ROAD": 0.056562778126967764,
-      "BUILD_INITIAL_SETTLEMENT": 0.028281389063483882,
-      "DISCARD": 0.056464860887848675,
-      "MOVE_ROBBER": 0.336009523208875,
-      "PLAY_TURN": 0.5226814487128247
+      "BUILD_INITIAL_ROAD": 0.05617698802311918,
+      "BUILD_INITIAL_SETTLEMENT": 0.02808849401155959,
+      "DISCARD": 0.05581640524684239,
+      "MOVE_ROBBER": 0.3299306883373039,
+      "PLAY_TURN": 0.5299874243811756
     },
     "named_hard_decisions_all_increase": true,
     "play_turn_no_longer_dominates_at_seventy_percent": true
