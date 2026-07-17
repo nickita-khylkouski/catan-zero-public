@@ -1060,15 +1060,15 @@ def _validate_target_quality_artifacts(contract: Mapping[str, Any]) -> None:
             "current coherent generator target-quality guard drifted: "
             f"{guard_drift}"
         )
-    critical_only = {
+    category_variant = {
         "--workers",
         "--eval-server",
     }
-    missing_critical = sorted(critical_only - critical)
-    if missing_critical:
+    overconstrained = sorted(category_variant & critical)
+    if overconstrained:
         raise ScienceContractError(
-            "current coherent generator guard omits variable-arity runtime "
-            f"flags: {missing_critical}"
+            "shared coherent generator guard overconstrains category-variant "
+            f"runtime flags: {overconstrained}"
         )
 
 

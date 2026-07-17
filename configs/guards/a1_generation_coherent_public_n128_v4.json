@@ -61,8 +61,6 @@
           "--event-history-limit",
           "--rust-featurize",
           "--eval-cache-size",
-          "--workers",
-          "--eval-server",
           "--format",
           "--score-actions"
         ],
@@ -109,8 +107,6 @@
           "--event-history-limit": 64,
           "--rust-featurize": true,
           "--eval-cache-size": 0,
-          "--workers": 24,
-          "--eval-server": true,
           "--format": "npz",
           "--score-actions": true
         }

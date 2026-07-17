@@ -300,10 +300,14 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
         == "a1_generation_coherent_public_n128_v4.json"
     )
     assert "coherent-public-v4" in str(current_science.CONTRACT_PATH)
-    assert "--workers" in lint["critical_flags"]
-    assert "--eval-server" in lint["critical_flags"]
-    assert lint["expected_values"]["--workers"] == 24
-    assert lint["expected_values"]["--eval-server"] is True
+    # Worker packing and EvalServer ownership differ by sealed opponent
+    # category.  They remain authenticated in each typed command/config, but
+    # the shared science guard must not force the current-producer topology
+    # onto history/hard-negative jobs.
+    assert "--workers" not in lint["critical_flags"]
+    assert "--eval-server" not in lint["critical_flags"]
+    assert "--workers" not in lint["expected_values"]
+    assert "--eval-server" not in lint["expected_values"]
     assert "--eval-server-max-batch" not in lint["critical_flags"]
     assert "--eval-server-request-collector" not in lint["critical_flags"]
 
