@@ -6,8 +6,9 @@
   },
   "checkpoint": "/absolute/run/arm-b-trunk25/candidate.pt",
   "data": {
-    "path": "/absolute/data/memmap_composite.json",
-    "sha256": "sha256:REPLACE_WITH_64_LOWERCASE_HEX"
+    "path": "/absolute/data/memmap",
+    "corpus_meta_sha256": "sha256:REPLACE_WITH_64_LOWERCASE_HEX",
+    "payload_inventory_sha256": "sha256:REPLACE_WITH_64_LOWERCASE_HEX"
   },
   "host_lock_file": "/tmp/catan_zero_train_bc_trunk25.lock",
   "init_checkpoint": {

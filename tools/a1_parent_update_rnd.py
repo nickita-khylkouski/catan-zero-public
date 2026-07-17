@@ -92,6 +92,35 @@ def _attest_file(record: object, *, field: str) -> Path:
     return path
 
 
+def _attest_memmap(record: object) -> Path:
+    expected_fields = {"path", "corpus_meta_sha256", "payload_inventory_sha256"}
+    if not isinstance(record, dict) or set(record) != expected_fields:
+        raise ArmError(
+            "data must bind path, corpus_meta_sha256, and payload_inventory_sha256"
+        )
+    raw_path = record["path"]
+    if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+        raise ArmError("data.path must be an absolute path")
+    path = Path(raw_path).expanduser().resolve(strict=True)
+    if path.is_symlink() or not path.is_dir():
+        raise ArmError("data.path must be a regular non-symlink memmap directory")
+    meta_path = path / "corpus_meta.json"
+    if meta_path.is_symlink() or not meta_path.is_file():
+        raise ArmError("data.path has no regular corpus_meta.json")
+    expected_meta = _expected_sha(
+        record["corpus_meta_sha256"], field="data.corpus_meta_sha256"
+    )
+    actual_meta = canonical_train._sha256(meta_path)  # noqa: SLF001
+    meta = _load_json(meta_path, what="memmap corpus metadata")
+    expected_inventory = _expected_sha(
+        record["payload_inventory_sha256"],
+        field="data.payload_inventory_sha256",
+    )
+    if actual_meta != expected_meta or meta.get("payload_inventory_sha256") != expected_inventory:
+        raise ArmError("data memmap metadata or payload inventory binding drifted")
+    return path
+
+
 def _load_arm(path: Path) -> tuple[Any, dict[str, Any], dict[str, Any]]:
     arm = _load_json(path, what="R&D arm")
     if set(arm) != {
@@ -151,7 +180,7 @@ def _load_bindings(path: Path) -> tuple[argparse.Namespace, dict[str, Any]]:
         )
     if value["schema_version"] != BINDINGS_SCHEMA or value["arm"] != ARM_NAME:
         raise ArmError("R&D bindings identity drifted")
-    data = _attest_file(value["data"], field="data")
+    data = _attest_memmap(value["data"])
     parent = _attest_file(value["parent_checkpoint"], field="parent_checkpoint")
     initializer = _attest_file(value["init_checkpoint"], field="init_checkpoint")
     receipt = ""
