@@ -153,18 +153,18 @@ def test_canonical_recipe_catalog_is_bound_to_role(
     train._load_recipe(recipe)
 
 
-def test_parent_update_recipe_reproduces_split1_full_step48() -> None:
+def test_parent_update_recipe_reproduces_split1_selected_step12() -> None:
     payload = json.loads(PARENT_RECIPE.read_text(encoding="utf-8"))
     engine = payload["engine_settings"]
     fields = payload["train_config"]["fields"]
 
     assert engine["initialization_mode"] == "parent_fresh_optimizer"
     assert engine["base_sampler"] == "weighted_replacement_v1"
-    assert engine["checkpoint_steps"] == "8,12,16,24,32"
+    assert engine["checkpoint_steps"] == "8"
     assert fields["batch_size"] == 64
     assert 8 * fields["batch_size"] == 512
     assert fields["epochs"] == 999
-    assert fields["max_steps"] == 48
+    assert fields["max_steps"] == 12
     assert fields["exact_max_steps"] is True
     assert fields["lr"] == 6e-5
     assert fields["lr_schedule"] == "flat"

@@ -240,14 +240,14 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     # The full random-initialization learner remains a useful R&D contract, but
     # its optimizer horizon is deliberately unresolved and go_authorized=false.
     # The commissioned production turn is the independently initialized,
-    # parent-fresh 48-step update.  Keep that routing decision separate from
+    # parent-fresh 12-step update.  Keep that routing decision separate from
     # the scratch construction so callers cannot infer "selected" from which
     # recipe happened to be added most recently.
     "mode": "canonical_parent_update",
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "4da048c7c470ef1b53cc8836b66821f8fcb777711b77ee2be241a8b68620b180"
+        "999c2966996f27108344ab936551c5c60c256963a8acfcdf0016ebbb649eedef"
     ),
     "scratch_status": "research_only_unresolved_not_selected",
 }

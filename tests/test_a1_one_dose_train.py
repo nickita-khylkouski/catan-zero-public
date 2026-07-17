@@ -1496,7 +1496,7 @@ def test_production_trainer_authority_binds_current_science_import() -> None:
     assert "tools/a1_feature_signal_admission.py" in records
 
 
-def test_canonical_parent_update_binds_48_step_8x64_recipe(tmp_path: Path) -> None:
+def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> None:
     producer = {"path": "/checkpoint/f7.pt", "sha256": "sha256:" + "1" * 64}
     verified = {
         "contract_sha256": "sha256:" + "2" * 64,
@@ -1519,7 +1519,7 @@ def test_canonical_parent_update_binds_48_step_8x64_recipe(tmp_path: Path) -> No
         bound, topology=executor.B200_8GPU_DDP_TOPOLOGY, gpu=0
     )
 
-    assert bound["recipe"]["max_steps"] == 48
+    assert bound["recipe"]["max_steps"] == 12
     assert bound["recipe"]["optimizer"] == "adamw"
     assert bound["recipe"]["world_size"] == 8
     assert bound["recipe"]["batch_size"] == 64
@@ -1527,13 +1527,7 @@ def test_canonical_parent_update_binds_48_step_8x64_recipe(tmp_path: Path) -> No
     assert bound["canonical_parent_update"]["parent_checkpoint_sha256"] == (
         producer["sha256"]
     )
-    assert bound["canonical_parent_update"]["checkpoint_steps"] == [
-        8,
-        12,
-        16,
-        24,
-        32,
-    ]
+    assert bound["canonical_parent_update"]["checkpoint_steps"] == [8]
 
     initializer = tmp_path / "initializer.pt"
     initializer.write_bytes(b"initializer")
@@ -1560,7 +1554,7 @@ def test_canonical_parent_update_binds_48_step_8x64_recipe(tmp_path: Path) -> No
         checkpoint=tmp_path / "candidate.pt",
         report=tmp_path / "report.json",
     )
-    assert _option(command, "--checkpoint-steps") == "8,12,16,24,32"
+    assert _option(command, "--checkpoint-steps") == "8"
 
 
 def test_canonical_parent_update_rejects_malformed_checkpoint_frontier(

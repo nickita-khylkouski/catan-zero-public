@@ -90,7 +90,7 @@ original tools; this exclusion applies to new work.
 The commissioned parent update is
 `configs/training/a1_parent_update_35m_b200.schema1.json`: exact f7 parent,
 direct current-v5+split1 function-preserving initializer, fresh AdamW,
-48 steps, and 8x64=512 global batch. New parent-update turns must pass it to
+12 steps, and 8x64=512 global batch. New parent-update turns must pass it to
 `a1_one_dose_train.py` with `--canonical-parent-update-config`; the loop binds
 that file as an immutable train input. Generic learner overrides remain
 diagnostic-only.

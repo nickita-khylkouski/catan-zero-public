@@ -2251,7 +2251,7 @@ def verify_training_inputs(
 def bind_canonical_parent_update_recipe(
     verified: dict[str, Any], config_path: Path
 ) -> dict[str, Any]:
-    """Bind the commissioned 48-step parent update as production authority.
+    """Bind the commissioned 12-step parent update as production authority.
 
     The generation lock remains the authority for producer/data/search identity.
     This checked-in catalog recipe is the independent learner authority.  It is
@@ -12167,7 +12167,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "exact checked-in 48-step f7 parent-update recipe; requires the "
+            "exact checked-in 12-step f7 parent-update recipe; requires the "
             "direct current-v5+split1 upgrade and production composite"
         ),
     )
