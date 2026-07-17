@@ -9591,8 +9591,7 @@ def _validate_a1_learner_objective(
         == "a1-canonical-parent-initializer-v1"
         and initialization.get("mode") == "information_contract_migration"
         and isinstance(initialization.get("parent"), dict)
-        and initialization["parent"].get("sha256")
-        == bound["producer_checkpoint_sha256"]
+        and _is_sha256(initialization["parent"].get("sha256"))
         and isinstance(initialization.get("initializer"), dict)
         and initialization["initializer"].get("sha256")
         == actual_initializer_sha256
@@ -9600,7 +9599,7 @@ def _validate_a1_learner_objective(
         and migration.get("schema_version")
         == "a1-lineage-information-contract-migration-v1"
         and migration.get("source_checkpoint_sha256")
-        == bound["producer_checkpoint_sha256"]
+        == initialization["parent"].get("sha256")
         and migration.get("migrated_initializer_sha256")
         == actual_initializer_sha256
         and migration.get("promotion_eligible") is False
@@ -10101,6 +10100,7 @@ def _validate_a1_decisive_training_semantics(
         or getattr(args, "a1_batch_probe_run_id", "")
         or getattr(args, "a1_learner_ablation_id", "")
         or getattr(args, "a1_dual_learner_lock", "")
+        or getattr(args, "a1_canonical_parent_update_authority", None)
         or bound.get("dual_arm") is True
     )
     world_size = int(ddp.get("world_size", 1))
@@ -12269,6 +12269,53 @@ def _validate_a1_learner_training_recipe(
     if batch_probe is not None:
         bound["learner_ablation"] = batch_probe
         bound["batch_probe_authorization"] = batch_probe
+        return effective
+    canonical_parent_authority = getattr(
+        args, "a1_canonical_parent_update_authority", None
+    )
+    if canonical_parent_authority is not None:
+        expected_authority_fields = {
+            "schema_version",
+            "config",
+            "config_file_sha256",
+            "diagnostic_only",
+            "promotion_eligible",
+        }
+        try:
+            config_path = Path(
+                str(canonical_parent_authority.get("config", ""))
+            ).expanduser().resolve(strict=True)
+        except (AttributeError, OSError) as error:
+            raise SystemExit(
+                f"canonical parent-update runtime authority is malformed: {error}"
+            ) from error
+        if (
+            not isinstance(canonical_parent_authority, dict)
+            or set(canonical_parent_authority) != expected_authority_fields
+            or canonical_parent_authority.get("schema_version")
+            != "a1-canonical-parent-update-runtime-authority-v1"
+            or str(config_path) != canonical_parent_authority.get("config")
+            or _sha256_existing_file(config_path)
+            != canonical_parent_authority.get("config_file_sha256")
+            or config_path.name != "a1_parent_update_35m_b200.schema1.json"
+            or canonical_parent_authority.get("diagnostic_only") is not True
+            or canonical_parent_authority.get("promotion_eligible") is not False
+        ):
+            raise SystemExit("canonical parent-update runtime authority drift")
+        # The historical data lock remains authoritative for teacher identity,
+        # target semantics, row membership, and outcomes. The checked-in
+        # canonical parent config is a separate, current authority for this
+        # deliberately non-promotable learner treatment.
+        override = {
+            **canonical_parent_authority,
+            "historical_learner_recipe_sha256": _canonical_json_sha256(
+                immutable_expected
+            ),
+            "effective_recipe": effective,
+            "effective_recipe_sha256": _canonical_json_sha256(effective),
+        }
+        bound["learner_ablation"] = override
+        bound["canonical_parent_update_recipe_override"] = override
         return effective
     if central_binding_raw:
         if any(

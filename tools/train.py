@@ -804,6 +804,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     # distinguish a function-preserving architecture expansion from candidate
     # chaining. This is an internal attribute, not a public bypass flag.
     engine_args.a1_parent_update_initialization = initialization
+    config_path = Path(str(public_args.config)).expanduser().resolve(strict=True)
+    engine_args.a1_canonical_parent_update_authority = {
+        "schema_version": "a1-canonical-parent-update-runtime-authority-v1",
+        "config": str(config_path),
+        "config_file_sha256": _sha256(config_path),
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+    }
     from tools import train_bc
 
     train_bc.main(engine_args)

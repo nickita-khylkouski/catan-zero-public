@@ -632,15 +632,16 @@ def test_a1_artifact_chain_replays_actual_seed_set_and_learner_objective(
     args.scalar_value_loss_readout = recipe.get("scalar_value_loss_readout", "raw")
 
     migrated_sha = "sha256:" + "1" * 64
+    independent_parent_sha = "sha256:" + "3" * 64
     args.init_checkpoint_sha256 = migrated_sha
     args.a1_parent_update_initialization = {
         "schema_version": "a1-canonical-parent-initializer-v1",
         "mode": "information_contract_migration",
-        "parent": {"sha256": bound["producer_checkpoint_sha256"]},
+        "parent": {"sha256": independent_parent_sha},
         "initializer": {"sha256": migrated_sha},
         "information_contract_migration": {
             "schema_version": "a1-lineage-information-contract-migration-v1",
-            "source_checkpoint_sha256": bound["producer_checkpoint_sha256"],
+            "source_checkpoint_sha256": independent_parent_sha,
             "migrated_initializer_sha256": migrated_sha,
             "promotion_eligible": False,
         },
