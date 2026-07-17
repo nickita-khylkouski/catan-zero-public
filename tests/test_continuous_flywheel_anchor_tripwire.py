@@ -3,8 +3,8 @@
 Roadmap Sec 1 standing rule (R8/gen-4 lesson): anchor telemetry is a drift
 TRIPWIRE ONLY, never a promotion signal -- gen-4 showed "the historical
 promotion signature" and still gated flat, so a flat/healthy anchor cannot be
-trusted to predict a flat/healthy gate either. These tests audit the actual
-code (static + a live dry-run), not just the docstrings/comments that say so.
+trusted to predict a flat/healthy gate either. The retired implementation stays
+available for static historical auditing; its dry-run is plan-only.
 """
 from __future__ import annotations
 
@@ -108,11 +108,10 @@ def test_anchor_telemetry_stored_under_a_separate_journal_key_not_decision():
     assert "anchor_telemetry" != "decision"
 
 
-def test_dry_run_end_to_end_anchor_telemetry_does_not_affect_promotion(tmp_path, monkeypatch):
-    """Live dry-run smoke test (the ticket's prescribed verification): run the
-    real control flow with anchor corpora configured but never built on disk,
-    and confirm every round still promotes based purely on the (stubbed) h2h
-    gate winrate -- unaffected by anchor telemetry being present/absent/failed."""
+def test_retired_dry_run_with_anchor_arguments_is_plan_only(
+    tmp_path, monkeypatch, capsys
+):
+    """Historical anchor arguments may be inspected but never executed."""
     import importlib
 
     cf = importlib.import_module("continuous_flywheel")
@@ -133,13 +132,10 @@ def test_dry_run_end_to_end_anchor_telemetry_does_not_affect_promotion(tmp_path,
     monkeypatch.setattr(sys, "argv", argv)
     rc = cf.main()
     assert rc == 0
-
-    journal = json.loads((loop_dir / "flywheel_state.json").read_text())
-    telemetry = json.loads((loop_dir / "anchor_telemetry.json").read_text())
-    assert set(telemetry.keys()) == {"anchor_r7", "anchor_gen4"}
-    for rec in journal["rounds"]:
-        # dry-run's stubbed h2h gate always promotes (winrate >= min_winrate at
-        # these round indices) -- decision must be the promote(...) form
-        # regardless of anchor_telemetry's presence in the same record.
-        assert rec["decision"].startswith("promote(")
-        assert "anchor_telemetry" in rec
+    assert not loop_dir.exists()
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["status"] == "plan_only"
+    assert plan["requested_arguments"]["anchor_corpora"] == [
+        "anchor_r7",
+        "anchor_gen4",
+    ]

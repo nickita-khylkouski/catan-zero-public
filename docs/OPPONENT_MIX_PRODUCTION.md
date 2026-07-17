@@ -4,24 +4,23 @@ The existing opponent-mix sampler remains deterministic and default-off. This
 runbook only makes its inputs reproducible: registry pointers are resolved once,
 every checkpoint is verified, and workers receive the same frozen config.
 
-## 1. Populate distinct registry slots
+## 1. Use the authenticated production registry
 
-Set the public/previous champion role, then append separate older and hard
-checkpoints with explicit provenance tags. `ChampionRegistry` computes each md5
-when the entry is written.
+The production registry must already come from `tools/a1_registry_bootstrap.py`
+and subsequent `tools/a1_promotion_transaction.py promote --go` transactions.
+Those authorities bind the incumbent, archived opponents, promotion count, and
+`CURRENT_CHAMPION` under the canonical promotion lock. The generic
+`tools/champion_registry.py` CLI is read-only; it cannot populate roles, append
+pool entries, or record promotions.
+
+Inspect the authenticated registry before resolving a mix:
 
 ```bash
-python -m tools.champion_registry --registry runs/champion_registry.json \
-  set-role --role public_champion --checkpoint runs/public/checkpoint.pt --version 3
-
-python -m tools.champion_registry --registry runs/champion_registry.json \
-  append-pool --checkpoint runs/archive/gen2/checkpoint.pt --version 2 \
-  --provenance '{"tag":"older_champion"}'
-
-python -m tools.champion_registry --registry runs/champion_registry.json \
-  append-pool --checkpoint runs/hard_negative/checkpoint.pt \
-  --provenance '{"tag":"hard_negative"}'
+python -m tools.champion_registry --registry runs/champion_registry.json show
 ```
+
+If a required public, older, or hard-negative identity is absent, update the
+sealed bootstrap/promotion evidence rather than editing the registry directly.
 
 The producer, public/previous, older, and hard checkpoints must contain distinct
 bytes. A copied or aliased producer checkpoint is not a real opponent and is

@@ -643,53 +643,6 @@ def _cmd_show(args: argparse.Namespace) -> None:
     print(json.dumps(out, indent=2, sort_keys=True))
 
 
-def _cmd_set_role(args: argparse.Namespace) -> None:
-    reg = ChampionRegistry.load(args.registry)
-    provenance = json.loads(args.provenance) if args.provenance else {}
-    pointer = reg.set_role(
-        args.role,
-        args.checkpoint,
-        expected_md5=args.expected_md5,
-        version=args.version,
-        provenance=provenance,
-        reason=args.reason or "",
-    )
-    reg.save()
-    print(json.dumps(pointer.to_dict(), indent=2, sort_keys=True))
-
-
-def _cmd_append_pool(args: argparse.Namespace) -> None:
-    reg = ChampionRegistry.load(args.registry)
-    provenance = json.loads(args.provenance) if args.provenance else {}
-    entry = reg.append_pool(
-        args.checkpoint,
-        expected_md5=args.expected_md5,
-        version=args.version,
-        provenance=provenance,
-        status=args.status,
-        reason=args.reason or "",
-    )
-    reg.save()
-    print(json.dumps(entry.to_dict(), indent=2, sort_keys=True))
-
-
-def _cmd_record_promotion(args: argparse.Namespace) -> None:
-    reg = ChampionRegistry.load(args.registry)
-    count = reg.record_promotion(args.role)
-    reg.save()
-    print(
-        json.dumps(
-            {
-                "role": args.role,
-                "promotion_count": count,
-                "requires_nth_confirmation": requires_nth_confirmation(count, every=args.every),
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
-
-
 def _cmd_tripwire_check(args: argparse.Namespace) -> None:
     current = PanelResult(**json.loads(Path(args.current_panel).read_text(encoding="utf-8")))
     previous = None
@@ -712,7 +665,7 @@ def _cmd_tripwire_check(args: argparse.Namespace) -> None:
     )
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CAT-9 champion registry: roles, opponent pool, tripwires.")
     parser.add_argument("--registry", required=True, help="Path to the registry JSON file.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -720,35 +673,17 @@ def main() -> None:
     p_show = sub.add_parser("show", help="Print the current registry state.")
     p_show.set_defaults(func=_cmd_show)
 
-    p_set = sub.add_parser("set-role", help="Point a role at a checkpoint.")
-    p_set.add_argument("--role", required=True, choices=ROLE_NAMES)
-    p_set.add_argument("--checkpoint", required=True)
-    p_set.add_argument("--expected-md5", dest="expected_md5")
-    p_set.add_argument("--version", type=int)
-    p_set.add_argument("--provenance", help="JSON object string.")
-    p_set.add_argument("--reason", default="")
-    p_set.set_defaults(func=_cmd_set_role)
-
-    p_pool = sub.add_parser("append-pool", help="Append a checkpoint to the opponent pool.")
-    p_pool.add_argument("--checkpoint", required=True)
-    p_pool.add_argument("--expected-md5", dest="expected_md5")
-    p_pool.add_argument("--version", type=int)
-    p_pool.add_argument("--provenance", help="JSON object string.")
-    p_pool.add_argument("--status", default="active")
-    p_pool.add_argument("--reason", default="")
-    p_pool.set_defaults(func=_cmd_append_pool)
-
-    p_promo = sub.add_parser("record-promotion", help="Increment the promotion counter and check the every-Nth flag.")
-    p_promo.add_argument("--role", default="generator_champion")
-    p_promo.add_argument("--every", type=int, default=3)
-    p_promo.set_defaults(func=_cmd_record_promotion)
-
     p_trip = sub.add_parser("tripwire-check", help="Evaluate the auto-revert tripwire against panel JSON files.")
     p_trip.add_argument("--current-panel", required=True, help='JSON file with {"wins":.., "losses":.., "draws":..}')
     p_trip.add_argument("--previous-panel", help="Optional JSON file for the prior panel.")
     p_trip.set_defaults(func=_cmd_tripwire_check)
+    return parser
 
-    args = parser.parse_args()
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
     args.func(args)
 
 

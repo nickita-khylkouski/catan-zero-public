@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from tools import champion_registry as registry_cli
 from tools.champion_registry import (
     BucketResult,
     ChampionRegistry,
@@ -21,6 +22,62 @@ from tools.champion_registry import (
 def _write_checkpoint(path: Path, content: bytes = b"checkpoint-bytes") -> Path:
     path.write_bytes(content)
     return path
+
+
+def test_registry_cli_exposes_only_read_only_commands() -> None:
+    parser = registry_cli.build_parser()
+    subparsers = next(
+        action
+        for action in parser._actions  # noqa: SLF001
+        if action.dest == "command"
+    )
+
+    assert set(subparsers.choices) == {"show", "tripwire-check"}
+
+
+@pytest.mark.parametrize("retired", ("set-role", "append-pool", "record-promotion"))
+def test_retired_registry_cli_mutations_cannot_create_or_change_registry(
+    tmp_path: Path, retired: str
+) -> None:
+    checkpoint = _write_checkpoint(tmp_path / "candidate.pt")
+    registry_path = tmp_path / "registry.json"
+    registry = ChampionRegistry(registry_path)
+    registry.set_role("generator_champion", checkpoint, version=7, reason="fixture")
+    registry.save()
+    before = registry_path.read_bytes()
+    argv = ["--registry", str(registry_path), retired]
+    if retired == "set-role":
+        argv.extend(("--role", "generator_champion", "--checkpoint", str(checkpoint)))
+    elif retired == "append-pool":
+        argv.extend(("--checkpoint", str(checkpoint)))
+
+    with pytest.raises(SystemExit):
+        registry_cli.main(argv)
+
+    assert registry_path.read_bytes() == before
+    absent = tmp_path / "absent-registry.json"
+    argv[1] = str(absent)
+    with pytest.raises(SystemExit):
+        registry_cli.main(argv)
+    assert not absent.exists()
+
+
+def test_registry_cli_show_remains_read_only(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    checkpoint = _write_checkpoint(tmp_path / "champion.pt")
+    registry_path = tmp_path / "registry.json"
+    registry = ChampionRegistry(registry_path)
+    registry.set_role("generator_champion", checkpoint, version=4, reason="fixture")
+    registry.save()
+    before = registry_path.read_bytes()
+
+    registry_cli.main(["--registry", str(registry_path), "show"])
+
+    assert json.loads(capsys.readouterr().out)["roles"]["generator_champion"][
+        "version"
+    ] == 4
+    assert registry_path.read_bytes() == before
 
 
 # =============================================================================

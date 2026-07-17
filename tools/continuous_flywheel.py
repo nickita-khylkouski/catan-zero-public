@@ -4,9 +4,9 @@ The canonical A1 loop is intentionally split across the sealed production
 executor, one-dose learner, evidence builders, and promotion transaction (see
 ``RL_AGENT_HANDOFF.md``). This module has no production caller and retains
 unresolved H1/H2/T4 integration gaps described below. Real execution therefore
-fails closed unless an operator explicitly acknowledges the noncanonical path
-with ``--allow-noncanonical-experimental-loop``. ``--dry-run`` remains available
-for unit and control-flow tests without that acknowledgement.
+fails closed permanently. ``--dry-run`` is a side-effect-free plan printer; it
+never creates a loop directory, seeds a checkpoint, or writes a champion
+registry.
 
 Do not tune this prototype's historical hardware defaults and mistake that for
 changing the production learner. A1 learner topology is sealed by
@@ -110,7 +110,7 @@ from tools.sprt_gate import (  # noqa: E402
 )
 
 
-NONCANONICAL_ACK_FLAG = "--allow-noncanonical-experimental-loop"
+RETIRED_PLAN_SCHEMA = "catan-zero-retired-continuous-flywheel-plan-v1"
 
 # Round-seed stride: each round's game_seed block starts here*round, disjoint across rounds so
 # game_seed = base + game_index never collides between rounds (the seed-collision bug class).
@@ -1157,14 +1157,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="physically delete out-of-window shards each round (recommended for long runs)")
     p.add_argument("--evict-grace-seconds", type=float, default=0.0,
                    help="defer deletion until a shard has been out-of-window this long (async safety)")
-    p.add_argument("--dry-run", action="store_true", help="stub gen/train/gate; exercise control flow only")
     p.add_argument(
-        NONCANONICAL_ACK_FLAG,
+        "--dry-run",
         action="store_true",
-        help=(
-            "Acknowledge that this legacy prototype is not the canonical A1 "
-            "production loop and permit a real (non-dry-run) execution."
-        ),
+        help="print the retired-loop plan without creating or changing any state",
     )
     p.add_argument(
         "--anchor-corpus", dest="anchor_corpora", action="append", default=[],
@@ -1238,20 +1234,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if not args.dry_run and not args.allow_noncanonical_experimental_loop:
+    if args.dry_run:
         print(
-            "[flywheel] ERROR: tools/continuous_flywheel.py is a noncanonical "
-            "experimental prototype with unresolved integration gaps. Use "
-            "tools/fleet/a1_production_executor.py for generation, "
-            "tools/a1_one_dose_train.py for training, and "
-            "tools/a1_promotion_transaction.py for promotion. If you are "
-            "deliberately testing this legacy path, pass "
-            f"{NONCANONICAL_ACK_FLAG}.",
-            file=sys.stderr,
-            flush=True,
+            json.dumps(
+                {
+                    "schema_version": RETIRED_PLAN_SCHEMA,
+                    "status": "plan_only",
+                    "retired": True,
+                    "side_effects_permitted": False,
+                    "canonical_operator": "tools/loop.py",
+                    "requested_arguments": vars(args),
+                },
+                indent=2,
+                sort_keys=True,
+            )
         )
-        return 2
+        return 0
+    print(
+        "[flywheel] ERROR: tools/continuous_flywheel.py is permanently retired "
+        "from real execution. Use tools/loop.py for a complete turn, "
+        "tools/fleet/a1_production_executor.py for generation, "
+        "tools/a1_one_dose_train.py for training, and "
+        "tools/a1_promotion_transaction.py for promotion.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return 2
 
+    # The retained implementation below is import-only historical replay code.
+    # No CLI branch can reach state creation or authority mutation.
     loop_dir = Path(args.loop_dir)
     loop_dir.mkdir(parents=True, exist_ok=True)
     gen_root = Path(args.gen_out_root) if args.gen_out_root else loop_dir / "gen"

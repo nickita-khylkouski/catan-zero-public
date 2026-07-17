@@ -310,7 +310,6 @@ GOLDEN_OPTION_STRINGS = {
         ("--winner-sample-weight",),
     },
     "continuous_flywheel": {
-        ("--allow-noncanonical-experimental-loop",),
         ("--anchor-corpus",),
         ("--anchor-drift-alert-threshold",),
         ("--anchor-eval-every-rounds",),
@@ -920,10 +919,8 @@ class TestContinuousFlywheelGuardWiring:
         assert not any(spec["name"] == "provenance" for spec in specs)
 
     def test_dry_run_never_reaches_guard_wiring(self, tmp_path):
-        """--dry-run must not construct/run any guard -- it legitimately points
-        --seed-checkpoint at a fixture path a real masked_regime guard would
-        correctly refuse (here: not even a valid torch checkpoint, just bytes;
-        --dry-run's seed_champion only copies the file, never torch.loads it)."""
+        """The retired plan-only dry-run never constructs guards or reads the
+        supplied checkpoint bytes."""
         loop_dir = tmp_path / "loop"
         fake_checkpoint = tmp_path / "not_a_real_checkpoint.pt"
         fake_checkpoint.write_bytes(b"not a real torch checkpoint")
@@ -938,6 +935,7 @@ class TestContinuousFlywheelGuardWiring:
         ]
         exit_code = continuous_flywheel.main(argv)
         assert exit_code == 0
+        assert not loop_dir.exists()
 
     def test_skip_guards_bypasses_refusal_with_warning(self, tmp_path, capsys):
         seed_checkpoint = tmp_path / "seed.pt"
