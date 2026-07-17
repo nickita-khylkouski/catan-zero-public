@@ -1,5 +1,5 @@
 {
-  "schema_version": "a1-coherent-dose-frontier-evidence-v1",
+  "schema_version": "a1-coherent-dose-frontier-evidence-v2",
   "source_host": "ubuntu@149.118.65.110",
   "source_results": "/home/ubuntu/experimental_nonpromotable/coherent-n128-active-policy-20260715-r1/eval-126afe1/stage-a-no-selection-frontier/results.summary.json",
   "source_matrix": "/home/ubuntu/experimental_nonpromotable/coherent-n128-active-policy-20260715-r1/eval-126afe1/stage-a-no-selection-frontier/matrix.json",
@@ -34,8 +34,61 @@
     }
   ],
   "root_cause": "the coherent active sampler redefined optimizer-step exposure, but production inherited the historical 128-step dose; offline teacher-gap closure kept improving while actual playing strength peaked much earlier and then regressed",
-  "production_decision": {
+  "historical_production_decision": {
     "max_steps": 32,
-    "reason": "earliest evaluated coherent checkpoint with the strongest matched broad playing result"
+    "reason": "earliest evaluated checkpoint in the historical active-policy frontier"
+  },
+  "superseding_current_runtime_commissioning": {
+    "source_host": "ubuntu@192.222.53.175",
+    "candidate_step12_sha256": "sha256:92a7df02d2f99a5cad993d667a78776256d7cb215ad7809a4c0739dfbf95d392",
+    "candidate_step48_sha256": "sha256:b896811535f41d75f78e89c97f845e750722be00633b647ac545a529680d1ddc",
+    "teacher_gap_artifact_sha256": "sha256:6952d251b7bd49e492294379c62a4e32a08373244e79005ea74874c6396cfd45",
+    "step12": {
+      "parent_forward_kl": 0.033278666756268165,
+      "global_relative_l2": 0.008823539832388793,
+      "cohorts": [
+        {
+          "seed_cohort": 104,
+          "games": 128,
+          "candidate_wins": 72,
+          "baseline_wins": 56,
+          "report_sha256": "sha256:990b823d8ee99e8cb55b4c47a7a6cc65320b579915eee3f2ca6002b75e47a824"
+        },
+        {
+          "seed_cohort": 105,
+          "games": 128,
+          "candidate_wins": 69,
+          "baseline_wins": 59,
+          "report_sha256": "sha256:32b00ab8b6557df05ede3cedeb55668e0951499951507f32e43a247c8d7fdf12"
+        }
+      ],
+      "strict_pool": {
+        "complete_pairs": 128,
+        "games": 256,
+        "candidate_wins": 141,
+        "baseline_wins": 115,
+        "candidate_win_rate": 0.55078125,
+        "truncations": 0,
+        "errors": 0,
+        "report_sha256": "sha256:bd9ada544583e8a4506693ded01fb5dbc230e806d80ce631b1f14421b2e4d404"
+      }
+    },
+    "step48": {
+      "parent_forward_kl": 0.06928532321715163,
+      "global_relative_l2": 0.013380134923473898,
+      "strict_pool_candidate_wins": 141,
+      "strict_pool_baseline_wins": 115,
+      "strict_pool_games": 256
+    },
+    "selection": {
+      "max_steps": 12,
+      "reason": "same 141-115 current-runtime pooled score as step48 with lower parent forward KL and global parameter drift",
+      "promotion_eligible": false,
+      "required_next_path": "sealed_one_dose_transaction_15d548f_or_later"
+    }
+  },
+  "production_decision": {
+    "max_steps": 12,
+    "reason": "minimal effective current-runtime dose; must be reproduced by the sealed one-dose path before promotion"
   }
 }
