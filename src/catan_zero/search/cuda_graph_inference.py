@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 
+from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY
 from catan_zero.rl.entity_token_policy import (
     PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
     STATIC_ACTION_RESIDUAL_SLICE,
@@ -409,11 +410,28 @@ class CudaGraphInferenceRunner:
         )
         if needs_targets:
             # _gather_target_tokens derives the fixed sequence offsets from
-            # these three shapes.  Values are not read, so retain the host
-            # arrays rather than launching three unnecessary H2D copies.
+            # these three shapes. Values are normally not read, so retain the
+            # host arrays rather than launching unnecessary H2D copies.
             batch["hex_tokens"] = entity_batch["hex_tokens"]
-            batch["vertex_tokens"] = entity_batch["vertex_tokens"]
             batch["edge_tokens"] = entity_batch["edge_tokens"]
+            if bool(
+                getattr(
+                    self.config,
+                    "v6_compatibility_preserving_inputs",
+                    False,
+                )
+            ):
+                # V7 reconstructs the inherited initial-road context from
+                # vertex feature values, not only the vertex tensor's shape.
+                # Keeping this as a NumPy host array makes score_actions call
+                # `.float()` on ndarray and crashes both eager split inference
+                # and the CUDA-graph action stage.
+                batch["vertex_tokens"] = torch.as_tensor(
+                    entity_batch["vertex_tokens"],
+                    device=self.device,
+                )
+            else:
+                batch["vertex_tokens"] = entity_batch["vertex_tokens"]
             batch["legal_action_target_ids"] = torch.as_tensor(
                 entity_batch["legal_action_target_ids"],
                 device=self.device,
@@ -583,12 +601,21 @@ class CudaGraphInferenceRunner:
     def _state_input_keys(self) -> tuple[str, ...]:
         """State tensors consumed by the loaded trunk, including opt-in topology."""
 
+        public_card_inputs = (
+            (DEDUCTION_FEATURES_KEY,)
+            if bool(getattr(self.config, "public_card_count_features", False))
+            else ()
+        )
         needs_topology = bool(
             str(getattr(self.config, "state_trunk", "transformer")) != "transformer"
             or getattr(self.config, "topology_residual_adapter", False)
             or getattr(self.config, "v6_compatibility_preserving_inputs", False)
         )
-        return _STATE_INPUT_KEYS + (_TOPOLOGY_STATE_INPUT_KEYS if needs_topology else ())
+        return (
+            _STATE_INPUT_KEYS
+            + public_card_inputs
+            + (_TOPOLOGY_STATE_INPUT_KEYS if needs_topology else ())
+        )
 
 
 def _as_numpy(value: Any) -> np.ndarray:

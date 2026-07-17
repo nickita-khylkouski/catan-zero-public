@@ -9,6 +9,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from catan_zero.deduction_tracker import (  # noqa: E402
+    DEDUCTION_FEATURE_SIZE,
+    DEDUCTION_FEATURES_KEY,
+)
 from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE  # noqa: E402
 from catan_zero.rl.entity_token_features import (  # noqa: E402
     EDGE_FEATURE_SIZE,
@@ -101,6 +105,9 @@ def _batch(batch_size=3, legal_width=5, event_width=8, live_events=0):
     entity["event_target_ids"] = np.full(
         (batch_size, event_width, 4), -1, dtype=np.int16
     )
+    entity[DEDUCTION_FEATURES_KEY] = rng.normal(
+        size=(batch_size, 4, DEDUCTION_FEATURE_SIZE)
+    ).astype(np.float32)
     context = rng.normal(
         size=(batch_size, legal_width, CONTEXT_ACTION_FEATURE_SIZE)
     ).astype(np.float32)
@@ -183,11 +190,14 @@ def test_v7_action_batch_carries_all_policy_side_inputs():
         "legal_action_tokens",
         "legal_action_context",
         "legal_action_target_ids",
+        "vertex_tokens",
         "edge_vertex_ids",
         "event_mask",
         "legal_action_mask",
         "legal_action_static_features",
     }.issubset(action_batch)
+    assert torch.is_tensor(action_batch["vertex_tokens"])
+    assert action_batch["vertex_tokens"].device == policy.device
     assert action_batch["legal_action_static_features"].shape[-1] == 22
     assert set(("hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids")).issubset(
         runner._state_input_keys()
@@ -211,6 +221,45 @@ def test_history_action_decoder_runs_through_split_eager_fallback() -> None:
     assert runner.last_path == "eager_disabled"
     assert outputs["logits"].shape == legal_ids.shape
     assert torch.isfinite(outputs["value"]).all()
+
+
+def test_v7_compatibility_route_matches_monolithic_split_eager() -> None:
+    policy = _policy(
+        action_cross_attention_layers=1,
+        meaningful_public_history=True,
+        event_history_limit=8,
+        public_card_count_features=True,
+        public_card_count_residual_bias=False,
+        v6_compatibility_preserving_inputs=True,
+    )
+    entity, legal_ids, context = _batch(event_width=8, live_events=2)
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(enabled=False),
+    )
+
+    actual = runner.forward_legal_np(
+        entity,
+        legal_ids,
+        context,
+        return_q=True,
+    )
+
+    monolithic_batch = {
+        key: torch.as_tensor(value) for key, value in entity.items()
+    }
+    monolithic_batch["legal_action_context"] = torch.as_tensor(context)
+    with torch.no_grad():
+        expected = policy.model(monolithic_batch, return_q=True)
+        expected["logits"] = expected["logits"].masked_fill(
+            torch.as_tensor(legal_ids) < 0,
+            -1.0e9,
+        )
+
+    assert runner.last_path == "eager_disabled"
+    assert DEDUCTION_FEATURES_KEY in runner._state_input_keys()
+    for key in actual:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0.0, atol=0.0)
 
 
 def test_legacy_award_bridge_also_applies_on_cuda_runner_bypass() -> None:
