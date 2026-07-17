@@ -579,6 +579,10 @@ class GenerateConfig(PipelineConfig):
     late_temperature: float = 0.0
     prior_temperature: float = 1.0
     value_scale: float = 1.0
+    # This changes the value consumed by MCTS and therefore the generated
+    # policy target.  Generation used to inherit the evaluator's code default
+    # invisibly, so tanh-vs-clip corpora could share one producer identity.
+    value_squash: str = "tanh"
     value_readout: str = "scalar"
     correct_rust_chance_spectra: bool = True
     lazy_interior_chance: bool = False

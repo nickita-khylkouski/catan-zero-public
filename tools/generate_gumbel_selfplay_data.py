@@ -1901,6 +1901,7 @@ def _server_worker_entry(
             config=EntityGraphRustEvaluatorConfig(
                 value_scale=float(worker_args["value_scale"]),
                 prior_temperature=float(worker_args["prior_temperature"]),
+                value_squash=str(worker_args.get("value_squash", "tanh")),
                 value_readout=str(worker_args.get("value_readout", "scalar")),
                 public_observation=bool(worker_args["public_observation"]),
                 rust_featurize=bool(worker_args["rust_featurize"]),
@@ -2201,6 +2202,7 @@ def _run_worker(
             config=EntityGraphRustEvaluatorConfig(
                 value_scale=float(worker_args["value_scale"]),
                 prior_temperature=float(worker_args["prior_temperature"]),
+                value_squash=str(worker_args.get("value_squash", "tanh")),
                 value_readout=str(worker_args.get("value_readout", "scalar")),
                 public_observation=bool(worker_args["public_observation"]),
                 rust_featurize=bool(worker_args["rust_featurize"]),
@@ -2248,6 +2250,7 @@ def _run_worker(
         opponent_eval_config = EntityGraphRustEvaluatorConfig(
             value_scale=float(worker_args["value_scale"]),
             prior_temperature=float(worker_args["prior_temperature"]),
+            value_squash=str(worker_args.get("value_squash", "tanh")),
             value_readout=str(worker_args.get("value_readout", "scalar")),
             public_observation=bool(worker_args["public_observation"]),
             rust_featurize=bool(worker_args["rust_featurize"]),
@@ -2295,6 +2298,7 @@ def _run_worker(
         mix_eval_config = EntityGraphRustEvaluatorConfig(
             value_scale=float(worker_args["value_scale"]),
             prior_temperature=float(worker_args["prior_temperature"]),
+            value_squash=str(worker_args.get("value_squash", "tanh")),
             value_readout=str(worker_args.get("value_readout", "scalar")),
             public_observation=bool(worker_args["public_observation"]),
             cache_size=int(worker_args.get("eval_cache_size", 100_000)),

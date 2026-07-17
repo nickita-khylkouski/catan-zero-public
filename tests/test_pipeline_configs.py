@@ -243,6 +243,13 @@ def test_boundary_value_particles_are_bound_in_eval_identity() -> None:
     assert experimental.config_hash() != historical.config_hash()
 
 
+def test_generation_value_squash_is_bound_in_teacher_identity() -> None:
+    """A clip-vs-tanh evaluator produces different MCTS teacher targets."""
+    assert GenerateConfig(value_squash="clip").config_hash() != GenerateConfig(
+        value_squash="tanh"
+    ).config_hash()
+
+
 def test_initial_road_d1_scope_changes_generation_config_hash() -> None:
     global_d1 = GenerateConfig(rescale_noise_floor_c=8.0)
     road_only_d1 = GenerateConfig(

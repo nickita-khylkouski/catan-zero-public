@@ -96,6 +96,7 @@
     "track": "2p_no_trade",
     "value_readout": "scalar",
     "value_scale": 1.0,
+    "value_squash": "tanh",
     "vps_to_win": 10,
     "wide_candidates_threshold": 24,
     "wide_roots_always_full": false,
