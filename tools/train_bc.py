@@ -17118,6 +17118,11 @@ def main(
         )
     )
     hard_decision_policy_mass_minima = _hard_decision_policy_mass_minima(args)
+    phase_admission_sampler_rng_state = copy.deepcopy(
+        rng.bit_generator.state
+        if resume_progress is None
+        else resume_progress["rng_state"]
+    )
     policy_phase_objective_mass_admission = _rank0_authoritative_call(
         ddp,
         "policy phase objective-mass admission",
@@ -17132,6 +17137,25 @@ def main(
             ),
             minimum_phase_mass_fractions=hard_decision_policy_mass_minima,
             objective_measure=policy_objective_measure,
+            sampler_rng_state=phase_admission_sampler_rng_state,
+            epochs=int(effective_epoch_limit),
+            max_steps=int(args.max_steps),
+            batch_size=int(args.batch_size),
+            world_size=(
+                int(ddp["world_size"]) if bool(ddp["enabled"]) else 1
+            ),
+            grad_accum_steps=int(args.grad_accum_steps),
+            completed_epochs=(
+                0
+                if resume_progress is None
+                else int(resume_progress["completed_epochs"])
+            ),
+            completed_optimizer_steps=(
+                0
+                if resume_progress is None
+                else int(resume_progress["optimizer_step"])
+            ),
+            data_sharded=bool(args.ddp_shard_data),
         ),
     )
     base_sampler_report["policy_phase_objective_mass_admission"] = dict(
@@ -40565,6 +40589,394 @@ def _hard_decision_policy_mass_minima(args) -> dict[str, float] | None:
     return minima
 
 
+def _planned_weighted_policy_phase_objective_mass_admission(
+    data,
+    train_indices: np.ndarray,
+    *,
+    policy_sample_weights: np.ndarray,
+    sampling_weights: np.ndarray,
+    minimum_phase_mass_fractions: Mapping[str, float] | None,
+    requested_objective_measure: str,
+    sampler_rng_state: Mapping[str, object] | None,
+    epochs: int | None,
+    max_steps: int,
+    batch_size: int | None,
+    world_size: int,
+    grad_accum_steps: int,
+    completed_epochs: int,
+    completed_optimizer_steps: int,
+    data_sharded: bool,
+) -> dict[str, object]:
+    """Replay weighted sampling and measure exact planned update attribution."""
+
+    expected_measure = (
+        "weighted_replacement_draw_probability_x_policy_loss_weight_v1"
+    )
+    if str(requested_objective_measure) != expected_measure:
+        raise SystemExit(
+            "weighted planned-batch phase admission received an unsupported "
+            f"objective measure {requested_objective_measure!r}"
+        )
+    if data_sharded:
+        raise SystemExit(
+            "weighted planned-batch phase admission cannot authenticate "
+            "rank-local sharded corpora"
+        )
+    if sampler_rng_state is None:
+        raise SystemExit(
+            "weighted planned-batch phase admission requires the exact sampler "
+            "RNG state"
+        )
+    epoch_limit = int(epochs) if epochs is not None else 0
+    local_batch_size = int(batch_size) if batch_size is not None else 0
+    world = int(world_size)
+    accumulation = int(grad_accum_steps)
+    start_epoch = int(completed_epochs)
+    start_step = int(completed_optimizer_steps)
+    step_limit = int(max_steps)
+    if (
+        epoch_limit < 1
+        or local_batch_size < 1
+        or world < 1
+        or accumulation < 1
+        or start_epoch < 0
+        or start_epoch > epoch_limit
+        or start_step < 0
+        or step_limit < 0
+        or (step_limit > 0 and start_step >= step_limit)
+    ):
+        raise SystemExit(
+            "weighted planned-batch phase admission received invalid training "
+            "geometry or resume progress"
+        )
+
+    rows = np.asarray(train_indices, dtype=np.int64)
+    weights = np.asarray(policy_sample_weights, dtype=np.float64)
+    draw_weights = np.asarray(sampling_weights, dtype=np.float64)
+    if (
+        rows.ndim != 1
+        or rows.size == 0
+        or weights.ndim != 1
+        or np.any(rows < 0)
+        or np.any(rows >= weights.size)
+        or draw_weights.shape != rows.shape
+        or not np.isfinite(draw_weights).all()
+        or np.any(draw_weights < 0.0)
+        or float(draw_weights.sum()) <= 0.0
+    ):
+        raise ValueError(
+            "weighted planned-batch phase admission received invalid aligned "
+            "rows, loss weights, or sampling weights"
+        )
+    scoped_weights = weights[rows]
+    if not np.isfinite(scoped_weights).all() or np.any(scoped_weights < 0.0):
+        raise ValueError(
+            "weighted planned-batch policy weights must be finite and non-negative"
+        )
+    if "phase" not in data:
+        raise SystemExit(
+            "weighted planned-batch phase admission requires a row-aligned phase "
+            "column"
+        )
+    phase_column = data["phase"]
+    if len(phase_column) <= int(rows.max()):
+        raise ValueError("policy phase column is not row-aligned")
+
+    try:
+        planned_rng = np.random.default_rng()
+        planned_rng.bit_generator.state = copy.deepcopy(dict(sampler_rng_state))
+    except (TypeError, ValueError) as error:
+        raise SystemExit(
+            "weighted planned-batch phase admission received an invalid sampler "
+            "RNG state"
+        ) from error
+    rng_state_before_sha256 = _canonical_json_sha256(
+        planned_rng.bit_generator.state
+    )
+
+    global_microbatch_size = local_batch_size * world
+    nominal_optimizer_batch_size = global_microbatch_size * accumulation
+    optimizer_batch_attributions: list[dict[str, float]] = []
+    planned_phase_draw_counts: Counter[str] = Counter()
+    active_phase_draw_counts: Counter[str] = Counter()
+    epoch_receipts: list[dict[str, object]] = []
+    raw_sampler_draw_count = 0
+    consumed_global_row_draw_count = 0
+    planned_synchronous_microbatches = 0
+    consumed_synchronous_microbatches = 0
+    planned_optimizer_batches = 0
+    consumed_optimizer_batches = 0
+    policy_inactive_synchronous_microbatches = 0
+    current_step = start_step
+
+    for epoch in range(start_epoch, epoch_limit):
+        if step_limit > 0 and current_step >= step_limit:
+            break
+        max_samples = (
+            None
+            if step_limit <= 0
+            else (step_limit - current_step) * nominal_optimizer_batch_size
+        )
+        raw_order = np.asarray(
+            _epoch_order(
+                planned_rng,
+                len(rows),
+                local_batch_size,
+                {
+                    "enabled": False,
+                    "world_size": 1,
+                    "rank": 0,
+                    "local_rank": 0,
+                },
+                sample_weights=draw_weights,
+                max_samples=max_samples,
+            ),
+            dtype=np.int64,
+        )
+        if world > 1:
+            padded_size = int(
+                np.ceil(len(raw_order) / global_microbatch_size)
+                * global_microbatch_size
+            )
+            padded_order = (
+                np.concatenate(
+                    (
+                        raw_order,
+                        np.resize(raw_order, padded_size - len(raw_order)),
+                    )
+                )
+                if padded_size > len(raw_order)
+                else raw_order
+            )
+        else:
+            padded_order = raw_order
+        microbatch_count = int(
+            np.ceil(len(padded_order) / global_microbatch_size)
+        )
+        epoch_optimizer_batches = int(
+            np.ceil(microbatch_count / accumulation)
+        )
+        planned_synchronous_microbatches += microbatch_count
+        planned_optimizer_batches += epoch_optimizer_batches
+        raw_sampler_draw_count += int(len(raw_order))
+
+        epoch_consumed_microbatches = 0
+        epoch_consumed_optimizer_batches = 0
+        for group_start in range(0, microbatch_count, accumulation):
+            if step_limit > 0 and current_step >= step_limit:
+                break
+            group_stop = min(group_start + accumulation, microbatch_count)
+            group_size = group_stop - group_start
+            group_attribution: Counter[str] = Counter()
+            for microbatch_index in range(group_start, group_stop):
+                start = microbatch_index * global_microbatch_size
+                stop = min(start + global_microbatch_size, len(padded_order))
+                positions = padded_order[start:stop]
+                batch_weights = scoped_weights[positions]
+                batch_phases = np.asarray(
+                    phase_column[rows[positions]]
+                ).astype(str)
+                if batch_phases.shape != positions.shape:
+                    raise ValueError("policy phase column is not row-aligned")
+                denominator = float(np.sum(batch_weights, dtype=np.float64))
+                if denominator <= 0.0:
+                    policy_inactive_synchronous_microbatches += 1
+                for phase in np.unique(batch_phases):
+                    selected = batch_phases == phase
+                    name = str(phase)
+                    planned_phase_draw_counts[name] += int(
+                        np.count_nonzero(selected)
+                    )
+                    active_phase_draw_counts[name] += int(
+                        np.count_nonzero(batch_weights[selected] > 0.0)
+                    )
+                    if denominator > 0.0:
+                        group_attribution[name] += float(
+                            np.sum(batch_weights[selected], dtype=np.float64)
+                            / denominator
+                        )
+            optimizer_batch_attributions.append(
+                {
+                    phase: float(value) / float(group_size)
+                    for phase, value in group_attribution.items()
+                }
+            )
+            consumed_synchronous_microbatches += group_size
+            epoch_consumed_microbatches += group_size
+            consumed_optimizer_batches += 1
+            epoch_consumed_optimizer_batches += 1
+            consumed_global_row_draw_count += sum(
+                min(
+                    global_microbatch_size,
+                    len(padded_order)
+                    - microbatch_index * global_microbatch_size,
+                )
+                for microbatch_index in range(group_start, group_stop)
+            )
+            current_step += 1
+
+        epoch_receipts.append(
+            {
+                "epoch": int(epoch),
+                "raw_sampler_draw_count": int(len(raw_order)),
+                "padded_global_row_draw_count": int(len(padded_order)),
+                "planned_synchronous_global_microbatch_count": microbatch_count,
+                "consumed_synchronous_global_microbatch_count": (
+                    epoch_consumed_microbatches
+                ),
+                "planned_optimizer_batch_count": epoch_optimizer_batches,
+                "consumed_optimizer_batch_count": (
+                    epoch_consumed_optimizer_batches
+                ),
+                "raw_order_sha256": _array_content_sha256(raw_order),
+                "padded_order_sha256": _array_content_sha256(padded_order),
+            }
+        )
+
+    if consumed_optimizer_batches == 0:
+        raise SystemExit(
+            "weighted planned-batch phase admission produced no optimizer batches"
+        )
+    all_phases = sorted(
+        set(planned_phase_draw_counts) | set(HARD_DECISION_POLICY_MASS_PHASES)
+    )
+    minima = (
+        None
+        if minimum_phase_mass_fractions is None
+        else {
+            phase: float(minimum_phase_mass_fractions[phase])
+            for phase in HARD_DECISION_POLICY_MASS_PHASES
+        }
+    )
+    per_phase: dict[str, dict[str, object]] = {}
+    for phase in all_phases:
+        attributions = np.asarray(
+            [
+                batch_attribution.get(phase, 0.0)
+                for batch_attribution in optimizer_batch_attributions
+            ],
+            dtype=np.float64,
+        )
+        mean_attribution = float(attributions.mean())
+        minimum = None if minima is None else minima.get(phase)
+        per_phase[phase] = {
+            "planned_draw_count": int(planned_phase_draw_counts.get(phase, 0)),
+            "policy_active_planned_draw_count": int(
+                active_phase_draw_counts.get(phase, 0)
+            ),
+            "optimizer_batch_attribution_sum": float(attributions.sum()),
+            "policy_objective_mass_fraction": mean_attribution,
+            "minimum_optimizer_batch_attribution": float(attributions.min()),
+            "maximum_optimizer_batch_attribution": float(attributions.max()),
+            "minimum_policy_objective_mass_fraction": minimum,
+            "admitted": None if minimum is None else mean_attribution >= minimum,
+        }
+    admitted = None
+    if minima is not None:
+        admitted = all(
+            bool(per_phase[phase]["admitted"])
+            for phase in HARD_DECISION_POLICY_MASS_PHASES
+        )
+
+    geometry = {
+        "local_microbatch_size": local_batch_size,
+        "world_size": world,
+        "grad_accum_steps": accumulation,
+        "synchronous_global_microbatch_size": global_microbatch_size,
+        "nominal_optimizer_global_batch_size": nominal_optimizer_batch_size,
+        "epoch_limit": epoch_limit,
+        "start_completed_epochs": start_epoch,
+        "max_steps": step_limit,
+        "start_optimizer_step": start_step,
+        "end_optimizer_step": current_step,
+    }
+    total_batch_normalized_policy_attribution = float(
+        sum(
+            phase_report["policy_objective_mass_fraction"]
+            for phase_report in per_phase.values()
+        )
+    )
+    inactive_optimizer_attribution = float(
+        np.clip(1.0 - total_batch_normalized_policy_attribution, 0.0, 1.0)
+    )
+    report: dict[str, object] = {
+        "schema_version": "policy-phase-planned-batch-admission-v1",
+        "available": True,
+        "admission_enforced": minima is not None,
+        "admitted": admitted,
+        "reason": (
+            "reviewed_minima_satisfied"
+            if admitted is True
+            else "reviewed_minima_not_commissioned"
+            if admitted is None
+            else "hard_decision_policy_objective_mass_below_reviewed_minimum"
+        ),
+        "objective_measure": (
+            "exact_planned_synchronous_global_minibatch_self_normalized_v1"
+        ),
+        "requested_objective_measure": str(requested_objective_measure),
+        "normalization": (
+            "mean_optimizer_batch_of_mean_self_normalized_synchronous_"
+            "microbatch_attribution_v1"
+        ),
+        "training_row_count": int(rows.size),
+        "geometry": geometry,
+        "sampler_binding": {
+            "train_indices_sha256": _array_content_sha256(rows),
+            "sampling_weights_sha256": _array_content_sha256(draw_weights),
+            "policy_sample_weights_sha256": _array_content_sha256(
+                scoped_weights
+            ),
+        },
+        "sampler_rng_state_before_sha256": rng_state_before_sha256,
+        "sampler_rng_state_after_sha256": _canonical_json_sha256(
+            planned_rng.bit_generator.state
+        ),
+        "planned_order_sha256": _canonical_json_sha256(epoch_receipts),
+        "epoch_receipts": epoch_receipts,
+        "planned_epoch_count": len(epoch_receipts),
+        "raw_sampler_draw_count": raw_sampler_draw_count,
+        "consumed_global_row_draw_count": int(consumed_global_row_draw_count),
+        "planned_synchronous_global_microbatch_count": (
+            planned_synchronous_microbatches
+        ),
+        "consumed_synchronous_global_microbatch_count": (
+            consumed_synchronous_microbatches
+        ),
+        "planned_optimizer_batch_count": planned_optimizer_batches,
+        "consumed_optimizer_batch_count": consumed_optimizer_batches,
+        "policy_inactive_synchronous_global_microbatch_count": (
+            policy_inactive_synchronous_microbatches
+        ),
+        "policy_inactive_synchronous_global_microbatch_fraction": float(
+            policy_inactive_synchronous_microbatches
+            / consumed_synchronous_microbatches
+        ),
+        "total_batch_normalized_policy_attribution": (
+            total_batch_normalized_policy_attribution
+        ),
+        "policy_inactive_optimizer_attribution_fraction": float(
+            inactive_optimizer_attribution
+        ),
+        "required_phases": list(HARD_DECISION_POLICY_MASS_PHASES),
+        "minimum_phase_mass_fractions": minima,
+        "per_phase": per_phase,
+    }
+    report["identity_sha256"] = _canonical_json_sha256(report)
+    if admitted is False:
+        details = ", ".join(
+            f"{phase}={per_phase[phase]['policy_objective_mass_fraction']:.6g}"
+            f"<{minima[phase]:.6g}"
+            for phase in HARD_DECISION_POLICY_MASS_PHASES
+            if not bool(per_phase[phase]["admitted"])
+        )
+        raise SystemExit(
+            "hard-decision planned-batch policy-mass admission refused before "
+            f"the first optimizer step: {details}"
+        )
+    return report
+
+
 def _policy_phase_objective_mass_admission(
     data,
     train_indices: np.ndarray,
@@ -40574,16 +40986,45 @@ def _policy_phase_objective_mass_admission(
     minimum_phase_mass_fractions: Mapping[str, float] | None,
     objective_measure: str,
     chunk_rows: int = 262_144,
+    sampler_rng_state: Mapping[str, object] | None = None,
+    epochs: int | None = None,
+    max_steps: int = 0,
+    batch_size: int | None = None,
+    world_size: int = 1,
+    grad_accum_steps: int = 1,
+    completed_epochs: int = 0,
+    completed_optimizer_steps: int = 0,
+    data_sharded: bool = False,
 ) -> dict[str, object]:
     """Measure the exact expected policy-loss mass by phase before training.
 
     ``policy_sample_weights`` is the final loss multiplier after forced-row,
     phase, per-game, reliability, and (for coverage traversal) importance
-    weighting. For weighted replacement, ``sampling_weights`` contributes the
-    row draw probability as well. Consequently the reported fractions describe
-    the objective the optimizer is expected to see, rather than raw row counts
-    or nominal phase multipliers.
+    weighting. Coverage traversal retains the population fixed-normalizer
+    report below. Weighted replacement dispatches to a versioned replay of the
+    exact planned synchronous minibatches because its loss denominator is
+    batch-local: a ratio of population expectations is not its expected
+    self-normalized phase attribution.
     """
+
+    if sampling_weights is not None:
+        return _planned_weighted_policy_phase_objective_mass_admission(
+            data,
+            train_indices,
+            policy_sample_weights=policy_sample_weights,
+            sampling_weights=sampling_weights,
+            minimum_phase_mass_fractions=minimum_phase_mass_fractions,
+            requested_objective_measure=str(objective_measure),
+            sampler_rng_state=sampler_rng_state,
+            epochs=epochs,
+            max_steps=max_steps,
+            batch_size=batch_size,
+            world_size=world_size,
+            grad_accum_steps=grad_accum_steps,
+            completed_epochs=completed_epochs,
+            completed_optimizer_steps=completed_optimizer_steps,
+            data_sharded=data_sharded,
+        )
 
     rows = np.asarray(train_indices, dtype=np.int64)
     weights = np.asarray(policy_sample_weights)

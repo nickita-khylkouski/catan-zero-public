@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from tools.train_bc import (
+    _array_content_sha256,
     _component_game_identities,
     _compose_per_game_policy_surprise_sampling_weights,
     _coverage_fixed_loss_normalizers,
@@ -17,6 +18,46 @@ from tools.train_bc import (
     per_game_policy_surprise_sampling_report,
     policy_surprise_sampling_weights,
 )
+
+
+def _planned_weighted_phase_admission(
+    phases,
+    *,
+    policy_weights,
+    sampling_weights,
+    seed=7,
+    epochs=1,
+    max_steps=0,
+    batch_size=1,
+    world_size=1,
+    grad_accum_steps=1,
+    completed_epochs=0,
+    completed_optimizer_steps=0,
+    sampler_rng_state=None,
+):
+    rng = np.random.default_rng(seed)
+    return _policy_phase_objective_mass_admission(
+        {"phase": np.asarray(phases)},
+        np.arange(len(phases), dtype=np.int64),
+        policy_sample_weights=np.asarray(policy_weights, dtype=np.float64),
+        sampling_weights=np.asarray(sampling_weights, dtype=np.float64),
+        minimum_phase_mass_fractions=None,
+        objective_measure=(
+            "weighted_replacement_draw_probability_x_policy_loss_weight_v1"
+        ),
+        sampler_rng_state=(
+            rng.bit_generator.state
+            if sampler_rng_state is None
+            else sampler_rng_state
+        ),
+        epochs=epochs,
+        max_steps=max_steps,
+        batch_size=batch_size,
+        world_size=world_size,
+        grad_accum_steps=grad_accum_steps,
+        completed_epochs=completed_epochs,
+        completed_optimizer_steps=completed_optimizer_steps,
+    )
 
 
 def _maritime_target_mass_admission(data, **overrides):
@@ -476,6 +517,7 @@ def test_hard_decision_phase_mass_reports_sparse_objective_without_floor() -> No
     robber = report["per_phase"]["MOVE_ROBBER"]
     assert report["admission_enforced"] is False
     assert report["admitted"] is None
+    assert report["schema_version"] == "policy-phase-objective-mass-admission-v2"
     assert report["identity_sha256"].startswith("sha256:")
     assert settlement["policy_objective_mass_fraction"] == pytest.approx(1 / 404)
     assert road["policy_objective_mass_fraction"] == pytest.approx(1 / 404)
@@ -544,6 +586,192 @@ def test_hard_decision_phase_mass_accepts_minima_and_binds_identity() -> None:
     assert all(
         report["per_phase"][phase]["admitted"] is True for phase in minima
     )
+
+
+def test_weighted_phase_admission_uses_planned_batch_normalization() -> None:
+    phases = ["BUILD_INITIAL_SETTLEMENT", "PLAY_TURN"]
+    report = _planned_weighted_phase_admission(
+        phases,
+        policy_weights=[100.0, 1.0],
+        sampling_weights=[0.1, 0.9],
+        epochs=50,
+        max_steps=100,
+        batch_size=1,
+    )
+    control = np.random.default_rng(7)
+    sampled = np.concatenate(
+        [
+            control.choice(2, size=2, replace=True, p=[0.1, 0.9])
+            for _epoch in range(50)
+        ]
+    )
+    exact_batch_mean = float(np.mean(sampled == 0))
+    ratio_of_expectations = (0.1 * 100.0) / (0.1 * 100.0 + 0.9)
+
+    settlement = report["per_phase"]["BUILD_INITIAL_SETTLEMENT"]
+    assert report["schema_version"] == "policy-phase-planned-batch-admission-v1"
+    assert settlement["policy_objective_mass_fraction"] == pytest.approx(
+        exact_batch_mean
+    )
+    assert exact_batch_mean < 0.3
+    assert ratio_of_expectations > 0.9
+    assert report["consumed_optimizer_batch_count"] == 100
+    assert report["total_batch_normalized_policy_attribution"] == pytest.approx(
+        1.0
+    )
+
+
+def test_weighted_phase_admission_does_not_advance_live_sampler_rng() -> None:
+    live_rng = np.random.default_rng(19)
+    control_rng = np.random.default_rng(19)
+
+    _planned_weighted_phase_admission(
+        ["BUILD_INITIAL_SETTLEMENT", "PLAY_TURN"] * 4,
+        policy_weights=np.ones(8),
+        sampling_weights=np.ones(8),
+        epochs=2,
+        batch_size=2,
+        sampler_rng_state=live_rng.bit_generator.state,
+    )
+
+    assert live_rng.integers(0, 2**31, size=16).tolist() == control_rng.integers(
+        0, 2**31, size=16
+    ).tolist()
+
+
+def test_weighted_phase_admission_binds_ddp_and_accumulation_geometry() -> None:
+    report = _planned_weighted_phase_admission(
+        [
+            "BUILD_INITIAL_SETTLEMENT",
+            "BUILD_INITIAL_ROAD",
+            "DISCARD",
+            "MOVE_ROBBER",
+            "PLAY_TURN",
+        ],
+        policy_weights=np.ones(5),
+        sampling_weights=np.ones(5),
+        epochs=1,
+        batch_size=1,
+        world_size=2,
+        grad_accum_steps=2,
+    )
+
+    assert report["raw_sampler_draw_count"] == 5
+    assert report["consumed_global_row_draw_count"] == 6
+    assert report["planned_synchronous_global_microbatch_count"] == 3
+    assert report["consumed_synchronous_global_microbatch_count"] == 3
+    assert report["planned_optimizer_batch_count"] == 2
+    assert report["consumed_optimizer_batch_count"] == 2
+    assert report["geometry"] == {
+        "local_microbatch_size": 1,
+        "world_size": 2,
+        "grad_accum_steps": 2,
+        "synchronous_global_microbatch_size": 2,
+        "nominal_optimizer_global_batch_size": 4,
+        "epoch_limit": 1,
+        "start_completed_epochs": 0,
+        "max_steps": 0,
+        "start_optimizer_step": 0,
+        "end_optimizer_step": 2,
+    }
+
+
+def test_weighted_phase_admission_matches_ddp_global_weight_denominator() -> None:
+    report = _planned_weighted_phase_admission(
+        ["BUILD_INITIAL_SETTLEMENT", "PLAY_TURN"],
+        policy_weights=[100.0, 1.0],
+        sampling_weights=[0.5, 0.5],
+        seed=8,  # exact sampled global order [0, 1]
+        epochs=1,
+        batch_size=1,
+        world_size=2,
+    )
+
+    # _weighted_mean_from_parts all-reduces the denominator, then scales each
+    # local numerator by world size so DDP's gradient average is the global
+    # ratio. A mean of independently normalized rank losses would be 0.5 and
+    # is explicitly not the live trainer estimator.
+    assert report["per_phase"]["BUILD_INITIAL_SETTLEMENT"][
+        "policy_objective_mass_fraction"
+    ] == pytest.approx(100.0 / 101.0)
+
+
+def test_weighted_phase_admission_truncates_exactly_at_max_steps() -> None:
+    report = _planned_weighted_phase_admission(
+        ["PLAY_TURN"] * 100,
+        policy_weights=np.ones(100),
+        sampling_weights=np.ones(100),
+        epochs=10,
+        max_steps=2,
+        batch_size=2,
+        world_size=2,
+        grad_accum_steps=3,
+    )
+
+    assert report["planned_epoch_count"] == 1
+    assert report["raw_sampler_draw_count"] == 24
+    assert report["consumed_global_row_draw_count"] == 24
+    assert report["consumed_synchronous_global_microbatch_count"] == 6
+    assert report["consumed_optimizer_batch_count"] == 2
+    assert report["geometry"]["end_optimizer_step"] == 2
+
+
+def test_weighted_phase_resume_replays_saved_sampler_state_and_binds_identity() -> None:
+    phases = np.asarray(["PLAY_TURN", "BUILD_INITIAL_ROAD"] * 4)
+    sampling_weights = np.arange(1, 9, dtype=np.float64)
+    control = np.random.default_rng(31)
+    control.choice(
+        8,
+        size=8,
+        replace=True,
+        p=sampling_weights / sampling_weights.sum(),
+    )
+    resumed_state = control.bit_generator.state
+    expected_order = control.choice(
+        8,
+        size=8,
+        replace=True,
+        p=sampling_weights / sampling_weights.sum(),
+    )
+
+    report = _planned_weighted_phase_admission(
+        phases,
+        policy_weights=np.ones(8),
+        sampling_weights=sampling_weights,
+        epochs=2,
+        batch_size=2,
+        completed_epochs=1,
+        completed_optimizer_steps=4,
+        sampler_rng_state=resumed_state,
+    )
+    repeated = _planned_weighted_phase_admission(
+        phases,
+        policy_weights=np.ones(8),
+        sampling_weights=sampling_weights,
+        epochs=2,
+        batch_size=2,
+        completed_epochs=1,
+        completed_optimizer_steps=4,
+        sampler_rng_state=resumed_state,
+    )
+    different_progress = _planned_weighted_phase_admission(
+        phases,
+        policy_weights=np.ones(8),
+        sampling_weights=sampling_weights,
+        epochs=2,
+        batch_size=2,
+        completed_epochs=1,
+        completed_optimizer_steps=3,
+        sampler_rng_state=resumed_state,
+    )
+
+    assert report["epoch_receipts"][0]["raw_order_sha256"] == (
+        _array_content_sha256(expected_order)
+    )
+    assert report["geometry"]["start_optimizer_step"] == 4
+    assert report["geometry"]["end_optimizer_step"] == 8
+    assert report["identity_sha256"] == repeated["identity_sha256"]
+    assert report["identity_sha256"] != different_progress["identity_sha256"]
 
 
 def test_maritime_target_mass_uses_fixed_normalizer_coverage_measure() -> None:
