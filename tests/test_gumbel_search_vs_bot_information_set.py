@@ -37,6 +37,21 @@ def test_vs_bot_search_threads_information_set_recipe() -> None:
     assert config["determinization_min_simulations"] == 32
 
 
+def test_vs_bot_search_threads_coherent_boundary_particle_operator() -> None:
+    config = _search_config_kwargs(
+        {
+            "n_full": 128,
+            "max_depth": 80,
+            "correct_rust_chance_spectra": True,
+            "coherent_public_belief_search": True,
+            "boundary_value_particles": 4,
+        }
+    )
+
+    assert config["coherent_public_belief_search"] is True
+    assert config["boundary_value_particles"] == 4
+
+
 @pytest.mark.parametrize("threshold", [None, 20])
 def test_vs_bot_search_threads_symmetry_averaging_threshold(
     threshold: int | None,
@@ -141,9 +156,14 @@ def test_vs_bot_cli_threshold_reaches_dumped_typed_config(
             "1",
             "--workers",
             "1",
+            "--public-observation",
+            "--coherent-public-belief-search",
+            "--boundary-value-particles",
+            "4",
             "--symmetry-averaged-eval",
             "--symmetry-averaged-eval-threshold",
             "20",
+            "--no-evaluator-rust-featurize",
             "--dump-config",
             str(dumped),
             "--out",
@@ -166,5 +186,9 @@ def test_vs_bot_cli_threshold_reaches_dumped_typed_config(
     config = load_config(dumped)
     report = json.loads(out.read_text(encoding="utf-8"))
     assert config.symmetry_averaged_eval_threshold == 20
+    assert config.coherent_public_belief_search is True
+    assert config.boundary_value_particles == 4
     assert report["symmetry_averaged_eval_threshold"] == 20
+    assert report["coherent_public_belief_search"] is True
+    assert report["boundary_value_particles"] == 4
     assert report["config_hash"] == config.config_hash()

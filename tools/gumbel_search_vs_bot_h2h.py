@@ -369,6 +369,9 @@ def _search_config_kwargs(worker_args: dict[str, Any]) -> dict[str, Any]:
         lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
         information_set_search=bool(worker_args.get("information_set_search", False)),
+        coherent_public_belief_search=bool(
+            worker_args.get("coherent_public_belief_search", False)
+        ),
         boundary_value_particles=int(
             worker_args.get("boundary_value_particles", 1)
         ),
@@ -540,6 +543,16 @@ def main() -> None:
     parser.add_argument(
         "--information-set-search", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--coherent-public-belief-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Search one sanitized public-belief tree. Requires "
+            "--public-observation and is mutually exclusive with "
+            "--information-set-search."
+        ),
+    )
     parser.add_argument("--boundary-value-particles", type=int, default=1)
     parser.add_argument("--determinization-particles", type=int, default=1)
     parser.add_argument("--determinization-min-simulations", type=int, default=32)
@@ -599,19 +612,35 @@ def main() -> None:
             require_rust_feature_path()
         except RuntimeError as error:
             parser.error(str(error))
-    if bool(args.public_observation) != bool(args.information_set_search):
+    information_set = bool(args.information_set_search)
+    coherent = bool(args.coherent_public_belief_search)
+    public = bool(args.public_observation)
+    if information_set and coherent:
         parser.error(
-            "--public-observation and --information-set-search must be enabled together"
+            "--information-set-search and --coherent-public-belief-search are "
+            "mutually exclusive"
         )
-    if bool(args.information_set_search) and bool(args.belief_chance_spectra):
+    if public and not (information_set or coherent):
         parser.error(
-            "--information-set-search cannot be combined with --belief-chance-spectra"
+            "--public-observation requires --information-set-search or "
+            "--coherent-public-belief-search"
+        )
+    if information_set and not public:
+        parser.error("--information-set-search requires --public-observation")
+    if coherent and not public:
+        parser.error("--coherent-public-belief-search requires --public-observation")
+    if (information_set or coherent) and bool(args.belief_chance_spectra):
+        parser.error(
+            "--information-set-search/--coherent-public-belief-search cannot be "
+            "combined with --belief-chance-spectra"
         )
     if int(args.determinization_particles) < 1:
         parser.error("--determinization-particles must be >= 1")
-    if int(args.boundary_value_particles) != 1:
+    if int(args.boundary_value_particles) < 1:
+        parser.error("--boundary-value-particles must be >= 1")
+    if int(args.boundary_value_particles) > 1 and not coherent:
         parser.error(
-            "--boundary-value-particles must remain 1 without "
+            "--boundary-value-particles > 1 requires "
             "--coherent-public-belief-search"
         )
     if int(args.determinization_min_simulations) < 1:
@@ -684,6 +713,9 @@ def main() -> None:
                 "public_observation": bool(args.public_observation),
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
                 "information_set_search": bool(args.information_set_search),
+                "coherent_public_belief_search": bool(
+                    args.coherent_public_belief_search
+                ),
                 "native_mcts_hot_loop": bool(args.native_mcts_hot_loop),
                 "evaluator_rust_featurize": bool(args.evaluator_rust_featurize),
                 "determinization_particles": int(args.determinization_particles),
@@ -853,6 +885,9 @@ def _build_summary(
         "public_observation": bool(args.public_observation),
         "belief_chance_spectra": bool(args.belief_chance_spectra),
         "information_set_search": bool(getattr(args, "information_set_search", False)),
+        "coherent_public_belief_search": bool(
+            getattr(args, "coherent_public_belief_search", False)
+        ),
         "native_mcts_hot_loop": bool(getattr(args, "native_mcts_hot_loop", False)),
         "mcts_implementation": (
             "rust_native_hot_loop_v1"

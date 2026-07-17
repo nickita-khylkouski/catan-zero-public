@@ -100,6 +100,9 @@ def _build_search_config(worker_args: dict[str, Any]) -> GumbelChanceMCTSConfig:
         lazy_interior_chance=bool(worker_args.get("lazy_interior_chance", False)),
         belief_chance_spectra=bool(worker_args.get("belief_chance_spectra", False)),
         information_set_search=bool(worker_args.get("information_set_search", False)),
+        coherent_public_belief_search=bool(
+            worker_args.get("coherent_public_belief_search", False)
+        ),
         boundary_value_particles=int(
             worker_args.get("boundary_value_particles", 1)
         ),
@@ -371,6 +374,16 @@ def main() -> None:
         "Default off; a search-semantics change gated on its own strength-based A/B.",
     )
     parser.add_argument("--information-set-search", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--coherent-public-belief-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Search one sanitized public-belief tree. Requires "
+            "--public-observation and is mutually exclusive with "
+            "--information-set-search."
+        ),
+    )
     parser.add_argument("--boundary-value-particles", type=int, default=1)
     parser.add_argument("--determinization-particles", type=int, default=1)
     parser.add_argument("--determinization-min-simulations", type=int, default=32)
@@ -434,19 +447,35 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     add_config_flags(parser, default_purpose="gumbel_search_vs_raw_h2h")
     args = parser.parse_args()
-    if bool(args.public_observation) != bool(args.information_set_search):
+    information_set = bool(args.information_set_search)
+    coherent = bool(args.coherent_public_belief_search)
+    public = bool(args.public_observation)
+    if information_set and coherent:
         parser.error(
-            "--public-observation and --information-set-search must be enabled together"
+            "--information-set-search and --coherent-public-belief-search are "
+            "mutually exclusive"
         )
-    if bool(args.information_set_search) and bool(args.belief_chance_spectra):
+    if public and not (information_set or coherent):
         parser.error(
-            "--information-set-search cannot be combined with --belief-chance-spectra"
+            "--public-observation requires --information-set-search or "
+            "--coherent-public-belief-search"
+        )
+    if information_set and not public:
+        parser.error("--information-set-search requires --public-observation")
+    if coherent and not public:
+        parser.error("--coherent-public-belief-search requires --public-observation")
+    if (information_set or coherent) and bool(args.belief_chance_spectra):
+        parser.error(
+            "--information-set-search/--coherent-public-belief-search cannot be "
+            "combined with --belief-chance-spectra"
         )
     if int(args.determinization_particles) < 1:
         parser.error("--determinization-particles must be >= 1")
-    if int(args.boundary_value_particles) != 1:
+    if int(args.boundary_value_particles) < 1:
+        parser.error("--boundary-value-particles must be >= 1")
+    if int(args.boundary_value_particles) > 1 and not coherent:
         parser.error(
-            "--boundary-value-particles must remain 1 without "
+            "--boundary-value-particles > 1 requires "
             "--coherent-public-belief-search"
         )
     if int(args.determinization_min_simulations) < 1:
@@ -505,6 +534,9 @@ def main() -> None:
                 "public_observation": bool(args.public_observation),
                 "belief_chance_spectra": bool(args.belief_chance_spectra),
                 "information_set_search": bool(args.information_set_search),
+                "coherent_public_belief_search": bool(
+                    args.coherent_public_belief_search
+                ),
                 "determinization_particles": int(args.determinization_particles),
                 "boundary_value_particles": int(args.boundary_value_particles),
                 "determinization_min_simulations": int(
@@ -668,6 +700,9 @@ def _build_summary(
         "belief_chance_spectra": bool(args.belief_chance_spectra),
         "information_set_search": bool(
             getattr(args, "information_set_search", False)
+        ),
+        "coherent_public_belief_search": bool(
+            getattr(args, "coherent_public_belief_search", False)
         ),
         "determinization_particles": int(
             getattr(args, "determinization_particles", 1)

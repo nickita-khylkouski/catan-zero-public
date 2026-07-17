@@ -7,7 +7,10 @@ _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-from gumbel_search_vs_raw_h2h import _concordant_pair_outcomes  # type: ignore  # noqa: E402
+import gumbel_search_vs_raw_h2h as h2h  # type: ignore  # noqa: E402
+
+
+_concordant_pair_outcomes = h2h._concordant_pair_outcomes
 
 
 def _game(pair_id: int, search_won: bool | None) -> dict:
@@ -71,3 +74,19 @@ def test_naive_per_game_pooling_would_overcount_relative_to_pair_level():
     pair_outcomes, _diagnostics = _concordant_pair_outcomes(games)
     assert len(naive_outcomes) == 4
     assert len(pair_outcomes) == 1
+
+
+def test_raw_h2h_threads_coherent_boundary_particle_operator() -> None:
+    config = h2h._build_search_config(
+        {
+            "worker_seed": 7,
+            "n_full": 128,
+            "max_depth": 80,
+            "correct_rust_chance_spectra": True,
+            "coherent_public_belief_search": True,
+            "boundary_value_particles": 4,
+        }
+    )
+
+    assert config.coherent_public_belief_search is True
+    assert config.boundary_value_particles == 4
