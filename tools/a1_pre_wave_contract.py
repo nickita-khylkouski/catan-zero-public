@@ -78,6 +78,7 @@ from catan_zero.rl.decision_taxonomy import (  # noqa: E402
     MANDATORY_SEQUENCE_CONTINUATION,
     NORMAL_CHOICE,
     WIDE_CHOICE,
+    WIDE_CHOICE_MIN_LEGAL_ACTIONS,
 )
 from catan_zero.rl.gumbel_self_play import (  # noqa: E402
     FAST_SEARCH_POLICY_REFERENCE_SIMULATIONS,
@@ -9874,6 +9875,16 @@ def _expected_generate_config_provenance(
 def _expected_selfplay_config(lock: dict[str, Any]) -> dict[str, Any]:
     generation = lock["generation"]
     search = lock["science"]["search_operator"]
+    meaningful_public_history = bool(
+        generation.get("meaningful_public_history", False)
+    )
+    meaningful_public_history_schema = MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION
+    if meaningful_public_history:
+        meaningful_public_history_schema = str(
+            _meaningful_public_event_authority(
+                str(generation.get("learner_entity_feature_adapter_version"))
+            )["event_history_semantic"]
+        )
     opening_fraction = float(generation["temperature_decisions"]) / float(
         generation["max_decisions"]
     )
@@ -9893,9 +9904,8 @@ def _expected_selfplay_config(lock: dict[str, Any]) -> dict[str, Any]:
             record_automatic_transitions=bool(
                 generation.get("record_automatic_transitions", True)
             ),
-            meaningful_public_history=bool(
-                generation.get("meaningful_public_history", False)
-            ),
+            meaningful_public_history=meaningful_public_history,
+            meaningful_public_history_schema=meaningful_public_history_schema,
             learner_entity_feature_adapter_version=generation.get(
                 "learner_entity_feature_adapter_version"
             ),
@@ -9904,6 +9914,12 @@ def _expected_selfplay_config(lock: dict[str, Any]) -> dict[str, Any]:
             temperature_low=float(generation["temperature_low"]),
             late_temperature_move_fraction=late_fraction,
             late_temperature=float(generation["late_temperature"]),
+            target_reliability_audit_fraction=float(
+                generation.get("target_reliability_audit_fraction", 0.0)
+            ),
+            target_reliability_audit_seed=int(
+                generation.get("target_reliability_audit_seed", 0)
+            ),
             correct_rust_chance_spectra=bool(search["correct_rust_chance_spectra"]),
         )
     )
@@ -11668,12 +11684,13 @@ def audit_outputs(
         lock["post_wave_acceptance"]["require_target_information_regime"]
     )
     search_operator = lock["science"]["search_operator"]
+    # The public decision taxonomy routes wide choices and mandatory sequence
+    # starts to full search before playout-cap randomization.  The p_full
+    # Bernoulli check must therefore use only the remaining randomized roots.
+    # ``n_full_wide_threshold`` is a separate legacy budget override and does
+    # not disable this taxonomy accounting.
     wide_full_threshold = (
-        int(search_operator["n_full_wide_threshold"])
-        if bool(search_operator.get("wide_roots_always_full"))
-        and search_operator.get("n_full_wide") is not None
-        and search_operator.get("n_full_wide_threshold") is not None
-        else None
+        WIDE_CHOICE_MIN_LEGAL_ACTIONS if enforce_target_activation else None
     )
     producer = _producer(lock)
     checkpoint_by_id = {record["id"]: record for record in lock["checkpoints"]}
@@ -11851,7 +11868,7 @@ def audit_outputs(
             )
         worker_summaries = list(manifest.get("worker_summaries", []))
         expected_workers = min(
-            int(lock["generation"]["workers_per_gpu"]), int(job["attempts"])
+            int(_expected_cli_fields(lock, job)["workers"]), int(job["attempts"])
         )
         if len(worker_summaries) != expected_workers:
             errors.append(
@@ -12470,7 +12487,7 @@ def audit_outputs(
     if len(record_seeds) != len(all_seeds) or set(record_seeds) != all_seeds:
         errors.append("selected game/source records do not bijectively cover selected seeds")
     expected_worker_manifest_count = sum(
-        min(int(lock["generation"]["workers_per_gpu"]), int(job["attempts"]))
+        min(int(_expected_cli_fields(lock, job)["workers"]), int(job["attempts"]))
         for job in lock["fleet"]["jobs"]
     )
     if public_award_generation_manifests != len(lock["fleet"]["jobs"]):
