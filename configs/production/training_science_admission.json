@@ -37,9 +37,11 @@
     },
     "a1-parent-update-35m-b200": {
       "recipe_canonical_sha256": "c99dd0d80ef3b233c6ce3121ac10ac95d9e37a0235e8ca14a5325353c17cd7d5",
-      "authorized": true,
-      "reason": "v6_b12_commissioned_on_fresh_coherent_n128",
-      "unresolved_requirements": [],
+      "authorized": false,
+      "reason": "v8_parent_update_requires_fresh_commissioning",
+      "unresolved_requirements": [
+        "v8_combined_information_migration_and_parent_fresh_dose"
+      ],
       "observations": {
         "architecture_information_surface": "v6_b12_all_required_modules_positive_learning_signal",
         "retained_composite_adapter_status": "fresh_adapter_v6_composite_authenticated",

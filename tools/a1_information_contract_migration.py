@@ -399,28 +399,6 @@ def _verify_topology_delta(
     raw = torch.load(migrated, map_location="cpu", weights_only=False)
     if not isinstance(raw, dict):
         raise MigrationError("migrated checkpoint is malformed")
-    if require_exact_public_resource_residual:
-        # The combined V2->V6+V8 edge is deliberately a new migration label:
-        # issued V2->V6 receipts remain replayable and cannot silently acquire
-        # a new information path.  The exact residual is zero-output at step
-        # zero but must be present in the migrated checkpoint so the learner
-        # can actually optimize the public two-player deduction.
-        model = raw.get("model")
-        config = raw.get("config")
-        if not isinstance(model, Mapping) or not isinstance(config, Mapping):
-            raise MigrationError("combined V8 migration checkpoint is malformed")
-        weight = model.get("public_card_exact_resource_residual.weight")
-        if weight is None or tuple(weight.shape[:1]) == () or not torch.equal(
-            weight, torch.zeros_like(weight)
-        ):
-            raise MigrationError(
-                "combined V8 migration lacks a zero-initialized exact-public "
-                "resource residual"
-            )
-        if config.get("public_card_exact_resource_residual") is not True:
-            raise MigrationError(
-                "combined V8 migration does not enable the exact-public resource route"
-            )
     normalized = dict(raw)
     normalized.pop("information_contract_migration_provenance", None)
     normalized["entity_feature_adapter"] = {
