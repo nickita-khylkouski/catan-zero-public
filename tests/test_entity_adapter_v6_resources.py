@@ -370,6 +370,51 @@ def test_v8_exact_public_resource_residual_keeps_physical_deduction_separate():
     assert torch.count_nonzero(capture.seen[:, 1]) > 0
 
 
+def test_v8_exact_public_resource_residual_learns_on_first_backward():
+    torch = pytest.importorskip("torch")
+    from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY
+    from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet
+
+    physical = _player_tokens(
+        _payload(_counts(11, 10, 0, 0, 0)),
+        "BLUE",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )[None, ...]
+    globals_ = np.zeros((1, 1, GLOBAL_FEATURE_SIZE), dtype=np.float32)
+    globals_[0, 0, 26:31] = (
+        np.asarray([8, 8, 19, 19, 19], dtype=np.float32) / 19.0
+    )
+    features = public_card_count_features_from_entity_tokens(
+        physical,
+        globals_,
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+    model = EntityGraphNet(
+        EntityGraphConfig(
+            action_size=1,
+            static_action_feature_size=1,
+            hidden_size=16,
+            state_layers=1,
+            attention_heads=4,
+            dropout=0.0,
+            action_cross_attention_layers=1,
+            v6_compatibility_preserving_inputs=True,
+            public_card_count_features=True,
+            public_card_count_residual_bias=False,
+            public_card_exact_resource_residual=True,
+        )
+    )
+    batch = _minimal_torch_entity_batch(physical)
+    batch["global_tokens"] = torch.as_tensor(globals_)
+    batch[DEDUCTION_FEATURES_KEY] = torch.as_tensor(features)
+    tokens, _mask, _history, _event_mask = model._state_tokens(batch)
+    tokens.square().sum().backward()
+    gradient = model.public_card_exact_resource_residual.weight.grad
+    assert gradient is not None
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) > 0
+
+
 def test_v6_training_batch_binds_decoder_and_admission_identity(monkeypatch):
     import tools.train_bc as train_bc
 
