@@ -82,6 +82,7 @@ REQUIRED_SCIENCE_FIELDS = {
     "late_temperature": 0.1,
     "prior_temperature": 1.0,
     "value_scale": 1.0,
+    "value_squash": "tanh",
     "public_observation": True,
     "coherent_public_belief_search": True,
     "determinization_particles": 1,

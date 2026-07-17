@@ -727,6 +727,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-temperature", type=float, default=1.0)
     parser.add_argument("--value-scale", type=float, default=1.0)
     parser.add_argument(
+        "--value-squash",
+        choices=("tanh", "clip"),
+        default="tanh",
+        help=(
+            "Value nonlinearity consumed by MCTS. This is part of the teacher "
+            "contract; canonical production uses tanh."
+        ),
+    )
+    parser.add_argument(
         "--value-readout",
         choices=("scalar", "categorical"),
         default="scalar",
@@ -2717,6 +2726,7 @@ def _merge_worker_summaries(
             getattr(args, "boundary_value_particles", 1)
         ),
         "rust_featurize": bool(args.rust_featurize),
+        "value_squash": str(getattr(args, "value_squash", "tanh")),
         "value_readout": str(getattr(args, "value_readout", "scalar")),
         "checkpoint": args.checkpoint,
         "base_seed": int(args.base_seed),

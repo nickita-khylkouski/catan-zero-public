@@ -44,6 +44,7 @@ PIPELINE_LAUNCHERS = {
 TRAIN_LAUNCHERS = {
     "a1-current-35m-b200": "tools/a1_scratch_train.py",
     "a1-parent-update-35m-b200": "tools/train.py",
+    "a1-parent-update-active-p25-35m-b200": "tools/train.py",
 }
 PIPELINE_ACCELERATOR_MODELS = {
     "generate": "NVIDIA H100",
@@ -52,6 +53,7 @@ PIPELINE_ACCELERATOR_MODELS = {
 TRAIN_ACCELERATOR_MODELS = {
     "a1-current-35m-b200": "NVIDIA B200",
     "a1-parent-update-35m-b200": "NVIDIA B200",
+    "a1-parent-update-active-p25-35m-b200": "NVIDIA B200",
 }
 TRAINING_SCIENCE_ADMISSION = Path("configs/production/training_science_admission.json")
 TRAINING_SCIENCE_ADMISSION_SCHEMA = "catan-zero-training-science-admission-v1"

@@ -287,7 +287,7 @@ def test_status_exposes_v7_parent_and_scratch_as_fail_closed() -> None:
     assert parent["authorized"] is False
     assert parent["status"] == "blocked"
     assert parent["reason"] == ("v8_parent_update_requires_fresh_commissioning")
-    assert len(parent["unresolved_requirements"]) == 2
+    assert len(parent["unresolved_requirements"]) == 1
     assert status["pipelines"]["ppo"]["authorized"] is False
 
 
@@ -363,7 +363,7 @@ def test_cataloged_parent_update_uses_exact_blocked_v7_recipe_and_parent(
     )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
-        "85359773c9685b96079759912c65ead695d8c09216d784b0c81211965d36c3a1"
+        "0979e6c73a13c3a0af2e5427528b03dab9c1a240f9f808c0b933be168c561aca"
     )
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]
@@ -410,7 +410,7 @@ def test_training_science_admission_keeps_v5_quarantine_after_v6_commissioning()
         for requirement in scratch["unresolved_requirements"]
     )
     assert parent["authorized"] is False
-    assert len(parent["unresolved_requirements"]) == 2
+    assert len(parent["unresolved_requirements"]) == 1
 
     for admission in (scratch, parent):
         observations = admission["observations"]
@@ -424,7 +424,7 @@ def test_training_science_admission_keeps_v5_quarantine_after_v6_commissioning()
             "training_admission": False,
         }
     assert parent["observations"]["retained_composite_adapter_status"] == (
-        "v6_b12_evidence_retained_but_not_reused_for_v7_authorization"
+        "fresh_adapter_v6_composite_authenticated"
     )
 
 

@@ -2,7 +2,7 @@
   "schema_version": "catan-zero-training-science-admission-v1",
   "recipes": {
     "a1-current-35m-b200": {
-      "recipe_canonical_sha256": "5d5acaab429cf65b3bf7016730533c635cbaec3ebc9942448b5d204c264cc130",
+      "recipe_canonical_sha256": "7598181895c1c0bfa10ca5efc9be5b2bea10cf4580a6370ed3b6e9be847f459d",
       "authorized": false,
       "reason": "scratch_training_signal_contract_unresolved",
       "unresolved_requirements": [
@@ -78,6 +78,23 @@
         "docs/evidence/A1_COHERENT_V5_B12_SELECTION_20260717.json",
         "docs/evidence/A1_EFFECTIVE_POLICY_SIGNAL_AUDIT_20260716.json"
       ]
+    },
+    "a1-parent-update-active-p25-35m-b200": {
+      "recipe_canonical_sha256": "7c5c22e6a0fb7e4467fa26b76b1e7fb4169c6797853de18b48ac09cad9b1e0ef",
+      "authorized": false,
+      "reason": "active_policy_parent_treatment_requires_fresh_commissioning",
+      "unresolved_requirements": [
+        "commission active-policy p25 dose against exact f7 parent"
+      ],
+      "observations": {
+        "architecture_information_surface": "v6_b12_all_required_modules_positive_learning_signal",
+        "retained_composite_adapter_status": "fresh_adapter_v6_composite_authenticated",
+        "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
+        "active_policy_treatment": "policy_aux_active_batch_size_64_policy_aux_loss_weight_0.25",
+        "shared_trunk_lr_multiplier": 0.25,
+        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh"
+      },
+      "commissioning_evidence": []
     }
   }
 }
