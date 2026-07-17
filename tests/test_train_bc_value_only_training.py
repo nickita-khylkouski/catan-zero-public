@@ -71,7 +71,7 @@ def test_apply_lr_warmup_sets_every_param_group() -> None:
 # --------------------------------------------------------------------------- freeze utility
 
 
-def _make_entity_policy():
+def _make_entity_policy(**overrides):
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.self_play import make_env_config
 
@@ -81,6 +81,7 @@ def _make_entity_policy():
         state_layers=1,
         attention_heads=2,
         seed=0,
+        **overrides,
     )
 
 
@@ -96,6 +97,8 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "static_action_residual",
         "public_card_residual",
         "meaningful_history_gate",
+        "v7_resource_residual",
+        "v7_initial_road_residual",
     }
     assert "value_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
     assert "public_rule_state_residual" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
@@ -111,6 +114,7 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "edge_policy",
         "action_cross",
         "static_action_residual",
+        "v7_initial_road_residual",
     }
 
 
@@ -147,6 +151,27 @@ def test_set_entity_graph_modules_trainable_freezes_and_restores() -> None:
     assert all(p.requires_grad for p in policy.model.hex_encoder.parameters())
     # action_encoder/policy_head were not re-enabled -- still frozen.
     assert all(not p.requires_grad for p in policy.model.action_encoder.parameters())
+
+
+def test_value_only_freezes_complete_v7_policy_surface() -> None:
+    from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V6
+
+    policy = _make_entity_policy(
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+        v6_compatibility_preserving_inputs=True,
+        action_cross_attention_layers=1,
+    )
+    _set_entity_graph_modules_trainable(
+        policy.model, ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS, trainable=False
+    )
+    for module_name in (
+        "v6_exact_resource_residual",
+        "v6_initial_road_residual",
+    ):
+        assert all(
+            not parameter.requires_grad
+            for parameter in getattr(policy.model, module_name).parameters()
+        )
 
 
 def test_freeze_groups_are_explicit_not_data_driven() -> None:

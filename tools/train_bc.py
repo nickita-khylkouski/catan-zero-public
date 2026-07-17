@@ -36715,6 +36715,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "vertex_encoder",
         "edge_encoder",
         "player_encoder",
+        "v6_exact_resource_residual",
         "public_card_count_residual",
         "public_rule_state_residual",
         "global_encoder",
@@ -36746,6 +36747,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "meaningful_history_sequence",
         "meaningful_history_target_proj",
     ),
+    "v7_resource_residual": ("v6_exact_resource_residual",),
     "policy_head": ("action_bias", "logit_scale"),
     # Keep optional action-local adapters independently freezable.  Grouping
     # them together would make a gather+edge ablation silently update the
@@ -36754,6 +36756,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
     "edge_policy": ("edge_policy_mlp",),
     "action_cross": ("action_cross_blocks",),
     "static_action_residual": ("static_action_residual_proj",),
+    "v7_initial_road_residual": ("v6_initial_road_residual",),
     "value_heads": (
         "value_blocks",
         "value_state_norm",
@@ -36788,6 +36791,7 @@ ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS: frozenset[str] = frozenset(
         "edge_policy",
         "action_cross",
         "static_action_residual",
+        "v7_initial_road_residual",
     }
 )
 
@@ -37268,6 +37272,7 @@ ACTION_LOCAL_MODULE_ATTRS: tuple[str, ...] = (
     "action_cross_blocks",
     "edge_policy_mlp",
     "static_action_residual_proj",
+    "v6_initial_road_residual",
 )
 
 # Mature action-side representation shared by every legal action scored by the
