@@ -590,6 +590,10 @@ def build_train_command(
         ("--graph-dropout", "graph_dropout"),
         ("--entity-state-trunk", "entity_state_trunk"),
         ("--action-cross-attention-layers", "action_cross_attention_layers"),
+        (
+            "--action-cross-attention-bottleneck",
+            "action_cross_attention_bottleneck",
+        ),
         ("--value-tower-split-layers", "value_tower_split_layers"),
         ("--entity-feature-adapter-version", "entity_feature_adapter_version"),
         ("--meaningful-public-history-pooling", "meaningful_public_history_pooling"),

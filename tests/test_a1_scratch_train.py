@@ -220,6 +220,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     )
     assert command.count("--action-target-gather") == 1
     assert command[command.index("--action-cross-attention-layers") + 1] == "1"
+    assert command[command.index("--action-cross-attention-bottleneck") + 1] == "80"
     assert command.count("--topology-residual-adapter") == 1
     assert command.count("--legal-action-value-set-statistics") == 1
     assert command.count("--public-rule-state-features") == 1
@@ -374,6 +375,7 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     args = SimpleNamespace(
         action_target_gather=True,
         action_cross_attention_layers=1,
+        action_cross_attention_bottleneck=80,
         static_action_residual=True,
         legal_action_value_residual=True,
         legal_action_value_set_statistics=True,
@@ -405,6 +407,7 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
     assert policy.config.public_rule_state_features is True
     assert policy.config.action_target_gather is True
     assert policy.config.action_cross_attention_layers == 1
+    assert policy.config.action_cross_attention_bottleneck == 80
     assert (
         policy.entity_feature_adapter_version == model["entity_feature_adapter_version"]
     )
@@ -687,6 +690,9 @@ def _runtime_args() -> SimpleNamespace:
             action_cross_attention_layers=model[
                 "action_cross_attention_layers"
             ],
+            action_cross_attention_bottleneck=model[
+                "action_cross_attention_bottleneck"
+            ],
             topology_residual_adapter=model["topology_residual_adapter"],
             static_action_residual=model["static_action_residual"],
             legal_action_value_residual=model["legal_action_value_residual"],
@@ -733,6 +739,7 @@ def test_scratch_runtime_projection_accepts_every_current_field() -> None:
     (
         ("action_target_gather", False),
         ("action_cross_attention_layers", 0),
+        ("action_cross_attention_bottleneck", 0),
         ("topology_residual_adapter", False),
         ("static_action_residual", False),
         ("public_card_count_residual_bias", True),

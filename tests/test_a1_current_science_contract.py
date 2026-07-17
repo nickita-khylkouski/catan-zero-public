@@ -65,6 +65,7 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
     assert model["value_tower_split_layers"] == 1
     assert model["action_target_gather"] is True
     assert model["action_cross_attention_layers"] == 1
+    assert model["action_cross_attention_bottleneck"] == 80
     assert model["legal_action_value_set_statistics"] is True
     assert model["actor_public_rule_state"].startswith("dev_used_")
     assert recipe["value_trunk_grad_scale"] == 0.1
@@ -166,6 +167,11 @@ def test_current_contract_rejects_non_scratch_v6_initialization(
         (
             "research_scratch_model_construction",
             "action_cross_attention_layers",
+            0,
+        ),
+        (
+            "research_scratch_model_construction",
+            "action_cross_attention_bottleneck",
             0,
         ),
         ("research_scratch_model_construction", "max_parameter_count", 40_000_000),

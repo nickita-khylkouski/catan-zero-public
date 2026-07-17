@@ -20,6 +20,7 @@ def test_report_uses_upgraded_checkpoint_config_not_cli_default() -> None:
         config=SimpleNamespace(
             action_target_gather=True,
             action_cross_attention_layers=1,
+            action_cross_attention_bottleneck=80,
             edge_policy_head=True,
             aux_subgoal_heads=False,
             aux_settlement_pointer_head=True,
@@ -43,6 +44,7 @@ def test_report_uses_upgraded_checkpoint_config_not_cli_default() -> None:
 
     assert report["action_target_gather"] is True
     assert report["action_cross_attention_layers"] == 1
+    assert report["action_cross_attention_bottleneck"] == 80
     assert report["relational_action_cross_layers"] == 0
     assert report["configured_relational_action_cross_layers"] == 1
     assert report["edge_policy_head"] is True

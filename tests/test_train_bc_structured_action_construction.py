@@ -10,6 +10,7 @@ from catan_zero.rl.self_play import make_env_config
 from tools.train_bc import (
     _checkpoint_config_mismatches,
     _effective_a1_learner_training_recipe,
+    _resolve_effective_action_cross_attention_bottleneck,
     _resolve_effective_action_cross_attention_layers,
     _resolve_effective_action_target_gather,
     _resolve_effective_structured_action_residuals,
@@ -74,6 +75,8 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
             "--action-target-gather",
             "--action-cross-attention-layers",
             "1",
+            "--action-cross-attention-bottleneck",
+            "80",
             "--static-action-residual",
             "--legal-action-value-residual",
             "--legal-action-value-set-statistics",
@@ -81,6 +84,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
     )
     assert parser.get_default("action_target_gather") is None
     assert parser.get_default("action_cross_attention_layers") is None
+    assert parser.get_default("action_cross_attention_bottleneck") is None
     assert parser.get_default("topology_residual_adapter") is None
     assert parser.get_default("static_action_residual") is None
     assert parser.get_default("legal_action_value_residual") is None
@@ -94,15 +98,20 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
     parsed.action_cross_attention_layers = (
         _resolve_effective_action_cross_attention_layers(parsed)
     )
+    parsed.action_cross_attention_bottleneck = (
+        _resolve_effective_action_cross_attention_bottleneck(parsed)
+    )
     parsed.topology_residual_adapter = _resolve_effective_topology_residual_adapter(
         parsed
     )
 
     kwargs = _structured_action_create_kwargs(parsed)
     assert kwargs["action_cross_attention_layers"] == 1
+    assert kwargs["action_cross_attention_bottleneck"] == 80
     assert kwargs == {
         "action_target_gather": True,
         "action_cross_attention_layers": 1,
+        "action_cross_attention_bottleneck": 80,
         "static_action_residual": True,
         "legal_action_value_residual": True,
         "legal_action_value_set_statistics": True,
@@ -118,6 +127,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
     )
     assert policy.config.action_target_gather is True
     assert policy.config.action_cross_attention_layers == 1
+    assert policy.config.action_cross_attention_bottleneck == 80
     assert policy.config.static_action_residual is True
     assert policy.config.legal_action_value_residual is True
     assert policy.config.legal_action_value_set_statistics is True
@@ -128,6 +138,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
     identity = TrainConfig.from_namespace(parsed)
     assert identity.action_target_gather is True
     assert identity.action_cross_attention_layers == 1
+    assert identity.action_cross_attention_bottleneck == 80
     assert identity.topology_residual_adapter is False
     assert identity.static_action_residual is True
     assert identity.legal_action_value_residual is True
@@ -210,6 +221,8 @@ def test_action_cross_attention_is_checkpoint_owned_and_trunk_specific(
         ]
     )
     assert _resolve_effective_action_cross_attention_layers(parsed) == 1
+    parsed.action_cross_attention_layers = 1
+    assert _resolve_effective_action_cross_attention_bottleneck(parsed) == 0
     parsed.action_cross_attention_layers = 0
     with pytest.raises(SystemExit, match="does not match --init-checkpoint"):
         _resolve_effective_action_cross_attention_layers(parsed)
@@ -296,6 +309,7 @@ def test_checkpoint_mismatch_and_a1_recipe_bind_enabled_repairs() -> None:
         dropout=0.05,
         action_target_gather=False,
         action_cross_attention_layers=0,
+        action_cross_attention_bottleneck=0,
         topology_residual_adapter=False,
         static_action_residual=False,
         legal_action_value_residual=False,
@@ -309,6 +323,7 @@ def test_checkpoint_mismatch_and_a1_recipe_bind_enabled_repairs() -> None:
         graph_dropout=0.05,
         action_target_gather=True,
         action_cross_attention_layers=1,
+        action_cross_attention_bottleneck=80,
         topology_residual_adapter=True,
         static_action_residual=True,
         legal_action_value_residual=True,
@@ -320,6 +335,10 @@ def test_checkpoint_mismatch_and_a1_recipe_bind_enabled_repairs() -> None:
     assert any(item.startswith("action_target_gather ") for item in mismatches)
     assert any(
         item.startswith("action_cross_attention_layers ")
+        for item in mismatches
+    )
+    assert any(
+        item.startswith("action_cross_attention_bottleneck ")
         for item in mismatches
     )
     assert any(item.startswith("topology_residual_adapter ") for item in mismatches)

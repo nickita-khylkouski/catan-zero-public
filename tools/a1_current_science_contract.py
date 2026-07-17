@@ -191,6 +191,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "entity_state_trunk": "transformer",
     "action_target_gather": True,
     "action_cross_attention_layers": 1,
+    "action_cross_attention_bottleneck": 80,
     "topology_residual_adapter": True,
     "static_action_residual": True,
     "legal_action_value_residual": True,
@@ -250,7 +251,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "c2a1d4959817c2382312432bef567f21d45de7a5a0c3ccfcf1e6f58345d5c361"
+        "bd045678f723d7c9888b02da18432f76062a0ba314b0b510fd02563a84167b38"
     ),
     "initialization": {
         "mode": "parent_fresh_optimizer",

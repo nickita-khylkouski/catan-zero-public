@@ -622,6 +622,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--action-cross-attention-bottleneck",
+        type=int,
+        default=None,
+        help=(
+            "Transformer action-decoder Q/K/V and FF bottleneck width. Zero "
+            "selects the historical full-width block; a positive value selects "
+            "the budgeted V7 adapter. This is checkpoint-owned architecture and "
+            "must be divisible by --attention-heads."
+        ),
+    )
+    parser.add_argument(
         "--topology-residual-adapter",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -3691,6 +3702,41 @@ def _checkpoint_action_cross_attention_layers(checkpoint_path: str) -> int:
             f"{checkpoint_path} records invalid action_cross_attention_layers={layers}"
         )
     return layers
+
+
+def _checkpoint_action_cross_attention_bottleneck(checkpoint_path: str) -> int:
+    """Read or infer the checkpoint-owned action-decoder topology."""
+
+    import torch
+
+    from catan_zero.rl.config_serialization import config_attr_view
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "config" not in checkpoint:
+        raise SystemExit(
+            f"{checkpoint_path} is not a policy checkpoint with a config; cannot "
+            "resolve --action-cross-attention-bottleneck"
+        )
+    config = config_attr_view(checkpoint["config"])
+    bottleneck = int(
+        getattr(config, "action_cross_attention_bottleneck", 0) or 0
+    )
+    if bottleneck == 0:
+        model = checkpoint.get("model", {})
+        q_weights = [
+            value
+            for name, value in model.items()
+            if str(name).startswith("action_cross_blocks.")
+            and str(name).endswith(".attn.q_proj.weight")
+        ]
+        if q_weights:
+            bottleneck = int(q_weights[0].shape[0])
+    if bottleneck < 0:
+        raise SystemExit(
+            f"{checkpoint_path} records invalid "
+            f"action_cross_attention_bottleneck={bottleneck}"
+        )
+    return bottleneck
 
 
 def _checkpoint_topology_residual_adapter(checkpoint_path: str) -> bool:
@@ -10237,6 +10283,10 @@ def _validate_a1_scratch_runtime_projection(
             args.action_cross_attention_layers
         )
         != model["action_cross_attention_layers"],
+        "action_cross_attention_bottleneck": int(
+            args.action_cross_attention_bottleneck
+        )
+        != model["action_cross_attention_bottleneck"],
         "topology_residual_adapter": bool(
             getattr(args, "topology_residual_adapter", False)
         )
@@ -11283,6 +11333,7 @@ def _require_explicit_production_checkpoint_architecture(
         "public_rule_state_features",
         "action_target_gather",
         "action_cross_attention_layers",
+        "action_cross_attention_bottleneck",
         "topology_residual_adapter",
         "static_action_residual",
         "legal_action_value_residual",
@@ -12988,6 +13039,66 @@ def _resolve_effective_action_cross_attention_layers(
     return 0 if requested is None else requested
 
 
+def _resolve_effective_action_cross_attention_bottleneck(
+    args: argparse.Namespace,
+) -> int:
+    """Resolve the full-width-vs-budgeted Transformer decoder identity."""
+
+    requested_raw = getattr(args, "action_cross_attention_bottleneck", None)
+    requested = None if requested_raw is None else int(requested_raw)
+    if requested is not None and requested < 0:
+        raise SystemExit("--action-cross-attention-bottleneck must be >= 0")
+    if str(args.arch) != "entity_graph":
+        if requested not in (None, 0):
+            raise SystemExit(
+                "--action-cross-attention-bottleneck is supported only for "
+                "--arch entity_graph"
+            )
+        return 0
+    state_trunk = str(getattr(args, "entity_state_trunk", "transformer"))
+    if state_trunk != "transformer":
+        if requested not in (None, 0):
+            raise SystemExit(
+                "--action-cross-attention-bottleneck belongs to the "
+                "Transformer decoder"
+            )
+        return 0
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    if init_checkpoint:
+        inherited = _checkpoint_action_cross_attention_bottleneck(
+            init_checkpoint
+        )
+        if requested is not None and requested != inherited:
+            raise SystemExit(
+                "--action-cross-attention-bottleneck does not match "
+                f"--init-checkpoint: checkpoint={inherited} cli={requested}. "
+                "Use the matching reviewed architecture migration."
+            )
+        result = inherited
+    elif grow_checkpoint:
+        inherited = _checkpoint_action_cross_attention_bottleneck(
+            grow_checkpoint
+        )
+        result = inherited if requested is None else requested
+    else:
+        result = 0 if requested is None else requested
+    layers = int(getattr(args, "action_cross_attention_layers", 0) or 0)
+    if result > 0 and layers <= 0:
+        raise SystemExit(
+            "--action-cross-attention-bottleneck requires at least one "
+            "--action-cross-attention-layers"
+        )
+    heads = int(getattr(args, "attention_heads", 1) or 1)
+    if result > 0 and result % heads:
+        raise SystemExit(
+            "--action-cross-attention-bottleneck must be divisible by "
+            f"--attention-heads: bottleneck={result} heads={heads}"
+        )
+    return result
+
+
 def _resolve_effective_topology_residual_adapter(
     args: argparse.Namespace,
 ) -> bool:
@@ -13062,6 +13173,9 @@ def _structured_action_create_kwargs(
         "action_target_gather": bool(args.action_target_gather),
         "action_cross_attention_layers": int(
             args.action_cross_attention_layers
+        ),
+        "action_cross_attention_bottleneck": int(
+            args.action_cross_attention_bottleneck
         ),
         "static_action_residual": bool(args.static_action_residual),
         "legal_action_value_residual": bool(args.legal_action_value_residual),
@@ -14158,6 +14272,12 @@ def main(
     args.action_cross_attention_layers = (
         _resolve_effective_action_cross_attention_layers(checkpoint_args)
     )
+    checkpoint_args.action_cross_attention_layers = (
+        args.action_cross_attention_layers
+    )
+    args.action_cross_attention_bottleneck = (
+        _resolve_effective_action_cross_attention_bottleneck(checkpoint_args)
+    )
     args.topology_residual_adapter = (
         _resolve_effective_topology_residual_adapter(checkpoint_args)
     )
@@ -14182,6 +14302,7 @@ def main(
         "public_rule_state_features",
         "action_target_gather",
         "action_cross_attention_layers",
+        "action_cross_attention_bottleneck",
         "topology_residual_adapter",
         "static_action_residual",
         "legal_action_value_residual",
@@ -36386,6 +36507,11 @@ def _checkpoint_config_mismatches(
                 "action_cross_attention_layers",
                 0,
             ),
+            (
+                "action_cross_attention_bottleneck",
+                "action_cross_attention_bottleneck",
+                0,
+            ),
             ("relational_block_pattern", "relational_block_pattern", ""),
             ("relational_ff_size", "relational_ff_size", 0),
             ("relational_bases", "relational_bases", 4),
@@ -36932,6 +37058,7 @@ def _effective_entity_graph_architecture_report(
         return {
             "action_target_gather": False,
             "action_cross_attention_layers": 0,
+            "action_cross_attention_bottleneck": 0,
             "edge_policy_head": bool(requested_edge_policy_head),
             "aux_subgoal_heads": bool(requested_aux_subgoal_heads),
             "aux_settlement_pointer_head": bool(
@@ -36977,6 +37104,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "action_cross_attention_layers": int(
             getattr(config, "action_cross_attention_layers", 0) or 0
+        ),
+        "action_cross_attention_bottleneck": int(
+            getattr(config, "action_cross_attention_bottleneck", 0) or 0
         ),
         "edge_policy_head": bool(getattr(config, "edge_policy_head", False)),
         "aux_subgoal_heads": bool(getattr(config, "aux_subgoal_heads", False)),
@@ -42044,6 +42174,9 @@ def _training_resume_recipe_identity(
         ),
         "action_cross_attention_layers": int(
             getattr(args, "action_cross_attention_layers", 0) or 0
+        ),
+        "action_cross_attention_bottleneck": int(
+            getattr(args, "action_cross_attention_bottleneck", 0) or 0
         ),
         "value_tower_split_layers": int(
             getattr(args, "value_tower_split_layers", 0) or 0
