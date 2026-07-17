@@ -775,6 +775,12 @@ def _verify_final_initializer_transition_chain(
             source_checkpoint=producer_path,
             transitioned_checkpoint=transitioned_path,
             expected_origin_tool_sha256=scientific_evidence.origin_tool_sha256(),
+            expected_source_checkpoint_sha256=str(
+                transition_row["source_checkpoint_sha256"]
+            ),
+            expected_transitioned_checkpoint_sha256=str(
+                transition_row["output_checkpoint_sha256"]
+            ),
         )
     except (scientific_evidence.EvidenceError, OSError, ValueError) as error:
         raise PromotionError(

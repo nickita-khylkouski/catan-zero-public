@@ -1076,7 +1076,7 @@ def test_train_bc_config_values_count_as_explicit_guard_inputs(tmp_path):
 def test_train_bc_checkpoint_topology_runs_before_memmap_preflight(
     monkeypatch, tmp_path
 ):
-    """A warm-start topology mismatch must not first hash the data payload."""
+    """Topology pickle loads run only after descriptor/payload identity is stable."""
 
     class TopologyRefused(RuntimeError):
         pass
@@ -1117,4 +1117,4 @@ def test_train_bc_checkpoint_topology_runs_before_memmap_preflight(
             ]
         )
 
-    assert preflight_calls == []
+    assert len(preflight_calls) == 1

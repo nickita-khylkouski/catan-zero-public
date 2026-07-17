@@ -1286,6 +1286,10 @@ def verify_public_award_transition_authority(
             source_checkpoint=source_path,
             transitioned_checkpoint=transitioned_path,
             expected_origin_tool_sha256=expected_origin,
+            expected_source_checkpoint_sha256=str(source["sha256"]),
+            expected_transitioned_checkpoint_sha256=str(
+                transitioned["sha256"]
+            ),
         )
     except (scientific_evidence.EvidenceError, OSError, ValueError) as error:
         raise CoordinatorError(

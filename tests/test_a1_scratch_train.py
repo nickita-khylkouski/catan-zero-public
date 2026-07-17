@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -798,10 +799,301 @@ def test_fresh_production_composite_cannot_delete_scratch_marker(
     _, meta, _ = _authority_fixture(tmp_path)
     args = _runtime_args()
     args.a1_scratch_authority_json = ""
-    with pytest.raises(SystemExit, match="requires the sealed A1 scratch plan marker"):
-        train_bc._require_scratch_marker_for_fresh_production_composite(  # noqa: SLF001
+    with pytest.raises(SystemExit, match="exactly one sealed scratch or central"):
+        train_bc._require_production_composite_execution_authority(  # noqa: SLF001
             args, meta
         )
+
+
+def test_warm_production_composite_cannot_fall_back_to_descriptor_subset(
+    tmp_path: Path,
+) -> None:
+    _, meta, _ = _authority_fixture(tmp_path)
+    parent = tmp_path / "parent.pt"
+    parent.write_bytes(b"parent")
+    parent_sha = train_bc._sha256_existing_file(parent)  # noqa: SLF001
+    meta["flywheel_replay_contract"] = {
+        "initializer_checkpoint_path": str(parent.resolve()),
+        "initializer_checkpoint_sha256": parent_sha,
+    }
+    meta["learner_recipe_overrides"] = {
+        "per_game_policy_weight": True,
+        "per_game_policy_weight_mode": "equal",
+    }
+    args = _runtime_args()
+    args.init_checkpoint = str(parent.resolve())
+    args.value_loss_weight = 0.0
+    args.lr = 0.5
+    args.epochs = 999
+    args.max_steps = 999
+    args.a1_scratch_authority_json = ""
+    args.a1_central_learner_binding_json = ""
+
+    # This is the historical bypass: the descriptor authenticates only its
+    # listed subset, so trajectory-changing fields outside that subset pass.
+    train_bc._validate_composite_learner_recipe_authorization(args, meta)  # noqa: SLF001
+
+    with pytest.raises(SystemExit, match="exactly one sealed scratch or central"):
+        train_bc._require_production_composite_execution_authority(  # noqa: SLF001
+            args, meta
+        )
+
+
+def test_warm_production_composite_requires_central_not_scratch_authority(
+    tmp_path: Path,
+) -> None:
+    _, meta, authority = _authority_fixture(tmp_path)
+    parent = tmp_path / "parent.pt"
+    parent.write_bytes(b"parent")
+    meta["flywheel_replay_contract"] = {
+        "initializer_checkpoint_path": str(parent.resolve()),
+        "initializer_checkpoint_sha256": train_bc._sha256_existing_file(parent),  # noqa: SLF001
+    }
+    args = _runtime_args()
+    args.init_checkpoint = str(parent.resolve())
+    args.a1_scratch_authority_json = json.dumps(authority)
+    args.a1_central_learner_binding_json = ""
+
+    with pytest.raises(SystemExit, match="warm-start.*central learner authority"):
+        train_bc._require_production_composite_execution_authority(  # noqa: SLF001
+            args, meta
+        )
+
+
+def test_warm_production_composite_requires_exact_descriptor_initializer(
+    tmp_path: Path,
+) -> None:
+    _, meta, _ = _authority_fixture(tmp_path)
+    expected = tmp_path / "expected-parent.pt"
+    expected.write_bytes(b"expected")
+    other = tmp_path / "other-parent.pt"
+    other.write_bytes(b"other")
+    meta["flywheel_replay_contract"] = {
+        "initializer_checkpoint_path": str(expected.resolve()),
+        "initializer_checkpoint_sha256": train_bc._sha256_existing_file(expected),  # noqa: SLF001
+    }
+    args = _runtime_args()
+    args.init_checkpoint = str(other.resolve())
+    args.a1_scratch_authority_json = ""
+    args.a1_central_learner_binding_json = "{}"
+
+    with pytest.raises(SystemExit, match="exact descriptor initializer"):
+        train_bc._require_production_composite_execution_authority(  # noqa: SLF001
+            args, meta
+        )
+
+
+def test_production_composite_refuses_multiple_execution_authorities(
+    tmp_path: Path,
+) -> None:
+    _, meta, authority = _authority_fixture(tmp_path)
+    args = _runtime_args()
+    args.a1_scratch_authority_json = json.dumps(authority)
+    args.a1_central_learner_binding_json = "{}"
+
+    with pytest.raises(SystemExit, match="exactly one sealed scratch or central"):
+        train_bc._require_production_composite_execution_authority(  # noqa: SLF001
+            args, meta
+        )
+
+
+def test_warm_production_composite_requires_full_replay_after_byte_preflight(
+    tmp_path: Path,
+) -> None:
+    _, meta, _ = _authority_fixture(tmp_path)
+    parent = (tmp_path / "parent.pt").resolve()
+    parent.write_bytes(b"parent")
+    parent_sha = train_bc._sha256_existing_file(parent)  # noqa: SLF001
+    meta["flywheel_replay_contract"] = {
+        "initializer_checkpoint_path": str(parent),
+        "initializer_checkpoint_sha256": parent_sha,
+    }
+    executor_authority = (tmp_path / "executor-authority.json").resolve()
+    executor_authority.write_text("{}\n", encoding="utf-8")
+    executor_sha = train_bc._sha256_existing_file(executor_authority)  # noqa: SLF001
+    immutable_recipe = {"lr": 6e-5}
+    effective_recipe = {"lr": 6e-5, "world_size": 8}
+    central = {
+        "schema_version": "a1-central-learner-binding-v3",
+        "initializer_sha256": parent_sha,
+        "immutable_contract_recipe": immutable_recipe,
+        "immutable_contract_recipe_sha256": train_bc._canonical_json_sha256(  # noqa: SLF001
+            immutable_recipe
+        ),
+        "effective_recipe": effective_recipe,
+        "effective_recipe_sha256": train_bc._canonical_json_sha256(  # noqa: SLF001
+            effective_recipe
+        ),
+        "executor_authority_path": str(executor_authority),
+        "executor_authority_file_sha256": executor_sha,
+        "sample_binding": {
+            "descriptor_sha256": meta["descriptor_file_sha256"],
+            "payload_inventory_sha256": meta["payload_inventory_sha256"],
+            "category_semantics": meta.get("category_semantics"),
+            "category_semantics_sha256": meta.get("category_semantics_sha256"),
+            "source_authority": meta["source_authority_ref"],
+        },
+    }
+    args = _runtime_args()
+    args.init_checkpoint = str(parent)
+    args.a1_scratch_authority_json = ""
+    args.a1_central_learner_binding_json = json.dumps(central)
+    args.a1_central_executor_authority = str(executor_authority)
+    args.a1_central_executor_authority_sha256 = executor_sha
+
+    train_bc._require_production_composite_execution_authority(  # noqa: SLF001
+        args, meta
+    )
+    with pytest.raises(SystemExit, match="central learner binding shape drift"):
+        train_bc._validate_production_composite_execution_authority_before_payloads(  # noqa: SLF001
+            args,
+            {"enabled": False, "rank": 0, "local_rank": 0, "world_size": 8},
+            meta,
+        )
+
+
+def test_production_authority_precedes_checkpoint_payload_cuda_and_corpus() -> None:
+    source = inspect.getsource(train_bc.main)
+    metadata = source.index(
+        "_preflight_production_composite_authority_metadata("
+    )
+    select_authority = source.index(
+        "_require_production_composite_execution_authority("
+    )
+    complete_authority = source.index(
+        "_validate_production_composite_execution_authority_before_payloads("
+    )
+    checkpoint_resolvers = [
+        source.index(call)
+        for call in (
+            "_resolve_effective_value_categorical_bins(",
+            "_resolve_effective_public_card_count_features(",
+            "_resolve_effective_public_card_count_residual_bias(",
+            "_resolve_effective_public_rule_state_features(",
+            "_resolve_effective_action_target_gather(",
+            "_resolve_effective_structured_action_residuals(",
+            "_resolve_effective_value_tower_split_layers(",
+            "_resolve_effective_meaningful_public_history(",
+        )
+    ]
+    checkpoint = source.index("_preflight_init_checkpoint_architecture(")
+    payload = source.index("_coordinated_a1_memmap_preflight(")
+    snapshot = source.index("_snapshot_authenticated_production_initializer(")
+    cheap_guards = source.index("launcher_guards.run_or_refuse(")
+    pickle_guards = source.rindex("launcher_guards.run_or_refuse(")
+    cuda = source.index("torch.cuda.set_device(")
+    corpus = source.index("load_teacher_data_memmap(")
+
+    assert (
+        metadata
+        < select_authority
+        < complete_authority
+        < payload
+        < snapshot
+        < pickle_guards
+        < min(checkpoint_resolvers)
+        < checkpoint
+        < cuda
+        < corpus
+    )
+    assert cheap_guards < metadata
+    assert "EntityGraphPolicy.load(\n                    checkpoint_load_path," in source
+    assert "XDimLitePolicy.load(\n                    checkpoint_load_path," in source
+
+
+def test_diagnostic_to_production_descriptor_race_is_refused() -> None:
+    early = {
+        "authority_preflight_kind": "descriptor",
+        "schema_version": "memmap_composite_v2",
+        "diagnostic_only": True,
+        "promotion_eligible": False,
+        "descriptor_path": "/tmp/descriptor.json",
+        "descriptor_file_sha256": "sha256:" + "1" * 64,
+        "descriptor_fingerprint": "sha256:" + "2" * 64,
+    }
+    full = {
+        **early,
+        "diagnostic_only": False,
+        "promotion_eligible": True,
+        "descriptor_file_sha256": "sha256:" + "3" * 64,
+        "descriptor_fingerprint": "sha256:" + "4" * 64,
+    }
+
+    with pytest.raises(SystemExit, match="changed during full payload preflight"):
+        train_bc._validate_composite_authority_metadata_parity(  # noqa: SLF001
+            early,
+            full,
+        )
+
+
+def test_late_production_descriptor_after_non_file_preflight_is_refused() -> None:
+    with pytest.raises(SystemExit, match="appeared after the authority"):
+        train_bc._validate_composite_authority_metadata_parity(  # noqa: SLF001
+            {
+                "authority_preflight_kind": "non_file",
+                "input_path": "/tmp/descriptor.json",
+            },
+            {
+                "schema_version": "memmap_composite_v2",
+                "promotion_eligible": True,
+            },
+        )
+
+
+def test_central_production_requires_explicit_checkpoint_architecture(
+    tmp_path: Path,
+) -> None:
+    _, meta, _ = _authority_fixture(tmp_path)
+    args = _runtime_args()
+    args.a1_central_learner_binding_json = "{}"
+    args.public_rule_state_features = None
+
+    with pytest.raises(SystemExit, match="public_rule_state_features"):
+        train_bc._require_explicit_production_checkpoint_architecture(  # noqa: SLF001
+            args,
+            meta,
+        )
+
+
+def test_central_production_requires_explicit_topology_adapter(
+    tmp_path: Path,
+) -> None:
+    _, meta, _ = _authority_fixture(tmp_path)
+    args = _runtime_args()
+    args.a1_central_learner_binding_json = "{}"
+    args.topology_residual_adapter = None
+
+    with pytest.raises(SystemExit, match="topology_residual_adapter"):
+        train_bc._require_explicit_production_checkpoint_architecture(  # noqa: SLF001
+            args,
+            meta,
+        )
+
+
+def test_authenticated_initializer_snapshot_pins_verified_bytes(
+    tmp_path: Path,
+) -> None:
+    initializer = (tmp_path / "initializer.pt").resolve()
+    initializer.write_bytes(b"authorized checkpoint bytes")
+    expected_sha256 = train_bc._sha256_existing_file(initializer)  # noqa: SLF001
+    args = SimpleNamespace(
+        init_checkpoint=str(initializer),
+        init_checkpoint_sha256=expected_sha256,
+    )
+    snapshot, owner = train_bc._snapshot_authenticated_production_initializer(  # noqa: SLF001
+        args,
+        {
+            "schema_version": "memmap_composite_v2",
+            "promotion_eligible": True,
+        },
+    )
+    assert owner is not None
+    try:
+        initializer.write_bytes(b"replaced after authority")
+        assert Path(snapshot).read_bytes() == b"authorized checkpoint bytes"
+        assert train_bc._sha256_existing_file(snapshot) == expected_sha256  # noqa: SLF001
+    finally:
+        owner.cleanup()
 
 
 def test_exact_scratch_plan_binding_accepts_authenticated_inputs(

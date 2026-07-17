@@ -371,6 +371,12 @@ def test_public_award_initializer_transition_is_exact_and_replayable(
         source_checkpoint=source,
         transitioned_checkpoint=transitioned,
         expected_origin_tool_sha256=evidence.origin_tool_sha256(),
+        expected_source_checkpoint_sha256=receipt[
+            "source_checkpoint_sha256"
+        ],
+        expected_transitioned_checkpoint_sha256=receipt[
+            "transitioned_checkpoint_sha256"
+        ],
     )
     assert replay["source_checkpoint_sha256"] == evidence._file_sha256(source)
     assert replay["transitioned_checkpoint_sha256"] == evidence._file_sha256(
@@ -384,6 +390,38 @@ def test_public_award_initializer_transition_is_exact_and_replayable(
         raw["model"]["model.player_encoder.0.weight"][:, 12]
     ).item() == 0
     assert torch.equal(raw["model"]["model.trunk.weight"], trunk)
+
+
+def test_authenticated_checkpoint_load_uses_hashed_descriptor_after_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch = pytest.importorskip("torch")
+    checkpoint = tmp_path / "checkpoint.pt"
+    displaced = tmp_path / "checkpoint.authenticated.pt"
+    torch.save({"identity": "authenticated"}, checkpoint)
+    expected_sha256 = evidence._file_sha256(checkpoint)
+    real_load = torch.load
+
+    def replace_path_then_load(handle, *args, **kwargs):
+        checkpoint.rename(displaced)
+        torch.save({"identity": "replacement"}, checkpoint)
+        return real_load(handle, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", replace_path_then_load)
+    actual_sha256, payload = evidence._load_checkpoint_after_digest(
+        checkpoint,
+        expected_sha256=expected_sha256,
+        where="test checkpoint",
+    )
+
+    assert actual_sha256 == expected_sha256
+    assert payload == {"identity": "authenticated"}
+    assert real_load(
+        checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    ) == {"identity": "replacement"}
 
 
 def test_public_award_initializer_transition_rejects_tampered_non_slot12_tensor(

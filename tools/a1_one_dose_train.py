@@ -6562,6 +6562,12 @@ def bind_function_preserving_upgrade(
                 source_transition_evidence = aux_coordinator.scientific_evidence._public_award_transition_evidence(  # noqa: SLF001
                     Path(verified["producer"]["path"]),
                     Path(upgrade["source"]["path"]),
+                    expected_source_sha256=str(
+                        verified["producer"]["sha256"]
+                    ),
+                    expected_transitioned_sha256=str(
+                        upgrade["source"]["sha256"]
+                    ),
                 )
             except (
                 OSError,

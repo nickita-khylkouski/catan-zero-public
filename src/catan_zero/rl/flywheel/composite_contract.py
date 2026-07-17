@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import BinaryIO, Mapping, Sequence
 
 import numpy as np
 
@@ -41,6 +41,7 @@ def _fixed_column(
     corpus_dir: Path,
     corpus_meta: Mapping[str, object],
     name: str,
+    authenticated_files: Mapping[str, BinaryIO] | None = None,
 ) -> np.ndarray:
     columns = corpus_meta.get("columns")
     if not isinstance(columns, dict) or not isinstance(columns.get(name), dict):
@@ -56,8 +57,13 @@ def _fixed_column(
     if kind != "fixed":
         raise ValueError(f"memmap {name} must be a fixed scalar column")
     inner = tuple(int(value) for value in schema.get("inner_shape", ()))
+    filename = f"{name}.dat"
+    source: Path | BinaryIO = corpus_dir / filename
+    if authenticated_files is not None and filename in authenticated_files:
+        source = authenticated_files[filename]
+        source.seek(0)
     values = np.memmap(
-        corpus_dir / f"{name}.dat",
+        source,
         dtype=np.dtype(schema["dtype"]),
         mode="r",
         shape=(row_count, *inner),
@@ -66,7 +72,10 @@ def _fixed_column(
 
 
 def measure_memmap_component(
-    corpus_dir: str | Path, corpus_meta: Mapping[str, object]
+    corpus_dir: str | Path,
+    corpus_meta: Mapping[str, object],
+    *,
+    authenticated_files: Mapping[str, BinaryIO] | None = None,
 ) -> dict[str, object]:
     """Measure game, row, and policy-active mass from authenticated payloads."""
 
@@ -74,9 +83,17 @@ def measure_memmap_component(
     row_count = int(corpus_meta.get("row_count", -1))
     if row_count <= 0 or corpus_meta.get("game_seed_present") is not True:
         raise ValueError("promotion-eligible component needs non-empty game_seed data")
-    seeds = _fixed_column(root, corpus_meta, "game_seed").reshape(-1)
+    seeds = _fixed_column(
+        root,
+        corpus_meta,
+        "game_seed",
+        authenticated_files,
+    ).reshape(-1)
     policy_mass = _fixed_column(
-        root, corpus_meta, "policy_weight_multiplier"
+        root,
+        corpus_meta,
+        "policy_weight_multiplier",
+        authenticated_files,
     ).astype(np.float64, copy=False).reshape(-1)
     if seeds.size != row_count or policy_mass.size != row_count:
         raise ValueError("component mass columns do not match corpus row_count")

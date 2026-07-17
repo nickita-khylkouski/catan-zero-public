@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import operator
 from pathlib import Path
+from typing import BinaryIO, Mapping
 
 import numpy as np
 
@@ -397,15 +398,45 @@ class MemmapRowOffsetsColumn:
 class MemmapCorpus:
     """Dict-of-arrays view over a production teacher memmap corpus."""
 
-    def __init__(self, corpus_dir: Path):
+    def __init__(
+        self,
+        corpus_dir: Path,
+        *,
+        authenticated_files: Mapping[str, BinaryIO] | None = None,
+        authenticated_meta: Mapping[str, object] | None = None,
+    ):
         corpus_dir = Path(corpus_dir)
+        self._authenticated_files = (
+            {} if authenticated_files is None else dict(authenticated_files)
+        )
+
+        def source(path: Path):
+            handle = self._authenticated_files.get(path.name)
+            if handle is None:
+                return path
+            handle.seek(0)
+            return handle
+
         meta_path = corpus_dir / "corpus_meta.json"
-        if not meta_path.exists():
+        meta_handle = self._authenticated_files.get("corpus_meta.json")
+        if (
+            authenticated_meta is None
+            and meta_handle is None
+            and not meta_path.exists()
+        ):
             raise SystemExit(
                 f"{corpus_dir} is not a memmap corpus (no corpus_meta.json). "
                 "Build it with tools/build_memmap_corpus.py or use --data-format npz."
             )
-        self.meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if authenticated_meta is not None:
+            self.meta = dict(authenticated_meta)
+        elif meta_handle is None:
+            raw_meta = meta_path.read_text(encoding="utf-8")
+            self.meta = json.loads(raw_meta)
+        else:
+            meta_handle.seek(0)
+            raw_meta = meta_handle.read().decode("utf-8")
+            self.meta = json.loads(raw_meta)
         if self.meta.get("schema") not in {"memmap_corpus_v1", "memmap_corpus_v2"}:
             raise SystemExit(
                 f"{meta_path}: unsupported corpus schema {self.meta.get('schema')!r}"
@@ -471,7 +502,7 @@ class MemmapCorpus:
             label=str(meta_path),
         )
         self._offsets = np.memmap(
-            shared_offsets_path,
+            source(shared_offsets_path),
             dtype=np.int64,
             mode="r",
             shape=(self.row_count + 1,),
@@ -501,7 +532,7 @@ class MemmapCorpus:
                 label=str(meta_path),
             )
             offsets = np.memmap(
-                path,
+                source(path),
                 dtype=dtype,
                 mode="r",
                 shape=(self.row_count + 1,),
@@ -527,7 +558,7 @@ class MemmapCorpus:
                 )
                 codes = (
                     np.memmap(
-                        path,
+                        source(path),
                         dtype=np.int32,
                         mode="r",
                         shape=(self.row_count,),
@@ -563,7 +594,7 @@ class MemmapCorpus:
                 shape = (self.row_count, *inner)
                 mm = (
                     np.memmap(
-                        path,
+                        source(path),
                         dtype=dtype,
                         mode="r",
                         shape=shape,
@@ -605,7 +636,7 @@ class MemmapCorpus:
                 )
                 flat = (
                     np.memmap(
-                        path,
+                        source(path),
                         dtype=dtype,
                         mode="r",
                         shape=(independent_flat_count,),
@@ -642,7 +673,7 @@ class MemmapCorpus:
             )
             flat = (
                 np.memmap(
-                    path,
+                    source(path),
                     dtype=dtype,
                     mode="r",
                     shape=flat_shape,

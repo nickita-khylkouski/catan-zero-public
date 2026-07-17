@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from catan_zero.rl.flywheel.composite_contract import measure_memmap_component
 from tools import train_bc
 from tools.mixed_memmap_corpus import ConcatMemmapCorpus
 
@@ -1344,3 +1345,162 @@ def test_prefetch_masks_historical_aux_but_preserves_policy_value_weights():
     # policy/value learner while its pre-v1 aux labels receive zero gradient.
     assert policy_batch.tolist() == [3.0, 4.0]
     assert value_batch.tolist() == [30.0, 40.0]
+
+
+def test_expected_descriptor_identity_refuses_before_payload_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = _descriptor(tmp_path)
+    expected = _sha(descriptor)
+    descriptor.write_text(descriptor.read_text() + "\n", encoding="utf-8")
+    payload_scans: list[Path] = []
+    monkeypatch.setattr(
+        train_bc,
+        "_validate_memmap_payload_inventory",
+        lambda path, _meta: payload_scans.append(Path(path)),
+    )
+
+    with pytest.raises(SystemExit, match="changed after authority preflight"):
+        train_bc._preflight_memmap_composite_descriptor(  # noqa: SLF001
+            descriptor,
+            expected_descriptor_file_sha256=expected,
+        )
+    assert payload_scans == []
+
+
+def test_late_production_descriptor_refuses_before_payload_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = _descriptor_v2(tmp_path)
+    value = json.loads(descriptor.read_text())
+    value["diagnostic_only"] = False
+    value["promotion_eligible"] = True
+    descriptor.write_text(json.dumps(value), encoding="utf-8")
+    payload_scans: list[Path] = []
+    monkeypatch.setattr(
+        train_bc,
+        "_validate_memmap_payload_inventory",
+        lambda path, _meta: payload_scans.append(Path(path)),
+    )
+
+    with pytest.raises(SystemExit, match="appeared after the authority"):
+        train_bc._preflight_memmap_composite_descriptor(  # noqa: SLF001
+            descriptor,
+            production_authority_preflight_completed=False,
+        )
+    assert payload_scans == []
+
+
+def test_payload_runtime_binding_refuses_writable_or_replaced_bytes(
+    tmp_path: Path,
+) -> None:
+    verified = train_bc._preflight_memmap_composite_descriptor(  # noqa: SLF001
+        _descriptor(tmp_path)
+    )
+    binding = verified["components"][0]["payload_runtime_binding"]
+    with pytest.raises(SystemExit, match="requires read-only"):
+        train_bc._validate_memmap_payload_runtime_binding(  # noqa: SLF001
+            binding,
+            require_read_only=True,
+        )
+
+    files = binding["files"]
+    for name in files:
+        (Path(binding["corpus_dir"]) / name).chmod(0o444)
+    read_only_binding = train_bc._memmap_payload_runtime_binding(  # noqa: SLF001
+        Path(binding["corpus_dir"]),
+        verified["components"][0]["corpus_meta"],
+    )
+    train_bc._validate_memmap_payload_runtime_binding(  # noqa: SLF001
+        read_only_binding,
+        require_read_only=True,
+    )
+    opened = train_bc._open_authenticated_memmap_payloads(  # noqa: SLF001
+        read_only_binding,
+        require_read_only=True,
+    )
+
+    payload = Path(binding["corpus_dir"]) / "game_seed.dat"
+    original_bytes = payload.read_bytes()
+    replacement = tmp_path / "replacement.dat"
+    replacement.write_bytes(original_bytes)
+    replacement.chmod(0o444)
+    replacement.replace(payload)
+    with pytest.raises(SystemExit, match="identity changed"):
+        train_bc._validate_memmap_payload_runtime_binding(  # noqa: SLF001
+            read_only_binding,
+            require_read_only=True,
+        )
+    transported_binding = train_bc._memmap_payload_runtime_binding(  # noqa: SLF001
+        Path(binding["corpus_dir"]),
+        verified["components"][0]["corpus_meta"],
+        authenticated_identities=list(read_only_binding["files"].values()),
+    )
+    with pytest.raises(SystemExit, match="inode changed before open"):
+        train_bc._open_authenticated_memmap_payloads(  # noqa: SLF001
+            transported_binding,
+            require_read_only=True,
+        )
+    try:
+        train_bc._validate_open_authenticated_memmap_payloads(  # noqa: SLF001
+            read_only_binding,
+            opened,
+        )
+        opened["game_seed.dat"].seek(0)
+        assert opened["game_seed.dat"].read() == original_bytes
+    finally:
+        for handle in opened.values():
+            handle.close()
+
+
+def test_component_mass_measurement_uses_authenticated_handles_after_path_swap(
+    tmp_path: Path,
+) -> None:
+    corpus = tmp_path / "mass"
+    corpus.mkdir()
+    seeds_path = corpus / "game_seed.dat"
+    weights_path = corpus / "policy_weight_multiplier.dat"
+    seeds_path.write_bytes(np.asarray([7, 7], dtype="<i8").tobytes())
+    weights_path.write_bytes(np.asarray([1.0, 1.0], dtype="<f4").tobytes())
+    meta = {
+        "row_count": 2,
+        "game_seed_present": True,
+        "columns": {
+            "game_seed": {
+                "kind": "fixed",
+                "dtype": "<i8",
+                "inner_shape": [],
+            },
+            "policy_weight_multiplier": {
+                "kind": "fixed",
+                "dtype": "<f4",
+                "inner_shape": [],
+            },
+        },
+    }
+    opened = {
+        "game_seed.dat": seeds_path.open("rb"),
+        "policy_weight_multiplier.dat": weights_path.open("rb"),
+    }
+    try:
+        seeds_path.unlink()
+        weights_path.unlink()
+        seeds_path.write_bytes(np.asarray([7, 8], dtype="<i8").tobytes())
+        weights_path.write_bytes(np.asarray([0.0, 0.0], dtype="<f4").tobytes())
+
+        authenticated = measure_memmap_component(
+            corpus,
+            meta,
+            authenticated_files=opened,
+        )
+        replacement = measure_memmap_component(corpus, meta)
+    finally:
+        for handle in opened.values():
+            handle.close()
+
+    assert authenticated["game_count"] == 1
+    assert authenticated["policy_active_row_count"] == 2
+    assert replacement["game_count"] == 2
+    assert replacement["policy_active_row_count"] == 0

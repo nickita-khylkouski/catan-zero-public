@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import io
 import json
 import math
 import os
@@ -152,6 +153,49 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _load_checkpoint_after_digest(
+    path: Path,
+    *,
+    expected_sha256: str | None,
+    where: str,
+) -> tuple[str, Any]:
+    """Hash a pinned checkpoint descriptor before any pickle-capable load."""
+
+    import torch
+
+    resolved = path.expanduser().resolve(strict=True)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    descriptor = os.open(resolved, flags)
+    try:
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise EvidenceError(f"{where} must be a regular file")
+            chunks = list(iter(lambda: handle.read(1 << 20), b""))
+            authenticated_bytes = b"".join(chunks)
+            del chunks
+            actual_sha256 = (
+                "sha256:" + hashlib.sha256(authenticated_bytes).hexdigest()
+            )
+            if (
+                expected_sha256 is not None
+                and actual_sha256 != expected_sha256
+            ):
+                raise EvidenceError(
+                    f"{where} digest differs before checkpoint deserialization"
+                )
+            payload = torch.load(
+                io.BytesIO(authenticated_bytes),
+                map_location="cpu",
+                weights_only=False,
+            )
+    except OSError as error:
+        raise EvidenceError(f"cannot read {where}: {error}") from error
+    return actual_sha256, payload
 
 
 def origin_tool_sha256() -> str:
@@ -864,7 +908,11 @@ def _checkpoint_value_equal(left: Any, right: Any) -> bool:
 
 
 def _public_award_transition_evidence(
-    source_checkpoint: Path, transitioned_checkpoint: Path
+    source_checkpoint: Path,
+    transitioned_checkpoint: Path,
+    *,
+    expected_source_sha256: str | None = None,
+    expected_transitioned_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Replay the only legal legacy->authoritative initializer mutation."""
 
@@ -872,10 +920,16 @@ def _public_award_transition_evidence(
 
     source = source_checkpoint.expanduser().resolve(strict=True)
     transitioned = transitioned_checkpoint.expanduser().resolve(strict=True)
-    source_sha = _file_sha256(source)
-    transitioned_sha = _file_sha256(transitioned)
-    before = torch.load(source, map_location="cpu", weights_only=False)
-    after = torch.load(transitioned, map_location="cpu", weights_only=False)
+    source_sha, before = _load_checkpoint_after_digest(
+        source,
+        expected_sha256=expected_source_sha256,
+        where="public-award transition source checkpoint",
+    )
+    transitioned_sha, after = _load_checkpoint_after_digest(
+        transitioned,
+        expected_sha256=expected_transitioned_sha256,
+        where="public-award transitioned checkpoint",
+    )
     if not isinstance(before, Mapping) or not isinstance(after, Mapping):
         raise EvidenceError("public-award transition checkpoint root is malformed")
     source_contract = str(
@@ -1326,6 +1380,8 @@ def verify_public_award_transition_receipt(
     source_checkpoint: Path,
     transitioned_checkpoint: Path,
     expected_origin_tool_sha256: str,
+    expected_source_checkpoint_sha256: str,
+    expected_transitioned_checkpoint_sha256: str,
 ) -> dict[str, Any]:
     receipt = _load_sealed(
         path,
@@ -1333,7 +1389,10 @@ def verify_public_award_transition_receipt(
         expected_origin_tool_sha256=expected_origin_tool_sha256,
     )
     replay = _public_award_transition_evidence(
-        source_checkpoint, transitioned_checkpoint
+        source_checkpoint,
+        transitioned_checkpoint,
+        expected_source_sha256=expected_source_checkpoint_sha256,
+        expected_transitioned_sha256=expected_transitioned_checkpoint_sha256,
     )
     if receipt != replay:
         raise EvidenceError(

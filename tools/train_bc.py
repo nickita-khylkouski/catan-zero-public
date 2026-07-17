@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, BinaryIO, Mapping, Sequence
 
 # A script path does not bind Python imports to the same checkout.  In particular,
 # ``python /new/checkout/tools/train_bc.py`` can otherwise import ``catan_zero``
@@ -4345,7 +4345,11 @@ def _require_exact_flywheel_category_semantics(
     return canonical
 
 
-def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
+def _validate_flywheel_source_authority(
+    path: Path,
+    *,
+    authenticated_payload: Mapping[str, object] | None = None,
+) -> dict[str, object]:
     """Validate the portable pre-descriptor wave authority.
 
     Large raw shards are authenticated while the composite is built and remain
@@ -4354,10 +4358,19 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
     interpret the preimages is copied into the composite authority bundle.
     """
 
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise SystemExit(f"cannot load flywheel source authority {path}: {error}") from error
+    if authenticated_payload is None:
+        try:
+            _, _, raw_payload = _stable_canonical_regular_file(
+                path,
+                where="flywheel source authority",
+            )
+            payload = json.loads(raw_payload.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"cannot load flywheel source authority {path}: {error}"
+            ) from error
+    else:
+        payload = dict(authenticated_payload)
     expected = {
         "schema_version",
         "canonical_composite_root",
@@ -4417,16 +4430,21 @@ def _validate_flywheel_source_authority(path: Path) -> dict[str, object]:
         if not isinstance(raw, dict) or set(raw) != fields:
             raise SystemExit("flywheel source authority artifact fields drift")
         try:
-            artifact = Path(str(raw["path"])).expanduser().resolve(strict=True)
-            value = json.loads(artifact.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            artifact, artifact_sha256, artifact_bytes = (
+                _stable_canonical_regular_file(
+                    str(raw["path"]),
+                    where="flywheel source authority artifact",
+                )
+            )
+            value = json.loads(artifact_bytes.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
             raise SystemExit(
                 f"cannot load flywheel source authority artifact: {error}"
             ) from error
         if (
             not isinstance(value, dict)
             or str(artifact) != raw["path"]
-            or _sha256_existing_file(artifact) != raw["file_sha256"]
+            or artifact_sha256 != raw["file_sha256"]
         ):
             raise SystemExit("flywheel source authority artifact byte binding drift")
         if kind == "contract":
@@ -4986,15 +5004,26 @@ def _validate_flywheel_component_provenance(
     component_id: str,
     corpus_dir: Path,
     corpus_meta: dict[str, object],
+    authenticated_payload: Mapping[str, object] | None = None,
+    authenticated_corpus_files: Mapping[str, BinaryIO] | None = None,
     source_authority_ref: dict[str, str] | None = None,
     allowed_source_ids: set[str] | None = None,
 ) -> dict[str, object]:
     """Authenticate the exact shards and producer checkpoints in one replay arm."""
 
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise SystemExit(f"cannot load flywheel component provenance {path}: {error}") from error
+    if authenticated_payload is None:
+        try:
+            _, _, raw_payload = _stable_canonical_regular_file(
+                path,
+                where="flywheel component provenance",
+            )
+            payload = json.loads(raw_payload.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"cannot load flywheel component provenance {path}: {error}"
+            ) from error
+    else:
+        payload = dict(authenticated_payload)
     expected = {
         "schema_version",
         "component_id",
@@ -5214,7 +5243,11 @@ def _validate_flywheel_component_provenance(
     ):
         raise SystemExit("flywheel component row count differs from authenticated shards")
     try:
-        actual_mass = measure_memmap_component(corpus_dir, corpus_meta)
+        actual_mass = measure_memmap_component(
+            corpus_dir,
+            corpus_meta,
+            authenticated_files=authenticated_corpus_files,
+        )
     except ValueError as error:
         raise SystemExit(f"cannot measure flywheel component sampler mass: {error}") from error
     if payload.get("component_mass") != actual_mass:
@@ -5519,7 +5552,12 @@ def _preflight_flywheel_diagnostic_derivative(
     return result
 
 
-def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object]:
+def _preflight_memmap_composite_descriptor(
+    path: str | Path,
+    *,
+    expected_descriptor_file_sha256: str | None = None,
+    production_authority_preflight_completed: bool = True,
+) -> dict[str, object]:
     """Authenticate an ordered diagnostic-only no-copy descriptor.
 
     V1 remains the exact historical two-component format. V2 admits two or
@@ -5528,10 +5566,22 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
     anchor. This prevents a current but regressed producer from silently
     becoming the policy that a recovery run preserves.
     """
-    descriptor_path = Path(path).expanduser().resolve(strict=True)
+    descriptor_path, descriptor_file_sha256, raw_descriptor = (
+        _stable_canonical_regular_file(
+            path,
+            where="memmap composite descriptor",
+        )
+    )
+    if (
+        expected_descriptor_file_sha256 is not None
+        and descriptor_file_sha256 != expected_descriptor_file_sha256
+    ):
+        raise SystemExit(
+            "memmap composite descriptor changed after authority preflight"
+        )
     try:
-        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        descriptor = json.loads(raw_descriptor.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
         raise SystemExit(f"cannot load memmap composite descriptor {path}: {error}") from error
     if not isinstance(descriptor, dict):
         raise SystemExit("memmap composite descriptor is not an object")
@@ -5550,6 +5600,10 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
         and descriptor.get("diagnostic_only") is False
         and descriptor.get("promotion_eligible") is True
     )
+    if is_flywheel_production and not production_authority_preflight_completed:
+        raise SystemExit(
+            "promotion composite appeared after the authority front-door preflight"
+        )
     if schema_version == "memmap_composite_v1":
         fields_valid = set(descriptor) == common_fields
     else:
@@ -5616,14 +5670,34 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             ).expanduser().resolve(strict=True)
         except OSError as error:
             raise SystemExit(f"cannot resolve flywheel source authority: {error}") from error
+        (
+            source_authority_path,
+            source_authority_file_sha256,
+            source_authority_bytes,
+        ) = _stable_canonical_regular_file(
+            source_authority_path,
+            where="flywheel source authority",
+        )
         if (
             str(source_authority_path) != descriptor["source_authority_manifest"]
-            or _sha256_existing_file(source_authority_path)
+            or source_authority_file_sha256
             != descriptor["source_authority_manifest_sha256"]
         ):
             raise SystemExit("flywheel source-authority byte binding drift")
+        try:
+            source_authority_payload = json.loads(
+                source_authority_bytes.decode("utf-8")
+            )
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"cannot load flywheel source authority "
+                f"{source_authority_path}: {error}"
+            ) from error
+        if not isinstance(source_authority_payload, dict):
+            raise SystemExit("flywheel source authority is not an object")
         source_authority = _validate_flywheel_source_authority(
-            source_authority_path
+            source_authority_path,
+            authenticated_payload=source_authority_payload,
         )
         if source_authority.get("authority_sha256") != descriptor[
             "source_authority_sha256"
@@ -5807,12 +5881,15 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             raise SystemExit("memmap composite component corpus directories must be unique")
         seen_dirs.add(str(corpus_dir))
         meta_path = corpus_dir / "corpus_meta.json"
-        actual_meta_sha = _sha256_existing_file(meta_path)
+        _, actual_meta_sha, raw_meta = _stable_canonical_regular_file(
+            meta_path,
+            where=f"memmap composite component {index} metadata",
+        )
         if not _is_sha256(raw["corpus_meta_sha256"]) or raw["corpus_meta_sha256"] != actual_meta_sha:
             raise SystemExit(f"memmap composite component {index} corpus metadata hash mismatch")
         try:
-            corpus_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            corpus_meta = json.loads(raw_meta.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
             raise SystemExit(f"cannot load component {index} corpus metadata {meta_path}: {error}") from error
         if not isinstance(corpus_meta, dict):
             raise SystemExit(f"memmap composite component {index} metadata is not an object")
@@ -5840,17 +5917,32 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             corpus_meta.get("selected_game_seed_manifest"), dict
         ) or not isinstance(corpus_meta.get("a1_post_wave_audit"), dict):
             raise SystemExit(f"memmap composite component {index} is not an authenticated A1 corpus")
-        actual_inventory_sha = _validate_memmap_payload_inventory(corpus_dir, corpus_meta)
+        (
+            actual_inventory_sha,
+            authenticated_payload_identities,
+        ) = _validate_memmap_payload_inventory(
+            corpus_dir,
+            corpus_meta,
+            return_identities=True,
+        )
         if not _is_sha256(raw["payload_inventory_sha256"]) or raw[
             "payload_inventory_sha256"
         ] != actual_inventory_sha:
             raise SystemExit(f"memmap composite component {index} payload inventory hash mismatch")
+        payload_runtime_binding = _memmap_payload_runtime_binding(
+            corpus_dir,
+            corpus_meta,
+            authenticated_identities=authenticated_payload_identities,
+        )
         evidence_sha_field = (
             "provenance_manifest_sha256"
             if is_flywheel_production
             else "validation_manifest_sha256"
         )
-        actual_evidence_sha = _sha256_existing_file(evidence_path)
+        _, actual_evidence_sha, raw_evidence = _stable_canonical_regular_file(
+            evidence_path,
+            where=f"memmap composite component {index} {evidence_field}",
+        )
         if not _is_sha256(raw[evidence_sha_field]) or raw[
             evidence_sha_field
         ] != actual_evidence_sha:
@@ -5859,6 +5951,17 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
                 f"{evidence_field.replace('_', ' ')} hash mismatch"
             )
         if is_flywheel_production:
+            try:
+                evidence_payload = json.loads(raw_evidence.decode("utf-8"))
+            except (UnicodeError, json.JSONDecodeError) as error:
+                raise SystemExit(
+                    f"cannot load flywheel component provenance "
+                    f"{evidence_path}: {error}"
+                ) from error
+            if not isinstance(evidence_payload, dict):
+                raise SystemExit(
+                    "flywheel component provenance is not an object"
+                )
             if (
                 raw["source_authority_manifest"]
                 != descriptor["source_authority_manifest"]
@@ -5883,18 +5986,40 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
                 raise SystemExit(
                     f"flywheel composite component {index} corpus provenance binding drift"
                 )
-            provenance = _validate_flywheel_component_provenance(
-                evidence_path,
-                component_id=str(raw["component_id"]),
-                corpus_dir=corpus_dir,
-                corpus_meta=corpus_meta,
-                source_authority_ref=source_authority_ref,
-                allowed_source_ids=(
-                    set(source_authority["fresh_source_ids"])
-                    if raw["component_id"] in FRESH_SOURCE_GAME_RATIOS
-                    else set(source_authority["historical_source_ids"])
-                ),
+            mass_filenames = {
+                "game_seed.dat",
+                "policy_weight_multiplier.dat",
+            }
+            mass_binding = {
+                **payload_runtime_binding,
+                "files": {
+                    name: identity
+                    for name, identity in payload_runtime_binding["files"].items()
+                    if name in mass_filenames
+                },
+            }
+            authenticated_mass_files = _open_authenticated_memmap_payloads(
+                mass_binding,
+                require_read_only=True,
             )
+            try:
+                provenance = _validate_flywheel_component_provenance(
+                    evidence_path,
+                    component_id=str(raw["component_id"]),
+                    corpus_dir=corpus_dir,
+                    corpus_meta=corpus_meta,
+                    authenticated_payload=evidence_payload,
+                    authenticated_corpus_files=authenticated_mass_files,
+                    source_authority_ref=source_authority_ref,
+                    allowed_source_ids=(
+                        set(source_authority["fresh_source_ids"])
+                        if raw["component_id"] in FRESH_SOURCE_GAME_RATIOS
+                        else set(source_authority["historical_source_ids"])
+                    ),
+                )
+            finally:
+                for handle in authenticated_mass_files.values():
+                    handle.close()
             if (
                 raw["source_category"] != provenance["source_category"]
                 or raw["component_mass"] != provenance["component_mass"]
@@ -5909,6 +6034,7 @@ def _preflight_memmap_composite_descriptor(path: str | Path) -> dict[str, object
             evidence_field: str(evidence_path),
             "corpus_meta": corpus_meta,
             "flywheel_provenance": provenance,
+            "payload_runtime_binding": payload_runtime_binding,
         })
         inventory_bindings.append({
             "corpus_meta_sha256": actual_meta_sha,
@@ -6736,6 +6862,143 @@ def _payload_stat_identity(
     }
 
 
+def _memmap_payload_runtime_binding(
+    corpus_dir: Path,
+    corpus_meta: Mapping[str, object],
+    *,
+    authenticated_identities: Sequence[Mapping[str, object]] | None = None,
+) -> dict[str, object]:
+    """Capture the exact metadata/payload inodes that the loader must map."""
+
+    records = corpus_meta.get("payload_inventory")
+    if not isinstance(records, list):
+        raise SystemExit("memmap corpus lacks its authenticated payload inventory")
+    names = [
+        str(record.get("filename", ""))
+        for record in records
+        if isinstance(record, Mapping)
+    ]
+    if len(names) != len(records) or not names or len(set(names)) != len(names):
+        raise SystemExit("memmap payload runtime binding has malformed filenames")
+    if authenticated_identities is None:
+        identities = {
+            name: _payload_filesystem_identity(corpus_dir / name)
+            for name in sorted(names)
+        }
+    else:
+        identities = {
+            str(identity.get("filename", "")): dict(identity)
+            for identity in authenticated_identities
+        }
+        if set(identities) != set(names):
+            raise SystemExit(
+                "authenticated memmap payload identity filenames drifted"
+            )
+    return {
+        "corpus_dir": str(corpus_dir),
+        "files": identities,
+    }
+
+
+def _validate_memmap_payload_runtime_binding(
+    binding: Mapping[str, object],
+    *,
+    require_read_only: bool,
+) -> None:
+    """Refuse replacement or writable backing bytes around mmap creation."""
+
+    corpus_dir = Path(str(binding.get("corpus_dir", "")))
+    expected = binding.get("files")
+    if not isinstance(expected, Mapping) or not expected:
+        raise SystemExit("memmap payload runtime binding is malformed")
+    for name, identity in expected.items():
+        if not isinstance(name, str) or not isinstance(identity, Mapping):
+            raise SystemExit("memmap payload runtime file binding is malformed")
+        actual = _payload_filesystem_identity(corpus_dir / name)
+        if actual != identity:
+            raise SystemExit(
+                f"authenticated memmap payload identity changed before use: {name}"
+            )
+        if (
+            require_read_only
+            and name != "corpus_meta.json"
+            and int(actual["mode"]) & 0o222
+        ):
+            raise SystemExit(
+                "promotion composite requires read-only authenticated memmap "
+                f"backing bytes before training: {corpus_dir / name}"
+            )
+
+
+def _open_authenticated_memmap_payloads(
+    binding: Mapping[str, object],
+    *,
+    require_read_only: bool,
+) -> dict[str, Any]:
+    """Open and pin the exact authenticated inodes used by NumPy memmaps."""
+
+    corpus_dir = Path(str(binding.get("corpus_dir", "")))
+    expected = binding.get("files")
+    if not isinstance(expected, Mapping) or not expected:
+        raise SystemExit("memmap payload runtime binding is malformed")
+    opened: dict[str, Any] = {}
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        for name, identity in expected.items():
+            if not isinstance(name, str) or not isinstance(identity, Mapping):
+                raise SystemExit("memmap payload runtime file binding is malformed")
+            fd = os.open(corpus_dir / name, flags)
+            handle = os.fdopen(fd, "rb")
+            actual = _payload_stat_identity(name, os.fstat(handle.fileno()))
+            if actual != identity:
+                handle.close()
+                raise SystemExit(
+                    f"authenticated memmap payload inode changed before open: {name}"
+                )
+            if (
+                require_read_only
+                and name != "corpus_meta.json"
+                and int(actual["mode"]) & 0o222
+            ):
+                handle.close()
+                raise SystemExit(
+                    "promotion composite requires read-only authenticated memmap "
+                    f"backing bytes before training: {corpus_dir / name}"
+                )
+            opened[name] = handle
+    except BaseException:
+        for handle in opened.values():
+            handle.close()
+        raise
+    return opened
+
+
+def _validate_open_authenticated_memmap_payloads(
+    binding: Mapping[str, object],
+    opened: Mapping[str, Any],
+) -> None:
+    """Prove mmap construction consumed handles for every expected inode."""
+
+    expected = binding.get("files")
+    if not isinstance(expected, Mapping) or set(opened) != set(expected):
+        raise SystemExit("open authenticated memmap payload set drift")
+    for name, identity in expected.items():
+        handle = opened[name]
+        actual = _payload_stat_identity(name, os.fstat(handle.fileno()))
+        stable_fields = {
+            "filename",
+            "device",
+            "inode",
+            "size_bytes",
+            "mtime_ns",
+            "mode",
+        }
+        if any(actual[field] != identity.get(field) for field in stable_fields):
+            raise SystemExit(
+                f"authenticated memmap payload inode changed while mapping: {name}"
+            )
+
+
 def _sha256_stable_payload(
     path: Path, expected_identity: dict[str, int | str]
 ) -> str:
@@ -6865,8 +7128,11 @@ def _publish_payload_auth_cache(
 
 
 def _validate_memmap_payload_inventory(
-    data_path: str | Path, corpus_meta: dict[str, object]
-) -> str:
+    data_path: str | Path,
+    corpus_meta: dict[str, object],
+    *,
+    return_identities: bool = False,
+) -> str | tuple[str, list[dict[str, int | str]]]:
     """Verify every A1 flat payload file against its immutable inventory."""
 
     if (
@@ -6967,7 +7233,11 @@ def _validate_memmap_payload_inventory(
             "bytes_avoided": total_bytes,
             "binding_sha256": _canonical_json_sha256(binding),
         }, sort_keys=True), flush=True)
-        return actual_inventory_sha
+        return (
+            (actual_inventory_sha, identities)
+            if return_identities
+            else actual_inventory_sha
+        )
 
     for filename in sorted(expected_names):
         record = records_by_name[filename]
@@ -7014,11 +7284,19 @@ def _validate_memmap_payload_inventory(
         "cache_eligible": cache_eligible,
         "binding_sha256": _canonical_json_sha256(binding),
     }, sort_keys=True), flush=True)
-    return actual_inventory_sha
+    return (
+        (actual_inventory_sha, final_identities)
+        if return_identities
+        else actual_inventory_sha
+    )
 
 
 def _preflight_a1_memmap_metadata(
-    data_path: str | Path, *, validation_manifest_path: str | Path | None
+    data_path: str | Path,
+    *,
+    validation_manifest_path: str | Path | None,
+    expected_descriptor_file_sha256: str | None = None,
+    production_authority_preflight_completed: bool = True,
 ) -> dict[str, object] | None:
     """Auto-detect an A1 corpus and forbid bypassing its exact holdout path."""
 
@@ -7029,7 +7307,13 @@ def _preflight_a1_memmap_metadata(
                 "memmap composite descriptor binds each component validation manifest; "
                 "do not also pass --validation-game-seed-manifest"
             )
-        return _preflight_memmap_composite_descriptor(expanded)
+        return _preflight_memmap_composite_descriptor(
+            expanded,
+            expected_descriptor_file_sha256=expected_descriptor_file_sha256,
+            production_authority_preflight_completed=(
+                production_authority_preflight_completed
+            ),
+        )
     meta_path = expanded / "corpus_meta.json"
     if not meta_path.is_file():
         return None
@@ -7268,6 +7552,8 @@ def _coordinated_a1_memmap_preflight(
     *,
     validation_manifest_path: str | Path | None,
     ddp: dict[str, int | bool],
+    expected_descriptor_file_sha256: str | None = None,
+    production_authority_preflight_completed: bool = True,
     _store: Any | None = None,
 ) -> dict[str, object] | None:
     """Verify an A1 corpus once for single-node DDP and fail closed on all ranks.
@@ -7279,9 +7565,16 @@ def _coordinated_a1_memmap_preflight(
     """
 
     if not _single_node_ddp_preflight_enabled(ddp):
-        return _preflight_a1_memmap_metadata(
-            data_path, validation_manifest_path=validation_manifest_path
-        )
+        preflight_kwargs: dict[str, object] = {
+            "validation_manifest_path": validation_manifest_path,
+        }
+        if expected_descriptor_file_sha256 is not None:
+            preflight_kwargs["expected_descriptor_file_sha256"] = (
+                expected_descriptor_file_sha256
+            )
+        if not production_authority_preflight_completed:
+            preflight_kwargs["production_authority_preflight_completed"] = False
+        return _preflight_a1_memmap_metadata(data_path, **preflight_kwargs)
 
     store = (
         _store
@@ -7295,8 +7588,18 @@ def _coordinated_a1_memmap_preflight(
     result_key = "result"
     if int(ddp.get("rank", 0)) == 0:
         try:
+            preflight_kwargs = {
+                "validation_manifest_path": validation_manifest_path,
+            }
+            if expected_descriptor_file_sha256 is not None:
+                preflight_kwargs["expected_descriptor_file_sha256"] = (
+                    expected_descriptor_file_sha256
+                )
+            if not production_authority_preflight_completed:
+                preflight_kwargs["production_authority_preflight_completed"] = False
             metadata = _preflight_a1_memmap_metadata(
-                data_path, validation_manifest_path=validation_manifest_path
+                data_path,
+                **preflight_kwargs,
             )
             packet = {"schema_version": 1, "ok": True, "metadata": metadata}
         except BaseException as error:
@@ -10536,35 +10839,539 @@ def _validate_production_composite_scratch_binding(
     return binding
 
 
-def _require_scratch_marker_for_fresh_production_composite(
+def _preflight_production_composite_authority_metadata(
+    data_path: str | Path,
+) -> dict[str, object]:
+    """Read only small authority metadata for a promotion composite.
+
+    This boundary deliberately does not map or hash component payload files.
+    It authenticates the descriptor, source authority, and the inventory
+    digest preimage needed by scratch/central execution authorities before any
+    checkpoint pickle, corpus payload, CUDA device, or process group is
+    touched. The complete payload/provenance replay still follows later.
+    """
+
+    candidate = Path(data_path).expanduser()
+    if not candidate.is_file():
+        return {
+            "authority_preflight_kind": "non_file",
+            "input_path": str(candidate.absolute()),
+        }
+    descriptor_path, descriptor_file_sha256, raw = _stable_canonical_regular_file(
+        candidate,
+        where="promotion composite descriptor",
+    )
+    try:
+        descriptor = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"cannot load promotion composite descriptor {candidate}: {error}"
+        ) from error
+    if not isinstance(descriptor, dict):
+        raise SystemExit("promotion composite descriptor is not an object")
+    base = {
+        "authority_preflight_kind": "descriptor",
+        "schema_version": descriptor.get("schema_version"),
+        "diagnostic_only": descriptor.get("diagnostic_only"),
+        "promotion_eligible": descriptor.get("promotion_eligible"),
+        "descriptor_path": str(descriptor_path),
+        "descriptor_file_sha256": descriptor_file_sha256,
+        "descriptor_fingerprint": _canonical_json_sha256(descriptor),
+    }
+    if descriptor.get("promotion_eligible") is not True:
+        return base
+    if (
+        descriptor.get("schema_version") != "memmap_composite_v2"
+        or descriptor.get("diagnostic_only") is not False
+    ):
+        raise SystemExit(
+            "promotion-eligible composite authority preflight requires "
+            "memmap_composite_v2 diagnostic_only=false"
+        )
+    if str(descriptor_path) != str(candidate):
+        raise SystemExit("promotion composite descriptor path is not canonical")
+
+    raw_components = descriptor.get("components")
+    if not isinstance(raw_components, list) or len(raw_components) < 2:
+        raise SystemExit(
+            "promotion composite authority preflight requires at least two components"
+        )
+    inventory_bindings: list[dict[str, object]] = []
+    for index, component in enumerate(raw_components):
+        if not isinstance(component, dict):
+            raise SystemExit(
+                f"promotion composite authority component {index} is malformed"
+            )
+        meta_sha = component.get("corpus_meta_sha256")
+        inventory_sha = component.get("payload_inventory_sha256")
+        if not _is_sha256(meta_sha) or not _is_sha256(inventory_sha):
+            raise SystemExit(
+                f"promotion composite authority component {index} lacks "
+                "authenticated inventory digests"
+            )
+        inventory_bindings.append(
+            {
+                "corpus_meta_sha256": meta_sha,
+                "payload_inventory_sha256": inventory_sha,
+            }
+        )
+
+    source_path_raw = descriptor.get("source_authority_manifest")
+    source_file_sha256 = descriptor.get("source_authority_manifest_sha256")
+    source_semantic_sha256 = descriptor.get("source_authority_sha256")
+    if (
+        not isinstance(source_path_raw, str)
+        or not source_path_raw
+        or not _is_sha256(source_file_sha256)
+        or not _is_sha256(source_semantic_sha256)
+    ):
+        raise SystemExit("promotion composite lacks its source authority binding")
+    source_path, actual_source_file_sha256, source_authority_bytes = (
+        _stable_canonical_regular_file(
+        source_path_raw,
+        where="promotion composite source authority",
+        )
+    )
+    try:
+        source_authority_payload = json.loads(
+            source_authority_bytes.decode("utf-8")
+        )
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"cannot load promotion composite source authority: {error}"
+        ) from error
+    if not isinstance(source_authority_payload, dict):
+        raise SystemExit("promotion composite source authority is not an object")
+    source_authority = _validate_flywheel_source_authority(
+        source_path,
+        authenticated_payload=source_authority_payload,
+    )
+    if (
+        str(source_path) != source_path_raw
+        or actual_source_file_sha256 != source_file_sha256
+        or source_authority.get("authority_sha256") != source_semantic_sha256
+    ):
+        raise SystemExit("promotion composite source authority binding drift")
+    source_authority_ref = {
+        "path": str(source_path),
+        "file_sha256": str(source_file_sha256),
+        "authority_sha256": str(source_semantic_sha256),
+    }
+
+    category_semantics = descriptor.get("category_semantics")
+    if category_semantics is not None:
+        category_semantics = _validate_flywheel_category_semantics(
+            category_semantics,
+            where="promotion composite authority descriptor",
+        )
+        if category_semantics != source_authority.get("category_semantics"):
+            raise SystemExit(
+                "promotion composite category semantics differ from source authority"
+            )
+    elif source_authority.get("category_semantics") is not None:
+        raise SystemExit(
+            "promotion composite stripped source-authority category semantics"
+        )
+    learner_recipe_sha256 = descriptor.get(
+        "learner_recipe_overrides_sha256"
+    )
+    if not _is_sha256(learner_recipe_sha256):
+        raise SystemExit("promotion composite learner recipe digest is malformed")
+    portable = _portable_composite_semantic_digests(
+        components=[],
+        component_ids=[],
+        aux_subgoal_component_ids=[],
+        source_authority=source_authority,
+        learner_recipe_overrides_sha256=str(learner_recipe_sha256),
+    )
+    replay_contract = descriptor.get("flywheel_replay_contract")
+    if not isinstance(replay_contract, dict):
+        raise SystemExit("promotion composite lacks its initializer contract")
+    return {
+        **base,
+        "payload_inventory_sha256": _canonical_json_sha256(inventory_bindings),
+        "flywheel_replay_contract": copy.deepcopy(replay_contract),
+        "source_authority": source_authority,
+        "source_authority_ref": source_authority_ref,
+        "source_authority_semantic_sha256": portable[
+            "source_authority_semantic_sha256"
+        ],
+        "category_semantics": (
+            None if category_semantics is None else dict(category_semantics)
+        ),
+        "category_semantics_sha256": (
+            None
+            if category_semantics is None
+            else _canonical_json_sha256(category_semantics)
+        ),
+    }
+
+
+def _validate_composite_authority_metadata_parity(
+    early: Mapping[str, object],
+    full: Mapping[str, object] | None,
+) -> None:
+    """Prove the descriptor did not change promotion identity between reads."""
+
+    full_is_production = bool(
+        isinstance(full, Mapping)
+        and full.get("schema_version") == "memmap_composite_v2"
+        and full.get("promotion_eligible") is True
+    )
+    if early.get("authority_preflight_kind") != "descriptor":
+        if full_is_production:
+            raise SystemExit(
+                "promotion composite appeared after the authority front-door preflight"
+            )
+        return
+    if not isinstance(full, Mapping):
+        raise SystemExit(
+            "memmap composite descriptor disappeared during full payload preflight"
+        )
+    fields = [
+        "schema_version",
+        "diagnostic_only",
+        "promotion_eligible",
+        "descriptor_path",
+        "descriptor_file_sha256",
+        "descriptor_fingerprint",
+    ]
+    if early.get("promotion_eligible") is True:
+        fields.extend(
+            [
+                "payload_inventory_sha256",
+                "flywheel_replay_contract",
+                "source_authority_ref",
+                "source_authority_semantic_sha256",
+                "category_semantics",
+                "category_semantics_sha256",
+            ]
+        )
+    for field in fields:
+        if early.get(field) != full.get(field):
+            raise SystemExit(
+                "composite authority metadata changed during full payload "
+                f"preflight: {field}"
+            )
+
+
+def _require_explicit_production_checkpoint_architecture(
+    args: argparse.Namespace,
+    composite_meta: Mapping[str, object],
+) -> None:
+    """Forbid checkpoint-owned inference before complete central replay."""
+
+    central_raw = str(
+        getattr(args, "a1_central_learner_binding_json", "") or ""
+    )
+    if not (
+        composite_meta.get("schema_version") == "memmap_composite_v2"
+        and composite_meta.get("promotion_eligible") is True
+        and central_raw
+    ):
+        return
+    checkpoint_owned = (
+        "value_categorical_bins",
+        "public_card_count_features",
+        "public_card_count_residual_bias",
+        "public_rule_state_features",
+        "action_target_gather",
+        "topology_residual_adapter",
+        "static_action_residual",
+        "legal_action_value_residual",
+        "legal_action_value_set_statistics",
+        "value_tower_split_layers",
+        "meaningful_public_history",
+        "event_history_limit",
+        "meaningful_public_history_pooling",
+        "meaningful_public_history_target_gather",
+        "entity_feature_adapter_version",
+    )
+    missing = [
+        field for field in checkpoint_owned if getattr(args, field, None) is None
+    ]
+    if missing:
+        raise SystemExit(
+            "production central learner must explicitly bind every checkpoint-owned "
+            "architecture field before checkpoint deserialization; missing="
+            f"{missing}"
+        )
+
+
+def _snapshot_authenticated_production_initializer(
+    args: argparse.Namespace,
+    composite_meta: Mapping[str, object] | None,
+) -> tuple[str, tempfile.TemporaryDirectory[str] | None]:
+    """Pin the exact authorized initializer bytes for every later load."""
+
+    original = str(getattr(args, "init_checkpoint", "") or "")
+    if not (
+        original
+        and isinstance(composite_meta, Mapping)
+        and composite_meta.get("schema_version") == "memmap_composite_v2"
+        and composite_meta.get("promotion_eligible") is True
+    ):
+        return original, None
+    expected_sha256 = getattr(args, "init_checkpoint_sha256", None)
+    _, actual_sha256, payload = _stable_canonical_regular_file(
+        original,
+        where="authenticated production initializer",
+    )
+    if actual_sha256 != expected_sha256:
+        raise SystemExit(
+            "production initializer changed after execution-authority replay"
+        )
+    snapshot_dir = tempfile.TemporaryDirectory(
+        prefix="catan-zero-authenticated-initializer-"
+    )
+    snapshot = Path(snapshot_dir.name) / "initializer.pt"
+    snapshot.write_bytes(payload)
+    snapshot.chmod(0o400)
+    if _sha256_existing_file(snapshot) != expected_sha256:
+        snapshot_dir.cleanup()
+        raise SystemExit("authenticated production initializer snapshot drift")
+    return str(snapshot), snapshot_dir
+
+
+def _preflight_production_composite_central_authority(
+    args: argparse.Namespace,
+    composite_meta: Mapping[str, object],
+    *,
+    initializer_sha256: str,
+) -> None:
+    """Byte-authenticate the central projection before mapping corpus payloads.
+
+    The complete recipe/code/coordinator replay remains in
+    :func:`_validate_a1_learner_training_recipe`.  This cheap boundary proves
+    that the supplied projection is at least the byte-bound authority for this
+    exact composite and initializer before the loader can touch the corpus.
+    """
+
+    raw = str(getattr(args, "a1_central_learner_binding_json", "") or "")
+    try:
+        central = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid A1 central learner binding JSON: {error}") from error
+    immutable_recipe = (
+        central.get("immutable_contract_recipe")
+        if isinstance(central, dict)
+        else None
+    )
+    effective_recipe = central.get("effective_recipe") if isinstance(central, dict) else None
+    sample_binding = central.get("sample_binding") if isinstance(central, dict) else None
+    if (
+        not isinstance(central, dict)
+        or central.get("schema_version") != "a1-central-learner-binding-v3"
+        or not isinstance(immutable_recipe, dict)
+        or central.get("immutable_contract_recipe_sha256")
+        != _canonical_json_sha256(immutable_recipe)
+        or not isinstance(effective_recipe, dict)
+        or central.get("effective_recipe_sha256")
+        != _canonical_json_sha256(effective_recipe)
+        or central.get("initializer_sha256") != initializer_sha256
+        or not isinstance(sample_binding, dict)
+        or sample_binding.get("descriptor_sha256")
+        != composite_meta.get("descriptor_file_sha256")
+        or sample_binding.get("payload_inventory_sha256")
+        != composite_meta.get("payload_inventory_sha256")
+        or sample_binding.get("category_semantics")
+        != composite_meta.get("category_semantics")
+        or sample_binding.get("category_semantics_sha256")
+        != composite_meta.get("category_semantics_sha256")
+        or sample_binding.get("source_authority")
+        != composite_meta.get("source_authority_ref")
+    ):
+        raise SystemExit(
+            "production composite central learner authority/initializer/sample "
+            "binding drift"
+        )
+
+    authority_path = str(
+        getattr(args, "a1_central_executor_authority", "") or ""
+    )
+    authority_sha256 = str(
+        getattr(args, "a1_central_executor_authority_sha256", "") or ""
+    )
+    if not authority_path or not _is_sha256(authority_sha256):
+        raise SystemExit(
+            "production composite central learner requires canonical "
+            "executor-authority path and SHA"
+        )
+    _, actual_authority_sha256, _ = _stable_canonical_regular_file(
+        authority_path, where="A1 central executor authority"
+    )
+    if (
+        actual_authority_sha256 != authority_sha256
+        or central.get("executor_authority_path") != authority_path
+        or central.get("executor_authority_file_sha256") != authority_sha256
+    ):
+        raise SystemExit(
+            "production composite central executor-authority path/file digest drift"
+        )
+
+
+def _require_production_composite_execution_authority(
     args: argparse.Namespace,
     composite_meta: Mapping[str, object] | None,
 ) -> None:
-    """Block generic fresh entity-graph training on promotion data."""
+    """Fail closed on every unsealed promotion-composite execution path."""
 
     if not (
         isinstance(composite_meta, Mapping)
         and composite_meta.get("schema_version") == "memmap_composite_v2"
         and composite_meta.get("promotion_eligible") is True
-        and str(args.arch) == "entity_graph"
-        and not str(getattr(args, "init_checkpoint", "") or "")
-        and not str(getattr(args, "grow_from_checkpoint", "") or "")
     ):
         return
-    marker = str(getattr(args, "a1_scratch_authority_json", "") or "")
-    if not marker:
+
+    scratch_raw = str(getattr(args, "a1_scratch_authority_json", "") or "")
+    central_raw = str(
+        getattr(args, "a1_central_learner_binding_json", "") or ""
+    )
+    if bool(scratch_raw) == bool(central_raw):
         raise SystemExit(
-            "fresh entity_graph training on a promotion-eligible production "
-            "composite requires the sealed A1 scratch plan marker"
+            "promotion-eligible production composite requires exactly one sealed "
+            "scratch or central learner execution authority"
+        )
+
+    init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
+    grow_checkpoint = str(getattr(args, "grow_from_checkpoint", "") or "")
+    warm_start = bool(init_checkpoint or grow_checkpoint)
+    if warm_start:
+        if not central_raw:
+            raise SystemExit(
+                "promotion-eligible production composite warm-start requires the "
+                "central learner authority, not a scratch authority"
+            )
+        if not init_checkpoint or grow_checkpoint:
+            raise SystemExit(
+                "promotion-eligible production composite central warm-start "
+                "requires --init-checkpoint and forbids --grow-from-checkpoint"
+            )
+        replay_contract = composite_meta.get("flywheel_replay_contract")
+        if not isinstance(replay_contract, Mapping):
+            raise SystemExit(
+                "promotion-eligible production composite lacks its initializer contract"
+            )
+        expected_path_raw = str(
+            replay_contract.get("initializer_checkpoint_path", "") or ""
+        )
+        expected_sha256 = replay_contract.get("initializer_checkpoint_sha256")
+        try:
+            expected_path = Path(expected_path_raw).expanduser().resolve(strict=True)
+            actual_path = Path(init_checkpoint).expanduser().resolve(strict=True)
+        except OSError as error:
+            raise SystemExit(
+                f"cannot resolve production composite initializer: {error}"
+            ) from error
+        actual_sha256 = _sha256_existing_file(actual_path)
+        if (
+            str(expected_path) != expected_path_raw
+            or not _is_sha256(expected_sha256)
+            or _sha256_existing_file(expected_path) != expected_sha256
+            or actual_path != expected_path
+            or actual_sha256 != expected_sha256
+        ):
+            raise SystemExit(
+                "promotion-eligible production composite warm-start differs from "
+                "its exact descriptor initializer"
+            )
+        _preflight_production_composite_central_authority(
+            args,
+            composite_meta,
+            initializer_sha256=actual_sha256,
+        )
+        args.init_checkpoint_sha256 = actual_sha256
+        return
+
+    if central_raw:
+        raise SystemExit(
+            "production composite central learner authority requires an exact "
+            "--init-checkpoint warm-start"
         )
     _preflight_a1_scratch_execution_authority(
-        marker,
+        scratch_raw,
         str(
             getattr(args, "a1_scratch_diagnostic_authority_json", "")
             or ""
         ),
         args=args,
     )
+
+
+def _validate_production_composite_execution_authority_before_payloads(
+    args: argparse.Namespace,
+    ddp: dict[str, int | bool],
+    composite_meta: Mapping[str, object] | None,
+) -> None:
+    """Complete the selected authority replay before payload/CUDA work."""
+
+    if not (
+        isinstance(composite_meta, Mapping)
+        and composite_meta.get("schema_version") == "memmap_composite_v2"
+        and composite_meta.get("promotion_eligible") is True
+    ):
+        return
+    scratch_raw = str(getattr(args, "a1_scratch_authority_json", "") or "")
+    central_raw = str(
+        getattr(args, "a1_central_learner_binding_json", "") or ""
+    )
+    if scratch_raw:
+        binding = _validate_production_composite_scratch_binding(
+            args,
+            ddp,
+            composite_meta,
+        )
+        args.early_production_composite_scratch_binding = binding
+        return
+    if not central_raw:
+        raise SystemExit(
+            "promotion composite lost its selected execution authority"
+        )
+    try:
+        central = json.loads(central_raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"invalid A1 central learner binding JSON: {error}") from error
+    immutable_recipe = (
+        central.get("immutable_contract_recipe")
+        if isinstance(central, dict)
+        else None
+    )
+    if not isinstance(immutable_recipe, dict):
+        raise SystemExit(
+            "production composite central learner lacks its immutable recipe"
+        )
+    central_bound: dict[str, object] = {
+        "learner_training_recipe": copy.deepcopy(immutable_recipe),
+        "learner_training_recipe_sha256": _canonical_json_sha256(
+            immutable_recipe
+        ),
+    }
+    central_bound["effective_learner_training_recipe"] = (
+        _validate_a1_learner_training_recipe(args, ddp, central_bound)
+    )
+    validated = central_bound.get("central_learner_binding")
+    published = central_bound.get("central_published_executor_authority")
+    if not isinstance(validated, dict) or not isinstance(published, dict):
+        raise SystemExit(
+            "central learner authority replay returned incomplete bindings"
+        )
+    sample_binding = validated["sample_binding"]
+    if (
+        sample_binding["descriptor_sha256"]
+        != composite_meta["descriptor_file_sha256"]
+        or sample_binding["payload_inventory_sha256"]
+        != composite_meta["payload_inventory_sha256"]
+        or sample_binding["category_semantics"]
+        != composite_meta.get("category_semantics")
+        or sample_binding["category_semantics_sha256"]
+        != composite_meta.get("category_semantics_sha256")
+        or sample_binding["source_authority"]
+        != composite_meta.get("source_authority_ref")
+    ):
+        raise SystemExit(
+            "central learner sample authority differs from composite authority metadata"
+        )
+    args.early_production_composite_central_bound = central_bound
 
 
 def _validate_a1_learner_training_recipe(
@@ -12627,16 +13434,33 @@ def main(
             args,
             _effective_a1_learner_training_recipe(args, ddp),
         )
-    # Fail cheap launch/host checks before authenticating a potentially
-    # hundreds-of-gigabytes memmap payload. A missing explicit CLI value or a
-    # low file-descriptor limit must not be reported only after the byte scan.
     guard_argv = launcher_guards.argv_with_config_values(
         args, parser, raw_argv, config_filled
     )
-    launcher_guards.run_or_refuse(
-        _build_guard_specs(args, guard_argv, parser),
-        launcher="train_bc",
-        skip=bool(args.skip_guards),
+    guard_specs = _build_guard_specs(args, guard_argv, parser)
+    pickle_guard_specs = [
+        spec for spec in guard_specs if spec.get("name") == "masked_regime"
+    ]
+    cheap_guard_specs = [
+        spec for spec in guard_specs if spec.get("name") != "masked_regime"
+    ]
+    if cheap_guard_specs:
+        launcher_guards.run_or_refuse(
+            cheap_guard_specs,
+            launcher="train_bc",
+            skip=bool(args.skip_guards),
+        )
+    early_composite_authority_meta = (
+        _preflight_production_composite_authority_metadata(args.data)
+        if str(args.data_format) == "memmap"
+        else {
+            "authority_preflight_kind": "non_file",
+            "input_path": str(Path(args.data).expanduser().absolute()),
+        }
+    )
+    _require_production_composite_execution_authority(
+        args,
+        early_composite_authority_meta,
     )
     # Check checkpoint/topology compatibility before authenticating the data
     # payload.  A parser default that disagrees with a warm-start checkpoint is
@@ -12658,35 +13482,23 @@ def main(
         )
     if args.grow_from_checkpoint and args.arch != "entity_graph":
         raise SystemExit("--grow-from-checkpoint currently supports --arch entity_graph only")
-    args.value_categorical_bins = _resolve_effective_value_categorical_bins(args)
-    args.public_card_count_features = (
-        _resolve_effective_public_card_count_features(args)
+    _require_explicit_production_checkpoint_architecture(
+        args,
+        early_composite_authority_meta,
     )
-    args.public_card_count_residual_bias = (
-        _resolve_effective_public_card_count_residual_bias(args)
+    if getattr(args, "init_checkpoint_sha256", None) is None:
+        args.init_checkpoint_sha256 = _sha256_existing_file(args.init_checkpoint)
+    args.a1_aux_regularization_binding = (
+        _validate_a1_aux_regularization_binding(args, recipe_drift=None)
     )
-    args.public_rule_state_features = (
-        _resolve_effective_public_rule_state_features(args)
+    _validate_production_composite_execution_authority_before_payloads(
+        args,
+        ddp,
+        early_composite_authority_meta,
     )
-    args.action_target_gather = _resolve_effective_action_target_gather(args)
-    args.topology_residual_adapter = (
-        _resolve_effective_topology_residual_adapter(args)
-    )
-    (
-        args.static_action_residual,
-        args.legal_action_value_residual,
-        args.legal_action_value_set_statistics,
-    ) = _resolve_effective_structured_action_residuals(args)
-    args.value_tower_split_layers = (
-        _resolve_effective_value_tower_split_layers(args)
-    )
-    (
-        args.meaningful_public_history,
-        args.event_history_limit,
-        args.meaningful_public_history_pooling,
-        args.meaningful_public_history_target_gather,
-    ) = _resolve_effective_meaningful_public_history(args)
-    _preflight_init_checkpoint_architecture(args, ddp)
+    # Establish the same descriptor identity under the complete payload
+    # preflight before any checkpoint guard/resolver can deserialize bytes.
+    # This closes diagnostic/non-file -> production replacement races.
     a1_preflight_meta: dict[str, object] | None = None
     coherent_corpus_binding_raw = str(
         getattr(args, "a1_coherent_corpus_binding_json", "") or ""
@@ -12696,6 +13508,24 @@ def main(
             args.data,
             validation_manifest_path=args.validation_game_seed_manifest or None,
             ddp=ddp,
+            expected_descriptor_file_sha256=(
+                str(
+                    early_composite_authority_meta[
+                        "descriptor_file_sha256"
+                    ]
+                )
+                if early_composite_authority_meta.get(
+                    "authority_preflight_kind"
+                )
+                == "descriptor"
+                else None
+            ),
+            production_authority_preflight_completed=bool(
+                early_composite_authority_meta.get(
+                    "authority_preflight_kind"
+                )
+                == "descriptor"
+            ),
         )
         if coherent_corpus_binding_raw and a1_preflight_meta is None:
             meta_path = Path(args.data).expanduser() / "corpus_meta.json"
@@ -12708,9 +13538,84 @@ def main(
             if not isinstance(value, dict):
                 raise SystemExit("coherent memmap corpus_meta.json is not an object")
             a1_preflight_meta = value
-    _require_scratch_marker_for_fresh_production_composite(
-        args, a1_preflight_meta
+    _validate_composite_authority_metadata_parity(
+        early_composite_authority_meta,
+        a1_preflight_meta,
     )
+    _require_production_composite_execution_authority(args, a1_preflight_meta)
+    checkpoint_load_path, _authenticated_initializer_snapshot = (
+        _snapshot_authenticated_production_initializer(args, a1_preflight_meta)
+    )
+    args.authenticated_init_checkpoint_load_path = checkpoint_load_path
+    checkpoint_args = copy.copy(args)
+    checkpoint_args.init_checkpoint = checkpoint_load_path
+    # The masked-regime guard is pickle-capable. Point it at the immutable
+    # authenticated snapshot too, and run it only after full authority/parity.
+    if pickle_guard_specs:
+        snapshot_guard_specs = copy.deepcopy(pickle_guard_specs)
+        for spec in snapshot_guard_specs:
+            spec["args"]["checkpoint_path"] = checkpoint_load_path
+        launcher_guards.run_or_refuse(
+            snapshot_guard_specs,
+            launcher="train_bc",
+            skip=bool(args.skip_guards),
+        )
+    # Checkpoint-owned fields may now be inferred and cross-checked. Every
+    # pickle-capable resolver remains after complete selected-authority replay.
+    args.value_categorical_bins = _resolve_effective_value_categorical_bins(
+        checkpoint_args
+    )
+    args.public_card_count_features = (
+        _resolve_effective_public_card_count_features(checkpoint_args)
+    )
+    args.public_card_count_residual_bias = (
+        _resolve_effective_public_card_count_residual_bias(checkpoint_args)
+    )
+    args.public_rule_state_features = (
+        _resolve_effective_public_rule_state_features(checkpoint_args)
+    )
+    args.action_target_gather = _resolve_effective_action_target_gather(
+        checkpoint_args
+    )
+    args.topology_residual_adapter = (
+        _resolve_effective_topology_residual_adapter(checkpoint_args)
+    )
+    (
+        args.static_action_residual,
+        args.legal_action_value_residual,
+        args.legal_action_value_set_statistics,
+    ) = _resolve_effective_structured_action_residuals(checkpoint_args)
+    args.value_tower_split_layers = (
+        _resolve_effective_value_tower_split_layers(checkpoint_args)
+    )
+    (
+        args.meaningful_public_history,
+        args.event_history_limit,
+        args.meaningful_public_history_pooling,
+        args.meaningful_public_history_target_gather,
+    ) = _resolve_effective_meaningful_public_history(checkpoint_args)
+    for field in (
+        "value_categorical_bins",
+        "public_card_count_features",
+        "public_card_count_residual_bias",
+        "public_rule_state_features",
+        "action_target_gather",
+        "topology_residual_adapter",
+        "static_action_residual",
+        "legal_action_value_residual",
+        "legal_action_value_set_statistics",
+        "value_tower_split_layers",
+        "meaningful_public_history",
+        "event_history_limit",
+        "meaningful_public_history_pooling",
+        "meaningful_public_history_target_gather",
+    ):
+        setattr(checkpoint_args, field, getattr(args, field))
+    # Only deserialize a warm-start checkpoint after its exact bytes and the
+    # complete selected central authority/recipe/code projection have passed.
+    # ``torch.load(..., weights_only=False)`` is intentionally outside the
+    # unauthenticated front door.
+    _preflight_init_checkpoint_architecture(checkpoint_args, ddp)
 
     validation_game_seed_ranges = _parse_game_seed_ranges(
         args.validation_game_seed_ranges
@@ -12899,7 +13804,15 @@ def main(
         if a1_preflight_meta is None
         else a1_preflight_meta["payload_inventory_sha256"]
     )
-    args.init_checkpoint_sha256 = _sha256_existing_file(args.init_checkpoint)
+    observed_init_checkpoint_sha256 = _sha256_existing_file(args.init_checkpoint)
+    if (
+        getattr(args, "init_checkpoint_sha256", "")
+        and args.init_checkpoint_sha256 != observed_init_checkpoint_sha256
+    ):
+        raise SystemExit(
+            "init checkpoint changed after its authenticated preflight snapshot"
+        )
+    args.init_checkpoint_sha256 = observed_init_checkpoint_sha256
     args.grow_from_checkpoint_sha256 = _sha256_existing_file(
         args.grow_from_checkpoint
     )
@@ -13177,34 +14090,27 @@ def main(
                 "A1 scratch and central learner authorities are mutually exclusive"
             )
         if scratch_raw:
-            a1_training_binding = _validate_production_composite_scratch_binding(
-                args, ddp, a1_preflight_meta
+            a1_training_binding = getattr(
+                args,
+                "early_production_composite_scratch_binding",
+                None,
             )
-        elif central_raw:
-            try:
-                unverified_central = json.loads(central_raw)
-            except json.JSONDecodeError as error:
+            if not isinstance(a1_training_binding, dict):
                 raise SystemExit(
-                    f"invalid A1 central learner binding JSON: {error}"
-                ) from error
-            immutable_recipe = (
-                unverified_central.get("immutable_contract_recipe")
-                if isinstance(unverified_central, dict)
-                else None
-            )
-            if not isinstance(immutable_recipe, dict):
-                raise SystemExit(
-                    "production composite central learner lacks its immutable recipe"
+                    "production composite scratch authority was not validated "
+                    "before payload loading"
                 )
-            central_bound = {
-                "learner_training_recipe": copy.deepcopy(immutable_recipe),
-                "learner_training_recipe_sha256": _canonical_json_sha256(
-                    immutable_recipe
-                ),
-            }
-            central_bound["effective_learner_training_recipe"] = (
-                _validate_a1_learner_training_recipe(args, ddp, central_bound)
+        elif central_raw:
+            central_bound = getattr(
+                args,
+                "early_production_composite_central_bound",
+                None,
             )
+            if not isinstance(central_bound, dict):
+                raise SystemExit(
+                    "production composite central authority was not validated "
+                    "before payload loading"
+                )
             central_composite_binding = central_bound.get(
                 "central_learner_binding"
             )
@@ -13233,6 +14139,11 @@ def main(
                 raise SystemExit(
                     "central learner sample authority differs from composite bytes"
                 )
+        elif a1_preflight_meta.get("promotion_eligible") is True:
+            raise SystemExit(
+                "promotion composite reached corpus execution without its "
+                "validated scratch or central authority"
+            )
     elif validation_seed_contract is not None:
         if coherent_corpus_binding_raw:
             a1_training_binding = _validate_coherent_direct_corpus_binding(
@@ -13485,7 +14396,7 @@ def main(
         if args.init_checkpoint:
             if args.arch == "entity_graph":
                 policy = EntityGraphPolicy.load(
-                    args.init_checkpoint,
+                    checkpoint_load_path,
                     device=args.device,
                     strict_metadata=not bool(args.allow_legacy_action_mask_upgrade),
                 )
@@ -13526,7 +14437,7 @@ def main(
                 policy.model.config = policy.config
             else:
                 policy = XDimLitePolicy.load(
-                    args.init_checkpoint,
+                    checkpoint_load_path,
                     device=args.device,
                     strict_metadata=not bool(args.allow_legacy_action_mask_upgrade),
                 )
@@ -25240,20 +26151,77 @@ def load_teacher_data_memmap(
         components = authenticated["components"]
         assert isinstance(components, list)
         dirs = [Path(str(component["corpus_dir"])) for component in components]
+        runtime_bindings = [
+            component.get("payload_runtime_binding")
+            for component in components
+        ]
+        if any(not isinstance(binding, Mapping) for binding in runtime_bindings):
+            raise SystemExit(
+                "authenticated composite lacks payload runtime inode bindings"
+            )
+        production = bool(
+            authenticated.get("schema_version") == "memmap_composite_v2"
+            and authenticated.get("promotion_eligible") is True
+        )
+        opened_payloads: list[dict[str, Any]] = []
+        try:
+            for binding in runtime_bindings:
+                assert isinstance(binding, Mapping)
+                opened_payloads.append(
+                    _open_authenticated_memmap_payloads(
+                        binding,
+                        require_read_only=production,
+                    )
+                )
+        except BaseException:
+            for opened in opened_payloads:
+                for handle in opened.values():
+                    handle.close()
+            raise
         adapter_versions_by_component = authenticated.get(
             "entity_feature_adapter_component_versions"
         )
-        corpus = ConcatMemmapCorpus(
-            [MemmapCorpus(component_dir) for component_dir in dirs],
-            dirs=dirs,
-            component_adapter_versions=(
-                None
-                if adapter_versions_by_component is None
-                else [
-                    str(adapter_versions_by_component[component_id])
-                    for component_id in authenticated["component_ids"]
-                ]
-            ),
+        try:
+            corpus = ConcatMemmapCorpus(
+                [
+                    MemmapCorpus(
+                        component_dir,
+                        authenticated_files=opened,
+                        authenticated_meta=component["corpus_meta"],
+                    )
+                    for component, component_dir, opened in zip(
+                        components, dirs, opened_payloads, strict=True
+                    )
+                ],
+                dirs=dirs,
+                component_adapter_versions=(
+                    None
+                    if adapter_versions_by_component is None
+                    else [
+                        str(adapter_versions_by_component[component_id])
+                        for component_id in authenticated["component_ids"]
+                    ]
+                ),
+            )
+        except BaseException:
+            for opened in opened_payloads:
+                for handle in opened.values():
+                    handle.close()
+            raise
+        # Memmaps and parsed metadata came from these already-authenticated
+        # handles, so directory/path replacement cannot switch the bytes.
+        for binding, opened in zip(
+            runtime_bindings, opened_payloads, strict=True
+        ):
+            assert isinstance(binding, Mapping)
+            _validate_open_authenticated_memmap_payloads(
+                binding,
+                opened,
+            )
+        corpus.authenticated_payload_runtime_bindings = tuple(
+            copy.deepcopy(dict(binding))
+            for binding in runtime_bindings
+            if isinstance(binding, Mapping)
         )
         if authenticated["schema_version"] == "memmap_composite_v2":
             corpus.component_ids = tuple(authenticated["component_ids"])
@@ -26420,7 +27388,15 @@ def _a1_training_event_history_contract(
     selected_adapter = getattr(args, "entity_feature_adapter_version", None)
     init_checkpoint = str(getattr(args, "init_checkpoint", "") or "")
     if selected_adapter is None and init_checkpoint:
-        selected_adapter = _checkpoint_entity_feature_adapter_version(init_checkpoint)
+        selected_adapter = _checkpoint_entity_feature_adapter_version(
+            str(
+                getattr(
+                    args,
+                    "authenticated_init_checkpoint_load_path",
+                    init_checkpoint,
+                )
+            )
+        )
     try:
         return build_a1_training_event_history_contract(
             components,
@@ -40519,7 +41495,13 @@ def _training_resume_recipe_identity(
         # Init resumes inherit the checkpoint's append-only adapter contract.
         # Do not infer v2/v3 from the same false public-feature flags.
         resume_entity_adapter = _checkpoint_entity_feature_adapter_version(
-            init_checkpoint
+            str(
+                getattr(
+                    args,
+                    "authenticated_init_checkpoint_load_path",
+                    init_checkpoint,
+                )
+            )
         )
     elif (
         bool(getattr(args, "public_rule_state_features", False))
