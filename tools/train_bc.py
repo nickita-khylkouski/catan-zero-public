@@ -16553,6 +16553,12 @@ def main(
     # exactly: every micro-batch zero-grads, backwards the undivided loss, clips,
     # and steps, and global_step (== optimizer steps) advances once per batch.
     accum = max(1, int(args.grad_accum_steps))
+    # Diagnostic cadences are dose-global.  ``batch_number`` below is local to
+    # one epoch and can reset before reaching the configured cadence when a
+    # small authenticated corpus is trained with replacement.  Using that
+    # resetting counter made exact-capped runs pass preflight yet collect zero
+    # module observations, so the terminal checkpoint was impossible to save.
+    dose_microbatch_number = 0
     central_realized_sample_evidence: dict[str, object] | None = None
     aux_stage_realized_sample_evidence: dict[str, object] | None = None
     for epoch in range(start_epoch, effective_epoch_limit):
@@ -17091,6 +17097,7 @@ def main(
                     )
             if len(batch) == 0:
                 continue
+            dose_microbatch_number += 1
             # C1 grad-accum bookkeeping. At accum==1 do_zero_grad and do_step are
             # both True every batch (identical to pre-C1). The LR schedule uses
             # global_step (optimizer steps), so within an accumulation group every
@@ -17225,7 +17232,7 @@ def main(
                         "measure_objective_gradient_interference"
                     ] = _objective_gradient_interference_due(
                         cadence_batches=interference_cadence,
-                        batch_number=batch_number,
+                        batch_number=dose_microbatch_number,
                         baseline_observed=objective_gradient_baseline_observed,
                         accum_do_step=accum_do_step,
                     ) and batch_policy_objective_fraction > 0.0
@@ -17268,7 +17275,9 @@ def main(
                     max_grad_norm=float(args.max_grad_norm),
                     diagnostics=(
                         int(args.train_diagnostics_every_batches) > 0
-                        and batch_number % int(args.train_diagnostics_every_batches) == 0
+                        and dose_microbatch_number
+                        % int(args.train_diagnostics_every_batches)
+                        == 0
                     ),
                     policy_target_blend_semantics=str(
                         args.policy_target_blend_semantics

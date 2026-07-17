@@ -22,10 +22,9 @@ from typing import Any, Iterator, Sequence
 SCHEMA = "a1-production-lane-v1"
 RECEIPT_SCHEMA = "a1-production-job-receipt-v1"
 CATEGORY_ORDER = ("current_producer", "recent_history", "hard_negative")
-CLIENT_ENVIRONMENT = {
-    "CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps_pipe_host",
-    "CUDA_MPS_LOG_DIRECTORY": "/tmp/mps_log_host",
-}
+# CUDA is owned by one EvalServer process per physical GPU.  CPU search
+# clients communicate over mp_queue and must not inherit retired MPS bindings.
+CLIENT_ENVIRONMENT: dict[str, str] = {}
 CONFIG_REGISTRY_ENVIRONMENT_VARIABLE = "CATAN_ZERO_CONFIG_REGISTRY"
 CONFIG_REGISTRY_FILENAME = "config_registry.jsonl"
 RUNTIME_REPO_TOKEN = "__A1_RUNTIME_REPO__"
@@ -46,6 +45,7 @@ FORBIDDEN_ADAPTIVE_ARGV = (
     "--raw-policy-above-width",
 )
 ARM_N_FULL = {"n128": 128, "n256": 256}
+HOST_GPU_COUNT = 8
 COHERENT_ROW_SURFACE_FIELDS = (
     "meaningful_public_history",
     "event_history_limit",
@@ -55,6 +55,85 @@ COHERENT_ROW_SURFACE_FIELDS = (
 
 class SupervisorError(RuntimeError):
     pass
+
+
+def _pin_lane_to_cpu_partition(gpu: int) -> list[int]:
+    """Pin one lane to whole physical-core sibling groups local to its GPU."""
+
+    if sys.platform != "linux":
+        return []
+    if isinstance(gpu, bool) or not isinstance(gpu, int) or not 0 <= gpu < HOST_GPU_COUNT:
+        raise SupervisorError(f"canonical lane GPU must be in [0,{HOST_GPU_COUNT})")
+    available = set(os.sched_getaffinity(0))
+
+    def parse_cpu_list(raw: str) -> set[int]:
+        result: set[int] = set()
+        for item in raw.strip().split(","):
+            if not item:
+                continue
+            first, separator, last = item.partition("-")
+            start = int(first)
+            end = int(last) if separator else start
+            result.update(range(start, end + 1))
+        return result
+
+    query = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,pci.bus_id",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if query.returncode != 0:
+        raise SupervisorError(f"cannot resolve GPU PCI topology: {query.stderr.strip()}")
+    gpu_nodes: dict[int, int] = {}
+    for line in query.stdout.splitlines():
+        raw_index, separator, raw_bus = line.partition(",")
+        if not separator:
+            raise SupervisorError(f"malformed nvidia-smi topology row: {line!r}")
+        index = int(raw_index.strip())
+        bus_tail = raw_bus.strip().lower().split(":", 1)[-1]
+        matches = list(Path("/sys/bus/pci/devices").glob(f"*:{bus_tail}"))
+        if len(matches) != 1:
+            raise SupervisorError(f"GPU {index} PCI device is not unique: {raw_bus.strip()}")
+        node = int((matches[0] / "numa_node").read_text().strip())
+        if node < 0:
+            raise SupervisorError(f"GPU {index} has no NUMA locality")
+        gpu_nodes[index] = node
+    if set(gpu_nodes) != set(range(HOST_GPU_COUNT)):
+        raise SupervisorError(f"expected {HOST_GPU_COUNT} GPU topology records: {gpu_nodes}")
+
+    node = gpu_nodes[gpu]
+    node_cpus = parse_cpu_list(
+        Path(f"/sys/devices/system/node/node{node}/cpulist").read_text()
+    ) & available
+    physical_groups: dict[tuple[int, ...], set[int]] = {}
+    for cpu in sorted(node_cpus):
+        siblings = parse_cpu_list(
+            Path(
+                f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            ).read_text()
+        ) & node_cpus
+        if siblings:
+            physical_groups.setdefault(tuple(sorted(siblings)), siblings)
+    local_gpus = sorted(index for index, gpu_node in gpu_nodes.items() if gpu_node == node)
+    lane_index = local_gpus.index(gpu)
+    groups = [physical_groups[key] for key in sorted(physical_groups)]
+    start = len(groups) * lane_index // len(local_gpus)
+    end = len(groups) * (lane_index + 1) // len(local_gpus)
+    selected_groups = groups[start:end]
+    partition = sorted(set().union(*selected_groups) if selected_groups else set())
+    if len(partition) < 26:
+        raise SupervisorError(
+            f"GPU {gpu} has only {len(partition)} local logical CPUs from "
+            f"{len(selected_groups)} physical cores; 24 clients plus lane "
+            "orchestration require 26 logical CPUs"
+        )
+    os.sched_setaffinity(0, set(partition))
+    return partition
 
 
 def _canonical(value: Any) -> bytes:
@@ -298,7 +377,7 @@ def load_lane(path: Path) -> dict[str, Any]:
     if tuple(command.get("category") for command in commands) != category_order:
         raise SupervisorError("lane category order drift")
     if lane.get("client_environment") != CLIENT_ENVIRONMENT:
-        raise SupervisorError("lane MPS client environment drift")
+        raise SupervisorError("lane CUDA client environment drift")
     for key in ("repo_dir", "python", "receipt_dir", "quarantine_dir", "log_dir", "lane_lock"):
         if not isinstance(lane.get(key), str) or not lane[key]:
             raise SupervisorError(f"lane {key} must be an explicit path")
@@ -411,9 +490,6 @@ def load_lane(path: Path) -> dict[str, Any]:
             raise SupervisorError("job render-to-runtime environment binding drift")
         if environment["CUDA_VISIBLE_DEVICES"] != gpu:
             raise SupervisorError("job CUDA_VISIBLE_DEVICES differs from lane GPU")
-        for key, value in CLIENT_ENVIRONMENT.items():
-            if environment[key] != value:
-                raise SupervisorError(f"job {key} differs from the systemd MPS service")
         out_dir = Path(argv[argv.index("--out-dir") + 1])
         registry = Path(environment[CONFIG_REGISTRY_ENVIRONMENT_VARIABLE])
         if not out_dir.is_absolute() or registry != out_dir / CONFIG_REGISTRY_FILENAME:
@@ -856,9 +932,15 @@ def _run_job(lane: dict[str, Any], command: dict[str, Any]) -> dict[str, Any]:
 
 def run_lane(path: Path, *, wait_for_lane_lock: bool = False) -> dict[str, Any]:
     lane = load_lane(path)
+    cpu_affinity = _pin_lane_to_cpu_partition(int(lane["gpu"]))
     with _lock(Path(lane["lane_lock"]), blocking=wait_for_lane_lock):
         receipts = [_run_job(lane, command) for command in lane["commands"]]
-    return {"worker_id": lane["worker_id"], "status": "complete", "receipts": receipts}
+    return {
+        "worker_id": lane["worker_id"],
+        "status": "complete",
+        "cpu_affinity": cpu_affinity,
+        "receipts": receipts,
+    }
 
 
 def status_lane(path: Path) -> dict[str, Any]:

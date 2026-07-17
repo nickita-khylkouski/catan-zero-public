@@ -52,6 +52,7 @@ from tools import train_bc  # noqa: E402
 from tools import train as canonical_train  # noqa: E402
 from tools import a1_lineage_dose as lineage  # noqa: E402
 from tools import a1_function_preserving_upgrade as architecture_upgrade  # noqa: E402
+from tools import a1_information_contract_migration as information_migration  # noqa: E402
 from tools import a1_ddp_epoch_canary as ddp_canary  # noqa: E402
 from tools import a1_aux_pair_coordinator as aux_coordinator  # noqa: E402
 from tools import a1_stage_c_final_replication as stage_c_final  # noqa: E402
@@ -134,6 +135,8 @@ ABLATION_RECEIPT_SCHEMA = "a1-learner-ablation-training-receipt-v1"
 ABLATION_CLAIM_SCHEMA = "a1-learner-ablation-training-claim-v1"
 UPGRADE_RECEIPT_SCHEMA = "a1-architecture-upgrade-training-receipt-v1"
 UPGRADE_CLAIM_SCHEMA = "a1-architecture-upgrade-training-claim-v1"
+MIGRATION_RECEIPT_SCHEMA = "a1-information-migration-training-receipt-v1"
+MIGRATION_CLAIM_SCHEMA = "a1-information-migration-training-claim-v1"
 CENTRAL_RECEIPT_SCHEMA = "a1-central-learner-training-receipt-v1"
 CENTRAL_CLAIM_SCHEMA = "a1-central-learner-training-claim-v1"
 CLAIM_DIRECTORY = ".a1-one-dose-training-claims"
@@ -1033,6 +1036,16 @@ def _input_binding(verified: dict[str, Any]) -> dict[str, Any]:
         "learner_lineage_parent": (
             copy.deepcopy(verified["learner_lineage_parent"])
             if isinstance(verified.get("learner_lineage_parent"), dict)
+            else None
+        ),
+        "information_contract_migration": (
+            copy.deepcopy(verified["information_contract_migration"])
+            if isinstance(verified.get("information_contract_migration"), dict)
+            else None
+        ),
+        "training_science_commissioning": (
+            copy.deepcopy(verified["training_science_commissioning"])
+            if isinstance(verified.get("training_science_commissioning"), dict)
             else None
         ),
     }
@@ -2372,29 +2385,49 @@ def bind_canonical_parent_update_recipe(
         ],
     }
     authority["authority_sha256"] = _value_sha256(authority)
-    upgrade = verified.get("function_preserving_upgrade")
+    try:
+        commissioning = current_science.selected_parent_update_commissioning()
+    except current_science.ScienceContractError as error:
+        raise ExecutorError(
+            f"canonical parent-update commissioning refused: {error}"
+        ) from error
+    migration = verified.get("information_contract_migration")
     if (
-        not isinstance(upgrade, dict)
-        or upgrade.get("module")
-        != architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY
-        or upgrade.get("source") != verified["producer"]
+        not isinstance(migration, dict)
+        or migration.get("migration")
+        != information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
+        or migration.get("source") != verified["producer"]
+        or migration.get("forward_identical") is not False
+        or migration.get("promotion_eligible") is not False
     ):
         raise ExecutorError(
-            "canonical parent update requires the direct B12 current-v5+split1 "
-            "to topology "
-            "function-preserving upgrade receipt"
+            "canonical parent update requires the direct non-promotable v2->v6 "
+            "information-contract migration receipt"
         )
     result = dict(verified)
     result["bound_recipe"] = recipe
     result["recipe"] = dict(recipe)
     result["canonical_parent_update"] = authority
+    result["training_science_commissioning"] = commissioning
+    result["promotion_eligible"] = False
+    result["eligible_for_full_gate"] = bool(
+        commissioning["authorized"] and commissioning["go_authorized"]
+    )
+    result["promotion_block_reason"] = (
+        "requires_normal_full_promotion_gates"
+        if result["eligible_for_full_gate"]
+        else "training_science_admission_unauthorized"
+    )
     result["claim_identity_sha256"] = _value_sha256(
         {
             "schema_version": "a1-canonical-parent-update-claim-v1",
             "contract_sha256": verified["contract_sha256"],
             "parent_update_authority_sha256": authority["authority_sha256"],
-            "upgrade_receipt_sha256": upgrade["receipt"]["sha256"],
-            "upgrade_receipt_digest": upgrade["receipt_sha256"],
+            "migration_receipt_sha256": migration["receipt"]["sha256"],
+            "migration_receipt_digest": migration["receipt_sha256"],
+            "training_science_commissioning_sha256": commissioning[
+                "commissioning_sha256"
+            ],
         }
     )
     return result
@@ -5608,14 +5641,15 @@ def bind_stage_c_final_replication(
 
 
 def _append_current_parent_topology_cli(
-    command: list[str], upgrade_module: str | None
+    command: list[str], initializer_identity: str | None
 ) -> None:
-    """Expose the checkpoint-owned current-v5 topology in trainer argv."""
+    """Expose the checkpoint-owned current parent topology in trainer argv."""
 
-    if upgrade_module not in {
+    if initializer_identity not in {
         architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
         architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
         architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
+        information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
     }:
         return
     command.extend(
@@ -5634,15 +5668,21 @@ def _append_current_parent_topology_cli(
             "--meaningful-public-history-target-gather",
             "--public-rule-state-features",
             "--entity-feature-adapter-version",
-            "rust_entity_adapter_v5_meaningful_history_v2",
+            (
+                "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
+                if initializer_identity
+                == information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
+                else "rust_entity_adapter_v5_meaningful_history_v2"
+            ),
             "--value-tower-split-layers",
             "1",
         ]
     )
     if (
-        upgrade_module in {
+        initializer_identity in {
             architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
             architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
+            information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
         }
     ):
         command.append("--topology-residual-adapter")
@@ -5730,16 +5770,21 @@ def _build_direct_train_command(
         command.append("--aux-subgoal-heads")
         command.append("--aux-settlement-pointer-head")
     upgrade_module = verified.get("function_preserving_upgrade", {}).get("module")
-    if upgrade_module in {
+    migration_kind = verified.get("information_contract_migration", {}).get(
+        "migration"
+    )
+    initializer_identity = migration_kind or upgrade_module
+    if initializer_identity in {
         architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
         architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
+        information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
     }:
         # Keep every checkpoint-owned switch visible in the
         # sealed trainer argv as well as in the replayed receipt.  In
         # particular, history-v2 owns cap 64 (the older generic history
         # upgrades below own cap 32), and the private value suffix must not be
         # inferred from an unrelated recipe default.
-        _append_current_parent_topology_cli(command, upgrade_module)
+        _append_current_parent_topology_cli(command, initializer_identity)
     if upgrade_module in {
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES,
         architecture_upgrade.MODULE_PUBLIC_CARD_COUNT_FEATURES_V2,
@@ -6721,6 +6766,52 @@ def bind_function_preserving_upgrade(
     return result
 
 
+def bind_information_contract_migration(
+    verified: dict[str, Any], receipt_path: Path
+) -> dict[str, Any]:
+    """Bind the reviewed v2->v6 treatment without claiming continuity."""
+
+    if verified.get("learner_ablation") is not None:
+        raise ExecutorError("information migration cannot hide inside an ablation")
+    try:
+        migration = information_migration.verify_receipt(receipt_path)
+    except information_migration.MigrationError as error:
+        raise ExecutorError(f"information migration receipt refused: {error}") from error
+    if (
+        migration.get("migration")
+        != information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
+        or migration.get("source") != verified.get("producer")
+        or migration.get("forward_identical") is not False
+        or migration.get("promotion_eligible") is not False
+    ):
+        raise ExecutorError(
+            "information migration must connect the exact corpus producer to "
+            "the non-promotable v6 treatment"
+        )
+    receipt = migration["receipt"]
+    lineage_binding = {
+        "schema_version": "a1-lineage-information-contract-migration-v1",
+        "migration": migration["migration"],
+        "receipt": receipt["path"],
+        "receipt_sha256": receipt["sha256"],
+        "source_checkpoint_sha256": migration["source"]["sha256"],
+        "migrated_initializer_sha256": migration["migrated_initializer"][
+            "sha256"
+        ],
+        "forward_identical": False,
+        "promotion_eligible": False,
+    }
+    result = dict(verified)
+    result["architecture_initializer"] = dict(migration["migrated_initializer"])
+    result["information_contract_migration"] = migration
+    result["information_contract_migration_lineage"] = lineage_binding
+    result["promotion_eligible"] = False
+    result["promotion_block_reason"] = (
+        "information_contract_migration_uncommissioned"
+    )
+    return result
+
+
 def _initializer_transition_record(
     *,
     kind: str,
@@ -7076,6 +7167,7 @@ def _load_claim_state(
             RETRY_CLAIM_SCHEMA,
             ABLATION_CLAIM_SCHEMA,
             UPGRADE_CLAIM_SCHEMA,
+            MIGRATION_CLAIM_SCHEMA,
             CENTRAL_CLAIM_SCHEMA,
         }
         if claim_identity_sha256 is not None
@@ -8825,6 +8917,9 @@ def _direct_lineage_dose(
             )
             if verified.get("initializer_transition_chain") is None
             else None,
+            information_contract_migration=verified.get(
+                "information_contract_migration_lineage"
+            ),
             initializer_transition_chain=verified.get("initializer_transition_chain"),
             current_sampled_rows=sampled_rows,
             current_optimizer_steps=steps,
@@ -8974,6 +9069,24 @@ def _bind_training_report(
             )
         payload["diagnostic_only"] = True
         payload["promotion_eligible"] = False
+    if isinstance(verified.get("information_contract_migration"), dict):
+        commissioning = verified.get("training_science_commissioning")
+        if (
+            not isinstance(commissioning, dict)
+            or commissioning.get("schema_version")
+            != current_science.TRAINING_SCIENCE_COMMISSIONING_SCHEMA
+        ):
+            raise ExecutorError(
+                "migration training report lacks typed science commissioning"
+            )
+        payload["training_science_commissioning"] = copy.deepcopy(commissioning)
+        payload["promotion_eligible"] = False
+        payload["eligible_for_full_gate"] = bool(
+            verified.get("eligible_for_full_gate")
+        )
+        payload["promotion_block_reason"] = str(
+            verified.get("promotion_block_reason")
+        )
     tmp = report.with_name(f".{report.name}.tmp.{os.getpid()}.{time.time_ns()}")
     try:
         with tmp.open("xb") as handle:
@@ -10113,6 +10226,8 @@ def _verify_training_outputs(
         expected_promotion = (
             central_binding["promotion_eligible"]
             if isinstance(central_binding, dict)
+            else False
+            if isinstance(verified.get("information_contract_migration"), dict)
             else learner_ablation is None
         )
         if (
@@ -10122,6 +10237,17 @@ def _verify_training_outputs(
             )
             or report_payload.get("diagnostic_only") != expected_diagnostic
             or report_payload.get("promotion_eligible") != expected_promotion
+            or (
+                isinstance(verified.get("information_contract_migration"), dict)
+                and (
+                    report_payload.get("eligible_for_full_gate")
+                    is not bool(verified.get("eligible_for_full_gate"))
+                    or report_payload.get("promotion_block_reason")
+                    != verified.get("promotion_block_reason")
+                    or report_payload.get("training_science_commissioning")
+                    != verified.get("training_science_commissioning")
+                )
+            )
             or (
                 isinstance(central_binding, dict)
                 and report_payload.get("eligible_for_full_gate")
@@ -11672,6 +11798,8 @@ def _one_dose_claim_and_receipt_schemas(
         return ABLATION_CLAIM_SCHEMA, ABLATION_RECEIPT_SCHEMA
     if verified.get("function_preserving_upgrade") is not None:
         return UPGRADE_CLAIM_SCHEMA, UPGRADE_RECEIPT_SCHEMA
+    if verified.get("information_contract_migration") is not None:
+        return MIGRATION_CLAIM_SCHEMA, MIGRATION_RECEIPT_SCHEMA
     return CLAIM_SCHEMA, RECEIPT_SCHEMA
 
 
@@ -11924,6 +12052,7 @@ def _execute_locked(
     is_retry = "retry_contract" in verified
     is_ablation = verified.get("learner_ablation") is not None
     is_upgrade = verified.get("function_preserving_upgrade") is not None
+    is_migration = verified.get("information_contract_migration") is not None
     is_central = isinstance(verified.get("central_learner_binding"), dict)
     central_execution_commitment = None
     if is_central:
@@ -11973,6 +12102,8 @@ def _execute_locked(
             if is_ablation
             else UPGRADE_CLAIM_SCHEMA
             if is_upgrade
+            else MIGRATION_CLAIM_SCHEMA
+            if is_migration
             else CLAIM_SCHEMA
         ),
         "status": "claimed",
@@ -11983,7 +12114,7 @@ def _execute_locked(
         "training_transaction_sha256": training_transaction_sha256,
         "started_unix_ns": started_ns,
     }
-    if is_retry or is_central or is_ablation or is_upgrade:
+    if is_retry or is_central or is_ablation or is_upgrade or is_migration:
         claim_payload["claim_identity_sha256"] = claim_identity
     if is_retry:
         claim_payload.update(
@@ -12057,6 +12188,8 @@ def _execute_locked(
             if is_ablation
             else UPGRADE_RECEIPT_SCHEMA
             if is_upgrade
+            else MIGRATION_RECEIPT_SCHEMA
+            if is_migration
             else RECEIPT_SCHEMA
         ),
         "status": status,
@@ -12140,6 +12273,21 @@ def _execute_locked(
         evidence_payload["function_preserving_upgrade"] = verified[
             "function_preserving_upgrade"
         ]
+    if is_migration:
+        evidence_payload["claim_identity_sha256"] = claim_identity
+        evidence_payload["information_contract_migration"] = verified[
+            "information_contract_migration"
+        ]
+        evidence_payload["training_science_commissioning"] = copy.deepcopy(
+            verified["training_science_commissioning"]
+        )
+        evidence_payload["promotion_eligible"] = False
+        evidence_payload["eligible_for_full_gate"] = bool(
+            verified.get("eligible_for_full_gate")
+        )
+        evidence_payload["promotion_block_reason"] = str(
+            verified.get("promotion_block_reason")
+        )
     if isinstance(verified.get("canonical_parent_update"), dict):
         evidence_payload["canonical_parent_update"] = copy.deepcopy(
             verified["canonical_parent_update"]
@@ -12154,6 +12302,8 @@ def _execute_locked(
         if is_ablation
         else UPGRADE_CLAIM_SCHEMA
         if is_upgrade
+        else MIGRATION_CLAIM_SCHEMA
+        if is_migration
         else CLAIM_SCHEMA
     )
     terminal_claim_payload["receipt_target"] = str(receipt)
@@ -12271,6 +12421,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "immutable allowlisted zero-diff initializer receipt; exact producer "
             "bytes remain the default"
+        ),
+    )
+    parser.add_argument(
+        "--information-contract-migration-receipt",
+        type=Path,
+        default=None,
+        help=(
+            "immutable non-promotable V2->V6 information-contract migration "
+            "receipt; required by the selected canonical parent treatment"
         ),
     )
     parser.add_argument(
@@ -12509,6 +12668,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         canonical_parent_update_requested = (
             args.canonical_parent_update_config is not None
         )
+        if (
+            args.architecture_upgrade_receipt is not None
+            and args.information_contract_migration_receipt is not None
+        ):
+            raise ExecutorError(
+                "initializer cannot claim both a function-preserving upgrade "
+                "and an information-contract migration"
+            )
+        if (
+            args.information_contract_migration_receipt is not None
+            and not canonical_parent_update_requested
+        ):
+            raise ExecutorError(
+                "information-contract migration is currently admitted only for "
+                "the selected canonical parent-update treatment"
+            )
         if stage_c_final_requested != (args.stage_c_final_arm is not None):
             raise ExecutorError(
                 "--stage-c-final-authority and --stage-c-final-arm are required together"
@@ -12586,12 +12761,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             or p1_requested
             or final_requested
             or stage_c_final_requested
-            or args.architecture_upgrade_receipt is None
+            or args.information_contract_migration_receipt is None
+            or args.architecture_upgrade_receipt is not None
             or args.topology != B200_8GPU_DDP_TOPOLOGY
             or args.gpu != 0
         ):
             raise ExecutorError(
-                "canonical parent update requires direct upgrade receipt and exact "
+                "canonical parent update requires the direct V2->V6 migration "
+                "receipt and exact "
                 "b200-8gpu-ddp GPU0 ownership; diagnostics are forbidden"
             )
         if (
@@ -12668,6 +12845,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 allow_diagnostic_recent_history_source=bool(args.diagnostic_dose_curve),
                 independent_parent_authority_path=(args.independent_parent_authority),
                 allow_stage_c_final_current_parent=stage_c_final_requested,
+            )
+        if args.information_contract_migration_receipt is not None:
+            verified = bind_information_contract_migration(
+                verified,
+                args.information_contract_migration_receipt,
             )
         if canonical_parent_update_requested:
             assert args.canonical_parent_update_config is not None
@@ -12940,6 +13122,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "report": str(report),
             "receipt": str(receipt),
             "function_preserving_upgrade": verified.get("function_preserving_upgrade"),
+            "information_contract_migration": verified.get(
+                "information_contract_migration"
+            ),
+            "training_science_commissioning": verified.get(
+                "training_science_commissioning"
+            ),
+            "promotion_eligible": bool(verified.get("promotion_eligible", False)),
+            "eligible_for_full_gate": bool(
+                verified.get("eligible_for_full_gate", False)
+            ),
+            "promotion_block_reason": verified.get("promotion_block_reason"),
             "diagnostic_comparison_source": verified.get(
                 "diagnostic_comparison_source"
             ),
@@ -12956,6 +13149,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(plan, indent=2, sort_keys=True))
         if not args.go:
             return 0
+        if canonical_parent_update_requested:
+            try:
+                live_commissioning = (
+                    current_science.require_selected_parent_update_go_authorized()
+                )
+            except current_science.ScienceContractError as error:
+                raise ExecutorError(str(error)) from error
+            if live_commissioning != verified.get("training_science_commissioning"):
+                raise ExecutorError(
+                    "selected parent-update commissioning changed after planning"
+                )
         execute(
             verified=verified,
             command=command,

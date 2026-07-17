@@ -24,6 +24,22 @@ def test_canonical_generation_default_requires_adapter_v6() -> None:
     ] == "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
 
 
+def test_canonical_generation_guard_is_bound_to_recipe() -> None:
+    config = ROOT / "configs/generation/coherent_public_n128.schema20.json"
+    expected = (
+        ROOT
+        / "configs/guards/"
+        "a1_generation_coherent_public_n128_v4.json"
+    )
+    generate._validate_guard(config=config, guard=expected)  # noqa: SLF001
+
+    with pytest.raises(ValueError, match="canonical generation guard mismatch"):
+        generate._validate_guard(  # noqa: SLF001
+            config=config,
+            guard=ROOT / "configs/guards/generate_gumbel_selfplay_data.json",
+        )
+
+
 @pytest.mark.parametrize(
     ("validator", "relative_path"),
     (

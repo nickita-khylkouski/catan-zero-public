@@ -749,6 +749,12 @@ def test_topology_aware_current_v5_split1_is_a_new_reviewed_upgrade_edge() -> No
     ) == selected["flags"]
 
 
+def test_adapter_v6_is_refused_as_a_function_preserving_upgrade() -> None:
+    assert all("v6" not in module for module in upgrade.ALLOWLIST)
+    with pytest.raises(SystemExit, match="not function preserving"):
+        upgrade_tool._parse_flags("current_v6_topology_split1")  # noqa: SLF001
+
+
 def test_b12_topology_upgrade_adds_only_zero_output_topology_parameters() -> None:
     selected = upgrade.ALLOWLIST[
         upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY

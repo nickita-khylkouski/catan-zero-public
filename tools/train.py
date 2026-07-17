@@ -194,14 +194,16 @@ def _require_exact_cap_feature_observability(
     if minimum == 0:
         return
 
-    # max_steps counts applied optimizer updates. Each update consumes at most
-    # grad_accum_steps micro-batches, while module diagnostics are sampled by
-    # micro-batch number. Epoch-boundary counter resets and partial accumulation
-    # groups can only reduce this upper bound.
+    # max_steps counts applied optimizer updates. Diagnostics are dose-global
+    # micro-batch events, but a retained observation must also close an
+    # accumulation group. The eligible indices are therefore the common
+    # multiples of cadence and grad_accum_steps, not every cadence hit.
+    accumulation = int(config.grad_accum_steps)
+    eligible_period = math.lcm(accumulation, cadence) if cadence else 0
     maximum_observations = (
         0
         if cadence == 0
-        else int(config.max_steps) * int(config.grad_accum_steps) // cadence
+        else int(config.max_steps) * accumulation // eligible_period
     )
     if maximum_observations < minimum:
         raise SystemExit(
@@ -230,8 +232,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--init-checkpoint",
         default="",
         help=(
-            "Exact learner initializer. For B12 this is the topology-only "
-            "function-preserving upgraded checkpoint, not the incumbent bytes."
+            "Exact learner initializer. The selected v6 parent treatment is a "
+            "measured non-promotable V2->V6 information-contract migration, "
+            "not a function-preserving upgrade."
         ),
     )
     parser.add_argument(
@@ -243,11 +246,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--architecture-upgrade-receipt",
+        "--information-contract-migration-receipt",
         default="",
         help=(
-            "Reviewed zero-diff receipt connecting --parent-checkpoint to "
-            "--init-checkpoint. Required when their bytes differ."
+            "Reviewed non-promotable information-contract migration connecting "
+            "--parent-checkpoint to --init-checkpoint. Required for the v6 treatment."
         ),
     )
     parser.add_argument("--device", default="auto")
@@ -552,55 +555,59 @@ def _parent_initializer_binding(
     initializer = _checkpoint_ref(
         public_args.init_checkpoint, where="learner initializer"
     )
-    receipt_raw = str(public_args.architecture_upgrade_receipt or "")
+    receipt_raw = str(public_args.information_contract_migration_receipt or "")
     if parent["sha256"] == initializer["sha256"]:
         if receipt_raw:
             raise SystemExit(
-                "exact-parent initialization must not claim an architecture receipt"
+                "exact-parent initialization must not claim a migration receipt"
             )
         return {
             "schema_version": "a1-canonical-parent-initializer-v1",
             "mode": "exact_parent",
             "parent": parent,
             "initializer": initializer,
-            "function_preserving_upgrade": None,
+            "information_contract_migration": None,
         }
     if not receipt_raw:
         raise SystemExit(
             "initializer bytes differ from the incumbent; "
-            "--architecture-upgrade-receipt is required"
+            "--information-contract-migration-receipt is required"
         )
-    from tools import a1_function_preserving_upgrade as upgrade
+    from tools import a1_information_contract_migration as migration
 
     try:
-        replayed = upgrade.verify_receipt(Path(receipt_raw))
-    except (OSError, upgrade.UpgradeError) as error:
-        raise SystemExit(f"architecture upgrade receipt refused: {error}") from error
+        replayed = migration.verify_receipt(Path(receipt_raw))
+    except (OSError, migration.MigrationError) as error:
+        raise SystemExit(f"information migration receipt refused: {error}") from error
     if (
-        replayed.get("module")
-        != upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY
+        replayed.get("migration")
+        != migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
         or replayed.get("source") != parent
-        or replayed.get("upgraded_initializer") != initializer
+        or replayed.get("migrated_initializer") != initializer
+        or replayed.get("forward_identical") is not False
+        or replayed.get("promotion_eligible") is not False
     ):
         raise SystemExit(
-            "architecture receipt must connect the exact incumbent directly to "
-            "the reviewed B12 current-v5+split1 topology initializer"
+            "migration receipt must connect the exact v2 incumbent directly to "
+            "the non-promotable adapter-v6 topology+split1 treatment"
         )
     receipt = replayed["receipt"]
     lineage_binding = {
-        "schema_version": "a1-lineage-function-preserving-upgrade-v1",
-        "module": replayed["module"],
+        "schema_version": "a1-lineage-information-contract-migration-v1",
+        "migration": replayed["migration"],
         "receipt": receipt["path"],
         "receipt_sha256": receipt["sha256"],
         "source_checkpoint_sha256": parent["sha256"],
-        "upgraded_initializer_sha256": initializer["sha256"],
+        "migrated_initializer_sha256": initializer["sha256"],
+        "forward_identical": False,
+        "promotion_eligible": False,
     }
     return {
         "schema_version": "a1-canonical-parent-initializer-v1",
-        "mode": "function_preserving_upgrade",
+        "mode": "information_contract_migration",
         "parent": parent,
         "initializer": initializer,
-        "function_preserving_upgrade": lineage_binding,
+        "information_contract_migration": lineage_binding,
     }
 
 
@@ -644,9 +651,9 @@ def _bind_parent_report(
             init_checkpoint_sha256=initialization["initializer"]["sha256"],
             current_sampled_rows=sampled_rows,
             current_optimizer_steps=steps,
-            function_preserving_upgrade=initialization[
-                "function_preserving_upgrade"
-            ],
+            information_contract_migration=initialization.get(
+                "information_contract_migration"
+            ),
         )
     except lineage.LineageDoseError as error:
         raise SystemExit(f"canonical parent lineage refused: {error}") from error
@@ -654,7 +661,9 @@ def _bind_parent_report(
     payload["a1_parent_update_initialization"] = dict(initialization)
     payload["promotion_eligible"] = False
     payload["promotion_block_reason"] = (
-        "requires_sealed_a1_one_dose_execution_receipt"
+        "information_contract_migration_uncommissioned"
+        if initialization.get("mode") == "information_contract_migration"
+        else "requires_sealed_a1_one_dose_execution_receipt"
     )
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
     try:

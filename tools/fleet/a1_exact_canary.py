@@ -2,9 +2,9 @@
 """Fail-closed static canary for the exact A1 n128 production render.
 
 The validator consumes the immutable render plus the executor's public dry-run
-plan.  It does not launch work.  Its purpose is to prove that both a 4-GPU and
-an 8-GPU host shape are represented by independent, per-GPU lanes using the
-one authorized search recipe and the host-managed MPS client environment.
+plan.  It does not launch work.  Its purpose is to prove that each physical
+GPU has one independent lane using the authorized search recipe and one
+EvalServer CUDA owner serving CPU search clients through ``mp_queue``.
 """
 
 from __future__ import annotations
@@ -27,10 +27,7 @@ class CanaryError(RuntimeError):
 
 
 CATEGORY_ORDER = ("current_producer", "recent_history", "hard_negative")
-EXPECTED_MPS_ENVIRONMENT = {
-    "CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps_pipe_host",
-    "CUDA_MPS_LOG_DIRECTORY": "/tmp/mps_log_host",
-}
+EXPECTED_CLIENT_ENVIRONMENT: dict[str, str] = {}
 EXPECTED_VALUE_FLAGS = {
     "--n-full": "128",
     "--n-fast": "16",
@@ -38,21 +35,37 @@ EXPECTED_VALUE_FLAGS = {
     "--c-scale": "0.1",
     "--c-visit": "50.0",
     "--max-depth": "80",
-    "--workers": "16",
+    "--workers": "24",
     "--device": "cuda",
     "--symmetry-averaged-eval-threshold": "20",
     "--rescale-noise-floor-c": "0.0",
-    "--determinization-particles": "4",
+    "--determinization-particles": "1",
     "--determinization-min-simulations": "32",
+    "--eval-server-max-batch": "96",
+    "--eval-server-max-wait-ms": "0.0",
+    "--eval-server-timeout-ms": "20000.0",
+    "--eval-server-batch-timeout-sec": "0.0",
+    "--eval-server-matmul-precision": "highest",
+    "--eval-server-transport": "mp_queue",
+    "--eval-server-shared-memory-slot-bytes": "4194304",
+    "--eval-server-cuda-graph-warmup-iterations": "3",
+    "--eval-server-cuda-graph-batch-buckets": "\x1f".join(
+        str(value) for value in (8, 16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192)
+    ),
 }
 REQUIRED_SWITCHES = {
     "--symmetry-averaged-eval",
     "--public-observation",
-    "--information-set-search",
+    "--coherent-public-belief-search",
+    "--no-information-set-search",
     "--lazy-interior-chance",
     "--no-belief-chance-spectra",
     "--no-wide-roots-always-full",
-    "--no-eval-server",
+    "--native-mcts-hot-loop",
+    "--eval-server",
+    "--no-eval-server-local-fallback",
+    "--eval-server-request-collector",
+    "--no-eval-server-cuda-graph",
     "--seed-claim",
     "--resume",
 }
@@ -60,11 +73,11 @@ FORBIDDEN_FLAGS = {
     "--n-full-wide",
     "--n-full-wide-threshold",
     "--wide-roots-always-full",
-    "--eval-server",
+    "--no-eval-server",
     "--skip-guards",
     "--no-seed-claim",
     "--no-public-observation",
-    "--no-information-set-search",
+    "--information-set-search",
     "--belief-chance-spectra",
 }
 MULTI_VALUE_FLAGS = {"--eval-server-cuda-graph-batch-buckets"}
@@ -124,11 +137,11 @@ def _parse_shapes(raw: Sequence[str]) -> dict[str, int]:
             value = int(count)
         except ValueError as error:
             raise CanaryError(f"invalid GPU count in host shape {item!r}") from error
-        if value not in (4, 8):
-            raise CanaryError(f"host shape {alias!r} must be exactly 4 or 8 GPUs")
+        if value != 8:
+            raise CanaryError(f"host shape {alias!r} must be exactly 8 GPUs")
         shapes[alias] = value
-    if sorted(shapes.values()) != [4, 8]:
-        raise CanaryError("canary must name exactly one 4-GPU host and one 8-GPU host")
+    if not shapes:
+        raise CanaryError("canary must name at least one 8-GPU host")
     return shapes
 
 
@@ -167,7 +180,7 @@ def _bound_lock(
 def validate_exact_canary(
     rendered: dict[str, Any], plan: dict[str, Any], host_shapes: dict[str, int]
 ) -> dict[str, Any]:
-    """Validate exact recipe, pinning, MPS binding, topology, outputs, and seeds."""
+    """Validate exact recipe, CUDA ownership, topology, outputs, and seeds."""
 
     if rendered.get("schema_version") != contract.RENDER_SCHEMA:
         raise CanaryError(f"render schema must be {contract.RENDER_SCHEMA}")
@@ -177,10 +190,8 @@ def validate_exact_canary(
         raise CanaryError("executor plan binds a different contract")
     if plan.get("render_sha256") != rendered.get("render_sha256"):
         raise CanaryError("executor plan binds a different render")
-    if plan.get("client_environment") != EXPECTED_MPS_ENVIRONMENT:
-        raise CanaryError(
-            "executor MPS client environment must exactly bind the managed host pipe/log"
-        )
+    if plan.get("client_environment") != EXPECTED_CLIENT_ENVIRONMENT:
+        raise CanaryError("executor must not export retired MPS client variables")
 
     bound_lock = _bound_lock(rendered, plan)
     commands = rendered.get("commands")
@@ -344,15 +355,21 @@ def validate_exact_canary(
             "n_fast": 16,
             "p_full": 0.25,
             "public_observation": True,
-            "information_set_search": True,
-            "determinization_particles": 4,
+            "coherent_public_belief_search": True,
+            "information_set_search": False,
+            "determinization_particles": 1,
             "determinization_min_simulations": 32,
             "symmetry_averaged_eval": True,
             "symmetry_averaged_eval_threshold": 20,
             "adaptive_wide_budget": False,
-            "workers_per_gpu": 16,
+            "workers_per_gpu": 24,
+            "eval_server": True,
+            "eval_server_transport": "mp_queue",
+            "eval_server_local_fallback": False,
+            "fleet_pipelines_per_gpu": 1,
         },
-        "mps_client_environment": EXPECTED_MPS_ENVIRONMENT,
+        "client_environment": EXPECTED_CLIENT_ENVIRONMENT,
+        "cuda_owner_model": "one_eval_server_per_physical_gpu",
         "lane_count": len(lanes),
         "job_count": len(commands_by_job),
         "unique_output_count": len(outputs),
@@ -370,7 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         action="append",
         metavar="ALIAS=GPU_COUNT",
-        help="repeat exactly twice: one 4-GPU host and one 8-GPU host",
+        help="repeat for each selected 8-GPU host; one host is a valid pilot",
     )
     return parser
 

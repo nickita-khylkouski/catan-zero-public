@@ -28,10 +28,13 @@ from catan_zero.rl.pipeline_configs import (  # noqa: E402
     GenerateConfig,
 )
 from catan_zero.rl.production_recipe_catalog import (  # noqa: E402
+    production_recipes,
     require_production_recipe,
 )
 
-from generate_gumbel_selfplay_data import main as _legacy_executor_main  # noqa: E402
+from tools.generate_gumbel_selfplay_data import (  # noqa: E402
+    main as _legacy_executor_main,
+)
 
 
 CANONICAL_OPTION_COUNT = 9
@@ -185,6 +188,35 @@ def _validate_config(path: Path) -> None:
             )
 
 
+def _validate_guard(*, config: Path, guard: Path) -> None:
+    """Bind the launcher to the one guard authenticated with its recipe.
+
+    A schema-valid guard is not interchangeable with the production guard:
+    older PIMC campaigns intentionally retained different determinization and
+    temperature values.  The catalog owns the recipe/guard pair, so accepting
+    an arbitrary ``--guard`` here would reintroduce science flags through a
+    placement-only CLI.
+    """
+
+    config_path = config.expanduser().resolve(strict=True)
+    guard_path = guard.expanduser().resolve(strict=True)
+    matches = [
+        entry
+        for entry in production_recipes("generate")
+        if Path(entry["path"]) == config_path
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"canonical generation recipe has no unique guard binding: {config_path}"
+        )
+    expected = Path(matches[0]["guard"])
+    if guard_path != expected:
+        raise ValueError(
+            "canonical generation guard mismatch: "
+            f"expected={expected} actual={guard_path}"
+        )
+
+
 def _executor_argv(args: argparse.Namespace) -> list[str]:
     output = args.out_dir.expanduser()
     forwarded = [
@@ -245,6 +277,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--base-seed must be non-negative")
     try:
         _validate_config(args.config.expanduser())
+        _validate_guard(config=args.config, guard=args.guard)
         _ensure_runtime_limits()
     except ValueError as error:
         parser.error(str(error))

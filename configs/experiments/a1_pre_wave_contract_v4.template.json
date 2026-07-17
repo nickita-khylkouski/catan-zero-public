@@ -303,12 +303,11 @@
     "output_root": "__UNRESOLVED__"
   },
   "provenance": {
-    "guard_config": "../guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json",
+    "guard_config": "../guards/a1_generation_coherent_public_n128_v4.json",
     "generator_code_files": [
       "../../tools/a1_current_science_contract.py",
       "../operations/a1-next-wave-coherent-public-v4/science.contract.json",
       "../../tools/generate_gumbel_selfplay_data.py",
-      "../../tools/fleet/systemd/nvidia-mps.service",
       "../../tools/opponent_mix_registry.py",
       "../../src/catan_zero/rl/gumbel_self_play.py",
       "../../src/catan_zero/rl/decision_taxonomy.py",

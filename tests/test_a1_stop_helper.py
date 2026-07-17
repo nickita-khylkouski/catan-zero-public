@@ -193,7 +193,7 @@ def test_stop_targets_only_exact_detached_groups_and_preserves_unrelated(
         lane_path, 101, term_timeout=0.0, kill_timeout=0.0
     )
     assert report["status"] == "stopped"
-    assert report["mps_preserved"] is True
+    assert report["gpu_runtime_preserved"] is True
     assert 202 in report["kill_targets"]
     assert 303 in processes
     assert not any(pid == 303 for pid, _signal in signals)
@@ -275,7 +275,7 @@ def test_executor_stop_is_dry_by_default_and_writes_resumable_stopped_receipt(
         return {
             "worker_id": worker,
             "status": "active" if action == "inspect" else "stopped",
-            "mps_preserved": True,
+            "gpu_runtime_preserved": True,
         }
 
     monkeypatch.setattr(executor, "_stop_helper_call", call)
@@ -287,7 +287,7 @@ def test_executor_stop_is_dry_by_default_and_writes_resumable_stopped_receipt(
     stopped = executor.stop_execution(plan, receipt_path=receipt_path, go=True)
     assert calls == ["inspect", "inspect", "stop"]
     assert stopped["status"] == "stopped"
-    assert stopped["mps_preserved"] is True
+    assert stopped["gpu_runtime_preserved"] is True
     persisted = json.loads(receipt_path.read_text())
     assert persisted["status"] == "stopped"
     assert "launch_pending_worker_id" not in persisted

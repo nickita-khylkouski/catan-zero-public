@@ -27,6 +27,9 @@ AUDIT_SCHEMAS = {
 V16_COMBINED_ARCHITECTURE_PROFILE = (
     "a1-v1.6-public-card-count-meaningful-history-bias-free-v2"
 )
+V6_INFORMATION_MIGRATION_ARCHITECTURE_PROFILE = (
+    "a1-v6-exact-actor-resources-initial-road-two-hop-topology-split1-v1"
+)
 
 
 class FlywheelTurnError(RuntimeError):
@@ -255,6 +258,7 @@ def build_turn(
     evaluation_parent: Path,
     initializer: Path,
     architecture_upgrade_receipt: Path | None = None,
+    information_contract_migration_receipt: Path | None = None,
 ) -> dict[str, Any]:
     """Build and replay one exact post-promotion learner-turn proof."""
 
@@ -334,7 +338,15 @@ def build_turn(
     }
 
     initializer_ref = _ref(initializer, where="learner initializer")
-    if architecture_upgrade_receipt is None:
+    if (
+        architecture_upgrade_receipt is not None
+        and information_contract_migration_receipt is not None
+    ):
+        raise FlywheelTurnError("initializer cannot claim both upgrade and migration")
+    if (
+        architecture_upgrade_receipt is None
+        and information_contract_migration_receipt is None
+    ):
         if initializer_ref != parent_ref:
             raise FlywheelTurnError(
                 "non-upgrade initializer must be the exact learner parent"
@@ -344,7 +356,7 @@ def build_turn(
             "checkpoint": initializer_ref,
             "receipt": None,
         }
-    else:
+    elif architecture_upgrade_receipt is not None:
         from tools import a1_function_preserving_upgrade as upgrade
 
         try:
@@ -377,6 +389,37 @@ def build_turn(
             initializer_binding["architecture_profile"] = (
                 V16_COMBINED_ARCHITECTURE_PROFILE
             )
+    else:
+        from tools import a1_information_contract_migration as migration
+
+        assert information_contract_migration_receipt is not None
+        try:
+            replayed = migration.verify_receipt(
+                information_contract_migration_receipt
+            )
+        except migration.MigrationError as error:
+            raise FlywheelTurnError(
+                f"information migration receipt failed: {error}"
+            ) from error
+        if (
+            replayed.get("source") != parent_ref
+            or replayed.get("migrated_initializer") != initializer_ref
+            or replayed.get("forward_identical") is not False
+            or replayed.get("promotion_eligible") is not False
+        ):
+            raise FlywheelTurnError(
+                "information migration does not connect parent to initializer"
+            )
+        initializer_binding = {
+            "mode": "information_contract_migration",
+            "checkpoint": initializer_ref,
+            "receipt": replayed["receipt"],
+            "receipt_sha256": replayed["receipt_sha256"],
+            "migration": replayed["migration"],
+            "forward_identical": False,
+            "promotion_eligible": False,
+            "architecture_profile": V6_INFORMATION_MIGRATION_ARCHITECTURE_PROFILE,
+        }
 
     dethroned = promotion["champion"]["sha256"]
     value: dict[str, Any] = {
@@ -436,8 +479,13 @@ def verify_turn(path: Path, *, verified: Mapping[str, Any]) -> dict[str, Any]:
         evaluation_parent=Path(value["evaluation_parent"]["path"]),
         initializer=Path(initializer["checkpoint"]["path"]),
         architecture_upgrade_receipt=(
+            Path(initializer["receipt"]["path"])
+            if initializer.get("mode") == "function_preserving_upgrade"
+            else None
+        ),
+        information_contract_migration_receipt=(
             None
-            if initializer.get("receipt") is None
+            if initializer.get("mode") != "information_contract_migration"
             else Path(initializer["receipt"]["path"])
         ),
     )

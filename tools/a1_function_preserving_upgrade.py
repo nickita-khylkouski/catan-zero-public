@@ -861,6 +861,7 @@ def _reconstruct_seeded_parameters(
     seed: int,
     config_delta: Mapping[str, Any],
     expected_names: set[str],
+    entity_feature_adapter_version: str | None = None,
 ) -> dict[str, Any]:
     """Rebuild deterministic PyTorch-default additions from the source bytes.
 
@@ -892,7 +893,9 @@ def _reconstruct_seeded_parameters(
         seed=seed,
         device="cpu",
         entity_feature_adapter_version=(
-            RUST_ENTITY_ADAPTER_V5
+            entity_feature_adapter_version
+            if entity_feature_adapter_version is not None
+            else RUST_ENTITY_ADAPTER_V5
             if values.get("meaningful_public_history_schema")
             == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
             else RUST_ENTITY_ADAPTER_V4
@@ -1051,6 +1054,9 @@ def inspect_upgrade(
             seed=seed,
             config_delta=spec["config_delta"],
             expected_names=set(expected_added),
+            entity_feature_adapter_version=spec.get(
+                "entity_feature_adapter_version"
+            ),
         )
         if seeded_names
         else {}

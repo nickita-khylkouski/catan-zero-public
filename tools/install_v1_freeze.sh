@@ -38,7 +38,6 @@ RS_WHEEL_SHA256_FILE_REL="native/catanatron-rs/WHEEL_SHA256SUMS"
 RUNTIME_CONTRACT_REL="configs/runtime/a1_production_runtime.json"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 PY="${PY:-python3.11}"
-MPS_REQUIRED_LIMIT_NOFILE_SOFT=65536
 
 INSTALL_TMP=""
 EXPORTER_TRANSACTION_ARMED=0
@@ -104,6 +103,20 @@ if [ -z "$CATAN_REF" ]; then
   echo "[install] ERROR: CATAN_REF is required; v1.0-deploy predates the current H100 launcher/lifecycle fixes." >&2
   echo "          Publish this verified tree as an immutable release tag, then rerun with CATAN_REF=<that-tag>." >&2
   exit 2
+fi
+
+# Generation no longer uses CUDA MPS.  This standalone installer deliberately
+# does not kill a possibly live legacy workload: fleet nodes must first pass
+# the workload-aware preflight, which disables MPS and removes its stale IPC.
+if command -v systemctl >/dev/null 2>&1; then
+  mps_active="$(systemctl is-active nvidia-mps.service 2>/dev/null || true)"
+  mps_enabled="$(systemctl is-enabled nvidia-mps.service 2>/dev/null || true)"
+  if [ "$mps_active" = "active" ] || [ "$mps_active" = "activating" ] \
+    || [ "$mps_enabled" = "enabled" ] || [ "$mps_enabled" = "enabled-runtime" ] \
+    || pgrep -f '^/usr/bin/nvidia-cuda-mps-(control|server)' >/dev/null 2>&1 \
+    || [ -e /tmp/mps_pipe_host ] || [ -e /tmp/mps_log_host ]; then
+    die "legacy CUDA MPS is present; run tools/fleet/a1_h100_generation_preflight.py --bootstrap on an idle host before installing"
+  fi
 fi
 
 echo "[install] repo=$CATAN_REPO ref=$CATAN_REF dest=$CATAN_DEST py=$PY"
@@ -272,48 +285,6 @@ if [ -e "$CATAN_INSTALL_RECEIPT" ] && [ ! -f "$CATAN_INSTALL_RECEIPT" ]; then
   die "install receipt path exists and is not a regular file: $CATAN_INSTALL_RECEIPT"
 fi
 rm -f -- "$CATAN_INSTALL_RECEIPT"
-
-# The production executor requires a boot-persistent foreground MPS daemon.
-# Install the exact unit from this immutable checkout; ad-hoc `-d` daemons can
-# disappear with their SSH session and strand every attached CUDA client.
-MPS_UNIT_SOURCE="$CATAN_DEST/tools/fleet/systemd/nvidia-mps.service"
-MPS_UNIT_DEST="/etc/systemd/system/nvidia-mps.service"
-if [ ! -f "$MPS_UNIT_SOURCE" ]; then
-  echo "[install] ERROR: canonical MPS unit is missing: $MPS_UNIT_SOURCE" >&2
-  exit 3
-fi
-if ! sudo -n true 2>/dev/null; then
-  echo "[install] ERROR: passwordless sudo is required to install nvidia-mps.service" >&2
-  exit 3
-fi
-sudo install -m 0644 "$MPS_UNIT_SOURCE" "$MPS_UNIT_DEST"
-sudo systemctl daemon-reload
-sudo systemctl enable nvidia-mps.service
-# `enable --now` does not reload an already-active service after unit bytes
-# change.  Restart explicitly so preflight observes the unit from this tag,
-# never a prior manually-staged definition.
-sudo systemctl restart nvidia-mps.service
-if [ "$(systemctl is-active nvidia-mps.service)" != "active" ] \
-  || [ "$(systemctl is-enabled nvidia-mps.service)" != "enabled" ]; then
-  echo "[install] ERROR: nvidia-mps.service is not active+enabled" >&2
-  sudo systemctl status nvidia-mps.service --no-pager >&2 || true
-  exit 3
-fi
-if ! CATAN_MPS_LIMIT_NOFILE_SOFT="$(
-  systemctl show nvidia-mps.service --property=LimitNOFILESoft --value
-)"; then
-  echo "[install] ERROR: cannot inspect nvidia-mps.service LimitNOFILESoft" >&2
-  sudo systemctl status nvidia-mps.service --no-pager >&2 || true
-  exit 3
-fi
-if [[ ! "$CATAN_MPS_LIMIT_NOFILE_SOFT" =~ ^[0-9]+$ ]] \
-  || [ "$CATAN_MPS_LIMIT_NOFILE_SOFT" -lt "$MPS_REQUIRED_LIMIT_NOFILE_SOFT" ]; then
-  echo "[install] ERROR: nvidia-mps.service effective LimitNOFILESoft is " \
-    "$CATAN_MPS_LIMIT_NOFILE_SOFT; required >=$MPS_REQUIRED_LIMIT_NOFILE_SOFT" >&2
-  sudo systemctl status nvidia-mps.service --no-pager >&2 || true
-  exit 3
-fi
-echo "[install] nvidia-mps.service active+enabled LimitNOFILESoft=$CATAN_MPS_LIMIT_NOFILE_SOFT"
 
 # 3. venv — the exact contracted Python patch is REQUIRED.  A command named
 #    python3.11 may still be 3.11.x with a different patch; probe the executable
@@ -606,9 +577,6 @@ export CATAN_INSTALL_RECEIPT CATAN_REPO CATAN_REF CATAN_DEST REF_KIND TAG_COMMIT
 export RS_WHEEL_NAME RS_WHEEL_ACTUAL_SHA256 RS_WHEEL_EXPECTED_SHA256
 export RS_WHEEL_SHA256_FILE_REL RS_WHEEL_INVENTORY_SHA256
 export RUNTIME_CONTRACT_REL RUNTIME_CONTRACT_SHA256
-export CATAN_MPS_ACTIVE="$(systemctl is-active nvidia-mps.service)"
-export CATAN_MPS_ENABLED="$(systemctl is-enabled nvidia-mps.service)"
-export CATAN_MPS_LIMIT_NOFILE_SOFT
 export CATAN_EXPORTER_ACTIVE="$(systemctl is-active catan-fleet-exporter.service)"
 export CATAN_EXPORTER_ENABLED="$(systemctl is-enabled catan-fleet-exporter.service)"
 export CATAN_EXPORTER_FRAGMENT_PATH CATAN_EXPORTER_DROPIN_PATHS CATAN_EXPORTER_ATTESTATION_JSON
@@ -741,11 +709,6 @@ payload = {
         },
     },
     "services": {
-        "nvidia_mps_active": os.environ["CATAN_MPS_ACTIVE"],
-        "nvidia_mps_enabled": os.environ["CATAN_MPS_ENABLED"],
-        "nvidia_mps_limit_nofile_soft": int(
-            os.environ["CATAN_MPS_LIMIT_NOFILE_SOFT"]
-        ),
         "fleet_exporter_active": os.environ["CATAN_EXPORTER_ACTIVE"],
         "fleet_exporter_enabled": os.environ["CATAN_EXPORTER_ENABLED"],
         "fleet_exporter_fragment_path": os.environ["CATAN_EXPORTER_FRAGMENT_PATH"],

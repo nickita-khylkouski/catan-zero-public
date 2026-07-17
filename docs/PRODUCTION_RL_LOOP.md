@@ -85,14 +85,15 @@ The historical shell fleet launcher was deleted. New production turns must
 enter through this coordinator and its sealed executor; Git history retains
 the old implementation when an issued receipt needs forensic review.
 
-The commissioned parent update is
-`configs/training/a1_parent_update_35m_b200.schema1.json`: exact B12 parent,
-direct topology-only function-preserving initializer over B12's learned
-current-v5+split1 bytes, fresh AdamW, 0.25x shared-trunk learning rate,
-12 steps, and 8x64=512 global batch. New parent-update turns must pass it to
-`a1_one_dose_train.py` with `--canonical-parent-update-config`; the loop binds
-that file as an immutable train input. Generic learner overrides remain
-diagnostic-only.
+The selected parent-update treatment is
+`configs/training/a1_parent_update_35m_b200.schema1.json`: exact V2 incumbent,
+an explicit V2->V6 information-contract migration initializer, fresh AdamW,
+0.25x shared-trunk learning rate, 12 steps, and 8x64=512 global batch. The
+migration is measured and reproducible but **not** function-preserving and is
+non-promotable until it is commissioned by the matched strength gates. New
+parent-update turns must pass the config and an immutable
+`--information-contract-migration-receipt` to `a1_one_dose_train.py`; the loop
+binds both as train inputs. Generic learner overrides remain diagnostic-only.
 
 `tools/evaluate.py` emits a matched internal H2H source report; it is not a
 promotion adjudication. After the existing matched evaluators have emitted

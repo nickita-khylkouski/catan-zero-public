@@ -160,6 +160,7 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
     mode = value.get("mode")
     if mode not in {
         "direct_from_declared_producer",
+        "direct_with_information_contract_migration",
         "direct_with_typed_initializer_chain",
         "typed_curriculum",
     }:
@@ -249,6 +250,7 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
         raise LineageDoseError("lineage cumulative dose arithmetic drift")
     if mode in {
         "direct_from_declared_producer",
+        "direct_with_information_contract_migration",
         "direct_with_typed_initializer_chain",
     } and (prior_rows or prior_steps):
         raise LineageDoseError("direct lineage cannot carry a prior dose")
@@ -257,15 +259,21 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
     for field in ("declared_producer_sha256", "init_checkpoint_sha256"):
         _typed_sha256(value.get(field), field)
     upgrade = value.get("function_preserving_upgrade")
+    migration = value.get("information_contract_migration")
     transition_chain = value.get("initializer_transition_chain")
     preparation = value.get("initializer_preparation_exposure")
     if mode == "typed_curriculum":
-        if upgrade is not None or transition_chain is not None or preparation is not None:
+        if (
+            upgrade is not None
+            or migration is not None
+            or transition_chain is not None
+            or preparation is not None
+        ):
             raise LineageDoseError(
                 "curriculum lineage cannot also claim an initializer transform"
             )
     elif mode == "direct_with_typed_initializer_chain":
-        if upgrade is not None:
+        if upgrade is not None or migration is not None:
             raise LineageDoseError(
                 "typed initializer chain cannot also claim a legacy single upgrade"
             )
@@ -289,13 +297,52 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
         }
         if chain != transition_chain or preparation != expected_preparation:
             raise LineageDoseError("initializer preparation exposure drift")
-    elif value["init_checkpoint_sha256"] == value["declared_producer_sha256"]:
+    elif mode == "direct_with_information_contract_migration":
         if upgrade is not None or transition_chain is not None or preparation is not None:
+            raise LineageDoseError(
+                "information migration cannot also claim an initializer transform"
+            )
+        if (
+            value["init_checkpoint_sha256"] == value["declared_producer_sha256"]
+            or not isinstance(migration, Mapping)
+            or set(migration)
+            != {
+                "schema_version",
+                "migration",
+                "receipt",
+                "receipt_sha256",
+                "source_checkpoint_sha256",
+                "migrated_initializer_sha256",
+                "forward_identical",
+                "promotion_eligible",
+            }
+            or migration.get("schema_version")
+            != "a1-lineage-information-contract-migration-v1"
+            or migration.get("source_checkpoint_sha256")
+            != value["declared_producer_sha256"]
+            or migration.get("migrated_initializer_sha256")
+            != value["init_checkpoint_sha256"]
+            or migration.get("forward_identical") is not False
+            or migration.get("promotion_eligible") is not False
+            or not isinstance(migration.get("migration"), str)
+            or not migration["migration"]
+            or not isinstance(migration.get("receipt"), str)
+            or not migration["receipt"]
+        ):
+            raise LineageDoseError("information-contract migration lineage drift")
+        _typed_sha256(migration.get("receipt_sha256"), "migration receipt_sha256")
+    elif value["init_checkpoint_sha256"] == value["declared_producer_sha256"]:
+        if (
+            upgrade is not None
+            or migration is not None
+            or transition_chain is not None
+            or preparation is not None
+        ):
             raise LineageDoseError(
                 "initializer transform is forbidden for an exact-parent init"
             )
     else:
-        if transition_chain is not None or preparation is not None:
+        if migration is not None or transition_chain is not None or preparation is not None:
             raise LineageDoseError(
                 "legacy single-upgrade lineage cannot carry a transition chain"
             )
@@ -332,20 +379,29 @@ def direct_lineage_dose(
     *, declared_producer_sha256: str, init_checkpoint_sha256: str,
     current_sampled_rows: int, current_optimizer_steps: int,
     function_preserving_upgrade: Mapping[str, Any] | None = None,
+    information_contract_migration: Mapping[str, Any] | None = None,
     initializer_transition_chain: list[Mapping[str, Any]] | None = None,
     objective_exposure: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if (
         init_checkpoint_sha256 != declared_producer_sha256
         and function_preserving_upgrade is None
+        and information_contract_migration is None
         and initializer_transition_chain is None
     ):
         raise LineageDoseError(
             "untyped checkpoint chaining: init SHA differs from declared producer SHA"
         )
-    if function_preserving_upgrade is not None and initializer_transition_chain is not None:
+    if sum(
+        value is not None
+        for value in (
+            function_preserving_upgrade,
+            information_contract_migration,
+            initializer_transition_chain,
+        )
+    ) > 1:
         raise LineageDoseError(
-            "initializer cannot use both legacy upgrade and typed transition chain"
+            "initializer can use only one typed transition mechanism"
         )
     normalized_chain = None
     preparation_exposure = None
@@ -375,12 +431,23 @@ def direct_lineage_dose(
         "mode": (
             "direct_with_typed_initializer_chain"
             if normalized_chain is not None
+            else "direct_with_information_contract_migration"
+            if information_contract_migration is not None
             else "direct_from_declared_producer"
         ),
         "declared_producer_sha256": declared_producer_sha256,
         "init_checkpoint_sha256": init_checkpoint_sha256,
         "function_preserving_upgrade": (
             None if function_preserving_upgrade is None else dict(function_preserving_upgrade)
+        ),
+        **(
+            {
+                "information_contract_migration": dict(
+                    information_contract_migration
+                )
+            }
+            if information_contract_migration is not None
+            else {}
         ),
         "initializer_transition_chain": normalized_chain,
         "initializer_preparation_exposure": preparation_exposure,

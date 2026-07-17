@@ -308,7 +308,6 @@
       "../../tools/a1_current_science_contract.py",
       "../operations/a1-next-wave-coherent-public-v3/science.contract.json",
       "../../tools/generate_gumbel_selfplay_data.py",
-      "../../tools/fleet/systemd/nvidia-mps.service",
       "../../tools/opponent_mix_registry.py",
       "../../src/catan_zero/rl/gumbel_self_play.py",
       "../../src/catan_zero/rl/decision_taxonomy.py",

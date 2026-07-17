@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop one sealed A1 lane without pattern matching or touching MPS.
+"""Stop one sealed A1 lane without pattern matching or touching other GPU work.
 
 The production executor runs this helper on the owning host.  A process is a
 signal target only when its complete argv and detached session/process-group
@@ -240,7 +240,7 @@ def stop_lane(
         "status": "stopped",
         "term_targets": [pid for pid, _ in all_targets],
         "kill_targets": killed,
-        "mps_preserved": True,
+        "gpu_runtime_preserved": True,
     }
 
 

@@ -45,6 +45,7 @@ from tools import a1_pre_wave_contract as a1_contract  # noqa: E402
 from tools import a1_current_science_contract as current_science  # noqa: E402
 from tools import a1_frozen_lock_verifier as frozen_lock_verifier  # noqa: E402
 from tools import a1_one_dose_train as one_dose  # noqa: E402
+from tools import a1_information_contract_migration as information_migration  # noqa: E402
 from tools import _a1_promotion_lock_state as promotion_lock_state  # noqa: E402
 from tools.a1_external_panel_compare import (  # noqa: E402
     ExternalPanelComparisonError,
@@ -93,6 +94,12 @@ MATCHED_QUICK_SCREEN_SELECTION_RULE = {
     "tie_break": "lowest_optimizer_step_on_exact_tie",
 }
 INTERMEDIATE_CHECKPOINT_SCHEMA = "train-bc-intermediate-checkpoint-v1"
+CANONICAL_PARENT_UPDATE_AUTHORITY_SCHEMAS = frozenset(
+    {
+        "a1-canonical-parent-update-authority-v1",
+        "a1-canonical-parent-update-authority-v2",
+    }
+)
 MODERN_RESUME_RECIPE_REQUIRED_FIELDS = frozenset(
     {
         "schema_version",
@@ -3404,7 +3411,8 @@ def _verify_one_dose_training_receipt(
             contract=contract,
         )
         return {**scratch_receipt, "checkpoint_selection": selection}
-    _require_training_receipt_initialization_authority(contract)
+    if raw_schema != one_dose.MIGRATION_RECEIPT_SCHEMA:
+        _require_training_receipt_initialization_authority(contract)
     if checkpoint_selection_requested and raw_schema != one_dose.RECEIPT_SCHEMA:
         raise PromotionError(
             "same-trajectory checkpoint selection requires an ordinary one-dose receipt"
@@ -3617,6 +3625,7 @@ def _verify_one_dose_training_receipt(
     receipt_schema = value.get("schema_version")
     is_retry = receipt_schema == one_dose.RETRY_RECEIPT_SCHEMA
     is_upgrade = receipt_schema == one_dose.UPGRADE_RECEIPT_SCHEMA
+    is_migration = receipt_schema == one_dose.MIGRATION_RECEIPT_SCHEMA
     canonical_parent_update = value.get("canonical_parent_update")
     if canonical_parent_update is not None:
         expected_keys.add("canonical_parent_update")
@@ -3641,11 +3650,21 @@ def _verify_one_dose_training_receipt(
         expected_keys.add("lineage_dose")
     if is_upgrade:
         expected_keys |= {"claim_identity_sha256", "function_preserving_upgrade"}
+    if is_migration:
+        expected_keys |= {
+            "claim_identity_sha256",
+            "information_contract_migration",
+            "training_science_commissioning",
+            "promotion_eligible",
+            "eligible_for_full_gate",
+            "promotion_block_reason",
+        }
     value = _require_exact_keys(value, expected_keys, where="one-dose training receipt")
     if receipt_schema not in {
         one_dose.RECEIPT_SCHEMA,
         one_dose.RETRY_RECEIPT_SCHEMA,
         one_dose.UPGRADE_RECEIPT_SCHEMA,
+        one_dose.MIGRATION_RECEIPT_SCHEMA,
     }:
         raise PromotionError(
             "one-dose receipt schema must be a supported direct or sealed-retry schema"
@@ -3796,7 +3815,7 @@ def _verify_one_dose_training_receipt(
             ]
             if (
                 parent_authority["schema_version"]
-                != "a1-canonical-parent-update-authority-v2"
+                not in CANONICAL_PARENT_UPDATE_AUTHORITY_SCHEMAS
                 or config_path
                 != one_dose.CANONICAL_PARENT_UPDATE_CONFIG.resolve(strict=True)
                 or _sha256(config_path) != parent_authority["config_sha256"]
@@ -3824,6 +3843,77 @@ def _verify_one_dose_training_receipt(
             )
         if value.get("claim_identity_sha256") != expected_identity:
             raise PromotionError("architecture-upgrade training identity drifted")
+    migration_value: dict[str, Any] | None = None
+    if is_migration:
+        raw_migration = value.get("information_contract_migration")
+        if not isinstance(raw_migration, dict):
+            raise PromotionError("migration training receipt lacks migration evidence")
+        receipt_ref = raw_migration.get("receipt")
+        if not isinstance(receipt_ref, dict) or set(receipt_ref) != {"path", "sha256"}:
+            raise PromotionError("migration training receipt has malformed receipt ref")
+        try:
+            migration_value = information_migration.verify_receipt(
+                Path(str(receipt_ref["path"]))
+            )
+        except information_migration.MigrationError as error:
+            raise PromotionError(f"information migration receipt refused: {error}") from error
+        if (
+            migration_value != raw_migration
+            or migration_value.get("forward_identical") is not False
+            or migration_value.get("promotion_eligible") is not False
+        ):
+            raise PromotionError("migration training evidence drifted")
+        commissioning = value.get("training_science_commissioning")
+        try:
+            live_commissioning = (
+                current_science.require_selected_parent_update_go_authorized()
+            )
+        except current_science.ScienceContractError as error:
+            raise PromotionError(
+                f"migration candidate is not commissioned: {error}"
+            ) from error
+        if (
+            commissioning != live_commissioning
+            or value.get("promotion_eligible") is not False
+            or value.get("eligible_for_full_gate") is not True
+            or value.get("promotion_block_reason")
+            != "requires_normal_full_promotion_gates"
+        ):
+            raise PromotionError(
+                "migration candidate lacks exact authorized commissioning for full gates"
+            )
+        if not isinstance(canonical_parent_update, dict):
+            raise PromotionError("migration training lacks canonical parent authority")
+        parent_authority = dict(canonical_parent_update)
+        authority_sha = parent_authority.pop("authority_sha256", None)
+        producers = [
+            record
+            for record in contract.get("checkpoints", [])
+            if isinstance(record, dict) and record.get("role") == "producer"
+        ]
+        if (
+            canonical_parent_update.get("schema_version")
+            != "a1-canonical-parent-update-authority-v2"
+            or authority_sha != _digest_value(parent_authority)
+            or len(producers) != 1
+            or canonical_parent_update.get("parent_checkpoint_sha256")
+            != producers[0].get("sha256")
+        ):
+            raise PromotionError("migration canonical parent authority drifted")
+        expected_identity = _digest_value(
+            {
+                "schema_version": "a1-canonical-parent-update-claim-v1",
+                "contract_sha256": contract["contract_sha256"],
+                "parent_update_authority_sha256": authority_sha,
+                "migration_receipt_sha256": receipt_ref["sha256"],
+                "migration_receipt_digest": migration_value["receipt_sha256"],
+                "training_science_commissioning_sha256": live_commissioning[
+                    "commissioning_sha256"
+                ],
+            }
+        )
+        if value.get("claim_identity_sha256") != expected_identity:
+            raise PromotionError("migration training identity drifted")
     gpu = value["gpu"]
     if isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0:
         raise PromotionError("one-dose receipt has an invalid primary GPU")
@@ -4418,6 +4508,29 @@ def _verify_one_dose_training_receipt(
             != upgrade_value["receipt"]["sha256"]
         ):
             raise PromotionError("architecture-upgrade report/receipt lineage drifted")
+    if is_migration:
+        try:
+            report_lineage = one_dose.lineage.validate_lineage_dose(
+                report.get("a1_lineage_dose")
+            )
+        except one_dose.lineage.LineageDoseError as error:
+            raise PromotionError(f"information-migration lineage refused: {error}") from error
+        if (
+            value.get("lineage_dose") != report_lineage
+            or outputs.get("lineage_dose") != report_lineage
+            or migration_value is None
+            or report_lineage.get("information_contract_migration", {}).get(
+                "receipt_sha256"
+            )
+            != migration_value["receipt"]["sha256"]
+            or report.get("promotion_eligible") is not False
+            or report.get("eligible_for_full_gate") is not True
+            or report.get("promotion_block_reason")
+            != "requires_normal_full_promotion_gates"
+            or report.get("training_science_commissioning")
+            != value.get("training_science_commissioning")
+        ):
+            raise PromotionError("information-migration report/receipt lineage drifted")
     if value["learner_training_recipe_sha256"] != contract["science"].get(
         "learner_training_recipe_sha256"
     ):
@@ -4477,7 +4590,9 @@ def _verify_one_dose_training_receipt(
             claim_path,
             contract_sha256=contract["contract_sha256"],
             claim_identity_sha256=(
-                value["claim_identity_sha256"] if (is_retry or is_upgrade) else None
+                value["claim_identity_sha256"]
+                if (is_retry or is_upgrade or is_migration)
+                else None
             ),
         )
     except one_dose.ExecutorError as error:
@@ -4512,6 +4627,18 @@ def _verify_one_dose_training_receipt(
         or (
             is_upgrade
             and claim.get("function_preserving_upgrade") != upgrade_value
+        )
+        or (
+            is_migration
+            and (
+                claim.get("information_contract_migration") != migration_value
+                or claim.get("training_science_commissioning")
+                != value.get("training_science_commissioning")
+                or claim.get("promotion_eligible") is not False
+                or claim.get("eligible_for_full_gate") is not True
+                or claim.get("promotion_block_reason")
+                != "requires_normal_full_promotion_gates"
+            )
         )
     ):
         raise PromotionError("one-dose receipt and durable claim disagree")

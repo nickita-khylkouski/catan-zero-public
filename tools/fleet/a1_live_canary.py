@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run an exact, validation-only 4-GPU + 8-GPU A1 canary transaction.
+"""Run an exact, validation-only 8-GPU A1 canary transaction.
 
-The production render remains immutable.  This tool verifies all 64 production
-lanes, selects only c1/gpu0-3 and h100-8a/gpu0-7, then derives a separately
+The production render remains immutable.  This tool verifies the production
+lanes, selects one or more complete 8-GPU nodes, then derives a separately
 hashed transaction by changing only job identity, output directory, game count,
 seed range, and ledger-claim identity.  Every science flag, checkpoint,
-opponent mix, guard, MPS binding, receipt, supervisor, and stop primitive is the
+opponent mix, guard, CUDA-owner contract, receipt, supervisor, and stop primitive is the
 same hardened implementation used by the production executor.
 
 Canary seeds must be wholly inside the repository's VAL-ONLY band.  A private
@@ -46,7 +46,7 @@ from tools.fleet import a1_production_executor as executor  # noqa: E402
 SCHEMA = "a1-live-canary-plan-v1"
 RENDER_SCHEMA = "a1-live-canary-render-v1"
 ATTESTATION_SCHEMA = "a1-live-canary-job-attestation-v1"
-CANARY_ALIASES = {"c1": 4, "h100-8a": 8}
+CANARY_ALIASES = {"h100-8a": 8}
 CATEGORY_ORDER = executor.CATEGORY_ORDER
 GAMES_PER_JOB = 16  # one game per declared generation worker
 JOB_COUNT = sum(CANARY_ALIASES.values()) * len(CATEGORY_ORDER)
@@ -82,14 +82,39 @@ for item in items:
  if record.get('pipeline')!='generate' or config.get('pipeline')!='generate' or record.get('full_config_hash')!=full or record.get('config_hash')!=short or m.get('config_hash')!=short or any(record.get(k)!=expected.get(k) for k in ('pipeline','config_hash','full_config_hash','config')): raise SystemExit('canary config registry mismatch: '+item['job_id'])
  result.append({'job_id':item['job_id'],'rows':int(m['rows']),'simulations':int(m['simulations_used_total']),'manifest_sha256':sha(mpath),'attestation_sha256':sha(apath),'config_hash':short,'full_config_hash':full,'config_registry_sha256':digest(rbytes)})
 print(json.dumps(result,sort_keys=True))"""
-MPS_RUNTIME_ATTESTATION_SCRIPT = r"""import json,pathlib,subprocess,sys,time
+EVAL_SERVER_RUNTIME_ATTESTATION_SCRIPT = r"""import json,os,pathlib,subprocess,sys,time
 required=int(sys.argv[1]);timeout=float(sys.argv[2]);not_before_ns=int(sys.argv[3]);expected=json.loads(sys.argv[4]);deadline=time.monotonic()+timeout
 def nofile_soft(pid):
  for line in pathlib.Path(f'/proc/{pid}/limits').read_text().splitlines():
   if line.startswith('Max open files'):
    value=line.split()[3]
    return -1 if value=='unlimited' else int(value)
- raise RuntimeError(f'Max open files is absent for MPS server {pid}')
+ raise RuntimeError(f'Max open files is absent for CUDA owner {pid}')
+def process_environment(pid):
+ raw=pathlib.Path(f'/proc/{pid}/environ').read_bytes()
+ return dict(item.split('=',1) for item in raw.decode(errors='surrogateescape').split('\0') if '=' in item)
+def command_line(pid):
+ return [item.decode(errors='surrogateescape') for item in pathlib.Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0') if item]
+def ancestors(pid):
+ result=set()
+ while pid>1 and pid not in result:
+  result.add(pid)
+  status=pathlib.Path(f'/proc/{pid}/status').read_text()
+  parent=next((int(line.split()[1]) for line in status.splitlines() if line.startswith('PPid:')),0)
+  pid=parent
+ return result
+def expected_owner_job(owner_pid,item):
+ owner_ancestors=ancestors(owner_pid);matches=[]
+ for job in item['jobs']:
+  try: receipt=json.loads(pathlib.Path(job['receipt']).read_text())
+  except (OSError,UnicodeError,json.JSONDecodeError): continue
+  root=receipt.get('pid')
+  if receipt.get('status')!='running' or type(root) is not int or root not in owner_ancestors: continue
+  argv=command_line(root)
+  if '--out-dir' not in argv or argv[argv.index('--out-dir')+1]!=job['output'] or '--device' not in argv or argv[argv.index('--device')+1]!='cuda': continue
+  matches.append((job['job_id'],root))
+ if len(matches)!=1: raise SystemExit(f'CUDA owner {owner_pid} does not bind exactly one launched canary job: {matches}')
+ return matches[0]
 def positive_progress(item):
  for job in item['jobs']:
   root=pathlib.Path(job['output']);workers={};valid=True
@@ -106,7 +131,7 @@ def positive_progress(item):
   if valid and len(workers)==job['workers']:
    return {'worker_id':item['worker_id'],'gpu':item['gpu'],'job_id':job['job_id'],'output':job['output'],'expected_workers':job['workers'],'workers':workers}
  return None
-last='no MPS server reported by nvidia-smi'
+last='no per-GPU EvalServer CUDA owners reported by nvidia-smi'
 while time.monotonic()<deadline:
  remaining=max(0.0,deadline-time.monotonic())
  try: response=subprocess.run(['nvidia-smi','--query-compute-apps=pid,process_name','--format=csv,noheader,nounits'],text=True,capture_output=True,check=False,timeout=max(0.1,min(2.0,remaining)))
@@ -114,25 +139,39 @@ while time.monotonic()<deadline:
   last='nvidia-smi compute query timed out';continue
  if response.returncode:
   last='nvidia-smi compute query failed: '+response.stderr;time.sleep(min(0.25,max(0.0,deadline-time.monotonic())));continue
- pids=sorted({int(line.split(',',1)[0].strip()) for line in response.stdout.splitlines() if 'nvidia-cuda-mps-server' in line})
- observed={}
+ applications=[]
+ for line in response.stdout.splitlines():
+  if not line.strip() or 'No running processes found' in line: continue
+  pid_text,name=(part.strip() for part in line.split(',',1))
+  if 'nvidia-cuda-mps-server' in name: raise SystemExit('retired MPS CUDA owner is active')
+  applications.append((int(pid_text),name))
+ observed={};owners={};owner_jobs={};expected_by_gpu={str(item['gpu']):item for item in expected}
  try:
-  for pid in pids: observed[str(pid)]=nofile_soft(pid)
+  for pid,name in applications:
+   environment=process_environment(pid);gpu=environment.get('CUDA_VISIBLE_DEVICES')
+   if gpu is None: raise SystemExit(f'unattributed CUDA compute PID {pid} lacks CUDA_VISIBLE_DEVICES')
+   if gpu not in expected_by_gpu: raise SystemExit(f'CUDA owner {pid} targets unexpected physical GPU {gpu}')
+   if 'CUDA_MPS_PIPE_DIRECTORY' in environment or 'CUDA_MPS_LOG_DIRECTORY' in environment: raise SystemExit(f'CUDA owner {pid} inherited retired MPS variables')
+   if gpu in owners: raise SystemExit(f'multiple CUDA owners for physical GPU {gpu}: {owners[gpu]} and {pid}')
+   job_id,generator_pid=expected_owner_job(pid,expected_by_gpu[gpu])
+   owners[gpu]=pid;owner_jobs[gpu]={'owner_pid':pid,'generator_pid':generator_pid,'job_id':job_id};observed[str(pid)]=nofile_soft(pid)
  except (FileNotFoundError,ProcessLookupError) as error:
-  last='MPS server changed during inspection: '+repr(error);time.sleep(0.25);continue
- if observed:
+  last='CUDA owner changed during inspection: '+repr(error);time.sleep(0.25);continue
+ expected_gpus={str(item['gpu']) for item in expected}
+ if set(owners)==expected_gpus:
   low={pid:value for pid,value in observed.items() if value!=-1 and value<required}
-  if low: raise SystemExit(f'MPS server RLIMIT_NOFILE below {required}: {low}')
+  if low: raise SystemExit(f'EvalServer CUDA owner RLIMIT_NOFILE below {required}: {low}')
   progress={}
   for item in expected:
    evidence=positive_progress(item)
    if evidence is not None: progress[item['worker_id']]=evidence
   missing=sorted(item['worker_id'] for item in expected if item['worker_id'] not in progress)
   if not missing:
-   print(json.dumps({'required_nofile_soft':required,'server_nofile_soft':observed,'canary_lane_progress':progress},sort_keys=True));raise SystemExit(0)
+   print(json.dumps({'required_nofile_soft':required,'cuda_owner_model':'one_eval_server_per_physical_gpu','cuda_owner_pids':owners,'cuda_owner_jobs':owner_jobs,'owner_nofile_soft':observed,'canary_lane_progress':progress},sort_keys=True));raise SystemExit(0)
   last='canary lanes without positive progress: '+repr(missing)
+ else: last=f'EvalServer CUDA owner topology drift: expected={sorted(expected_gpus)} got={sorted(owners)}'
  time.sleep(0.25)
-raise SystemExit(f'MPS/canary runtime proof incomplete within {timeout}s: {last}')"""
+raise SystemExit(f'EvalServer/canary runtime proof incomplete within {timeout}s: {last}')"""
 
 
 class CanaryError(RuntimeError):
@@ -221,6 +260,8 @@ def _assert_exact_recipe(
     derived_values, derived_switches = static_canary._flag_map(
         list(derived), job_id="canary"
     )
+    if "--skip-guards" in original_switches or "--skip-guards" in derived_switches:
+        raise CanaryError("canary source/derived recipe contains forbidden --skip-guards")
     expected_switches = set(original_switches)
     if native_runtime:
         expected_switches -= {"--no-native-mcts-hot-loop", "--no-rust-featurize"}
@@ -840,7 +881,6 @@ def validate_canary_plan(plan: Mapping[str, Any]) -> None:
     executor._verify_plan_digest(plan)
     aliases = plan.get("canary_aliases", CANARY_ALIASES)
     games_per_job = plan.get("games_per_job", GAMES_PER_JOB)
-    native_runtime = bool(plan.get("native_runtime", False))
     categories = tuple(plan.get("category_order", CATEGORY_ORDER))
     if not isinstance(aliases, Mapping) or not aliases:
         raise CanaryError("canary host topology is missing")
@@ -1150,6 +1190,14 @@ def audit_canary(plan: dict[str, Any]) -> dict[str, Any]:
 def _runtime_lane_expectations(
     plan: Mapping[str, Any], alias: str
 ) -> list[dict[str, Any]]:
+    remote_root = str(
+        plan.get(
+            "remote_root",
+            plan.get("_private", {}).get("hosts", {}).get(
+                "remote_root", "/tmp/a1-live-canary"
+            ),
+        )
+    )
     expectations: list[dict[str, Any]] = []
     for worker_id, lane in sorted(plan["_private"]["lanes"].items()):
         if lane[0]["host_alias"] != alias:
@@ -1162,6 +1210,11 @@ def _runtime_lane_expectations(
                     {
                         "job_id": command["job_id"],
                         "output": _flag_value(command["argv"], "--out-dir"),
+                        "receipt": str(
+                            Path(remote_root)
+                            / "receipts"
+                            / f"{command['job_id']}.json"
+                        ),
                         "workers": min(
                             int(_flag_value(command["argv"], "--workers")),
                             int(_flag_value(command["argv"], "--games")),
@@ -1178,13 +1231,13 @@ def _runtime_lane_expectations(
     return expectations
 
 
-def attest_mps_runtime(
+def attest_eval_server_runtime(
     plan: dict[str, Any],
     *,
     not_before_epoch: float,
     timeout_seconds: float = 600.0,
 ) -> dict[str, Any]:
-    """Prove every canary GPU produced rows through a safely-limited MPS server."""
+    """Prove every canary GPU has one EvalServer owner and positive worker rows."""
 
     validate_canary_plan(plan)
     if (
@@ -1192,7 +1245,7 @@ def attest_mps_runtime(
         or not isinstance(not_before_epoch, (int, float))
         or not_before_epoch <= 0
     ):
-        raise CanaryError("MPS runtime attestation requires a positive not-before time")
+        raise CanaryError("EvalServer attestation requires a positive not-before time")
     not_before_ns = int(float(not_before_epoch) * 1_000_000_000)
     hosts = plan["_private"]["hosts"]
     reports: dict[str, Any] = {}
@@ -1203,7 +1256,7 @@ def attest_mps_runtime(
             for value in (
                 hosts["python"],
                 "-c",
-                MPS_RUNTIME_ATTESTATION_SCRIPT,
+                EVAL_SERVER_RUNTIME_ATTESTATION_SCRIPT,
                 str(executor.REQUIRED_NOFILE_SOFT),
                 str(timeout_seconds),
                 str(not_before_ns),
@@ -1219,33 +1272,50 @@ def attest_mps_runtime(
             )
         except subprocess.TimeoutExpired as error:
             raise CanaryError(
-                f"MPS runtime attestation transport timed out on {alias}"
+                f"EvalServer attestation transport timed out on {alias}"
             ) from error
         if response.returncode != 0:
             raise CanaryError(
-                f"MPS runtime attestation failed on {alias}: "
+                f"EvalServer attestation failed on {alias}: "
                 f"{(response.stderr or response.stdout).strip()}"
             )
         try:
             report = json.loads(response.stdout)
         except json.JSONDecodeError as error:
             raise CanaryError(
-                f"MPS runtime attestation returned invalid JSON on {alias}"
+                f"EvalServer attestation returned invalid JSON on {alias}"
             ) from error
-        limits = report.get("server_nofile_soft")
+        limits = report.get("owner_nofile_soft")
+        owner_jobs = report.get("cuda_owner_jobs")
         progress = report.get("canary_lane_progress")
         expected_by_worker = {item["worker_id"]: item for item in expected_lanes}
+        expected_by_gpu = {str(item["gpu"]): item for item in expected_lanes}
         if (
             report.get("required_nofile_soft") != executor.REQUIRED_NOFILE_SOFT
+            or report.get("cuda_owner_model")
+            != "one_eval_server_per_physical_gpu"
             or not isinstance(limits, dict)
             or not limits
+            or not isinstance(owner_jobs, dict)
+            or set(owner_jobs) != set(expected_by_gpu)
             or any(
                 type(value) is not int
                 or (value != -1 and value < executor.REQUIRED_NOFILE_SOFT)
                 for value in limits.values()
             )
         ):
-            raise CanaryError(f"unsafe MPS runtime limit report on {alias}")
+            raise CanaryError(f"unsafe EvalServer runtime limit report on {alias}")
+        for gpu, binding in owner_jobs.items():
+            expected_job_ids = {
+                job["job_id"] for job in expected_by_gpu[gpu]["jobs"]
+            }
+            if (
+                not isinstance(binding, dict)
+                or type(binding.get("owner_pid")) is not int
+                or type(binding.get("generator_pid")) is not int
+                or binding.get("job_id") not in expected_job_ids
+            ):
+                raise CanaryError(f"unbound EvalServer owner for GPU {gpu} on {alias}")
         if not isinstance(progress, dict) or set(progress) != set(expected_by_worker):
             raise CanaryError(f"incomplete canary lane progress report on {alias}")
         for worker_id, evidence in progress.items():
@@ -1310,8 +1380,8 @@ def _parse_host_shapes(values: Sequence[str] | None) -> dict[str, int]:
             count = int(raw_count)
         except ValueError as error:
             raise CanaryError(f"invalid GPU count in --host-shape {value!r}") from error
-        if count not in (4, 8):
-            raise CanaryError("live canary host shapes must contain 4 or 8 GPUs")
+        if count != 8:
+            raise CanaryError("live canary host shapes must contain exactly 8 GPUs")
         result[alias] = count
     return result
 
@@ -1425,7 +1495,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     plan, receipt_path=args.receipt, resume=bool(args.resume)
                 )
                 execute_returned = True
-                result["mps_runtime"] = attest_mps_runtime(
+                result["eval_server_runtime"] = attest_eval_server_runtime(
                     plan, not_before_epoch=runtime_not_before
                 )
                 executor._atomic_json(args.receipt, result)

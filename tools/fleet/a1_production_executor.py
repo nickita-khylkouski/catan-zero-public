@@ -35,16 +35,16 @@ BRIDGE_SCHEMA = "a1-frozen-plan-hardened-executor-bridge-v1"
 LANE_SCHEMA = "a1-production-lane-v1"
 SAFE_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 CATEGORY_ORDER = ("current_producer", "recent_history", "hard_negative")
-CLIENT_ENVIRONMENT = {
-    "CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps_pipe_host",
-    "CUDA_MPS_LOG_DIRECTORY": "/tmp/mps_log_host",
-}
+# One generator owns the CUDA context on each physical GPU and serves its CPU
+# search workers through EvalServer.  MPS belonged to the retired design where
+# every worker opened its own CUDA context; exporting its variables here can
+# silently reconnect the new single-owner process to a stale host daemon.
+CLIENT_ENVIRONMENT: dict[str, str] = {}
 SUPERVISOR_ENVIRONMENT = {"PYTHONDONTWRITEBYTECODE": "1"}
 REQUIRED_NOFILE_SOFT = 65_536
 STOP_SSH_TIMEOUT_SECONDS = 45.0
 WAIT_POLL_SECONDS = 5.0
 MAX_PARALLEL_STAGE_HOSTS = 12
-MPS_UNIT_PATH = _REPO_ROOT / "tools/fleet/systemd/nvidia-mps.service"
 PRODUCTION_RUNTIME = runtime_contract.load_runtime_contract()
 PRODUCTION_RUNTIME_CONTRACT_PATH = runtime_contract.DEFAULT_CONTRACT
 NATIVE_WHEEL_VERSION = PRODUCTION_RUNTIME["catanatron_rs_version"]
@@ -1412,15 +1412,13 @@ if sha(dst.read_bytes())!=expected: raise SystemExit('installed live ledger dige
 def _preflight_host(
     hosts: dict[str, Any], alias: str, expected_gpus: Sequence[int]
 ) -> dict[str, Any]:
-    """Read-only launch preflight: topology, resources, idle compute plane, MPS."""
-    expected_mps_unit_sha256 = _sha256(MPS_UNIT_PATH)
+    """Read-only launch preflight: topology, runtime, limits, and idle GPUs."""
     expected_native_wheel = _native_wheel_release_identity()
-    script = r"""import hashlib,importlib.metadata,json,os,pathlib,resource,subprocess,sys
+    script = r"""import importlib.metadata,json,resource,subprocess,sys
 expected=json.loads(sys.argv[1])
 required_nofile=int(sys.argv[2])
-expected_mps_unit_sha256=sys.argv[3]
-expected_native_wheel=json.loads(sys.argv[4])
-expected_runtime=json.loads(sys.argv[5])
+expected_native_wheel=json.loads(sys.argv[3])
+expected_runtime=json.loads(sys.argv[4])
 nofile_soft_before,nofile_hard=resource.getrlimit(resource.RLIMIT_NOFILE)
 unlimited=resource.RLIM_INFINITY
 if nofile_hard!=unlimited and nofile_hard<required_nofile: raise SystemExit(f'hard RLIMIT_NOFILE {nofile_hard} is below required {required_nofile}')
@@ -1459,34 +1457,8 @@ if apps.returncode not in (0,): raise SystemExit('nvidia-smi compute query faile
 foreign=[]
 for line in apps.stdout.splitlines():
     if not line.strip() or 'No running processes found' in line: continue
-    fields=[part.strip() for part in line.split(',',1)]
-    if len(fields)!=2 or 'nvidia-cuda-mps-server' not in fields[1]: foreign.append(line.strip())
-if foreign: raise SystemExit('non-MPS compute applications present: '+repr(foreign))
-show=run('systemctl','show','nvidia-mps.service','--property=ActiveState,UnitFileState,MainPID,Environment,FragmentPath,LimitNOFILESoft')
-if show.returncode: raise SystemExit('cannot inspect nvidia-mps.service: '+show.stderr)
-properties={}
-for line in show.stdout.splitlines():
-    if '=' in line:
-        key,value=line.split('=',1);properties[key]=value
-required_properties={'ActiveState','UnitFileState','MainPID','Environment','FragmentPath','LimitNOFILESoft'}
-if not required_properties.issubset(properties): raise SystemExit('incomplete nvidia-mps.service properties: '+repr(properties))
-active=properties['ActiveState'];enabled=properties['UnitFileState'];main_pid_raw=properties['MainPID'];environment=properties['Environment']
-if active!='active' or enabled!='enabled': raise SystemExit(f'MPS service not active+enabled: {active}/{enabled}')
-try: mps_limit_nofile_soft=int(properties['LimitNOFILESoft'])
-except ValueError: raise SystemExit('invalid MPS LimitNOFILESoft: '+properties['LimitNOFILESoft'])
-if mps_limit_nofile_soft<required_nofile: raise SystemExit(f'MPS LimitNOFILESoft {mps_limit_nofile_soft} is below required {required_nofile}')
-try: main_pid=int(main_pid_raw)
-except ValueError: raise SystemExit('invalid MPS MainPID: '+main_pid_raw)
-if main_pid<=0 or not pathlib.Path(f'/proc/{main_pid}').exists(): raise SystemExit('MPS MainPID is not live')
-required={'CUDA_MPS_PIPE_DIRECTORY':'/tmp/mps_pipe_host','CUDA_MPS_LOG_DIRECTORY':'/tmp/mps_log_host'}
-for key,value in required.items():
-    if f'{key}={value}' not in environment: raise SystemExit(f'MPS service {key} drift')
-    path=pathlib.Path(value)
-    if not path.is_dir() or not os.access(path,os.R_OK|os.W_OK|os.X_OK): raise SystemExit(f'MPS directory inaccessible: {path}')
-fragment=pathlib.Path(properties['FragmentPath'])
-if not fragment.is_file(): raise SystemExit('MPS service FragmentPath is not a file: '+str(fragment))
-mps_unit_sha256='sha256:'+hashlib.sha256(fragment.read_bytes()).hexdigest()
-if mps_unit_sha256!=expected_mps_unit_sha256: raise SystemExit(f'MPS service unit digest drift: expected {expected_mps_unit_sha256}, got {mps_unit_sha256}')
+    foreign.append(line.strip())
+if foreign: raise SystemExit('GPU compute applications already active: '+repr(foreign))
 try:
     rust_distribution=importlib.metadata.distribution('catanatron-rs')
 except importlib.metadata.PackageNotFoundError:
@@ -1513,7 +1485,7 @@ capabilities=set(capability_fn())
 required_capabilities=set(expected_native_wheel['required_capabilities'])
 missing=sorted(required_capabilities-capabilities)
 if missing: raise SystemExit('installed catanatron-rs lacks required capabilities: '+repr(missing))
-print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_active':active,'mps_enabled':enabled,'mps_main_pid':main_pid,'mps_unit_sha256':mps_unit_sha256,'mps_limit_nofile_soft':mps_limit_nofile_soft,'client_environment':required,'python':sys.executable,'python_version':python_version,'torch_version':torch_version,'torch_cuda_version':torch_cuda_version,'dependency_versions':dependency_versions,'nvidia_driver_version':nvidia_driver_version,'catanatron_rs_version':rust_version,'native_wheel_sha256':expected_native_wheel['sha256'],'native_mcts_capabilities':sorted(capabilities),'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))"""
+print(json.dumps({'gpu_indices':indices,'compute_apps':'empty','cuda_owner_model':'one_eval_server_per_physical_gpu','client_environment':{},'python':sys.executable,'python_version':python_version,'torch_version':torch_version,'torch_cuda_version':torch_cuda_version,'dependency_versions':dependency_versions,'nvidia_driver_version':nvidia_driver_version,'catanatron_rs_version':rust_version,'native_wheel_sha256':expected_native_wheel['sha256'],'native_mcts_capabilities':sorted(capabilities),'required_nofile_soft':required_nofile,'nofile_soft_before':nofile_soft_before,'nofile_soft':nofile_soft,'nofile_hard':nofile_hard},sort_keys=True))"""
     command = " ".join(
         shlex.quote(value)
         for value in (
@@ -1522,7 +1494,6 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
             script,
             json.dumps(sorted(expected_gpus)),
             str(REQUIRED_NOFILE_SOFT),
-            expected_mps_unit_sha256,
             json.dumps(expected_native_wheel, sort_keys=True),
             json.dumps(PRODUCTION_RUNTIME, sort_keys=True),
         )
@@ -1538,7 +1509,9 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
             f"host preflight returned invalid JSON on {alias}"
         ) from error
     if report.get("client_environment") != CLIENT_ENVIRONMENT:
-        raise ExecutorError(f"host MPS client environment drift on {alias}")
+        raise ExecutorError(f"host CUDA client environment drift on {alias}")
+    if report.get("cuda_owner_model") != "one_eval_server_per_physical_gpu":
+        raise ExecutorError(f"host CUDA owner model drift on {alias}")
     expected_dependencies = {
         name: PRODUCTION_RUNTIME[f"{name}_version"]
         for name in ("numpy", "networkx", "gymnasium", "zstandard", "scipy", "whr")
@@ -1556,8 +1529,6 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
         != PRODUCTION_RUNTIME["nvidia_driver_version"]
     ):
         raise ExecutorError(f"host NVIDIA driver runtime drift on {alias}")
-    if report.get("mps_unit_sha256") != expected_mps_unit_sha256:
-        raise ExecutorError(f"host MPS service unit digest drift on {alias}")
     if report.get("catanatron_rs_version") != expected_native_wheel["version"]:
         raise ExecutorError(f"host catanatron-rs version drift on {alias}")
     if report.get("native_wheel_sha256") != expected_native_wheel["sha256"]:
@@ -1569,14 +1540,6 @@ print(json.dumps({'gpu_indices':indices,'compute_apps':'mps_only_or_empty','mps_
         or not NATIVE_REQUIRED_CAPABILITIES <= set(reported_capabilities)
     ):
         raise ExecutorError(f"host catanatron-rs capability drift on {alias}")
-    mps_limit_nofile_soft = report.get("mps_limit_nofile_soft")
-    if type(mps_limit_nofile_soft) is not int:
-        raise ExecutorError(f"invalid MPS LimitNOFILESoft report on {alias}")
-    if mps_limit_nofile_soft < REQUIRED_NOFILE_SOFT:
-        raise ExecutorError(
-            f"host MPS LimitNOFILESoft {mps_limit_nofile_soft} is below required "
-            f"{REQUIRED_NOFILE_SOFT} on {alias}"
-        )
     limit_fields = (
         "required_nofile_soft",
         "nofile_soft_before",
@@ -2270,7 +2233,7 @@ def stop_execution(
             "contract_sha256": plan["contract_sha256"],
             "status": "stop_dry_run",
             "lanes": inspection,
-            "mps_preserved": True,
+            "gpu_runtime_preserved": True,
         }
 
     receipt.update({"status": "stopping", "stop_started_at": time.time()})
@@ -2300,7 +2263,7 @@ def stop_execution(
             "status": "stopped",
             "stopped_at": time.time(),
             "stopped_lanes": stopped,
-            "mps_preserved": True,
+            "gpu_runtime_preserved": True,
         }
     )
     receipt.pop("launch_pending_worker_id", None)

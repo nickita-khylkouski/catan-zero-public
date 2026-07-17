@@ -711,7 +711,7 @@ def test_db1_runtime_relocation_rejects_drift_symlinks_and_other_roots(
         )
 
 
-def test_dry_plan_is_exact_40_lane_120_job_n128_mps_contract(
+def test_dry_plan_is_exact_40_lane_120_job_n128_eval_server_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock_path, render_path, lock, rendered = _fixture(tmp_path)
@@ -1154,6 +1154,9 @@ def test_completed_receipts_are_validated_and_never_rerun(
         "Popen",
         lambda *_a, **_k: pytest.fail("completed job reran"),
     )
+    monkeypatch.setattr(
+        supervisor, "_pin_lane_to_cpu_partition", lambda _gpu: list(range(26))
+    )
     assert supervisor.run_lane(lane_path)["status"] == "complete"
 
 
@@ -1222,6 +1225,9 @@ def test_run_lane_selects_requested_lane_lock_mode(
 
     monkeypatch.setattr(supervisor, "_lock", record_lock)
     monkeypatch.setattr(
+        supervisor, "_pin_lane_to_cpu_partition", lambda _gpu: list(range(26))
+    )
+    monkeypatch.setattr(
         supervisor,
         "_run_job",
         lambda _lane_payload, command: {
@@ -1280,11 +1286,15 @@ def test_incomplete_lane_runs_exact_resume_sequentially(
             return 0
 
     monkeypatch.setattr(supervisor.subprocess, "Popen", Process)
+    monkeypatch.setattr(
+        supervisor, "_pin_lane_to_cpu_partition", lambda _gpu: list(range(26))
+    )
     assert supervisor.run_lane(lane_path)["status"] == "complete"
     assert len(calls) == 3
     assert all("--resume" in argv for argv, _environment, _kwargs in calls)
     assert all(
-        environment["CUDA_MPS_PIPE_DIRECTORY"] == "/tmp/mps_pipe_host"
+        "CUDA_MPS_PIPE_DIRECTORY" not in environment
+        and "CUDA_MPS_LOG_DIRECTORY" not in environment
         for _argv, environment, _kwargs in calls
     )
     assert all(
@@ -1747,12 +1757,8 @@ def test_exact_stop_ssh_is_hard_bounded(monkeypatch: pytest.MonkeyPatch) -> None
 def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) -> None:
     report = {
         "gpu_indices": [0, 1, 2, 3],
-        "compute_apps": "mps_only_or_empty",
-        "mps_active": "active",
-        "mps_enabled": "enabled",
-        "mps_main_pid": 123,
-        "mps_unit_sha256": executor._sha256(executor.MPS_UNIT_PATH),
-        "mps_limit_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "compute_apps": "empty",
+        "cuda_owner_model": "one_eval_server_per_physical_gpu",
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
         **_exact_runtime_report(),
@@ -1779,8 +1785,8 @@ def test_preflight_accepts_only_exact_report(monkeypatch: pytest.MonkeyPatch) ->
     with pytest.raises(executor.ExecutorError, match="environment drift"):
         executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
     report["client_environment"] = dict(executor.CLIENT_ENVIRONMENT)
-    report["mps_unit_sha256"] = "sha256:" + "0" * 64
-    with pytest.raises(executor.ExecutorError, match="unit digest drift"):
+    report["cuda_owner_model"] = "multiple_worker_cuda_contexts"
+    with pytest.raises(executor.ExecutorError, match="CUDA owner model drift"):
         executor._preflight_host({"python": "/venv/bin/python"}, "h00", [0, 1, 2, 3])
 
 
@@ -1803,12 +1809,8 @@ def test_preflight_fails_closed_on_production_runtime_report(
 ) -> None:
     report = {
         "gpu_indices": [0, 1, 2, 3],
-        "compute_apps": "mps_only_or_empty",
-        "mps_active": "active",
-        "mps_enabled": "enabled",
-        "mps_main_pid": 123,
-        "mps_unit_sha256": executor._sha256(executor.MPS_UNIT_PATH),
-        "mps_limit_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "compute_apps": "empty",
+        "cuda_owner_model": "one_eval_server_per_physical_gpu",
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
         **_exact_runtime_report(),
@@ -1839,8 +1841,6 @@ def test_preflight_fails_closed_on_production_runtime_report(
         ("nofile_soft", 1024, "soft RLIMIT_NOFILE"),
         ("nofile_hard", 1024, "hard RLIMIT_NOFILE"),
         ("nofile_soft", "65536", "invalid RLIMIT_NOFILE report"),
-        ("mps_limit_nofile_soft", 1024, "MPS LimitNOFILESoft"),
-        ("mps_limit_nofile_soft", "65536", "invalid MPS LimitNOFILESoft report"),
     ],
 )
 def test_preflight_fails_closed_on_nofile_report(
@@ -1848,12 +1848,8 @@ def test_preflight_fails_closed_on_nofile_report(
 ) -> None:
     report = {
         "gpu_indices": [0, 1, 2, 3],
-        "compute_apps": "mps_only_or_empty",
-        "mps_active": "active",
-        "mps_enabled": "enabled",
-        "mps_main_pid": 123,
-        "mps_unit_sha256": executor._sha256(executor.MPS_UNIT_PATH),
-        "mps_limit_nofile_soft": executor.REQUIRED_NOFILE_SOFT,
+        "compute_apps": "empty",
+        "cuda_owner_model": "one_eval_server_per_physical_gpu",
         "client_environment": dict(executor.CLIENT_ENVIRONMENT),
         "python": "/venv/bin/python",
         **_exact_runtime_report(),
@@ -1930,9 +1926,7 @@ time.sleep(30)
         assert observed["argv"] == ["run", "--lane", "/sealed/lane.json"]
         assert observed["soft"] >= executor.REQUIRED_NOFILE_SOFT
         assert observed["pid"] == observed["sid"] == observed["pgid"] == pid
-        assert (
-            observed["pipe"] == executor.CLIENT_ENVIRONMENT["CUDA_MPS_PIPE_DIRECTORY"]
-        )
+        assert observed["pipe"] is None
         assert observed["pythonpath"] == "/sealed/repo/src:/sealed/repo"
         assert observed["dont_write_bytecode"] == "1"
         assert observed["tf32_override"] is None

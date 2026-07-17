@@ -1,11 +1,37 @@
 {
   "schema_version": "a1-h100-generation-fleet-v1",
   "fleet_authority": "catan-h100-8x6-v1",
+  "coordinator_alias": "h100-8a",
+  "git_url": "https://github.com/nickita-khylkouski/catan-zero-public.git",
   "ssh_user": "ubuntu",
   "ssh_key": "/home/ubuntu/.ssh/catan_fleet_ed25519",
   "strict_host_key_checking": "accept-new",
-  "remote_repo": "/home/ubuntu/catan-zero-v1",
+  "remote_repo": "/home/ubuntu/catan-zero-fleet-v2",
+  "remote_python": "/home/ubuntu/catan-zero-fleet-v2/.venv/bin/python",
   "remote_root": "/home/ubuntu/catan-fleet-jobs",
+  "resource_minima": {
+    "physical_cores": 104,
+    "physical_cores_per_gpu": 13,
+    "numa_nodes": 2,
+    "usable_logical_cpus_per_gpu": 26,
+    "ram_bytes": 1500000000000,
+    "disk_available_bytes": 1000000000000,
+    "disk_available_inodes": 1000000
+  },
+  "checkpoint": {
+    "path": "/home/ubuntu/catan-fleet-authority/checkpoints/incumbent-6817ab.pt",
+    "sha256": "6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c"
+  },
+  "native_wheel": {
+    "path": "/home/ubuntu/catan-fleet-authority/wheels/catanatron_rs-0.1.13-cp311-cp311-manylinux_2_34_x86_64.whl",
+    "sha256": "2e0c6fda344ae85dd1bccd1f5474acea92218a0b561cdde0e43b386ec284fb97"
+  },
+  "seed_authority": {
+    "path": "/home/ubuntu/catan-fleet-authority/seed-authority.json",
+    "range_start": 200000000000,
+    "host_stride": 1000000000,
+    "gpu_stride": 125000000
+  },
   "hosts": [
     {"alias": "h100-8a", "address": "192.222.53.175", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3"},
     {"alias": "h100-8b", "address": "192.222.54.137", "gpu_count": 8, "accelerator": "NVIDIA H100 80GB HBM3"},

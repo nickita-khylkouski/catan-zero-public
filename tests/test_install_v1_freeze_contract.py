@@ -11,7 +11,6 @@ from tools import production_runtime_contract as runtime_contract
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "tools" / "install_v1_freeze.sh"
-MPS_UNIT = ROOT / "tools" / "fleet" / "systemd" / "nvidia-mps.service"
 RUNTIME = runtime_contract.load_runtime_contract()
 WHEEL_NAME = RUNTIME["catanatron_rs_wheel_filename"]
 
@@ -86,6 +85,12 @@ def _fake_sudo(tmp_path: Path) -> tuple[Path, Path]:
         encoding="utf-8",
     )
     sudo.chmod(0o755)
+    # Keep the post-wheel bootstrap boundary deterministic and offline on every
+    # test platform. Earlier assertions prove malformed wheels fail before this
+    # executable can be reached; the valid-wheel case must stop here with 2.
+    uv = fake_bin / "uv"
+    uv.write_text("#!/usr/bin/env bash\nexit 2\n", encoding="utf-8")
+    uv.chmod(0o755)
     return fake_bin, marker
 
 
@@ -134,7 +139,6 @@ def test_installer_shell_syntax_and_preflight_order() -> None:
     text = INSTALLER.read_text(encoding="utf-8")
     verified = text.index("catanatron_rs wheel preflight verified")
     mutations = (
-        text.index('sudo install -m 0644 "$MPS_UNIT_SOURCE"'),
         text.index('"$PY" -m venv .venv'),
         text.index('"torch==$RUNTIME_TORCH_VERSION" --index-url "$TORCH_INDEX"'),
     )
@@ -241,15 +245,15 @@ def test_wrong_wheel_filename_fails_closed(tmp_path: Path) -> None:
     assert not sudo_marker.exists()
 
 
-def test_valid_wheel_is_verified_before_sudo_is_reached(tmp_path: Path) -> None:
+def test_valid_wheel_is_verified_before_runtime_bootstrap(tmp_path: Path) -> None:
     wheel = _wheel(tmp_path)
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     repo = _release_repo(tmp_path, f"{digest}  {WHEEL_NAME}\n")
     result, sudo_marker, destination = _invoke(tmp_path, repo=repo, wheel=wheel)
-    assert result.returncode == 3
+    assert result.returncode == 2
     assert f"wheel preflight verified: {digest}" in result.stdout
-    assert "passwordless sudo is required" in result.stdout
-    assert sudo_marker.exists()
+    assert "bootstrapping exact runtime via uv" in result.stdout
+    assert not sudo_marker.exists()
     assert not (destination / ".venv").exists()
 
 
@@ -312,7 +316,6 @@ def test_receipt_is_outside_checkout_and_binds_release_evidence() -> None:
         '"fleet_exporter_fragment_path"',
         '"fleet_exporter_dropin_paths"',
         '"fleet_exporter_effective"',
-        '"nvidia_mps_limit_nofile_soft"',
         '"runtime_contract"',
         '"dependency_versions"',
         '"nvidia_driver_version"',
@@ -321,23 +324,6 @@ def test_receipt_is_outside_checkout_and_binds_release_evidence() -> None:
     assert "handle.flush()" in text
     assert "os.fsync(handle.fileno())" in text
     assert "os.replace(temporary, receipt)" in text
-
-
-def test_mps_unit_and_installer_bind_effective_nofile_limit() -> None:
-    unit = MPS_UNIT.read_text(encoding="utf-8")
-    assert unit.splitlines().count("LimitNOFILE=65536") == 1
-
-    text = INSTALLER.read_text(encoding="utf-8")
-    restart = text.index("sudo systemctl restart nvidia-mps.service")
-    inspect = text.index(
-        "systemctl show nvidia-mps.service --property=LimitNOFILESoft --value"
-    )
-    receipt = text.index('"nvidia_mps_limit_nofile_soft"')
-    assert restart < inspect < receipt
-    assert "MPS_REQUIRED_LIMIT_NOFILE_SOFT=65536" in text
-    assert '[[ ! "$CATAN_MPS_LIMIT_NOFILE_SOFT" =~ ^[0-9]+$ ]]' in text
-    assert '"$CATAN_MPS_LIMIT_NOFILE_SOFT" -lt "$MPS_REQUIRED_LIMIT_NOFILE_SOFT"' in text
-    assert "export CATAN_MPS_LIMIT_NOFILE_SOFT" in text
 
 
 def test_exporter_install_removes_legacy_dropins_and_attests_effective_process() -> None:

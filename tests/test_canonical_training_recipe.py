@@ -30,7 +30,7 @@ def _public_args(*, init_checkpoint: str = "") -> argparse.Namespace:
         report="/tmp/train.json",
         init_checkpoint=init_checkpoint,
         parent_checkpoint="",
-        architecture_upgrade_receipt="",
+        information_contract_migration_receipt="",
         device="auto",
         host_lock_file="/tmp/catan-test.lock",
         allow_concurrent_bc=False,
@@ -110,6 +110,25 @@ def test_exact_cap_accepts_feature_observation_boundary() -> None:
     train._require_exact_cap_feature_observability(
         config, _feature_observability_engine()
     )
+
+
+def test_exact_cap_counts_only_cadence_hits_that_close_accumulation() -> None:
+    config = train.TrainConfig(
+        max_steps=4,
+        exact_max_steps=True,
+        grad_accum_steps=3,
+    )
+    engine = {
+        "require_feature_learning_signal_modules": "event_encoder,value_head",
+        "minimum_feature_learning_signal_observations": 2,
+        "train_diagnostics_every_batches": 4,
+    }
+
+    with pytest.raises(
+        SystemExit,
+        match="maximum_feature_learning_signal_observations=1",
+    ):
+        train._require_exact_cap_feature_observability(config, engine)
 
 
 def test_epoch_mode_skips_exact_cap_feature_observation_arithmetic() -> None:
@@ -298,10 +317,10 @@ def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
     args = _public_args(init_checkpoint=str(initializer))
     args.parent_checkpoint = str(parent)
 
-    with pytest.raises(SystemExit, match="upgrade-receipt is required"):
+    with pytest.raises(SystemExit, match="migration-receipt is required"):
         train._parent_initializer_binding(args)
 
-    from tools import a1_function_preserving_upgrade as upgrade
+    from tools import a1_information_contract_migration as migration
 
     parent_ref = train._checkpoint_ref(str(parent), where="parent")
     initializer_ref = train._checkpoint_ref(str(initializer), where="initializer")
@@ -310,27 +329,31 @@ def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
         "sha256": "sha256:" + "a" * 64,
     }
     monkeypatch.setattr(
-        upgrade,
+        migration,
         "verify_receipt",
         lambda _path: {
-            "module": upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
+            "migration": migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
             "source": parent_ref,
-            "upgraded_initializer": initializer_ref,
+            "migrated_initializer": initializer_ref,
             "receipt": receipt_ref,
+            "forward_identical": False,
+            "promotion_eligible": False,
         },
     )
-    args.architecture_upgrade_receipt = str(receipt)
+    args.information_contract_migration_receipt = str(receipt)
     binding = train._parent_initializer_binding(args)
 
     assert binding["parent"] == parent_ref
     assert binding["initializer"] == initializer_ref
-    assert binding["function_preserving_upgrade"] == {
-        "schema_version": "a1-lineage-function-preserving-upgrade-v1",
-        "module": upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
+    assert binding["information_contract_migration"] == {
+        "schema_version": "a1-lineage-information-contract-migration-v1",
+        "migration": migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
         "receipt": receipt_ref["path"],
         "receipt_sha256": receipt_ref["sha256"],
         "source_checkpoint_sha256": parent_ref["sha256"],
-        "upgraded_initializer_sha256": initializer_ref["sha256"],
+        "migrated_initializer_sha256": initializer_ref["sha256"],
+        "forward_identical": False,
+        "promotion_eligible": False,
     }
 
 

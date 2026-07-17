@@ -30,7 +30,7 @@ GENERATOR_CONFIG_PATH = (
 PRODUCTION_RECIPE_CATALOG_PATH = REPO_ROOT / "configs/production_recipes.json"
 GENERATOR_GUARD_PATH = (
     REPO_ROOT
-    / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json"
+    / "configs/guards/a1_generation_coherent_public_n128_v4.json"
 )
 CANONICAL_PARENT_UPDATE_CONFIG_PATH = (
     REPO_ROOT / "configs/training/a1_parent_update_35m_b200.schema1.json"
@@ -41,6 +41,9 @@ TRAINING_SCIENCE_ADMISSION_PATH = (
 SCHEMA_VERSION = "a1-current-science-contract-v3"
 TEACHER_REPORT_SCHEMA = "teacher-operator-causal-report-v1"
 ADOPTION_RECEIPT_SCHEMA = "a1-teacher-operator-adoption-v1"
+TRAINING_SCIENCE_COMMISSIONING_SCHEMA = (
+    "a1-selected-parent-update-commissioning-v1"
+)
 ADAPTIVE_FIELDS = (
     "n_full_wide",
     "n_full_wide_threshold",
@@ -52,18 +55,10 @@ CURRENT_LEARNER_ENTITY_ADAPTER = (
     "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
 )
 CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
-    "structured_action_value,card_count_v2,meaningful_history,"
-    "history_target_gather,action_target_gather,legal_set_statistics,public_rule_state,"
-    "topology,value_tower_split1"
+    "current_v6_information_migration_topology_split1"
 )
 CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
-    "entity_graph.topology_residual_adapter+action_target_gather+"
-    "static_action_residual+"
-    "legal_action_value_residual+"
-    "legal_action_value_set_statistics+"
-    "public_card_count_features+meaningful_public_history+"
-    "meaningful_history_target_gather+"
-    "actor_public_rule_state.v5+value_tower_split1"
+    "entity_graph.current_v2_to_v6_information_contract+topology+split1.v1"
 )
 CURRENT_MEANINGFUL_HISTORY_POOLING = "ordered_attention_v2"
 PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
@@ -258,7 +253,9 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
         "binding_schema": "a1-canonical-parent-initializer-v1",
         "parent_checkpoint": "required_runtime_input",
         "init_checkpoint": "required_runtime_input",
-        "architecture_upgrade_receipt": "required_if_checkpoint_bytes_differ",
+        "information_contract_migration_receipt": (
+            "required_if_checkpoint_bytes_differ"
+        ),
         "entity_feature_adapter_version": (
             "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
         ),
@@ -516,13 +513,27 @@ def _load() -> dict[str, Any]:
         or not isinstance(admission_recipe, dict)
         or admission_recipe.get("recipe_canonical_sha256")
         != PRODUCTION_LEARNER_SELECTION_CONTRACT["config_canonical_sha256"]
-        or admission_recipe.get("authorized") is not False
-        or selected_topology.get("go_authorized") is not False
+        or not isinstance(admission_recipe.get("authorized"), bool)
+        or not isinstance(selected_topology.get("go_authorized"), bool)
+        or admission_recipe.get("authorized")
+        is not selected_topology.get("go_authorized")
         or admission_recipe.get("reason")
         != selected_topology["authorization_reason"]
+        or (
+            admission_recipe.get("authorized") is True
+            and (
+                not isinstance(admission_recipe.get("commissioning_evidence"), list)
+                or not admission_recipe["commissioning_evidence"]
+                or not all(
+                    isinstance(item, str) and item
+                    for item in admission_recipe["commissioning_evidence"]
+                )
+            )
+        )
     ):
         raise ScienceContractError(
-            "selected parent-update admission must remain exact and fail-closed"
+            "selected parent-update admission must remain exact and fail-closed "
+            "unless its typed commissioning and go authority agree"
         )
     if (
         learner_value.get("research_scratch_initialization")
@@ -717,6 +728,58 @@ def require_selected_parent_update(config_path: str | Path) -> Path:
             "selected canonical parent-update config content drifted"
         )
     return supplied
+
+
+def selected_parent_update_commissioning() -> dict[str, Any]:
+    """Return the typed live commissioning state for the selected treatment."""
+
+    selection = learner_production_selection()
+    admission = _read_object(TRAINING_SCIENCE_ADMISSION_PATH)
+    recipes = admission.get("recipes")
+    record = recipes.get(selection["recipe"]) if isinstance(recipes, dict) else None
+    if (
+        admission.get("schema_version")
+        != "catan-zero-training-science-admission-v1"
+        or not isinstance(record, dict)
+        or record.get("recipe_canonical_sha256")
+        != selection["config_canonical_sha256"]
+        or not isinstance(record.get("authorized"), bool)
+        or not isinstance(selection["execution_topology"].get("go_authorized"), bool)
+    ):
+        raise ScienceContractError("selected parent-update commissioning is malformed")
+    value = {
+        "schema_version": TRAINING_SCIENCE_COMMISSIONING_SCHEMA,
+        "recipe": selection["recipe"],
+        "config_canonical_sha256": selection["config_canonical_sha256"],
+        "admission": {
+            "path": str(TRAINING_SCIENCE_ADMISSION_PATH.resolve(strict=True)),
+            "sha256": _file_sha256(TRAINING_SCIENCE_ADMISSION_PATH),
+        },
+        "authorized": bool(record["authorized"]),
+        "go_authorized": bool(selection["execution_topology"]["go_authorized"]),
+        "reason": record.get("reason"),
+        "commissioning_evidence": copy.deepcopy(
+            record.get("commissioning_evidence", [])
+        ),
+    }
+    value["commissioning_sha256"] = _content_sha256(value)
+    return value
+
+
+def require_selected_parent_update_go_authorized() -> dict[str, Any]:
+    """Refuse GPU execution until the selected treatment is commissioned."""
+
+    value = selected_parent_update_commissioning()
+    if (
+        value["authorized"] is not True
+        or value["go_authorized"] is not True
+        or not isinstance(value["commissioning_evidence"], list)
+        or not value["commissioning_evidence"]
+    ):
+        raise ScienceContractError(
+            "selected parent-update training science is not authorized for --go"
+        )
+    return value
 
 
 def learner_training_recipe() -> dict[str, Any]:

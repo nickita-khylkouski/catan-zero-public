@@ -117,8 +117,11 @@ LEGACY_DRAFT_SCHEMA = "a1-pre-wave-contract-draft-v2"
 LOCK_SCHEMA = "a1-pre-wave-contract-lock-v3"
 LEGACY_LOCK_SCHEMA = "a1-pre-wave-contract-lock-v2"
 RENDER_SCHEMA = "a1-pre-wave-render-v2"
-MPS_PIPE_DIRECTORY = "/tmp/mps_pipe_host"
-MPS_LOG_DIRECTORY = "/tmp/mps_log_host"
+# Historical v2 campaign contracts included these values in their immutable
+# semantic hash.  They remain parser-only constants; current job environments
+# deliberately do not export MPS variables.
+LEGACY_MPS_PIPE_DIRECTORY = "/tmp/mps_pipe_host"
+LEGACY_MPS_LOG_DIRECTORY = "/tmp/mps_log_host"
 CONFIG_REGISTRY_ENVIRONMENT_VARIABLE = "CATAN_ZERO_CONFIG_REGISTRY"
 CONFIG_REGISTRY_FILENAME = "config_registry.jsonl"
 RUNTIME_REPO_TOKEN = "__A1_RUNTIME_REPO__"
@@ -500,7 +503,6 @@ REQUIRED_SELECTED_TELEMETRY_COLUMNS = {
 }
 REQUIRED_GENERATOR_CODE_SUFFIXES = {
     "tools/generate_gumbel_selfplay_data.py",
-    "tools/fleet/systemd/nvidia-mps.service",
     "tools/opponent_mix_registry.py",
     "src/catan_zero/rl/gumbel_self_play.py",
     "src/catan_zero/rl/decision_taxonomy.py",
@@ -543,12 +545,17 @@ REQUIRED_LEARNER_CODE_SUFFIXES = {
 # The issued 56-GPU campaign schema is immutable and predates the two native
 # wheel inputs added to future draft/runtime closures. Keep its exact file-set
 # contract separate instead of retroactively rewriting already-running data.
-ISSUED_CAMPAIGN_GENERATOR_CODE_SUFFIXES = REQUIRED_GENERATOR_CODE_SUFFIXES - {
+LEGACY_MPS_RUNTIME_SUFFIX = "tools/fleet/systemd/nvidia-mps.service"
+ISSUED_CAMPAIGN_GENERATOR_CODE_SUFFIXES = (
+    REQUIRED_GENERATOR_CODE_SUFFIXES | {LEGACY_MPS_RUNTIME_SUFFIX}
+) - {
     "src/catan_zero/rl/decision_taxonomy.py",
     "native/gumbel_mcts_rs/Cargo.lock",
     "native/gumbel_mcts_rs/src/python_binding.rs",
 }
-ISSUED_REVISION_GENERATOR_CODE_SUFFIXES = REQUIRED_GENERATOR_CODE_SUFFIXES - {
+ISSUED_REVISION_GENERATOR_CODE_SUFFIXES = (
+    REQUIRED_GENERATOR_CODE_SUFFIXES | {LEGACY_MPS_RUNTIME_SUFFIX}
+) - {
     "src/catan_zero/rl/decision_taxonomy.py",
 }
 REQUIRED_RUNTIME_CODE_SUFFIXES = (
@@ -1653,7 +1660,6 @@ def _runtime_code_tree_records() -> list[dict[str, Any]]:
         "native/gumbel_mcts_rs/Cargo.lock",
         "native/gumbel_mcts_rs/src/lib.rs",
         "native/gumbel_mcts_rs/src/python_binding.rs",
-        "tools/fleet/systemd/nvidia-mps.service",
     ):
         paths.add((REPO_ROOT / relative).resolve(strict=True))
     paths.update(
@@ -6387,8 +6393,8 @@ def validate_generation_campaign(
         "eval_server": False,
         "workers_per_gpu": 16,
         "mps_client_environment": {
-            "CUDA_MPS_PIPE_DIRECTORY": MPS_PIPE_DIRECTORY,
-            "CUDA_MPS_LOG_DIRECTORY": MPS_LOG_DIRECTORY,
+            "CUDA_MPS_PIPE_DIRECTORY": LEGACY_MPS_PIPE_DIRECTORY,
+            "CUDA_MPS_LOG_DIRECTORY": LEGACY_MPS_LOG_DIRECTORY,
         },
     }
     if recipe != expected_recipe:
@@ -8665,8 +8671,6 @@ def _job_environment(lock: dict[str, Any], job: dict[str, Any]) -> dict[str, str
     return {
         **SEALED_RUNTIME_ENVIRONMENT,
         "CUDA_VISIBLE_DEVICES": str(job["gpu"]),
-        "CUDA_MPS_PIPE_DIRECTORY": MPS_PIPE_DIRECTORY,
-        "CUDA_MPS_LOG_DIRECTORY": MPS_LOG_DIRECTORY,
         "CATAN_SEED_LEDGER": str(lock["fleet"]["seed_ledger"]["path"]),
         "CATAN_A1_CONTRACT_SHA256": str(lock["contract_sha256"]),
         CONFIG_REGISTRY_ENVIRONMENT_VARIABLE: str(

@@ -83,7 +83,7 @@ def test_generation_guard_drift_is_rejected_from_catalog(
     for relative in (
         "configs/production_recipes.json",
         APPROVED["generate"][0],
-        "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json",
+        "configs/guards/a1_generation_coherent_public_n128_v4.json",
     ):
         source = ROOT / relative
         destination = copied_root / relative
@@ -91,7 +91,7 @@ def test_generation_guard_drift_is_rejected_from_catalog(
         destination.write_bytes(source.read_bytes())
     guard = (
         copied_root
-        / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json"
+        / "configs/guards/a1_generation_coherent_public_n128_v4.json"
     )
     payload = json.loads(guard.read_text(encoding="utf-8"))
     payload["schema_version"] = "drifted"

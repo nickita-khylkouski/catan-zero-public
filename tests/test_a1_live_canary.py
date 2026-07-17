@@ -15,72 +15,23 @@ from tools import prelaunch_guard
 
 
 def _source_argv(out_dir: str, base_seed: int, claim: str) -> list[str]:
-    return [
-        "tools/generate_gumbel_selfplay_data.py",
-        "--out-dir",
-        out_dir,
-        "--games",
-        "245",
-        "--workers",
-        "16",
-        "--checkpoint",
-        "/models/champion.pt",
-        "--device",
-        "cuda",
-        "--n-full",
-        "128",
-        "--n-fast",
-        "16",
-        "--p-full",
-        "0.25",
-        "--c-visit",
-        "50.0",
-        "--c-scale",
-        "0.1",
-        "--rescale-noise-floor-c",
-        "0.0",
-        "--sigma-eval",
-        "0.98",
-        "--wide-candidates-threshold",
-        "24",
-        "--max-depth",
-        "80",
-        "--base-seed",
-        str(base_seed),
-        "--ledger-claim-label",
-        claim,
-        "--symmetry-averaged-eval-threshold",
-        "20",
-        "--determinization-particles",
-        "4",
-        "--determinization-min-simulations",
-        "32",
-        "--symmetry-averaged-eval",
-        "--no-wide-roots-always-full",
-        "--lazy-interior-chance",
-        "--no-belief-chance-spectra",
-        "--information-set-search",
-        "--public-observation",
-        "--no-native-mcts-hot-loop",
-        "--no-rust-featurize",
-        "--no-eval-server",
-        "--seed-claim",
-        "--resume",
-    ]
+    return canary._replace_values(
+        _current_coherent_source_argv(),
+        {
+            "--out-dir": out_dir,
+            "--games": "245",
+            "--base-seed": str(base_seed),
+            "--ledger-claim-label": claim,
+        },
+    )
 
 
 def _source_config_provenance(base_seed: int) -> dict:
-    config = canary.contract.GenerateConfig(
-        games=245,
-        base_seed=base_seed,
-        n_full=128,
-        information_set_search=True,
-        determinization_particles=4,
-        determinization_min_simulations=32,
-        public_observation=True,
-        native_mcts_hot_loop=False,
-        rust_featurize=False,
-    )
+    fields = json.loads(
+        canary.current_science.GENERATOR_CONFIG_PATH.read_text(encoding="utf-8")
+    )["fields"]
+    fields.update(games=245, base_seed=base_seed)
+    config = canary.contract.GenerateConfig(**fields)
     value = {
         "pipeline": "generate",
         "config_hash": config.config_hash(),
@@ -110,7 +61,7 @@ def _current_coherent_lock_job() -> tuple[dict, dict]:
             "guard_config": {
                 "path": (
                     "configs/guards/"
-                    "a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json"
+                    "a1_generation_coherent_public_n128_v4.json"
                 )
             }
         },
@@ -174,7 +125,7 @@ def test_current_coherent_render_accepts_disabled_adaptive_budget() -> None:
         assert projected[config_field] == generation[science_field]
 
 
-def test_opponent_mix_local_mps_render_is_not_production_generation() -> None:
+def test_opponent_mix_local_render_is_not_production_generation() -> None:
     lock, job = _current_coherent_lock_job()
     job["category"] = "recent_history"
     mix_path = Path("/sealed/recent_history.opponent-mix.json")
@@ -198,7 +149,7 @@ def test_opponent_mix_local_mps_render_is_not_production_generation() -> None:
 
     guard_path = (
         canary.contract.REPO_ROOT
-        / "configs/guards/a1_generation_coherent_public_n128_adaptive256_forced_value_v4.json"
+        / "configs/guards/a1_generation_coherent_public_n128_v4.json"
     )
     guard = json.loads(guard_path.read_text(encoding="utf-8"))
     lint = next(item["args"] for item in guard["guards"] if item["name"] == "cli_flag_lint")
@@ -356,32 +307,27 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return plan, lock, rendered, lanes, hosts, root, production_ledger
 
 
-def test_derives_exact_twelve_lane_validation_transaction(
+def test_derives_exact_eight_lane_validation_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plan, _lock, _rendered, _lanes, _hosts, root, production_ledger = _fixture(
         tmp_path, monkeypatch
     )
     assert plan["validation_only"] is True
-    assert plan["lane_count"] == 12
-    assert plan["job_count"] == 36
+    assert plan["lane_count"] == 8
+    assert plan["job_count"] == 24
     assert plan["claim_count"] == 0
-    assert plan["canary_claim_count"] == 36
+    assert plan["canary_claim_count"] == 24
     assert plan["production_claims_consumed"] == 0
-    assert set(plan["_private"]["hosts"]["hosts"]) == {"c1", "h100-8a"}
+    assert set(plan["_private"]["hosts"]["hosts"]) == {"h100-8a"}
     assert plan["canary_seed_ledger"] != str(production_ledger)
     assert Path(plan["canary_seed_ledger"]).is_relative_to(root)
     assert production_ledger.read_text() == "# production\n"
     parsed_claims = canary.contract.parse_seed_ledger(plan["canary_seed_ledger"])
-    assert len(parsed_claims) == 36
+    assert len(parsed_claims) == 24
     assert all(
         "VAL-ONLY" in label and "claim=val-" in label for _, _, label in parsed_claims
     )
-    assert [
-        lane[0]["gpu"]
-        for lane in plan["_private"]["lanes"].values()
-        if lane[0]["host_alias"] == "c1"
-    ] == [0, 1, 2, 3]
     assert sorted(
         lane[0]["gpu"]
         for lane in plan["_private"]["lanes"].values()
@@ -389,9 +335,9 @@ def test_derives_exact_twelve_lane_validation_transaction(
     ) == list(range(8))
     assert all(
         command["config_provenance"]["config"]["fields"]["rust_featurize"]
-        is False
-        and "--no-rust-featurize" in command["argv"]
-        and "--rust-featurize" not in command["argv"]
+        is True
+        and "--rust-featurize" in command["argv"]
+        and "--no-rust-featurize" not in command["argv"]
         for lane in plan["_private"]["lanes"].values()
         for command in lane
     )
@@ -424,18 +370,18 @@ def test_derives_operator_selected_cohort_and_game_count(
         base_seed=canary.contract.VAL_ONLY_SEED_RANGE[0] + 10_000,
         canary_root=chosen_root,
         allowed_root=tmp_path / "allowed",
-        canary_aliases={"c2": 4, "h100-8b": 8},
+        canary_aliases={"h100-8b": 8},
         games_per_job=8,
         native_runtime=True,
         categories=("current_producer",),
     )
-    assert plan["canary_aliases"] == {"c2": 4, "h100-8b": 8}
+    assert plan["canary_aliases"] == {"h100-8b": 8}
     assert plan["games_per_job"] == 8
     assert plan["native_runtime"] is True
-    assert plan["lane_count"] == 12
-    assert plan["job_count"] == 12
+    assert plan["lane_count"] == 8
+    assert plan["job_count"] == 8
     assert plan["category_order"] == ["current_producer"]
-    assert set(plan["_private"]["hosts"]["hosts"]) == {"c2", "h100-8b"}
+    assert set(plan["_private"]["hosts"]["hosts"]) == {"h100-8b"}
     assert all(
         canary._flag_value(command["argv"], "--games") == "8"
         for lane in plan["_private"]["lanes"].values()
@@ -495,7 +441,7 @@ def test_only_identity_seed_output_and_attempt_values_change(
                 == "public_conservation_pimc_v1"
             )
             assert attestation["source_job"]["job_id"] == original["job_id"]
-    assert len(ranges) == len(set(ranges)) == 36
+    assert len(ranges) == len(set(ranges)) == 24
     assert ranges == sorted(ranges)
 
 
@@ -536,8 +482,8 @@ def test_rejects_missing_shape_or_scalar_attestation(
 ) -> None:
     plan, lock, rendered, lanes, hosts, root, _ledger = _fixture(tmp_path, monkeypatch)
     broken_lanes = dict(lanes)
-    broken_lanes.pop("c1_gpu3")
-    with pytest.raises(canary.CanaryError, match="c1 gpu0-3"):
+    broken_lanes.pop("h8a_gpu7")
+    with pytest.raises(canary.CanaryError, match="h100-8a gpu0-7"):
         canary.derive_canary_plan(
             lock=lock,
             rendered=rendered,
@@ -559,7 +505,7 @@ def test_rejects_any_source_science_or_guard_bypass_drift(
 ) -> None:
     plan, lock, rendered, lanes, hosts, root, _ledger = _fixture(tmp_path, monkeypatch)
     broken_lanes = copy.deepcopy(lanes)
-    command = broken_lanes["c1_gpu0"][0]
+    command = broken_lanes["h8a_gpu0"][0]
     n_full_index = command["argv"].index("--n-full") + 1
     command["argv"][n_full_index] = "64"
     with pytest.raises(canary.CanaryError, match="exact recipe requires --n-full=128"):
@@ -582,9 +528,9 @@ def test_rejects_any_source_science_or_guard_bypass_drift(
         )
 
     broken_lanes = copy.deepcopy(lanes)
-    command = broken_lanes["c1_gpu0"][0]
+    command = broken_lanes["h8a_gpu0"][0]
     command["argv"].append("--skip-guards")
-    with pytest.raises(canary.CanaryError, match="switch drift"):
+    with pytest.raises(canary.CanaryError, match="forbidden --skip-guards"):
         canary.derive_canary_plan(
             lock=lock,
             rendered={
@@ -597,9 +543,9 @@ def test_rejects_any_source_science_or_guard_bypass_drift(
             render_path=tmp_path / "render.json",
             hosts_path=tmp_path / "hosts.json",
             receipt_path=tmp_path / "guard.receipt.json",
-            canary_id="shapecheck",
+            canary_id="guardcheck",
             base_seed=canary.contract.VAL_ONLY_SEED_RANGE[0],
-            canary_root=root,
+            canary_root=root.with_name("a1-live-canary-guardcheck"),
             allowed_root=tmp_path / "gen_out",
         )
     broken_lock = copy.deepcopy(lock)
@@ -676,9 +622,9 @@ def test_status_stop_and_execute_reuse_hardened_receipt_semantics(
     )
     monkeypatch.setattr(
         canary,
-        "attest_mps_runtime",
+        "attest_eval_server_runtime",
         lambda built, **_kwargs: (
-            calls.append(("mps-runtime", built))
+            calls.append(("eval-server-runtime", built))
             or {"required_nofile_soft": canary.executor.REQUIRED_NOFILE_SOFT}
         ),
     )
@@ -699,11 +645,11 @@ def test_status_stop_and_execute_reuse_hardened_receipt_semantics(
     assert canary.main(["run", *common, "--resume", "--go"]) == 0
     assert canary.main(["status", *common]) == 0
     assert canary.main(["stop", *common, "--go"]) == 0
-    assert [call[0] for call in calls] == ["run", "mps-runtime", "status", "stop"]
+    assert [call[0] for call in calls] == ["run", "eval-server-runtime", "status", "stop"]
     assert calls[0][3] is True and calls[3][3] is True
 
 
-def test_live_mps_runtime_attestation_rejects_low_server_limit(
+def test_live_eval_server_runtime_attestation_rejects_low_owner_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lanes = {}
@@ -784,7 +730,16 @@ def test_live_mps_runtime_attestation_rejects_low_server_limit(
             stdout=json.dumps(
                 {
                     "required_nofile_soft": canary.executor.REQUIRED_NOFILE_SOFT,
-                    "server_nofile_soft": {"4242": limit},
+                    "cuda_owner_model": "one_eval_server_per_physical_gpu",
+                    "owner_nofile_soft": {"4242": limit},
+                    "cuda_owner_jobs": {
+                        str(item["gpu"]): {
+                            "owner_pid": 4200 + item["gpu"],
+                            "generator_pid": 5200 + item["gpu"],
+                            "job_id": item["jobs"][0]["job_id"],
+                        }
+                        for item in canary._runtime_lane_expectations(plan, alias)
+                    },
                     "canary_lane_progress": progress,
                 }
             ),
@@ -802,21 +757,21 @@ def test_live_mps_runtime_attestation_rejects_low_server_limit(
         "_ssh",
         safe_ssh,
     )
-    report = canary.attest_mps_runtime(
+    report = canary.attest_eval_server_runtime(
         plan, not_before_epoch=not_before, timeout_seconds=0.01
     )
-    assert set(report["hosts"]) == {"c1", "h100-8a"}
-    assert len(timeouts) == 2
+    assert set(report["hosts"]) == {"h100-8a"}
+    assert len(timeouts) == 1
     assert all(15.0 <= timeout <= 16.0 for timeout in timeouts)
-    assert "timeout=" in canary.MPS_RUNTIME_ATTESTATION_SCRIPT
+    assert "timeout=" in canary.EVAL_SERVER_RUNTIME_ATTESTATION_SCRIPT
 
     monkeypatch.setattr(
         canary.executor,
         "_ssh",
         lambda _hosts, alias, _command, **_kwargs: response(alias, 1024),
     )
-    with pytest.raises(canary.CanaryError, match="unsafe MPS runtime limit"):
-        canary.attest_mps_runtime(
+    with pytest.raises(canary.CanaryError, match="unsafe EvalServer runtime limit"):
+        canary.attest_eval_server_runtime(
             plan, not_before_epoch=not_before, timeout_seconds=0.01
         )
 
@@ -828,7 +783,7 @@ def test_live_mps_runtime_attestation_rejects_low_server_limit(
         ),
     )
     with pytest.raises(canary.CanaryError, match="incomplete canary lane progress"):
-        canary.attest_mps_runtime(
+        canary.attest_eval_server_runtime(
             plan, not_before_epoch=not_before, timeout_seconds=0.01
         )
 
@@ -840,7 +795,7 @@ def test_live_mps_runtime_attestation_rejects_low_server_limit(
         ),
     )
     with pytest.raises(canary.CanaryError, match="unsafe canary lane progress"):
-        canary.attest_mps_runtime(
+        canary.attest_eval_server_runtime(
             plan, not_before_epoch=not_before, timeout_seconds=0.01
         )
 
@@ -852,12 +807,12 @@ def test_live_mps_runtime_attestation_rejects_low_server_limit(
         ),
     )
     with pytest.raises(canary.CanaryError, match="stale/unsafe canary worker progress"):
-        canary.attest_mps_runtime(
+        canary.attest_eval_server_runtime(
             plan, not_before_epoch=not_before, timeout_seconds=0.01
         )
 
 
-def test_live_mps_runtime_attestation_hard_bounds_ssh(
+def test_live_eval_server_runtime_attestation_hard_bounds_ssh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lanes = {
@@ -894,16 +849,16 @@ def test_live_mps_runtime_attestation_hard_bounds_ssh(
             subprocess.TimeoutExpired("ssh", 1.0)
         ),
     )
-    with pytest.raises(canary.CanaryError, match="transport timed out on c1"):
-        canary.attest_mps_runtime(
+    with pytest.raises(canary.CanaryError, match="transport timed out on h100-8a"):
+        canary.attest_eval_server_runtime(
             plan, not_before_epoch=1.0, timeout_seconds=0.01
         )
 
 
-def test_go_stops_exact_canary_when_mps_runtime_attestation_fails(
+def test_go_stops_exact_canary_when_eval_server_attestation_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    plan = {"plan_sha256": "sha256:mps-failure", "_private": {}}
+    plan = {"plan_sha256": "sha256:eval-server-failure", "_private": {}}
     monkeypatch.setattr(canary, "build_canary_plan", lambda **_kwargs: plan)
     monkeypatch.setattr(
         canary.executor,
@@ -912,9 +867,9 @@ def test_go_stops_exact_canary_when_mps_runtime_attestation_fails(
     )
     monkeypatch.setattr(
         canary,
-        "attest_mps_runtime",
+        "attest_eval_server_runtime",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            canary.CanaryError("low MPS server limit")
+            canary.CanaryError("low EvalServer owner limit")
         ),
     )
     stops: list[tuple[Path, bool]] = []
@@ -1053,7 +1008,7 @@ def test_go_stops_exact_canary_when_runtime_receipt_persistence_fails(
     )
     monkeypatch.setattr(
         canary,
-        "attest_mps_runtime",
+        "attest_eval_server_runtime",
         lambda *_args, **_kwargs: {"status": "safe"},
     )
     monkeypatch.setattr(
@@ -1102,7 +1057,7 @@ def test_go_keyboard_interrupt_exact_stops_then_propagates(
     )
     monkeypatch.setattr(
         canary,
-        "attest_mps_runtime",
+        "attest_eval_server_runtime",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
     stops: list[bool] = []
@@ -1145,7 +1100,7 @@ def test_go_surfaces_primary_and_exact_stop_failures(
     )
     monkeypatch.setattr(
         canary,
-        "attest_mps_runtime",
+        "attest_eval_server_runtime",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("transport lost")),
     )
     monkeypatch.setattr(
@@ -1214,9 +1169,9 @@ def test_audit_requires_clean_public_information_manifests(
     monkeypatch.setattr(canary.executor, "_ssh", fake_ssh)
     report = canary.audit_canary(plan)
     assert report["status"] == "PASS"
-    assert report["job_count"] == 36
-    assert report["rows"] == 360
-    assert report["simulations"] == 36 * 128
+    assert report["job_count"] == 24
+    assert report["rows"] == 240
+    assert report["simulations"] == 24 * 128
     assert report["audit_sha256"].startswith("sha256:")
 
 

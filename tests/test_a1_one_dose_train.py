@@ -1522,11 +1522,13 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         "producer": producer,
         "corpus_meta_file_sha256": "sha256:" + "3" * 64,
         "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
-        "function_preserving_upgrade": {
-            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
+        "information_contract_migration": {
+            "migration": executor.information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
             "source": producer,
             "receipt": {"sha256": "sha256:" + "5" * 64},
             "receipt_sha256": "sha256:" + "6" * 64,
+            "forward_identical": False,
+            "promotion_eligible": False,
         },
     }
 
@@ -1556,6 +1558,13 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         "symmetry_augment": True,
     }
     assert bound["canonical_parent_update"]["checkpoint_steps"] == [8]
+    assert bound["training_science_commissioning"]["authorized"] is False
+    assert bound["training_science_commissioning"]["go_authorized"] is False
+    assert bound["promotion_eligible"] is False
+    assert bound["eligible_for_full_gate"] is False
+    assert bound["promotion_block_reason"] == (
+        "training_science_admission_unauthorized"
+    )
 
     initializer = tmp_path / "initializer.pt"
     initializer.write_bytes(b"initializer")
@@ -1588,6 +1597,26 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert _option(command, "--scalar-value-loss-scale") == "1.0"
 
 
+def test_migration_claim_schema_replays_as_derived_identity(tmp_path: Path) -> None:
+    contract = "sha256:" + "1" * 64
+    identity = "sha256:" + "2" * 64
+    claim = tmp_path / "migration.claim.json"
+    payload = {
+        "schema_version": executor.MIGRATION_CLAIM_SCHEMA,
+        "contract_sha256": contract,
+        "claim_identity_sha256": identity,
+        "status": "claimed",
+    }
+    payload["state_sha256"] = executor._value_sha256(payload)  # noqa: SLF001
+    claim.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert executor._load_claim_state(  # noqa: SLF001
+        claim,
+        contract_sha256=contract,
+        claim_identity_sha256=identity,
+    )["schema_version"] == executor.MIGRATION_CLAIM_SCHEMA
+
+
 def test_canonical_parent_update_rejects_malformed_checkpoint_frontier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1607,11 +1636,13 @@ def test_canonical_parent_update_rejects_malformed_checkpoint_frontier(
         "producer": producer,
         "corpus_meta_file_sha256": "sha256:" + "3" * 64,
         "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
-        "function_preserving_upgrade": {
-            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
+        "information_contract_migration": {
+            "migration": executor.information_migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
             "source": producer,
             "receipt": {"sha256": "sha256:" + "5" * 64},
             "receipt_sha256": "sha256:" + "6" * 64,
+            "forward_identical": False,
+            "promotion_eligible": False,
         },
     }
 

@@ -1989,6 +1989,18 @@ def test_dry_run_binds_v3_one_dose_receipt(tmp_path: Path) -> None:
     }
 
 
+def test_promotion_supports_migration_receipts_without_breaking_v1_replay() -> None:
+    assert one_dose.MIGRATION_RECEIPT_SCHEMA == (
+        "a1-information-migration-training-receipt-v1"
+    )
+    assert "a1-canonical-parent-update-authority-v1" in (
+        promotion.CANONICAL_PARENT_UPDATE_AUTHORITY_SCHEMAS
+    )
+    assert "a1-canonical-parent-update-authority-v2" in (
+        promotion.CANONICAL_PARENT_UPDATE_AUTHORITY_SCHEMAS
+    )
+
+
 def test_dry_run_accepts_exact_authenticated_eight_rank_one_dose_topology(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

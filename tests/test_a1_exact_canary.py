@@ -22,7 +22,7 @@ def _command(alias: str, gpu: int, category: str, seed: int) -> dict:
         "tools/generate_gumbel_selfplay_data.py",
         "--out-dir", f"/wave/{job}",
         "--games", "10",
-        "--workers", "16",
+        "--workers", "24",
         "--checkpoint", "/models/champion.pt",
         "--device", "cuda",
         "--n-full", "128",
@@ -32,18 +32,33 @@ def _command(alias: str, gpu: int, category: str, seed: int) -> dict:
         "--c-scale", "0.1",
         "--max-depth", "80",
         "--rescale-noise-floor-c", "0.0",
-        "--sigma-eval", "0.98",
+        "--sigma-eval", "0.79",
         "--base-seed", str(seed),
         "--symmetry-averaged-eval",
         "--symmetry-averaged-eval-threshold", "20",
         "--public-observation",
-        "--information-set-search",
-        "--determinization-particles", "4",
+        "--coherent-public-belief-search",
+        "--no-information-set-search",
+        "--native-mcts-hot-loop",
+        "--determinization-particles", "1",
         "--determinization-min-simulations", "32",
         "--lazy-interior-chance",
         "--no-belief-chance-spectra",
         "--no-wide-roots-always-full",
-        "--no-eval-server",
+        "--eval-server",
+        "--eval-server-max-batch", "96",
+        "--eval-server-max-wait-ms", "0.0",
+        "--eval-server-timeout-ms", "20000.0",
+        "--eval-server-batch-timeout-sec", "0.0",
+        "--eval-server-matmul-precision", "highest",
+        "--eval-server-transport", "mp_queue",
+        "--eval-server-shared-memory-slot-bytes", "4194304",
+        "--eval-server-cuda-graph-warmup-iterations", "3",
+        "--eval-server-cuda-graph-batch-buckets",
+        "8", "16", "24", "32", "40", "48", "64", "80", "96", "128", "160", "192",
+        "--no-eval-server-local-fallback",
+        "--eval-server-request-collector",
+        "--no-eval-server-cuda-graph",
         "--seed-claim",
         "--resume",
     ]
@@ -63,20 +78,15 @@ def _command(alias: str, gpu: int, category: str, seed: int) -> dict:
 def _fixture(*, current_v3: bool = False) -> tuple[dict, dict]:
     commands = []
     seed = 300_000_000_000
-    shapes = {
-        **{f"c{i}": 4 for i in range(1, 9 if current_v3 else 7)},
-        **{
-            f"h100-8{letter}": 8
-            for letter in ("a", "b", "c", "d")[: 4 if current_v3 else 2]
-        },
-    }
+    del current_v3
+    shapes = {f"h100-8{letter}": 8 for letter in "abcdef"}
     for alias, count in shapes.items():
         for gpu in range(count):
             for category in canary.CATEGORY_ORDER:
                 commands.append(_command(alias, gpu, category, seed))
                 seed += 10
     lane_count = sum(shapes.values())
-    assert lane_count == (64 if current_v3 else 40)
+    assert lane_count == 48
     assert len(commands) == lane_count * len(canary.CATEGORY_ORDER)
     rendered = {
         "schema_version": contract.RENDER_SCHEMA,
@@ -103,7 +113,7 @@ def _fixture(*, current_v3: bool = False) -> tuple[dict, dict]:
     plan = {
         "contract_sha256": rendered["contract_sha256"],
         "render_sha256": rendered["render_sha256"],
-        "client_environment": dict(canary.EXPECTED_MPS_ENVIRONMENT),
+        "client_environment": dict(canary.EXPECTED_CLIENT_ENVIRONMENT),
         "lane_count": lane_count,
         "job_count": len(commands),
         "lanes": lanes,
@@ -120,10 +130,10 @@ def _rehash(rendered: dict, plan: dict) -> None:
     plan["plan_sha256"] = contract._digest_value(plan)
 
 
-def test_exact_canary_proves_four_and_eight_gpu_shapes() -> None:
+def test_exact_canary_proves_six_eight_gpu_shapes() -> None:
     rendered, plan = _fixture()
     report = canary.validate_exact_canary(
-        rendered, plan, {"c1": 4, "h100-8a": 8}
+        rendered, plan, {"h100-8a": 8}
     )
 
     assert report["status"] == "pass"
@@ -132,37 +142,41 @@ def test_exact_canary_proves_four_and_eight_gpu_shapes() -> None:
         "n_fast": 16,
         "p_full": 0.25,
         "public_observation": True,
-        "information_set_search": True,
-        "determinization_particles": 4,
+        "coherent_public_belief_search": True,
+        "information_set_search": False,
+        "determinization_particles": 1,
         "determinization_min_simulations": 32,
         "symmetry_averaged_eval": True,
         "symmetry_averaged_eval_threshold": 20,
         "adaptive_wide_budget": False,
-        "workers_per_gpu": 16,
+        "workers_per_gpu": 24,
+        "eval_server": True,
+        "eval_server_transport": "mp_queue",
+        "eval_server_local_fallback": False,
+        "fleet_pipelines_per_gpu": 1,
     }
-    assert report["cohorts"]["c1"]["job_count"] == 12
     assert report["cohorts"]["h100-8a"]["job_count"] == 24
-    assert report["lane_count"] == 40
-    assert report["job_count"] == 120
-    assert report["unique_output_count"] == 120
-    assert report["disjoint_seed_range_count"] == 120
+    assert report["lane_count"] == 48
+    assert report["job_count"] == 144
+    assert report["unique_output_count"] == 144
+    assert report["disjoint_seed_range_count"] == 144
 
 
-def test_exact_canary_accepts_current_v3_64_lane_192_job_topology() -> None:
-    rendered, plan = _fixture(current_v3=True)
+def test_exact_canary_accepts_current_six_node_topology() -> None:
+    rendered, plan = _fixture()
     report = canary.validate_exact_canary(
-        rendered, plan, {"c1": 4, "h100-8a": 8}
+        rendered, plan, {"h100-8a": 8}
     )
 
-    assert report["lane_count"] == 64
-    assert report["job_count"] == 192
-    assert report["unique_output_count"] == 192
-    assert report["disjoint_seed_range_count"] == 192
+    assert report["lane_count"] == 48
+    assert report["job_count"] == 144
+    assert report["unique_output_count"] == 144
+    assert report["disjoint_seed_range_count"] == 144
 
 
-def test_canary_mps_contract_matches_executor_and_lane_supervisor() -> None:
-    assert executor.CLIENT_ENVIRONMENT == canary.EXPECTED_MPS_ENVIRONMENT
-    assert supervisor.CLIENT_ENVIRONMENT == canary.EXPECTED_MPS_ENVIRONMENT
+def test_canary_eval_server_contract_matches_executor_and_lane_supervisor() -> None:
+    assert executor.CLIENT_ENVIRONMENT == canary.EXPECTED_CLIENT_ENVIRONMENT
+    assert supervisor.CLIENT_ENVIRONMENT == canary.EXPECTED_CLIENT_ENVIRONMENT
 
 
 @pytest.mark.parametrize(
@@ -171,7 +185,7 @@ def test_canary_mps_contract_matches_executor_and_lane_supervisor() -> None:
         (lambda command: command["argv"].__setitem__(command["argv"].index("128"), "64"), "--n-full"),
         (lambda command: command["argv"].extend(["--n-full-wide", "256"]), "forbidden"),
         (lambda command: command["argv"].remove("--symmetry-averaged-eval"), "missing required"),
-        (lambda command: command["argv"].remove("--information-set-search"), "missing required"),
+        (lambda command: command["argv"].remove("--coherent-public-belief-search"), "missing required"),
         (lambda command: command["environment"].__setitem__("CUDA_VISIBLE_DEVICES", "7"), "CUDA_VISIBLE"),
     ],
 )
@@ -184,17 +198,17 @@ def test_exact_canary_rejects_recipe_or_placement_drift(mutation, message: str) 
     _rehash(rendered, plan)
 
     with pytest.raises(canary.CanaryError, match=message):
-        canary.validate_exact_canary(rendered, plan, {"c1": 4, "h100-8a": 8})
+        canary.validate_exact_canary(rendered, plan, {"h100-8a": 8})
 
 
-def test_exact_canary_rejects_missing_mps_binding() -> None:
+def test_exact_canary_rejects_retired_mps_binding() -> None:
     rendered, plan = _fixture()
-    plan["client_environment"].pop("CUDA_MPS_PIPE_DIRECTORY")
+    plan["client_environment"]["CUDA_MPS_PIPE_DIRECTORY"] = "/tmp/mps_pipe_host"
     plan.pop("plan_sha256")
     plan["plan_sha256"] = contract._digest_value(plan)
 
-    with pytest.raises(canary.CanaryError, match="MPS client environment"):
-        canary.validate_exact_canary(rendered, plan, {"c1": 4, "h100-8a": 8})
+    with pytest.raises(canary.CanaryError, match="retired MPS"):
+        canary.validate_exact_canary(rendered, plan, {"h100-8a": 8})
 
 
 def test_exact_canary_rejects_shared_output_or_seed() -> None:
@@ -206,7 +220,7 @@ def test_exact_canary_rejects_shared_output_or_seed() -> None:
     _rehash(rendered, plan)
 
     with pytest.raises(canary.CanaryError, match="output directory"):
-        canary.validate_exact_canary(rendered, plan, {"c1": 4, "h100-8a": 8})
+        canary.validate_exact_canary(rendered, plan, {"h100-8a": 8})
 
 
 def test_exact_canary_rejects_shape_or_executor_lane_drift() -> None:
@@ -216,10 +230,10 @@ def test_exact_canary_rejects_shape_or_executor_lane_drift() -> None:
     broken.pop("plan_sha256")
     broken["plan_sha256"] = contract._digest_value(broken)
     with pytest.raises(canary.CanaryError, match="job order drift"):
-        canary.validate_exact_canary(rendered, broken, {"c1": 4, "h100-8a": 8})
+        canary.validate_exact_canary(rendered, broken, {"h100-8a": 8})
 
     with pytest.raises(canary.CanaryError, match="exact GPU lanes"):
-        canary.validate_exact_canary(rendered, plan, {"c1": 8, "h100-8a": 4})
+        canary.validate_exact_canary(rendered, plan, {"h100-8a": 4})
 
 
 def test_exact_canary_rejects_declared_topology_count_drift() -> None:
@@ -230,4 +244,4 @@ def test_exact_canary_rejects_declared_topology_count_drift() -> None:
     plan["plan_sha256"] = contract._digest_value(plan)
 
     with pytest.raises(canary.CanaryError, match="three jobs per lane"):
-        canary.validate_exact_canary(rendered, plan, {"c1": 4, "h100-8a": 8})
+        canary.validate_exact_canary(rendered, plan, {"h100-8a": 8})

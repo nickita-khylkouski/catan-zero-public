@@ -125,7 +125,7 @@
         "binding_schema": "a1-canonical-parent-initializer-v1",
         "parent_checkpoint": "required_runtime_input",
         "init_checkpoint": "required_runtime_input",
-        "architecture_upgrade_receipt": "required_if_checkpoint_bytes_differ",
+        "information_contract_migration_receipt": "required_if_checkpoint_bytes_differ",
         "entity_feature_adapter_version": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
         "optimizer_state": "fresh"
       },
@@ -167,8 +167,8 @@
       "checkpoint": null,
       "optimizer_state": "fresh"
     },
-    "architecture_upgrade_flags": "structured_action_value,card_count_v2,meaningful_history,history_target_gather,action_target_gather,legal_set_statistics,public_rule_state,topology,value_tower_split1",
-    "architecture_upgrade_module": "entity_graph.topology_residual_adapter+action_target_gather+static_action_residual+legal_action_value_residual+legal_action_value_set_statistics+public_card_count_features+meaningful_public_history+meaningful_history_target_gather+actor_public_rule_state.v5+value_tower_split1",
+    "architecture_upgrade_flags": "current_v6_information_migration_topology_split1",
+    "architecture_upgrade_module": "entity_graph.current_v2_to_v6_information_contract+topology+split1.v1",
     "research_scratch_model_construction": {
       "arch": "entity_graph",
       "hidden_size": 640,

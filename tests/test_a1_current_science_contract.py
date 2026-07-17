@@ -220,6 +220,17 @@ def test_current_contract_rejects_parent_update_admission_becoming_implicit(
         current_science.load()
 
 
+def test_selected_parent_update_go_is_explicitly_unauthorized() -> None:
+    commissioning = current_science.selected_parent_update_commissioning()
+    assert commissioning["authorized"] is False
+    assert commissioning["go_authorized"] is False
+    with pytest.raises(
+        current_science.ScienceContractError,
+        match="not authorized for --go",
+    ):
+        current_science.require_selected_parent_update_go_authorized()
+
+
 def test_current_target_quality_generation_is_bound_to_config_and_guard() -> None:
     generation = current_science.generation()
     learner = current_science.learner()
@@ -284,7 +295,10 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     assert lint["expected_values"][
         "--teacher-entity-feature-adapter-version"
     ] == current_science.CURRENT_TEACHER_ENTITY_ADAPTER
-    assert "forced_value_v4.json" in current_science.GENERATOR_GUARD_PATH.name
+    assert (
+        current_science.GENERATOR_GUARD_PATH.name
+        == "a1_generation_coherent_public_n128_v4.json"
+    )
     assert "coherent-public-v4" in str(current_science.CONTRACT_PATH)
     assert "--workers" in lint["critical_flags"]
     assert "--eval-server" in lint["critical_flags"]
