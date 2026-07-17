@@ -366,6 +366,7 @@ def _complete_effective_evaluator_config(
     kwargs = {
         "value_scale": float(fields.get("value_scale", 1.0)),
         "prior_temperature": float(fields.get("prior_temperature", 1.0)),
+        "value_squash": str(fields.get("value_squash", "tanh")),
         "value_readout": str(fields.get("value_readout", "scalar")),
         "public_observation": bool(fields.get("public_observation", False)),
         "rust_featurize": bool(fields.get("rust_featurize", True)),

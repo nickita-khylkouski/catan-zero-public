@@ -141,6 +141,7 @@ OPERATOR_FIELDS = (
     "rust_featurize",
     "value_readout",
     "value_scale",
+    "value_squash",
     "prior_temperature",
     "sigma_eval",
     "symmetry_averaged_eval",

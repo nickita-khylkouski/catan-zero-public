@@ -47,6 +47,14 @@ def test_complete_effective_search_config_binds_resolved_defaults() -> None:
     }
 
 
+def test_complete_effective_evaluator_config_binds_value_squash() -> None:
+    """Reanalysis must use the same nonlinearity as the target producer."""
+    effective = alignment._complete_effective_evaluator_config(  # noqa: SLF001
+        {"value_squash": "clip"}
+    )
+    assert effective["value_squash"] == "clip"
+
+
 def test_stage_c_identity_binds_code_owned_action_catalog() -> None:
     """Action ids are target semantics even though the catalog is not a CLI knob."""
 

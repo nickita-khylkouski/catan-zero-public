@@ -1239,6 +1239,7 @@ def _evaluator_from_plan(plan: Mapping[str, Any], *, device: str) -> Any:
             value_scale=float(fields.get("value_scale", 1.0)),
             prior_temperature=float(fields.get("prior_temperature", 1.0)),
             cache_size=int(fields.get("eval_cache_size", 0)),
+            value_squash=str(fields.get("value_squash", "tanh")),
             value_readout=str(fields.get("value_readout", "scalar")),
             public_observation=True,
             rust_featurize=True,
