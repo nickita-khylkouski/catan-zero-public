@@ -1,0 +1,72 @@
+---
+session: fix-bug-v7-v8-training-signal-audit
+ts: 2026-07-17T20:30:00Z
+commit: 1d17f7bb
+branch: main
+status: complete
+---
+
+scope: bug
+options: []
+
+issue:
+  description: >-
+    Repair root-level V7/V8 training-signal and production-admission bugs for
+    two-player no-trade without starting a long training job.
+  evidence:
+    - The selected parent recipe sent value gradients through the shared policy trunk at 1.0 instead of 0.1.
+    - V6 B12 evidence authorized a changed V7/V8 architecture and different canonical recipe.
+    - Hard opening, discard, and robber decisions were below intended policy-objective mass.
+    - policy_target_min_visits reached workers but was absent from typed generation identity.
+    - Production admission accepted arbitrary nonempty commissioning-evidence strings.
+
+diagnosis:
+  root_cause: >-
+    Architecture, objective, and recipe changes were versioned independently,
+    but the production gate authenticated only the live recipe hash and a
+    nonempty evidence list. Historical evidence could therefore authorize new
+    parameters and new gradient routing that it never trained or measured.
+  files:
+    - configs/training/a1_parent_update_35m_b200.schema1.json
+    - configs/production/training_science_admission.json
+    - src/catan_zero/production_contracts.py
+    - src/catan_zero/rl/pipeline_configs.py
+    - tools/a1_current_science_contract.py
+
+fix:
+  approach: >-
+    Set both canonical training routes to the 0.1 shared value-gradient
+    boundary while retaining full private value gradients; replay exact
+    per-game hard-decision mass; bind policy-target pruning into typed config;
+    fail-close the current V8 parent pending matched commissioning; and require
+    safe, exact-recipe, passing primary evidence before any future authorization.
+  commits:
+    - e43cca39 Raise hard-decision policy objective mass
+    - 9988f8db Bind policy target pruning to typed generation identity
+    - 6d6b590a Replay hard-decision mass through runtime weights
+    - 443d57f7 Fail close uncommissioned V7 parent updates
+    - 168453a3 Scale V7 parent shared value gradients
+    - 27870c58 Authenticate training commissioning evidence
+    - cc824574 Bind fail-closed gate to current V8 parent
+    - 1d17f7bb Keep V7 typed fields append-only
+
+verification:
+  local: >-
+    309 passed and 1 skipped before the final upstream integration; 246 passed
+    and 1 skipped after integration; the final targeted suite passed 246 tests
+    plus 56 typed-config tests.
+  h100: >-
+    Exact commit e81428e0 passed 310 focused tests on NVIDIA H100 80GB HBM3.
+    A real CUDA BF16 forward/backward and fused AdamW step measured shared
+    gradient ratio 0.1001626849, private value gradients bit-identical at 1.0,
+    and nonzero action-cross gradients. Later rebases changed contracts/tests,
+    not this model gradient path.
+  hashes:
+    scratch_recipe: f41b90e0111788d92cb9555d63ca7b0d94db7c761838eb08c24c438d1e3ca1a8
+    parent_recipe: 85359773c9685b96079759912c65ead695d8c09216d784b0c81211965d36c3a1
+  pushed_main: 1d17f7bba89b01a40eb3c736ddbea8e799702464
+
+next:
+  - Commission the exact current V8 initializer and 0.1 parent recipe before changing authorized to true.
+  - Add the future V8 primary evidence schema to the explicit allowlist only with an exact recipe/path/hash binding.
+  - Run the sealed 12-step policy/value no-regression gates, then gameplay promotion gates.
