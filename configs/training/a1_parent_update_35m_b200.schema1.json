@@ -152,7 +152,7 @@
       "truncated_vp_margin_value_weight": 0.25,
       "trunk_lr_mult": 0.25,
       "validation_contract_file_sha256": "",
-      "validation_fraction": 0.125,
+      "validation_fraction": 0.05,
       "validation_game_seed_ranges": "",
       "validation_game_seed_set_sha256": "",
       "validation_max_samples": 0,
