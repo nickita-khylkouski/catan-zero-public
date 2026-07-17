@@ -8368,6 +8368,58 @@ def _read_sha256_bound_json(
     return path, payload, actual_file_sha256
 
 
+def _replay_a1_v3_promotion_handoff(
+    lock_path: Path,
+    lock_payload: dict[str, object],
+) -> None:
+    """Replay the normalized v3 producer handoff through its issuing contract.
+
+    V3 permits either an ordinary post-promotion handoff or the one typed
+    disaster-recovery lineage used to recover the current producer.  Checking
+    only ``mode == post_promotion`` rejects that legitimate first recovered
+    wave, while accepting a mode string alone would be unsafe.  Reconstructing
+    the normalized record from the bound receipt reuses the exact issuer
+    semantics and requires byte-for-byte equality with the sealed lock.
+    """
+
+    handoff = lock_payload.get("promotion_handoff")
+    checkpoints = lock_payload.get("checkpoints")
+    science = lock_payload.get("science")
+    generation = lock_payload.get("generation")
+    producers = [
+        record
+        for record in checkpoints
+        if isinstance(record, dict) and record.get("role") == "producer"
+    ] if isinstance(checkpoints, list) else []
+    if (
+        not isinstance(handoff, dict)
+        or handoff.get("mode") not in {"post_promotion", "disaster_recovery"}
+        or not isinstance(handoff.get("path"), str)
+        or len(producers) != 1
+        or not isinstance(science, dict)
+        or not isinstance(science.get("effective_search_config"), dict)
+        or not isinstance(science.get("evaluator"), dict)
+        or not isinstance(generation, dict)
+    ):
+        raise SystemExit("A1 v3 contract has a malformed producer handoff")
+
+    from tools import a1_pre_wave_contract as pre_wave_contract
+
+    try:
+        replayed = pre_wave_contract._promotion_handoff_record(  # noqa: SLF001
+            {"mode": handoff["mode"], "path": handoff["path"]},
+            base=lock_path.parent,
+            producer=producers[0],
+            effective_search=science["effective_search_config"],
+            evaluator=science["evaluator"],
+            generation=generation,
+        )
+    except (OSError, pre_wave_contract.ContractError) as error:
+        raise SystemExit(f"A1 v3 producer handoff replay failed: {error}") from error
+    if replayed != handoff:
+        raise SystemExit("A1 v3 producer handoff differs from its receipt replay")
+
+
 def _validate_dual_arm_corpus_artifacts_and_seeds(
     corpus_meta: dict[str, object],
     validation_seed_contract: dict[str, object],
@@ -9139,11 +9191,7 @@ def _validate_a1_corpus_artifacts_and_seeds(
         raise SystemExit("A1 contract lock schema drift")
     promotion_handoff = lock_payload.get("promotion_handoff")
     if lock_schema == "a1-pre-wave-contract-lock-v3":
-        if (
-            not isinstance(promotion_handoff, dict)
-            or promotion_handoff.get("mode") != "post_promotion"
-        ):
-            raise SystemExit("A1 v3 contract lacks its post-promotion producer handoff")
+        _replay_a1_v3_promotion_handoff(lock_path, lock_payload)
     elif promotion_handoff is not None:
         # v2 locks created after the boundary carry an explicit historical
         # marker.  Markerless v2 remains readable only here for already-audited
