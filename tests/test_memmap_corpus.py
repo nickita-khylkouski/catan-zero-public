@@ -224,6 +224,83 @@ def test_mixed_npz_restart_provenance_is_row_aligned(tmp_path):
     assert loaded["archived_game_seed"].tolist() == [-1, -1, 123, 123]
 
 
+def test_mixed_npz_optional_targets_are_row_aligned(tmp_path):
+    shards = [tmp_path / f"optional-{index}.npz" for index in range(3)]
+    for index, shard in enumerate(shards):
+        _minimal_teacher_shard(shard, seed=100 + index, opponent=False)
+    for index in (0, 2):
+        with np.load(shards[index], allow_pickle=True) as source:
+            payload = {key: np.asarray(source[key]) for key in source.files}
+        base = float((index + 1) * 10)
+        payload.update(
+            {
+                "root_value": np.asarray([base, base + 1], dtype=np.float32),
+                "root_value_mask": np.ones(2, dtype=np.bool_),
+                "root_prior_value": np.asarray(
+                    [base + 2, base + 3], dtype=np.float32
+                ),
+                "root_prior_value_mask": np.ones(2, dtype=np.bool_),
+                "afterstate_target": np.asarray(
+                    [[base + 4, np.nan], [base + 5, np.nan]],
+                    dtype=np.float32,
+                ),
+                "afterstate_target_mask": np.asarray(
+                    [[True, False], [True, False]], dtype=np.bool_
+                ),
+            }
+        )
+        np.savez(shards[index], **payload)
+    teacher = _make_teacher_dir(tmp_path, [str(path) for path in shards])
+
+    loaded = load_teacher_data(teacher)
+
+    for key in (
+        "root_value",
+        "root_value_mask",
+        "root_prior_value",
+        "root_prior_value_mask",
+        "afterstate_target",
+        "afterstate_target_mask",
+    ):
+        assert len(loaded[key]) == len(loaded["action_taken"]) == 6
+    np.testing.assert_allclose(
+        loaded["root_value"],
+        [10.0, 11.0, np.nan, np.nan, 30.0, 31.0],
+        equal_nan=True,
+    )
+    assert loaded["root_value_mask"].tolist() == [
+        True,
+        True,
+        False,
+        False,
+        True,
+        True,
+    ]
+    np.testing.assert_allclose(
+        loaded["root_prior_value"],
+        [12.0, 13.0, np.nan, np.nan, 32.0, 33.0],
+        equal_nan=True,
+    )
+    assert loaded["afterstate_target"][5, 0] == pytest.approx(35.0)
+    assert np.isnan(loaded["afterstate_target"][2:4]).all()
+    assert not loaded["afterstate_target_mask"][2:4].any()
+
+
+def test_mixed_npz_unsafe_optional_provenance_fails_closed(tmp_path):
+    present = tmp_path / "full-search-present.npz"
+    absent = tmp_path / "full-search-absent.npz"
+    _minimal_teacher_shard(present, seed=1, opponent=False)
+    _minimal_teacher_shard(absent, seed=2, opponent=False)
+    with np.load(present, allow_pickle=True) as source:
+        payload = {key: np.asarray(source[key]) for key in source.files}
+    payload["used_full_search"] = np.ones(2, dtype=np.bool_)
+    np.savez(present, **payload)
+    teacher = _make_teacher_dir(tmp_path, [str(present), str(absent)])
+
+    with pytest.raises(SystemExit, match="used_full_search.*row alignment"):
+        load_teacher_data(teacher)
+
+
 @pytest.mark.parametrize("malformation", ["partial", "source_seed_as_game_seed"])
 def test_restart_provenance_loader_rejects_malformed_identity(
     tmp_path,

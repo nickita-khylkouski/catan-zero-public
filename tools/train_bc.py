@@ -25672,7 +25672,19 @@ def load_teacher_data(
         for key in keys:
             if key in shard:
                 arrays.setdefault(key, []).append(shard[key])
-    return {key: _concat_padded(key, values) for key, values in arrays.items()}
+    expected_rows = int(sum(prior_row_counts))
+    result: dict[str, np.ndarray] = {}
+    for key, values in arrays.items():
+        concatenated = _concat_padded(key, values)
+        if int(concatenated.shape[0]) != expected_rows:
+            raise SystemExit(
+                f"teacher field {key!r} violates cross-shard row alignment: "
+                f"rows={int(concatenated.shape[0])} expected={expected_rows}. "
+                "Mixed optional schemas require a safe per-row default or must "
+                "be rebuilt with one consistent schema."
+            )
+        result[key] = concatenated
+    return result
 
 
 def _policy_target_completeness_report(
@@ -26873,53 +26885,60 @@ def _normalize_teacher_shard(
             leading=n,
         ).astype(np.bool_, copy=False),
     }
-    if "root_value" in shard:
-        result["root_value"] = _field_or_default(
-            shard,
-            "root_value",
-            np.full(n, np.nan, dtype=np.float32),
-            path,
-            leading=n,
-        ).astype(np.float32, copy=False)
-        result["root_value_mask"] = _field_or_default(
-            shard,
-            "root_value_mask",
-            np.isfinite(result["root_value"]),
-            path,
-            leading=n,
-        ).astype(np.bool_, copy=False)
-    if "root_prior_value" in shard:
-        result["root_prior_value"] = _field_or_default(
-            shard,
-            "root_prior_value",
-            np.full(n, np.nan, dtype=np.float32),
-            path,
-            leading=n,
-        ).astype(np.float32, copy=False)
-        result["root_prior_value_mask"] = _field_or_default(
-            shard,
-            "root_prior_value_mask",
-            np.isfinite(result["root_prior_value"]),
-            path,
-            leading=n,
-        ).astype(np.bool_, copy=False)
-    if "afterstate_target" in shard:
-        result["afterstate_target"] = _field_or_default(
-            shard,
-            "afterstate_target",
-            np.full((n, legal_width), np.nan, dtype=np.float32),
-            path,
-            leading=n,
-            width=legal_width,
-        ).astype(np.float32, copy=False)
-        result["afterstate_target_mask"] = _field_or_default(
-            shard,
-            "afterstate_target_mask",
-            np.isfinite(result["afterstate_target"]),
-            path,
-            leading=n,
-            width=legal_width,
-        ).astype(np.bool_, copy=False)
+    for value_key, mask_key in (
+        ("root_value", "root_value_mask"),
+        ("root_prior_value", "root_prior_value_mask"),
+        ("afterstate_target", "afterstate_target_mask"),
+    ):
+        if mask_key in shard and value_key not in shard:
+            raise SystemExit(
+                f"{path} field {mask_key} is present without {value_key}"
+            )
+
+    result["root_value"] = _field_or_default(
+        shard,
+        "root_value",
+        np.full(n, np.nan, dtype=np.float32),
+        path,
+        leading=n,
+    ).astype(np.float32, copy=False)
+    result["root_value_mask"] = _field_or_default(
+        shard,
+        "root_value_mask",
+        np.isfinite(result["root_value"]),
+        path,
+        leading=n,
+    ).astype(np.bool_, copy=False)
+    result["root_prior_value"] = _field_or_default(
+        shard,
+        "root_prior_value",
+        np.full(n, np.nan, dtype=np.float32),
+        path,
+        leading=n,
+    ).astype(np.float32, copy=False)
+    result["root_prior_value_mask"] = _field_or_default(
+        shard,
+        "root_prior_value_mask",
+        np.isfinite(result["root_prior_value"]),
+        path,
+        leading=n,
+    ).astype(np.bool_, copy=False)
+    result["afterstate_target"] = _field_or_default(
+        shard,
+        "afterstate_target",
+        np.full((n, legal_width), np.nan, dtype=np.float32),
+        path,
+        leading=n,
+        width=legal_width,
+    ).astype(np.float32, copy=False)
+    result["afterstate_target_mask"] = _field_or_default(
+        shard,
+        "afterstate_target_mask",
+        np.isfinite(result["afterstate_target"]),
+        path,
+        leading=n,
+        width=legal_width,
+    ).astype(np.bool_, copy=False)
     if "simulations_used" in shard:
         result["simulations_used"] = _field_or_default(
             shard,
