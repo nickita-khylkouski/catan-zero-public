@@ -132,6 +132,13 @@ def test_public_rule_state_upgrade_binds_v4_schema_and_parameter_allowlist():
     assert "public_rule_state_residual." in upgrade_tool.NEW_PARAM_PREFIXES
 
 
+def test_action_cross_upgrade_parameters_are_admitted_by_checkpoint_builder():
+    # The cross block is an exact-identity warm-start module.  If this prefix
+    # is absent, ``--flags cross:1`` constructs the model but rejects its own
+    # new parameters before a checkpoint can be issued.
+    assert "action_cross_blocks." in upgrade_tool.NEW_PARAM_PREFIXES
+
+
 def test_structured_action_value_upgrade_enables_both_zero_diff_paths():
     base = EntityGraphConfig(action_size=607, static_action_feature_size=45)
     assert base.static_action_residual is False

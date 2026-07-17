@@ -104,6 +104,7 @@ NEW_PARAM_PREFIXES = (
     "public_rule_state_residual.",
     "v6_exact_resource_residual.",
     "v6_initial_road_residual.",
+    "action_cross_blocks.",
 )
 
 
