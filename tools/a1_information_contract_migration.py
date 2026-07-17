@@ -218,9 +218,9 @@ def _verify_anchor_evidence(
         raise MigrationError("information migration must prove a real feature change")
     if v5_compatibility and output_max != 0.0:
         raise MigrationError(
-            "V7 compatibility routing must preserve exact forward output"
+            "V7/V8 compatibility routing must preserve exact forward output"
         )
-    if not v7_input_routing and output_max <= 0.0:
+    if not v5_compatibility and output_max <= 0.0:
         raise MigrationError("V2->V6 evidence must prove real output drift")
     anchors = evidence.get("anchors")
     if not isinstance(anchors, list) or not anchors:

@@ -175,6 +175,21 @@ def test_v7_anchor_requires_real_feature_change_and_exact_forward_identity() -> 
         )
 
 
+def test_v8_anchor_keeps_exact_forward_identity() -> None:
+    evidence = _v7_anchor_evidence()
+    evidence["schema_version"] = migration.V8_INPUT_ANCHOR_SCHEMA
+
+    assert (
+        migration._verify_anchor_evidence(  # noqa: SLF001
+            evidence,
+            migration=(
+                migration.MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY
+            ),
+        )
+        == evidence
+    )
+
+
 def test_v7_replay_does_not_apply_float_tolerance_to_exact_forward_claim() -> None:
     evidence = _v7_anchor_evidence()
     replayed = copy.deepcopy(evidence)
