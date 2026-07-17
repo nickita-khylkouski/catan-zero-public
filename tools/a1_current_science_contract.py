@@ -306,6 +306,10 @@ PRODUCTION_TARGET_QUALITY_LEARNER_CONTRACT = {
     "value_root_blend_global_compat": False,
 }
 PRODUCTION_TARGET_QUALITY_GENERATION_CONTRACT = {
+    # The teacher policy is the full legal-support MCTS distribution.  Bind
+    # the pruning threshold even at zero so a future recipe cannot claim a
+    # different target operator than workers actually construct.
+    "policy_target_min_visits": 0,
     # A stable root hash selects this audit slice without consuming gameplay or
     # primary-search RNG. Five percent is enough to calibrate target stability
     # without turning the duplicate reference search into the dominant cost.
@@ -365,6 +369,7 @@ PRODUCTION_GENERATION_RUNTIME_FIELD_MAP = {
         "eval_server_cuda_graph_warmup_iterations"
     ),
     "native_mcts_hot_loop": "native_mcts_hot_loop",
+    "policy_target_min_visits": "policy_target_min_visits",
     "target_reliability_audit_fraction": "target_reliability_audit_fraction",
     "target_reliability_audit_seed": "target_reliability_audit_seed",
     "preserve_search_evidence": "preserve_search_evidence",

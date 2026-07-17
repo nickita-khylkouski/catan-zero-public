@@ -149,6 +149,15 @@ def test_rescale_noise_floor_c_default_is_the_dataclass_no_op(monkeypatch) -> No
 
     assert captured["search_config"].rescale_noise_floor_c == 0.0
     assert captured["search_config"].rescale_noise_floor_initial_road_only is False
+
+
+def test_policy_target_pruning_is_explicitly_forwarded_to_worker_search(monkeypatch) -> None:
+    """A sealed generation recipe must not silently fall back to MCTS defaults."""
+
+    captured = _capture_configs(monkeypatch)
+    cli._run_worker(_worker_args(policy_target_min_visits=3))
+
+    assert captured["search_config"].policy_target_min_visits == 3
     assert captured["search_config"].sigma_eval == 0.79
 
 

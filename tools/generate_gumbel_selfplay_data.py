@@ -2376,6 +2376,12 @@ def _run_worker(
         boundary_value_particles=int(
             worker_args.get("boundary_value_particles", 1)
         ),
+        # Bind the target-pruning operator explicitly.  Leaving this at the
+        # dataclass default made a future nonzero recipe silently generate
+        # unpruned training targets despite its recorded config.
+        policy_target_min_visits=int(
+            worker_args.get("policy_target_min_visits", 0)
+        ),
         forced_root_target_mode=str(worker_args.get("forced_root_target_mode", "full")),
         determinization_particles=int(worker_args.get("determinization_particles", 1)),
         determinization_min_simulations=int(
