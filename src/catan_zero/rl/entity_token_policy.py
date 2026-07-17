@@ -1028,6 +1028,15 @@ class EntityGraphNet:
                 )
                 if self.action_cross_attention_layers < 0:
                     raise ValueError("action cross-attention layer count must be >= 0")
+                if (
+                    self.v6_compatibility_preserving_inputs_enabled
+                    and not self.uses_relational_topology
+                    and self.action_cross_attention_layers < 1
+                ):
+                    raise ValueError(
+                        "v6 compatibility-preserving inputs require at least one "
+                        "Transformer action cross-attention layer"
+                    )
                 self.value_attention_pool = bool(
                     getattr(cfg, "value_attention_pool", False)
                 )

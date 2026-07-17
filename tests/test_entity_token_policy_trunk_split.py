@@ -190,7 +190,10 @@ def test_v7_compatibility_route_preserves_legacy_initial_road_input():
     corrected score only through a new zero-initialized residual.
     """
     model = EntityGraphNet(
-        _config(v6_compatibility_preserving_inputs=True)
+        _config(
+            v6_compatibility_preserving_inputs=True,
+            action_cross_attention_layers=1,
+        )
     ).eval()
     batch = _batch(batch_size=1, action_width=2)
     batch.update(
@@ -230,6 +233,11 @@ def test_v7_compatibility_route_preserves_legacy_initial_road_input():
     # Non-initial-road actions retain their old context feature unchanged.
     assert seen[0][0, 1, legacy_context_offset].item() == pytest.approx(0.0)
     assert torch.count_nonzero(model.v6_initial_road_residual.weight) == 0
+
+
+def test_v7_compatibility_route_requires_live_action_cross_attention():
+    with pytest.raises(ValueError, match="require at least one Transformer action"):
+        EntityGraphNet(_config(v6_compatibility_preserving_inputs=True))
 
 
 @pytest.mark.parametrize(
