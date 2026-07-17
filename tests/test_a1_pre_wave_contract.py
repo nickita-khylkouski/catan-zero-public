@@ -537,9 +537,12 @@ def test_dual_arm_materializes_renders_and_replays_in_production_executor(
             assert command["argv"][command["argv"].index("--c-scale") + 1] == (
                 expected_c_scale
             )
-            guard_path = contract.REPO_ROOT / command["argv"][
+            guard_argument = command["argv"][
                 command["argv"].index("--prelaunch-guard-config") + 1
             ]
+            guard_path = contract.REPO_ROOT / guard_argument.removeprefix(
+                f"{contract.RUNTIME_REPO_TOKEN}/"
+            )
             guard = json.loads(guard_path.read_text())
             expected = guard["guards"][0]["args"]["expected_values"]
             assert str(expected["--c-scale"]) == expected_c_scale

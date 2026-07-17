@@ -16,7 +16,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Sequence
 
 SCHEMA = "a1-production-lane-v1"
@@ -403,6 +403,26 @@ def load_lane(path: Path) -> dict[str, Any]:
             raise SupervisorError("job argv must be a string list")
         if command.get("argv_sha256") != _digest(argv):
             raise SupervisorError("job argv digest mismatch")
+        repo_indices = command.get("runtime_repo_argv_indices")
+        if (
+            not isinstance(repo_indices, list)
+            or any(type(item) is not int for item in repo_indices)
+            or repo_indices != sorted(set(repo_indices))
+            or any(item < 0 or item >= len(argv) for item in repo_indices)
+        ):
+            raise SupervisorError("job runtime repo argv indices are invalid")
+        source_argv = list(argv)
+        runtime_prefix = f"{lane['repo_dir']}/"
+        for item in repo_indices:
+            value = argv[item]
+            if not value.startswith(runtime_prefix):
+                raise SupervisorError("job runtime repo argv path escapes sealed repo")
+            relative = value.removeprefix(runtime_prefix)
+            if not relative or ".." in PurePosixPath(relative).parts:
+                raise SupervisorError("job runtime repo argv path is unsafe")
+            source_argv[item] = f"{RUNTIME_REPO_TOKEN}/{relative}"
+        if command.get("render_argv_sha256") != _digest(source_argv):
+            raise SupervisorError("job render-to-runtime argv binding drift")
         if "--skip-guards" in argv or "--no-seed-claim" in argv:
             raise SupervisorError("guard/seed-claim bypass is forbidden")
         if "--resume" not in argv:

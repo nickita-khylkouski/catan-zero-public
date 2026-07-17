@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import json
@@ -970,6 +971,61 @@ def test_render_environment_digest_and_per_job_registry_fail_closed(
         executor.verify_render(lock_path, render_path, verify_lock_fn=_verifier(lock))
 
 
+def test_materialized_repo_argv_is_rebased_and_bound_to_render(tmp_path: Path) -> None:
+    _lock_path, _render_path, _lock, rendered = _fixture(tmp_path)
+    command = copy.deepcopy(rendered["commands"][0])
+    guard_index = len(command["argv"]) + 1
+    command["argv"].extend(
+        (
+            "--prelaunch-guard-config",
+            f"{contract.RUNTIME_REPO_TOKEN}/configs/guards/generate.json",
+        )
+    )
+    command["argv_sha256"] = contract._digest_value(command["argv"])
+
+    repo_dir = "/sealed/repo-deadbeef"
+    materialized = executor._materialize_job_environment(
+        command, repo_dir=repo_dir
+    )
+
+    assert materialized["argv"][guard_index] == (
+        f"{repo_dir}/configs/guards/generate.json"
+    )
+    assert materialized["runtime_repo_argv_indices"] == [guard_index]
+    assert materialized["render_argv_sha256"] == command["argv_sha256"]
+    assert materialized["argv_sha256"] == contract._digest_value(
+        materialized["argv"]
+    )
+
+
+def test_lane_rejects_runtime_repo_argv_retargeting(tmp_path: Path) -> None:
+    _lock_path, _render_path, _lock, rendered = _fixture(tmp_path)
+    command = copy.deepcopy(rendered["commands"][0])
+    guard_index = len(command["argv"]) + 1
+    command["argv"].extend(
+        (
+            "--prelaunch-guard-config",
+            f"{contract.RUNTIME_REPO_TOKEN}/configs/guards/generate.json",
+        )
+    )
+    command["argv_sha256"] = contract._digest_value(command["argv"])
+    lane_path, lane = _lane(tmp_path, [command, *rendered["commands"][1:3]])
+    supervisor.load_lane(lane_path)
+
+    lane["commands"][0]["argv"][guard_index] = "/tmp/unsealed-guard.json"
+    lane["commands"][0]["argv_sha256"] = supervisor._digest(
+        lane["commands"][0]["argv"]
+    )
+    lane["lane_sha256"] = supervisor._digest(
+        {key: value for key, value in lane.items() if key != "lane_sha256"}
+    )
+    lane_path.write_text(json.dumps(lane), encoding="utf-8")
+    with pytest.raises(
+        supervisor.SupervisorError, match="escapes sealed repo"
+    ):
+        supervisor.load_lane(lane_path)
+
+
 def _lane(tmp_path: Path, commands: list[dict]) -> tuple[Path, dict]:
     lock_copy = tmp_path / "remote" / "contract.lock.json"
     render_copy = tmp_path / "remote" / "commands.json"
@@ -1062,6 +1118,7 @@ def test_supervisor_rejects_malformed_live_shaped_arm_lane(
     elif mutation == "adaptive_override":
         argv.extend(["--n-full-wide", "512"])
     command["argv_sha256"] = supervisor._digest(argv)
+    command["render_argv_sha256"] = supervisor._digest(argv)
     lane["lane_sha256"] = supervisor._digest(
         {key: value for key, value in lane.items() if key != "lane_sha256"}
     )

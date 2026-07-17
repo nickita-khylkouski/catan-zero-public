@@ -125,6 +125,27 @@ LEGACY_MPS_LOG_DIRECTORY = "/tmp/mps_log_host"
 CONFIG_REGISTRY_ENVIRONMENT_VARIABLE = "CATAN_ZERO_CONFIG_REGISTRY"
 CONFIG_REGISTRY_FILENAME = "config_registry.jsonl"
 RUNTIME_REPO_TOKEN = "__A1_RUNTIME_REPO__"
+
+
+def _runtime_repo_artifact_path(record: Mapping[str, Any]) -> str:
+    """Render repo-owned argv paths without binding a mutable checkout path.
+
+    Production jobs execute from an immutable content-addressed repository
+    staged by the fleet executor.  A path inside this checkout must therefore
+    be represented by the same runtime token used by ``PYTHONPATH``.  Test and
+    recovery fixtures outside the repository remain absolute because they are
+    staged as ordinary artifacts rather than repo members.
+    """
+
+    raw = Path(str(record["path"])).resolve(strict=True)
+    root = REPO_ROOT.resolve(strict=True)
+    try:
+        relative = raw.relative_to(root)
+    except ValueError:
+        return str(raw)
+    return f"{RUNTIME_REPO_TOKEN}/{relative.as_posix()}"
+
+
 SEALED_RUNTIME_ENVIRONMENT = {
     "HOME": "/home/ubuntu",
     "LANG": "C.UTF-8",
@@ -8752,7 +8773,9 @@ def _generator_argv(
         argv.extend(
             (
                 "--prelaunch-guard-config",
-                str(lock["provenance"]["guard_configs"][job["category"]]["path"]),
+                _runtime_repo_artifact_path(
+                    lock["provenance"]["guard_configs"][job["category"]]
+                ),
                 "--generation-arm-id",
                 str(job["arm_id"]),
             )
@@ -8767,7 +8790,7 @@ def _generator_argv(
             argv.extend(
                 (
                     "--prelaunch-guard-config",
-                    str(guard_record["path"]),
+                    _runtime_repo_artifact_path(guard_record),
                 )
             )
         argv.append("--score-actions")

@@ -461,7 +461,7 @@ class ExecutorError(RuntimeError):
 def _materialize_job_environment(
     command: Mapping[str, Any], *, repo_dir: str
 ) -> dict[str, Any]:
-    """Resolve the one sealed repo token without inheriting host environment."""
+    """Resolve sealed repo tokens without inheriting host environment."""
 
     environment = command.get("environment")
     if not isinstance(environment, dict):
@@ -475,10 +475,35 @@ def _materialize_job_environment(
         raise ExecutorError("rendered environment digest drift before materialization")
     runtime = {str(key): str(value) for key, value in environment.items()}
     runtime["PYTHONPATH"] = f"{repo_dir}/src:{repo_dir}"
+    source_argv = command.get("argv")
+    if not isinstance(source_argv, list) or not all(
+        isinstance(value, str) for value in source_argv
+    ):
+        raise ExecutorError("rendered job argv is not a string list")
+    if command.get("argv_sha256") != _digest(source_argv):
+        raise ExecutorError("rendered argv digest drift before materialization")
+    prefix = f"{contract.RUNTIME_REPO_TOKEN}/"
+    runtime_argv: list[str] = []
+    repo_indices: list[int] = []
+    for index, value in enumerate(source_argv):
+        if contract.RUNTIME_REPO_TOKEN not in value:
+            runtime_argv.append(value)
+            continue
+        if not value.startswith(prefix) or value.count(contract.RUNTIME_REPO_TOKEN) != 1:
+            raise ExecutorError("unsafe runtime repo token in rendered argv")
+        relative = PurePosixPath(value.removeprefix(prefix))
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise ExecutorError("unsafe runtime repo-relative argv path")
+        runtime_argv.append(f"{repo_dir}/{relative.as_posix()}")
+        repo_indices.append(index)
     materialized = dict(command)
     materialized["render_environment_sha256"] = command["environment_sha256"]
     materialized["environment"] = runtime
     materialized["environment_sha256"] = _digest(runtime)
+    materialized["render_argv_sha256"] = command["argv_sha256"]
+    materialized["runtime_repo_argv_indices"] = repo_indices
+    materialized["argv"] = runtime_argv
+    materialized["argv_sha256"] = _digest(runtime_argv)
     return materialized
 
 
