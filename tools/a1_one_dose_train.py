@@ -9534,6 +9534,31 @@ def _verify_objective_matched_evaluation_identity(
         )
 
 
+def _training_report_runtime_contract(
+    recipe: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project authenticated recipe fields that train_bc reports verbatim."""
+
+    optimizer = recipe.get("optimizer")
+    fused_optimizer = recipe.get("fused_optimizer")
+    epochs = recipe.get("epochs")
+    symmetry_augment = recipe.get("symmetry_augment")
+    if not isinstance(optimizer, str) or not optimizer:
+        raise ExecutorError("learner recipe optimizer is invalid")
+    if type(fused_optimizer) is not bool:
+        raise ExecutorError("learner recipe fused_optimizer is invalid")
+    if type(epochs) is not int or epochs < 1:
+        raise ExecutorError("learner recipe epochs is invalid")
+    if type(symmetry_augment) is not bool:
+        raise ExecutorError("learner recipe symmetry_augment is invalid")
+    return {
+        "optimizer": optimizer,
+        "fused_optimizer": fused_optimizer,
+        "epochs": epochs,
+        "symmetry_augment": symmetry_augment,
+    }
+
+
 def _verify_training_outputs(
     *,
     checkpoint: Path,
@@ -9652,11 +9677,9 @@ def _verify_training_outputs(
         "arch": "entity_graph",
         **SEALED_A1_MODEL_REPORT,
         "world_size": int(recipe["world_size"]),
-        "optimizer": "adam",
+        **_training_report_runtime_contract(recipe),
         "resume_optimizer": False,
         "optimizer_restored": False,
-        "fused_optimizer": False,
-        "epochs": 1,
         "max_steps": int(recipe["max_steps"]),
         "exact_max_steps": int(recipe["max_steps"]) > 0,
         "batch_size": int(recipe["batch_size"]),
@@ -9669,7 +9692,6 @@ def _verify_training_outputs(
         "seed": int(recipe["seed"]),
         "training_rng_rank_offset": bool(recipe.get("training_rng_rank_offset", False)),
         "mask_hidden_info": True,
-        "symmetry_augment": False,
         "data": str(verified["data_path"]),
         "data_format": "memmap",
         "data_fingerprint": verified["data_fingerprint"],

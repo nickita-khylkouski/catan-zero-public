@@ -1633,6 +1633,52 @@ def test_wait_fails_closed_on_any_generation_job_failure(
     assert failed["status"] == "generation_failed"
 
 
+def test_wait_fails_closed_when_running_generation_pid_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    receipt_path = tmp_path / "executor.json"
+    receipt_path.write_text(
+        json.dumps({"status": "launched", "plan_sha256": "sha256:plan"}),
+        encoding="utf-8",
+    )
+    plan = {
+        "plan_sha256": "sha256:plan",
+        "_private": {"lanes": {"w0": [{}]}},
+    }
+    monkeypatch.setattr(
+        executor,
+        "status",
+        lambda *_args, **_kwargs: {
+            "executor_status": "launched",
+            "lanes": [
+                {
+                    "worker_id": "w0",
+                    "jobs": [
+                        {
+                            "job_id": "job-0",
+                            "status": "running",
+                            "pid_alive": False,
+                        }
+                    ],
+                }
+            ],
+            "job_status_counts": {"running": 1},
+        },
+    )
+    monkeypatch.setattr(
+        executor.time,
+        "sleep",
+        lambda _seconds: pytest.fail("wait slept after the running PID was dead"),
+    )
+
+    with pytest.raises(executor.ExecutorError, match="dead_running=1"):
+        executor.wait_for_completion(plan, receipt_path=receipt_path)
+
+    failed = json.loads(receipt_path.read_text())
+    assert failed["status"] == "generation_failed"
+    assert failed["terminal_status"]["lanes"][0]["jobs"][0]["pid_alive"] is False
+
+
 def test_exact_stop_ssh_is_hard_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         executor,

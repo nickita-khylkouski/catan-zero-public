@@ -1527,6 +1527,12 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert bound["canonical_parent_update"]["parent_checkpoint_sha256"] == (
         producer["sha256"]
     )
+    assert executor._training_report_runtime_contract(bound["recipe"]) == {  # noqa: SLF001
+        "optimizer": "adamw",
+        "fused_optimizer": True,
+        "epochs": 999,
+        "symmetry_augment": True,
+    }
     assert bound["canonical_parent_update"]["checkpoint_steps"] == [8]
 
     initializer = tmp_path / "initializer.pt"
@@ -1652,8 +1658,6 @@ def test_canonical_checkpoint_frontier_is_bound_into_failure_receipt(
     assert payload["input_binding"]["canonical_parent_update"] == payload[
         "canonical_parent_update"
     ]
-
-
 def test_production_failure_receipt_binds_current_trainer_authority(
     tmp_path: Path,
 ) -> None:

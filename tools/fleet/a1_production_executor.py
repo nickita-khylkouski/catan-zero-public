@@ -2386,6 +2386,12 @@ def wait_for_completion(
             for lane in snapshot.get("lanes", [])
             if lane.get("status") in {"unreachable_or_invalid", "invalid_status_output"}
         ]
+        dead_running = [
+            (lane.get("worker_id"), job.get("job_id"))
+            for lane in snapshot.get("lanes", [])
+            for job in lane.get("jobs", [])
+            if job.get("status") == "running" and job.get("pid_alive") is False
+        ]
         counts = snapshot.get("job_status_counts")
         if not isinstance(counts, dict):
             raise ExecutorError("generation status omitted job status counts")
@@ -2395,7 +2401,7 @@ def wait_for_completion(
             if key not in {"pending", "prepared", "running", "complete", "failed"}
         )
         failed = int(counts.get("failed", 0))
-        if invalid_lanes or unknown or failed:
+        if invalid_lanes or dead_running or unknown or failed:
             receipt = _load(receipt_path)
             receipt.update(
                 {
@@ -2407,7 +2413,9 @@ def wait_for_completion(
             _atomic_json(receipt_path, receipt)
             raise ExecutorError(
                 "generation did not reach terminal success: "
-                f"failed={failed} unknown={unknown} invalid_lanes={len(invalid_lanes)}"
+                f"failed={failed} unknown={unknown} "
+                f"invalid_lanes={len(invalid_lanes)} "
+                f"dead_running={len(dead_running)}"
             )
         observed_jobs = sum(int(value) for value in counts.values())
         complete = int(counts.get("complete", 0))
