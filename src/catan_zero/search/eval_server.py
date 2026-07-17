@@ -885,6 +885,7 @@ def _policy_needs_action_targets(policy: Any) -> bool:
         str(getattr(policy_config, "state_trunk", "transformer")) != "transformer"
         or getattr(policy_config, "action_target_gather", False)
         or getattr(policy_config, "edge_policy_head", False)
+        or getattr(policy_config, "v6_compatibility_preserving_inputs", False)
     )
 
 
@@ -896,6 +897,7 @@ def _policy_needs_relational_topology(policy: Any) -> bool:
     return bool(
         str(getattr(policy_config, "state_trunk", "transformer")) != "transformer"
         or getattr(policy_config, "topology_residual_adapter", False)
+        or getattr(policy_config, "v6_compatibility_preserving_inputs", False)
     )
 
 

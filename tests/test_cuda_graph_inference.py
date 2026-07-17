@@ -47,6 +47,9 @@ def _policy(**overrides):
     return SimpleNamespace(
         config=config,
         model=EntityGraphNet(config).eval(),
+        static_action_features=torch.zeros(
+            config.action_size, LEGAL_ACTION_FEATURE_SIZE, dtype=torch.float32
+        ),
         device=torch.device("cpu"),
         public_award_feature_contract=PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
     )
@@ -158,6 +161,34 @@ def test_enabled_cpu_path_falls_back_eager_and_trims_outputs():
         )
     for key in outputs:
         torch.testing.assert_close(outputs[key], expected[key], rtol=0.0, atol=0.0)
+
+
+def test_v7_action_batch_carries_all_policy_side_inputs():
+    policy = _policy(
+        topology_residual_adapter=True,
+        action_target_gather=True,
+        action_cross_attention_layers=1,
+        static_action_residual=True,
+        legal_action_value_residual=True,
+        v6_compatibility_preserving_inputs=True,
+    )
+    runner = CudaGraphInferenceRunner(policy, CudaGraphInferenceConfig())
+    entity, legal_ids, context = _batch()
+
+    action_batch, _action_ids = runner._action_batch(entity, legal_ids, context)
+
+    assert {
+        "legal_action_tokens",
+        "legal_action_context",
+        "legal_action_target_ids",
+        "edge_vertex_ids",
+        "legal_action_mask",
+        "legal_action_static_features",
+    }.issubset(action_batch)
+    assert action_batch["legal_action_static_features"].shape[-1] == 22
+    assert set(("hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids")).issubset(
+        runner._state_input_keys()
+    )
 
 
 def test_legacy_award_bridge_also_applies_on_cuda_runner_bypass() -> None:

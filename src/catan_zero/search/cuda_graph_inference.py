@@ -21,6 +21,7 @@ import numpy as np
 
 from catan_zero.rl.entity_token_policy import (
     PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+    STATIC_ACTION_RESIDUAL_SLICE,
     _apply_public_award_feature_contract,
     _assert_entity_batch_shapes,
 )
@@ -383,6 +384,9 @@ class CudaGraphInferenceRunner:
         needs_targets = bool(
             getattr(self.model, "action_target_gather", False)
             or getattr(self.model, "edge_policy_head", False)
+            or getattr(
+                self.config, "v6_compatibility_preserving_inputs", False
+            )
         )
         if needs_targets:
             # _gather_target_tokens derives the fixed sequence offsets from
@@ -395,6 +399,35 @@ class CudaGraphInferenceRunner:
                 entity_batch["legal_action_target_ids"],
                 device=self.device,
             )
+        if bool(
+            getattr(self.config, "v6_compatibility_preserving_inputs", False)
+        ):
+            # V7 reconstructs V5's initial-road feature from edge endpoints in
+            # the action scorer. This is action-side topology, not a captured
+            # trunk input, so carry exactly the one tensor score_actions reads.
+            batch["edge_vertex_ids"] = torch.as_tensor(
+                entity_batch["edge_vertex_ids"], device=self.device
+            )
+        if bool(getattr(self.config, "legal_action_value_residual", False)):
+            batch["legal_action_mask"] = torch.as_tensor(
+                entity_batch["legal_action_mask"],
+                dtype=torch.bool,
+                device=self.device,
+            )
+        if bool(getattr(self.config, "static_action_residual", False)):
+            valid = legal_action_ids >= 0
+            catalog_ids = np.where(valid, legal_action_ids, 0)
+            static = self.policy.static_action_features.index_select(
+                0,
+                torch.as_tensor(
+                    catalog_ids.reshape(-1), dtype=torch.long, device=self.device
+                ),
+            ).reshape(*catalog_ids.shape, -1)
+            static = static[..., STATIC_ACTION_RESIDUAL_SLICE].masked_fill(
+                ~torch.as_tensor(valid, dtype=torch.bool, device=self.device).unsqueeze(-1),
+                0.0,
+            )
+            batch["legal_action_static_features"] = static
         action_ids = torch.as_tensor(
             legal_action_ids,
             dtype=torch.long,
@@ -534,6 +567,7 @@ class CudaGraphInferenceRunner:
         needs_topology = bool(
             str(getattr(self.config, "state_trunk", "transformer")) != "transformer"
             or getattr(self.config, "topology_residual_adapter", False)
+            or getattr(self.config, "v6_compatibility_preserving_inputs", False)
         )
         return _STATE_INPUT_KEYS + (_TOPOLOGY_STATE_INPUT_KEYS if needs_topology else ())
 
