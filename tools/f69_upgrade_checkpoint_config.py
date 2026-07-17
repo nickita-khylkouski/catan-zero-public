@@ -487,7 +487,13 @@ def main() -> None:
     missing, unexpected = upgraded.model.load_state_dict(
         base.model.state_dict(), strict=False
     )
-    if int(getattr(upgraded_config, "value_tower_split_layers", 0) or 0) > 0:
+    source_value_split_layers = int(
+        getattr(base.config, "value_tower_split_layers", 0) or 0
+    )
+    upgraded_value_split_layers = int(
+        getattr(upgraded_config, "value_tower_split_layers", 0) or 0
+    )
+    if upgraded_value_split_layers > source_value_split_layers:
         upgraded.model.initialize_value_tower_from_policy()
     disallowed = [
         k for k in missing if not k.startswith(NEW_PARAM_PREFIXES + ("q_head.",))

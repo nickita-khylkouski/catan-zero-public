@@ -398,3 +398,58 @@ def test_combined_topology_gather_upgrade_verifies_exact_real_root(
     }
     assert raw["upgrade_provenance"]["forward_max_diff"] == 0.0
     assert raw["upgrade_provenance"]["forward_identical_at_init"] is True
+
+
+def test_topology_only_upgrade_preserves_an_existing_learned_value_tower(
+    tmp_path, monkeypatch
+) -> None:
+    import torch
+
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import make_env_config
+
+    source = tmp_path / "split-source.pt"
+    output = tmp_path / "split-plus-topology.pt"
+    policy = EntityGraphPolicy.create(
+        env_config=make_env_config(vps_to_win=3),
+        hidden_size=16,
+        state_layers=2,
+        attention_heads=2,
+        value_tower_split_layers=1,
+        seed=19,
+    )
+    with torch.no_grad():
+        for name, parameter in policy.model.named_parameters():
+            if name.startswith(("value_blocks.", "value_state_norm.")):
+                parameter.add_(0.125)
+    policy.save(source)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "f69_upgrade_checkpoint_config.py",
+            "--in-checkpoint",
+            str(source),
+            "--out-checkpoint",
+            str(output),
+            "--flags",
+            "topology",
+            "--seed",
+            "73",
+            "--device",
+            "cpu",
+            "--no-verify",
+        ],
+    )
+    upgrade_tool.main()
+
+    before = torch.load(source, map_location="cpu", weights_only=False)["model"]
+    after = torch.load(output, map_location="cpu", weights_only=False)["model"]
+    value_names = [
+        name
+        for name in before
+        if name.startswith(("value_blocks.", "value_state_norm."))
+    ]
+    assert value_names
+    assert all(torch.equal(before[name], after[name]) for name in value_names)
