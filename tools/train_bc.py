@@ -20497,12 +20497,16 @@ def main(
                         "policy_kl_anchor_loss", 0.0
                     )
                 )
-            base_validation_key = (
-                OBJECTIVE_MATCHED_VALIDATION_KEY
-                if OBJECTIVE_MATCHED_VALIDATION_KEY in metrics[-1]
-                else NATURAL_COMPOSITE_VALIDATION_KEY
+            base_validation_key = None
+            if OBJECTIVE_MATCHED_VALIDATION_KEY in metrics[-1]:
+                base_validation_key = OBJECTIVE_MATCHED_VALIDATION_KEY
+            elif NATURAL_COMPOSITE_VALIDATION_KEY in metrics[-1]:
+                base_validation_key = NATURAL_COMPOSITE_VALIDATION_KEY
+            base_wrapper = (
+                metrics[-1].get(base_validation_key)
+                if base_validation_key is not None
+                else None
             )
-            base_wrapper = metrics[-1].get(base_validation_key)
             base_objective_metrics = (
                 base_wrapper["metrics"]
                 if isinstance(base_wrapper, dict)
@@ -20520,38 +20524,61 @@ def main(
                     else float(policy_kl_controller.coefficient)
                 ),
             )
-            objective_wrapper = (
-                dict(base_wrapper) if isinstance(base_wrapper, dict) else {}
-            )
-            objective_wrapper.update(
-                {
-                    "schema_version": POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
-                    "measure": (
-                        f"{objective_wrapper.get('measure', 'weighted_held_out_base')}"
-                        "+conditioned_policy_aux"
-                    ),
-                    "objective_matched": bool(
-                        objective_wrapper.get("objective_matched", False)
-                    ),
-                    "metrics": combined_validation,
-                    "policy_aux": {
-                        "measure": "held_out_conditioned_policy_aux",
-                        "loss_weight": float(args.policy_aux_loss_weight),
-                        "sampling_weight_mass": float(
-                            policy_aux_validation_sampling_weights.sum()
+            policy_aux_validation_evidence = {
+                "measure": "held_out_conditioned_policy_aux",
+                "loss_weight": float(args.policy_aux_loss_weight),
+                "sampling_weight_mass": float(
+                    policy_aux_validation_sampling_weights.sum()
+                ),
+                "policy_loss_weight_mass": float(
+                    policy_aux_validation_loss_weights.sum()
+                ),
+                "policy_loss_measure": "conditioned_sampling_x_policy_weight",
+                "policy_kl_measure": "conditioned_sampling",
+                "metrics": validation_policy_aux,
+            }
+            if isinstance(base_wrapper, dict):
+                objective_wrapper = dict(base_wrapper)
+                objective_wrapper.update(
+                    {
+                        "schema_version": POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+                        "measure": (
+                            f"{objective_wrapper.get('measure', 'weighted_held_out_base')}"
+                            "+conditioned_policy_aux"
                         ),
-                        "policy_loss_weight_mass": float(
-                            policy_aux_validation_loss_weights.sum()
+                        "objective_matched": bool(
+                            objective_wrapper.get("objective_matched", False)
                         ),
-                        "policy_loss_measure": "conditioned_sampling_x_policy_weight",
-                        "policy_kl_measure": "conditioned_sampling",
-                        "metrics": validation_policy_aux,
-                    },
-                }
-            )
-            metrics[-1][base_validation_key] = (
-                _reseal_objective_matched_validation_wrapper(objective_wrapper)
-            )
+                        "metrics": combined_validation,
+                        "policy_aux": policy_aux_validation_evidence,
+                    }
+                )
+                assert base_validation_key is not None
+                metrics[-1][base_validation_key] = (
+                    _reseal_objective_matched_validation_wrapper(
+                        objective_wrapper
+                    )
+                )
+            else:
+                # A directly authenticated A1 corpus has no composite
+                # provenance wrapper to reseal. Keep its validation under the
+                # ordinary direct-corpus key and bind the two-stream objective
+                # there instead of manufacturing composite provenance.
+                direct_validation = dict(validation_metrics)
+                direct_validation.update(combined_validation)
+                direct_validation.update(
+                    {
+                        "schema_version": POLICY_AUX_VALIDATION_MEASURE_SCHEMA,
+                        "measure": (
+                            f"{validation_metrics.get('measure', 'held_out_base')}"
+                            "+conditioned_policy_aux"
+                        ),
+                        "objective_matched": True,
+                        "policy_aux": policy_aux_validation_evidence,
+                        "direct_corpus": True,
+                    }
+                )
+                metrics[-1]["validation"] = direct_validation
         _rank0_print(
             json.dumps(
                 {
