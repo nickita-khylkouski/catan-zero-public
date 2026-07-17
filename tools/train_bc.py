@@ -36579,6 +36579,7 @@ def _effective_entity_graph_architecture_report(
             "static_action_residual": False,
             "legal_action_value_residual": False,
             "legal_action_value_set_statistics": False,
+            "v6_compatibility_preserving_inputs": False,
             "value_tower_split_layers": 0,
             "public_card_count_features": False,
             "public_card_count_residual_bias": False,
@@ -36626,6 +36627,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "legal_action_value_set_statistics": bool(
             getattr(config, "legal_action_value_set_statistics", False)
+        ),
+        "v6_compatibility_preserving_inputs": bool(
+            getattr(config, "v6_compatibility_preserving_inputs", False)
         ),
         "value_tower_split_layers": int(
             getattr(config, "value_tower_split_layers", 0) or 0
