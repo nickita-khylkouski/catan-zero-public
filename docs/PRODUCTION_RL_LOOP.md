@@ -78,7 +78,7 @@ evaluation configs. The coordinator does not reinterpret those settings.
 | audit | `tools/a1_pre_wave_contract.py audit` |
 | composite | `tools/a1_build_post_wave_composite.py` |
 | train | issued `a1_one_dose_train.py --go`, `a1_scratch_train.py --go` |
-| evaluate | `tools/evaluate.py`, `tools/a1_candidate_promotion_pack.py` |
+| evaluate | `tools/a1_candidate_promotion_pack.py` |
 | promote | `tools/a1_promotion_transaction.py promote --go` |
 
 `tools/fleet/fleet_launch.sh` is intentionally absent. It is a historical

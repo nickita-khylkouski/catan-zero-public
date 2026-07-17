@@ -44,7 +44,7 @@ if Path(sys.argv[0]).name == "a1_pre_wave_contract.py":
     out.with_suffix(".selected_games.json").write_text("selected games\n")
     raise SystemExit(0)
 outputs = []
-output_flags = ["--emit", "--execution-receipt", "--checkpoint", "--report", "--out", "--receipt"]
+output_flags = ["--emit", "--execution-receipt", "--checkpoint", "--report", "--out", "--cohort-exclusions-out", "--receipt"]
 if Path(sys.argv[0]).name == "a1_scratch_train.py":
     output_flags.remove("--receipt")
 for flag in output_flags:
@@ -87,7 +87,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
         "audit": tools_dir / "a1_pre_wave_contract.py",
         "composite": tools_dir / "a1_build_post_wave_composite.py",
         "train": tools_dir / "a1_one_dose_train.py",
-        "evaluate": tools_dir / "evaluate.py",
+        "evaluate": tools_dir / "a1_candidate_promotion_pack.py",
         "promote": tools_dir / "a1_promotion_transaction.py",
     }
     for tool in tool_paths.values():
@@ -178,7 +178,22 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
                 str(training_receipt),
             ]
         elif name == "evaluate":
-            command += ["--candidate", str(previous), "--out", str(output)]
+            exclusions = tmp_path / "evaluate-exclusions.json"
+            pack_receipt = tmp_path / "evaluate-pack-receipt.json"
+            command += [
+                "--candidate",
+                str(previous),
+                "--training-receipt",
+                str(training_receipt),
+                "--training-report",
+                str(training_report),
+                "--out",
+                str(output),
+                "--cohort-exclusions-out",
+                str(exclusions),
+                "--receipt",
+                str(pack_receipt),
+            ]
         else:
             command += [
                 "promote",
@@ -197,11 +212,15 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, object]]:
             outputs.append(str(output.parent / "build_receipt.json"))
         if name == "train":
             outputs.extend((str(training_report), str(training_receipt)))
+        if name == "evaluate":
+            outputs.extend((str(exclusions), str(pack_receipt)))
         inputs = [str(previous)]
         if name == "composite":
             inputs.append(str(previous.with_suffix(".selected_games.json")))
         if name == "train":
             inputs.append(str(composite_receipt))
+        if name == "evaluate":
+            inputs.extend((str(training_receipt), str(training_report)))
         stages[name] = {
             "command": command,
             "inputs": inputs,
@@ -255,7 +274,7 @@ def test_loop_binds_and_executes_exact_artifact_chain(tmp_path: Path) -> None:
         "a1_pre_wave_contract.py",
         "a1_build_post_wave_composite.py",
         "a1_one_dose_train.py",
-        "evaluate.py",
+        "a1_candidate_promotion_pack.py",
         "a1_promotion_transaction.py",
     ]
     assert execute(loaded, state_dir=state_dir) == state
@@ -333,7 +352,7 @@ def test_fleet_generation_requires_terminal_wait_before_harvest(
 
 def test_stage_cannot_mutate_its_input_and_advance_same_turn(tmp_path: Path) -> None:
     repository, config_path, _final, payload = _fixture(tmp_path)
-    evaluate = repository / "tools" / "evaluate.py"
+    evaluate = repository / "tools" / "a1_candidate_promotion_pack.py"
     evaluate.write_text(
         """from pathlib import Path
 import sys
@@ -401,8 +420,6 @@ def test_commissioned_parent_update_and_candidate_pack_are_connected(
     tmp_path: Path,
 ) -> None:
     repository, config_path, _final, payload = _fixture(tmp_path)
-    pack_tool = repository / "tools" / "a1_candidate_promotion_pack.py"
-    pack_tool.write_text(WRITER, encoding="utf-8")
     config = repository / "configs" / "training" / "parent-update.json"
     config.parent.mkdir(parents=True)
     config.write_text("{}", encoding="utf-8")
@@ -429,41 +446,11 @@ def test_commissioned_parent_update_and_candidate_pack_are_connected(
     assert isinstance(stages, dict)
     train = stages["train"]
     evaluate = stages["evaluate"]
-    promote = stages["promote"]
     assert isinstance(train, dict) and isinstance(evaluate, dict)
-    assert isinstance(promote, dict)
     train_command = train["command"]
     assert isinstance(train_command, list)
     train_command.extend(("--canonical-parent-update-config", str(config)))
     train["inputs"].append(str(config))  # type: ignore[union-attr]
-    training_receipt = train_command[train_command.index("--receipt") + 1]
-    training_report = train_command[train_command.index("--report") + 1]
-    candidate = train_command[train_command.index("--checkpoint") + 1]
-    adjudication = tmp_path / "evaluation-pack" / "adjudication.json"
-    exclusions = tmp_path / "evaluation-pack" / "exclusions.json"
-    pack_receipt = tmp_path / "evaluation-pack" / "receipt.json"
-    evaluate["command"] = [
-        sys.executable,
-        str(pack_tool),
-        "--candidate",
-        candidate,
-        "--training-receipt",
-        training_receipt,
-        "--training-report",
-        training_report,
-        "--out",
-        str(adjudication),
-        "--cohort-exclusions-out",
-        str(exclusions),
-        "--receipt",
-        str(pack_receipt),
-    ]
-    evaluate["inputs"] = [candidate, training_receipt, training_report]
-    evaluate["outputs"] = [str(adjudication), str(exclusions), str(pack_receipt)]
-    promote_command = promote["command"]
-    assert isinstance(promote_command, list)
-    promote_command[promote_command.index("--adjudication") + 1] = str(adjudication)
-    promote["inputs"] = [str(adjudication), training_receipt]
     config_path.write_text(json.dumps(payload), encoding="utf-8")
 
     loaded = load_config(config_path, state_dir=tmp_path / "state")
@@ -483,6 +470,38 @@ def test_commissioned_parent_update_and_candidate_pack_are_connected(
         "cohort_exclusions",
         "evaluation_pack_receipt",
     }
+
+
+def test_full_turn_rejects_raw_evaluator_as_adjudication(tmp_path: Path) -> None:
+    repository, config_path, _final, payload = _fixture(tmp_path)
+    raw_evaluator = repository / "tools" / "evaluate.py"
+    raw_evaluator.write_text(WRITER, encoding="utf-8")
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Loop Test",
+            "-c",
+            "user.email=loop@example.invalid",
+            "commit",
+            "-qm",
+            "raw evaluator",
+        ),
+        check=True,
+    )
+    payload["repository_commit"] = subprocess.check_output(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"), text=True
+    ).strip()
+    stages = payload["stages"]
+    assert isinstance(stages, dict) and isinstance(stages["evaluate"], dict)
+    stages["evaluate"]["command"][1] = str(raw_evaluator)  # type: ignore[index]
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ProductionLoopError, match="cannot invoke 'tools/evaluate.py'"):
+        load_config(config_path, state_dir=tmp_path / "state")
 
 
 def test_exact_repo_relative_tool_and_untracked_cleanliness(tmp_path: Path) -> None:
@@ -626,6 +645,7 @@ def test_scratch_plan_only_or_invalid_execution_receipt_cannot_advance(
     plan_receipt = tmp_path / "scratch-plan.json"
     plan_receipt.write_text("{}", encoding="utf-8")
     execution_receipt = tmp_path / "scratch-execution.json"
+    scratch_report = tmp_path / "scratch-report.json"
     stages = payload["stages"]
     assert isinstance(stages, dict) and isinstance(stages["train"], dict)
     train = stages["train"]
@@ -640,13 +660,33 @@ def test_scratch_plan_only_or_invalid_execution_receipt_cannot_advance(
         str(plan_receipt),
         "--execution-receipt",
         str(execution_receipt),
+        "--report",
+        str(scratch_report),
         "--go",
     ]
     train["inputs"] = [
         str(tmp_path / "composite" / "memmap_composite.json"),
         str(plan_receipt),
     ]
-    train["outputs"] = [str(tmp_path / "train.json"), str(execution_receipt)]
+    train["outputs"] = [
+        str(tmp_path / "train.json"),
+        str(execution_receipt),
+        str(scratch_report),
+    ]
+    evaluate = stages["evaluate"]
+    assert isinstance(evaluate, dict) and isinstance(evaluate["command"], list)
+    evaluation_command = evaluate["command"]
+    evaluation_command[
+        evaluation_command.index("--training-receipt") + 1
+    ] = str(execution_receipt)
+    evaluation_command[evaluation_command.index("--training-report") + 1] = str(
+        scratch_report
+    )
+    evaluate["inputs"] = [
+        str(tmp_path / "train.json"),
+        str(execution_receipt),
+        str(scratch_report),
+    ]
     promote = stages["promote"]
     assert isinstance(promote, dict) and isinstance(promote["command"], list)
     promotion_command = promote["command"]

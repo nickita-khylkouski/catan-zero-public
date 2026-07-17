@@ -40,9 +40,7 @@ STAGE_TOOLS = {
     "train": frozenset(
         ("tools/a1_one_dose_train.py", "tools/a1_scratch_train.py")
     ),
-    "evaluate": frozenset(
-        ("tools/evaluate.py", "tools/a1_candidate_promotion_pack.py")
-    ),
+    "evaluate": frozenset(("tools/a1_candidate_promotion_pack.py",)),
     "promote": frozenset(("tools/a1_promotion_transaction.py",)),
 }
 PLACEHOLDERS = frozenset(("repo", "state_dir", "python"))
