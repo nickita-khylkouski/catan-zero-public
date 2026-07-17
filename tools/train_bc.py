@@ -2573,21 +2573,33 @@ def _value_trunk_gradient_routing(
         model is not None
         and getattr(model, "legal_action_value_residual_enabled", False)
     )
+    legal_action_value_set_statistics = bool(
+        legal_action_value_residual
+        and getattr(model, "legal_action_value_set_statistics_enabled", False)
+    )
+    meaningful_public_history = bool(
+        model is not None
+        and getattr(model, "meaningful_public_history_enabled", False)
+    )
     shared_input_paths = (
         ["value_tower_shared_prefix_tokens"]
         if value_tower_split_layers > 0
         else ["cls_state"]
     )
+    if value_tower_split_layers > 0 and meaningful_public_history:
+        # The split value branch receives the bounded history residual outside
+        # value_tower_shared_prefix_tokens. score_actions applies the same
+        # gradient boundary to it explicitly, so provenance must name it.
+        shared_input_paths.append("meaningful_public_history_residual")
+    if legal_action_value_residual:
+        # Preserve the durable v1 name for the mean-pooled encoded-action path.
+        shared_input_paths.append("legal_action_encoded_affordance")
+        if legal_action_value_set_statistics:
+            shared_input_paths.append("legal_action_max_affordance")
     if value_attention_pool:
         shared_input_paths.extend(
             ["attention_pool_state", "attention_pool_tokens"]
         )
-    if legal_action_value_residual:
-        # The affordance residual reads encoded actions after every enabled
-        # shared action-side adapter. score_actions applies the same boundary
-        # scale before the private value projection, so this path belongs in
-        # durable checkpoint provenance alongside the state-token inputs.
-        shared_input_paths.append("legal_action_encoded_affordance")
     return {
         "schema_version": "scalar-value-trunk-gradient-routing-v1",
         "scalar_value_trunk_grad_scale": scale,
@@ -2604,6 +2616,9 @@ def _value_trunk_gradient_routing(
         "value_attention_pool_enabled": value_attention_pool,
         "value_tower_split_layers": value_tower_split_layers,
         "legal_action_value_residual_enabled": legal_action_value_residual,
+        "legal_action_value_set_statistics_enabled": (
+            legal_action_value_set_statistics
+        ),
         "shared_action_representation_upstream_gradient_scale": (
             scale if legal_action_value_residual else None
         ),
@@ -10218,6 +10233,10 @@ def _validate_a1_scratch_runtime_projection(
         != model["entity_state_trunk"],
         "action_target_gather": bool(args.action_target_gather)
         != model["action_target_gather"],
+        "action_cross_attention_layers": int(
+            args.action_cross_attention_layers
+        )
+        != model["action_cross_attention_layers"],
         "topology_residual_adapter": bool(
             getattr(args, "topology_residual_adapter", False)
         )
@@ -11263,6 +11282,7 @@ def _require_explicit_production_checkpoint_architecture(
         "public_card_count_residual_bias",
         "public_rule_state_features",
         "action_target_gather",
+        "action_cross_attention_layers",
         "topology_residual_adapter",
         "static_action_residual",
         "legal_action_value_residual",
@@ -36464,6 +36484,19 @@ def _checkpoint_config_mismatches(
                 f"cli={requested_target_gather}; use the action_target_gather "
                 "checkpoint upgrade"
             )
+        checkpoint_action_cross = int(
+            getattr(config, "action_cross_attention_layers", 0) or 0
+        )
+        requested_action_cross = int(
+            getattr(args, "action_cross_attention_layers", 0) or 0
+        )
+        if checkpoint_action_cross != requested_action_cross:
+            mismatches.append(
+                "action_cross_attention_layers "
+                f"checkpoint={checkpoint_action_cross} "
+                f"cli={requested_action_cross}; use the action cross-attention "
+                "checkpoint upgrade"
+            )
         checkpoint_topology_residual = bool(
             getattr(config, "topology_residual_adapter", False)
         )
@@ -41994,6 +42027,9 @@ def _training_resume_recipe_identity(
         ),
         "topology_residual_adapter": bool(
             getattr(args, "topology_residual_adapter", False)
+        ),
+        "action_cross_attention_layers": int(
+            getattr(args, "action_cross_attention_layers", 0) or 0
         ),
         "value_tower_split_layers": int(
             getattr(args, "value_tower_split_layers", 0) or 0

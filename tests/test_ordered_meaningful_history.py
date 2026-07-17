@@ -209,12 +209,24 @@ def test_action_cross_attention_can_condition_on_live_public_history() -> None:
     with torch.no_grad():
         # Uniform attention with an identity value/output path makes the
         # decoder's dependence on each unmasked memory row deterministic.
-        block.attn.in_proj_weight.zero_()
-        block.attn.in_proj_bias.zero_()
-        block.attn.in_proj_weight[2 * width : 3 * width].copy_(
-            torch.eye(width)
-        )
-        block.attn.out_proj.weight.copy_(torch.eye(width))
+        if hasattr(block.attn, "in_proj_weight"):
+            block.attn.in_proj_weight.zero_()
+            block.attn.in_proj_bias.zero_()
+            block.attn.in_proj_weight[2 * width : 3 * width].copy_(
+                torch.eye(width)
+            )
+            block.attn.out_proj.weight.copy_(torch.eye(width))
+        else:
+            for projection in (
+                block.attn.q_proj,
+                block.attn.k_proj,
+                block.attn.v_proj,
+            ):
+                projection.weight.zero_()
+                projection.bias.zero_()
+            block.attn.v_proj.weight[0, 0] = 1.0
+            block.attn.out_proj.weight.zero_()
+            block.attn.out_proj.weight[0, 0] = 1.0
         block.attn.out_proj.bias.zero_()
         block.ff[3].weight.zero_()
         block.ff[3].bias.zero_()
@@ -280,6 +292,35 @@ def test_only_v7_action_cross_exposes_history_to_action_memory() -> None:
     event_stop = -64 + 32
     assert v7_mask[:, event_start:event_stop].all()
     assert not v7_action_mask[:, event_start:event_stop].any()
+
+
+@pytest.mark.parametrize("event_width", (0, 1, 4, 32, 64))
+def test_v7_action_history_mask_aligns_variable_width_to_event_suffix_prefix(
+    event_width: int,
+) -> None:
+    """Short event batches occupy the start, not the end, of the 64-row suffix."""
+
+    model = EntityGraphNet(
+        replace(
+            _config(ordered=True),
+            action_cross_attention_layers=1,
+            v6_compatibility_preserving_inputs=True,
+        )
+    ).eval()
+    trunk_mask = torch.ones(2, 211, dtype=torch.bool)
+    event_mask = torch.zeros(2, event_width, dtype=torch.bool)
+    if event_width:
+        event_mask[:, ::2] = True
+
+    action_mask = model._action_memory_padding_mask(
+        trunk_mask,
+        {"event_mask": event_mask},
+    )
+    expected_suffix = torch.ones(2, 64, dtype=torch.bool)
+    expected_suffix[:, :event_width] = ~event_mask
+
+    assert torch.equal(action_mask[:, :-64], trunk_mask[:, :-64])
+    assert torch.equal(action_mask[:, -64:], expected_suffix)
 
 
 @pytest.mark.parametrize(

@@ -108,6 +108,7 @@ def test_report_binds_effective_meaningful_history_contract() -> None:
             meaningful_public_history_schema=(MEANINGFUL_PUBLIC_HISTORY_SCHEMA_VERSION),
             event_history_limit=32,
             meaningful_public_history_pooling="masked_mean_v1",
+            meaningful_public_history_target_gather=True,
         ),
     )
 
@@ -127,6 +128,7 @@ def test_report_binds_effective_meaningful_history_contract() -> None:
     )
     assert report["event_history_limit"] == 32
     assert report["meaningful_public_history_pooling"] == "masked_mean_v1"
+    assert report["meaningful_public_history_target_gather"] is True
 
 
 def test_requested_settlement_pointer_rejects_legacy_warm_start() -> None:

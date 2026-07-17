@@ -80,6 +80,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
         ]
     )
     assert parser.get_default("action_target_gather") is None
+    assert parser.get_default("action_cross_attention_layers") is None
     assert parser.get_default("topology_residual_adapter") is None
     assert parser.get_default("static_action_residual") is None
     assert parser.get_default("legal_action_value_residual") is None
@@ -98,6 +99,7 @@ def test_fresh_cli_flags_reach_policy_construction_and_typed_identity() -> None:
     )
 
     kwargs = _structured_action_create_kwargs(parsed)
+    assert kwargs["action_cross_attention_layers"] == 1
     assert kwargs == {
         "action_target_gather": True,
         "action_cross_attention_layers": 1,
@@ -293,6 +295,7 @@ def test_checkpoint_mismatch_and_a1_recipe_bind_enabled_repairs() -> None:
         attention_heads=8,
         dropout=0.05,
         action_target_gather=False,
+        action_cross_attention_layers=0,
         topology_residual_adapter=False,
         static_action_residual=False,
         legal_action_value_residual=False,
@@ -305,6 +308,7 @@ def test_checkpoint_mismatch_and_a1_recipe_bind_enabled_repairs() -> None:
         attention_heads=8,
         graph_dropout=0.05,
         action_target_gather=True,
+        action_cross_attention_layers=1,
         topology_residual_adapter=True,
         static_action_residual=True,
         legal_action_value_residual=True,
@@ -314,6 +318,10 @@ def test_checkpoint_mismatch_and_a1_recipe_bind_enabled_repairs() -> None:
         policy_type="entity_graph", config=config, args=args
     )
     assert any(item.startswith("action_target_gather ") for item in mismatches)
+    assert any(
+        item.startswith("action_cross_attention_layers ")
+        for item in mismatches
+    )
     assert any(item.startswith("topology_residual_adapter ") for item in mismatches)
     assert any(item.startswith("static_action_residual ") for item in mismatches)
     assert any(item.startswith("legal_action_value_residual ") for item in mismatches)

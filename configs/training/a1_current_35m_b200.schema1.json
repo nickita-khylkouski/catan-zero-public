@@ -28,8 +28,8 @@
   "train_config": {
     "fields": {
       "acknowledge_empty_event_history_payload_inventory_sha256": [],
-      "action_cross_attention_layers": null,
       "action_module_lr_mult": 1.0,
+      "action_cross_attention_layers": 1,
       "shared_action_lr_mult": 1.0,
       "action_target_gather": true,
       "advantage_policy_weighting": "none",

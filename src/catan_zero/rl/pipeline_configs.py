@@ -244,6 +244,7 @@ class TrainConfig(PipelineConfig):
     # Structured action/value residuals are checkpoint-owned architecture.
     # Main resolves the inherit sentinel to concrete bools before hashing.
     static_action_residual: bool | None = None
+    action_cross_attention_layers: int | None = None
     legal_action_value_residual: bool | None = None
     legal_action_value_set_statistics: bool | None = None
     meaningful_public_history: bool | None = None

@@ -468,3 +468,32 @@ def test_transport_filtered_entity_fields_are_exact_noop_with_all_optional_heads
     assert full_outputs.keys() == filtered_outputs.keys()
     for key in full_outputs:
         assert torch.equal(full_outputs[key], filtered_outputs[key]), key
+
+
+def test_entity_graph_policy_create_and_reload_preserve_action_cross_depth(
+    tmp_path,
+):
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    policy = EntityGraphPolicy.create(
+        hidden_size=64,
+        state_layers=2,
+        attention_heads=4,
+        dropout=0.0,
+        action_cross_attention_layers=1,
+        meaningful_public_history=True,
+        event_history_limit=32,
+        meaningful_public_history_target_gather=True,
+        device="cpu",
+    )
+    assert policy.config.action_cross_attention_layers == 1
+    assert policy.model.action_cross_attention_layers == 1
+    assert len(policy.model.action_cross_blocks) == 1
+
+    checkpoint = tmp_path / "cross-one.pt"
+    policy.save(checkpoint)
+    reloaded = EntityGraphPolicy.load(checkpoint, device="cpu")
+    assert reloaded.config.action_cross_attention_layers == 1
+    assert reloaded.model.action_cross_attention_layers == 1
+    assert len(reloaded.model.action_cross_blocks) == 1
+    assert set(reloaded.model.state_dict()) == set(policy.model.state_dict())

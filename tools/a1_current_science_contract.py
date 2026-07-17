@@ -190,6 +190,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "graph_dropout": 0.05,
     "entity_state_trunk": "transformer",
     "action_target_gather": True,
+    "action_cross_attention_layers": 1,
     "topology_residual_adapter": True,
     "static_action_residual": True,
     "legal_action_value_residual": True,

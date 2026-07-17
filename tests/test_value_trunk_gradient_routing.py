@@ -217,6 +217,52 @@ def test_routing_validation_fails_closed_on_unsupported_paths() -> None:
     ]
 
 
+def test_split_routing_report_enumerates_every_active_shared_input_path() -> None:
+    model = SimpleNamespace(
+        value_tower_split_layers=1,
+        meaningful_public_history_enabled=True,
+        legal_action_value_residual_enabled=True,
+        legal_action_value_set_statistics_enabled=True,
+        value_attention_pool=True,
+    )
+
+    routing = train_bc._value_trunk_gradient_routing(
+        _args(value_trunk_grad_scale=0.1),
+        scalar_weight=0.25,
+        categorical_weight=0.1,
+        final_vp_weight=0.05,
+        model=model,
+    )
+
+    assert routing["shared_input_paths"] == [
+        "value_tower_shared_prefix_tokens",
+        "meaningful_public_history_residual",
+        "legal_action_encoded_affordance",
+        "legal_action_max_affordance",
+        "attention_pool_state",
+        "attention_pool_tokens",
+    ]
+    assert routing["all_value_family_shared_inputs_scaled"] is True
+
+
+def test_routing_report_omits_inactive_optional_shared_input_paths() -> None:
+    model = SimpleNamespace(
+        value_tower_split_layers=1,
+        meaningful_public_history_enabled=False,
+        legal_action_value_residual_enabled=False,
+        legal_action_value_set_statistics_enabled=False,
+        value_attention_pool=False,
+    )
+
+    routing = train_bc._value_trunk_gradient_routing(
+        _args(value_trunk_grad_scale=0.1),
+        scalar_weight=0.25,
+        model=model,
+    )
+
+    assert routing["shared_input_paths"] == ["value_tower_shared_prefix_tokens"]
+
+
 def test_checkpoint_metadata_carries_exact_gradient_routing_contract(tmp_path) -> None:
     args = _args(value_trunk_grad_scale=0.0)
     args.value_gradient_routing = train_bc._value_trunk_gradient_routing(
