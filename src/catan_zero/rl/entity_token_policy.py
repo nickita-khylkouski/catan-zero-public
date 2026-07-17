@@ -2508,11 +2508,19 @@ class EntityGraphNet:
                 target_ids = batch[target_key].long()
                 # Start index of each targeted type in the concatenated
                 # sequence (CLS occupies index 0).
-                offsets = torch.tensor(
-                    _entity_token_start_offsets(batch),
+                offset_values = _entity_token_start_offsets(batch)
+                namespaces = torch.arange(
+                    len(offset_values),
                     dtype=torch.long,
                     device=target_ids.device,
                 )
+                offsets = torch.zeros_like(namespaces)
+                for namespace, offset in enumerate(offset_values):
+                    offsets = torch.where(
+                        namespaces == namespace,
+                        torch.full_like(offsets, offset),
+                        offsets,
+                    )
                 seq_len = int(tokens.shape[1])
                 width = int(tokens.shape[2])
                 valid = target_ids >= 0  # [B, A, 4]

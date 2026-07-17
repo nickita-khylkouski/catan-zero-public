@@ -192,6 +192,11 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # optional encode_state argument. Legacy callers omit it and execute
         # the same topology-disabled Transformer forward.
         "sha256:618fad7337b4bb3bc1b51d6e3c65d8d63bc3c67f61e2c2c6b99555ea3a19b738",
+        # Target-offset constants were then made graph-capturable; this path is
+        # reachable only when target gathering is enabled. These are the final
+        # macOS and H100 Linux guarded-source identities.
+        "sha256:1ec23d4529460fea85dabc978550abb3f23fe62a07207ac0bd34ed045c915656",
+        "sha256:f09180dc0a372d8b2170e50e9e722d128036e6cc2276542945a426635a9020c3",
     }
 }
 
