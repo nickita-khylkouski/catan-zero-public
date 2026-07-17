@@ -669,6 +669,7 @@ def _parent_initializer_binding(
     expected_forward_identity = {
         migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1: False,
         migration.MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY: True,
+        migration.MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY: True,
     }.get(migration_kind)
     if (
         expected_forward_identity is None

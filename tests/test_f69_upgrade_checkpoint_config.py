@@ -182,6 +182,17 @@ def test_v7_input_migration_constructs_complete_strict_checkpoint(
         EntityGraphPolicy.load(truncated, device="cpu")
 
 
+def test_direct_v8_migration_preserves_v7_route_and_adds_exact_public_resources():
+    overrides = upgrade_tool._parse_flags(  # noqa: SLF001
+        "v5_to_v8_public_resource_compatibility_migration"
+    )
+
+    assert overrides["v6_compatibility_preserving_inputs"] is True
+    assert overrides["action_cross_attention_layers"] == 1
+    assert overrides["action_cross_attention_bottleneck"] == 80
+    assert overrides["public_card_exact_resource_residual"] is True
+
+
 def test_build_upgraded_config_preserves_a_full_config():
     """A current (non-stale) config round-trips with only the overrides changed."""
     base = EntityGraphConfig(

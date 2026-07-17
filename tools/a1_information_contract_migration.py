@@ -41,9 +41,15 @@ MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1 = (
     "entity_graph.current_v2_to_v6_information_contract+topology+split1.v1"
 )
 MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY = "entity_graph.v5_to_v7_input_compatibility.v1"
+MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY = (
+    "entity_graph.v5_to_v8_public_resource_compatibility.v1"
+)
 CHECKPOINT_PROVENANCE_SCHEMA = "entity-graph-information-contract-migration-v1"
 ANCHOR_SCHEMA = "adapter-v6-step0-anchor-evidence-v1"
 V7_INPUT_ANCHOR_SCHEMA = "adapter-v7-compatibility-step0-anchor-evidence-v1"
+V8_INPUT_ANCHOR_SCHEMA = (
+    "adapter-v8-public-resource-compatibility-step0-anchor-evidence-v1"
+)
 
 
 class MigrationError(RuntimeError):
@@ -152,9 +158,19 @@ def _verify_anchor_evidence(
         raise MigrationError("migration lacks step-zero anchor evidence")
     evidence = dict(value)
     v7_input_routing = migration == MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY
-    expected_schema = V7_INPUT_ANCHOR_SCHEMA if v7_input_routing else ANCHOR_SCHEMA
+    v8_input_routing = (
+        migration == MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY
+    )
+    v5_compatibility = v7_input_routing or v8_input_routing
+    expected_schema = (
+        V8_INPUT_ANCHOR_SCHEMA
+        if v8_input_routing
+        else V7_INPUT_ANCHOR_SCHEMA
+        if v7_input_routing
+        else ANCHOR_SCHEMA
+    )
     expected_source_adapter = (
-        RUST_ENTITY_ADAPTER_V5 if v7_input_routing else RUST_ENTITY_ADAPTER_V2
+        RUST_ENTITY_ADAPTER_V5 if v5_compatibility else RUST_ENTITY_ADAPTER_V2
     )
     if (
         evidence.get("schema_version") != expected_schema
@@ -167,12 +183,12 @@ def _verify_anchor_evidence(
         or evidence.get("promotion_eligible") is not False
     ):
         raise MigrationError("step-zero anchor contract is malformed")
-    if evidence.get("forward_identical") is not v7_input_routing:
+    if evidence.get("forward_identical") is not v5_compatibility:
         raise MigrationError(
             "step-zero forward-identity claim mismatches migration type"
         )
-    if v7_input_routing and evidence.get("adapter_features_identical") is not False:
-        raise MigrationError("V7 evidence must bind the real V5->V6 feature change")
+    if v5_compatibility and evidence.get("adapter_features_identical") is not False:
+        raise MigrationError("V7/V8 evidence must bind the real V5->V6 feature change")
     numeric = (
         "migration_output_max_abs_diff",
         "feature_max_abs_diff",
@@ -200,7 +216,7 @@ def _verify_anchor_evidence(
     output_max = float(evidence["migration_output_max_abs_diff"])
     if feature_max <= 0.0 or feature_changes <= 0:
         raise MigrationError("information migration must prove a real feature change")
-    if v7_input_routing and output_max != 0.0:
+    if v5_compatibility and output_max != 0.0:
         raise MigrationError(
             "V7 compatibility routing must preserve exact forward output"
         )
@@ -370,6 +386,7 @@ def _verify_v7_input_routing_delta(
     after: Mapping[str, Any],
     *,
     initialization_seed: int,
+    require_exact_public_resource_residual: bool = False,
 ) -> dict[str, Any]:
     """Replay the complete budgeted V7 construction from the V5 bytes.
 
@@ -393,11 +410,18 @@ def _verify_v7_input_routing_delta(
         "v6_exact_resource_residual.weight",
         "v6_initial_road_residual.weight",
     }
+    if require_exact_public_resource_residual:
+        required_parameters.add("public_card_exact_resource_residual.weight")
     allowed_prefixes = (
         "topology_residual_adapter.",
         "action_cross_blocks.0.",
         "v6_exact_resource_residual.",
         "v6_initial_road_residual.",
+        *(
+            ("public_card_exact_resource_residual.",)
+            if require_exact_public_resource_residual
+            else ()
+        ),
     )
     if (
         removed
@@ -436,6 +460,11 @@ def _verify_v7_input_routing_delta(
         "v6_compatibility_preserving_inputs": True,
         "action_cross_attention_layers": 1,
         "action_cross_attention_bottleneck": 80,
+        **(
+            {"public_card_exact_resource_residual": True}
+            if require_exact_public_resource_residual
+            else {}
+        ),
     }
     if effective_after != expected_config:
         raise MigrationError("V7 migration changed config outside input routing")
@@ -555,6 +584,7 @@ def inspect_migration(
     if migration not in {
         MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
         MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+        MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY,
     }:
         raise MigrationError(f"information migration is not allowlisted: {migration!r}")
     import torch
@@ -566,22 +596,28 @@ def inspect_migration(
         raise MigrationError("migration checkpoints are malformed")
     provenance = after.get("information_contract_migration_provenance")
     v7_input_routing = migration == MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY
+    v8_input_routing = (
+        migration == MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY
+    )
+    v5_compatibility = v7_input_routing or v8_input_routing
     expected_checkpoint_migration = (
-        "v5_to_v7_input_compatibility"
+        "v5_to_v8_public_resource_compatibility"
+        if v8_input_routing
+        else "v5_to_v7_input_compatibility"
         if v7_input_routing
         else "current_v2_to_v6_topology_split1"
     )
     expected_source_adapter = (
-        RUST_ENTITY_ADAPTER_V5 if v7_input_routing else RUST_ENTITY_ADAPTER_V2
+        RUST_ENTITY_ADAPTER_V5 if v5_compatibility else RUST_ENTITY_ADAPTER_V2
     )
     expected_source_routing = (
         "v5_legacy_resource_and_initial_road_inputs"
-        if v7_input_routing
+        if v5_compatibility
         else "adapter_v2_legacy_information_surface"
     )
     expected_target_routing = (
         "v6_raw_inputs_with_legacy_encoder_views_plus_zero_output_residuals"
-        if v7_input_routing
+        if v5_compatibility
         else "adapter_v6_exact_resource_and_initial_road_surface"
     )
     if (
@@ -593,14 +629,14 @@ def inspect_migration(
         or provenance.get("source_adapter") != expected_source_adapter
         or provenance.get("target_adapter") != RUST_ENTITY_ADAPTER_V6
         or (
-            v7_input_routing
+            v5_compatibility
             and provenance.get("source_input_routing") != expected_source_routing
         )
         or (
-            v7_input_routing
+            v5_compatibility
             and provenance.get("target_input_routing") != expected_target_routing
         )
-        or provenance.get("forward_identical") is not v7_input_routing
+        or provenance.get("forward_identical") is not v5_compatibility
         or provenance.get("promotion_eligible") is not False
         or provenance.get("commissioning_status")
         != "non_promotable_architecture_treatment"
@@ -652,8 +688,9 @@ def inspect_migration(
             before,
             after,
             initialization_seed=initialization_seed,
+            require_exact_public_resource_residual=v8_input_routing,
         )
-        if v7_input_routing
+        if v5_compatibility
         else _verify_topology_delta(
             Path(source_ref["path"]),
             Path(migrated_ref["path"]),
@@ -667,7 +704,7 @@ def inspect_migration(
         "migrated_initializer": migrated_ref,
         "source_adapter": source_adapter,
         "target_adapter": target_adapter,
-        "forward_identical": bool(v7_input_routing),
+        "forward_identical": bool(v5_compatibility),
         "promotion_eligible": False,
         "commissioning_status": "non_promotable_architecture_treatment",
         "step0_anchor_evidence": anchor,
@@ -754,6 +791,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
             MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+            MIGRATION_V5_TO_V8_PUBLIC_RESOURCE_COMPATIBILITY,
         ),
     )
     return parser

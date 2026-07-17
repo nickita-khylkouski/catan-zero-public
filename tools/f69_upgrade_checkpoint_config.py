@@ -229,6 +229,19 @@ def _parse_flags(raw: str) -> dict[str, object]:
             # residual for the exact public 2p resource deduction, avoiding
             # both an input-distribution rewrite and masked-opponent loss.
             overrides["public_card_exact_resource_residual"] = True
+        elif entry in (
+            "v5_to_v8_public_resource_compatibility_migration",
+            "v5-to-v8-public-resource-compatibility-migration",
+        ):
+            # A new direct V5 parent edge that preserves the issued V7 receipt
+            # semantics and additionally commissions exact public opponent
+            # resources through a separate zero-output residual.
+            overrides.update(
+                {
+                    **_parse_flags("v5_to_v7_input_compatibility_migration"),
+                    "public_card_exact_resource_residual": True,
+                }
+            )
         elif entry in ("gather", "action_target_gather"):
             overrides["action_target_gather"] = True
         elif entry in ("value", "value_attention_pool"):
@@ -508,9 +521,11 @@ def _migration_anchor_evidence(
     target_adapter = str(upgraded.entity_feature_adapter_version)
     legacy_v2_to_v6 = migration == "current_v2_to_v6_topology_split1"
     v5_to_v7 = migration == "v5_to_v7_input_compatibility"
+    v5_to_v8 = migration == "v5_to_v8_public_resource_compatibility"
+    v5_compatibility = v5_to_v7 or v5_to_v8
     if legacy_v2_to_v6:
         expected = (RUST_ENTITY_ADAPTER_V2, RUST_ENTITY_ADAPTER_V6)
-    elif v5_to_v7:
+    elif v5_compatibility:
         expected = (RUST_ENTITY_ADAPTER_V5, RUST_ENTITY_ADAPTER_V6)
     else:
         raise RuntimeError(f"unsupported information migration: {migration!r}")
@@ -693,11 +708,11 @@ def _migration_anchor_evidence(
                 "anchor_identity_sha256": anchor_sha256,
             }
         )
-    if (legacy_v2_to_v6 or v5_to_v7) and (
+    if (legacy_v2_to_v6 or v5_compatibility) and (
         feature_changed_values <= 0 or feature_max_diff <= 0.0
     ):
         raise RuntimeError("v6 migration anchors did not observe a feature change")
-    if v5_to_v7 and migration_max_diff != 0.0:
+    if v5_compatibility and migration_max_diff != 0.0:
         raise RuntimeError(
             "V7 compatibility routing failed exact step-zero forward identity"
         )
@@ -715,7 +730,11 @@ def _migration_anchor_evidence(
         "schema_version": (
             "adapter-v6-step0-anchor-evidence-v1"
             if legacy_v2_to_v6
-            else "adapter-v7-compatibility-step0-anchor-evidence-v1"
+            else (
+                "adapter-v8-public-resource-compatibility-step0-anchor-evidence-v1"
+                if v5_to_v8
+                else "adapter-v7-compatibility-step0-anchor-evidence-v1"
+            )
         ),
         "device": "cpu",
         "source_adapter": source_adapter,
@@ -724,7 +743,7 @@ def _migration_anchor_evidence(
         "separate_adapter_specific_entity_features": True,
         "separate_adapter_specific_action_contexts": True,
         "adapter_features_identical": False,
-        "forward_identical": bool(v5_to_v7),
+        "forward_identical": bool(v5_compatibility),
         "promotion_eligible": False,
         "topology_construction_proof": "deterministic_parameter_replay_in_receipt",
         "migration_output_max_abs_diff": migration_max_diff,
@@ -863,6 +882,8 @@ def _record_information_migration_provenance(
     output = Path(out_checkpoint)
     raw = torch.load(output, map_location="cpu", weights_only=False)
     v5_to_v7 = migration == "v5_to_v7_input_compatibility"
+    v5_to_v8 = migration == "v5_to_v8_public_resource_compatibility"
+    v5_compatibility = v5_to_v7 or v5_to_v8
     raw["information_contract_migration_provenance"] = {
         "schema_version": "entity-graph-information-contract-migration-v1",
         "migration": str(migration),
@@ -880,10 +901,10 @@ def _record_information_migration_provenance(
                     "v6_raw_inputs_with_legacy_encoder_views_plus_zero_output_residuals"
                 ),
             }
-            if v5_to_v7
+            if v5_compatibility
             else {}
         ),
-        "forward_identical": bool(v5_to_v7),
+        "forward_identical": bool(v5_compatibility),
         "promotion_eligible": False,
         "commissioning_status": "non_promotable_architecture_treatment",
         "step0_anchor_evidence": anchor_evidence,
@@ -939,13 +960,36 @@ def main() -> None:
         }
         for piece in args.flags.split(",")
     )
-    if requested_v6_migration and requested_v7_migration:
+    requested_v8_migration = any(
+        piece.strip()
+        in {
+            "v5_to_v8_public_resource_compatibility_migration",
+            "v5-to-v8-public-resource-compatibility-migration",
+        }
+        for piece in args.flags.split(",")
+    )
+    if sum(
+        int(value)
+        for value in (
+            requested_v6_migration,
+            requested_v7_migration,
+            requested_v8_migration,
+        )
+    ) > 1:
         raise SystemExit("only one information-contract migration may be requested")
-    requested_information_migration = requested_v6_migration or requested_v7_migration
+    requested_information_migration = (
+        requested_v6_migration
+        or requested_v7_migration
+        or requested_v8_migration
+    )
     migration_name = (
         "current_v2_to_v6_topology_split1"
         if requested_v6_migration
-        else "v5_to_v7_input_compatibility"
+        else (
+            "v5_to_v8_public_resource_compatibility"
+            if requested_v8_migration
+            else "v5_to_v7_input_compatibility"
+        )
     )
     if requested_information_migration and str(args.device) != "cpu":
         raise SystemExit(
@@ -960,7 +1004,7 @@ def main() -> None:
         torch.cuda.manual_seed_all(int(args.seed))
     base = EntityGraphPolicy.load(args.in_checkpoint, device=args.device)
     base.model.eval()
-    if requested_v7_migration and (
+    if (requested_v7_migration or requested_v8_migration) and (
         base.entity_feature_adapter_version != RUST_ENTITY_ADAPTER_V5
         or bool(
             getattr(base.config, "v6_compatibility_preserving_inputs", False)

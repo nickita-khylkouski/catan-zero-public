@@ -311,6 +311,7 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
                 "+topology+split1.v1"
             ): False,
             "entity_graph.v5_to_v7_input_compatibility.v1": True,
+            "entity_graph.v5_to_v8_public_resource_compatibility.v1": True,
         }.get(migration_kind)
         if (
             value["init_checkpoint_sha256"] == value["declared_producer_sha256"]

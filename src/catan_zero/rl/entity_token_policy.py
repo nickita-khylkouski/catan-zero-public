@@ -429,11 +429,6 @@ class EntityGraphConfig:
     # legacy-compatible view remains its input, while a bias-free zero-output
     # residual learns the new exact counts.  Appended for pickle compatibility.
     v6_compatibility_preserving_inputs: bool = False
-    # V8 restores exact public opponent-resource composition without changing
-    # the mature V5 public-card residual's clipped input measure. In two-player
-    # Catan this composition is public by bank conservation, but V7's exact
-    # residual only sees masked opponent player tokens.
-    public_card_exact_resource_residual: bool = False
     # Explicit serialized topology for the Transformer-only action adapter.
     # Zero retains the historical full-width block used by issued f69
     # checkpoints/receipts. A positive value selects the parameter-efficient
@@ -442,6 +437,13 @@ class EntityGraphConfig:
     # constructing the module, so both historical and budgeted artifacts remain
     # replayable. Appended last for positional legacy-pickle compatibility.
     action_cross_attention_bottleneck: int = 0
+    # V8 restores exact public opponent-resource composition without changing
+    # the mature V5 public-card residual's clipped input measure. In two-player
+    # Catan this composition is public by bank conservation, but V7's exact
+    # residual only sees masked opponent player tokens. Keep every new config
+    # field after the previously issued bottleneck field: legacy slots
+    # dataclasses serialize positionally.
+    public_card_exact_resource_residual: bool = False
 
 
 class EntityGraphNet:
