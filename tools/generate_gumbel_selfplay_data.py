@@ -68,6 +68,7 @@ from catan_zero.rl.meaningful_history import (
 )
 from catan_zero.rl.decision_taxonomy import DECISION_TAXONOMY_SCHEMA_VERSION
 from catan_zero.rl.gumbel_self_play import (
+    ACTION_MASK_VERSION,
     COLORS,
     GumbelSelfPlayConfig,
     MixRuntime,
@@ -2652,6 +2653,10 @@ def _merge_worker_summaries(
         "forced_decisions_total": int(forced_decisions_total),
         "simulations_used_total": int(simulations_used_total),
         "target_information_regime": target_information_regime,
+        # The policy target is indexed by this catalog.  Keep the exact action
+        # contract in the manifest as well as every row so target-identity
+        # admission can reject a corpus produced under different action rules.
+        "action_mask_version": ACTION_MASK_VERSION,
         "adapter_version": learner_entity_feature_adapter_version,
         "learner_entity_feature_adapter_version": (
             learner_entity_feature_adapter_version

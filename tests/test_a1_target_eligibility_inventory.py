@@ -396,6 +396,7 @@ def test_current_manifest_identity_resolves_complete_teacher_and_code_contract(
                     "rust_featurize": True,
                     "boundary_value_particles": 1,
                     "policy_target_min_visits": 0,
+                    "action_mask_version": "colonist-multiagent-v1",
                 },
             }
         ),
@@ -431,12 +432,41 @@ def test_current_manifest_identity_resolves_complete_teacher_and_code_contract(
     assert identity["effective_evaluator_config"]["value_squash"] == "clip"
     assert identity["target_semantics"]["boundary_value_particles"] == 1
     assert identity["target_semantics"]["policy_target_min_visits"] == 0
+    assert identity["target_semantics"]["action_mask_version"] == (
+        "colonist-multiagent-v1"
+    )
     assert identity["teacher_feature_contract"][
         "entity_feature_adapter_version"
     ] == "rust_entity_adapter_v2_land_topology_ports_maritime"
     assert identity["producer_code_identity"]["runtime_code_tree_sha256"] == (
         "sha256:" + "c" * 64
     )
+
+    # A target distribution is indexed by the action catalog.  It is not safe
+    # to infer that contract from a checkpoint hash or search budget alone.
+    stale = json.loads(manifest_path.read_text(encoding="utf-8"))
+    stale["cli_args"].pop("action_mask_version")
+    manifest_path.write_text(json.dumps(stale), encoding="utf-8")
+    with pytest.raises(inventory.InventoryError, match="action_mask_version"):
+        inventory._manifest_operator_groups(  # noqa: SLF001
+            {
+                "current_contract": {
+                    "path": str(lock_path),
+                    "file_sha256": inventory._file_sha256(lock_path),  # noqa: SLF001
+                },
+                "fresh_generation_manifests": [
+                    {
+                        "category": "n128",
+                        "artifact": {
+                            "path": str(manifest_path),
+                            "file_sha256": inventory._file_sha256(  # noqa: SLF001
+                                manifest_path
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
 
 
 def test_current_manifest_identity_fails_closed_without_teacher_adapter(

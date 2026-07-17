@@ -158,6 +158,11 @@ TARGET_SEMANTIC_FIELDS = (
     # be merged as one teacher.
     "boundary_value_particles",
     "policy_target_min_visits",
+    # Policy targets are stored in the legal-row order induced by the action
+    # catalog.  A rules/catalog change can preserve every MCTS scalar while
+    # changing what an integer action id means, so it is an immutable teacher
+    # semantic—not merely row metadata.
+    "action_mask_version",
     "forced_root_target_mode",
     "record_automatic_transitions",
     "public_observation",
@@ -962,6 +967,9 @@ def _canonical_policy_target_identity(
             field == "boundary_value_particles" and value < 1
         ):
             missing.append(field)
+    action_mask_version = _first_operator_value(candidates, "action_mask_version")
+    if not isinstance(action_mask_version, str) or not action_mask_version.strip():
+        missing.append("action_mask_version")
     if missing:
         raise InventoryError(
             "current policy-target identity is incomplete; missing "
