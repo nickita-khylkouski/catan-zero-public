@@ -24067,7 +24067,12 @@ def _reduce_value_validation_strata(
         for label, parts in labels.items()
         for key, value in parts.items()
     }
-    reduced = _reduce_named_sums(flattened, ddp)
+    # Phase/action strata are rank-local and sparse: one rank may legitimately
+    # observe no rows for a label in its distributed validation slice.  A dense
+    # NCCL vector built from local keys can therefore differ in both length and
+    # ordering across ranks, causing a collective mismatch/hang.  Gather and
+    # union the tiny telemetry maps instead.
+    reduced = _reduce_sparse_named_sums(flattened, ddp)
     result: dict[str, dict[str, dict[str, float]]] = {}
     for name, value in reduced.items():
         axis, label, key = name.split("\0", 2)
@@ -24837,6 +24842,21 @@ def evaluate_bc_batches(
     eval_indices = np.asarray(indices, dtype=np.int64)
     if not data_sharded:
         eval_indices = _distributed_index_slice(eval_indices, ddp)
+    ddp_model = None
+    if bool(ddp.get("enabled", False)):
+        import torch
+
+        model = getattr(policy, "model", None)
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            # Validation ranks may receive different numbers of rows (most
+            # notably for the exact per-game composite measure).  DDP forward
+            # broadcasts are collectives, so leaving the wrapper active makes
+            # a shorter rank enter metric reduction while a peer is still in a
+            # forward broadcast.  Inference needs no gradient synchronization;
+            # unwrap only for the validation scope and retain the explicit
+            # sufficient-statistic reductions below.
+            ddp_model = model
+            policy.model = model.module
     previous_modes = _set_policy_training(policy, False)
     try:
         loss_sum = 0.0
@@ -25352,6 +25372,8 @@ def evaluate_bc_batches(
         }
     finally:
         _restore_policy_training(policy, previous_modes)
+        if ddp_model is not None:
+            policy.model = ddp_model
 
 
 def _run_teacher_quality_gate(
