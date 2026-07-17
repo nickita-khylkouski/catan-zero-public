@@ -357,3 +357,85 @@ def test_vtrace_skip_does_not_commit_staged_learner_references(
         ) == snapshot
         assert not hasattr(trajectory, "ppo_reference_log_probs")
         assert not hasattr(trajectory, "ppo_reference_values")
+
+
+def test_current_value_vtrace_uses_recomputed_cutoff_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample, bootstrap_sample = _make_trajectory(n=2).samples
+    trajectory = SimpleNamespace(
+        samples=[sample],
+        returns=[99.0],
+        advantages=[99.0],
+        old_log_probs=[0.0],
+        old_values=[0.0],
+        shaped_rewards=[0.0],
+        rewards=[0.0],
+        truncated=True,
+        bootstrap_value=9.0,
+        bootstrap_sample=bootstrap_sample,
+    )
+
+    def recompute(_policy, batches, **_kwargs):
+        flattened = [item for batch in batches for item in batch.samples]
+        if len(flattened) == 1 and flattened[0] is sample:
+            return np.asarray([0.0]), np.asarray([0.0])
+        assert len(flattened) == 1 and flattened[0] is bootstrap_sample
+        return np.asarray([0.0]), np.asarray([2.0])
+
+    monkeypatch.setattr(
+        learner,
+        "_recompute_target_logp_and_values_batched",
+        recompute,
+    )
+    config = SimpleNamespace(
+        vtrace_forward_chunk=8192,
+        behavior_temperature=1.0,
+        vtrace_use_current_values=True,
+        gamma=1.0,
+        vtrace_clip_rho=1.0,
+        vtrace_clip_pg_rho=1.0,
+    )
+
+    stats = apply_vtrace_in_place(object(), [trajectory], config)
+
+    assert stats["vtrace_skipped"] == 0.0
+    assert trajectory.returns == pytest.approx([2.0])
+    assert trajectory.returns != pytest.approx([9.0])
+
+
+def test_current_value_vtrace_rejects_old_truncated_shard_without_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample = _make_trajectory(n=1).samples[0]
+    trajectory = SimpleNamespace(
+        samples=[sample],
+        returns=[7.0],
+        advantages=[8.0],
+        old_log_probs=[0.0],
+        old_values=[0.0],
+        shaped_rewards=[0.0],
+        rewards=[0.0],
+        truncated=True,
+        bootstrap_value=3.0,
+    )
+    monkeypatch.setattr(
+        learner,
+        "_recompute_target_logp_and_values_batched",
+        lambda *_args, **_kwargs: (np.asarray([0.0]), np.asarray([0.0])),
+    )
+    config = SimpleNamespace(
+        vtrace_forward_chunk=8192,
+        behavior_temperature=1.0,
+        vtrace_use_current_values=True,
+        gamma=1.0,
+        vtrace_clip_rho=1.0,
+        vtrace_clip_pg_rho=1.0,
+    )
+
+    stats = apply_vtrace_in_place(object(), [trajectory], config)
+
+    assert stats["vtrace_skipped"] == 1.0
+    assert stats["vtrace_missing_current_bootstrap"] == 1.0
+    assert trajectory.returns == [7.0]
+    assert trajectory.advantages == [8.0]

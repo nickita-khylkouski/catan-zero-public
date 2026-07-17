@@ -276,6 +276,49 @@ def test_fresh_entity_actor_to_learner_starts_at_ratio_one() -> None:
     assert metrics["clip_fraction"] == 0.0
 
 
+def test_entity_truncation_drains_to_learner_decision_boundary() -> None:
+    from types import SimpleNamespace
+
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from catan_zero.rl.self_play import RandomPolicy, make_env_config
+    from catan_zero.rl.torch_ppo import collect_ppo_episode
+    from tools.ppo_distributed_learner import (
+        _recompute_target_logp_and_values_batched,
+    )
+
+    config = make_env_config(players=2, vps_to_win=3)
+    policy = EntityGraphPolicy.create(
+        env_config=config,
+        hidden_size=16,
+        state_layers=1,
+        attention_heads=2,
+        seed=0,
+    )
+    trajectory = collect_ppo_episode(
+        policy,
+        {"RED": RandomPolicy()},
+        seed=1,
+        config=config,
+        max_decisions=2,
+        rng=np.random.default_rng(2),
+        training_seats={"BLUE"},
+    )
+
+    assert trajectory.truncated is True
+    assert len(trajectory.samples) == 2
+    assert trajectory.bootstrap_sample is not None
+    assert trajectory.bootstrap_sample.player == "BLUE"
+    assert trajectory.bootstrap_value != 0.0
+    _, learner_values = _recompute_target_logp_and_values_batched(
+        policy,
+        [SimpleNamespace(samples=[trajectory.bootstrap_sample])],
+    )
+    assert learner_values[0] == pytest.approx(
+        trajectory.bootstrap_value,
+        abs=1e-6,
+    )
+
+
 def test_entity_ppo_update_restores_eval_mode_after_training() -> None:
     """Autograd stays active while the likelihood model remains in eval mode."""
     import torch

@@ -85,6 +85,10 @@ class PPOTrajectory:
     # a terminal 0. For genuinely terminal games both stay at their 0.0/False defaults.
     bootstrap_value: float = 0.0
     truncated: bool = False
+    # Exact learner-seat decision state at a time-limit cutoff. The distributed
+    # learner uses it to recompute a bootstrap under the same current snapshot
+    # as the in-trajectory V-trace values. Older shards leave this slot unset.
+    bootstrap_sample: StepSample | None = None
     # Learner-snapshot references used by PPO after V-trace has already corrected from the
     # actor behavior policy. Empty (or an unset slot in an older pickle) falls back to the
     # actor-side old_* evidence, preserving the ordinary non-V-trace PPO contract.
@@ -847,8 +851,14 @@ def collect_ppo_episode(
         terminated = False
         truncated = False
         decisions = 0
-        while not (terminated or truncated) and decisions < max_decisions:
+        # Stop only at a learner-seat decision boundary. If the nominal cap lands
+        # on an opponent prompt, drain opponent actions without recording another
+        # learner decision; valuing a non-current learner seat against the
+        # opponent's legal-action set is out-of-distribution for entity policies.
+        while not (terminated or truncated):
             player = info["current_player"]
+            if decisions >= max_decisions and player in training_seats:
+                break
             observation = np.asarray(observations[player], dtype=np.float64)
             valid_actions = tuple(int(action) for action in info["valid_actions"])
             action_context_features = build_action_context_feature_table(env, info)
@@ -940,6 +950,7 @@ def collect_ppo_episode(
                 )
             decisions += 1
         bootstrap_values = None
+        bootstrap_sample = None
         time_limit_truncated = (
             not terminated
             and (
@@ -954,7 +965,7 @@ def collect_ppo_episode(
             truncated = True
         if time_limit_truncated:
             rewards = {name: 0.0 for name in env.player_names}
-            bootstrap_values = _bootstrap_values(
+            bootstrap_values, bootstrap_sample = _bootstrap_values(
                 policy,
                 observations,
                 set(players),
@@ -1003,6 +1014,7 @@ def collect_ppo_episode(
             opponent_names=opponent_names,
             bootstrap_value=trajectory_bootstrap_value,
             truncated=bool(time_limit_truncated),
+            bootstrap_sample=bootstrap_sample,
         )
     finally:
         env.close()
@@ -1015,7 +1027,7 @@ def _bootstrap_values(
     *,
     env: ColonistMultiAgentEnv | None = None,
     info: dict[str, Any] | None = None,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], StepSample | None]:
     import torch
 
     values: dict[str, float] = {}
@@ -1025,7 +1037,7 @@ def _bootstrap_values(
         valid_actions = tuple(int(action) for action in info.get("valid_actions", ()))
         if current_player in players and current_player in observations and valid_actions:
             with torch.no_grad():
-                outputs, _entity, _legal_context = entity_outputs_from_env(
+                outputs, raw_entity_features, _legal_context = entity_outputs_from_env(
                     env,
                     info,
                     valid_actions,
@@ -1033,11 +1045,24 @@ def _bootstrap_values(
                 )
             value = outputs["value"].reshape(-1)[0]
             values[current_player] = float(value.item())
-            return values
+            entity_features = {
+                key: np.asarray(item).copy()
+                for key, item in raw_entity_features.items()
+                if key != "schema"
+            }
+            return values, StepSample(
+                observation=np.asarray(observations[current_player], dtype=np.float64).copy(),
+                valid_actions=valid_actions,
+                action=valid_actions[0],
+                player=current_player,
+                action_context_features=build_action_context_feature_table(env, info),
+                entity_features=entity_features,
+                phase=_phase_from_info(info),
+            )
 
     observation_tensor = getattr(policy, "_observation_tensor", None)
     if not callable(observation_tensor):
-        return values
+        return values, None
     with torch.no_grad():
         for player in players:
             if player not in observations:
@@ -1045,7 +1070,27 @@ def _bootstrap_values(
             obs = observation_tensor(observations[player])
             _, value = policy.forward(obs, None)
             values[player] = float(value.item())
-    return values
+    current_player = str((info or {}).get("current_player") or "")
+    valid_actions = tuple(int(action) for action in (info or {}).get("valid_actions", ()))
+    sample = None
+    if (
+        current_player in players
+        and current_player in observations
+        and valid_actions
+    ):
+        sample = StepSample(
+            observation=np.asarray(observations[current_player], dtype=np.float64).copy(),
+            valid_actions=valid_actions,
+            action=valid_actions[0],
+            player=current_player,
+            action_context_features=(
+                build_action_context_feature_table(env, info)
+                if env is not None and info is not None
+                else None
+            ),
+            phase=_phase_from_info(info or {}),
+        )
+    return values, sample
 
 
 def collect_dagger_episode(

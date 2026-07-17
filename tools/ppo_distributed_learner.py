@@ -40,6 +40,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 import numpy as np
@@ -865,6 +866,7 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
             "vtrace_bad_trajectories": 0.0,
             "vtrace_total_trajectories": 0.0,
             "vtrace_skipped": 0.0,
+            "vtrace_missing_current_bootstrap": 0.0,
         }
 
     # FIX 4: trajectories are read here — assert the actor-side alignment invariant up front.
@@ -881,6 +883,61 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
         forward_chunk=getattr(config, "vtrace_forward_chunk", 8192),
         behavior_temperature=getattr(config, "behavior_temperature", 1.0),
     )
+    current_bootstrap_values: dict[int, float] = {}
+    missing_current_bootstrap = 0
+    if config.vtrace_use_current_values:
+        truncated_trajectories = [
+            trajectory
+            for trajectory in non_empty
+            if bool(getattr(trajectory, "truncated", False))
+        ]
+        bootstrap_samples = [
+            getattr(trajectory, "bootstrap_sample", None)
+            for trajectory in truncated_trajectories
+        ]
+        missing_current_bootstrap = sum(
+            sample is None for sample in bootstrap_samples
+        )
+        if missing_current_bootstrap:
+            return {
+                "vtrace_steps": 0.0,
+                "vtrace_bad_trajectories": float(missing_current_bootstrap),
+                "vtrace_total_trajectories": float(total),
+                "vtrace_skipped": 1.0,
+                "vtrace_missing_current_bootstrap": float(
+                    missing_current_bootstrap
+                ),
+            }
+        if bootstrap_samples:
+            _, recomputed_bootstrap_values = (
+                _recompute_target_logp_and_values_batched(
+                    policy,
+                    [SimpleNamespace(samples=bootstrap_samples)],
+                    forward_chunk=getattr(config, "vtrace_forward_chunk", 8192),
+                    behavior_temperature=getattr(
+                        config, "behavior_temperature", 1.0
+                    ),
+                )
+            )
+            if (
+                len(recomputed_bootstrap_values) != len(truncated_trajectories)
+                or not np.isfinite(recomputed_bootstrap_values).all()
+            ):
+                return {
+                    "vtrace_steps": 0.0,
+                    "vtrace_bad_trajectories": float(len(truncated_trajectories)),
+                    "vtrace_total_trajectories": float(total),
+                    "vtrace_skipped": 1.0,
+                    "vtrace_missing_current_bootstrap": 0.0,
+                }
+            current_bootstrap_values = {
+                id(trajectory): float(value)
+                for trajectory, value in zip(
+                    truncated_trajectories,
+                    recomputed_bootstrap_values,
+                    strict=True,
+                )
+            }
 
     n_steps = 0
     n_bad = 0
@@ -917,7 +974,11 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
 
         # FIX 2: bootstrap on the seat's cutoff value for truncated games (0.0 for terminal).
         bootstrap_value = (
-            float(getattr(trajectory, "bootstrap_value", 0.0) or 0.0)
+            (
+                current_bootstrap_values[id(trajectory)]
+                if config.vtrace_use_current_values
+                else float(getattr(trajectory, "bootstrap_value", 0.0) or 0.0)
+            )
             if bool(getattr(trajectory, "truncated", False))
             else 0.0
         )
@@ -979,6 +1040,9 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
             "vtrace_bad_trajectories": float(n_bad),
             "vtrace_total_trajectories": float(total),
             "vtrace_skipped": 1.0,
+            "vtrace_missing_current_bootstrap": float(
+                missing_current_bootstrap
+            ),
         }
 
     for trajectory, vs_list, pg_list, target_logp_list, current_values_list in pending:
@@ -992,6 +1056,7 @@ def apply_vtrace_in_place(policy: Any, trajectories: list[Any], config: LearnerC
         "vtrace_bad_trajectories": float(n_bad),
         "vtrace_total_trajectories": float(total),
         "vtrace_skipped": 0.0,
+        "vtrace_missing_current_bootstrap": 0.0,
     }
 
 
