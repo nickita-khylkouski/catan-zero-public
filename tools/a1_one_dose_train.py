@@ -6640,16 +6640,21 @@ def build_train_command(
                 runtime_recipe=runtime_recipe,
             )
         )
+        # The binder deliberately returns the original mapping when a legacy
+        # or synthetic caller lacks the complete typed child authority.  Copy
+        # before mutating the caller-owned dictionary so that aliasing cannot
+        # clear the entire verified launch contract.
+        replacement = dict(verified_with_child_authority)
         verified.clear()
-        verified.update(verified_with_child_authority)
-        direct.extend(
-            [
-                "--a1-canonical-parent-update-authority-json",
-                _canonical_bytes(
-                    verified["canonical_parent_update_child_authority"]
-                ).decode("ascii"),
-            ]
-        )
+        verified.update(replacement)
+        child_authority = verified.get("canonical_parent_update_child_authority")
+        if isinstance(child_authority, dict):
+            direct.extend(
+                [
+                    "--a1-canonical-parent-update-authority-json",
+                    _canonical_bytes(child_authority).decode("ascii"),
+                ]
+            )
     command = _topologize_train_command(direct, world_size=world_size)
     _require_current_production_trainer_authority(verified, command=command)
     return command
