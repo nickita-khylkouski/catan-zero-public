@@ -1,7 +1,7 @@
 ---
 session: fix-bug-v7-training-contracts
 ts: 2026-07-17T18:16:52Z
-commit: 559db3f
+commit: 8ca12d1
 branch: codex/v7-value-signal-audit-20260717
 status: complete
 ---
@@ -66,7 +66,9 @@ verification:
     tests/test_train_bc_value_only_training.py tests/test_train_bc_value_lr_mult.py
     tests/test_train_bc_optimizer_observability.py
     tests/test_a1_current_science_contract.py tests/test_canonical_training_recipe.py
-  result: 157 passed after final race rebase; earlier combined V7 suite 173 passed
+  result: >-
+    157 passed after the integration race rebase; 173 passed in the combined
+    V7 suite; final commissioned-H100 contract suites 99 passed.
   h100: >-
     Bounded probe measured shared value-gradient ratios approximately 0.1,
     private value tower/head ratios 1.0, both V7 adapters frozen value-only,
