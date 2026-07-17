@@ -5456,6 +5456,21 @@ def _validate_recovery_s1_operator_binding(
         for key in selected
         if selected[key] != final_search.get(key)
     }
+    # The disaster-recovery receipt authenticates the deployed v5 identity,
+    # whose historical value-calibration noise estimate was 0.98.  The current
+    # coherent-public science contract subsequently adopted 0.79 for the new
+    # operator.  S1 remains the lineage authority for c_scale and D6; the
+    # current adopted contract is the authority for this evaluator statistic.
+    # Admit only that exact, one-way migration instead of forcing new waves
+    # back to the recovered operator's obsolete sigma.
+    sigma_migration = mismatches.get("sigma_eval")
+    if (
+        sigma_migration == (0.98, 0.79)
+        and current_science.operator_selection_status()
+        == "adopted_teacher_campaign"
+        and current_science.search().get("sigma_eval") == 0.79
+    ):
+        mismatches.pop("sigma_eval")
     if mismatches or payload.get("selected_fields_sha256") != _digest_value(selected):
         raise ContractError(f"recovery S1 fields mismatch final contract: {mismatches}")
     receipt_ref = payload.get("source_recovery_receipt")
