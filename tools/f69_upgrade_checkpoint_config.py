@@ -103,6 +103,7 @@ NEW_PARAM_PREFIXES = (
     "value_state_norm.",
     "public_rule_state_residual.",
     "v6_exact_resource_residual.",
+    "v6_initial_road_residual.",
 )
 
 

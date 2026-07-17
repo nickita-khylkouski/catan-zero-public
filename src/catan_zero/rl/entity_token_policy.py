@@ -618,6 +618,8 @@ class EntityGraphNet:
                     # residual; only the inherited encoder sees the legacy view.
                     self.v6_exact_resource_residual = nn.Linear(7, h, bias=False)
                     nn.init.zeros_(self.v6_exact_resource_residual.weight)
+                    self.v6_initial_road_residual = nn.Linear(1, h, bias=False)
+                    nn.init.zeros_(self.v6_initial_road_residual.weight)
                 self.public_card_count_features_enabled = bool(
                     getattr(cfg, "public_card_count_features", False)
                 )
@@ -1534,7 +1536,58 @@ class EntityGraphNet:
                     ),
                     dim=-1,
                 )
+                initial_road_residual = None
+                if self.v6_compatibility_preserving_inputs_enabled:
+                    target_ids = batch.get("legal_action_target_ids")
+                    edge_vertices = batch.get("edge_vertex_ids")
+                    if target_ids is None or edge_vertices is None:
+                        raise ValueError(
+                            "v6 compatibility-preserving inputs require action "
+                            "targets and edge topology"
+                        )
+                    context = batch["legal_action_context"].float()
+                    edge_ids = target_ids[..., 2].long()
+                    initial_road = (context[..., 12] > 0.5) & (edge_ids >= 0)
+                    safe_edges = edge_ids.clamp(min=0, max=edge_vertices.shape[1] - 1)
+                    endpoint_ids = torch.gather(
+                        edge_vertices.long(),
+                        1,
+                        safe_edges.unsqueeze(-1).expand(-1, -1, 2),
+                    )
+                    safe_vertices = endpoint_ids.clamp(
+                        min=0, max=batch["vertex_tokens"].shape[1] - 1
+                    )
+                    vertices = batch["vertex_tokens"].float()
+                    endpoint_tokens = torch.gather(
+                        vertices.unsqueeze(1).expand(
+                            -1, safe_vertices.shape[1], -1, -1
+                        ),
+                        2,
+                        safe_vertices.unsqueeze(-1).expand(-1, -1, -1, vertices.shape[-1]),
+                    )
+                    endpoint_live = endpoint_ids >= 0
+                    legacy_endpoint_score = torch.where(
+                        endpoint_live,
+                        endpoint_tokens[..., 6] * endpoint_tokens[..., 9],
+                        torch.zeros_like(endpoint_tokens[..., 9]),
+                    ).amax(dim=-1)
+                    legacy_context = context.clone()
+                    legacy_context[..., 16] = torch.where(
+                        initial_road,
+                        legacy_endpoint_score,
+                        context[..., 16],
+                    )
+                    action_features = torch.cat(
+                        (batch["legal_action_tokens"].float(), legacy_context), dim=-1
+                    )
+                    initial_road_residual = (
+                        context[..., 16:17] * initial_road.unsqueeze(-1).to(context.dtype)
+                    )
                 encoded_actions = self.action_encoder(action_features)
+                if initial_road_residual is not None:
+                    encoded_actions = encoded_actions + self.v6_initial_road_residual(
+                        initial_road_residual
+                    )
                 if self.static_action_residual_enabled:
                     static_features = batch.get("legal_action_static_features")
                     if static_features is None:
@@ -2618,6 +2671,7 @@ class EntityGraphPolicy:
             str(getattr(self.config, "state_trunk", "transformer")) != "transformer"
             or getattr(self.config, "action_target_gather", False)
             or getattr(self.config, "edge_policy_head", False)
+            or getattr(self.config, "v6_compatibility_preserving_inputs", False)
         )
         needs_event_targets = bool(
             getattr(
@@ -2630,6 +2684,8 @@ class EntityGraphPolicy:
             getattr(self.config, "state_trunk", "transformer")
         ) != "transformer" or bool(
             getattr(self.config, "topology_residual_adapter", False)
+        ) or bool(
+            getattr(self.config, "v6_compatibility_preserving_inputs", False)
         )
         needs_public_card_counts = bool(
             getattr(self.config, "public_card_count_features", False)
@@ -3282,6 +3338,7 @@ class EntityGraphPolicy:
             "meaningful_history_target_proj.",
             "public_rule_state_residual.",
             "v6_exact_resource_residual.",
+            "v6_initial_road_residual.",
         )
         if bool(allow_missing_optional_parameters):
             allowed_missing_prefixes += optional_warmstart_prefixes
@@ -3386,6 +3443,7 @@ def _assert_entity_batch_shapes(
         str(getattr(config, "state_trunk", "transformer")) != "transformer"
         or bool(getattr(config, "action_target_gather", False))
         or bool(getattr(config, "edge_policy_head", False))
+        or bool(getattr(config, "v6_compatibility_preserving_inputs", False))
     )
     if needs_action_targets:
         key = "legal_action_target_ids"
@@ -3478,6 +3536,8 @@ def _assert_entity_batch_shapes(
 
     if str(getattr(config, "state_trunk", "transformer")) != "transformer" or bool(
         getattr(config, "topology_residual_adapter", False)
+    ) or bool(
+        getattr(config, "v6_compatibility_preserving_inputs", False)
     ):
         topology_shapes = {
             "hex_vertex_ids": (batch_size, 19, 6),

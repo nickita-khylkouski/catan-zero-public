@@ -181,6 +181,57 @@ def test_split1_inference_cls_suffix_matches_loaded_full_block_parameters(
         )
 
 
+def test_v7_compatibility_route_preserves_legacy_initial_road_input():
+    """A corrected V6 road score must not overwrite the inherited input.
+
+    V5's action encoder learned an endpoint-production feature in context slot
+    16.  V6 repurposed that slot for a two-hop score.  The compatibility route
+    feeds the reconstructed V5 feature to the inherited encoder and exposes the
+    corrected score only through a new zero-initialized residual.
+    """
+    model = EntityGraphNet(
+        _config(v6_compatibility_preserving_inputs=True)
+    ).eval()
+    batch = _batch(batch_size=1, action_width=2)
+    batch.update(
+        {
+            "hex_vertex_ids": torch.zeros(1, 19, 6, dtype=torch.long),
+            "hex_edge_ids": torch.zeros(1, 19, 6, dtype=torch.long),
+            "edge_vertex_ids": -torch.ones(1, 72, 2, dtype=torch.long),
+            "event_target_ids": -torch.ones(1, 16, 4, dtype=torch.long),
+        }
+    )
+    batch["edge_vertex_ids"][0, 7] = torch.tensor((3, 11))
+    batch["legal_action_target_ids"][:, :, 2] = -1
+    batch["legal_action_target_ids"][0, 0, 2] = 7
+    batch["legal_action_context"].zero_()
+    batch["legal_action_context"][0, 0, 12] = 1.0  # initial-road row
+    batch["legal_action_context"][0, 0, 16] = 0.91  # V6 two-hop score
+    batch["vertex_tokens"].zero_()
+    batch["vertex_tokens"][0, 3, 6] = 1.0
+    batch["vertex_tokens"][0, 3, 9] = 0.25
+    batch["vertex_tokens"][0, 11, 6] = 1.0
+    batch["vertex_tokens"][0, 11, 9] = 0.75
+
+    seen: list[torch.Tensor] = []
+    hook = model.action_encoder.register_forward_pre_hook(
+        lambda _module, args: seen.append(args[0].detach().clone())
+    )
+    try:
+        with torch.no_grad():
+            model(batch)
+    finally:
+        hook.remove()
+
+    assert len(seen) == 1
+    legacy_context_offset = LEGAL_ACTION_FEATURE_SIZE + 16
+    # max(endpoint unoccupied * pips) = max(.25, .75), not V6's .91.
+    assert seen[0][0, 0, legacy_context_offset].item() == pytest.approx(0.75)
+    # Non-initial-road actions retain their old context feature unchanged.
+    assert seen[0][0, 1, legacy_context_offset].item() == pytest.approx(0.0)
+    assert torch.count_nonzero(model.v6_initial_road_residual.weight) == 0
+
+
 @pytest.mark.parametrize(
     ("split_layers", "value_attention_pool", "training", "expect_cls_only"),
     (
