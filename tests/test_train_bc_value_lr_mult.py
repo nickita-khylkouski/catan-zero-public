@@ -28,11 +28,13 @@ def _make_entity_policy(
     public_card_count_residual_bias: bool = True,
     public_rule_state_features: bool = False,
     legal_set_stats: bool = False,
+    v6_compatibility_preserving_inputs: bool = False,
 ):
     from catan_zero.rl.entity_token_policy import EntityGraphPolicy
     from catan_zero.rl.entity_feature_adapter import (
         CURRENT_RUST_ENTITY_ADAPTER_VERSION,
         RUST_ENTITY_ADAPTER_V4,
+        RUST_ENTITY_ADAPTER_V6,
     )
     from catan_zero.rl.self_play import make_env_config
 
@@ -52,12 +54,15 @@ def _make_entity_policy(
         or public_card_count_features
         or public_rule_state_features
         or legal_set_stats
+        or v6_compatibility_preserving_inputs
     ):
         config = replace(
             policy.config,
             value_categorical_bins=int(categorical_bins),
             action_target_gather=bool(action_local),
-            action_cross_attention_layers=2 if action_local else 0,
+            action_cross_attention_layers=(
+                2 if action_local else 1 if v6_compatibility_preserving_inputs else 0
+            ),
             edge_policy_head=bool(edge_policy_head),
             value_attention_pool=bool(value_attention_pool),
             value_tower_split_layers=int(value_tower_split_layers),
@@ -67,15 +72,22 @@ def _make_entity_policy(
             static_action_residual=bool(legal_set_stats),
             legal_action_value_residual=bool(legal_set_stats),
             legal_action_value_set_statistics=bool(legal_set_stats),
+            v6_compatibility_preserving_inputs=bool(
+                v6_compatibility_preserving_inputs
+            ),
         )
         policy = EntityGraphPolicy(
             config,
             policy.static_action_features.detach().cpu().numpy(),
             device="cpu",
             entity_feature_adapter_version=(
-                RUST_ENTITY_ADAPTER_V4
-                if public_rule_state_features
-                else CURRENT_RUST_ENTITY_ADAPTER_VERSION
+                RUST_ENTITY_ADAPTER_V6
+                if v6_compatibility_preserving_inputs
+                else (
+                    RUST_ENTITY_ADAPTER_V4
+                    if public_rule_state_features
+                    else CURRENT_RUST_ENTITY_ADAPTER_VERSION
+                )
             ),
         )
     return policy
@@ -330,6 +342,27 @@ def test_trunk_lr_multiplier_changes_only_canonical_entity_graph_trunk() -> None
     expected = [id(p) for p in policy.model.parameters() if p.requires_grad]
     assert len(assigned) == len(set(assigned))
     assert set(assigned) == set(expected)
+
+
+def test_v7_exact_resource_residual_stays_at_commissioning_lr() -> None:
+    policy = _make_entity_policy(v6_compatibility_preserving_inputs=True)
+    groups = _build_optimizer_param_groups(
+        policy.model,
+        base_lr=2e-4,
+        value_lr_mult=1.0,
+        trunk_lr_mult=0.1,
+        architecture="entity_graph",
+    )
+
+    by_name = {group["_group_name"]: group for group in groups}
+    residual_ids = {
+        id(parameter)
+        for parameter in policy.model.v6_exact_resource_residual.parameters()
+    }
+    assert residual_ids <= {id(parameter) for parameter in by_name["base"]["params"]}
+    assert residual_ids.isdisjoint(
+        {id(parameter) for parameter in by_name["trunk"]["params"]}
+    )
 
 
 def test_shared_action_multiplier_is_independent_of_trunk_and_new_action_modules() -> (

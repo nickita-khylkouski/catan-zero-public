@@ -140,6 +140,20 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # allowlists for explicitly versioned v6 checkpoints; the legacy
         # missing-metadata v2 adapter path remains numerically unchanged.
         "sha256:99e56f7bd3916b1c18a425f3c0f39dff6b5e274bf3fdc81944205d32fd53fff1",
+        # V7 adds only the config-gated, zero-output exact-resource residual
+        # path. Legacy checkpoints resolve the flag false and therefore retain
+        # the reviewed topology-disabled Transformer function exactly.
+        "sha256:60f49b48fa550f36ad709cbaaf041d632370ad8bf6a9f9e3c5ce0f6f37de7758",
+        # The complete V7 input migration also adds the config-gated,
+        # zero-output initial-road residual. Both compatibility paths are off
+        # for legacy checkpoints, so the reviewed topology-disabled function
+        # remains identical after the second adapter landed.
+        "sha256:ebfaac6c97ac6e9d0f3960814e40d648a43e51c5e1e2e68be42ffb096d2c7e84",
+        # V7's final bit-exact inherited-input reconstruction and action
+        # decoder remain behind the same absent/false legacy config flags.
+        # The default topology-disabled path is therefore still the reviewed
+        # legacy function even though its guarded AST surface changed again.
+        "sha256:c2f9dd663839489263447263a0b01deb247aa3067cb1958e35465ffd73d6b473",
         # The legacy v2 tokenizer produces a different identity for the same
         # source across supported Python f-string tokenization modes. Schema v3
         # uses a stable AST surface, but both reviewed v2 spellings remain.

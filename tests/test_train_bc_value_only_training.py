@@ -102,6 +102,7 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
     }
     assert "value_head" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["value_heads"]
     assert "public_rule_state_residual" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
+    assert "v6_exact_resource_residual" in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
     assert (
         "v6_exact_resource_residual"
         in ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS["trunk"]
@@ -123,6 +124,37 @@ def test_freeze_module_groups_cover_expected_submodules() -> None:
         "static_action_residual",
         "v7_initial_road_residual",
     }
+
+
+def test_value_only_freezes_v7_input_migration_policy_adapters() -> None:
+    from dataclasses import replace
+
+    from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V6
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+
+    incumbent = _make_entity_policy()
+    policy = EntityGraphPolicy(
+        replace(
+            incumbent.config,
+            v6_compatibility_preserving_inputs=True,
+            action_cross_attention_layers=1,
+        ),
+        incumbent.static_action_features.detach().cpu().numpy(),
+        device="cpu",
+        entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6,
+    )
+
+    _set_entity_graph_modules_trainable(
+        policy.model,
+        ENTITY_GRAPH_VALUE_ONLY_FREEZE_GROUPS,
+        trainable=False,
+    )
+
+    for module in (
+        policy.model.v6_exact_resource_residual,
+        policy.model.v6_initial_road_residual,
+    ):
+        assert all(not parameter.requires_grad for parameter in module.parameters())
 
 
 def test_set_entity_graph_modules_trainable_freezes_and_restores() -> None:

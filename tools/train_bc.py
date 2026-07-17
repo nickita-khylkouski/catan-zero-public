@@ -37500,6 +37500,16 @@ def _build_optimizer_param_groups(
                 "upgrade with the v2/v3 bias-free receipt."
             )
     public_card_param_ids = {id(p) for p in public_card_params}
+    # V7's exact-resource adapter belongs to the trunk *freeze* surface because
+    # it changes the shared representation consumed by policy and value.  It is
+    # nevertheless a fresh, zero-output residual and must commission at base LR
+    # while --trunk-lr-mult protects the inherited trunk.  Keep it in the base
+    # group just as the dedicated public-card group overrides the mature-trunk
+    # multiplier below.
+    commissioning_adapter_param_ids = {
+        id(parameter)
+        for parameter in _params_under(("v6_exact_resource_residual",))
+    }
     trunk_params = (
         [
             parameter
@@ -37510,7 +37520,8 @@ def _build_optimizer_param_groups(
             # surface, but its dedicated LR control is explicitly independent
             # from the mature trunk. When both controls are active, the
             # narrower public-card group owns these parameters.
-            if id(parameter) not in public_card_param_ids
+            if id(parameter)
+            not in public_card_param_ids | commissioning_adapter_param_ids
         ]
         if float(trunk_lr_mult) != 1.0
         else []
