@@ -132,12 +132,10 @@ def test_parent_update_recipe_reproduces_split1_full_step48() -> None:
     assert fields["lr_schedule"] == "flat"
     assert fields["lr_warmup_steps"] == 16
     assert fields["validation_fraction"] == 0.125
-    assert fields["validation_game_seed_ranges"] == (
-        "96000000000:96000000007,96000010000:96000010007,"
-        "96000020000:96000020007,96000030000:96000030007,"
-        "96000040000:96000040007,96000050000:96000050007,"
-        "96000060000:96000060007,96000070000:96000070007"
-    )
+    # The parent-update recipe accepts arbitrary authenticated coherent corpora;
+    # validation is the deterministic game-level 12.5% split above, not stale
+    # seed ranges from one historical wave.
+    assert fields["validation_game_seed_ranges"] == ""
     assert fields["validation_max_samples"] == 0
     assert fields["minimum_policy_effective_rows_per_global_batch"] == 0.0
     assert fields["value_trunk_grad_scale"] == 1.0

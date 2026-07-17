@@ -19,7 +19,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-35m-b200": {
-      "recipe_canonical_sha256": "ada85baa252882011c93614cd5fabea5211442e4769a1255d37f92862682a137",
+      "recipe_canonical_sha256": "4da048c7c470ef1b53cc8836b66821f8fcb777711b77ee2be241a8b68620b180",
       "authorized": false,
       "reason": "parent_update_training_signal_contract_unresolved",
       "unresolved_requirements": [

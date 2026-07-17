@@ -149,7 +149,7 @@
       "trunk_lr_mult": 1.0,
       "validation_contract_file_sha256": "",
       "validation_fraction": 0.125,
-      "validation_game_seed_ranges": "96000000000:96000000007,96000010000:96000010007,96000020000:96000020007,96000030000:96000030007,96000040000:96000040007,96000050000:96000050007,96000060000:96000060007,96000070000:96000070007",
+      "validation_game_seed_ranges": "",
       "validation_game_seed_set_sha256": "",
       "validation_max_samples": 0,
       "validation_seed": 17,
