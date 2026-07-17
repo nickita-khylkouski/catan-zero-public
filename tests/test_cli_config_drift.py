@@ -86,16 +86,6 @@ ARGPARSE_CLI_DEFAULT_OVERRIDES: dict[str, dict[str, object]] = {
     },
 }
 
-# Modal factory exposes its parameters as @app.local_entrypoint function kwargs,
-# not argparse; the defaults live in the function signatures.
-ENTRYPOINT_CLIS: dict[str, dict] = {
-    "modal_gumbel_factory.py": {
-        "funcs": ("launch_gumbel_pilot", "launch_gumbel_gen"),
-        "configs": (GumbelSelfPlayConfig, GumbelChanceMCTSConfig),
-    },
-}
-
-
 def _dataclass_defaults(cls: type) -> dict[str, object]:
     out: dict[str, object] = {}
     for field in dataclasses.fields(cls):
@@ -166,25 +156,6 @@ def _parse_argparse_defaults(path: Path) -> dict[str, object]:
                 if value is not _MISSING:
                     defaults[field] = value
     return defaults
-
-
-def _parse_entrypoint_defaults(path: Path, func_names: tuple[str, ...]) -> dict[str, dict[str, object]]:
-    tree = ast.parse(path.read_text(), filename=str(path))
-    wanted = set(func_names)
-    out: dict[str, dict[str, object]] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef) or node.name not in wanted:
-            continue
-        params = node.args.args
-        defaults = node.args.defaults  # align to the tail of params
-        offset = len(params) - len(defaults)
-        collected: dict[str, object] = {}
-        for i, default_node in enumerate(defaults):
-            value = _literal(default_node)
-            if value is not _MISSING:
-                collected[params[offset + i].arg] = value
-        out[node.name] = collected
-    return out
 
 
 def _same(a: object, b: object) -> bool:
@@ -264,19 +235,6 @@ def test_raw_selfplay_keeps_teacher_and_stored_row_adapter_roles_separate() -> N
     )
     assert defaults["public_observation"] is True
     assert defaults["meaningful_public_history"] is True
-
-
-def test_modal_entrypoint_defaults_match_dataclasses() -> None:
-    problems: list[str] = []
-    for filename, spec in ENTRYPOINT_CLIS.items():
-        path = TOOLS_DIR / filename
-        assert path.exists(), f"expected CLI missing: {path}"
-        truth = _merged_defaults(spec["configs"])
-        per_func = _parse_entrypoint_defaults(path, spec["funcs"])
-        for func in spec["funcs"]:
-            assert func in per_func, f"{filename}: entrypoint {func} not found"
-            problems.extend(_mismatches(f"{filename}::{func}", per_func[func], truth))
-    assert not problems, "config-default drift detected:\n" + "\n".join(problems)
 
 
 def test_temperature_decisions_coupling_holds() -> None:

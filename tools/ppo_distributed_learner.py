@@ -1,6 +1,6 @@
 """GPU LEARNER for distributed PPO (the actor-learner split's learner half).
 
-The Modal actor fleet (``tools/modal_ppo_factory.py``) plays games with the latest
+The actor fleet plays games with the latest
 *published* weights and writes pickled trajectory shards into a shared run directory; this
 process is the single GPU learner that:
 

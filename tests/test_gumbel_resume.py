@@ -1,10 +1,7 @@
-"""Unit tests for the Modal GPU factory's incremental-resume fix.
+"""Unit tests for generation's incremental-resume behavior.
 
 No Modal SDK, no CUDA, no compiled `catanatron_rs` Rust engine is required:
 
-- `resolve_part_resume_action` (tools/gumbel_factory_resume.py) is pure
-  stdlib logic, deliberately split out of `modal_gumbel_factory_gpu.py` (which
-  pulls in `modal` at import time) so it can be exercised directly here.
 - `run_worker_games`'s incremental-resume bookkeeping is exercised end to end
   by monkeypatching `play_one_game` (so no Rust engine is needed) and
   `_require_rust_module` (so `GumbelChanceMCTS.__init__` doesn't need the
@@ -35,7 +32,6 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 from catan_zero.rl import gumbel_self_play as gsp  # noqa: E402
 from catan_zero.search import gumbel_chance_mcts as gcm  # noqa: E402
 from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig  # noqa: E402
-from gumbel_factory_resume import resolve_part_resume_action  # noqa: E402
 
 DECISIONS_PER_GAME = 4
 SHARD_SIZE = DECISIONS_PER_GAME  # exactly one shard flushed per completed game
@@ -1432,106 +1428,6 @@ def test_seed_formula_is_independent_of_resume(tmp_path, monkeypatch):
         resume_semantics_sha256=RESUME_SEMANTICS_SHA256,
     )
 
-
-# --------------------------------------------------------------------------
-# Factory-level resume/wipe/hard-error decision (tools/gumbel_factory_resume.py)
-# --------------------------------------------------------------------------
-
-
-def _touch(path: Path, content: str = "x") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-
-
-def test_resolve_part_resume_action_fresh_part(tmp_path):
-    part_dir = tmp_path / "part_00000"
-    action, complete = resolve_part_resume_action(
-        part_dir=part_dir,
-        manifest_path=part_dir / "manifest.json",
-        marker_path=part_dir / ".run_id",
-        run_id="run-A",
-        resume=False,
-    )
-    assert action == "fresh"
-    assert complete is None
-
-
-def test_resolve_part_resume_action_returns_complete_manifest(tmp_path):
-    part_dir = tmp_path / "part_00000"
-    manifest_path = part_dir / "manifest.json"
-    _touch(manifest_path, json.dumps({"run_id": "run-A", "games_completed": 500}))
-    action, complete = resolve_part_resume_action(
-        part_dir=part_dir,
-        manifest_path=manifest_path,
-        marker_path=part_dir / ".run_id",
-        run_id="run-A",
-        resume=False,
-    )
-    assert action == "return_complete"
-    assert complete == {"run_id": "run-A", "games_completed": 500}
-
-
-def test_resolve_part_resume_action_same_run_id_preemption_is_incremental_resume(
-    tmp_path,
-):
-    """The core bug fix: a same-run_id retry on an INCOMPLETE part must
-    request incremental resume, never wipe."""
-    part_dir = tmp_path / "part_00000"
-    marker_path = part_dir / ".run_id"
-    _touch(marker_path, "run-A")
-    _touch(part_dir / "gumbel_self_play_shard_00000.npz", "fake-shard-bytes")
-
-    action, complete = resolve_part_resume_action(
-        part_dir=part_dir,
-        manifest_path=part_dir / "manifest.json",  # doesn't exist: incomplete
-        marker_path=marker_path,
-        run_id="run-A",
-        resume=False,
-    )
-    assert action == "incremental_resume"
-    assert complete is None
-    # Nothing must have been deleted.
-    assert marker_path.exists()
-    assert (part_dir / "gumbel_self_play_shard_00000.npz").exists()
-
-
-def test_resolve_part_resume_action_different_run_id_hard_errors(tmp_path):
-    """The duplicate-launch guard (seed-collision incident) must be untouched."""
-    part_dir = tmp_path / "part_00000"
-    marker_path = part_dir / ".run_id"
-    _touch(marker_path, "run-OLD")
-    _touch(part_dir / "gumbel_self_play_shard_00000.npz", "fake-shard-bytes")
-
-    with pytest.raises(RuntimeError, match="different run_id"):
-        resolve_part_resume_action(
-            part_dir=part_dir,
-            manifest_path=part_dir / "manifest.json",
-            marker_path=marker_path,
-            run_id="run-NEW",
-            resume=False,
-        )
-
-
-def test_resolve_part_resume_action_explicit_resume_wipes_foreign_incomplete_part(
-    tmp_path,
-):
-    """Operator-explicit resume=True on a DIFFERENT run_id's incomplete part
-    is still a deliberate wipe-and-restart (unchanged, distinct from the
-    automatic same-run_id incremental-resume path)."""
-    part_dir = tmp_path / "part_00000"
-    marker_path = part_dir / ".run_id"
-    _touch(marker_path, "run-OLD")
-    _touch(part_dir / "gumbel_self_play_shard_00000.npz", "fake-shard-bytes")
-
-    action, complete = resolve_part_resume_action(
-        part_dir=part_dir,
-        manifest_path=part_dir / "manifest.json",
-        marker_path=marker_path,
-        run_id="run-NEW",
-        resume=True,
-    )
-    assert action == "wipe_and_restart"
-    assert complete is None
 
 
 if __name__ == "__main__":

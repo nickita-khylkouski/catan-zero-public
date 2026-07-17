@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CAT-129 explicit local/cluster acceptance — the mandatory pre/post-deploy
 # (CAT-130) check, and consolidator's Wave-2 re-gate. Exit 0 IFF ALL stages pass:
-#   suite  — full pytest suite green (GPU tests self-skip; CAT-94 concat + modal
+#   suite  — full pytest suite green (GPU tests self-skip; CAT-94 concat is
 #            collection-quarantined via conftest.py). This is the comprehensive
 #            check; parity + CLI goldens are part of it.
 #   parity — featurizer parity 19/19 (rust_featurize + action_context + symmetry),
@@ -34,8 +34,7 @@ export PYTHONPATH="$REPO/src"
 
 ONLY="${2:-all}"; [ "${1:-}" = "--only" ] && ONLY="${2:?--only needs a stage}" || ONLY="all"
 
-QUARANTINE=(--ignore=tests/test_concat_memmap_corpus.py
-            --ignore=tests/test_modal_gumbel_factory_legacy_guard.py)
+QUARANTINE=(--ignore=tests/test_concat_memmap_corpus.py)
 PARITY=(tests/test_rust_featurize_parity.py
         tests/test_rust_action_context_parity.py
         tests/test_rust_symmetry_averaging_parity.py)

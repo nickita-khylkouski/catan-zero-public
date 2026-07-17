@@ -2105,9 +2105,16 @@ def test_reviewed_public_card_one_dose_renders_exact_eight_b200_command(
         "_current_ablation_code_binding",
         lambda _lock: {"code_tree_sha256": code_sha, "records": []},
     )
-    overrides_path = (
-        Path(executor.__file__).resolve().parents[1]
-        / "configs/experiments/next_wave/one_dose_public_card_overrides.json"
+    overrides_json = json.dumps(
+        {
+            "forced_action_weight": 0.0,
+            "forced_row_value_action_type_weights": "END_TURN=1,ROLL=1",
+            "forced_row_value_weight": 1.0,
+            "max_steps": 128,
+            "per_game_policy_surprise_weighting": True,
+            "public_card_lr_mult": 4.0,
+            "value_loss_weight": 0.25,
+        }
     )
 
     upgraded = executor.bind_function_preserving_upgrade(
@@ -2116,7 +2123,7 @@ def test_reviewed_public_card_one_dose_renders_exact_eight_b200_command(
     arm = executor.bind_learner_ablation(
         upgraded,
         ablation_id="coherent-public-card-count-v2",
-        overrides_json=overrides_path.read_text(encoding="utf-8"),
+        overrides_json=overrides_json,
         reviewed_code_tree_sha256=code_sha,
     )
     arm = executor.bind_diagnostic_training_descriptor(

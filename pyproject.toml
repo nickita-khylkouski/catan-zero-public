@@ -22,12 +22,6 @@ catan-zero = "catan_zero.production_cli:main"
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "whr>=2.2", "scipy>=1.11"]
 rl = ["torch>=2.0"]
-# RUN-6: modal is pinned in its own extra ONLY for the legacy CPU-factory guard
-# test (tools/modal_gumbel_factory.py). It is NOT needed for training, generation,
-# gates, or the GPU factory (modal_gumbel_factory_gpu.py). The guard test uses
-# pytest.importorskip("modal"), so it skips cleanly when this extra is absent;
-# install `.[modal]` only to exercise that one test.
-modal = ["modal>=0.62"]
 # Optional: filesystem-mode MLflow gate-run logging (tools/mlflow_gate_logging.py).
 # The logger is fail-open, so this is not required to run gates.
 eval = ["mlflow>=2.0"]

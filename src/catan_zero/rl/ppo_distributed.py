@@ -1,7 +1,6 @@
-"""Distributed-PPO backbone: the on-disk contract shared by the Modal actors and the
-GPU learner.
+"""Distributed-PPO backbone: the on-disk actor/learner contract.
 
-The actor fleet (``tools/modal_ppo_factory.py``) and the learner
+An actor fleet and the learner
 (``tools/ppo_distributed_learner.py``) never talk directly — they coordinate ONLY through a
 shared run directory (a Modal volume path, or any shared filesystem):
 

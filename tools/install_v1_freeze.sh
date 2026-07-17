@@ -353,7 +353,7 @@ python -m pip install --quiet --upgrade pip
 # 4. deps in the order that keeps the CUDA torch build:
 #    torch (cu128) FIRST so the `rl` extra's torch>=2.0 is already satisfied and
 #    pip never swaps in a CPU wheel; then the editable project + dev/rl extras;
-#    then the local rust wheel (the one dep pip cannot resolve from PyPI); + modal.
+#    then the local rust wheel (the one dep pip cannot resolve from PyPI).
 python -m pip install -c "$RUNTIME_CONSTRAINTS" \
   "torch==$RUNTIME_TORCH_VERSION" --index-url "$TORCH_INDEX"
 python -m pip install -c "$RUNTIME_CONSTRAINTS" \
@@ -369,7 +369,6 @@ python -m pip install -c "$RUNTIME_CONSTRAINTS" \
 python -m pip install -c "$RUNTIME_CONSTRAINTS" -e vendor/catanatron
 python -m pip install -c "$RUNTIME_CONSTRAINTS" -e '.[dev,rl]'
 python -m pip install --force-reinstall --no-deps "$CATAN_RS_WHEEL"
-python -m pip install modal
 
 # 5. env-doctor — fail LOUD if the canonical stack is incomplete
 python - <<'PY'
@@ -378,7 +377,7 @@ from importlib.metadata import version, PackageNotFoundError
 from tools.production_runtime_contract import load_runtime_contract
 
 expected = load_runtime_contract()
-mods = ("torch","scipy","whr","numpy","networkx","gymnasium","zstandard","catanatron_rs","modal","pytest")
+mods = ("torch","scipy","whr","numpy","networkx","gymnasium","zstandard","catanatron_rs","pytest")
 missing = []
 for m in mods:
     try: importlib.import_module(m)
