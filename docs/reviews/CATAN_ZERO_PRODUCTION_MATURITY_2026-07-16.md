@@ -103,7 +103,6 @@ The underlying complexity is still severe. Current inventory:
 - 910 Python files, including 270 under `tools/`;
 - 3,643 literal `add_argument` calls across 238 tools;
 - 39,776 lines in `tools/train_bc.py`;
-- 5,591 lines in `tools/gcp_fleet_controller.py`;
 - 2,192 lines in `tools/train_ppo.py`;
 - 2,274 lines in the production generation executor;
 - 162 broad `except Exception` handlers in `src/` and `tools/`.
