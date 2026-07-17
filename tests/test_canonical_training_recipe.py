@@ -82,9 +82,11 @@ def test_canonical_memmap_binds_authenticated_validation_manifest(tmp_path) -> N
     (corpus / "corpus_meta.json").write_text(
         json.dumps(
             {
-                "selected_game_seed_manifest": {
-                    "path": str(manifest),
-                    "file_sha256": digest,
+                "a1_post_wave_audit": {
+                    "validation_holdout": {
+                        "path": str(manifest),
+                        "file_sha256": digest,
+                    }
                 }
             }
         ),
@@ -102,9 +104,11 @@ def test_canonical_memmap_rejects_changed_validation_manifest(tmp_path) -> None:
     (corpus / "corpus_meta.json").write_text(
         json.dumps(
             {
-                "selected_game_seed_manifest": {
-                    "path": str(manifest),
-                    "file_sha256": "sha256:" + ("0" * 64),
+                "a1_post_wave_audit": {
+                    "validation_holdout": {
+                        "path": str(manifest),
+                        "file_sha256": "sha256:" + ("0" * 64),
+                    }
                 }
             }
         ),

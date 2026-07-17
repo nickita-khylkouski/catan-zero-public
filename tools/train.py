@@ -543,11 +543,13 @@ def _sha256(path: Path) -> str:
 def _validation_manifest_from_memmap(raw_data: str | Path) -> str:
     """Bind the exact validation split already authenticated by a memmap.
 
-    The corpus builder records the immutable selected-game manifest and its
-    file digest in ``corpus_meta.json``.  Canonical training must consume that
-    exact sidecar; leaving the internal flag blank makes every valid A1 corpus
-    fail preflight, while recomputing a fractional split would change the
-    experiment.  Non-directory/composite inputs retain their existing routing.
+    The corpus builder records the immutable validation-only manifest and its
+    file digest under the audited holdout in ``corpus_meta.json``. Canonical
+    training must consume that exact sidecar; the broader selected-game
+    envelope is a different schema and cannot substitute for it. Leaving the
+    internal flag blank makes every valid A1 corpus fail preflight, while
+    recomputing a fractional split would change the experiment.
+    Non-directory/composite inputs retain their existing routing.
     """
 
     raw_path = Path(raw_data).expanduser()
@@ -562,13 +564,16 @@ def _validation_manifest_from_memmap(raw_data: str | Path) -> str:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise SystemExit(f"invalid memmap corpus metadata {meta_path}: {error}") from error
-    selected = meta.get("selected_game_seed_manifest")
-    if selected is None:
+    audit = meta.get("a1_post_wave_audit")
+    if audit is None:
         return ""
-    if not isinstance(selected, Mapping):
-        raise SystemExit("memmap selected_game_seed_manifest must be an object")
-    path_raw = selected.get("path")
-    digest = selected.get("file_sha256")
+    if not isinstance(audit, Mapping):
+        raise SystemExit("memmap a1_post_wave_audit must be an object")
+    validation = audit.get("validation_holdout")
+    if not isinstance(validation, Mapping):
+        raise SystemExit("memmap audit lacks an authenticated validation holdout")
+    path_raw = validation.get("path")
+    digest = validation.get("file_sha256")
     if not isinstance(path_raw, str) or not path_raw:
         raise SystemExit("memmap selected-game manifest path is missing")
     if not isinstance(digest, str) or not digest.startswith("sha256:"):
