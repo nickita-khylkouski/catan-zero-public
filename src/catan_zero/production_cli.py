@@ -1275,6 +1275,12 @@ def _execute_claimed(
     receipt["command_returncode"] = returncode
     if returncode == 0:
         try:
+            input_errors = _verify_plan_artifacts(plan)
+            if input_errors:
+                raise ProductionCLIError(
+                    "production inputs changed during execution: "
+                    + "; ".join(input_errors)
+                )
             receipt["outputs"] = _admit_required_outputs(plan)
         except Exception as error:  # noqa: BLE001 - malformed outputs must fail closed.
             returncode = 1

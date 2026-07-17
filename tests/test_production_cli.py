@@ -842,6 +842,31 @@ def test_success_requires_and_hashes_pipeline_outputs(
         assert output["size_bytes"] == path.stat().st_size
 
 
+def test_zero_exit_with_input_mutation_is_failed_before_output_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = cli.build_plan(_write_job(tmp_path, "generate"))
+    monkeypatch.setattr(cli, "doctor", lambda _plan: {"ok": True, "errors": []})
+
+    def mutate_input_then_exit(_command, **_kwargs):
+        Path(plan["inputs"]["checkpoint"]["path"]).write_bytes(b"mutated")
+        _write_admissible_outputs(plan)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(cli.subprocess, "run", mutate_input_then_exit)
+
+    assert cli.execute(plan) == 1
+    receipt = json.loads(Path(plan["run_receipt"]).read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    assert receipt["command_returncode"] == 0
+    assert receipt["returncode"] == 1
+    assert "production inputs changed during execution" in receipt[
+        "output_admission_error"
+    ]
+    assert "input checkpoint drift" in receipt["output_admission_error"]
+    assert "outputs" not in receipt
+
+
 def test_zero_exit_generation_refuses_a_missing_manifest_shard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
