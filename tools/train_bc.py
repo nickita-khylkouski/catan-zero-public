@@ -1297,6 +1297,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--minimum-maritime-trade-policy-objective-mass-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Optional minimum fraction of the realized policy objective's target "
+            "probability assigned to legal MARITIME_TRADE actions. Unlike selected-"
+            "action frequency, this follows the exact effective soft teacher. The "
+            "initial implementation is intentionally restricted to complete pure-"
+            "policy fallback-v2 targets with no advantage reweighting or policy-AUX "
+            "stream. Omission is a strict legacy no-op."
+        ),
+    )
+    parser.add_argument(
         "--training-rng-rank-offset",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -10099,6 +10112,11 @@ def _bind_late_a1_recipe_fields(
         "minimum_move_robber_policy_mass_fraction": getattr(
             args, "minimum_move_robber_policy_mass_fraction", None
         ),
+        "minimum_maritime_trade_policy_objective_mass_fraction": getattr(
+            args,
+            "minimum_maritime_trade_policy_objective_mass_fraction",
+            None,
+        ),
     }
     for key, value in late_bound_values.items():
         if key in expected:
@@ -17090,6 +17108,15 @@ def main(
         }
     else:
         raise SystemExit(f"unsupported --base-sampler {base_sampler!r}")
+    policy_objective_measure = (
+        "weighted_replacement_draw_probability_x_policy_loss_weight_v1"
+        if epoch_sample_weights is not None
+        else (
+            "uniform_coverage_row_probability_x_policy_loss_weight_v1"
+            if base_sampler == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1
+            else "uniform_replacement_row_probability_x_policy_loss_weight_v1"
+        )
+    )
     hard_decision_policy_mass_minima = _hard_decision_policy_mass_minima(args)
     policy_phase_objective_mass_admission = _rank0_authoritative_call(
         ddp,
@@ -17104,20 +17131,55 @@ def main(
                 else None
             ),
             minimum_phase_mass_fractions=hard_decision_policy_mass_minima,
-            objective_measure=(
-                "weighted_replacement_draw_probability_x_policy_loss_weight_v1"
-                if epoch_sample_weights is not None
-                else (
-                    "uniform_coverage_row_probability_x_policy_loss_weight_v1"
-                    if base_sampler == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1
-                    else "uniform_replacement_row_probability_x_policy_loss_weight_v1"
-                )
-            ),
+            objective_measure=policy_objective_measure,
         ),
     )
     base_sampler_report["policy_phase_objective_mass_admission"] = dict(
         policy_phase_objective_mass_admission
     )
+    maritime_target_mass_floor = getattr(
+        args,
+        "minimum_maritime_trade_policy_objective_mass_fraction",
+        None,
+    )
+    policy_action_type_target_mass_admission = None
+    if maritime_target_mass_floor is not None:
+        policy_action_type_target_mass_admission = _rank0_authoritative_call(
+            ddp,
+            "maritime-trade policy target-mass admission",
+            lambda: _policy_action_type_target_mass_admission(
+                data,
+                train_indices,
+                policy_sample_weights=training_policy_sample_weights,
+                sampling_weights=(
+                    epoch_sample_weights
+                    if base_sampler == BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1
+                    else None
+                ),
+                action_types_by_id=value_validation_action_types_by_id,
+                target_action_type="MARITIME_TRADE",
+                minimum_target_mass_fraction=float(maritime_target_mass_floor),
+                soft_target_temperature=float(args.soft_target_temperature),
+                soft_target_source=str(args.soft_target_source),
+                soft_target_min_legal_coverage=float(
+                    args.soft_target_min_legal_coverage
+                ),
+                soft_target_weight=float(args.soft_target_weight),
+                policy_target_blend_semantics=str(
+                    args.policy_target_blend_semantics
+                ),
+                advantage_policy_weighting=str(
+                    args.advantage_policy_weighting
+                ),
+                policy_aux_active_batch_size=int(
+                    args.policy_aux_active_batch_size
+                ),
+                objective_measure=policy_objective_measure,
+            ),
+        )
+        base_sampler_report["policy_action_type_target_mass_admission"] = dict(
+            policy_action_type_target_mass_admission
+        )
     policy_aux_sampling_weights = None
     policy_aux_validation_sampling_weights = None
     policy_aux_preconditioning_weights = None
@@ -17523,6 +17585,15 @@ def main(
                 "base_sampler": base_sampler_report,
                 "policy_phase_objective_mass_admission": (
                     policy_phase_objective_mass_admission
+                ),
+                **(
+                    {
+                        "policy_action_type_target_mass_admission": (
+                            policy_action_type_target_mass_admission
+                        )
+                    }
+                    if policy_action_type_target_mass_admission is not None
+                    else {}
                 ),
             },
             sort_keys=True,
@@ -21507,6 +21578,15 @@ def main(
         "base_sampler": base_sampler_report,
         "policy_phase_objective_mass_admission": (
             policy_phase_objective_mass_admission
+        ),
+        **(
+            {
+                "policy_action_type_target_mass_admission": (
+                    policy_action_type_target_mass_admission
+                )
+            }
+            if policy_action_type_target_mass_admission is not None
+            else {}
         ),
         "first_batch_profile": first_batch_profile,
         # Backward-compatible headline: ``parameter_count`` remains the TOTAL
@@ -40629,6 +40709,370 @@ def _policy_phase_objective_mass_admission(
     return report
 
 
+def _policy_action_type_target_mass_admission(
+    data,
+    train_indices: np.ndarray,
+    *,
+    policy_sample_weights: np.ndarray,
+    sampling_weights: np.ndarray | None,
+    action_types_by_id: Sequence[str],
+    target_action_type: str,
+    minimum_target_mass_fraction: float,
+    soft_target_temperature: float,
+    soft_target_source: str,
+    soft_target_min_legal_coverage: float,
+    soft_target_weight: float,
+    policy_target_blend_semantics: str,
+    advantage_policy_weighting: str,
+    policy_aux_active_batch_size: int,
+    objective_measure: str,
+    chunk_rows: int = 262_144,
+) -> dict[str, object]:
+    """Measure positive action-type supervision in the exact policy objective.
+
+    A row coefficient alone cannot attribute policy mass inside a mixed-action
+    phase such as ``PLAY_TURN``. The played ``action_taken`` is also not the
+    teacher under pure search-policy distillation. This admission therefore
+    multiplies the final row/draw coefficient by the effective teacher
+    probability on legal actions of ``target_action_type``.
+
+    The first version deliberately supports only the current scratch contract.
+    Dynamic advantage weighting and the independently normalized policy-AUX
+    stream would change the realized measure after this preflight and must gain
+    their own versioned accounting before they can use this floor.
+    """
+
+    minimum = float(minimum_target_mass_fraction)
+    if not math.isfinite(minimum) or not 0.0 < minimum <= 1.0:
+        raise SystemExit(
+            "action-type policy target-mass minimum must be a finite fraction "
+            "in (0, 1]"
+        )
+    required_contract = {
+        "policy_target_blend_semantics": POLICY_TARGET_BLEND_FALLBACK_V2,
+        "soft_target_source": "policy",
+        "soft_target_weight": 1.0,
+        "soft_target_min_legal_coverage": 1.0,
+        "advantage_policy_weighting": "none",
+        "policy_aux_active_batch_size": 0,
+    }
+    observed_contract = {
+        "policy_target_blend_semantics": str(policy_target_blend_semantics),
+        "soft_target_source": str(soft_target_source),
+        "soft_target_weight": float(soft_target_weight),
+        "soft_target_min_legal_coverage": float(
+            soft_target_min_legal_coverage
+        ),
+        "advantage_policy_weighting": str(advantage_policy_weighting),
+        "policy_aux_active_batch_size": int(policy_aux_active_batch_size),
+    }
+    drift = {
+        key: {"required": required, "observed": observed_contract[key]}
+        for key, required in required_contract.items()
+        if observed_contract[key] != required
+    }
+    if drift:
+        raise SystemExit(
+            "action-type policy target-mass admission requires the exact pure "
+            "complete-policy scratch contract: "
+            + json.dumps(drift, sort_keys=True)
+        )
+    temperature = float(soft_target_temperature)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise SystemExit(
+            "action-type policy target-mass admission requires a finite positive "
+            "soft-target temperature"
+        )
+
+    rows = np.asarray(train_indices, dtype=np.int64)
+    weights = np.asarray(policy_sample_weights)
+    if rows.ndim != 1 or rows.size == 0:
+        raise ValueError("action-type policy target-mass admission requires training rows")
+    if (
+        weights.ndim != 1
+        or np.any(rows < 0)
+        or np.any(rows >= weights.size)
+    ):
+        raise ValueError("action-type policy target-mass weight alignment drift")
+    if "legal_action_ids" not in data or "action_taken" not in data:
+        raise SystemExit(
+            "action-type policy target-mass admission requires legal_action_ids "
+            "and action_taken"
+        )
+
+    action_types = tuple(str(value).upper() for value in action_types_by_id)
+    target_type = str(target_action_type).upper()
+    if not action_types or target_type not in set(action_types):
+        raise SystemExit(
+            "action-type policy target-mass admission received an invalid "
+            f"ActionCatalog projection for {target_type!r}"
+        )
+    type_lookup = np.asarray(action_types, dtype="<U48")
+
+    component_lookup = getattr(data, "component_indices_for_rows", None)
+    component_ids = tuple(
+        str(value) for value in getattr(data, "component_ids", tuple())
+    )
+    authenticated_components = bool(component_ids) and callable(component_lookup)
+    if authenticated_components and len(set(component_ids)) != len(component_ids):
+        raise SystemExit(
+            "action-type policy target-mass admission received duplicate "
+            "authenticated component ids"
+        )
+    component_total_mass = np.zeros(len(component_ids), dtype=np.float64)
+    component_target_mass = np.zeros(len(component_ids), dtype=np.float64)
+
+    draw_weights = None
+    if sampling_weights is not None:
+        draw_weights = np.asarray(sampling_weights, dtype=np.float64)
+        if (
+            draw_weights.shape != rows.shape
+            or not np.isfinite(draw_weights).all()
+            or np.any(draw_weights < 0.0)
+            or float(draw_weights.sum()) <= 0.0
+        ):
+            raise ValueError(
+                "action-type policy target-mass sampling measure is invalid"
+            )
+        draw_weights = draw_weights / float(draw_weights.sum())
+
+    total_objective_mass = 0.0
+    target_objective_mass = 0.0
+    policy_active_rows = 0
+    target_legal_rows = 0
+    target_positive_rows = 0
+    selected_target_rows = 0
+    block_size = max(1, int(chunk_rows))
+    for start in range(0, rows.size, block_size):
+        stop = min(start + block_size, rows.size)
+        block = rows[start:stop]
+        coefficients = np.asarray(weights[block], dtype=np.float64)
+        if not np.isfinite(coefficients).all() or np.any(coefficients < 0.0):
+            raise ValueError(
+                "action-type policy target-mass weights must be finite and "
+                "non-negative"
+            )
+        if draw_weights is not None:
+            coefficients = coefficients * draw_weights[start:stop]
+        active = coefficients > 0.0
+        policy_active_rows += int(np.count_nonzero(active))
+        if not np.any(active):
+            continue
+
+        legal = np.asarray(data["legal_action_ids"][block], dtype=np.int64)
+        if legal.ndim != 2 or legal.shape[0] != block.size:
+            raise SystemExit(
+                "action-type policy target-mass legal-action payload is malformed"
+            )
+        legal_mask = legal >= 0
+        invalid_legal = legal_mask & (legal >= len(action_types))
+        if np.any(active[:, None] & invalid_legal):
+            raise SystemExit(
+                "action-type policy target-mass legal id is outside the active "
+                "ActionCatalog"
+            )
+        # Inactive rows do not contribute to this objective, but the vectorized
+        # lookup still spans the full chunk. Clamp their malformed ids so only
+        # positive-objective rows participate in fail-closed validation.
+        safe_legal = np.where(legal_mask & ~invalid_legal, legal, 0)
+        target_columns = legal_mask & (type_lookup[safe_legal] == target_type)
+
+        payload = _soft_target_array(
+            data,
+            block,
+            temperature,
+            str(soft_target_source),
+        )
+        if payload is None:
+            raise SystemExit(
+                "action-type policy target-mass admission found positive policy "
+                "rows without a soft teacher"
+            )
+        targets, support = payload
+        targets = np.asarray(targets, dtype=np.float64)
+        support = np.asarray(support, dtype=np.bool_)
+        if targets.shape != legal.shape or support.shape != legal.shape:
+            raise SystemExit(
+                "action-type policy target-mass teacher payload is malformed"
+            )
+        has_soft = _has_distillation_distribution(
+            targets,
+            support,
+            legal_action_ids=legal,
+            min_legal_coverage=float(soft_target_min_legal_coverage),
+        )
+        if np.any(active & ~has_soft):
+            source_rows = block[np.flatnonzero(active & ~has_soft)]
+            raise SystemExit(
+                "action-type policy target-mass admission refuses hard-action "
+                "fallback on positive policy rows: "
+                f"{source_rows[:16].tolist()}"
+            )
+        normalized_mass = np.sum(
+            np.where(support & legal_mask, targets, 0.0),
+            axis=1,
+            dtype=np.float64,
+        )
+        if (
+            np.any(~np.isfinite(targets[active]))
+            or np.any(targets[active] < 0.0)
+            or not np.allclose(
+                normalized_mass[active], 1.0, rtol=1.0e-5, atol=1.0e-6
+            )
+        ):
+            raise SystemExit(
+                "action-type policy target-mass teacher is non-finite, negative, "
+                "or unnormalized"
+            )
+        per_row_target_mass = np.sum(
+            np.where(target_columns & support, targets, 0.0),
+            axis=1,
+            dtype=np.float64,
+        )
+        if np.any(
+            active
+            & (
+                ~np.isfinite(per_row_target_mass)
+                | (per_row_target_mass < -1.0e-8)
+                | (per_row_target_mass > 1.0 + 1.0e-6)
+            )
+        ):
+            raise SystemExit(
+                "action-type policy target-mass contribution is outside [0, 1]"
+            )
+
+        actions = np.asarray(data["action_taken"][block], dtype=np.int64)
+        if (
+            actions.shape != (block.size,)
+            or np.any(active & ((actions < 0) | (actions >= len(action_types))))
+        ):
+            raise SystemExit(
+                "action-type policy target-mass selected action is outside the "
+                "active ActionCatalog"
+            )
+        active_legal = legal[active]
+        active_actions = actions[active]
+        selected_columns = _target_columns(active_legal, active_actions)
+        selected_types = type_lookup[
+            active_legal[np.arange(active_legal.shape[0]), selected_columns]
+        ]
+        if authenticated_components:
+            block_components = np.asarray(
+                component_lookup(block), dtype=np.int64
+            )
+            if (
+                block_components.shape != (block.size,)
+                or np.any(block_components < 0)
+                or np.any(block_components >= len(component_ids))
+            ):
+                raise SystemExit(
+                    "action-type policy target-mass authenticated component "
+                    "row mapping drifted"
+                )
+            np.add.at(
+                component_total_mass,
+                block_components[active],
+                coefficients[active],
+            )
+            np.add.at(
+                component_target_mass,
+                block_components[active],
+                coefficients[active] * per_row_target_mass[active],
+            )
+
+        total_objective_mass += float(
+            np.sum(coefficients[active], dtype=np.float64)
+        )
+        target_objective_mass += float(
+            np.dot(coefficients[active], per_row_target_mass[active])
+        )
+        target_legal_rows += int(
+            np.count_nonzero(active & np.any(target_columns, axis=1))
+        )
+        target_positive_rows += int(
+            np.count_nonzero(active & (per_row_target_mass > 0.0))
+        )
+        selected_target_rows += int(
+            np.count_nonzero(selected_types == target_type)
+        )
+
+    if not math.isfinite(total_objective_mass) or total_objective_mass <= 0.0:
+        raise SystemExit(
+            "action-type policy target-mass admission found zero policy objective mass"
+        )
+    fraction = target_objective_mass / total_objective_mass
+    aggregate_admitted = bool(fraction >= minimum)
+    per_component: dict[str, dict[str, object]] = {}
+    component_admitted = True
+    if authenticated_components:
+        for index, component_id in enumerate(component_ids):
+            component_total = float(component_total_mass[index])
+            component_target = float(component_target_mass[index])
+            if not math.isfinite(component_total) or component_total <= 0.0:
+                component_fraction = None
+                accepted = False
+                reason = "zero_policy_objective_mass"
+            else:
+                component_fraction = component_target / component_total
+                accepted = bool(component_fraction >= minimum)
+                reason = (
+                    "reviewed_minimum_satisfied"
+                    if accepted
+                    else "target_action_policy_objective_mass_below_reviewed_minimum"
+                )
+            component_admitted = component_admitted and accepted
+            per_component[component_id] = {
+                "total_policy_objective_mass": component_total,
+                "target_action_policy_objective_mass": component_target,
+                "target_action_policy_objective_mass_fraction": component_fraction,
+                "admitted": accepted,
+                "reason": reason,
+            }
+    admitted = aggregate_admitted and component_admitted
+    report: dict[str, object] = {
+        "schema_version": "policy-action-type-target-mass-admission-v1",
+        "target_action_type": target_type,
+        "objective_measure": str(objective_measure),
+        "training_row_count": int(rows.size),
+        "policy_active_row_count": int(policy_active_rows),
+        "target_action_legal_row_count": int(target_legal_rows),
+        "target_action_positive_teacher_row_count": int(target_positive_rows),
+        "selected_target_action_row_count_diagnostic": int(selected_target_rows),
+        "total_policy_objective_mass": float(total_objective_mass),
+        "target_action_policy_objective_mass": float(target_objective_mass),
+        "target_action_policy_objective_mass_fraction": float(fraction),
+        "minimum_target_action_policy_objective_mass_fraction": minimum,
+        "authenticated_composite_components_enforced": authenticated_components,
+        "per_component": per_component,
+        "effective_target_contract": observed_contract,
+        "admission_enforced": True,
+        "admitted": admitted,
+        "reason": (
+            "reviewed_minimum_satisfied"
+            if admitted
+            else "target_action_policy_objective_mass_below_reviewed_minimum"
+        ),
+    }
+    report["identity_sha256"] = _canonical_json_sha256(report)
+    if not admitted:
+        failed_components = [
+            component_id
+            for component_id, component_report in per_component.items()
+            if not bool(component_report["admitted"])
+        ]
+        component_detail = (
+            f"; failed_components={failed_components}"
+            if failed_components
+            else ""
+        )
+        raise SystemExit(
+            "action-type policy target-mass admission refused before the first "
+            f"optimizer step: {target_type}={fraction:.6g}, "
+            f"minimum={minimum:.6g}{component_detail}"
+        )
+    return report
+
+
 def _compose_per_game_policy_surprise_sampling_weights(
     data,
     train_indices: np.ndarray,
@@ -43032,6 +43476,17 @@ def _training_resume_recipe_identity(
                 "sampler_seed": _resolved_sampler_seed(args),
                 "sampler_seed_explicit": True,
             }
+        )
+    maritime_target_mass_floor = getattr(
+        args,
+        "minimum_maritime_trade_policy_objective_mass_fraction",
+        None,
+    )
+    if maritime_target_mass_floor is not None:
+        # Omission is deliberately absent from the identity so historical
+        # recipes and resumable checkpoints retain byte-for-byte semantics.
+        identity["minimum_maritime_trade_policy_objective_mass_fraction"] = (
+            float(maritime_target_mass_floor)
         )
     return identity
 

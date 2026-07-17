@@ -217,6 +217,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     ):
         assert command.count(flag) == 1
         assert command[command.index(flag) + 1] == "0.02"
+    assert "--minimum-maritime-trade-policy-objective-mass-fraction" not in command
     assert command[command.index("--moe-balance-loss-weight") + 1] == "0.0"
     assert "--init-checkpoint" not in command
     assert "--grow-from-checkpoint" not in command
@@ -328,6 +329,34 @@ def test_scratch_command_emits_optional_forced_value_mass_ceiling(
 
     flag = "--maximum-nominal-forced-scalar-value-mass-fraction"
     assert command[command.index(flag) + 1] == "0.4"
+
+
+def test_scratch_command_forwards_optional_maritime_target_mass_floor(
+    tmp_path: Path,
+) -> None:
+    verified, _, _ = _authority_fixture(tmp_path)
+    verified["recipe"][
+        "minimum_maritime_trade_policy_objective_mass_fraction"
+    ] = 0.08
+
+    command = scratch.build_train_command(
+        verified,
+        python=Path("/usr/bin/python3"),
+        checkpoint=tmp_path / "model.pt",
+        report=tmp_path / "report.json",
+    )
+
+    flag = "--minimum-maritime-trade-policy-objective-mass-fraction"
+    assert command.count(flag) == 1
+    assert command[command.index(flag) + 1] == "0.08"
+    trainer_index = command.index(str(verified["trainer_authority"]["path"]))
+    parsed = train_bc.build_parser().parse_args(command[trainer_index + 1 :])
+    effective = train_bc._effective_a1_scratch_training_recipe(  # noqa: SLF001
+        parsed,
+        {"enabled": True, "world_size": 8, "rank": 0, "local_rank": 0},
+        verified["recipe"],
+    )
+    assert effective == verified["recipe"]
 
 
 def test_scratch_command_cannot_emit_trust_without_quality_admission(

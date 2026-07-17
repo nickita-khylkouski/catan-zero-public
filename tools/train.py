@@ -120,6 +120,7 @@ _CANONICAL_RUNTIME_DEFAULTS: dict[str, Any] = {
     "ddp_find_unused_parameters": False,
     "float32_matmul_precision": None,
     "require_strict_35m_teacher": False,
+    "minimum_maritime_trade_policy_objective_mass_fraction": None,
     "skip_guards": False,
     "config": None,
     "dump_config": None,

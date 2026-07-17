@@ -10,12 +10,37 @@ from tools.train_bc import (
     _coverage_importance_weights,
     _coverage_policy_signal_admission,
     _epoch_order,
+    _policy_action_type_target_mass_admission,
     _policy_phase_objective_mass_admission,
     compute_policy_surprise_kl,
     per_game_capped_policy_surprise_sampling_weights,
     per_game_policy_surprise_sampling_report,
     policy_surprise_sampling_weights,
 )
+
+
+def _maritime_target_mass_admission(data, **overrides):
+    kwargs = {
+        "policy_sample_weights": np.ones(len(data["action_taken"]), dtype=np.float64),
+        "sampling_weights": None,
+        "action_types_by_id": ("END_TURN", "MARITIME_TRADE", "BUILD_ROAD"),
+        "target_action_type": "MARITIME_TRADE",
+        "minimum_target_mass_fraction": 0.01,
+        "soft_target_temperature": 1.0,
+        "soft_target_source": "policy",
+        "soft_target_min_legal_coverage": 1.0,
+        "soft_target_weight": 1.0,
+        "policy_target_blend_semantics": "policy_target_fallback_v2",
+        "advantage_policy_weighting": "none",
+        "policy_aux_active_batch_size": 0,
+        "objective_measure": "synthetic_exact_policy_objective",
+    }
+    kwargs.update(overrides)
+    return _policy_action_type_target_mass_admission(
+        data,
+        np.arange(len(data["action_taken"]), dtype=np.int64),
+        **kwargs,
+    )
 
 
 def _base_data(**overrides):
@@ -517,6 +542,164 @@ def test_hard_decision_phase_mass_accepts_minima_and_binds_identity() -> None:
     assert all(
         report["per_phase"][phase]["admitted"] is True for phase in minima
     )
+
+
+def test_maritime_target_mass_uses_final_row_and_draw_measure() -> None:
+    data = {
+        "legal_action_ids": np.asarray([[0, 1], [0, 1]], dtype=np.int16),
+        "target_policy": np.asarray([[0.8, 0.2], [0.2, 0.8]], dtype=np.float32),
+        "target_policy_mask": np.ones((2, 2), dtype=np.bool_),
+        "action_taken": np.asarray([0, 0], dtype=np.int64),
+    }
+
+    report = _maritime_target_mass_admission(
+        data,
+        policy_sample_weights=np.asarray([2.0, 1.0], dtype=np.float64),
+        sampling_weights=np.asarray([3.0, 1.0], dtype=np.float64),
+        minimum_target_mass_fraction=0.28,
+    )
+
+    # Effective row coefficients are 2*(3/4) and 1*(1/4). Maritime mass is
+    # therefore (1.5*0.2 + 0.25*0.8) / 1.75 = 2/7.
+    assert report["target_action_policy_objective_mass_fraction"] == pytest.approx(
+        2.0 / 7.0
+    )
+    assert report["selected_target_action_row_count_diagnostic"] == 0
+    assert report["admitted"] is True
+    assert report["identity_sha256"].startswith("sha256:")
+
+
+def test_maritime_target_mass_does_not_use_exploration_action_taken() -> None:
+    selected_maritime_zero_target = {
+        "legal_action_ids": np.asarray([[0, 1]], dtype=np.int16),
+        "target_policy": np.asarray([[1.0, 0.0]], dtype=np.float32),
+        "target_policy_mask": np.ones((1, 2), dtype=np.bool_),
+        "action_taken": np.asarray([1], dtype=np.int64),
+    }
+    with pytest.raises(
+        SystemExit,
+        match="refused before the first optimizer step",
+    ):
+        _maritime_target_mass_admission(selected_maritime_zero_target)
+
+    selected_non_maritime_positive_target = {
+        **selected_maritime_zero_target,
+        "target_policy": np.asarray([[0.7, 0.3]], dtype=np.float32),
+        "action_taken": np.asarray([0], dtype=np.int64),
+    }
+    report = _maritime_target_mass_admission(
+        selected_non_maritime_positive_target,
+        minimum_target_mass_fraction=0.25,
+    )
+    assert report["target_action_policy_objective_mass_fraction"] == pytest.approx(
+        0.3
+    )
+    assert report["selected_target_action_row_count_diagnostic"] == 0
+
+
+def test_maritime_target_mass_rejects_action_catalog_drift() -> None:
+    data = {
+        "legal_action_ids": np.asarray([[0, 99]], dtype=np.int16),
+        "target_policy": np.asarray([[0.5, 0.5]], dtype=np.float32),
+        "target_policy_mask": np.ones((1, 2), dtype=np.bool_),
+        "action_taken": np.asarray([0], dtype=np.int64),
+    }
+
+    with pytest.raises(SystemExit, match="outside the active ActionCatalog"):
+        _maritime_target_mass_admission(data)
+
+
+def test_maritime_target_mass_rejects_missing_effective_soft_target() -> None:
+    data = {
+        "legal_action_ids": np.asarray([[0, 1]], dtype=np.int16),
+        "target_policy": np.zeros((1, 2), dtype=np.float32),
+        "target_policy_mask": np.ones((1, 2), dtype=np.bool_),
+        "action_taken": np.asarray([1], dtype=np.int64),
+    }
+
+    with pytest.raises(SystemExit, match="without a soft teacher"):
+        _maritime_target_mass_admission(data)
+
+
+class _SyntheticComposite(dict):
+    component_ids = ("current", "replay")
+
+    def component_indices_for_rows(self, rows):
+        return np.asarray(rows, dtype=np.int64) // 2
+
+
+def test_maritime_target_mass_reports_each_authenticated_component() -> None:
+    data = _SyntheticComposite(
+        legal_action_ids=np.asarray([[0, 1]] * 4, dtype=np.int16),
+        target_policy=np.asarray(
+            [[0.9, 0.1], [0.7, 0.3], [0.8, 0.2], [0.4, 0.6]],
+            dtype=np.float32,
+        ),
+        target_policy_mask=np.ones((4, 2), dtype=np.bool_),
+        action_taken=np.zeros(4, dtype=np.int64),
+    )
+
+    report = _maritime_target_mass_admission(
+        data,
+        policy_sample_weights=np.asarray([1.0, 3.0, 2.0, 1.0]),
+        minimum_target_mass_fraction=0.19,
+    )
+
+    assert report["authenticated_composite_components_enforced"] is True
+    assert report["per_component"]["current"][
+        "target_action_policy_objective_mass_fraction"
+    ] == pytest.approx(0.25)
+    assert report["per_component"]["replay"][
+        "target_action_policy_objective_mass_fraction"
+    ] == pytest.approx(1.0 / 3.0)
+    assert all(
+        component["admitted"] for component in report["per_component"].values()
+    )
+
+
+def test_maritime_target_mass_rejects_starved_authenticated_component() -> None:
+    data = _SyntheticComposite(
+        legal_action_ids=np.asarray([[0, 1]] * 4, dtype=np.int16),
+        target_policy=np.asarray(
+            [[0.8, 0.2], [0.8, 0.2], [0.95, 0.05], [0.95, 0.05]],
+            dtype=np.float32,
+        ),
+        target_policy_mask=np.ones((4, 2), dtype=np.bool_),
+        action_taken=np.zeros(4, dtype=np.int64),
+    )
+
+    with pytest.raises(SystemExit, match=r"failed_components=\['replay'\]"):
+        _maritime_target_mass_admission(
+            data,
+            policy_sample_weights=np.asarray([10.0, 10.0, 1.0, 1.0]),
+            minimum_target_mass_fraction=0.1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "value"),
+    [
+        ("policy_target_blend_semantics", "legacy_convex_v1"),
+        ("soft_target_source", "prefer_policy"),
+        ("soft_target_weight", 0.5),
+        ("soft_target_min_legal_coverage", 0.9),
+        ("advantage_policy_weighting", "signed"),
+        ("policy_aux_active_batch_size", 32),
+    ],
+)
+def test_maritime_target_mass_rejects_unaccounted_objective_contracts(
+    override: str,
+    value,
+) -> None:
+    data = {
+        "legal_action_ids": np.asarray([[0, 1]], dtype=np.int16),
+        "target_policy": np.asarray([[0.5, 0.5]], dtype=np.float32),
+        "target_policy_mask": np.ones((1, 2), dtype=np.bool_),
+        "action_taken": np.asarray([0], dtype=np.int64),
+    }
+
+    with pytest.raises(SystemExit, match="exact pure complete-policy scratch contract"):
+        _maritime_target_mass_admission(data, **{override: value})
 
 
 def test_coverage_permutation_visits_every_row_once() -> None:

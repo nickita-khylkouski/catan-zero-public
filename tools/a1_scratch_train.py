@@ -780,6 +780,15 @@ def build_train_command(
     for key, flag in hard_decision_mass_fields:
         if key in recipe:
             _add(command, flag, recipe[key])
+    maritime_target_mass_floor = recipe.get(
+        "minimum_maritime_trade_policy_objective_mass_fraction"
+    )
+    if maritime_target_mass_floor is not None:
+        _add(
+            command,
+            "--minimum-maritime-trade-policy-objective-mass-fraction",
+            maritime_target_mass_floor,
+        )
     maximum_forced_value_mass = recipe.get(
         "maximum_nominal_forced_scalar_value_mass_fraction"
     )

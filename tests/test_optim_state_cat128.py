@@ -540,6 +540,7 @@ def _resume_identity_args(**overrides):
         "minimum_initial_road_policy_mass_fraction": None,
         "minimum_discard_policy_mass_fraction": None,
         "minimum_move_robber_policy_mass_fraction": None,
+        "minimum_maritime_trade_policy_objective_mass_fraction": None,
         "entity_feature_adapter_version": None,
         "public_rule_state_features": False,
         "value_tower_split_layers": 0,
@@ -573,6 +574,7 @@ def _resume_identity_args(**overrides):
         ("minimum_initial_road_policy_mass_fraction", 0.01),
         ("minimum_discard_policy_mass_fraction", 0.01),
         ("minimum_move_robber_policy_mass_fraction", 0.01),
+        ("minimum_maritime_trade_policy_objective_mass_fraction", 0.08),
         (
             "entity_feature_adapter_version",
             "rust_entity_adapter_v5_meaningful_history_v2",
