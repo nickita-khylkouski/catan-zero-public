@@ -15,6 +15,7 @@ if str(_TOOLS) not in sys.path:
     sys.path.insert(0, str(_TOOLS))
 
 from train_bc import (  # type: ignore  # noqa: E402
+    A1_ARCHIVAL_LEARNER_CODE_OMISSIONS_BY_CONTRACT_SHA256,
     A1_REQUIRED_LEARNER_CODE_SUFFIXES,
     A1_REQUIRED_RUNTIME_CODE_SUFFIXES,
     _canonical_json_sha256,
@@ -29,6 +30,7 @@ from train_bc import (  # type: ignore  # noqa: E402
     _validate_a1_decisive_training_semantics,
     _validate_a1_learner_objective,
     _validate_a1_learner_training_recipe,
+    _validate_a1_required_code_coverage,
     _validate_a1_validation_manifest_corpus_binding,
     split_train_validation_indices,
 )
@@ -38,6 +40,60 @@ from a1_pre_wave_contract import (  # type: ignore  # noqa: E402
 
 
 _CONTRACT_SHA = "sha256:" + "a" * 64
+_ARCHIVAL_CONTRACT_SHA = (
+    "sha256:3a9abbf3cca3d22e074bf74d7842ca9615e1d764b5f37d8dc10a6521de565295"
+)
+
+
+def test_exact_archival_contract_may_bind_feature_admission_in_runtime_only() -> None:
+    omitted = "tools/a1_feature_signal_admission.py"
+    learner_paths = [
+        f"/sealed/{suffix}"
+        for suffix in A1_REQUIRED_LEARNER_CODE_SUFFIXES
+        if suffix != omitted
+    ]
+    runtime_paths = [
+        f"/sealed/{suffix}" for suffix in A1_REQUIRED_RUNTIME_CODE_SUFFIXES
+    ]
+
+    assert A1_ARCHIVAL_LEARNER_CODE_OMISSIONS_BY_CONTRACT_SHA256 == {
+        _ARCHIVAL_CONTRACT_SHA: frozenset({omitted})
+    }
+    _validate_a1_required_code_coverage(
+        contract_sha256=_ARCHIVAL_CONTRACT_SHA,
+        learner_paths=learner_paths,
+        runtime_paths=runtime_paths,
+    )
+
+
+def test_archival_learner_omission_is_fail_closed() -> None:
+    omitted = "tools/a1_feature_signal_admission.py"
+    learner_paths = [
+        f"/sealed/{suffix}"
+        for suffix in A1_REQUIRED_LEARNER_CODE_SUFFIXES
+        if suffix != omitted
+    ]
+    complete_runtime_paths = [
+        f"/sealed/{suffix}" for suffix in A1_REQUIRED_RUNTIME_CODE_SUFFIXES
+    ]
+
+    with pytest.raises(SystemExit, match="required learner implementation"):
+        _validate_a1_required_code_coverage(
+            contract_sha256="sha256:" + "f" * 64,
+            learner_paths=learner_paths,
+            runtime_paths=complete_runtime_paths,
+        )
+
+    with pytest.raises(SystemExit, match="authenticated runtime tree"):
+        _validate_a1_required_code_coverage(
+            contract_sha256=_ARCHIVAL_CONTRACT_SHA,
+            learner_paths=learner_paths,
+            runtime_paths=[
+                path
+                for path in complete_runtime_paths
+                if not path.endswith(omitted)
+            ],
+        )
 
 
 def test_validation_contract_identity_binds_metric_and_excluded_game_sets() -> None:

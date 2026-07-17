@@ -342,6 +342,17 @@ A1_REQUIRED_LEARNER_CODE_SUFFIXES = {
     "src/catan_zero/rl/optim_state.py",
     "src/catan_zero/rl/torch_ppo.py",
 }
+# This immutable pre-feature-admission lock sealed the implementation in its
+# transitive runtime tree, but did not duplicate the later
+# a1_feature_signal_admission module in its narrower learner-code list.  The
+# semantic contract digest makes this a one-artifact compatibility rule, not a
+# schema-wide relaxation.  New locks still have to bind every required learner
+# file directly.
+A1_ARCHIVAL_LEARNER_CODE_OMISSIONS_BY_CONTRACT_SHA256 = {
+    "sha256:3a9abbf3cca3d22e074bf74d7842ca9615e1d764b5f37d8dc10a6521de565295": frozenset(
+        {"tools/a1_feature_signal_admission.py"}
+    ),
+}
 A1_REQUIRED_RUNTIME_CODE_SUFFIXES = (
     A1_REQUIRED_LEARNER_CODE_SUFFIXES
     | {
@@ -357,6 +368,53 @@ A1_REQUIRED_RUNTIME_CODE_SUFFIXES = (
         "src/catan_zero/search/rust_mcts.py",
     }
 )
+
+
+def _validate_a1_required_code_coverage(
+    *,
+    contract_sha256: str,
+    learner_paths: list[str],
+    runtime_paths: list[str],
+) -> None:
+    missing_learner_code = {
+        suffix
+        for suffix in A1_REQUIRED_LEARNER_CODE_SUFFIXES
+        if not any(path.endswith(suffix) for path in learner_paths)
+    }
+    archival_omissions = (
+        A1_ARCHIVAL_LEARNER_CODE_OMISSIONS_BY_CONTRACT_SHA256.get(
+            contract_sha256, frozenset()
+        )
+    )
+    unauthorized_missing_learner_code = missing_learner_code - archival_omissions
+    if unauthorized_missing_learner_code:
+        raise SystemExit(
+            "A1 contract omits required learner implementation files: "
+            f"{sorted(unauthorized_missing_learner_code)}"
+        )
+    # An archival learner-list omission is admissible only when the exact same
+    # lock still authenticates that implementation in its transitive runtime
+    # tree.  Its file hash is checked before this coverage check.
+    unbound_archival_omissions = {
+        suffix
+        for suffix in missing_learner_code & archival_omissions
+        if not any(path.endswith(suffix) for path in runtime_paths)
+    }
+    if unbound_archival_omissions:
+        raise SystemExit(
+            "A1 archival learner omission is absent from the authenticated "
+            f"runtime tree: {sorted(unbound_archival_omissions)}"
+        )
+    missing_runtime_code = {
+        suffix
+        for suffix in A1_REQUIRED_RUNTIME_CODE_SUFFIXES
+        if not any(path.endswith(suffix) for path in runtime_paths)
+    }
+    if missing_runtime_code:
+        raise SystemExit(
+            "A1 contract omits required transitive runtime files: "
+            f"{sorted(missing_runtime_code)}"
+        )
 
 DUAL_ARM_SELECTED_GAMES_SCHEMA = "a1-dual-arm-selected-training-games-v1"
 A1_POST_WAVE_AUDIT_SCHEMAS = {
@@ -9326,16 +9384,6 @@ def _validate_a1_corpus_artifacts_and_seeds(
                 f"{code_path} declared={record['sha256']!r} actual={actual_code_sha!r}"
             )
         learner_paths.append(code_path.as_posix())
-    missing_learner_code = {
-        suffix
-        for suffix in A1_REQUIRED_LEARNER_CODE_SUFFIXES
-        if not any(path.endswith(suffix) for path in learner_paths)
-    }
-    if missing_learner_code:
-        raise SystemExit(
-            "A1 contract omits required learner implementation files: "
-            f"{sorted(missing_learner_code)}"
-        )
     runtime_code_tree = provenance.get("runtime_code_tree")
     if not isinstance(runtime_code_tree, list) or not runtime_code_tree:
         raise SystemExit("A1 contract lock does not bind the transitive runtime tree")
@@ -9370,16 +9418,11 @@ def _validate_a1_corpus_artifacts_and_seeds(
                 f"actual={actual_runtime_sha!r}"
             )
         runtime_paths.append(runtime_path.as_posix())
-    missing_runtime_code = {
-        suffix
-        for suffix in A1_REQUIRED_RUNTIME_CODE_SUFFIXES
-        if not any(path.endswith(suffix) for path in runtime_paths)
-    }
-    if missing_runtime_code:
-        raise SystemExit(
-            "A1 contract omits required transitive runtime files: "
-            f"{sorted(missing_runtime_code)}"
-        )
+    _validate_a1_required_code_coverage(
+        contract_sha256=contract_sha,
+        learner_paths=learner_paths,
+        runtime_paths=runtime_paths,
+    )
     science = lock_payload.get("science")
     if not isinstance(science, dict):
         raise SystemExit("A1 contract lock has no science section")
