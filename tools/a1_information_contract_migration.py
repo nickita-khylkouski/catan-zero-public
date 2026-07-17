@@ -486,6 +486,11 @@ def _verify_v7_input_routing_delta(
         "config",
         "entity_feature_adapter",
         "information_contract_migration_provenance",
+        # Information migrations deliberately remove the source checkpoint's
+        # function-preserving upgrade claim. inspect_migration independently
+        # requires this key to be absent from the migrated artifact, so its
+        # removal is mandatory rather than unauthenticated metadata drift.
+        "upgrade_provenance",
     }
     unexpected_added = sorted(
         set(after) - set(before) - {"information_contract_migration_provenance"}
