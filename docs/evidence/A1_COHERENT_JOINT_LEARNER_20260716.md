@@ -184,8 +184,32 @@ A partial H2H launched from the older evaluator checkout was discarded before
 interpretation: that runtime carried entity-model source SHA
 `sha256:70be73d688372fa857799e1ca61a3c3e00a8b70a263b17f0dba03d1626f90906`,
 not the candidate's current source. No result from that partial panel is
-promotion or commissioning evidence. A fully current-runtime H2H remains the
-open measurement; this document intentionally does not claim its outcome.
+promotion or commissioning evidence.
+
+The replacement panel used a clean checkout at
+`4c4322ba1ae1c525bcec3c9c17f8e6455871a173`, exact matching entity-model SHA
+`sha256:b4e2618bc36296470f13ce3dee228b34fd7d117c0211380c46393450793ce975`,
+and native runtime SHA
+`sha256:461b9d1637e7027ff59b3ec781fec9bd4b1ad51331693c75951e8f44f4f9014c`.
+It completed two disjoint cohorts with zero truncations:
+
+| Cohort | games | candidate-baseline | win rate | report SHA |
+|---|---:|---:|---:|---|
+| seed 102 | 128 | 76-52 | 59.375% | `sha256:3722597d22abb344c3eaba014f8ae5c48bdd258efe0220500d1551646e51b84d` |
+| seed 103 | 128 | 65-63 | 50.781% | `sha256:7318448f9209f90b445cc9b687909897689daa75a96108815d8695a4399ae94c` |
+| **strict pool** | **256** | **141-115** | **55.078%** | `sha256:fbbba4598b4451cb230035da2b63a6f32bf37adbffbbece12b2fb9e0e2194ccc` |
+
+The seed-102 production pentanomial test remained `continue`
+(`LLR=1.719`), as did seed 103. The strict 128-pair pool also remained
+`continue`: production pentanomial `LLR=2.025` and superiority pentanomial
+`LLR=1.027`. This is positive current-runtime commissioning evidence for the
+lineage-bound treatment, not a promotion result.
+
+The `b896...` standalone training report records `promotion_eligible=false`
+because it predates the sealed one-dose transaction. The next canonical
+candidate must be emitted by the `15d548f` (or later) sealed path, which binds
+the parent update, execution receipt, evaluation, and promotion transaction;
+this R&D checkpoint must not be promoted retroactively.
 
 ## Runtime performance repairs
 
@@ -213,10 +237,11 @@ Two implementation changes reduce work without changing the learner recipe:
   quality. Selection must combine target closure, value quality, functional
   drift, and matched gameplay.
 - The selected research treatment is the split-value FULL arm at exactly 48
-  updates, with fresh optimizer state and no candidate chaining. The corrected
-  DDP cohort is still inconclusive, so production commissioning remains open
-  pending the current-runtime H2H. The separate fresh-scratch recipe is not
-  modified by this warm-start result.
+  updates, with fresh optimizer state and no candidate chaining. Its valid
+  current-runtime pool is positive but statistically inconclusive, so it
+  commissions the treatment for a sealed replay rather than promoting the R&D
+  checkpoint. The separate fresh-scratch recipe is not modified by this
+  warm-start result.
 
 The selected checkpoint and evidence bundle are durably staged at
 `/home/ubuntu/catan-zero-artifacts/rl-system-repair-20260716/split1-full48`.
