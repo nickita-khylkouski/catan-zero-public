@@ -2283,7 +2283,6 @@ def bind_canonical_parent_update_recipe(
         }
     )
     required = {
-        "max_steps": 48,
         "optimizer": "adamw",
         "resume_optimizer": False,
         "lr": 6e-5,
@@ -2300,12 +2299,27 @@ def bind_canonical_parent_update_recipe(
     }
     if drift:
         raise ExecutorError(f"canonical parent-update recipe drift: {drift}")
+    if int(recipe.get("max_steps", 0)) <= 0:
+        raise ExecutorError("canonical parent-update requires a positive exact dose")
+    try:
+        checkpoint_steps = train_bc._parse_checkpoint_steps(  # noqa: SLF001
+            str(engine.get("checkpoint_steps", "") or ""),
+            max_steps=int(recipe["max_steps"]),
+        )
+    except SystemExit as error:
+        raise ExecutorError(
+            f"canonical parent-update checkpoint frontier is malformed: {error}"
+        ) from error
+    if not checkpoint_steps:
+        raise ExecutorError("canonical parent-update checkpoint frontier is empty")
     if engine.get("value_tower_split_layers") != 1:
         raise ExecutorError("canonical parent-update value tower split drift")
     authority = {
-        "schema_version": "a1-canonical-parent-update-authority-v1",
+        "schema_version": "a1-canonical-parent-update-authority-v2",
         "config": str(path),
         "config_sha256": _file_sha256(path),
+        "engine_settings_sha256": _value_sha256(engine),
+        "checkpoint_steps": list(checkpoint_steps),
         "recipe": recipe,
         "recipe_sha256": _value_sha256(recipe),
         "parent_checkpoint_sha256": verified["producer"]["sha256"],
@@ -5907,6 +5921,35 @@ def _build_direct_train_command(
     max_steps = int(recipe.get("max_steps", 0))
     reporting = (verified.get("learner_ablation") or {}).get("reporting_contract", {})
     explicit_checkpoints = list(reporting.get("checkpoint_steps", ()))
+    canonical_parent_update = verified.get("canonical_parent_update")
+    if isinstance(canonical_parent_update, dict):
+        canonical_checkpoints = canonical_parent_update.get("checkpoint_steps")
+        if not isinstance(canonical_checkpoints, list) or any(
+            isinstance(step, bool) or not isinstance(step, int)
+            for step in canonical_checkpoints
+        ):
+            raise ExecutorError(
+                "canonical parent-update checkpoint frontier authority drifted"
+            )
+        try:
+            parsed_canonical_checkpoints = train_bc._parse_checkpoint_steps(  # noqa: SLF001
+                ",".join(map(str, canonical_checkpoints)), max_steps=max_steps
+            )
+        except SystemExit as error:
+            raise ExecutorError(
+                "canonical parent-update checkpoint frontier authority drifted: "
+                f"{error}"
+            ) from error
+        if list(parsed_canonical_checkpoints) != canonical_checkpoints:
+            raise ExecutorError(
+                "canonical parent-update checkpoint frontier authority drifted"
+            )
+        if explicit_checkpoints and explicit_checkpoints != canonical_checkpoints:
+            raise ExecutorError(
+                "learner reporting checkpoint frontier differs from canonical "
+                "parent-update authority"
+            )
+        explicit_checkpoints = list(canonical_checkpoints)
     if not explicit_checkpoints:
         stage_c_final_binding = verified.get("stage_c_final_replication_binding")
         if isinstance(stage_c_final_binding, dict):

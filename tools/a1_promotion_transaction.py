@@ -3739,6 +3739,8 @@ def _verify_one_dose_training_receipt(
                     "schema_version",
                     "config",
                     "config_sha256",
+                    "engine_settings_sha256",
+                    "checkpoint_steps",
                     "recipe",
                     "recipe_sha256",
                     "parent_checkpoint_sha256",
@@ -3754,6 +3756,30 @@ def _verify_one_dose_training_receipt(
                 Path(str(parent_authority["config"])),
                 where="canonical parent-update config",
             )
+            try:
+                config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+                engine_settings = config_payload["engine_settings"]
+            except (
+                OSError,
+                UnicodeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+            ) as error:
+                raise PromotionError(
+                    f"canonical parent-update engine settings are unreadable: {error}"
+                ) from error
+            try:
+                configured_checkpoint_steps = list(
+                    one_dose.train_bc._parse_checkpoint_steps(  # noqa: SLF001
+                        str(engine_settings.get("checkpoint_steps", "") or ""),
+                        max_steps=int(parent_authority["recipe"]["max_steps"]),
+                    )
+                )
+            except (SystemExit, KeyError, TypeError, ValueError) as error:
+                raise PromotionError(
+                    f"canonical parent-update checkpoint frontier is invalid: {error}"
+                ) from error
             producers = [
                 record
                 for record in contract.get("checkpoints", [])
@@ -3761,10 +3787,15 @@ def _verify_one_dose_training_receipt(
             ]
             if (
                 parent_authority["schema_version"]
-                != "a1-canonical-parent-update-authority-v1"
+                != "a1-canonical-parent-update-authority-v2"
                 or config_path
                 != one_dose.CANONICAL_PARENT_UPDATE_CONFIG.resolve(strict=True)
                 or _sha256(config_path) != parent_authority["config_sha256"]
+                or parent_authority["engine_settings_sha256"]
+                != _digest_value(engine_settings)
+                or not configured_checkpoint_steps
+                or parent_authority["checkpoint_steps"]
+                != configured_checkpoint_steps
                 or parent_authority["recipe_sha256"]
                 != _digest_value(parent_authority["recipe"])
                 or authority_sha != _digest_value(authority_unhashed)

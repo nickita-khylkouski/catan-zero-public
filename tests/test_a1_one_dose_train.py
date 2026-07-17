@@ -1496,7 +1496,7 @@ def test_production_trainer_authority_binds_current_science_import() -> None:
     assert "tools/a1_feature_signal_admission.py" in records
 
 
-def test_canonical_parent_update_binds_48_step_8x64_recipe() -> None:
+def test_canonical_parent_update_binds_48_step_8x64_recipe(tmp_path: Path) -> None:
     producer = {"path": "/checkpoint/f7.pt", "sha256": "sha256:" + "1" * 64}
     verified = {
         "contract_sha256": "sha256:" + "2" * 64,
@@ -1527,6 +1527,137 @@ def test_canonical_parent_update_binds_48_step_8x64_recipe() -> None:
     assert bound["canonical_parent_update"]["parent_checkpoint_sha256"] == (
         producer["sha256"]
     )
+    assert bound["canonical_parent_update"]["checkpoint_steps"] == [
+        8,
+        12,
+        16,
+        24,
+        32,
+    ]
+
+    initializer = tmp_path / "initializer.pt"
+    initializer.write_bytes(b"initializer")
+    bound.update(
+        {
+            "data_path": tmp_path / "corpus",
+            "trainer_authority": executor._current_production_trainer_authority(),
+            "architecture_initializer": {
+                "path": str(initializer),
+                "sha256": executor._file_sha256(initializer),
+            },
+            "event_history_training_contract": {
+                "training_event_history_trainable": False,
+                "event_history_end_to_end_usable": False,
+                "empty_payload_inventory_acknowledgements": [
+                    "sha256:" + f"{index:x}" * 64 for index in range(6, 10)
+                ],
+            },
+        }
+    )
+    command = executor.build_train_command(
+        bound,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+    assert _option(command, "--checkpoint-steps") == "8,12,16,24,32"
+
+
+def test_canonical_parent_update_rejects_malformed_checkpoint_frontier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded_config, loaded_engine = executor.canonical_train._load_recipe(  # noqa: SLF001
+        executor.CANONICAL_PARENT_UPDATE_CONFIG
+    )
+    drifted_engine = {**loaded_engine, "checkpoint_steps": "12,8"}
+    monkeypatch.setattr(
+        executor.canonical_train,
+        "_load_recipe",
+        lambda _path: (loaded_config, drifted_engine),
+    )
+    producer = {"path": "/checkpoint/f7.pt", "sha256": "sha256:" + "1" * 64}
+    verified = {
+        "contract_sha256": "sha256:" + "2" * 64,
+        "data_kind": "production_composite_v2",
+        "producer": producer,
+        "corpus_meta_file_sha256": "sha256:" + "3" * 64,
+        "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
+        "function_preserving_upgrade": {
+            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+            "source": producer,
+            "receipt": {"sha256": "sha256:" + "5" * 64},
+            "receipt_sha256": "sha256:" + "6" * 64,
+        },
+    }
+
+    with pytest.raises(executor.ExecutorError, match="frontier is malformed"):
+        executor.bind_canonical_parent_update_recipe(
+            verified, executor.CANONICAL_PARENT_UPDATE_CONFIG
+        )
+
+
+def test_canonical_checkpoint_frontier_supports_twelve_step_terminal(
+    tmp_path: Path,
+) -> None:
+    verified = _production_trainer_verified(tmp_path)
+    verified["recipe"] = {**verified["recipe"], "max_steps": 12}
+    verified["canonical_parent_update"] = {
+        "schema_version": "a1-canonical-parent-update-authority-v2",
+        "checkpoint_steps": [8],
+    }
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=tmp_path / "candidate.pt",
+        report=tmp_path / "report.json",
+    )
+
+    assert _option(command, "--max-steps") == "12"
+    assert _option(command, "--checkpoint-steps") == "8"
+
+
+def test_canonical_checkpoint_frontier_is_bound_into_failure_receipt(
+    tmp_path: Path,
+) -> None:
+    verified = _production_trainer_verified(tmp_path)
+    verified["canonical_parent_update"] = {
+        "schema_version": "a1-canonical-parent-update-authority-v2",
+        "checkpoint_steps": [8, 12, 16, 24, 32],
+    }
+    checkpoint = tmp_path / "candidate.pt"
+    report = tmp_path / "report.json"
+    receipt = tmp_path / "receipt.json"
+    command = executor.build_train_command(
+        verified,
+        python=Path(sys.executable),
+        checkpoint=checkpoint,
+        report=report,
+    )
+
+    with pytest.raises(executor.ExecutorError, match="exited nonzero"):
+        executor.execute(
+            verified=verified,
+            command=command,
+            checkpoint=checkpoint,
+            report=report,
+            receipt=receipt,
+            gpu=0,
+            runner=lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 1),
+            probe=lambda _gpu: "NVIDIA B200",
+        )
+
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert _option(payload["command"], "--checkpoint-steps") == "8,12,16,24,32"
+    assert payload["canonical_parent_update"]["checkpoint_steps"] == [
+        8,
+        12,
+        16,
+        24,
+        32,
+    ]
+    assert payload["input_binding"]["canonical_parent_update"] == payload[
+        "canonical_parent_update"
+    ]
 
 
 def test_production_failure_receipt_binds_current_trainer_authority(
