@@ -196,6 +196,22 @@ def _parse_flags(raw: str) -> dict[str, object]:
                 "adapter-v6 is not function preserving; use "
                 "current_v6_information_migration_topology_split1"
             )
+        elif entry in (
+            "current_v7_compatibility_action_cross1",
+            "current-v7-compatibility-action-cross1",
+        ):
+            # V7 is deliberately an information-routing treatment, not a
+            # function-preserving upgrade.  The mature V5 encoders receive
+            # reconstructed legacy resource/initial-road inputs; V6's exact
+            # values enter through new residuals, and the existing
+            # action-to-board cross block is activated as an identity path.
+            overrides.update(
+                {
+                    **_parse_flags("current_v5_topology_split1"),
+                    "v6_compatibility_preserving_inputs": True,
+                    "action_cross_attention_layers": 1,
+                }
+            )
         elif entry in ("gather", "action_target_gather"):
             overrides["action_target_gather"] = True
         elif entry in ("value", "value_attention_pool"):
@@ -446,9 +462,13 @@ def _migration_anchor_roots(catanatron_rs) -> list[tuple[str, object]]:
 
 
 def _migration_anchor_evidence(
-    base: EntityGraphPolicy, upgraded: EntityGraphPolicy, device: str
+    base: EntityGraphPolicy,
+    upgraded: EntityGraphPolicy,
+    device: str,
+    *,
+    migration: str = "current_v2_to_v6_topology_split1",
 ) -> dict[str, object]:
-    """Measure the deliberate v2->v6 surface change without calling it parity.
+    """Measure an explicit input-contract change without calling it parity.
 
     Every policy receives features and action contexts built using its own
     adapter. Parameter-topology construction is proven independently by the
@@ -469,12 +489,17 @@ def _migration_anchor_evidence(
 
     source_adapter = str(base.entity_feature_adapter_version)
     target_adapter = str(upgraded.entity_feature_adapter_version)
-    if (
-        source_adapter != RUST_ENTITY_ADAPTER_V2
-        or target_adapter != RUST_ENTITY_ADAPTER_V6
-    ):
+    adapter_surface_change = migration == "current_v2_to_v6_topology_split1"
+    if adapter_surface_change:
+        expected = (RUST_ENTITY_ADAPTER_V2, RUST_ENTITY_ADAPTER_V6)
+    elif migration == "current_v6_to_v7_compatibility_action_cross1":
+        expected = (RUST_ENTITY_ADAPTER_V6, RUST_ENTITY_ADAPTER_V6)
+    else:
+        raise RuntimeError(f"unsupported information migration: {migration!r}")
+    if (source_adapter, target_adapter) != expected:
         raise RuntimeError(
-            "information migration requires the exact incumbent v2 adapter and v6 target"
+            "information migration adapter contract mismatch: "
+            f"expected={expected} observed={(source_adapter, target_adapter)}"
         )
     rows: list[dict[str, object]] = []
     migration_max_diff = 0.0
@@ -650,10 +675,12 @@ def _migration_anchor_evidence(
                 "anchor_identity_sha256": anchor_sha256,
             }
         )
-    if feature_changed_values <= 0 or feature_max_diff <= 0.0:
+    if adapter_surface_change and (
+        feature_changed_values <= 0 or feature_max_diff <= 0.0
+    ):
         raise RuntimeError("v6 migration anchors did not observe a feature change")
     if migration_max_diff <= 0.0:
-        raise RuntimeError("v6 migration anchors did not observe output drift")
+        raise RuntimeError("migration anchors did not observe output drift")
     anchor_count = len(rows)
     anchor_set_sha256 = "sha256:" + hashlib.sha256(
         json.dumps(
@@ -663,13 +690,18 @@ def _migration_anchor_evidence(
         ).encode("utf-8")
     ).hexdigest()
     return {
-        "schema_version": "adapter-v6-step0-anchor-evidence-v1",
+        "schema_version": (
+            "adapter-v6-step0-anchor-evidence-v1"
+            if adapter_surface_change
+            else "v7-compatibility-input-routing-step0-anchor-evidence-v1"
+        ),
         "device": "cpu",
         "source_adapter": source_adapter,
         "target_adapter": target_adapter,
         "public_observation": True,
-        "separate_adapter_specific_entity_features": True,
-        "separate_adapter_specific_action_contexts": True,
+        "separate_adapter_specific_entity_features": adapter_surface_change,
+        "separate_adapter_specific_action_contexts": adapter_surface_change,
+        "internal_model_input_routing_changed": not adapter_surface_change,
         "forward_identical": False,
         "promotion_eligible": False,
         "topology_construction_proof": "deterministic_parameter_replay_in_receipt",
@@ -800,8 +832,9 @@ def _record_information_migration_provenance(
     flags: dict[str, object],
     seed: int,
     anchor_evidence: dict[str, object],
+    migration: str = "current_v2_to_v6_topology_split1",
 ) -> None:
-    """Atomically record an honest non-function-preserving v6 transition."""
+    """Atomically record an honest non-function-preserving transition."""
 
     import torch
 
@@ -809,7 +842,7 @@ def _record_information_migration_provenance(
     raw = torch.load(output, map_location="cpu", weights_only=False)
     raw["information_contract_migration_provenance"] = {
         "schema_version": "entity-graph-information-contract-migration-v1",
-        "migration": "current_v2_to_v6_topology_split1",
+        "migration": str(migration),
         "source_checkpoint_sha256": _sha256_file(in_checkpoint),
         "flags": dict(flags),
         "initialization_seed": int(seed),
@@ -863,7 +896,23 @@ def main() -> None:
         }
         for piece in args.flags.split(",")
     )
-    if requested_v6_migration and str(args.device) != "cpu":
+    requested_v7_migration = any(
+        piece.strip()
+        in {
+            "current_v7_compatibility_action_cross1",
+            "current-v7-compatibility-action-cross1",
+        }
+        for piece in args.flags.split(",")
+    )
+    if requested_v6_migration and requested_v7_migration:
+        raise SystemExit("only one information-contract migration may be requested")
+    requested_information_migration = requested_v6_migration or requested_v7_migration
+    migration_name = (
+        "current_v2_to_v6_topology_split1"
+        if requested_v6_migration
+        else "current_v6_to_v7_compatibility_action_cross1"
+    )
+    if requested_information_migration and str(args.device) != "cpu":
         raise SystemExit(
             "information-contract migration evidence is replayed on CPU; "
             "issue it with --device cpu"
@@ -889,7 +938,7 @@ def main() -> None:
         device=args.device,
         entity_feature_adapter_version=(
             RUST_ENTITY_ADAPTER_V6
-            if requested_v6_migration
+            if requested_information_migration
             else RUST_ENTITY_ADAPTER_V5
             if overrides.get("meaningful_public_history_schema")
             == MEANINGFUL_PUBLIC_HISTORY_SCHEMA_V2
@@ -922,9 +971,9 @@ def main() -> None:
     migration_anchor_evidence = None
     forward_tolerance = _forward_tolerance(overrides)
     if not args.no_verify:
-        if requested_v6_migration:
+        if requested_information_migration:
             migration_anchor_evidence = _migration_anchor_evidence(
-                base, upgraded, args.device
+                base, upgraded, args.device, migration=migration_name
             )
         else:
             max_diff = _verify_forward_identical(base, upgraded, args.device)
@@ -933,7 +982,7 @@ def main() -> None:
                     "forward changed beyond reviewed initialization tolerance: "
                     f"max_diff={max_diff} tolerance={forward_tolerance}"
                 )
-    elif requested_v6_migration:
+    elif requested_information_migration:
         raise SystemExit("information-contract migration cannot skip anchor evidence")
 
     upgraded.save(args.out_checkpoint)
@@ -950,7 +999,7 @@ def main() -> None:
             else ("model", "config")
         ),
     )
-    if requested_v6_migration:
+    if requested_information_migration:
         assert migration_anchor_evidence is not None
         _record_information_migration_provenance(
             args.out_checkpoint,
@@ -958,6 +1007,7 @@ def main() -> None:
             flags=overrides,
             seed=int(args.seed),
             anchor_evidence=migration_anchor_evidence,
+            migration=migration_name,
         )
     else:
         _record_upgrade_provenance(
@@ -981,13 +1031,15 @@ def main() -> None:
                 "forward_tolerance": forward_tolerance,
                 "forward_identical_at_init": (
                     False
-                    if requested_v6_migration
+                    if requested_information_migration
                     else (max_diff <= forward_tolerance)
                     if max_diff is not None
                     else "skipped"
                 ),
                 "information_contract_migration": migration_anchor_evidence,
-                "promotion_eligible": False if requested_v6_migration else None,
+                "promotion_eligible": (
+                    False if requested_information_migration else None
+                ),
                 "preserved_source_keys": preserved_source_keys,
                 "initialization_seed": int(args.seed),
             },

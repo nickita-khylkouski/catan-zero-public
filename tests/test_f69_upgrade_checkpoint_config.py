@@ -139,6 +139,15 @@ def test_action_cross_upgrade_parameters_are_admitted_by_checkpoint_builder():
     assert "action_cross_blocks." in upgrade_tool.NEW_PARAM_PREFIXES
 
 
+def test_v7_migration_token_binds_compatibility_route_and_live_decoder():
+    overrides = upgrade_tool._parse_flags(
+        "current_v7_compatibility_action_cross1"
+    )
+    assert overrides["v6_compatibility_preserving_inputs"] is True
+    assert overrides["action_cross_attention_layers"] == 1
+    assert overrides["topology_residual_adapter"] is True
+
+
 def test_structured_action_value_upgrade_enables_both_zero_diff_paths():
     base = EntityGraphConfig(action_size=607, static_action_feature_size=45)
     assert base.static_action_residual is False
