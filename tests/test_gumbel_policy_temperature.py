@@ -137,6 +137,41 @@ def test_native_nonunit_temperature_refuses_stale_wheel(
         search._validate_native_semantics()
 
 
+def test_native_rng_stream_separation_refuses_silent_operator_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(gumbel_search_capabilities=lambda: []),
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(rng_stream_separation=True)
+    search.using_native_hot_loop = True
+
+    with pytest.raises(ValueError, match="rng_stream_separation"):
+        search._validate_native_semantics()
+
+
+def test_native_config_revalidates_temperature_after_runtime_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "catanatron_rs",
+        SimpleNamespace(gumbel_search_capabilities=lambda: []),
+    )
+    search = object.__new__(NativeGumbelChanceMCTS)
+    search.config = GumbelChanceMCTSConfig(temperature=0.0)
+    search.using_native_hot_loop = True
+    search.rng = SimpleNamespace(getrandbits=lambda _bits: 7)
+    search._validate_native_semantics()
+
+    search.config = GumbelChanceMCTSConfig(temperature=0.3)
+    with pytest.raises(ValueError, match="policy_temperature_semantics"):
+        search._native_config()
+
+
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 def test_native_zero_and_unit_temperature_keep_legacy_noop_contract(
     monkeypatch: pytest.MonkeyPatch, temperature: float

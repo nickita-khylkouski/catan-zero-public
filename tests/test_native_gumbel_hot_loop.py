@@ -502,7 +502,13 @@ def test_native_boundary_callback_uses_real_particle_legal_sets(monkeypatch) -> 
     monkeypatch.setitem(
         sys.modules,
         "catanatron_rs",
-        SimpleNamespace(gumbel_search=fake_search),
+        SimpleNamespace(
+            gumbel_search=fake_search,
+            gumbel_search_capabilities=lambda: [
+                "coherent_public_belief_search",
+                "boundary_value_particles",
+            ],
+        ),
     )
     evaluator = _Evaluator()
     search = object.__new__(NativeGumbelChanceMCTS)
@@ -569,7 +575,13 @@ def test_native_boundary_callback_rejects_batch_cardinality_mismatch(
     monkeypatch.setitem(
         sys.modules,
         "catanatron_rs",
-        SimpleNamespace(gumbel_search=fake_search),
+        SimpleNamespace(
+            gumbel_search=fake_search,
+            gumbel_search_capabilities=lambda: [
+                "coherent_public_belief_search",
+                "boundary_value_particles",
+            ],
+        ),
     )
     search = object.__new__(NativeGumbelChanceMCTS)
     search.config = GumbelChanceMCTSConfig(

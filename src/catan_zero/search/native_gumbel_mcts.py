@@ -89,6 +89,11 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
             unsupported.append("use_batch_api=False")
         if bool(self.config.uncertainty_backup_weighting):
             unsupported.append("uncertainty_backup_weighting=True")
+        if self.using_native_hot_loop and bool(self.config.rng_stream_separation):
+            unsupported.append(
+                "rng_stream_separation=True requires independent native Gumbel, "
+                "chance, and belief RNG streams"
+            )
         if self.using_native_hot_loop and bool(
             self.config.rescale_noise_floor_initial_road_only
         ):
@@ -188,6 +193,11 @@ class NativeGumbelChanceMCTS(GumbelChanceMCTS):
         n_simulations_override: int | None = None,
         attested_root_phase: str | None = None,
     ) -> dict[str, Any]:
+        # Self-play replaces the frozen config at decision boundaries to apply
+        # gameplay temperature. Recheck wheel capabilities at the last boundary
+        # before native execution so construction-time validation cannot go stale.
+        if getattr(self, "using_native_hot_loop", False):
+            self._validate_native_semantics()
         config = self.config
         values = {
             name: getattr(config, name)
