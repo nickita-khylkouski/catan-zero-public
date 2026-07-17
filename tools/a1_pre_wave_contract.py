@@ -2516,9 +2516,11 @@ def sync_generation_guard(draft_path: Path) -> dict[str, Any]:
         # guard recipe is validated below before the atomic replacement.
         if (
             allow_recovery_s1
-            and isinstance(existing_receipt, dict)
-            and existing_receipt.get("source_s1_evidence")
-            != expected_s1_reference
+            and (
+                not isinstance(existing_receipt, dict)
+                or existing_receipt.get("source_s1_evidence")
+                != expected_s1_reference
+            )
         ):
             rebound_payload = json.loads(json.dumps(guard_payload))
             rebound_payload[GUARD_SYNC_KEY] = {
