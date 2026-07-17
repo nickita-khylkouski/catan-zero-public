@@ -1496,11 +1496,13 @@ def play_one_game(
     actions.
 
     When ``config.target_reliability_audit_fraction`` is nonzero, eligible
-    recorded full-search roots with nominal n128 budget may run one diagnostic duplicate through
-    ``target_reliability_mcts``.  Its three stochastic roles are domain
-    separated, its RNG is reset from (audit_seed, game_seed, decision_index),
-    and only typed evidence is recorded; the primary result remains the sole
-    source of the applied action.
+    recorded full-search roots with nominal n128 budget may run one diagnostic
+    duplicate through ``target_reliability_mcts``.  It uses the same MCTS
+    implementation as the primary teacher and an independently derived root
+    seed.  That distinction is load-bearing: disagreement must measure search
+    stochasticity, not Python-vs-Rust traversal differences. Only typed
+    evidence is recorded; the primary result remains the sole source of the
+    applied action.
     """
     started = time.perf_counter()
     catanatron_rs = _gumbel_chance_mcts._require_rust_module()
@@ -3041,12 +3043,18 @@ def run_worker_games(
         audit_seed=int(config.target_reliability_audit_seed),
     )
     if reliability_fraction > 0.0:
-        # The replica is deliberately the feature-complete Python reference:
-        # this gives it explicit Gumbel/chance/belief substreams even when the
-        # primary trajectory uses the parity-gated native hot loop. Preserve
-        # the primary exact/legacy SH and wide-budget semantics: otherwise the
-        # duplicate would audit a different target operator. Per-root
-        # eligibility below admits only roots whose nominal full budget is 128.
+        # Duplicate the *production* target operator rather than comparing a
+        # Rust-produced label with a Python-reference label.  The latter
+        # confounds target stochasticity with implementation drift and makes
+        # reliability weights scientifically uninterpretable. Per-root
+        # eligibility below admits only roots whose nominal full budget is
+        # exactly n128, so forcing p_full=1 merely selects that same full-root
+        # branch rather than changing its search budget.
+        #
+        # Native traversal intentionally does not advertise independently
+        # separated Gumbel/chance/belief streams. It still receives a distinct
+        # deterministic root seed, which is sufficient for an independent
+        # duplicate while retaining the deployed native operator exactly.
         reliability_search_config = dataclasses.replace(
             search_config,
             seed=int(config.target_reliability_audit_seed),
@@ -3055,12 +3063,21 @@ def run_worker_games(
             p_full=1.0,
             raw_policy_above_width=None,
             temperature=0.0,
-            rng_stream_separation=True,
+            rng_stream_separation=not bool(native_mcts_hot_loop),
         )
-        target_reliability_mcts = GumbelChanceMCTS(reliability_search_config, evaluator)
+        target_reliability_mcts = create_gumbel_search(
+            reliability_search_config,
+            evaluator,
+            native_hot_loop=bool(native_mcts_hot_loop),
+        )
         assert target_reliability_manifest is not None
         target_reliability_manifest["duplicate_search_config"] = dataclasses.asdict(
             reliability_search_config
+        )
+        target_reliability_manifest["duplicate_mcts_implementation"] = (
+            "native_rust_hot_loop"
+            if bool(native_mcts_hot_loop)
+            else "python_reference"
         )
 
     resume_offset = 0
