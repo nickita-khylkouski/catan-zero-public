@@ -10,6 +10,7 @@ from tools.train_bc import (
     _coverage_importance_weights,
     _coverage_policy_signal_admission,
     _epoch_order,
+    _policy_phase_objective_mass_admission,
     compute_policy_surprise_kl,
     per_game_capped_policy_surprise_sampling_weights,
     per_game_policy_surprise_sampling_report,
@@ -419,6 +420,80 @@ def test_zero_floor_reports_absent_policy_signal_without_new_refusal() -> None:
     assert report["admitted"] is True
     assert report["signal_present"] is False
     assert report["expected_policy_effective_rows_per_global_batch"] == 0.0
+
+
+def test_opening_phase_mass_reports_sparse_objective_without_inventing_floor() -> None:
+    phases = np.asarray(
+        ["PLAY_TURN"] * 100
+        + ["BUILD_INITIAL_SETTLEMENT", "BUILD_INITIAL_ROAD"]
+    )
+    weights = np.asarray([4.0] * 100 + [1.0, 1.0], dtype=np.float64)
+
+    report = _policy_phase_objective_mass_admission(
+        {"phase": phases},
+        np.arange(phases.size, dtype=np.int64),
+        policy_sample_weights=weights,
+        sampling_weights=None,
+        minimum_phase_mass_fractions=None,
+        objective_measure="synthetic_uniform_coverage",
+    )
+
+    settlement = report["per_phase"]["BUILD_INITIAL_SETTLEMENT"]
+    road = report["per_phase"]["BUILD_INITIAL_ROAD"]
+    assert report["admission_enforced"] is False
+    assert report["admitted"] is None
+    assert report["identity_sha256"].startswith("sha256:")
+    assert settlement["policy_objective_mass_fraction"] == pytest.approx(1 / 402)
+    assert road["policy_objective_mass_fraction"] == pytest.approx(1 / 402)
+
+
+def test_opening_phase_mass_rejects_sparse_objective_before_training() -> None:
+    phases = np.asarray(
+        ["PLAY_TURN"] * 100
+        + ["BUILD_INITIAL_SETTLEMENT", "BUILD_INITIAL_ROAD"]
+    )
+    weights = np.asarray([4.0] * 100 + [1.0, 1.0], dtype=np.float64)
+
+    with pytest.raises(SystemExit, match="refused before the first optimizer step"):
+        _policy_phase_objective_mass_admission(
+            {"phase": phases},
+            np.arange(phases.size, dtype=np.int64),
+            policy_sample_weights=weights,
+            sampling_weights=None,
+            minimum_phase_mass_fractions={
+                "BUILD_INITIAL_SETTLEMENT": 0.01,
+                "BUILD_INITIAL_ROAD": 0.01,
+            },
+            objective_measure="synthetic_uniform_coverage",
+        )
+
+
+def test_opening_phase_mass_accepts_reviewed_minima_and_binds_identity() -> None:
+    phases = np.asarray(
+        ["PLAY_TURN"] * 100
+        + ["BUILD_INITIAL_SETTLEMENT", "BUILD_INITIAL_ROAD"]
+    )
+    weights = np.asarray([4.0] * 100 + [8.0, 8.0], dtype=np.float64)
+    minima = {
+        "BUILD_INITIAL_SETTLEMENT": 0.01,
+        "BUILD_INITIAL_ROAD": 0.01,
+    }
+
+    report = _policy_phase_objective_mass_admission(
+        {"phase": phases},
+        np.arange(phases.size, dtype=np.int64),
+        policy_sample_weights=weights,
+        sampling_weights=None,
+        minimum_phase_mass_fractions=minima,
+        objective_measure="synthetic_uniform_coverage",
+    )
+
+    assert report["admission_enforced"] is True
+    assert report["admitted"] is True
+    assert report["minimum_phase_mass_fractions"] == minima
+    assert all(
+        report["per_phase"][phase]["admitted"] is True for phase in minima
+    )
 
 
 def test_coverage_permutation_visits_every_row_once() -> None:

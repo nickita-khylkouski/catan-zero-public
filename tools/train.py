@@ -13,6 +13,7 @@ import copy
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -51,6 +52,8 @@ _ENGINE_SETTING_KEYS = frozenset(
         "entity_feature_adapter_version",
         "initialization_mode",
         "minimum_feature_learning_signal_observations",
+        "minimum_initial_road_policy_mass_fraction",
+        "minimum_initial_settlement_policy_mass_fraction",
         "objective_gradient_interference_every_batches",
         "public_rule_state_features",
         "require_35m_model",
@@ -68,6 +71,50 @@ _ENGINE_SETTING_KEYS = frozenset(
         "max_35m_params",
     }
 )
+
+
+_OPENING_POLICY_MASS_MINIMUM_KEYS = (
+    "minimum_initial_settlement_policy_mass_fraction",
+    "minimum_initial_road_policy_mass_fraction",
+)
+
+
+def _require_production_opening_policy_mass_contract(
+    engine_settings: Mapping[str, Any],
+) -> dict[str, float]:
+    """Refuse a production learner until both opening minima are reviewed.
+
+    The checked-in science admission currently names these values as unresolved,
+    so there is intentionally no fallback threshold. Once commissioned, values
+    live in ``engine_settings``: the production catalog hashes those recipe
+    semantics and train_bc additionally binds them into resume identity.
+    """
+
+    missing = [
+        key
+        for key in _OPENING_POLICY_MASS_MINIMUM_KEYS
+        if key not in engine_settings
+    ]
+    if missing:
+        raise SystemExit(
+            "production training remains fail-closed until reviewed opening "
+            "policy-mass minima are commissioned for both initial settlement "
+            f"and initial road; missing={missing}"
+        )
+    minima: dict[str, float] = {}
+    for key in _OPENING_POLICY_MASS_MINIMUM_KEYS:
+        raw = engine_settings[key]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise SystemExit(f"canonical engine setting {key} must be numeric")
+        value = float(raw)
+        if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            raise SystemExit(
+                f"canonical engine setting {key} must be a finite fraction in (0, 1]"
+            )
+        minima[key] = value
+    if sum(minima.values()) > 1.0:
+        raise SystemExit("canonical opening policy-mass minima cannot sum above one")
+    return minima
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -524,6 +571,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "--report, and --receipt to create the authenticated plan; rerun "
             "that same command with --go only after the plan is commissioned."
         )
+    _require_production_opening_policy_mass_contract(engine_settings)
     initialization = _parent_initializer_binding(public_args)
     engine_args = _engine_namespace(
         config=config,

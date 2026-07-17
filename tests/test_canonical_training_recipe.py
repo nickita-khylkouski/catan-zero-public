@@ -55,6 +55,44 @@ def test_canonical_coverage_recipe_can_reach_composite_training() -> None:
     assert fields["validation_max_samples"] == 0
 
 
+def test_production_opening_mass_contract_is_fail_closed_until_reviewed() -> None:
+    engine = _payload()["engine_settings"]
+
+    with pytest.raises(SystemExit, match="remains fail-closed"):
+        train._require_production_opening_policy_mass_contract(engine)
+
+
+def test_parent_production_launcher_refuses_before_training_without_minima() -> None:
+    with pytest.raises(SystemExit, match="remains fail-closed"):
+        train.main(
+            [
+                "--config",
+                str(PARENT_RECIPE),
+                "--data",
+                "/tmp/unopened-data",
+                "--checkpoint",
+                "/tmp/unwritten-candidate.pt",
+                "--report",
+                "/tmp/unwritten-train.json",
+                "--init-checkpoint",
+                "/tmp/unopened-initializer.pt",
+            ]
+        )
+
+
+def test_production_opening_mass_contract_accepts_only_complete_reviewed_pair() -> None:
+    settlement = "minimum_initial_settlement_policy_mass_fraction"
+    road = "minimum_initial_road_policy_mass_fraction"
+
+    with pytest.raises(SystemExit, match="missing=.*initial_road"):
+        train._require_production_opening_policy_mass_contract({settlement: 0.01})
+
+    minima = train._require_production_opening_policy_mass_contract(
+        {settlement: 0.01, road: 0.02}
+    )
+    assert minima == {settlement: 0.01, road: 0.02}
+
+
 def test_canonical_non_moe_recipe_has_no_phantom_moe_objective() -> None:
     """Coverage normalization must not bind an objective with no live head."""
 

@@ -299,6 +299,10 @@ CHECKPOINT_DOSE_TELEMETRY_SCHEMA = "train-bc-checkpoint-dose-telemetry-v1"
 CHECKPOINT_DOSE_TRAJECTORY_SCHEMA = "train-bc-checkpoint-dose-trajectory-v1"
 BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1 = "weighted_replacement_v1"
 BASE_SAMPLER_COVERAGE_IMPORTANCE_V1 = "coverage_importance_v1"
+OPENING_POLICY_MASS_PHASES = (
+    "BUILD_INITIAL_SETTLEMENT",
+    "BUILD_INITIAL_ROAD",
+)
 
 MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
 MEMMAP_PAYLOAD_AUTH_CACHE_SCHEMA = "memmap-payload-auth-cache-v1"
@@ -1136,6 +1140,28 @@ def build_parser() -> argparse.ArgumentParser:
             "fails closed when sparse or concentrated policy weights provide "
             "less effective supervision than commissioned. 0 preserves "
             "historical and diagnostic recipes."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-initial-settlement-policy-mass-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Reviewed minimum fraction of the realized policy objective assigned "
+            "to BUILD_INITIAL_SETTLEMENT after every row, phase, per-game, and "
+            "sampler/importance weight. Must be commissioned together with the "
+            "initial-road minimum; omitted values are reported but not admitted."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-initial-road-policy-mass-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Reviewed minimum fraction of the realized policy objective assigned "
+            "to BUILD_INITIAL_ROAD. Must be commissioned together with the "
+            "initial-settlement minimum; omitted values are reported but not "
+            "admitted."
         ),
     )
     parser.add_argument(
@@ -14814,6 +14840,34 @@ def main(
         }
     else:
         raise SystemExit(f"unsupported --base-sampler {base_sampler!r}")
+    opening_policy_mass_minima = _opening_policy_mass_minima(args)
+    policy_phase_objective_mass_admission = _rank0_authoritative_call(
+        ddp,
+        "policy phase objective-mass admission",
+        lambda: _policy_phase_objective_mass_admission(
+            data,
+            train_indices,
+            policy_sample_weights=training_policy_sample_weights,
+            sampling_weights=(
+                epoch_sample_weights
+                if base_sampler == BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1
+                else None
+            ),
+            minimum_phase_mass_fractions=opening_policy_mass_minima,
+            objective_measure=(
+                "weighted_replacement_draw_probability_x_policy_loss_weight_v1"
+                if epoch_sample_weights is not None
+                else (
+                    "uniform_coverage_row_probability_x_policy_loss_weight_v1"
+                    if base_sampler == BASE_SAMPLER_COVERAGE_IMPORTANCE_V1
+                    else "uniform_replacement_row_probability_x_policy_loss_weight_v1"
+                )
+            ),
+        ),
+    )
+    base_sampler_report["policy_phase_objective_mass_admission"] = dict(
+        policy_phase_objective_mass_admission
+    )
     policy_aux_sampling_weights = None
     policy_aux_validation_sampling_weights = None
     policy_aux_preconditioning_weights = None
@@ -15169,6 +15223,9 @@ def main(
                 "policy_surprise_sampling": policy_surprise_sampling_report,
                 "policy_aux_sampling": policy_aux_sampling_report,
                 "base_sampler": base_sampler_report,
+                "policy_phase_objective_mass_admission": (
+                    policy_phase_objective_mass_admission
+                ),
             },
             sort_keys=True,
         ),
@@ -18988,6 +19045,9 @@ def main(
         "policy_surprise_sampling": policy_surprise_sampling_report,
         "policy_aux_sampling": policy_aux_sampling_report,
         "base_sampler": base_sampler_report,
+        "policy_phase_objective_mass_admission": (
+            policy_phase_objective_mass_admission
+        ),
         "first_batch_profile": first_batch_profile,
         # Backward-compatible headline: ``parameter_count`` remains the TOTAL
         # serialized/checkpoint-compatible architecture size. Never interpret
@@ -37505,6 +37565,199 @@ def _coverage_policy_signal_admission(
     return report
 
 
+def _opening_policy_mass_minima(args) -> dict[str, float] | None:
+    """Return the complete reviewed opening contract or the unset sentinel.
+
+    A single configured phase would make the other opening decision silently
+    unprotected, so partial contracts are invalid. Zero is not a meaningful
+    production floor: callers that have not commissioned values must leave
+    both fields unset and remain fail-closed at the production launcher.
+    """
+
+    raw = {
+        "BUILD_INITIAL_SETTLEMENT": getattr(
+            args, "minimum_initial_settlement_policy_mass_fraction", None
+        ),
+        "BUILD_INITIAL_ROAD": getattr(
+            args, "minimum_initial_road_policy_mass_fraction", None
+        ),
+    }
+    present = {phase: value is not None for phase, value in raw.items()}
+    if not any(present.values()):
+        return None
+    if not all(present.values()):
+        raise SystemExit(
+            "opening policy-mass admission requires reviewed minima for both "
+            "BUILD_INITIAL_SETTLEMENT and BUILD_INITIAL_ROAD"
+        )
+    minima = {phase: float(value) for phase, value in raw.items()}
+    if any(
+        not math.isfinite(value) or not 0.0 < value <= 1.0
+        for value in minima.values()
+    ):
+        raise SystemExit(
+            "opening policy-mass minima must be finite fractions in (0, 1]"
+        )
+    if sum(minima.values()) > 1.0:
+        raise SystemExit("opening policy-mass minima cannot sum above one")
+    return minima
+
+
+def _policy_phase_objective_mass_admission(
+    data,
+    train_indices: np.ndarray,
+    *,
+    policy_sample_weights: np.ndarray,
+    sampling_weights: np.ndarray | None,
+    minimum_phase_mass_fractions: Mapping[str, float] | None,
+    objective_measure: str,
+    chunk_rows: int = 262_144,
+) -> dict[str, object]:
+    """Measure the exact expected policy-loss mass by phase before training.
+
+    ``policy_sample_weights`` is the final loss multiplier after forced-row,
+    phase, per-game, reliability, and (for coverage traversal) importance
+    weighting. For weighted replacement, ``sampling_weights`` contributes the
+    row draw probability as well. Consequently the reported fractions describe
+    the objective the optimizer is expected to see, rather than raw row counts
+    or nominal phase multipliers.
+    """
+
+    rows = np.asarray(train_indices, dtype=np.int64)
+    weights = np.asarray(policy_sample_weights)
+    if rows.ndim != 1 or rows.size == 0:
+        raise ValueError("policy phase-mass admission requires training rows")
+    if (
+        weights.ndim != 1
+        or np.any(rows < 0)
+        or np.any(rows >= weights.size)
+    ):
+        raise ValueError("policy phase-mass weight alignment drift")
+    if "phase" not in data:
+        if minimum_phase_mass_fractions is not None:
+            raise SystemExit(
+                "opening policy-mass admission requires a row-aligned phase column"
+            )
+        report: dict[str, object] = {
+            "schema_version": "policy-phase-objective-mass-admission-v1",
+            "available": False,
+            "admission_enforced": False,
+            "admitted": None,
+            "reason": "phase_column_unavailable",
+            "objective_measure": str(objective_measure),
+            "required_phases": list(OPENING_POLICY_MASS_PHASES),
+            "minimum_phase_mass_fractions": None,
+            "per_phase": {},
+        }
+        report["identity_sha256"] = _canonical_json_sha256(report)
+        return report
+
+    draw_weights = None
+    if sampling_weights is not None:
+        draw_weights = np.asarray(sampling_weights, dtype=np.float64)
+        if (
+            draw_weights.shape != rows.shape
+            or not np.isfinite(draw_weights).all()
+            or np.any(draw_weights < 0.0)
+            or float(draw_weights.sum()) <= 0.0
+        ):
+            raise ValueError("policy phase-mass sampling measure is invalid")
+        draw_weights = draw_weights / float(draw_weights.sum())
+
+    row_counts: Counter[str] = Counter()
+    active_counts: Counter[str] = Counter()
+    phase_mass: Counter[str] = Counter()
+    block_rows = max(1, int(chunk_rows))
+    for start in range(0, rows.size, block_rows):
+        stop = start + block_rows
+        block = rows[start:stop]
+        phases = np.asarray(data["phase"][block]).astype(str)
+        scoped = np.asarray(weights[block], dtype=np.float64)
+        if phases.shape != block.shape:
+            raise ValueError("policy phase column is not row-aligned")
+        if not np.isfinite(scoped).all() or np.any(scoped < 0.0):
+            raise ValueError(
+                "policy phase-mass weights must be finite and non-negative"
+            )
+        if draw_weights is not None:
+            scoped = scoped * draw_weights[start:stop]
+        for phase in np.unique(phases):
+            selected = phases == phase
+            name = str(phase)
+            row_counts[name] += int(np.count_nonzero(selected))
+            active_counts[name] += int(np.count_nonzero(scoped[selected] > 0.0))
+            phase_mass[name] += float(
+                np.sum(scoped[selected], dtype=np.float64)
+            )
+
+    total_mass = float(sum(phase_mass.values()))
+    if not math.isfinite(total_mass) or total_mass <= 0.0:
+        if minimum_phase_mass_fractions is not None:
+            raise SystemExit(
+                "opening policy-mass admission found zero policy objective mass"
+            )
+        total_mass = 0.0
+    minima = (
+        None
+        if minimum_phase_mass_fractions is None
+        else {
+            phase: float(minimum_phase_mass_fractions[phase])
+            for phase in OPENING_POLICY_MASS_PHASES
+        }
+    )
+    per_phase: dict[str, dict[str, object]] = {}
+    for phase in sorted(set(row_counts) | set(OPENING_POLICY_MASS_PHASES)):
+        mass = float(phase_mass.get(phase, 0.0))
+        fraction = mass / total_mass if total_mass > 0.0 else 0.0
+        minimum = None if minima is None else minima.get(phase)
+        per_phase[phase] = {
+            "training_row_count": int(row_counts.get(phase, 0)),
+            "policy_active_row_count": int(active_counts.get(phase, 0)),
+            "policy_objective_mass": mass,
+            "policy_objective_mass_fraction": fraction,
+            "minimum_policy_objective_mass_fraction": minimum,
+            "admitted": None if minimum is None else fraction >= minimum,
+        }
+    admitted = None
+    if minima is not None:
+        admitted = all(
+            bool(per_phase[phase]["admitted"])
+            for phase in OPENING_POLICY_MASS_PHASES
+        )
+    report = {
+        "schema_version": "policy-phase-objective-mass-admission-v1",
+        "available": True,
+        "admission_enforced": minima is not None,
+        "admitted": admitted,
+        "reason": (
+            "reviewed_minima_satisfied"
+            if admitted is True
+            else "reviewed_minima_not_commissioned"
+            if admitted is None
+            else "opening_policy_objective_mass_below_reviewed_minimum"
+        ),
+        "objective_measure": str(objective_measure),
+        "training_row_count": int(rows.size),
+        "total_policy_objective_mass": total_mass,
+        "required_phases": list(OPENING_POLICY_MASS_PHASES),
+        "minimum_phase_mass_fractions": minima,
+        "per_phase": per_phase,
+    }
+    report["identity_sha256"] = _canonical_json_sha256(report)
+    if admitted is False:
+        details = ", ".join(
+            f"{phase}={per_phase[phase]['policy_objective_mass_fraction']:.6g}"
+            f"<{minima[phase]:.6g}"
+            for phase in OPENING_POLICY_MASS_PHASES
+            if not bool(per_phase[phase]["admitted"])
+        )
+        raise SystemExit(
+            "opening policy-mass admission refused before the first optimizer "
+            f"step: {details}"
+        )
+    return report
+
+
 def _compose_per_game_policy_surprise_sampling_weights(
     data,
     train_indices: np.ndarray,
@@ -39805,6 +40058,12 @@ def _training_resume_recipe_identity(
         ),
         "minimum_policy_effective_rows_per_global_batch": float(
             getattr(args, "minimum_policy_effective_rows_per_global_batch", 0.0)
+        ),
+        "minimum_initial_settlement_policy_mass_fraction": getattr(
+            args, "minimum_initial_settlement_policy_mass_fraction", None
+        ),
+        "minimum_initial_road_policy_mass_fraction": getattr(
+            args, "minimum_initial_road_policy_mass_fraction", None
         ),
         "entity_feature_adapter_version": resume_entity_adapter,
         "public_rule_state_features": bool(
