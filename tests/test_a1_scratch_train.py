@@ -393,9 +393,6 @@ def test_train_bc_fresh_create_boundary_builds_card_count_v2() -> None:
         public_rule_state_features=model["public_rule_state_features"],
         public_rule_state_feature_schema=model["public_rule_state_feature_schema"],
         entity_feature_adapter_version=model["entity_feature_adapter_version"],
-        **train_bc._entity_adapter_create_kwargs(  # noqa: SLF001
-            model["entity_feature_adapter_version"]
-        ),
         meaningful_public_history=model["meaningful_public_history"],
         meaningful_public_history_schema=model["meaningful_public_history_schema"],
         meaningful_public_history_pooling=model["meaningful_public_history_pooling"],

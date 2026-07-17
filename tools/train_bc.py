@@ -13427,17 +13427,6 @@ def _public_card_count_create_kwargs(
     }
 
 
-def _entity_adapter_create_kwargs(
-    adapter_version: object,
-) -> dict[str, bool]:
-    """Commission adapter-owned residuals for fresh model construction."""
-
-    resolved = require_known_entity_feature_adapter(adapter_version)
-    return {
-        "v6_compatibility_preserving_inputs": resolved == RUST_ENTITY_ADAPTER_V6,
-    }
-
-
 def _resolve_effective_meaningful_public_history(
     args: argparse.Namespace,
 ) -> tuple[bool, int, str, bool]:
@@ -15425,7 +15414,6 @@ def main(
                     entity_feature_adapter_version=(
                         training_adapter
                     ),
-                    **_entity_adapter_create_kwargs(training_adapter),
                     **_structured_action_create_kwargs(args),
                     value_tower_split_layers=int(
                         args.value_tower_split_layers
