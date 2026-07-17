@@ -160,10 +160,14 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
     # The coherent corpus's natural policy-active distribution assigns only
     # 34.16% of policy objective mass to ordinary PLAY_TURN decisions; the
     # successful selected-dose corpus assigned 66.08%.  Fourfold PLAY_TURN
-    # weighting restores 66.49% after the existing equal-per-game
-    # normalization, keeping mandatory prompts supervised without letting
-    # them dominate the strategic policy update.
-    "phase_weights": "PLAY_TURN=4.0",
+    # weighting originally restored ordinary PLAY_TURN representation.  The
+    # sealed r5 objective then measured 71.71% PLAY_TURN mass, so V7 also binds
+    # the previously audited exact-prompt hard-decision weights.  On that same
+    # measure they reduce PLAY_TURN to 52.27% and raise road/discard/robber.
+    "phase_weights": (
+        "PLAY_TURN=4.0,MOVE_ROBBER=3.0,"
+        "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
+    ),
     # Policy phase repair must not silently starve opening/robber/discard value
     # calibration.
     "value_phase_weights": "none",
@@ -252,7 +256,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "b0f7cad82a94849ebc5c1ebcf007a9ed20741025f03387d2b3002433b7765c09"
+        "c4787615b410f6a723efd2e5164f98544b661fbe08da9bc90bf9241a42b76f53"
     ),
     "initialization": {
         "mode": "parent_fresh_optimizer",
@@ -282,7 +286,9 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
         "authorization_authority": (
             "configs/production/training_science_admission.json"
         ),
-        "authorization_reason": "v6_b12_commissioned_on_fresh_coherent_n128",
+        "authorization_reason": (
+            "v7_hard_decision_mass_correction_bound_to_v6_b12"
+        ),
     },
     "research_scratch_status": "research_only_unresolved_not_selected",
 }

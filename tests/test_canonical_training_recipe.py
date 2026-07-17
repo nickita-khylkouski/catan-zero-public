@@ -6,14 +6,23 @@ import hashlib
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from tools import train
+from tools import train, train_bc
 
 
 REPO = Path(__file__).resolve().parents[1]
 RECIPE = REPO / "configs/training/a1_current_35m_b200.schema1.json"
 PARENT_RECIPE = REPO / "configs/training/a1_parent_update_35m_b200.schema1.json"
+HARD_DECISION_EVIDENCE = (
+    REPO
+    / "docs/evidence/A1_V7_HARD_DECISION_POLICY_MASS_CORRECTION_20260717.json"
+)
+HARD_DECISION_POLICY_PHASE_WEIGHTS = (
+    "PLAY_TURN=4.0,MOVE_ROBBER=3.0,"
+    "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
+)
 
 
 def _payload() -> dict[str, object]:
@@ -257,6 +266,75 @@ def test_canonical_v7_value_routing_protects_only_the_shared_trunk() -> None:
     engine = _payload()["engine_settings"]
     assert fields["value_trunk_grad_scale"] == 0.1
     assert engine["value_tower_split_layers"] == 1
+
+
+@pytest.mark.parametrize("recipe", (RECIPE, PARENT_RECIPE))
+def test_canonical_recipe_emphasizes_hard_decisions_without_weighting_value(
+    recipe: Path,
+) -> None:
+    """V7 keeps the proven PLAY_TURN repair but restores hard-decision mass."""
+
+    fields = json.loads(recipe.read_text(encoding="utf-8"))["train_config"][
+        "fields"
+    ]
+
+    assert fields["phase_weights"] == HARD_DECISION_POLICY_PHASE_WEIGHTS
+    assert fields["value_phase_weights"] == "none"
+    assert fields["forced_action_weight"] == 0.0
+
+
+def test_hard_decision_mass_projection_replays_sealed_objective_measure() -> None:
+    evidence = json.loads(HARD_DECISION_EVIDENCE.read_text(encoding="utf-8"))
+    baseline = evidence["baseline"]["policy_objective_mass_fraction"]
+    factors = evidence["correction"]["relative_to_baseline_recipe"]
+    projected = evidence["same_measure_projection"][
+        "policy_objective_mass_fraction"
+    ]
+    denominator = sum(baseline[phase] * factors[phase] for phase in baseline)
+
+    for phase, old_fraction in baseline.items():
+        assert projected[phase] == pytest.approx(
+            old_fraction * factors[phase] / denominator
+        )
+    for phase in ("BUILD_INITIAL_ROAD", "DISCARD", "MOVE_ROBBER"):
+        assert projected[phase] > baseline[phase]
+    assert projected["PLAY_TURN"] < baseline["PLAY_TURN"]
+    assert evidence["isolation"] == {
+        "forced_action_weight": 0.0,
+        "value_phase_weights": "none",
+        "forced_rows_remain_value_only": True,
+        "value_objective_phase_distribution_changed": False,
+    }
+
+
+def test_hard_decision_recipe_weights_only_active_policy_rows() -> None:
+    fields = _fields()
+    phases = np.asarray(
+        ["BUILD_INITIAL_ROAD", "DISCARD", "MOVE_ROBBER", "PLAY_TURN", "DISCARD"]
+    )
+    data = {
+        "action_taken": np.arange(phases.size, dtype=np.int16),
+        "phase": phases,
+        "legal_action_ids": np.asarray(
+            [[0, 1], [0, 1], [0, 1], [0, 1], [0, -1]], dtype=np.int16
+        ),
+    }
+    policy_weights = train_bc.build_sample_weights(
+        data,
+        teacher_weights={},
+        phase_weights=train_bc._parse_weight_map(fields["phase_weights"]),
+        forced_action_weight=float(fields["forced_action_weight"]),
+        winner_sample_weight=1.0,
+        loser_sample_weight=1.0,
+        vp_margin_weight=0.0,
+        vps_to_win=10,
+    )
+    value_weights = train_bc.build_value_sample_weights(data, phase_weights={})
+
+    assert policy_weights / policy_weights[3] == pytest.approx(
+        [0.5, 0.375, 0.75, 1.0, 0.0]
+    )
+    assert value_weights == pytest.approx(np.ones(phases.size))
 
 
 def test_scratch_horizon_is_not_relabelled_as_the_parent_update_frontier() -> None:

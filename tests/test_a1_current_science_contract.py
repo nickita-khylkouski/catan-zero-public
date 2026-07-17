@@ -93,7 +93,10 @@ def test_current_learner_selects_parent_update_and_keeps_scratch_research_only()
     ) in current_science.PRODUCTION_TARGET_QUALITY_LEARNER_CONTRACT.items():
         assert recipe[key] == expected
     assert not current_science.DIAGNOSTIC_POLICY_AUX_FIELDS & set(recipe)
-    assert recipe["phase_weights"] == "PLAY_TURN=4.0"
+    assert recipe["phase_weights"] == (
+        "PLAY_TURN=4.0,MOVE_ROBBER=3.0,"
+        "BUILD_INITIAL_ROAD=2.0,DISCARD=1.5"
+    )
     assert recipe["base_sampler"] == "coverage_importance_v1"
     assert recipe["minimum_policy_effective_rows_per_global_batch"] == 32.0
     assert recipe["moe_balance_loss_weight"] == 0.0
@@ -387,7 +390,7 @@ def test_current_contract_rejects_uncommissioned_boundary_particles(
         ("value_trunk_grad_scale", 0.25),
         ("grad_accum_steps", 4),
         ("max_steps", 1024),
-        ("phase_weights", ""),
+        ("phase_weights", "PLAY_TURN=4.0"),
     ),
 )
 def test_current_contract_rejects_diagnostic_training_settings(

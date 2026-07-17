@@ -19,4 +19,13 @@ The v5 quarantine evidence currently covers:
 - 7,440 rows at resource saturation risk.
 
 The machine-readable admission state is in
-`configs/production/training_science_admission.json` and remains fail-closed.
+`configs/production/training_science_admission.json`. The selected parent update
+is authorized on the fresh v6 composite; native scratch training remains
+fail-closed.
+
+V7 also retains the commissioned `PLAY_TURN=4.0` repair while adding the
+previously audited exact-prompt weights `MOVE_ROBBER=3.0`,
+`BUILD_INITIAL_ROAD=2.0`, and `DISCARD=1.5`. Replaying those multipliers against
+the sealed r5 objective measure lowers `PLAY_TURN` from 71.71% to 52.27% and
+raises all three named hard-decision masses. This changes policy sampling only:
+forced rows remain policy-inactive and value phase weights remain disabled.

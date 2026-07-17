@@ -21,12 +21,12 @@
     ],
     "train": [
       {
-        "canonical_sha256": "5d5acaab429cf65b3bf7016730533c635cbaec3ebc9942448b5d204c264cc130",
+        "canonical_sha256": "f41b90e0111788d92cb9555d63ca7b0d94db7c761838eb08c24c438d1e3ca1a8",
         "name": "a1-current-35m-b200",
         "path": "configs/training/a1_current_35m_b200.schema1.json"
       },
       {
-        "canonical_sha256": "b0f7cad82a94849ebc5c1ebcf007a9ed20741025f03387d2b3002433b7765c09",
+        "canonical_sha256": "c4787615b410f6a723efd2e5164f98544b661fbe08da9bc90bf9241a42b76f53",
         "name": "a1-parent-update-35m-b200",
         "path": "configs/training/a1_parent_update_35m_b200.schema1.json"
       }

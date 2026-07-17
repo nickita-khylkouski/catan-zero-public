@@ -1,0 +1,65 @@
+{
+  "schema_version": "a1-v7-hard-decision-policy-mass-correction-v1",
+  "status": "commissioned_recipe_correction",
+  "scope": "policy_objective_only",
+  "source": {
+    "host_role": "b200_read_only_evidence_store",
+    "path": "/home/ubuntu/catan-zero-production/runs/learner/a1-v6-coherent-n128-12000-20260717-r4-v4-b12-sealed-r5/train.report.json",
+    "file_sha256": "sha256:d3faad69d9e5c36b3cdeb8be6c25fdd635169817950992f72ba0002bb4d5fbdd",
+    "data_fingerprint": "sha256:50c4ac6b0d4e1a4fb4dc5d8c5c816a0beac58fd5b2d5c5bb6dd1c6ddc78d6f25",
+    "policy_phase_objective_mass_identity_sha256": "sha256:c9ee59c17be83f69b915ad98e6d6ea370cdfac52e45a5fae84db1f437e35809f",
+    "objective_measure": "weighted_replacement_draw_probability_x_policy_loss_weight_v1"
+  },
+  "baseline": {
+    "phase_weights": {
+      "PLAY_TURN": 4.0
+    },
+    "policy_objective_mass_fraction": {
+      "BUILD_INITIAL_ROAD": 0.03880059290142397,
+      "BUILD_INITIAL_SETTLEMENT": 0.03880059290142397,
+      "DISCARD": 0.05164456563353512,
+      "MOVE_ROBBER": 0.15366252215975965,
+      "PLAY_TURN": 0.7170917264038573
+    }
+  },
+  "correction": {
+    "phase_weights": {
+      "BUILD_INITIAL_ROAD": 2.0,
+      "DISCARD": 1.5,
+      "MOVE_ROBBER": 3.0,
+      "PLAY_TURN": 4.0
+    },
+    "relative_to_baseline_recipe": {
+      "BUILD_INITIAL_ROAD": 2.0,
+      "BUILD_INITIAL_SETTLEMENT": 1.0,
+      "DISCARD": 1.5,
+      "MOVE_ROBBER": 3.0,
+      "PLAY_TURN": 1.0
+    },
+    "rationale": "preserve the commissioned PLAY_TURN=4 repair while adding the previously audited absolute hard-decision weights in exact production prompt vocabulary"
+  },
+  "same_measure_projection": {
+    "formula": "normalize(baseline_policy_objective_mass * correction_weight / baseline_weight)",
+    "policy_objective_mass_fraction": {
+      "BUILD_INITIAL_ROAD": 0.056562778126967764,
+      "BUILD_INITIAL_SETTLEMENT": 0.028281389063483882,
+      "DISCARD": 0.056464860887848675,
+      "MOVE_ROBBER": 0.336009523208875,
+      "PLAY_TURN": 0.5226814487128247
+    },
+    "named_hard_decisions_all_increase": true,
+    "play_turn_no_longer_dominates_at_seventy_percent": true
+  },
+  "isolation": {
+    "forced_action_weight": 0.0,
+    "value_phase_weights": "none",
+    "forced_rows_remain_value_only": true,
+    "value_objective_phase_distribution_changed": false
+  },
+  "admission": {
+    "existing_minimum_initial_road_policy_mass_fraction": 0.02,
+    "minimum_discard_policy_mass_fraction": 0.02,
+    "minimum_move_robber_policy_mass_fraction": 0.02,
+    "decision": "reuse the reviewed two-percent hard-decision signal floor; exact phase weights are recipe-hashed and train_bc reports realized per-phase objective mass before training"
+  }
+}

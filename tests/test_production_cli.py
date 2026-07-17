@@ -239,11 +239,11 @@ def test_cataloged_parent_update_uses_exact_authorized_recipe_and_parent(
 
     assert plan["readiness"]["authorized"] is True
     assert plan["readiness"]["reason"] == (
-        "v6_b12_commissioned_on_fresh_coherent_n128"
+        "v7_hard_decision_mass_correction_bound_to_v6_b12"
     )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
-        "b0f7cad82a94849ebc5c1ebcf007a9ed20741025f03387d2b3002433b7765c09"
+        "c4787615b410f6a723efd2e5164f98544b661fbe08da9bc90bf9241a42b76f53"
     )
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]
