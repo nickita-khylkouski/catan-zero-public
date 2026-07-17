@@ -1046,23 +1046,31 @@ def test_current_guard_refuses_rust_featurizer_drift(mutation: str) -> None:
         )
 
 
-def test_v3_authoritative_fleet_balances_exact_64_gpu_quotas() -> None:
-    workers, record = contract._canonical_workers_from_fleet_manifest(  # noqa: SLF001
+def test_v3_manifest_drives_48_gpu_scale_and_exact_8_gpu_pilot() -> None:
+    manifest_workers, record = contract._canonical_workers_from_fleet_manifest(  # noqa: SLF001
         contract.CURRENT_FLEET_MANIFEST
     )
-    quotas = contract._balanced_worker_quotas(workers)  # noqa: SLF001
+    pilot_workers = contract._workers_for_quota_policy(  # noqa: SLF001
+        manifest_workers, contract.PILOT_ONE_NODE_QUOTA_POLICY
+    )
+    pilot_quotas = contract._balanced_worker_quotas(  # noqa: SLF001
+        pilot_workers, quota_policy=contract.PILOT_ONE_NODE_QUOTA_POLICY
+    )
 
-    assert len(workers) == 64
+    assert len(manifest_workers) == 48
+    assert len(pilot_workers) == 8
+    assert {worker["host_alias"] for worker in pilot_workers} == {"h100-8a"}
+    assert [worker["gpu"] for worker in pilot_workers] == list(range(8))
     assert record["sha256"] == contract._sha256(  # noqa: SLF001
         contract.CURRENT_FLEET_MANIFEST
     )
-    assert {category: sum(q[category] for q in quotas.values()) for category in contract.EXPECTED_GAMES} == contract.EXPECTED_GAMES
-    ordered = [quotas[worker["id"]] for worker in workers]
-    assert {quota["current_producer"] for quota in ordered} == {150}
-    assert [quota["recent_history"] for quota in ordered].count(29) == 8
-    assert [quota["recent_history"] for quota in ordered].count(28) == 56
-    assert [quota["hard_negative"] for quota in ordered].count(10) == 24
-    assert [quota["hard_negative"] for quota in ordered].count(9) == 40
+    assert set(map(tuple, (quota.values() for quota in pilot_quotas.values()))) == {
+        (8, 2, 1)
+    }
+    assert {
+        category: sum(quota[category] for quota in pilot_quotas.values())
+        for category in contract.EXPECTED_GAMES
+    } == {"current_producer": 64, "recent_history": 16, "hard_negative": 8}
 
 
 def test_v3_balanced_jobs_have_exact_selected_and_bounded_attempt_totals(
@@ -1079,7 +1087,7 @@ def test_v3_balanced_jobs_have_exact_selected_and_bounded_attempt_totals(
         contract_id="v3-test",
     )
 
-    assert len(jobs) == 192
+    assert len(jobs) == 144
     assert Counter(
         {
             category: sum(job["games"] for job in jobs if job["category"] == category)
@@ -1090,62 +1098,43 @@ def test_v3_balanced_jobs_have_exact_selected_and_bounded_attempt_totals(
         category: sum(job["attempts"] for job in jobs if job["category"] == category)
         for category in contract.EXPECTED_GAMES
     } == {
-        category: total + 64 * contract.ATTEMPT_RESERVE_PER_JOB[category]
+        category: total + len(workers) * contract.ATTEMPT_RESERVE_PER_JOB[category]
         for category, total in contract.EXPECTED_GAMES.items()
     }
-    assert quotas["c1_gpu0"] == {
-        "current_producer": 150,
-        "recent_history": 29,
-        "hard_negative": 10,
+    assert quotas["h100-8a_gpu0"] == {
+        "current_producer": 200,
+        "recent_history": 38,
+        "hard_negative": 13,
     }
-    assert quotas["h100-8d_gpu7"] == {
-        "current_producer": 150,
-        "recent_history": 28,
-        "hard_negative": 9,
+    assert quotas["h100-8f_gpu7"] == {
+        "current_producer": 200,
+        "recent_history": 37,
+        "hard_negative": 12,
     }
 
 
-def test_v3_64k_profile_is_exactly_1000_selected_games_per_gpu() -> None:
-    workers, _ = contract._canonical_workers_from_fleet_manifest(  # noqa: SLF001
+def test_pilot_jobs_put_all_three_categories_on_every_gpu(tmp_path: Path) -> None:
+    manifest_workers, _ = contract._canonical_workers_from_fleet_manifest(  # noqa: SLF001
         contract.CURRENT_FLEET_MANIFEST
     )
-
-    with pytest.raises(contract.ContractError, match="maximum 1008 attempts/worker"):
-        contract._build_balanced_jobs(  # noqa: SLF001
-            workers,
-            seed_base=560_000_000_000,
-            block_size=1_000,
-            output_root="/tmp/a1-scale-profile",
-            contract_id="a1-scale-profile",
-            quota_policy=contract.BALANCED_PER_LANE_64K_QUOTA_POLICY,
-        )
-
+    workers = contract._workers_for_quota_policy(  # noqa: SLF001
+        manifest_workers, contract.PILOT_ONE_NODE_QUOTA_POLICY
+    )
     jobs, quotas = contract._build_balanced_jobs(  # noqa: SLF001
         workers,
-        seed_base=560_000_000_000,
-        block_size=1_024,
-        output_root="/tmp/a1-scale-profile",
-        contract_id="a1-scale-profile",
-        quota_policy=contract.BALANCED_PER_LANE_64K_QUOTA_POLICY,
+        seed_base=590_000_000_000,
+        block_size=32,
+        output_root=str(tmp_path),
+        contract_id="one-node-pilot",
+        quota_policy=contract.PILOT_ONE_NODE_QUOTA_POLICY,
     )
 
-    assert len(jobs) == 192
-    assert set(map(tuple, (quota.values() for quota in quotas.values()))) == {
-        (800, 150, 50)
-    }
-    assert all(sum(quota.values()) == 1_000 for quota in quotas.values())
-    assert {
-        category: sum(job["games"] for job in jobs if job["category"] == category)
-        for category in contract.SCALE_64K_GAMES
-    } == contract.SCALE_64K_GAMES
-    assert {
-        category: sum(job["attempts"] for job in jobs if job["category"] == category)
-        for category in contract.SCALE_64K_GAMES
-    } == {
-        "current_producer": 51_520,
-        "recent_history": 9_728,
-        "hard_negative": 3_264,
-    }
+    assert len(jobs) == 24
+    assert all(set(quota) == set(contract.EXPECTED_GAMES) for quota in quotas.values())
+    assert all(all(value > 0 for value in quota.values()) for quota in quotas.values())
+    assert {job["host_alias"] for job in jobs} == {"h100-8a"}
+    assert {job["gpu"] for job in jobs} == set(range(8))
+    assert sum(job["games"] for job in jobs) == 88
 
 
 def test_checked_in_relative_provenance_paths_canonicalize_to_required_files() -> None:

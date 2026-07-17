@@ -123,7 +123,11 @@ def test_native_release_requires_coherent_belief_and_forced_root_capabilities() 
 
 
 def _fixture(
-    tmp_path: Path, *, current_v3: bool = False
+    tmp_path: Path,
+    *,
+    current_v3: bool = False,
+    current_lane_count: int = 64,
+    current_gpus_per_host: int = 4,
 ) -> tuple[Path, Path, dict, dict]:
     ledger = tmp_path / "seed-ledger.md"
     ledger.write_text("# ledger\n", encoding="utf-8")
@@ -207,8 +211,8 @@ def _fixture(
             **(
                 {
                     "profile": contract.CURRENT_GAME_CONTRACT_PROFILE,
-                    "worker_count": 64,
-                    "job_count": 192,
+                    "worker_count": current_lane_count,
+                    "job_count": current_lane_count * 3,
                 }
                 if current_v3
                 else {}
@@ -239,9 +243,10 @@ def _fixture(
     }
     commands = []
     categories = executor.CATEGORY_ORDER
-    for lane_index in range(64 if current_v3 else 40):
-        alias = f"h{lane_index // 4:02d}"
-        gpu = lane_index % 4
+    for lane_index in range(current_lane_count if current_v3 else 40):
+        gpus_per_host = current_gpus_per_host if current_v3 else 4
+        alias = f"h{lane_index // gpus_per_host:02d}"
+        gpu = lane_index % gpus_per_host
         worker_id = f"{alias}_gpu{gpu}"
         previous = None
         for category_index, category in enumerate(categories):
@@ -760,6 +765,39 @@ def test_current_v3_dry_plan_is_exact_64_lane_192_job_contract(
 
     assert plan["lane_count"] == 64
     assert plan["job_count"] == plan["claim_count"] == 192
+
+
+def test_current_v3_one_node_pilot_is_exact_8_lane_24_job_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path, render_path, lock, rendered = _fixture(
+        tmp_path,
+        current_v3=True,
+        current_lane_count=8,
+        current_gpus_per_host=8,
+    )
+    lock["game_contract"]["profile"] = contract.PILOT_GAME_CONTRACT_PROFILE
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    hosts = _hosts(tmp_path, rendered)
+    monkeypatch.setattr(executor, "_repo_artifacts", lambda _rendered, **_kwargs: [])
+
+    plan = executor.build_plan(
+        lock_path=lock_path,
+        render_path=render_path,
+        hosts_path=hosts,
+        receipt_path=tmp_path / "receipt.json",
+        verify_lock_fn=_verifier(lock),
+    )
+
+    assert plan["lane_count"] == 8
+    assert plan["job_count"] == plan["claim_count"] == 24
+    assert {lane["host_alias"] for lane in plan["lanes"]} == {"h00"}
+    assert [lane["gpu"] for lane in plan["lanes"]] == list(range(8))
+    assert all(len(lane["jobs"]) == 3 for lane in plan["lanes"])
+    assert all(
+        command["argv"][command["argv"].index("--n-full") + 1] == "128"
+        for command in rendered["commands"]
+    )
 
 
 def test_dual_arm_n256_profile_is_exact_28_lane_84_job_contract(

@@ -1,6 +1,6 @@
 """CAT-75 regression + integration tests: build_parser() extraction from the
-three real launchers (tools/generate_gumbel_selfplay_data.py, tools/train_bc.py,
-tools/continuous_flywheel.py) is behavior-identical to their old inline-main()
+the retained internal launchers (tools/generate_gumbel_selfplay_data.py and
+tools/train_bc.py) is behavior-identical to their old inline-main()
 parsers, and tools/prelaunch_guard.py's guard library (CAT-69) is actually
 wired into each launcher's main() rather than build-and-shelved.
 
@@ -32,7 +32,6 @@ _TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
-import continuous_flywheel  # type: ignore  # noqa: E402
 import generate_gumbel_selfplay_data as gen_cli  # type: ignore  # noqa: E402
 import launcher_guards  # type: ignore  # noqa: E402
 import prelaunch_guard  # type: ignore  # noqa: E402
@@ -309,52 +308,6 @@ GOLDEN_OPTION_STRINGS = {
         ("--weight-decay",),
         ("--winner-sample-weight",),
     },
-    "continuous_flywheel": {
-        ("--anchor-corpus",),
-        ("--anchor-drift-alert-threshold",),
-        ("--anchor-eval-every-rounds",),
-        ("--anchor-holdout-ranges",),
-        ("--base-seed",),
-        ("--batch-size",),
-        ("--champion-registry",),
-        ("--device",),
-        ("--dry-run",),
-        ("--evict-grace-seconds",),
-        ("--evict-stale-shards",),
-        ("--games-per-round",),
-        ("--gate-games",),
-        ("--gate-baseline-value-readout",),
-        ("--gate-candidate-value-readout",),
-        ("--gen-c-scale",),
-        ("--gen-c-visit",),
-        ("--gen-correct-rust-chance-spectra", "--no-gen-correct-rust-chance-spectra"),
-        ("--gen-determinization-min-simulations",),
-        ("--gen-determinization-particles",),
-        ("--gen-information-set-search", "--no-gen-information-set-search"),
-        ("--gen-lazy-interior-chance", "--no-gen-lazy-interior-chance"),
-        ("--gen-max-decisions",),
-        ("--gen-max-depth",),
-        ("--gen-n-fast",),
-        ("--gen-n-full",),
-        ("--gen-n-full-wide",),
-        ("--gen-n-full-wide-threshold",),
-        ("--gen-out-root",),
-        ("--gen-p-full",),
-        ("--gen-symmetry-averaged-eval", "--no-gen-symmetry-averaged-eval"),
-        ("--gen-symmetry-averaged-eval-threshold",),
-        ("--gen-temperature-decisions",),
-        ("--gen-wide-candidates-threshold",),
-        ("--gen-wide-roots-always-full", "--no-gen-wide-roots-always-full"),
-        ("--help", "-h"),
-        ("--loop-dir",),
-        ("--max-rounds",),
-        ("--opponent-pool-fraction",),
-        ("--regime",),
-        ("--seed-checkpoint",),
-        ("--skip-guards",),
-        ("--window-c-rows",),
-        ("--workers",),
-    },
 }
 
 
@@ -399,7 +352,7 @@ def test_canonical_train_cli_exposes_only_config_and_artifact_bindings() -> None
 
 @pytest.mark.parametrize(
     "module",
-    [gen_cli, train_cli, continuous_flywheel],
+    [gen_cli, train_cli],
 )
 def test_build_parser_is_import_safe_and_side_effect_free(module):
     """Calling build_parser() twice must not raise or leak state -- pure
@@ -461,34 +414,11 @@ def test_train_bc_sample_argv_produces_expected_namespace(tmp_path):
     assert args.skip_guards is False
 
 
-def test_continuous_flywheel_sample_argv_produces_expected_namespace(tmp_path):
-    parser = continuous_flywheel.build_parser()
-    args = parser.parse_args(
-        [
-            "--loop-dir",
-            str(tmp_path / "loop"),
-            "--seed-checkpoint",
-            str(tmp_path / "seed.pt"),
-            "--dry-run",
-        ]
-    )
-    assert args.loop_dir == str(tmp_path / "loop")
-    assert args.dry_run is True
-    # Untouched defaults must be unaffected by the extraction.
-    assert args.regime == "continuous"
-    assert args.batch_size == 65536
-    assert args.gen_information_set_search is None
-    assert args.gen_determinization_particles is None
-    assert args.gen_determinization_min_simulations is None
-    assert args.skip_guards is False
-
-
 @pytest.mark.parametrize(
     "module, launcher",
     [
         (gen_cli, "generate_gumbel_selfplay_data"),
         (train_bc, "train_bc"),
-        (continuous_flywheel, "continuous_flywheel"),
     ],
 )
 def test_static_guard_config_critical_flags_are_not_stale(module, launcher):
@@ -821,136 +751,6 @@ class TestTrainBcGuardWiring:
         assert "WARNING" in capsys.readouterr().err
 
 
-class TestContinuousFlywheelGuardWiring:
-    def test_seed_checkpoint_masked_regime_mismatch_is_refused(self, tmp_path):
-        seed_checkpoint = tmp_path / "seed.pt"
-        _write_fake_checkpoint(seed_checkpoint, mask_hidden_info=False)
-        loop_dir = tmp_path / "loop"
-
-        parser = continuous_flywheel.build_parser()
-        argv = [
-            "--loop-dir",
-            str(loop_dir),
-            "--seed-checkpoint",
-            str(seed_checkpoint),
-            "--batch-size",
-            "65536",
-            "--games-per-round",
-            "2000",
-            "--gate-games",
-            "150",
-        ]
-        args = parser.parse_args(argv)
-        loop_dir.mkdir(parents=True, exist_ok=True)
-        specs = continuous_flywheel._build_guard_specs(args, argv, parser, loop_dir)
-        with pytest.raises(SystemExit, match="masked_regime"):
-            launcher_guards.run_or_refuse(
-                specs, launcher="continuous_flywheel", skip=False
-            )
-
-    def test_matching_masked_regime_is_not_refused(self, tmp_path):
-        seed_checkpoint = tmp_path / "seed.pt"
-        _write_fake_checkpoint(seed_checkpoint, mask_hidden_info=True)
-        loop_dir = tmp_path / "loop"
-
-        parser = continuous_flywheel.build_parser()
-        argv = [
-            "--loop-dir",
-            str(loop_dir),
-            "--seed-checkpoint",
-            str(seed_checkpoint),
-            "--batch-size",
-            "65536",
-            "--games-per-round",
-            "2000",
-            "--gate-games",
-            "150",
-        ]
-        args = parser.parse_args(argv)
-        loop_dir.mkdir(parents=True, exist_ok=True)
-        specs = continuous_flywheel._build_guard_specs(args, argv, parser, loop_dir)
-        launcher_guards.run_or_refuse(specs, launcher="continuous_flywheel", skip=False)
-
-    def test_resumed_config_provenance_drift_is_refused(self, tmp_path):
-        seed_checkpoint = tmp_path / "seed.pt"
-        _write_fake_checkpoint(seed_checkpoint, mask_hidden_info=True)
-        loop_dir = tmp_path / "loop"
-        loop_dir.mkdir(parents=True, exist_ok=True)
-        # Simulate a prior run that recorded regime="continuous".
-        (loop_dir / "flywheel_config.json").write_text(
-            json.dumps({"regime": "continuous"})
-        )
-
-        parser = continuous_flywheel.build_parser()
-        argv = [
-            "--loop-dir",
-            str(loop_dir),
-            "--seed-checkpoint",
-            str(seed_checkpoint),
-            "--regime",
-            "discrete",  # drifts from the recorded "continuous"
-            "--batch-size",
-            "65536",
-            "--games-per-round",
-            "2000",
-            "--gate-games",
-            "150",
-        ]
-        args = parser.parse_args(argv)
-        specs = continuous_flywheel._build_guard_specs(args, argv, parser, loop_dir)
-        with pytest.raises(SystemExit, match="provenance"):
-            launcher_guards.run_or_refuse(
-                specs, launcher="continuous_flywheel", skip=False
-            )
-
-    def test_fresh_loop_has_no_provenance_guard(self, tmp_path):
-        """A brand-new --loop-dir has no flywheel_config.json yet -- the
-        provenance guard must not be added at all (it would otherwise FAIL on
-        a merely-absent report, which is the wrong verdict for a fresh start)."""
-        seed_checkpoint = tmp_path / "seed.pt"
-        _write_fake_checkpoint(seed_checkpoint, mask_hidden_info=True)
-        loop_dir = tmp_path / "loop"
-        loop_dir.mkdir(parents=True, exist_ok=True)
-
-        parser = continuous_flywheel.build_parser()
-        argv = ["--loop-dir", str(loop_dir), "--seed-checkpoint", str(seed_checkpoint)]
-        args = parser.parse_args(argv)
-        specs = continuous_flywheel._build_guard_specs(args, argv, parser, loop_dir)
-        assert not any(spec["name"] == "provenance" for spec in specs)
-
-    def test_dry_run_never_reaches_guard_wiring(self, tmp_path):
-        """The retired plan-only dry-run never constructs guards or reads the
-        supplied checkpoint bytes."""
-        loop_dir = tmp_path / "loop"
-        fake_checkpoint = tmp_path / "not_a_real_checkpoint.pt"
-        fake_checkpoint.write_bytes(b"not a real torch checkpoint")
-        argv = [
-            "--loop-dir",
-            str(loop_dir),
-            "--seed-checkpoint",
-            str(fake_checkpoint),
-            "--dry-run",
-            "--max-rounds",
-            "0",
-        ]
-        exit_code = continuous_flywheel.main(argv)
-        assert exit_code == 0
-        assert not loop_dir.exists()
-
-    def test_skip_guards_bypasses_refusal_with_warning(self, tmp_path, capsys):
-        seed_checkpoint = tmp_path / "seed.pt"
-        _write_fake_checkpoint(seed_checkpoint, mask_hidden_info=False)
-        loop_dir = tmp_path / "loop"
-        loop_dir.mkdir(parents=True, exist_ok=True)
-
-        parser = continuous_flywheel.build_parser()
-        argv = ["--loop-dir", str(loop_dir), "--seed-checkpoint", str(seed_checkpoint)]
-        args = parser.parse_args(argv)
-        specs = continuous_flywheel._build_guard_specs(args, argv, parser, loop_dir)
-        launcher_guards.run_or_refuse(specs, launcher="continuous_flywheel", skip=True)
-        assert "WARNING" in capsys.readouterr().err
-
-
 # ---------------------------------------------------------------------------
 # --help must never trigger a guard (argparse exits during parse_args itself,
 # before any launcher's main() body -- including the guard wiring -- runs).
@@ -971,10 +771,6 @@ class TestContinuousFlywheelGuardWiring:
                 "--report",
                 "/tmp/z.json",
             ],
-        ),
-        (
-            continuous_flywheel,
-            ["--loop-dir", "/tmp/x", "--seed-checkpoint", "/tmp/y.pt"],
         ),
     ],
 )

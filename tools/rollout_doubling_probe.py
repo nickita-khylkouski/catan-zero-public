@@ -66,7 +66,7 @@ H2H_TOOL_RELPATH = "tools/gumbel_search_cross_net_h2h.py"
 # caller's cwd (H2H_TOOL_RELPATH itself stays relative/repo-root-relative,
 # since it's also what gets printed for a human to copy-paste onto a GPU
 # host -- mirrors the cwd=str(REPO_ROOT) convention in
-# tools/continuous_flywheel.py's subprocess.run call).
+# the retired prototype's subprocess invocation).
 _REPO_ROOT = _TOOLS_DIR.parent
 
 

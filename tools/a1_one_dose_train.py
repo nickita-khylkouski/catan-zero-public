@@ -2300,6 +2300,21 @@ def bind_canonical_parent_update_recipe(
             "canonical parent-update scalar value objective contract drifted"
         )
     recipe.update(scalar_contract)
+    # Engine settings are part of the cataloged science contract and must
+    # reach train_bc, not merely be hashed into an authority record. Keeping
+    # them in the effective recipe closes the launcher/executor ownership gap.
+    for key in (
+        "base_sampler",
+        "data_loader_prefetch",
+        "data_loader_workers",
+        "minimum_initial_road_policy_mass_fraction",
+        "minimum_initial_settlement_policy_mass_fraction",
+        "minimum_feature_learning_signal_observations",
+        "objective_gradient_interference_every_batches",
+        "require_feature_learning_signal_modules",
+        "train_diagnostics_every_batches",
+    ):
+        recipe[key] = engine[key]
     # The schema records the per-rank B200 batch.  Bind a logical one-rank
     # recipe here so bind_training_topology can prove the exact 8x64=512 dose.
     recipe.update(
@@ -2361,12 +2376,12 @@ def bind_canonical_parent_update_recipe(
     if (
         not isinstance(upgrade, dict)
         or upgrade.get("module")
-        != architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
+        != architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY
         or upgrade.get("source") != verified["producer"]
     ):
         raise ExecutorError(
-            "canonical parent update requires the direct producer-to-current-v5+"
-            "topology+split1 "
+            "canonical parent update requires the direct B12 current-v5+split1 "
+            "to topology "
             "function-preserving upgrade receipt"
         )
     result = dict(verified)
@@ -5595,11 +5610,12 @@ def bind_stage_c_final_replication(
 def _append_current_parent_topology_cli(
     command: list[str], upgrade_module: str | None
 ) -> None:
-    """Expose the reviewed legacy-parent topology edge in trainer argv."""
+    """Expose the checkpoint-owned current-v5 topology in trainer argv."""
 
     if upgrade_module not in {
         architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
         architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+        architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
     }:
         return
     command.extend(
@@ -5624,8 +5640,10 @@ def _append_current_parent_topology_cli(
         ]
     )
     if (
-        upgrade_module
-        == architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
+        upgrade_module in {
+            architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+            architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
+        }
     ):
         command.append("--topology-residual-adapter")
 
@@ -5712,12 +5730,11 @@ def _build_direct_train_command(
         command.append("--aux-subgoal-heads")
         command.append("--aux-settlement-pointer-head")
     upgrade_module = verified.get("function_preserving_upgrade", {}).get("module")
-    if (
-        upgrade_module
-        == architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
-    ):
-        # This is the one reviewed legacy-incumbent -> production parent
-        # topology edge.  Keep every checkpoint-owned switch visible in the
+    if upgrade_module in {
+        architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+        architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
+    }:
+        # Keep every checkpoint-owned switch visible in the
         # sealed trainer argv as well as in the replayed receipt.  In
         # particular, history-v2 owns cap 64 (the older generic history
         # upgrades below own cap 32), and the private value suffix must not be
@@ -5777,9 +5794,11 @@ def _build_direct_train_command(
             "--data-format",
             "memmap",
             "--data-loader-workers",
-            str(DATA_LOADER_WORKERS),
+            str(recipe.get("data_loader_workers", DATA_LOADER_WORKERS)),
             "--data-loader-prefetch",
-            str(DATA_LOADER_PREFETCH),
+            str(recipe.get("data_loader_prefetch", DATA_LOADER_PREFETCH)),
+            "--base-sampler",
+            str(recipe.get("base_sampler", "weighted_replacement_v1")),
             "--device",
             "cuda",
             "--track",
@@ -5823,6 +5842,24 @@ def _build_direct_train_command(
             str(recipe.get("public_card_lr_mult", 1.0)),
             "--trunk-lr-mult",
             str(recipe.get("trunk_lr_mult", 1.0)),
+            *(
+                [
+                    "--minimum-initial-settlement-policy-mass-fraction",
+                    str(recipe["minimum_initial_settlement_policy_mass_fraction"]),
+                    "--minimum-initial-road-policy-mass-fraction",
+                    str(recipe["minimum_initial_road_policy_mass_fraction"]),
+                    "--train-diagnostics-every-batches",
+                    str(recipe["train_diagnostics_every_batches"]),
+                    "--objective-gradient-interference-every-batches",
+                    str(recipe["objective_gradient_interference_every_batches"]),
+                    "--require-feature-learning-signal-modules",
+                    str(recipe["require_feature_learning_signal_modules"]),
+                    "--minimum-feature-learning-signal-observations",
+                    str(recipe["minimum_feature_learning_signal_observations"]),
+                ]
+                if "minimum_initial_settlement_policy_mass_fraction" in recipe
+                else []
+            ),
             "--policy-loss-weight",
             str(recipe["policy_loss_weight"]),
             "--soft-target-source",

@@ -9,20 +9,10 @@ import time
 
 import pytest
 
-from tools.fleet import build_a1_neutral_panel_jobset as historical_panel
 from tools.fleet import gpu_fleet as fleet
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_historical_panel_snapshot_cannot_impersonate_generic_authority(tmp_path):
-    raw = historical_panel.manifest(ssh_key="/tmp/key")
-    assert raw["schema_version"] == historical_panel.HISTORICAL_MANIFEST_SCHEMA
-    path = tmp_path / "historical-panel.json"
-    path.write_text(json.dumps(raw))
-    with pytest.raises(fleet.FleetError, match="unsupported fleet manifest schema"):
-        fleet.load_manifest(path)
 
 
 def _manifest(tmp_path: Path, commits: dict[str, str] | None = None):

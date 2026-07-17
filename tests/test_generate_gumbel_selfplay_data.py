@@ -87,6 +87,34 @@ def test_evaluator_history_contract_ignores_limit_when_history_is_disabled() -> 
     )
 
 
+def test_current_v5_producer_contract_accepts_only_v5_teacher() -> None:
+    evaluator = types.SimpleNamespace(
+        policy=types.SimpleNamespace(
+            entity_feature_adapter_version=CURRENT_RUST_ENTITY_ADAPTER_VERSION,
+            config=types.SimpleNamespace(
+                meaningful_public_history=True,
+                event_history_limit=64,
+            ),
+        )
+    )
+    worker = {
+        "meaningful_public_history": True,
+        "event_history_limit": 64,
+        "learner_entity_feature_adapter_version": (
+            CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        ),
+        "teacher_entity_feature_adapter_version": (
+            CURRENT_RUST_ENTITY_ADAPTER_VERSION
+        ),
+    }
+
+    cli._assert_evaluator_history_contract(evaluator, worker)
+
+    worker["teacher_entity_feature_adapter_version"] = RUST_ENTITY_ADAPTER_V2
+    with pytest.raises(ValueError, match="teacher evaluator adapter"):
+        cli._assert_evaluator_history_contract(evaluator, worker)
+
+
 @pytest.mark.parametrize("lane", ["pool", "mix"])
 @pytest.mark.parametrize("mismatch", ["history", "adapter"])
 def test_archived_opponent_feature_contract_mismatch_is_rejected(

@@ -156,18 +156,17 @@ tools/loop.py + one sealed turn config
 - **Training input path:** The canonical B200 recipe overlaps memmap reconstruction with GPU work using four materialization threads and a four-batch bounded prefetch window. The epoch iterator must remain lazy; rebuilding every batch-index array duplicates the complete row order on every DDP rank.
 
 ### `/tools/fleet`
-- **Owns:** Alias-based host resolution and guarded launch/stop/status operations.
+- **Owns:** Receipt-bound fleet generation, harvest, evaluation, and teardown.
 - **Entry point:** `tools/fleet/a1_production_executor.py` through a sealed
   `tools/loop.py` generation stage.
 - **Key files:**
-  - `fleet_lib.sh` — uncommitted alias-to-IP boundary.
   - `a1_production_executor.py` — content-addressed multi-host generation transaction.
-  - `launch_detached.sh` — teardown-safe supervision and heartbeat.
-  - `fleet_stop.sh` / `fleet_status.sh` — explicit-PID control and read-only status.
+  - `a1_harvest_transaction.py` — authenticated direct harvest transaction.
+  - `a1_lane_supervisor.py` and `a1_stop_helper.py` — receipt-bound supervision and teardown.
 - **Connects to:** H100/B200 hosts, seed ledger, generator, and trainer.
 - **Contribute here if:** Work changes physical resource placement or launch safety.
-- **Retired path:** `fleet_launch.sh` still reconstructs legacy PIMC/history flags
-  and is excluded from new production turns.
+- Historical generic shell launch/status/stop helpers were deleted. Git history
+  is the only archive for those noncanonical operator surfaces.
 
 ### `/configs`
 - **Owns:** Typed pipeline settings, guard expectations, and experiment manifests.
@@ -215,10 +214,14 @@ tools/loop.py + one sealed turn config
 - **If wrong →** A future subtree-reuse/transposition design may create enough hits to justify a bounded cache.
 - **Verify:** Add hit/miss telemetry to a representative long run.
 
-### [HIGH CONFIDENCE] The current canonical learner is not commissioned to run
-- **Evidence:** The coherent-public v3 contract sets the optimizer schedule unresolved and `go_authorized=false`; `a1_scratch_train.py --go` refuses it.
-- **If correct →** Do not interpret a plan receipt as a runnable flywheel turn.
-- **Verify:** `configs/operations/a1-next-wave-coherent-public-v3/science.contract.json` and `tools/a1_scratch_train.py`.
+### [HIGH CONFIDENCE] Parent update is commissioned; scratch training is not
+- **Evidence:** The parent-update admission binds B12 selection evidence, a
+  12-step fresh-Adam dose, 0.25x trunk learning rate, and runtime feature-signal
+  gates. The separate random-initialization recipe remains blocked.
+- **If correct →** Route production training through the parent recipe and do
+  not substitute the scratch constructor.
+- **Verify:** `configs/production/training_science_admission.json` and
+  `configs/training/a1_parent_update_35m_b200.schema1.json`.
 
 ### [HIGH CONFIDENCE] Scratch and parent-update learners are different experiments
 - **Evidence:** The compact trainer now requires an explicit `initialization_mode`. The checked-in native-v5 recipe binds `scratch_fresh_optimizer` and rejects parent/grow checkpoints or restored optimizer state.

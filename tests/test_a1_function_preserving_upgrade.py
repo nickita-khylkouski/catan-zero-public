@@ -749,6 +749,34 @@ def test_topology_aware_current_v5_split1_is_a_new_reviewed_upgrade_edge() -> No
     ) == selected["flags"]
 
 
+def test_b12_topology_upgrade_adds_only_zero_output_topology_parameters() -> None:
+    selected = upgrade.ALLOWLIST[
+        upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY
+    ]
+    current = upgrade.ALLOWLIST[upgrade.MODULE_CURRENT_V5]
+
+    assert selected["flags"] == {"topology_residual_adapter": True}
+    assert selected["config_delta"] == {"topology_residual_adapter": True}
+    assert selected["source_config_requirements"] == {
+        **current["flags"],
+        "state_trunk": "transformer",
+        "state_layers": 6,
+        "value_tower_split_layers": 1,
+        "latent_deliberation_steps": 0,
+        "topology_residual_adapter": False,
+    }
+    assert set(selected["new_parameter_initialization"]) == {
+        "topology_residual_adapter.message_norm.bias",
+        "topology_residual_adapter.message_norm.weight",
+        "topology_residual_adapter.output_projection.bias",
+        "topology_residual_adapter.output_projection.weight",
+        "topology_residual_adapter.source_norm.bias",
+        "topology_residual_adapter.source_norm.weight",
+        "topology_residual_adapter.source_projection.bias",
+        "topology_residual_adapter.source_projection.weight",
+    }
+
+
 @pytest.mark.parametrize(
     "source_overrides",
     [

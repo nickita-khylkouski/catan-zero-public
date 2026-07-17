@@ -81,15 +81,14 @@ evaluation configs. The coordinator does not reinterpret those settings.
 | evaluate | `tools/a1_candidate_promotion_pack.py` |
 | promote | `tools/a1_promotion_transaction.py promote --go` |
 
-`tools/fleet/fleet_launch.sh` is intentionally absent. It is a historical
-launcher that still expands legacy generation/training flags, including stale
-search/history combinations. A new production turn cannot invoke it through
-the coordinator. Issued historical receipts remain replayable through their
-original tools; this exclusion applies to new work.
+The historical shell fleet launcher was deleted. New production turns must
+enter through this coordinator and its sealed executor; Git history retains
+the old implementation when an issued receipt needs forensic review.
 
 The commissioned parent update is
-`configs/training/a1_parent_update_35m_b200.schema1.json`: exact f7 parent,
-direct current-v5+split1 function-preserving initializer, fresh AdamW,
+`configs/training/a1_parent_update_35m_b200.schema1.json`: exact B12 parent,
+direct topology-only function-preserving initializer over B12's learned
+current-v5+split1 bytes, fresh AdamW, 0.25x shared-trunk learning rate,
 12 steps, and 8x64=512 global batch. New parent-update turns must pass it to
 `a1_one_dose_train.py` with `--canonical-parent-update-config`; the loop binds
 that file as an immutable train input. Generic learner overrides remain

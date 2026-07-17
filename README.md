@@ -1,219 +1,101 @@
 # CatanZero
 
-This repository consolidates the Catan-Zero source, development history,
-planning documents, and external reviews. The original import came from one
-B200 and two now-retired A100 hosts. The production data fleet is 64 H100s:
-eight four-GPU nodes plus four eight-GPU nodes. Two separate eight-B200 nodes
-provide evaluation, orchestration, and independent learner R&D lanes; FLEET.md
-is the live inventory. Project #1 goal:
-build the strongest Catan agent under the benchmark below.
+CatanZero is an expert-iteration research stack for building a strong Catan
+agent. The commissioned production track is currently two-player, no-trade
+Catan; four-player trading remains a separate benchmark target.
 
-## Hard rule
-
-**All software must be complete and reviewed before any large training run
-consumes GPU-hours.** Training is expensive and self-play generation data
-compounds — a bug shipped into a multi-day generation run poisons everything
-downstream of it. Land the fix, land the test, then generate.
-
-## Production RL path
-
-The supported improvement system is configuration-first expert iteration:
+## Production loop
 
 ```text
-coherent-public n128 self-play
-  -> authenticated corpus
-  -> parent-bounded or commissioned scratch learner
-  -> same-operator evaluation
-  -> transactional promotion
+B12 champion
+  -> coherent-public n128 self-play
+  -> authenticated harvest, audit, and composite
+  -> 12-step parent update on 8 B200 GPUs
+  -> paired n128 candidate-vs-B12 evaluation
+  -> statistical promotion or rejection
 ```
 
-Use `tools/generate.py`, `tools/train.py`, and `tools/evaluate.py` with recipes
-listed in `configs/production_recipes.json`. Each public launcher has at most
-ten operational options; model, search, objective, and optimizer settings live
-in reviewed recipe files. `tools/loop.py` journals one complete
-generate-to-promotion turn with three options and crash-safe stage receipts.
+Use `tools/loop.py` for a complete turn. Use the `catan-zero` command for an
+individual config-first stage. The supported stage launchers are:
 
-`tools/train_bc.py`, `tools/generate_gumbel_selfplay_data.py`, and the older
-fleet shell launchers are implementation or historical-replay surfaces, not
-interfaces for constructing new experiments. PPO remains an explicit
-diagnostic/finisher lane after the observation and value contracts are stable;
-it is not the default replacement for MCTS distillation.
+- `tools/generate.py`
+- `tools/train.py`
+- `tools/evaluate.py`
 
-## Pointer map
+Their complete science defaults live in `configs/production_recipes.json` and
+the referenced generation, training, and evaluation configs. The large
+internal engines (`generate_gumbel_selfplay_data.py`, `train_bc.py`, and the
+search harnesses) are implementation details, not public experiment CLIs.
 
-- `RL_AGENT_HANDOFF.md` — production RL operator runbook: release and artifact
-  acceptance, fleet launch, seed allocation, corpus QA, DDP training, searched
-  gates, promotion, rollback, and current integration gaps.
-- `docs/audits/A1_RL_SOFTWARE_DIAGNOSIS_20260715.md` — current collaboration
-  entry point for the P0 information-state, value-learning, search-target, and
-  PPO repairs. Large learner/generation runs remain paused until its P0 work
-  packages are resolved.
-- `docs/plans/A1_REPRESENTATION_VALUE_RECOVERY_PLAN_20260715.md` — parallel
-  workstream ownership, dependency order, experiment contract, and definition
-  of done for the repair cycle.
-- `src/`, `tools/`, `tests/` — the Python package described below (search,
-  training, self-play generation, promotion gate, H2H evaluation). Use the
-  verified current worktree and its next immutable H100 release, not an old
-  host branch or the obsolete `v1.0-deploy` tag.
-- `docs/plans/` — the live planning documents: `CATAN_ZERO_MASTER_PLAN.md`
-  (plan of record with a status table and per-recommendation verdicts),
-  `CATAN_ZERO_ROADMAP.md`, and `CATAN_ZERO_RESEARCH_CHRONICLE.md` (the
-  claims ledger reviewers read).
-- `docs/reviews/` — eight external expert reviews (R1-R8) plus the internal
-  2026-07-06 critique report; see `docs/reviews/README.md` for an index
-  mapping each file back to its original filename and what it added.
-- `tools/modal_gumbel_factory_gpu.py` — the GPU self-play generation
-  factory (Modal/L4 fleet), recovered from a local-only mirror that was
-  never committed anywhere.
-- `rescue/` — untracked working-tree files rescued from each GPU host before
-  they could be lost to reprovisioning, kept on separate `rescue/untracked-*`
-  branches rather than merged into `master`; see `rescue/README.md`.
-- Task tracking: Linear workspace, team **Catan**.
-- Production H100 aliases are `c1` through `c8` and `h100-8a` through
-  `h100-8d`.
-  B200 control-plane aliases are separate. Host IPs live only in the
-  uncommitted `$FLEET_CONF`; see FLEET.md. The retired A100 names below
-  describe repository history, not active compute.
+The current H100 authority is `configs/gpu_fleet_h100_8x6.json`: six identical
+8×H100 nodes. New code first runs the one-node 8-GPU/88-game pilot described in
+`docs/operations/A1_H100_8X_PILOT.md`; only a successful complete turn scales
+to all 48 H100s. Training uses one 8×B200 node.
 
-## Branches
+## Current science
 
-The historical import happened simultaneously across three hosts with
-independent local commits, so the repository preserves those branches:
-`f60-value-squash` through `f80b-hygiene-harden`, `gen3-wheel-sync`,
-`savefix`, `v3-combined-staging`, `integ-v3`, `opt-arch`, `opt-inference`,
-`opt-rust-work` (B200 feature branches, each a `git worktree` sibling of
-`~/catan-zero` sharing full history with `master`); `host-a100a/master` and
-`host-a100a/integrated_master` (a100a's own `master`, which diverged from
-B200's with a host-local sync commit, plus its `integrated_master` branch);
-`host-a100b/master` and `host-a100b/integrated_master` (same, for a100b);
-`rust-engine/master` and `rust-engine/gen3-wheel-sync` (`catanatron-rs`, the
-standalone Rust engine — native featurizer + MCTS — pulled from its own
-separate repo on B200, not a worktree of the main repo).
+- Champion: B12, SHA-256
+  `1871f710623e0ee1ff8cb6d5fb659221f5e905f2718e502ca6a5b67a0bb6051c`.
+- Search: single coherent public-belief tree, global n128, native Rust
+  simulation/features/MCTS, strict-FP32 EvalServer batching, D6 root averaging,
+  and a 5% duplicate-search reliability audit.
+- Information: exact own private state plus complete public state/history and
+  public-card deductions; inaccessible hidden truth is never exposed.
+- Learner: current-v5 entity model with a split value suffix and zero-output
+  topology upgrade, fresh AdamW, global batch 512, 12 steps, and a 0.25× shared
+  trunk learning rate.
+- Forced actions: zero policy mass, retained value supervision.
+- Promotion: paired seeds and seat swaps under the same n128 operator; no
+  automatic replacement from training loss.
 
-Those branches are provenance, not current deployment inputs. For operations,
-follow RL_AGENT_HANDOFF.md and FLEET.md and require one immutable release.
+Selection evidence is in
+`docs/evidence/A1_COHERENT_V5_B12_SELECTION_20260717.json`.
 
-## Not imported (and why)
+## Repository map
 
-- `~/gen3_gate_test_catan_zero` on B200 (5.6 GB, not a git repo — includes a
-  full `.venv` and appears to be an old non-version-controlled snapshot of
-  the working tree). Flagged for manual review rather than bulk-copied.
-- `~/catanatron-upstream-git-backup` on B200: a local mirror of the public
-  third-party repo `github.com/bcollazo/catanatron` (upstream dependency,
-  not project code).
-- `~/gh200_backup_20260628/catan-zero` on B200: a plain-file backup
-  directory (not a git repo) from a decommissioned GH200 host generation;
-  not inspected for unique content.
-- Uncommitted local edits to already-tracked files on any host (e.g.
-  `catanatron-rs`'s modified `pyproject.toml`/`Cargo.lock` on B200) — these
-  are in-progress working-tree diffs, not untracked artifacts, and weren't
-  captured by this import.
+- `src/catan_zero/search/` — coherent-public Gumbel chance MCTS, native
+  evaluator, and EvalServer batching.
+- `src/catan_zero/rl/` — entity model, self-play, features, histories, and
+  learner support.
+- `src/catan_zero/adapters/` — Python/Rust engine and action equivalence.
+- `tools/fleet/` — receipt-bound generation, harvest, supervision, and stop
+  transactions.
+- `configs/generation/`, `configs/training/`, `configs/eval/` — complete
+  production defaults.
+- `tests/` — rule, information-set, model, search, learner, and operator
+  regressions.
+- `RL_AGENT_HANDOFF.md` — current operator and research handoff.
+- `CODEBASE_GUIDE.md` — architecture guide.
+- `docs/PRODUCTION_RL_LOOP.md` — transaction semantics.
 
----
+Git history is the archive. Do not add historical archive directories or
+duplicate launchers/runbooks to the working tree.
 
-CatanZero is a research stack for building a top full-game Catan agent.
+## Development rules
 
-The target benchmark is `CatanBench-4P-Full-v1`:
+1. Preserve information-set invariance: changing hidden truth unavailable to
+   the acting player must not change its inference or search.
+2. Preserve exact recipe identity across generation, learning, and evaluation.
+3. Never chain a rejected candidate or restore its optimizer state.
+4. A policy target is valid only for its bound checkpoint/search/belief
+   operator contract.
+5. Performance changes require semantic parity; search-policy changes require
+   paired playing-strength evidence.
+6. One generator and one EvalServer belong to one physical GPU.
+7. Never reinterpret a detached launch receipt as completed generation.
+8. Keep commissioned defaults in configs, not optional CLI flags.
 
-- Standard four-player base Catan.
-- Ten victory points.
-- Full legal player trading through structured offers.
-- Player-chosen discards.
-- Robber placement, victim selection, and hidden resources/development cards.
-- No free-form natural-language agreements in the primary benchmark.
+## Install
 
-The project is intentionally split into contracts before algorithms:
+The project targets Python 3.11 and a matching `catanatron_rs` wheel. Follow
+the pinned installer and environment checks in `tools/install_v1_freeze.sh`.
+Do not silently fall back from the native Rust path to Python feature
+construction or simulation.
 
-1. Certified simulator and replay contract.
-2. Per-player observation and legal-action schemas.
-3. Human-game importer and supervised foundation model.
-4. Population self-play and exploiters.
-5. Belief-aware search and search distillation.
+## Benchmark scope
 
-The final public claim should be "strongest evaluated agent under
-CatanBench-4P-Full-v1" until a permissioned Colonist/human evaluation exists.
-Do not build stealth automation against live services.
-
-## Current runnable environments
-
-The main Colonist/self-play target is `catan_zero.rl.ColonistMultiAgentEnv`.
-It uses Catanatron's rule engine but surfaces every current-player decision to
-the caller instead of auto-playing opponent seats. It exposes:
-
-- all four per-seat observations,
-- serializable per-seat API payloads through `observation_payload(player)`,
-- current-player legal actions, structured legal-action descriptions, and masks,
-- `structured_legal_actions` plus `step_structured_action(action)` for
-  Colonist-like action objects on top of stable integer indices,
-- a simple playable loop: `reset()`, `valid_actions()`, `step(action)`,
-- concrete domestic trades,
-- strategic chat,
-- open/wildcard/counteroffer negotiation state,
-- a Colonist-like `trade_panel()` snapshot with waiting, accepted, rejected,
-  countered, confirmable, and cancellable offer state,
-- proposal-to-board-trade resolution,
-- virtual Colonist-style timers and timeout fallbacks,
-- a lightweight public `event_log` in `info` with hidden discard, robber-steal,
-  and development-card-buy results redacted,
-- `replay_trace()` frames that pair each redacted public event with safe
-  per-seat observation payloads, rewards, and terminal flags for replay and
-  offline training,
-- `write_replay_jsonl(path)` and `catan_zero.rl.dump_replay_jsonl()` /
-  `load_replay_jsonl()` for local imitation/RL datasets.
-
-For turn-based self-play trainer integration, use
-`catan_zero.rl.ColonistAECEnv`. It is a lightweight PettingZoo-style AEC adapter
-around `ColonistMultiAgentEnv` with `possible_agents`, `agent_selection`,
-`observe(agent)`, `last()`, `step(action)`, and `agent_iter()`.
-
-The older one-seat wrapper is `catan_zero.rl.CatanZeroGymEnv`. It wraps
-Catanatron's Gymnasium environment for one learning player against bot enemies
-and extends its action space with structured player-to-player trade actions.
-It exposes:
-
-- `reset(seed=...)`
-- `step(action)`
-- `valid_actions()`
-- `action_mask()` / `action_masks()`
-
-The default config targets a Colonist-like base-game surface:
-
-- Four players.
-- Ten victory points.
-- Player-chosen discard, robber, steal, and build actions from Catanatron.
-- Structured domestic trade offers, accept/reject, confirm, and cancel.
-- A per-turn offer cap to prevent RL agents from learning zero-cost trade spam.
-- A public strategic chat side channel exposed through `post_chat()`,
-  `post_chat_template()`, and Gym `info`.
-
-Chat is intentionally separate from `step(action)`: it is a negotiation/event
-stream for trade, robber, leader-blocking, and future LLM adapters, not a board
-rule action. This keeps PPO-style action masks tied to legal game moves while
-still preserving Colonist-like table talk as observable public context.
-
-Important limitation: the multi-agent env is a local simulator for self-play
-and benchmark development, not stealth live-site automation.
-
-Smoke test:
-
-```bash
-.venv/bin/python -m pytest -q
-.venv/bin/python tools/smoke_multiagent_random.py --games 1 --players 4
-.venv/bin/python tools/export_random_replay.py --output /tmp/catan_replay.jsonl --seed 42
-.venv/bin/python tools/smoke_random_policy.py --games 5 --players 4
-```
-
-The lower-level `catan_zero.rl.CatanatronRLEnv` keeps a smaller flat action
-catalog that mirrors Catanatron's default non-domestic-trade Gym surface. Keep
-it for algorithm plumbing and fast baseline tests.
-
-## Self-play
-
-The first trainable loop is in `catan_zero.rl.self_play` with commands:
-
-```bash
-.venv/bin/python tools/train_self_play.py --bootstrap-episodes 8 --episodes 32
-.venv/bin/python tools/evaluate_self_play.py --candidate heuristic --opponent random
-```
-
-See `docs/SELF_PLAY.md` for the current smoke result and next PPO upgrade.
+The long-term target is full four-player Catan with structured trades,
+player-chosen discards, robber decisions, and hidden resources/development
+cards. Current promotion claims must remain explicitly scoped to the mature
+two-player/no-trade production track until the four-player simulator,
+observation, action, and neutral-evaluation contracts are complete.

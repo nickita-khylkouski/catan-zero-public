@@ -5,7 +5,7 @@ It retains complete forced-transition retention as value-only rows and
 explicitly separates the pinned
 legacy teacher feature contract from the fresh learner-row contract:
 
-- teacher/search evaluator: `rust_entity_adapter_v2_land_topology_ports_maritime`
+- teacher/search evaluator: `rust_entity_adapter_v5_meaningful_history_v2`
 - stored learner rows: `rust_entity_adapter_v5_meaningful_history_v2`
 
 Search priors, values, and selected actions remain checkpoint-bound. Only the

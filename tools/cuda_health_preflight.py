@@ -3,7 +3,7 @@
 
 The caller must impose a process-level timeout.  CUDA context creation can hang
 inside the driver, where a Python timer or distributed timeout cannot reliably
-interrupt it.  ``tools/fleet/fleet_launch.sh`` therefore wraps this program in
+interrupt it. Receipt-bound fleet executors therefore run this program in
 GNU ``timeout`` before any training run directory is created.
 """
 

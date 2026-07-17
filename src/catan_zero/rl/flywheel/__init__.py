@@ -1,29 +1,17 @@
-"""KataGo-style hybrid continuous-flywheel for catan-zero self-play.
-
-The architecture the discrete-vs-continuous research (memory ``catan-discrete-vs-continuous-verdict``)
-landed on: a *continuous* training loop over a *growing windowed* replay buffer, with a *cheap
-discrete gate* on the self-play-generating checkpoint only, plus a *15-25% opponent pool* of
-archived champions. NOT pure discrete (idles GPUs on a barrier), NOT pure AlphaZero (a bad net
-poisons a small buffer).
+"""Reusable opponent-pool, checkpoint, and evaluation contracts.
 
 Modules (each has a stdlib-only ``__main__`` self-test):
-  - ``replay_window``       — KataGo power-law window + shard registry (the sampling distribution)
   - ``checkpoint_registry`` — candidate publish / gated champion promotion / opponent archive
   - ``opponent_pool``       — deterministic archived-opponent sampling (anti-forgetting)
   - ``opponent_mix``        — generalized N-way categorical opponent-mix sampling (CAT-54)
   - ``exploit_probe``       — adversary-vs-FROZEN-champion exploitability probe (R8/Wang, scaffolding)
-  - ``config``              — durable name-keyed FlywheelConfig (regime switch for the ablation)
 
-Orchestration lives in ``tools/continuous_flywheel.py`` (references the existing generation/train/
-gate scripts, mirroring ``tools/selfplay_loop.py``'s shape).
-
-Build status: modules + self-tests written; NOT yet wired into a running fleet (intentional — the
-current discrete gen-1 must clear its G1 gate first to validate the loop before we flip continuous).
+The old all-in-one continuous-loop prototype has been removed. Production
+orchestration lives in ``tools/loop.py``; the modules here remain because the
+generator and corpus/training contracts import them directly.
 """
 from __future__ import annotations
 
-from .config import FlywheelConfig, SCHEMA_VERSION
-from .replay_window import WindowedReplay, katago_window_rows, ShardMeta, WindowSelection
 from .checkpoint_registry import (
     CandidateRef, ChampionRef, publish_candidate, read_candidate, read_champion,
     seed_champion, promote, list_archive, ensure_dirs,
@@ -44,8 +32,6 @@ from .exploit_probe import (
 )
 
 __all__ = [
-    "FlywheelConfig", "SCHEMA_VERSION",
-    "WindowedReplay", "katago_window_rows", "ShardMeta", "WindowSelection",
     "CandidateRef", "ChampionRef", "publish_candidate", "read_candidate", "read_champion",
     "seed_champion", "promote", "list_archive", "ensure_dirs",
     "OpponentPolicy", "OpponentChoice", "choose_opponent", "realized_pool_fraction",

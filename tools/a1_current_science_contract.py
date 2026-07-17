@@ -44,9 +44,7 @@ ADAPTIVE_FIELDS = (
     "wide_roots_always_full",
 )
 POLICY_TARGET_BLEND_FALLBACK_V2 = "policy_target_fallback_v2"
-CURRENT_TEACHER_ENTITY_ADAPTER = (
-    "rust_entity_adapter_v2_land_topology_ports_maritime"
-)
+CURRENT_TEACHER_ENTITY_ADAPTER = "rust_entity_adapter_v5_meaningful_history_v2"
 CURRENT_LEARNER_ENTITY_ADAPTER = (
     "rust_entity_adapter_v5_meaningful_history_v2"
 )
@@ -250,7 +248,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "be4b2bc31fc9e7f4c36c782169f9084219e31de51761d7f38269f9d33a3163fa"
+        "08923652c214c876d3ed6409da6caac67371ed0109f78d093b026eb54d3d1e7a"
     ),
     "scratch_status": "research_only_unresolved_not_selected",
 }

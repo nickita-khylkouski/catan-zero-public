@@ -239,6 +239,13 @@ def test_current_target_quality_generation_is_bound_to_config_and_guard() -> Non
     assert lint["expected_values"][
         "--learner-entity-feature-adapter-version"
     ] == current_science.CURRENT_LEARNER_ENTITY_ADAPTER
+    assert lint["expected_values"][
+        "--teacher-entity-feature-adapter-version"
+    ] == current_science.CURRENT_TEACHER_ENTITY_ADAPTER
+    assert (
+        current_science.CURRENT_TEACHER_ENTITY_ADAPTER
+        == current_science.CURRENT_LEARNER_ENTITY_ADAPTER
+    )
     assert "--workers" in lint["critical_flags"]
     assert "--eval-server" in lint["critical_flags"]
     assert lint["expected_values"]["--workers"] == 128

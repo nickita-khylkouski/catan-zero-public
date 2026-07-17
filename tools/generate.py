@@ -110,7 +110,7 @@ REQUIRED_SCIENCE_FIELDS = {
         "rust_entity_adapter_v5_meaningful_history_v2"
     ),
     "teacher_entity_feature_adapter_version": (
-        "rust_entity_adapter_v2_land_topology_ports_maritime"
+        "rust_entity_adapter_v5_meaningful_history_v2"
     ),
     "public_card_count_feature_schema": "public_card_state_v2",
     "preserve_search_evidence": True,

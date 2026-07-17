@@ -152,16 +152,16 @@ def test_status_exposes_only_commissioned_production_state() -> None:
     assert status["pipelines"]["generate"]["authorized"] is True
     assert status["pipelines"]["evaluate"]["authorized"] is True
     train = status["pipelines"]["train"]
-    assert train["authorized"] is False
+    assert train["authorized"] is True
     assert train["reason"] == "recipe_specific_authorization"
     assert train["recipes"]["a1-current-35m-b200"]["authorized"] is False
     parent = train["recipes"]["a1-parent-update-35m-b200"]
-    assert parent["authorized"] is False
-    assert parent["status"] == "blocked"
-    assert parent["reason"] == "parent_update_training_signal_contract_unresolved"
-    assert parent["unresolved_requirements"][0].startswith(
-        "commission topology_residual_adapter learning signal"
+    assert parent["authorized"] is True
+    assert parent["status"] == "ready"
+    assert parent["reason"] == (
+        "commissioned_b12_parent_update_with_runtime_topology_signal_gate"
     )
+    assert parent["unresolved_requirements"] == []
     assert status["pipelines"]["ppo"]["authorized"] is False
 
 
@@ -224,20 +224,20 @@ def test_other_pipelines_resolve_through_compact_launchers(
         assert "--lock" in plan["command"]
 
 
-def test_cataloged_parent_update_uses_exact_recipe_and_parent_but_is_blocked(
+def test_cataloged_parent_update_uses_exact_recipe_and_parent_and_is_ready(
     tmp_path: Path,
 ) -> None:
     plan = cli.build_plan(
         _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
     )
 
-    assert plan["readiness"]["authorized"] is False
+    assert plan["readiness"]["authorized"] is True
     assert plan["readiness"]["reason"] == (
-        "parent_update_training_signal_contract_unresolved"
+        "commissioned_b12_parent_update_with_runtime_topology_signal_gate"
     )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
-        "be4b2bc31fc9e7f4c36c782169f9084219e31de51761d7f38269f9d33a3163fa"
+        "08923652c214c876d3ed6409da6caac67371ed0109f78d093b026eb54d3d1e7a"
     )
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]

@@ -181,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--init-checkpoint",
         default="",
         help=(
-            "Exact learner initializer. For a legacy incumbent this is the "
+            "Exact learner initializer. For B12 this is the topology-only "
             "function-preserving upgraded checkpoint, not the incumbent bytes."
         ),
     )
@@ -519,13 +519,13 @@ def _parent_initializer_binding(
         raise SystemExit(f"architecture upgrade receipt refused: {error}") from error
     if (
         replayed.get("module")
-        != upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
+        != upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY
         or replayed.get("source") != parent
         or replayed.get("upgraded_initializer") != initializer
     ):
         raise SystemExit(
             "architecture receipt must connect the exact incumbent directly to "
-            "the reviewed current-v5+topology+split1 initializer"
+            "the reviewed B12 current-v5+split1 topology initializer"
         )
     receipt = replayed["receipt"]
     lineage_binding = {

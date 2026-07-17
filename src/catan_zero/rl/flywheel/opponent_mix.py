@@ -8,7 +8,7 @@ catanatron_value -- and explicitly asks the generator to support *arbitrary*
 mix configs (weights and categories are data, not hardcoded constants), not
 just this one five-way split. This module is that generalization: it stays
 independent of ``opponent_pool.py`` (which keeps its own binary callers, e.g.
-``tools/continuous_flywheel.py``, working unchanged) and adds a categorical
+the generator, working unchanged) and adds a categorical
 sampler over any number of named ``MixCategory`` entries.
 
 Design choices (mirrors ``opponent_pool.py``'s, see its docstring for the

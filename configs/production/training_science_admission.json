@@ -27,18 +27,13 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-35m-b200": {
-      "recipe_canonical_sha256": "be4b2bc31fc9e7f4c36c782169f9084219e31de51761d7f38269f9d33a3163fa",
-      "authorized": false,
-      "reason": "parent_update_training_signal_contract_unresolved",
-      "unresolved_requirements": [
-        "commission topology_residual_adapter learning signal and topology-sensitive value behavior",
-        "commission minimum realized initial-settlement and initial-road policy-loss mass",
-        "materialize and authenticate a full adapter-v5 training composite",
-        "seal an opening-specific value and policy no-regression gate"
-      ],
+      "recipe_canonical_sha256": "08923652c214c876d3ed6409da6caac67371ed0109f78d093b026eb54d3d1e7a",
+      "authorized": true,
+      "reason": "commissioned_b12_parent_update_with_runtime_topology_signal_gate",
+      "unresolved_requirements": [],
       "observations": {
-        "architecture_information_surface": "topology_path_present_zero_output_pending_learning_evidence",
-        "retained_composite_adapter_status": "adapter_v2_retained_v5_r2_quarantined",
+        "architecture_information_surface": "b12_v5_split1_plus_zero_output_topology_runtime_signal_gated",
+        "retained_composite_adapter_status": "fresh_adapter_v5_required_old_v5_r2_quarantined",
         "adapter_v5_r2_quarantine": {
           "status": "quarantined_actor_public_rule_state_contradiction",
           "rows": 959142,
@@ -47,9 +42,15 @@
           "training_admission": false
         },
         "opening_policy_loss_mass_fraction": 0.027885,
+        "minimum_initial_settlement_policy_mass_fraction": 0.02,
+        "minimum_initial_road_policy_mass_fraction": 0.02,
+        "shared_trunk_lr_multiplier": 0.25,
         "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh"
       },
-      "commissioning_evidence": []
+      "commissioning_evidence": [
+        "docs/evidence/A1_COHERENT_V5_B12_SELECTION_20260717.json",
+        "docs/evidence/A1_EFFECTIVE_POLICY_SIGNAL_AUDIT_20260716.json"
+      ]
     }
   }
 }

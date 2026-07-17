@@ -213,7 +213,7 @@
     "record_automatic_transitions": true,
     "meaningful_public_history": true,
     "event_history_limit": 64,
-    "teacher_entity_feature_adapter_version": "rust_entity_adapter_v2_land_topology_ports_maritime",
+    "teacher_entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
     "learner_entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
     "workers_per_gpu": 128,
     "shard_size": 512,
@@ -295,10 +295,10 @@
     }
   ],
   "fleet": {
-    "fleet_manifest": "../gpu_fleet_64.json",
-    "quota_policy": "balanced_prefix_v1",
+    "fleet_manifest": "../gpu_fleet_h100_8x6.json",
+    "quota_policy": "pilot_one_8gpu_node_v1",
     "seed_base": "__UNRESOLVED__",
-    "seed_block_size": 1000,
+    "seed_block_size": 32,
     "seed_ledger": "__UNRESOLVED__",
     "output_root": "__UNRESOLVED__"
   },

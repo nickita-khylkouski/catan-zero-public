@@ -1095,6 +1095,21 @@ def test_coherent_one_dose_renders_deployed_scalar_value_objective(
 
     assert _option(command, "--scalar-value-loss-readout") == "deployed_tanh"
     assert _option(command, "--scalar-value-loss-scale") == "1.0"
+    assert _option(command, "--data-loader-workers") == "4"
+    assert _option(command, "--data-loader-prefetch") == "4"
+    assert _option(command, "--base-sampler") == "weighted_replacement_v1"
+    assert (
+        _option(command, "--minimum-initial-settlement-policy-mass-fraction")
+        == "0.02"
+    )
+    assert _option(command, "--minimum-initial-road-policy-mass-fraction") == "0.02"
+    assert _option(command, "--train-diagnostics-every-batches") == "6"
+    assert (
+        _option(command, "--minimum-feature-learning-signal-observations") == "2"
+    )
+    assert "topology_residual_adapter" in _option(
+        command, "--require-feature-learning-signal-modules"
+    )
     assert _option(command, "--max-steps") == "0"
     assert "--exact-max-steps" not in command
     assert "--checkpoint-steps" not in command
@@ -1507,7 +1522,7 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         "corpus_meta_file_sha256": "sha256:" + "3" * 64,
         "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
         "function_preserving_upgrade": {
-            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
             "source": producer,
             "receipt": {"sha256": "sha256:" + "5" * 64},
             "receipt_sha256": "sha256:" + "6" * 64,
@@ -1526,6 +1541,7 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert bound["recipe"]["world_size"] == 8
     assert bound["recipe"]["batch_size"] == 64
     assert bound["recipe"]["global_batch_size"] == 512
+    assert bound["recipe"]["trunk_lr_mult"] == 0.25
     assert bound["recipe"]["scalar_value_objective"] == "binary_win_bce"
     assert bound["recipe"]["scalar_value_loss_readout"] == "deployed_tanh"
     assert bound["recipe"]["scalar_value_loss_scale"] == 1.0
@@ -1591,7 +1607,7 @@ def test_canonical_parent_update_rejects_malformed_checkpoint_frontier(
         "corpus_meta_file_sha256": "sha256:" + "3" * 64,
         "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
         "function_preserving_upgrade": {
-            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
             "source": producer,
             "receipt": {"sha256": "sha256:" + "5" * 64},
             "receipt_sha256": "sha256:" + "6" * 64,
@@ -4859,7 +4875,7 @@ def test_direct_composite_parent_upgrade_renders_complete_topology() -> None:
     command = ["python", "train_bc.py"]
     executor._append_current_parent_topology_cli(  # noqa: SLF001
         command,
-        executor.architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+        executor.architecture_upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
     )
 
     assert command == [

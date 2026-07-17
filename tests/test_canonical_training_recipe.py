@@ -62,28 +62,14 @@ def test_production_opening_mass_contract_is_fail_closed_until_reviewed() -> Non
         train._require_production_opening_policy_mass_contract(engine)
 
 
-def test_parent_production_launcher_refuses_impossible_observability_first() -> None:
-    with pytest.raises(
-        SystemExit,
-        match=(
-            "max_steps=12 .*maximum_feature_learning_signal_observations=1 "
-            ".*minimum_feature_learning_signal_observations=2"
-        ),
-    ):
-        train.main(
-            [
-                "--config",
-                str(PARENT_RECIPE),
-                "--data",
-                "/tmp/unopened-data",
-                "--checkpoint",
-                "/tmp/unwritten-candidate.pt",
-                "--report",
-                "/tmp/unwritten-train.json",
-                "--init-checkpoint",
-                "/tmp/unopened-initializer.pt",
-            ]
-        )
+def test_parent_production_recipe_can_collect_two_signal_observations() -> None:
+    config, engine = train._load_recipe(PARENT_RECIPE)  # noqa: SLF001
+
+    train._require_exact_cap_feature_observability(config, engine)  # noqa: SLF001
+
+    assert config.max_steps == 12
+    assert engine["train_diagnostics_every_batches"] == 6
+    assert engine["minimum_feature_learning_signal_observations"] == 2
 
 
 def _feature_observability_engine() -> dict[str, object]:
@@ -327,7 +313,7 @@ def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
         upgrade,
         "verify_receipt",
         lambda _path: {
-            "module": upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+            "module": upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
             "source": parent_ref,
             "upgraded_initializer": initializer_ref,
             "receipt": receipt_ref,
@@ -340,7 +326,7 @@ def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
     assert binding["initializer"] == initializer_ref
     assert binding["function_preserving_upgrade"] == {
         "schema_version": "a1-lineage-function-preserving-upgrade-v1",
-        "module": upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+        "module": upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
         "receipt": receipt_ref["path"],
         "receipt_sha256": receipt_ref["sha256"],
         "source_checkpoint_sha256": parent_ref["sha256"],

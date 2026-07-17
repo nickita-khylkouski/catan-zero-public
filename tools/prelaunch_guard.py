@@ -520,7 +520,8 @@ def guard_fcntl_lock_present(source_text: str, *, source_name: str = "<script>")
 
 def guard_lock_available(lock_path: str | Path) -> GuardResult:
     """Host-only: test-then-release an exclusive non-blocking fcntl lock at
-    `lock_path`, mirroring `continuous_flywheel.acquire_loop_lock`'s
+    `lock_path`, providing the same process-level exclusion as the production
+    loop coordinator's lock.
     mechanism, to confirm no other live process already holds it before
     this launch proceeds to acquire it for real.
     """

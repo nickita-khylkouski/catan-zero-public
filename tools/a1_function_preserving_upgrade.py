@@ -109,6 +109,9 @@ MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1 = (
     "meaningful_public_history+meaningful_history_target_gather+"
     "actor_public_rule_state.v5+value_tower_split1"
 )
+MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY = (
+    "entity_graph.current_v5_value_tower_split1+topology_residual_adapter.v1"
+)
 
 
 def _module_forward_tolerance(module: str) -> float:
@@ -703,6 +706,27 @@ ALLOWLIST[MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1] = {
         **ALLOWLIST[MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1]["config_delta"],
         "topology_residual_adapter": True,
     },
+    "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V5,
+}
+
+# B12 already owns the entire current-v5 information surface and the private
+# one-layer value suffix.  Rebuilding those modules from its tensors would be
+# checkpoint chaining and, worse, would discard learned B12 parameters.  This
+# edge adds only the zero-output topology residual to that exact incumbent.
+# It is the canonical B12 -> next-learner initializer transition.
+_CURRENT_V5_SPLIT1_SOURCE_REQUIREMENTS = {
+    **ALLOWLIST[MODULE_CURRENT_V5]["flags"],
+    "state_trunk": "transformer",
+    "state_layers": 6,
+    "value_tower_split_layers": 1,
+    "latent_deliberation_steps": 0,
+    "topology_residual_adapter": False,
+}
+ALLOWLIST[MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY] = {
+    "flags": {"topology_residual_adapter": True},
+    "source_config_requirements": _CURRENT_V5_SPLIT1_SOURCE_REQUIREMENTS,
+    "new_parameter_initialization": dict(_TOPOLOGY_RESIDUAL_INITIALIZATION),
+    "config_delta": {"topology_residual_adapter": True},
     "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V5,
 }
 

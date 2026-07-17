@@ -53,7 +53,7 @@
     "late_temperature_decisions": 100,
     "lazy_interior_chance": true,
     "learner_entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
-    "teacher_entity_feature_adapter_version": "rust_entity_adapter_v2_land_topology_ports_maritime",
+    "teacher_entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
     "max_decisions": 600,
     "max_depth": 80,
     "meaningful_public_history": true,

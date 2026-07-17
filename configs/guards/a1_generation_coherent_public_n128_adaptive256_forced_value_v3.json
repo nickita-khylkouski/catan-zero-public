@@ -91,7 +91,7 @@
           "--preserve-search-evidence": true,
           "--record-automatic-transitions": true,
           "--meaningful-public-history": true,
-          "--teacher-entity-feature-adapter-version": "rust_entity_adapter_v2_land_topology_ports_maritime",
+          "--teacher-entity-feature-adapter-version": "rust_entity_adapter_v5_meaningful_history_v2",
           "--learner-entity-feature-adapter-version": "rust_entity_adapter_v5_meaningful_history_v2",
           "--event-history-limit": 64,
           "--rust-featurize": true,

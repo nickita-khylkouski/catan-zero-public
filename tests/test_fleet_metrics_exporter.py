@@ -790,11 +790,3 @@ def test_dual_pipeline_directories_are_both_exposed(tmp_path: Path) -> None:
     metrics = exporter.render_metrics(snapshots, host="c1", roots=[], now=now)
     assert 'pipeline="0"' in metrics
     assert 'pipeline="1"' in metrics
-
-
-def test_launcher_dumps_typed_config_before_generation() -> None:
-    source = (
-        Path(__file__).resolve().parents[1] / "tools/fleet/fleet_launch.sh"
-    ).read_text(encoding="utf-8")
-    assert '--dump-config "$PIPELINE_OUT/config.json"' in source
-    assert '--config-purpose "fleet-$PIPELINE_ID"' in source

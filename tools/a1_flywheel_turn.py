@@ -372,6 +372,7 @@ def build_turn(
             upgrade.MODULE_STRUCTURED_ACTION_VALUE_PUBLIC_CARD_COUNT_MEANINGFUL_HISTORY_V3,
             upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
             upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+            upgrade.MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY,
         }:
             initializer_binding["architecture_profile"] = (
                 V16_COMBINED_ARCHITECTURE_PROFILE

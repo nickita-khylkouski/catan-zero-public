@@ -15,8 +15,8 @@ guard, and refuse to proceed (``SystemExit``) on any FAIL -- unless the
 launcher's own ``--skip-guards`` escape hatch was passed, in which case a
 loud WARNING is logged and the launch proceeds anyway.
 
-Each of the three real launchers (``tools/generate_gumbel_selfplay_data.py``,
-``tools/train_bc.py``, ``tools/continuous_flywheel.py``) calls
+Each retained internal launcher (``tools/generate_gumbel_selfplay_data.py``
+and ``tools/train_bc.py``) calls
 :func:`run_or_refuse` once, at the very top of ``main()``, immediately after
 ``build_parser().parse_args()`` -- before any other side effect (file I/O,
 subprocess, torch import). Guards never fire on ``--help`` (argparse exits

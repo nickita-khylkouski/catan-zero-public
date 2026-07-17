@@ -54,7 +54,6 @@ LEGACY_CONFIG = (
 LEGACY_GUARD = (
     REPO / "configs/guards/a1_generation_coherent_public_n128_adaptive256_v1.json"
 )
-LEGACY_OPERATION = REPO / "configs/operations/a1-next-wave-coherent-public-v1"
 
 
 def _canonical_sha256(value: object) -> str:
@@ -113,7 +112,7 @@ def test_next_wave_typed_generation_config_is_exact_schema_20_recipe() -> None:
         "rust_entity_adapter_v5_meaningful_history_v2"
     )
     assert cfg.teacher_entity_feature_adapter_version == (
-        "rust_entity_adapter_v2_land_topology_ports_maritime"
+        "rust_entity_adapter_v5_meaningful_history_v2"
     )
     assert cfg.temperature_clock == "nonforced_choice"
     assert (cfg.temperature_decisions, cfg.late_temperature_decisions) == (40, 100)
@@ -143,16 +142,10 @@ def test_current_generation_config_has_no_duplicate_json_keys() -> None:
     assert payload["fields"]["boundary_value_particles"] == 1
 
 
-def test_issued_v1_generation_artifacts_remain_byte_identical() -> None:
+def test_issued_v1_generation_config_and_guard_remain_byte_identical() -> None:
     expected = {
         LEGACY_CONFIG: "0023bfc5fb3fb1b10d39259bd73e1b0818c6a98faa6c3208d9919fe34d5e8fd5",
         LEGACY_GUARD: "d816efe9e2878e7d185f067d40c85fa7bfe5c8d817c62fdc6739bb4d0c284cc6",
-        LEGACY_OPERATION / "science.contract.json": (
-            "0eb2fdf6d633bb4841ab2c74c33f337ce1ce35805e7e950df4d0778150fa4301"
-        ),
-        LEGACY_OPERATION / "README.md": (
-            "c40b3b226753baef9b7a48b44bd8c2734420512f4656661a39bd9cc64ad2da62"
-        ),
     }
     for path, digest in expected.items():
         assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
@@ -162,9 +155,6 @@ def test_issued_v1_generation_artifacts_remain_byte_identical() -> None:
     assert (
         legacy_guard["expected_values"]["--record-automatic-transitions"] is False
     )
-    assert "--no-record-automatic-transitions" in (
-        LEGACY_OPERATION / "README.md"
-    ).read_text()
 
 
 def test_next_wave_guard_pins_the_same_science_values() -> None:
