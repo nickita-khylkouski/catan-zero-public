@@ -4938,11 +4938,26 @@ def _validate_a0_evidence(
             f"A0 evidence selected {decision['status']!r}, contract learner objective requires "
             f"one of {sorted(expected_statuses)!r}"
         )
+    # A0 adjudicated the value *representation*: retain one scalar readout or
+    # adopt the categorical HL-Gauss head.  Its historical scalar arm happened
+    # to optimize MSE, but that is not evidence against a later scalar
+    # binary-win BCE objective.  Requiring the old loss name to equal the
+    # current loss made the coherent-public contract internally impossible to
+    # seal after the scalar objective was upgraded to binary_win_bce.  Keep the
+    # categorical path exact, while allowing the two explicitly supported
+    # scalar losses to share the same retain-scalar A0 decision.
+    objective_matches = (
+        decision["learner_objective"] == learner_objective["objective"]
+        if learner_objective["objective"] == "hlgauss"
+        else decision["learner_objective"] in {"mse", "binary_win_bce"}
+    )
     if (
-        decision["learner_objective"] != learner_objective["objective"]
+        not objective_matches
         or decision["learner_value_readout"] != learner_objective["value_readout"]
     ):
-        raise ContractError("A0 learner objective/readout does not match the contract")
+        raise ContractError(
+            "A0 value representation/readout does not match the contract"
+        )
     if decision["mechanism_checkpoint_is_production_candidate"] is not False:
         raise ContractError(
             "A0 mechanism checkpoint must remain evidence-only, not production"

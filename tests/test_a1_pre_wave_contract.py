@@ -1793,13 +1793,13 @@ def _rebind_search_evidence_checkpoint(payload: dict, checkpoint: Path) -> None:
         decisions[stage] = decision_path
 
 
-def test_a0_retain_scalar_is_valid_and_separate_from_teacher_readout(
+def test_a0_retain_scalar_is_valid_for_later_scalar_bce_objective(
     tmp_path: Path,
 ) -> None:
     draft = _resolved_draft(tmp_path)
     payload = json.loads(draft.read_text())
     payload["science"]["learner_value_objective"] = {
-        "objective": "mse",
+        "objective": "binary_win_bce",
         "value_readout": "scalar",
         "value_categorical_bins": None,
         "hlgauss_sigma_ratio": None,
@@ -1829,7 +1829,10 @@ def test_a0_retain_scalar_is_valid_and_separate_from_teacher_readout(
     draft.write_text(json.dumps(payload), encoding="utf-8")
 
     lock = contract.build_lock(draft)
-    assert lock["science"]["learner_value_objective"]["objective"] == "mse"
+    assert (
+        lock["science"]["learner_value_objective"]["objective"]
+        == "binary_win_bce"
+    )
     assert lock["science"]["value_readout"] == "scalar"
 
 
