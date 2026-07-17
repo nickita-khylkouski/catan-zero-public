@@ -181,6 +181,13 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # source across supported Python f-string tokenization modes. Schema v3
         # uses a stable AST surface, but both reviewed v2 spellings remain.
         "sha256:3e4ca62d77dd5d9f8ddb7cf625a4347f085d6ae08080aaafc9417d59a01180cb",
+        # The V7 bottleneck topology is now explicitly serialized and legacy
+        # checkpoints infer the historical full-width block from state-dict
+        # names. With every optional topology flag absent/false, the reviewed
+        # legacy Transformer forward remains unchanged. These are the macOS
+        # and H100 Linux tokenizer identities for that guarded source.
+        "sha256:8453de906f03b6a60bbb6f60806d4d876ddf6468985881246714c6e274f2c2e9",
+        "sha256:494d98a204d183973bfa6dca4ef563710ca69789d37bd0d25698c311041588b7",
     }
 }
 
