@@ -161,6 +161,9 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # Public-history exposure to the V7 action decoder is also gated off
         # for legacy checkpoints, leaving their reviewed forward unchanged.
         "sha256:166693b514e1feb5e73a3c7a23c1a5e0bc39c97884d959a29e9b1b7afb8935e9",
+        # Same reviewed guarded source under the commissioned Linux/Python
+        # tokenizer used by the H100 training runtime.
+        "sha256:2e7e4ca59d0dacc83dd8225092a33b620245b7a88062b39b3da1bd56fe5ee897",
         # Rebasing the V7 decoder onto the final bit-exact input migration
         # changed the selected policy AST fingerprint once more. Every added
         # path remains behind the absent/false V7 compatibility flags for a
