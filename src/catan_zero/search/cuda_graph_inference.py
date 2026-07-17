@@ -381,6 +381,25 @@ class CudaGraphInferenceRunner:
                 device=self.device,
             ),
         }
+        if (
+            int(getattr(self.model, "action_cross_attention_layers", 0)) > 0
+            and bool(
+                getattr(
+                    self.model,
+                    "meaningful_public_history_enabled",
+                    False,
+                )
+            )
+        ):
+            # State encoding deliberately keeps public events masked from the
+            # inherited Transformer. V7 builds a decoder-private memory mask
+            # during score_actions, so the split CUDA-graph action stage must
+            # retain the cropped live-event mask used by the state stage.
+            batch["event_mask"] = torch.as_tensor(
+                entity_batch["event_mask"],
+                dtype=torch.bool,
+                device=self.device,
+            )
         needs_targets = bool(
             getattr(self.model, "action_target_gather", False)
             or getattr(self.model, "edge_policy_head", False)

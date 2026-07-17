@@ -168,6 +168,8 @@ def test_v7_action_batch_carries_all_policy_side_inputs():
         topology_residual_adapter=True,
         action_target_gather=True,
         action_cross_attention_layers=1,
+        meaningful_public_history=True,
+        event_history_limit=8,
         static_action_residual=True,
         legal_action_value_residual=True,
         v6_compatibility_preserving_inputs=True,
@@ -182,6 +184,7 @@ def test_v7_action_batch_carries_all_policy_side_inputs():
         "legal_action_context",
         "legal_action_target_ids",
         "edge_vertex_ids",
+        "event_mask",
         "legal_action_mask",
         "legal_action_static_features",
     }.issubset(action_batch)
@@ -189,6 +192,25 @@ def test_v7_action_batch_carries_all_policy_side_inputs():
     assert set(("hex_vertex_ids", "hex_edge_ids", "edge_vertex_ids", "event_target_ids")).issubset(
         runner._state_input_keys()
     )
+
+
+def test_history_action_decoder_runs_through_split_eager_fallback() -> None:
+    policy = _policy(
+        action_cross_attention_layers=1,
+        meaningful_public_history=True,
+        event_history_limit=8,
+    )
+    entity, legal_ids, context = _batch(event_width=8, live_events=2)
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(enabled=False),
+    )
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context)
+
+    assert runner.last_path == "eager_disabled"
+    assert outputs["logits"].shape == legal_ids.shape
+    assert torch.isfinite(outputs["value"]).all()
 
 
 def test_legacy_award_bridge_also_applies_on_cuda_runner_bypass() -> None:
