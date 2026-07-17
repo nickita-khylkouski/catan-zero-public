@@ -129,6 +129,13 @@ from catan_zero.rl.flywheel.composite_contract import (
 
 
 CHECKOUT_RUNTIME_BINDING_SCHEMA = "train-bc-checkout-runtime-v1"
+EFFECTIVE_INITIALIZATION_REFERENCE_SCHEMA = (
+    "train-bc-effective-initialization-reference-v1"
+)
+CHECKPOINT_HOLDOUT_SCHEMA = "train-bc-checkpoint-holdout-v1"
+CHECKPOINT_HOLDOUT_FRONTIER_SCHEMA = (
+    "train-bc-checkpoint-holdout-frontier-v1"
+)
 POLICY_AUX_SAMPLING_LEGACY_REPLACEMENT_V1 = (
     "weighted_with_replacement_legacy_v1"
 )
@@ -12742,6 +12749,19 @@ def main(
             raise SystemExit(
                 f"intermediate checkpoint path already exists: {snapshot_path}"
             )
+    initialization_reference_path = (
+        _step_checkpoint_path(args.checkpoint, 0)
+        if checkpoint_steps and args.init_checkpoint
+        else None
+    )
+    if initialization_reference_path is not None and (
+        initialization_reference_path.exists()
+        or initialization_reference_path.is_symlink()
+    ):
+        raise SystemExit(
+            "effective initialization reference path already exists: "
+            f"{initialization_reference_path}"
+        )
     if int(args.policy_aux_active_batch_size) < 0:
         raise SystemExit("--policy-aux-active-batch-size must be >= 0")
     if not math.isfinite(float(args.policy_aux_loss_weight)) or float(
@@ -15485,7 +15505,117 @@ def main(
     total_training_steps = int(args.max_steps) if int(args.max_steps) > 0 else 0
     intermediate_checkpoints: list[dict[str, object]] = []
     checkpoint_dose_snapshots: list[dict[str, object]] = []
+    checkpoint_holdout_snapshots: list[dict[str, object]] = []
+    effective_initialization_reference: dict[str, object] | None = None
     saved_checkpoint_steps: set[int] = set()
+
+    def _evaluate_validation_indices(eval_indices: np.ndarray) -> dict:
+        return evaluate_bc_batches(
+            policy,
+            data,
+            eval_indices,
+            policy_sample_weights,
+            value_sample_weights,
+            args.batch_size,
+            args.soft_target_temperature,
+            args.soft_target_weight,
+            args.soft_target_source,
+            args.soft_target_min_legal_coverage,
+            args.policy_loss_weight,
+            resolved_scalar_value_weight,
+            args.final_vp_loss_weight,
+            args.q_loss_weight,
+            _parse_prefixes(args.q_skip_teacher_prefixes),
+            args.vps_to_win,
+            args.advantage_policy_weighting,
+            args.advantage_temperature,
+            args.advantage_weight_cap,
+            args.advantage_weight_floor,
+            ddp,
+            args.amp,
+            policy_target_blend_semantics=str(
+                args.policy_target_blend_semantics
+            ),
+            data_sharded=bool(args.ddp_shard_data),
+            truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
+            policy_kl_anchor_weight=(
+                float(args.policy_kl_anchor_weight)
+                if policy_kl_controller is None
+                else float(policy_kl_controller.coefficient)
+            ),
+            policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
+            value_uncertainty_loss_weight=float(args.value_uncertainty_loss_weight),
+            aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
+            belief_resource_loss_weight=float(
+                args.belief_resource_loss_weight
+            ),
+            moe_balance_loss_weight=float(args.moe_balance_loss_weight),
+            value_categorical_loss_weight=resolved_categorical_value_weight,
+            value_hlgauss_sigma_ratio=float(args.value_hlgauss_sigma_ratio),
+            value_target_lambda=float(args.value_target_lambda),
+            value_root_blend_phases=tuple(value_root_blend_regime["phases"]),
+            value_root_blend_global_compat=(
+                value_root_blend_regime["mode"] == "global_compat"
+            ),
+            data_loader_workers=int(args.data_loader_workers),
+            data_loader_prefetch=int(args.data_loader_prefetch),
+            scalar_value_objective=str(args.scalar_value_objective),
+            scalar_value_loss_readout=str(args.scalar_value_loss_readout),
+            scalar_value_loss_scale=float(args.scalar_value_loss_scale),
+            value_validation_action_types_by_id=(
+                value_validation_action_types_by_id
+            ),
+        )
+
+    if initialization_reference_path is not None:
+        if global_step != 0 or optimizer_restored:
+            raise SystemExit(
+                "effective initialization reference requires a fresh optimizer-step-zero start"
+            )
+        checkpoint_model = getattr(policy.model, "module", policy.model)
+        initialization_value_training = _value_training_metadata(
+            args,
+            scalar_weight=resolved_scalar_value_weight,
+            categorical_weight=resolved_categorical_value_weight,
+            categorical_bins=int(
+                getattr(checkpoint_model, "value_categorical_bins", 0) or 0
+            ),
+            optimizer_steps=0,
+            completed_epochs=0,
+            scalar_training_weight_sum=0.0,
+            categorical_training_weight_sum=0.0,
+        )
+        _save_policy(
+            policy,
+            str(initialization_reference_path),
+            ddp,
+            mask_hidden_info=bool(args.mask_hidden_info),
+            soft_target_source=args.soft_target_source,
+            value_training=initialization_value_training,
+            training_information_surface=training_information_surface,
+        )
+        if bool(ddp["enabled"]):
+            import torch.distributed as dist
+
+            dist.barrier()
+        initialization_holdout = _evaluate_validation_indices(
+            validation_indices
+        )
+        if int(ddp["rank"]) == 0:
+            effective_initialization_reference = {
+                "schema_version": EFFECTIVE_INITIALIZATION_REFERENCE_SCHEMA,
+                "optimizer_step": 0,
+                "checkpoint": str(initialization_reference_path),
+                "checkpoint_sha256": _sha256_existing_file(
+                    initialization_reference_path
+                ),
+                "size_bytes": int(initialization_reference_path.stat().st_size),
+                "public_award_feature_contract": str(
+                    policy.public_award_feature_contract
+                ),
+                "same_training_trajectory": True,
+                "holdout_metrics": initialization_holdout,
+            }
     # Exact cumulative source-row coverage for the auxiliary active-policy
     # stream.  Short Stage-C doses sample with replacement; draw count alone
     # cannot distinguish broad target coverage from repeatedly replaying a
@@ -17004,16 +17134,33 @@ def main(
                     import torch.distributed as dist
 
                     dist.barrier()
+                snapshot_holdout = _evaluate_validation_indices(
+                    validation_indices
+                )
                 if int(ddp["rank"]) == 0:
+                    snapshot_sha256 = _sha256_existing_file(snapshot_path)
                     intermediate_checkpoints.append(
                         {
                             "schema_version": "train-bc-intermediate-checkpoint-v1",
                             "optimizer_step": int(global_step),
                             "checkpoint": str(snapshot_path),
-                            "checkpoint_sha256": _sha256_existing_file(snapshot_path),
+                            "checkpoint_sha256": snapshot_sha256,
                             "size_bytes": int(snapshot_path.stat().st_size),
                             "same_training_trajectory": True,
                             "optimizer_sidecar": None,
+                        }
+                    )
+                    checkpoint_holdout_snapshots.append(
+                        {
+                            "schema_version": CHECKPOINT_HOLDOUT_SCHEMA,
+                            "optimizer_step": int(global_step),
+                            "checkpoint": str(snapshot_path),
+                            "checkpoint_sha256": snapshot_sha256,
+                            "measure": "report_bound_raw_validation_rows",
+                            "validation_game_seed_set_sha256": (
+                                validation_seed_set_sha256 or None
+                            ),
+                            "metrics": snapshot_holdout,
                         }
                     )
                     checkpoint_dose_snapshots.append(snapshot_dose_telemetry)
@@ -17932,66 +18079,6 @@ def main(
                 "teacher_accuracy": _finalize_phase_stats(teacher_stats),
             }
         )
-        def _evaluate_validation_indices(eval_indices: np.ndarray) -> dict:
-            return evaluate_bc_batches(
-                policy,
-                data,
-                eval_indices,
-                policy_sample_weights,
-                value_sample_weights,
-                args.batch_size,
-                args.soft_target_temperature,
-                args.soft_target_weight,
-                args.soft_target_source,
-                args.soft_target_min_legal_coverage,
-                args.policy_loss_weight,
-                resolved_scalar_value_weight,
-                args.final_vp_loss_weight,
-                args.q_loss_weight,
-                _parse_prefixes(args.q_skip_teacher_prefixes),
-                args.vps_to_win,
-                args.advantage_policy_weighting,
-                args.advantage_temperature,
-                args.advantage_weight_cap,
-                args.advantage_weight_floor,
-                ddp,
-                args.amp,
-                policy_target_blend_semantics=str(
-                    args.policy_target_blend_semantics
-                ),
-                data_sharded=bool(args.ddp_shard_data),
-                truncated_vp_margin_value_weight=args.truncated_vp_margin_value_weight,
-                policy_kl_anchor_weight=(
-                    float(args.policy_kl_anchor_weight)
-                    if policy_kl_controller is None
-                    else float(policy_kl_controller.coefficient)
-                ),
-                policy_kl_anchor_direction=str(args.policy_kl_anchor_direction),
-                value_uncertainty_loss_weight=float(args.value_uncertainty_loss_weight),
-                aux_subgoal_loss_weight=float(args.aux_subgoal_loss_weight),
-                belief_resource_loss_weight=float(
-                    args.belief_resource_loss_weight
-                ),
-                moe_balance_loss_weight=float(args.moe_balance_loss_weight),
-                value_categorical_loss_weight=resolved_categorical_value_weight,
-                value_hlgauss_sigma_ratio=float(args.value_hlgauss_sigma_ratio),
-                value_target_lambda=float(args.value_target_lambda),
-                value_root_blend_phases=tuple(
-                    value_root_blend_regime["phases"]
-                ),
-                value_root_blend_global_compat=(
-                    value_root_blend_regime["mode"] == "global_compat"
-                ),
-                data_loader_workers=int(args.data_loader_workers),
-                data_loader_prefetch=int(args.data_loader_prefetch),
-                scalar_value_objective=str(args.scalar_value_objective),
-                scalar_value_loss_readout=str(args.scalar_value_loss_readout),
-                scalar_value_loss_scale=float(args.scalar_value_loss_scale),
-                value_validation_action_types_by_id=(
-                    value_validation_action_types_by_id
-                ),
-            )
-
         validation_metrics = _evaluate_validation_indices(validation_indices)
         validation_metrics["measure"] = "raw_row_concat"
         validation_metrics["objective_matched"] = False
@@ -18479,6 +18566,20 @@ def main(
         ),
         ddp=ddp,
     )
+    if int(ddp["rank"]) == 0 and checkpoint_steps:
+        checkpoint_holdout_snapshots.append(
+            {
+                "schema_version": CHECKPOINT_HOLDOUT_SCHEMA,
+                "optimizer_step": int(global_step),
+                "checkpoint": str(args.checkpoint),
+                "checkpoint_sha256": _sha256_existing_file(args.checkpoint),
+                "measure": "report_bound_raw_validation_rows",
+                "validation_game_seed_set_sha256": (
+                    validation_seed_set_sha256 or None
+                ),
+                "metrics": validation_metrics,
+            }
+        )
     policy_component_active_dose = {
         component_id: {
             key: (
@@ -18988,6 +19089,19 @@ def main(
         "checkpoint_steps_requested": list(checkpoint_steps),
         "intermediate_checkpoints": intermediate_checkpoints,
         "checkpoint_dose_trajectory": checkpoint_dose_trajectory,
+        "effective_initialization_reference": effective_initialization_reference,
+        "checkpoint_holdout_frontier": (
+            {
+                "schema_version": CHECKPOINT_HOLDOUT_FRONTIER_SCHEMA,
+                "measure": "report_bound_raw_validation_rows",
+                "validation_game_seed_set_sha256": (
+                    validation_seed_set_sha256 or None
+                ),
+                "checkpoints": checkpoint_holdout_snapshots,
+            }
+            if checkpoint_steps
+            else None
+        ),
         "init_checkpoint": args.init_checkpoint or None,
         "init_checkpoint_sha256": str(args.init_checkpoint_sha256) or None,
         "a1_curriculum_parent": getattr(args, "a1_curriculum_parent", None),

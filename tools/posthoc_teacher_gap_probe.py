@@ -966,6 +966,25 @@ def _policy_input_surface(
 
 
 def _report_parent_binding(report: Mapping[str, Any]) -> tuple[str, str] | None:
+    effective = report.get("effective_initialization_reference")
+    if effective is not None:
+        if (
+            not isinstance(effective, dict)
+            or effective.get("schema_version")
+            != "train-bc-effective-initialization-reference-v1"
+            or effective.get("optimizer_step") != 0
+            or effective.get("same_training_trajectory") is not True
+            or not isinstance(effective.get("checkpoint_sha256"), str)
+        ):
+            raise SystemExit(
+                "training report effective initialization reference is malformed"
+            )
+        value = str(effective["checkpoint_sha256"])
+        if not value.startswith("sha256:") or len(value) != 71:
+            raise SystemExit(
+                "training report effective initialization reference SHA is malformed"
+            )
+        return "effective_initialization_reference.checkpoint_sha256", value
     bindings = [
         (field, str(report[field]))
         for field in ("init_checkpoint_sha256", "grow_from_checkpoint_sha256")

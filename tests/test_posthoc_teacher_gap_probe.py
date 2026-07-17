@@ -21,6 +21,42 @@ def _module():
     return module
 
 
+def test_report_parent_binding_prefers_effective_step_zero_reference() -> None:
+    module = _module()
+    effective_sha = "sha256:" + "a" * 64
+
+    assert module._report_parent_binding(  # noqa: SLF001
+        {
+            "init_checkpoint_sha256": "sha256:" + "b" * 64,
+            "effective_initialization_reference": {
+                "schema_version": "train-bc-effective-initialization-reference-v1",
+                "optimizer_step": 0,
+                "same_training_trajectory": True,
+                "checkpoint_sha256": effective_sha,
+            },
+        }
+    ) == (
+        "effective_initialization_reference.checkpoint_sha256",
+        effective_sha,
+    )
+
+
+def test_report_parent_binding_rejects_malformed_effective_reference() -> None:
+    module = _module()
+    with pytest.raises(SystemExit, match="effective initialization reference"):
+        module._report_parent_binding(  # noqa: SLF001
+            {
+                "init_checkpoint_sha256": "sha256:" + "b" * 64,
+                "effective_initialization_reference": {
+                    "schema_version": "train-bc-effective-initialization-reference-v1",
+                    "optimizer_step": 1,
+                    "same_training_trajectory": True,
+                    "checkpoint_sha256": "sha256:" + "a" * 64,
+                },
+            }
+        )
+
+
 def _report() -> dict:
     return {
         "arch": "entity_graph",
