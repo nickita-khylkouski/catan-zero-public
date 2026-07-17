@@ -205,10 +205,10 @@ def test_scratch_training_activates_history_but_warm_start_preserves_zero():
         scratch_report["masked_mean_gate_initialization"]
         == "cold_start_small_nonzero_constant"
     )
-    assert scratch_report["masked_mean_gate_initial_scale"] == 0.1
+    assert scratch_report["masked_mean_gate_initial_scale"] == 0.01
     assert torch.equal(
         scratch.meaningful_history_residual_gate,
-        torch.full_like(scratch.meaningful_history_residual_gate, 0.1),
+        torch.full_like(scratch.meaningful_history_residual_gate, 0.01),
     )
 
     warm_start = EntityGraphNet(_config(history=True)).train()
@@ -221,7 +221,7 @@ def test_scratch_training_activates_history_but_warm_start_preserves_zero():
     )
     assert torch.equal(
         warm_start.meaningful_history_residual_gate,
-        torch.full_like(warm_start.meaningful_history_residual_gate, 0.1),
+        torch.full_like(warm_start.meaningful_history_residual_gate, 0.01),
     )
 
     # A checkpoint whose history branch has actually started learning must not

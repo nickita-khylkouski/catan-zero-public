@@ -21062,7 +21062,11 @@ def _route_mixed_public_award_batch(
     return routed
 
 
-MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE = 0.1
+# A newly added history branch contains random event embeddings and is injected
+# after the mature state normalization.  This is deliberately much smaller
+# than the scratch-model scale: it opens a gradient path without giving a
+# cold adapter enough amplitude to replace an incumbent's representation.
+MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE = 0.01
 
 
 def _initialize_cold_start_meaningful_history_path(

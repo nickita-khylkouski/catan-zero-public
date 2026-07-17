@@ -167,11 +167,11 @@ def test_scratch_ordered_history_is_live_on_the_first_backward() -> None:
     assert report["ordered_additive_gate_initialization"] == (
         "cold_start_small_nonzero_constant"
     )
-    assert report["masked_mean_gate_initial_scale"] == 0.1
-    assert report["ordered_additive_gate_initial_scale"] == 0.1
+    assert report["masked_mean_gate_initial_scale"] == 0.01
+    assert report["ordered_additive_gate_initial_scale"] == 0.01
     assert torch.equal(
         model.meaningful_history_ordered_gate,
-        torch.full_like(model.meaningful_history_ordered_gate, 0.1),
+        torch.full_like(model.meaningful_history_ordered_gate, 0.01),
     )
 
     output = model(_batch(history=True))
