@@ -194,6 +194,94 @@ def test_scratch_ordered_history_is_live_on_the_first_backward() -> None:
     assert model.meaningful_history_ordered_gate.grad.abs().sum().item() > 0.0
 
 
+def test_action_cross_attention_can_condition_on_live_public_history() -> None:
+    """The V7 action decoder must not inherit the trunk's all-event mask."""
+
+    torch.manual_seed(29)
+    config = replace(
+        _config(ordered=True),
+        action_cross_attention_layers=1,
+        v6_compatibility_preserving_inputs=True,
+    )
+    model = EntityGraphNet(config).eval()
+    width = model.config.hidden_size
+    block = model.action_cross_blocks[0]
+    with torch.no_grad():
+        # Uniform attention with an identity value/output path makes the
+        # decoder's dependence on each unmasked memory row deterministic.
+        block.attn.in_proj_weight.zero_()
+        block.attn.in_proj_bias.zero_()
+        block.attn.in_proj_weight[2 * width : 3 * width].copy_(
+            torch.eye(width)
+        )
+        block.attn.out_proj.weight.copy_(torch.eye(width))
+        block.attn.out_proj.bias.zero_()
+        block.ff[3].weight.zero_()
+        block.ff[3].bias.zero_()
+        model.meaningful_history_residual_gate.zero_()
+        model.meaningful_history_ordered_gate.zero_()
+
+    baseline = _batch(history=True)
+    # V7 also requires the native action/edge topology fields used by its
+    # compatibility-preserving initial-road residual.  All action targets are
+    # absent here, so that residual is inactive; we are isolating history.
+    baseline["legal_action_target_ids"] = torch.full(
+        (2, 3, 4), -1, dtype=torch.long
+    )
+    baseline["edge_vertex_ids"] = torch.zeros(2, 72, 2, dtype=torch.long)
+    changed_live = {key: value.clone() for key, value in baseline.items()}
+    changed_live["event_tokens"][:, -1, 0] += 20.0
+    changed_masked = {key: value.clone() for key, value in baseline.items()}
+    changed_masked["event_tokens"][:, 0, 0] += 20.0
+
+    with torch.no_grad():
+        baseline_logits = model(baseline)["logits"]
+        live_logits = model(changed_live)["logits"]
+        masked_logits = model(changed_masked)["logits"]
+
+    assert not torch.equal(baseline_logits, live_logits)
+    assert torch.equal(baseline_logits, masked_logits)
+
+
+def test_only_v7_action_cross_exposes_history_to_action_memory() -> None:
+    """Old action-cross checkpoints retain their all-event memory mask.
+
+    This is the function-preserving-upgrade boundary: action cross-attention
+    alone is an older f69 option, while V7 explicitly couples it to the
+    compatibility-preserving input route before public event rows become
+    decoder memory.
+    """
+
+    batch = _batch(history=True)
+    batch["legal_action_target_ids"] = torch.full((2, 3, 4), -1, dtype=torch.long)
+    batch["edge_vertex_ids"] = torch.zeros(2, 72, 2, dtype=torch.long)
+    legacy = EntityGraphNet(
+        replace(_config(ordered=True), action_cross_attention_layers=1)
+    ).eval()
+    v7 = EntityGraphNet(
+        replace(
+            _config(ordered=True),
+            action_cross_attention_layers=1,
+            v6_compatibility_preserving_inputs=True,
+        )
+    ).eval()
+    with torch.no_grad():
+        legacy_tokens, legacy_mask, *_ = legacy._state_tokens(batch)
+        v7_tokens, v7_mask, *_ = v7._state_tokens(batch)
+        del legacy_tokens, v7_tokens
+        legacy_action_mask = legacy._action_memory_padding_mask(legacy_mask, batch)
+        v7_action_mask = v7._action_memory_padding_mask(v7_mask, batch)
+
+    assert torch.equal(legacy_action_mask, legacy_mask)
+    # The final four rows in the 32-event batch are valid. The state token
+    # layout retains a 64-row event suffix, so these are positions 28:32 within
+    # that suffix, not the final four padded event rows.
+    event_start = -64 + 28
+    event_stop = -64 + 32
+    assert v7_mask[:, event_start:event_stop].all()
+    assert not v7_action_mask[:, event_start:event_stop].any()
+
+
 @pytest.mark.parametrize(
     ("masked_scale", "ordered_scale", "masked_status", "ordered_status"),
     (

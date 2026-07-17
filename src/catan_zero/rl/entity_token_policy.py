@@ -1666,11 +1666,15 @@ class EntityGraphNet:
                         pooled_targets + target_identity
                     )
                 if self.action_cross_attention_layers > 0:
+                    action_memory_padding_mask = self._action_memory_padding_mask(
+                        padding_mask,
+                        batch,
+                    )
                     for cross_block in self.action_cross_blocks:
                         encoded_actions = cross_block(
                             encoded_actions,
                             tokens,
-                            key_padding_mask=padding_mask,
+                            key_padding_mask=action_memory_padding_mask,
                         )
                 policy_state = torch.nn.functional.normalize(state, dim=-1)
                 policy_actions = torch.nn.functional.normalize(encoded_actions, dim=-1)
@@ -1955,6 +1959,60 @@ class EntityGraphNet:
                     )
                     outputs["q_values"] = self.q_head(q_features).squeeze(-1)
                 return outputs
+
+            def _action_memory_padding_mask(self, trunk_padding_mask, batch):
+                """Expose live public-history rows only to the V7 action decoder.
+
+                Meaningful event rows remain masked inside the inherited state
+                Transformer so activating the history adapter does not change
+                its mature representation. Reusing that trunk mask for the new
+                action cross-attention block also hid every event from the
+                decoder, reducing V7 to the old pooled global history bias.
+                """
+
+                # This is deliberately narrower than "history + action cross".
+                # Earlier f69 action-cross experiments used the inherited board
+                # memory only; changing their memory mask would silently change
+                # that architecture.  V7 is the explicit contract that both
+                # preserves V5 inputs and exposes the authenticated public event
+                # suffix to the *new* action decoder.
+                if (
+                    not self.v6_compatibility_preserving_inputs_enabled
+                    or self.action_cross_attention_layers <= 0
+                    or not self.meaningful_public_history_enabled
+                ):
+                    return trunk_padding_mask
+                event_mask = batch.get("event_mask")
+                if event_mask is None or event_mask.ndim != 2:
+                    raise ValueError(
+                        "action-local public history requires event_mask [B,E]"
+                    )
+                if event_mask.shape[0] != trunk_padding_mask.shape[0]:
+                    raise ValueError(
+                        "action-local public-history batch size differs from "
+                        "the encoded state"
+                    )
+                event_width = int(event_mask.shape[1])
+                if event_width > _LEGACY_EVENT_HISTORY_WIDTH:
+                    raise ValueError(
+                        "action-local public history exceeds the inherited "
+                        f"event width: {event_width} > {_LEGACY_EVENT_HISTORY_WIDTH}"
+                    )
+                if trunk_padding_mask.shape[1] < _LEGACY_EVENT_HISTORY_WIDTH:
+                    raise ValueError(
+                        "encoded state is missing the inherited event-token suffix"
+                    )
+                action_event_padding = torch.ones(
+                    (event_mask.shape[0], _LEGACY_EVENT_HISTORY_WIDTH),
+                    dtype=torch.bool,
+                    device=trunk_padding_mask.device,
+                )
+                action_event_padding[:, :event_width] = ~event_mask.bool()
+                action_memory_padding_mask = trunk_padding_mask.clone()
+                action_memory_padding_mask[
+                    :, -_LEGACY_EVENT_HISTORY_WIDTH:
+                ] = action_event_padding
+                return action_memory_padding_mask
 
             def _validate_event_token_limit(
                 self,
