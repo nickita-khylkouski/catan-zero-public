@@ -67,6 +67,7 @@ def test_checkpoint_set_restores_exact_optimizer_state(tmp_path: Path) -> None:
     fresh_model = torch.nn.Linear(3, 2)
     fresh_optimizer = torch.optim.Adam(fresh_model.parameters(), lr=9.0)
     payload = learner._restore_optimizer_checkpoint(  # noqa: SLF001
+        policy=_TinyPolicy(fresh_model),
         optimizer=fresh_optimizer,
         checkpoint_path=checkpoint,
         step=7,
@@ -121,6 +122,7 @@ def test_checkpoint_restores_rng_and_finalizes_consumed_shard_frontier(
     fresh_model = torch.nn.Linear(3, 2)
     fresh_optimizer = torch.optim.Adam(fresh_model.parameters())
     payload = learner._restore_optimizer_checkpoint(  # noqa: SLF001
+        policy=_TinyPolicy(fresh_model),
         optimizer=fresh_optimizer,
         checkpoint_path=checkpoint,
         step=4,
@@ -159,6 +161,7 @@ def test_resume_refuses_unsafe_consumed_shard_frontier(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="unsafe consumed-shard frontier"):
         learner._restore_optimizer_checkpoint(  # noqa: SLF001
+            policy=_TinyPolicy(fresh_model),
             optimizer=fresh_optimizer,
             checkpoint_path=checkpoint,
             step=9,
@@ -192,13 +195,15 @@ def test_recovery_update_commits_before_publish_consume_and_evaluation(
         "_finalize_consumed_frontier",
         lambda *_args, **_kwargs: events.append("consume"),
     )
+    model, optimizer = _adam_with_state()
 
     learner._commit_recovery_update(  # noqa: SLF001
-        policy=SimpleNamespace(save=lambda _path: None),
-        optimizer=object(),
+        policy=_TinyPolicy(model),
+        optimizer=optimizer,
         root=tmp_path,
         completed_step=1,
         shard_paths=[shard],
+        update_stats={"loss": 0.25},
         volume_commit_fn=lambda: events.append("commit"),
     )
     events.append("evaluation")
@@ -239,16 +244,124 @@ def test_checkpoint_commit_failure_prevents_publish_and_consumption(
             "consumed after failed checkpoint commit"
         ),
     )
+    model, optimizer = _adam_with_state()
 
     with pytest.raises(RuntimeError, match="commit failed after recovery checkpoint"):
         learner._commit_recovery_update(  # noqa: SLF001
-            policy=object(),
-            optimizer=object(),
+            policy=_TinyPolicy(model),
+            optimizer=optimizer,
             root=tmp_path,
             completed_step=1,
             shard_paths=[shard],
+            update_stats={"loss": 0.25},
             volume_commit_fn=lambda: (_ for _ in ()).throw(OSError("volume down")),
         )
+
+
+@pytest.mark.parametrize(
+    "poison",
+    ["parameter", "gradient", "optimizer", "metric"],
+)
+def test_nonfinite_update_is_refused_before_durable_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    poison: str,
+) -> None:
+    import torch
+
+    model, optimizer = _adam_with_state()
+    parameter = next(model.parameters())
+    stats: dict[str, object] = {"loss": 0.25}
+    if poison == "parameter":
+        parameter.data.reshape(-1)[0] = float("nan")
+    elif poison == "gradient":
+        parameter.grad = torch.full_like(parameter, float("inf"))
+    elif poison == "optimizer":
+        state = optimizer.state[parameter]
+        state["exp_avg"].reshape(-1)[0] = float("nan")
+    elif poison == "metric":
+        stats["loss"] = np.float32(np.nan)
+    else:  # pragma: no cover - parametrization is exhaustive
+        raise AssertionError(poison)
+
+    shard = dist.trajectories_dir(tmp_path) / "worker-A" / "shard_1.pkl"
+    shard.parent.mkdir(parents=True)
+    shard.touch()
+    monkeypatch.setattr(
+        learner,
+        "_save_checkpoint_set",
+        lambda **_kwargs: pytest.fail("checkpointed a non-finite update"),
+    )
+    monkeypatch.setattr(
+        dist,
+        "publish_weights",
+        lambda *_args, **_kwargs: pytest.fail("published a non-finite update"),
+    )
+    monkeypatch.setattr(
+        learner,
+        "_finalize_consumed_frontier",
+        lambda *_args, **_kwargs: pytest.fail("consumed a non-finite update"),
+    )
+
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        learner._commit_recovery_update(  # noqa: SLF001
+            policy=_TinyPolicy(model),
+            optimizer=optimizer,
+            root=tmp_path,
+            completed_step=1,
+            shard_paths=[shard],
+            update_stats=stats,
+            volume_commit_fn=None,
+        )
+
+    assert shard.is_file()
+    assert not dist.checkpoints_dir(tmp_path).exists()
+    assert dist.read_version(tmp_path) is None
+
+
+def test_resume_refuses_poisoned_generation_before_consuming_frontier(
+    tmp_path: Path,
+) -> None:
+    import torch
+
+    root = tmp_path / "run"
+    dist.ensure_run_dirs(root)
+    shard = dist.write_trajectory_shard(
+        root,
+        "worker-A",
+        7,
+        [{"trajectory": 1}],
+        policy_version=2,
+    )
+    model, optimizer = _adam_with_state()
+    next(model.parameters()).data.reshape(-1)[0] = float("nan")
+    optimizer_state = next(iter(optimizer.state.values()))
+    optimizer_state["exp_avg"].reshape(-1)[0] = float("inf")
+    checkpoint, _optimizer_path = learner._save_checkpoint_set(  # noqa: SLF001
+        policy=_TinyPolicy(model),
+        optimizer=optimizer,
+        root=root,
+        step=3,
+        consumed_shards=[shard],
+    )
+
+    stored = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    fresh_model = torch.nn.Linear(3, 2)
+    fresh_model.load_state_dict(stored["model"])
+    fresh_optimizer = torch.optim.Adam(fresh_model.parameters())
+
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        learner._restore_optimizer_checkpoint(  # noqa: SLF001
+            policy=_TinyPolicy(fresh_model),
+            optimizer=fresh_optimizer,
+            checkpoint_path=checkpoint,
+            step=3,
+            map_location="cpu",
+        )
+
+    assert shard.is_file()
+    assert list(dist.iter_unconsumed_shards(root)) == [shard]
+    assert dist.read_version(root) is None
 
 
 def test_resume_refuses_discovered_model_without_optimizer_sidecar(
@@ -266,6 +379,7 @@ def test_resume_refuses_discovered_model_without_optimizer_sidecar(
     assert learner.find_resume_checkpoint(root) == (3, checkpoint)
     with pytest.raises(RuntimeError, match="has no optimizer sidecar"):
         learner._restore_optimizer_checkpoint(  # noqa: SLF001
+            policy=_TinyPolicy(model),
             optimizer=optimizer,
             checkpoint_path=checkpoint,
             step=3,
@@ -291,6 +405,7 @@ def test_resume_refuses_optimizer_sidecar_bound_to_different_model(
 
     with pytest.raises(RuntimeError, match="binds different model bytes"):
         learner._restore_optimizer_checkpoint(  # noqa: SLF001
+            policy=_TinyPolicy(fresh_model),
             optimizer=fresh_optimizer,
             checkpoint_path=checkpoint,
             step=5,
@@ -328,6 +443,7 @@ def test_resume_refuses_mismatched_optimizer_sidecar_metadata(
 
     with pytest.raises(RuntimeError, match=message):
         learner._restore_optimizer_checkpoint(  # noqa: SLF001
+            policy=_TinyPolicy(fresh_model),
             optimizer=fresh_optimizer,
             checkpoint_path=checkpoint,
             step=6,

@@ -32,10 +32,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import numbers
 import os
 import random
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -1340,6 +1342,7 @@ def _save_checkpoint_set(
 
 def _restore_optimizer_checkpoint(
     *,
+    policy: Any,
     optimizer: Any,
     checkpoint_path: Path,
     step: int,
@@ -1393,6 +1396,11 @@ def _restore_optimizer_checkpoint(
         raise RuntimeError(
             f"refusing PPO resume: optimizer state is incompatible: {error}"
         ) from error
+    _assert_finite_update(
+        policy=policy,
+        optimizer=optimizer,
+        update_stats={},
+    )
     return payload
 
 
@@ -1480,16 +1488,93 @@ def prune_checkpoints(root: str | os.PathLike, league: League, config: LearnerCo
     return deleted
 
 
-def _policy_is_finite(policy: Any) -> bool:
-    """FIX H6: True iff every trainable parameter is finite (no NaN/inf after the update)."""
+def _assert_finite_nested(value: Any, *, path: str) -> None:
+    """Reject a non-finite numeric leaf in nested durable learner state."""
+
     import torch
 
-    model = getattr(policy, "model", None)
-    params = model.parameters() if model is not None else []
-    for p in params:
-        if not torch.isfinite(p).all():
-            return False
-    return True
+    if isinstance(value, torch.Tensor):
+        if (value.is_floating_point() or value.is_complex()) and not bool(
+            torch.isfinite(value).all().item()
+        ):
+            raise FloatingPointError(
+                f"refusing PPO recovery commit: non-finite {path}"
+            )
+        return
+    if isinstance(value, np.ndarray):
+        if np.issubdtype(value.dtype, np.number) and not bool(
+            np.isfinite(value).all()
+        ):
+            raise FloatingPointError(
+                f"refusing PPO recovery commit: non-finite {path}"
+            )
+        return
+    if isinstance(value, np.generic):
+        if np.issubdtype(value.dtype, np.number) and not bool(np.isfinite(value)):
+            raise FloatingPointError(
+                f"refusing PPO recovery commit: non-finite {path}"
+            )
+        return
+    if isinstance(value, numbers.Complex) and not isinstance(value, bool):
+        if not (math.isfinite(float(value.real)) and math.isfinite(float(value.imag))):
+            raise FloatingPointError(
+                f"refusing PPO recovery commit: non-finite {path}"
+            )
+        return
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            _assert_finite_nested(nested, path=f"{path}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _assert_finite_nested(nested, path=f"{path}[{index}]")
+
+
+def _assert_finite_update(
+    *,
+    policy: Any,
+    optimizer: Any,
+    update_stats: Mapping[str, Any],
+) -> None:
+    """Refuse to durably commit a poisoned model/optimizer/metric generation."""
+
+    import torch
+    from torch import nn
+
+    policy_attributes = getattr(policy, "__dict__", {})
+    checked_modules: set[int] = set()
+    for attribute, value in policy_attributes.items():
+        if not isinstance(value, nn.Module) or id(value) in checked_modules:
+            continue
+        checked_modules.add(id(value))
+        _assert_finite_nested(
+            value.state_dict(),
+            path=f"policy.{attribute}",
+        )
+    for attribute, value in policy_attributes.items():
+        if isinstance(value, torch.Tensor):
+            _assert_finite_nested(value, path=f"policy.{attribute}")
+
+    for group_index, group in enumerate(optimizer.param_groups):
+        for parameter_index, parameter in enumerate(group.get("params", ())):
+            _assert_finite_nested(
+                parameter,
+                path=(
+                    f"optimizer.param_groups[{group_index}]"
+                    f".params[{parameter_index}]"
+                ),
+            )
+            if parameter.grad is not None:
+                _assert_finite_nested(
+                    parameter.grad,
+                    path=(
+                        f"optimizer.param_groups[{group_index}]"
+                        f".params[{parameter_index}].grad"
+                    ),
+                )
+
+    _assert_finite_nested(optimizer.state_dict(), path="optimizer")
+    _assert_finite_nested(update_stats, path="update_stats")
 
 
 def _maybe_commit(volume_commit_fn: Any | None) -> None:
@@ -1519,9 +1604,15 @@ def _commit_recovery_update(
     root: str | os.PathLike,
     completed_step: int,
     shard_paths: Iterable[str | os.PathLike],
+    update_stats: Mapping[str, Any],
     volume_commit_fn: Any | None,
 ) -> tuple[Any, Path, Path]:
     """Durably checkpoint, publish, then finalize one applied PPO update."""
+    _assert_finite_update(
+        policy=policy,
+        optimizer=optimizer,
+        update_stats=update_stats,
+    )
     shards = list(shard_paths)
     frontier = _relative_shard_frontier(root, shards)
     checkpoint_path, optimizer_path = _save_checkpoint_set(
@@ -1617,6 +1708,7 @@ def train(
             trunk_lr_mult=config.trunk_lr_mult,
         )
         resume_payload = _restore_optimizer_checkpoint(
+            policy=policy,
             optimizer=optimizer,
             checkpoint_path=resume_path,
             step=resume_step,
@@ -1823,6 +1915,7 @@ def train(
             root=root,
             completed_step=completed_step,
             shard_paths=shard_paths,
+            update_stats=stats,
             volume_commit_fn=volume_commit_fn,
         )
         print(
