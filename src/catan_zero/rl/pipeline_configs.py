@@ -523,6 +523,10 @@ class GenerateConfig(PipelineConfig):
     n_full: int = 64
     n_fast: int = 16
     p_full: float = 0.25
+    # Minimum visit count retained in the stored MCTS policy target.  This is
+    # part of the teacher operator, so it must participate in the typed
+    # generation identity instead of being forwarded only to worker search.
+    policy_target_min_visits: int = 0
     # Diagnostic duplicate-search dose. Zero is a strict producer no-op; when
     # enabled the generator admits only coherent exact-n128 roots.
     target_reliability_audit_fraction: float = 0.0

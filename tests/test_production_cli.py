@@ -145,29 +145,23 @@ def _mock_exact_runtime(
     monkeypatch.setattr(cli, "_git_identity", lambda _root: clean_repository)
 
 
-def test_status_exposes_v5_parent_commissioning_as_invalidated() -> None:
+def test_status_exposes_commissioned_parent_and_blocked_scratch_recipe() -> None:
     status = production_status(ROOT)
 
     assert status["supported_operator_interface"] == "catan-zero"
     assert status["pipelines"]["generate"]["authorized"] is True
     assert status["pipelines"]["evaluate"]["authorized"] is True
     train = status["pipelines"]["train"]
-    assert train["authorized"] is False
+    assert train["authorized"] is True
     assert train["reason"] == "recipe_specific_authorization"
     assert train["recipes"]["a1-current-35m-b200"]["authorized"] is False
     parent = train["recipes"]["a1-parent-update-35m-b200"]
-    assert parent["authorized"] is False
-    assert parent["status"] == "blocked"
+    assert parent["authorized"] is True
+    assert parent["status"] == "ready"
     assert parent["reason"] == (
-        "commissioned_b12_invalidated_by_adapter_v5_information_aliasing"
+        "v7_hard_decision_mass_correction_bound_to_v6_b12"
     )
-    assert parent["unresolved_requirements"] == [
-        "materialize and authenticate a fresh "
-        "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop "
-        "training composite",
-        "recommission B12 topology, opening-policy, and value no-regression "
-        "gates on adapter v6",
-    ]
+    assert parent["unresolved_requirements"] == []
     assert status["pipelines"]["ppo"]["authorized"] is False
 
 
@@ -272,7 +266,7 @@ def test_training_science_admission_cannot_authorize_recipe_digest_drift(
         contracts.pipeline_readiness(ROOT, "train", "a1-parent-update-35m-b200")
 
 
-def test_training_science_admission_quarantines_v5_and_requires_fresh_v6() -> None:
+def test_training_science_admission_keeps_v5_quarantine_after_v6_commissioning() -> None:
     payload = json.loads(
         (ROOT / contracts.TRAINING_SCIENCE_ADMISSION).read_text(encoding="utf-8")
     )
@@ -280,12 +274,17 @@ def test_training_science_admission_quarantines_v5_and_requires_fresh_v6() -> No
         "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop"
     )
 
-    for admission in payload["recipes"].values():
-        assert admission["authorized"] is False
-        assert any(
-            expected_adapter in requirement
-            for requirement in admission["unresolved_requirements"]
-        )
+    scratch = payload["recipes"]["a1-current-35m-b200"]
+    parent = payload["recipes"]["a1-parent-update-35m-b200"]
+    assert scratch["authorized"] is False
+    assert any(
+        expected_adapter in requirement
+        for requirement in scratch["unresolved_requirements"]
+    )
+    assert parent["authorized"] is True
+    assert parent["unresolved_requirements"] == []
+
+    for admission in (scratch, parent):
         observations = admission["observations"]
         assert observations["required_fresh_learner_adapter"] == expected_adapter
         assert observations["adapter_v5_resource_quarantine"] == {
@@ -296,6 +295,9 @@ def test_training_science_admission_quarantines_v5_and_requires_fresh_v6() -> No
             "saturation_risk_rows": 7440,
             "training_admission": False,
         }
+    assert parent["observations"]["retained_composite_adapter_status"] == (
+        "fresh_adapter_v6_composite_authenticated"
+    )
 
 
 def test_parent_update_requires_receipt_only_for_changed_initializer(
