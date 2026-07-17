@@ -422,12 +422,17 @@ def test_zero_floor_reports_absent_policy_signal_without_new_refusal() -> None:
     assert report["expected_policy_effective_rows_per_global_batch"] == 0.0
 
 
-def test_opening_phase_mass_reports_sparse_objective_without_inventing_floor() -> None:
+def test_hard_decision_phase_mass_reports_sparse_objective_without_floor() -> None:
     phases = np.asarray(
         ["PLAY_TURN"] * 100
-        + ["BUILD_INITIAL_SETTLEMENT", "BUILD_INITIAL_ROAD"]
+        + [
+            "BUILD_INITIAL_SETTLEMENT",
+            "BUILD_INITIAL_ROAD",
+            "DISCARD",
+            "MOVE_ROBBER",
+        ]
     )
-    weights = np.asarray([4.0] * 100 + [1.0, 1.0], dtype=np.float64)
+    weights = np.asarray([4.0] * 100 + [1.0] * 4, dtype=np.float64)
 
     report = _policy_phase_objective_mass_admission(
         {"phase": phases},
@@ -440,19 +445,28 @@ def test_opening_phase_mass_reports_sparse_objective_without_inventing_floor() -
 
     settlement = report["per_phase"]["BUILD_INITIAL_SETTLEMENT"]
     road = report["per_phase"]["BUILD_INITIAL_ROAD"]
+    discard = report["per_phase"]["DISCARD"]
+    robber = report["per_phase"]["MOVE_ROBBER"]
     assert report["admission_enforced"] is False
     assert report["admitted"] is None
     assert report["identity_sha256"].startswith("sha256:")
-    assert settlement["policy_objective_mass_fraction"] == pytest.approx(1 / 402)
-    assert road["policy_objective_mass_fraction"] == pytest.approx(1 / 402)
+    assert settlement["policy_objective_mass_fraction"] == pytest.approx(1 / 404)
+    assert road["policy_objective_mass_fraction"] == pytest.approx(1 / 404)
+    assert discard["policy_objective_mass_fraction"] == pytest.approx(1 / 404)
+    assert robber["policy_objective_mass_fraction"] == pytest.approx(1 / 404)
 
 
-def test_opening_phase_mass_rejects_sparse_objective_before_training() -> None:
+def test_hard_decision_phase_mass_rejects_sparse_objective_before_training() -> None:
     phases = np.asarray(
         ["PLAY_TURN"] * 100
-        + ["BUILD_INITIAL_SETTLEMENT", "BUILD_INITIAL_ROAD"]
+        + [
+            "BUILD_INITIAL_SETTLEMENT",
+            "BUILD_INITIAL_ROAD",
+            "DISCARD",
+            "MOVE_ROBBER",
+        ]
     )
-    weights = np.asarray([4.0] * 100 + [1.0, 1.0], dtype=np.float64)
+    weights = np.asarray([4.0] * 100 + [1.0] * 4, dtype=np.float64)
 
     with pytest.raises(SystemExit, match="refused before the first optimizer step"):
         _policy_phase_objective_mass_admission(
@@ -463,20 +477,29 @@ def test_opening_phase_mass_rejects_sparse_objective_before_training() -> None:
             minimum_phase_mass_fractions={
                 "BUILD_INITIAL_SETTLEMENT": 0.01,
                 "BUILD_INITIAL_ROAD": 0.01,
+                "DISCARD": 0.01,
+                "MOVE_ROBBER": 0.01,
             },
             objective_measure="synthetic_uniform_coverage",
         )
 
 
-def test_opening_phase_mass_accepts_reviewed_minima_and_binds_identity() -> None:
+def test_hard_decision_phase_mass_accepts_minima_and_binds_identity() -> None:
     phases = np.asarray(
         ["PLAY_TURN"] * 100
-        + ["BUILD_INITIAL_SETTLEMENT", "BUILD_INITIAL_ROAD"]
+        + [
+            "BUILD_INITIAL_SETTLEMENT",
+            "BUILD_INITIAL_ROAD",
+            "DISCARD",
+            "MOVE_ROBBER",
+        ]
     )
-    weights = np.asarray([4.0] * 100 + [8.0, 8.0], dtype=np.float64)
+    weights = np.asarray([4.0] * 100 + [8.0] * 4, dtype=np.float64)
     minima = {
         "BUILD_INITIAL_SETTLEMENT": 0.01,
         "BUILD_INITIAL_ROAD": 0.01,
+        "DISCARD": 0.01,
+        "MOVE_ROBBER": 0.01,
     }
 
     report = _policy_phase_objective_mass_admission(

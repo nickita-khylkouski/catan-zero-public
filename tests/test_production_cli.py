@@ -230,20 +230,20 @@ def test_other_pipelines_resolve_through_compact_launchers(
         assert "--lock" in plan["command"]
 
 
-def test_cataloged_parent_update_uses_exact_recipe_and_parent_but_is_quarantined(
+def test_cataloged_parent_update_uses_exact_authorized_recipe_and_parent(
     tmp_path: Path,
 ) -> None:
     plan = cli.build_plan(
         _write_job(tmp_path, "train", recipe="a1-parent-update-35m-b200")
     )
 
-    assert plan["readiness"]["authorized"] is False
+    assert plan["readiness"]["authorized"] is True
     assert plan["readiness"]["reason"] == (
-        "commissioned_b12_invalidated_by_adapter_v5_information_aliasing"
+        "v6_b12_commissioned_on_fresh_coherent_n128"
     )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
-        "757b1376bf1903841f6f26f60f361f81eb59a38b682a5468e14cafcce2d38131"
+        "7780697033485eba9c9f768676bc59cd51456414391693f77b766917fd9d1198"
     )
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]

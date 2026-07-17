@@ -309,9 +309,11 @@ CHECKPOINT_DOSE_TELEMETRY_SCHEMA = "train-bc-checkpoint-dose-telemetry-v1"
 CHECKPOINT_DOSE_TRAJECTORY_SCHEMA = "train-bc-checkpoint-dose-trajectory-v1"
 BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1 = "weighted_replacement_v1"
 BASE_SAMPLER_COVERAGE_IMPORTANCE_V1 = "coverage_importance_v1"
-OPENING_POLICY_MASS_PHASES = (
+HARD_DECISION_POLICY_MASS_PHASES = (
     "BUILD_INITIAL_SETTLEMENT",
     "BUILD_INITIAL_ROAD",
+    "DISCARD",
+    "MOVE_ROBBER",
 )
 
 MEMMAP_PAYLOAD_INVENTORY_SCHEMA = "memmap-payload-inventory-v1"
@@ -1168,6 +1170,26 @@ def build_parser() -> argparse.ArgumentParser:
             "to BUILD_INITIAL_ROAD. Must be commissioned together with the "
             "initial-settlement minimum; omitted values are reported but not "
             "admitted."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-discard-policy-mass-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Reviewed minimum fraction of the realized policy objective assigned "
+            "to DISCARD. Must be commissioned with all other hard-decision "
+            "minima; omitted values are reported but not admitted."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-move-robber-policy-mass-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Reviewed minimum fraction of the realized policy objective assigned "
+            "to MOVE_ROBBER. Must be commissioned with all other hard-decision "
+            "minima; omitted values are reported but not admitted."
         ),
     )
     parser.add_argument(
@@ -16186,7 +16208,7 @@ def main(
         }
     else:
         raise SystemExit(f"unsupported --base-sampler {base_sampler!r}")
-    opening_policy_mass_minima = _opening_policy_mass_minima(args)
+    hard_decision_policy_mass_minima = _hard_decision_policy_mass_minima(args)
     policy_phase_objective_mass_admission = _rank0_authoritative_call(
         ddp,
         "policy phase objective-mass admission",
@@ -16199,7 +16221,7 @@ def main(
                 if base_sampler == BASE_SAMPLER_WEIGHTED_REPLACEMENT_V1
                 else None
             ),
-            minimum_phase_mass_fractions=opening_policy_mass_minima,
+            minimum_phase_mass_fractions=hard_decision_policy_mass_minima,
             objective_measure=(
                 "weighted_replacement_draw_probability_x_policy_loss_weight_v1"
                 if epoch_sample_weights is not None
@@ -39143,13 +39165,13 @@ def _coverage_policy_signal_admission(
     return report
 
 
-def _opening_policy_mass_minima(args) -> dict[str, float] | None:
-    """Return the complete reviewed opening contract or the unset sentinel.
+def _hard_decision_policy_mass_minima(args) -> dict[str, float] | None:
+    """Return the complete reviewed hard-decision contract or unset sentinel.
 
-    A single configured phase would make the other opening decision silently
-    unprotected, so partial contracts are invalid. Zero is not a meaningful
-    production floor: callers that have not commissioned values must leave
-    both fields unset and remain fail-closed at the production launcher.
+    A partial contract would leave a strategic decision silently unprotected.
+    Zero is not a meaningful production floor: callers that have not
+    commissioned values must leave every field unset and remain fail-closed at
+    the production launcher.
     """
 
     raw = {
@@ -39159,14 +39181,18 @@ def _opening_policy_mass_minima(args) -> dict[str, float] | None:
         "BUILD_INITIAL_ROAD": getattr(
             args, "minimum_initial_road_policy_mass_fraction", None
         ),
+        "DISCARD": getattr(args, "minimum_discard_policy_mass_fraction", None),
+        "MOVE_ROBBER": getattr(
+            args, "minimum_move_robber_policy_mass_fraction", None
+        ),
     }
     present = {phase: value is not None for phase, value in raw.items()}
     if not any(present.values()):
         return None
     if not all(present.values()):
         raise SystemExit(
-            "opening policy-mass admission requires reviewed minima for both "
-            "BUILD_INITIAL_SETTLEMENT and BUILD_INITIAL_ROAD"
+            "hard-decision policy-mass admission requires reviewed minima for "
+            "BUILD_INITIAL_SETTLEMENT, BUILD_INITIAL_ROAD, DISCARD, and MOVE_ROBBER"
         )
     minima = {phase: float(value) for phase, value in raw.items()}
     if any(
@@ -39174,10 +39200,10 @@ def _opening_policy_mass_minima(args) -> dict[str, float] | None:
         for value in minima.values()
     ):
         raise SystemExit(
-            "opening policy-mass minima must be finite fractions in (0, 1]"
+            "hard-decision policy-mass minima must be finite fractions in (0, 1]"
         )
     if sum(minima.values()) > 1.0:
-        raise SystemExit("opening policy-mass minima cannot sum above one")
+        raise SystemExit("hard-decision policy-mass minima cannot sum above one")
     return minima
 
 
@@ -39214,16 +39240,16 @@ def _policy_phase_objective_mass_admission(
     if "phase" not in data:
         if minimum_phase_mass_fractions is not None:
             raise SystemExit(
-                "opening policy-mass admission requires a row-aligned phase column"
+                "hard-decision policy-mass admission requires a row-aligned phase column"
             )
         report: dict[str, object] = {
-            "schema_version": "policy-phase-objective-mass-admission-v1",
+            "schema_version": "policy-phase-objective-mass-admission-v2",
             "available": False,
             "admission_enforced": False,
             "admitted": None,
             "reason": "phase_column_unavailable",
             "objective_measure": str(objective_measure),
-            "required_phases": list(OPENING_POLICY_MASS_PHASES),
+            "required_phases": list(HARD_DECISION_POLICY_MASS_PHASES),
             "minimum_phase_mass_fractions": None,
             "per_phase": {},
         }
@@ -39272,7 +39298,7 @@ def _policy_phase_objective_mass_admission(
     if not math.isfinite(total_mass) or total_mass <= 0.0:
         if minimum_phase_mass_fractions is not None:
             raise SystemExit(
-                "opening policy-mass admission found zero policy objective mass"
+                "hard-decision policy-mass admission found zero policy objective mass"
             )
         total_mass = 0.0
     minima = (
@@ -39280,11 +39306,11 @@ def _policy_phase_objective_mass_admission(
         if minimum_phase_mass_fractions is None
         else {
             phase: float(minimum_phase_mass_fractions[phase])
-            for phase in OPENING_POLICY_MASS_PHASES
+            for phase in HARD_DECISION_POLICY_MASS_PHASES
         }
     )
     per_phase: dict[str, dict[str, object]] = {}
-    for phase in sorted(set(row_counts) | set(OPENING_POLICY_MASS_PHASES)):
+    for phase in sorted(set(row_counts) | set(HARD_DECISION_POLICY_MASS_PHASES)):
         mass = float(phase_mass.get(phase, 0.0))
         fraction = mass / total_mass if total_mass > 0.0 else 0.0
         minimum = None if minima is None else minima.get(phase)
@@ -39300,10 +39326,10 @@ def _policy_phase_objective_mass_admission(
     if minima is not None:
         admitted = all(
             bool(per_phase[phase]["admitted"])
-            for phase in OPENING_POLICY_MASS_PHASES
+            for phase in HARD_DECISION_POLICY_MASS_PHASES
         )
     report = {
-        "schema_version": "policy-phase-objective-mass-admission-v1",
+        "schema_version": "policy-phase-objective-mass-admission-v2",
         "available": True,
         "admission_enforced": minima is not None,
         "admitted": admitted,
@@ -39312,12 +39338,12 @@ def _policy_phase_objective_mass_admission(
             if admitted is True
             else "reviewed_minima_not_commissioned"
             if admitted is None
-            else "opening_policy_objective_mass_below_reviewed_minimum"
+            else "hard_decision_policy_objective_mass_below_reviewed_minimum"
         ),
         "objective_measure": str(objective_measure),
         "training_row_count": int(rows.size),
         "total_policy_objective_mass": total_mass,
-        "required_phases": list(OPENING_POLICY_MASS_PHASES),
+        "required_phases": list(HARD_DECISION_POLICY_MASS_PHASES),
         "minimum_phase_mass_fractions": minima,
         "per_phase": per_phase,
     }
@@ -39326,11 +39352,11 @@ def _policy_phase_objective_mass_admission(
         details = ", ".join(
             f"{phase}={per_phase[phase]['policy_objective_mass_fraction']:.6g}"
             f"<{minima[phase]:.6g}"
-            for phase in OPENING_POLICY_MASS_PHASES
+            for phase in HARD_DECISION_POLICY_MASS_PHASES
             if not bool(per_phase[phase]["admitted"])
         )
         raise SystemExit(
-            "opening policy-mass admission refused before the first optimizer "
+            "hard-decision policy-mass admission refused before the first optimizer "
             f"step: {details}"
         )
     return report
@@ -41636,6 +41662,12 @@ def _training_resume_recipe_identity(
         ),
         "minimum_initial_road_policy_mass_fraction": getattr(
             args, "minimum_initial_road_policy_mass_fraction", None
+        ),
+        "minimum_discard_policy_mass_fraction": getattr(
+            args, "minimum_discard_policy_mass_fraction", None
+        ),
+        "minimum_move_robber_policy_mass_fraction": getattr(
+            args, "minimum_move_robber_policy_mass_fraction", None
         ),
         "entity_feature_adapter_version": resume_entity_adapter,
         "public_rule_state_features": bool(

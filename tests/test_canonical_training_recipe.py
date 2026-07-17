@@ -55,11 +55,11 @@ def test_canonical_coverage_recipe_can_reach_composite_training() -> None:
     assert fields["validation_max_samples"] == 0
 
 
-def test_production_opening_mass_contract_is_fail_closed_until_reviewed() -> None:
+def test_production_hard_decision_mass_contract_is_fail_closed_until_reviewed() -> None:
     engine = _payload()["engine_settings"]
 
     with pytest.raises(SystemExit, match="remains fail-closed"):
-        train._require_production_opening_policy_mass_contract(engine)
+        train._require_production_hard_decision_policy_mass_contract(engine)
 
 
 def test_parent_production_recipe_can_collect_two_signal_observations() -> None:
@@ -143,17 +143,44 @@ def test_epoch_mode_skips_exact_cap_feature_observation_arithmetic() -> None:
     )
 
 
-def test_production_opening_mass_contract_accepts_only_complete_reviewed_pair() -> None:
+def test_production_hard_decision_mass_contract_requires_every_phase() -> None:
     settlement = "minimum_initial_settlement_policy_mass_fraction"
     road = "minimum_initial_road_policy_mass_fraction"
+    discard = "minimum_discard_policy_mass_fraction"
+    robber = "minimum_move_robber_policy_mass_fraction"
 
     with pytest.raises(SystemExit, match="missing=.*initial_road"):
-        train._require_production_opening_policy_mass_contract({settlement: 0.01})
+        train._require_production_hard_decision_policy_mass_contract(
+            {settlement: 0.01}
+        )
 
-    minima = train._require_production_opening_policy_mass_contract(
-        {settlement: 0.01, road: 0.02}
+    with pytest.raises(SystemExit, match="missing=.*discard.*move_robber"):
+        train._require_production_hard_decision_policy_mass_contract(
+            {settlement: 0.01, road: 0.02}
+        )
+
+    minima = train._require_production_hard_decision_policy_mass_contract(
+        {settlement: 0.01, road: 0.02, discard: 0.03, robber: 0.04}
     )
-    assert minima == {settlement: 0.01, road: 0.02}
+    assert minima == {
+        settlement: 0.01,
+        road: 0.02,
+        discard: 0.03,
+        robber: 0.04,
+    }
+
+
+def test_parent_recipe_commissions_every_hard_decision_mass_floor() -> None:
+    _config, engine = train._load_recipe(PARENT_RECIPE)  # noqa: SLF001
+
+    minima = train._require_production_hard_decision_policy_mass_contract(engine)
+
+    assert minima == {
+        "minimum_initial_settlement_policy_mass_fraction": 0.02,
+        "minimum_initial_road_policy_mass_fraction": 0.02,
+        "minimum_discard_policy_mass_fraction": 0.02,
+        "minimum_move_robber_policy_mass_fraction": 0.02,
+    }
 
 
 def test_canonical_non_moe_recipe_has_no_phantom_moe_objective() -> None:

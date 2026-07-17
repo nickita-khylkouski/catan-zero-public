@@ -1102,6 +1102,8 @@ def test_coherent_one_dose_renders_deployed_scalar_value_objective(
     assert _option(command, "--base-sampler") == "coverage_importance_v1"
     assert "--minimum-initial-settlement-policy-mass-fraction" not in command
     assert "--minimum-initial-road-policy-mass-fraction" not in command
+    assert "--minimum-discard-policy-mass-fraction" not in command
+    assert "--minimum-move-robber-policy-mass-fraction" not in command
     assert _option(command, "--train-diagnostics-every-batches") == "16"
     assert (
         _option(command, "--objective-gradient-interference-every-batches")
@@ -1597,6 +1599,13 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
     assert _option(command, "--scalar-value-loss-scale") == "1.0"
     assert _option(command, "--min-35m-params") == "42500000"
     assert _option(command, "--max-35m-params") == "43000000"
+    assert _option(
+        command, "--minimum-initial-road-policy-mass-fraction"
+    ) == "0.02"
+    assert _option(command, "--minimum-discard-policy-mass-fraction") == "0.02"
+    assert _option(
+        command, "--minimum-move-robber-policy-mass-fraction"
+    ) == "0.02"
 
 
 def test_migration_claim_schema_replays_as_derived_identity(tmp_path: Path) -> None:

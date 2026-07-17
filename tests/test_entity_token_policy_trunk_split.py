@@ -329,6 +329,52 @@ def test_split_value_gradient_scale_zero_stops_shared_prefix_not_private_tower()
     )
 
 
+def test_split_value_gradient_scale_point_one_keeps_private_tower_full_strength():
+    """The V7 routing scale applies only before the private value suffix."""
+    control = EntityGraphNet(
+        _config(state_layers=2, value_tower_split_layers=1)
+    ).train()
+    treatment = copy.deepcopy(control)
+    batch = _batch(batch_size=3, action_width=5)
+
+    results = []
+    for model, scale in ((control, 1.0), (treatment, 0.1)):
+        model.zero_grad(set_to_none=True)
+        output = model(batch, value_trunk_grad_scale=scale)["value"]
+        output.sum().backward()
+        results.append(
+            (
+                output.detach().clone(),
+                {
+                    name: parameter.grad.detach().clone()
+                    for name, parameter in model.named_parameters()
+                    if parameter.grad is not None
+                },
+            )
+        )
+
+    (control_value, control_grads), (treatment_value, treatment_grads) = results
+    assert torch.equal(treatment_value, control_value)
+    private_value_prefixes = (
+        "value_blocks.",
+        "value_state_norm.",
+        "value_head.",
+    )
+    for name, control_grad in control_grads.items():
+        expected = (
+            control_grad
+            if name.startswith(private_value_prefixes)
+            else 0.1 * control_grad
+        )
+        torch.testing.assert_close(
+            treatment_grads[name],
+            expected,
+            rtol=2e-5,
+            atol=1e-7,
+            msg=name,
+        )
+
+
 def test_split_value_history_target_gather_does_not_leak_into_policy_suffix():
     """The history side input must respect the same late-tower boundary."""
     model = EntityGraphNet(

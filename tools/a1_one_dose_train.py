@@ -2446,8 +2446,10 @@ def bind_canonical_parent_update_recipe(
         "base_sampler",
         "data_loader_prefetch",
         "data_loader_workers",
+        "minimum_discard_policy_mass_fraction",
         "minimum_initial_road_policy_mass_fraction",
         "minimum_initial_settlement_policy_mass_fraction",
+        "minimum_move_robber_policy_mass_fraction",
         "minimum_feature_learning_signal_observations",
         "min_35m_params",
         "max_35m_params",
@@ -6033,6 +6035,10 @@ def _build_direct_train_command(
                     str(recipe["minimum_initial_settlement_policy_mass_fraction"]),
                     "--minimum-initial-road-policy-mass-fraction",
                     str(recipe["minimum_initial_road_policy_mass_fraction"]),
+                    "--minimum-discard-policy-mass-fraction",
+                    str(recipe["minimum_discard_policy_mass_fraction"]),
+                    "--minimum-move-robber-policy-mass-fraction",
+                    str(recipe["minimum_move_robber_policy_mass_fraction"]),
                 ]
                 if "minimum_initial_settlement_policy_mass_fraction" in recipe
                 else []

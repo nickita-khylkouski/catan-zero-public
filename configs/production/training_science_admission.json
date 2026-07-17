@@ -36,7 +36,7 @@
       "commissioning_evidence": []
     },
     "a1-parent-update-35m-b200": {
-      "recipe_canonical_sha256": "757b1376bf1903841f6f26f60f361f81eb59a38b682a5468e14cafcce2d38131",
+      "recipe_canonical_sha256": "7780697033485eba9c9f768676bc59cd51456414391693f77b766917fd9d1198",
       "authorized": true,
       "reason": "v6_b12_commissioned_on_fresh_coherent_n128",
       "unresolved_requirements": [],
@@ -62,6 +62,8 @@
         "opening_policy_loss_mass_fraction": 0.027885,
         "minimum_initial_settlement_policy_mass_fraction": 0.02,
         "minimum_initial_road_policy_mass_fraction": 0.02,
+        "minimum_discard_policy_mass_fraction": 0.02,
+        "minimum_move_robber_policy_mass_fraction": 0.02,
         "shared_trunk_lr_multiplier": 0.25,
         "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh",
         "v6_commissioning_teacher_target_kl_delta": -0.019447026033010335,
