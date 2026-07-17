@@ -23,6 +23,7 @@ value_surprise from a batched value-head pass over their STORED entity tokens
 from __future__ import annotations
 
 import argparse
+import hashlib
 import heapq
 import json
 import time
@@ -37,6 +38,7 @@ from regret_common import (
     discover_shards,
     load_shard,
     score_shard,
+    stable_shard_sample_value,
     write_json_atomic,
 )
 from high_regret_suite_contract import load_validation_seed_manifest
@@ -45,6 +47,40 @@ from high_regret_suite_contract import load_validation_seed_manifest
 # small non-negative sum of ~[0,1] components; 0..4 covers the weighted range
 # comfortably (out-of-range values are clipped into the end bins).
 _HIST_LO, _HIST_HI, _HIST_BINS = 0.0, 4.0, 80
+REGRET_MANIFEST_SCHEMA = "catan-zero-regret-manifest-v2-byte-bound"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+
+def _extraction_identity(config: RegretConfig, args: argparse.Namespace) -> str:
+    payload = {
+        "schema": REGRET_MANIFEST_SCHEMA,
+        "sample_frac": float(args.sample_frac),
+        "sample_seed": int(args.sample_seed),
+        "teacher_filter": args.teacher_filter,
+        "top_k": int(args.top_k),
+        "max_shards": int(args.max_shards),
+        "weights": {
+            "value_surprise": float(config.value_surprise_weight),
+            "phase_bonus": float(config.phase_bonus_weight),
+            "legal_count": float(config.legal_count_weight),
+            "kl_disagreement": float(config.kl_disagreement_weight),
+            "argmax_mismatch_lost": float(config.argmax_mismatch_lost_weight),
+            "include_forced": bool(config.include_forced),
+        },
+        "value_scale": float(args.value_scale),
+        "value_squash": str(args.value_squash),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _teacher_of(shard: dict[str, np.ndarray]) -> str:
@@ -144,6 +180,7 @@ def main() -> None:
 
     topk = _TopK(args.top_k)
     shard_paths: list[str] = []
+    shard_sha256: list[str] = []
     hist = np.zeros(_HIST_BINS, dtype=np.int64)
     edges = np.linspace(_HIST_LO, _HIST_HI, _HIST_BINS + 1)
 
@@ -161,7 +198,7 @@ def main() -> None:
 
     for shard_index, path in enumerate(shards):
         if args.sample_frac < 1.0:
-            h = (hash((str(path), int(args.sample_seed))) & 0xFFFFFFFF) / 0xFFFFFFFF
+            h = stable_shard_sample_value(path, seed=int(args.sample_seed))
             if h >= args.sample_frac:
                 continue
         shard = load_shard(path)
@@ -169,6 +206,7 @@ def main() -> None:
         if args.teacher_filter and teacher != args.teacher_filter:
             continue
         shard_paths.append(str(path))
+        shard_sha256.append(_file_sha256(path))
         this_shard_id = len(shard_paths) - 1
 
         is_raw = _is_raw_shard(shard)
@@ -246,7 +284,7 @@ def main() -> None:
             "validation-seed filtering retained no high-regret candidate rows"
         )
     _write_manifest(
-        Path(args.out), records, shard_paths, config, args,
+        Path(args.out), records, shard_paths, shard_sha256, config, args,
         held_out_binding=held_out_binding,
     )
     summary = _build_summary(
@@ -276,6 +314,7 @@ def _write_manifest(
     out: Path,
     records: list[dict[str, Any]],
     shard_paths: list[str],
+    shard_sha256: list[str],
     config: RegretConfig,
     args: argparse.Namespace,
     *,
@@ -283,12 +322,26 @@ def _write_manifest(
 ) -> None:
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
+    if len(shard_paths) != len(shard_sha256):
+        raise ValueError("regret manifest shard path/hash inventory is misaligned")
+    value_checkpoint_sha256 = (
+        _file_sha256(Path(args.value_checkpoint)) if args.value_checkpoint else ""
+    )
+    binding_cols = {
+        "manifest_schema": np.asarray(REGRET_MANIFEST_SCHEMA),
+        "extraction_identity_sha256": np.asarray(_extraction_identity(config, args)),
+        "sample_frac": np.asarray(float(args.sample_frac), dtype=np.float64),
+        "sample_seed": np.asarray(int(args.sample_seed), dtype=np.int64),
+        "value_checkpoint_sha256": np.asarray(value_checkpoint_sha256),
+        "shard_paths": np.asarray(shard_paths),
+        "shard_sha256": np.asarray(shard_sha256),
+    }
     if not records:
         if held_out_binding is not None:
             raise ValueError(
                 "validation-seed filtering retained no high-regret candidate rows"
             )
-        np.savez(out, shard_paths=np.asarray(shard_paths))
+        np.savez(out, **binding_cols)
         return
     cols = {
         "shard_id": np.asarray([r["shard_id"] for r in records], dtype=np.int32),
@@ -305,7 +358,7 @@ def _write_manifest(
         "z": np.asarray([r["z"] for r in records], dtype=np.float32),
         "phase": np.asarray([r["phase"] for r in records]),
         "teacher": np.asarray([r["teacher"] for r in records]),
-        "shard_paths": np.asarray(shard_paths),
+        **binding_cols,
     }
     if held_out_binding is not None:
         cols.update(

@@ -107,6 +107,16 @@ H2H_SEARCH_RNG_CONTRACT = {
     "worker_schedule_independent": True,
 }
 
+SHARD_SAMPLE_DERIVATION = "sha256(path,seed)-u64-v1"
+
+
+def stable_shard_sample_value(path: Path, *, seed: int = 0) -> float:
+    """Return a process-independent value in ``[0, 1)`` for shard sampling."""
+
+    payload = f"regret-shard-sample-v1:{int(seed)}:{Path(path)}".encode("utf-8")
+    numerator = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+    return numerator / float(1 << 64)
+
 
 def h2h_search_seed(*, game_seed: int, seat_color: str) -> int:
     color = str(seat_color).upper()
@@ -367,7 +377,7 @@ def iter_shards(roots: list[Path], *, sample_frac: float = 1.0, seed: int = 0) -
     for path in shards:
         if sample_frac < 1.0:
             # Deterministic per-path selection independent of iteration order.
-            h = (hash((str(path), int(seed))) & 0xFFFFFFFF) / 0xFFFFFFFF
+            h = stable_shard_sample_value(path, seed=seed)
             if h >= sample_frac:
                 continue
         yield path, load_shard(path)

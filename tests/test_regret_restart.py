@@ -345,6 +345,81 @@ def test_topk_keeps_highest():
     assert kept == [0.95, 0.9, 0.5]
 
 
+def test_shard_sampling_is_stable_and_seeded() -> None:
+    import regret_common
+
+    path = Path("/corpus/shard-00017.npz")
+    first = regret_common.stable_shard_sample_value(path, seed=41)
+    assert first == regret_common.stable_shard_sample_value(path, seed=41)
+    assert first != regret_common.stable_shard_sample_value(path, seed=42)
+    assert 0.0 <= first < 1.0
+
+
+def test_regret_manifest_binds_sources_sampling_and_checkpoint(tmp_path) -> None:
+    import extract_regret_states as ex
+
+    shard = tmp_path / "source.npz"
+    checkpoint = tmp_path / "value.pt"
+    shard.write_bytes(b"source-payload")
+    checkpoint.write_bytes(b"checkpoint-payload")
+    args = argparse.Namespace(
+        sample_frac=0.25,
+        sample_seed=17,
+        teacher_filter=None,
+        top_k=10,
+        max_shards=0,
+        value_scale=1.0,
+        value_squash="tanh",
+        value_checkpoint=str(checkpoint),
+    )
+    out = tmp_path / "regret.npz"
+    ex._write_manifest(
+        out,
+        [],
+        [str(shard)],
+        [ex._file_sha256(shard)],
+        regret_common.RegretConfig(),
+        args,
+    )
+
+    with np.load(out, allow_pickle=False) as data:
+        assert str(data["manifest_schema"]) == ex.REGRET_MANIFEST_SCHEMA
+        assert int(data["sample_seed"]) == 17
+        assert float(data["sample_frac"]) == pytest.approx(0.25)
+        assert str(data["shard_sha256"][0]) == ex._file_sha256(shard)
+        assert str(data["value_checkpoint_sha256"]) == ex._file_sha256(checkpoint)
+        assert str(data["extraction_identity_sha256"]).startswith("sha256:")
+
+
+def test_restart_generation_rejects_failed_or_incomplete_mix() -> None:
+    import generate_restart_selfplay as gr
+
+    planned = {
+        "normal": 6,
+        "opening": 2,
+        "robber_dev": 1,
+        "random_archived": 1,
+    }
+    with pytest.raises(RuntimeError, match="restart generation incomplete"):
+        gr.validate_restart_generation_result(
+            planned,
+            {"normal": 6, "opening": 1, "robber_dev": 1, "random_archived": 1},
+            failures=[{"bucket": "opening", "error": "boom"}],
+        )
+
+
+def test_restart_generation_accepts_exact_mix_without_failures() -> None:
+    import generate_restart_selfplay as gr
+
+    planned = {
+        "normal": 6,
+        "opening": 2,
+        "robber_dev": 1,
+        "random_archived": 1,
+    }
+    gr.validate_restart_generation_result(planned, dict(planned), failures=[])
+
+
 # --------------------------------------------------------------------------- #
 # --public-observation threading into _build_evaluator (cat92-public-obs-fix)
 # --------------------------------------------------------------------------- #

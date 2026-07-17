@@ -565,6 +565,29 @@ def validate_archived_selection_counts(
         )
 
 
+def validate_restart_generation_result(
+    planned_counts: dict[str, int],
+    produced_counts: dict[str, int],
+    *,
+    failures: list[dict[str, Any]],
+) -> None:
+    """Refuse a partial restart corpus instead of publishing a success manifest."""
+
+    mismatches = {
+        bucket: {
+            "planned": int(planned_counts.get(bucket, 0)),
+            "produced": int(produced_counts.get(bucket, 0)),
+        }
+        for bucket in ("normal", "opening", "robber_dev", "random_archived")
+        if int(produced_counts.get(bucket, 0)) != int(planned_counts.get(bucket, 0))
+    }
+    if failures or mismatches:
+        raise RuntimeError(
+            "restart generation incomplete; refusing success manifest: "
+            f"bucket_mismatches={mismatches} failures={len(failures)}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate restart self-play from archived high-regret states."
@@ -811,6 +834,11 @@ def main() -> None:
             restart_seed += 1
 
     writer.close()
+    validate_restart_generation_result(
+        counts,
+        stats["by_bucket"],
+        failures=stats["failures"],
+    )
     summary = {
         "out_dir": str(output),
         "teacher_name": TEACHER_NAME,
