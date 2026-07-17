@@ -14440,6 +14440,15 @@ def main(
 
     sampler_seed = _resolved_sampler_seed(args)
     rng = np.random.default_rng(sampler_seed)
+    # Belief labels are decoded before the policy object is constructed. Bind
+    # that decode to the exact adapter the impending learner will use rather
+    # than the process-global default (currently V3), otherwise V6's /19,/95
+    # privileged counts are silently decoded as legacy /10,/20 values.
+    belief_target_adapter = (
+        _checkpoint_entity_feature_adapter_version(args.init_checkpoint)
+        if args.init_checkpoint
+        else _resolved_training_entity_adapter(args)
+    )
     if args.data_format == "memmap":
         if bool(args.ddp_shard_data):
             raise SystemExit(
@@ -14460,6 +14469,7 @@ def main(
             preserve_belief_resource_targets=(
                 float(args.belief_resource_loss_weight) > 0.0
             ),
+            entity_feature_adapter_version=belief_target_adapter,
         )
     if bool(args.ddp_shard_data) and "winner" in data and "player" in data:
         raise SystemExit(
@@ -21920,7 +21930,8 @@ def _belief_resource_loss(outputs: dict, data: dict, batch: np.ndarray, device):
         valid_np = np.asarray(data[derived_keys[2]][batch])
     else:
         composition_np, totals_np, valid_np = resource_belief_targets(
-            np.asarray(data["player_tokens"][batch])
+            np.asarray(data["player_tokens"][batch]),
+            entity_feature_adapter_version=_TRAINING_ENTITY_FEATURE_ADAPTER_VERSION,
         )
     composition = torch.as_tensor(composition_np, dtype=torch.float32, device=device)
     totals = torch.as_tensor(totals_np, dtype=torch.float32, device=device)
@@ -21976,7 +21987,8 @@ def _belief_resource_coverage(data, *, chunk_rows: int = 262_144) -> dict:
                 valid = np.asarray(component["belief_resource_valid"][index])
             else:
                 _, totals, valid = resource_belief_targets(
-                    np.asarray(component["player_tokens"][index])
+                    np.asarray(component["player_tokens"][index]),
+                    entity_feature_adapter_version=_TRAINING_ENTITY_FEATURE_ADAPTER_VERSION,
                 )
             valid = np.asarray(valid, dtype=np.bool_)
             totals = np.asarray(totals, dtype=np.float32)
@@ -26875,6 +26887,7 @@ def load_teacher_data(
     shard_data: bool = False,
     mask_hidden_info: bool = False,
     preserve_belief_resource_targets: bool = False,
+    entity_feature_adapter_version: str = LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
 ) -> dict:
     files = _teacher_shard_files(path)
     if not files:
@@ -27007,7 +27020,8 @@ def load_teacher_data(
                 )
 
                 composition, total, valid = resource_belief_targets(
-                    shard["player_tokens"]
+                    shard["player_tokens"],
+                    entity_feature_adapter_version=entity_feature_adapter_version,
                 )
                 shard["belief_resource_composition"] = composition
                 shard["belief_resource_total"] = total

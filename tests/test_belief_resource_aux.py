@@ -25,6 +25,7 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
     VERTEX_FEATURE_SIZE,
     mask_player_tokens_public,
 )
+from catan_zero.rl.entity_feature_adapter import RUST_ENTITY_ADAPTER_V6  # noqa: E402
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
     EntityGraphConfig,
     EntityGraphNet,
@@ -101,6 +102,47 @@ def test_inconsistent_private_composition_is_rejected() -> None:
     _, _, valid = resource_belief_targets(raw)
     assert not valid[0, 1]
     assert valid[1, 1]
+
+
+def test_v6_exact_resource_scales_produce_privileged_labels() -> None:
+    """V6's /19 and /95 surface must not be decoded as legacy V2 scales."""
+
+    raw = np.zeros((1, 4, PLAYER_FEATURE_SIZE), dtype=np.float32)
+    raw[:, :2, 0] = 1.0
+    raw[:, 0, 1] = 1.0
+    raw[:, 0, 6] = 4 / 95
+    raw[:, 0, 15] = 1.0
+    raw[:, 0, 16:21] = np.array([1, 1, 1, 1, 0]) / 19
+    expected = np.array([5, 2, 3, 1, 1], dtype=np.float32)
+    raw[:, 1, 6] = expected.sum() / 95
+    raw[:, 1, 15] = 1.0
+    raw[:, 1, 16:21] = expected / 19
+
+    composition, totals, valid = resource_belief_targets(
+        raw, entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6
+    )
+
+    assert valid[0, 1]
+    assert totals[0, 1] == 12
+    assert np.array_equal(composition[0, 1], expected)
+
+
+def test_v6_physical_deck_boundary_is_not_treated_as_legacy_clipping() -> None:
+    raw = np.zeros((1, 4, PLAYER_FEATURE_SIZE), dtype=np.float32)
+    raw[:, :2, 0] = 1.0
+    raw[:, 0, 1] = 1.0
+    exact = np.array([19, 0, 0, 0, 0], dtype=np.float32)
+    raw[:, 1, 6] = exact.sum() / 95
+    raw[:, 1, 15] = 1.0
+    raw[:, 1, 16:21] = exact / 19
+
+    composition, totals, valid = resource_belief_targets(
+        raw, entity_feature_adapter_version=RUST_ENTITY_ADAPTER_V6
+    )
+
+    assert valid[0, 1]
+    assert totals[0, 1] == 19
+    assert np.array_equal(composition[0, 1], exact)
 
 
 def test_saturation_ambiguous_hidden_hand_is_rejected() -> None:

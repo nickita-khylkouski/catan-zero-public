@@ -10,6 +10,11 @@ from __future__ import annotations
 
 import numpy as np
 
+from catan_zero.rl.entity_feature_adapter import (
+    LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
+    RUST_ENTITY_ADAPTER_V6,
+    require_known_entity_feature_adapter,
+)
 from catan_zero.rl.entity_token_features import PLAYER_ACTOR_FLAG_SLOT
 
 
@@ -21,12 +26,16 @@ PLAYER_PRESENT_SLOT = 0
 
 def resource_belief_targets(
     player_tokens: np.ndarray,
+    *,
+    entity_feature_adapter_version: str = LEGACY_MISSING_CHECKPOINT_ADAPTER_VERSION,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return ``(composition, public_total, valid)`` for opponent player rows.
 
     ``composition`` is an unnormalised count vector with shape ``(..., P, 5)``;
     ``public_total`` and ``valid`` have shape ``(..., P)``.  The featurizer
-    stores resource counts divided by 10 and the public total divided by 20.
+    stores resource counts on the scale bound to
+    ``entity_feature_adapter_version``: legacy adapters use composition /10
+    and total /20, while V6 stores exact physical counts on /19 and /95.
     A row is valid only when it is a present non-actor player, omniscient labels
     are present, the public total is positive, and the private counts sum to the
     public total. Saturated or non-integral banked encodings are rejected too:
@@ -44,26 +53,33 @@ def resource_belief_targets(
     if single:
         tokens = tokens[None, ...]
 
-    composition_scaled = (
-        tokens[..., RESOURCE_COMPOSITION_SLICE].astype(np.float32) * 10.0
+    adapter_version = require_known_entity_feature_adapter(
+        entity_feature_adapter_version
     )
-    total_scaled = tokens[..., RESOURCE_TOTAL_SLOT].astype(np.float32) * 20.0
+    composition_ceiling = 19.0 if adapter_version == RUST_ENTITY_ADAPTER_V6 else 10.0
+    total_ceiling = 95.0 if adapter_version == RUST_ENTITY_ADAPTER_V6 else 20.0
+    composition_scaled = (
+        tokens[..., RESOURCE_COMPOSITION_SLICE].astype(np.float32)
+        * composition_ceiling
+    )
+    total_scaled = tokens[..., RESOURCE_TOTAL_SLOT].astype(np.float32) * total_ceiling
     numeric = (
         np.isfinite(composition_scaled).all(axis=-1)
         & np.isfinite(total_scaled)
         & (composition_scaled >= 0.0).all(axis=-1)
         & (total_scaled >= 0.0)
     )
-    # The source featurizer clips every resource slot at 10 cards and the
-    # public total at 20.  Once either encoded value reaches its ceiling we
-    # cannot distinguish the exact boundary from a larger, clipped hand.  In
-    # particular, an actual 21-card hand such as [11, 3, 2, 2, 3] is banked as
-    # [10, 3, 2, 2, 3] with total 20 and would otherwise pass the sum check as a
-    # silently incomplete label.  Reject the (rare) ambiguous boundary rather
-    # than train on invented hidden truth.
-    unsaturated = (composition_scaled < 10.0 - 0.01).all(axis=-1) & (
-        total_scaled < 20.0 - 0.01
-    )
+    # Legacy /10,/20 fields are clipped and cannot distinguish an exact boundary
+    # from a larger hand. V6 is different: /19 and /95 are physical deck limits,
+    # so a value at that boundary is still exact (no player can own more than the
+    # deck). Reject only legacy saturation; otherwise we would discard valid V6
+    # labels precisely in high-resource tactical positions.
+    if adapter_version == RUST_ENTITY_ADAPTER_V6:
+        unsaturated = np.ones(total_scaled.shape, dtype=np.bool_)
+    else:
+        unsaturated = (
+            composition_scaled < composition_ceiling - 0.01
+        ).all(axis=-1) & (total_scaled < total_ceiling - 0.01)
     # Valid feature-bank counts are integer-valued before scaling.  Checking
     # integrality before rounding prevents malformed fractional encodings from
     # being silently coerced into plausible privileged labels.  The tolerance
