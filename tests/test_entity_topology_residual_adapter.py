@@ -209,6 +209,61 @@ def test_adapter_output_changes_when_explicit_vertex_edge_incidence_changes():
     assert not torch.equal(left_tokens, right_tokens)
 
 
+def test_incumbent_state_and_value_alias_identical_tokens_with_rewired_topology():
+    """The legacy Transformer cannot distinguish connectivity by construction.
+
+    Keep every public token and legal-action tensor byte-identical, and swap two
+    edge-to-vertex incidence rows.  This preserves the token multiset and even
+    the multiset of endpoint ids while changing which edge token is adjacent to
+    which vertices.  The incumbent must alias the states exactly; an activated
+    topology residual must expose the rewire to both CLS and scalar value.
+    """
+
+    left = _batch(batch_size=1)
+    right = {name: value.clone() for name, value in left.items()}
+    right["edge_vertex_ids"][0, [0, 17]] = left["edge_vertex_ids"][0, [17, 0]]
+
+    token_and_action_fields = set(left) - {
+        "hex_vertex_ids",
+        "hex_edge_ids",
+        "edge_vertex_ids",
+        "event_target_ids",
+    }
+    assert all(
+        torch.equal(left[name], right[name]) for name in token_and_action_fields
+    )
+    assert torch.equal(
+        left["edge_vertex_ids"].flatten().sort().values,
+        right["edge_vertex_ids"].flatten().sort().values,
+    )
+    assert not torch.equal(left["edge_vertex_ids"], right["edge_vertex_ids"])
+
+    incumbent = EntityGraphNet(_config()).eval()
+    with torch.no_grad():
+        left_encoded = incumbent.encode_state(left)
+        right_encoded = incumbent.encode_state(right)
+        left_output = incumbent(left, return_final_vp=False)
+        right_output = incumbent(right, return_final_vp=False)
+    assert torch.equal(left_encoded[0], right_encoded[0])
+    assert torch.equal(left_encoded[2], right_encoded[2])
+    assert torch.equal(left_output["value"], right_output["value"])
+
+    topology_aware = EntityGraphNet(
+        _config(topology_residual_adapter=True)
+    ).eval()
+    with torch.no_grad():
+        topology_aware.topology_residual_adapter.output_projection.weight.copy_(
+            torch.eye(topology_aware.config.hidden_size)
+        )
+        aware_left_encoded = topology_aware.encode_state(left)
+        aware_right_encoded = topology_aware.encode_state(right)
+        aware_left_output = topology_aware(left, return_final_vp=False)
+        aware_right_output = topology_aware(right, return_final_vp=False)
+    assert not torch.equal(aware_left_encoded[0], aware_right_encoded[0])
+    assert not torch.equal(aware_left_encoded[2], aware_right_encoded[2])
+    assert not torch.equal(aware_left_output["value"], aware_right_output["value"])
+
+
 def test_adapter_does_not_update_isolated_or_padded_tokens_after_training():
     width, length = 8, 5
     adapter = TopologyResidualAdapter(width).eval()
