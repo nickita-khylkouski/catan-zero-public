@@ -158,6 +158,11 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # likewise gated to V7 checkpoints. Legacy topology-disabled models
         # still execute the same reviewed forward function.
         "sha256:911589137df1296d927feba059eaebb78704d8d5d41ffbf1dabb6e52016a9df9",
+        # Rebasing the V7 decoder onto the final bit-exact input migration
+        # changed the selected policy AST fingerprint once more. Every added
+        # path remains behind the absent/false V7 compatibility flags for a
+        # legacy checkpoint, so the topology-disabled forward is unchanged.
+        "sha256:3824e6f68fb23240cfa3193160af3625fa649195a8db31f4c55677d1ad1c992a",
         # The legacy v2 tokenizer produces a different identity for the same
         # source across supported Python f-string tokenization modes. Schema v3
         # uses a stable AST surface, but both reviewed v2 spellings remain.
