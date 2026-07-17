@@ -1459,6 +1459,7 @@ class EntityGraphNet:
                 batch: dict[str, Any],
                 *,
                 event_token_limit: int | None = None,
+                precomputed_relation_ids=None,
             ):
                 """Run the typed-token transformer trunk.
 
@@ -1490,16 +1491,18 @@ class EntityGraphNet:
                 if self.topology_residual_adapter_enabled:
                     from catan_zero.rl.relational_trunks import build_relation_ids
 
-                    relation_batch = batch
-                    if event_token_limit is not None and "event_target_ids" in batch:
-                        relation_batch = dict(batch)
-                        relation_batch["event_target_ids"] = batch["event_target_ids"][
-                            :, :event_token_limit
-                        ]
-                    relation_ids = build_relation_ids(
-                        relation_batch,
-                        sequence_length=int(tokens.shape[1]),
-                    )
+                    relation_ids = precomputed_relation_ids
+                    if relation_ids is None:
+                        relation_batch = batch
+                        if event_token_limit is not None and "event_target_ids" in batch:
+                            relation_batch = dict(batch)
+                            relation_batch["event_target_ids"] = batch[
+                                "event_target_ids"
+                            ][:, :event_token_limit]
+                        relation_ids = build_relation_ids(
+                            relation_batch,
+                            sequence_length=int(tokens.shape[1]),
+                        )
                     tokens = self.topology_residual_adapter(
                         tokens, relation_ids, key_padding_mask=padding_mask
                     )
@@ -1507,16 +1510,18 @@ class EntityGraphNet:
                 if self.uses_relational_topology:
                     from catan_zero.rl.relational_trunks import build_relation_ids
 
-                    relation_batch = batch
-                    if event_token_limit is not None and "event_target_ids" in batch:
-                        relation_batch = dict(batch)
-                        relation_batch["event_target_ids"] = batch["event_target_ids"][
-                            :, :event_token_limit
-                        ]
-                    relation_ids = build_relation_ids(
-                        relation_batch,
-                        sequence_length=int(tokens.shape[1]),
-                    )
+                    relation_ids = precomputed_relation_ids
+                    if relation_ids is None:
+                        relation_batch = batch
+                        if event_token_limit is not None and "event_target_ids" in batch:
+                            relation_batch = dict(batch)
+                            relation_batch["event_target_ids"] = batch[
+                                "event_target_ids"
+                            ][:, :event_token_limit]
+                        relation_ids = build_relation_ids(
+                            relation_batch,
+                            sequence_length=int(tokens.shape[1]),
+                        )
                     moe_balance = []
                     moe_load = []
                     moe_importance = []

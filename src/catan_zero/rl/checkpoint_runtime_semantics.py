@@ -188,6 +188,10 @@ _REVIEWED_LEGACY_POLICY_SEMANTIC_TRANSLATIONS = {
         # and H100 Linux tokenizer identities for that guarded source.
         "sha256:8453de906f03b6a60bbb6f60806d4d876ddf6468985881246714c6e274f2c2e9",
         "sha256:494d98a204d183973bfa6dca4ef563710ca69789d37bd0d25698c311041588b7",
+        # Relation-id preprocessing moved outside CUDA Graph capture behind an
+        # optional encode_state argument. Legacy callers omit it and execute
+        # the same topology-disabled Transformer forward.
+        "sha256:618fad7337b4bb3bc1b51d6e3c65d8d63bc3c67f61e2c2c6b99555ea3a19b738",
     }
 }
 

@@ -101,6 +101,8 @@ class _GraphEntry:
     static_inputs: dict[str, Any]
     encoded_state: tuple[Any, Any, Any]
     capture_stream: Any
+    relation_ids: Any | None = None
+    relation_sequence_length: int | None = None
 
 
 class CudaGraphInferenceRunner:
@@ -251,6 +253,12 @@ class CudaGraphInferenceRunner:
                 entry.static_inputs,
                 batch_size=batch_size,
             )
+            if entry.relation_ids is not None:
+                current_relations = self._build_relation_ids(
+                    entry.static_inputs,
+                    sequence_length=int(entry.relation_sequence_length),
+                )
+                entry.relation_ids.copy_(current_relations)
             entry.graph.replay()
             encoded_state = tuple(value[:batch_size] for value in entry.encoded_state)
             action_batch, action_ids = self._action_batch(
@@ -308,11 +316,26 @@ class CudaGraphInferenceRunner:
         self._copy_state_inputs(
             entity_batch, static_inputs, batch_size=len(entity_batch["hex_tokens"])
         )
+        relation_ids = None
+        relation_sequence_length = None
+        if self._needs_relations():
+            # Relation construction contains host-driven indexed writes that
+            # are not CUDA-graph capturable. Build it eagerly into a stable GPU
+            # tensor and treat that tensor as an explicit graph input.
+            state_tokens, *_ = self.model._state_tokens(static_inputs)
+            relation_sequence_length = int(state_tokens.shape[1])
+            relation_ids = self._build_relation_ids(
+                static_inputs,
+                sequence_length=relation_sequence_length,
+            )
         capture_stream = torch.cuda.Stream(device=self.device)
         capture_stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(capture_stream):
             for _ in range(self.runner_config.warmup_iterations):
-                self.model.encode_state(static_inputs)
+                self.model.encode_state(
+                    static_inputs,
+                    precomputed_relation_ids=relation_ids,
+                )
         capture_stream.synchronize()
 
         graph = torch.cuda.CUDAGraph()
@@ -321,13 +344,30 @@ class CudaGraphInferenceRunner:
             stream=capture_stream,
             capture_error_mode="thread_local",
         ):
-            encoded_state = self.model.encode_state(static_inputs)
+            encoded_state = self.model.encode_state(
+                static_inputs,
+                precomputed_relation_ids=relation_ids,
+            )
         return _GraphEntry(
             graph=graph,
             static_inputs=static_inputs,
             encoded_state=encoded_state,
             capture_stream=capture_stream,
+            relation_ids=relation_ids,
+            relation_sequence_length=relation_sequence_length,
         )
+
+    def _needs_relations(self) -> bool:
+        return bool(
+            str(getattr(self.config, "state_trunk", "transformer")) != "transformer"
+            or getattr(self.config, "topology_residual_adapter", False)
+        )
+
+    @staticmethod
+    def _build_relation_ids(batch: dict[str, Any], *, sequence_length: int):
+        from catan_zero.rl.relational_trunks import build_relation_ids
+
+        return build_relation_ids(batch, sequence_length=sequence_length)
 
     def _allocate_state_inputs(
         self,
