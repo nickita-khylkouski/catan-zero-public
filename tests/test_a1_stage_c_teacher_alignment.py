@@ -47,6 +47,12 @@ def test_complete_effective_search_config_binds_resolved_defaults() -> None:
     }
 
 
+def test_stage_c_identity_binds_code_owned_action_catalog() -> None:
+    """Action ids are target semantics even though the catalog is not a CLI knob."""
+
+    assert alignment.ACTION_MASK_VERSION == "colonist-multiagent-v1"
+
+
 def test_paired_root_output_contract_binds_preservation_semantics() -> None:
     preserved = alignment._paired_root_value_output_contract(  # noqa: SLF001
         {"preserve_root_prior_value": True},

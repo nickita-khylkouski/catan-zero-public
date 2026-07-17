@@ -64,6 +64,7 @@ from catan_zero.search.gumbel_chance_mcts import (  # noqa: E402
 from catan_zero.search.neural_rust_mcts import (  # noqa: E402
     EntityGraphRustEvaluatorConfig,
 )
+from catan_zero.rl.gumbel_self_play import ACTION_MASK_VERSION  # noqa: E402
 
 
 PLAN_SCHEMA = "a1-stage-c-teacher-alignment-plan-v3"
@@ -481,6 +482,12 @@ def _operator_identity(
     chance = _field_bundle(fields, CHANCE_FIELDS)
     symmetry = _field_bundle(fields, SYMMETRY_FIELDS)
     semantics = _semantic_field_bundle(fields, operator, TARGET_SEMANTIC_FIELDS)
+    # Stored policy columns are probabilities over the legal rows produced by
+    # this catalog. The action catalog is code-owned rather than a tunable
+    # GenerateConfig field, so bind its reviewed version explicitly instead of
+    # allowing a Stage-C reanalysis plan to compare targets with different
+    # action-id semantics.
+    semantics["action_mask_version"] = ACTION_MASK_VERSION
     regime = contract.get("target_information_regime")
     if not isinstance(regime, str) or not regime:
         raise AlignmentError("operator target information regime is missing")
