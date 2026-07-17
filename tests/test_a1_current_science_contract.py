@@ -38,8 +38,8 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
     model = current_science.learner_model_construction()
     assert model["graph_tokens"] is None
     assert model["hidden_size"] == 640
-    assert model["min_parameter_count"] == 41_700_000
-    assert model["max_parameter_count"] == 42_000_000
+    assert model["min_parameter_count"] == 42_500_000
+    assert model["max_parameter_count"] == 43_000_000
     assert model["public_card_count_residual_bias"] is False
     assert model["public_rule_state_features"] is True
     assert model["value_tower_split_layers"] == 1
@@ -99,6 +99,7 @@ def test_current_production_learner_binds_full_value_and_exact_dose() -> None:
         "public_card_count_residual",
         "public_rule_state_residual",
         "static_action_residual_proj",
+        "topology_residual_adapter",
         "value_blocks",
         "value_head",
         "value_state_norm",

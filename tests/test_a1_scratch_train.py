@@ -218,6 +218,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
         == "sha256:" + "a" * 64
     )
     assert command.count("--action-target-gather") == 1
+    assert command.count("--topology-residual-adapter") == 1
     assert command.count("--legal-action-value-set-statistics") == 1
     assert command.count("--public-rule-state-features") == 1
     assert command[command.index("--value-tower-split-layers") + 1] == "1"
@@ -225,9 +226,9 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert command.count("--entity-feature-adapter-version") == 1
     assert command[command.index("--hidden-size") + 1] == "640"
     assert command.count("--min-35m-params") == 1
-    assert command[command.index("--min-35m-params") + 1] == "41700000"
+    assert command[command.index("--min-35m-params") + 1] == "42500000"
     assert command.count("--max-35m-params") == 1
-    assert command[command.index("--max-35m-params") + 1] == "42000000"
+    assert command[command.index("--max-35m-params") + 1] == "43000000"
     assert command.count("--fused-optimizer") == 1
     assert command.count("--symmetry-augment") == 1
     assert command.count("--symmetry-augment-events") == 1
@@ -253,6 +254,7 @@ def test_scratch_command_is_native_bias_free_8gpu_and_fresh(tmp_path: Path) -> N
     assert "event_encoder" in required_modules
     assert "target_gather_proj" in required_modules
     assert "public_rule_state_residual" in required_modules
+    assert "topology_residual_adapter" in required_modules
     assert "--ddp-shard-data" not in command
     assert "--target-reliability-confidence-weighting" not in command
     assert (
@@ -678,6 +680,7 @@ def _runtime_args() -> SimpleNamespace:
             graph_dropout=model["graph_dropout"],
             entity_state_trunk=model["entity_state_trunk"],
             action_target_gather=model["action_target_gather"],
+            topology_residual_adapter=model["topology_residual_adapter"],
             static_action_residual=model["static_action_residual"],
             legal_action_value_residual=model["legal_action_value_residual"],
             legal_action_value_set_statistics=model[
@@ -722,6 +725,7 @@ def test_scratch_runtime_projection_accepts_every_current_field() -> None:
     ("field", "bad_value"),
     (
         ("action_target_gather", False),
+        ("topology_residual_adapter", False),
         ("static_action_residual", False),
         ("public_card_count_residual_bias", True),
         ("public_rule_state_features", False),

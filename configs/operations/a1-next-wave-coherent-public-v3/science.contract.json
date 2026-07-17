@@ -119,7 +119,7 @@
       "mode": "canonical_parent_update",
       "recipe": "a1-parent-update-35m-b200",
       "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
-      "config_canonical_sha256": "837655af21b288a97c9fb6fe07cbf84851096c9c322e56223701c3c48a757002",
+      "config_canonical_sha256": "be4b2bc31fc9e7f4c36c782169f9084219e31de51761d7f38269f9d33a3163fa",
       "scratch_status": "research_only_unresolved_not_selected"
     },
     "value_objective": {
@@ -134,8 +134,8 @@
       "checkpoint": null,
       "optimizer_state": "fresh"
     },
-    "architecture_upgrade_flags": "structured_action_value,card_count_v2,meaningful_history,history_target_gather,action_target_gather,legal_set_statistics,public_rule_state,value_tower_split1",
-    "architecture_upgrade_module": "entity_graph.action_target_gather+static_action_residual+legal_action_value_residual+legal_action_value_set_statistics+public_card_count_features+meaningful_public_history+meaningful_history_target_gather+actor_public_rule_state.v5+value_tower_split1",
+    "architecture_upgrade_flags": "structured_action_value,card_count_v2,meaningful_history,history_target_gather,action_target_gather,legal_set_statistics,public_rule_state,topology,value_tower_split1",
+    "architecture_upgrade_module": "entity_graph.topology_residual_adapter+action_target_gather+static_action_residual+legal_action_value_residual+legal_action_value_set_statistics+public_card_count_features+meaningful_public_history+meaningful_history_target_gather+actor_public_rule_state.v5+value_tower_split1",
     "model_construction": {
       "arch": "entity_graph",
       "hidden_size": 640,
@@ -145,6 +145,7 @@
       "graph_dropout": 0.05,
       "entity_state_trunk": "transformer",
       "action_target_gather": true,
+      "topology_residual_adapter": true,
       "static_action_residual": true,
       "legal_action_value_residual": true,
       "legal_action_value_set_statistics": true,
@@ -162,8 +163,8 @@
       "mask_hidden_info": true,
       "entity_feature_adapter_version": "rust_entity_adapter_v5_meaningful_history_v2",
       "require_35m_model": true,
-      "min_parameter_count": 41700000,
-      "max_parameter_count": 42000000
+      "min_parameter_count": 42500000,
+      "max_parameter_count": 43000000
     },
     "execution_topology": {
       "schema_version": "a1-scratch-training-topology-v1",
@@ -209,7 +210,7 @@
       "post_policy_dose_value_trunk_grad_scale": 0.0,
       "train_diagnostics_every_batches": 16,
       "objective_gradient_interference_every_batches": 16,
-      "require_feature_learning_signal_modules": "event_encoder,target_gather_proj,legal_action_value_residual_proj,legal_action_value_static_proj,legal_action_value_max_proj,legal_action_value_count_proj,legal_action_value_static_max_proj,meaningful_history_residual_gate,meaningful_history_ordered_gate,meaningful_history_sequence,meaningful_history_target_proj,public_card_count_residual,public_rule_state_residual,static_action_residual_proj,value_blocks,value_head,value_state_norm,final_vp_head",
+      "require_feature_learning_signal_modules": "event_encoder,target_gather_proj,legal_action_value_residual_proj,legal_action_value_static_proj,legal_action_value_max_proj,legal_action_value_count_proj,legal_action_value_static_max_proj,meaningful_history_residual_gate,meaningful_history_ordered_gate,meaningful_history_sequence,meaningful_history_target_proj,public_card_count_residual,public_rule_state_residual,static_action_residual_proj,topology_residual_adapter,value_blocks,value_head,value_state_norm,final_vp_head",
       "minimum_feature_learning_signal_observations": 2,
       "action_module_lr_mult": 1.0,
       "trunk_lr_mult": 1.0,

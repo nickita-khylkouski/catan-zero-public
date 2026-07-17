@@ -2361,11 +2361,12 @@ def bind_canonical_parent_update_recipe(
     if (
         not isinstance(upgrade, dict)
         or upgrade.get("module")
-        != architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1
+        != architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
         or upgrade.get("source") != verified["producer"]
     ):
         raise ExecutorError(
-            "canonical parent update requires the direct producer-to-current-v5+split1 "
+            "canonical parent update requires the direct producer-to-current-v5+"
+            "topology+split1 "
             "function-preserving upgrade receipt"
         )
     result = dict(verified)
@@ -5596,7 +5597,10 @@ def _append_current_parent_topology_cli(
 ) -> None:
     """Expose the reviewed legacy-parent topology edge in trainer argv."""
 
-    if upgrade_module != architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1:
+    if upgrade_module not in {
+        architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+        architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
+    }:
         return
     command.extend(
         [
@@ -5619,6 +5623,11 @@ def _append_current_parent_topology_cli(
             "1",
         ]
     )
+    if (
+        upgrade_module
+        == architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
+    ):
+        command.append("--topology-residual-adapter")
 
 
 def _build_direct_train_command(
@@ -5705,7 +5714,7 @@ def _build_direct_train_command(
     upgrade_module = verified.get("function_preserving_upgrade", {}).get("module")
     if (
         upgrade_module
-        == architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1
+        == architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
     ):
         # This is the one reviewed legacy-incumbent -> production parent
         # topology edge.  Keep every checkpoint-owned switch visible in the
@@ -9197,7 +9206,7 @@ def _strict_load_production_entity_checkpoint(checkpoint: Path, *, where: str) -
             f"{where} cannot strict-load as the declared entity model: {error}"
         ) from error
     parameter_count = sum(parameter.numel() for parameter in policy.model.parameters())
-    if not 30_000_000 <= parameter_count <= 40_000_000:
+    if not 30_000_000 <= parameter_count <= 43_000_000:
         raise ExecutorError(
             f"{where} strict-loaded an unexpected parameter count: {parameter_count}"
         )
@@ -10495,7 +10504,7 @@ def _verify_training_outputs(
     if (
         isinstance(parameter_count, bool)
         or not isinstance(parameter_count, int)
-        or not 30_000_000 <= parameter_count <= 40_000_000
+        or not 30_000_000 <= parameter_count <= 43_000_000
     ):
         raise ExecutorError("A1 training report does not prove the required 35M model")
     value_training = report_payload.get("value_training")

@@ -611,8 +611,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Enable the zero-output direct-incidence residual before the entity "
-            "Transformer. Default off; sealed production scratch rejects it. "
-            "Only the bounded topology diagnostic authority may opt in."
+            "Transformer. Default off for compatibility; sealed production "
+            "scratch binds the explicit reviewed model-construction value."
         ),
     )
     parser.add_argument(
@@ -9686,9 +9686,11 @@ def _validate_a1_scratch_runtime_projection(
         else CURRENT_RUST_ENTITY_ADAPTER_VERSION
     )
     expected_topology_residual = bool(
-        diagnostic_authority.get("topology_residual_adapter", False)
+        diagnostic_authority.get(
+            "topology_residual_adapter", model["topology_residual_adapter"]
+        )
         if isinstance(diagnostic_authority, Mapping)
-        else False
+        else model["topology_residual_adapter"]
     )
     expected_max_parameter_count = int(
         diagnostic_authority.get(

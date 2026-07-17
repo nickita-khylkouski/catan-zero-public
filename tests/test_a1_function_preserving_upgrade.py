@@ -713,6 +713,42 @@ def test_current_v5_split1_is_one_direct_reviewed_upgrade_edge() -> None:
     ) == composite["flags"]
 
 
+def test_topology_aware_current_v5_split1_is_a_new_reviewed_upgrade_edge() -> None:
+    historical = upgrade.ALLOWLIST[
+        upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1
+    ]
+    selected = upgrade.ALLOWLIST[
+        upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
+    ]
+
+    assert selected["flags"] == {
+        **historical["flags"],
+        "topology_residual_adapter": True,
+    }
+    assert selected["config_delta"] == {
+        **historical["config_delta"],
+        "topology_residual_adapter": True,
+    }
+    topology_initializers = {
+        name: initializer
+        for name, initializer in selected["new_parameter_initialization"].items()
+        if name.startswith("topology_residual_adapter.")
+    }
+    assert topology_initializers == {
+        "topology_residual_adapter.message_norm.bias": "zeros",
+        "topology_residual_adapter.message_norm.weight": "ones",
+        "topology_residual_adapter.output_projection.bias": "zeros",
+        "topology_residual_adapter.output_projection.weight": "zeros",
+        "topology_residual_adapter.source_norm.bias": "zeros",
+        "topology_residual_adapter.source_norm.weight": "ones",
+        "topology_residual_adapter.source_projection.bias": "zeros",
+        "topology_residual_adapter.source_projection.weight": "identity",
+    }
+    assert upgrade_tool._parse_flags(  # noqa: SLF001
+        "current_v5_topology_split1"
+    ) == selected["flags"]
+
+
 @pytest.mark.parametrize(
     "source_overrides",
     [

@@ -152,6 +152,19 @@ def _parse_flags(raw: str) -> dict[str, object]:
                     "value_tower_split_layers": 1,
                 }
             )
+        elif entry in (
+            "current_v5_topology_split1",
+            "current-v5-topology-split1",
+        ):
+            # Reviewed topology-aware successor to current_v5_split1. This is
+            # still only an initializer construction; science admission remains
+            # fail-closed until the checked-in recipe's independent gates pass.
+            overrides.update(
+                {
+                    **_parse_flags("current_v5_split1"),
+                    "topology_residual_adapter": True,
+                }
+            )
         elif entry in ("gather", "action_target_gather"):
             overrides["action_target_gather"] = True
         elif entry in ("value", "value_attention_pool"):

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 
+from catan_zero.deduction_tracker import DEDUCTION_FEATURES_KEY
 from catan_zero.rl.action_features import CONTEXT_ACTION_FEATURE_SIZE
 from catan_zero.rl.entity_token_features import (
     EDGE_FEATURE_SIZE,
@@ -12,6 +15,7 @@ from catan_zero.rl.entity_token_features import (
     HEX_FEATURE_SIZE,
     LEGAL_ACTION_FEATURE_SIZE,
     PLAYER_FEATURE_SIZE,
+    PUBLIC_RULE_STATE_FEATURE_SLICE,
     VERTEX_FEATURE_SIZE,
 )
 from catan_zero.rl.entity_token_policy import EntityGraphConfig, EntityGraphNet
@@ -20,6 +24,7 @@ from catan_zero.rl.relational_trunks import (
     REL_VERTEX_TO_EDGE,
     TopologyResidualAdapter,
 )
+from tools import a1_function_preserving_upgrade as upgrade
 
 
 def _config(**overrides) -> EntityGraphConfig:
@@ -105,6 +110,59 @@ def test_combined_topology_gather_upgrade_is_bit_identical_at_init():
     assert control.keys() == treatment.keys()
     for name in control:
         assert torch.equal(control[name], treatment[name]), name
+
+
+def test_selected_canonical_initializer_is_topology_aware_and_step_zero_exact():
+    historical = upgrade.ALLOWLIST[
+        upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1
+    ]
+    selected = upgrade.ALLOWLIST[
+        upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
+    ]
+    base_config = dataclasses.replace(
+        _config(state_layers=6), **historical["config_delta"]
+    )
+    selected_config = dataclasses.replace(
+        _config(state_layers=6), **selected["config_delta"]
+    )
+    assert selected_config.topology_residual_adapter is True
+
+    torch.manual_seed(20260716)
+    control = EntityGraphNet(base_config).eval()
+    torch.manual_seed(20260716)
+    topology_aware = EntityGraphNet(selected_config).eval()
+    control_state = control.state_dict()
+    topology_shared = {
+        name: value
+        for name, value in topology_aware.state_dict().items()
+        if not name.startswith("topology_residual_adapter.")
+    }
+    assert control_state.keys() == topology_shared.keys()
+    assert all(
+        torch.equal(value, topology_shared[name])
+        for name, value in control_state.items()
+    )
+
+    adapter = topology_aware.topology_residual_adapter
+    assert torch.equal(
+        adapter.source_projection.weight,
+        torch.eye(selected_config.hidden_size),
+    )
+    assert torch.count_nonzero(adapter.source_projection.bias).item() == 0
+    assert torch.count_nonzero(adapter.output_projection.weight).item() == 0
+    assert torch.count_nonzero(adapter.output_projection.bias).item() == 0
+
+    batch = _batch()
+    batch[DEDUCTION_FEATURES_KEY] = torch.zeros(3, 4, 11)
+    batch["legal_action_static_features"] = torch.zeros(3, 7, 22)
+    batch["legal_action_mask"] = torch.ones(3, 7, dtype=torch.bool)
+    batch["global_tokens"][:, :, PUBLIC_RULE_STATE_FEATURE_SLICE] = 0.0
+    with torch.no_grad():
+        expected = control(batch, return_q=True)
+        actual = topology_aware(batch, return_q=True)
+    assert expected.keys() == actual.keys()
+    for name, value in expected.items():
+        assert torch.equal(value, actual[name]), name
 
 
 def test_topology_treatment_preserves_every_shared_random_initialization():

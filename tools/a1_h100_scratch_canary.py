@@ -271,6 +271,19 @@ def _remove_pair(command: list[str], flag: str) -> None:
     del command[index : index + 2]
 
 
+def _replace_boolean_flag(
+    command: list[str], *, positive: str, enabled: bool
+) -> None:
+    negative = f"--no-{positive.removeprefix('--')}"
+    matches = [flag for flag in (positive, negative) if flag in command]
+    if len(matches) != 1:
+        raise CanaryError(
+            f"base scratch command must carry exactly one of {positive}/{negative}"
+        )
+    command.remove(matches[0])
+    command.append(positive if enabled else negative)
+
+
 def _code_binding() -> dict[str, Any]:
     records = [
         {
@@ -406,10 +419,10 @@ def build_commands(
         _replace_value(command, "--max-35m-params", CANARY_MAX_PARAMETER_COUNT)
         if "--exact-max-steps" not in command:
             command.append("--exact-max-steps")
-        command.append(
-            "--topology-residual-adapter"
-            if arm_id == "T640"
-            else "--no-topology-residual-adapter"
+        _replace_boolean_flag(
+            command,
+            positive="--topology-residual-adapter",
+            enabled=arm_id == "T640",
         )
         authority = diagnostic_authority(
             arm_id=arm_id,

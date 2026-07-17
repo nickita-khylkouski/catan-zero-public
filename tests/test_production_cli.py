@@ -160,7 +160,7 @@ def test_status_exposes_only_commissioned_production_state() -> None:
     assert parent["status"] == "blocked"
     assert parent["reason"] == "parent_update_training_signal_contract_unresolved"
     assert parent["unresolved_requirements"][0].startswith(
-        "remove spatial_state_topology_aliasing"
+        "commission topology_residual_adapter learning signal"
     )
     assert status["pipelines"]["ppo"]["authorized"] is False
 
@@ -237,7 +237,7 @@ def test_cataloged_parent_update_uses_exact_recipe_and_parent_but_is_blocked(
     )
     assert plan["contract"]["recipe"] == "a1-parent-update-35m-b200"
     assert plan["contract"]["config_sha256"] == (
-        "837655af21b288a97c9fb6fe07cbf84851096c9c322e56223701c3c48a757002"
+        "be4b2bc31fc9e7f4c36c782169f9084219e31de51761d7f38269f9d33a3163fa"
     )
     assert str((ROOT / "tools/train.py").resolve()) in plan["command"]
     assert "--init-checkpoint" in plan["command"]

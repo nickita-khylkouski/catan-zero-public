@@ -174,6 +174,7 @@ def test_arm_commands_differ_only_declared_architecture_and_outputs(
         "tools/train_bc.py",
         "--hidden-size",
         "640",
+        "--topology-residual-adapter",
         "--max-35m-params",
         "42000000",
         "--max-steps",
@@ -422,7 +423,7 @@ def test_production_scratch_authority_remains_uncommissioned_and_canary_is_rejec
         canary.require_production_admission({"promotion_eligible": False})
 
 
-def test_production_runtime_projection_rejects_topology_treatment() -> None:
+def test_production_runtime_projection_requires_reviewed_topology() -> None:
     model = current_science.learner_model_construction()
     topology = current_science.learner_execution_topology()
     args = SimpleNamespace(
@@ -436,7 +437,7 @@ def test_production_runtime_projection_rejects_topology_treatment() -> None:
         graph_dropout=model["graph_dropout"],
         entity_state_trunk=model["entity_state_trunk"],
         action_target_gather=model["action_target_gather"],
-        topology_residual_adapter=True,
+        topology_residual_adapter=False,
         static_action_residual=model["static_action_residual"],
         legal_action_value_residual=model["legal_action_value_residual"],
         legal_action_value_set_statistics=model["legal_action_value_set_statistics"],

@@ -1507,7 +1507,7 @@ def test_canonical_parent_update_binds_12_step_8x64_recipe(tmp_path: Path) -> No
         "corpus_meta_file_sha256": "sha256:" + "3" * 64,
         "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
         "function_preserving_upgrade": {
-            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
             "source": producer,
             "receipt": {"sha256": "sha256:" + "5" * 64},
             "receipt_sha256": "sha256:" + "6" * 64,
@@ -1591,7 +1591,7 @@ def test_canonical_parent_update_rejects_malformed_checkpoint_frontier(
         "corpus_meta_file_sha256": "sha256:" + "3" * 64,
         "composite_build_receipt": {"file_sha256": "sha256:" + "4" * 64},
         "function_preserving_upgrade": {
-            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+            "module": executor.architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
             "source": producer,
             "receipt": {"sha256": "sha256:" + "5" * 64},
             "receipt_sha256": "sha256:" + "6" * 64,
@@ -4859,7 +4859,7 @@ def test_direct_composite_parent_upgrade_renders_complete_topology() -> None:
     command = ["python", "train_bc.py"]
     executor._append_current_parent_topology_cli(  # noqa: SLF001
         command,
-        executor.architecture_upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+        executor.architecture_upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
     )
 
     assert command == [
@@ -4882,4 +4882,5 @@ def test_direct_composite_parent_upgrade_renders_complete_topology() -> None:
         "rust_entity_adapter_v5_meaningful_history_v2",
         "--value-tower-split-layers",
         "1",
+        "--topology-residual-adapter",
     ]

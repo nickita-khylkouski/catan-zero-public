@@ -117,8 +117,15 @@ def test_scratch_horizon_is_not_relabelled_as_the_parent_update_frontier() -> No
     """The proven 32-step result was a parent update, not scratch evidence."""
 
     fields = _fields()
+    engine = _payload()["engine_settings"]
     assert fields["init_checkpoint"] == ""
     assert fields["resume_optimizer"] is False
+    assert fields["topology_residual_adapter"] is True
+    assert "topology_residual_adapter" in engine[
+        "require_feature_learning_signal_modules"
+    ].split(",")
+    assert engine["min_35m_params"] == 42_500_000
+    assert engine["max_35m_params"] == 43_000_000
     assert fields["max_steps"] == 0
     assert fields["epochs"] == 3
 
@@ -262,7 +269,7 @@ def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
         upgrade,
         "verify_receipt",
         lambda _path: {
-            "module": upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+            "module": upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
             "source": parent_ref,
             "upgraded_initializer": initializer_ref,
             "receipt": receipt_ref,
@@ -275,7 +282,7 @@ def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
     assert binding["initializer"] == initializer_ref
     assert binding["function_preserving_upgrade"] == {
         "schema_version": "a1-lineage-function-preserving-upgrade-v1",
-        "module": upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+        "module": upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
         "receipt": receipt_ref["path"],
         "receipt_sha256": receipt_ref["sha256"],
         "source_checkpoint_sha256": parent_ref["sha256"],

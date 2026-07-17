@@ -470,13 +470,13 @@ def _parent_initializer_binding(
         raise SystemExit(f"architecture upgrade receipt refused: {error}") from error
     if (
         replayed.get("module")
-        != upgrade.MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1
+        != upgrade.MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1
         or replayed.get("source") != parent
         or replayed.get("upgraded_initializer") != initializer
     ):
         raise SystemExit(
             "architecture receipt must connect the exact incumbent directly to "
-            "the commissioned current-v5+split1 initializer"
+            "the reviewed current-v5+topology+split1 initializer"
         )
     receipt = replayed["receipt"]
     lineage_binding = {

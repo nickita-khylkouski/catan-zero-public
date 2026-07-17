@@ -631,6 +631,11 @@ def build_train_command(
         if model["public_rule_state_features"]
         else "--no-public-rule-state-features"
     )
+    command.append(
+        "--topology-residual-adapter"
+        if model["topology_residual_adapter"]
+        else "--no-topology-residual-adapter"
+    )
     scalar_fields = (
         ("track", "--track"),
         ("vps_to_win", "--vps-to-win"),

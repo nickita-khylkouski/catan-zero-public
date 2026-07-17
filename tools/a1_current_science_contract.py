@@ -53,10 +53,11 @@ CURRENT_LEARNER_ENTITY_ADAPTER = (
 CURRENT_ARCHITECTURE_UPGRADE_FLAGS = (
     "structured_action_value,card_count_v2,meaningful_history,"
     "history_target_gather,action_target_gather,legal_set_statistics,public_rule_state,"
-    "value_tower_split1"
+    "topology,value_tower_split1"
 )
 CURRENT_ARCHITECTURE_UPGRADE_MODULE = (
-    "entity_graph.action_target_gather+static_action_residual+"
+    "entity_graph.topology_residual_adapter+action_target_gather+"
+    "static_action_residual+"
     "legal_action_value_residual+"
     "legal_action_value_set_statistics+"
     "public_card_count_features+meaningful_public_history+"
@@ -129,7 +130,7 @@ PRODUCTION_LEARNER_SIGNAL_CONTRACT = {
         "meaningful_history_ordered_gate,meaningful_history_sequence,"
         "meaningful_history_target_proj,"
         "public_card_count_residual,public_rule_state_residual,"
-        "static_action_residual_proj,value_blocks,value_head,"
+        "static_action_residual_proj,topology_residual_adapter,value_blocks,value_head,"
         "value_state_norm,final_vp_head"
     ),
     "minimum_feature_learning_signal_observations": 2,
@@ -190,6 +191,7 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
     "graph_dropout": 0.05,
     "entity_state_trunk": "transformer",
     "action_target_gather": True,
+    "topology_residual_adapter": True,
     "static_action_residual": True,
     "legal_action_value_residual": True,
     "legal_action_value_set_statistics": True,
@@ -213,8 +215,8 @@ PRODUCTION_LEARNER_MODEL_CONSTRUCTION_CONTRACT = {
         "rust_entity_adapter_v5_meaningful_history_v2"
     ),
     "require_35m_model": True,
-    "min_parameter_count": 41_700_000,
-    "max_parameter_count": 42_000_000,
+    "min_parameter_count": 42_500_000,
+    "max_parameter_count": 43_000_000,
 }
 PRODUCTION_LEARNER_EXECUTION_TOPOLOGY_CONTRACT = {
     "schema_version": "a1-scratch-training-topology-v1",
@@ -248,7 +250,7 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
     "recipe": "a1-parent-update-35m-b200",
     "config_path": "configs/training/a1_parent_update_35m_b200.schema1.json",
     "config_canonical_sha256": (
-        "837655af21b288a97c9fb6fe07cbf84851096c9c322e56223701c3c48a757002"
+        "be4b2bc31fc9e7f4c36c782169f9084219e31de51761d7f38269f9d33a3163fa"
     ),
     "scratch_status": "research_only_unresolved_not_selected",
 }

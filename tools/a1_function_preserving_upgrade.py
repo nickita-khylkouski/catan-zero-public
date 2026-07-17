@@ -102,6 +102,13 @@ MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1 = (
     "meaningful_history_target_gather+actor_public_rule_state.v5+"
     "value_tower_split1"
 )
+MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1 = (
+    "entity_graph.topology_residual_adapter+action_target_gather+"
+    "static_action_residual+legal_action_value_residual+"
+    "legal_action_value_set_statistics+public_card_count_features+"
+    "meaningful_public_history+meaningful_history_target_gather+"
+    "actor_public_rule_state.v5+value_tower_split1"
+)
 
 
 def _module_forward_tolerance(module: str) -> float:
@@ -110,6 +117,7 @@ def _module_forward_tolerance(module: str) -> float:
     if module in {
         MODULE_VALUE_TOWER_SPLIT_1,
         MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1,
+        MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1,
     }:
         # The cloned tower preserves the function algebraically, but evaluating
         # it outside the shared policy suffix may reorder FP32 operations by one
@@ -658,6 +666,42 @@ ALLOWLIST[MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1] = {
     "config_delta": {
         **ALLOWLIST[MODULE_CURRENT_V5]["config_delta"],
         **ALLOWLIST[MODULE_VALUE_TOWER_SPLIT_1]["config_delta"],
+    },
+    "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V5,
+}
+
+# Do not mutate the historical current-v5+split1 identity: issued receipts must
+# remain replayable.  The topology-aware canonical initializer is a new reviewed
+# edge that composes that exact function with the existing zero-output topology
+# adapter.  Only the output projection can affect the trunk and it starts at
+# exact zero, so enabling this information surface cannot perturb step-zero
+# logits/value while making incidence parameters trainable on the first step.
+_TOPOLOGY_RESIDUAL_INITIALIZATION = {
+    name: initializer
+    for name, initializer in ALLOWLIST[MODULE_TOPOLOGY_TARGET_GATHER][
+        "new_parameter_initialization"
+    ].items()
+    if name.startswith("topology_residual_adapter.")
+}
+ALLOWLIST[MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1] = {
+    "flags": {
+        **ALLOWLIST[MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1]["flags"],
+        "topology_residual_adapter": True,
+    },
+    "source_config_requirements": dict(
+        ALLOWLIST[MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1][
+            "source_config_requirements"
+        ]
+    ),
+    "new_parameter_initialization": {
+        **ALLOWLIST[MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1][
+            "new_parameter_initialization"
+        ],
+        **_TOPOLOGY_RESIDUAL_INITIALIZATION,
+    },
+    "config_delta": {
+        **ALLOWLIST[MODULE_CURRENT_V5_VALUE_TOWER_SPLIT_1]["config_delta"],
+        "topology_residual_adapter": True,
     },
     "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V5,
 }
