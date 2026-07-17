@@ -4095,14 +4095,35 @@ def bind_learner_ablation(
         # train_bc authenticates enabled diagnostic instrumentation in the
         # effective recipe. Bind the exact reporting-only command delta here
         # so the child cannot run telemetry absent from its sealed declaration.
+        diagnostic_feature_modules: set[str] = set()
+        diagnostic_feature_observations = 0
+        if (
+            isinstance(upgrade, dict)
+            and upgrade.get("module")
+            == architecture_upgrade.MODULE_V7_PUBLIC_CARD_EXACT_RESOURCE_RESIDUAL
+        ):
+            # V8 is function-preserving at step zero, so its scientific claim
+            # depends on this new public resource path actually participating
+            # in optimization.  The generic diagnostic path used to blank all
+            # feature-signal requirements; that allowed a V8 learner result to
+            # be reported even if this residual was disconnected or never saw
+            # gradient.  Keep the ordinary generic diagnostics lightweight,
+            # but make a V8 dose fail closed unless the new residual is seen
+            # at least twice by the existing optimizer observability ledger.
+            diagnostic_feature_modules.add("public_card_exact_resource_residual")
+            diagnostic_feature_observations = 2
         effective.update(
             {
                 "train_diagnostics_every_batches": train_diagnostic_cadence,
                 "objective_gradient_interference_every_batches": (
                     objective_gradient_cadence
                 ),
-                "require_feature_learning_signal_modules": "",
-                "minimum_feature_learning_signal_observations": 0,
+                "require_feature_learning_signal_modules": ",".join(
+                    sorted(diagnostic_feature_modules)
+                ),
+                "minimum_feature_learning_signal_observations": (
+                    diagnostic_feature_observations
+                ),
             }
         )
     code_binding = (

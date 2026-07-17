@@ -2483,6 +2483,7 @@ def test_generic_ablation_accepts_v8_public_resource_receipt(
         ablation_id="v8-value-trunk10",
         overrides_json='{"value_trunk_grad_scale":0.1}',
         reviewed_code_tree_sha256=code_sha,
+        diagnostic_dose_curve=True,
     )
 
     assert arm["recipe"]["value_trunk_grad_scale"] == pytest.approx(0.1)
@@ -2490,6 +2491,13 @@ def test_generic_ablation_accepts_v8_public_resource_receipt(
         "contract": 1.0,
         "effective": 0.1,
     }
+    # A V8 experiment is meaningful only if its newly added exact-public
+    # resource path is observed learning, rather than merely loading a
+    # function-preserving zero-output module.
+    assert arm["recipe"]["require_feature_learning_signal_modules"] == (
+        "public_card_exact_resource_residual"
+    )
+    assert arm["recipe"]["minimum_feature_learning_signal_observations"] == 2
 
 def test_generic_ablation_preserves_explicit_parent_moe_balance_weight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
