@@ -104,6 +104,7 @@ NEW_PARAM_PREFIXES = (
     "public_rule_state_residual.",
     "v6_exact_resource_residual.",
     "v6_initial_road_residual.",
+    "public_card_exact_resource_residual.",
     "action_cross_blocks.",
 )
 
@@ -219,6 +220,15 @@ def _parse_flags(raw: str) -> dict[str, object]:
                     "action_cross_attention_bottleneck": 80,
                 }
             )
+        elif entry in (
+            "v7_to_v8_public_card_exact_residual",
+            "v7-to-v8-public-card-exact-residual",
+        ):
+            # V7 intentionally keeps the mature V5 public-card residual on
+            # its clipped input measure. This adds a separate zero-output
+            # residual for the exact public 2p resource deduction, avoiding
+            # both an input-distribution rewrite and masked-opponent loss.
+            overrides["public_card_exact_resource_residual"] = True
         elif entry in ("gather", "action_target_gather"):
             overrides["action_target_gather"] = True
         elif entry in ("value", "value_attention_pool"):

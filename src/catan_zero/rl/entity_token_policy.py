@@ -429,6 +429,11 @@ class EntityGraphConfig:
     # legacy-compatible view remains its input, while a bias-free zero-output
     # residual learns the new exact counts.  Appended for pickle compatibility.
     v6_compatibility_preserving_inputs: bool = False
+    # V8 restores exact public opponent-resource composition without changing
+    # the mature V5 public-card residual's clipped input measure. In two-player
+    # Catan this composition is public by bank conservation, but V7's exact
+    # residual only sees masked opponent player tokens.
+    public_card_exact_resource_residual: bool = False
     # Explicit serialized topology for the Transformer-only action adapter.
     # Zero retains the historical full-width block used by issued f69
     # checkpoints/receipts. A positive value selects the parameter-efficient
@@ -747,6 +752,24 @@ class EntityGraphNet:
                     nn.init.zeros_(self.public_card_count_residual.weight)
                     if self.public_card_count_residual.bias is not None:
                         nn.init.zeros_(self.public_card_count_residual.bias)
+                self.public_card_exact_resource_residual_enabled = bool(
+                    getattr(cfg, "public_card_exact_resource_residual", False)
+                )
+                if self.public_card_exact_resource_residual_enabled:
+                    if not self.public_card_count_features_enabled:
+                        raise ValueError(
+                            "public_card_exact_resource_residual requires "
+                            "public_card_count_features"
+                        )
+                    if not self.v6_compatibility_preserving_inputs_enabled:
+                        raise ValueError(
+                            "public_card_exact_resource_residual requires the "
+                            "V7 compatibility-preserving input route"
+                        )
+                    self.public_card_exact_resource_residual = nn.Linear(
+                        5, h, bias=False
+                    )
+                    nn.init.zeros_(self.public_card_exact_resource_residual.weight)
                 self.global_encoder = _token_encoder(GLOBAL_FEATURE_SIZE, h, dropout)
                 self.public_rule_state_features_enabled = bool(
                     getattr(cfg, "public_rule_state_features", False)
@@ -2290,7 +2313,8 @@ class EntityGraphNet:
                 else:
                     player_piece = self.player_encoder(raw_player_tokens)
                 if self.public_card_count_features_enabled:
-                    public_card_count_features = batch[DEDUCTION_FEATURES_KEY].float()
+                    exact_public_card_features = batch[DEDUCTION_FEATURES_KEY].float()
+                    public_card_count_features = exact_public_card_features
                     if self.v6_compatibility_preserving_inputs_enabled:
                         # The mature public-card residual was also trained on a
                         # V5-derived tensor.  V6 exact actor counts can make its
@@ -2345,6 +2369,16 @@ class EntityGraphNet:
                     player_piece = player_piece + self.public_card_count_residual(
                         public_card_count_features
                     )
+                    if self.public_card_exact_resource_residual_enabled:
+                        # Keep the trained V5 residual on its reconstructed
+                        # legacy feature measure above. This separate new path
+                        # owns the physical, public 2p resource deduction.
+                        player_piece = (
+                            player_piece
+                            + self.public_card_exact_resource_residual(
+                                exact_public_card_features[..., :5]
+                            )
+                        )
                 if self.public_rule_state_features_enabled:
                     rule_state = global_tokens[
                         :, :, PUBLIC_RULE_STATE_FEATURE_SLICE
@@ -2708,6 +2742,19 @@ class EntityGraphPolicy:
             raise ValueError(
                 "v6 compatibility-preserving inputs require the V6 entity adapter"
             )
+        if bool(getattr(config, "public_card_exact_resource_residual", False)):
+            if not bool(getattr(config, "public_card_count_features", False)):
+                raise ValueError(
+                    "public_card_exact_resource_residual requires "
+                    "public_card_count_features"
+                )
+            if not bool(
+                getattr(config, "v6_compatibility_preserving_inputs", False)
+            ) or self.entity_feature_adapter_version != RUST_ENTITY_ADAPTER_V6:
+                raise ValueError(
+                    "public_card_exact_resource_residual requires the V7/V6 "
+                    "compatibility input contract"
+                )
         if bool(getattr(config, "meaningful_public_history", False)):
             uses_history_v2 = (
                 str(getattr(config, "meaningful_public_history_schema", ""))
@@ -2828,6 +2875,7 @@ class EntityGraphPolicy:
         meaningful_public_history_pooling: str = MASKED_MEAN_V1,
         meaningful_public_history_target_gather: bool = False,
         v6_compatibility_preserving_inputs: bool = False,
+        public_card_exact_resource_residual: bool = False,
         value_tower_split_layers: int = 0,
         public_rule_state_features: bool = False,
         public_rule_state_feature_schema: str = (
@@ -2905,6 +2953,9 @@ class EntityGraphPolicy:
                 ),
                 v6_compatibility_preserving_inputs=bool(
                     v6_compatibility_preserving_inputs
+                ),
+                public_card_exact_resource_residual=bool(
+                    public_card_exact_resource_residual
                 ),
                 value_tower_split_layers=int(value_tower_split_layers),
                 public_rule_state_features=bool(public_rule_state_features),
@@ -3648,6 +3699,7 @@ class EntityGraphPolicy:
             "public_rule_state_residual.",
             "v6_exact_resource_residual.",
             "v6_initial_road_residual.",
+            "public_card_exact_resource_residual.",
         )
         if bool(allow_missing_optional_parameters):
             allowed_missing_prefixes += optional_warmstart_prefixes

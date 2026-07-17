@@ -43,6 +43,7 @@ from catan_zero.rl.meaningful_history import (  # noqa: E402
 from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     RUST_ENTITY_ADAPTER_V4,
     RUST_ENTITY_ADAPTER_V5,
+    RUST_ENTITY_ADAPTER_V6,
     resolve_checkpoint_entity_feature_adapter,
 )
 from catan_zero.rl.entity_token_features import (  # noqa: E402
@@ -111,6 +112,9 @@ MODULE_CURRENT_V5_TOPOLOGY_VALUE_TOWER_SPLIT_1 = (
 )
 MODULE_CURRENT_V5_SPLIT1_TOPOLOGY_ONLY = (
     "entity_graph.current_v5_value_tower_split1+topology_residual_adapter.v1"
+)
+MODULE_V7_PUBLIC_CARD_EXACT_RESOURCE_RESIDUAL = (
+    "entity_graph.public_card_exact_resource_residual.v1"
 )
 
 
@@ -642,6 +646,19 @@ ALLOWLIST: dict[str, dict[str, Any]] = {
             "action_cross_blocks.0.norm_q.weight": "ones",
         },
         "config_delta": {"action_cross_attention_layers": 1},
+    },
+    MODULE_V7_PUBLIC_CARD_EXACT_RESOURCE_RESIDUAL: {
+        "flags": {"public_card_exact_resource_residual": True},
+        "source_config_requirements": {
+            "v6_compatibility_preserving_inputs": True,
+            "public_card_count_features": True,
+            "public_card_exact_resource_residual": False,
+        },
+        "new_parameter_initialization": {
+            "public_card_exact_resource_residual.weight": "zeros",
+        },
+        "config_delta": {"public_card_exact_resource_residual": True},
+        "entity_feature_adapter_version": RUST_ENTITY_ADAPTER_V6,
     },
 }
 

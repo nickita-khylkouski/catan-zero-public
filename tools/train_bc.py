@@ -36807,6 +36807,7 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "edge_encoder",
         "player_encoder",
         "v6_exact_resource_residual",
+        "public_card_exact_resource_residual",
         "public_card_count_residual",
         "public_rule_state_residual",
         "global_encoder",
@@ -36838,7 +36839,10 @@ ENTITY_GRAPH_FREEZABLE_MODULE_GROUPS: dict[str, tuple[str, ...]] = {
         "meaningful_history_sequence",
         "meaningful_history_target_proj",
     ),
-    "v7_resource_residual": ("v6_exact_resource_residual",),
+    "v7_resource_residual": (
+        "v6_exact_resource_residual",
+        "public_card_exact_resource_residual",
+    ),
     "policy_head": ("action_bias", "logit_scale"),
     # Keep optional action-local adapters independently freezable.  Grouping
     # them together would make a gather+edge ablation silently update the
@@ -36938,6 +36942,7 @@ def _effective_entity_graph_architecture_report(
             "legal_action_value_residual": False,
             "legal_action_value_set_statistics": False,
             "v6_compatibility_preserving_inputs": False,
+            "public_card_exact_resource_residual": False,
             "value_tower_split_layers": 0,
             "public_card_count_features": False,
             "public_card_count_residual_bias": False,
@@ -36992,6 +36997,9 @@ def _effective_entity_graph_architecture_report(
         ),
         "v6_compatibility_preserving_inputs": bool(
             getattr(config, "v6_compatibility_preserving_inputs", False)
+        ),
+        "public_card_exact_resource_residual": bool(
+            getattr(config, "public_card_exact_resource_residual", False)
         ),
         "value_tower_split_layers": int(
             getattr(config, "value_tower_split_layers", 0) or 0
@@ -37585,7 +37593,12 @@ def _build_optimizer_param_groups(
     # multiplier below.
     commissioning_adapter_param_ids = {
         id(parameter)
-        for parameter in _params_under(("v6_exact_resource_residual",))
+        for parameter in _params_under(
+            (
+                "v6_exact_resource_residual",
+                "public_card_exact_resource_residual",
+            )
+        )
     }
     trunk_params = (
         [
@@ -41420,6 +41433,7 @@ def _checkpoint_dose_telemetry(
                 (
                     "v6_exact_resource_residual",
                     "v6_initial_road_residual",
+                    "public_card_exact_resource_residual",
                 ),
             ),
         },
