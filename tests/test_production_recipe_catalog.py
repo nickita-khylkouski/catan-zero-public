@@ -33,6 +33,10 @@ APPROVED_PARENT_UPDATE = (
     "configs/training/a1_parent_update_35m_b200.schema1.json",
     "a1-parent-update-35m-b200",
 )
+APPROVED_ACTIVE_PARENT_UPDATE = (
+    "configs/training/a1_parent_update_active_p25_35m_b200.schema1.json",
+    "a1-parent-update-active-p25-35m-b200",
+)
 
 
 @pytest.mark.parametrize("entrypoint", sorted(APPROVED))
@@ -55,6 +59,21 @@ def test_checked_in_parent_update_recipe_is_authenticated() -> None:
         require_production_recipe(entrypoint="train", path=path, payload=payload)
         == expected_name
     )
+
+
+def test_checked_in_active_parent_update_recipe_is_authenticated() -> None:
+    relative, expected_name = APPROVED_ACTIVE_PARENT_UPDATE
+    path = ROOT / relative
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert (
+        require_production_recipe(entrypoint="train", path=path, payload=payload)
+        == expected_name
+    )
+    fields = payload["train_config"]["fields"]
+    assert fields["policy_aux_active_batch_size"] == 64
+    assert fields["policy_aux_loss_weight"] == pytest.approx(0.25)
+    assert fields["policy_aux_sampling_mode"] == "weighted_permutation_cycles_v1"
 
 
 def test_generation_recipe_round_trips_every_typed_science_field() -> None:
@@ -108,6 +127,7 @@ def test_authenticated_catalog_listing_has_no_second_identity_registry() -> None
     assert [entry["name"] for entry in train] == [
         "a1-current-35m-b200",
         "a1-parent-update-35m-b200",
+        "a1-parent-update-active-p25-35m-b200",
     ]
     assert all(Path(entry["path"]).is_absolute() for entry in train)
     assert all(len(entry["canonical_sha256"]) == 64 for entry in train)

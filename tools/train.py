@@ -44,6 +44,7 @@ REQUIRED_NOFILE_SOFT = 65_536
 CANONICAL_CONFIG_ROLES_BY_CATALOG_NAME = {
     "a1-current-35m-b200": "scratch_fresh_optimizer",
     "a1-parent-update-35m-b200": "parent_fresh_optimizer",
+    "a1-parent-update-active-p25-35m-b200": "parent_fresh_optimizer",
 }
 _ENGINE_SETTING_KEYS = frozenset(
     {
