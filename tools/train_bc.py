@@ -22962,6 +22962,190 @@ def _train_xdim_batch(
     }
 
 
+COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_KEY = (
+    "common_uniform_clean_outcome_scalar_mse"
+)
+COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_SCHEMA = (
+    "common-uniform-clean-outcome-scalar-mse-v1"
+)
+_COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_CONTRACT_FIELDS = (
+    "schema_version",
+    "measure",
+    "target",
+    "prediction_readout",
+    "prediction_scale",
+    "training_value_sample_weights_applied",
+    "outcome_confidence_applied",
+    "truncated_rows_included",
+    "root_value_blend_applied",
+)
+
+
+def _common_uniform_clean_outcome_scalar_mse_report(
+    squared_error_sum: float,
+    eligible_rows: int,
+    *,
+    prediction_readout: str,
+    prediction_scale: float,
+) -> dict[str, object]:
+    """Finalize the recipe-independent clean terminal-outcome value metric."""
+
+    error_sum = float(squared_error_sum)
+    rows = int(eligible_rows)
+    scale = float(prediction_scale)
+    if (
+        not math.isfinite(error_sum)
+        or error_sum < 0.0
+        or isinstance(eligible_rows, bool)
+        or rows < 0
+        or not math.isfinite(scale)
+        or scale <= 0.0
+        or not str(prediction_readout)
+    ):
+        raise ValueError("common uniform scalar-value metric parts are malformed")
+    if rows == 0 and error_sum != 0.0:
+        raise ValueError("empty common uniform scalar-value metric has nonzero error")
+    return {
+        "schema_version": COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_SCHEMA,
+        "measure": "uniform_clean_terminal_outcome_rows",
+        "target": "actor_perspective_terminal_outcome_pm1",
+        "prediction_readout": str(prediction_readout),
+        "prediction_scale": scale,
+        "training_value_sample_weights_applied": False,
+        "outcome_confidence_applied": False,
+        "truncated_rows_included": False,
+        "root_value_blend_applied": False,
+        "available": rows > 0,
+        "eligible_rows": rows,
+        "squared_error_sum": error_sum,
+        "mse": error_sum / rows if rows > 0 else None,
+    }
+
+
+def _validated_common_uniform_clean_outcome_scalar_mse(
+    value: object,
+) -> tuple[dict[str, object], float, int]:
+    if not isinstance(value, dict):
+        raise ValueError("common uniform scalar-value metric is not a mapping")
+    required = {
+        *_COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_CONTRACT_FIELDS,
+        "available",
+        "eligible_rows",
+        "squared_error_sum",
+        "mse",
+    }
+    if set(value) != required:
+        raise ValueError("common uniform scalar-value metric fields are malformed")
+    if (
+        isinstance(value["eligible_rows"], bool)
+        or not isinstance(value["eligible_rows"], int)
+        or isinstance(value["squared_error_sum"], bool)
+        or isinstance(value["prediction_scale"], bool)
+        or not isinstance(value["prediction_readout"], str)
+        or not isinstance(value["available"], bool)
+        or (
+            value["mse"] is not None
+            and isinstance(value["mse"], bool)
+        )
+        or any(
+            value[key] is not False
+            for key in (
+                "training_value_sample_weights_applied",
+                "outcome_confidence_applied",
+                "truncated_rows_included",
+                "root_value_blend_applied",
+            )
+        )
+    ):
+        raise ValueError("common uniform scalar-value metric values are malformed")
+    try:
+        rows = int(value["eligible_rows"])
+        error_sum = float(value["squared_error_sum"])
+        scale = float(value["prediction_scale"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "common uniform scalar-value metric values are malformed"
+        ) from error
+    expected = _common_uniform_clean_outcome_scalar_mse_report(
+        error_sum,
+        rows,
+        prediction_readout=str(value["prediction_readout"]),
+        prediction_scale=scale,
+    )
+    if value != expected:
+        raise ValueError("common uniform scalar-value metric is inconsistent")
+    contract = {
+        key: expected[key]
+        for key in _COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_CONTRACT_FIELDS
+    }
+    return contract, error_sum, rows
+
+
+def _aggregate_common_uniform_clean_outcome_scalar_mse(
+    reports: list[dict],
+) -> dict[str, object] | None:
+    present = [COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_KEY in row for row in reports]
+    if not any(present):
+        return None
+    if not all(present):
+        raise SystemExit(
+            "validation reports only partially expose the common uniform "
+            "scalar-value metric"
+        )
+    parsed = []
+    try:
+        parsed = [
+            _validated_common_uniform_clean_outcome_scalar_mse(
+                row[COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_KEY]
+            )
+            for row in reports
+        ]
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    contract = parsed[0][0]
+    if any(item[0] != contract for item in parsed[1:]):
+        raise SystemExit(
+            "common uniform scalar-value prediction contracts differ across "
+            "validation reports"
+        )
+    return _common_uniform_clean_outcome_scalar_mse_report(
+        sum(item[1] for item in parsed),
+        sum(item[2] for item in parsed),
+        prediction_readout=str(contract["prediction_readout"]),
+        prediction_scale=float(contract["prediction_scale"]),
+    )
+
+
+def _reduce_common_uniform_clean_outcome_scalar_mse(
+    squared_error_sum: float,
+    eligible_rows: int,
+    ddp: dict[str, int | bool],
+    *,
+    prediction_readout: str,
+    prediction_scale: float,
+) -> dict[str, object]:
+    reduced = _reduce_named_sums(
+        {
+            "squared_error_sum": float(squared_error_sum),
+            "eligible_rows": float(eligible_rows),
+        },
+        ddp,
+    )
+    reduced_rows = float(reduced["eligible_rows"])
+    if (
+        not math.isfinite(reduced_rows)
+        or reduced_rows < 0.0
+        or not reduced_rows.is_integer()
+    ):
+        raise ValueError("reduced common uniform scalar-value row count is malformed")
+    return _common_uniform_clean_outcome_scalar_mse_report(
+        float(reduced["squared_error_sum"]),
+        int(reduced_rows),
+        prediction_readout=prediction_readout,
+        prediction_scale=prediction_scale,
+    )
+
+
 _OBJECTIVE_MATCHED_VALIDATION_MEANS = (
     "loss",
     "raw_batch_mean_loss",
@@ -23996,6 +24180,17 @@ def _objective_measure_validation_aggregate(
     normalized = np.asarray(weights, dtype=np.float64)
     normalized = normalized / float(normalized.sum())
     metrics = _weighted_validation_means(reports, normalized)
+    common_uniform_value = _aggregate_common_uniform_clean_outcome_scalar_mse(
+        reports
+    )
+    if common_uniform_value is not None:
+        # This metric intentionally answers a different, cross-recipe question
+        # than the objective-matched aggregate below. Sum raw held-out row SSE
+        # and count exactly once, independent of component/game sampling ratios
+        # and every learner loss weight.
+        metrics[COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_KEY] = (
+            common_uniform_value
+        )
     if all(
         isinstance(report.get("value_mse_strata_sufficient_statistics"), dict)
         and int(report.get("samples", 0)) > 0
@@ -24724,6 +24919,8 @@ def evaluate_bc_batches(
         value_mse_strata_sufficient_statistics: dict[
             str, dict[str, dict[str, float]]
         ] = {}
+        common_uniform_clean_outcome_squared_error_sum = 0.0
+        common_uniform_clean_outcome_eligible_rows = 0
         eval_fn = _eval_xdim_batch if hasattr(policy, "forward_legal_np") else _eval_candidate_batch
         eval_fn_extra_kwargs: dict[str, object] = {}
         if eval_fn is _eval_xdim_batch:
@@ -24894,6 +25091,16 @@ def evaluate_bc_batches(
                     "value_mse_strata_sufficient_statistics", {}
                 ),
             )
+            common_uniform_clean_outcome_squared_error_sum += float(
+                batch_metrics[
+                    "_common_uniform_clean_outcome_scalar_squared_error_sum"
+                ]
+            )
+            common_uniform_clean_outcome_eligible_rows += int(
+                batch_metrics[
+                    "_common_uniform_clean_outcome_scalar_eligible_rows"
+                ]
+            )
         extra_sums = _reduce_named_sums(extra_sums, ddp)
         extra_denominators = _reduce_named_sums(extra_denominators, ddp)
         aux_subgoal_sums = _reduce_named_sums(aux_subgoal_sums, ddp)
@@ -24919,6 +25126,15 @@ def evaluate_bc_batches(
         value_mse_strata_sufficient_statistics = (
             _reduce_value_validation_strata(
                 value_mse_strata_sufficient_statistics, ddp
+            )
+        )
+        common_uniform_clean_outcome_scalar_mse = (
+            _reduce_common_uniform_clean_outcome_scalar_mse(
+                common_uniform_clean_outcome_squared_error_sum,
+                common_uniform_clean_outcome_eligible_rows,
+                ddp,
+                prediction_readout=scalar_value_loss_readout,
+                prediction_scale=scalar_value_loss_scale,
             )
         )
         policy_loss_eval = _metric_from_sum_denominator(
@@ -24996,6 +25212,9 @@ def evaluate_bc_batches(
             "policy_loss": policy_loss_eval,
             "value_loss": value_loss_eval,
             "scalar_value_mse_diagnostic": scalar_value_mse_diagnostic_eval,
+            COMMON_UNIFORM_CLEAN_OUTCOME_SCALAR_MSE_KEY: (
+                common_uniform_clean_outcome_scalar_mse
+            ),
             "value_mse_strata": _finalize_value_validation_strata(
                 value_mse_strata_sufficient_statistics
             ),
@@ -25304,7 +25523,15 @@ def _eval_candidate_batch(
             per_sample_loss = hard_loss
         policy_loss_sum, policy_loss_denominator = _weighted_loss_parts(per_sample_loss, policy_weights)
         policy_loss = policy_loss_sum / torch.clamp(policy_loss_denominator, min=1e-6)
-        _, _, _, _, outcome_targets, has_outcome, outcome_confidence = _value_targets(
+        (
+            clean_outcome_targets,
+            _,
+            clean_has_outcome,
+            _,
+            outcome_targets,
+            has_outcome,
+            outcome_confidence,
+        ) = _value_targets(
             data,
             batch,
             policy.device,
@@ -25319,7 +25546,7 @@ def _eval_candidate_batch(
             (
                 value_error,
                 scalar_value_mse_error,
-                _value_prediction,
+                value_prediction,
             ) = _scalar_value_objective_errors(
                 raw_values,
                 outcome_targets,
@@ -25347,11 +25574,26 @@ def _eval_candidate_batch(
                     scalar_value_mse_diagnostic_denominator, min=1e-6
                 )
             )
+            common_uniform_clean_outcome_error = (
+                value_prediction - clean_outcome_targets
+            ) ** 2
+            (
+                common_uniform_clean_outcome_squared_error_sum,
+                common_uniform_clean_outcome_eligible_rows,
+            ) = _weighted_loss_parts(
+                common_uniform_clean_outcome_error,
+                torch.ones_like(common_uniform_clean_outcome_error),
+                mask=clean_has_outcome,
+            )
         else:
             value_loss_sum, value_loss_denominator = _zero_loss_parts(policy.device)
             (
                 scalar_value_mse_diagnostic_sum,
                 scalar_value_mse_diagnostic_denominator,
+            ) = _zero_loss_parts(policy.device)
+            (
+                common_uniform_clean_outcome_squared_error_sum,
+                common_uniform_clean_outcome_eligible_rows,
             ) = _zero_loss_parts(policy.device)
         loss = float(policy_loss_weight) * policy_loss + float(value_loss_weight) * value_loss
         predictions = torch.argmax(masked, dim=-1)
@@ -25396,6 +25638,12 @@ def _eval_candidate_batch(
             ),
             "scalar_value_mse_diagnostic_weight_sum": float(
                 scalar_value_mse_diagnostic_denominator.item()
+            ),
+            "_common_uniform_clean_outcome_scalar_squared_error_sum": float(
+                common_uniform_clean_outcome_squared_error_sum.item()
+            ),
+            "_common_uniform_clean_outcome_scalar_eligible_rows": int(
+                common_uniform_clean_outcome_eligible_rows.item()
             ),
             "final_vp_loss_weighted_sum": 0.0,
             "final_vp_loss_weight_sum": 0.0,
@@ -25653,6 +25901,17 @@ def _eval_xdim_batch(
                         scalar_value_mse_diagnostic_denominator, min=1e-6
                     )
                 )
+                common_uniform_clean_outcome_error = (
+                    scalar_value_prediction - outcome_targets
+                ) ** 2
+                (
+                    common_uniform_clean_outcome_squared_error_sum,
+                    common_uniform_clean_outcome_eligible_rows,
+                ) = _weighted_loss_parts(
+                    common_uniform_clean_outcome_error,
+                    torch.ones_like(common_uniform_clean_outcome_error),
+                    mask=has_outcome,
+                )
                 effective_value_weights = value_weights * outcome_confidence
                 value_mse_strata_sufficient_statistics = (
                     _value_validation_strata_parts(
@@ -25671,6 +25930,10 @@ def _eval_xdim_batch(
                 (
                     scalar_value_mse_diagnostic_sum,
                     scalar_value_mse_diagnostic_denominator,
+                ) = _zero_loss_parts(policy.device)
+                (
+                    common_uniform_clean_outcome_squared_error_sum,
+                    common_uniform_clean_outcome_eligible_rows,
                 ) = _zero_loss_parts(policy.device)
             if vp_targets is not None and "final_vp" in outputs:
                 vp_error = nn.functional.mse_loss(outputs["final_vp"], vp_targets, reduction="none")
@@ -26061,6 +26324,12 @@ def _eval_xdim_batch(
             ),
             "scalar_value_mse_diagnostic_weight_sum": float(
                 scalar_value_mse_diagnostic_denominator.item()
+            ),
+            "_common_uniform_clean_outcome_scalar_squared_error_sum": float(
+                common_uniform_clean_outcome_squared_error_sum.item()
+            ),
+            "_common_uniform_clean_outcome_scalar_eligible_rows": int(
+                common_uniform_clean_outcome_eligible_rows.item()
             ),
             "final_vp_loss_weighted_sum": float(final_vp_loss_sum.item()),
             "final_vp_loss_weight_sum": float(final_vp_loss_denominator.item()),

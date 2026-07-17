@@ -9,6 +9,7 @@ from tools.train_bc import (
     _IndexedValidationWeights,
     _objective_measure_validation_aggregate,
     _policy_aux_validation_objective_weights,
+    _reduce_common_uniform_clean_outcome_scalar_mse,
     evaluate_composite_validation_measure,
     objective_matched_validation_component_metrics,
     objective_matched_validation_evaluation_identity,
@@ -65,6 +66,45 @@ def test_policy_aux_validation_reconstructs_the_training_objective() -> None:
     assert combined["component_reconstructed_loss"] == pytest.approx(2.35)
     assert combined["base_raw_batch_mean_loss"] == 2.5
     assert combined["policy_aux_validation_effective_weight_sum"] == 3.0
+
+
+def test_policy_aux_validation_preserves_base_common_uniform_value_metric() -> None:
+    common = {
+        "schema_version": "common-uniform-clean-outcome-scalar-mse-v1",
+        "measure": "uniform_clean_terminal_outcome_rows",
+        "target": "actor_perspective_terminal_outcome_pm1",
+        "prediction_readout": "raw",
+        "prediction_scale": 1.0,
+        "training_value_sample_weights_applied": False,
+        "outcome_confidence_applied": False,
+        "truncated_rows_included": False,
+        "root_value_blend_applied": False,
+        "available": True,
+        "eligible_rows": 10,
+        "squared_error_sum": 4.0,
+        "mse": 0.4,
+    }
+    combined = _combine_policy_aux_validation_metrics(
+        {
+            "loss": 1.0,
+            "policy_loss": 0.5,
+            "common_uniform_clean_outcome_scalar_mse": common,
+        },
+        {
+            "samples": 2,
+            "policy_loss": 0.25,
+            "common_uniform_clean_outcome_scalar_mse": {
+                **common,
+                "eligible_rows": 2,
+                "squared_error_sum": 20.0,
+                "mse": 10.0,
+            },
+        },
+        policy_loss_weight=1.0,
+        policy_aux_loss_weight=0.5,
+    )
+
+    assert combined["common_uniform_clean_outcome_scalar_mse"] == common
 
 
 def test_indexed_validation_weights_avoid_a_corpus_sized_allocation() -> None:
@@ -406,6 +446,152 @@ def test_objective_measure_aggregates_weight_density_before_dividing() -> None:
     assert report["metrics"]["policy_loss"] == pytest.approx(11.0 / 3.0)
     assert report["metrics"]["loss"] == pytest.approx(11.0 / 3.0)
     assert report["metrics"]["raw_batch_mean_loss"] == 5.0
+
+
+def test_common_uniform_value_metric_ignores_composite_objective_ratios() -> None:
+    reports = [
+        {
+            "samples": 1,
+            "loss": 1.0,
+            "common_uniform_clean_outcome_scalar_mse": {
+                "schema_version": "common-uniform-clean-outcome-scalar-mse-v1",
+                "measure": "uniform_clean_terminal_outcome_rows",
+                "target": "actor_perspective_terminal_outcome_pm1",
+                "prediction_readout": "raw",
+                "prediction_scale": 1.0,
+                "training_value_sample_weights_applied": False,
+                "outcome_confidence_applied": False,
+                "truncated_rows_included": False,
+                "root_value_blend_applied": False,
+                "available": True,
+                "eligible_rows": 1,
+                "squared_error_sum": 9.0,
+                "mse": 9.0,
+            },
+        },
+        {
+            "samples": 9,
+            "loss": 3.0,
+            "common_uniform_clean_outcome_scalar_mse": {
+                "schema_version": "common-uniform-clean-outcome-scalar-mse-v1",
+                "measure": "uniform_clean_terminal_outcome_rows",
+                "target": "actor_perspective_terminal_outcome_pm1",
+                "prediction_readout": "raw",
+                "prediction_scale": 1.0,
+                "training_value_sample_weights_applied": False,
+                "outcome_confidence_applied": False,
+                "truncated_rows_included": False,
+                "root_value_blend_applied": False,
+                "available": True,
+                "eligible_rows": 9,
+                "squared_error_sum": 9.0,
+                "mse": 1.0,
+            },
+        },
+    ]
+
+    left, _ = _objective_measure_validation_aggregate(
+        reports, np.asarray([0.9, 0.1], dtype=np.float64)
+    )
+    right, _ = _objective_measure_validation_aggregate(
+        reports, np.asarray([0.1, 0.9], dtype=np.float64)
+    )
+
+    assert left["loss"] != right["loss"]
+    assert left["common_uniform_clean_outcome_scalar_mse"] == right[
+        "common_uniform_clean_outcome_scalar_mse"
+    ]
+    assert left["common_uniform_clean_outcome_scalar_mse"]["mse"] == pytest.approx(
+        1.8
+    )
+
+
+def test_common_uniform_value_reduction_uses_global_sse_and_row_count(
+    monkeypatch,
+) -> None:
+    def reduce_named(values, _ddp):
+        assert values == {"squared_error_sum": 5.0, "eligible_rows": 2.0}
+        return {"squared_error_sum": 14.0, "eligible_rows": 5.0}
+
+    monkeypatch.setattr("tools.train_bc._reduce_named_sums", reduce_named)
+    report = _reduce_common_uniform_clean_outcome_scalar_mse(
+        5.0,
+        2,
+        {"enabled": True, "world_size": 2, "rank": 0, "local_rank": 0},
+        prediction_readout="raw",
+        prediction_scale=1.0,
+    )
+
+    assert report["eligible_rows"] == 5
+    assert report["squared_error_sum"] == 14.0
+    assert report["mse"] == pytest.approx(2.8)
+
+
+def test_common_uniform_value_metric_rejects_mismatched_component_contracts() -> None:
+    common = {
+        "schema_version": "common-uniform-clean-outcome-scalar-mse-v1",
+        "measure": "uniform_clean_terminal_outcome_rows",
+        "target": "actor_perspective_terminal_outcome_pm1",
+        "prediction_readout": "raw",
+        "prediction_scale": 1.0,
+        "training_value_sample_weights_applied": False,
+        "outcome_confidence_applied": False,
+        "truncated_rows_included": False,
+        "root_value_blend_applied": False,
+        "available": True,
+        "eligible_rows": 1,
+        "squared_error_sum": 1.0,
+        "mse": 1.0,
+    }
+    reports = [
+        {"samples": 1, "loss": 1.0, "common_uniform_clean_outcome_scalar_mse": common},
+        {
+            "samples": 1,
+            "loss": 1.0,
+            "common_uniform_clean_outcome_scalar_mse": {
+                **common,
+                "prediction_readout": "deployed_search",
+            },
+        },
+    ]
+
+    with pytest.raises(SystemExit, match="prediction contracts differ"):
+        _objective_measure_validation_aggregate(
+            reports, np.asarray([0.5, 0.5], dtype=np.float64)
+        )
+
+
+@pytest.mark.parametrize("eligible_rows", [True, 1.5, "1"])
+def test_common_uniform_value_metric_rejects_noninteger_row_counts(
+    eligible_rows,
+) -> None:
+    common = {
+        "schema_version": "common-uniform-clean-outcome-scalar-mse-v1",
+        "measure": "uniform_clean_terminal_outcome_rows",
+        "target": "actor_perspective_terminal_outcome_pm1",
+        "prediction_readout": "raw",
+        "prediction_scale": 1.0,
+        "training_value_sample_weights_applied": False,
+        "outcome_confidence_applied": False,
+        "truncated_rows_included": False,
+        "root_value_blend_applied": False,
+        "available": True,
+        "eligible_rows": eligible_rows,
+        "squared_error_sum": 1.0,
+        "mse": 1.0,
+    }
+
+    with pytest.raises(SystemExit, match="values are malformed"):
+        _objective_measure_validation_aggregate(
+            [
+                {
+                    "samples": 1,
+                    "loss": 1.0,
+                    "common_uniform_clean_outcome_scalar_mse": common,
+                }
+            ],
+            np.asarray([1.0], dtype=np.float64),
+        )
 
 
 def test_exact_total_loss_reconstruction_includes_zero_weight_belief_term() -> None:

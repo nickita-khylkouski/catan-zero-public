@@ -439,6 +439,148 @@ def test_xdim_validation_default_mse_objective_and_telemetry() -> None:
     assert policy.model.training is True  # validation restores the caller's mode
 
 
+def test_common_uniform_clean_outcome_mse_ignores_recipe_value_weights() -> None:
+    torch = pytest.importorskip("torch")
+    policy, data = _validation_fixture()
+    with torch.no_grad():
+        policy.model.marker.fill_(0.5)
+
+    neutral = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        value_weights=np.ones(4, dtype=np.float32),
+    )
+    weighted = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        value_weights=np.asarray([10.0, 1.0, 1.0, 1.0], dtype=np.float32),
+    )
+
+    assert weighted["scalar_value_mse_diagnostic"] != pytest.approx(
+        neutral["scalar_value_mse_diagnostic"]
+    )
+    expected = {
+        "schema_version": "common-uniform-clean-outcome-scalar-mse-v1",
+        "measure": "uniform_clean_terminal_outcome_rows",
+        "target": "actor_perspective_terminal_outcome_pm1",
+        "prediction_readout": "raw",
+        "prediction_scale": 1.0,
+        "training_value_sample_weights_applied": False,
+        "outcome_confidence_applied": False,
+        "truncated_rows_included": False,
+        "root_value_blend_applied": False,
+        "available": True,
+        "eligible_rows": 4,
+        "squared_error_sum": pytest.approx(5.0),
+        "mse": pytest.approx(1.25),
+    }
+    assert neutral["common_uniform_clean_outcome_scalar_mse"] == expected
+    assert weighted["common_uniform_clean_outcome_scalar_mse"] == expected
+    assert "common_uniform_clean_outcome_scalar_mse" not in neutral[
+        "loss_denominators"
+    ]
+
+
+def test_common_uniform_clean_outcome_mse_excludes_truncated_proxy_targets() -> None:
+    torch = pytest.importorskip("torch")
+    policy, data = _validation_fixture()
+    with torch.no_grad():
+        policy.model.marker.fill_(0.5)
+    data["truncated"] = np.asarray([True, False, False, False], dtype=np.bool_)
+    data["seat"] = np.asarray([0, 0, 0, 0], dtype=np.int8)
+    data["final_public_vps"] = np.asarray(
+        [[6, 4, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+        dtype=np.int16,
+    )
+
+    metrics = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        truncation_weight=0.25,
+    )
+    common = metrics["common_uniform_clean_outcome_scalar_mse"]
+
+    assert metrics["loss_denominators"]["scalar_value_mse_diagnostic"] == pytest.approx(
+        3.25
+    )
+    assert common["eligible_rows"] == 3
+    assert common["squared_error_sum"] == pytest.approx(4.75)
+    assert common["mse"] == pytest.approx(4.75 / 3.0)
+
+
+def test_common_uniform_clean_outcome_mse_is_unavailable_without_clean_rows() -> None:
+    pytest.importorskip("torch")
+    policy, data = _validation_fixture()
+    data["truncated"] = np.ones(4, dtype=np.bool_)
+
+    common = _evaluate(
+        policy,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+        truncation_weight=0.25,
+    )["common_uniform_clean_outcome_scalar_mse"]
+
+    assert common["available"] is False
+    assert common["eligible_rows"] == 0
+    assert common["squared_error_sum"] == 0.0
+    assert common["mse"] is None
+
+
+def test_candidate_and_xdim_common_uniform_contracts_match() -> None:
+    torch = pytest.importorskip("torch")
+    xdim, data = _validation_fixture()
+    with torch.no_grad():
+        xdim.model.marker.fill_(0.5)
+    xdim_metrics = _evaluate(
+        xdim,
+        data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+    )
+
+    class CandidatePolicy:
+        device = torch.device("cpu")
+        action_size = 2
+        context_action_feature_size = 1
+
+        def __init__(self) -> None:
+            self.model = torch.nn.Linear(1, 1, bias=False)
+
+        def forward(self, obs, context):
+            del context
+            rows = len(obs)
+            return (
+                torch.zeros((rows, 2), dtype=torch.float32),
+                torch.full((rows,), 0.5, dtype=torch.float32),
+            )
+
+    candidate_data = {
+        **data,
+        "legal_action_ids": np.asarray(
+            [[0, 1, -1], [0, 1, -1], [0, 1, -1], [0, 1, -1]],
+            dtype=np.int16,
+        ),
+        "action_taken": np.asarray([0, 1, 0, 1], dtype=np.int16),
+    }
+    candidate_metrics = _evaluate(
+        CandidatePolicy(),
+        candidate_data,
+        scalar_weight=1.0,
+        categorical_weight=0.0,
+    )
+
+    assert candidate_metrics["common_uniform_clean_outcome_scalar_mse"] == (
+        xdim_metrics["common_uniform_clean_outcome_scalar_mse"]
+    )
+
+
 def test_xdim_validation_can_score_the_deployed_scalar_search_readout() -> None:
     torch = pytest.importorskip("torch")
     policy, data = _validation_fixture()
