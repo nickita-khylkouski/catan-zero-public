@@ -52,6 +52,10 @@ if str(TOOLS) not in sys.path:
 from catan_zero.search.gumbel_chance_mcts import GumbelChanceMCTSConfig  # noqa: E402
 from catan_zero.search.neural_rust_mcts import EntityGraphRustEvaluatorConfig  # noqa: E402
 from catan_zero.rl.action_mask import ActionCatalog  # noqa: E402
+from catan_zero.rl.actor_public_rule_state_admission import (  # noqa: E402
+    ActorPublicRuleStateAdmissionError,
+    audit_actor_playable_development_cards,
+)
 from catan_zero.rl.entity_feature_adapter import (  # noqa: E402
     CURRENT_RUST_ENTITY_ADAPTER_VERSION,
     ENTITY_FEATURE_ADAPTER_SPECS,
@@ -11029,6 +11033,7 @@ def audit_outputs(
     active_legal_action_count = 0
     event_history_width_counts: Counter[int] = Counter()
     event_history_nonzero_mask_count = 0
+    actor_playable_card_counts: dict[str, Counter[str]] = {}
     public_award_generation_manifests = 0
     public_award_worker_manifests = 0
     required_target_information_regime = str(
@@ -11437,6 +11442,30 @@ def audit_outputs(
                         event_history_limit=event_history_limit,
                         expected_adapter_version=expected_learner_adapter,
                     )
+                    actor_playable_scan: dict[str, Any] | None = None
+                    if expected_learner_adapter == RUST_ENTITY_ADAPTER_V5:
+                        try:
+                            actor_playable_scan = (
+                                audit_actor_playable_development_cards(
+                                    payload,
+                                    where=(
+                                        f"{job['job_id']}:{canonical_shard.name}"
+                                    ),
+                                )
+                            )
+                        except ActorPublicRuleStateAdmissionError as error:
+                            raise ContractError(str(error)) from error
+                        for card, counts in actor_playable_scan["cards"].items():
+                            aggregate = actor_playable_card_counts.setdefault(
+                                str(card), Counter()
+                            )
+                            for key in (
+                                "selected_rows",
+                                "legal_rows",
+                                "required_rows",
+                                "positive_feature_rows",
+                            ):
+                                aggregate[key] += int(counts[key])
                     feature_semantic_rows += int(feature_semantics["row_count"])
                     adapter_version_counts.update(
                         [str(feature_semantics["entity_feature_adapter_version"])]
@@ -11471,6 +11500,10 @@ def audit_outputs(
                     data_shard_record["feature_semantics_sha256"] = _digest_value(
                         feature_semantics
                     )
+                    if actor_playable_scan is not None:
+                        data_shard_record[
+                            "actor_playable_development_card_admission_sha256"
+                        ] = _digest_value(actor_playable_scan)
                     target_information_regimes.update(regimes.tolist())
                     if np.any(regimes != required_target_information_regime):
                         actual = sorted(set(regimes.tolist()))
@@ -11963,6 +11996,30 @@ def audit_outputs(
     aggregate_structured_resource_scan["scan_sha256"] = _digest_value(
         aggregate_structured_resource_scan
     )
+    aggregate_actor_playable_scan: dict[str, Any] | None = None
+    if expected_learner_adapter == RUST_ENTITY_ADAPTER_V5:
+        aggregate_actor_playable_scan = {
+            "schema_version": (
+                "actor-playable-development-card-wave-admission-v1"
+            ),
+            "authenticated": True,
+            "implication": (
+                "selected_or_legal_play_development_card_implies_"
+                "positive_actor_playable_card_feature"
+            ),
+            "observed_cards": sorted(
+                card
+                for card, counts in actor_playable_card_counts.items()
+                if int(counts["required_rows"]) > 0
+            ),
+            "cards": {
+                card: dict(sorted(counts.items()))
+                for card, counts in sorted(actor_playable_card_counts.items())
+            },
+        }
+        aggregate_actor_playable_scan["scan_sha256"] = _digest_value(
+            aggregate_actor_playable_scan
+        )
     feature_semantics_report: dict[str, Any] = {
         "public_award_feature_provenance": {
             "expected": expected_public_award_provenance,
@@ -11979,6 +12036,7 @@ def audit_outputs(
             "row_counts": dict(adapter_version_counts),
         },
         "structured_action_resources": aggregate_structured_resource_scan,
+        "actor_playable_development_cards": aggregate_actor_playable_scan,
         "event_history": {
             **event_authority,
             "authenticated_empty": not meaningful_public_history,
