@@ -1,0 +1,94 @@
+{
+  "schema_version": "a1-coherent-v6-b12-commissioning-evidence-v1",
+  "status": "commissioned_non_promotable_parent_update",
+  "date_utc": "2026-07-17",
+  "code": {
+    "git_commit": "8424c8497f5ba761b2957abbe0d019de1b0a5f73",
+    "recipe": "configs/training/a1_parent_update_35m_b200.schema1.json",
+    "recipe_canonical_sha256": "757b1376bf1903841f6f26f60f361f81eb59a38b682a5468e14cafcce2d38131"
+  },
+  "initialization": {
+    "mode": "information_contract_migration",
+    "incumbent_sha256": "sha256:6817ab054506f962a758ebf48addce5cc7eb801bf451cf2d02b62fb91f5da39c",
+    "v6_initializer_sha256": "sha256:b0647f696b797dd009cd28c14a6f393866282b73c9ff4684ab5b8d9d0e22e777",
+    "migration": "entity_graph.current_v2_to_v6_information_contract+topology+split1.v1",
+    "fresh_optimizer": true
+  },
+  "data": {
+    "role": "current_producer_commissioning_slice",
+    "path": "/home/ubuntu/catan-zero-production/runs/composites/a1-v6-coherent-n128-12000-20260717-r4-v4/corpora/current_producer",
+    "games": 9600,
+    "rows": 2232310,
+    "policy_active_rows": 505618,
+    "data_fingerprint": "sha256:df7ae5bb6705607a3dfc70668081a6ec3866d09abe9c7fb1f1661658551b787d",
+    "target_information_regime": "public_belief_single_tree_v1",
+    "search_budget": 128
+  },
+  "training": {
+    "run_path": "/home/ubuntu/catan-zero-production/runs/learner/a1-v6-coherent-n128-current9600-b12-commissioning-r5",
+    "report_sha256": "sha256:65df24ee96e95ad7c3fe6a3003791b71e1f36ba70939986f035454b2a1eb0559",
+    "candidate_sha256": "sha256:0c1627e42497b21772c2a5c88cf15d30e92ad86aa2d7b3724a0601118404ae8e",
+    "validation_manifest_sha256": "sha256:c6021efdc0578cd1230ec61fdbf2c994ef9a95617409e802760fb37b2d67b3ac",
+    "validation_game_seed_set_sha256": "sha256:495c54e93d9a7060705c540f3255abe45521407c5c001270fbae75d0ff2bb278",
+    "accelerator": "8x NVIDIA B200",
+    "world_size": 8,
+    "global_batch_size": 512,
+    "optimizer_steps": 12,
+    "sampled_rows": 6144,
+    "elapsed_sec": 39.35401811398333,
+    "parameter_count": 42531273,
+    "trainable_parameter_count": 41095112
+  },
+  "heldout_frontier": [
+    {
+      "step": 0,
+      "checkpoint_sha256": "sha256:fcd7ff6d279ca4bd17f5d487e4d1d9799fcd0127331c587f368a34375b2109ca",
+      "teacher_target_kl": 0.778782180031262,
+      "teacher_target_cross_entropy": 1.5058188264881542,
+      "clean_terminal_value_mse": 0.6247781858792809,
+      "active_policy_teacher_gap_closure": -0.2584051248855943
+    },
+    {
+      "step": 8,
+      "checkpoint_sha256": "sha256:f0584756888394e74267a2986b36b14a0429c523d0c3b38ed7e8db44d4af0469",
+      "teacher_target_kl": 0.7662501931887361,
+      "teacher_target_cross_entropy": 1.4932868397353936,
+      "clean_terminal_value_mse": 0.6162743051135927,
+      "active_policy_teacher_gap_closure": -0.2267729910002465
+    },
+    {
+      "step": 10,
+      "checkpoint_sha256": "sha256:9bee7dc1683c6b4144735cd1c1e5d5655403d813347d372fd7950c80a116c1c4",
+      "teacher_target_kl": 0.7635063616541836,
+      "teacher_target_cross_entropy": 1.4905430081872113,
+      "clean_terminal_value_mse": 0.6161846509643927,
+      "active_policy_teacher_gap_closure": -0.21580169120894066
+    },
+    {
+      "step": 12,
+      "checkpoint_sha256": "sha256:0c1627e42497b21772c2a5c88cf15d30e92ad86aa2d7b3724a0601118404ae8e",
+      "teacher_target_kl": 0.7593351539982517,
+      "teacher_target_cross_entropy": 1.4863718005449091,
+      "clean_terminal_value_mse": 0.6172061297680805,
+      "active_policy_teacher_gap_closure": -0.2051617822674423
+    }
+  ],
+  "commissioning_gates": {
+    "teacher_target_kl_delta_step12_minus_step0": -0.019447026033010335,
+    "clean_terminal_value_mse_delta_step12_minus_step0": -0.0075720561112004,
+    "opening_initial_settlement_policy_mass_fraction": 0.03831884995015131,
+    "opening_initial_road_policy_mass_fraction": 0.03831884995015131,
+    "minimum_opening_policy_mass_fraction": 0.02,
+    "required_feature_modules_with_positive_gradient_and_update_signal": 19,
+    "required_feature_modules_missing_signal": 0,
+    "objective_gradient_observations": 2,
+    "policy_gradient_signal_present": true,
+    "value_gradient_signal_present": true,
+    "passed": true
+  },
+  "decision": {
+    "authorize_sealed_parent_update": true,
+    "commissioning_checkpoint_promotable": false,
+    "reason": "The independently initialized V6 B12 treatment improved held-out teacher-target KL and clean terminal-value MSE, exceeded both opening-policy mass minima, and produced authenticated learning signal in every required V6 feature and value module. Production must still rerun independently through the sealed 80/15/5 composite executor and pass gameplay promotion gates."
+  }
+}

@@ -272,13 +272,11 @@ PRODUCTION_LEARNER_SELECTION_CONTRACT = {
         "local_batch_size": 64,
         "grad_accum_steps": 1,
         "global_batch_size": 512,
-        "go_authorized": False,
+        "go_authorized": True,
         "authorization_authority": (
             "configs/production/training_science_admission.json"
         ),
-        "authorization_reason": (
-            "commissioned_b12_invalidated_by_adapter_v5_information_aliasing"
-        ),
+        "authorization_reason": "v6_b12_commissioned_on_fresh_coherent_n128",
     },
     "research_scratch_status": "research_only_unresolved_not_selected",
 }

@@ -37,15 +37,12 @@
     },
     "a1-parent-update-35m-b200": {
       "recipe_canonical_sha256": "757b1376bf1903841f6f26f60f361f81eb59a38b682a5468e14cafcce2d38131",
-      "authorized": false,
-      "reason": "commissioned_b12_invalidated_by_adapter_v5_information_aliasing",
-      "unresolved_requirements": [
-        "materialize and authenticate a fresh rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop training composite",
-        "recommission B12 topology, opening-policy, and value no-regression gates on adapter v6"
-      ],
+      "authorized": true,
+      "reason": "v6_b12_commissioned_on_fresh_coherent_n128",
+      "unresolved_requirements": [],
       "observations": {
-        "architecture_information_surface": "b12_v5_signal_commissioned_but_requires_v6_revalidation",
-        "retained_composite_adapter_status": "adapter_v2_retained_v5_r2_quarantined_v6_required",
+        "architecture_information_surface": "v6_b12_all_required_modules_positive_learning_signal",
+        "retained_composite_adapter_status": "fresh_adapter_v6_composite_authenticated",
         "required_fresh_learner_adapter": "rust_entity_adapter_v6_exact_actor_resources_initial_road_two_hop",
         "adapter_v5_r2_quarantine": {
           "status": "quarantined_actor_public_rule_state_contradiction",
@@ -66,9 +63,14 @@
         "minimum_initial_settlement_policy_mass_fraction": 0.02,
         "minimum_initial_road_policy_mass_fraction": 0.02,
         "shared_trunk_lr_multiplier": 0.25,
-        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh"
+        "scalar_value_objective": "binary_win_bce_logit_equivalent_deployed_tanh",
+        "v6_commissioning_teacher_target_kl_delta": -0.019447026033010335,
+        "v6_commissioning_clean_terminal_value_mse_delta": -0.0075720561112004,
+        "v6_commissioning_initial_settlement_policy_mass_fraction": 0.03831884995015131,
+        "v6_commissioning_initial_road_policy_mass_fraction": 0.03831884995015131
       },
       "commissioning_evidence": [
+        "docs/evidence/A1_COHERENT_V6_B12_COMMISSIONING_20260717.json",
         "docs/evidence/A1_COHERENT_V5_B12_SELECTION_20260717.json",
         "docs/evidence/A1_EFFECTIVE_POLICY_SIGNAL_AUDIT_20260716.json"
       ]
