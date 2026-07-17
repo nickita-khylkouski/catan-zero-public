@@ -1278,8 +1278,8 @@ def test_local_controller_status_reports_claimed_remote_workers() -> None:
 
 def test_local_controller_status_ignores_shell_wrappers_with_worker_variables() -> None:
     ps_output = """
- 50000       00:02 /bin/zsh -lc for spec in catan-zero-c1:us-central1-c; do .venv/bin/python tools/gcp_fleet_controller.py --worker "$spec" remote-sync-code --file tools/remote_fleet_autopilot.py; done
- 50001       00:02 /venv/bin/python tools/gcp_fleet_controller.py --worker catan-zero-c1:us-central1-c remote-sync-code --file tools/remote_fleet_autopilot.py
+ 50000       00:02 /bin/zsh -lc for spec in catan-zero-c1:us-central1-c; do .venv/bin/python tools/gcp_fleet_controller.py --worker "$spec" remote-sync-code --file tools/gpu_fleet.py; done
+ 50001       00:02 /venv/bin/python tools/gcp_fleet_controller.py --worker catan-zero-c1:us-central1-c remote-sync-code --file tools/gpu_fleet.py
 """
 
     status = local_controller_status(ps_output, current_pid=99999)
