@@ -302,6 +302,16 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
             raise LineageDoseError(
                 "information migration cannot also claim an initializer transform"
             )
+        migration_kind = (
+            migration.get("migration") if isinstance(migration, Mapping) else None
+        )
+        expected_forward_identity = {
+            (
+                "entity_graph.current_v2_to_v6_information_contract"
+                "+topology+split1.v1"
+            ): False,
+            "entity_graph.v5_to_v7_input_compatibility.v1": True,
+        }.get(migration_kind)
         if (
             value["init_checkpoint_sha256"] == value["declared_producer_sha256"]
             or not isinstance(migration, Mapping)
@@ -322,10 +332,9 @@ def validate_lineage_dose(value: Any) -> dict[str, Any]:
             != value["declared_producer_sha256"]
             or migration.get("migrated_initializer_sha256")
             != value["init_checkpoint_sha256"]
-            or migration.get("forward_identical") is not False
+            or expected_forward_identity is None
+            or migration.get("forward_identical") is not expected_forward_identity
             or migration.get("promotion_eligible") is not False
-            or not isinstance(migration.get("migration"), str)
-            or not migration["migration"]
             or not isinstance(migration.get("receipt"), str)
             or not migration["receipt"]
         ):

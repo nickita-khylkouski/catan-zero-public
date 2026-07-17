@@ -140,6 +140,54 @@ def test_validator_rejects_forged_cumulative_arithmetic() -> None:
         lineage.validate_lineage_dose(dose)
 
 
+def test_direct_dose_accepts_authenticated_v5_to_v7_compatibility_migration() -> None:
+    initializer = "sha256:" + "4" * 64
+    migration = {
+        "schema_version": "a1-lineage-information-contract-migration-v1",
+        "migration": "entity_graph.v5_to_v7_input_compatibility.v1",
+        "receipt": "/evidence/v5-to-v7.json",
+        "receipt_sha256": RECEIPT,
+        "source_checkpoint_sha256": PRODUCER,
+        "migrated_initializer_sha256": initializer,
+        "forward_identical": True,
+        "promotion_eligible": False,
+    }
+
+    dose = lineage.direct_lineage_dose(
+        declared_producer_sha256=PRODUCER,
+        init_checkpoint_sha256=initializer,
+        information_contract_migration=migration,
+        current_sampled_rows=6_144,
+        current_optimizer_steps=12,
+    )
+
+    assert dose["mode"] == "direct_with_information_contract_migration"
+    assert dose["information_contract_migration"] == migration
+
+
+def test_v5_to_v7_compatibility_migration_rejects_false_forward_identity() -> None:
+    initializer = "sha256:" + "4" * 64
+    migration = {
+        "schema_version": "a1-lineage-information-contract-migration-v1",
+        "migration": "entity_graph.v5_to_v7_input_compatibility.v1",
+        "receipt": "/evidence/v5-to-v7.json",
+        "receipt_sha256": RECEIPT,
+        "source_checkpoint_sha256": PRODUCER,
+        "migrated_initializer_sha256": initializer,
+        "forward_identical": False,
+        "promotion_eligible": False,
+    }
+
+    with pytest.raises(lineage.LineageDoseError, match="lineage drift"):
+        lineage.direct_lineage_dose(
+            declared_producer_sha256=PRODUCER,
+            init_checkpoint_sha256=initializer,
+            information_contract_migration=migration,
+            current_sampled_rows=6_144,
+            current_optimizer_steps=12,
+        )
+
+
 def test_direct_dose_binds_exact_objective_exposure() -> None:
     exposure = {
         "measurement_status": "bound_exactly",

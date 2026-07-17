@@ -191,6 +191,86 @@ def test_v7_replay_does_not_apply_float_tolerance_to_exact_forward_claim() -> No
         )
 
 
+def test_v7_receipt_replay_uses_v5_to_v7_anchor_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "f7-v5.pt"
+    migrated = tmp_path / "f7-v7.pt"
+    source.write_bytes(b"source")
+    migrated.write_bytes(b"migrated")
+    source_ref = migration._ref(source)  # noqa: SLF001
+    evidence = _v7_anchor_evidence()
+    before = {
+        "entity_feature_adapter": checkpoint_entity_feature_adapter_metadata(
+            RUST_ENTITY_ADAPTER_V5
+        )
+    }
+    after = {
+        "entity_feature_adapter": checkpoint_entity_feature_adapter_metadata(
+            RUST_ENTITY_ADAPTER_V6
+        ),
+        "information_contract_migration_provenance": {
+            "schema_version": migration.CHECKPOINT_PROVENANCE_SCHEMA,
+            "migration": "v5_to_v7_input_compatibility",
+            "source_checkpoint_sha256": source_ref["sha256"].removeprefix("sha256:"),
+            "source_adapter": RUST_ENTITY_ADAPTER_V5,
+            "target_adapter": RUST_ENTITY_ADAPTER_V6,
+            "source_input_routing": (
+                "v5_legacy_resource_and_initial_road_inputs"
+            ),
+            "target_input_routing": (
+                "v6_raw_inputs_with_legacy_encoder_views_plus_zero_output_residuals"
+            ),
+            "forward_identical": True,
+            "promotion_eligible": False,
+            "commissioning_status": "non_promotable_architecture_treatment",
+            "step0_anchor_evidence": evidence,
+        },
+    }
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda path, **_kwargs: before if Path(path) == source.resolve() else after,
+    )
+
+    class _Model:
+        def eval(self) -> None:
+            return None
+
+    class _Policy:
+        model = _Model()
+
+    from catan_zero.rl.entity_token_policy import EntityGraphPolicy
+    from tools import f69_upgrade_checkpoint_config as checkpoint_migration
+
+    monkeypatch.setattr(
+        EntityGraphPolicy, "load", lambda *_args, **_kwargs: _Policy()
+    )
+    observed: list[str] = []
+
+    def _anchors(*_args: object, migration: str) -> dict:
+        observed.append(migration)
+        return evidence
+
+    monkeypatch.setattr(
+        checkpoint_migration, "_migration_anchor_evidence", _anchors
+    )
+    monkeypatch.setattr(
+        migration,
+        "_verify_v7_input_routing_delta",
+        lambda *_args: {"shared_parameters_bit_identical": True},
+    )
+
+    inspected = migration.inspect_migration(
+        source,
+        migrated,
+        migration=migration.MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+    )
+
+    assert observed == ["v5_to_v7_input_compatibility"]
+    assert inspected["forward_identical"] is True
+
+
 def _v7_delta() -> tuple[dict, dict]:
     before_config = EntityGraphConfig(action_size=4, static_action_feature_size=3)
     after_config = EntityGraphConfig(

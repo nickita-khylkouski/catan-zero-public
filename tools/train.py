@@ -598,29 +598,33 @@ def _parent_initializer_binding(
         replayed = migration.verify_receipt(Path(receipt_raw))
     except (OSError, migration.MigrationError) as error:
         raise SystemExit(f"information migration receipt refused: {error}") from error
+    migration_kind = replayed.get("migration")
+    expected_forward_identity = {
+        migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1: False,
+        migration.MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY: True,
+    }.get(migration_kind)
     if (
-        replayed.get("migration")
-        != migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
+        expected_forward_identity is None
         or not _same_checkpoint_bytes(replayed.get("source"), parent)
         or not _same_checkpoint_bytes(
             replayed.get("migrated_initializer"), initializer
         )
-        or replayed.get("forward_identical") is not False
+        or replayed.get("forward_identical") is not expected_forward_identity
         or replayed.get("promotion_eligible") is not False
     ):
         raise SystemExit(
-            "migration receipt must connect the exact v2 incumbent directly to "
-            "the non-promotable adapter-v6 topology+split1 treatment"
+            "migration receipt must connect the exact incumbent directly to an "
+            "allowlisted non-promotable architecture treatment"
         )
     receipt = replayed["receipt"]
     lineage_binding = {
         "schema_version": "a1-lineage-information-contract-migration-v1",
-        "migration": replayed["migration"],
+        "migration": migration_kind,
         "receipt": receipt["path"],
         "receipt_sha256": receipt["sha256"],
         "source_checkpoint_sha256": parent["sha256"],
         "migrated_initializer_sha256": initializer["sha256"],
-        "forward_identical": False,
+        "forward_identical": expected_forward_identity,
         "promotion_eligible": False,
     }
     return {

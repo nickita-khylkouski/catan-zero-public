@@ -401,6 +401,59 @@ def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
     }
 
 
+def test_parent_initializer_accepts_exact_v5_to_v7_compatibility_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "f7-v5.pt"
+    initializer = tmp_path / "f7-v7.pt"
+    receipt = tmp_path / "v7-migration.json"
+    parent.write_bytes(b"exact-v5-parent")
+    initializer.write_bytes(b"exact-v7-initializer")
+    receipt.write_text("{}", encoding="utf-8")
+    args = _public_args(init_checkpoint=str(initializer))
+    args.parent_checkpoint = str(parent)
+    args.information_contract_migration_receipt = str(receipt)
+
+    from tools import a1_information_contract_migration as migration
+
+    parent_ref = train._checkpoint_ref(str(parent), where="parent")
+    initializer_ref = train._checkpoint_ref(str(initializer), where="initializer")
+    receipt_ref = {
+        "path": str(receipt.resolve()),
+        "sha256": "sha256:" + "b" * 64,
+    }
+    monkeypatch.setattr(
+        migration,
+        "verify_receipt",
+        lambda _path: {
+            "migration": migration.MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+            "source": {**parent_ref, "path": "/producer/f7-v5.pt"},
+            "migrated_initializer": {
+                **initializer_ref,
+                "path": "/learner/f7-v7.pt",
+            },
+            "receipt": receipt_ref,
+            "forward_identical": True,
+            "promotion_eligible": False,
+        },
+    )
+
+    binding = train._parent_initializer_binding(args)
+
+    assert binding["parent"] == parent_ref
+    assert binding["initializer"] == initializer_ref
+    assert binding["information_contract_migration"] == {
+        "schema_version": "a1-lineage-information-contract-migration-v1",
+        "migration": migration.MIGRATION_V5_TO_V7_INPUT_COMPATIBILITY,
+        "receipt": receipt_ref["path"],
+        "receipt_sha256": receipt_ref["sha256"],
+        "source_checkpoint_sha256": parent_ref["sha256"],
+        "migrated_initializer_sha256": initializer_ref["sha256"],
+        "forward_identical": True,
+        "promotion_eligible": False,
+    }
+
+
 def test_parent_update_rejects_growth_or_optimizer_resume() -> None:
     base, engine = train._load_recipe(PARENT_RECIPE)
     variants = (

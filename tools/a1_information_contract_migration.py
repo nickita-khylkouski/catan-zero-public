@@ -583,7 +583,10 @@ def inspect_migration(
     base_policy.model.eval()
     migrated_policy.model.eval()
     recomputed_anchor = checkpoint_migration._migration_anchor_evidence(  # noqa: SLF001
-        base_policy, migrated_policy, "cpu"
+        base_policy,
+        migrated_policy,
+        "cpu",
+        migration=expected_checkpoint_migration,
     )
     _verify_anchor_replay(anchor, recomputed_anchor, migration=migration)
     topology = (
