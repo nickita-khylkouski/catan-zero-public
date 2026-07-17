@@ -324,6 +324,14 @@ def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
 
     parent_ref = train._checkpoint_ref(str(parent), where="parent")
     initializer_ref = train._checkpoint_ref(str(initializer), where="initializer")
+    receipt_parent_ref = {
+        **parent_ref,
+        "path": "/producer-host/original/f7.pt",
+    }
+    receipt_initializer_ref = {
+        **initializer_ref,
+        "path": "/migration-host/original/f7-current-v6-split1.pt",
+    }
     receipt_ref = {
         "path": str(receipt.resolve()),
         "sha256": "sha256:" + "a" * 64,
@@ -333,8 +341,8 @@ def test_parent_initializer_requires_exact_incumbent_upgrade_edge(
         "verify_receipt",
         lambda _path: {
             "migration": migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1,
-            "source": parent_ref,
-            "migrated_initializer": initializer_ref,
+            "source": receipt_parent_ref,
+            "migrated_initializer": receipt_initializer_ref,
             "receipt": receipt_ref,
             "forward_identical": False,
             "promotion_eligible": False,

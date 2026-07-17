@@ -539,6 +539,17 @@ def _checkpoint_ref(raw: str, *, where: str) -> dict[str, str]:
     return {"path": str(path), "sha256": _sha256(path)}
 
 
+def _same_checkpoint_bytes(left: Any, right: Any) -> bool:
+    """Compare immutable checkpoint identity without binding deployment paths."""
+
+    return (
+        isinstance(left, dict)
+        and isinstance(right, dict)
+        and isinstance(left.get("sha256"), str)
+        and left["sha256"] == right.get("sha256")
+    )
+
+
 def _parent_initializer_binding(
     public_args: argparse.Namespace,
 ) -> dict[str, Any]:
@@ -582,8 +593,10 @@ def _parent_initializer_binding(
     if (
         replayed.get("migration")
         != migration.MIGRATION_CURRENT_V2_TO_V6_TOPOLOGY_SPLIT1
-        or replayed.get("source") != parent
-        or replayed.get("migrated_initializer") != initializer
+        or not _same_checkpoint_bytes(replayed.get("source"), parent)
+        or not _same_checkpoint_bytes(
+            replayed.get("migrated_initializer"), initializer
+        )
         or replayed.get("forward_identical") is not False
         or replayed.get("promotion_eligible") is not False
     ):
