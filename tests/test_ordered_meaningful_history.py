@@ -194,6 +194,56 @@ def test_scratch_ordered_history_is_live_on_the_first_backward() -> None:
     assert model.meaningful_history_ordered_gate.grad.abs().sum().item() > 0.0
 
 
+@pytest.mark.parametrize(
+    ("masked_scale", "ordered_scale", "masked_status", "ordered_status"),
+    (
+        (
+            0.03,
+            0.0,
+            "checkpoint_preserved",
+            "cold_start_small_nonzero_constant",
+        ),
+        (
+            0.0,
+            0.04,
+            "cold_start_small_nonzero_constant",
+            "checkpoint_preserved",
+        ),
+    ),
+)
+def test_cold_start_initializes_each_history_gate_independently(
+    masked_scale: float,
+    ordered_scale: float,
+    masked_status: str,
+    ordered_status: str,
+) -> None:
+    from tools import train_bc
+
+    model = EntityGraphNet(_config(ordered=True)).train()
+    with torch.no_grad():
+        model.meaningful_history_residual_gate.fill_(masked_scale)
+        model.meaningful_history_ordered_gate.fill_(ordered_scale)
+
+    report = train_bc._initialize_cold_start_meaningful_history_path(
+        model, scratch=False
+    )
+
+    assert report["masked_mean_gate_initialization"] == masked_status
+    assert report["ordered_additive_gate_initialization"] == ordered_status
+    assert torch.equal(
+        model.meaningful_history_residual_gate,
+        torch.full_like(
+            model.meaningful_history_residual_gate, masked_scale or 0.01
+        ),
+    )
+    assert torch.equal(
+        model.meaningful_history_ordered_gate,
+        torch.full_like(
+            model.meaningful_history_ordered_gate, ordered_scale or 0.01
+        ),
+    )
+
+
 def test_ordered_upgrade_has_typed_function_preserving_receipt() -> None:
     from tools import a1_function_preserving_upgrade as upgrade
 

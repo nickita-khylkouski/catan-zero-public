@@ -21083,10 +21083,13 @@ def _initialize_cold_start_meaningful_history_path(
     exactly none.  The old scratch-only rule accidentally left this dead path
     in place for every function-preserving history upgrade.
 
-    Preserve a checkpoint that has already learned either history gate.  For a
-    cold path (both configured gates are exactly zero), seed a small scale once
-    before the optimizer is created.  This keeps the new random residual
-    bounded, while letting its representation learn on the first backward pass.
+    Preserve each history gate that has already learned a value.  Seed every
+    configured gate that is still exactly zero once before the optimizer is
+    created.  Treating the two gates as one all-or-nothing path is incorrect:
+    upgrading a trained masked-mean branch with a new ordered branch otherwise
+    leaves the ordered encoder permanently gradient-starved (and vice versa).
+    The small seed keeps each new random residual bounded while letting its
+    representation learn on the first backward pass.
     """
 
     import torch
@@ -21110,33 +21113,38 @@ def _initialize_cold_start_meaningful_history_path(
     ordered_gate_is_live = bool(
         ordered_gate is not None and torch.count_nonzero(ordered_gate).item()
     )
-    if gate_is_live or ordered_gate_is_live:
-        return {
-            "enabled": True,
-            "scratch": bool(scratch),
-            "masked_mean_gate_initialization": "checkpoint_preserved",
-            "ordered_additive_gate_initialization": "checkpoint_preserved",
-        }
-
-    with torch.no_grad():
-        gate.fill_(MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE)
-    if ordered_gate is not None:
+    if not gate_is_live:
+        with torch.no_grad():
+            gate.fill_(MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE)
+    if ordered_gate is not None and not ordered_gate_is_live:
         with torch.no_grad():
             ordered_gate.fill_(MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE)
     return {
         "enabled": True,
         "scratch": bool(scratch),
-        "masked_mean_gate_initialization": "cold_start_small_nonzero_constant",
-        "masked_mean_gate_initial_scale": MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE,
+        "masked_mean_gate_initialization": (
+            "checkpoint_preserved"
+            if gate_is_live
+            else "cold_start_small_nonzero_constant"
+        ),
+        "masked_mean_gate_initial_scale": (
+            None
+            if gate_is_live
+            else MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE
+        ),
         "ordered_additive_gate_initialization": (
-            "cold_start_small_nonzero_constant"
-            if ordered_gate is not None
-            else "not_present"
+            "not_present"
+            if ordered_gate is None
+            else (
+                "checkpoint_preserved"
+                if ordered_gate_is_live
+                else "cold_start_small_nonzero_constant"
+            )
         ),
         "ordered_additive_gate_initial_scale": (
-            MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE
-            if ordered_gate is not None
-            else None
+            None
+            if ordered_gate is None or ordered_gate_is_live
+            else MEANINGFUL_HISTORY_COLD_START_GATE_INITIAL_SCALE
         ),
     }
 
