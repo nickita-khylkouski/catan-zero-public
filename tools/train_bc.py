@@ -12283,13 +12283,39 @@ def _validate_a1_learner_training_recipe(
             "promotion_eligible",
         }
         try:
+            from tools import train as canonical_train
+
             config_path = Path(
                 str(canonical_parent_authority.get("config", ""))
             ).expanduser().resolve(strict=True)
-        except (AttributeError, OSError) as error:
+            # Replay the checked-in production catalog instead of recognizing
+            # one historical basename. This admits only exact cataloged
+            # parent_fresh_optimizer recipes (including bounded treatments)
+            # and rejects copied or mutated JSON even when its filename looks
+            # familiar.
+            canonical_config, canonical_engine_settings = (
+                canonical_train._load_recipe(config_path)  # noqa: SLF001
+            )
+        except (AttributeError, OSError, SystemExit) as error:
             raise SystemExit(
                 f"canonical parent-update runtime authority is malformed: {error}"
             ) from error
+        projected_args = canonical_train._engine_namespace(  # noqa: SLF001
+            config=canonical_config,
+            engine_settings=canonical_engine_settings,
+            public_args=argparse.Namespace(
+                data=str(args.data),
+                checkpoint=str(args.checkpoint),
+                report=str(args.report),
+                init_checkpoint=str(args.init_checkpoint),
+                device=str(args.device),
+                host_lock_file=str(args.host_lock_file),
+                allow_concurrent_bc=bool(args.allow_concurrent_bc),
+            ),
+        )
+        projected_effective = _effective_a1_learner_training_recipe(
+            projected_args, ddp
+        )
         if (
             not isinstance(canonical_parent_authority, dict)
             or set(canonical_parent_authority) != expected_authority_fields
@@ -12298,9 +12324,9 @@ def _validate_a1_learner_training_recipe(
             or str(config_path) != canonical_parent_authority.get("config")
             or _sha256_existing_file(config_path)
             != canonical_parent_authority.get("config_file_sha256")
-            or config_path.name != "a1_parent_update_35m_b200.schema1.json"
             or canonical_parent_authority.get("diagnostic_only") is not True
             or canonical_parent_authority.get("promotion_eligible") is not False
+            or projected_effective != effective
         ):
             raise SystemExit("canonical parent-update runtime authority drift")
         # The historical data lock remains authoritative for teacher identity,
@@ -14903,10 +14929,18 @@ def main(
             raise SystemExit(
                 "--policy-aux-active-batch-size requires --grad-accum-steps 1"
             )
-        if not is_memmap_composite and not coherent_corpus_binding_raw:
+        canonical_parent_runtime_authority = getattr(
+            args, "a1_canonical_parent_update_authority", None
+        )
+        if (
+            not is_memmap_composite
+            and not coherent_corpus_binding_raw
+            and not isinstance(canonical_parent_runtime_authority, dict)
+        ):
             raise SystemExit(
                 "--policy-aux-active-batch-size requires an authenticated "
-                "memmap_composite_v2 descriptor or coherent direct-corpus binding"
+                "memmap_composite_v2 descriptor, coherent direct-corpus binding, "
+                "or canonical parent-update authority"
             )
         if float(args.policy_loss_weight) <= 0.0:
             raise SystemExit(
@@ -15331,6 +15365,63 @@ def main(
         a1_training_binding["effective_learner_training_recipe"] = (
             _validate_a1_learner_training_recipe(args, ddp, a1_training_binding)
         )
+        if (
+            int(args.policy_aux_active_batch_size) > 0
+            and isinstance(
+                getattr(args, "a1_canonical_parent_update_authority", None),
+                dict,
+            )
+            and not coherent_corpus_binding_raw
+        ):
+            override = a1_training_binding.get(
+                "canonical_parent_update_recipe_override"
+            )
+            completeness = target_information_admission.get(
+                "policy_target_completeness"
+            )
+            if (
+                not isinstance(override, dict)
+                or target_information_admission.get(
+                    "required_target_information_regime"
+                )
+                != TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+                or int(
+                    target_information_admission.get(
+                        "mismatched_target_information_rows", -1
+                    )
+                )
+                != 0
+                or not isinstance(completeness, dict)
+                or completeness.get("require_exact_public_policy") is not True
+                or int(completeness.get("hard_action_fallback_rows", -1)) != 0
+                or int(
+                    completeness.get(
+                        "exact_complete_public_soft_target_rows", -1
+                    )
+                )
+                != int(completeness.get("policy_active_rows", -2))
+            ):
+                raise SystemExit(
+                    "canonical direct-corpus policy AUX requires the exact "
+                    "cataloged parent-update recipe and a complete coherent-public "
+                    "policy-target admission"
+                )
+            a1_training_binding["canonical_direct_policy_aux_authority"] = {
+                "schema_version": "a1-canonical-direct-policy-aux-authority-v1",
+                "config": override["config"],
+                "config_file_sha256": override["config_file_sha256"],
+                "required_target_information_regime": (
+                    TARGET_INFORMATION_REGIME_PUBLIC_COHERENT
+                ),
+                "mismatched_target_information_rows": 0,
+                "policy_active_rows": int(completeness["policy_active_rows"]),
+                "exact_complete_public_soft_target_rows": int(
+                    completeness["exact_complete_public_soft_target_rows"]
+                ),
+                "base_measure": "authenticated_a1_direct_uniform_row",
+                "diagnostic_only": True,
+                "promotion_eligible": False,
+            }
         args.a1_contract_sha256 = validation_seed_contract["a1_contract_sha256"]
         args.a1_selected_game_seed_set_sha256 = a1_training_binding[
             "selected_game_seed_set_sha256"
@@ -17005,10 +17096,22 @@ def main(
             isinstance(a1_training_binding, dict)
             and a1_training_binding.get("coherent_direct_corpus") is True
         )
-        if component_game_sampling is None and not coherent_direct_policy_aux:
+        canonical_direct_policy_aux = bool(
+            isinstance(a1_training_binding, dict)
+            and isinstance(
+                a1_training_binding.get(
+                    "canonical_direct_policy_aux_authority"
+                ),
+                dict,
+            )
+        )
+        authenticated_direct_policy_aux = (
+            coherent_direct_policy_aux or canonical_direct_policy_aux
+        )
+        if component_game_sampling is None and not authenticated_direct_policy_aux:
             raise SystemExit(
                 "policy auxiliary sampling requires authenticated composite base "
-                "weights or a coherent direct-corpus binding"
+                "weights or an authenticated direct-corpus authority"
             )
         stage_c_base = (
             _stage_c_policy_aux_base_measure(data, train_indices)
@@ -17033,7 +17136,7 @@ def main(
                 if exact_per_game_surprise or legacy_policy_surprise
                 else (
                     np.ones(len(train_indices), dtype=np.float64)
-                    if coherent_direct_policy_aux
+                    if authenticated_direct_policy_aux
                     else component_game_sampling
                 )
             )
@@ -17054,6 +17157,8 @@ def main(
             if coherent_direct_policy_aux and legacy_policy_surprise
             else "coherent_direct_uniform_row"
             if coherent_direct_policy_aux
+            else "authenticated_a1_direct_uniform_row"
+            if canonical_direct_policy_aux
             else "authenticated_component_x_exact_per_game_policy_surprise"
             if exact_per_game_surprise
             else "authenticated_component"
