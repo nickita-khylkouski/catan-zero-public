@@ -26,6 +26,7 @@ from catan_zero.rl.entity_token_features import (  # noqa: E402
 from catan_zero.rl.entity_token_policy import (  # noqa: E402
     PUBLIC_AWARD_FEATURE_CONTRACT_AUTHORITATIVE,
     PUBLIC_AWARD_FEATURE_CONTRACT_LEGACY_ZERO,
+    STATIC_ACTION_RESIDUAL_SLICE,
     EntityGraphConfig,
     EntityGraphNet,
 )
@@ -260,6 +261,127 @@ def test_v7_compatibility_route_matches_monolithic_split_eager() -> None:
     assert DEDUCTION_FEATURES_KEY in runner._state_input_keys()
     for key in actual:
         torch.testing.assert_close(actual[key], expected[key], rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph capture")
+def test_canonical_v7_inputs_run_through_real_cuda_graph() -> None:
+    policy = _policy(
+        topology_residual_adapter=True,
+        action_target_gather=True,
+        action_cross_attention_layers=1,
+        meaningful_public_history=True,
+        event_history_limit=8,
+        meaningful_public_history_target_gather=True,
+        static_action_residual=True,
+        legal_action_value_residual=True,
+        public_card_count_features=True,
+        public_card_count_residual_bias=False,
+        v6_compatibility_preserving_inputs=True,
+    )
+    policy.device = torch.device("cuda")
+    policy.model = policy.model.to(policy.device)
+    policy.static_action_features = policy.static_action_features.to(policy.device)
+    entity, legal_ids, context = _batch(
+        batch_size=2,
+        legal_width=4,
+        event_width=8,
+        live_events=2,
+    )
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(
+            enabled=True,
+            batch_buckets=(2, 4),
+            event_token_limit=2,
+            warmup_iterations=1,
+        ),
+    )
+
+    outputs = runner.forward_legal_np(
+        entity,
+        legal_ids,
+        context,
+        return_q=True,
+    )
+
+    assert runner.last_path == "cuda_graph"
+    assert runner.graph_count == 1
+    assert outputs["logits"].shape == legal_ids.shape
+    assert outputs["q_values"].shape == legal_ids.shape
+    assert torch.isfinite(outputs["value"]).all()
+
+
+def test_split_runner_uses_symmetry_remapped_static_catalog_rows() -> None:
+    policy = _policy(static_action_residual=True)
+    with torch.no_grad():
+        policy.static_action_features[
+            :, STATIC_ACTION_RESIDUAL_SLICE.start
+        ] = torch.arange(policy.config.action_size, dtype=torch.float32)
+        policy.model.static_action_residual_proj.weight.zero_()
+        policy.model.static_action_residual_proj.bias.zero_()
+        policy.model.static_action_residual_proj.weight[0, 0] = 1.0
+    entity, legal_ids, context = _batch(batch_size=2, legal_width=4)
+    symmetry_ids = legal_ids.copy()
+    symmetry_ids[legal_ids >= 0] = 3 - legal_ids[legal_ids >= 0]
+    entity["_symmetry_legal_action_ids"] = symmetry_ids
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(enabled=False),
+    )
+
+    actual = runner.forward_legal_np(entity, legal_ids, context)
+    action_batch, _ = runner._action_batch(entity, legal_ids, context)
+
+    expected_catalog = torch.as_tensor(
+        np.where(symmetry_ids >= 0, symmetry_ids, 0),
+        dtype=torch.long,
+    )
+    expected_static = policy.static_action_features.index_select(
+        0,
+        expected_catalog.reshape(-1),
+    ).reshape(*expected_catalog.shape, -1)
+    expected_static = expected_static[..., STATIC_ACTION_RESIDUAL_SLICE].masked_fill(
+        ~torch.as_tensor(symmetry_ids >= 0).unsqueeze(-1),
+        0.0,
+    )
+    torch.testing.assert_close(
+        action_batch["legal_action_static_features"],
+        expected_static,
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    monolithic_batch = {
+        key: torch.as_tensor(value)
+        for key, value in entity.items()
+        if key != "_symmetry_legal_action_ids"
+    }
+    monolithic_batch["legal_action_context"] = torch.as_tensor(context)
+    monolithic_batch["legal_action_static_features"] = expected_static
+    with torch.no_grad():
+        expected = policy.model(monolithic_batch)
+        expected["logits"] = expected["logits"].masked_fill(
+            torch.as_tensor(legal_ids) < 0,
+            -1.0e9,
+        )
+    for key in actual:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0.0, atol=0.0)
+
+
+def test_split_runner_disables_learner_only_auxiliary_outputs() -> None:
+    policy = _policy(
+        aux_subgoal_heads=True,
+        aux_settlement_pointer_head=True,
+    )
+    entity, legal_ids, context = _batch(batch_size=2, legal_width=4)
+    runner = CudaGraphInferenceRunner(
+        policy,
+        CudaGraphInferenceConfig(enabled=False),
+    )
+
+    outputs = runner.forward_legal_np(entity, legal_ids, context)
+
+    assert outputs.keys() == {"logits", "value", "final_vp"}
 
 
 def test_legacy_award_bridge_also_applies_on_cuda_runner_bypass() -> None:

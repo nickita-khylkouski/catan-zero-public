@@ -263,6 +263,7 @@ class CudaGraphInferenceRunner:
                 action_batch,
                 return_q=return_q,
                 return_final_vp=return_final_vp,
+                return_aux_subgoals=False,
             )
             outputs["logits"] = outputs["logits"].masked_fill(action_ids < 0, -1.0e9)
 
@@ -452,8 +453,24 @@ class CudaGraphInferenceRunner:
                 device=self.device,
             )
         if bool(getattr(self.config, "static_action_residual", False)):
-            valid = legal_action_ids >= 0
-            catalog_ids = np.where(valid, legal_action_ids, 0)
+            catalog_rows = int(self.policy.static_action_features.shape[0])
+            symmetry_catalog_ids = entity_batch.get("_symmetry_legal_action_ids")
+            if symmetry_catalog_ids is None:
+                catalog_ids = np.asarray(legal_action_ids, dtype=np.int64)
+            else:
+                # D6 relabels catalog identity without reordering legal rows.
+                # The split runner must use the same remapped static rows as
+                # EntityGraphPolicy.forward_legal_np.
+                catalog_ids = np.asarray(symmetry_catalog_ids, dtype=np.int64)
+                if catalog_ids.shape != legal_action_ids.shape:
+                    raise ValueError(
+                        "symmetry/static catalog ids must match legal_action_ids: "
+                        f"{catalog_ids.shape} != {legal_action_ids.shape}"
+                    )
+            valid = catalog_ids >= 0
+            if bool(np.any(catalog_ids[valid] >= catalog_rows)):
+                raise ValueError("static action catalog id is outside catalog rows")
+            catalog_ids = np.where(valid, catalog_ids, 0)
             static = self.policy.static_action_features.index_select(
                 0,
                 torch.as_tensor(
@@ -504,6 +521,7 @@ class CudaGraphInferenceRunner:
                 action_batch,
                 return_q=return_q,
                 return_final_vp=return_final_vp,
+                return_aux_subgoals=False,
             )
             outputs["logits"] = outputs["logits"].masked_fill(action_ids < 0, -1.0e9)
             return outputs
