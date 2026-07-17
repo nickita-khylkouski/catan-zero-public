@@ -48,7 +48,10 @@ def _tensor_inventory_sha256(model: dict[str, Any]) -> str:
         digest.update(name.encode("utf-8") + b"\0")
         digest.update(str(tensor.dtype).encode("ascii") + b"\0")
         digest.update(json.dumps(list(tensor.shape)).encode("ascii") + b"\0")
-        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+        # Flatten first: PyTorch does not permit a dtype-changing view of a
+        # zero-dimensional scalar tensor, while model state dictionaries may
+        # legitimately contain scalar buffers.
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
     return "sha256:" + digest.hexdigest()
 
 
